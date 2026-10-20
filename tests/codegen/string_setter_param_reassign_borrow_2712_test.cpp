@@ -63,6 +63,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -71,14 +72,25 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 8 absorbing rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it —
+// the definition scripts/check_toolchain_skip_surface.py uses for an
+// ABSORBING site. It was also a silent vacuous pass: on a box whose clang
+// cannot link the ASan binary, every one of those rows returned WITHOUT
+// asserting, and the suite reported a clean PASS having compiled and run
+// nothing.
+//
+// Each guard becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position:
+// the skip is still recognised as an environment condition rather than a
+// product failure, but it now MARKS THE ROW FAILED instead of hiding it.
+// Every substantive assertion in every row — `r.ran` and the exitCode pins —
+// stays exactly where it was, and the local predicate is deleted so no
+// absorbing shape survives. The guard stays a SEPARATE statement from the
+// predicate on purpose: inlining it into an `if` recreates the shape the
+// predicate exists to end.
 
 // Every program below returns sum over i in 1..20 of len("v-{i}")
 //   = 9*3 + 11*4 = 71.
@@ -327,7 +339,7 @@ const char* kSetterNeverAssignsTakesNoRetain =
 BEZEL_TEST(codegen_string_setter_param_reassign_2712,
            inlined_indexer_setter_reassigning_index_param_spec_23_4) {
     JitResult r = runAotChecked(kInlinedIndexerSetterReassignsIndexParam);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);          // no use-after-free AND no leak
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
 }
@@ -349,7 +361,7 @@ BEZEL_TEST(codegen_string_setter_param_reassign_2712,
 BEZEL_TEST(codegen_string_setter_param_reassign_2712,
            inlined_indexer_setter_reassigning_value_spec_23_3) {
     JitResult r = runAotChecked(kInlinedIndexerSetterReassignsValue);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
 }
@@ -360,7 +372,7 @@ BEZEL_TEST(codegen_string_setter_param_reassign_2712,
 BEZEL_TEST(codegen_string_setter_param_reassign_2712,
            inlined_indexer_compound_setter_reassigning_index_param_spec_4_6) {
     JitResult r = runAotChecked(kInlinedIndexerCompoundReassignsIndexParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
 }
@@ -371,7 +383,7 @@ BEZEL_TEST(codegen_string_setter_param_reassign_2712,
 BEZEL_TEST(codegen_string_setter_param_reassign_2712,
            inlined_indexer_increment_setter_reassigning_index_param_spec_23_4) {
     JitResult r = runAotChecked(kInlinedIndexerIncrementReassignsIndexParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
 }
@@ -382,7 +394,7 @@ BEZEL_TEST(codegen_string_setter_param_reassign_2712,
 BEZEL_TEST(codegen_string_setter_param_reassign_2712,
            inlined_instance_property_setter_reassigning_value_spec_23_3) {
     JitResult r = runAotChecked(kInlinedInstancePropertySetterReassignsValue);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
 }
@@ -393,7 +405,7 @@ BEZEL_TEST(codegen_string_setter_param_reassign_2712,
 BEZEL_TEST(codegen_string_setter_param_reassign_2712,
            inlined_static_property_setter_reassigning_value_spec_23_3) {
     JitResult r = runAotChecked(kInlinedStaticPropertySetterReassignsValue);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
 }
@@ -405,7 +417,7 @@ BEZEL_TEST(codegen_string_setter_param_reassign_2712,
 BEZEL_TEST(codegen_string_setter_param_reassign_2712,
            inlined_record_ctor_reassigning_string_param_spec_28_1) {
     JitResult r = runAotChecked(kInlinedRecordCtorReassignsStringParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
 }
@@ -417,7 +429,7 @@ BEZEL_TEST(codegen_string_setter_param_reassign_2712,
 BEZEL_TEST(codegen_string_setter_param_reassign_2712,
            setter_that_never_assigns_takes_no_retain_spec_28_9) {
     JitResult r = runAotChecked(kSetterNeverAssignsTakesNoRetain);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);          // a spurious retain would leak here
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
 }

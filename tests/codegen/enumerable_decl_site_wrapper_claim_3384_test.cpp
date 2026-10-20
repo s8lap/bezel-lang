@@ -91,6 +91,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -98,14 +99,25 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 7 absorbing rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it —
+// the definition scripts/check_toolchain_skip_surface.py uses for an
+// ABSORBING site. It was also a silent vacuous pass: on a box whose clang
+// cannot link the ASan binary, every one of those rows returned WITHOUT
+// asserting, and the suite reported a clean PASS having compiled and run
+// nothing.
+//
+// Each guard becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position:
+// the skip is still recognised as an environment condition rather than a
+// product failure, but it now MARKS THE ROW FAILED instead of hiding it.
+// Every substantive assertion in every row — `r.ran` and the exitCode pins —
+// stays exactly where it was, and the local predicate is deleted so no
+// absorbing shape survives. The guard stays a SEPARATE statement from the
+// predicate on purpose: inlining it into an `if` recreates the shape the
+// predicate exists to end.
 
 const char* const kItem =
     "module M; "
@@ -148,7 +160,7 @@ BEZEL_TEST(enumerable_decl_site_wrapper_claim_3384,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: LeakSanitizer reports 1632 bytes in 51 allocations.
     BEZEL_EXPECT_TRUE(r.ran);
     // Count == 2 and total == 7: the borrowing wrap is non-destructive
@@ -190,7 +202,7 @@ BEZEL_TEST(enumerable_decl_site_wrapper_claim_3384,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: LeakSanitizer reports 1200 bytes in 50 allocations.
     BEZEL_EXPECT_TRUE(r.ran);
     // Count == 2: fifty draining views were minted and dropped without a
@@ -228,7 +240,7 @@ BEZEL_TEST(enumerable_decl_site_wrapper_claim_3384,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: 24 bytes leaked in 1 allocation (the single unclaimed frame).
     BEZEL_EXPECT_TRUE(r.ran);
     // Count == 0 (stdlib §4.5: "elements leave the collection as they are
@@ -274,7 +286,7 @@ BEZEL_TEST(enumerable_decl_site_wrapper_claim_3384,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: LeakSanitizer reports 1632 bytes in 51 allocations.
     BEZEL_EXPECT_TRUE(r.ran);
     // first == 3 (pop order, stdlib §4.11) and total == 6 — the reverse
@@ -313,7 +325,7 @@ BEZEL_TEST(enumerable_decl_site_wrapper_claim_3384,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: LeakSanitizer reports 1632 bytes in 51 allocations.
     BEZEL_EXPECT_TRUE(r.ran);
     // Count == 2 (the borrowing node-walk leaves the list intact), total == 9.
@@ -354,7 +366,7 @@ BEZEL_TEST(enumerable_decl_site_wrapper_claim_3384,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 213);
 }
@@ -394,7 +406,7 @@ BEZEL_TEST(enumerable_decl_site_wrapper_claim_3384,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix this shape LEAKED (two unclaimed frames per iteration) but did
     // not crash; the assertion that matters here is the post-fix one — 40
     // claimed frames dropped, the source untouched.

@@ -52,6 +52,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -60,15 +61,25 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// the helper returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 7 absorbing rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it —
+// the definition scripts/check_toolchain_skip_surface.py uses for an
+// ABSORBING site. It was also a silent vacuous pass: on a box whose clang
+// cannot link the ASan binary, every one of those rows returned WITHOUT
+// asserting, and the suite reported a clean PASS having compiled and run
+// nothing.
+//
+// Each guard becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position:
+// the skip is still recognised as an environment condition rather than a
+// product failure, but it now MARKS THE ROW FAILED instead of hiding it.
+// Every substantive assertion in every row — `r.ran` and the exitCode pins —
+// stays exactly where it was, and the local predicate is deleted so no
+// absorbing shape survives. The guard stays a SEPARATE statement from the
+// predicate on purpose: inlining it into an `if` recreates the shape the
+// predicate exists to end.
 
 }  // namespace
 
@@ -99,7 +110,7 @@ BEZEL_TEST(codegen_3195_scoped_passive, minimal_repro_releases_scoped_closure_ar
         "    return 0; "
         "  end Main; "
         "end Program;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -141,7 +152,7 @@ BEZEL_TEST(codegen_3195_scoped_passive, capture_bearing_lambda_scoped_param_no_u
         "  end Main; "
         "  public static method Touch(s: Sub) end Touch; "
         "end Program;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -172,7 +183,7 @@ BEZEL_TEST(codegen_3195_scoped_passive, explicit_p_dispose_does_not_double_free_
         "    return 0; "
         "  end Main; "
         "end Program;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -200,7 +211,7 @@ BEZEL_TEST(codegen_3195_scoped_passive, control_no_call_still_auto_drops_clean_s
         "    return 0; "
         "  end Main; "
         "end Program;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -231,7 +242,7 @@ BEZEL_TEST(codegen_3195_scoped_passive, method_reference_scoped_param_released_s
         "  end Main; "
         "  public static method Noop() end Noop; "
         "end Program;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -267,7 +278,7 @@ BEZEL_TEST(codegen_3195_scoped_passive, over_arm_control_body_references_h_spec_
         "    return 0; "
         "  end Main; "
         "end Program;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -302,7 +313,7 @@ BEZEL_TEST(codegen_3195_scoped_passive, over_arm_control_sync_iterator_retains_s
         "    return 0; "
         "  end Main; "
         "end Program;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

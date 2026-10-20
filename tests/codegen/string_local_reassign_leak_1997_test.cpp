@@ -65,6 +65,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::codegen::CodegenOptions;
@@ -74,15 +75,25 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 11 absorbing rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it —
+// the definition scripts/check_toolchain_skip_surface.py uses for an
+// ABSORBING site. It was also a silent vacuous pass: on a box whose clang
+// cannot link the ASan binary, every one of those rows returned WITHOUT
+// asserting, and the suite reported a clean PASS having compiled and run
+// nothing.
+//
+// Each guard becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position:
+// the skip is still recognised as an environment condition rather than a
+// product failure, but it now MARKS THE ROW FAILED instead of hiding it.
+// Every substantive assertion in every row — `r.ran` and the exitCode pins —
+// stays exactly where it was, and the local predicate is deleted so no
+// absorbing shape survives. The guard stays a SEPARATE statement from the
+// predicate on purpose: inlining it into an `if` recreates the shape the
+// predicate exists to end.
 
 // #1997 BLOCKER oracle — AddressSanitizer with LeakSanitizer OFF.
 //
@@ -327,7 +338,7 @@ const char* kGroupingAliasReassignDoubleFree =
 BEZEL_TEST(string_local_reassign_leak_1997,
            reassign_numeric_tostring_lsan_clean_spec_28_9) {
     JitResult r = runAotChecked(kReassignNumericToString);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // final "2" freed once (was leaked pre-fix)
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // "2".Length
 }
@@ -335,7 +346,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            triple_reassign_intermediates_released_once_spec_28_9) {
     JitResult r = runAotChecked(kTripleReassign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // "1","22" released once each; final "333" freed
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // "333".Length
 }
@@ -343,7 +354,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            nonconst_concat_reassign_lsan_clean_spec_4_6) {
     JitResult r = runAotChecked(kNonConstConcatReassign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // final heap "QQWW" freed once (not literal-folded)
     BEZEL_EXPECT_EQ(r.exitCode, 4);  // "QQWW".Length
 }
@@ -351,7 +362,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            self_assign_lsan_clean_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kSelfAssign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // clean: no leak, no double-free (retain-before-release)
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // "42".Length
 }
@@ -359,7 +370,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            borrow_init_then_reassign_lsan_clean_spec_28_9) {
     JitResult r = runAotChecked(kBorrowInitThenReassign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // borrow-candidate path: final "5" freed once
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // "5".Length
 }
@@ -372,7 +383,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            method_alias_reassign_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kMethodAliasReassign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // `a := a.ToUpper()` — no double-free of the aliased value
     BEZEL_EXPECT_EQ(r.exitCode, 6);  // "HELLO!".Length
 }
@@ -380,7 +391,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            escaping_reassigned_return_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kEscapingReassignReturn);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // reassigned + returned: transferred +1 not double-freed
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // "6".Length
 }
@@ -388,7 +399,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            self_assign_escaping_return_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kSelfAssignEscapingReturn);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // self-assign + returned: single +1 transferred, not double-freed
     BEZEL_EXPECT_EQ(r.exitCode, 1);  // "7".Length
 }
@@ -405,7 +416,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            dict_materializer_alias_reassign_no_double_free_spec_28_9) {
     JitResult r = runAotAsanNoLeak(kDictAliasReassignDoubleFree);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // #1028: no bz_dict_free double-free (blocker guard SEGVs here)
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // d.Count
 }
@@ -413,7 +424,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            dict_materializer_two_alias_reassign_no_double_free_spec_28_9) {
     JitResult r = runAotAsanNoLeak(kDictTwoAliasReassignDoubleFree);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // #1028: two aliases onto one using-owned dict, freed once
     BEZEL_EXPECT_EQ(r.exitCode, 4);  // d.Count + e.Count
 }
@@ -421,7 +432,7 @@ BEZEL_TEST(string_local_reassign_leak_1997,
 BEZEL_TEST(string_local_reassign_leak_1997,
            grouping_alias_reassign_no_double_free_spec_28_9) {
     JitResult r = runAotAsanNoLeak(kGroupingAliasReassignDoubleFree);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // #1930: no bz_grouping_free double-free (blocker guard SEGVs here)
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // key-1 group {1,3}, Count()
 }

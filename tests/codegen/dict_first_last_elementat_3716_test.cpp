@@ -50,6 +50,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -69,12 +70,25 @@ std::string prog(const std::string& mainBody) {
            " end Main; end C;";
 }
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 7 absorbing rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it —
+// the definition scripts/check_toolchain_skip_surface.py uses for an
+// ABSORBING site. It was also a silent vacuous pass: on a box whose clang
+// cannot link the ASan binary, every one of those rows returned WITHOUT
+// asserting, and the suite reported a clean PASS having compiled and run
+// nothing.
+//
+// Each guard becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position:
+// the skip is still recognised as an environment condition rather than a
+// product failure, but it now MARKS THE ROW FAILED instead of hiding it.
+// Every substantive assertion in every row — `r.ran` and the exitCode pins —
+// stays exactly where it was, and the local predicate is deleted so no
+// absorbing shape survives. The guard stays a SEPARATE statement from the
+// predicate on purpose: inlining it into an `if` recreates the shape the
+// predicate exists to end.
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
@@ -151,7 +165,7 @@ BEZEL_TEST(dict_first_last_elementat_3716, sorted_dictionary_first_empty_throws_
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -170,7 +184,7 @@ BEZEL_TEST(dict_first_last_elementat_3716, sorted_dictionary_last_empty_throws_5
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -190,7 +204,7 @@ BEZEL_TEST(dict_first_last_elementat_3716, sorted_dictionary_element_at_oor_thro
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -210,7 +224,7 @@ BEZEL_TEST(dict_first_last_elementat_3716, sorted_dictionary_element_at_negative
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -249,7 +263,7 @@ BEZEL_TEST(dict_first_last_elementat_3716,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x 7 == 1400; disposed exactly once per iteration == 200.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1400 n=200"));
@@ -274,7 +288,7 @@ BEZEL_TEST(dict_first_last_elementat_3716,
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x (1 + 3) == 800 (ascending: First key=1, Last key=3).
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=800"));
@@ -348,7 +362,7 @@ BEZEL_TEST(dict_first_last_elementat_3716,
     // reject rows above could only come from the reject path itself (which
     // never reaches codegen at all, since sema rejects before lowering).
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

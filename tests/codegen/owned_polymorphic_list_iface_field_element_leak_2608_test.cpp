@@ -76,6 +76,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -83,13 +84,25 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// ASan toolchain skip-guard (matches the #2603 / #2606 test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 8 absorbing rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it —
+// the definition scripts/check_toolchain_skip_surface.py uses for an
+// ABSORBING site. It was also a silent vacuous pass: on a box whose clang
+// cannot link the ASan binary, every one of those rows returned WITHOUT
+// asserting, and the suite reported a clean PASS having compiled and run
+// nothing.
+//
+// Each guard becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position:
+// the skip is still recognised as an environment condition rather than a
+// product failure, but it now MARKS THE ROW FAILED instead of hiding it.
+// Every substantive assertion in every row — `r.ran` and the exitCode pins —
+// stays exactly where it was, and the local predicate is deleted so no
+// absorbing shape survives. The guard stays a SEPARATE statement from the
+// predicate on purpose: inlining it into an `if` recreates the shape the
+// predicate exists to end.
 
 // ----------------------------------------------------------------------
 // (A) CARDINAL: owned IReadOnlyList<Cell> field with an OWNING backing. The
@@ -368,7 +381,7 @@ const char* kOwnedOwningArrayControl =
 BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
            ireadonlylist_field_owning_backing_elements_disposed_spec_28_11) {
     JitResult r = runAotChecked(kOwningBackedElements);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);          // LSan-clean (the #2608 leak flips this)
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0 — disposed exactly once
 }
@@ -381,7 +394,7 @@ BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
 BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
            ireadonlylist_field_borrowing_backing_elements_not_disposed_spec_4_3) {
     JitResult r = runAotChecked(kBorrowingBackedElements);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0 — no double-free
 }
@@ -392,7 +405,7 @@ BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
 BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
            ireadonlylist_field_owning_backing_reassign_exactly_once_spec_28_11) {
     JitResult r = runAotChecked(kOwningBackedReassign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0 — 3 created, 3 disposed
 }
@@ -404,7 +417,7 @@ BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
 BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
            ireadonlylist_ctor_param_owning_backing_disposed_spec_22_10_28_11) {
     JitResult r = runAotChecked(kOwningBackedCtorParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0
 }
@@ -416,7 +429,7 @@ BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
 BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
            ireadonlylist_field_borrowing_backing_reassign_no_uaf_spec_4_3) {
     JitResult r = runAotChecked(kBorrowingBackedReassign);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0
 }
@@ -428,7 +441,7 @@ BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
 BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
            owned_ilist_string_field_static_release_preserved_spec_28_11) {
     JitResult r = runAotChecked(kOwnedIListStringControl);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);   // 300 mod 256
 }
@@ -440,7 +453,7 @@ BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
 BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
            owned_iowninglist_field_static_owning_preserved_spec_28_11) {
     JitResult r = runAotChecked(kOwnedIOwningListControl);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0
 }
@@ -452,7 +465,7 @@ BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
 BEZEL_TEST(codegen_owned_polymorphic_list_iface_field_element_leak_2608,
            owned_owningarray_field_concrete_path_unaffected_spec_28_5) {
     JitResult r = runAotChecked(kOwnedOwningArrayControl);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0
 }

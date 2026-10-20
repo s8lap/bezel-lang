@@ -91,6 +91,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -98,13 +99,25 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// ASan toolchain skip-guard (matches the #2608 test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 6 absorbing rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it —
+// the definition scripts/check_toolchain_skip_surface.py uses for an
+// ABSORBING site. It was also a silent vacuous pass: on a box whose clang
+// cannot link the ASan binary, every one of those rows returned WITHOUT
+// asserting, and the suite reported a clean PASS having compiled and run
+// nothing.
+//
+// Each guard becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position:
+// the skip is still recognised as an environment condition rather than a
+// product failure, but it now MARKS THE ROW FAILED instead of hiding it.
+// Every substantive assertion in every row — `r.ran` and the exitCode pins —
+// stays exactly where it was, and the local predicate is deleted so no
+// absorbing shape survives. The guard stays a SEPARATE statement from the
+// predicate on purpose: inlining it into an `if` recreates the shape the
+// predicate exists to end.
 
 // ----------------------------------------------------------------------
 // (A) CARDINAL: `using var v := Make()` where Make returns
@@ -293,7 +306,7 @@ const char* kOwningLocalToOwningInterface =
 BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
            ireadonlylist_local_owning_backing_elements_disposed_spec_28_11) {
     JitResult r = runAotChecked(kOwningBackedLocal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);          // LSan-clean (the #2630 leak flips this)
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0 — disposed exactly once
 }
@@ -307,7 +320,7 @@ BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
 BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
            ireadonlylist_local_borrowing_backing_elements_not_disposed_spec_4_3) {
     JitResult r = runAotChecked(kBorrowingBackedLocal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0 — no double-free
 }
@@ -320,7 +333,7 @@ BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
 BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
            iowninglist_local_static_owning_preserved_spec_28_11) {
     JitResult r = runAotChecked(kOwningListLocal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0
 }
@@ -333,7 +346,7 @@ BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
 BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
            ireadonlylist_local_owned_arg_to_iface_param_disposed_spec_28_11) {
     JitResult r = runAotChecked(kOwningBackedParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0
 }
@@ -349,7 +362,7 @@ BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
 BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
            ireadonlylist_string_local_static_release_preserved_spec_28_11) {
     JitResult r = runAotChecked(kStringElementRelease);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);   // 100 × 3 mod 256 = 300 mod 256 = 44
 }
@@ -362,7 +375,7 @@ BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
 BEZEL_TEST(codegen_erased_interface_local_disposal_2630,
            iowninglist_local_owned_assignment_static_owning_spec_28_11) {
     JitResult r = runAotChecked(kOwningLocalToOwningInterface);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0
 }
