@@ -6572,6 +6572,137 @@ void ExprTC::checkAssignable(
             return;
         }
     }
+    // fix #6565 (§5.1, §3.1, §9.1, v0.338): a CONCRETE PRIMITIVE source into a
+    // VALUE-TYPED BUILT-IN record target. §5.1's table is closed and lists only
+    // numeric rows, and its "Reference conversions" list is closed too — an
+    // `int` is not a class, is not a base of `DateTime`, and boxes only to
+    // `Object` and to the compiler-provided interfaces `primitiveBoxesInto-
+    // BuiltinIface` admits just below. So NO row converts `int` (or any other
+    // concrete primitive) to a built-in VALUE record, and each one is a
+    // different record layout from the primitive's.
+    //
+    // It reached the catch-all accept because every arm above is keyed on
+    // something a built-in value record does not have: the #1178 mixed
+    // class/primitive gate requires `declaration != nullptr` and these carry
+    // `declaration == nullptr` by construction (#1463 — that null is exactly
+    // what makes `new T(...)` dispatch); the Named-Named gate requires
+    // `from->declaration`; the §12.9 variance gate requires `to->genericArgs`
+    // non-empty, which excludes the non-generic heads.
+    //
+    // MEASURED, and it is not a benign accept: codegen lowers the slot alloca
+    // from the ARGUMENT's LLVM type and passes the RECEIVER's element stride
+    // to `bz_array_add`, which memcpy's that stride out of the slot. So
+    // `Array<DateTime>.Add(5)` emitted `bz_array_add(arr, <4-byte i32 alloca>,
+    // 16)` and read 12 bytes of redzone — `AddressSanitizer:
+    // stack-buffer-overflow`, READ of size 16, in `memcpy` <-
+    // bz_array_add (bezel_runtime_collections.cpp:310), rc=99. Same for
+    // `TimeSpan`, `Guid`, `IntPtr`, `UIntPtr`, `ReadOnlyStringSpan` and
+    // `DictionaryEntry<K, V>` — every head this predicate names, and every
+    // concrete primitive source (`int`, `long`, `string`, `char`, `bool`, the
+    // floats, the small integers), measured over the full 12-target ×
+    // 14-source matrix (168 pairs): all 168 accepted before this arm, and 0 of
+    // 168 still accept after it.
+    //
+    // SCOPE, and why it is exactly these heads. The target set is
+    // `isValueBuiltinByName` (the #1463 authority for "a value-builtin whose
+    // Named TypeRef carries declaration=null") plus the two stdlib §4.18
+    // synthetic entry RECORDS. Those are precisely the null-declaration Named
+    // types that are RECORDS rather than heap classes, which is what separates
+    // them from the three families that already reject correctly further down
+    // and must keep doing so through their own arms: the builtin CLASSES
+    // (#4733's `isHeapPointerReferenceBuiltin` / `isBuiltinExceptionName`),
+    // the BUILT-IN GENERIC collections/spans/iterable interfaces (#6312), and
+    // the enum gate just above. The heads `isValueBuiltinByName` shares with
+    // #4733 (`CancellationToken`) and with #6312 (the four span heads) are
+    // carved out so those arms keep their rejections AND their diagnostics —
+    // see the carve-outs' own comment below.
+    //
+    // Nothing here is a type variable — those are excluded by name
+    // (`refMentionsTypeVariable` / `freeTypeParamNames`), so
+    // a generic body keeps deferring to its instantiations per §14.2 rule 2,
+    // the same fail-open #6500 adopted for the dictionary key slot.
+    //
+    // `IntPtr`/`UIntPtr` deserve their note: §32.7 gives them EXPLICIT
+    // conversions to and from `long`/`ulong` and declares no implicit one, so
+    // `var p: IntPtr := 5` is rejected here and `IntPtr(5L)` is the §5.2
+    // spelling that works — which is what §14.2's closed constructor surface
+    // and §32.7 already require of every other built-in with no implicit row.
+    {
+        auto isBuiltinClassHead = [](std::string_view n) {
+            return !n.empty() &&
+                   (common::isHeapPointerReferenceBuiltin(n) ||
+                    common::isBuiltinExceptionName(n)) &&
+                   !common::isBuiltinInterfaceHead(n);
+        };
+        // The four SPAN heads are #6312's (`spanHead` in that arm, further
+        // down this chain), and `isValueBuiltinByName` names all four.
+        auto isSpanHead = [](std::string_view n) {
+            return n == "Span" || n == "ReadOnlySpan" ||
+                   n == "ArraySpan" || n == "ReadOnlyArraySpan";
+        };
+        bool fromConcretePrim = from->kind == TypeRef::Kind::Primitive &&
+                                from->primitive != PrimitiveType::Object;
+        // `!isBuiltinClassHead && !isSpanHead` are OWNERSHIP carve-outs, not
+        // kind carve-outs: two heads `isValueBuiltinByName` names are already
+        // rejected, with their OWN diagnostic, by an arm FURTHER DOWN this
+        // chain — and this arm sits EARLIER, so without the carve-outs it
+        // would silently STEAL the rejection and rewrite a message that fix's
+        // tests pin. Deferring is not missing: both heads stay rejected.
+        //
+        //  * `CancellationToken` is a `public record` (stdlib §6.1) yet wraps a
+        //    reference to shared cancellation state, so it sits in
+        //    `isHeapPointerReferenceBuiltins` (see `isNoDisposalObligation-
+        //    BuiltinName`'s comment in SemaContext.hpp) and #4733's arm owns
+        //    it. MEASURED `var t: CancellationToken := 5` rc=1 on the base and
+        //    rc=1 after, with #4733's "the built-in class" wording intact.
+        //  * the four span heads are #6312's, and its test
+        //    `explicit_type_arg_list_overload_6312.sole_survivor_int_and_class-
+        //    _to_span_params_rejected_spec_5_1` pins the string
+        //    "to the built-in generic type `Span<…>`". MEASURED WITHOUT the
+        //    carve-out that row goes RED: the program is still correctly
+        //    rejected, but this arm's wording replaces #6312's.
+        //
+        // `ReadOnlyStringSpan` (stdlib §3.3) is the fifth span and is NOT
+        // carved out: it is non-generic, so #6312's arm — guarded on a
+        // non-empty generic-argument list — can never reach it, and
+        // `var s: ReadOnlyStringSpan := "abc"` is one of the unsound pairs
+        // this fix closes.
+        bool toIsValueBuiltinNamed =
+            to->kind == TypeRef::Kind::Named && !to->declaration &&
+            isValueBuiltinByName(to->headName()) &&
+            !isBuiltinClassHead(to->headName()) &&
+            !isSpanHead(to->headName());
+        // stdlib §4.18: `DictionaryEntry<K, V>` / `DrainedEntry<K, V>` are
+        // synthetic record TypeRefs (no astNode, importedName-keyed — see
+        // BuiltinRegistry's stdlib §4.18 note), so they carry neither a
+        // declaration nor one of the `isValueBuiltinByName` names, yet they
+        // are records with a two-field layout exactly as unsound to reach from
+        // a primitive. Named here rather than folded into the predicate above
+        // because #1463's list answers a different question and its own header
+        // says so.
+        bool toIsSyntheticEntryRecord =
+            to->kind == TypeRef::Kind::Named && !to->declaration &&
+            (to->headName() == "DictionaryEntry" ||
+             to->headName() == "DrainedEntry");
+        bool toIsTypeVar =
+            refMentionsTypeVariable(to) ||
+            (freeTypeParamNames && freeTypeParamNames->count(to->headName()));
+        if (fromConcretePrim && !toIsTypeVar &&
+            (toIsValueBuiltinNamed || toIsSyntheticEntryRecord)) {
+            if (from->nullable && to->nullable) {
+                return;  // `null → T?` — §5.1's "Nullable conversions".
+            }
+            if (from->nullable) { reportNullable(); return; }
+            reportNotConvertible(
+                std::string("§5.1 has no implicit conversion from a "
+                            "concrete primitive to the value type `") +
+                std::string(namedTypeSimpleName(to)) +
+                "` — its table is closed and lists only numeric rows, and a "
+                "primitive boxes only to `Object` and to the interfaces it "
+                "conforms to (§8.6); convert explicitly per §5.2");
+            return;
+        }
+    }
     // §8.6 / §5.1 (#1311): a primitive value type boxes into a builtin generic
     // interface it implements (IComparable<T>/IEquatable<T>, stdlib §9.1–§9.5)
     // — `var c: IComparable<int> := 5` boxes the int. The interface's type
