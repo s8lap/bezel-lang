@@ -129,7 +129,11 @@ GLIBCXX_FLOOR=$(objdump -T "$STAGE/$NAME/bin/bezelc" 2>/dev/null \
   | grep -o 'GLIBCXX_[0-9][0-9.]*' | sort -uV | tail -1 || true)
 if [ -n "$GLIBC_FLOOR" ]; then
   LINKAGE="LLVM linked in statically and depends dynamically on glibc (needs ${GLIBC_FLOOR/_/ } or newer)"
-  [ -z "$GLIBCXX_FLOOR" ] || LINKAGE="$LINKAGE and libstdc++.so.6 (needs $GLIBCXX_FLOOR or newer)"
+  if [ -n "$GLIBCXX_FLOOR" ]; then
+    LINKAGE="$LINKAGE and libstdc++.so.6 (needs $GLIBCXX_FLOOR or newer)"
+  else
+    LINKAGE="LLVM and libstdc++ linked in statically and depends dynamically on glibc (needs ${GLIBC_FLOOR/_/ } or newer)"
+  fi
 else
   LINKAGE="no shared-library dependencies (fully static)"
 fi

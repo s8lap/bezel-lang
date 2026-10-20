@@ -388,6 +388,27 @@ if(BEZEL_STATIC_RELEASE)
     llvm_map_components_to_libnames(BEZEL_LLVM_LIBS
         core orcjit native nativecodegen target codegen mc object)
     message(STATUS "Bezel: static release -- linking static LLVM components")
+    if(BEZEL_STATIC_RELEASE_FULL)
+        # LLVMSupport's exported INTERFACE_LINK_LIBRARIES name
+        # `ZLIB::ZLIB;zstd::libzstd_shared` (LLVMExports.cmake). Both resolve to
+        # the SHARED libraries even when the static archives are installed
+        # (LLVM's Findzstd.cmake always points libzstd_shared at libzstd.so;
+        # FindZLIB prefers libz.so), and `-static` cannot link a .so. So, for a
+        # fully static link only, swap those two entries for the archives.
+        find_library(BEZEL_LIBZ_A NAMES libz.a)
+        find_library(BEZEL_LIBZSTD_A NAMES libzstd.a)
+        if(NOT BEZEL_LIBZ_A OR NOT BEZEL_LIBZSTD_A)
+            message(FATAL_ERROR "BEZEL_STATIC_RELEASE_FULL needs libz.a and "
+                "libzstd.a (Fedora: zlib-ng-compat-static libzstd-static); "
+                "found '${BEZEL_LIBZ_A}' / '${BEZEL_LIBZSTD_A}'")
+        endif()
+        get_target_property(_bezel_support_libs LLVMSupport INTERFACE_LINK_LIBRARIES)
+        list(TRANSFORM _bezel_support_libs REPLACE "^ZLIB::ZLIB$" "${BEZEL_LIBZ_A}")
+        list(TRANSFORM _bezel_support_libs REPLACE "^zstd::libzstd_shared$" "${BEZEL_LIBZSTD_A}")
+        set_target_properties(LLVMSupport PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${_bezel_support_libs}")
+        message(STATUS "Bezel: static release -- LLVMSupport links ${BEZEL_LIBZ_A} ${BEZEL_LIBZSTD_A}")
+    endif()
 elseif(LLVM_LINK_LLVM_DYLIB OR TARGET LLVM)
     set(BEZEL_LLVM_LIBS LLVM)
     message(STATUS "Bezel: linking shared libLLVM (dylib)")
