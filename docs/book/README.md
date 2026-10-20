@@ -6,6 +6,7 @@ This site is generated from the documents in the repository's `docs/` folder at 
 
 ## Where to start
 
+- **[A Tour of Bezel](tour/index.md)** — the language in half an hour: syntax, the ownership model, errors, collections, concurrency and contracts.
 - **Guides** — short, example-first introductions: start with [Memory and Ownership](guide-01/index.md), then [Errors and Nullability](guide-02/index.md).
 - **Reference** — the normative [Language Specification](spec/index.md) and [Standard Library](stdlib/index.md), and the dense [Writing Reference](writing/index.md) for writing Bezel code.
 - **Background** — the [Design Rationale](rationale/index.md), which records why each decision was made and which alternatives were declined, and the [Changelog](changelog/index.md), one entry per revision.

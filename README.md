@@ -1,129 +1,121 @@
-# bezel-lang
+# Bezel
 
-Bezel is a compiled language for services and tools, with ownership-based memory
-management and no GC. Instead of a garbage collector, the compiler tracks
-ownership of every heap object and guarantees each is disposed exactly once;
-borrowing lets you pass references without transferring ownership, with lifetimes
-checked at compile time.
+**A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-The normative spec lives in `docs/`; this repository hosts the compiler that
-implements it. Start with `docs/Bezel_Language_Spec.md` for the language and
-`CLAUDE.md` for the project's working discipline.
+The compiler tracks who owns every heap object and frees it at a point it knows statically: on the normal path and when an exception passes through, with no collector, no pauses and no `Dispose`/`finally`/`defer` plumbing. Borrowing lets code pass references around without transferring ownership, and the compiler checks that no borrow outlives what it borrows.
 
-## Status
+```bezel
+module Example;
 
-`bezelc` compiles `.bzl` source to native executables and implements a large,
-growing subset of the spec, backed by an extensive spec-derived test suite (all
-passing on Fedora) spanning lexer through codegen.
+public class Connection(host: string)
+  public readonly property Host: string := host;
+  public method Send(text: string)
+    Console.WriteLine($"{Host} <- {text}");
+  end Send;
+end Connection;
 
-**Works:** ownership tracking (dispose-exactly-once) and borrow checking;
-classes, interfaces, generics, records, enums; inheritance and virtual/interface
-dispatch (incl. cross-module); exceptions (`try`/`catch`/`finally`);
-reference-counted strings, closures, and boxes; standard-library collections
-(`Array<T>`, `Dictionary<K,V>`, `Set<T>`, `Stack<T>`, `Queue<T>`,
-`LinkedList<T>`, and owned variants), `String`/`StringBuilder`, LINQ,
-`Encoding.UTF8`, `Math`/`Convert`, `DateTime`/`TimeSpan`/`Guid`,
-`CancellationToken`/`Task`; async/await end-to-end (scheduler, async iterators /
-`await for`, `Task` combinators, `await using`); multi-module separate
-compilation (`bezelc -c` / `--import`).
+public class Program
+  public static method Connect(host: string): owned Connection   // `owned`: the caller gets a new object
+    return new Connection(host);
+  end Connect;
 
-**Not yet implemented** (the compiler emits a diagnostic): runtime reflection
-(`typeof(T)`, `.GetType()`; §17.10, §8.2); async lambdas (§30.6); cross-module
-construction of imported generic types (§14, §2.5); a few `await`-in-guard /
--finally corners (§30, §29). See the issue tracker for the live list.
+  public static method Retire(owned c: Connection)                // takes ownership...
+    c.Send("goodbye");
+  end Retire;                                                     // ...and disposes it here
 
-Developed and tested on **Fedora Linux**; the runtime uses POSIX APIs, so other
-platforms are untested (tracked in #446).
+  public static method Main()
+    using var db := Connect("db");          // owned by this block, disposed at its end
+    var view := db;                         // a borrow: nothing copied, nothing transferred
+    view.Send("hello");
 
-## Building
+    var cache := Connect("cache");
+    Retire(move cache);                     // a transfer is always written down
+  end Main;
+end Program;
+```
 
-**Requirements:** CMake ≥ 3.20, clang/clang++, and LLVM 21 dev headers and
-libraries (the compiler uses the LLVM 21 C++ API extensively; other versions are
-untested).
+> **Status: experimental.** The language design is close to settled and is written down in full; the compiler implements most of it and is still being brought up to the specification. Expect rough edges, and expect the language to change. There are no stability guarantees yet.
+
+## Why Bezel
+
+- **Memory safety without a collector.** Every object has exactly one owner and is disposed exactly once. Using a moved-out value, disposing twice, keeping a borrow past its owner and dropping a resource silently are compile-time errors; where a stale reference can still arise at run time, the default build fails with an exception instead of corrupting memory.
+- **Ownership you can read.** The declaration says who owns a slot (`owned` on a parameter, a return type or a field); the use site says when ownership moves (`move`). An assignment never transfers anything silently.
+- **Familiar everywhere else.** Classes, interfaces, generics, records, enums, sum types (`choice`) with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions, and contracts (`requires`/`ensures`) — in a syntax that reads like the Pascal family with the type system of C#.
+- **A specification first.** The language is defined by a normative specification, and every rule is pinned by a test that states the specification's verdict, not the compiler's.
+
+## Getting started
+
+Bezel builds on Linux with clang and LLVM 21. It is developed and tested on Fedora; other platforms are untested ([#446](https://github.com/s8lap/bezel-lang/issues/446)).
 
 ```sh
-sudo dnf install cmake clang llvm llvm-devel
+sudo dnf install cmake clang llvm llvm-devel      # LLVM 21
 cmake -B build -DCMAKE_CXX_COMPILER=clang++
 cmake --build build -j$(nproc)
 ```
 
-Optional, auto-detected accelerators: `ccache` and the `mold` (or `lld`) linker
-— CMake prints which it found (`Bezel: using LLVM 21.x.x`, `… using ccache`, …).
+Write `hello.bzl`:
 
-## Usage
+```bezel
+module Hello;
 
-`.bzl` source; `Main`'s return value becomes the process exit code:
-
-```
-module M;
-class C
+public class Program
   public static method Main(): int
-    return 42;
+    Console.WriteLine("Hello, Bezel!");
+    return 0;
   end Main;
-end C;
+end Program;
 ```
+
+and run it:
 
 ```sh
-./build/bezelc hello.bzl -o hello && ./hello; echo $?   # 42
+./build/bezelc hello.bzl -o hello && ./hello
 ```
 
-Multi-module separate compilation — compile a library to a native object with
-embedded interface metadata (§2.4), then import it (§2.5) for metadata and
-linking:
+`Main`'s return value becomes the exit code. Libraries compile separately and are imported by their object file: `bezelc -c lib.bzl -o lib.o`, then `bezelc app.bzl --import lib.o -o app`.
 
-```sh
-./build/bezelc -c lib.bzl -o lib.o
-./build/bezelc app.bzl --import lib.o -o app     # repeat --import for more deps
-```
+## Learn the language
 
-## Testing
+| Start with | What it is |
+|---|---|
+| [A Tour of Bezel](docs/Bezel_Tour.md) | the language in half an hour: syntax, ownership, errors, collections, concurrency, contracts |
+| [The guides](docs/Bezel_Guide_01_Memory_and_Ownership.md) | short, example-first: memory and ownership, errors and nullability, modelling data, concurrency, collections, contracts, style |
+| [Writing reference](docs/Bezel_For_Code_Generation.md) | the whole syntax, the ownership rules as a checklist, every library name with its signature, and the shapes that look right but are rejected |
+| [Standard library](docs/Bezel_Standard_Library.md) | every type and member; if a name is not there, it does not exist |
+| [Language specification](docs/Bezel_Language_Spec.md) | the normative reference, with the full grammar and the compiler-enforced invariants |
+| [Design rationale](docs/Bezel_Design_Rationale.md) | why each decision was made, and what was declined |
 
-Two tracks: a **gtest behavior suite** (compiles and runs programs through the
-real `bezelc`) and a **lit + FileCheck diagnostic track**
-(`tests/lit/*.bzl`, matching compiler diagnostics). The diagnostic track needs
-`lit` and `FileCheck` (from LLVM) on `PATH`; without them it is skipped cleanly.
+`scripts/build_book.py` builds the same documents into a searchable site, one page per chapter; it is published to GitHub Pages once Pages is enabled for the repository.
 
-The gtest suite builds as several per-area binaries
-(`build/tests/bezel_tests_<group>`, one per `tests/<area>/` group); `bezel_tests`
-remains the CMake target that builds them all, and
-`build/tests/test_binaries.txt` is the generated list every runner reads.
+**Editor support:** [`editors/vscode/`](editors/vscode/) is a VS Code extension with syntax highlighting, editing rules and snippets. Its grammar is generated from the specification.
 
-```sh
-tests/run_parallel.sh 16                    # sharded gtest suite, all binaries (~2 min)
-cmake --build build --target check-lit      # diagnostic track
-scripts/gate.sh                             # both; prints a combined total
-scripts/agent_check.sh <substr>             # a targeted subset (finds the right binary for you)
-BEZEL_TEST_FILTER=<substr> build/tests/bezel_tests_sema   # one area, serially
-```
+## How far along is it
 
-`scripts/gate.sh` is the blessed pre-push gate (`--full` adds a whole-suite ASan
-sweep). The sharded runner is the authoritative oracle (every test is
-process-isolated) and fails loudly on a crashed or dropped slice. See
-`tests/README.md` for how to write a test (the `runAot` harness and lit
-conventions).
+- **The design** is written down in full: the [specification](docs/Bezel_Language_Spec.md), the [standard library](docs/Bezel_Standard_Library.md) and the [rationale](docs/Bezel_Design_Rationale.md), with one [changelog](docs/Bezel_Changelog.md) entry per revision.
+- **The compiler**, `bezelc`, is an ahead-of-time front end and LLVM back end. It compiles the language's core end to end — ownership and borrow checking, classes and generics, records, enums and choices, exceptions, collections and queries, `async`/`await`, multi-module builds — and much of the standard library.
+- **The gap** is measured. A rule corpus of one hand-written case per specification rule ([`tests/conformance/rules/`](tests/conformance/rules/)) records where the compiler still differs: of the 2,671 cases with a recorded result, 2,462 match the specification. Every difference has a tracking issue.
 
 ## Repository layout
 
-```
-src/    lexer, ast, parser, sema, flow, ownership, codegen, runtime, module, driver
-tests/  spec-derived gtest tests + lit/ diagnostic track, mirroring src/ phases
-scripts/ build/test/gate helpers (gate.sh, dev_heavy.sh, run_parallel.sh, …)
-docs/   normative spec, standard library, design rationale, changelog, guides
+```text
+src/      the compiler: lexer, parser, semantic analysis, ownership, codegen, runtime, modules, driver
+tests/    behaviour tests (gtest), diagnostic tests (lit + FileCheck), the conformance corpora
+docs/     specification, standard library, rationale, changelog, tour and guides
+editors/  editor support (VS Code)
+scripts/  build, test and documentation tooling
 ```
 
-## Further reading
+## Contributing and testing
 
-- `docs/Bezel_Language_Spec.md` — normative reference (Appendix A grammar,
-  Appendix C invariants)
-- `docs/Bezel_Standard_Library.md` — every stdlib type and method
-- `docs/Bezel_Design_Rationale.md` — the recorded reasoning behind each decision
-- `docs/Bezel_Changelog.md` — the per-revision narrative history and migration notes
-- `docs/Bezel_Guide_01_Memory_and_Ownership.md`,
-  `docs/Bezel_Guide_02_Errors_and_Nullability.md` — example-first guides
-- The documentation site: `scripts/build_book.py` builds it with mdBook from `docs/` into `build/book/html` (published to GitHub Pages by `.github/workflows/docs-site.yml`)
-- `editors/vscode/` — the VS Code extension (syntax highlighting, editing rules, snippets); its grammar is generated from the spec by `scripts/gen_editor_grammars.py`
-- `CLAUDE.md` — working discipline; `tests/README.md` — test-writing guide
+The project works specification first: if the compiler and the specification disagree, the compiler is wrong, and every fix ships a regression test that cites the section it enforces. [`CLAUDE.md`](CLAUDE.md) is the project's working discipline, [`tests/README.md`](tests/README.md) explains how to write a test, and [`docs/proposals/spec-change-process.md`](docs/proposals/spec-change-process.md) describes how the language itself changes.
+
+```sh
+tests/run_parallel.sh 16                    # the behaviour suite, sharded (~2 min)
+cmake --build build --target check-lit      # the diagnostic suite (needs lit and FileCheck)
+scripts/gate.sh                             # both, with a combined total
+scripts/check_docs.sh                       # the documentation checks
+```
 
 ## License
 
-Apache 2.0. See `LICENSE`.
+Apache 2.0. See [`LICENSE`](LICENSE).

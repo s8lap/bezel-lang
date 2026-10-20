@@ -88,6 +88,7 @@ DOCS = {
     'guide05':   'docs/Bezel_Guide_05_Collections_and_Iteration.md',
     'guide06':   'docs/Bezel_Guide_06_Contracts_and_Purity.md',
     'guide07':   'docs/Bezel_Guide_07_Style.md',
+    'tour':      'docs/Bezel_Tour.md',
 }
 text = {}
 for k, p in DOCS.items():

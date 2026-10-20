@@ -40,6 +40,7 @@ REPO_URL = 'https://github.com/s8lap/bezel-lang/blob/main/'
 
 # (file, slug, title, how to split)
 DOCUMENTS = [
+    ('Bezel_Tour.md', 'tour', 'A Tour of Bezel', 'h2'),
     ('Bezel_Language_Spec.md', 'spec', 'Language Specification', 'h2'),
     ('Bezel_Standard_Library.md', 'stdlib', 'Standard Library', 'h2'),
     ('Bezel_Guide_01_Memory_and_Ownership.md', 'guide-01', 'Memory and Ownership', 'h2'),
@@ -53,7 +54,8 @@ DOCUMENTS = [
     ('Bezel_Design_Rationale.md', 'rationale', 'Design Rationale', 'h2'),
     ('Bezel_Changelog.md', 'changelog', 'Changelog', 'h3-decade'),
 ]
-PARTS = [('Guides', ['guide-01', 'guide-02', 'guide-03', 'guide-04', 'guide-05', 'guide-06',
+PARTS = [('Start here', ['tour']),
+         ('Guides', ['guide-01', 'guide-02', 'guide-03', 'guide-04', 'guide-05', 'guide-06',
                      'guide-07']),
          ('Reference', ['spec', 'stdlib', 'writing']),
          ('Background', ['rationale', 'changelog'])]

@@ -46,6 +46,7 @@ DOCS = [
     ("guide5", "docs/Bezel_Guide_05_Collections_and_Iteration.md"),
     ("guide6", "docs/Bezel_Guide_06_Contracts_and_Purity.md"),
     ("stdlib", "docs/Bezel_Standard_Library.md"),
+    ("tour",   "docs/Bezel_Tour.md"),
 ]
 
 _DEFAULT_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
