@@ -243,6 +243,36 @@ struct bz_array_t {
     // (existing codegen reads data@0 / count@8 / capacity@16 at fixed
     // offsets; this field lives at the new end-of-struct offset).
     int64_t kind;
+    // fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): the element STRIDE at which
+    // this array co-owns a +1 ref-counted `string` at struct field 0 of every
+    // slot — i.e. the array's elements are `{bz_string*, V}` structs, each
+    // carrying a runtime-managed Key the array holds a reference to.
+    //
+    // WHY A HEADER FIELD AND NOT A FREE-TIME ARGUMENT. `bz_array_free`'s
+    // per-element disposer is a `void(*)(void*)` applied to the slot at a
+    // STRIDE-8 offset (`((void**)arr->data)[i]`), so for the 16-byte
+    // `{bz_string*, V}` entry struct it reaches neither field correctly —
+    // `wrapDictionaryEntryArrayAsIEnumerable`'s own comment records that same
+    // limitation. A stride-aware release therefore has to learn the stride,
+    // and `bz_array_free` has no `elem_size` parameter: the header does not
+    // record one. This field IS that record, and it is recorded at the point
+    // that KNOWS the element layout (the producer, `bz_array_own_str_dict_keys`),
+    // exactly as #2608's `elem_disposer` is recorded at construction because
+    // "the concrete type is known only there".
+    //
+    // PROVENANCE, NOT ELEMENT TYPE. The flag is set only by a producer that
+    // actually took a reference (`bz_array_own_str_dict_keys` retains field 0
+    // of every slot), never from the element TYPE alone. That is what makes the
+    // discharge at free safe: an `Array<DictionaryEntry<string,V>>` built by the
+    // user from `new DictionaryEntry(...)` or by `Add` leaves this zero, because
+    // §28.11's value-copy row gives such an array no Key obligation — the flag
+    // can only ever mean "this array holds a +1 per slot that this array's free
+    // must give back". Zero (the calloc default) is byte-for-byte today's
+    // behaviour on every other array in the runtime.
+    //
+    // APPENDED last so every prior field's offset (data@0 / count@8 /
+    // capacity@16, read at fixed offsets by codegen) is preserved.
+    int64_t str_key_esz;
 };
 typedef struct { char* data; int64_t len; uint8_t width; int64_t rc; } bz_string_hdr;
 struct bz_string_struct {

@@ -379,9 +379,94 @@ void bz_array_free_owning_wrap(void* arrp, void (*fallback)(void*),
     bz_array_free(arrp, disp);
 }
 
+// fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): the DISCHARGE half of the
+// {string, V} Key co-ownership recorded by `bz_array_own_str_dict_keys`.
+//
+// §28.11 puts a `DictionaryEntry<string, V>` in the VALUE row — the array
+// "copies the value in", its `Dispose()` does "no user-visible work", and the
+// indexer-get "copies out" — so the DISPOSAL side of that array must not call
+// a user `Dispose()` on its entries and must not touch their Values. But §28.9
+// leaves the mechanism of a runtime-managed `string`'s lifecycle unspecified
+// ("reference counting, region allocation, or other is not part of this
+// specification"), and the implementation chose refcounting, so the runtime's
+// OWN refcount discipline is what has to be symmetric across the copy.
+//
+// `bz_array_free`'s per-element disposer cannot express this: it is a
+// `void(*)(void*)` applied to the slot at STRIDE 8
+// (`((void**)arr->data)[i]`), which for the 16-byte `{bz_string*, V}` entry
+// struct reaches neither field. `wrapDictionaryEntryArrayAsIEnumerable`'s
+// Dispose already performs exactly this walk on the enumerator side —
+// `bz_array_ptr_at(arr, i, esz)`, `bz_string_release` on field 0, then
+// `bz_array_free(arr, null)` — and its own comment records the same limitation.
+// This is that walk, lifted to the array side, driven by the header's recorded
+// stride so no free site has to learn the element size.
+//
+// ORDER. The Keys are released in insertion order and BEFORE the
+// `dispose_elem` loop, which by the guard above can only be non-NULL for a
+// pointer-element array (a `{bz_string*, V}` array reaches here with a NULL
+// disposer), so the two never overlap on one array.
+static void bz_array_release_str_dict_keys(bz_array_t* arr) {
+    if (!arr || !arr->data || arr->str_key_esz <= 0) return;
+    int64_t esz = arr->str_key_esz;
+    int64_t n = arr->count;
+    for (int64_t i = 0; i < n; i++) {
+        char* slot = (char*)bz_array_ptr_at(arr, i, esz);
+        if (slot) bz_string_release(*(void**)slot);
+    }
+    // Clear the stamp: this array has given back every reference it held, so a
+    // second free (or the checked-disposal twin) must not release again.
+    arr->str_key_esz = 0;
+}
+
+// fix #6550 / §28.11 (v0.338): the PRODUCE half — a snapshot array whose
+// elements are `{bz_string*, V}` structs takes a +1 reference on each slot's
+// Key, and records the stride so `bz_array_free` / `bz_array_mark_disposed`
+// can give it back.
+//
+// THE RULE, and why it is a co-ownership rather than a transfer. §28.11's
+// value-copy row makes the snapshot array's own disposal obligation empty, so
+// nothing in the element policy will discharge these Keys for it — and §9.7
+// explains why that is consistent: a record whose reference-typed fields are
+// runtime-managed does NOT make the record borrow-bearing "because
+// runtime-managed values have unbounded lifetime by construction". The
+// implementation realizes that unbounded lifetime by refcount, so for a
+// snapshot that OUTLIVES the pipeline which produced it, the +1 has to be held
+// by something. Before #6550 the two halves were each defensible alone and
+// wrong together: the LINQ pipeline released the rebuilt Key +1
+// (`arr_str_keys` → `bz_lazy_release_str_dict_keys`) and the result array
+// released nothing, so a caller reading `arr[i].Key` after the drain read a
+// freed `bz_string` — a heap-use-after-free measured at
+// bezel_runtime_collections.cpp:2733.
+//
+// SYMMETRY, which is what makes this a retain and not a move. The pipeline
+// still releases its own +1 as it always did; this entry adds a SECOND
+// reference first, so each Key's count goes 1 → 2 → 1 (pipeline) → 0 (snapshot
+// free) rather than being transferred. Retaining rather than suppressing the
+// pipeline's release keeps the invariant local and self-checking — a stamped
+// array owns exactly one reference per slot, discharged at whichever free runs
+// — and leaves `bz_lazy_dispose` untouched for every other consumer (for-in,
+// `First()`, `Count()`, the `for var e in d` loop), whose Keys never escape.
+//
+// PROVENANCE, NOT ELEMENT TYPE. This is stamped only by a producer that
+// actually took the reference, never inferred from the element type alone, so
+// an `Array<DictionaryEntry<string,V>>` a user builds with `new
+// DictionaryEntry(...)` or `Add` — which §28.11's value row gives no Key
+// obligation — leaves `str_key_esz` zero and is byte-for-byte unaffected.
+extern "C" void bz_array_own_str_dict_keys(void* arrp, int64_t esz) {
+    if (!arrp || esz <= 0) return;
+    auto* arr = (bz_array_t*)arrp;
+    if (!arr->data) return;
+    for (int64_t i = 0; i < arr->count; ++i) {
+        char* slot = (char*)bz_array_ptr_at(arr, i, esz);
+        if (slot) bz_string_retain(*(void**)slot);
+    }
+    arr->str_key_esz = esz;
+}
+
 void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;
+    bz_array_release_str_dict_keys(arr);
     if (dispose_elem && arr->data) {
         // Dispose elements in REVERSE insertion order per §28.11: ordered owning
         // collections (OwningArray, OwningStack, OwningQueue) dispose last-inserted
@@ -410,6 +495,11 @@ void bz_array_mark_disposed(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;
     if (arr->disposed) return;  // idempotent
+    // fix #6550: the checked-disposal twin must discharge the co-owned
+    // {string, V} Keys exactly as bz_array_free does — same reason, same
+    // stride-recorded walk — or a checked build would leak every Key of a
+    // snapshot array that bz_array_free would have released.
+    bz_array_release_str_dict_keys(arr);
     if (dispose_elem && arr->data) {
         for (int64_t i = arr->count - 1; i >= 0; --i) {
             void* elem_ptr = ((void**)arr->data)[i];
@@ -3530,16 +3620,68 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
 
 // Materialize a lazy enumerator into a fresh owned Array<T> (stdlib §5 ToArray,
 // the eager materialization point). Consumes (drains + disposes) the pipeline.
-extern "C" void* bz_lazy_to_array(void* lazy, int64_t esz) {
-    auto* e = (bz_lazy_t*)lazy;
+//
+// fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): `coown_str_dict_keys` says the
+// produced elements are `{K, V}` entry structs whose field 0 is a `string` Key
+// the PIPELINE owns and is about to release — the `Dictionary<string, V>`
+// source materialization (#2544's `arr_str_keys`). The drain copies those
+// structs' BYTES, Key pointer included, so without the co-ownership the result
+// array is handed to the caller holding freed `bz_string`s and `arr[i].Key` is
+// a heap-use-after-free (MEASURED: freed by `bz_lazy_release_str_dict_keys`).
+//
+// §28.11's VALUE row is why this is needed and is not an over-retain: a
+// `DictionaryEntry<string, V>` is a value type, so the snapshot runs no
+// user-visible element disposal and nothing in the element policy will ever
+// discharge these Keys for it. §9.7 says a record with runtime-managed fields is
+// not borrow-bearing "because runtime-managed values have unbounded lifetime by
+// construction", and §28.9 leaves how that lifetime is realized unspecified —
+// this runtime realizes it by refcount, so a snapshot that outlives its
+// pipeline must hold the reference itself.
+//
+// ORDERING IS THE WHOLE FIX, and it is why this is inside the drain rather than
+// emitted by the caller: `bz_lazy_dispose` below walks down to the dictionary
+// source and releases every rebuilt Key. A co-ownership taken AFTER this
+// function returned would retain already-freed memory. So the +1 is taken while
+// the pipeline still holds its own, and dispose then brings each Key 1 → 2 → 1,
+// with `bz_array_free` / `bz_array_mark_disposed` completing 1 → 0 at the
+// snapshot's end of life.
+static void* bz_lazy_drain_to_array(bz_lazy_t* e, int64_t esz,
+                                    bool coown_str_dict_keys) {
     void* arr = bz_array_alloc(esz, 8);
     void** vt = (void**)e->vtable;
     typedef int32_t (*mn_t)(void*);
     typedef void*   (*cur_t)(void*);
     while (((mn_t)vt[2])(e))
         bz_array_add(arr, ((cur_t)vt[3])(e), esz);
+    // Take the snapshot's reference BEFORE the dispose below releases the
+    // pipeline's; see the ordering note above.
+    if (coown_str_dict_keys) bz_array_own_str_dict_keys(arr, esz);
     bz_lazy_dispose(e);
     return arr;
+}
+
+extern "C" void* bz_lazy_to_array(void* lazy, int64_t esz) {
+    return bz_lazy_drain_to_array((bz_lazy_t*)lazy, esz,
+                                  /*coown_str_dict_keys=*/false);
+}
+
+// fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): `bz_lazy_to_array` specialized to
+// a `Dictionary<string, V>` entry snapshot, whose slots co-own the Keys. Codegen
+// picks it ONLY when the produced element type is `DictionaryEntry<K, V>` with a
+// runtime-managed `string` K — the same predicate `lowerToLazyEnumerator`'s
+// Dictionary arm used to decide `isStringKey`, so the two cannot disagree, and
+// so neither a `Dictionary<int, V>` snapshot (Keys are inline bytes with no heap
+// ownership), a `Select(e => e.Key)` snapshot (a bare `string`, already handled
+// by `bz_array_retain_strings`) nor any element-REPLACING chain (whose field 0
+// is not a dictionary Key) can reach it.
+//
+// A separate entry point rather than a third argument to `bz_lazy_to_array` on
+// purpose: eight other drain sites materialize pipelines whose elements this
+// does not apply to, and their 2-argument declaration — and therefore their
+// generated call — stays byte-identical.
+extern "C" void* bz_lazy_to_array_str_dict_keys(void* lazy, int64_t esz) {
+    return bz_lazy_drain_to_array((bz_lazy_t*)lazy, esz,
+                                  /*coown_str_dict_keys=*/true);
 }
 
 // stdlib §5 ToSet: materialize a lazy enumerator into a fresh owned Set<T>.

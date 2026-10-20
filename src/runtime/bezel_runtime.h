@@ -183,6 +183,36 @@ void* bz_array_slice(void* arr, int64_t start, int64_t end, int64_t elem_size);
 // sentinel/literal or null, so partial/empty arrays are safe.
 void bz_array_retain_strings(void* arr);
 
+// fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): the `{K, V}`-struct analogue of
+// `bz_array_retain_strings`, for an array whose elements are `{bz_string*, V}`
+// structs — a snapshot of a `Dictionary<string, V>`'s entries — rather than
+// pointer-sized strings.  bz_string_retain the `bz_string*` at struct field 0 of
+// every slot (the Key), and RECORD `elem_size` in the header so
+// bz_array_free / bz_array_mark_disposed can release them stride-aware; both
+// release exactly the +1 taken here.
+//
+// `bz_array_free`'s own per-element disposer cannot do this half: it is a
+// `void(*)(void*)` applied at stride 8 (`((void**)arr->data)[i]`), which for a
+// 16-byte `{K, V}` struct reaches neither field — the same limitation
+// `wrapDictionaryEntryArrayAsIEnumerable`'s Dispose documents before doing this
+// walk by hand.  Hence the stride is recorded rather than passed to the free.
+//
+// WHY THE ARRAY CO-OWNS AT ALL, given §28.11's value-copy row.  That row makes
+// the snapshot's element DISPOSAL empty (a `DictionaryEntry<string,V>` is a
+// value type; nothing user-visible is disposed), but §9.7 does not make the
+// record borrow-bearing — "runtime-managed values have unbounded lifetime by
+// construction" — and §28.9 leaves how that unbounded lifetime is realized
+// unspecified.  This runtime realizes it by refcount, so a snapshot that
+// outlives the LINQ pipeline which produced it must hold the reference itself.
+//
+// PROVENANCE-GATED.  Call this only for an array this producer actually gave a
+// +1 on — never on the element type alone.  An `Array<DictionaryEntry<string,V>>`
+// a user builds with `new DictionaryEntry(...)` or `Add` has no such obligation
+// under §28.11's value row and must be left unstamped, or its Keys would be
+// released without ever having been retained.  The stamp is calloc-zeroed, so an
+// unstamped array is byte-for-byte unaffected by the discharge.
+void bz_array_own_str_dict_keys(void* arr, int64_t elem_size);
+
 // Return a pointer directly into the array's internal buffer at element `idx`.
 // Only valid until the next mutation; used for zero-copy access in codegen.
 void* bz_array_ptr_at(void* arr, int64_t idx, int64_t elem_size);
@@ -1243,6 +1273,30 @@ void* bz_lazy_selectmany(void* up, int64_t out_elem_size,
 void* bz_lazy_zip(void* up, void* down, int64_t out_elem_size,
                   void* closure, void* comb);                        // comb: void(closure, a, b, out)
 void* bz_lazy_to_array(void* lazy, int64_t elem_size);
+// fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): `bz_lazy_to_array` specialized to
+// a `Dictionary<string, V>` entry snapshot, whose `{bz_string*, V}` slots
+// CO-OWN the Key strings.  Same drain, same dispose, one extra reference taken
+// while the pipeline still holds its own — so each Key goes 1 → 2 → 1 at the
+// drain and 1 → 0 when the snapshot array is freed.
+//
+// WITHOUT it the drain copies each entry's BYTES, Key pointer included, into the
+// result array and then `bz_lazy_dispose` releases every rebuilt Key (#2544's
+// `arr_str_keys`), so `arr[i].Key` read after the drain was a
+// heap-use-after-free.  §28.11's VALUE row is why the snapshot cannot discharge
+// those Keys itself — a `DictionaryEntry<string, V>` is a value type, so the
+// array runs no user-visible element disposal — while §9.7 makes a co-owned
+// reference the right shape rather than a borrow ("runtime-managed values have
+// unbounded lifetime by construction") and §28.9 leaves how that lifetime is
+// realized unspecified; this runtime realizes it by refcount.
+//
+// Codegen calls this ONLY when the produced element is `DictionaryEntry<K, V>`
+// with a runtime-managed `string` K — the same predicate that made the source
+// mark itself `arr_str_keys` — so neither a `Dictionary<int, V>` snapshot, nor a
+// `Select(e => e.Key)` snapshot (a bare `string`, handled by
+// `bz_array_retain_strings`), nor any element-REPLACING chain can reach it.  It
+// is a separate entry point, not a third argument, so the eight other
+// `bz_lazy_to_array` call sites keep their exact 2-argument call.
+void* bz_lazy_to_array_str_dict_keys(void* lazy, int64_t elem_size);
 // #6380 (§28.3 K8 / §28.9, v0.338): mark the SOURCE this lazy enumerator wraps
 // as owned, so bz_lazy_dispose frees it. `kind` names the source's backing —
 // 1 bz_array_t*, 2 bz_llist_t*, 3 bz_dict_t*. Codegen calls this only for a

@@ -2935,9 +2935,67 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* lazy = lowerToLazyEnumerator(*ma->target, elemRef);
         if (!lazy) return nullptr;
         int64_t esz = lazyElemSize(elemLlvmOf(elemRef), module_->getDataLayout());
-        auto* toArr = declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+        // fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): when the produced element
+        // is a `DictionaryEntry<K, V>` whose Key is a runtime-managed `string`,
+        // drain through the co-owning specialization instead. The specialization
+        // has to be chosen HERE, before the drain, because the co-ownership is
+        // taken inside the drain — `bz_lazy_to_array` disposes the pipeline (and
+        // with it every rebuilt Key) before it returns, so a retain emitted at
+        // the call site would retain already-freed memory.
+        //
+        // THE DEFECT. `bz_lazy_to_array` drains by copying each element's BYTES
+        // into the fresh result array — for a `DictionaryEntry<string, V>` that
+        // copy carries the Key POINTER at struct field 0 — then calls
+        // `bz_lazy_dispose`, which walks down to the dictionary-entry source
+        // and `bz_string_release`s every rebuilt Key (#2544's `arr_str_keys`).
+        // The result array is handed to the caller holding freed strings, so
+        // `arr[0].Key` was a heap-use-after-free (MEASURED, freed by
+        // `bz_lazy_release_str_dict_keys`). The two halves were each defensible
+        // alone — the pipeline owns the rebuilt Keys, and §28.11's VALUE row
+        // gives the snapshot array no element disposal — and wrong together.
+        //
+        // THE RULE. §28.11's value-copy row is about USER-VISIBLE disposal (no
+        // `Dispose()` runs, the Values are untouched); it says nothing about the
+        // refcounts §28.9 permits, and §9.7 explains why a co-owned reference is
+        // the right shape rather than a borrow — a record whose reference-typed
+        // fields are runtime-managed does not make the record borrow-bearing
+        // "because runtime-managed values have unbounded lifetime by
+        // construction". This runtime realizes that unbounded lifetime by
+        // refcount, so a snapshot that OUTLIVES the pipeline which produced it
+        // must hold the reference itself.
+        //
+        // WHY THE GATE IS THE PRODUCED ELEMENT TYPE, keyed on exactly what
+        // `lowerToLazyEnumerator`'s Dictionary arm used to decide `isStringKey`
+        // (a string primitive Key — `arr_str_keys` is set under precisely this
+        // predicate, so the two can never disagree):
+        //
+        //   * a `Dictionary<int, V>` entry snapshot — Keys are inline bytes with
+        //     no heap ownership, so the source never releases them and there is
+        //     nothing to co-own;
+        //   * `d.Select(lambda(e) => e.Key)` — the produced element is a bare
+        //     `string`, not an entry, and is already handled by the
+        //     `bz_array_retain_strings` intercept below (which must not also run,
+        //     or every element would be retained twice and released once);
+        //   * any chain that REPLACES the element (a selector producing some other
+        //     record) — the snapshot's field 0 is then whatever the selector
+        //     wrote, not a dictionary Key, and §28.11's value row gives it no Key
+        //     obligation, so stamping it would over-release.
+        bool entryWithStringKey = false;
+        if (elemRef && elemRef->kind == sema::TypeRef::Kind::Named &&
+            builtinTypeName(elemRef) == "DictionaryEntry" &&
+            elemRef->genericArgs.size() >= 2 && elemRef->genericArgs[0]) {
+            const sema::TypeRef* keyTy = elemRef->genericArgs[0];
+            entryWithStringKey =
+                keyTy->kind == sema::TypeRef::Kind::Primitive &&
+                keyTy->primitive == sema::PrimitiveType::String;
+        }
+        auto* toArr = declareC(entryWithStringKey
+                                   ? "bz_lazy_to_array_str_dict_keys"
+                                   : "bz_lazy_to_array",
+                               ptrTy(), {ptrTy(), i64()});
         llvm::Value* arr =
-            builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)}, "linq.toarr");
+            builder_.CreateCall(toArr, {lazy, builder_.getInt64(esz)},
+                                "linq.toarr");
         // #602 / #429 / §4.6 / §28.9 / §28.11 v0.134: a materialized Array<string>
         // co-owns a +1 per element so it can be released symmetrically. Keyed on
         // the produced element type being in the RuntimeManaged row AND specifically
