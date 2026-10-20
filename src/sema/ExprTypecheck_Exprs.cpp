@@ -3911,6 +3911,77 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 "range slicing `[a..b]` is not admitted on "
                                 "`OwningArray<T>` — it would manufacture a second "
                                 "owner for each owned element (§15.6)");
+                        // §15.6 (#6513): the §15.6 receiver set is `Array<T>` and
+                        // nothing else, and the remaining `isArrLike` heads are
+                        // outside it — the list INTERFACES `IReadOnlyList<T>` /
+                        // `IList<T>` / `IOwningList<T>`, plus `FrozenArray<T>`
+                        // (stdlib §4.19) and `OwningBuffer<T>` (stdlib §4.14).
+                        //
+                        // None of them declares the form. stdlib §4.4 (v0.338) is
+                        // the ONLY `Slice(r: Range<int>): owned Array<T>` in the
+                        // standard library; §4.1/§4.2 spell the list interfaces out
+                        // in full (Count / IsReadOnly / indexer / Add / Clear /
+                        // Contains / Remove / Insert) and none of them is a Slice;
+                        // stdlib §4.14 (v0.338) says outright that "`Slice` is a
+                        // member of the span *views*, not of the buffer — a buffer
+                        // is range-restricted by taking a span of it"; §4.19's
+                        // `FrozenArray<T>` listing declares `From` / `Length` /
+                        // indexer / `ToArray` and no Slice. So for these heads
+                        // there is no member route to a slice, and the index
+                        // syntax is §15.6's — which names `Array<T>` and nothing
+                        // else.
+                        //
+                        // WHAT THIS FIXES. Falling through to the `else` below typed
+                        // the WHOLE index expression as the ELEMENT `T`, while
+                        // codegen's `lowerCollectionIndexerGet`
+                        // (`src/codegen/LlvmBackend_Assign.cpp`: `isArr =
+                        // isCollectionTypeName(recvTy) || isListInterfaceName(recvTy)`)
+                        // DID take the slice arm and returned a `bz_array_t*` — the
+                        // emitted value was then consumed as a scalar.
+                        // MEASURED on the base for the interface heads: an
+                        // `IList<string>` receiver's `il[0..1].Count` printed 0 where
+                        // 2 is required, exit 0, with no diagnostic; the same
+                        // program over a concrete `Array<string>` prints 2. At a
+                        // primitive element type the mismatch surfaces as a
+                        // misleading downstream error instead ("no member `Count` on
+                        // primitive type `int`"), which is the issue's second half.
+                        //
+                        // WHY NOT IMPLEMENT IT INSTEAD. The array-backing premise
+                        // codegen relies on for a list-interface receiver is an
+                        // implementation premise, not a spec guarantee: stdlib §4.1
+                        // says `ICollection<T>` "exists for user-defined
+                        // implementations", nothing stops a user class from
+                        // conforming to `IList<T>`, and #853 records exactly this
+                        // reasoning for the non-list collection interfaces — "a
+                        // compile-time 'treat as bz_array_t*' assumption is UNSOUND
+                        // here [...] a real fix needs a runtime foundation (kind-tag
+                        // header or a per-backing collection itable); that is
+                        // deferred". Emitting `bz_array_slice` over a receiver that
+                        // may not be an array type-puns an arbitrary object.
+                        //
+                        // INTERPRETATION, stated plainly: §15.6 does not name a
+                        // list-interface (or `FrozenArray`/`OwningBuffer`) receiver,
+                        // so reading its closed "is supported on `Array<T>`" as
+                        // excluding them is an INTERPRETATION of that clause, not a
+                        // quotation of one that names them. It follows the precedent
+                        // the `OwningArray<T>` arm above set (#746 R41-E) and keeps
+                        // one rule — one admitted receiver — rather than a
+                        // head-by-head list of exceptions.
+                        if (isRangeIdx && (cn == "IReadOnlyList" ||
+                                           cn == "IList" ||
+                                           cn == "IOwningList" ||
+                                           cn == "FrozenArray" ||
+                                           cn == "OwningBuffer"))
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "range slicing `[a..b]` is not admitted on `" +
+                                    std::string(cn) +
+                                    "<T>` — §15.6 supports range slicing on "
+                                    "`Array<T>` only, producing a fresh owned "
+                                    "`Array<T>`; this receiver declares no slice "
+                                    "form, and materialise the sub-range explicitly "
+                                    "(a new `Array<T>`, or a span view where the "
+                                    "type has one)");
                         if (isRangeIdx && cn == "Array")
                             ctx_.setExprType(&e, tt);
                         else {
