@@ -12984,9 +12984,16 @@ private:
     // §4.11 pop order) and every other array-backed family keeps
     // `bz_array_drain_next` (front-to-back). The two variants never share a
     // vtable — the name prefix carries the key.
+    // fix #6544 (§28.11 / §29.2, v0.338): `ownsBacking` says this frame is the
+    // collection's SOLE owner (a callee-owned value returned at an
+    // `IOwningEnumerable<T>` head), so its slot-1 Dispose reclaims the
+    // collection and cascades over the elements the drain did not pop, while
+    // its slot-4 clones carry a frame-only Dispose. False for every borrowed
+    // source, whose real owner frees the collection.
     llvm::Value* wrapArrayAsIOwningEnumerator(llvm::Value* arr,
                                               const sema::TypeRef* iOwnEnumTy,
-                                              bool lifo = false);
+                                              bool lifo = false,
+                                              bool ownsBacking = false);
     // fix #4750 / #4772 (§29.1, v0.307): the slot-3 `TakeCurrent` body BOTH
     // builtin draining frames install (`wrapArrayAsIOwningEnumerator` and
     // `wrapLinkedListAsIOwningEnumerator`, whose layouts share `pending` at
@@ -13012,8 +13019,11 @@ private:
     // pending); only the drain primitive differs — `bz_llist_drain_next`,
     // stdlib §4.7's own `Drain()` pop, head-to-tail per §28.11. Borrows the
     // list: the source's owner still frees the (drained) container.
+    // fix #6544 (§28.11 / §29.2, v0.338): `ownsBacking` — the array sibling's
+    // contract verbatim; see that declaration.
     llvm::Value* wrapLinkedListAsIOwningEnumerator(
-        llvm::Value* list, const sema::TypeRef* iOwnEnumTy);
+        llvm::Value* list, const sema::TypeRef* iOwnEnumTy,
+        bool ownsBacking = false);
 
     // fix #3461 (v0.283): the element-type resolution both owning-drain wraps
     // share (`IOwningEnumerable<T>` constrains `T: class` per stdlib §4.13;

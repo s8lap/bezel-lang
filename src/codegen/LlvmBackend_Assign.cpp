@@ -11033,6 +11033,34 @@ std::string Emitter::ownedWrapDisposerKey(llvm::Function* elDisp) {
 
 llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
                                                   const sema::TypeRef* iEnumTy) {
+    // fix #6544 (§28.11 / §29.1 / §29.2; stdlib §4.13, v0.338): an
+    // `IOwningEnumerable<T>` head DRAINS. §29.1 makes slot 3 `TakeCurrent` —
+    // "transfers ownership of the most-recently-yielded value to the caller,
+    // leaving the enumerator's internal slot empty" — so ownership LEAVES the
+    // collection at each yield, and §28.11's `Dispose()` row then owes the
+    // frame "every live element" (what the drain did NOT pop) plus the storage.
+    //
+    // This frame is the collection's SOLE owner (the callee returned it, #1911
+    // / §28.3 K3), so nobody else can pay that. Every other owning head already
+    // drains for this reason — `owningDrainWrapForHead` (#3385 / #3405 / #3461)
+    // routes the three BORROWING leaves there, and `Drain()` itself mints the
+    // same shape (stdlib §4.5). This one leaf installed the plain borrowing
+    // MoveNext/Current and `consultHeader = 0`, so it freed the storage and
+    // stranded every element: MEASURED on HEAD, a callee-owned `OwningArray<Item>`
+    // bound at an `IOwningEnumerable<Item>` head and never iterated leaked
+    // 32 B in 2 allocations (`bz$M.Holder$ctor`), and a PARTIAL iteration
+    // (`break`) leaked the remainder the same way. Flipping only the
+    // #6439 `consultHeader` flag would have been the wrong repair — with no
+    // drain the array still names pointers the loop already freed, and that
+    // measured `heap-use-after-free` in `bz$elemDispose` on the fully-iterated
+    // twin. Draining FIRST is what makes the cascade correct in every state.
+    //
+    // `ownsBacking = true`: the source frame's slot-1 Dispose reclaims the
+    // array itself, since no other owner exists. Its slot-4 clones carry a
+    // frame-only Dispose (see `wrapArrayAsIOwningEnumerator`).
+    if (builtinTypeName(iEnumTy) == "IOwningEnumerable")
+        return wrapArrayAsIOwningEnumerator(arr, iEnumTy, /*lifo=*/false,
+                                            /*ownsBacking=*/true);
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
         elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
@@ -11064,37 +11092,26 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
     // `ownedWrapElementDisposer` for why sharing one Dispose across two
     // element types that both lower to `ptr` is an over-release hazard.
     llvm::Function* elDisp = ownedWrapElementDisposer(iEnumTy);
-    // fix #6439 (§28.6 / §28.11, v0.338): the head decides whether the array's
-    // RECORDED header disposer may be consulted at this free site.
+    // fix #6439 (§28.6 / §28.11, v0.338): the free site consults the array's
+    // RECORDED header disposer. The wrap installs the BORROWING `Current`
+    // (#2710), so iteration LENDS — the collection still holds every class
+    // element at Dispose and the header is the authoritative statement of how
+    // to reclaim them. That consult is what closed #6439's store-time cascade
+    // leak (2x16 B measured, property never read).
     //
-    // `IEnumerable<T>` — the wrap installs the BORROWING `Current` (#2710):
-    // iteration lends, the collection still holds every class element at
-    // Dispose, so the header is authoritative and consulting it closes
-    // #6439's store-time cascade leak (2x16 B measured, property never read).
-    //
-    // `IOwningEnumerable<T>` — §29.1/§29.2 slot 3 is `TakeCurrent`: ownership
-    // LEFT the collection at each yield, and this wrap does not drain
-    // (`bz_array_drain_next` absent from the IR, MEASURED), so the header
-    // names pointers the loop already freed. Consulting it here is a
-    // double-dispose. Keep the element-type-derived disposer verbatim.
-    bool consultHeader = builtinTypeName(iEnumTy) != "IOwningEnumerable";
-    // The head is part of the cache key for the same reason #3450 put the
-    // disposer there: two element types that both lower to `ptr` must not
-    // share one Dispose, and neither must the two HEADS over one element type
-    // now that the head changes the BODY.
-    //
-    // The segment marks the NON-cascading (owning) head, so every borrowing
-    // name is unchanged. That is not cosmetic: `IOwningEnumerable<T>`
-    // constrains `where T: class` (stdlib §4.13), so the owning head is
-    // reachable only for a class element and therefore only under the `ptr`
-    // elemName — a borrowing `ptr` wrap and an owning `ptr` wrap are exactly
-    // the pair that would otherwise collide. Every non-`ptr` name keeps its
-    // pre-fix spelling (including the `i32` rows pinned by
-    // `tests/lit/enumerator_vtable_cache_internal_linkage_3477.bzl`), and the
-    // one shape that gains a segment is the one that had no name before.
+    // fix #6544 (§28.11 / §29.1 / §29.2, v0.338): this is now the ONLY head
+    // that reaches this body. `IOwningEnumerable<T>` returns at the top of this
+    // function, before `elDisp` is derived — because that head must DRAIN, and
+    // a borrowing Current over a frame that does not drain is exactly the
+    // defect #6544 closes. So the `$iow` cache-key segment and the head test
+    // that introduced it (#6439) are both gone: there is no second head to keep
+    // apart from, and a consult here can no longer name a pointer the consumer
+    // already freed, because at this head nothing has been transferred out.
+    bool consultHeader = true;
+    // The disposer is part of the cache key for the reason #3450 gave: two
+    // element types that both lower to `ptr` must not share one Dispose.
     std::string prefix =
-        "bz$arrenumown$" + elemName + ownedWrapDisposerKey(elDisp) +
-        (consultHeader ? "" : "$iow") + "$";
+        "bz$arrenumown$" + elemName + ownedWrapDisposerKey(elDisp) + "$";
 
     // Owning Dispose: bz_array_free(self->arr, <element disposer>); free(self).
     // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the element disposer is
@@ -11626,7 +11643,8 @@ void Emitter::emitOwningDrainTakeCurrentBody(llvm::Function* tcFn,
 }
 
 llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
-        llvm::Value* arr, const sema::TypeRef* iOwnEnumTy, bool lifo) {
+        llvm::Value* arr, const sema::TypeRef* iOwnEnumTy, bool lifo,
+        bool ownsBacking) {
     llvm::Type* elemLlvm = owningDrainElemType(iOwnEnumTy);
 
     // Element-name key (same scheme as ensureArrayEnumMachinery) so the
@@ -11641,8 +11659,20 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
     // share a vtable — a front-to-back MoveNext installed on a stack view
     // would silently yield §4.11's wrong order, which is the defect this fix
     // closes.
+    //
+    // fix #6544 (§28.11 / §29.2, v0.338): `ownsBacking` keys the cache for the
+    // same reason and for the same class of hazard. Every caller above borrows
+    // the collection — its real owner disposes it — so this frame's slot-1
+    // Dispose frees only `pending` and the frame. A callee-OWNED collection
+    // handed back at an `IOwningEnumerable<T>` head has no other owner, so
+    // nobody else will ever free it: the SOURCE frame's Dispose must reclaim
+    // it too, cascading over whatever the drain did NOT pop (§28.11's
+    // `Dispose()` row — "disposes every live element ... then releases
+    // storage"). That makes the SOURCE and its slot-4 clones two different
+    // vtables over one struct layout, keyed here.
     std::string prefix =
-        std::string("bz$ownarrenum$") + (lifo ? "lifo$" : "") + elemName + "$";
+        std::string("bz$ownarrenum$") + (lifo ? "lifo$" : "") + elemName + "$" +
+        (ownsBacking ? "own$" : "");
 
     // Wrapper struct: { ptr vtable, ptr arr, ptr pending, i8 advanced }. The
     // `advanced` flag (#4796) says a yielded value is pending, independent of
@@ -11665,12 +11695,23 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
     // a no-op (mirrors the iterator-frame's -2 sentinel + slot nulling).
 
     // --- Dispose(self) — dispose pending (if any), free wrapper. ---
-    auto* dispFn = module_->getFunction(prefix + "Dispose");
+    // fix #6544 (§28.11, v0.338): TWO bodies when `ownsBacking`. `dispFn` is
+    // the SOURCE frame's and reclaims the collection as well; `cloneDispFn` is
+    // what the slot-4 enumerator carries and frees only the frame. The cascade
+    // is correct in every iteration state precisely BECAUSE the frame drains:
+    // never iterated ⇒ the collection still holds every element and the cascade
+    // disposes all of them; fully iterated ⇒ the drain popped every slot, the
+    // cascade finds nothing and only releases storage; partially iterated ⇒
+    // the cascade disposes exactly the remainder. That is why the array twin's
+    // header consult below is safe here and was a double-dispose in
+    // `wrapOwnedArrayAsIEnumerable`, which did NOT drain.
+    llvm::Function* dispFn = module_->getFunction(prefix + "Dispose");
+    llvm::Function* cloneDispFn =
+        ownsBacking ? module_->getFunction(prefix + "CloneDispose") : nullptr;
     if (!dispFn) {
-        dispFn = llvm::Function::Create(
-            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
-            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
+        auto buildDispose = [this, stTy, iOwnEnumTy](llvm::Function* fn,
+                                                    bool freeBacking) {
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
         // §28: emitDisposeAndReclaim uses the Emitter's `builder_` /
         // `currentFn_` to insert into. Swap them in for the duration of the
         // helper body, then restore so the caller of
@@ -11685,16 +11726,16 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         auto* savedBB = builder_.GetInsertBlock();
         llvm::BasicBlock::iterator savedIP{};
         if (savedBB) savedIP = builder_.GetInsertPoint();
-        currentFn_ = dispFn;
+        currentFn_ = fn;
         builder_.SetInsertPoint(bb);
-        llvm::Value* self = dispFn->arg_begin();
+        llvm::Value* self = fn->arg_begin();
         // Load pending (ptr); if non-null, dispose + reclaim.
         llvm::Value* pendF = builder_.CreateStructGEP(stTy, self, 2);
         llvm::Value* pend = builder_.CreateLoad(ptrTy(), pendF, "oaed.pend");
         llvm::Value* isNull = builder_.CreateICmpEQ(
             pend, llvm::ConstantPointerNull::get(ptrTy()), "oaed.pend.null");
-        auto* dispBB = llvm::BasicBlock::Create(llvm_, "oaed.disp", dispFn);
-        auto* contBB = llvm::BasicBlock::Create(llvm_, "oaed.cont", dispFn);
+        auto* dispBB = llvm::BasicBlock::Create(llvm_, "oaed.disp", fn);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "oaed.cont", fn);
         builder_.CreateCondBr(isNull, contBB, dispBB);
         builder_.SetInsertPoint(dispBB);
         // emitDisposeAndReclaim expects an instruction-point set on the
@@ -11706,15 +11747,53 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         emitDisposeAndReclaim(pend);
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
+        auto* voidTy = llvm::Type::getVoidTy(llvm_);
+        // fix #6544 (§28.11 / §28.6, v0.338): the SOURCE frame reclaims the
+        // collection. `bz_array_free_owning_wrap` with `consultHeader = 1`
+        // disposes the elements STILL LIVE in the array (what the drain did not
+        // pop) and then releases the storage — §28.11's `Dispose()` row, in
+        // reverse storage order. The fallback argument is the element-type
+        // disposer, exactly as the borrowing head's own free site passes it, so
+        // an array whose header was never stamped degrades to that rather than
+        // to a null cascade.
+        if (freeBacking) {
+            llvm::Value* arrF = builder_.CreateStructGEP(stTy, self, 1);
+            llvm::Value* arrPtr = builder_.CreateLoad(ptrTy(), arrF, "oaed.arr");
+            llvm::Function* elDisp = ownedWrapElementDisposer(iOwnEnumTy);
+            llvm::Value* elDispVal = elDisp
+                ? llvm::cast<llvm::Value>(elDisp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            auto* freeArrFn = module_->getOrInsertFunction(
+                "bz_array_free_owning_wrap", llvm::FunctionType::get(
+                    voidTy, {ptrTy(), ptrTy(), i32()}, false)).getCallee();
+            builder_.CreateCall(
+                llvm::FunctionType::get(voidTy, {ptrTy(), ptrTy(), i32()}, false),
+                freeArrFn, {arrPtr, elDispVal, builder_.getInt32(1)});
+        }
         // Free the wrapper struct.
         auto* freeFn = module_->getOrInsertFunction(
-            "free", llvm::FunctionType::get(
-                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
-        builder_.CreateCall(llvm::FunctionType::get(
-            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false), freeFn, {self});
+            "free", llvm::FunctionType::get(voidTy, {ptrTy()}, false)).getCallee();
+        builder_.CreateCall(
+            llvm::FunctionType::get(voidTy, {ptrTy()}, false), freeFn, {self});
         builder_.CreateRetVoid();
         currentFn_ = savedCurrentFn;
         if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+        };
+        if (ownsBacking) {
+            cloneDispFn = llvm::Function::Create(
+                llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy()}, false),
+                llvm::Function::InternalLinkage, prefix + "CloneDispose",
+                module_.get());
+            buildDispose(cloneDispFn, /*freeBacking=*/false);
+        }
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
+        // A BORROWED source's frame frees only itself — its real owner
+        // reclaims the collection, which is the pre-#6544 contract for every
+        // caller that does not set `ownsBacking`.
+        buildDispose(dispFn, /*freeBacking=*/ownsBacking);
     }
 
     // --- MoveNext(self) -> i1 — pop next element via bz_array_drain_next. ---
@@ -11823,11 +11902,57 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
     // --- Slot 4 (GetOwningEnumerator): a FRESH enumerator over the same
     // borrowed array, positioned before the collection's current remainder. ---
     auto* geFn = module_->getFunction(prefix + "GetOwningEnumerator");
-    if (!geFn) {
+    bool freshGE = (geFn == nullptr);
+    if (freshGE)
         geFn = llvm::Function::Create(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "GetOwningEnumerator",
             module_.get());
+
+    // Vtable: [0]=self, [1]=Dispose, [2]=MoveNext, [3]=TakeCurrent,
+    // [4]=GetOwningEnumerator (fresh clone over the current remainder).
+    //
+    // fix #6544 (§28.11, v0.338): the vtables are built BEFORE slot 4's BODY,
+    // because that body has to name the clone's vtable. Slot 4 is created as a
+    // bare Function first — an `llvm::Function*` is already a valid constant,
+    // so a vtable may list a function whose body is emitted later in this same
+    // call.
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getNamedGlobal(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self-ptr (below)
+            dispFn, mnFn, tcFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+    // The clone's vtable: identical slots 0 and 2-4, but slot 1 is the
+    // frame-only Dispose, because the SOURCE frame — and only it — reclaims the
+    // collection it owns. See the #6544 note on `buildDispose` above.
+    llvm::GlobalVariable* cloneVtGV = nullptr;
+    if (ownsBacking) {
+        std::string cName = prefix + "clonevtable";
+        cloneVtGV = module_->getNamedGlobal(cName);
+        if (!cloneVtGV) {
+            auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+            std::vector<llvm::Constant*> celems = {
+                llvm::ConstantPointerNull::get(ptrTy()),
+                cloneDispFn, mnFn, tcFn, geFn
+            };
+            cloneVtGV = new llvm::GlobalVariable(*module_, vtTy,
+                /*isConst=*/true, llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantArray::get(vtTy, celems), cName);
+            celems[0] = llvm::ConstantExpr::getPointerCast(cloneVtGV, ptrTy());
+            cloneVtGV->setInitializer(llvm::ConstantArray::get(vtTy, celems));
+        }
+    }
+
+    if (freshGE) {
         auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
         llvm::IRBuilder<> b(bb);
         // fix #3385 (§29.1 / §29.11; stdlib §4.13, v0.282): the previous body
@@ -11857,6 +11982,14 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
             "oaege.clone");
         llvm::Value* vt =
             b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 0));
+        // fix #6544 (§28.11, v0.338): when the SOURCE frame owns the backing
+        // collection, the clone must NOT — cloning `self`'s vtable verbatim
+        // would free the array twice (once per frame). The clone carries the
+        // same MoveNext / TakeCurrent / GetOwningEnumerator (stdlib §4.13: a
+        // re-enumeration continues draining what remains) over a DIFFERENT
+        // slot-1 Dispose that reclaims the frame alone, which is the same split
+        // `wrapOwnedArrayAsIEnumerable` already makes with `m.vtGV`.
+        if (ownsBacking) vt = cloneVtGV;
         b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
         llvm::Value* arrCp =
             b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
@@ -11864,25 +11997,6 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
                       b.CreateStructGEP(stTy, clone, 2));
         b.CreateRet(clone);
-    }
-
-    // Vtable: [0]=self, [1]=Dispose, [2]=MoveNext, [3]=TakeCurrent,
-    // [4]=GetOwningEnumerator (fresh clone over the current remainder).
-    std::string vtName = prefix + "vtable";
-    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
-    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
-    auto* vtGV = module_->getNamedGlobal(vtName);
-    if (!vtGV) {
-        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
-        std::vector<llvm::Constant*> elems = {
-            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self-ptr (below)
-            dispFn, mnFn, tcFn, geFn
-        };
-        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
-            llvm::GlobalValue::InternalLinkage,
-            llvm::ConstantArray::get(vtTy, elems), vtName);
-        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
-        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
     }
 
     // Allocate + fill the OWNING-enumerator instance { vtable, arr, pending=0 }.
@@ -11940,7 +12054,8 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
 //     out of sharing the list, since the drain has already unlinked the nodes
 //     that left).
 llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
-        llvm::Value* list, const sema::TypeRef* iOwnEnumTy) {
+        llvm::Value* list, const sema::TypeRef* iOwnEnumTy,
+        bool ownsBacking) {
     llvm::Type* elemLlvm = owningDrainElemType(iOwnEnumTy);
 
     // Element-name key (the scheme ensureLinkedListEnumMachinery uses) so the
@@ -11951,7 +12066,14 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
     std::string elemName = elemLlvm->isIntegerTy()
         ? ("i" + std::to_string(elemLlvm->getIntegerBitWidth()))
         : (elemLlvm->isPointerTy() ? "ptr" : "f");
-    std::string prefix = "bz$ownllenum$" + elemName + "$";
+    // fix #6544 (§28.11 / §29.2, v0.338): `ownsBacking` keys the cache for
+    // the same reason the array leaf's does — a callee-OWNED list handed back
+    // at an `IOwningEnumerable<T>` head has no other owner, so the SOURCE
+    // frame's slot-1 Dispose must reclaim it (cascading over the elements the
+    // drain did not pop), while its slot-4 clones must not. See
+    // `wrapArrayAsIOwningEnumerator` for the array sibling and the reasoning.
+    std::string prefix = "bz$ownllenum$" + elemName + "$" +
+        (ownsBacking ? "own$" : "");
     std::string stName = "ownllenum." + elemName;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy)
@@ -11960,31 +12082,45 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
     auto* voidTy = llvm::Type::getVoidTy(llvm_);
 
     // --- Dispose(self) — dispose pending (if any), free the frame. ---
+    // fix #6544 (§28.11, v0.338): TWO bodies when `ownsBacking` — see the array
+    // leaf's `buildDispose` for the same split and the same justification. The
+    // list difference is that `bz_llist_t` carries NO element-disposer header on
+    // this base (the array twin reads one via `bz_array_free_owning_wrap`), so
+    // the cascade's disposer is derived from the ELEMENT TYPE and passed
+    // outright — the same derivation `patternAResultCollFree` makes for an
+    // OwningLinkedList result (LlvmBackend_Disposal.cpp). §28.11's `Dispose()`
+    // row wants the elements disposed in REVERSE INSERTION order, which is what
+    // `bz_llist_free`'s sequence sort does.
     auto* dispFn = module_->getFunction(prefix + "Dispose");
+    llvm::Function* cloneDispFn =
+        ownsBacking ? module_->getFunction(prefix + "CloneDispose") : nullptr;
     if (!dispFn) {
-        dispFn = llvm::Function::Create(
-            llvm::FunctionType::get(voidTy, {ptrTy()}, false),
-            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
-        // §28: emitDisposeAndReclaim inserts through the Emitter's `builder_` /
-        // `currentFn_`. Swap them in for the helper body and restore after, so
-        // the caller's own insert point is untouched (the save pattern
-        // wrapArrayAsIOwningEnumerator uses, and for the same #2218 reason —
-        // an unsaved builder emits the helper's instructions into the wrong
-        // function).
-        llvm::Function* savedCurrentFn = currentFn_;
-        auto* savedBB = builder_.GetInsertBlock();
-        llvm::BasicBlock::iterator savedIP{};
-        if (savedBB) savedIP = builder_.GetInsertPoint();
-        currentFn_ = dispFn;
+        auto buildDispose = [this, stTy, iOwnEnumTy](llvm::Function* fn,
+                                                    bool freeBacking) {
+        llvm::Function* savedFn = currentFn_;
+        auto* sBB = builder_.GetInsertBlock();
+        llvm::BasicBlock::iterator sIP{};
+        if (sBB) sIP = builder_.GetInsertPoint();
+        currentFn_ = fn;
+        // `llvm::Function::Create` does NOT create an entry block (unlike the
+        // array sibling's `BasicBlock::Create` line) — getEntryBlock() on an
+        // empty function is undefined and takes the IRBuilder's module lookup
+        // down with it.
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
         builder_.SetInsertPoint(bb);
-        llvm::Value* self = dispFn->arg_begin();
+        auto* vTy = llvm::Type::getVoidTy(llvm_);
+        llvm::Value* self = fn->arg_begin();
+        // §28: emitDisposeAndReclaim inserts through the Emitter's `builder_` /
+        // `currentFn_` (swapped in above, restored below — the save pattern
+        // wrapArrayAsIOwningEnumerator uses, and for the same #2218 reason: an
+        // unsaved builder emits the helper's instructions into the wrong
+        // function).
         llvm::Value* pendF = builder_.CreateStructGEP(stTy, self, 2);
         llvm::Value* pend = builder_.CreateLoad(ptrTy(), pendF, "olld.pend");
         llvm::Value* isNull = builder_.CreateICmpEQ(
             pend, llvm::ConstantPointerNull::get(ptrTy()), "olld.pend.null");
-        auto* dispBB = llvm::BasicBlock::Create(llvm_, "olld.disp", dispFn);
-        auto* contBB = llvm::BasicBlock::Create(llvm_, "olld.cont", dispFn);
+        auto* dispBB = llvm::BasicBlock::Create(llvm_, "olld.disp", fn);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "olld.cont", fn);
         builder_.CreateCondBr(isNull, contBB, dispBB);
         builder_.SetInsertPoint(dispBB);
         // Null the slot BEFORE disposing so a re-entrant Dispose (the class's
@@ -11993,14 +12129,59 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
         emitDisposeAndReclaim(pend);
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
+        if (freeBacking) {
+            llvm::Value* listPtr = builder_.CreateLoad(ptrTy(),
+                builder_.CreateStructGEP(stTy, self, 1));
+            auto* freeLstFn = module_->getOrInsertFunction(
+                "bz_llist_free",
+                llvm::FunctionType::get(vTy, {ptrTy(), ptrTy()}, false))
+                .getCallee();
+            // Element-type-derived disposer: the class-element thunk for a
+            // class, the string release for a non-nullable `string`, null for a
+            // value element (nothing to dispose). Mirrors
+            // `ownedWrapElementDisposer`, except that this head's cascade wants
+            // the OWNING row of `elementPolicyFor` — the element is a class
+            // (stdlib §4.13's `where T: class`) and it is still LIVE here
+            // precisely because no loop ever took it.
+            const sema::TypeRef* elTy = (iOwnEnumTy &&
+                    !iOwnEnumTy->genericArgs.empty())
+                                        ? iOwnEnumTy->genericArgs[0] : nullptr;
+            ElementPolicy pol = elementPolicyFor(elTy, /*owning=*/true);
+            llvm::Function* elDisp = pol.disposerThunk;
+            bool isStringElem = !elDisp &&
+                pol.cat == ElementPolicy::Category::RuntimeManaged &&
+                elTy && elTy->kind == sema::TypeRef::Kind::Primitive &&
+                elTy->primitive == sema::PrimitiveType::String &&
+                !elTy->nullable;
+            if (isStringElem) elDisp = stringElementReleaseThunk();
+            llvm::Value* elDispVal = elDisp
+                ? llvm::cast<llvm::Value>(elDisp)
+                : llvm::ConstantPointerNull::get(ptrTy());
+            builder_.CreateCall(
+                llvm::FunctionType::get(vTy, {ptrTy(), ptrTy()}, false),
+                freeLstFn, {listPtr, elDispVal});
+        }
         auto* freeFn = module_->getOrInsertFunction(
-            "free", llvm::FunctionType::get(voidTy, {ptrTy()}, false))
-            .getCallee();
+            "free", llvm::FunctionType::get(vTy, {ptrTy()}, false)).getCallee();
         builder_.CreateCall(
-            llvm::FunctionType::get(voidTy, {ptrTy()}, false), freeFn, {self});
+            llvm::FunctionType::get(vTy, {ptrTy()}, false), freeFn, {self});
         builder_.CreateRetVoid();
-        currentFn_ = savedCurrentFn;
-        if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+        currentFn_ = savedFn;
+        if (sBB) builder_.SetInsertPoint(sBB, sIP);
+        };
+        if (ownsBacking) {
+            cloneDispFn = llvm::Function::Create(
+                llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()},
+                                        false),
+                llvm::Function::InternalLinkage, prefix + "CloneDispose",
+                module_.get());
+            buildDispose(cloneDispFn, /*freeBacking=*/false);
+        }
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(voidTy, {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
+        // A BORROWED source's frame frees only itself — see the array sibling.
+        buildDispose(dispFn, /*freeBacking=*/ownsBacking);
     }
 
     // --- MoveNext(self) -> i1 — pop the head node via bz_llist_drain_next. ---
@@ -12078,36 +12259,20 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
     // list, with an empty pending — never `self` (§29.2 disposes both the view
     // and the loop enumerator; sharing one frame would free it twice). ---
     auto* geFn = module_->getFunction(prefix + "GetOwningEnumerator");
-    if (!geFn) {
+    bool freshGE = (geFn == nullptr);
+    if (freshGE)
         geFn = llvm::Function::Create(
             llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
             llvm::Function::InternalLinkage, prefix + "GetOwningEnumerator",
             module_.get());
-        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
-        llvm::IRBuilder<> b(bb);
-        llvm::Value* self = &*geFn->arg_begin();
-        uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
-        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
-        auto* callocC =
-            module_->getOrInsertFunction("calloc", callocFT).getCallee();
-        llvm::Value* clone = b.CreateCall(
-            callocFT, callocC,
-            {llvm::ConstantInt::get(i64(), 1),
-             llvm::ConstantInt::get(i64(), (int64_t)cloneSz)},
-            "ollge.clone");
-        llvm::Value* vt =
-            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 0));
-        b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
-        llvm::Value* listCp =
-            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
-        b.CreateStore(listCp, b.CreateStructGEP(stTy, clone, 1));
-        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
-                      b.CreateStructGEP(stTy, clone, 2));
-        b.CreateRet(clone);
-    }
 
     // Vtable: [0]=self, [1]=Dispose, [2]=MoveNext, [3]=TakeCurrent,
     // [4]=GetOwningEnumerator (the same 5-slot §29.11 shape).
+    //
+    // fix #6544 (§28.11, v0.338): built BEFORE slot 4's BODY, because that body
+    // has to name the clone's vtable — an `llvm::Function*` is already a valid
+    // constant, so a vtable may list a function whose body is emitted later in
+    // this same call.
     std::string vtName = prefix + "vtable";
     // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
     // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
@@ -12123,6 +12288,56 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
             llvm::ConstantArray::get(vtTy, elems), vtName);
         elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
         vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+    // The clone's vtable: identical slots 0 and 2-4, but slot 1 is the
+    // frame-only Dispose, because the SOURCE frame — and only it — reclaims the
+    // list it owns. Mirrors the array leaf's split.
+    llvm::GlobalVariable* cloneVtGV = nullptr;
+    if (ownsBacking) {
+        std::string cName = prefix + "clonevtable";
+        cloneVtGV = module_->getNamedGlobal(cName);
+        if (!cloneVtGV) {
+            auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+            std::vector<llvm::Constant*> celems = {
+                llvm::ConstantPointerNull::get(ptrTy()),
+                cloneDispFn, mnFn, tcFn, geFn
+            };
+            cloneVtGV = new llvm::GlobalVariable(*module_, vtTy,
+                /*isConst=*/true, llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantArray::get(vtTy, celems), cName);
+            celems[0] = llvm::ConstantExpr::getPointerCast(cloneVtGV, ptrTy());
+            cloneVtGV->setInitializer(llvm::ConstantArray::get(vtTy, celems));
+        }
+    }
+
+    if (freshGE) {
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = &*geFn->arg_begin();
+        uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        auto* callocC =
+            module_->getOrInsertFunction("calloc", callocFT).getCallee();
+        llvm::Value* clone = b.CreateCall(
+            callocFT, callocC,
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), (int64_t)cloneSz)},
+            "ollge.clone");
+        llvm::Value* vt =
+            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 0));
+        // fix #6544 (§28.11, v0.338): a clone of a frame that OWNS the list must
+        // not carry the owning slot-1 Dispose — that would free the list twice,
+        // once per frame. Same MoveNext / TakeCurrent / GetOwningEnumerator over
+        // a frame-only Dispose, which is the split
+        // `wrapOwnedLinkedListAsIEnumerable` already makes with `plainVtGV`.
+        if (ownsBacking) vt = cloneVtGV;
+        b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
+        llvm::Value* listCp =
+            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+        b.CreateStore(listCp, b.CreateStructGEP(stTy, clone, 1));
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                      b.CreateStructGEP(stTy, clone, 2));
+        b.CreateRet(clone);
     }
 
     // Allocate + fill the frame { vtable, list, pending=null }.
@@ -13423,6 +13638,22 @@ llvm::Value* Emitter::wrapLinkedListAsIEnumerable(llvm::Value* list,
 // The free site now asks `bz_llist_free_owning_wrap(list, elDisp, head)`.
 llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
         llvm::Value* list, const sema::TypeRef* iEnumTy) {
+    // fix #6544 (§28.11 / §29.1 / §29.2; stdlib §4.13, v0.338): the TWIN of the
+    // array leaf's early return of the same name. An `IOwningEnumerable<T>`
+    // head DRAINS — §29.1's `TakeCurrent` transfers ownership out of the
+    // collection at each yield, so §28.11's `Dispose()` row leaves the SOURCE
+    // frame owing "every live element" (the ones no yield took) plus the
+    // storage. This frame is the list's sole owner (the callee returned it),
+    // and the frame below installs the plain node-walking MoveNext/Current
+    // with a NULL element disposer, so it freed the list and stranded every
+    // element: MEASURED on HEAD, a callee-owned `OwningLinkedList<Item>` bound at
+    // an `IOwningEnumerable<Item>` head and never iterated leaked 32 B in 2
+    // allocations — the array twin's byte for byte, which is what makes the two
+    // leaves a family rather than a coincidence. `ownsBacking = true` because no
+    // other owner exists; the drain's slot-4 clones carry a frame-only Dispose.
+    if (builtinTypeName(iEnumTy) == "IOwningEnumerable")
+        return wrapLinkedListAsIOwningEnumerator(list, iEnumTy,
+                                                 /*ownsBacking=*/true);
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
         elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
