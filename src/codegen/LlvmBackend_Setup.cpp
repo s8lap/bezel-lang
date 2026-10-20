@@ -49573,7 +49573,29 @@ llvm::Value* Emitter::emitEnumToString(llvm::Value* enumVal,
 // comparison) for the boxed-dispatch and hash-container consumers.
 llvm::Value* Emitter::emitEnumEquals(llvm::Value* a, llvm::Value* b,
                                      const sema::TypeSymbol* ts) {
-    if (sema::MethodSymbol* user = enumUserMember(ts, "Equals", 1)) {
+    // fix #6202 (§10.5 / §9.2, v0.338): only the own-typed `Equals(other: E)`
+    // fills the enum's equality; an `Equals(other: int)` is a different
+    // member and must not run on the enumerator integers. Scan for the
+    // own-typed one (plain, preferred over a moded overload as in #6263).
+    sema::MethodSymbol* user = nullptr;
+    for (sema::Symbol* sym : ts->members) {
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+        if (!ms || ms->isOperator || isStaticMethod(ms) ||
+            ms->name != "Equals" || ms->params.size() != 1)
+            continue;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[0]);
+        const sema::TypeRef* pt =
+            !ps ? nullptr
+                : (ps->declType ? ctx_.resolvedType(*ps->declType)
+                                : ps->resolvedDeclType);
+        if (!pt || pt->kind != sema::TypeRef::Kind::Named || pt->nullable ||
+            pt->declaration != ts)
+            continue;
+        bool plain = ps->modifier.empty() && !ps->hasDefault;
+        if (plain || !user) user = ms;
+        if (plain) break;
+    }
+    if (user) {
         auto fit = methodFns_.find(user);
         if (fit != methodFns_.end()) {
             llvm::FunctionType* fty = fit->second->getFunctionType();
