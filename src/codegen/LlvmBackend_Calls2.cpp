@@ -17621,6 +17621,25 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                     rt->declaration == iface && !rt->genericArgs.empty()) {
                     std::vector<const sema::TypeRef*> ra(
                         rt->genericArgs.begin(), rt->genericArgs.end());
+                    // fix #6224 (§11.1 / §22.6, v0.339): inside a generic
+                    // body the receiver `IL<X>` names the CALLER's parameter,
+                    // which the callee environment lowerCall installed no
+                    // longer binds; it binds the interface's own parameters
+                    // (`T`) to the receiver's arguments instead (as #6307's
+                    // dispatch reads it). Without this the open `IL<X>`
+                    // selected the shared itab, i.e. the class's first
+                    // instantiation.
+                    if (!descArgsConcrete(ra)) {
+                        std::vector<const sema::TypeRef*> env;
+                        for (std::string_view n : sema::genericParamNames(iface)) {
+                            auto it = genericSubstSemaTy_.find(n);
+                            if (it == genericSubstSemaTy_.end()) break;
+                            env.push_back(it->second);
+                        }
+                        if (env.size() == sema::genericParamNames(iface).size() &&
+                            descArgsConcrete(env))
+                            ra = std::move(env);
+                    }
                     if (descArgsConcrete(ra)) {
                         llvm::GlobalVariable* g = instanceDescriptorFor(iface, ra);
                         if (g && g != descIt->second) instTd = g;
