@@ -4510,6 +4510,35 @@ bool ExprTC::isTaskFamilyRef(const TypeRef* t) const {
             t->headName() == "OwningTask");
 }
 
+// fix #6555 (§21.9, v0.338): §21.9's fluent-receiver exemption's TYPE
+// EQUALITY condition — "whose static type equals the receiver's static type".
+//
+// This is `ExprTypecheck_Calls.cpp`'s `sameTypeRef` re-spelled at file scope
+// rather than reused across TUs, deliberately: `sameTypeRef` is a static helper
+// of a 30k-line TU that this walk has no other business calling into, and the
+// two must not drift. Both bodies below are the same three clauses — kind,
+// nullability, then the payload — and `sameTypeRef`'s payload arm is exactly
+// the fallback this repeats (`declaration` when both sides carry one, else the
+// `headName()` spelling, which is what a Named TypeRef reconstructed from
+// module metadata has). If `sameTypeRef` is ever changed, change this with it.
+//
+// Not `unifyTypes`/`assignableFrom`: this asks IDENTITY, not convertibility.
+// §21.9 wants "equals", and its base-typed-fluent case is deliberately
+// conservative — a fluent method declared to return a base of the receiver's
+// type is NOT exempt, so a widening test here would silently un-warn it.
+static bool discardSameStaticType(const TypeRef* a, const TypeRef* b) {
+    if (!a || !b) return false;
+    if (a->kind != b->kind) return false;
+    if (a->nullable != b->nullable) return false;
+    if (a->kind == TypeRef::Kind::Primitive) return a->primitive == b->primitive;
+    if (a->kind == TypeRef::Kind::Named) {
+        if (a->declaration && b->declaration)
+            return a->declaration == b->declaration;
+        return a->headName() == b->headName();
+    }
+    return false;
+}
+
 // fix #1820 (§28.3, v0.223 ruling; carried in v0.282): is `t` a concrete
 // class-or-interface slot that triggers the Concrete-slot function bodies
 // callee-side rule? The ruling lists the slot's claimed exclusions verbatim
@@ -22784,6 +22813,128 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     "for supervised fire-and-forget, or bind it explicitly "
                     "(`using var t := expression;`) to dispose it at scope end "
                     "(§21.9)");
+            }
+        }
+
+        // fix #6555 (§21.9, v0.338): the UNUSED-RESULT WARNING — the base rule
+        // of this section, which was never implemented. §21.9: "An expression
+        // statement whose result is a non-`()` type is permitted but the
+        // compiler emits a warning: the result is silently discarded, which may
+        // indicate a bug (a return value the programmer forgot to use)."
+        //
+        // MEASURED on this base: `G();` over `G(): int` and a bare accessor
+        // read `s.Length;` both compiled with NO diagnostic of any severity and
+        // exit 0. So were §21.9's ONE EXEMPTION and its ESCALATION unreachable
+        // as spec rules: there was nothing to except from, and the hard-error
+        // arms further up (the owned non-trivial-dispose reject and the `Task`
+        // reject, both measured live) key on their OWN predicates rather than
+        // on this rule, so they fired while the warning they are stated as
+        // replacing did not. This walk is what makes the section a rule rather
+        // than two disconnected hard errors.
+        //
+        // ⚠ WHERE THE §21.9 KEY IS READ. The regime is keyed on the RESULT'S
+        // STATIC TYPE (§21.9: "keyed as that regime is on the result's static
+        // type"), NOT on §28.3's ownership classification and NOT on how the
+        // value was produced. So the test below is one question — "is this
+        // expression statement's type non-`()`?" — asked of the AST the
+        // parser built, with the ONE exemption of the next paragraph applied
+        // before it becomes a diagnostic.
+        //
+        // The `()` answer: `ascribedReturnTypeProducesValue` is the ONE helper
+        // for "does this type carry a value", so this walk asks it rather than
+        // open-coding `kind == Unit`. §21.9's closing sentence — "Method calls
+        // returning `()` and `await` expressions on `Task` (no result) are the
+        // common cases; no warning is emitted for these" — is exactly the false
+        // answer, and it needs no separate arm: both spellings type as `()`.
+        // The helper's `!nullable` conjunct is load-bearing: a `()?` DOES carry
+        // a value, so a nullable-`()` result is a discarded value like any other
+        // and must warn. (That helper exists because §29.2's `returnsValue` and
+        // codegen's `arrowBodyLoweredAsUnit` had already drifted to disagree;
+        // issue #3095's fix made the second ask the first's question. Asking
+        // it here is the same discipline applied a third time.)
+        if (es->expr) {
+            const TypeRef* resTy = ctx_.exprType(*es->expr);
+            // An unresolved / error-recovery type answers no question. A
+            // diagnostic has already been reported on that program; stacking
+            // this warning on it would make every cascade site carry a second
+            // unrelated message.
+            if (resTy && resTy->kind != TypeRef::Kind::Error &&
+                ascribedReturnTypeProducesValue(resTy)) {
+                // §21.9's ONE EXEMPTION, the fluent-receiver discard: "A
+                // discarded method-call result draws no warning when it is a
+                // §28.3 borrow whose source set lies within the statement's
+                // receiver chain AND whose static type equals the receiver's
+                // static type — the `return this` fluent shape
+                // (`sb.Append(x);` …chained calls included)."
+                //
+                // Both conditions are load-bearing and BOTH are read here.
+                //   (1) METHOD CALL ONLY. §21.9: the exemption "deliberately
+                //       covers method calls only, not accessor reads" — a
+                //       property/indexer read is itself an admissible
+                //       statement (the paragraph above) and stays diagnosed.
+                //       Structurally: a CallExpr whose callee is a
+                //       MemberAccessExpr. A bare accessor read is a
+                //       MemberAccessExpr with no call, so it never matches.
+                //   (2) TYPE EQUALITY with the receiver's static type. §21.9:
+                //       "dropping the type test would silence same-source
+                //       queries (`FirstOrNull()`-class results are
+                //       receiver-sourced too)" — and a fluent method whose
+                //       declared return is a BASE of the receiver's type stays
+                //       warned "conservative by design".
+                //
+                // BORROW-ONLY, per the exemption's own words ("a §28.3
+                // borrow"): the call must not produce an OWNED value. §21.9:
+                // "Owned results and every other borrow keep this section's
+                // regime unchanged", and the escalation above is explicit that
+                // "the fluent-receiver discard above being the sole exemption"
+                // applies to an owned production too. `calleeReturnsOwned` is
+                // the one predicate the rest of this section already uses for
+                // that fact (§2.11 / §28.3), so the three agree by
+                // construction rather than by a fourth spelling.
+                //
+                // The RECEIVER is the call's own target — `sb.Append(x)`'s
+                // `sb`. §21.9's "chained calls included" needs no extra arm: in
+                // `sb.Append(x).Append(y);` the outer call's target is the
+                // inner call, whose type IS the receiver's static type, so the
+                // same equality test admits it.
+                bool fluentExempt = false;
+                if (auto* ce =
+                        dynamic_cast<const ast::CallExpr*>(es->expr.get())) {
+                    if (!common::calleeReturnsOwned(*ce, ctx_)) {
+                        if (auto* ma =
+                                dynamic_cast<const ast::MemberAccessExpr*>(
+                                    ce->callee.get())) {
+                            if (ma->target) {
+                                const TypeRef* recvTy =
+                                    ctx_.exprType(*ma->target);
+                                if (recvTy &&
+                                    recvTy->kind != TypeRef::Kind::Error)
+                                    fluentExempt =
+                                        discardSameStaticType(resTy, recvTy);
+                            }
+                        }
+                    }
+                }
+                // The ESCALATION is NOT consulted here: §21.9's hard-error
+                // arms (the owned non-trivial-dispose reject above and the
+                // `Task` reject above it) each report on their own predicate,
+                // and this walk runs after them, so a program that drew a hard
+                // error above draws exactly one diagnostic, not two. What this
+                // walk owns is the case they do not: a non-`()` result that is
+                // neither owned-producer nor Task-family — the copyable,
+                // `string`, runtime-managed and trivial-dispose results §27.3
+                // and §28.3 both name — plus the interface-typed and
+                // non-trivial-dispose BORROW results §21.9's escalation clause
+                // covers but the owned-gated arm above cannot reach.
+                if (!fluentExempt) {
+                    ctx_.diagnostics().report(
+                        Severity::Warning, es->expr->span.begin,
+                        "the result of this expression statement is unused — a non-`()` "
+                        "result is silently discarded, which may indicate a "
+                        "bug (a return value the programmer forgot to use); "
+                        "to suppress this warning bind it explicitly "
+                        "(`_ := expression;`) (§21.9)");
+                }
             }
         }
     } else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
