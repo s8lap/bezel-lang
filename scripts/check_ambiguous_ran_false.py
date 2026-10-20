@@ -128,6 +128,48 @@ only_walkers.py, ...). A count BELOW baseline fails as STALE HEADROOM: a sweep
 PR that fixes rows but forgets `--update` silently buys room for the next
 regression.
 
+⚠ THE ASYMMETRY IS PARTLY DELIBERATE, PARTLY A CLOSED HOLE (issue #6546).
+The skip-marker exclusion is POSITIVE: a guard is denied protective status
+only when its needle can be CONFIRMED to be the bail-out marker, and
+anything this module cannot confirm defaults to PROTECTIVE. That fail-
+toward-under-flagging posture is DELIBERATE and unchanged - an inflated
+baseline never reaches zero and people stop trusting it, whereas a missed
+row is one fewer defect caught by THIS ratchet, not a false alarm.
+
+Three spellings used to defeat the confirmation, all classifying a bail-out
+guard as PROTECTIVE, and all now closed: the needle behind a NAMED CONSTANT
+(`.find(kSkip)`), the needle split across ADJACENT LITERALS (`"SK" "IP"`,
+which the compiler concatenates), and the marker at the CALL SITE of a
+needle-forwarding helper (`skipped(r, "SKIP")`, invisible to an edge rule
+that only reads the edge inside the helper). See `_skip_constants`,
+`_fold_literals`, `_resolve_literals` and `_protected`.
+
+Those three closures are deliberately NOT symmetric, and the asymmetry is a
+decision rather than an oversight:
+
+  * `_text_checking_helpers` - the DIRECT rule as an IMPORTED FUNCTION - is
+    still the FROZEN pre-#6546 rule and compares the argument text
+    VERBATIMLY. Two sibling ratchets import it
+    (`check_toolchain_skip_surface.py`, which uses its COMPLEMENT as its
+    SKIP-only set, and `check_timeout_satisfiable_negatives.py`), and
+    hardening it in place would move the first one's banked
+    `absorbing_sites` count, which may only FALL. `_text_checking_helpers`
+    therefore keeps its hole, deliberately and with the reason recorded
+    here and at its own def.
+  * `_protective_helpers` - the layer ABOVE it, and the only classifier
+    THIS ratchet's own row count uses - is fully hardened, with the
+    named-constant table threaded into both its leaf test and its edge
+    test.
+  * `_protected` gained an optional fourth argument defaulting to empty,
+    so `check_timeout_satisfiable_negatives.py`'s three-argument call is
+    unchanged.
+
+Both remaining gaps under-detect (a missed row), which is the safe
+direction, and neither can manufacture protection: a name enters the
+closure only by reading `.message` itself or by forwarding to a name that
+already did, and `_skip_constants` collects ONLY constants whose value IS
+the skip marker, so adding an entry can only ever DENY protection.
+
 Usage:  scripts/check_ambiguous_ran_false.py [--strict] [--self-test]
                                              [--update [--force]] [--list]
 """
@@ -184,6 +226,159 @@ NAME_MARKERS = (
 # `BEZEL_TEST` guarded ONLY by `if (wasSkipped(r)) return;` before
 # `BEZEL_EXPECT_FALSE(r.ran)` is measurably as unprotected as a bare row.
 SKIP_LITERAL = '"SKIP"'
+
+# The CONTENT of that literal - what a needle denotes once the surrounding
+# quotes, and any adjacent-literal concatenation, have been resolved.
+_SKIP_CONTENT = 'SKIP'
+
+# ── issue #6546: resolving a needle that is not spelled `"SKIP"` verbatim ──
+#
+# The SKIP-literal exclusion is a POSITIVE confirmation, so a needle this
+# file cannot positively confirm to be the skip marker is read as a REAL
+# needle. #6546 names three ordinary C++ spellings that used to defeat it,
+# each classifying a bail-out guard as PROTECTIVE (all three fail toward
+# under-flagging):
+#
+#   1. the needle behind a NAMED CONSTANT (`static const char* kSkip =
+#      "SKIP";` then `.find(kSkip)`) - nothing to see in the argument text;
+#   2. ADJACENT-LITERAL CONCATENATION (`"SK" "IP"`, which the compiler
+#      joins into one literal) - two literals, neither of them `"SKIP"`;
+#   3. the SKIP literal at the CALL SITE, not in the helper body
+#      (`skipped(r, "SKIP")` where `skipped` forwards a needle parameter).
+#
+# `_fold_literals` / `_resolve_literals` close (1) and (2) for BOTH rules;
+# the call-site check in `_protected` closes (3).
+
+# A run of one or more ADJACENT double-quoted literals. `_STRING_LITERAL`
+# finds each piece; `_fold_literals` joins a run the way the C++ compiler
+# does, so `"SK" "IP"` folds to the single content `SKIP`.
+_ADJACENT_LITERAL_RUN = re.compile(r'(?:"(?:[^"\\]|\\.)*"\s*)+')
+
+# A named string constant initialised from an adjacent-literal run:
+#   static const char* kSkip = "SKIP";
+#   static constexpr char kSkip[] = "SKIP";
+#   const std::string_view kSkip = "SKIP";
+#   static auto kSkip = "SKIP";
+# Only constants whose initialiser folds to the skip marker are collected
+# (see `_skip_constants`), so this regex is deliberately permissive about
+# the declared TYPE and strict about the value.
+_NAMED_STRING_CONST = re.compile(
+    r'\b(?:static\s+|constexpr\s+|inline\s+|extern\s+|const\s+)*'
+    r'(?:const\s+)?(?:char|auto|std::string|std::string_view|string_view)'
+    r'\s*\**\s*(\w+)\s*(?:\[[^\]]*\])?\s*=\s*'
+    r'((?:"(?:[^"\\]|\\.)*"\s*)+)')
+
+
+_HEXDIGITS = '0123456789abcdefABCDEF'
+
+
+def _unescape(literal_with_quotes):
+    """The CONTENT of one string literal: quotes stripped and the C++ escape
+    forms resolved, so `needle` is compared by VALUE and not by spelling.
+
+    Handles \\\\ \\" \\' \\n \\r \\t \\a \\b \\f \\v \\0 and the numeric forms
+    \\xHH (greedy, exactly as C++ phase 5 - the escape absorbs every
+    following hex digit, so `"\\x53KIP"` is `SKIP` but `"\\x53AB"` is ONE
+    character) and \\NNN octal (up to three digits). Only enough to decide
+    whether a needle IS the skip marker; an escape form not listed here is
+    left verbatim, which can only fail to CONFIRM - the under-flagging
+    direction this module documents everywhere.
+
+    Without the numeric forms, `"\\x53KIP"` and `"\\123KIP"` are yet two more
+    spellings of the same bail-out marker that the confirmation cannot see,
+    which is the re-entry #6546 exists to prevent: the point is that the
+    VALUE is SKIP, not that it is spelled a particular way."""
+    s = literal_with_quotes[1:-1]
+    out = []
+    i, n = 0, len(s)
+    simple = {'\\': '\\', '"': '"', "'": "'", 'n': '\n', 'r': '\r',
+              't': '\t', 'a': '\a', 'b': '\b', 'f': '\f', 'v': '\v',
+              '?': '?'}
+    while i < n:
+        c = s[i]
+        if c != '\\' or i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        e = s[i + 1]
+        if e in simple:
+            out.append(simple[e])
+            i += 2
+            continue
+        if e == 'x':
+            j = i + 2
+            while j < n and s[j] in _HEXDIGITS:
+                j += 1
+            if j > i + 2:
+                out.append(chr(int(s[i + 2:j], 16) & 0xFF))
+                i = j
+                continue
+        elif e in '01234567':
+            j = i + 1
+            while j < n and j < i + 4 and s[j] in '01234567':
+                j += 1
+            out.append(chr(int(s[i + 1:j], 8) & 0xFF))
+            i = j
+            continue
+        # An unrecognised (or truncated) escape: pass both characters
+        # through verbatim, so the value simply fails to match later.
+        out.append(c)
+        out.append(e)
+        i += 2
+    return ''.join(out)
+
+
+def _fold_literals(text):
+    """The CONTENT of every adjacent-literal RUN in `text`, in order.
+    `"SK" "IP"` -> `['SKIP']`; `"a" ", " "b"` -> `['a', ', b']`. This is the
+    C++ adjacent-literal concatenation rule (phase 6) reduced to what a text
+    scan can do: join the pieces of each run, keep the runs separate."""
+    out = []
+    for m in _ADJACENT_LITERAL_RUN.finditer(text):
+        out.append(''.join(_unescape(p) for p in _STRING_LITERAL.findall(m.group(0))))
+    return out
+
+
+def _resolve_literals(args, consts=()):
+    """Every string value `args` can denote: the contents of its adjacent-
+    literal runs, PLUS the value of any identifier in `consts` (the named-
+    constant shape). Order is source order, which is what the exactness
+    argument in `_edge_is_skip_only` needs.
+
+    An identifier that is NOT in `consts` contributes nothing, so an
+    argument text this module cannot resolve contributes no value - and a
+    caller that requires at least one value therefore falls on the
+    protective side, the documented under-flagging direction."""
+    out = []
+    pos = 0
+    for m in _ADJACENT_LITERAL_RUN.finditer(args):
+        for ident in re.findall(r'\b\w+\b', args[pos:m.start()]):
+            if ident in consts:
+                out.append(consts[ident])
+        out.extend(_fold_literals(m.group(0)))
+        pos = m.end()
+    for ident in re.findall(r'\b\w+\b', args[pos:]):
+        if ident in consts:
+            out.append(consts[ident])
+    return out
+
+
+def _skip_constants(text):
+    """{name: value} for every named string constant in `text` whose
+    initialiser folds to the skip marker - the shape-1 table.
+
+    Deliberately collects ONLY skip-marker-valued constants. A constant
+    holding any other needle contributes no entry, so a call passing it
+    resolves to no value and stays protective; and because a skip-marker
+    constant is only ever consulted to DENY protection, there is no path
+    by which adding an entry could promote a helper."""
+    out = {}
+    for m in _NAMED_STRING_CONST.finditer(text):
+        vals = _fold_literals(m.group(2))
+        if len(vals) == 1 and vals[0] == _SKIP_CONTENT:
+            out[m.group(1)] = vals[0]
+    return out
+
 
 # A local alias for `.message`: `const std::string& m = d.message;` (or
 # `auto`/`std::string_view`, with or without `&`/`const`). A helper may read
@@ -590,7 +785,7 @@ def _helper_bodies(text):
     return out
 
 
-def _is_directly_text_checking(body):
+def _is_directly_text_checking(body, consts=None):
     """The DIRECT classification rule, factored out of
     _text_checking_helpers so both the classifier and the delegation
     closure below apply the SAME rule to a leaf body.
@@ -599,11 +794,35 @@ def _is_directly_text_checking(body):
     (or a recognised `.message` ALIAS) whose `.find(...)` argument is not
     the fixed `"SKIP"` literal. A body whose every recognised `.find(...)`
     is exactly `"SKIP"` is the toolchain-unavailable bail-out idiom and is
-    DENIED protective status (SKIP_LITERAL above)."""
+    DENIED protective status (SKIP_LITERAL above).
+
+    `consts` (issue #6546). OMITTED - the default - means the FROZEN
+    pre-#6546 rule: the argument text must be VERBATIMLY `"SKIP"`, compared
+    as a string. `_text_checking_helpers` calls it that way and must keep
+    calling it that way, because two sibling ratchets import that function
+    and one of them uses its COMPLEMENT as its SKIP-only set; widening it
+    in place would move that ratchet's banked `absorbing_sites` count
+    (see `_text_checking_helpers` and #6538).
+
+    A `consts` mapping switches the rule to the RESOLVED one, which
+    recognises the two additional #6546 spellings of the skip marker: the
+    needle behind a named constant (`.find(kSkip)`) and the needle split
+    across adjacent literals (`.find("SK" "IP")`, which the compiler
+    concatenates into one). `_protective_helpers` - the layer ABOVE
+    `_text_checking_helpers`, and the only classifier this ratchet's own
+    row count uses - always passes one, so the direct rule is hardened
+    exactly where this ratchet decides. Both spellings can only ever make
+    a body DENY protection, never grant it, so the resolution cannot
+    promote a helper."""
     if '.message' not in body:
         return False
     finds = _message_find_call_args(body)
-    if finds and all(a == SKIP_LITERAL for a in finds):
+    if consts is None:
+        if finds and all(a == SKIP_LITERAL for a in finds):
+            return False
+        return True
+    if finds and all(_resolve_literals(a, consts) == [_SKIP_CONTENT]
+                     for a in finds):
         return False
     return True
 
@@ -618,10 +837,10 @@ _CALL_SITE = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
 _STRING_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
 
 
-def _edge_is_skip_only(args):
-    """True if a delegation edge's argument text passes ONLY the fixed
-    `"SKIP"` literal as string arguments - i.e. the callee is being handed
-    the skip marker and nothing else.
+def _edge_is_skip_only(args, consts=()):
+    """True if a delegation edge's argument text passes ONLY the skip marker
+    as string arguments - i.e. the callee is being handed the skip marker and
+    nothing else.
 
     This is what keeps the delegation closure from over-widening. The
     canonical shape is `tests/support/aot_leak_detection_4638_test.cpp`'s
@@ -639,12 +858,19 @@ def _edge_is_skip_only(args):
     Mirrors the DIRECT rule's exactness: a needle that merely CONTAINS the
     substring SKIP (`"toolchain SKIP"`) is a real needle and does NOT count
     as a skip-only edge, so the closure still fails toward under-flagging
-    rather than over-flagging."""
-    literals = _STRING_LITERAL.findall(args)
-    return bool(literals) and all(l == SKIP_LITERAL for l in literals)
+    rather than over-flagging.
+
+    `consts` (issue #6546) threads the named-constant table through, so an
+    edge passing `diagnosticMessageContains(r, kSkip)` is recognised as
+    skip-only exactly as one passing the literal is. Adjacent-literal
+    concatenation needs no parameter - `_resolve_literals` folds `"SK" "IP"`
+    unconditionally - so BOTH sides of #6546's shapes 1 and 2 are closed
+    here as well as in the DIRECT rule."""
+    values = _resolve_literals(args, consts)
+    return bool(values) and all(v == _SKIP_CONTENT for v in values)
 
 
-def _protective_helpers(local_bodies, support_bodies):
+def _protective_helpers(local_bodies, support_bodies, consts=None):
     """Set of helper names that ULTIMATELY check diagnostic message text -
     either directly (their own body reads `.message` with a non-SKIP needle)
     or by DELEGATING, transitively, to a helper that does.
@@ -686,7 +912,13 @@ def _protective_helpers(local_bodies, support_bodies):
     Both directions are pinned by self-test fixtures:
       - a helper delegating to a text-checking assertion IS protective;
       - a helper delegating to something that does NOT check text, and a
-        helper delegating with the SKIP literal, are NOT."""
+        helper delegating with the SKIP literal, are NOT.
+
+    `consts` (issue #6546) is the file's named-skip-constant table, threaded
+    into BOTH the leaf test and the edge test so the three #6546 spellings
+    of the bail-out marker are denied here as well as in the DIRECT rule.
+    `None` (the default) selects the frozen pre-#6546 behaviour; every
+    caller inside this module passes a real table."""
     bodies = {}
     for src in (support_bodies, local_bodies):
         for name, bs in src.items():
@@ -699,7 +931,7 @@ def _protective_helpers(local_bodies, support_bodies):
             if name in prot:
                 continue
             for body in bs:
-                if _is_directly_text_checking(body):
+                if _is_directly_text_checking(body, consts):
                     prot.add(name)
                     changed = True
                     break
@@ -708,7 +940,7 @@ def _protective_helpers(local_bodies, support_bodies):
                     if callee not in prot:
                         continue
                     args = _balanced_paren(body, m.end() - 1)
-                    if _edge_is_skip_only(args):
+                    if _edge_is_skip_only(args, consts or ()):
                         continue
                     prot.add(name)
                     changed = True
@@ -748,7 +980,29 @@ def _text_checking_helpers(text):
     commit body / #3892 review round 3): an inflated baseline never reaches
     zero and people stop trusting it, whereas a missed row is merely one
     fewer defect caught THIS ratchet, not a false alarm. Fail toward
-    under-flagging, never over-flagging."""
+    under-flagging, never over-flagging.
+
+    ⚠ THIS FUNCTION IS DELIBERATELY FROZEN AT ITS PRE-#6546 BEHAVIOUR
+    (issue #6546). It has the same three under-detection holes the
+    delegation closure had - a needle behind a named constant, a needle
+    split across adjacent literals, and a marker at a call site rather
+    than in the body - and they are NOT closed here. They are closed one
+    layer up, in `_protective_helpers` and `_protected`, which is the only
+    classifier THIS ratchet's own row count uses. Closing them HERE is
+    impossible without moving a banked number in another ratchet:
+    `scripts/check_toolchain_skip_surface.py` imports this function and
+    uses its COMPLEMENT as its "SKIP-only" set (see that script's
+    `_absorbing_sites_in_body`), so denying one more helper as
+    non-protective here ADDS a name to that complement and can only RAISE
+    `absorbing_sites` - which `--update` refuses and which may only fall.
+    The same import is why `_is_directly_text_checking` takes `consts` as
+    an OPTIONAL argument defaulting to `None` = this frozen comparison:
+    this function calls it with the default, so its result is unchanged
+    byte for byte, while `_protective_helpers` passes a real table.
+
+    Recorded here rather than left implicit so the next reader sees a
+    decision, not an oversight. See the module docstring's
+    "THE ASYMMETRY IS PARTLY DELIBERATE, PARTLY A CLOSED HOLE" note."""
     out = set()
     for m in HELPER.finditer(text):
         params = m.group(2)
@@ -831,6 +1085,32 @@ def _support_helper_bodies(root):
     return out
 
 
+def _support_skip_constants(root):
+    """{name: value} for the named skip-marker constants declared under
+    `tests/support/*.hpp` (issue #6546) - the header-side companion to
+    `_support_helpers`/`_support_helper_bodies`, and the same
+    once-per-`measure()` collection discipline.
+
+    A test that #includes a shared header and calls a header-declared
+    `skipped(r, kSkip)` would otherwise see `kSkip` as an unresolvable
+    identifier at the call site and, per the documented
+    fail-toward-under-flagging polarity, count a row that the bail-out
+    idiom in the header actually absorbs. Same JitResult-free shape as the
+    other two support collectors (this one is keyed on the declaration,
+    not on a JitResult parameter)."""
+    out = {}
+    support_dir = root / 'tests' / 'support'
+    if not support_dir.is_dir():
+        return out
+    for p in sorted(support_dir.glob('*.hpp')):
+        try:
+            text = p.read_text(errors='replace')
+        except OSError:
+            continue
+        out.update(_skip_constants(_strip_comments(text)))
+    return out
+
+
 LOC_LINE = re.compile(r'\.line\b\s*[><=!]=?\s*0')
 LOC_COLUMN = re.compile(r'\.column\b\s*[><=!]=?\s*0')
 
@@ -860,14 +1140,64 @@ def _name_marker_call(body, var):
     return False
 
 
-def _protected(body, var, text_helpers):
+def _protective_call_sites(body, name, var):
+    """Raw argument text of every `<name>(<var>, ...)` call in `body`.
+    The helper-call arm of `_protected` used to be a bare `re.search`,
+    which cannot see the ARGUMENTS; #6546 needs them, because shape 3 puts
+    the skip marker at the call site rather than in the helper body.
+
+    `var` must be the FIRST argument, exactly as the old regex required
+    (`NAME\\s*\\(\\s*VAR\\s*[,)]`): a needle or substring often comes first
+    in C++ (`contains(r, "needle")`), so anything after the first argument
+    is deliberately not matched here. The old regex's `[,)]` tail became a
+    `,`-or-end-of-arguments tail here, because `_balanced_paren` returns
+    the text BETWEEN the parens and so never the closing one.
+    """
+    out = []
+    for m in re.finditer(r'\b' + re.escape(name) + r'\s*\(', body):
+        args = _balanced_paren(body, m.end() - 1)
+        if re.match(r'\s*' + re.escape(var) + r'\s*(?:,|$)', args):
+            out.append(args)
+    return out
+
+
+def _protected(body, var, text_helpers, consts=()):
+    """True if this BEZEL_TEST body pins the rejection for `var`.
+
+    `consts` (issue #6546) is the file's named-skip-constant table, used by
+    the skip-only CALL-SITE arm below. It defaults to empty so that
+    `scripts/check_timeout_satisfiable_negatives.py`, which calls this with
+    three positional arguments, keeps working unchanged - and keeps this
+    function's external signature exactly as it was.
+
+    THE CALL-SITE ARM (shape 3 of #6546). A helper classified protective is
+    protective because it ULTIMATELY reads message text - a statement about
+    the helper, not about any one of its call sites. The bail-out idiom can
+    hide behind that: a helper forwarding a needle PARAMETER
+    (`skipped(r, needle) { return diagnosticMessageContains(r, needle); }`)
+    is genuinely text-checking, so the closure is RIGHT to classify it
+    protective, yet the call `if (skipped(r, "SKIP")) return;` is a SKIP-ONLY
+    guard pinning nothing. The edge rule cannot catch this on its own: it
+    inspects the delegation edge INSIDE the helper, where the call site's
+    `"SKIP"` is not visible.
+
+    So the skip marker is checked here, where the arguments are: a
+    protective-helper call whose arguments resolve to skip-only does NOT
+    protect. The polarity is fail-toward-under-flagging, as everywhere else
+    here - an argument text that resolves to NO value (a needle in a local
+    variable, an unrecognised spelling) is not skip-only and still
+    protects."""
     if re.search(r'\.message\s*\.\s*find\s*\(', body):
         return True
     if _name_marker_call(body, var):
         return True
     for name in text_helpers:
-        if re.search(r'\b' + re.escape(name) + r'\s*\(\s*' + re.escape(var) +
-                      r'\s*[,)]', body):
+        sites = _protective_call_sites(body, name, var)
+        # Protective if there is at least one call site, and either it
+        # passes a real needle or its arguments resolve to nothing this
+        # module can call skip-only.
+        if sites and any(not _edge_is_skip_only(args, consts)
+                         for args in sites):
             return True
     if LOC_LINE.search(body) and LOC_COLUMN.search(body):
         return True
@@ -943,7 +1273,8 @@ def _ambiguous_debt_markers(raw):
     return out
 
 
-def scan_file(path, raw, support_helpers=None, support_bodies=None):
+def scan_file(path, raw, support_helpers=None, support_bodies=None,
+              support_consts=None):
     """-> list of (test_name, var) unprotected rows in this file's raw
     text. `raw` is the file's actual on-disk text (the marker-attach
     logic reads from it directly, since both AMBIGUOUS-RAN-FALSE-OK and
@@ -952,7 +1283,8 @@ def scan_file(path, raw, support_helpers=None, support_bodies=None):
     the same point). `support_helpers` is the set of helper NAMES
     collected from `tests/support/*.hpp` by `_support_helpers()` (C5);
     a call to one of those names in a test body counts as protection
-    exactly like an in-file helper would."""
+    exactly like an in-file helper would. `support_consts` is the
+    named-skip-constant table of those same headers (issue #6546)."""
     if 'BEZEL_TEST' not in raw:
         return []
     # fix #3915: scan a COMMENT-STRIPPED copy, never the raw text - a
@@ -969,8 +1301,17 @@ def scan_file(path, raw, support_helpers=None, support_bodies=None):
     text = _strip_disabled_preprocessor(text)
     if not (RAN_FALSE.search(text) or HAS_ERRORS_TRUE.search(text)):
         return []
+    # #6546: the named-skip-constant table for THIS file, threaded into
+    # both the delegation closure and the per-row protection test. Built
+    # from the comment-stripped, preprocessor-blanked text for the same
+    # reason that text is: a constant declared in a comment is not a
+    # constant. A caller may pass `support_consts` to add the names
+    # declared in the tests/support headers a test #includes.
+    consts = _skip_constants(text)
+    if support_consts:
+        consts = {**support_consts, **consts}
     text_helpers = _protective_helpers(_helper_bodies(text),
-                                       support_bodies or {})
+                                       support_bodies or {}, consts)
     # C5: union the in-file helper names with the support-header
     # helper names collected once per measure() call (avoiding one
     # glob+read per scan_file invocation; the union is per-call).
@@ -1009,7 +1350,8 @@ def scan_file(path, raw, support_helpers=None, support_bodies=None):
         suite, _, test_name = tname.partition('.')
         test_exempt = test_name in ok_tests
         for var in sorted(claim_vars & bound_vars):
-            if not _protected(body, var, text_helpers) and not test_exempt:
+            if (not _protected(body, var, text_helpers, consts)
+                    and not test_exempt):
                 out.append((tname, var))
     return out
 
@@ -1080,13 +1422,15 @@ def measure(root):
     # docstring for the rationale and the same-classification rule.
     support_helpers = _support_helpers(root)
     support_bodies = _support_helper_bodies(root)
+    support_consts = _support_skip_constants(root)
     for p in sorted(tests_dir.rglob('*_test.cpp')):
         try:
             raw = p.read_text(errors='replace')
         except OSError:
             continue
         rows = scan_file(p, raw, support_helpers=support_helpers,
-                         support_bodies=support_bodies)
+                         support_bodies=support_bodies,
+                         support_consts=support_consts)
         rel = str(p.relative_to(root))
         if rows:
             per_file[rel] = rows
@@ -2123,6 +2467,175 @@ BEZEL_TEST(fixture_suite, c6_mutual_recursion) {
     BEZEL_EXPECT_TRUE(c6Ping(r));
 }
 ''')
+        # ── issue #6546 fixtures: the three SKIP-needle spellings ──
+        #
+        # Each shape is a POSITIVE control: the guard is a genuine
+        # bail-out (it pins only the skip marker, never the rejection
+        # wording), so the row it absorbs MUST be counted. Each is written
+        # in the shape that produced the hole and nothing else, so a
+        # regression in one cannot be masked by the other two.
+        #
+        # SHAPE 1 - the needle behind a NAMED CONSTANT. Two arms, because
+        # the issue names BOTH rules as holding the hole and fixing only
+        # one leaves the other as a re-entry: the DIRECT arm puts the
+        # constant in a helper's own `.message.find(...)`, the EDGE arm
+        # puts it in a delegation argument. They are separate files
+        # because `_protective_helpers` reaches the two by different code
+        # paths (the leaf test vs the fixpoint's edge test), and a single
+        # fixture containing both would go green if either path regressed
+        # and the other still denied the helper.
+        _mk(root, 'tests/codegen/c6546_named_const_direct_test.cpp', '''
+namespace {
+static const char* c6546SkipMarker = "SKIP";
+bool c6546SkippedDirect(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(c6546SkipMarker) != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_named_const_direct) {
+    auto r = runAot("module M;");
+    if (c6546SkippedDirect(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        _mk(root, 'tests/codegen/c6546_named_const_edge_test.cpp', '''
+#include "support/c6_text_asserts_test.hpp"
+namespace {
+static const char* c6546SkipNeedle = "SKIP";
+bool c6546SkippedEdge(const bezel::test::JitResult& r) {
+    return c6_test_support::c6HasText(r, c6546SkipNeedle);
+}
+}
+BEZEL_TEST(fixture_suite, c6546_named_const_edge) {
+    auto r = runAot("module M;");
+    if (c6546SkippedEdge(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # SHAPE 2 - ADJACENT-LITERAL CONCATENATION. Again both rules: the
+        # compiler joins `"SK" "IP"` into one literal before it ever means
+        # anything, so a text scan has to fold the run to see it. Same
+        # two-files rule as shape 1.
+        _mk(root, 'tests/codegen/c6546_concat_direct_test.cpp', '''
+namespace {
+bool c6546SkippedConcatDirect(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SK" "IP") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_concat_direct) {
+    auto r = runAot("module M;");
+    if (c6546SkippedConcatDirect(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        _mk(root, 'tests/codegen/c6546_concat_edge_test.cpp', '''
+#include "support/c6_text_asserts_test.hpp"
+namespace {
+bool c6546SkippedConcatEdge(const bezel::test::JitResult& r) {
+    return c6_test_support::c6HasText(r, "SK" "IP");
+}
+}
+BEZEL_TEST(fixture_suite, c6546_concat_edge) {
+    auto r = runAot("module M;");
+    if (c6546SkippedConcatEdge(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # SHAPE 3 - the marker at the CALL SITE, not in the helper body.
+        # `c6546SkippedCallSite` FORWARDS a needle parameter, so the helper
+        # is genuinely text-checking and the closure is right to call it
+        # protective; the hole is that the edge rule only ever reads the
+        # edge INSIDE the helper and never sees the `"SKIP"` the caller
+        # passes. This fixture therefore discriminates the call-site check
+        # alone - neither of the shape-1/2 mechanisms can catch it, which
+        # is why it is a separate file and a separate assertion.
+        _mk(root, 'tests/codegen/c6546_call_site_test.cpp', '''
+#include "support/c6_text_asserts_test.hpp"
+namespace {
+bool c6546SkippedCallSite(const bezel::test::JitResult& r, const char* needle) {
+    return c6_test_support::c6HasText(r, needle);
+}
+}
+BEZEL_TEST(fixture_suite, c6546_call_site) {
+    auto r = runAot("module M;");
+    if (c6546SkippedCallSite(r, "SKIP")) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # ...and the load-bearing CONTROL for shape 3: the SAME helper,
+        # same file, called with a REAL needle must still protect. Without
+        # this arm a fix that simply stopped honouring protective helper
+        # calls would go green on the fixture above.
+        _mk(root, 'tests/codegen/c6546_call_site_real_needle_test.cpp', '''
+#include "support/c6_text_asserts_test.hpp"
+namespace {
+bool c6546RealNeedleCallSite(const bezel::test::JitResult& r, const char* needle) {
+    return c6_test_support::c6HasText(r, needle);
+}
+}
+BEZEL_TEST(fixture_suite, c6546_call_site_real_needle) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(c6546RealNeedleCallSite(r, "`a..b` is not admitted"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # #6546 companion: the marker spelled with a NUMERIC ESCAPE.
+        # `"\x53KIP"` and `"\123KIP"` are the same four characters the
+        # compiler sees, so a confirmation that compared SPELLINGS rather
+        # than values would read them as real needles - the same re-entry as
+        # shapes 1 and 2, reached by a fourth spelling.
+        #
+        # The `"\x053KIP"` file is a SEPARATE, load-bearing arm: C++ phase 5
+        # absorbs EVERY following hex digit into one escape, so `"\x053KIP"`
+        # is `SKIP` (0x053 = 'S') while a two-digit cap would read it as
+        # "\x05" + "3KIP" and miss it. A single `\x53KIP` fixture does NOT
+        # discriminate greediness - both readings give the same value there -
+        # so this arm exists and is mutation-proved separately.
+        _mk(root, 'tests/codegen/c6546_escaped_marker_test.cpp', '''
+namespace {
+bool c6546SkippedEscaped(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("\\x53KIP") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_escaped_marker) {
+    auto r = runAot("module M;");
+    if (c6546SkippedEscaped(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        _mk(root, 'tests/codegen/c6546_escaped_greedy_test.cpp', '''
+namespace {
+bool c6546SkippedEscapedGreedy(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("\\x053KIP") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_escaped_greedy) {
+    auto r = runAot("module M;");
+    if (c6546SkippedEscapedGreedy(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        _mk(root, 'tests/codegen/c6546_escaped_not_marker_test.cpp', '''
+namespace {
+bool c6546EscapedRealNeedle(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("\\x53AB") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_escaped_not_marker) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(c6546EscapedRealNeedle(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
         # Re-measure AFTER the C5 fixtures are added so the post-C5
         # NEGATIVE assertions below (the SKIP-only and non-JitResult
         # helper cases both DO count) can reference a `per_file` that
@@ -2182,6 +2695,57 @@ BEZEL_TEST(fixture_suite, c6_mutual_recursion) {
             'manufacture protection - neither is in the seed set, so the '
             'fixpoint adds neither',
             'tests/codegen/c6_mutual_recursion_test.cpp' in per_file)
+        # fix #6546 assertions: the three SKIP-needle spellings.
+        chk('#6546 shape 1 (DIRECT rule): a helper reading `.message.find(kSkip)` '
+            'where `kSkip` is a named constant holding the literal "SKIP" is a '
+            'bail-out guard and MUST be denied (its own body carries no '
+            'literal to see)',
+            'tests/codegen/c6546_named_const_direct_test.cpp' in per_file)
+        chk('#6546 shape 1 (EDGE rule): a helper DELEGATING with a named '
+            'constant holding the literal "SKIP" is a bail-out guard and '
+            'MUST be denied - the two shape-1 fixtures are separate files '
+            'because the leaf test and the fixpoint edge test are separate '
+            'code paths, so fixing only one leaves the other a re-entry',
+            'tests/codegen/c6546_named_const_edge_test.cpp' in per_file)
+        chk('#6546 shape 2 (DIRECT rule): a helper reading '
+            '`.message.find("SK" "IP")` is a bail-out guard and MUST be '
+            'denied (C++ joins adjacent literals before they mean anything)',
+            'tests/codegen/c6546_concat_direct_test.cpp' in per_file)
+        chk('#6546 shape 2 (EDGE rule): the same concatenation on a '
+            'delegation edge MUST be denied, for the same two-path reason',
+            'tests/codegen/c6546_concat_edge_test.cpp' in per_file)
+        chk('#6546 shape 3 (call site): a needle-FORWARDING helper is '
+            'genuinely text-checking and the closure is right to call it '
+            'protective - but the call `skipped(r, "SKIP")` is a bail-out, '
+            'and the edge rule cannot see a caller\'s literal, so the row '
+            'MUST still be counted',
+            'tests/codegen/c6546_call_site_test.cpp' in per_file)
+        chk('#6546 shape 3 CONTROL (load-bearing): the SAME '
+            'needle-forwarding shape called with a REAL needle still '
+            'protects - without this arm a fix that merely stopped '
+            'honouring protective helper calls would go green on the '
+            'assertion above',
+            'tests/codegen/c6546_call_site_real_needle_test.cpp'
+            not in per_file)
+        chk('#6546 companion: a marker spelled with a NUMERIC ESCAPE '
+            '(`"\\x53KIP"`) is the same four characters the compiler sees, so '
+            'it MUST be denied - a confirmation comparing SPELLINGS rather '
+            'than values would read it as a real needle, which is the same '
+            're-entry as shapes 1 and 2 by a fourth spelling',
+            'tests/codegen/c6546_escaped_marker_test.cpp' in per_file)
+        chk('#6546 companion: a hex escape absorbs EVERY following hex '
+            'digit (C++ phase 5), so `"\\x053KIP"` is `SKIP` - a two-digit '
+            'cap would read it as "\\x05"+"3KIP" and miss it. A single '
+            '`"\\x53KIP"` fixture cannot discriminate this (both readings '
+            'agree there), so the greedy case is a SEPARATE arm',
+            'tests/codegen/c6546_escaped_greedy_test.cpp' in per_file)
+        chk('#6546 companion CONTROL (load-bearing): `"\\x53AB"` is ONE '
+            'character (C++ phase 5 absorbs every following hex digit), so '
+            'it is NOT the marker and must still protect - without this arm '
+            'a fix that resolved escapes non-greedily would go green on the '
+            'assertion above',
+            'tests/codegen/c6546_escaped_not_marker_test.cpp'
+            not in per_file)
         # C1 fixtures: the suppression marker mechanism.
         chk('C1: an AMBIGUOUS-RAN-FALSE-OK marker on the line before a '
             'BEZEL_TEST body suppresses that row from the count (the '
@@ -2200,20 +2764,23 @@ BEZEL_TEST(fixture_suite, c6_mutual_recursion) {
             'BEZEL_TEST within 8 lines below (e.g. with too many padded '
             'comment lines) does not exempt anything in this file',
             'tests/codegen/marker_no_match_test.cpp' in per_file)
-        chk('exactly 17 unprotected rows across the fixture tree (12 from '
-            'the C4-counted tree + 2 net C5 delta + 3 net #6538 delta: '
-            'every POSITIVE fixture is non-counting by design - the C5 '
-            'support-helper case and the #6538 delegation cases '
-            '(delegating-to-support-text, two-hop-transitive, and the '
-            'SKIP-substring needle) are all correctly PROTECTED, so their '
-            'rows are removed from the count; every NEGATIVE control '
-            'contributes +1 because its protection claim is rejected by '
-            'the SAME positive-exclusion rule that applies to in-file '
-            'helpers - the C5 SKIP-only helper, the C5 non-JitResult '
+        chk('exactly 24 unprotected rows across the fixture tree (12 from '
+            'the C4-counted tree + 2 net C5 delta + 3 net #6538 delta + 7 '
+            'net #6546 delta: every POSITIVE fixture is non-counting by '
+            'design - the C5 support-helper case, the #6538 delegation '
+            'cases (delegating-to-support-text, two-hop-transitive, and the '
+            'SKIP-substring needle), the #6546 real-needle call site and '
+            'the #6546 escaped-NOT-marker case are all correctly PROTECTED, '
+            'so their rows are removed from the count; every NEGATIVE '
+            'control contributes +1 because its protection claim is '
+            'rejected by the SAME positive-exclusion rule that applies to '
+            'in-file helpers - the C5 SKIP-only helper, the C5 non-JitResult '
             'helper, the #6538 delegate-to-non-text helper, the #6538 '
-            'SKIP-literal delegation, and the #6538 mutually-recursive '
-            'pair)',
-            total == 17)
+            'SKIP-literal delegation, the #6538 mutually-recursive pair, '
+            'and the seven #6546 skip-marker spellings (named const on each '
+            'rule, adjacent-literal concatenation on each rule, the '
+            'call-site marker, and the two numerically-escaped markers))',
+            total == 24)
         # (Debug prints removed; count was confirmed = 14 via a temp
         # print during the C5 fix - left the count assertion here as
         # the tripwire for any future change that lifts the C5 net.)
