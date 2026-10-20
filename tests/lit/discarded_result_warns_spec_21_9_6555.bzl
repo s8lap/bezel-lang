@@ -56,10 +56,21 @@
 // the base rule being absent did leave unreachable is §21.9's EXEMPTION,
 // which had nothing to exempt from. See the handback for the full argument.
 //
-// Note on `CHECK-NOT` and the `#6555` tail: the needle below is the PREFIX
-// `this expression statement discards a non-`()` result`, deliberately not
-// the full sentence and not the issue number, so that a future rewording of
-// the remedy list does not silently un-pin every row here.
+// Note on `CHECK-NOT` and the `#6555` tail (fix #6572: this note previously
+// quoted a needle that exists in NO directive in this file — it read
+// `this expression statement discards a non-()` result`, which is the
+// `Task`-arm HARD ERROR's wording, not the warning's. The correct prefix,
+// and the one every CHECK and CHECK-NOT below actually uses, is
+// `warning: the result of this expression statement is unused`. It is quoted
+// as that full prefix deliberately — not the whole sentence, and not the
+// issue number — so a future rewording of the remedy list does not silently
+// un-pin every row here.
+//
+// ⚠ THIS FILE PINS THE WARNING ONLY, so it does NOT pin one-diagnostic-not-two
+// on the §21.9 escalation shapes (a program that draws the hard error draws no
+// warning and REJECTS, and every program here must compile — the first RUN
+// line pins exit 0). That is a separate row:
+// `tests/lit/s21_9_escalation_one_diagnostic_6572.bzl`.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
@@ -239,25 +250,25 @@ end Program;
 // which line it is warning on.
 // ===========================================================================
 
-// Leg 1: the discarded method-call result (`c.Bump(1);`, line 105) — §21.9's
+// Leg 1: the discarded method-call result (`c.Bump(1);`, line 128) — §21.9's
 // own first sentence, and the shape the filed issue turned on: `d[k] = v`
 // written where `=` is §8.4 equality, so the comparison is evaluated and
 // thrown away.
-// CHECK: discarded_result_warns_spec_21_9_6555.bzl:117:5: warning: the result of this expression statement is unused
+// CHECK: discarded_result_warns_spec_21_9_6555.bzl:128:5: warning: the result of this expression statement is unused
 
 // Leg 2: the bare ACCESSOR read §21.9's first paragraph admits explicitly
-// (`c.value;`, line 115). §21.9's exemption "deliberately covers method calls
+// (`c.value;`, line 138). §21.9's exemption "deliberately covers method calls
 // only, **not accessor reads**", so a fix that keyed its exemption on the type
 // test ALONE — dropping the method-call-only condition — would silence this
 // row too. That is what makes it load-bearing rather than a duplicate of
 // leg 1.
-// CHECK: discarded_result_warns_spec_21_9_6555.bzl:127:5: warning: the result of this expression statement is unused
+// CHECK: discarded_result_warns_spec_21_9_6555.bzl:138:5: warning: the result of this expression statement is unused
 
 // Leg 3: the bare INDEXER read, the second spelling of the same paragraph
-// (`xs[1];`, line 123). Kept separate from leg 2 because the indexer reaches
+// (`xs[1];`, line 146). Kept separate from leg 2 because the indexer reaches
 // the walk through a different AST node, so a fix that recognized only the
 // property spelling would miss it.
-// CHECK: discarded_result_warns_spec_21_9_6555.bzl:135:5: warning: the result of this expression statement is unused
+// CHECK: discarded_result_warns_spec_21_9_6555.bzl:146:5: warning: the result of this expression statement is unused
 
 // ===== MUST-NOT-WARN leg 1: the fluent-receiver EXEMPTION =====
 // §21.9: "A discarded method-call result draws no warning when it is a §28.3
@@ -267,23 +278,23 @@ end Program;
 //
 // Both stated conditions are load-bearing and both are pinned by this block:
 //
-//   * METHOD-CALL-ONLY + TYPE EQUALITY: `sb.ToString();` (line 153) is a
+//   * METHOD-CALL-ONLY + TYPE EQUALITY: `sb.ToString();` (line 176) is a
 //     discarded call on the SAME receiver that MUST warn — it is not fluent
 //     (its result is a `string`, not the receiver's `StringBuilder`). It is
 //     pinned by the CHECK immediately below these two CHECK-NOTs, which is
 //     what makes those CHECK-NOTs statements about `Append` specifically
 //     rather than about a method that happens to be silent. Drop either
 //     condition from the exemption and this block fails: without the
-//     method-call-only condition, `c.value;` (line 115) would go silent and
+//     method-call-only condition, `c.value;` (line 138) would go silent and
 //     the Leg-2 CHECK above would fail; without type equality, `sb.ToString();`
 //     would go silent and the CHECK below would fail.
-//   * "chained calls included": line 152 reaches the exemption through the
+//   * "chained calls included": line 175 reaches the exemption through the
 //     OUTER call's receiver (the inner call), so it is a distinct walk from
-//     line 151's and is pinned separately.
+//     line 174's and is pinned separately.
 //
-// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:163:5: warning: the result of this expression statement is unused
-// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:164:5: warning: the result of this expression statement is unused
-// CHECK: discarded_result_warns_spec_21_9_6555.bzl:165:5: warning: the result of this expression statement is unused
+// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:174:5: warning: the result of this expression statement is unused
+// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:175:5: warning: the result of this expression statement is unused
+// CHECK: discarded_result_warns_spec_21_9_6555.bzl:176:5: warning: the result of this expression statement is unused
 
 // ===== MUST-NOT-WARN leg 2: the `()`-returning call =====
 // §21.9: "Method calls returning `()` … are the common cases; no warning is
@@ -291,18 +302,18 @@ end Program;
 //
 // TWO SPELLINGS, because §22.1 admits a procedure either way ("A method has a
 // return type after `:`, or no `:` clause for a procedure (return type `()`)"):
-// `c.Reset();` (line 169, `: ()` written) and `c.Noop();` (line 170, no `:`
+// `c.Reset();` (line 192, `: ()` written) and `c.Noop();` (line 193, no `:`
 // clause at all). A fix that keyed on the SPELLING rather than the resolved
 // `()` admits one and rejects the other, so both are pinned.
 //
 // The two CHECKs that FOLLOW are the two statements in the same method that
-// must warn (`c.value;` line 171, `c.Bump(1);` line 172). They bound this
+// must warn (`c.value;` line 194, `c.Bump(1);` line 195). They bound this
 // span, so the CHECK-NOTs are a claim about those two specific lines and not
 // about a method with no expression statements in it.
-// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:181:5: warning: the result of this expression statement is unused
-// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:182:5: warning: the result of this expression statement is unused
-// CHECK: discarded_result_warns_spec_21_9_6555.bzl:183:5: warning: the result of this expression statement is unused
-// CHECK: discarded_result_warns_spec_21_9_6555.bzl:184:5: warning: the result of this expression statement is unused
+// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:192:5: warning: the result of this expression statement is unused
+// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:193:5: warning: the result of this expression statement is unused
+// CHECK: discarded_result_warns_spec_21_9_6555.bzl:194:5: warning: the result of this expression statement is unused
+// CHECK: discarded_result_warns_spec_21_9_6555.bzl:195:5: warning: the result of this expression statement is unused
 
 // ===== MUST-NOT-WARN leg 3: `await` on a resultless `Task` =====
 // §21.9: "and `await` expressions on `Task` (no result) … no warning is
@@ -312,11 +323,11 @@ end Program;
 // not be confused, and only this row separates them.
 //
 // This is the LAST CHECK-NOT in the file, so its span runs to end of input —
-// which is the whole remaining program: the `_ :=` sink at line 196 and
-// `Main`'s seven statement calls at lines 212-218. So this one row also pins
+// which is the whole remaining program: the `_ :=` sink at line 219 and
+// `Main`'s seven statement calls at lines 223-229. So this one row also pins
 // the tail of the file, and in particular that `Main`'s `WarnCall();` etc. —
 // calls to `()`-returning methods — stay silent too.
-// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:196:5: warning: the result of this expression statement is unused
+// CHECK-NOT: discarded_result_warns_spec_21_9_6555.bzl:207:5: warning: the result of this expression statement is unused
 
 // ===== MUST-NOT-WARN leg 4: the `_ :=` suppression sink =====
 // §21.9: "To suppress the warning, use the discard form `_ := expression;`."
@@ -325,4 +336,4 @@ end Program;
 // its severity: a fix that widened the predicate from "any discarded
 // expression-statement result" to "any discarded value" would fire here.
 // It is covered by the leg-3 CHECK-NOT above, whose end-of-input span
-// includes line 196.
+// includes line 219.

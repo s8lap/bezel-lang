@@ -4516,11 +4516,31 @@ bool ExprTC::isTaskFamilyRef(const TypeRef* t) const {
 // This is `ExprTypecheck_Calls.cpp`'s `sameTypeRef` re-spelled at file scope
 // rather than reused across TUs, deliberately: `sameTypeRef` is a static helper
 // of a 30k-line TU that this walk has no other business calling into, and the
-// two must not drift. Both bodies below are the same three clauses — kind,
-// nullability, then the payload — and `sameTypeRef`'s payload arm is exactly
-// the fallback this repeats (`declaration` when both sides carry one, else the
-// `headName()` spelling, which is what a Named TypeRef reconstructed from
-// module metadata has). If `sameTypeRef` is ever changed, change this with it.
+// two must not drift. If `sameTypeRef` is ever changed, change this with it.
+//
+// ⚠ THE DUPLICATION IS NOT AN EQUIVALENCE — fix #6572 (§21.9, v0.338). The two
+// bodies share the SAME THREE CLAUSES — kind, nullability, then the payload —
+// and `sameTypeRef`'s payload arm is exactly the fallback this repeats
+// (`declaration` when both sides carry one, else the `headName()` spelling,
+// which is what a Named TypeRef reconstructed from module metadata has). But
+// `sameTypeRef` opens with a fourth clause this does NOT have:
+//
+//     if (a == b) return true;            // sameTypeRef only
+//
+// So for every `TypeRef::Kind` that falls through to the trailing
+// `return false` — `Kind::Unit`, `Kind::InlineArray` and `Kind::Function`
+// (TypeRef.hpp's `enum class Kind`, all three carrying no payload arm here)
+// — the two DISAGREE whenever `a` and `b` are literally the same pointer:
+// `sameTypeRef` says true, this says false. For `Primitive` and `Named` the
+// bodies agree outright. The omission is KEPT deliberately, not by oversight:
+// this gates §21.9's fluent exemption, so admitting a pointer-identity fast
+// path would widen the set of un-warned programs to any receiver/result pair
+// the checker happened to intern into one TypeRef — a change to the WARNING
+// SURFACE, which is a behaviour flip needing its own lit rows, not a cleanup.
+// The two call sites are disjoint predicates today, so nothing reads across
+// the gap; what this comment exists to stop is a future reader believing the
+// duplication makes them interchangeable and dropping the missing clause (or
+// the whole helper) on the strength of it.
 //
 // Not `unifyTypes`/`assignableFrom`: this asks IDENTITY, not convertibility.
 // §21.9 wants "equals", and its base-typed-fluent case is deliberately
@@ -22334,6 +22354,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
     } else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
         if (es->expr) visitExpr(*es->expr);
+        // fix #6572 (§21.9, v0.338): §21.9's escalation says the unused-result
+        // WARNING "is replaced by" a hard error. The two hard-error arms below
+        // (the owned non-trivial-dispose reject and the `Task` reject) each
+        // REPORT and then fall through — neither returns — so without this
+        // latch the warning walk at the bottom of this arm runs anyway and a
+        // program that drew the hard error draws BOTH, at the same
+        // file:line:col. §21.9 states one message for this regime, not two.
+        //
+        // ⚠ The latch is set at the REPORT site, not at the predicate, so it
+        // records "a diagnostic was emitted here" and nothing more. It is what
+        // the six escalation rows in
+        // `tests/lit/s21_9_escalation_one_diagnostic_6572.bzl` pin.
+        bool s21_9Escalated = false;
         // per §14.1 + §A.7 (issue #391): a bare expression statement discards
         // the result, so a return-only type parameter has no target. Diagnose.
         if (es->expr) {
@@ -22698,6 +22731,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     trivialDisposeProducer = !reject;
                 }
                 if (reject) {
+                    // fix #6572 (§21.9, v0.338): latch the escalation so the
+                    // unused-result warning walk below does not stack a second
+                    // §21.9 message on this same file:line:col.
+                    s21_9Escalated = true;
                     ctx_.diagnostics().report(
                         Severity::Error, es->expr->span.begin,
                         "this expression produces an owned value that requires "
@@ -22805,6 +22842,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             auto* moveExpr = dynamic_cast<const ast::UnaryExpr*>(es->expr.get());
             bool isMove = moveExpr && moveExpr->op == "move";
             if (isTaskFamilyRef(taskStmtTy) && !isMove) {
+                // fix #6572 (§21.9, v0.338): same latch as the owned arm above —
+                // §21.9's escalation REPLACES the warning, so this statement
+                // must not also draw one.
+                s21_9Escalated = true;
                 ctx_.diagnostics().report(
                     Severity::Error, es->expr->span.begin,
                     "this expression statement discards a `Task` result — an "
@@ -22915,18 +22956,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
-                // The ESCALATION is NOT consulted here: §21.9's hard-error
-                // arms (the owned non-trivial-dispose reject above and the
-                // `Task` reject above it) each report on their own predicate,
-                // and this walk runs after them, so a program that drew a hard
-                // error above draws exactly one diagnostic, not two. What this
-                // walk owns is the case they do not: a non-`()` result that is
-                // neither owned-producer nor Task-family — the copyable,
-                // `string`, runtime-managed and trivial-dispose results §27.3
-                // and §28.3 both name — plus the interface-typed and
-                // non-trivial-dispose BORROW results §21.9's escalation clause
-                // covers but the owned-gated arm above cannot reach.
-                if (!fluentExempt) {
+                // ⚠ THE ESCALATION IS NOT CONSULTED, AND IT IS NOT REACHED BY
+                // FALL-THROUGH. fix #6572 (§21.9, v0.338): the two hard-error
+                // arms above (the owned non-trivial-dispose reject and the
+                // `Task` reject) each REPORT and then fall through — neither
+                // returns — so this walk DID run on every statement that drew
+                // one, and a program that escalated drew the error AND the
+                // warning at the same file:line:col. That was measured, not
+                // inferred: 15 lit rows and two banked corpus cases
+                // (`s21_9_0003`, `s21_9_0026`) whose own rule text says
+                // "replaced by a hard error" were drawing both. §21.9 says the
+                // escalation REPLACES the warning, so `s21_9Escalated` — set at
+                // the report site of each arm, above — gates this one. Do not
+                // read "the walk runs after both arms" as implying it is
+                // unreachable after one: it was reachable, and that was the
+                // defect.
+                //
+                // What this walk owns is the case the arms do not: a non-`()`
+                // result that is neither owned-producer nor Task-family — the
+                // copyable, `string`, runtime-managed and trivial-dispose
+                // results §27.3 and §28.3 both name — plus the interface-typed
+                // and non-trivial-dispose BORROW results §21.9's escalation
+                // clause covers but the owned-gated arm above cannot reach.
+                if (!fluentExempt && !s21_9Escalated) {
                     ctx_.diagnostics().report(
                         Severity::Warning, es->expr->span.begin,
                         "the result of this expression statement is unused — a non-`()` "
