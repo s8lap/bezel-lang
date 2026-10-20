@@ -54,6 +54,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -61,12 +62,25 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. Each row in this file used to guard on a
+// local `wasSkipped` predicate whose whole body read the literal "SKIP" out
+// of the result's diagnostics and returned from the row on it. That is an
+// ABSORBING site by scripts/check_toolchain_skip_surface.py's own
+// definition, and it is a silent vacuous pass: on a box whose clang cannot
+// link the ASan binary, all 11 rows returned WITHOUT asserting and the suite
+// reported a clean PASS having compiled and run nothing. MEASURED on the
+// pre-change tree with the harness's own knob
+// (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): 11 passed, 0 failed, and
+// `CHECKED TOOLCHAIN: 11 skip(s)`.
+//
+// Each guard became the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r))`
+// (tests/support/aot_result_asserts.hpp): the skip is still recognised as an
+// environment condition, but it now MARKS THE ROW FAILED instead of hiding
+// it. That is strictly stronger than the guard it replaced — the row can no
+// longer report green on a machine that never compiled the program — and
+// every substantive assertion in every row (r.ran and the value pins) stays
+// exactly where it was.
 
 // One program shape, four knobs:
 //   extraMembers - members added to `Src` (a property / an indexer)
@@ -164,7 +178,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
            member_access_property_source_disposed_on_abandonment_29_7) {
     JitResult r = runAotChecked(
         program(kSeqProperty, "", "this.Seq", kBorrowBody, /*abandon=*/true));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kAbandonedOut);
 }
 
@@ -177,7 +191,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
            bare_identifier_property_source_disposed_on_abandonment_29_7) {
     JitResult r = runAotChecked(
         program(kSeqProperty, "", "Seq", kBorrowBody, /*abandon=*/true));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kAbandonedOut);
 }
 
@@ -190,7 +204,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
            indexer_source_disposed_on_abandonment_29_7) {
     JitResult r = runAotChecked(
         program(kSeqIndexer, "", "this[0]", kBorrowBody, /*abandon=*/true));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kAbandonedOut);
 }
 
@@ -205,7 +219,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
     JitResult r = runAotChecked(
         program("", "    var seq: IOwningEnumerable<Item> := _a;\n", "seq",
                 kOwningBody, /*abandon=*/true));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kAbandonedOut);
 }
 
@@ -222,7 +236,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
     JitResult r = runAotChecked(
         program("", "    var seq: IEnumerable<Item> := _a;\n", "seq",
                 kBorrowBody, /*abandon=*/true));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kAbandonedOut);
 }
 
@@ -231,7 +245,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
     JitResult r = runAotChecked(
         program("", "    using var seq: IEnumerable<Item> := _a;\n", "seq",
                 kBorrowBody, /*abandon=*/true));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kAbandonedOut);
 }
 
@@ -246,7 +260,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
            member_access_property_source_full_drain_disposes_once_29_7) {
     JitResult r = runAotChecked(
         program(kSeqProperty, "", "this.Seq", kBorrowBody, /*abandon=*/false));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kDrainedOut);
 }
 
@@ -254,7 +268,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
            indexer_source_full_drain_disposes_once_29_7) {
     JitResult r = runAotChecked(
         program(kSeqIndexer, "", "this[0]", kBorrowBody, /*abandon=*/false));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kDrainedOut);
 }
 
@@ -263,7 +277,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
     JitResult r = runAotChecked(
         program("", "    var seq: IOwningEnumerable<Item> := _a;\n", "seq",
                 kOwningBody, /*abandon=*/false));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kDrainedOut);
 }
 
@@ -272,7 +286,7 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
     JitResult r = runAotChecked(
         program("", "    var seq: IEnumerable<Item> := _a;\n", "seq",
                 kBorrowBody, /*abandon=*/false));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kDrainedOut);
 }
 
@@ -288,6 +302,6 @@ BEZEL_TEST(forin_builtin_enumerator_frame_slot_3468,
     JitResult r = runAotChecked(
         program("  public property Ro: IReadOnlyList<Item> => _a;\n", "",
                 "this.Ro", kBorrowBody, /*abandon=*/false));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     expectClean(r, kDrainedOut);
 }

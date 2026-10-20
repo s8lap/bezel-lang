@@ -61,6 +61,7 @@
 // not evidence the value is right — #2896 measured 44 where 149 is correct.
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -69,13 +70,25 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. Each row in this file used to guard on a
+// local `wasSkipped` predicate whose whole body read the literal "SKIP" out
+// of the result's diagnostics and returned from the row on it. That is an
+// ABSORBING site by scripts/check_toolchain_skip_surface.py's own
+// definition, and it is a silent vacuous pass: on a box whose clang cannot
+// link the ASan binary, all 11 rows returned WITHOUT asserting and the suite
+// reported a clean PASS having compiled and run nothing. MEASURED on the
+// pre-change tree with the harness's own knob
+// (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): 11 passed, 0 failed, and
+// `CHECKED TOOLCHAIN: 11 skip(s)`.
+//
+// Each guard became the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r))`
+// (tests/support/aot_result_asserts.hpp): the skip is still recognised as an
+// environment condition, but it now MARKS THE ROW FAILED instead of hiding
+// it. That is strictly stronger than the guard it replaced — the row can no
+// longer report green on a machine that never compiled the program — and
+// every substantive assertion in every row (r.ran and the value pins) stays
+// exactly where it was.
 
 // ⚠ MAINTENANCE NOTE — THE PREMISE OF EVERY CASE BELOW, AND HOW IT EXPIRES.
 //
@@ -122,7 +135,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, layout_premise_canary_spec_22_8) 
         "  using var g := new GBase<string>(); "
         "  return g.a + g.cell.tag; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 — through the composed layout, where `v`/`v2` are ptr-wide.
     BEZEL_EXPECT_EQ(r.exitCode, 44);
@@ -149,7 +162,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, virtual_property_getter_via_base_
         "  var g: GBase<string> := d; "
         "  return g.Score; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 149);
@@ -190,7 +203,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, virtual_property_setter_writes_sp
         "  g.Score := 10; "
         "  return g.Score + d.a + d.own + d.cell.tag; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // a := 11, own := 12 -> get = 23; 23 + 11 + 12 + 3 (cell UNCLOBBERED)
     BEZEL_EXPECT_EQ(r.exitCode, 49);
@@ -236,7 +249,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, virtual_indexer_getter_via_base_s
         "  var g: GBase<string> := d; "
         "  return g[2]; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3 + 2
     BEZEL_EXPECT_EQ(r.exitCode, 151);
@@ -267,7 +280,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, interface_property_getter_spec_13
         "  var i: IScore := g; "
         "  return i.Score; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 44);
@@ -304,7 +317,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, interface_property_setter_spec_23
         "  Console.WriteLine(\"tag=\" + g.cell.tag.ToString()); "
         "  return i.Score; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // a := 11, + cell.tag 3
     BEZEL_EXPECT_EQ(r.exitCode, 14);
@@ -340,7 +353,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, inherited_not_overridden_accessor
         "  var g: GBase<string> := d; "
         "  return g.Score; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 44);
@@ -371,7 +384,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, two_instantiations_via_one_base_s
         "  Console.WriteLine(\"sum=\" + (g1.Score + g2.Score).ToString()); "
         "  return g1.Score - g2.Score + 7; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("sum=298") != std::string::npos);
@@ -410,7 +423,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, accessor_constructs_own_instantia
         "  var g: GBase<string> := d; "
         "  return g.Score; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3 + (41 + 5)
     BEZEL_EXPECT_EQ(r.exitCode, 195);
@@ -442,7 +455,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, int_instantiation_keeps_shared_ac
         "  var g: GBase<int> := d; "
         "  return g.Score; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 149);
@@ -471,7 +484,7 @@ BEZEL_TEST(generic_virtual_accessor_slot_2928, nongeneric_declarer_keeps_shared_
         "  var p: Plain := d; "
         "  return p.Score; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 44);
