@@ -43,15 +43,20 @@
 // not a theoretical one. `owningDrainWrapForHead` only intercepts the head
 // inside `wrapLinkedListAsIEnumerable`; a callee-owned list returned at an
 // `IOwningEnumerable<T>` head routes to `wrapOwnedLinkedListAsIEnumerable`
-// instead, and that wrap does NOT drain. MEASURED: the IR of
-// `static method Build(): IOwningEnumerable<Item>` returning a populated
-// `OwningLinkedList<Item>` contains `bz$llenumown$ptr$Dispose` and ZERO
-// `bz_llist_drain_next` calls. There the loop has discharged each element
+// instead, and that wrap does NOT drain. MEASURED: the object code of
+// `static method Make(): IOwningEnumerable<Item>` returning a populated
+// `OwningLinkedList<Item>` contains `bz$llenumown$ptr$iow$Dispose`, whose
+// body calls `bz_llist_free_owning_wrap`, and ZERO calls to
+// `bz_llist_drain_next`. There the loop has discharged each element
 // while the list still names the pointer, so consulting the header would
-// double-dispose. Rows (f)-(g) are the NEGATIVE CONTROL that makes the fix
-// falsifiable: they are the owning-head shapes a header-always rule breaks,
-// pinned so a reintroduced over-dispose fails here BY NAME instead of
-// surfacing as an unexplained sanitizer report in some other lane's test.
+// double-dispose. Row (f) is THE NEGATIVE CONTROL that makes the fix
+// falsifiable: it is the owning-head shape that reaches the free site this
+// fix changes, pinned so a reintroduced header-always over-dispose fails
+// there BY NAME instead of surfacing as an unexplained sanitizer report in
+// some other lane's test. Row (g) sits beside it as a SHAPE regression on
+// the same head reached through a different face; MEASURED, it never reaches
+// that site at all, so it is NOT a second falsifier — its own comment says
+// why, and this header used to overclaim that it was one.
 //
 // THE CACHE KEY. `bz$llenumown$<elemName>$` is keyed on the lowered element
 // type, and `string`, a class and `IGrouping` all lower to `ptr` — so the
@@ -269,8 +274,8 @@ BEZEL_TEST(owning_linkedlist_field_cascade_6519,
 //     `IEnumerable<Item>` head — the OTHER caller of this wrap (row (a) is
 //     the field-store face). Pinned separately because a fix that closes only
 //     the field face leaves this one leaking, and because it is the face
-//     `owningDrainWrapForHead` does NOT intercept at the owning head (rows
-//     (f)-(g)). MEASURED on base: `32 byte(s) leaked in 2 allocation(s)`.
+//     `owningDrainWrapForHead` does NOT intercept at the owning head (row
+//     (f)). MEASURED on base: `32 byte(s) leaked in 2 allocation(s)`.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(owning_linkedlist_field_cascade_6519,
            callee_owned_return_cascades_28_11) {
@@ -353,14 +358,20 @@ BEZEL_TEST(owning_linkedlist_field_cascade_6519,
 // ===========================================================================
 // NEGATIVE CONTROL — the over-dispose direction.
 //
-// The `IOwningEnumerable<T>` head is REACHABLE at this wrap (measured: a
-// callee-owned list returned at that head mints `bz$llenumown$ptr$Dispose`,
-// with zero `bz_llist_drain_next` calls in the IR). This wrap does not
+// The `IOwningEnumerable<T>` head is REACHABLE at this wrap (MEASURED: a
+// callee-owned list returned at that head mints `bz$llenumown$ptr$iow$Dispose`,
+// whose body calls `bz_llist_free_owning_wrap`, with zero calls to
+// `bz_llist_drain_next` anywhere in the object). This wrap does not
 // drain, so the loop has already discharged each element while the list
 // still names the pointer, and consulting the header there is a
-// heap-use-after-free. These two rows are pinned so a header-always rule —
-// the obvious "simpler" variant of this fix — fails HERE, by name, rather
-// than surfacing later as an unexplained sanitizer report.
+// heap-use-after-free. Row (f) is pinned so a header-always rule — the
+// obvious "simpler" variant of this fix — fails THERE, by name, rather than
+// surfacing later as an unexplained sanitizer report.
+//
+// Row (g) sits below it on the same head reached through a different face.
+// It is a SHAPE regression, NOT a second falsifier: MEASURED, its program
+// never calls `bz_llist_free_owning_wrap` at all, so no header-always
+// variant can reach it. Its own comment carries that evidence. It is kept.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -405,9 +416,43 @@ BEZEL_TEST(owning_linkedlist_field_cascade_6519,
 // ---------------------------------------------------------------------------
 // (g) Stored-view face: the same owning head reached through a property
 //     over an owned `OwningLinkedList<Item>` field, iterated with an `owned`
-//     loop variable. The array twin of this shape is #6439's own row (e); it
-//     is kept here so this file's negative control does not depend on another
-//     file's row staying in place. Expected sum 3+4 = 7.
+//     loop variable. Expected sum 3+4 = 7.
+//
+//     NOT A FALSIFIER, and this comment does not claim it is one — only row
+//     (f) above can fail under a header-always variant of this fix, while
+//     the file header and the NEGATIVE CONTROL banner both used to name this
+//     row as one of "two" controls. MEASURED (`llvm-nm` +
+//     `llvm-objdump` on the object compiled from exactly this program, at
+//     this branch's tip):
+//
+//       * it mints `bz$ownllenum$ptr$Dispose` (+ MoveNext / TakeCurrent /
+//         GetOwningEnumerator and its vtable) — the DRAINING wrap, and
+//         `bz$ownllenum$ptr$MoveNext` is the caller of `bz_llist_drain_next`
+//         (one call in the whole object);
+//       * it mints ZERO `bz$llenum*` symbols — so
+//         `wrapOwnedLinkedListAsIEnumerable`, the function this fix changed,
+//         is not emitted at all;
+//       * it contains ZERO calls to `bz_llist_free_owning_wrap`, the helper
+//         this fix added and the only site a header-always variant could
+//         change.
+//
+//     So no header-always variant executes any line this row's program
+//     reaches, and this row stays green under all of them. The two faces
+//     differ in WHICH leaf handles the owning head, not in how: a property
+//     getter returns the FIELD, so the coercion lands in
+//     `wrapLinkedListAsIEnumerable`, which diverts to the drain at its top;
+//     a callee RETURN lands in `wrapOwnedLinkedListAsIEnumerable`, which has
+//     no such divert and mints the owning wrap. Measured on row (f)'s
+//     object for contrast: `bz$llenumown$ptr$iow$Dispose` →
+//     `bz_llist_free_owning_wrap`, and zero drain calls.
+//
+//     KEPT, as a shape regression: it pins that the stored-view owning-head
+//     path still DRAINS. A future change that let the header reach the
+//     stored-view face — or that stopped diverting to the drain there — would
+//     double-dispose these two `Item`s, and this row would see it by name.
+//     It also keeps this file's owning-head coverage independent of #6439's
+//     array-side row (e), so deleting or moving that row cannot silently
+//     remove the last coverage of the array twin's shape.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(owning_linkedlist_field_cascade_6519,
            owning_head_stored_view_no_double_dispose_28_11) {
