@@ -6855,6 +6855,107 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
                     llvm::ConstantPointerNull::get(ptrTy())),
                 nn, cont);
             builder_.SetInsertPoint(nn);
+            // fix #6553 (§29.1 / §29.2 / §28.11 / §28.2; v0.338): WHICH SLOT
+            // carries `Dispose` is a RUNTIME question, and this chain was
+            // asking it statically — wrongly.
+            //
+            // THE RULE. §28.3's consume table (K3.9) makes `x.Dispose()` on an
+            // owned receiver the discharge itself: post-state
+            // "explicitly-disposed", "logical disposal at ... the call". The
+            // glossary entry for that post-state then says "Scope-end
+            // machinery skips its disposal". So the explicit call OWNS the
+            // obligation and the auto-drop stands down — the slot-null below is
+            // that hand-off, and it is already correct. What was missing is
+            // that the call DISPOSED nothing.
+            //
+            // THE DEFECT. `emitDisposeAndReclaim` dispatches vtable slot 2,
+            // which is the CG35-itable CLASS convention (§8.5/§8.6 #417:
+            // [0]=td$, [1]=itmap$, [2]=Dispose). But a value at an
+            // `IOwningEnumerable<T>` head is a compiler-minted frame in
+            // §29.2's ITERATOR format — [0]=self, [1]=Dispose,
+            // [2]=MoveNext, [3]=TakeCurrent, [4]=GetOwningEnumerator — where
+            // slot 2 is `MoveNext`. MEASURED with `BEZEL_DUMP_IR` on this HEAD
+            // (`4aaa4f21`): the explicit `d.Dispose()` lowers to
+            // `%v = load ptr, ptr %d ; %s = getelementptr ptr, ptr %v, i32 2 ;
+            // call void %f(ptr %d)` against
+            // `@"bz$ownarrenum$ptr$own$vtable" = [self, Dispose, MoveNext,
+            // TakeCurrent, GetOwningEnumerator]` — so it called `MoveNext`,
+            // which drained ONE element into the frame's `pending` slot and
+            // dropped its i1 result on the floor, and the reclaim tail then
+            // `free`d the frame with that element still named by it. That is
+            // neither of the two shapes the issue offered: the call was not a
+            // silent no-op (it called the WRONG function and mutated the
+            // enumerator), and it did not merely set a flag (it ran the whole
+            // reclaim tail — the auto-drop is suppressed because the slot was
+            // nulled, which is the CORRECT §28.3 hand-off of an obligation
+            // that was never paid).
+            //
+            // THE LEAK ARITHMETIC PINS THE MECHANISM. ASan on the issue's repro
+            // reports 232 B in 5 allocations, and 232 = 56 (array header)
+            // + 128 (array data) + 3x16 (the Items). Broken down: `Direct 16`
+            // is the ONE Item `MoveNext` popped into `pending` and which died
+            // with the freed frame; `Direct 56` is the array header;
+            // `Indirect 128` the array data; `Indirect 16 + 16` the two Items
+            // still in it. Every one of the five is accounted for by "slot 2
+            // was MoveNext", and by no other shape.
+            //
+            // THE FIX is the SAME discriminator #6372 already built for the
+            // `for`-in loop's loop-end disposal (`iterEnumOrClassDispose`,
+            // LlvmBackend_Disposal.cpp) and #6381 unified into the one
+            // definition: §29.2's own positive shape test, "every iterator
+            // vtable this compiler emits puts ITSELF in slot 0, while every
+            // CLASS vtable puts a type descriptor there" — `vtable[0] ==
+            // vtable` is true for the iterator format and false for every
+            // class instance INCLUDING a subclass. That is why the gate is
+            // asked of the VALUE and not of the static type: a receiver typed
+            // `IOwningEnumerable<T>` is a frame in every shape this compiler
+            // mints, but asking at runtime is also correct for the shapes it
+            // does not (a hypothetical user class implementing the head, the
+            // open itable question #853 records), where the old static answer
+            // would have been wrong in the other direction.
+            //
+            // The iterator arm's body is `iterEnumOrClassDispose`'s iterBB
+            // verbatim, and it differs from the class arm in exactly one way
+            // that is forced, not chosen: the slot-1 Dispose frees its OWN
+            // frame, so there is no separate block release AND the slot must
+            // be nulled UNCONDITIONALLY — including in checked-disposal mode,
+            // where the class arm deliberately keeps the slot valid because its
+            // `emitDisposeAndReclaim` QUARANTINES rather than frees. Leaving
+            // the slot pointing at a freed frame there would be a
+            // use-after-free on the auto-drop. (Checked-disposal mode is off
+            // by default and `runAotChecked` sets ASan, not this, so the
+            // checked path is reasoned from `iterEnumOrClassDispose`'s own
+            // unconditional store rather than measured here.)
+            llvm::Value* isIterFmt = isIterVtableSelfReferenced(
+                recv, "disp.selfref");
+            auto* iterBB = llvm::BasicBlock::Create(
+                llvm_, "disp.iter", currentFn_);
+            auto* clsBB = llvm::BasicBlock::Create(
+                llvm_, "disp.cls", currentFn_);
+            builder_.CreateCondBr(isIterFmt, iterBB, clsBB);
+
+            builder_.SetInsertPoint(iterBB);
+            // §29.2: Dispose is slot 1 in the iterator format, and this
+            // frame's slot-1 Dispose reclaims the collection it owns (#6544's
+            // `ownsBacking` source frame) and then the frame — so this arm
+            // IS the whole disposal, §28.11's `Dispose()` row end to end
+            // (dispose every live element, then release storage, then the
+            // frame), and the auto-drop's null-guard makes the scope-end
+            // disposal a no-op, per the "explicitly-disposed" glossary entry
+            // quoted above.
+            llvm::Value* vtI = builder_.CreateLoad(ptrTy(), recv);
+            llvm::Value* dispSlotI =
+                builder_.CreateGEP(ptrTy(), vtI, {builder_.getInt32(1)});
+            llvm::Value* dispFnI = builder_.CreateLoad(ptrTy(), dispSlotI);
+            builder_.CreateCall(
+                llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+                dispFnI, {recv});
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), slot);
+            builder_.CreateBr(cont);
+
+            builder_.SetInsertPoint(clsBB);
             emitDisposeAndReclaim(recv);
             // §28.2 v0.134 / issue #601: in checked-disposal
             // mode the object is quarantined (not freed), so
@@ -6866,6 +6967,8 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()),
                     slot);
+            builder_.CreateBr(cont);
+            builder_.SetInsertPoint(cont);
             // #2310 / §29.8 / §30.1 (#973a residual): also null
             // the FRAME capture slot of an `owned` STATE-MACHINE
             // parameter this discharge just consumed — so the
@@ -6877,8 +6980,15 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             // state-machine body, for non-parameter sources, for
             // non-owned parameters). // per §29.8 / §30.1
             nullStateMachineOwnedParamCapture(&target);
-            builder_.CreateBr(cont);
-            builder_.SetInsertPoint(cont);
+            // fix #6553: `cont` is now the MERGE of `disp.iter` and
+            // `disp.cls` — both branch here — so the `builder_.CreateBr(cont)`
+            // that used to terminate this block is GONE. Left in place it would
+            // be `cont: br label %cont`, an infinite self-loop (LLVM would
+            // accept it and every program with an explicit `Dispose()` on an
+            // owned slot would hang). `cont` now simply continues into the
+            // chain's tail — `emitDisposalFaultCheck(excBeforeDispose)` below,
+            // which is what terminates it, exactly as it did when `cont` was
+            // the merge of `disp.nn` and the null-guard's skip edge.
         } else if (isFreshOwnedClassProducer(&target)) {
             // #1053-case-1 / #415: no owning slot, but the
             // receiver is a FRESH owned producer (`new X()` or an
