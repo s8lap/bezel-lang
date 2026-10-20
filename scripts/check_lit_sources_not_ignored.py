@@ -53,11 +53,26 @@ An artifact shape that ever slips through surfaces as an untracked file under
 `tests/`, where scripts/untracked_guard.sh FAILs the gate LOUDLY. That is the
 failure mode we want: this class of bug must not fail silently again.
 
+WHICH #6548 ADDED, and why it was invisible to the artifact half. The rule
+`!tests/lit/**/*.*` is a RE-INCLUSION and it sits BELOW every suppression in the
+file, so it overrides all of them for dotted names under tests/lit/. The
+repo's own `__pycache__/` rule is at line 17 and was silently dead there:
+`python3 -m py_compile tests/lit/lit.cfg.py` left `tests/lit/__pycache__/*.pyc`
+exposed. The anchored `/tests/lit/.lit_test_times.txt` had the same shape one
+level down. Both are probed here now, at EVERY depth, because neither can be
+named by a `config.suffixes`-derived list.
+
+Note for anyone extending `ignored()` below: on git 2.55.0 `git check-ignore -q`
+exits 0 only when the path is EFFECTIVELY ignored, while `git check-ignore -v`
+exits 0 whenever ANY pattern matched - including a NEGATION, which means the
+path is exposed. Use `-q` (as here); never read `-v`'s exit code as a boolean.
+
 Usage:  check_lit_sources_not_ignored.py [--self-test] [--strict]
 Exit 0 = every property holds.  Exit 1 = a violation (with --strict, a gate
-FAIL).  --self-test reconstructs TWO .gitignore states that each break one
-half and requires this detector to FAIL on both, so a green here is not a
-matcher that matched nothing.
+FAIL).  --self-test reconstructs FOUR .gitignore states - one that breaks the
+SOURCE half, three that break the ARTIFACT half (#6548) - and requires this
+detector to FAIL on each, so a green here is not a matcher that matched
+nothing.
 """
 
 import os
@@ -70,12 +85,31 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIT_CFG = os.path.join(REPO, "tests", "lit", "lit.cfg.py")
 GITIGNORE = os.path.join(REPO, ".gitignore")
 
-# Two reconstructed .gitignore states, each of which breaks exactly one half.
-# The first is r30-c1's rule (the #6523 defect). The second drops the
-# suppression entirely, which is what a careless "just delete the broken rule"
-# does - and which review caught leaving 1127 artifacts exposed.
+# Reconstructed .gitignore states, each of which breaks exactly one half.
+# PRE_FIX_RULES is r30-c1's rule (the #6523 defect). NO_SUPPRESSION_RULES drops
+# the suppression entirely, which is what a careless "just delete the broken
+# rule" does - and which review caught leaving 1127 artifacts exposed. The two
+# states below are the #6548 half.
 PRE_FIX_RULES = ["tests/lit/*[!.]"]
 NO_SUPPRESSION_RULES: list = []
+
+# The #6548 state, verbatim in shape: the repo's own top-level `__pycache__/`
+# suppression FOLLOWED BY the #6523 block, whose `!tests/lit/**/*.*` re-includes
+# every dotted name under tests/lit/ - so the earlier rule no longer applies
+# there. Reproducing the ORDER is the whole point; a state with `__pycache__/`
+# last would not expose anything and would pass vacuously. The test-times rule
+# is the ANCHORED spelling on purpose, so this state also reproduces the
+# per-suite hole the anchored form leaves behind.
+R32_C1_LIT_RULES = [
+    "__pycache__/",
+    "tests/lit/**/*",
+    "!tests/lit/**/",
+    "!tests/lit/**/*.*",
+    "/tests/lit/.lit_test_times.txt",
+    "tests/lit/**/Output/",
+    "tests/lit/**/*.bzl.tmp",
+    "tests/lit/**/*.bzl.tmp.*",
+]
 
 # Depths a lane actually writes a row at. `tests/lit/sema/` holds the
 # conformance rows; the ignored-parent-directory trap meant a top-level-only
@@ -120,8 +154,23 @@ def artifact_probes(suffixes):
     Derived from the real suffixes so `foo.bzl` -> also probe `foo` (the
     defaultOutput row-stem object), `foo.bzl.tmp`, `foo.bzl.tmp.exec`,
     `foo.bzl.tmp.lib.o` and the Output/ copies of the same.
+
+    NOT everything here is a lit-emitted shape. A `suffixes`-derived list
+    cannot name `__pycache__/` or a nested `.lit_test_times.txt` - neither
+    contains a lit suffix - so those are listed EXPLICITLY. They are listed
+    because the `.gitignore` block they need sits BELOW the `!tests/lit/**/*.*`
+    re-inclusion that #6523 introduced, and every suppression above that line
+    is dead: the repo's own `__pycache__/` rule was overridden exactly that
+    way (#6548).
     """
-    out = ["tests/lit/.lit_test_times.txt"]          # lit's test-times file
+    out = []
+    for d in PROBE_DIRS:
+        # lit's test-times file. Probed at EVERY depth: the rule it needs
+        # (`tests/lit/**/.lit_test_times.txt`) is unanchored, and an anchored
+        # `/tests/lit/.lit_test_times.txt` covered only the top level.
+        out.append(f"{d}/.lit_test_times.txt")
+        # CPython bytecode, from `python3 -m py_compile tests/lit/lit.cfg.py`.
+        out.append(f"{d}/__pycache__/{PROBE_STEM}.pyc")
     for d in PROBE_DIRS:
         for s in suffixes:
             # 1. THE 1127: defaultOutput() strips the extension, so the object
@@ -171,24 +220,36 @@ def _seed_repo(td, rules):
 
 
 def self_test():
-    """The checker must FAIL on each reconstructed state, for the right reason."""
+    """The checker must FAIL on each reconstructed state, for the right reason.
+
+    `needle`, when given, additionally requires the finding to be on a path of
+    that shape - so a state cannot be "reproduced" by an unrelated artifact
+    finding while the shape under test sits unprobed.
+    """
     suffixes = lit_source_suffixes()
     cases = [
-        ("pre-fix rule (r30-c1)", PRE_FIX_RULES, "SOURCE-SWALLOWED"),
-        ("no suppression at all", NO_SUPPRESSION_RULES, "ARTIFACT-EXPOSED"),
+        ("pre-fix rule (r30-c1)", PRE_FIX_RULES, "SOURCE-SWALLOWED", None),
+        ("no suppression at all", NO_SUPPRESSION_RULES, "ARTIFACT-EXPOSED", None),
+        ("#6523 block over __pycache__ (#6548)", R32_C1_LIT_RULES,
+         "ARTIFACT-EXPOSED", "__pycache__"),
+        ("#6523 block, ANCHORED test-times rule (#6548)",
+         R32_C1_LIT_RULES, "ARTIFACT-EXPOSED", ".lit_test_times.txt"),
     ]
     rc = 0
     with tempfile.TemporaryDirectory(prefix="lit-ignore-selftest-") as root:
-        for i, (label, rules, want) in enumerate(cases):
+        for i, (label, rules, want, needle) in enumerate(cases):
             td = os.path.join(root, str(i))
             os.makedirs(td, exist_ok=True)
             _seed_repo(td, rules)
             found = violations(td, suffixes)
-            hits = [v for v in found if v[0] == want]
+            hits = [v for v in found if v[0] == want
+                    and (needle is None or needle in v[1])]
             if not hits:
                 print(f"check_lit_sources_not_ignored: SELF-TEST FAILED - the "
-                      f"{label!r} state produced no {want} finding, so this checker "
-                      "does not reproduce the defect it exists to prevent.",
+                      f"{label!r} state produced no {want} finding"
+                      + (f" on a {needle!r} path" if needle else "")
+                      + ", so this checker does not reproduce the defect it "
+                      "exists to prevent.",
                       file=sys.stderr)
                 rc = 1
             else:

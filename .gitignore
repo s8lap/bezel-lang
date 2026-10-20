@@ -74,10 +74,29 @@ __pycache__/
 # from a worktree predating that change, or a future artifact shape. One that
 # slips through surfaces as an untracked file under tests/, where
 # scripts/untracked_guard.sh FAILs the gate LOUDLY rather than silently.
+#
+# EVERY trailing rule below must come AFTER the `!tests/lit/**/*.*` line,
+# because that is the point at which every dotted name under tests/lit/ is put
+# back. A suppression written ABOVE it is dead: the repo's own `__pycache__/`
+# rule, at the top of this file, is the standing example. It is overridden
+# here, so `python3 -m py_compile tests/lit/lit.cfg.py` left
+# tests/lit/__pycache__/*.pyc EXPOSED — `git status` showed it and
+# scripts/untracked_guard.sh FAILed the gate (#6548). The `__pycache__/` rule
+# below says the same thing at the depth where it still applies.
+#
+# `/tests/lit/.lit_test_times.txt` was ANCHORED, which has the same shape of
+# hole one level down: the leading `/` matches only the top-level one, so a
+# per-suite tests/lit/<dir>/.lit_test_times.txt was re-included by the same
+# `*.*` line. Today that is unreachable (there is exactly ONE lit.cfg.py, and
+# lit/TestTimes.py:34 writes to suite.exec_root, which is the single suite's),
+# but the whole point of this block is to survive the next artifact shape, so
+# the anchor is dropped and `**` — which also matches zero directories, so the
+# top-level file stays covered — reaches every suite.
 tests/lit/**/*
 !tests/lit/**/
 !tests/lit/**/*.*
-/tests/lit/.lit_test_times.txt
+tests/lit/**/__pycache__/
+tests/lit/**/.lit_test_times.txt
 tests/lit/**/Output/
 tests/lit/**/*.bzl.tmp
 tests/lit/**/*.bzl.tmp.*

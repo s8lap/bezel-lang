@@ -998,9 +998,11 @@ say "null-guard-vacuous phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nullguard.log"))
 # nothing". A lit source must be addable at every depth, AND every artifact
 # shape lit is known to leave in the source tree must stay ignored (those are
 # what turn `git status --porcelain` into a 1127-line wall that hides real WIP).
-# The self-test reconstructs TWO .gitignore states — the pre-fix rule, and one
-# with no suppression at all — and REQUIRES this detector to fail on each, so a
-# green here is not a matcher that matched nothing and not a ratchet that
+# The self-test reconstructs FOUR .gitignore states — the pre-fix rule, one
+# with no suppression at all, and the two #6548 shapes (the #6523 block sitting
+# BELOW the repo's own `__pycache__/` rule, and its anchored test-times rule) —
+# and REQUIRES this detector to fail on each, on a path of the right SHAPE, so
+# a green here is not a matcher that matched nothing and not a ratchet that
 # certifies only the half it was written against.
 say "lit-source-not-ignored phase: detector self-test + ratchet (#6523)"
 if ! python3 scripts/check_lit_sources_not_ignored.py --self-test \
