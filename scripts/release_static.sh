@@ -29,15 +29,16 @@
 #                  libstdc++-static; see the CMake BEZEL_STATIC_RELEASE_FULL)
 #   --allow-dirty  package a tree with uncommitted changes (version gets
 #                  a "-dirty" suffix)
-#   --build-dir    default: <repo>/scratch/build-static
-#   --out          default: <repo>/scratch/release
+#   --build-dir    default: <repo>/scratch/build-static (build-static-full with --full)
+#   --out          default: <repo>/scratch/release (release-full with --full); the
+#                  two variants share a tarball name, so they get separate dirs
 #   -j N           build parallelism (default 8; builds go through
 #                  scripts/dev_heavy.sh and the machine's build-token pool)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BUILD_DIR="$ROOT/scratch/build-static"
-OUT_DIR="$ROOT/scratch/release"
+BUILD_DIR=""
+OUT_DIR=""
 JOBS=8
 FULL=OFF
 ALLOW_DIRTY=0
@@ -49,13 +50,17 @@ while [ $# -gt 0 ]; do
     --build-dir) BUILD_DIR="$2"; shift ;;
     --out) OUT_DIR="$2"; shift ;;
     -j) JOBS="$2"; shift ;;
-    -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,/^set -e/{/^set -e/d;p}' "$0"; exit 0 ;;
     *) echo "release_static: unknown argument '$1'" >&2; exit 2 ;;
   esac
   shift
 done
 
 die() { echo "release_static: $*" >&2; exit 1; }
+
+SUFFIX=""; [ "$FULL" = ON ] && SUFFIX="-full"
+[ -n "$BUILD_DIR" ] || BUILD_DIR="$ROOT/scratch/build-static$SUFFIX"
+[ -n "$OUT_DIR" ] || OUT_DIR="$ROOT/scratch/release$SUFFIX"
 
 [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ] || die "only Linux x86_64 is supported"
 for tool in clang clang++ cmake tar gzip sha256sum; do
@@ -105,6 +110,11 @@ RT="$BUILD_DIR/libbezel_runtime.a"
 # tree's runtime archive.
 if command -v ldd >/dev/null && ldd "$BIN" 2>/dev/null | grep -q 'libLLVM'; then
   die "bezelc links libLLVM dynamically -- BEZEL_STATIC_RELEASE did not take effect"
+fi
+# Users link the runtime against THEIR glibc: it must not reference the
+# glibc 2.38 C23 strto* entry points (see the BEZEL_STATIC_RELEASE block).
+if nm -u "$RT" 2>/dev/null | grep -q '__isoc23_'; then
+  die "libbezel_runtime.a references __isoc23_* (glibc 2.38+ only)"
 fi
 if strings "$BIN" | grep -qF "$BUILD_DIR"; then
   die "bezelc embeds the build-dir path $BUILD_DIR"
