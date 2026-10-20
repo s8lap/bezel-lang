@@ -33,11 +33,40 @@ config.suffixes = [".bzl"]
 # ── Roots ────────────────────────────────────────────────────────────────────
 # Source root: the directory holding this config (and the .bzl tests).
 config.test_source_root = os.path.dirname(__file__)
-# Exec root: where lit writes per-test scratch (`%t`).  The site config sets
-# this to the CMake build tree; fall back to the source tree for a hand-run
-# `lit tests/lit` with no generated site config.
+# Exec root: where lit writes per-test scratch (`%t`) AND the directory a test
+# runs IN.  The site config sets this to the CMake build tree; a hand-run
+# `lit tests/lit` with no generated site config falls back to build/lit-exec-root.
+#
+# WHY NOT `config.test_source_root`, which is what this used to fall back to.
+# That fallback is what put 1127 build artifacts INSIDE the source tree. A RUN
+# line that compiles without -o — `%bezelc -c %s`, 2463 of them — leaves
+# bezelc's outputPath empty, and bezelc fills it with defaultOutput(inputPath)
+# (src/main.cpp:254), which strips the directory AND the final extension
+# (src/main.cpp:96-107). So the compile emits a file named for the ROW'S STEM
+# with no extension, relative to the process CWD; `-c` does not avoid it,
+# because line 254 runs before the compile branch at 259-260. lit runs a test
+# with its cwd inside test_exec_root, so an exec root at the source root means
+# every one of those objects lands beside its own source.
+#
+# MEASURED on this tree, lit 18.1.8, real bezelc on PATH, no site config: a
+# hand-run `lit tests/lit` (2513 tests, 17 s) left 2323 files under tests/lit —
+# 1127 extensionless row-stem objects plus 1196 dotted ones (.lit_test_times.txt
+# and %t scratch under **/Output/). They turned `git status --porcelain` into a
+# 1127-line wall that hid real WIP, and scripts/untracked_guard.sh FAILs the gate
+# on every untracked file under tests/.
+#
+# So the fallback exec root is build/lit-exec-root, OUTSIDE the source tree.
+# build/ is already gitignored (`/build/`), so a hand-run now leaves the source
+# tree untouched rather than depending on a .gitignore rule to hide the mess.
+# Override with -Dtest_exec_root=<dir> (what the site config does) or
+# $BEZEL_LIT_EXEC_ROOT. The CMake site config still wins when present, so the
+# gate's behaviour is unchanged.
+_LIT_DIR = os.path.dirname(os.path.abspath(__file__))          # .../tests/lit
+_REPO_ROOT = os.path.dirname(os.path.dirname(_LIT_DIR))        # repo root
 if not getattr(config, "test_exec_root", None):
-    config.test_exec_root = config.test_source_root
+    config.test_exec_root = os.environ.get("BEZEL_LIT_EXEC_ROOT") or os.path.join(
+        _REPO_ROOT, "build", "lit-exec-root"
+    )
 
 # ── Substitutions ────────────────────────────────────────────────────────────
 # `config.bezelc` and `config.filecheck` are set by lit.site.cfg.py (from the

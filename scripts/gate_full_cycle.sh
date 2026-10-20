@@ -968,6 +968,62 @@ if ! python3 scripts/check_null_guard_vacuous.py --strict \
 fi
 say "null-guard-vacuous phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_nullguard.log"))"
 
+# ── LIT-SOURCE-NOT-IGNORED PHASE (#6523) ───────────────────────────────────
+# The .gitignore rule that suppressed lit's in-tree build artifacts was written
+# `tests/lit/*[!.]`, which reads as "a name containing no dot" and is not: git
+# matches a gitignore glob against the path's BASENAME and lets `*` cross `/`,
+# so `[!.]` tested only the LAST CHARACTER. Every new `*.bzl` row matched, and
+# because git does not descend into an excluded directory it matched at EVERY
+# depth too, so a row written into tests/lit/sema/ was swallowed as well.
+#
+# NOT silent: `git add tests/lit/<row>.bzl` prints "the following paths are
+# ignored" and exits 1 (for a subdir it names the DIRECTORY as ignored). The
+# hazard is that the row is absent from the commit while `git status` never
+# mentions it, and that one non-zero path inside a multi-path `git add` is easy
+# to lose.
+#
+# AND THAT RULE WAS NOT USELESS — replacing it carelessly is a real regression
+# that review caught here. Measured on this tree with a real bezelc on PATH, a
+# hand-run `lit tests/lit` (2513 tests, lit 18.1.8) leaves 2323 files under
+# tests/lit: 1127 EXTENSIONLESS objects named for the row stem — written by the
+# 2463 `-o`-less `%bezelc -c %s` RUN lines, because bezelc fills an empty
+# outputPath with defaultOutput() (src/main.cpp:254), which strips the
+# extension — plus 1196 dotted files. The 1127 were suppressed ONLY by the
+# broken rule. An earlier attempt replaced it with `*.bzl.tmp` shapes, which
+# left all 1127 exposed while this phase still reported GREEN.
+#
+# So BOTH halves are pinned, and the checker is the control that makes this
+# phase mean something: it fails on the pre-fix rule AND on a rule that drops
+# the suppression. Do not read this phase as "the .gitignore must ignore
+# nothing". A lit source must be addable at every depth, AND every artifact
+# shape lit is known to leave in the source tree must stay ignored (those are
+# what turn `git status --porcelain` into a 1127-line wall that hides real WIP).
+# The self-test reconstructs TWO .gitignore states — the pre-fix rule, and one
+# with no suppression at all — and REQUIRES this detector to fail on each, so a
+# green here is not a matcher that matched nothing and not a ratchet that
+# certifies only the half it was written against.
+say "lit-source-not-ignored phase: detector self-test + ratchet (#6523)"
+if ! python3 scripts/check_lit_sources_not_ignored.py --self-test \
+      > "$LOGDIR/${TAG}_litignore.log" 2>&1; then
+  say "CYCLE FAILURE: check_lit_sources_not_ignored SELF-TEST failed — the"
+  say "  detector no longer reproduces the .gitignore defect it exists to"
+  say "  prevent, so its verdict means nothing. See $LOGDIR/${TAG}_litignore.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_litignore.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_lit_sources_not_ignored.py --strict \
+      >> "$LOGDIR/${TAG}_litignore.log" 2>&1; then
+  say "CYCLE FAILURE: .gitignore swallows a new lit source, or stops suppressing"
+  say "  a lit build artifact (#6523). A swallowed source is silently absent from"
+  say "  the commit; an exposed artifact FAILs untracked_guard.sh. See"
+  say "  $LOGDIR/${TAG}_litignore.log"
+  sed -n '/check_lit_sources_not_ignored:/,$p' "$LOGDIR/${TAG}_litignore.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "lit-source-not-ignored phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_litignore.log"))"
+
 # ── LEAK-EXEMPT STATUS PHASE (#4557) ───────────────────────────────────────
 # scripts/gate/sanitizer_leak_exempt.txt declares every test whose
 # generated-code sanitizer LEAK report is a deliberate assertion (#4537), not

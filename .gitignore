@@ -25,16 +25,60 @@ __pycache__/
 # Local scheduler lock files (per-session)
 .claude/scheduled_tasks.lock
 
-# lit hand-run fallback writes these in-tree (lit.cfg.py test_exec_root); #5265
+# ── lit's in-tree build output ───────────────────────────────────────────────
+# MEASURED, with a real bezelc on PATH and the repo's own lit.cfg.py (lit
+# 18.1.8): a hand-run `lit tests/lit` leaves 2323 files under tests/lit/ —
+#   1127 EXTENSIONLESS objects named for the row stem, one per row whose
+#   RUN line compiles without -o, sitting NEXT TO THAT ROW'S SOURCE;
+#   1196 dotted files: .lit_test_times.txt plus %t scratch under **/Output/.
+# The dotted half is suppressed by two explicit rules below. The extensionless
+# half is the 1127, and the rule that used to stand here — `tests/lit/*[!.]` —
+# is exactly what suppressed them. It has been replaced, not deleted.
+#
+# WHY a `-o`-less RUN line writes an extensionless file beside its source.
+# bezelc fills an empty outputPath with defaultOutput(inputPath)
+# (src/main.cpp:254), and defaultOutput strips the directory AND the final
+# extension — src/main.cpp:96-107 — so `%bezelc -c %s` emits a file called
+# after the row's stem with NO extension, relative to the CWD. lit runs each
+# test with its cwd inside test_exec_root, and lit.cfg.py used to fall back to
+# test_exec_root = test_source_root, so cwd was the source directory. 2463 RUN
+# lines invoke %bezelc with no -o. (`-c` does not skip this: line 254 runs
+# before the compile branch at 259-260.)
+#
+# The rules below suppress exactly the extensionless half: everything under
+# tests/lit, minus every directory (so git still descends), minus every name
+# CONTAINING A DOT (every source and config: lit.cfg.py:31 makes `.bzl` the
+# only lit test suffix, so a lit source always has a dot and can never be
+# swallowed). The two trailing rules re-suppress lit's own Output subtree and
+# test-times file, which the `*.*` re-inclusion would otherwise expose.
+#
+# The `tests/lit/*[!.]` rule this replaces read as "a name containing no dot"
+# and is not: git matches a gitignore glob against the path's BASENAME and lets
+# `*` cross `/`, so `[!.]` tested only the LAST CHARACTER. `row.bzl` ends in `l`,
+# so every new lit source matched, and because git does not descend into an
+# excluded directory it matched at EVERY depth — a row written into
+# tests/lit/sema/ was swallowed too. All 2513 tracked tests/lit/**.bzl files
+# were force-added past it, which is why the tracked-row count never revealed
+# the hole (#6523).
+#
+# On git 2.55 `git add tests/lit/<row>.bzl` is NOT silent: it prints "the
+# following paths are ignored" and exits 1 (and for a subdir it names the
+# DIRECTORY, tests/lit/sema, as ignored). The hazard is that the row is simply
+# absent from the commit while `git status` never mentions it, and that one
+# non-zero path in a multi-path `git add` is easy to lose.
+#
+# BELT AND BRACES. lit.cfg.py no longer falls back to test_exec_root =
+# test_source_root — it uses build/lit-exec-root, outside the source tree — so
+# a hand-run no longer writes any of this into tests/lit/ in the first place.
+# These rules cover the remaining paths in: an older lit.cfg.py, a hand-run
+# from a worktree predating that change, or a future artifact shape. One that
+# slips through surfaces as an untracked file under tests/, where
+# scripts/untracked_guard.sh FAILs the gate LOUDLY rather than silently.
+tests/lit/**/*
+!tests/lit/**/
+!tests/lit/**/*.*
 /tests/lit/.lit_test_times.txt
 tests/lit/**/Output/
-
-# A hand-run `lit tests/lit` without `-Dtest_exec_root` writes one extensionless
-# build artifact per test NEXT TO ITS SOURCE — ~1119 of them under tests/lit/ in a
-# single run, plus tree-root ELF objects from ad-hoc `--probe` compiles. Measured
-# across several R28 worktrees: 2366 in one tree, 870 in another. They are
-# untracked build output, never sources, and they turn `git status --porcelain`
-# into a 2400-line wall that hides real WIP. Prefer `-Dtest_exec_root=<dir>`
-# under /var/tmp; this is the belt-and-braces for the lanes that forget.
-tests/lit/*[!.]
+tests/lit/**/*.bzl.tmp
+tests/lit/**/*.bzl.tmp.*
 /tmp*
