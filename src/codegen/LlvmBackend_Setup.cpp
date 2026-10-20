@@ -18813,6 +18813,48 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (v && declaredTy)
         v = coerceNumericToType(v, declaredTy,
                                 init && isUnsignedTargetExpr(*init));
+    // fix #6554 (§5.1 "Constant narrowing", v0.338) — the CODEGEN half of
+    // relaxing that rule's source gate, and the half that makes the relaxation
+    // sound rather than merely permissive. §5.1 as amended is VALUE-BASED: a
+    // compile-time constant of any integer type lands in any integer slot
+    // whose range contains it. Sema re-types the initializer's RECORDED type,
+    // but the producer still lowers at its own width — `const N: long := 5;`
+    // loads its declared i64 slot whatever `ctx_.exprType` says afterwards, and
+    // `coerceNumericToType` above is §5.1's WIDENING direction only.
+    //
+    // This has to happen HERE, before `slotTy` is derived from `v->getType()`
+    // on the next line, not at the store: the slot is SIZED from the value, so
+    // coercing only at the store leaves an i64 local behind an i8 declaration
+    // and every later read re-widens it. MEASURED on the #6554 tip, with
+    // `var b: byte := N` over a `long` const:
+    //
+    //   %1 = alloca i64                 ; slot sized from the i64 VALUE
+    //   %3 = load i64, ptr %2           ; the const's own i64 slot
+    //   store i64 %3, ptr %1
+    //   %5 = zext i64 %4 to i32         ; emitPrimitiveToString's Byte arm
+    //   Type too small for ZExt -> "IR verification failed"
+    //
+    // so the program was ADMITTED by sema and then died in the verifier — a
+    // relaxation that trades a correct §5.1 rejection for malformed IR is not
+    // a fix. `Console.WriteLine(b)`, `b.ToString()` and `$"{b}"` all reached
+    // it; `int(b)`, a `long(b)` comparison and an `Array<byte>` element did
+    // not, because those coerce at their own site.
+    //
+    // `coerceInitializerToSlot` is the ONE definition of "bring an initializer
+    // to the width of the slot it is about to be stored into" (#2903) and
+    // already carries §5.1's OTHER direction: an integer strictly wider than
+    // an integer slot is truncated. That is value-preserving HERE because sema
+    // admitted the initializer only after checking the constant FITS the slot
+    // (§5.1's "a constant whose value does not fit the target's range is a
+    // compile error at the conversion site — never a silent truncation"), so
+    // no information is dropped. It is a no-op for a value already at the
+    // slot's width, and it declines every pair §5.1 does not convert (a struct,
+    // a pointer, a `bool`), so it adds no conversion of its own. Signedness
+    // comes from the initializer expression, the same source the widening call
+    // above reads.
+    if (v && declaredTy)
+        v = coerceInitializerToSlot(v, declaredTy,
+                                    init && isUnsignedTargetExpr(*init));
     llvm::Type* slotTy = v ? v->getType() : (declaredTy ? declaredTy : i32());
     // issue #490 / §14.2: in an INFERRED-TYPE local (`var n := x.Member`) in a
     // generic method body, the initializer may return nullptr in the

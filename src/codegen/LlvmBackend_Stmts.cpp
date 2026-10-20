@@ -2191,6 +2191,30 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // struct to its value. No-op for a nullable target (elemTy is
                     // the struct, not its value element).
                     rhs = unwrapNarrowedNullable(rhs, elemTy);
+                    // fix #6554 (§5.1 "Constant narrowing", v0.338): the
+                    // ASSIGNMENT twin of the `:=` initializer half of this
+                    // fix. §5.1 has no position carve-out — "it covers every
+                    // written-declared-type position" — so `b := N` must admit
+                    // the same wide constant `var b: byte := N` does. The
+                    // coercion has to happen HERE, immediately before the
+                    // store, because `addr` was already computed against the
+                    // declared `elemTy` and re-deriving it would be a much
+                    // larger change to the addressing path. `coerceNumericToType`
+                    // above (line ~1542) only WIDENS: an i64 RHS stored into an
+                    // i8 slot passed it straight through. MEASURED on the
+                    // #6554 tip, `var b: byte := 0; b := N;` under ASan:
+                    //
+                    //   ==4131434==ERROR: AddressSanitizer: stack-buffer-overflow
+                    //   WRITE of size 8 … [128, 129) '' <== access partially
+                    //   overflows this variable
+                    //
+                    // `coerceInitializerToSlot` (#2903) is the ONE definition of
+                    // "bring a value to the width of the slot it is about to be
+                    // stored into" and already carries §5.1's OTHER direction,
+                    // so it is the right call here rather than a new truncate.
+                    if (elemTy)
+                        rhs = coerceInitializerToSlot(
+                            rhs, elemTy, isUnsignedTargetExpr(*as->value));
                     llvm::StoreInst* si = builder_.CreateStore(rhs, addr);
                     // fix #4566 / §15.3 *Local-to-local assignment* + §28.7
                     // *Moved-from and null* (v0.306): the MOVE half of the

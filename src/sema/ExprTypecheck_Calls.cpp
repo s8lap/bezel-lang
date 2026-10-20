@@ -1153,6 +1153,24 @@ ExprTC::ArgMatch ExprTC::classifyArg(const TypeRef* argTy,
     return ArgMatch::NotApplicable;
 }
 
+// fix #6554 (§5.1, v0.338): the integer-primitive predicate, local to this
+// TU. The copy in ExprTypecheck.cpp is file-static, and this file needs the
+// same question answered for the pre-ranking gate below. `char` is excluded
+// for the reason documented there (§5.2 owns it, with its own code-point
+// range); `bool` / `float` / `double` / `decimal` are never "an integer type"
+// for §5.1's constant-narrowing rule.
+static bool isIntegerPrimitiveTypeForOverload(PrimitiveType p) {
+    switch (p) {
+        case PrimitiveType::SByte: case PrimitiveType::Byte:
+        case PrimitiveType::Short: case PrimitiveType::UShort:
+        case PrimitiveType::Int:   case PrimitiveType::UInt:
+        case PrimitiveType::Long:  case PrimitiveType::ULong:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // §22.6 overload resolution among same-arity, all-positional candidates.
 ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<std::vector<const TypeRef*>>& paramTypes,
@@ -1279,6 +1297,12 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             // site that does not yet supply the AST arguments) skips the
             // re-type and keeps the old behaviour verbatim.
             const TypeRef* argTy = argTypes[i];
+            // fix #6554: whether THIS cell's grade was produced by a re-type,
+            // and the source type that re-type came from. Null unless the
+            // pre-pass below fired, so the Convert cap in the grading step
+            // never applies to a cell no conversion produced.
+            const PrimitiveType* narrowFromPrim = nullptr;
+            bool narrowFired = false;
             if (!argExprs.empty() && i < argExprs.size() && argExprs[i]) {
                 // narrowIntConstantToTarget's signature takes TypeRef* (the
                 // #2925 mutating re-typing variant); both argTypes[i] and
@@ -1291,6 +1315,15 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                     argExprs[i],
                     const_cast<TypeRef*>(argTypes[i]),
                     const_cast<TypeRef*>(paramTypes[c][i]));
+                // "Fired" means the rule actually re-typed the argument —
+                // narrowIntConstantToTarget returns `from` untouched when it
+                // does not apply. A returned pointer differing from the input
+                // is that signal; the pointer compare, not the grade, is what
+                // the Convert cap below keys on.
+                narrowFired = (argTy != argTypes[i]);
+                if (narrowFired && argTypes[i] &&
+                    argTypes[i]->kind == TypeRef::Kind::Primitive)
+                    narrowFromPrim = &argTypes[i]->primitive;
             }
             // fix #5862 (§7.4 / §22.6, v0.338): grade a built-in exception
             // argument at the type it is READ at. `classifyArg` sees only the
@@ -1306,6 +1339,37 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                 argTy = nn;
             }
             ArgMatch m = classifyArg(argTy, paramTypes[c][i]);
+            // fix #6554 (§5.1 "Constant narrowing" + §22.6, v0.338): §5.1 says
+            // the rule "participates in overload-resolution APPLICABILITY
+            // (§22.6)" — it never says the resulting cell is an EXACT match.
+            // #2985 could grade the re-typed cell Exact without harm because
+            // its whole population was `int`-SOURCED, where §4.2's
+            // target-typed integer constant means the literal has no type of
+            // its own: re-typing it to the parameter IS the identity, and the
+            // §5.1 worked example (`Set(level: byte)` called as `Set(3)`)
+            // depends on that. #6554 widened the SOURCE population to
+            // constants of ANY integer type, and for a constant with a real,
+            // DECLARED wider type (`const N: long := 42;`, `42L`) the
+            // narrowing to `int` is a genuine CONVERSION, not an identity.
+            // Grading it Exact ties with the candidate the argument already
+            // matches identically, and §22.6 then leaves the winner to
+            // DECLARATION ORDER. MEASURED on this tip — §22.6 Example 1:
+            //
+            //   Log(level: int): int / Log(level: long): bool; Log(42L)
+            //     long declared FIRST  -> compiles (bool)
+            //     int  declared FIRST  -> "the initializer for `x` … between
+            //                              integers and `bool` is never
+            //                              implicit" (§5.1)
+            //
+            // because `Log(int)` won the tie and returned `int`. Capping the
+            // re-typed cell at Convert restores §22.6's Exact-beats-Convert
+            // ranking, so the identity match wins in EITHER order. The cap is
+            // scoped to the `from` type the pre-pass actually re-typed, so
+            // #2985's `int`-sourced rows are bit-for-bit unaffected: an
+            // `int` source (a literal, or `const k: int`) is exempt.
+            if (m == ArgMatch::Exact && narrowFired && narrowFromPrim &&
+                *narrowFromPrim != PrimitiveType::Int)
+                m = ArgMatch::Convert;
             grid[c][i] = m;
             if (m == ArgMatch::NotApplicable) res.applicable[c] = false;
         }
@@ -3305,9 +3369,40 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 // the very predicates that let the existing checkArgsAgainst-
                 // Params path avoid false positives on non-constant or out-of-
                 // range values.
-                (void)narrowIntConstantToTarget(carg->value.get(),
-                                                ctx_.exprType(*carg->value),
-                                                const_cast<TypeRef*>(pt));
+                //
+                // fix #6554 (§5.1 "Constant narrowing" + §22.6, v0.338): this
+                // pre-ranking re-type is confined to the `int`-SOURCED
+                // population #2925/#2985 established, and it must STAY confined
+                // to it. `argTypeRows[c]` below reads back the MUTATED type, and
+                // `argTypes` is `argTypeRows[0]` — candidate 0's row — so
+                // narrowing here makes candidate 0's choice the type every
+                // other candidate is then ranked against. For an `int` source
+                // that is harmless (§4.2's target-typed integer constant: the
+                // literal has no type of its own, so the re-type IS the
+                // identity, and §5.1's `Set(3)`/`Set(level: byte)` example
+                // depends on it). For a constant with a real, DECLARED wider
+                // type it is not: `Log(level: int)` declared FIRST pre-narrows
+                // `42L` to `int`, after which `Log(level: long)` is ranked as
+                // a mere `int -> long` WIDENING and `Log(level: int)` wins —
+                // MEASURED, §22.6 Example 1, and the reverse declaration order
+                // compiles. §22.6 ranks a candidate the argument matches
+                // IDENTICALLY above one it merely converts to, so ranking must
+                // see every candidate against the argument's OWN type.
+                // resolveOverload's own per-candidate pre-pass (the #2985 call)
+                // then narrows for the WINNER, and grades the re-typed cell
+                // Convert for a wide source — so nothing is lost here.
+                const TypeRef* preNarrowAt = ctx_.exprType(*carg->value);
+                const bool wideSource =
+                    preNarrowAt &&
+                    preNarrowAt->kind == TypeRef::Kind::Primitive &&
+                    !preNarrowAt->nullable &&
+                    preNarrowAt->primitive != PrimitiveType::Int &&
+                    isIntegerPrimitiveTypeForOverload(preNarrowAt->primitive);
+                if (!wideSource)
+                    (void)narrowIntConstantToTarget(
+                        carg->value.get(),
+                        const_cast<TypeRef*>(preNarrowAt),
+                        const_cast<TypeRef*>(pt));
             }
             const TypeRef* at = carg && carg->value
                                     ? ctx_.exprType(*carg->value)

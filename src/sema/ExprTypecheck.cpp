@@ -41,10 +41,71 @@ static bool fitsInIntType(long long v, PrimitiveType t) {
         case PrimitiveType::Byte:   return v >= 0 && v <= 255;
         case PrimitiveType::Short:  return v >= -32768 && v <= 32767;
         case PrimitiveType::UShort: return v >= 0 && v <= 65535;
+        // fix #6554 (§5.1, v0.338): the `Int` arm is what the `default: true`
+        // used to elide, and eliding it was safe ONLY while every caller
+        // below pre-gated the target to the six types an `int` does not
+        // already widen to. `Int` is not one of them, so with the rule's
+        // SOURCE side relaxed to a constant of ANY integer type, `Int`
+        // became reachable as a target — §5.1's own second named example,
+        // "a `uint`-typed constant `7` is admissible where `int` is
+        // expected" — and the `default: true` would have admitted
+        // `const N: long := 5000000000; var b: int := N;`, a silent
+        // truncation of exactly the kind the same paragraph forbids ("A
+        // constant whose value does not fit the target's range is a compile
+        // error at the conversion site — never a silent truncation"). The
+        // other two previously-unreachable integer targets need no arm:
+        // `Long` holds every `long long` this fold produces, and `ULong`
+        // has one above.
+        case PrimitiveType::Int:    return v >= -2147483648LL &&
+                                           v <= 2147483647LL;
         case PrimitiveType::UInt:   return v >= 0 && v <= 4294967295LL;
         case PrimitiveType::ULong:  return v >= 0;  // any non-neg ll fits ulong
         default:                    return true;
     }
+}
+
+// fix #6554 (§5.1 "Constant narrowing", v0.338) — the rule's SOURCE side,
+// shared by narrowIntConstantToTarget (the re-type) and
+// primitiveNeverImplicitReason (the diagnostic), which must ask the SAME
+// question or an out-of-range wide constant reports the never-implicit
+// signedness bullet instead of the constant-narrowing one.
+//
+// §5.1 verbatim: "The rule is **value-based, not type-based**: the source
+// may be a compile-time constant of **any** integer type — not only `int`
+// — and the target any integer type whose range contains the value,
+// **across signedness** (`const N: long := 8; var b: byte := N;` is
+// well-typed; a `uint`-typed constant `7` is admissible where `int` is
+// expected)". The pre-#6554 gate tested `primitive != PrimitiveType::Int`,
+// which is the type-based reading the spec explicitly rejects.
+static bool isIntegerPrimitiveType(PrimitiveType p) {
+    switch (p) {
+        case PrimitiveType::SByte: case PrimitiveType::Byte:
+        case PrimitiveType::Short: case PrimitiveType::UShort:
+        case PrimitiveType::Int:   case PrimitiveType::UInt:
+        case PrimitiveType::Long:  case PrimitiveType::ULong:
+            return true;
+        default:
+            // `char` is deliberately absent: §5.2 governs it, with its own
+            // code-point range (charIntConstantFits below, #5217), not this
+            // rule's integer range. `bool` / `float` / `double` / `decimal`
+            // are never "an integer type" here.
+            return false;
+    }
+}
+
+// §5.1, same paragraph: "the TARGET any integer type whose range contains
+// its value". A pair §5.1's ORDINARY widening table already admits needs
+// no rule and must not be re-typed — re-typing `var l: long := 8;` would
+// lower the literal at i64 instead of i32 for no semantic gain. So the
+// test is "an integer target the widening table does not already cover",
+// which for an `int` source is exactly the six types that source did not
+// widen to (the pre-#6554 `narrowerIntTarget` list) and for a `long` or
+// `uint` source additionally reaches `int`, per the spec's own example.
+static bool constantNarrowingTargetApplies(PrimitiveType src,
+                                           PrimitiveType tgt) {
+    if (!isIntegerPrimitiveType(tgt)) return false;
+    if (tgt == src) return false;  // identity needs no rule
+    return !primitiveImplicitlyWidens(src, tgt);
 }
 
 // §5.2 (v0.313, #5217): does the compile-time integer constant `v` fit the
@@ -4876,14 +4937,12 @@ std::string ExprTC::primitiveNeverImplicitReason(const ast::Expr* fromExpr,
     };
     // "Constant narrowing": "A constant whose value does not fit the
     // target's range is a compile error at the conversion site." Mirrors
-    // narrowIntConstantToTarget's own gate (only a plain, non-nullable `int`
-    // source and one of these six narrower integer targets — the ones §5.1's
-    // widening table does not already admit from `int` — are eligible).
-    if (fromExpr && from == P::Int) {
-        const bool narrowerIntTarget =
-            to == P::Byte || to == P::SByte || to == P::Short ||
-            to == P::UShort || to == P::UInt || to == P::ULong;
-        if (narrowerIntTarget) {
+    // narrowIntConstantToTarget's own gate (fix #6554: a constant of ANY
+    // integer type as the source, and any integer target §5.1's widening
+    // table does not already admit from it — for an `int` source that is the
+    // same six narrower types the pre-#6554 list named).
+    if (fromExpr && isIntegerPrimitiveType(from)) {
+        if (constantNarrowingTargetApplies(from, to)) {
             if (auto cv = foldIntConstExprTC(*fromExpr);
                 cv && !fitsInIntType(*cv, to)) {
                 return "a constant whose value does not fit the target's "
@@ -5206,26 +5265,40 @@ static std::string spellMoveOnlySource(const TypeRef* t) {
 // asks the same question through `implicitlyConvertible`, which takes TYPES
 // only (no expression) and so cannot see the constant — `Pick(3)` against
 // `Pick(byte)`/`Pick(string)` still reports "no overload … is applicable".
+//
+// fix #6554 (§5.1, v0.338) relaxed this ONE gate's SOURCE side, per the
+// rule's own words: "The rule is **value-based, not type-based**: the source
+// may be a compile-time constant of **any** integer type — not only `int` —
+// and the target any integer type whose range contains its value, **across
+// signedness**", with two examples the type-based gate rejected outright:
+// `const N: long := 8; var b: byte := N;` and a `uint`-typed constant `7`
+// where `int` is expected. MEASURED on 26ca3bd9, both REJECT at a plain
+// local initializer with the never-implicit SIGNEDNESS bullet quoted — the
+// wrong clause, since that bullet says it governs "non-constant expressions"
+// and this rule "may cross signedness". Both the re-type gate here and the
+// diagnostic's gate in primitiveNeverImplicitReason move together, since a
+// mismatched pair would report the wrong §5.1 sub-rule for an out-of-range
+// wide constant.
 TypeRef* ExprTC::narrowIntConstantToTarget(const ast::Expr* fromExpr,
                                            TypeRef* from, TypeRef* to) {
     if (!fromExpr || !from || !to) return from;
     // The rule's SOURCE side: "an expression of integer type that is a
-    // compile-time constant". A folded constant is typed plain `int` here (a
-    // suffixed / wide literal already carries its own wider type and needs no
-    // narrowing); a NULLABLE source is not a bare constant and stays out.
-    if (from->kind != TypeRef::Kind::Primitive ||
-        from->primitive != PrimitiveType::Int || from->nullable)
+    // compile-time constant" — and, per fix #6554 (§5.1, v0.338), VALUE-BASED,
+    // not type-based: "the source may be a compile-time constant of ANY
+    // integer type — not only `int`". The pre-#6554 guard tested
+    // `from->primitive != PrimitiveType::Int`, so `const N: long := 8;`
+    // (which is itself well-typed — §5.1's table admits `int -> long`) fell
+    // straight through to the §5.1 rejection at its narrowing use. A NULLABLE
+    // source is not a bare constant and stays out.
+    if (from->kind != TypeRef::Kind::Primitive || from->nullable ||
+        !isIntegerPrimitiveType(from->primitive))
         return from;
     if (to->kind != TypeRef::Kind::Primitive) return from;
     // The rule's TARGET side: "any integer type whose range contains its
-    // value". Only the integer types an `int` does NOT already widen to
-    // (§5.1's table) need the rule; everything else is an ordinary widening.
+    // value" — i.e. any integer target §5.1's ordinary widening table does
+    // not already admit from this source (see constantNarrowingTargetApplies).
     PrimitiveType tgt = to->primitive;
-    const bool narrowerIntTarget =
-        tgt == PrimitiveType::Byte  || tgt == PrimitiveType::SByte ||
-        tgt == PrimitiveType::Short || tgt == PrimitiveType::UShort ||
-        tgt == PrimitiveType::UInt  || tgt == PrimitiveType::ULong;
-    if (!narrowerIntTarget) return from;
+    if (!constantNarrowingTargetApplies(from->primitive, tgt)) return from;
     // Only re-type an expression whose OWN recorded type is the one being
     // checked. Some callers synthesise `from` (the `this` seed on the
     // assignment path, a cloned non-nullable probe) — re-typing the expression
