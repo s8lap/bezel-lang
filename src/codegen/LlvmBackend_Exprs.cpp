@@ -3216,11 +3216,38 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::Value* igKeyRcv = lowerExpr(*nm->target);
                 if (!igKeyRcv || !igKeyRcv->getType()->isPointerTy())
                     return nullptr;
+                // fix #6537 (§7.5, v0.338 / stdlib §5, v0.338): the §7.5 lift
+                // is admitted for EVERY `TKey` stdlib §5 declares
+                // `readonly property Key: TKey` for — §7.5 restricts the
+                // RECEIVER's nullability, never the member's result type, and
+                // "the result type is always nullable" names no type
+                // restriction. This arm used to gate on the LLVM SHAPE
+                // (pointer, or an integer of at most 32 bits), so `TKey` =
+                // double / long / ulong / float silently returned nullptr:
+                // the store was dropped, the target kept its previous value,
+                // and `g?.Key ?? fallback` took the fallback for a grouping
+                // whose key was never null. The program exited 0 printing the
+                // wrong answer, signalled only by the `internal:` #2961
+                // backstop. The `.` form — which reaches the SAME
+                // `bz_grouping_key` intrinsic through the MemberAccessExpr arm
+                // with NO shape gate at all — was already correct on the same
+                // program, so the `?.` spelling must mirror it.
+                //
+                // The discriminator is the compiler's own nullable-shape
+                // predicate (`isNullableValueTy`, §7.2's `{i8 hasValue; T}`
+                // tagged struct) over a nullable copy of `TKey` — the same
+                // predicate `lowerTypeRef` uses to give a `TKey?` its
+                // representation, so the value this arm builds is bit-for-bit
+                // the representation every `TKey?` consumer already expects.
+                // A pointer-typed `TKey` keeps the bare-nullable-pointer shape
+                // (a null ptr IS the null value); anything with no nullable
+                // representation still declines, as before.
+                sema::TypeRef igKeyNullTy = *igKeyRcvTy->genericArgs[0];
+                igKeyNullTy.nullable = true;
                 llvm::Type* igKeyTy = lowerTypeRef(igKeyRcvTy->genericArgs[0]);
-                if (!igKeyTy ||
-                    (!igKeyTy->isIntegerTy() && !igKeyTy->isPointerTy()) ||
-                    (igKeyTy->isIntegerTy() &&
-                     igKeyTy->getIntegerBitWidth() > 32))
+                if (!igKeyTy) return nullptr;
+                const bool igKeyIsRef = igKeyTy->isPointerTy();
+                if (!igKeyIsRef && !isNullableValueTy(&igKeyNullTy))
                     return nullptr;
                 auto* igKeyEntryBB = builder_.GetInsertBlock();
                 auto* igKeyAccessBB = llvm::BasicBlock::Create(
@@ -3248,13 +3275,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // struct ("GEP base pointer is not a vector or a vector of
                 // pointers" / "Load operand must be a pointer") — measured on
                 // `(g?.Key ?? "?").Length`.
-                const bool igKeyIsRef = igKeyTy->isPointerTy();
                 llvm::Type* igKeyNst = igKeyIsRef
                                            ? static_cast<llvm::Type*>(ptrTy())
-                                           : static_cast<llvm::Type*>(
-                                                 llvm::StructType::get(
-                                                     llvm_, {nullablePrimHasValTy(),
-                                                             igKeyTy}));
+                                           : nullableValueStructTy(&igKeyNullTy);
                 // The wrapped value MUST be built while the insert point is
                 // still igKeyAccessBB — after CreateBr(igKeyEndBB) it would
                 // land in igKeyEndBB below the phi ("PHI nodes not grouped at
