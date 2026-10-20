@@ -43,10 +43,16 @@ to; only the CRITERIA need to be stated so the baseline means something):
             / hasErrorLocatedAt - and the two this issue promotes -
             failedAtCompileTimeNotRuntime / failedAtCompileTimeWithRealLocation
             / diagnosticMessageContains), nor
-        (c) an in-file helper taking a JitResult-shaped parameter whose OWN
-            body reads `.message` (the same "classify a local predicate by
-            its body, not its name" technique scripts/check_vacuous_tests.py
-            uses, for a helper this script has not been told the name of),
+        (c) an in-file helper taking a JitResult-shaped parameter that
+            ULTIMATELY reads `.message` - either directly in its own body,
+            or by DELEGATING (transitively) to a helper that does (fix
+            #6538). Same "classify a local predicate by its body, not its
+            name" technique scripts/check_vacuous_tests.py uses, extended
+            from one hop to the whole visible call graph so a wrapper that
+            forwards to a shared assertion is recognised as protective.
+            The SKIP-literal bail-out exclusion is carried across each
+            delegation edge by its ARGUMENT, so a helper forwarding
+            `"SKIP"` stays denied; see `_protective_helpers`,
             nor
         (d) a location check anywhere in the body: both a `.line` and a
             `.column` member compared against 0 (the
@@ -75,6 +81,18 @@ header this script does not parse, under a name matching none of the markers,
 would be missed. That is why the count here differs from the issue's manually
 measured 60 - and why FIXING rows (the sweep) is explicitly out of THIS
 lane's scope (see #3892 and its filed follow-up).
+
+⚠ DELEGATION-CLOSURE SCOPE (fix #6538). `_protective_helpers` resolves a
+helper chain through every helper it can SEE: those defined in the file
+under scan, plus those defined in `tests/support/*.hpp` (the same scope
+C5 already collects). A forwarder in, say, `tests/codegen/codegen_helpers.hpp`
+is still not resolvable, exactly as it was before - the closure widened
+WHICH BODY is read, not WHICH FILES. It is also name-keyed, so two
+same-named helpers in different translation units are treated as one (the
+pre-existing C5 approximation). Both limits under-detect (a missed row is
+one fewer defect caught by this ratchet); neither can manufacture
+protection, because a name enters the closure only by reading `.message`
+itself or by forwarding to a name that already did.
 
 ⚠ PREPROCESSOR CONDITIONAL HANDLING (C4 COMPLETION ITEM). The scanner
 does not understand preprocessor conditionals in general: only `#if 0`
@@ -557,11 +575,164 @@ def _message_find_call_args(body):
     return args
 
 
+def _helper_bodies(text):
+    """{name: [body, ...]} for every `bool NAME(...)` taking a
+    JitResult-shaped parameter defined in `text`. A name can appear more
+    than once (an overload set, or the same helper name defined in several
+    translation units - the tree has several), so each body is kept and the
+    name is treated as protective if ANY visible body is."""
+    out = {}
+    for m in HELPER.finditer(text):
+        if 'JitResult' not in m.group(2):
+            continue
+        out.setdefault(m.group(1), []).append(
+            _balanced_body(text, m.end() - 1))
+    return out
+
+
+def _is_directly_text_checking(body):
+    """The DIRECT classification rule, factored out of
+    _text_checking_helpers so both the classifier and the delegation
+    closure below apply the SAME rule to a leaf body.
+
+    A body reads diagnostic message text when it contains a `.message`
+    (or a recognised `.message` ALIAS) whose `.find(...)` argument is not
+    the fixed `"SKIP"` literal. A body whose every recognised `.find(...)`
+    is exactly `"SKIP"` is the toolchain-unavailable bail-out idiom and is
+    DENIED protective status (SKIP_LITERAL above)."""
+    if '.message' not in body:
+        return False
+    finds = _message_find_call_args(body)
+    if finds and all(a == SKIP_LITERAL for a in finds):
+        return False
+    return True
+
+
+# One `NAME(` call site in a helper body. The CALLEE NAME plus the call's
+# raw argument text - the argument text is what lets the SKIP literal be
+# tracked ACROSS a delegation edge (see _edge_is_skip_only).
+_CALL_SITE = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+
+# Every double-quoted string literal in a piece of argument text, as the
+# literal INCLUDING its quotes (so it can be compared to SKIP_LITERAL).
+_STRING_LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def _edge_is_skip_only(args):
+    """True if a delegation edge's argument text passes ONLY the fixed
+    `"SKIP"` literal as string arguments - i.e. the callee is being handed
+    the skip marker and nothing else.
+
+    This is what keeps the delegation closure from over-widening. The
+    canonical shape is `tests/support/aot_leak_detection_4638_test.cpp`'s
+
+        bool skipped(const JitResult& r) {
+            return bezel::test::diagnosticMessageContains(r, "SKIP");
+        }
+
+    which DELEGATES to a genuinely text-checking shared assertion and is
+    nonetheless a SKIP-ONLY bail-out guard - exactly the shape the SKIP_LITERAL
+    exclusion exists to deny. Without argument-sensitive edge classification
+    it would be promoted to protective and real absorbing sites would stop
+    being counted.
+
+    Mirrors the DIRECT rule's exactness: a needle that merely CONTAINS the
+    substring SKIP (`"toolchain SKIP"`) is a real needle and does NOT count
+    as a skip-only edge, so the closure still fails toward under-flagging
+    rather than over-flagging."""
+    literals = _STRING_LITERAL.findall(args)
+    return bool(literals) and all(l == SKIP_LITERAL for l in literals)
+
+
+def _protective_helpers(local_bodies, support_bodies):
+    """Set of helper names that ULTIMATELY check diagnostic message text -
+    either directly (their own body reads `.message` with a non-SKIP needle)
+    or by DELEGATING, transitively, to a helper that does.
+
+    WHY DELEGATION (issue #6538). The direct rule reads a helper's OWN body
+    and looks for `.message` there, so it cannot see through a helper that
+    forwards to the shared assertion in `tests/support/
+    aot_result_asserts.hpp`. `tests/sema/dict_range_index_6500_test.cpp`'s
+    `rejectedWith` is the canonical shape:
+
+        bool rejectedWith(const JitResult& r, const char* msg) {
+            return failedAtCompileTimeWithRealLocation(r) &&
+                   diagnosticMessageContains(r, msg);
+        }
+
+    Both halves pin the diagnostic WORDING, but no `.message` read is
+    visible in `rejectedWith`'s own body, so it was denied protective
+    status and its test was wrongly reported as an unprotected bare-`!ran`
+    row - taking the gate-enforced ratchet RED over a row that is in fact
+    correct. The question the ratchet really asks is "does this helper
+    ULTIMATELY check message text?", and that is answered by FOLLOWING the
+    delegation, not by listing known helper names: an allowlist of
+    `diagnosticMessageContains` and friends would have to be re-extended
+    every time a new wrapper appears, and would miss a wrapper whose own
+    name says nothing.
+
+    MEASURED on the tree at this revision, six helpers across five files
+    were denied protective status for exactly this reason
+    (`rejectedWith`, `rejectedWithNeedle`, `diagnosticAbsent`,
+    `rejectedAt`, `hasAnyObjectTrioDiag`, and the #3892 header's own
+    `failedAtCompileTimeNotRuntime`), so this is a family-wide defect,
+    not one file's.
+
+    The fixpoint is monotone (the protective set only ever grows) so it
+    terminates in at most len(helpers) passes. Mutual recursion between two
+    helpers cannot manufacture protection: neither is in the seed set, so
+    neither is ever added, and both stay denied.
+
+    Both directions are pinned by self-test fixtures:
+      - a helper delegating to a text-checking assertion IS protective;
+      - a helper delegating to something that does NOT check text, and a
+        helper delegating with the SKIP literal, are NOT."""
+    bodies = {}
+    for src in (support_bodies, local_bodies):
+        for name, bs in src.items():
+            bodies.setdefault(name, []).extend(bs)
+    prot = set()
+    changed = True
+    while changed:
+        changed = False
+        for name, bs in bodies.items():
+            if name in prot:
+                continue
+            for body in bs:
+                if _is_directly_text_checking(body):
+                    prot.add(name)
+                    changed = True
+                    break
+                for m in _CALL_SITE.finditer(body):
+                    callee = m.group(1)
+                    if callee not in prot:
+                        continue
+                    args = _balanced_paren(body, m.end() - 1)
+                    if _edge_is_skip_only(args):
+                        continue
+                    prot.add(name)
+                    changed = True
+                    break
+                if name in prot:
+                    break
+    return prot
+
+
 def _text_checking_helpers(text):
     """Set of in-file helper names taking a JitResult-shaped parameter whose
     OWN body reads `.message` - classified by BODY, not name (the
     check_vacuous_tests.py technique), so an oddly-named local helper is
     still recognised as protective.
+
+    This is the DIRECT (single-hop) rule. `scan_file` deliberately uses
+    `_protective_helpers` - the transitive closure built on the same direct
+    rule - because a helper that forwards to a shared text-checking
+    assertion protects a row just as much as one that reads `.message`
+    itself (issue #6538). This DIRECT function is kept as-is because two
+    sibling ratchets import it and one
+    (`scripts/check_toolchain_skip_surface.py`) uses its COMPLEMENT as its
+    "SKIP-only" set; widening it in place would silently change that
+    checker's `absorbing_sites` count.
 
     The exclusion is POSITIVE, not a parse failure: a helper is EXCLUDED
     (denied protective status) only when every `.message`-derived
@@ -584,11 +755,8 @@ def _text_checking_helpers(text):
         if 'JitResult' not in params:
             continue
         body = _balanced_body(text, m.end() - 1)
-        if '.message' not in body:
-            continue
-        finds = _message_find_call_args(body)
-        if finds and all(a == SKIP_LITERAL for a in finds):
-            continue  # positively confirmed skip-only - deny
+        if not _is_directly_text_checking(body):
+            continue  # no `.message` read, or positively confirmed skip-only
         out.add(m.group(1))
     return out
 
@@ -632,6 +800,34 @@ def _support_helpers(root):
         except OSError:
             continue
         out.update(_text_checking_helpers(text))
+    return out
+
+
+def _support_helper_bodies(root):
+    """{name: [body, ...]} for every helper defined under `tests/support/
+    *.hpp` whose signature takes a `JitResult`-shaped parameter - the BODY
+    form of `_support_helpers`, read once per `measure()` call.
+
+    Bodies (not just names) are needed because the delegation closure in
+    `_protective_helpers` has to read what each shared helper does in order
+    to know whether forwarding to it pins message text: a support header
+    may itself define a SKIP-ONLY guard, and a caller of THAT must stay
+    denied. Returning names only (as `_support_helpers` does) would make
+    every forwarder to a support-header helper look equally protective.
+
+    Same JitResult-signature gate as `_support_helpers`, so a helper whose
+    parameter is not a JitResult is still not collected."""
+    out = {}
+    support_dir = root / 'tests' / 'support'
+    if not support_dir.is_dir():
+        return out
+    for p in sorted(support_dir.glob('*.hpp')):
+        try:
+            text = p.read_text(errors='replace')
+        except OSError:
+            continue
+        for name, bs in _helper_bodies(text).items():
+            out.setdefault(name, []).extend(bs)
     return out
 
 
@@ -747,7 +943,7 @@ def _ambiguous_debt_markers(raw):
     return out
 
 
-def scan_file(path, raw, support_helpers=None):
+def scan_file(path, raw, support_helpers=None, support_bodies=None):
     """-> list of (test_name, var) unprotected rows in this file's raw
     text. `raw` is the file's actual on-disk text (the marker-attach
     logic reads from it directly, since both AMBIGUOUS-RAN-FALSE-OK and
@@ -773,10 +969,14 @@ def scan_file(path, raw, support_helpers=None):
     text = _strip_disabled_preprocessor(text)
     if not (RAN_FALSE.search(text) or HAS_ERRORS_TRUE.search(text)):
         return []
-    text_helpers = _text_checking_helpers(text)
+    text_helpers = _protective_helpers(_helper_bodies(text),
+                                       support_bodies or {})
     # C5: union the in-file helper names with the support-header
     # helper names collected once per measure() call (avoiding one
     # glob+read per scan_file invocation; the union is per-call).
+    # `_protective_helpers` already folds the support-header bodies in, so
+    # their names are covered; this keeps the pass-through for a caller
+    # that supplies only the name set.
     if support_helpers:
         text_helpers = text_helpers | support_helpers
     ok_tests = _ambiguous_ok_test_names(raw)  # C1: suppression marker
@@ -879,12 +1079,14 @@ def measure(root):
     # measure() call (not once per file). See _support_helpers
     # docstring for the rationale and the same-classification rule.
     support_helpers = _support_helpers(root)
+    support_bodies = _support_helper_bodies(root)
     for p in sorted(tests_dir.rglob('*_test.cpp')):
         try:
             raw = p.read_text(errors='replace')
         except OSError:
             continue
-        rows = scan_file(p, raw, support_helpers=support_helpers)
+        rows = scan_file(p, raw, support_helpers=support_helpers,
+                         support_bodies=support_bodies)
         rel = str(p.relative_to(root))
         if rows:
             per_file[rel] = rows
@@ -1763,6 +1965,131 @@ BEZEL_TEST(fixture_suite, protected_via_non_jit_helper) {
     if (c5_test_support::someOtherCheck(std::string("hello"))) return;
 }
 ''')
+        # fix #6538 fixtures: the DELEGATION closure. A helper whose own
+        # body contains no `.message` read but which FORWARDS to a
+        # text-checking assertion pins its diagnostic wording just as much
+        # as one that reads `.message` itself, and must be protective. The
+        # real shape is tests/sema/dict_range_index_6500_test.cpp's
+        # `rejectedWith` -> `failedAtCompileTimeWithRealLocation` +
+        # `diagnosticMessageContains`, both in
+        # tests/support/aot_result_asserts.hpp.
+        _mk(root, 'tests/support/c6_text_asserts_test.hpp', '''
+#pragma once
+#include <string>
+namespace c6_test_support {
+inline bool c6HasText(const bezel::test::JitResult& r, const char* needle) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+}
+''')
+        _mk(root, 'tests/codegen/c6_delegates_to_support_text_test.cpp', '''
+#include "support/c6_text_asserts_test.hpp"
+namespace {
+bool c6RejectedWith(const bezel::test::JitResult& r, const char* msg) {
+    return c6_test_support::c6HasText(r, msg);
+}
+}
+BEZEL_TEST(fixture_suite, c6_delegates_to_support_text) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(c6RejectedWith(r, "range index `a..b` is not admitted"));
+}
+''')
+        # Transitivity: the closure must follow a TWO-hop chain, not just
+        # one. The real two-hop shape is
+        # tests/sema/cyclic_class_const_initializer_4865_test.cpp's
+        # `rejectedWith` -> `hasDiag` -> `.message`.
+        _mk(root, 'tests/codegen/c6_transitive_delegation_test.cpp', '''
+namespace {
+bool c6Leaf(const bezel::test::JitResult& r, const char* n) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(n) != std::string::npos) return true;
+    return false;
+}
+bool c6Middle(const bezel::test::JitResult& r, const char* n) {
+    return c6Leaf(r, n);
+}
+bool c6Outer(const bezel::test::JitResult& r, const char* n) {
+    return c6Middle(r, n);
+}
+}
+BEZEL_TEST(fixture_suite, c6_transitive_delegation) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(c6Outer(r, "some specific rejection text"));
+}
+''')
+        # #6538 NEGATIVE CONTROL, load-bearing: a helper that DELEGATES to
+        # something which does NOT check message text is still NOT
+        # protective. Without this fixture the closure could regress into
+        # "anything that calls a helper is protective", which would hide
+        # every unprotected row in the tree.
+        _mk(root, 'tests/codegen/c6_delegates_to_non_text_test.cpp', '''
+namespace {
+bool c6RanFlag(const bezel::test::JitResult& r) { return r.ran; }
+bool c6ExitCodeIs(const bezel::test::JitResult& r, int c) { return r.exitCode == c; }
+bool c6DelegatesToNonText(const bezel::test::JitResult& r) {
+    return c6RanFlag(r) || c6ExitCodeIs(r, 139);
+}
+}
+BEZEL_TEST(fixture_suite, c6_delegates_to_non_text) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(c6DelegatesToNonText(r));
+}
+''')
+        # #6538 NEGATIVE CONTROL, the sharp one: a helper that delegates to
+        # a GENUINELY text-checking shared assertion but passes it the SKIP
+        # literal is still a SKIP-ONLY bail-out guard and must stay denied.
+        # The real shape is tests/support/aot_leak_detection_4638_test.cpp's
+        # `skipped` -> `bezel::test::diagnosticMessageContains(r, "SKIP")`,
+        # which guards five `if (skipped(r)) return;` absorbing sites.
+        _mk(root, 'tests/codegen/c6_delegates_skip_literal_test.cpp', '''
+#include "support/c6_text_asserts_test.hpp"
+namespace {
+bool c6SkippedShape(const bezel::test::JitResult& r) {
+    return c6_test_support::c6HasText(r, "SKIP");
+}
+}
+BEZEL_TEST(fixture_suite, c6_delegates_skip_literal) {
+    auto r = runAot("module M;");
+    if (c6SkippedShape(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        # ...and the mirror of that control: a needle that merely CONTAINS
+        # the substring SKIP is a REAL needle, not the bail-out marker, so
+        # the delegation edge must still count as protection. This pins the
+        # exactness of _edge_is_skip_only (same exactness the DIRECT rule
+        # uses) so a future loosening does not start denying real checks.
+        _mk(root, 'tests/codegen/c6_skip_substring_needle_test.cpp', '''
+#include "support/c6_text_asserts_test.hpp"
+namespace {
+bool c6CheckedToolchainAbsent(const bezel::test::JitResult& r) {
+    return c6_test_support::c6HasText(r, "toolchain SKIP");
+}
+}
+BEZEL_TEST(fixture_suite, c6_skip_substring_needle) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(c6CheckedToolchainAbsent(r));
+}
+''')
+        # Mutual recursion between two helpers must NOT manufacture
+        # protection: neither is in the seed set, so neither is ever added.
+        _mk(root, 'tests/codegen/c6_mutual_recursion_test.cpp', '''
+namespace {
+bool c6Ping(const bezel::test::JitResult& r) { return r.ran || c6Pong(r); }
+bool c6Pong(const bezel::test::JitResult& r) { return c6Ping(r) && !r.ran; }
+}
+BEZEL_TEST(fixture_suite, c6_mutual_recursion) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(c6Ping(r));
+}
+''')
         # Re-measure AFTER the C5 fixtures are added so the post-C5
         # NEGATIVE assertions below (the SKIP-only and non-JitResult
         # helper cases both DO count) can reference a `per_file` that
@@ -1784,6 +2111,36 @@ BEZEL_TEST(fixture_suite, protected_via_non_jit_helper) {
             'counted (the union with support_helpers preserves the '
             'protection across re-measure)',
             'tests/codegen/uses_support_helper_test.cpp' not in per_file)
+        # fix #6538 assertions: the DELEGATION closure, both directions.
+        chk('#6538 POSITIVE: a helper whose own body has no `.message` read '
+            'but DELEGATES to a tests/support/*.hpp text-checking assertion '
+            'IS protective (the #6538 shape: rejectedWith -> '
+            'failedAtCompileTimeWithRealLocation + diagnosticMessageContains)',
+            'tests/codegen/c6_delegates_to_support_text_test.cpp'
+            not in per_file)
+        chk('#6538: the closure is TRANSITIVE - a two-hop chain '
+            '(c6Outer -> c6Middle -> c6Leaf, the real '
+            'rejectedWith -> hasDiag -> .message shape) is protective too',
+            'tests/codegen/c6_transitive_delegation_test.cpp' not in per_file)
+        chk('#6538 NEGATIVE (load-bearing): a helper that delegates to '
+            'something which does NOT check message text is still NOT '
+            'protective - the closure must not regress into "anything '
+            'that calls a helper is protective"',
+            'tests/codegen/c6_delegates_to_non_text_test.cpp' in per_file)
+        chk('#6538 NEGATIVE: a helper that delegates to a genuinely '
+            'text-checking assertion but passes it the SKIP literal is '
+            'still a SKIP-ONLY bail-out and stays denied (the real '
+            '`skipped` shape in tests/support/aot_leak_detection_4638_test.cpp, '
+            'which guards five absorbing sites)',
+            'tests/codegen/c6_delegates_skip_literal_test.cpp' in per_file)
+        chk('#6538: a needle that merely CONTAINS the substring SKIP is a '
+            'REAL needle, so the delegation edge still counts as protection '
+            '(_edge_is_skip_only is exact, matching the DIRECT rule)',
+            'tests/codegen/c6_skip_substring_needle_test.cpp' not in per_file)
+        chk('#6538: mutual recursion between two helpers must NOT '
+            'manufacture protection - neither is in the seed set, so the '
+            'fixpoint adds neither',
+            'tests/codegen/c6_mutual_recursion_test.cpp' in per_file)
         # C1 fixtures: the suppression marker mechanism.
         chk('C1: an AMBIGUOUS-RAN-FALSE-OK marker on the line before a '
             'BEZEL_TEST body suppresses that row from the count (the '
@@ -1802,16 +2159,20 @@ BEZEL_TEST(fixture_suite, protected_via_non_jit_helper) {
             'BEZEL_TEST within 8 lines below (e.g. with too many padded '
             'comment lines) does not exempt anything in this file',
             'tests/codegen/marker_no_match_test.cpp' in per_file)
-        chk('exactly 14 unprotected rows across the fixture tree (12 from '
-            'the C4-counted tree + 2 net C5 delta: the positive support-'
-            'helper case is correctly PROTECTED by C5 (its row is removed '
-            'from the count, a non-counting fixture by design), but the '
-            'two negative controls each contribute +1 (the SKIP-only '
-            'helper denial case and the non-JitResult-helper denial case '
-            'are both still counted as unprotected because their '
-            'protection claim is rejected by the SAME positive-exclusion '
-            'rule that applies to in-file helpers)',
-            total == 14)
+        chk('exactly 17 unprotected rows across the fixture tree (12 from '
+            'the C4-counted tree + 2 net C5 delta + 3 net #6538 delta: '
+            'every POSITIVE fixture is non-counting by design - the C5 '
+            'support-helper case and the #6538 delegation cases '
+            '(delegating-to-support-text, two-hop-transitive, and the '
+            'SKIP-substring needle) are all correctly PROTECTED, so their '
+            'rows are removed from the count; every NEGATIVE control '
+            'contributes +1 because its protection claim is rejected by '
+            'the SAME positive-exclusion rule that applies to in-file '
+            'helpers - the C5 SKIP-only helper, the C5 non-JitResult '
+            'helper, the #6538 delegate-to-non-text helper, the #6538 '
+            'SKIP-literal delegation, and the #6538 mutually-recursive '
+            'pair)',
+            total == 17)
         # (Debug prints removed; count was confirmed = 14 via a temp
         # print during the C5 fix - left the count assertion here as
         # the tripwire for any future change that lifts the C5 net.)
