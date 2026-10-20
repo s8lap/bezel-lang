@@ -2001,24 +2001,57 @@ BEZEL_TEST(fixture_suite, c6_delegates_to_support_text) {
         # one. The real two-hop shape is
         # tests/sema/cyclic_class_const_initializer_4865_test.cpp's
         # `rejectedWith` -> `hasDiag` -> `.message`.
+        # ORDERING IS THE POINT (reviewer NOTE 2 on the first version of
+        # this fixture). `_protective_helpers` iterates a dict, so bodies
+        # arrive in DECLARATION order: a chain written leaf-first is
+        # already fully resolved by a SINGLE pass and therefore cannot
+        # tell a fixpoint from a one-shot loop. This fixture declares the
+        # leaf LAST, so c6Outer is examined before c6Middle before c6Leaf
+        # and only an actual fixpoint resolves it. The leaf-FIRST mirror
+        # is pinned separately below, so BOTH orderings are covered and a
+        # future single-pass simplification has to pass one of them no
+        # matter which direction it is written in.
         _mk(root, 'tests/codegen/c6_transitive_delegation_test.cpp', '''
 namespace {
-bool c6Leaf(const bezel::test::JitResult& r, const char* n) {
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(n) != std::string::npos) return true;
-    return false;
+bool c6Outer(const bezel::test::JitResult& r, const char* n) {
+    return c6Middle(r, n);
 }
 bool c6Middle(const bezel::test::JitResult& r, const char* n) {
     return c6Leaf(r, n);
 }
-bool c6Outer(const bezel::test::JitResult& r, const char* n) {
-    return c6Middle(r, n);
+bool c6Leaf(const bezel::test::JitResult& r, const char* n) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(n) != std::string::npos) return true;
+    return false;
 }
 }
 BEZEL_TEST(fixture_suite, c6_transitive_delegation) {
     auto r = runAot("module M;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(c6Outer(r, "some specific rejection text"));
+}
+''')
+        # ...and the leaf-FIRST mirror, so the ordering blind spot is
+        # pinned from both sides rather than only in the direction that
+        # happens to break a single pass.
+        _mk(root, 'tests/codegen/c6_transitive_leaf_first_test.cpp', '''
+namespace {
+bool c6LfLeaf(const bezel::test::JitResult& r, const char* n) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(n) != std::string::npos) return true;
+    return false;
+}
+bool c6LfMiddle(const bezel::test::JitResult& r, const char* n) {
+    return c6LfLeaf(r, n);
+}
+bool c6LfOuter(const bezel::test::JitResult& r, const char* n) {
+    return c6LfMiddle(r, n);
+}
+}
+BEZEL_TEST(fixture_suite, c6_transitive_leaf_first) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(c6LfOuter(r, "some specific rejection text"));
 }
 ''')
         # #6538 NEGATIVE CONTROL, load-bearing: a helper that DELEGATES to
@@ -2118,10 +2151,18 @@ BEZEL_TEST(fixture_suite, c6_mutual_recursion) {
             'failedAtCompileTimeWithRealLocation + diagnosticMessageContains)',
             'tests/codegen/c6_delegates_to_support_text_test.cpp'
             not in per_file)
-        chk('#6538: the closure is TRANSITIVE - a two-hop chain '
-            '(c6Outer -> c6Middle -> c6Leaf, the real '
-            'rejectedWith -> hasDiag -> .message shape) is protective too',
+        chk('#6538: the closure is TRANSITIVE - a two-hop chain with the '
+            'leaf declared LAST (c6Outer -> c6Middle -> c6Leaf, the real '
+            'rejectedWith -> hasDiag -> .message shape) is protective, '
+            'which a SINGLE pass cannot resolve (bodies arrive in '
+            'declaration order) - this is the arm that makes the fixture '
+            'ordering load-bearing',
             'tests/codegen/c6_transitive_delegation_test.cpp' not in per_file)
+        chk('#6538: the leaf-FIRST mirror of the same two-hop chain is '
+            'also protective, so BOTH declaration orderings are pinned and '
+            'a single-pass simplification cannot pass every fixture',
+            'tests/codegen/c6_transitive_leaf_first_test.cpp'
+            not in per_file)
         chk('#6538 NEGATIVE (load-bearing): a helper that delegates to '
             'something which does NOT check message text is still NOT '
             'protective - the closure must not regress into "anything '
