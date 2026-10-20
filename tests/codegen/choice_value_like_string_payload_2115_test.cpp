@@ -31,6 +31,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked / runAot — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -40,16 +41,24 @@ using bezel::codegen::CodegenOptions;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway (mirrors the
-// choice_equality_control_flow_rework_2083 test).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 / #6608 toolchain-SKIP burn-down. This file's absorbing rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it —
+// the shape scripts/check_toolchain_skip_surface.py counts as an ABSORBING
+// site, and a silent vacuous pass besides: on a box whose clang cannot link
+// the ASan binary every one of those rows returned WITHOUT asserting and the
+// suite reported a clean PASS having compiled and run nothing.
+//
+// Every guard below is now the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition rather than a product
+// failure, but it now MARKS THE ROW FAILED instead of hiding it. Every
+// substantive assertion in every row — `r.ran`, the exitCode and stdout pins —
+// stays exactly where it was, and the local predicate is deleted so no
+// absorbing shape survives. The guard stays a SEPARATE statement from the
+// predicate on purpose: inlining it into an `if` recreates the shape the
+// predicate exists to end.
 
 // runAot with generated-code ASan on and LSan OFF — the SPEC_28_9_35_4 escape
 // oracle. The gate's safety contract (a value-like choice whose value escapes
@@ -59,10 +68,24 @@ bool wasSkipped(const JitResult& r) {
 // leak on the unreleased local's +1 payload string is the cost of never
 // arming the release on a possibly-aliased slot). Mirrors the
 // `runAotAsanNoLeak` helper in string_local_reassign_leak_1997_test.cpp.
+//
+// #6608. This wrapper delegates to `runAot` — the harness entry point that does
+// NOT consult the toolchain knob — so its SKIP branch was reachable only by a
+// box genuinely lacking clang. That left the CONTROL ARM with no purchase on
+// the rows below: `BEZEL_AOT_FORCE_NO_TOOLCHAIN=1` could not steer them onto
+// the skip path, so the one experiment that proves a converted oracle CAN
+// fail was untestable here. The branch now consults the harness's OWN knob,
+// `bezel::test::forceToolchainMissing()` (the reader of
+// BEZEL_AOT_FORCE_NO_TOOLCHAIN that `runAotCheckedImpl` itself consults),
+// alongside the `clang --version` probe. Only the PROBE stays memoised — it
+// shells out, and `runAotCheckedImpl` memoises it for the same reason; the
+// env-var read deliberately does NOT, so a per-test `setenv` can still toggle
+// it, exactly as in the harness.
 JitResult runAotAsanNoLeak(std::string_view src) {
     static const bool toolchainOk =
         std::system("clang --version > /dev/null 2>&1") == 0;
-    if (!toolchainOk) return runAotChecked(src);  // SKIP diagnostic
+    if (bezel::test::forceToolchainMissing() || !toolchainOk)
+        return runAotChecked(src);  // SKIP diagnostic, counted + asserted on below
     bezel::codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
     return runAot(src, opts);
@@ -87,7 +110,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "  var a := Msg.Note(\"he\" + \"llo\"); "  // +1 concat stored as payload
         "  return 0; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: LSan leak → ran=false
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // clean run
 }
@@ -106,7 +129,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "  var a := Msg.Note(\"ab\" + \"cd\"); "
         "  return 0; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -126,7 +149,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "  var b := Msg.Empty; "  // payload-free — no string minted
         "  return 0; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -143,7 +166,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "  var a := Msg.Note($\"{\"wo\"}{\"rld\"}\"); "  // +1 interpolation
         "  return 0; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -189,7 +212,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "  if len = 4 then return 0; end; "
         "  return 1; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // pre-fix (no gate): ASan UAF on h.TextLen() → ran=false
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // post-fix (gate): c excluded, no UAF, len = 4
 }
@@ -235,7 +258,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "  if n > 0 then return 0; end; "
         "  return 1; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: LSan reports the leak → ran=false
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -679,6 +702,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "    var a := P.Ok(q + \"p\"); case a of Ok(var s) => do a := P.No; "
         "n := s.Length; end, Two(var x, var y) => do n := 0; end, "
         "No => do n := 0; end end case;"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);  // pre-fix: ASan heap-use-after-free
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("890") != std::string::npos);
@@ -693,6 +717,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "    var a := P.Ok(q + \"p\"); case a of Ok(var s) => do "
         "a := P.Ok(q + \"r\"); n := s.Length; end, Two(var x, var y) => do "
         "n := 0; end, No => do n := 0; end end case;"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r1));
     BEZEL_EXPECT_TRUE(r1.ran);  // pre-fix: ASan heap-use-after-free
     BEZEL_EXPECT_EQ(r1.exitCode, 0);
     BEZEL_EXPECT_TRUE(r1.stdoutText.find("890") != std::string::npos);
@@ -701,6 +726,7 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
         "    var a := P.Ok(q + \"p\"); var b := a; case b of Ok(var s) => do "
         "b := P.No; a := P.No; n := s.Length; end, Two(var x, var y) => do "
         "n := 0; end, No => do n := 0; end end case;"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r2));
     BEZEL_EXPECT_TRUE(r2.ran);  // pre-fix: ASan heap-use-after-free
     BEZEL_EXPECT_EQ(r2.exitCode, 0);
     BEZEL_EXPECT_TRUE(r2.stdoutText.find("890") != std::string::npos);

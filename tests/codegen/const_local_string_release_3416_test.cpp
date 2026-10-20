@@ -120,6 +120,7 @@
 #include <string_view>
 
 #include "support/aot_support.hpp"   // runAotChecked — ASan/LSan AOT harness
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
@@ -131,10 +132,21 @@ namespace {
 // leak. ASan still aborts on a use-after-free or double-free, which is the
 // property that guard asserts. Mirrors the `runAotAsanNoLeak` helper in
 // choice_value_like_string_payload_2115_test.cpp.
+//
+// #6608. The SKIP branch also consults the harness's OWN test-only knob,
+// `bezel::test::forceToolchainMissing()` (the reader of
+// BEZEL_AOT_FORCE_NO_TOOLCHAIN that `runAotCheckedImpl` itself consults).
+// This wrapper delegates to `runAot`, which never reads that knob, so before
+// this the only way onto the skip path was a box genuinely lacking clang — and
+// the CONTROL ARM, the one experiment that proves a converted oracle CAN fail,
+// had no way to reach this row. Only the `clang --version` PROBE stays
+// memoised (it shells out, and the harness memoises it for the same reason);
+// the env-var read deliberately does not, so a per-test setenv can toggle it.
 bezel::test::JitResult runAotAsanNoLeak(std::string_view src) {
     static const bool toolchainOk =
         std::system("clang --version > /dev/null 2>&1") == 0;
-    if (!toolchainOk) return runAotChecked(src);  // SKIP diagnostic
+    if (bezel::test::forceToolchainMissing() || !toolchainOk)
+        return runAotChecked(src);  // SKIP diagnostic, counted + asserted on below
     bezel::codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
     return runAot(src, opts);
@@ -399,7 +411,7 @@ BEZEL_TEST(const_local_string_release_3416,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (!r.ran) return;  // SKIP: no ASan toolchain
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_EQ(r.stdoutText, "200\n");
 }
 
