@@ -164,6 +164,58 @@ static void bz_array_drop_str_dict_key(void* arrp, int64_t idx, int64_t esz) {
     bz_string_release(*(void**)slot);
 }
 
+// Give back the co-owned reference on the POINTER VALUE `key` itself rather
+// than on a slot — the discharge half of a replace that must read the displaced
+// Key before the copy can overwrite it. Split out from `bz_array_drop_str_dict_key`
+// precisely because that helper re-derives the slot address, which a replace has
+// already overwritten by the time it wants to release.
+//
+// fix #6560 (review `ab860a86f9a8ebce7`): the take/drop PAIR for an indexer
+// store is order-SENSITIVE in a way the grow/shrink mutators are not, because
+// only the store's source can ALIAS its destination. §28.11's value row makes
+// the indexer-get a plain "copy out", so a value copied out of a stamped array
+// — into a local, or into a second slot — carries the SAME `bz_string*` the
+// source slot holds. A store whose incoming Key IS the displaced Key is then
+// not "replace A with A"; it is the identity, and the two halves must cancel.
+//
+//   drop → memcpy → take   (the shape #6560 first shipped) is wrong here: the
+//   drop drives that Key's count to 0 and FREES it, the memcpy writes the
+//   now-dangling pointer back into the slot, and the take retains freed memory.
+//   MEASURED on this lane's tip `0ff67af8` (reproduced independently of the
+//   review that found it, via `scripts/agent_check.sh --probe --asan`):
+//   `AddressSanitizer: heap-use-after-free`, READ of size 8, freed by
+//   `bz_string_release` <- `bz_array_drop_str_dict_key`
+//   (bezel_runtime_collections.cpp:164) <- `bz_array_set` (:279), rc=99, on
+//   `arr[0] := arr[0]`, on `var e := arr[0]; arr[0] := e;`, and on the
+//   `var t := arr[0]; arr[0] := arr[1]; arr[1] := t;` swap — while the
+//   distinct-Key control `arr[0] := other[0]` was clean, which is why a fixture
+//   set that only ever stores a DIFFERENT Key cannot see this class at all.
+//   (QUOTED from the reviewing agent, not re-measured here: its generated-code
+//   binaries carried `nm -D | grep -c __asan` = 182 against 0 on the parent.)
+//
+// THE RULE this restores is the one the stamp already states: a stamped array
+// co-owns exactly one reference on the Key of every slot in [0, count). A
+// replace therefore has to be ATOMIC with respect to that reference — the old
+// owner must let go only once the new owner has taken, so the count never
+// passes through zero on an object that is still reachable. Take-then-release
+// is the only ordering with that property:
+//
+//   take(incoming) → memcpy → release(displaced)
+//
+// Self-assignment then nets to a no-op (count 1 → 2 → 1), and a genuine
+// replacement still nets to one-for-one. Note the displaced pointer is read
+// BEFORE the memcpy, so a store that also moves its own source (a swap's second
+// half, `arr[1] := t` after `arr[0] := arr[1]`) releases the value that was
+// there, not the value it just wrote — the same "read the old pointer before
+// the store" rule `bz_array_set_disposing` has always used for an owning
+// element's disposal (issue #388 / stdlib §4.5).
+static inline void bz_take_str_dict_key_ptr(void* key) {
+    bz_string_retain(key);
+}
+static inline void bz_drop_str_dict_key_ptr(void* key) {
+    bz_string_release(key);
+}
+
 // Give back every slot the array currently holds, and clear the stamp so the
 // array no longer claims ownership of anything. Shared by `bz_array_clear` and
 // by the two frees, so all three discharge exactly the slots they empty.
@@ -273,12 +325,33 @@ void bz_array_get(void* arrp, int64_t idx, void* out, int64_t elem_size) {
 void bz_array_set(void* arrp, int64_t idx, const void* elem, int64_t elem_size) {
     auto* arr = (bz_array_t*)arrp;
     // fix #6560: an indexer store REPLACES the slot, so a stamped array gives
-    // back the Key it co-owned and takes the one it now co-owns. Read the
-    // displaced pointer BEFORE the memcpy, exactly as bz_array_set_disposing
-    // does for an owning array's element (issue #388 / stdlib §4.5).
-    if (arr->str_key_esz > 0) bz_array_drop_str_dict_key(arrp, idx, elem_size);
+    // back the Key it co-owned and takes the one it now co-owns.
+    //
+    // fix #6560 follow-up: TAKE FIRST, THEN RELEASE (see
+    // `bz_drop_str_dict_key_ptr` for the measurement and the rule). The
+    // displaced Key is read out of the slot before the memcpy — exactly as
+    // `bz_array_set_disposing` does for an owning array's element (issue #388
+    // / stdlib §4.5) — so a store whose source is the slot it overwrites, or a
+    // later slot the caller is about to overwrite, releases the value that was
+    // there. Releasing BEFORE the copy is what freed the Key under a
+    // self-aliasing store; the incoming one is taken first so the count never
+    // passes through zero while the Key is still reachable from either side.
+    if (arr->str_key_esz > 0) {
+        // Same bounds the slot helpers apply: a stamp at a DIFFERENT stride, or
+        // an index outside [0, count), is not a slot this array co-owns, so no
+        // Key is taken or given back — only the bytes move.
+        if (bz_array_str_key_slot(arr, elem_size) && idx >= 0 && idx < arr->count) {
+            void* displaced = *(void**)bz_array_ptr_at(arr, idx, elem_size);
+            // The incoming Key comes from `elem`, NOT from the slot: after the
+            // memcpy the slot holds it, but reading it there would retain the
+            // displaced value a second time when the two alias.
+            bz_take_str_dict_key_ptr(*(void**)elem);
+            memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
+            bz_drop_str_dict_key_ptr(displaced);
+            return;
+        }
+    }
     memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
-    if (arr->str_key_esz > 0) bz_array_take_str_dict_key(arrp, idx, elem_size);
 }
 
 // issue #388 / stdlib §4.5: OwningArray<T>'s `set(owned)` indexer — dispose the
@@ -296,11 +369,23 @@ void bz_array_set_disposing(void* arrp, int64_t idx, const void* elem,
     // fix #6560: for a stamped entry snapshot the disposer above is NULL (a
     // value-row element has no element disposal, §28.11), so this slot's Key is
     // discharged by the strided walk instead — exactly once, either way.
-    if (arr->str_key_esz > 0)
-        bz_array_drop_str_dict_key(arrp, idx, elem_size);
+    //
+    // fix #6560 follow-up: same TAKE-THEN-RELEASE ordering as `bz_array_set`,
+    // and for the same reason — this function has the identical drop → copy →
+    // take shape, so it carried the identical aliasing defect, and a fix that
+    // corrected only the non-disposing store would leave a stamped array
+    // reachable through `set(owned)` just as broken. `elem_size` is the
+    // stamped stride here precisely because the value-row element is 16 B while
+    // the `((void**)arr->data)[idx]` disposer read above is a stride-8 reach.
+    if (arr->str_key_esz > 0 &&
+        bz_array_str_key_slot(arr, elem_size) && idx >= 0 && idx < arr->count) {
+        void* displaced = *(void**)bz_array_ptr_at(arr, idx, elem_size);
+        bz_take_str_dict_key_ptr(*(void**)elem);
+        memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
+        bz_drop_str_dict_key_ptr(displaced);
+        return;
+    }
     memcpy((char*)arr->data + idx * elem_size, elem, (size_t)elem_size);
-    if (arr->str_key_esz > 0)
-        bz_array_take_str_dict_key(arrp, idx, elem_size);
 }
 
 void bz_array_remove_at(void* arrp, int64_t idx, int64_t elem_size) {
@@ -368,8 +453,27 @@ void bz_array_clear(void* arrp) {
         // slots this array co-owned — so the discharge has to happen HERE, not at
         // free, where the walk would visit nothing and strand every Key. Emptying
         // a stamped array is the one place the invariant cannot survive as a
-        // free-time property. The stamp clears with the contents; a later `Add`
-        // re-establishes it, because `bz_array_add` takes on every append.
+        // free-time property.
+        //
+        // THE STAMP DOES NOT COME BACK, and that is deliberate rather than an
+        // oversight — an earlier version of this comment claimed the opposite
+        // ("a later `Add` re-establishes it, because `bz_array_add` takes on
+        // every append"). MEASURED FALSE: `bz_array_add`'s take is gated on
+        // `if (arr->str_key_esz > 0)` (below), and `bz_array_drop_all_str_dict_keys`
+        // zeroes `str_key_esz` as it walks, so an emptied stamped array is
+        // PERMANENTLY unstamped and every later `Add` takes nothing. The stated
+        // reason it is still correct: after `Clear` the array holds nothing, so
+        // the invariant "co-owns one reference on every slot in [0, count)" is
+        // vacuously true at `count == 0`, and the only thing lost is the
+        // DISCIPLINE for slots added afterwards — which puts a re-filled array
+        // back on the ordinary unstamped value-row footing (§28.11 gives a
+        // user-built `Array<DictionaryEntry<string,V>>` no Key obligation either),
+        // i.e. the pre-#6550 shape. That is a leak-or-borrow question about
+        // re-filling, NOT an over-release: an unstamped array neither takes nor
+        // gives back, so it can never release a reference it never took. Making
+        // the stamp survive `Clear` would instead have every post-`Clear` `Add`
+        // retain, which is a behaviour change to the re-fill path and is filed
+        // rather than smuggled in here.
         bz_array_drop_all_str_dict_keys(arrp);
         arr->count = 0;
         arr->mod_count++;  // §29.12 / #1232: structural mutation

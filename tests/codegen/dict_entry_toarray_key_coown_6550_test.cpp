@@ -87,9 +87,24 @@
 // row (`expectRunsClean`) that asserts the program RAN TO COMPLETION — `r.ran` is
 // false if and only if the generated program died on a memory error — and asserts
 // the exact stdout, because a fix that returns the right bytes by accident is
-// still a fix that must be pinned. And `BEZEL_AOT_DETECT_LEAKS` defaults OFF, so
-// every leak row arms it explicitly through `LeakEnv`; `runAotChecked` without
-// that arm would be a VACUOUS leak oracle.
+// still a fix that must be pinned. And `runAotCheckedLenient` passes
+// `detect_leaks=0` (aot_support.hpp), so a leak assertion written against it is
+// VACUOUS; every leak assertion here goes through `runAotChecked`, which
+// hardcodes `detectLeaks = true`.
+//
+// A CORRECTION, because the previous version of this header claimed
+// "`BEZEL_AOT_DETECT_LEAKS` defaults OFF, so every leak row arms it explicitly
+// through `LeakEnv`; `runAotChecked` without that arm would be a VACUOUS leak
+// oracle." MEASURED FALSE: `runAotCheckedImpl` never reads
+// `BEZEL_AOT_DETECT_LEAKS` at all — `runAotChecked` passes `/*detectLeaks=*/true`
+// as a hardcoded argument (aot_support.hpp), so the harness arms LeakSanitizer
+// unconditionally and the `LeakEnv` scopes in this file were INERT. The
+// conclusion the claim reached (use `runAotChecked`, not the Lenient variant) is
+// right and is why every row below still passes; the mechanism was wrong, and a
+// false model of the oracle is worse than no comment. The same false claim
+// appears in `dict_entry_value_refcount_6470_test.cpp` and
+// `dict_terminal_unbound_reclaim_6419_test.cpp`, which are NOT this lane's files;
+// they are filed rather than edited.
 #include "support/aot_support.hpp"
 #include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
@@ -104,7 +119,14 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-// Save/restore BEZEL_AOT_DETECT_LEAKS around a row — see the file header.
+// Save/restore BEZEL_AOT_DETECT_LEAKS around a row.
+//
+// IT IS INERT, and deliberately kept only so the rows read the same as they did
+// before the header correction above. `runAotCheckedImpl` never consults this
+// variable — it takes `detectLeaks` as a hardcoded argument — so this scope
+// changes nothing about the leak oracle. Delete it once the rows that carry it
+// are next edited; do NOT read it as "this row's leak checking is armed here",
+// because it is `runAotChecked` vs `runAotCheckedLenient` that decides that.
 class LeakEnv {
 public:
     explicit LeakEnv(const char* value) {
@@ -462,9 +484,14 @@ BEZEL_TEST(dict_entry_toarray_key_coown_6550,
 }
 
 // All three mutators, interleaved, on the SAME array. This is the row that a
-// per-mutator patch tends to miss: the stamp is cleared by `Clear`, so the
-// `Add` that follows it must re-establish ownership, and the `RemoveAt` that
-// precedes it must have left the survivors owned. Expected 200 x ("yy".Length).
+// per-mutator patch tends to miss: the `RemoveAt` that precedes the `Add` must
+// have left the survivors owned, and the `Add` must take on what it appends.
+// (This comment previously also claimed the `Add` "re-establishes" the stamp
+// `Clear` cleared — MEASURED FALSE, see `bz_array_clear` in the runtime: the
+// stamp does not come back, so a post-`Clear` `Add` takes nothing and the array
+// is on the ordinary unstamped footing. The row below still pins the sequence's
+// balance, because an unstamped array neither takes nor gives back and so
+// cannot over-release.) Expected 200 x ("yy".Length).
 BEZEL_TEST(dict_entry_toarray_key_coown_6550,
            mixed_add_remove_clear_sequence_spec_28_11) {
     expectNoOverRelease(
@@ -577,6 +604,171 @@ BEZEL_TEST(dict_entry_toarray_key_coown_6550,
         "  return 0; "
         "end Main; end C; ",
         "a 1");
+}
+
+// ---------------------------------------------------------------------------
+// THE ALIASING SHAPES — the blind spot in the row above.
+//
+// `indexer_set_swaps_key_ownership_spec_28_11` stores a key that came from a
+// DIFFERENT snapshot, so its incoming Key and the displaced Key are always two
+// different objects. That makes it blind to the whole class where the two are
+// the SAME object, which §28.11's value row makes the COMMON case rather than an
+// exotic one: the indexer-get is a plain "copy out", so a value copied out of a
+// stamped array — into a local, or into another slot — carries the very
+// `bz_string*` the source slot holds. `arr[0] := arr[0]` is then not "replace A
+// with A"; it is the identity, and the store's take and drop must cancel.
+//
+// #6560 first shipped the store as drop → copy → take, which is wrong precisely
+// here: the drop drives the shared Key's count to 0 and FREES it, the copy
+// writes the now-dangling pointer back, and the take retains freed memory.
+// MEASURED on the rejected tip `0ff67af8` (both legs instrumented —
+// `nm -D | grep -c __asan` = 182 vs 0, `ASAN_OPTIONS=detect_leaks=0:exitcode=99:
+// abort_on_error=0`): `AddressSanitizer: heap-use-after-free`, READ of size 8,
+// freed by `bz_string_release` <- `bz_array_drop_str_dict_key`
+// (bezel_runtime_collections.cpp:164) <- `bz_array_set` (:279), rc=99 on all
+// three rows below; the distinct-Key control measured clean on the same leg.
+//
+// THE FIX is the ORDER, not a special case: take the incoming Key first, then
+// copy, then release the DISPLACED one, so the count never passes through zero
+// while the Key is still reachable from either side. Self-assignment then nets
+// to a no-op (1 → 2 → 1).
+
+// The identity store. Nothing about the array's contents may change, and the Key
+// must still be readable afterwards.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           indexer_set_self_assign_keeps_the_key_alive_spec_28_11) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var arr := P.MakeDict().ToArray(); "
+        "  arr[0] := arr[0]; "
+        "  Console.WriteLine($\"{arr.Count} {arr[0].Key} {arr[1].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "3 aa bb");
+}
+
+// THE SAME ALIAS, one indirection out: §28.11's "copy out" puts the Key pointer
+// into a local, and storing the local back stores the same pointer. This is the
+// shape a swap's first half produces, and it is the one that distinguishes a
+// fix which compares the two pointers from one which merely reorders them —
+// under a reorder-only fix the local round-trip still passes (take-then-release
+// nets to zero on the same object), so BOTH this row and the self-assign row are
+// needed to pin the behaviour rather than the implementation.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           indexer_set_local_roundtrip_keeps_the_key_alive_spec_28_11) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var arr := P.MakeDict().ToArray(); "
+        "  var e := arr[0]; "
+        "  arr[0] := e; "
+        "  Console.WriteLine($\"{arr.Count} {arr[0].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "3 aa");
+}
+
+// TWO SLOTS, ONE KEY. `arr[0] := arr[1]` is the store's other direction: the
+// array ends up holding the same `bz_string*` twice, so that Key's count is 2
+// and the free must give back exactly two references. Under the drop → copy →
+// take shape the FIRST half of this store released a reference the second slot
+// still counted, and the free released the survivor once too many — the §28.9
+// over-release abort, MEASURED on the parent leg `d8d81745` as
+// `bezel: fatal: refcount over-release (string) — two releases for one
+// reference; terminating per §28.9`, rc=134. Take-then-release makes the two
+// halves cancel at the refcount rather than at the allocator.
+//
+// Both directions are here because they are the two halves of a swap, and a
+// fix that only balances one of them still over-releases on the other.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           indexer_set_duplicate_slot_does_not_over_release_spec_28_9) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var arr := P.MakeDict().ToArray(); "
+        "  arr[0] := arr[1]; "
+        "  Console.WriteLine($\"{arr.Count} {arr[0].Key} {arr[1].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "3 bb bb");
+}
+
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           indexer_set_duplicate_slot_reverse_does_not_over_release_spec_28_9) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var arr := P.MakeDict().ToArray(); "
+        "  arr[1] := arr[0]; "
+        "  Console.WriteLine($\"{arr.Count} {arr[0].Key} {arr[1].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "3 aa aa");
+}
+
+// ---------------------------------------------------------------------------
+// THE MUTATOR SWEEP — every other slot-moving entry point, measured rather than
+// assumed. Each of these MOVES or REPLACES a Key, so each was a candidate for
+// the same drop-then-re-take aliasing shape. They are clean, and the reason is
+// worth recording rather than leaving to a future reader's suspicion:
+//
+//   * `Add` and `Insert` only ever ADD a slot; there is no displaced Key to give
+//     back, so there is no drop/take pair to order. They take AFTER the copy,
+//     which is the only safe order for them regardless of aliasing.
+//   * `RemoveAt` and `drain_next_lifo` only ever DISCARD a slot, so the dropped
+//     Key is one the array is genuinely losing; a survivor that happens to share
+//     it holds its own separate reference, and the memmove shifts slot addresses
+//     without touching any count.
+//   * `Clear` discharges every slot, which is a whole-population walk.
+//
+// These rows are what turns "I checked the others" into a pinned fact.
+
+// `arr.Add(arr[0])` — appending a slot whose Key another slot of the SAME array
+// already co-owns. The appended slot must take its own reference, so the shared
+// Key's count is 2 and the free balances.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           add_of_a_slot_of_the_same_array_balances_spec_28_9) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var arr := P.MakeDict().ToArray(); "
+        "  arr.Add(arr[0]); "
+        "  Console.WriteLine($\"{arr.Count} {arr[0].Key} {arr[3].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "4 aa aa");
+}
+
+// `arr.Insert(1, arr[1])` — the shift-up half of an insert, where the memmove
+// runs BEFORE the copy, so the source slot is one the move has just relocated.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           insert_of_a_slot_of_the_same_array_balances_spec_28_9) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var arr := P.MakeDict().ToArray(); "
+        "  arr.Insert(1, arr[1]); "
+        "  Console.WriteLine($\"{arr.Count} {arr[0].Key} {arr[1].Key} {arr[2].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "4 aa bb bb");
+}
+
+// A duplicate created first, then a REMOVE — the removal must give back exactly
+// one of the two references the duplicate created, leaving the survivor's.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           remove_at_after_a_duplicate_leaves_the_survivor_owned_spec_28_9) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var arr := P.MakeDict().ToArray(); "
+        "  arr[0] := arr[1]; "
+        "  arr.RemoveAt(0); "
+        "  Console.WriteLine($\"{arr.Count} {arr[0].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "2 bb");
 }
 
 }  // namespace
