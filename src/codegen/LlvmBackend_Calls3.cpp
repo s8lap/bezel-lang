@@ -151,6 +151,7 @@ bool Emitter::userValueEqualityPair(const sema::TypeSymbol* ts,
     if (!ts) return false;
     sema::MethodSymbol* eqMs = nullptr;
     sema::MethodSymbol* hashMs = nullptr;
+    bool eqPlain = false;
     for (sema::Symbol* sym : ts->members) {
         auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
         if (!ms || ms->isOperator || isStaticMethod(ms)) continue;
@@ -163,8 +164,17 @@ bool Emitter::userValueEqualityPair(const sema::TypeSymbol* ts,
                     : (ps->declType ? ctx_.resolvedType(*ps->declType)
                                     : ps->resolvedDeclType);
             if (pt && pt->kind == sema::TypeRef::Kind::Named && !pt->nullable &&
-                pt->declaration == ts)
-                eqMs = ms;
+                pt->declaration == ts) {
+                // fix #6263 (§9.2, v0.338): the own-typed `Equals(other: T)` is
+                // "the one member that fills the kind's `Object` slot"; a
+                // mode-only overload (`Equals(ref other: T)`) or one carrying
+                // a default is not that member. Prefer the plain candidate
+                // regardless of declaration order; with only a moded one
+                // declared, keep it (the caller's shape check then declines).
+                bool plain = ps->modifier.empty() && !ps->hasDefault;
+                if (plain || !eqPlain) eqMs = ms;
+                if (plain) eqPlain = true;
+            }
         } else if (ms->name == "GetHashCode" && ms->params.empty()) {
             hashMs = ms;
         }
