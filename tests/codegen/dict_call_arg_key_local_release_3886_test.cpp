@@ -82,6 +82,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -89,15 +90,25 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent — mirrors dict_indexer_set_key_local_release_3872_test.cpp /
-// dict_string_key_leak_3703_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. Each of this file's eleven rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics and returned from the row on it.
+// That is an ABSORBING site by scripts/check_toolchain_skip_surface.py's own
+// definition, and it is a silent vacuous pass: on a box whose clang cannot
+// link the ASan binary, all eleven rows returned WITHOUT asserting and the
+// suite reported a clean PASS having compiled and run nothing. MEASURED on
+// the pre-change tree with the harness's own knob
+// (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): 11 passed, 0 failed, and
+// `CHECKED TOOLCHAIN: 11 skip(s)` — eleven rows green, zero programs run.
+//
+// Each guard is replaced by the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r))`
+// (tests/support/aot_result_asserts.hpp): the skip is still recognised as an
+// environment condition, but it now MARKS THE ROW FAILED instead of hiding
+// it. That is strictly stronger than the guard it replaces — the row can no
+// longer report green on a machine that never compiled the program — and it
+// leaves every substantive assertion in these eleven rows (r.ran, exitCode,
+// stdoutText) exactly where it was, in the same order.
 
 std::string prog(const std::string& mainBody) {
     return "module M; class C public static method Main(): int " + mainBody +
@@ -144,7 +155,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += 1 + keyLen(j);
@@ -170,7 +181,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += 1 + keyLen(j);
@@ -196,7 +207,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j) + 1;
@@ -221,7 +232,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += 1 + keyLen(j);
@@ -247,7 +258,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += 1 + keyLen(j);
@@ -270,7 +281,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j) + 1;
@@ -296,7 +307,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j) + 1;
@@ -324,7 +335,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return R._n; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j) + j;
@@ -353,7 +364,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return R._n; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j) + j;
@@ -396,7 +407,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j)
@@ -454,7 +465,7 @@ BEZEL_TEST(dict_call_arg_key_local_release_3886,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 50; ++j) {
