@@ -300,6 +300,194 @@ BEZEL_TEST(dict_entry_toarray_key_coown_6550,
 }
 
 // ---------------------------------------------------------------------------
+// fix #6560 — THE MUTATION ROWS. #6550 discharged `count` slots at free, which
+// is correct for an array nobody touched and wrong the moment anyone does. Both
+// directions of drift were reachable from ordinary Bezel, and neither is a leak:
+// GROWTH released a reference nobody owned (a §28.9 over-release ABORT, rc 134,
+// on a five-line program that ran to completion before #6550), and SHRINKAGE
+// stranded every retained Key.
+//
+// The invariant these rows pin is stated over the PRESENT, not the past:
+//
+//   A STAMPED ARRAY CO-OWNS EXACTLY ONE REFERENCE ON THE Key OF EVERY SLOT IN
+//   [0, count).
+//
+// so each mutator maintains it where it changes the population — an insert takes,
+// a remove or clear gives back. That is why the fix is the mutator half and not
+// a free-time re-derivation: a retained-count or ownership BITMAP would have to
+// be shifted by `RemoveAt`, appended to by `Add`, and would have to survive
+// `Clear` — the one operation that erases the record of what was owned.
+
+// The ORACLE FOR THE ABORT, which is the assertion that matters most here. A
+// refcount over-release is not a leak: `bz_refcount_overrelease_fail` (#4547)
+// prints `bezel: fatal: refcount over-release (string) ... terminating per
+// §28.9` and aborts the process. So every mutation row asserts all three of
+// `ran`, `exitCode == 0`, and the ABSENCE of that banner — asserting only the
+// leak bound would pass here, because a hard abort reports no leak at all.
+//
+// 200 iterations: one reproduction is a single extra release, which is small
+// enough to hide under refcount noise, and the defect repeats per operation.
+const char* kMutations = "i < 200";
+
+// Every entry is rebuilt by the Dictionary materialization, so every mutation
+// below moves a genuine heap `bz_string`, not a literal sentinel (which would
+// make retain/release no-ops and every row vacuous).
+std::string mutationProducer() {
+    return
+        "module M; "
+        "class P public "
+        "  static method MakeDict(): owned Dictionary<string, int> "
+        "    var d := new Dictionary<string, int>(); "
+        "    d.Add(\"aa\", 1); d.Add(\"bb\", 2); d.Add(\"cc\", 3); "
+        "    return d; "
+        "  end MakeDict; "
+        // A SECOND dictionary, so the entry handed to `Add` comes from another
+        // snapshot that co-owns its own reference — the transfer case that made
+        // the pre-#6560 free-time walk release a reference nobody owned.
+        "  static method MakeOther(): owned Dictionary<string, int> "
+        "    var d := new Dictionary<string, int>(); "
+        "    d.Add(\"zz\", 9); d.Add(\"yy\", 8); "
+        "    return d; "
+        "  end MakeOther; "
+        "end P; ";
+}
+
+// THE ABORT ROW. `a1.Add(a2[0])` appends a slot whose Key `a2` co-owns; before
+// #6560 `a1`'s free-time walk released it as if `a1` owned it too.
+//
+// ORACLE CHOICE, and it is load-bearing: `runAotCheckedLenient` passes
+// `detect_leaks=0` (aot_support.hpp — "LeakSanitizer DISABLED at runtime … The
+// *Lenient variant"), so a leak assertion written against it is VACUOUS. This
+// helper asserts a LEAK BOUND, so it must use `runAotChecked`, which runs
+// LeakSanitizer with `exitcode=99:abort_on_error=0`: a leak exits 99 and prints
+// the report, and an over-release — a real `abort()` from
+// `bz_refcount_overrelease_fail` (#4547), not a sanitizer diagnostic — kills the
+// process so `r.ran` goes false and the stdout never appears. All three of
+// `ran`, `exitCode == 0` and the banner check are asserted because the two
+// failure modes report through different channels.
+//
+// MEASURED trap this row exists to catch: with `detect_leaks=0` the Clear and
+// RemoveAt rows below both PASSED against the broken runtime — a leak reported
+// by nothing. The standalone `bezelc --sanitize=address` binary for the Clear
+// row leaked `21000 byte(s) in 1200 allocation(s)` at the same instant the
+// harness called it clean.
+void expectNoOverRelease(const std::string& program, const char* expected) {
+    LeakEnv scope("strict");
+    JitResult r = runAotChecked(program);
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    if (skipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find(expected) != std::string::npos);
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        BEZEL_EXPECT_TRUE(d.message.find("over-release") == std::string::npos);
+        BEZEL_EXPECT_TRUE(d.message.find("byte(s) leaked") == std::string::npos);
+    }
+}
+
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           add_of_a_borrowed_entry_does_not_over_release_spec_28_9) {
+    expectNoOverRelease(
+        "module M; class C public static method Main(): int "
+        "  var d := new Dictionary<string, int>(); "
+        "  d.Add(\"aa\", 1); d.Add(\"bb\", 2); "
+        "  var a1 := d.ToArray(); var a2 := d.ToArray(); "
+        "  a1.Add(a2[0]); "
+        "  Console.WriteLine($\"{a1.Count} {a1[0].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "3 aa");
+}
+
+// `Clear` erases `count`, which is the only record of which slots were owned,
+// so the discharge has to happen IN `Clear`. Pre-#6560 MEASURED 21000 bytes in
+// 1200 allocations over these 200 iterations; the expected value is 0.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           clear_releases_the_keys_it_drops_spec_28_11) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var i := 0; var n := 0; "
+        "  while " + std::string(kMutations) + " do "
+        "    var arr := P.MakeDict().ToArray(); "
+        "    arr.Clear(); "
+        "    n := n + arr.Count; "
+        "    i := i + 1; "
+        "  end while; "
+        "  Console.WriteLine(n); "
+        "  return 0; "
+        "end Main; end C; ",
+        "0");
+}
+
+// `RemoveAt` must give back the dropped slot AND leave the survivors owned —
+// ownership follows the SLOT, so the shift needs no further bookkeeping. Both
+// survivors' Keys are READ here, so a fix that released the whole array on a
+// remove (instead of one slot) fails on the read, not only on the bound.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           remove_at_releases_only_the_dropped_key_spec_28_11) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var i := 0; var n := 0; "
+        "  while " + std::string(kMutations) + " do "
+        "    var arr := P.MakeDict().ToArray(); "
+        "    arr.RemoveAt(1); "
+        "    n := n + arr[0].Key.Length + arr[1].Key.Length; "
+        "    i := i + 1; "
+        "  end while; "
+        "  Console.WriteLine(n); "
+        "  return 0; "
+        "end Main; end C; ",
+        "800");  // 200 x ("aa".Length + "cc".Length) = 200 x 4
+}
+
+// An indexer store REPLACES the slot: give back the Key the array co-owned,
+// take the one it now co-owns. Before #6560 neither happened, so the displaced
+// Key leaked and the incoming one was released without ever being retained.
+// The expected value proves the store actually landed ("zz", not the displaced
+// "aa") — a wrong-answer fix would pass a leak bound alone.
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           indexer_set_swaps_key_ownership_spec_28_11) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var arr := P.MakeDict().ToArray(); "
+        "  var other := P.MakeOther().ToArray(); "
+        "  arr[0] := other[0]; "
+        "  Console.WriteLine($\"{arr.Count} {arr[0].Key} {arr[1].Key}\"); "
+        "  return 0; "
+        "end Main; end C; ",
+        "3 zz bb");
+}
+
+// All three mutators, interleaved, on the SAME array. This is the row that a
+// per-mutator patch tends to miss: the stamp is cleared by `Clear`, so the
+// `Add` that follows it must re-establish ownership, and the `RemoveAt` that
+// precedes it must have left the survivors owned. Expected 200 x ("yy".Length).
+BEZEL_TEST(dict_entry_toarray_key_coown_6550,
+           mixed_add_remove_clear_sequence_spec_28_11) {
+    expectNoOverRelease(
+        mutationProducer() +
+        "class C public static method Main(): int "
+        "  var i := 0; var n := 0; "
+        "  while " + std::string(kMutations) + " do "
+        "    var arr := P.MakeDict().ToArray(); "
+        "    var other := P.MakeOther().ToArray(); "
+        "    arr.Add(other[0]); "
+        "    arr.RemoveAt(0); "
+        "    arr.Clear(); "
+        "    arr.Add(other[1]); "
+        "    n := n + arr[0].Key.Length; "
+        "    i := i + 1; "
+        "  end while; "
+        "  Console.WriteLine(n); "
+        "  return 0; "
+        "end Main; end C; ",
+        "400");
+}
+
+// ---------------------------------------------------------------------------
 // THE GATE'S NEGATIVE SPACE. A fix keyed on the produced element STRIDE, or on
 // "the element is a 2-field struct whose field 0 is a pointer", passes every row
 // above and fails these.
