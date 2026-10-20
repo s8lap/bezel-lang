@@ -113,6 +113,12 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
+// The value `leakedBytes` returns when the harness SKIPPED because the ASan
+// toolchain could not link — i.e. when no leak number was measured at all.
+// Negative, so it can never be confused with a real LSan byte count (LSan
+// reports non-negative) and can never satisfy a caller's `== 0`. #6611.
+constexpr long kNotMeasured = -1;
+
 // Save/restore BEZEL_AOT_DETECT_LEAKS around a row.
 //
 // IT IS INERT for every `runAotChecked` row in this file, and deliberately kept
@@ -232,9 +238,32 @@ std::string firstValueLengthLoop(std::string& producer) {
 // leaked bytes only across a genuinely-live root set, which is not the regime
 // here: every byte this fix strands was unreachable the moment the table free
 // returned). So the assertion below is an exact `== 0`, not a ceiling.
+//
+// ⚠ 0 IS NOT ONLY "MEASURED, AND CLEAN" (#6611). This helper used to `return 0`
+// on every path that produced no leak line, and the harness's toolchain SKIP
+// produces no leak line: on a box whose clang cannot link the ASan binary no
+// sanitizer ever ran, yet `leakedBytes` handed back the same 0 a clean run
+// hands back and `BEZEL_EXPECT_EQ(..., 0)` went green. A row that reports 0
+// leaked bytes because NOTHING WAS MEASURED is not coverage — it is the
+// absorbing shape #3733 exists to end, reproduced inside a leak BYTE oracle.
+//
+// Two changes, neither of which weakens a row and neither of which adds an
+// oracle call site (the ratchet counts that token by raw text, so the existing
+// `r` below is reused, not a second run):
+//   1. the sanctioned loud assertion `checkedToolchainSkipped` on the SAME `r`,
+//      in the same statement position as every other row in this file — the
+//      skip now MARKS THE ROW FAILED instead of being absorbed;
+//   2. a SENTINEL return of `kNotMeasured` for that case. `kNotMeasured` is
+//      negative and LSan only ever reports non-negative byte counts, so a
+//      caller asserting `== 0` fails on it even if the assertion above were
+//      ever deleted. Defence in depth: the row that cannot prove a leak must
+//      FAIL, not pass.
 long leakedBytes(const std::string& program) {
     LeakEnv scope("strict");
     JitResult r = runAotChecked(program);
+    const bool skip = bezel::test::checkedToolchainSkipped(r);
+    BEZEL_EXPECT_FALSE(skip);
+    if (skip) return kNotMeasured;
     static const std::regex kLeak(R"(AddressSanitizer: (\d+) byte\(s\) leaked)");
     for (const auto& d : r.diagnostics.diagnostics()) {
         std::smatch m;
