@@ -1304,6 +1304,49 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             const PrimitiveType* narrowFromPrim = nullptr;
             bool narrowFired = false;
             if (!argExprs.empty() && i < argExprs.size() && argExprs[i]) {
+                // fix-forward #6561 (§5.1 "Constant narrowing" + §22.6,
+                // v0.338) — WHY THIS CELL'S RESULT IS A PROBE, NOT A
+                // PUBLICATION. narrowIntConstantToTarget MUTATES the shared
+                // `ctx_` record (setExprType) and every cell of this grid
+                // reads the SAME `argTypes[i]` entry, so the type that
+                // survives the loop is the LAST cell's, not the WINNER's.
+                //
+                // MEASURED on 1c5191ab (the rejected #6554 tip) by tracing
+                // every call — `Pick(short)` declared before `Pick(byte)`,
+                // called with `const N: int := 5`:
+                //
+                //   c=0  from=int  to=short  -> re-types, ctx_ := short
+                //   c=1  from=short to=byte  -> re-types, ctx_ := byte
+                //   §22.6 winner: c=0 (short, graded Exact)
+                //   recorded type left behind: BYTE   <-- disagrees
+                //
+                // §22.6 picks the RIGHT candidate; the recorded type then
+                // disagrees with the winning signature, and codegen's
+                // `coerceExprValueToSlot` gate (LlvmBackend_Layout.cpp) only
+                // narrows when `ctx_.exprType(arg)` IS the parameter width —
+                // it saw `byte` where the winner wanted `short`, declined,
+                // and emitted `i32 %5` into an `i16` parameter:
+                // "Call parameter type does not match function signature!"
+                // (IR verify failure). Reverse declaration order is
+                // unaffected because the last cell there agrees with the
+                // winner — so the defect is invisible to any single-order
+                // fixture, which is exactly the blind spot that let #6554
+                // through review.
+                //
+                // The GRADE each cell computes here is correct and is left
+                // exactly as it was: restoring the recorded type between
+                // cells (the full restore-and-re-measure shape
+                // ExprTypecheck_Exprs.cpp:6711 uses for binary operators)
+                // was MEASURED to change resolution on `Pick(int)` vs
+                // `Pick(byte)` for an `int`-sourced constant — it turns a
+                // call that resolved into "ambiguous call to `Pick`: no
+                // overload is unambiguously better (§22.6)". Restoring
+                // changes what a LATER cell sees, so it re-decides §22.6
+                // ties that this branch did not ask to re-decide. The
+                // narrow repair is therefore to leave grading alone and
+                // publish the winner's narrowing ONCE, after ranking — see
+                // `publishWinnerNarrowing` below.
+                //
                 // narrowIntConstantToTarget's signature takes TypeRef* (the
                 // #2925 mutating re-typing variant); both argTypes[i] and
                 // paramTypes[c][i] are const TypeRef*, so const_cast matches
@@ -1378,6 +1421,41 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     std::vector<std::size_t> appl;
     for (std::size_t c = 0; c < nCand; ++c)
         if (res.applicable[c]) appl.push_back(c);
+
+    // fix-forward #6561 (§5.1 "Constant narrowing" + §22.6, v0.338): the
+    // grid above now probes WITHOUT side effects (it restores the recorded
+    // type after every cell), so the winner's §5.1 narrowing has to be
+    // applied once, here, against the WINNER's own parameter type. That is
+    // what publishes to codegen — `coerceExprValueToSlot` narrows the value
+    // to the parameter width only when `ctx_.exprType(arg)` IS that width, so
+    // a recorded type left at some losing candidate's width produces
+    // malformed IR (see the MEASURED trace at the grid).
+    //
+    // Applied at EVERY resolved exit, and keyed on the winner's own parameter
+    // row, so the recorded type cannot depend on declaration order: the same
+    // winner publishes the same recorded type whichever way the candidates
+    // were declared. A winner whose parameter needs no narrowing leaves the
+    // recorded type untouched (narrowIntConstantToTarget returns `from`).
+    auto publishWinnerNarrowing = [&](std::size_t winner) {
+        if (winner >= paramTypes.size()) return;
+        for (std::size_t i = 0; i < nArg; ++i) {
+            if (argExprs.empty() || i >= argExprs.size() || !argExprs[i])
+                continue;
+            if (i >= paramTypes[winner].size()) continue;
+            // Restore the PRISTINE recorded type first. `argTypes[i]` is the
+            // type the argument had on entry, and the grid may have left a
+            // LOSING candidate's narrowing in `ctx_`; narrowIntConstantToTarget
+            // re-types only when `ctx_.exprType(arg)` IS the `from` it was
+            // handed, so without the restore the winner's own re-type is a
+            // no-op whenever a loser overwrote the record — which is exactly
+            // the case this repairs.
+            ctx_.setExprType(const_cast<ast::Expr*>(argExprs[i]),
+                             const_cast<TypeRef*>(argTypes[i]));
+            (void)narrowIntConstantToTarget(
+                argExprs[i], const_cast<TypeRef*>(argTypes[i]),
+                const_cast<TypeRef*>(paramTypes[winner][i]));
+        }
+    };
 
     // fix #6157 (§22.6 / §7, v0.338): a bare `null` argument is typed as the
     // nullable-`Object` sentinel, which `classifyArg` relates to no nullable
@@ -1457,6 +1535,7 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     if (appl.size() == 1) {
         res.outcome = OverloadOutcome::Resolved;
         res.winnerIndex = appl[0];
+        publishWinnerNarrowing(res.winnerIndex);
         return res;
     }
 
@@ -1516,6 +1595,7 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
         if (dominatesAll) {
             res.outcome = OverloadOutcome::Resolved;
             res.winnerIndex = cx;
+            publishWinnerNarrowing(res.winnerIndex);
             return res;
         }
     }
