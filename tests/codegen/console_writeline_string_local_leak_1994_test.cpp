@@ -64,6 +64,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -71,15 +72,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 8 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 8 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // =====================================================================
 // LEAK REPROS — LSan-leak on base 35e854b, LSan-clean with the fix.
@@ -214,7 +224,7 @@ const char* kDirectProducerArgs =
 BEZEL_TEST(console_writeline_string_local_leak_1994,
            user_method_return_local_writeline_lsan_clean_spec_28_9) {
     JitResult r = runAotChecked(kUserMethodReturnLocal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // producer +1 released once (leaked pre-fix)
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // "n=7".Length
 }
@@ -222,7 +232,7 @@ BEZEL_TEST(console_writeline_string_local_leak_1994,
 BEZEL_TEST(console_writeline_string_local_leak_1994,
            concat_local_write_lsan_clean_spec_4_6) {
     JitResult r = runAotChecked(kConcatLocalWrite);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // Console.Write (no newline) borrows too
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // "v=4".Length
 }
@@ -230,7 +240,7 @@ BEZEL_TEST(console_writeline_string_local_leak_1994,
 BEZEL_TEST(console_writeline_string_local_leak_1994,
            console_error_facet_local_lsan_clean_spec_2_1) {
     JitResult r = runAotChecked(kConsoleErrorFacet);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // Console.Error.WriteLine facet borrows
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // "e=3".Length
 }
@@ -238,7 +248,7 @@ BEZEL_TEST(console_writeline_string_local_leak_1994,
 BEZEL_TEST(console_writeline_string_local_leak_1994,
            console_out_facet_local_lsan_clean_spec_7_4) {
     JitResult r = runAotChecked(kConsoleOutFacet);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // Console.Out.Write facet borrows
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // "o=6".Length
 }
@@ -246,7 +256,7 @@ BEZEL_TEST(console_writeline_string_local_leak_1994,
 BEZEL_TEST(console_writeline_string_local_leak_1994,
            multiple_writes_same_local_released_once_spec_28_3) {
     JitResult r = runAotChecked(kMultipleWritesSameLocal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // single +1 freed once — no leak, no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // "v=7".Length
 }
@@ -254,7 +264,7 @@ BEZEL_TEST(console_writeline_string_local_leak_1994,
 BEZEL_TEST(console_writeline_string_local_leak_1994,
            reassigned_local_then_writeline_lsan_clean_spec_28_9) {
     JitResult r = runAotChecked(kReassignedLocalThenWriteLine);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // composes with #1997 reassign-release, no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // "q=2".Length
 }
@@ -266,7 +276,7 @@ BEZEL_TEST(console_writeline_string_local_leak_1994,
 BEZEL_TEST(console_writeline_string_local_leak_1994,
            writeline_then_return_transfer_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kWriteLineThenReturnTransfer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // WriteLine'd + returned: +1 transferred, not double-freed
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // "v=5".Length
 }
@@ -274,7 +284,7 @@ BEZEL_TEST(console_writeline_string_local_leak_1994,
 BEZEL_TEST(console_writeline_string_local_leak_1994,
            direct_producer_args_untouched_spec_28_9) {
     JitResult r = runAotChecked(kDirectProducerArgs);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // literal + fresh interpolation/concat: #1031 path intact
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

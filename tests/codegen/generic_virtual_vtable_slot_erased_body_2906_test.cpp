@@ -51,6 +51,7 @@
 // 149 is correct).
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -59,13 +60,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 10 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 10 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // The shared generic base: `v: T` PRECEDES an owned concrete field and an int,
 // so `T = string` widens slot 0 of the storage and moves both of the ones after
@@ -113,7 +125,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, undetermined_own_param_via_base_spe
         "  var g: GBase<string> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 149);
@@ -144,7 +156,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, two_instantiations_via_one_base_spe
         "  var g2: GBase<string> := dl; "
         "  return g1.Show() + g2.Show() - 200; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 149 + 149 - 200
     BEZEL_EXPECT_EQ(r.exitCode, 98);
@@ -185,7 +197,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, inherited_not_overridden_slot_spec_
         "  var g: GBase<string> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 44);
@@ -224,7 +236,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, virtual_writes_inherited_field_spec
         "  return (r - 148) + (d.v.Length - 4) + (d.a - 141) + (d.own - 7) "
         "         + (d.cell.tag - 4); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // Every term is written as a difference from its expected value, so any one
     // of them being wrong shows up as a non-zero exit.
@@ -255,7 +267,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, three_level_chain_via_root_base_spe
         "  var g: GBase<string> := x; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 + 7 + 9
     BEZEL_EXPECT_EQ(r.exitCode, 60);
@@ -285,7 +297,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, virtual_body_constructs_own_instant
         "  var g: GBase<string> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3 + 5
     BEZEL_EXPECT_EQ(r.exitCode, 154);
@@ -322,7 +334,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, exactly_once_disposal_loop_spec_28_
         "  end; "
         "  return (acc - 1788) + Cell.live * 100 + (Cell.made - 12); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 12 * 149 = 1788; 12 cells made, 0 live at the end.
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -363,7 +375,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, nongeneric_base_generic_override_sp
         "  var p: Plain := g; "
         "  return p.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 + 4
     BEZEL_EXPECT_EQ(r.exitCode, 48);
@@ -391,7 +403,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, control_t_is_int_layout_identical_s
         "  var g: GBase<int> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 149);
@@ -417,7 +429,7 @@ BEZEL_TEST(generic_virtual_vtable_slot_2906, control_nongeneric_subclass_of_gene
         "  var g: GBase<string> := d; "
         "  return g.Show(); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 100 + 41 + 5 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 149);

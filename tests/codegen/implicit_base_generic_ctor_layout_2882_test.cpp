@@ -25,6 +25,7 @@
 // nothing — a live-object count, not merely "does not crash", is the oracle.
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -33,13 +34,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 8 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 8 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // The shared generic base of most cases below: a type-parameter field AHEAD of
 // an owned class field, so a non-placeholder-compatible T shifts `cell`.
@@ -66,7 +78,7 @@ BEZEL_TEST(implicit_base_generic_ctor_2882, implicit_chain_reference_type_arg_sp
         "  using var d := new DCtor(); "
         "  return d.a + d.cell.tag; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);
 }
@@ -87,7 +99,7 @@ BEZEL_TEST(implicit_base_generic_ctor_2882, two_levels_and_two_instantiations_sp
         "  using var g := new DLong(); "
         "  return l.a + l.cell.tag + l.own + g.a + g.cell.tag; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 95);   // 41+3+7 + 41+3
 }
@@ -141,7 +153,7 @@ BEZEL_TEST(implicit_base_generic_ctor_2882, field_order_and_type_arg_axes_spec_2
         "  end; "
         "  return n; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 236);  // 4*(41+3+3) + 2*(17+3+4)
 }
@@ -204,7 +216,7 @@ BEZEL_TEST(implicit_base_generic_ctor_2882, own_ctor_throwing_base_and_this_dele
         "  end; "
         "  return n + Cell.live; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 179);  // (41+3+9) + (23+3) + 100 + 0 live
 }
@@ -245,7 +257,7 @@ BEZEL_TEST(implicit_base_generic_ctor_2882, loop_amplified_owned_base_field_disp
         "  end; "
         "  return acc + Cell.live * 1000 + (Cell.made - 40); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 120);  // 20*(3+3), 0 live, 40 made
 }
@@ -265,7 +277,7 @@ BEZEL_TEST(implicit_base_generic_ctor_2882, control_int_type_arg_layout_equals_p
         "  using var d := new DInt(); "
         "  return d.a + d.cell.tag; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);
 }
@@ -291,7 +303,7 @@ BEZEL_TEST(implicit_base_generic_ctor_2882, control_no_ctor_base_and_direct_new_
         "  end; "
         "  return n; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 88);
 }
@@ -310,7 +322,7 @@ BEZEL_TEST(implicit_base_generic_ctor_2882, control_explicit_base_call_unchanged
         "  using var l := new LeafChain(); "
         "  return l.a + l.cell.tag + l.own; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 51);
 }

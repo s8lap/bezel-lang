@@ -36,6 +36,7 @@
 // silently does nothing, which "does not crash" would pass.
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -44,13 +45,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 9 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 9 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // A `Cell` whose live count is the exactly-once disposal oracle.
 const char* kCountedCell =
@@ -85,7 +97,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, no_ctor_reference_type_arg_spec_14
         "  using var d := new DGenNo<string>(); "
         "  return d.a + d.cell.tag; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);
 }
@@ -112,7 +124,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, explicit_base_call_spec_22_8_step_
         "  using var d := new DGenChain<string>(); "
         "  return d.a + d.cell.tag + d.own; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 53);
 }
@@ -135,7 +147,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, concrete_base_instantiation_spec_1
         "  using var d := new DConc<int>(); "
         "  return d.a + d.cell.tag; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);
 }
@@ -175,7 +187,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, three_level_renamed_params_spec_12
         "  end; "
         "  return (acc - 2790) + Cell.live * 100 + (Cell.made - 30); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // per iteration: 62 (qualified) + 62 (L3<string>.Total) + 62 (L3<int>.Total)
     //              = 186; 15 iterations = 2790. 30 Cells made, 0 left live.
@@ -228,7 +240,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, field_order_and_type_arg_axes_spec
         "  end; "
         "  return (acc - 5360) + Cell.live * 100 + (Cell.made - 120); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // per iteration: p1 42+3+3+5 = 53; p2/p3/p4 41+3+3+5 = 52 each; q1 18+3+4+5
     // = 30; q2 17+3+4+5 = 29  => 268; 20 iterations = 5360. 120 Cells, 0 live.
@@ -273,7 +285,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, permuted_two_param_base_spec_14_1)
         "  end; "
         "  return (acc - 936) + Cell.live * 100 + (Cell.made - 24); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // per iteration: 41+3+6+4+7 = 61 and 5+3+9 = 17 => 78; 12 iterations = 936.
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -322,7 +334,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, throwing_generic_base_ctor_spec_22
         "  end; "
         "  return (n - 490) + Cell.live * 100 + (Cell.made - 20); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // per iteration: 1 (caught) + 41 + 3 + 4 = 49; 10 iterations = 490.
     // 20 Cells made (one per throwing ctor, one per successful ctor), 0 live.
@@ -363,7 +375,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, control_non_generic_derived_unchan
         "  end; "
         "  return n - 183; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 44 + 51 + 44 + 44 = 183
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -399,7 +411,7 @@ BEZEL_TEST(generic_derived_generic_base_2889, control_non_generic_base_and_same_
         "  end; "
         "  return n - 60; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 4+5+3+2 = 14 and 41+3+2 = 46 => 60
     BEZEL_EXPECT_EQ(r.exitCode, 0);

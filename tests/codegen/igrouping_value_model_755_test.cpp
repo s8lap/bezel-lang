@@ -60,6 +60,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -67,13 +68,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 10 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 10 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // ---------------------------------------------------------------------------
 // [17] Inner `for var el in g` over an IGrouping — stdlib §5:3076 + spec §29.2.
@@ -336,7 +348,7 @@ BEZEL_TEST(igrouping_value_model_755,
     // Pre-fix: compile error "not yet implemented: codegen for this for
     // statement" at the inner `for var el in g` (finding [17]).
     JitResult r = runAotChecked(kInnerForOverGrouping);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);  // 1+3 + 2+4
 }
@@ -346,7 +358,7 @@ BEZEL_TEST(igrouping_value_model_755,
     // Pre-fix: did not compile. Post-fix this also pins that the inner loop
     // does not null the outer loop variable's slot (`g.Key` after it).
     JitResult r = runAotChecked(kInnerForThenKey);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 110);  // (4 + 100) + (6 + 0)
 }
@@ -356,7 +368,7 @@ BEZEL_TEST(igrouping_value_model_755,
     // Pre-fix: Count() = 8 (the int key's byte size per group, finding [20]),
     // and the materialized groups leaked (LSan).
     JitResult r = runAotChecked(kSelectManyOverGroups);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 50);  // n=4 → 40, s=1+2+3+4=10
 }
@@ -365,7 +377,7 @@ BEZEL_TEST(igrouping_value_model_755,
            selectmany_over_uneven_groups_counts_per_group_spec_5) {
     // Pre-fix: 8 (4 per group × 2 groups) instead of 6.
     JitResult r = runAotChecked(kSelectManyUnevenGroups);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);
 }
@@ -375,7 +387,7 @@ BEZEL_TEST(igrouping_value_model_755,
     // Pre-fix: Sum(sel), Min, Max, Any, All, Aggregate and Count(pred) all saw
     // an EMPTY sequence, so r stayed 0 (a silent wrong value, no diagnostic).
     JitResult r = runAotChecked(kGroupingSelectorTerminals);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 60 + (10+30) + 1 + 2 + 60 + 2
     BEZEL_EXPECT_EQ(r.exitCode, 165);
@@ -388,7 +400,7 @@ BEZEL_TEST(igrouping_value_model_755,
     // is closed by construction: the copy is produced by the ordinary
     // materialize path, not by returning the grouping's own array.)
     JitResult r = runAotChecked(kGroupingToArrayIsAFreshCopy);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 218);  // copy 9+200, group still 9
 }
@@ -397,7 +409,7 @@ BEZEL_TEST(igrouping_value_model_755,
            grouping_toarray_count_is_group_size_spec_5_3070) {
     // Pre-fix: 0 (untyped local → `.Count` lowered to 0) plus a leak.
     JitResult r = runAotChecked(kGroupingToArrayCount);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);  // even {2,4} = 2, odd {3} = 1
 }
@@ -405,7 +417,7 @@ BEZEL_TEST(igrouping_value_model_755,
 BEZEL_TEST(igrouping_value_model_755,
            grouping_single_returns_the_one_element_spec_5_3020) {
     JitResult r = runAotChecked(kGroupingSingleOnOneElement);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -416,7 +428,7 @@ BEZEL_TEST(igrouping_value_model_755,
     // returned 4 and the catch arm was dead (#2265 item 2 — the behaviour the
     // shipped #1296 test pinned as correct).
     JitResult r = runAotChecked(kGroupingSingleFaultsOnTwo);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 55);
 }
@@ -427,7 +439,7 @@ BEZEL_TEST(igrouping_value_model_755,
     // arithmetic — an ASan heap-buffer-overflow READ (#2265 item 3), so this
     // test flipped r.ran rather than reaching the catch arm.
     JitResult r = runAotChecked(kGroupingElementAtBounds);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 71);  // 5 in range + 66 from the caught fault
 }

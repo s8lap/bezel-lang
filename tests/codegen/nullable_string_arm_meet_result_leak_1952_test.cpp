@@ -62,6 +62,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -69,12 +70,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 9 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 9 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // (A) #1952 repro — a NULLABLE `case` expression whose producer arm mints
 // `"a"+"b"`, bound to a `string?` local inside a loop. Each of the 5 iterations
@@ -221,7 +234,7 @@ const char* kNullableCoalesceBorrowsReturnedLoop =
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            nullable_case_producer_arm_loop_lsan_clean_spec_19_2) {
     JitResult r = runAotChecked(kNullableCaseProducerArmLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);          // 5 minted strings each freed once
     BEZEL_EXPECT_EQ(r.exitCode, 10);   // 5 * "ab".Length
 }
@@ -232,7 +245,7 @@ BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            nullable_if_expr_producer_branch_loop_lsan_clean_spec_20) {
     JitResult r = runAotChecked(kNullableIfExprProducerBranchLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);
 }
@@ -244,7 +257,7 @@ BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            nullable_case_null_arm_loop_sound_spec_28_3) {
     JitResult r = runAotChecked(kNullableCaseNullArmLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }
@@ -256,7 +269,7 @@ BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            inferred_nullable_case_producer_loop_lsan_clean_spec_19_2) {
     JitResult r = runAotChecked(kInferredNullableCaseProducerLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);
 }
@@ -269,7 +282,7 @@ BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            nullable_case_borrow_arm_returned_loop_no_regression_spec_28_3) {
     JitResult r = runAotChecked(kNullableCaseBorrowArmReturnedLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);
 }
@@ -281,7 +294,7 @@ BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            nullable_coalesce_borrows_returned_loop_no_regression_spec_7_7) {
     JitResult r = runAotChecked(kNullableCoalesceBorrowsReturnedLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);
 }
@@ -330,7 +343,7 @@ const char* kNullableStringMethodReturnBindLoop =
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            nullable_string_method_return_bind_loop_lsan_clean_28_9) {
     JitResult r = runAotChecked(kNullableStringMethodReturnBindLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // 5 minted strings each freed once
     BEZEL_EXPECT_EQ(r.exitCode, 10);  // 5 * "ab".Length
 }
@@ -371,7 +384,7 @@ const char* kNullableConditionalEscapeLocalLoop =
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            nullable_conditional_escape_local_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kNullableConditionalEscapeLocalLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // 4 minted "xy" each freed once
     BEZEL_EXPECT_EQ(r.exitCode, 4);   // 4 (every iteration null)
 }
@@ -398,7 +411,7 @@ const char* kNullableIfConditionalEscapeLocalLoop =
 BEZEL_TEST(nullable_string_arm_meet_result_leak_1952,
            nullable_if_conditional_escape_local_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kNullableIfConditionalEscapeLocalLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 4);
 }

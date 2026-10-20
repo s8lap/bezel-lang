@@ -83,15 +83,24 @@ using bezel::test::diagnosticMessageContains;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent — mirrors dict_indexer_set_key_local_release_3872_test.cpp /
-// dict_call_arg_key_local_release_3886_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 10 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 10 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 std::string prog(const std::string& mainBody) {
     return "module M; class C public static method Main(): int " + mainBody +
@@ -120,7 +129,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j);
@@ -146,7 +155,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j) + 1;
@@ -171,7 +180,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += 1 + keyLen(j);
@@ -198,7 +207,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += 1 + keyLen(j);
@@ -225,7 +234,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j) + 1;
@@ -250,7 +259,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += 1 + keyLen(j);
@@ -277,7 +286,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += 1 + keyLen(j);
@@ -300,7 +309,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) expected += keyLen(j) + 1;
@@ -336,7 +345,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j)
@@ -377,7 +386,7 @@ BEZEL_TEST(dict_sorted_key_local_release_3887_3888,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Deliberately the INVERSE of every row above: the VALUE position is NOT
     // claimed by this fix, so it must still trip LeakSanitizer on both sides
     // of this commit — a leak report here is the expected, unchanging result.

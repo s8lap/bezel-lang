@@ -54,6 +54,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -63,12 +64,27 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 6 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. 2 of them ran their assertion block only inside an
+// `if (!wasSkipped(...))` — the same SKIP test in POSITIVE polarity — so
+// those rows skipped their assertions outright as well.
+// That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 6 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // ===========================================================================
 // (A) The issue's primary repro — `Console.WriteLine(h.M())` where
@@ -244,7 +260,7 @@ BEZEL_TEST(codegen_object_temp_box_call_arg_2876,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(kConsoleWriteLineProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-fix: 1 (LSan reports 480 B / 20)
 }
@@ -258,7 +274,7 @@ BEZEL_TEST(codegen_object_temp_box_call_arg_2876,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(kConsoleWriteProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-fix: 1
 }
@@ -272,7 +288,7 @@ BEZEL_TEST(codegen_object_temp_box_call_arg_2876,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(kInterpolationProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-fix: 1 (480 B / 20 — same shape)
 }
@@ -287,7 +303,7 @@ BEZEL_TEST(codegen_object_temp_box_call_arg_2876,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(kBlockBodyProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -303,12 +319,11 @@ BEZEL_TEST(codegen_object_temp_box_call_arg_2876,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult lenient = runAotCheckedLenient(kBoundObjectNoOverRelease);
-    if (!wasSkipped(lenient)) {
-        BEZEL_EXPECT_TRUE(lenient.ran);
-        BEZEL_EXPECT_EQ(lenient.exitCode, 0);
-    }
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(lenient));
+    BEZEL_EXPECT_TRUE(lenient.ran);
+    BEZEL_EXPECT_EQ(lenient.exitCode, 0);
     JitResult r = runAotChecked(kBoundObjectNoOverRelease);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -325,12 +340,11 @@ BEZEL_TEST(codegen_object_temp_box_call_arg_2876,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult lenient = runAotCheckedLenient(kStoredFieldReturnNoOverRelease);
-    if (!wasSkipped(lenient)) {
-        BEZEL_EXPECT_TRUE(lenient.ran);
-        BEZEL_EXPECT_EQ(lenient.exitCode, 0);
-    }
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(lenient));
+    BEZEL_EXPECT_TRUE(lenient.ran);
+    BEZEL_EXPECT_EQ(lenient.exitCode, 0);
     JitResult r = runAotChecked(kStoredFieldReturnNoOverRelease);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

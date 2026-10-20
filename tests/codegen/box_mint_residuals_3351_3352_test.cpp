@@ -72,6 +72,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -81,12 +82,27 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 6 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. 2 of them ran their assertion block only inside an
+// `if (!wasSkipped(...))` — the same SKIP test in POSITIVE polarity — so
+// those rows skipped their assertions outright as well.
+// That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 6 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // ===========================================================================
 // #3351 (A) — `var ob: Object := h.M() as Object;` — the issue's primary
@@ -288,7 +304,7 @@ BEZEL_TEST(codegen_box_mint_residuals_3351_3352,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(k3351_ObjectAsObject);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-fix: 1 (LSan reports 480 B / 20)
 }
@@ -302,12 +318,11 @@ BEZEL_TEST(codegen_box_mint_residuals_3351_3352,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult lenient = runAotCheckedLenient(k3351_BoundNoAs);
-    if (!wasSkipped(lenient)) {
-        BEZEL_EXPECT_TRUE(lenient.ran);
-        BEZEL_EXPECT_EQ(lenient.exitCode, 0);
-    }
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(lenient));
+    BEZEL_EXPECT_TRUE(lenient.ran);
+    BEZEL_EXPECT_EQ(lenient.exitCode, 0);
     JitResult r = runAotChecked(k3351_BoundNoAs);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -321,7 +336,7 @@ BEZEL_TEST(codegen_box_mint_residuals_3351_3352,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(k3352_IndexerCallArg);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-fix: 1 (LSan reports 480 B / 20)
 }
@@ -335,7 +350,7 @@ BEZEL_TEST(codegen_box_mint_residuals_3351_3352,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(k3352_IndexerInterp);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -349,7 +364,7 @@ BEZEL_TEST(codegen_box_mint_residuals_3351_3352,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(k3352_PropertyCallArg);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -364,12 +379,11 @@ BEZEL_TEST(codegen_box_mint_residuals_3351_3352,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult lenient = runAotCheckedLenient(k3352_StoredFieldNoOverRelease);
-    if (!wasSkipped(lenient)) {
-        BEZEL_EXPECT_TRUE(lenient.ran);
-        BEZEL_EXPECT_EQ(lenient.exitCode, 0);
-    }
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(lenient));
+    BEZEL_EXPECT_TRUE(lenient.ran);
+    BEZEL_EXPECT_EQ(lenient.exitCode, 0);
     JitResult r = runAotChecked(k3352_StoredFieldNoOverRelease);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

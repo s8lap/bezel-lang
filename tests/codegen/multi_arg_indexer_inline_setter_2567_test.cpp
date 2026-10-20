@@ -56,6 +56,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -63,12 +64,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 9 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 9 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // ----------------------------------------------------------------------
 // Probe A — 2-arg inline-setter on a CLASS. The inline body stores
@@ -358,7 +371,7 @@ const char* kOneArgCompoundNamedLocalClassLoop =
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            two_arg_inline_class_field_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kTwoArgInlineClassFieldLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -372,7 +385,7 @@ BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            two_arg_inline_class_array_delegate_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kTwoArgInlineClassArrayDelegateLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -382,7 +395,7 @@ BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            three_arg_inline_class_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kThreeArgInlineClassLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -393,7 +406,7 @@ BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            one_arg_inline_class_regression_clean_spec_23_4_28_9) {
     JitResult r = runAotChecked(kOneArgInlineClassLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -404,7 +417,7 @@ BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            two_arg_interface_dispatch_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kTwoArgInterfaceDispatchLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -416,7 +429,7 @@ BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            two_arg_class_vtable_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kTwoArgClassVtableLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -429,7 +442,7 @@ BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            two_arg_compound_class_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kTwoArgCompoundClassLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -440,7 +453,7 @@ BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            one_arg_compound_class_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kOneArgCompoundClassLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -454,6 +467,6 @@ BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
 BEZEL_TEST(codegen_multi_arg_indexer_inline_setter_2567,
            one_arg_compound_named_local_class_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kOneArgCompoundNamedLocalClassLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }

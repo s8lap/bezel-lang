@@ -168,6 +168,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -176,14 +177,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 8 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 8 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
@@ -237,7 +248,7 @@ BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
 BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
            callee_owned_dictionary_return_is_not_a_wild_jump_28_9) {
     JitResult r = runAotChecked(kReturnRepro);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: "SEGV on unknown address 0x… (pc 0x… ) … Hint: PC is at a
     // non-executable region. Maybe a wild jump?". `r.ran` is also the no-leak
     // half: the snapshot is freed by the wrapper's slot-1 Dispose and the
@@ -271,7 +282,7 @@ BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix on e57a1eb: SIGSEGV, rc 139 — identical symptom to (A)/(B).
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "n=30"));
@@ -302,7 +313,7 @@ BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix on e57a1eb: SIGSEGV, rc 139.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "n=30"));
@@ -340,7 +351,7 @@ BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix on e57a1eb: SIGSEGV, rc 139.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "order=123"));
@@ -383,7 +394,7 @@ BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x ((1 + 1) + (2 + 2)) == 1200.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1200"));
@@ -418,7 +429,7 @@ BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix on e57a1eb this SEGV'd like every other coerced shape; the
     // dictionary is empty by construction, so the value observable is 0 and
     // `r.ran` (no fault, no leak, no double free) carries the row.
@@ -447,7 +458,7 @@ BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Identical on both sides of the fix.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "n=30"));
@@ -488,7 +499,7 @@ BEZEL_TEST(callee_owned_dictionary_ienumerable_wrap_3519,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 x (2 + 3) == 1000.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1000"));

@@ -73,6 +73,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAot / runAotChecked — the AOT oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -85,15 +86,24 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked AOT run is SKIPPED (not failed) when the ASan link toolchain is
-// absent (mirrors the #3968 harness helper — lane worktrees in this project
-// have the ASan runtime unavailable; the gate tree has it).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// #3733 toolchain-SKIP burn-down. This file's 9 checked rows used to
+// guard on a local `wasSkipped` predicate whose whole body read the literal
+// "SKIP" out of the result's diagnostics, and then RETURNED from the row on
+// it. That is an ABSORBING site by
+// scripts/check_toolchain_skip_surface.py's own definition, and it is a silent
+// vacuous pass: on a box whose clang cannot link the ASan binary, all
+// 9 rows returned WITHOUT asserting and the suite reported a clean PASS
+// having compiled and run nothing. MEASURED on the pre-change tree with the
+// harness's own knob (`BEZEL_AOT_FORCE_NO_TOOLCHAIN=1`): every row green.
+//
+// Every one of those guards becomes the sanctioned LOUD form,
+// `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
+// (tests/support/aot_result_asserts.hpp), in the same statement position: the
+// skip is still recognised as an environment condition, but it now MARKS THE
+// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
+// the strengthening. Every substantive assertion in every row (r.ran and the
+// exitCode pins) stays exactly where it was.
 
 // `class Res` is the disposable-shaped class from the issue. `body` is the
 // Main method body. The destructor prints "D" so tests can count disposals
@@ -171,7 +181,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "  i := i + 1; "
         "end; "
         "return acc - 100;"));
-    if (wasSkipped(jr)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // Pre-fix: LSan catches the leak (one `Res(1)` block per iteration, 100
     // of them) and `jr.ran` becomes false. Post-fix: the explicit Dispose
     // reclaims each block, LSan is silent, `jr.ran` stays true.
@@ -245,7 +255,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "    return acc - 700; "
         "  end Main; "
         "end C; ");
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 0);
 }
@@ -267,7 +277,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "x.Dispose(); "
         "x2.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // Only x and x2 are ever independently disposed; y is never itself
     // disposed on this row (MEASURED: exit=2).
@@ -331,7 +341,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "y.Dispose(); "
         "x.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // MEASURED: exit=2 (Res(1) once via the first Dispose(), Res(5) once via
     // x.Dispose(); the second y.Dispose() is a clean no-op).
@@ -378,7 +388,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "y.Dispose(); "
         "x.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // MEASURED: exit=2 (Res(1) reclaimed via y.Dispose(); Res(5) reclaimed
     // via x.Dispose()).
@@ -423,7 +433,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "x.Dispose(); "
         "x2.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // MEASURED: exit=3 (Res(1) reclaimed via y.Dispose(); x's Res(5)
     // reclaimed via x.Dispose(); x2's Res(9) reclaimed via x2.Dispose()).
@@ -532,7 +542,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "    return Counter.Dropped + a + b - 2; "
         "  end Main; "
         "end C; ");
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // MEASURED: exit=4 (each call: its own arm's Res(1)/Res(2) reclaimed [1]
     // + post-merge y.Dispose() no-op, sticky bit AND-merge correctly true on
@@ -624,7 +634,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "    return acc - 300; "
         "  end Main; "
         "end C; ");
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // The load-bearing assertion: `jr.ran` false here means either a SIGSEGV
     // (the null-guard regressed) or a leak/double-free (the AND-merge or the
     // dispatch-only fallback regressed). MEASURED: exit=0 (each
@@ -733,7 +743,7 @@ BEZEL_TEST(explicit_dispose_borrow_became_owned_leak_4246,
         "    return acc - 300; "
         "  end Main; "
         "end C; ");
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // MEASURED: exit=0 (each OneIteration returns 1, 300 calls, minus 300;
     // 150 reclaiming-arm + 150 borrow-arm calls, alternating, never crash).
     BEZEL_EXPECT_TRUE(jr.ran);
