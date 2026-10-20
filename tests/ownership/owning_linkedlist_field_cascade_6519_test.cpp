@@ -15,8 +15,9 @@
 //
 // The leak itself: a field declared `private owned _seq: IEnumerable<Item>`
 // stores an `OwningLinkedList<Item>`. Because `IEnumerable<T>` is an
-// iterator-format head (§29.7), the store materialises an OWNING ENUMERATOR
-// WRAPPER (`bz$llenumown$ptr$Dispose`) holding the list pointer, and the
+// iterator-format head (§29.2, with stdlib §4.12's declaration of it,
+// v0.338), the store materialises an OWNING ENUMERATOR WRAPPER
+// (`bz$llenumown$ptr$Dispose`) holding the list pointer, and the
 // holder's teardown calls that wrapper's slot-1 Dispose. That Dispose
 // emitted `bz_llist_free(self->list, NULL)` — a hardcoded NULL, with no
 // element-type-derived fallback either. The list was freed; the `Item`s were
