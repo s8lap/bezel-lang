@@ -4142,6 +4142,90 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                         "admitted on `Array<T>` (§15.6), so "
                                         "iterate `Keys` or copy the entries into "
                                         "an array to take a sub-range");
+                            // fix #6551 (§5.1, v0.338; §23.4, v0.338; stdlib
+                            // §4.8/§4.9/§4.17): the indexer key slot is an
+                            // ORDINARY declared parameter position, so §5.1
+                            // governs it exactly as it governs `Add(key: K,
+                            // …)`. stdlib §4.8 declares the indexer as
+                            // `public property [key: K]: V` — the same written
+                            // `K` it declares for `ContainsKey(key: K)`,
+                            // `Remove(key: K)`, `GetOrNull(key: K)` and
+                            // `Add(key: K, value: V)` — and §23.4 makes the
+                            // parameter-TYPE LIST what admits an index, so
+                            // there is no raw key slot and no carve-out: §5.1's
+                            // own closing words are "there is no position
+                            // carve-out … the list is illustrative, not closed",
+                            // and its never-implicit bullet names signed/unsigned
+                            // of the same-or-narrower width with no exception
+                            // for an index argument.
+                            //
+                            // MEASURED on the pre-fix base, the indexer was the
+                            // ONE member of the six that did not check, and it
+                            // agreed with none of the other five — `var i := 7`
+                            // against `Dictionary<ulong, string> := [7: "S"]`:
+                            //
+                            //   d[i]           ACCEPTED, no diagnostic  (this)
+                            //   d[i] := v      ACCEPTED, no diagnostic  (this)
+                            //   i in d         rejected (§5.1)     (#6527)
+                            //   d.GetOrNull(i) rejected (§5.1)     (#6527)
+                            //   d.ContainsKey(i) / d.Remove(i) / d.Add(i, v)
+                            //                                      rejected
+                            //
+                            // The accepted answer is a side effect, not a check:
+                            // #6541's `coerceDictKeyToKeyType` zero-extends the
+                            // `int` at the indexer (and nowhere else), so `d[i]`
+                            // happens to read the right entry today. That is
+                            // memory-safety-relevant rather than cosmetic —
+                            // §5.2 makes a signed/unsigned conversion a CHECKED
+                            // `OverflowException`, and admitting it implicitly
+                            // at one member of six is what turns any future
+                            // narrowing at a key slot into a silent wrap at the
+                            // indexer and nowhere else.
+                            //
+                            // NOT range-specific, and not gated on the index
+                            // SPELLING: `d[3.5]`, `d[b]` at a `bool`, and
+                            // `d[s]` at a `string` are the same gap (§5.1's
+                            // table is numeric widening only), so a fix matching
+                            // the `Range` spelling would have left every one of
+                            // them reading a key the other five refuse.
+                            //
+                            // `checkAssignable` is the SAME function the call
+                            // form uses, with `fromExpr` supplied so §5.1's
+                            // constant-narrowing clause applies identically to
+                            // both spellings — `d[7]` at a `Dictionary<byte, V>`
+                            // or `Dictionary<ulong, V>` is a §5.1 constant
+                            // narrowing across signedness and stays admitted.
+                            //
+                            // SCOPED to the indexer's own key argument. The
+                            // wider index-argument question — `Array<T>[j]` at
+                            // a `long j` is likewise a §5.1 error (#6527 left
+                            // it alone for the same reason) — is a separate
+                            // gate on a different declared parameter type, and
+                            // widening this one to it is not this fix's call.
+                            //
+                            // The BARE TYPE PARAMETER carve-out is #6500's and
+                            // #6527's precedent for this exact mechanism, not a
+                            // new ruling: at `T := int` the key is an `int` and
+                            // at `T := Range<int>` it is a `Range`, and
+                            // §14.1 / §14.2 rule 2 read an interior use at the
+                            // instantiations the declaration forms, not at the
+                            // declaration. Fail OPEN there.
+                            if (keyT && !keyIsBareParam &&
+                                !(rangeIdx && !keyIsRange)) {
+                                if (auto* idxTy = ctx_.exprType(
+                                        *ix->indices[0].value)) {
+                                    SourceLocation kLoc =
+                                        ix->indices[0].value->span.begin
+                                                .line != 0
+                                            ? ix->indices[0].value->span.begin
+                                            : e.span.begin;
+                                    checkAssignable(
+                                        idxTy, ctx_.makeTypeRef(*keyT), kLoc,
+                                        std::string("index argument to `") +
+                                            std::string(cn) + "[key]`",
+                                        ix->indices[0].value.get());
+                                }
+                            }
                         }
                         ctx_.setExprType(&e, tt->genericArgs[1]);
                     }
