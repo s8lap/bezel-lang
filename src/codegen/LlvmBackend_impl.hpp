@@ -12757,6 +12757,13 @@ private:
     // Queue/OwningQueue. For borrowed sources (a named local already owned
     // elsewhere, a parameter, a field), keep the plain borrowing wrap so the
     // shared source is not double-freed.
+    // fix #6552 (§28.11 / §29.1; stdlib §4.11, v0.338): at an
+    // `IOwningEnumerable<T>` head this returns the DRAINING machinery with
+    // `lifo = true` and `ownsBacking = true` — the array/List twins' #6544
+    // repair, with the order MEASURED rather than assumed: stdlib §4.11 makes a
+    // stack iterate TOP-first (pop order), which is `bz_array_drain_next_lifo`,
+    // not the front-to-back default. The body below is therefore the
+    // BORROWING `IEnumerable<T>` head only.
     llvm::Value* wrapOwnedStackAsIEnumerator(llvm::Value* arr,
                                              const sema::TypeRef* iEnumTy);
 

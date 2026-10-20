@@ -12845,6 +12845,56 @@ llvm::Value* Emitter::wrapStackAsIEnumerator(llvm::Value* arr,
 // coincidence.
 llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
                                                   const sema::TypeRef* iEnumTy) {
+    // fix #6552 (§28.11 / §29.1 / §29.2; stdlib §4.11 / §4.13, v0.338): this
+    // leaf was the THIRD owning sibling with #6544's defect, and its order is
+    // the reverse of theirs, so the drain had to be settled by MEASUREMENT
+    // rather than by copying #6544's.
+    //
+    // THE RULE, identical to the array/List twins' and derived from the same
+    // two clauses. §29.1 makes slot 3 `TakeCurrent` — "transfers ownership of
+    // the most-recently-yielded value to the caller, leaving the enumerator's
+    // internal slot empty" — so ownership LEAVES the collection at each yield
+    // and the head DRAINS. §28.11's `Dispose()` row then owes the frame "every
+    // live element ... then releases storage", i.e. everything no yield took.
+    // A callee-owned collection returned at this head (the callee's local is
+    // gone, §28.3 K3) has no other owner, so nobody else can pay it.
+    //
+    // THE DEFECT, MEASURED on `c31298da`: a callee-owned `OwningStack<Item>`
+    // bound at an `IOwningEnumerable<Item>` head and never iterated leaks
+    // 32 B in 2 allocations from `bz$M.C$Build` — byte for byte the array and
+    // LinkedList twins. This leaf installed the plain BORROWING
+    // MoveNext/Current and, via #6439's `consultHeader = 0`, freed the backing
+    // with a null element disposer, stranding every element. Flipping only the
+    // `consultHeader` flag would be the wrong repair for the same reason #6544
+    // gave: with no drain the array still names pointers the loop already
+    // freed. Draining FIRST makes the cascade correct in every iteration
+    // state (never iterated ⇒ all; fully iterated ⇒ storage only; partial ⇒
+    // exactly the remainder).
+    //
+    // THE ORDER — MEASURED, not assumed, and this is the one thing that does
+    // NOT transfer from #6544. stdlib §4.11 "Iteration order": "All four types
+    // iterate (via `IReadOnlyCollection<T>`) in take order — a stack top-to-
+    // bottom (pop order)". `bz_array_drain_next` pops index 0, which for a
+    // stack's backing array is the BOTTOM — the wrong end. So this leaf must
+    // ask for `lifo`, which selects `bz_array_drain_next_lifo` (stdlib §4.11's
+    // own `OwningStack<T>.Drain()`, `bz_runtime.h:483`). MEASURED both ways on
+    // `c31298da`, pushing 1,2,3 onto an `OwningStack<Item>` and reading it at an
+    // `IOwningEnumerable<Item>` head: the loop prints 3,2,1 — TOP-FIRST — and
+    // the pre-fix read path here is therefore already §4.11-correct, which is
+    // why #3405 gave the BORROWING stack leaf its `ArrayLifo` divert and why
+    // `lifo = true` here REPRODUCES the existing read order rather than
+    // changing it. The order row in the regression test is what keeps that
+    // true: a drain popping the wrong end would satisfy every leak row below
+    // and fail only that one.
+    //
+    // `ownsBacking = true`: the source frame's slot-1 Dispose reclaims the
+    // array (cascading over the elements the drain did not pop) while its
+    // slot-4 clones carry a frame-only Dispose — the array twin's split, and
+    // the same reason: a clone of a frame that owns the backing would free it
+    // twice.
+    if (builtinTypeName(iEnumTy) == "IOwningEnumerable")
+        return wrapArrayAsIOwningEnumerator(arr, iEnumTy, /*lifo=*/true,
+                                            /*ownsBacking=*/true);
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
         elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
@@ -12871,21 +12921,21 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
     // cache-key segment that keeps two `ptr`-lowered element types from
     // sharing one Dispose.
     llvm::Function* elDisp = ownedWrapElementDisposer(iEnumTy);
-    // fix #6439 (§28.6 / §28.11, v0.338): the array twin's head gate, asked
-    // rather than re-spelled. `IEnumerable<T>` borrows and keeps every element
-    // at Dispose, so the header disposer recorded at construction is
-    // authoritative; `IOwningEnumerable<T>` has already moved ownership out to
-    // the loop via §29.1's `TakeCurrent` and this wrap does not drain, so the
-    // header would name freed pointers. In the cache key because the head now
-    // changes the Dispose BODY, for the same reason #3450 keyed on the
-    // disposer: two `ptr`-lowered element types, or the two heads over one
-    // element type, must not share one function. The segment marks the
-    // NON-cascading (owning) head — reachable only for a class element, so
-    // only under `ptr` — which leaves every borrowing name unchanged.
-    bool consultHeader = builtinTypeName(iEnumTy) != "IOwningEnumerable";
+    // fix #6552 (§28.6 / §28.11, v0.338): #6439's head gate is GONE. It existed
+    // only to keep the `IOwningEnumerable<T>` head — which does NOT drain here
+    // — from consulting a header naming pointers the loop had already freed;
+    // that head is the very head the divert above now routes onto the DRAINING
+    // machinery (the array/List twins' #6544 repair), so the borrowing
+    // `IEnumerable<T>` head is the only one reaching this body and the header
+    // is always the authoritative record. With the second head gone there is
+    // nothing left for the gate to keep apart from, and the `$iow` cache-key
+    // segment goes with it: the Dispose BODY no longer varies with the head,
+    // so the key does not need to. Borrowing symbol names are unchanged, which
+    // is why `tests/lit/enumerator_vtable_cache_internal_linkage_3477.bzl` (the
+    // only lit row pinning these names) is untouched.
+    bool consultHeader = true;
     std::string prefix =
-        "bz$stackenumown$" + elemName + ownedWrapDisposerKey(elDisp) +
-        (consultHeader ? "" : "$iow") + "$";
+        "bz$stackenumown$" + elemName + ownedWrapDisposerKey(elDisp) + "$";
 
     // Owning Dispose: bz_array_free(self->arr, <element disposer>); free(self).
     auto* dispFn = module_->getFunction(prefix + "Dispose");
@@ -12905,10 +12955,13 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
         llvm::Value* elDispVal = elDisp
             ? llvm::cast<llvm::Value>(elDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
-        // fix #6439 (§28.6 / §28.11, v0.338): head-aware free, so the
-        // BORROWING `IEnumerable<T>` head consults the construction-time header
-        // disposer (this array twin's leak, 2x16 B) while the owning head keeps
-        // the element-type disposer verbatim. See the cache-key comment above.
+        // fix #6439 (§28.6 / §28.11, v0.338): consult the construction-time
+        // header disposer — this array twin's leak, 2x16 B, and the correct
+        // record for the only head left here. fix #6552 (§28.11, v0.338) removed
+        // the head test: the `IOwningEnumerable<T>` head now leaves for the
+        // draining machinery above, so the fallback argument below is never
+        // reached with a collection a loop had already emptied. See the
+        // cache-key comment above.
         auto* freeArrFn = module_->getOrInsertFunction(
             "bz_array_free_owning_wrap", llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i32()}, false))
