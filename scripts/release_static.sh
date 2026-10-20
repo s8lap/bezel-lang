@@ -141,6 +141,27 @@ fi
 GCC_MAJOR=$(clang++ -v 2>&1 | sed -n 's|^Selected GCC installation: .*/||p')
 NEEDED=$(objdump -p "$STAGE/$NAME/bin/bezelc" 2>/dev/null | awk '/NEEDED/{print "    " $2}' || true)
 
+# The floor a PROGRAM bezelc links needs. It is set by the runtime archive,
+# which was compiled against this machine's glibc headers (e.g. glibc >= 2.38
+# headers redirect strtol to __isoc23_strtol), not by how bezelc itself is
+# linked: link one program with the staged tree and read its symbol versions.
+PROBE="$OUT_DIR/probe"
+rm -rf "$PROBE"; mkdir -p "$PROBE"
+cat >"$PROBE/probe.bzl" <<'BZL'
+module Probe;
+
+public class Program
+  public static method Main()
+    Console.WriteLine("probe");
+  end Main;
+end Program;
+BZL
+(cd "$PROBE" && "$STAGE/$NAME/bin/bezelc" probe.bzl -o probe) \
+  || die "the staged compiler could not link a program"
+PROG_GLIBC=$(objdump -T "$PROBE/probe" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1)
+PROG_GLIBCXX=$(objdump -T "$PROBE/probe" | grep -o 'GLIBCXX_[0-9][0-9.]*' | sort -uV | tail -1)
+rm -rf "$PROBE"
+
 cat >"$STAGE/$NAME/README.md" <<EOF
 # bezelc $VERSION (Linux x86_64)
 
@@ -160,8 +181,10 @@ So you need:
 - \`clang\` on \`PATH\` (any recent version; built and tested with clang 21);
 - the C and C++ development files clang links against: glibc (crt files,
   libm, libpthread) and libstdc++ (\`libstdc++.so\` for \`-lstdc++\`). The
-  runtime archive was built against the libstdc++ headers of GCC $GCC_MAJOR;
-  an older libstdc++ may lack symbols it references.
+  runtime archive was built against the libstdc++ headers of GCC $GCC_MAJOR
+  and this build machine's glibc headers, so the programs it links need
+  ${PROG_GLIBC/_/ } and ${PROG_GLIBCXX:-libstdc++} or newer, at link time and at
+  run time, whatever the floor of \`bezelc\` itself.
   - Fedora: \`sudo dnf install clang libstdc++-devel\`
   - Debian/Ubuntu: \`sudo apt install clang libstdc++-dev\` (or
     \`libstdc++-<N>-dev\` matching your GCC)
