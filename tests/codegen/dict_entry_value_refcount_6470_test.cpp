@@ -62,15 +62,31 @@
 // simply never registered, so its minted +1 leaks — §28.3's stated safe
 // direction, and the identical trade the Key half has made since #3720.
 //
-// A leak pin must prove its detector ran. `runAotChecked` defaults to
-// `ASAN_OPTIONS=detect_leaks=0`, so a plain row is VACUOUS for a leak: green on
-// a broken tree while showing a clean sanitizer trio. Every leak row below arms
-// the leak oracle with `BEZEL_AOT_DETECT_LEAKS=strict` (save/restored, so a gate
-// running the knob does not leak into a sibling row) and asserts
-// `!checkedToolchainSkipped(r)` BEFORE any guard that could absorb the skip —
-// `if (skipped(r)) return;` inverts the oracle, reporting a clean pass on a
-// box whose ASan link was unavailable. No `LSAN_OPTIONS` is set: these are
-// found at LSan defaults.
+// A leak pin must prove its detector ran, and WHICH HELPER THE ROW CALLS is
+// what arms it — not an environment variable. The one-argument `runAotChecked`
+// helper is `runAotCheckedImpl` called with the `/*detectLeaks=*/true` literal
+// (tests/support/aot_support.hpp), and that flag is what builds
+// `ASAN_OPTIONS=detect_leaks=1:exitcode=99:abort_on_error=0`; the sibling
+// `runAotCheckedLenient` passes `false` and runs `detect_leaks=0`, so a leak
+// assertion written against IT is VACUOUS — green on a broken tree while
+// printing the same clean "no leak" output an armed row prints. Every leak
+// assertion below therefore goes through `runAotChecked`;
+// `runAotCheckedLenient` is used only for the crash half (`expectRunsClean`),
+// where `r.ran` is the oracle. A helper named `runAotChecked*` is NOT evidence
+// the check is on: grep the `detectLeaks` argument in aot_support.hpp before
+// asserting anything about a row's leak coverage.
+//
+// `BEZEL_AOT_DETECT_LEAKS` is not that knob. It is read only by
+// `leakDetectMode()` (tests/support/force_sanitize.hpp), which `runAot` calls;
+// `runAotCheckedImpl` never calls it, so the `LeakEnv("strict")` scopes in this
+// file are INERT (see the note on the class). They are kept — and corrected
+// rather than deleted — only so the rows read as they did; nothing about leak
+// coverage depends on them.
+//
+// Every leak row asserts `!checkedToolchainSkipped(r)` BEFORE any guard that
+// could absorb the skip — `if (skipped(r)) return;` inverts the oracle,
+// reporting a clean pass on a box whose ASan link was unavailable. No
+// `LSAN_OPTIONS` is set: these are found at LSan defaults.
 //
 // THE OTHER ARM IS NOT COVERED HERE, DELIBERATELY. `lowerDictEntryFor`'s
 // loop-exit reclaim (LlvmBackend_Stmts.cpp) passes the same escape axis for a
@@ -97,7 +113,16 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-// Save/restore BEZEL_AOT_DETECT_LEAKS around a row — see the file header.
+// Save/restore BEZEL_AOT_DETECT_LEAKS around a row.
+//
+// IT IS INERT for every `runAotChecked` row in this file, and deliberately kept
+// only so the rows read the same as they did before the header correction
+// above. `runAotCheckedImpl` takes `detectLeaks` as a hardcoded argument and
+// never consults this variable — `leakDetectMode()` is read only by `runAot` —
+// so this scope changes nothing about the leak oracle. Do NOT read it as "this
+// row's leak checking is armed here": it is `runAotChecked` vs
+// `runAotCheckedLenient` that decides that. Delete it whenever the rows that
+// carry it are next edited for another reason.
 class LeakEnv {
 public:
     explicit LeakEnv(const char* value) {
