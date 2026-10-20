@@ -45,10 +45,21 @@
 // rather than hidden under the sanitizer's noise.
 //
 // THE ORACLE. `runAotChecked` (the ASan/LSan oracle), never the deprecated
-// in-process JIT harness: this is disposal work. `LeakEnv("strict")` makes a
-// LEAK a hard failure, which is what separates the two ways this can go wrong —
-// the base ABORTS (over-release), and a fix that stops copying at all would
-// instead produce the right count with a leak per element. Neither may pass.
+// in-process JIT harness: this is disposal work. It passes
+// `/*detectLeaks=*/true` as a hardcoded argument (aot_support.hpp), so the
+// harness arms LeakSanitizer BY CONSTRUCTION and a LEAK is a hard failure —
+// which is what separates the two ways this can go wrong: the base ABORTS
+// (over-release), and a fix that stops copying at all would instead produce the
+// right count with a leak per element. Neither may pass.
+//
+// WHY `LeakEnv("strict")` IS STILL HERE even though it is not what makes these
+// rows observe a leak. The `BEZEL_AOT_DETECT_LEAKS` knob is read at
+// aot_support.hpp:3416 and :4014, which are `runAot` and the two-module path —
+// NOT the `runAotChecked` family — so for these rows it is belt-and-braces
+// rather than load-bearing. It is kept for the direction it DOES protect: the
+// gate may run a whole shard with the knob set, and the RAII save/restore
+// stops that from polluting a `runAot`-based row elsewhere in the same process.
+// It is deliberately NOT what the leak rows rest on.
 //
 // The `expectClean` helper asserts `BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r))`
 // so an unarmed oracle reads red rather than silently green.
@@ -67,6 +78,15 @@ using bezel::test::runAotChecked;
 namespace {
 
 // Save/restore BEZEL_AOT_DETECT_LEAKS around a row.
+//
+// IT IS INERT for every `runAotChecked` row in this file, and deliberately kept
+// only so the rows read the same as they did before the header correction
+// above. `runAotCheckedImpl` takes `detectLeaks` as a hardcoded argument and
+// never consults this variable — `leakDetectMode()` is read only by `runAot` —
+// so this scope changes nothing about the leak oracle. Do NOT read it as "this
+// row's leak checking is armed here": it is `runAotChecked` vs
+// `runAotCheckedLenient` that decides that. Delete it whenever the rows that
+// carry it are next edited for another reason.
 class LeakEnv {
 public:
     explicit LeakEnv(const char* value) {
@@ -223,7 +243,9 @@ BEZEL_TEST(array_slice_retains_string_elements_6492,
 // un-retained and this row would go red.
 //
 // ⚠ THE BINDING SPELLING IS LOAD-BEARING HERE, AND IT IS NOT THE OBVIOUS ONE.
-// Measured on the BASE, over 200 rounds, `BEZEL_AOT_DETECT_LEAKS=strict`:
+// Measured on the BASE, over 200 rounds, `BEZEL_AOT_DETECT_LEAKS=strict` (that
+// knob is INERT for the rows below — see the file header; the rows are armed
+// by the helper they call):
 //   `using var s: Array<string> := src.Slice(0..1);`
 //       -> bezel: fatal: refcount over-release (string)   [abort]   DETERMINISTIC
 //   `var s: Array<string> := src.Slice(0..1);`  (and `var s := …`)

@@ -59,13 +59,26 @@
 // freed exactly once and its own `owned` fields are discharged by its
 // destructor rather than reinterpreted as an iterator frame.
 //
-// WHY EVERY ROW ARMS THE LEAK ORACLE (`LeakEnv("strict")`). The defect is a
-// wild jump, but a fix that merely stopped jumping could do it by DECLINING the
-// slot-1 dispatch — which would leak the enumerator frame instead. That is the
-// same failure mode the controls are aimed at from the other side, and it is
-// invisible to a plain run: `runAotChecked` DEFAULTS to
-// `ASAN_OPTIONS=detect_leaks=0`, so a tree that stopped jumping by leaking would
-// go green. Arming the knob is what makes "and does not leak" real. Each row
+// WHY EVERY ROW IS A REAL LEAK ORACLE. The defect is a wild jump, but a fix
+// that merely stopped jumping could do it by DECLINING the slot-1 dispatch —
+// which would leak the enumerator frame instead. That is the same failure mode
+// the controls are aimed at from the other side, and it is invisible to a plain
+// run: a row that could not see that leak would go green on exactly that
+// broken tree. `runAotChecked` passes `/*detectLeaks=*/true` as a hardcoded
+// argument (aot_support.hpp), so the harness arms LeakSanitizer BY CONSTRUCTION
+// and "and does not leak" is real — the `LeakEnv("strict")` scope below is NOT
+// what arms it. Each row
+//
+// WHY `LeakEnv("strict")` IS STILL HERE even though it is not what makes these
+// rows observe a leak. The `BEZEL_AOT_DETECT_LEAKS` knob is read at
+// aot_support.hpp:3416 and :4014, which are `runAot` and the two-module path —
+// NOT the `runAotChecked` family — so for these rows it is belt-and-braces
+// rather than load-bearing. It is kept for the direction it DOES protect: the
+// gate may run a whole shard with the knob set, and the RAII save/restore
+// stops that from polluting a `runAot`-based row elsewhere in the same process.
+// It is deliberately NOT what the leak rows rest on.
+//
+// Each row
 // accumulates 500–1000 heap objects, far above the 50–500 one-shot band, and
 // every row returns a value derived from those iterations so a partial discharge
 // also shows as a wrong exit code.
@@ -87,6 +100,13 @@ namespace {
 // Save/restore BEZEL_AOT_DETECT_LEAKS around a row — the gate may run a whole
 // shard with the knob set, and a row must not pollute or inherit it. Copied
 // from todictionary_duplicate_key_leak_5421_test.cpp.
+//
+// IT IS INERT for every `runAotChecked` row in this file: `runAotCheckedImpl`
+// takes `detectLeaks` as a hardcoded argument and never consults this
+// variable — `leakDetectMode()` is read only by `runAot` — so this scope
+// changes nothing about the leak oracle. Do NOT read it as "this row's leak
+// checking is armed here": it is `runAotChecked` vs `runAotCheckedLenient`
+// that decides that.
 class LeakEnv {
 public:
     explicit LeakEnv(const char* value) {

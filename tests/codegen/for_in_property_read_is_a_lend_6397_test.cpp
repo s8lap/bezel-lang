@@ -93,15 +93,27 @@
 // loops so the free-then-read sequence is reached on every iteration rather
 // than by luck.
 //
-// ⚠ LSan IS **OFF** IN `runAotChecked` BY DEFAULT (`aot_support.hpp`'s
-// `LeakDetectMode` passes `detect_leaks=0`), so a plain `runAotChecked` row
-// CANNOT observe a leak — it exits 0 on a tree that leaks. Rows A–E assert the
-// USE-AFTER-FREE, which ASan reports with `detect_leaks=0` and which is what
-// this file's original defect was, so they are armed correctly by construction.
-// The LEAK rows must arm the knob explicitly with `LeakEnv("strict")` below; a
-// leak row that does not is worse than no row, because it looks like coverage
-// and certifies nothing. (`todictionary_duplicate_key_leak_5421_test.cpp`
-// carries the same save/restore, for the same reason.)
+// ⚠ WHICH HELPER A ROW CALLS IS WHAT ARMS IT, NOT AN ENVIRONMENT VARIABLE.
+// `runAotChecked` passes `/*detectLeaks=*/true` as a hardcoded argument
+// (aot_support.hpp), so the harness arms LeakSanitizer BY CONSTRUCTION and a
+// row on that helper DOES observe a leak; the sibling `runAotCheckedLenient`
+// passes `false` and runs `detect_leaks=0`, so a leak assertion written
+// against THAT helper is VACUOUS — it exits 0 on a tree that leaks. Rows A–E
+// assert the USE-AFTER-FREE, which ASan reports regardless of the leak knob
+// and which is what this file's original defect was, so they are armed
+// correctly by construction. Every leak row below goes through `runAotChecked`
+// as well, and is therefore armed for leaks too.
+//
+// WHY `LeakEnv("strict")` IS STILL HERE even though it is not what makes these
+// rows observe a leak. The `BEZEL_AOT_DETECT_LEAKS` knob is read at
+// aot_support.hpp:3416 and :4014, which are `runAot` and the two-module path —
+// NOT the `runAotChecked` family — so for these rows it is belt-and-braces
+// rather than load-bearing. It is kept for the direction it DOES protect: the
+// gate may run a whole shard with the knob set, and the RAII save/restore
+// stops that from polluting a `runAot`-based row elsewhere in the same process.
+// It is deliberately NOT what the leak rows rest on.
+// (`todictionary_duplicate_key_leak_5421_test.cpp` carries the same
+// save/restore, for the same reason.)
 //
 // NO ROW HERE ASSERTS THAT A LEAK OR A USE-AFTER-FREE IS PRESENT. Each row
 // asserts the program runs clean and prints the right sum, which is what stops
@@ -125,6 +137,15 @@ namespace {
 // Save/restore BEZEL_AOT_DETECT_LEAKS around a row. Required, not tidiness: the
 // gate may run a whole shard with the knob set, and a row that asserts
 // knob-ON behaviour must not be polluted by (or pollute) its neighbours.
+//
+// IT IS INERT for every `runAotChecked` row in this file, and deliberately kept
+// only so the rows read the same as they did before the header correction
+// above. `runAotCheckedImpl` takes `detectLeaks` as a hardcoded argument and
+// never consults this variable — `leakDetectMode()` is read only by `runAot` —
+// so this scope changes nothing about the leak oracle. Do NOT read it as "this
+// row's leak checking is armed here": it is `runAotChecked` vs
+// `runAotCheckedLenient` that decides that. Delete it whenever the rows that
+// carry it are next edited for another reason.
 class LeakEnv {
 public:
     explicit LeakEnv(const char* value) {
@@ -543,12 +564,12 @@ BEZEL_TEST(for_in_property_read_is_a_lend_6397,
 // consumer was told "no mint", took the field-lend branch, and withdrew the
 // loop's reclamation.
 //
-// WHY THE KNOB IS ARMED. `runAotChecked` passes `detect_leaks=0` by default
-// (see the file header), so this row is a leak assertion and must arm
-// `BEZEL_AOT_DETECT_LEAKS=strict` itself or it would pass on the very tree it
-// exists to catch. The `checkedToolchainSkipped` assertion comes FIRST and
-// INVERTS the skip, so a toolchain that cannot link the ASan binary fails
-// loudly here instead of being absorbed into a green row.
+// WHY THIS ROW IS A REAL LEAK ASSERTION. `runAotChecked` passes
+// `/*detectLeaks=*/true` as a hardcoded argument (see the file header), so the
+// harness arms LeakSanitizer for this row BY CONSTRUCTION and the row would
+// fail on the very tree it exists to catch. The `checkedToolchainSkipped`
+// assertion comes FIRST and INVERTS the skip, so a toolchain that cannot link
+// the ASan binary fails loudly here instead of being absorbed into a green row.
 //
 // §28.9 makes the two body spellings "semantically indistinguishable at every
 // read site", which is why the arrow face owes the reader the verdict the

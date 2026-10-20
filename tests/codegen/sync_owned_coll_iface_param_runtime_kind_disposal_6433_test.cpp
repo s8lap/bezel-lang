@@ -20,8 +20,9 @@
 // is the one place the spec says it. So sema
 // accepts the call with the ordinary §28.3 must-use WARNING — never an error —
 // the program computes the right answer, and the object is never freed. No
-// crash, no diagnostic. A pure leak, and `runAotChecked` is blind to it by
-// default (see WHY EVERY ROW ARMS THE LEAK ORACLE below).
+// crash, no diagnostic. A pure leak, and `runAotChecked` is NOT blind to it —
+// it passes `/*detectLeaks=*/true` as a hardcoded argument (see WHY EVERY ROW
+// IS A REAL LEAK ORACLE below).
 //
 // SCOPE IS THE THREE COLLECTION HEADS, MEASURED NOT ASSUMED. Unlike the three
 // LIST heads — whose sole implementer pair (`Array<T>` / `OwningArray<T>`) makes
@@ -109,6 +110,13 @@ namespace {
 
 // Save/restore BEZEL_AOT_DETECT_LEAKS around a row — the gate may run a whole
 // shard with the knob set, and a row must neither pollute nor inherit it.
+//
+// IT IS INERT for every `runAotChecked` row in this file: `runAotCheckedImpl`
+// takes `detectLeaks` as a hardcoded argument and never consults this
+// variable — `leakDetectMode()` is read only by `runAot` — so this scope
+// changes nothing about the leak oracle. Do NOT read it as "this row's leak
+// checking is armed here": it is `runAotChecked` vs `runAotCheckedLenient`
+// that decides that.
 class LeakEnv {
 public:
     explicit LeakEnv(const char* value) {
