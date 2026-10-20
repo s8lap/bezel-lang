@@ -92,6 +92,13 @@ endif()
 if(NOT BEZEL_GIT_DESCRIBE)
     set(BEZEL_GIT_DESCRIBE "0.0.0-unknown")
 endif()
+# A release build names its version explicitly (scripts/release_static.sh):
+# `git describe --tags` picks up any LOCAL tag (backup/bookkeeping tags on a dev
+# box), which must not leak into a published `bezelc --version`.
+set(BEZEL_VERSION_OVERRIDE "" CACHE STRING "Version string for --version (release builds)")
+if(BEZEL_VERSION_OVERRIDE)
+    set(BEZEL_GIT_DESCRIBE "${BEZEL_VERSION_OVERRIDE}")
+endif()
 message(STATUS "Bezel: version ${BEZEL_GIT_DESCRIBE} (from git describe, fix #3084)")
 
 # C++20 per CLAUDE.md's "Build toolchain" section.
@@ -360,7 +367,28 @@ message(STATUS "Bezel: using LLVM ${LLVM_PACKAGE_VERSION} (cmake dir ${LLVM_DIR}
 # codegen and the JIT share the one libLLVM, and the JIT still resolves the
 # Bezel `bz_*` runtime symbols via the test binary's own --whole-archive +
 # --export-dynamic. Falls back to the static components if no shared build.
-if(LLVM_LINK_LLVM_DYLIB OR TARGET LLVM)
+# --- Static release build (opt-in) ------------------------------------------
+# BEZEL_STATIC_RELEASE=ON builds a RELOCATABLE bezelc for a release tarball
+# (scripts/release_static.sh). It is OFF by default and changes nothing in the
+# normal build/ tree. When ON:
+#   * LLVM is linked from the static component archives (llvm-static), not the
+#     shared libLLVM, so the binary does not need libLLVM.so.NN at run time;
+#   * libgcc is linked statically, libstdc++ too when libstdc++.a is
+#     available (libstdc++-static), and with BEZEL_STATIC_RELEASE_FULL=ON the
+#     whole binary is `-static` (needs glibc-static as well);
+#   * the driver locates libbezel_runtime.a RELATIVE TO ITS OWN EXECUTABLE
+#     (<prefix>/bin/bezelc -> <prefix>/lib/bezel/libbezel_runtime.a) instead of
+#     the build tree's absolute path, which would only exist on this machine;
+#   * the test tree is not configured: the tests assume the build-tree runtime.
+option(BEZEL_STATIC_RELEASE
+    "Relocatable release bezelc: static LLVM/libgcc(/libstdc++), exe-relative runtime" OFF)
+option(BEZEL_STATIC_RELEASE_FULL
+    "With BEZEL_STATIC_RELEASE: link bezelc fully -static (needs glibc-static)" OFF)
+if(BEZEL_STATIC_RELEASE)
+    llvm_map_components_to_libnames(BEZEL_LLVM_LIBS
+        core orcjit native nativecodegen target codegen mc object)
+    message(STATUS "Bezel: static release -- linking static LLVM components")
+elseif(LLVM_LINK_LLVM_DYLIB OR TARGET LLVM)
     set(BEZEL_LLVM_LIBS LLVM)
     message(STATUS "Bezel: linking shared libLLVM (dylib)")
 else()
@@ -478,8 +506,33 @@ target_compile_definitions(bezelc PRIVATE
 # #5010: scoped to the ONE source that reads it, not the whole target — a
 # per-worktree absolute path on the command line is part of the ccache key, so
 # on all 52 bezel_core TUs it made every one of them miss in a fresh worktree.
-set_source_files_properties(src/driver/Driver.cpp PROPERTIES
-    COMPILE_DEFINITIONS "BEZEL_RUNTIME_LIB_PATH=\"$<TARGET_FILE:bezel_runtime>\"")
+if(BEZEL_STATIC_RELEASE)
+    # Static release: the runtime path is relative to bezelc's own directory
+    # (see the BEZEL_STATIC_RELEASE block above and Driver::runtimeLibraryPath).
+    set_source_files_properties(src/driver/Driver.cpp PROPERTIES
+        COMPILE_DEFINITIONS "BEZEL_RUNTIME_LIB_EXE_RELATIVE=\"../lib/bezel/libbezel_runtime.a\"")
+    # The shipped archive is linked into user programs by whatever clang the
+    # user has, which may not default to PIE codegen the way Fedora's does.
+    set_target_properties(bezel_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_options(bezelc PRIVATE -static-libgcc)
+    # clang prints the bare name back when the archive is absent.
+    execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.a
+        OUTPUT_VARIABLE _bezel_libstdcxx_a OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(IS_ABSOLUTE "${_bezel_libstdcxx_a}" AND EXISTS "${_bezel_libstdcxx_a}")
+        target_link_options(bezelc PRIVATE -static-libstdc++)
+        message(STATUS "Bezel: static release -- static libstdc++ (${_bezel_libstdcxx_a})")
+    else()
+        message(WARNING "Bezel: static release -- libstdc++.a not found "
+            "(install libstdc++-static); bezelc links libstdc++.so dynamically")
+    endif()
+    if(BEZEL_STATIC_RELEASE_FULL)
+        target_link_options(bezelc PRIVATE -static)
+        message(STATUS "Bezel: static release -- fully static (-static)")
+    endif()
+else()
+    set_source_files_properties(src/driver/Driver.cpp PROPERTIES
+        COMPILE_DEFINITIONS "BEZEL_RUNTIME_LIB_PATH=\"$<TARGET_FILE:bezel_runtime>\"")
+endif()
 # APPENDED after the #5010 SET above (a SET after it would drop this).
 # The linker the DRIVER uses for the programs it links (`clang -fuse-ld=<name>`
 # in Driver::linkCommandLine). This is the one link recipe both a shipped
@@ -550,4 +603,6 @@ endif()
 
 # --- Tests ------------------------------------------------------------------
 enable_testing()
-add_subdirectory(tests)
+if(NOT BEZEL_STATIC_RELEASE)  # the tests assume the build-tree runtime path
+    add_subdirectory(tests)
+endif()

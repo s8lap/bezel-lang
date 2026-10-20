@@ -33,6 +33,9 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 
 namespace bezel {
 
@@ -286,6 +289,18 @@ std::string Driver::preludeSourceFingerprint() {
 std::string Driver::runtimeLibraryPath() {
 #ifdef BEZEL_RUNTIME_LIB_PATH
     return BEZEL_RUNTIME_LIB_PATH;
+#elif defined(BEZEL_RUNTIME_LIB_EXE_RELATIVE)
+    // Static release build (CMake BEZEL_STATIC_RELEASE): the archive ships
+    // next to the executable, at a path relative to bezelc's own directory, so
+    // an extracted release tarball works wherever it is unpacked.
+    static int anchor;
+    const std::string exe = llvm::sys::fs::getMainExecutable(
+        nullptr, reinterpret_cast<void*>(&anchor));
+    if (exe.empty()) return {};
+    llvm::SmallString<256> p(llvm::sys::path::parent_path(exe));
+    llvm::sys::path::append(p, BEZEL_RUNTIME_LIB_EXE_RELATIVE);
+    llvm::sys::path::remove_dots(p, /*remove_dot_dot=*/true);
+    return std::string(p);
 #else
     return {};
 #endif
