@@ -267,6 +267,26 @@ void* bz_llist_node_prev(void* node);
 // Free all nodes (calling dispose_elem on each element if non-null) and the list struct.
 void bz_llist_free(void* list, void (*dispose_elem)(void*));
 
+// fix #6519 (§28.11 / stdlib §4.7, v0.338): record an OWNING list's element
+// disposer in its `bz_llist_t` header at construction — the list twin of
+// #2608's `bz_array_set_elem_disposer`. Codegen emits this only for a
+// concrete owning collection (`new OwningLinkedList<T>()`) whose element
+// policy yields a disposer thunk; a borrowing `LinkedList<T>` is never tagged
+// and keeps the calloc-zeroed NULL.
+void bz_llist_set_elem_disposer(void* list, void (*dispose_elem)(void*));
+
+// fix #6519 (§28.11 / stdlib §4.7, v0.338): the OWNING enumerable wrap's
+// slot-1 free — the list twin of `bz_array_free_owning_wrap`. `consult_header`
+// is set only for the BORROWING `IEnumerable<T>` head, where iteration lends
+// and the list still holds every element at Dispose, so the header disposer
+// recorded at construction is authoritative and skipping it strands the list's
+// class elements. It is CLEARED for the `IOwningEnumerable<T>` head, where
+// §29.1's `TakeCurrent` has already moved ownership out to the loop.
+// `fallback` is the element-type-derived disposer, used when the header
+// carries none.
+void bz_llist_free_owning_wrap(void* list, void (*fallback)(void*),
+                               int32_t consult_header);
+
 // ---------------------------------------------------------------------------
 // bz_dict_t — open-addressing hash table used by Dictionary<K,V>.
 // Two variants: string keys (most common) and generic keys (via fn pointers).

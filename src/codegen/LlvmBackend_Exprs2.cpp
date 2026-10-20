@@ -7084,9 +7084,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // in each node — same sizing as bz_array_t (4 for int/float, 8 otherwise).
             if (colName == "LinkedList" || colName == "OwningLinkedList") {
                 auto* allocFn = declareC("bz_llist_alloc", ptrTy(), {i64()});
+                // fix #6519 (§28.11 / stdlib §4.7, v0.338): stamp the element
+                // disposer into an OWNING list's header HERE, at construction,
+                // for #2608's reason — the concrete type is known only here, and
+                // an erased free site (the owning enumerable wrap, which emits
+                // `bz_llist_free(list, NULL)`) cannot recover it from the static
+                // type it was handed. Stamping inside `allocEmpty` rather than at
+                // each `return` covers BOTH construction forms of this arm — the
+                // no-arg form and the §4.6 source form — so a future one cannot
+                // skip it, the same pairing argument #2635 made for the array
+                // family. A borrowing `LinkedList<T>` is never tagged.
                 auto allocEmpty = [&]() -> llvm::Value* {
-                    return builder_.CreateCall(allocFn,
-                                               {builder_.getInt64(elemSize)});
+                    llvm::Value* l = builder_.CreateCall(
+                        allocFn, {builder_.getInt64(elemSize)});
+                    stampOwningLlistElemDisposer(
+                        l, rt->genericArgs.empty() ? nullptr : rt->genericArgs[0],
+                        common::isOwningPrefixedName(colName));
+                    return l;
                 };
                 if (ne.args.empty() || !ne.args[0].value) return allocEmpty();
                 // fix #2693 / stdlib §4.6 (v0.240): the SOURCE constructor.

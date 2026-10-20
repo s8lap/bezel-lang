@@ -13951,6 +13951,29 @@ private:
         builder_.CreateCall(setFn, {arr, d});
     }
 
+    // fix #6519 (§28.11 / stdlib §4.7, v0.338): the bz_llist_t twin, for
+    // `OwningLinkedList<T>`'s construction sites. Same invariant as the array
+    // stamp above ("an owning backing is always tagged at construction"), same
+    // `owning` gate, same #816 `resolveTypeParamRef`, same NULL-means-
+    // "borrowing" reading — it just names the list's own setter, because the
+    // list's element disposer lives in a DIFFERENT header field than the
+    // array's. `LinkedList<T>` never calls this (its `owning` is false), so
+    // the borrowing list keeps the calloc-zeroed NULL and can never be
+    // over-disposed by a consulting free site.
+    void stampOwningLlistElemDisposer(llvm::Value* list,
+                                      const sema::TypeRef* elemTy,
+                                      bool owning) {
+        if (!list || !owning) return;
+        llvm::Function* d =
+            elementPolicyFor(resolveTypeParamRef(elemTy), /*owningFamily=*/true)
+                .disposerThunk;
+        if (!d) return;   // value/unknown elements: nothing to run
+        auto* setFn = declareC("bz_llist_set_elem_disposer",
+                               llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), ptrTy()});
+        builder_.CreateCall(setFn, {list, d});
+    }
+
     // #362 / stdlib §4.5: a module-level `void(void*)` thunk that runs an
     // owning collection element's destructor via dynamic dispatch (vtable
     // slot 1), null-checking the element first. Suitable as the `dispose_elem`

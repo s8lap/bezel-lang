@@ -1923,6 +1923,22 @@ struct bz_llist_t {
     // next_seq@32, mod_count@40) unchanged — existing codegen and
     // runtime read those at fixed offsets.
     int64_t          kind;
+    // fix #6519 (§28.11 / stdlib §4.7, v0.338): the element disposer of an
+    // OWNING list, recorded at CONSTRUCTION (bz_llist_set_elem_disposer) for
+    // exactly the reason #2608 records it on bz_array_t — the concrete type is
+    // known only at construction, and an erased free site (the owning
+    // enumerable wrap, `bz_llist_free(list, NULL)`) cannot recover it from the
+    // static type it was handed. APPENDED AFTER `kind`, so kind STAYS at
+    // offset 48 and bz_runtime_dispose's single-offset probe is undisturbed
+    // (this field lands at 56, inside the struct's new 64-byte size, and the
+    // dict probe at 88 is past the end of an llist header but is only reached
+    // when the offset-48 probe already failed — a live llist always tags
+    // itself in bz_llist_alloc).
+    //
+    // NULL (calloc-zeroed) means "borrowing / no element disposal", i.e.
+    // exactly the pre-#6519 behaviour, so an untagged list can never be
+    // over-disposed by the consulting path.
+    void (*elem_disposer)(void*);
 };
 
 // Allocate a node with elem_size bytes of value storage, stamping it with the
@@ -1944,6 +1960,17 @@ void* bz_llist_alloc(int64_t elem_size) {
     l->kind = BZ_RUNTIME_KIND_LLIST;  // fix #3026
     l->elem_size = elem_size;
     return l;
+}
+
+// fix #6519 (§28.11 / stdlib §4.7, v0.338): the bz_llist_t twin of
+// #2608's `bz_array_set_elem_disposer`. Codegen emits this only for a
+// concrete OWNING list (`new OwningLinkedList<T>()`) whose element policy
+// yields a disposer thunk; a borrowing `LinkedList<T>` is never tagged and
+// keeps the calloc-zeroed NULL. Idempotent, like the array twin, so a
+// stamp-then-override sequence is supported.
+void bz_llist_set_elem_disposer(void* listp, void (*dispose_elem)(void*)) {
+    if (!listp) return;
+    ((bz_llist_t*)listp)->elem_disposer = dispose_elem;
 }
 
 int64_t bz_llist_count(void* listp) {
@@ -2100,6 +2127,45 @@ void* bz_llist_node_next(void* nodep) {
 
 void* bz_llist_node_prev(void* nodep) {
     return nodep ? ((bz_llist_node_t*)nodep)->prev : nullptr;
+}
+
+// fix #6519 (§28.11 / stdlib §4.7, v0.338): the OWNING enumerable wrap's
+// slot-1 free — the bz_llist_t twin of `bz_array_free_owning_wrap`. Same
+// question, same answer, asked with the list's own header:
+//
+//   * `IEnumerable<T>` head — the wrap installs the BORROWING `Current`, so
+//     iteration LENDS each element and the list still holds every one of them
+//     at Dispose. The header disposer recorded at construction is
+//     authoritative, and skipping it is #6519's leak: an `OwningLinkedList<Item>`
+//     behind an `owned IEnumerable<Item>` field stranded both Items
+//     (MEASURED 32 B / 2 allocs on base; 1,440,000 B / 90,000 allocs at 300×300).
+//
+//   * `IOwningEnumerable<T>` head — §29.1/§29.2 make slot 3 `TakeCurrent`, so
+//     ownership LEAVES the list at each yield. `wrapLinkedListAsIEnumerable`
+//     routes that head to the DRAINING wrap (`owningDrainWrapForHead` →
+//     `wrapLinkedListAsIOwningEnumerator`), whose `bz_llist_drain_next` REMOVES
+//     each node, so the header is a harmless no-op on an emptied list. But the
+//     OWNING wrap (`wrapOwnedLinkedListAsIEnumerable`) does NOT drain —
+//     MEASURED, zero `bz_llist_drain_next` calls in the IR of a callee-owned
+//     `IOwningEnumerable<Item>` return, where the wrap used is
+//     `bz$llenumown$ptr$Dispose` — so there the loop has already discharged
+//     each element while the list still holds the pointer, and consulting the
+//     header is a DOUBLE DISPOSE. The head is therefore passed as an explicit
+//     flag rather than inferred; header-always over-disposes, no-header leaks,
+//     and only the head separates them (the same measured argument #6439
+//     records for the array-backed families).
+//
+// `fallback` is the element-type-derived disposer, used when the header
+// carries none — the untagged-borrowing-list case, where it keeps the
+// `LinkedList<string>` +1 release that the insert side's retain paired.
+void bz_llist_free_owning_wrap(void* listp, void (*fallback)(void*),
+                               int32_t consult_header) {
+    if (!listp) return;
+    auto* l = (bz_llist_t*)listp;
+    void (*disp)(void*) = consult_header && l->elem_disposer
+                              ? l->elem_disposer
+                              : fallback;
+    bz_llist_free(listp, disp);
 }
 
 void bz_llist_free(void* listp, void (*dispose_elem)(void*)) {

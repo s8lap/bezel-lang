@@ -13411,11 +13411,16 @@ llvm::Value* Emitter::wrapLinkedListAsIEnumerable(llvm::Value* list,
 // the "unbound `new` LinkedList" local-decl case needs. Slot 4 stamps fresh
 // NON-owning clones (GetEnumerator) so a per-loop enumerator disposes only
 // its own struct while the wrapper owns the list exactly once at the local's
-// scope end (§28.3 — leak-free, no double-free). Element-disposer-less
-// bz_llist_free is correct at the local-decl site because the source is an
-// unbound `new` by construction, so it is EMPTY (no constructor takes
-// elements; collection constructors reserve a node pool, not contents —
-// mirroring #2975 manifestation 3's empty-by-construction predicate).
+// scope end (§28.3 — leak-free, no double-free).
+//
+// fix #6519 (§28.11 / stdlib §4.7, v0.338) RETRACTS the "element-disposer-less
+// bz_llist_free is correct here" claim this comment used to make. That claim
+// rested on the source being an unbound `new` and therefore EMPTY — true of
+// the local-decl face (#2987) but NOT of the RETURN face this function also
+// serves (`srcOwnedByCallee`), and not of the `owned IEnumerable<Item>` FIELD
+// store, where the list is populated before the wrap is minted. MEASURED on
+// the issue's repro: 32 B / 2 allocs; 1,440,000 B / 90,000 allocs amplified.
+// The free site now asks `bz_llist_free_owning_wrap(list, elDisp, head)`.
 llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
         llvm::Value* list, const sema::TypeRef* iEnumTy) {
     llvm::Type* elemTy = i32();
@@ -13441,10 +13446,51 @@ llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
     // "plain" family that the OWNING vtable never points at).
     std::string elemName = linkedListEnumElementName(elemTy);
     std::string plainPrefix = "bz$llenum$" + elemName + "$";
-    std::string prefix = "bz$llenumown$" + elemName + "$";
+    // fix #6519 (§28.11 / stdlib §4.7, v0.338): the free site asked
+    // `bz_llist_free(self->list, NULL)` — an unconditional hardcoded NULL,
+    // which for a CLASS element is wrong in the leak direction on the
+    // borrowing head (the wrap's `Current` lends, so the list still holds
+    // every element at Dispose: MEASURED 32 B / 2 allocs for the issue's
+    // repro, 1,440,000 B / 90,000 allocs amplified). The array twins were
+    // fixed by #6439; this is the same question asked of the list.
+    //
+    // The ELEMENT-TYPE-DERIVED disposer is the fallback, exactly as on the
+    // array twins (`ownedWrapElementDisposer`): it is what keeps the
+    // `LinkedList<string>` +1 release that the insert side's `llRetainElem`
+    // paired (#2686 / #2692), which this site was ALSO leaking —
+    // MEASURED 3,297,600 B / 180,000 allocs amplified, against a clean
+    // `using var a := new LinkedList<string>()` baseline. NULL for a class
+    // element (ClassBorrow's thunk is null), so the fallback alone never
+    // closes #6519 — the header is what does.
+    llvm::Function* elDisp = ownedWrapElementDisposer(iEnumTy);
+    // The head decides whether the list's RECORDED header disposer may be
+    // consulted here — the same measured argument #6439 records for the array
+    // families, and it applies here because the OWNING list wrap is reachable
+    // at the `IOwningEnumerable<T>` head too (MEASURED: a callee-owned
+    // `OwningLinkedList<Item>` returned at an `IOwningEnumerable<Item>` head
+    // mints `bz$llenumown$ptr$Dispose`, with zero `bz_llist_drain_next` calls
+    // in the IR — this wrap does NOT drain, so the loop has already
+    // discharged each element while the list still names the pointer, and
+    // consulting the header is a double-dispose). Header-always
+    // over-disposes; no-header leaks on the borrowing head; only the head
+    // separates them, so it is passed as an explicit flag.
+    bool consultHeader = builtinTypeName(iEnumTy) != "IOwningEnumerable";
+    // The head AND the disposer are both part of the cache key, for #6439's
+    // and #3450's reasons respectively: each changes the Dispose BODY, so two
+    // wraps that share a name would share a body that runs the wrong
+    // disposer. The segment marks the NON-cascading (owning) head, which
+    // `IOwningEnumerable<T>`'s `where T: class` (stdlib §4.13) makes
+    // reachable only for a class element and so only under the `ptr` elemName
+    // — leaving every other name (including the `i32` rows pinned by
+    // `tests/lit/enumerator_vtable_cache_internal_linkage_3477.bzl`)
+    // unchanged.
+    std::string prefix = "bz$llenumown$" + elemName +
+                         ownedWrapDisposerKey(elDisp) +
+                         (consultHeader ? "" : "$iow") + "$";
     auto* voidTy = llvm::Type::getVoidTy(llvm_);
 
-    // --- Owning Dispose: bz_llist_free(self->list, null); free(self).
+    // --- Owning Dispose: bz_llist_free_owning_wrap(self->list, elDisp, head);
+    //     free(self).
     auto* dispFn = module_->getFunction(prefix + "Dispose");
     if (!dispFn) {
         dispFn = llvm::Function::Create(
@@ -13456,13 +13502,17 @@ llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
         llvm::Value* self = dispFn->arg_begin();
         llvm::Value* listPtr = b.CreateLoad(ptrTy(),
             b.CreateStructGEP(stTy, self, 1));
+        llvm::Value* elDispVal = elDisp
+            ? llvm::cast<llvm::Value>(elDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
         auto* freeLstFn = module_->getOrInsertFunction(
-            "bz_llist_free",
-            llvm::FunctionType::get(voidTy, {ptrTy(), ptrTy()}, false))
+            "bz_llist_free_owning_wrap",
+            llvm::FunctionType::get(voidTy, {ptrTy(), ptrTy(), i32()}, false))
             .getCallee();
         b.CreateCall(
-            llvm::FunctionType::get(voidTy, {ptrTy(), ptrTy()}, false),
-            freeLstFn, {listPtr, llvm::ConstantPointerNull::get(ptrTy())});
+            llvm::FunctionType::get(voidTy, {ptrTy(), ptrTy(), i32()}, false),
+            freeLstFn, {listPtr, elDispVal,
+                        llvm::ConstantInt::get(i32(), consultHeader ? 1 : 0)});
         auto* freeFn = module_->getOrInsertFunction(
             "free", llvm::FunctionType::get(voidTy, {ptrTy()}, false))
             .getCallee();

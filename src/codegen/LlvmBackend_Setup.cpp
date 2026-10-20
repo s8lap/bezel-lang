@@ -45442,6 +45442,16 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         auto* allocFn = declareC("bz_llist_alloc", ptrTy(), {i64()});
         llvm::Value* ll =
             builder_.CreateCall(allocFn, {builder_.getInt64(es)}, "clit.ll");
+        // fix #6519 (§28.11 / stdlib §4.7, v0.338): the SECOND `bz_llist_alloc`
+        // construction site, and the one the array family's #2635 pass had to
+        // chase down separately — a stamp living at only one construction site
+        // is an invariant nothing enforces. Same pairing rationale as the
+        // `new` arm in LlvmBackend_Exprs2.cpp. `owning` is the concrete head
+        // test, so a borrowing `LinkedList<T>` literal is never tagged and
+        // keeps the calloc-zeroed NULL header.
+        stampOwningLlistElemDisposer(ll, er,
+                                     common::isOwningPrefixedName(
+                                         collTy->headName()));
         auto* addFn = declareC("bz_llist_add_last", ptrTy(),
                                {ptrTy(), ptrTy(), i64()});
         for (const auto& elemPtr : cl->elements) {
