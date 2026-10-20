@@ -8620,6 +8620,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // count as a byte count and truncates every width>1 key.
         auto strDataLen = [&](llvm::Value* s)
                 -> std::tuple<llvm::Value*, llvm::Value*, llvm::Value*> {
+            // fix #6540 (§8.4 / §3.6, v0.338): a `Dictionary<string?, V>` key
+            // may be ABSENT, and `s` is then a null `bz_string*` — the ONE
+            // encoder every named string-key member of the isDict block shares
+            // (ContainsKey/Contains/Add/TryAdd/Remove/TryGetValue/GetOrNull/
+            // GetOrAdd/Clear's callers), so substituting here covers the whole
+            // named surface at the one site that defines the encoding.
+            s = dictStringKeyOperand(s);
             llvm::Value* data = loadStringData(s);
             llvm::Value* len  = loadStringLen(s);
             llvm::Value* w    = loadStringWidth(s);   // i8, fix #4499

@@ -5926,6 +5926,39 @@ private:
         return builder_.CreateLoad(i8Ty, p, "str.width");
     }
 
+    // fix #6540 (spec §8.4 / §3.6, v0.338): a DICTIONARY KEY operand that is
+    // safe to read the (data, length, width) triple from when the key may be
+    // ABSENT. `Dictionary<string?, V>` is a legal instantiation and `null` is a
+    // legal key there — §3.6's *hashable* row admits `T?` through §8.4's
+    // null-safe wrapper, which "hashes `null` to one fixed implementation-defined
+    // value", and §8.4 states `null = null` is `true`. `null` lowers to a null
+    // `bz_string*`, so every string-key encoder pre-fix ran
+    // `loadStringData(nullptr)` — a struct-GEP off the null pointer followed by
+    // a load. MEASURED (issue 6540, base `e0594ff4`): a SEGV reading address
+    // 0, inside `main`, at exit 139, on `.Add(null, v)`, `.GetOrNull(null)`,
+    // `.ContainsKey(null)` and `null in d` alike (ASan: "SEGV on unknown
+    // address 0x000000000000 ... caused by a READ memory access").
+    //
+    // The substitution is a ZERO-INITIALISED `bz_string` in the entry frame,
+    // whose triple is exactly (null, 0, 0) — and a zero width is what no real
+    // `bz_string` carries (§4.6 widths are 1/2/4), so it is a marker the
+    // runtime can tell from any present key. Selecting a SAFE POINTER and then
+    // loading from it (rather than selecting the three already-loaded values)
+    // is what keeps the load itself off address 0: a `select` over
+    // `loadStringData(null)` still faults, because the faulting load is emitted
+    // unconditionally either way.
+    //
+    // Emitted unconditionally, not gated on the key type's nullability: at a
+    // non-nullable `Dictionary<string, V>` the branch is dead and folds away,
+    // and it makes the absent-key encoding identical at every string-key site
+    // rather than dependent on each site's ability to recover `K`.
+    llvm::Value* dictStringKeyOperand(llvm::Value* strPtr) {
+        llvm::Value* absent = entryAlloca(stringType());
+        builder_.CreateStore(llvm::Constant::getNullValue(stringType()), absent);
+        return builder_.CreateSelect(builder_.CreateIsNull(strPtr, "key.absent"),
+                                     absent, strPtr, "key.sel");
+    }
+
     // Return the total byte size of the string data (len * width).
     llvm::Value* loadStringByteSize(llvm::Value* strPtr) {
         llvm::Value* len = loadStringLen(strPtr);

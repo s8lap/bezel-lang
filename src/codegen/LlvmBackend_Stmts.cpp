@@ -8824,6 +8824,17 @@ std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictStringKeyAt(
     // code-point-sequence question.
     llvm::Value* wpPtr = builder_.CreateGEP(i8Ty, widthsArr, idx);
     llvm::Value* kwB   = builder_.CreateLoad(i8Ty, wpPtr, "dk.width");
+    // fix #6540 (spec §8.4 / §3.6, v0.338): a width of ZERO is the ABSENT-key
+    // marker — no real `bz_string` carries it (§4.6 widths are 1/2/4), and
+    // `bz_dict_keys_str` / `bz_dict_next_str` record it for a stored `null`
+    // key. The rebuild below is harmless for it (`kl * kw` is 0, and the
+    // snapshot's raw pointer is the ordinary 1-byte `bz_key_dup` allocation, so
+    // nothing reads through a null pointer and the caller's `free` is
+    // unchanged); only the REBUILT value is replaced, by the null `bz_string*`
+    // a `null` binding already is everywhere else in codegen, so a `null` key
+    // read back out of a `Dictionary<string?, V>` IS null rather than "".
+    llvm::Value* keyAbsent =
+        builder_.CreateICmpEQ(kwB, builder_.getInt8(0), "dk.absent");
     llvm::Value* kw64  = builder_.CreateZExt(kwB, i64(), "dk.w64");
     llvm::Value* kbytes = builder_.CreateMul(kl, kw64, "dk.bytes");
     // One extra width-sized zero slot, matching how bz_string data buffers are
@@ -8841,6 +8852,9 @@ std::pair<llvm::Value*, llvm::Value*> Emitter::decodeDictStringKeyAt(
     builder_.CreateStore(kwB,
         builder_.CreateStructGEP(stringType(), strObj, 2));
     initStringRc(strObj);
+    strObj = builder_.CreateSelect(keyAbsent,
+                                   llvm::ConstantPointerNull::get(ptrTy()),
+                                   strObj, "dk.key");
     return {strObj, kp};
 }
 

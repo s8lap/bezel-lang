@@ -920,9 +920,14 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
                             {ptrTy(), ptrTy(), ptrTy()});
         found = builder_.CreateCall(fn, {recv, keyPtr, tmpSlot});
     } else {
-        llvm::Value* kd = loadStringData(k);
-        llvm::Value* kl = loadStringLen(k);
-        llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3, v0.306)
+        // fix #6540 (§8.4 / §3.6, v0.338): `d[null]` is admitted at
+        // `Dictionary<string?, V>` exactly when `d.ContainsKey(null)` is, so
+        // the indexer GET encodes an absent key like every other string-key
+        // site instead of reading through the null pointer.
+        llvm::Value* kk = dictStringKeyOperand(k);
+        llvm::Value* kd = loadStringData(kk);
+        llvm::Value* kl = loadStringLen(kk);
+        llvm::Value* kw = loadStringWidth(kk);   // fix #4499 (§4.6/§8.3, v0.306)
         auto* fn = declareC("bz_dict_try_get_str", i1(),
                             {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
         found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
@@ -1172,9 +1177,13 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
                             {ptrTy(), ptrTy(), ptrTy()});
         found = builder_.CreateCall(fn, {recv, keyPtr, tmpSlot});
     } else {
-        kd = loadStringData(k);
-        kl = loadStringLen(k);
-        kw = loadStringWidth(k);        // fix #4499
+        // fix #6540 (§8.4 / §3.6, v0.338): same absent-key encoding as the
+        // indexer get (lowerCollectionIndexerGet above) — this is the
+        // `move d[k]` twin of it.
+        llvm::Value* kk = dictStringKeyOperand(k);
+        kd = loadStringData(kk);
+        kl = loadStringLen(kk);
+        kw = loadStringWidth(kk);        // fix #4499
         auto* fn = declareC("bz_dict_try_get_str", i1(),
                             {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
         found = builder_.CreateCall(fn, {recv, kd, kl, kw, tmpSlot});
@@ -1967,9 +1976,13 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         }
         return true;
     }
-    llvm::Value* kd = loadStringData(k);
-    llvm::Value* kl = loadStringLen(k);
-    llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3, v0.306)
+    // fix #6540 (§8.4 / §3.6, v0.338): `d[null] := v` is admitted at
+    // `Dictionary<string?, V>`, so the indexer SET stores the absent key under
+    // the same encoding every other string-key site uses.
+    llvm::Value* kk = dictStringKeyOperand(k);
+    llvm::Value* kd = loadStringData(kk);
+    llvm::Value* kl = loadStringLen(kk);
+    llvm::Value* kw = loadStringWidth(kk);   // fix #4499 (§4.6/§8.3, v0.306)
     if (valDisp) {
         auto* fn = declareC("bz_dict_set_str_disposing",
             llvm::Type::getVoidTy(llvm_),

@@ -710,6 +710,16 @@ static inline uint32_t bz_key_cp(const char* d, int8_t w, int64_t i) {
 // the first `len/width` code points only, which is the collision this fixes.)
 static uint32_t fnv1a_cp(const char* s, int64_t cp_len, int8_t w) {
     uint32_t h = 2166136261u;
+    // fix #6540 (spec §8.4 / §3.6, v0.338): `null` is a KEY of its own, not an
+    // absent one — §3.6 admits `T?` as hashable through §8.4's null-safe
+    // wrapper, which "hashes `null` to one fixed implementation-defined
+    // value". Without this the loop below would return the offset basis for
+    // `cp_len == 0`, which is also the hash of the EMPTY STRING — so `null`
+    // and `""` would share every bucket. Equality (bz_key_eq) still decides
+    // that correctly, so this is a probe-quality fix, not a correctness one;
+    // it is here because the spec asks for a fixed value OF ITS OWN and one is
+    // free.
+    if (!s) return h ^ 0x9E3779B9u;
     for (int64_t i = 0; i < cp_len; i++) {
         uint32_t c = bz_key_cp(s, w, i);
         h = (h ^ (uint8_t)( c        & 0xFFu)) * 16777619u;
@@ -728,6 +738,15 @@ static uint32_t fnv1a_cp(const char* s, int64_t cp_len, int8_t w) {
 // ordering.
 static bool bz_key_eq(const char* a, int64_t alen, int8_t aw,
                       const char* b, int64_t blen, int8_t bw) {
+    // fix #6540 (spec §8.4 / §3.6, v0.338): `null` is a KEY, equal only to
+    // itself (§8.4: `null = null` is true, `null = nonNull` is false). It is
+    // marked by a zero storage WIDTH — a value no real `bz_string` carries
+    // (§4.6 widths are 1/2/4) — and its stored buffer is a real 1-byte
+    // allocation, so every free/copy/snapshot path below is unchanged. The
+    // rule is tested FIRST: an absent key has length 0 and would otherwise
+    // compare equal to the empty string through the memcmp fast path below.
+    bool anull = (aw == 0), bnull = (bw == 0);
+    if (anull || bnull) return anull && bnull;
     if (alen != blen) return false;
     if (!a || !b) return a == b;
     if (aw == bw) {
@@ -747,6 +766,15 @@ static bool bz_key_eq(const char* a, int64_t alen, int8_t aw,
 // would end a strcmp early. Same relation as bz_str_compare_cp (#4487).
 static int bz_key_cmp_cp(const char* a, int64_t alen, int8_t aw,
                          const char* b, int64_t blen, int8_t bw) {
+    // fix #6540 (spec §8.4 / §3.6, v0.338): an ABSENT key (the zero-width
+    // marker) orders before every present key, and equal to another absent
+    // key. The spec does not rank `null` against a present key, so this is a
+    // RECORDED interpretation rather than a derived one — chosen because the
+    // alternative readings (treat it as "" or leave it unordered) either
+    // contradict §8.4's `null = null` or leave `bz_dict_min_key_str` /
+    // `bz_dict_max_key_str` with two keys they cannot rank.
+    bool anull = (aw == 0), bnull = (bw == 0);
+    if (anull || bnull) return anull == bnull ? 0 : (anull ? -1 : 1);
     if (!a) alen = 0;
     if (!b) blen = 0;
     int64_t n = alen < blen ? alen : blen;
@@ -955,7 +983,14 @@ int8_t bz_dict_is_disposed(void* dp) {
 bool bz_dict_try_get_str(void* dp, const char* k, int64_t k_len, int8_t k_w,
                          void** out) {
     auto* d = (bz_dict_t*)dp;
-    if (!d || !k) return false;
+    // fix #6540 (spec §8.4 / §3.6, v0.338): the pre-fix `|| !k` short-circuit
+    // read a null KEY as "no such entry", which cannot tell `ContainsKey(null)`
+    // after `Add(null, v)` from a lookup of a key that was never added. §8.4
+    // makes `null = null` true, so a null key is a key: with the zero-width
+    // marker in `k_w` it now hashes and compares like any other, and the
+    // `bz_key_dup(nullptr, 0, w)` store in `bz_dict_set_str` needs no change
+    // (its `if (n && k) memcpy` already skips the copy).
+    if (!d) return false;
     uint32_t h = fnv1a_cp(k, k_len, k_w);
     int64_t idx = dict_find(d, k, k_len, k_w, h);
     if (idx < 0) return false;
@@ -1078,7 +1113,13 @@ void bz_dict_keys_str(void* dp, char*** keys_out, int64_t** lens_out,
             if (e.key && !e.deleted) {
                 keys[j] = bz_key_dup(e.key, e.key_len, e.key_w);  // fix #4499
                 lens[j] = e.key_len;
-                wids[j] = e.key_w ? e.key_w : 1;
+                // fix #6540 (§8.4 / §3.6): an ABSENT key is stored with width
+                // 0 and must stay 0 here — normalising it to 1 would make the
+                // snapshot's absent key indistinguishable from "" — and no
+                // real key carries 0 (§4.6 widths are 1/2/4), so dropping the
+                // `?: 1` guard changes nothing else. `decodeDictStringKeyAt`
+                // reads the 0 back and rebuilds a null `bz_string*`.
+                wids[j] = e.key_w;
                 j++;
             }
         }
@@ -1617,7 +1658,9 @@ bool bz_dict_drain_next_str(void* dp, int64_t* cursor,
         // rides along so the caller can rebuild the key at its true width.
         if (key_out)     *key_out     = bz_key_dup(e.key, e.key_len, e.key_w);
         if (key_len_out) *key_len_out = e.key_len;
-        if (key_w_out)   *key_w_out   = e.key_w ? e.key_w : 1;
+        // fix #6540 (§8.4 / §3.6): the absent-key width-0 marker must survive
+        // the drain — same reason as bz_dict_keys_str above.
+        if (key_w_out)   *key_w_out   = e.key_w;
         if (val_out)     *val_out     = e.val;
         // Remove from the bucket (mark deleted, free key storage, nil val).
         free(e.key);

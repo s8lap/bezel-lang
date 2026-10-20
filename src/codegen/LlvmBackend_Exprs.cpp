@@ -9439,7 +9439,13 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                         {ptrTy(), ptrTy()});
                     return builder_.CreateCall(fn, {dict, kp}, "dict.in");
                 }
-                // String key fast path.
+                // String key fast path. fix #6540 (§8.4 / §3.6, v0.338): the
+                // left operand of `key in dict` is admitted exactly when
+                // `dict.Contains(key)`'s argument is (stdlib §4.8, §17.5), and
+                // at `Dictionary<string?, V>` that includes `null` — so this
+                // arm must encode an absent key like every other string-key
+                // encoder rather than reading through the null pointer.
+                key = dictStringKeyOperand(key);
                 llvm::Value* kdata = loadStringData(key);
                 llvm::Value* klen  = loadStringLen(key);
                 llvm::Value* kwid  = loadStringWidth(key);   // fix #4499

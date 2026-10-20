@@ -46955,9 +46955,13 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
             builder_.CreateCall(fn, {dict, spillKey(k), vPtr});
         } else {
             // String key: extract data/len from the bz_string struct.
-            llvm::Value* kd = loadStringData(k);
-            llvm::Value* kl = loadStringLen(k);
-            llvm::Value* kw = loadStringWidth(k);   // fix #4499 (§4.6/§8.3)
+            // fix #6540 (§8.4 / §3.6, v0.338): a `[key: value]` literal over
+            // `Dictionary<string?, V>` admits a `null` key, so this encoder
+            // takes the same absent-key substitution as every named member.
+            llvm::Value* kk = dictStringKeyOperand(k);
+            llvm::Value* kd = loadStringData(kk);
+            llvm::Value* kl = loadStringLen(kk);
+            llvm::Value* kw = loadStringWidth(kk);   // fix #4499 (§4.6/§8.3)
             auto* fn = declareC("bz_dict_set_str", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), i64(), i8(), ptrTy()});
             builder_.CreateCall(fn, {dict, kd, kl, kw, vPtr});
