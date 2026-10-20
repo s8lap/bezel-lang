@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.338. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.339. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.338 and `Bezel_Standard_Library.md` v0.338 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.339 and `Bezel_Standard_Library.md` v0.339 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -156,9 +156,9 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;`. A chain argument may read only the constructor's own parameters, constants and statics — never a field of `this` or a primary-constructor parameter. A `this(...)` chain must end at a constructor with no `this(...)`; a cycle is rejected. A **class** that declares no instance constructor has an implicit `public` parameterless one, so `new C()` compiles; declaring any instance constructor (a primary parameter list included) removes it, and a **body record** has no such implicit constructor | §22.7, §12.8 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
 | Operator | `public static pure method operator +(a: V, b: V): V => …;` closes `end operator +;` | §25.1 |
-| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `GetHashCode` beside them (`override` or plain, on a record, enum, or choice alike — v0.288), and by itself strips the record or value-like choice of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. Declaring `Equals` or `GetHashCode` (either spelling) strips the same package on a record or value-like choice; the type is then **hashable** on the declared pair, and `=`/`<>` are rejected until the overloads are written (§3.6, §9.2, §35.7). A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). Declaring `Equals` at all obliges `GetHashCode` beside it — on a record, enum or choice in either spelling, except on a choice owning at every instantiation (v0.317; records v0.336). | §25.2, §9.2, §8.3 |
+| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `GetHashCode` beside them (`override` or plain, on a record, enum, or choice alike — v0.288), and by itself strips the record or value-like choice of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. Declaring `Equals` or `GetHashCode` (either spelling) strips the same package on a record or value-like choice; the type is then **hashable** on the declared pair, and `=`/`<>` are rejected until the overloads are written (§3.6, §9.2, §35.7). A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). An enum declaring its own-typed `Equals` likewise has no `=`/`<>` until it overloads them, every other consumer reaching the declared pair (§10.5); inside the body compare `int(this) = int(other)`. Declaring the `Object`-slot `Equals` — the own-typed one on a record, enum or choice, in either spelling; `Equals(Object?)` or the own-typed one on a class — obliges the zero-parameter `GetHashCode` beside it, except on a choice owning at every instantiation (v0.317; records v0.336); an `Equals` at any other parameter list, an `override` of a user base's `Equals(a: K, b: K)` included, obliges nothing (§8.3). | §25.2, §9.2, §8.3 |
 | `override` on a value kind | only `Equals`, `GetHashCode` and `ToString` take it, `override` or plain (§9.2); on a record, an enum and a choice alike the `Equals` is the one taking the type's **own** type — `public override method Equals(other: Priority): bool`, `public method Equals(other: Money): bool` — and it **is** the `Object` slot: a boxed value and an `Object?` argument reach it (a non-own-typed argument is unequal), an `Equals(o: Object?)` is **rejected** on every value kind, `override` or plain, and the own-typed `Equals` obliges `GetHashCode` beside it (§8.3); an interface member `Equals(other: Object?)`, `GetHashCode(): int` or `ToString(): string` is satisfied by the member filling that slot — none, no conformance (§14.2) | §9.2, §10.5, §35.2, §8.3, §14.2 |
-| Invariant | `invariant(_bal + _limit >= 0m);` — class bodies only, no visibility, keeps its `;` | §22.16 |
+| Invariant | `invariant(_bal + _limit >= 0m);` — class bodies only, no visibility, keeps its `;`; checked at `public` entry and normal exit, an `async` method's entry only | §22.16 |
 | Nested type | `public record Token(…);` inside a class body — visibility **required**; one type per declaration, blind to an enclosing generic's type parameters (declare its own: `Node<U>` inside `Tree<T>`, used there as `Node<T>`); outside `Tree` and the bodies of types deriving from it, it has no type spelling (`Tree.Node<int>` is an arity error and `Tree<int>.Node<int>` does not parse in a type): reach it through a chain head (`Tree<int>.Node<int>.Create()`) or an inferred local, or declare it top-level | §11.6 |
 
 Also: `public const Max: int := 100;`; `static constructor()` … `end constructor;` (no visibility, no `pure`, no clauses); `polymorphic("dog": Dog, "cat": Cat);` (at most one per class).
@@ -641,7 +641,7 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 **Materializing is not a liveness remedy at class element types** (v0.265). `ToArray()`/`ToSet()`/`ToDictionary(…)` there build **borrowing** collections, so the materialized slots dangle exactly as the original borrow did; materialize-first is the **re-enumeration** remedy over a *live* backing, nothing more. What does remedy a dead-on-arrival element borrow: consume each element inside the loop body that borrows it, or give the elements an owner (an `IOwningEnumerable<T>` producer, consumed by owning iteration into an owning collection, with the accessor applied to *that* collection). Where the producer is a borrowing minting iterator you cannot change, **no retention remedy exists** (§29.11).
 
-**Lazy queries are single-consumption** (§29.11): enumerated at most once. The right is spent by enumeration or a terminal operator, by applying a further deferred operator (`var q2 := q.Select(f);`), or by passing the query as an `IEnumerable<T>` argument. It is orthogonal to ownership.
+**Lazy queries are single-consumption** (§29.11): enumerated at most once. The right is spent by enumeration or a terminal operator (an explicit `q.GetEnumerator()` call included — it begins the enumeration), by applying a further deferred operator (`var q2 := q.Select(f);`), or by passing the query as an `IEnumerable<T>` argument. It is orthogonal to ownership.
 
 **Element disposal is the owner's, always** (§28.6). `Dispose()` requires a receiver you own: an owned local or `owned` parameter, a `using var`, an unbound owned temporary, a `move` result, or an `owned` field / owning slot read by code of the owning object's declaring type. Through a **borrow it is a compile error with no exception** — a borrowed local or parameter, **`this`**, a non-`owned` field read, an owned-field read outside the declaring class, a getter result, a `catch`-arm binding, a pattern binding, a captured owned binding inside a closure, and an element borrow of *either* family. A borrowed **owning collection** may be added to, removed from, drained and read — the pass-and-fill idiom `method Fill(a: OwningArray<T>)  a.Add(…)` is core — but it may not be `Dispose`d.
 
@@ -673,7 +673,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.338 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.339 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -867,7 +867,8 @@ public interface IReadOnlyCollection<out T>: IEnumerable<T>   pure readonly prop
 public interface IReadOnlyList<out T>: IReadOnlyCollection<T>   readonly property [i: int]: T;  end
 public interface ICollection<T>: IReadOnlyCollection<T>
   readonly property IsReadOnly: bool;
-  method Add(item: T);  Clear();  Contains(item: T): bool;  Remove(item: T): bool;
+  method Add(item: T);  Clear();  Contains(item: T): bool;  Remove(item: T): bool;   // every bool Remove: true iff it removed
+                                                                                   //   (the first equal element); false, unchanged, if absent
 end
 public interface IList<T>: IReadOnlyList<T>, ICollection<T>
   property [i: int]: T;   method Insert(index: int, item: T);
@@ -1733,6 +1734,7 @@ when c1 => A(), _ => B() end when;                            // WRONG: same —
 public static method operator ++(c: Counter): Counter => …;   // WRONG: `++`/`--` are not overloadable (v0.289) — declare `operator +`, write `c := c + 1;`
 if count then ... end;                                        // WRONG: no truthiness
 var (a, b) := point;                                        // WRONG: destructuring is pattern-position only
+case o of Nope(var v) => A(), _ => B() end;                 // WRONG: a pattern head that names no type, case or constant (another module's alias included) is a compile error, never a silent non-match (§19.3)
 public method Log(params items: Array<string>);             // WRONG: no `params`
 var c := new Config() with(Timeout := 30);                  // WRONG: `with` needs a RECORD source
 var caller: (a: int, b: int) -> int := Sub;  caller(b := 2, a := 100);   // WRONG: a call through a FUNCTION VALUE admits no named argument (§27.1, v0.295)
@@ -1758,6 +1760,20 @@ var caller: (a: int, b: int) -> int := Sub;  caller(100, 2);              // a f
 ```
 
 Also absent, with the landed spelling beside it: `goto`/`break 2`/labels on non-loop statements → labeled loops (`scan: for … break scan;`); `let`/`val`/`readonly var` → `const x := e;`; `defer`/`errdefer` → `using var`, `finally`, `ScopeGuard`; `do…while`/`repeat…until` → `while` with a leading flag; local functions → a lambda bound to a local; attributes `[Obsolete]` → the closed clause vocabulary (`serialized`, `equality skip`, `when true`); `#if`/`#region` → runtime branching; `import M.{X}`/`import M.*`/`public import` → plain `import M;` (+ `as`); tuples, anonymous types, comprehensions, a value-form `(try E catch …)`, block expressions → a `record` (possibly method-local), the lazy operators, the `try` statement, and the binding atom `(var x := e; body)`; `x not in c` → `not (x in c)`; `not is` → `is not`; `default(SomeChoice)` → construct a case, or use `C?`; implicit/explicit conversion **operators** → named `To…`/`From…` methods; `operator ==` on a class → `=` always calls `Equals` (records, enums, and choices may overload); member hiding, `protected internal`, `default interface methods`, `ref` returns, class deconstruction — all rejected.
+
+```bezel
+public class Box<T> where T: int end Box;          // ERROR: a type bound names a class, an interface or a type parameter (§14.2) — `int` would admit one type: drop the parameter, write `int`
+public class Keyed<T> where T: string end Keyed;   // ERROR: `string` is not a class; the same for a record, an enum, a choice, a function type, an inline array or a `T?`
+public class Keyed<T> where T: IComparable<T> end Keyed;   // fine: an interface bound; `Array<Point>` is a class bound admitting that class alone
+extension Bag<T>
+  public method F<U>(x: U): int where T: IFoo => 1;   // ERROR: a member's `where` constrains the member's own parameters only; the block's `T` is the enclosing declaration's (§26.4) — a second block, `extension Bag<T> where T: IFoo`
+  public method G<U>(x: U): int where U: T => 1;      // fine: the block parameter as the BOUND
+end;
+var v: IEnumerable<string> := nullableStrings;    // ERROR over an `Array<string?>`: a variant conversion relates arguments by a reference conversion or `T` to `T?`, never `T?` to `T` (§12.9)
+var w: IEnumerable<string?> := strings;           // fine over an `Array<string>`
+```
+
+> §14.2: Appendix A.4's `Constraint ::= … | Type` parses any type as a bound, and the language gives three a meaning — a class, an interface, a type parameter; every other bound is rejected at the declaration. §26.4: the block's `where` clause is the one place a block parameter is constrained. §12.9: nullability is part of a type argument's identity (§7.1); an `out` view widens `T` to `T?` and an `in` view narrows it, and neither reverses.
 
 ### 7.2 Ownership shapes that look fine
 
@@ -2171,6 +2187,13 @@ public enum Priority
 end Priority;
 method IsUrgent(p: Priority): bool => p >= Priority.High;  // ERROR: an enum has no intrinsic `<`/`>` (§10.5); write int(p) >= int(Priority.High)
 
+public enum Color
+  Red, Green;
+  public method Equals(other: Color): bool => this = other;   // ERROR: an enum declaring its own `Equals` has no `=` until it overloads it (§10.5, §8.4) — write int(this) = int(other)
+  public method GetHashCode(): int => int(this);
+end Color;
+var same := Color.Red = Color.Green;                           // ERROR: declare `operator =`/`<>` (§25.2), or call `.Equals`; a Set<Color> and `case` over Color are fine
+
 // In an owning choice `Pool` with `Ready(conns: [4 owned]Conn?)`:
 case this of
   Ready(arr) => do k(); return arr[0]!.Id; end,  // ERROR: `arr` used after `k()`; `this` may be overwritten (§19.3)
@@ -2203,6 +2226,16 @@ Console.WriteLine($"{Tag.B}");      // ERROR: no generated `ToString` beside a d
 ```
 
 > §35.7 / §9.2: on a record and a value-like choice alike, declaring `Equals` or `GetHashCode` in either spelling takes over equality — the generated package goes, `=`/`<>` need the operator overloads, and the declared pair alone makes the type **hashable** (`Set<Key>`, `where T: hashable`). A record declaring `Equals(other: Key)` with `GetHashCode` and no `=` is a hash key on the same terms. An interface member `Equals(other: Object?)` is satisfied by a value kind's own `Equals`, declared or generated; a kind with none does not conform (§14.2).
+
+```bezel
+public record Ticket(Id: int)
+  public ToString: int := 0;                                          // ERROR: `Equals`, `GetHashCode` and `ToString` are reserved for the Object slot on every value kind (§9.2)
+  public static method Equals(a: Object?, b: Object?): bool => false;   // ERROR: the same rule — a static of one of the names is rejected at any parameter list
+  public method Equals(other: Ticket, tolerance: int): bool => true;    // fine: an instance method at another parameter list is an ordinary member (§10.5)
+end Ticket;
+```
+
+> §9.2: a value kind reserves the three names exactly as §12.2 does on a class — an instance method at another parameter list is an overload, everything else of the name (a static, a field, a property, a `const`, a nested type) is rejected. A `static class` is outside the class rule: `Convert.ToString(value: int)` is the standard library's own instance (§11.7).
 
 A record whose constructor carries a contract clause:
 
@@ -2346,6 +2379,21 @@ public class Money: IFormattable
   public method ToString(format: string): string => $"{Cents}";          // beside the inherited ToString()
 end Money;
 ```
+
+```bezel
+public interface J: I                     // over `interface I  method A(x: Widget): string;  end I;`
+  method A(owned x: Widget): string;      // ERROR at J: an inherited member takes part in the clash check, and `owned` never distinguishes (§11.3)
+  method A(x: Widget): string;            // fine: a redeclaration at the same signature is one member (§11.2's diamond rule: `IList<T>`'s indexer over `IReadOnlyList<T>`'s)
+end J;
+public class C: B<int>                    // over `class B<T>` declaring `virtual Q<U>(e: U, t: T)` beside `virtual Q<U>(e: U, t: int)`
+  public override method Q<V>(e: V, t: int): int => 2;   // ERROR: the override matches two base members at `B<int>` (§12.1); the base pair is legal — derive from a `B<string>`, or rename one
+end C;
+using var g := new G<string>();  g.Q("s");   // ERROR when `G<T>` declares `Q(x: T)` beside `Q(x: string)`: both exact at `G<string>`, ambiguous (§22.6) — a `G<int>` receiver, or distinct names
+if d <> null then L(d); end;                 // fine: `d: Dog?` narrowed is read as `Dog` — exact at `L(Dog)`, converting at `L(Animal)` and at `L(Dog?)` (§22.6, §7.4)
+G(null);                                     // fine at `G(string)` beside `G(string?)`: the nullable one; ERROR at `H(Dog?)` beside `H(Animal?)`, or `string?` beside `Object?`: ambiguous — `var n: Dog? := null; H(n);`
+```
+
+> §11.3: an interface's members, for the clash rule, are those it declares and those it inherits; two declarations at one signature are one member. §12.1: an `override` matches exactly one virtual member of the base as substituted at the derived class's base clause. §22.6: a narrowed read's static type is its non-nullable type (as §7.11 reads it); `null` is applicable at every nullable parameter, at no non-nullable one, and separates no two candidates; two members of a generic type that coincide at the receiver's instantiation are both exact, and the non-generic preference does not apply to them.
 
 ### 7.5 Iterators, queries, liveness
 
@@ -2576,6 +2624,23 @@ end constructor;
 ```
 
 > §22.8: a `readonly` field is assigned in a field initializer or in the constructor's own body (for `static readonly`, its static initializer or `static constructor()`), never inside a lambda, which can run after construction. Assign in the constructor; let the lambda read.
+
+```bezel
+public static method Run(s: string?): int
+  if s <> null then
+    var f := lambda(): int => s.Length;   // ERROR: a parameter's or `var` local's narrowing does not enter a lambda body (§7.4)
+    return f();
+  end;
+  const t := s;
+  if t <> null then
+    var g := lambda(): int => t.Length;   // fine: a `const` local's fact rides into the lambda
+    return g();
+  end;
+  return 0;
+end Run;
+```
+
+> §7.4: a lambda body reads its captured variables at their declared types, except a `const` local's fact and a `readonly`-field fact rooted at a `const` local, `this` or a type name; copy to a `const` first, or re-test inside the lambda.
 
 ### 7.9 Small standard-library mistakes
 

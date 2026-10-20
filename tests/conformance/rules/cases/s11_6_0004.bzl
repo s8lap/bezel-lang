@@ -2,8 +2,9 @@
 //! doc: spec
 //! section: 11.6
 //! title: a nested class may access the private members of an enclosing instance
-//! rule: A nested class has access to all members (including private) of its
-//!   enclosing class when it holds an instance of the enclosing class.
+//! rule: A nested class has access to all members (including `private`) of
+//!   every class enclosing it, at any depth: an instance member through an
+//!   instance of that class it holds
 //! cites: 11.6
 //! expect: accept
 module Conf;

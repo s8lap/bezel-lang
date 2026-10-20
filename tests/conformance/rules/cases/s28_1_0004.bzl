@@ -2,9 +2,10 @@
 //! doc: spec
 //! section: 28.1
 //! title: owned on a return type of enum type is rejected
-//! rule: On a primitive, `string`, a function type, an ordinary record, an enum, or the
-//!   unit type, `owned` is a compile error: such values carry no disposal
-//!   obligation to transfer.
+//! rule: **Any other type** — a primitive, `string`, `Type`, a function type,
+//!   an ordinary record, a value-like or borrow-bearing choice (§35.4), an
+//!   enum, a non-owning inline array, or the unit type: `owned` is a
+//!   **compile error**. Such values carry no disposal obligation to transfer
 //! expect: reject
 //! diagnostic: owned
 module Conf;

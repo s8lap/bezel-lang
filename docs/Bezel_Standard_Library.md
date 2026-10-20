@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.338 — October 2026**
+**Companion to the Bezel Language Specification, v0.339 — October 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1586,6 +1586,8 @@ end IList;
 The four interfaces form the borrowing collection family. `IReadOnlyCollection<T>` and `IReadOnlyList<T>` are covariant in T (`out T`); `ICollection<T>` and `IList<T>` are invariant because they admit mutation through the type parameter.
 
 `IsReadOnly` is `false` for every standard collection implementing `ICollection<T>` (`Array<T>`, `LinkedList<T>`, `Set<T>`, `Dictionary<K, V>`; `Stack<T>`/`Queue<T>` conform only to `IReadOnlyCollection<T>` (#1354) and have no `IsReadOnly` member). The standard library currently ships no read-only `ICollection<T>` implementation; the member exists for user-defined read-only implementations, which return `true` and raise `InvalidOperationException` from the mutating methods.
+
+**`Remove`'s result** (stated here once, for both families). Every `Remove` that returns `bool` — `ICollection<T>.Remove(item)` and `IOwningCollection<T>.Remove(item)` with their implementations, the keyed `Remove(key)` of `Dictionary<K, V>`, `OwningDictionary<K, V>`, `SortedDictionary<K, V>` and `Counter<K>`, `SortedSet<T>.Remove(item)`, `OwningSlotMap<T>.Remove(handle)`, and the entry form `Remove(entry)` of [§4.8](#sec-dictionaryk-v) — returns `true` iff it removed an element, and `false`, leaving the collection unchanged, when nothing matched: no equal element, an absent key, a stale or vacated handle. An equality search removes the **first** equal element in iteration order where the collection admits duplicates (`Array<T>`, `OwningArray<T>`, `LinkedList<T>`, `OwningLinkedList<T>`), under the type's standard equality as `Contains` and `IndexOf` read it; an owning collection disposes the element it removed and disposes nothing on `false`. A `// false if absent` comment on a declaration restates this rule.
 
 Element disposal is never performed by or through a borrowing collection (spec §28.6): a holder that owns its elements uses the owning family, whose `Dispose()` cascades; selective cleanup takes elements out (`Drain()`, `Pop*`, `move coll[i]`) into owned bindings first.
 

@@ -2,10 +2,10 @@
 //! doc: spec
 //! section: 28.6
 //! title: a freshly-produced owning value through a non-owned return escapes
-//! rule: A freshly-produced owning value (`return new OwningArray<T>(...)`)
-//!   returned through a **non-`owned`** return type is an error: the value
-//!   would escape with no owner and leak. Expose the factory as a method
-//!   returning `owned T` instead.
+//! rule: A `move`d owned field returned through a non-`owned` return is an
+//!   **error** ... and a freshly-produced owning value (`return new
+//!   OwningArray<T>(...)`) returned through a non-`owned` return is likewise
+//!   an error
 //! cites: 28.6, 28.3
 //! expect: reject
 //! diagnostic: owner

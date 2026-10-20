@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.338 — October 2026**
+**Companion to the Bezel Language Specification, v0.339 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -14417,5 +14417,288 @@ The composition step resolved these seams:
   - **Generics** (the relocation): R5/C14's fragment now lives in Appendix E. That is a `cite` change, not a re-quote.
   - **Borrow-flow** (`W1`, found at composition): R3/C10, R4/C10 and R5/C10 quote "contributes the sources of the borrows it carries, as the closure bullet's provenance clause 1 and *The sources an argument contributes* item 3 count it". The deferred-activation rewrite moved that rule to its home, the closure bullet's provenance clause 1 ("a captured local or parameter of a value type that holds borrows … the sources of the borrows it carries, the count *The sources an argument contributes* item 3 gives the same value as an argument"). Re-quote it; the verdicts are unchanged.
   - Each lane re-walked its cells' row and column neighbours and found none opened.
+
+---
+
+### v0.339 changelog (v0.338 → v0.339)
+
+**The open spec questions after the 2026-10-19 rulings: 29 issues decided, two proposals, and an editorial batch.** On 2026-10-08 the owner delegated the open specification questions ("Please resolve and decide all known spec related issues. Do proposals for issues that need them."). On 2026-10-19 the owner asked to "look at the spec issues and rule on them", and four ruling lanes posted a ruling on every issue the v0.338 text decides. The issues below are the ones the text did **not** decide. Each had a classification entry from that sweep with competing readings and a recommendation; the owner then said "Proceed with drafting." Every decision here is a delegated ruling (process §8, `accepted (delegated)`).
+
+Each decision was classed:
+- **A ruling.** The text was silent or ambiguous, and one or two sentences settle it without moving a verdict the text clearly stated. 26 of the 29 issues decided here are rulings (#6031 a clarification, #6485 an editorial fix, #5936 a recorded decline), recorded by this entry and their `DECLINED.md` rows.
+- **A design change.** The decision retires a stated or shipped reading, or narrows a stated admission. Three issues need one, carried by two proposals that both graduate here: [0189](proposals/0189-a-type-position-names-a-type.md) (a type position names a type; [#6390](https://github.com/s8lap/bezel-lang/issues/6390), [#6400](https://github.com/s8lap/bezel-lang/issues/6400), [#6432](https://github.com/s8lap/bezel-lang/issues/6432)) and [0192](proposals/0192-enum-declared-equals-has-no-operator.md) (an enum declaring its own `Equals` has no `=`; [#5929](https://github.com/s8lap/bezel-lang/issues/5929)).
+- **Editorial.** Twelve sentences state, where a reader looks, rules the 2026-10-19 rulings had to infer. No verdict moves.
+
+Five lanes:
+- `E`: the editorial batch (twelve edits, spec only).
+- `A1`: ownership, iteration, contracts and stdlib results — [#5931](https://github.com/s8lap/bezel-lang/issues/5931), [#6050](https://github.com/s8lap/bezel-lang/issues/6050), [#5936](https://github.com/s8lap/bezel-lang/issues/5936), [#6247](https://github.com/s8lap/bezel-lang/issues/6247) part 1, [#6249](https://github.com/s8lap/bezel-lang/issues/6249), [#6196](https://github.com/s8lap/bezel-lang/issues/6196), [#6485](https://github.com/s8lap/bezel-lang/issues/6485).
+- `A2`: names and modules — proposal 0189, and [#6111](https://github.com/s8lap/bezel-lang/issues/6111), [#6028](https://github.com/s8lap/bezel-lang/issues/6028) part 2, [#6132](https://github.com/s8lap/bezel-lang/issues/6132).
+- `A3`: generics and overloading — [#5947](https://github.com/s8lap/bezel-lang/issues/5947), [#5964](https://github.com/s8lap/bezel-lang/issues/5964), [#5965](https://github.com/s8lap/bezel-lang/issues/5965), [#6031](https://github.com/s8lap/bezel-lang/issues/6031), [#6133](https://github.com/s8lap/bezel-lang/issues/6133), [#6220](https://github.com/s8lap/bezel-lang/issues/6220), [#6302](https://github.com/s8lap/bezel-lang/issues/6302).
+- `A4`: equality, conversions and lambdas — proposal 0192, and [#5930](https://github.com/s8lap/bezel-lang/issues/5930), [#5993](https://github.com/s8lap/bezel-lang/issues/5993), [#6054](https://github.com/s8lap/bezel-lang/issues/6054), [#6055](https://github.com/s8lap/bezel-lang/issues/6055), [#6083](https://github.com/s8lap/bezel-lang/issues/6083), [#6143](https://github.com/s8lap/bezel-lang/issues/6143), [#6191](https://github.com/s8lap/bezel-lang/issues/6191) (a), [#6305](https://github.com/s8lap/bezel-lang/issues/6305).
+
+Each lane passed its author's adversarial pass and an independent critique, and every critique accepted its lane with fixes. The 106 documentation edits (`E` 12, `A1` 24, `A2` 14, `A3` 18, `A4` 38) were applied as one sequence in the order `E`, `A1`, `A2`, `A3`, `A4`. Four were re-anchored on their group-closing headings, rows unchanged; none was dropped. The composition step added six edits of its own, and the corpus took six (below). Proposal numbers 0187, 0188, 0190, 0191 and 0193 were reserved for the train and are left unused: those decisions turned out to be rulings.
+
+The critiques' substantive findings:
+- `E`:
+  - Six of its twelve sentences said more than the rulings decided. The §11.2 sentence had made every failed matching clause an error at the implementing class; it now names only the closing sentence's scope.
+  - The §28.3 materialize remedy had implied a new rejection of `return local.ToArray()` over a borrow-free element type. It is now scoped to class and interface element types, as §28.11 already reads.
+  - The §28.8.1 `move` sentence had called every call result a fresh producer. It now uses the spec's own list (a `new` expression, a call returning `owned T`, an owned operator result).
+  - Two clauses at §5.1 and §27.3 were narrowed to what the rulings state.
+- `A1`:
+  - **#5936's premise was stale.** Lint A has been implemented since v0.330 and is banked passing. The same measurement found that **lint B, retired at v0.338 as "never implemented", is implemented too** and still emitted (filed below).
+  - The #6050 "compiler matches" claim for the owned join was unfounded: the compiler does not track `Object`-typed locals at all. It is now listed as spec-ahead-of-impl and unmeasured.
+  - Two passages enumerating K1's auxiliary states still listed three of them; both are updated.
+  - #6249's citation of proposal 0043 §10.1 for the invariant was dropped, since §10.1 names `ensures` only.
+- `A2`:
+  - 0189's new table row was ambiguous at a single-identifier pattern, which A.7 resolves by what the name means. The row now lists only positions the grammar reads as a `Type`.
+  - Its stop sentence now selects by arity, as §2.2 does. §11.6's rewrite had contradicted §2.7's rule for generic enclosers; it now defers to it.
+  - The reach was recounted: 25 gtest rows, not 26, and only 20 of them flip to accept.
+  - #6132's first draft would have rejected nested choice-case heads that six gtest rows pin. #6028's first draft admitted, through an alias, the position equality §26.4 rejects in so many words.
+- `A3`:
+  - Two migration claims called pinned rows "unpinned": five gtest rows flip under #6220, all listed below.
+  - #6133's "no other conversion takes part" had read out the lifted `Dog?` → `Animal?`, so the relation now names the nullable lift.
+  - #5947's sentence is reworded to compose with `E`'s §11.3 sentence (inherited members are read at the base clause's arguments, the extending interface's own parameters abstract).
+  - #6220 (a)'s decline row now cites the ruling that rejected declared-type keying (rationale §6.4, #3686), not the fix that implemented it.
+- `A4`:
+  - **#6143's first draft added a mechanism**, a whole-body write analysis, at zero measured sites, and would have flipped a lit pin and two gtest rows. The critique applied the lane's own fallback, the compiler's rule.
+  - The critique found that the `const` carve-out depends on an unstated rule, that a loop-body local is a fresh binding per execution. §27.5 now states it.
+  - 0192 had left §9.2's and §35.7's generated equality comparing an enum component through an `=` that no longer exists. They now reach the declared `Equals`.
+  - 0192's decline of `=`-dispatch is argued as the enum analogue of proposal 0178's declined option C, not as that row.
+  - #5993's first draft replaced a sentence seven banked rule cases quote. The sentence is kept and a defining sentence added after it.
+  - #5930's three receiver lists are unified.
+
+**Outcomes the owner should see.**
+- **29 issues close:** the 28 `spec-question`s and #6485. #6247's part 2 (the compiler's divergence on `q.Equals(q)`) is split into its own tracking issue.
+- **Five decisions deviate from the recorded recommendation**, each with its grounds and a decline row:
+  - **#5936 KEEP**, where the 2026-10-19 lane said retire. The retire grounds rested on "unimplemented", which is false.
+  - **#6390 option C**, where the issue's author recommended A and the 2026-10-19 lanes B. A type position can mean nothing but a type, so a stop there protects nothing; C needs no carve-out and deletes compiler code.
+  - **#5929 option C**, where the issue recommended dispatching `=` to the declared `Equals`. That is the enum analogue of 0178's declined option, and it would make the natural body `this = other` a self-call.
+  - **#6220 (a) reading A**, where the fixing commit recorded B. B would make overload resolution the one place narrowing is invisible, against rationale §6.4 and three decline rows.
+  - **#6143 reading 2** (the compiler's rule), where the issue proposed carrying every not-mutably-captured fact. That proposal is unsound (#2259's crash).
+- **What programs see.**
+  - **Newly rejected**, all ahead of the compiler:
+    - an interface member indistinguishable from an inherited one;
+    - an extension member's `where` on a block parameter;
+    - bounds naming non-class, non-interface types;
+    - the unsafe nullability direction under variance;
+    - `null` between `string?` and `Object?`;
+    - members of a generic type coinciding at the receiver;
+    - an override matching two base slots;
+    - `=` on an `Equals`-declaring enum;
+    - statics, fields and other non-method members named `Equals`/`GetHashCode`/`ToString` on value kinds;
+    - a bound reference over a move-only receiver;
+    - an unresolved pattern head;
+    - a second consumption after `GetEnumerator()`;
+    - the field self-assignment forms.
+
+    The measured reach is test rows of the questions themselves, and otherwise zero.
+  - **Newly admitted:**
+    - a bare type name beside a same-named member (20 gtest rows);
+    - an override of a non-slot `Equals` without `GetHashCode`;
+    - a type fact after an exiting `is not T` and in a type-pattern arm, at a user-class carrier;
+    - a narrowed argument exact at its non-nullable overload.
+  - **No rule-corpus or lit verdict moves.**
+- **Every compiler delta has a tracker:** 19 are filed. 14 questions are filed: 10 `spec-question`s, the #6247 part-2 tracker, a measurement issue and two documentation issues. 19 existing issues get notes.
+
+The composition step resolved these seams:
+- **The proposals folder.**
+  - All five lanes inserted `DECLINED.md` rows at the group ends, but `A2`'s two insertions had anchored on the group's last row plus the closing heading. Once `A1`'s rows are in, the two are no longer adjacent, which is the 102-of-103 seam the critiques measured. `A2`'s insertions were re-anchored on the headings alone, so every group now lists its rows in lane order.
+  - `A2`'s and `A4`'s README rows both anchored on the 0106 row's tail, so the later one would have landed above the earlier. Both were re-anchored on the *Graduated* heading. Composition then moved 0189 and 0192 to *Graduated*, after 0186, in the v0.338 form.
+  - `DECLINED.md` is recounted at 1,018 rows.
+  - One `A2` row's closing cell, "—(no reopening bar stated)", is respelled in the file's form, "Reopening bar: none stated."
+- **Shared paragraphs read consistently as composed.**
+  - §11.3's clash rule: `E`'s "compared as declared, not re-run at an instantiation", then `A3`'s inherited interface members. The `A3` critique had already reworded its sentence to compose.
+  - §5.1's conversion list: `E`'s `T?`-to-`Object?` clause and `A3`'s variance relation.
+  - Appendix C.1: `A3`'s four bullets and `A4`'s pairing bullet.
+  - The code-generation reference's §2 and §3.3 table: `A1`'s invariant row and `A4`'s equality row.
+  - §22.6: `A3` alone edits it. `E`'s §27.3 sentence cites it without editing it. `A3`'s "static type at the call" is consistent with `A4`'s type-fact narrowing, since §12.7's list already says a narrowing retypes the read.
+- **No stale citation.** ANCHOR, BOOK and CITATION are clean. The one CITATION advisory, `§4.12`, was already present at v0.338.
+
+**`scripts/check_docs.sh`** passes on the composed tree, with this entry, the four version headers and the code-generation reference's three pin lines at v0.339. PIN, FENCE, ANCHOR, VERSION, FACTS, TABLE, SETS, REGISTER, STYLE, EXTRACT, GRAMMAR and BOOK are clean. EXTRACT finds 531 fragments, as at v0.338. The extractor finds four new code-generation blocks, all `error` examples: `A3`'s #5947 and #5965 fences and `A4`'s #6191 and #6143 *Looks right, is rejected* blocks. `scripts/check_src_citations.py`, run over `src/` against the composed documents, is clean. `scripts/check_proposals.sh` passes (186 ↔ 186; accepted 21, graduated 137). `corpus.py lint --strict` is clean (2,927 cases), `corpus.py check` finds the manifest up to date, and the rule-corpus and conformance-harness self-tests pass. `scripts/build_book.py --check` and `scripts/gen_editor_grammars.py --check` are clean.
+
+- **§2.7 *Enclosing-type members* (rule 1's table gains a *Bare type name* row) and *Through nesting*, §11.6; rationale §9.10 — a type position names a type (design change; [proposal 0189](proposals/0189-a-type-position-names-a-type.md); [#6390](https://github.com/s8lap/bezel-lang/issues/6390), [#6400](https://github.com/s8lap/bezel-lang/issues/6400), [#6432](https://github.com/s8lap/bezel-lang/issues/6432)).**
+  - **The problem.** Rule 1's table, "the normative statement", had no row for a bare type name. The *Through nesting* stop ("the first type that has an accessible member of that name ends the search") was scoped to a nested type's bodies. Two compiler lanes read it opposite ways at a type position. One stopped a bare `Box<int>` on a nested type's `method Box`, and shipped a guard switching the stop off in a top-level type's own body, a carve-out for `property Color: Color` and no base-type walk. The other reverted the same reading.
+  - **The rule.** The new row covers positions the grammar reads only as a `Type`: an ascription, `new`, a generic argument, a base or interface list, the right operand of `is`/`is not`/`as`, a `typeof` or `default` operand, a destructuring pattern's head, a `where` clause. A single-identifier pattern is not one; A.7 resolves it by name. At such a position only **nested types** are candidates, ranked between local scope and the module's declarations, innermost first. The first type with a nested type of the name, declared or inherited, whose arity the reference fixes (§2.2) ends the search. A same-named member of any other kind, on the type's own body or on a type enclosing it, declared or inherited, neither binds nor ends the search. So `property Status: string` and `method Kind(): Status` coexist at any nesting depth.
+  - **Name positions.** At the positions the table ranks members at, the stop is unchanged and reads "declared or inherited" (#6400). §11.6 now states its grant as one: a nested class has access to all members, `private` included, of every class enclosing it, **at any depth**. An instance member is reached through an instance it holds, and a static member or nested type by bare name where §2.7 admits it (#6432). So a grandparent's `private` member is found and ends the search at a name position.
+  - **Declined:** the nested-only type-position stop (option A, the shipped reading); the uniform type-position stop with the carve-out generalised (option B); excluding inherited members from the stop. These are three `declined-at-proposal` rows. Reading §11.6's grant as conditioned on holding an instance, so that a `private` or `protected` member past the first link would not end the search, is a `rejected` row.
+  - Kernel: no contact. Body-locality: local.
+- **§8.4, §10.5 (*Ordering* scoped to the default), §10.6, §9.2, §35.7; rationale §9.3; the code-generation reference §2, §7.3 — an enum that declares its own `Equals` has no `=` until it overloads it (design change; [proposal 0192](proposals/0192-enum-declared-equals-has-no-operator.md); [#5929](https://github.com/s8lap/bezel-lang/issues/5929)).**
+  - **The problem.** Since v0.337 a record or a value-like choice that declares its own-typed `Equals` has no `=` (§8.4). The enum was left on its own model, and three sentences disagreed about `Color.Red = Color.Blue` beside a declared `Equals(other: Color)`. §8.4 and §10.5's "every consumer" sent it to the declared member, and §10.5's *Ordering* to the underlying integer. §9.2's type-parameter path already reached the declared member for `=` over `T`, so one operator had two definitions.
+  - **The rule.** Declaring the own-typed `Equals`, without the homogeneous overloads, takes `=`/`<>` away; a use at the enum's static type is a compile error at the expression. The remedy is to declare the overloads (§25.2) or call `.Equals`. Every other consumer reaches the declared pair: direct calls, hash containers, interpolation, boxed dispatch, §9.2's kinds through a type parameter, and a generated record, choice or inline-array comparison over such an enum component. A constant pattern over an enum scrutinee matches by §10.2's underlying-integer identity on every enum, so `case` is untouched. Inside the declared `Equals`, compare `int(this) = int(other)`.
+  - **Declined:** the status quo, and routing `=` to the declared `Equals` (the issue's recommendation, and the enum analogue of 0178's declined option C, whose reasons apply by analogy). Two `declined-at-proposal` rows. Keying the loss on `Equals` or `GetHashCode` is declined in the proposal without a row.
+- **Rulings: ownership, iteration, contracts and stdlib results (lane `A1`).**
+  - **§15.3 *Whole-value reassignment*, §28.7 — the self-assignment no-op is a local's ([#5931](https://github.com/s8lap/bezel-lang/issues/5931)).** The clause "a reassignment whose RHS consumes the LHS … is a no-op" held "at locals and instance fields". Since proposal 0174 no RHS leaves a move-only field moved-from (the replacing `move`; C.3), so at a field the clause named a state that does not arise. At a field, `_arr := _arr;` now stores the plain read's lend into an owned location and is rejected under §28.3's state match. `_arr := f(_arr);` is rejected at the argument; `f(move _arr with fresh)` is the transfer. **Declined:** a special-cased no-op at the field (a `rejected` row). Kernel: derivation (K1.5, K1.7, K3.11).
+  - **§28.3 (K1, *Ownership state of locals*, *Producers*, the adoption clause), §28.8, §30.5 — a boxing conversion is a runtime-managed production; the unclassified local ([#6050](https://github.com/s8lap/bezel-lang/issues/6050)).** A boxing conversion, or any runtime-managed value stored into an `Object` location, carries no classification (K1.6), and a new *Producers* row says so. A local it initializes is **unclassified**, K1's fourth auxiliary state. Its reads are no borrow, so `return o;` under `Task<Object>` is admitted. It adopts the first classified assignment's state. At a join it takes a borrowed edge's state, and against an owned edge it is K7.3's mixed merge. An `Object`-typed parameter, field read, capture, getter or indexer result stays a borrow by its form. **Declined:** classifying the local as borrowed by its declared type; reading the forms off the run-time value. Two `rejected` rows. Kernel: derivation (K1.6 + K1.7).
+  - **Rationale §5.28, `DECLINED.md` — §29.12's mutation-during-iteration warning stays ([#5936](https://github.com/s8lap/bezel-lang/issues/5936); a recorded decline).** The criterion that retired lint B at v0.338 does not carry to lint A:
+    - It has been implemented since v0.330 (fix [#4603](https://github.com/s8lap/bezel-lang/issues/4603)), and `s29_12_0001`, `0004` and `0005` are banked passing. The issue's "unimplemented" premise, and the v0.338 entry's, were stale.
+    - Its predicate is local and exact, with no alias tracking.
+    - It names the common trap the guides teach.
+    - It reports the shape whatever the inputs, where the run-time fault fires only on a run that reaches the guarded mutation.
+
+    **Declined:** retiring it (a `rejected` row). No normative text changes.
+  - **§29.11 *Consumption points* point 1, the code-generation reference §4.5 — an explicit `GetEnumerator()` spends the query ([#6247](https://github.com/s8lap/bezel-lang/issues/6247) part 1).** A `GetEnumerator()` or `GetAsyncEnumerator()` call on a bound lazy query counts as the enumeration it begins, as §29.8 already rules for an iterator-minted iterable. So `var e := q.GetEnumerator(); for var x in q` is the static error. **Declined:** iteration-only consumption (a `rejected` row). Part 2 (`q.Equals(q)` spends nothing) was decided by the text on 2026-10-19; the compiler's divergence is split out.
+  - **§22.16 *Async methods*, Appendix C.6, Guide 06, the code-generation reference §3.3 — an `async` public method's invariant is checked at entry only ([#6249](https://github.com/s8lap/bezel-lang/issues/6249)).** The check runs in the synchronous prefix after the `requires` clauses. The method's normal exit is its task's settlement, the point `ensures` awaits, and the invariant's exit evaluation is deferred with that design. The instance is observable with that exit unchecked until the task settles, and a violation is reported at the next instrumented public entry. **Deferred:** settlement-time evaluation (a `deferred` row). The compiler already behaves so.
+  - **Stdlib §4.1, the code-generation reference §5.4 — `Remove(…): bool` means removed-or-absent everywhere ([#6196](https://github.com/s8lap/bezel-lang/issues/6196)).** The rule is now stated once for every `bool` `Remove` of both collection families, the keyed and entry forms included. It returns `true` iff an element was removed, and `false` with the collection unchanged otherwise. Where duplicates are admitted, an equality search removes the first equal element in iteration order. An owning collection disposes what it removed, and nothing on `false`. The compiler matches.
+  - **§14.4's `OwningCache<T>` example, rationale §5.3 (editorial; [#6485](https://github.com/s8lap/bezel-lang/issues/6485)).** The constructor wrote `_items := new();`, the typed-assignment-target position §17.7 excludes, a recorded deferral. It now writes `new OwningArray<T>()`, and the doc-example corpus's copy is updated in this commit.
+- **Rulings: names and modules (lane `A2`).**
+  - **§27.8, §13.7 — a signature may name a module-level type alias at any visibility ([#6111](https://github.com/s8lap/bezel-lang/issues/6111)).** An alias creates no type and has no §13.1 level. §13.7 judges the aliased type, which is what the module's interface carries (§2.8.2), and "module-internal" in §27.8 is the alias's scope. **Declined:** the leak reading (a `rejected` row).
+  - **§26.2 — a type alias may head an extension block ([#6028](https://github.com/s8lap/bezel-lang/issues/6028) part 2).** The head is the alias's expansion, judged by §26.2 and §26.4 as if written. `extension Lookup<K, V>` over `type Lookup<K, V> := Dictionary<K, Array<V>>` binds `K` and `V`, while `extension Twin<T>` over `type Twin<T> := Pair<T, T>` is §26.4's repeated-identifier error. The alias's `where` clause is decided by the block's clause. **Declined:** rejecting an alias head at the declaration (a `rejected` row). Part 1 (an `extension Object` member on a `string` receiver) was decided by the text on 2026-10-19 and gets a codegen tracker.
+  - **§19.3 *Record destructuring*, the code-generation reference §7.1 — an unresolved pattern head is a compile error ([#6132](https://github.com/s8lap/bezel-lang/issues/6132)).** The rule covers a destructuring head, positional or named, at any nesting, that resolves neither to a type nor to a case or constant through §19.8/§35.5's prefix omission. Such a head is a compile error naming the unresolved name, and another module's alias is such a name (§27.8). **Declined:** a silently non-matching pattern (a `rejected` row).
+- **Rulings: generics and overloading (lane `A3`).**
+  - **§11.3, Appendix C.1, the code-generation reference §7.4 — an interface's clash check reads the members it inherits ([#5947](https://github.com/s8lap/bezel-lang/issues/5947)).** An inherited member is read at the extending interface's base-clause arguments, with the extending interface's own parameters abstract. A declared member indistinguishable from an inherited one clashes at its declaration, as do two indistinguishable inherited members. Two declarations at one signature are one member (`IList<T>`'s indexer over `IReadOnlyList<T>`'s). **Declined:** declared members only (a `rejected` row).
+  - **§26.4, §14.2 rule 1, Appendix C.1, the code-generation reference §7.1 — a generic extension block is its members' enclosing declaration for the member-`where` rule ([#5964](https://github.com/s8lap/bezel-lang/issues/5964)).** `method F<U>(x: U): int where T: IFoo` under `extension Bag<T>` is §14.2 rule 1's error, while `where U: T` stays the ordinary form. A stronger condition on a block parameter is a second block. **Declined:** the block parameters as the member's own (a `rejected` row).
+  - **§14.2 *The types a bound may name*, Appendix A.4, the code-generation reference §7.1 ([#5965](https://github.com/s8lap/bezel-lang/issues/5965)).** A bound names a class, an interface or a type parameter. Any other bound — a primitive, `string`, a record, an enum, a choice, a function type, an inline array or a nullable type — is a compile error at the declaration. `Array<Point>` is a class bound like any other. **Declined:** "exactly that type" and the inert reading (a `rejected` row).
+  - **§14.2 *Interface conformance* rule 6 — a class bound whose class conforms guarantees the interface (clarification; [#6031](https://github.com/s8lap/bezel-lang/issues/6031)).** This is the answer rule 1 of *A type parameter as the type argument* already gave. The compiler matches. **Declined:** reading rule 6's list as exhaustive (a `rejected` row).
+  - **§12.9, §5.1, Appendix C.1, the code-generation reference §7.1 — a variant conversion relates its arguments by a reference conversion, its nullable lift or the nullable view, never the reverse ([#6133](https://github.com/s8lap/bezel-lang/issues/6133)).** `Array<string?>` does not convert to `IEnumerable<string>`, nor `IComparer<string>` to `IComparer<string?>`. `IEnumerable<string>` to `IEnumerable<string?>` and `IEnumerable<Dog?>` to `IEnumerable<Animal?>` are admitted. **Declined:** ignoring top-level nullability (B); nullability invariant under variance (C). Two `rejected` rows.
+  - **§22.6 *Generic candidates*, *The argument's static type*, the code-generation reference §7.4 — a narrowed argument, the `null` literal, coinciding members ([#6220](https://github.com/s8lap/bezel-lang/issues/6220)).**
+    - (a) A §7.4-narrowed read is graded at its non-nullable type; a `ref`/`out` argument names the declared location (§22.3). So `L(Dog)` beside `L(Animal)` on a narrowed `Dog?` selects `L(Dog)`, and `F(T)` beside `F(T?)` on a narrowed `T?` selects `F(T)`.
+    - (b) `null` is applicable at every nullable parameter and at no non-nullable one, and separates no two candidates: `string?`/`Object?` on `null` is ambiguous.
+    - (c) Members of a generic type coinciding at the receiver's instantiation are both exact, so the call is ambiguous.
+
+    **Declined:** grading at the declared type; typing `null` as `Object?`; a tie-break for the member not spelled with the type parameter. Three `rejected` rows.
+  - **§12.1, Appendix C.1, the code-generation reference §7.4 — an override matches exactly one virtual member ([#6302](https://github.com/s8lap/bezel-lang/issues/6302)).** The member is matched as substituted at the derived class's base clause; more than one match is a compile error at the override. **Declined:** overriding both slots; overriding the exact-spelled slot (a `rejected` row).
+- **Rulings: equality, conversions and lambdas (lane `A4`).**
+  - **§27.6, §27.7.1 — every receiver that is not a class or interface is value-shaped for a bound method reference ([#5930](https://github.com/s8lap/bezel-lang/issues/5930)).** That covers a record, an enum, a copyable choice, a non-owning inline array, a primitive, the unit value, `string` and a function value: captured by copy, no identity, two evaluations unequal. A bound reference over a move-only receiver is a compile error at the formation. **Declined:** identity capture for `string` and function values; a borrow-formed reference over an owning receiver. Two `rejected` rows.
+  - **§8.3, Appendix C.1, rationale §7.3, the code-generation reference §2 — the pairing obligation is the `Object` slot's ([#5993](https://github.com/s8lap/bezel-lang/issues/5993)).** An `Equals` that fills no slot, such as an `override` of a user base's `Equals(a: int, b: int)`, obliges nothing. **Declined:** the any-signature reading (a `rejected` row).
+  - **§8.5 — a function value's `ToString()` renders its formed function type ([#6054](https://github.com/s8lap/bezel-lang/issues/6054)).** The rendering is stdlib §2.13's `FullName` form: `"(int) -> int"`, or `"() -> ()"` for a procedure. **Declined:** an opaque string; a method-name rendering (a `rejected` row).
+  - **§27.6, §12.7 — a method reference is formed at its callee's signature, or at the target where an adapter is synthesized ([#6055](https://github.com/s8lap/bezel-lang/issues/6055)).** Under pure variance the target is a view of the same value. A target reached only through a further §5.1 conversion gets an adapter, a new function value. **Declined:** forming every reference at its target (a `rejected` row).
+  - **§7.4, §12.7, §19.1 — type facts flow like null facts ([#6083](https://github.com/s8lap/bezel-lang/issues/6083)).** An exiting `is not T` narrows the surviving path. A type-pattern arm narrows its scrutinee in its guard and body. A fact holds at a point only when it holds on every path reaching it. **Declined:** confining type facts to the controlled block and the `else` branch (a `rejected` row).
+  - **§7.4 *Narrowing inside a lambda body*, §27.5 — a lambda body reads a captured variable at its declared type unless the fact cannot be invalidated ([#6143](https://github.com/s8lap/bezel-lang/issues/6143)).** Only a `const` local's fact, and a `readonly`-field fact rooted at a `const` local, `this` or a type name, enter the body. The remedy is a `const` copy. A local declared in a loop body is a fresh binding per execution of its declaration. **Declined:** the not-mutably-captured reading (unsound); a write-free condition (a new mechanism). Two `rejected` rows.
+  - **§9.2, §10.5, §35.2, §11.7, §12.2, the code-generation reference §7.3 — the three names are reserved on every value kind as on a class; a `static class` is outside the rule ([#6191](https://github.com/s8lap/bezel-lang/issues/6191) (a), [#6305](https://github.com/s8lap/bezel-lang/issues/6305)).** On a record, an enum or a choice, an instance method named `Equals`, `GetHashCode` or `ToString` at another parameter list is ordinary. Every other member of one of the names — a static at any parameter list, a field, a property, a `const`, an enum constant or a nested type — is a compile error. A static class has no instances and carries none of `Object`'s instance surface, so stdlib §2.3's `Convert.ToString` stands. **Declined:** an ordinary static of the names; the field; blocking the static class. Three `rejected` rows.
+- **Editorial clarifications from the 2026-10-19 rulings (lane `E`; no verdict changes).** Each sentence states a ruling where a reader looks:
+  - §2.7 rule 1: the type parameters in scope are among the types rule 1 finds, matched by name and arity ([#6068](https://github.com/s8lap/bezel-lang/issues/6068)).
+  - §11.3: the clash rule compares members as declared and is not re-run at an instantiation; a pair coinciding after substitution is §22.6's ambiguity at the call ([#5946](https://github.com/s8lap/bezel-lang/issues/5946)).
+  - §11.2: the implementing-class error closes the whole matching rule, and a generic type's conformance is judged with its type parameters abstract ([#6264](https://github.com/s8lap/bezel-lang/issues/6264)).
+  - §19.3: visibility filters the named-slot target sets and never widens them ([#6047](https://github.com/s8lap/bezel-lang/issues/6047)).
+  - §27.3: a body whose every path throws or loops forever is a procedure lambda ([#6195](https://github.com/s8lap/bezel-lang/issues/6195)).
+  - §5.1: `T?` converts at most to `Object?`, never to `Object` ([#6225](https://github.com/s8lap/bezel-lang/issues/6225)).
+  - §28.8.1: `move` over a fresh producer is rejected at every position ([#5977](https://github.com/s8lap/bezel-lang/issues/5977)).
+  - §28.6: a getter never returns a fresh owned value, at any declared type and in any spelling ([#6428](https://github.com/s8lap/bezel-lang/issues/6428), [#6483](https://github.com/s8lap/bezel-lang/issues/6483)).
+  - §28.3: `t := t` on an owned-state class-typed local is the state-match rejection ([#6427](https://github.com/s8lap/bezel-lang/issues/6427)).
+  - §28.1 clause 2 names value-like and borrow-bearing choices ([#5945](https://github.com/s8lap/bezel-lang/issues/5945)).
+  - §35.11 names the move-only substitution's reading ([#6006](https://github.com/s8lap/bezel-lang/issues/6006)).
+  - §28.3's materialize remedy names a collection whose elements outlive the method; a class-element `ToArray()` snapshot is not one ([#6489](https://github.com/s8lap/bezel-lang/issues/6489)).
+- **Migration.**
+
+  *Newly rejected (spec-ahead-of-impl):*
+  - #5947: a sub-interface member indistinguishable from an inherited one (the issue's `J`). 0 other sites.
+  - #5964: a member `where` constraining an extension block parameter. 0 sites.
+  - #5965: bounds naming a primitive, `string`, a function type, an inline array or a nullable type. 0 written sites. The record, enum and choice arm was already rejected by the compiler.
+  - #6133: `I<X?>` → `I<X>` under `out` and `I<X>` → `I<X?>` under `in`. 0 programs.
+  - #6220:
+    - (b) `string?` beside `Object?` on `null` (unpinned);
+    - (c) two members of a generic type coinciding at the receiver. **Three gtest rows flip run → reject:** `tests/sema/overload_generic_receiver_6001_6158_test.cpp:328` `generic_class_overloads_coinciding_unchanged_pending_6220`, `:342` `generic_class_static_overloads_coinciding_unchanged_pending_6220` and `:355` `generic_interface_overloads_coinciding_unchanged_pending_6220` (stdout `4` → "ambiguous call").
+  - #6302: an override matching two substituted base members. 0 sites. Also rejected: a non-generic `override Q(x: Animal?)` over `virtual Q(Animal)` beside `virtual Q(Animal?)`, 0 sites (filed).
+  - 0192: `=`/`<>` at an `Equals`-declaring enum's static type. **Two gtest bodies:** `tests/sema/override_equals_parameter_type_5610_test.cpp:109` `enum_override_equals_own_type_accepted_spec_10_5` and `:260` `enum_equals_own_type_plain_runs_spec_10_5`, both `this = other`. Respell them `int(this) = int(other)`; the oracles are unchanged.
+  - #6191 (a), #6305 B: a static of the three names on a value kind. **Three gtest rows flip accept → reject:** `override_equals_parameter_type_5610_test.cpp:317` `record_static_equals_object_nullable_not_rejected_pending_6191`, `:331` `enum_static_equals_object_not_rejected_pending_6191` and `:345` `choice_static_equals_object_nullable_not_rejected_pending_6191`. A field, property, `const`, enum constant or nested type of the names: 0 sites.
+  - #5930: a bound reference over a move-only receiver. 0 sites; probe first.
+  - #6132: an unresolved destructuring head (the issue's `Nope(var v)`; [#6069](https://github.com/s8lap/bezel-lang/issues/6069)'s imported-alias heads). 0 other sites.
+  - #6247 part 1: a second consumption after `GetEnumerator()`. 0 sites.
+  - #5931: `_arr := _arr;` and `_arr := f(_arr);` at a move-only field. 0 sites; unprobed.
+  - #6050: the owned join of an unclassified local. Unmeasured, since the compiler does not track `Object` locals. Already rejected by v0.338's form list, now with no exemption to argue: `return p;` for `p: Object` under `Task<Object>` ([#5704](https://github.com/s8lap/bezel-lang/issues/5704)'s `Object` leg). Its rows `tests/codegen/async_object_result_teardown_5949_test.cpp:191` `task_object_plain_param_not_reclaimed_by_task_looped_30_5` and `:203` `task_object_plain_param_two_tasks_not_reclaimed_looped_30_5` flip accept → reject when that leg lands.
+
+  *Newly admitted (spec-ahead-of-impl):*
+  - 0189: a bare type name in a nested or local type's body that a non-type member of it, or of a type enclosing it, shares; also the §12.9 composition through such a head.
+    - **20 gtest rows flip reject → accept:** the `expectStoppedAtEnclosingMember` rows of `tests/sema/enclosing_member_bare_type_name_test.cpp` (call sites `:209`–`:745`), including `spec_2_7_public_outer_member_is_accessible_so_it_does_stop` (`:359`).
+    - **Five rows stay rejected with changed diagnostics.** Two are in the same file: `spec_2_7_member_without_any_nested_type_names_the_stop_reason` (`:229`) and `spec_2_7_agreement_with_6383_the_resolver_stops_at_the_member` (`:424`). Three are the `expectStopEndsOnlyTheStoppedChain` rows of `tests/sema/enclosing_member_bare_name_variance_stop_6383_test.cpp` (`:167`, `:185`, `:211`), which become `expectBothCompose`.
+    - The banked `s2_7_0003` keeps its `warn`.
+  - #5993: an override of a user base's non-slot `Equals` without `GetHashCode()` (the issue's `b3`, `b4`, `a1`). No pin.
+  - #6083: both shapes over a user-class carrier. The `pending_ruling_6083_*` rows of `tests/sema/object_downcast_not_implicit_6023_test.cpp` and the reject rows beside them keep their verdicts.
+  - #6220 (a): `L(Dog)` beside `L(Animal)` on a narrowed `Dog?`. **`tests/sema/overload_narrowed_nullable_arg_6002_test.cpp:193` `narrowed_derived_between_two_admitting_candidates_pending_6220` flips reject → runs, stdout `1`.**
+
+  *Changed selection (spec-ahead-of-impl):* #6220 (a): `F(T)` beside `F(T?)` on a narrowed `T?`. **`overload_narrowed_nullable_arg_6002_test.cpp:203` `nullable_overload_present_selection_unchanged_spec_22_6` flips stdout `2\n2\n` → `2\n1\n`.**
+
+  *Doc-only (the compiler matches):* #6249, #6196, #6111, #6028 part 2 (non-generic heads), #6031, #6054 (its tests assert `Length > 0` only, so the tracker tightens them), #6055 under pure variance, #6143, #6485, #5936 and every editorial sentence. No lit program and no rule-corpus verdict moves.
+
+  *Spec-ahead-of-impl (tracking issues filed at landing):*
+  - 0189: [#6604](https://github.com/s8lap/bezel-lang/issues/6604) deletes the type-position stop and its plumbing (`lookupBareTypeName`, `enclosingTypeMemberBlocksBareName`, `memberDeclaresCollidingName`, the §12.9 member arm) and carries the 25 row flips. [#6605](https://github.com/s8lap/bezel-lang/issues/6605) carries "declared or inherited" and §11.6's every-depth access at name positions, the v0.314 delta whose tracker [#5401](https://github.com/s8lap/bezel-lang/issues/5401) is closed.
+  - 0192: [#6602](https://github.com/s8lap/bezel-lang/issues/6602) covers the sema rejection, the generated component comparisons by the declared `Equals`, and the two gtest bodies.
+  - `A1`: [#6587](https://github.com/s8lap/bezel-lang/issues/6587) (#5931's probe); [#6599](https://github.com/s8lap/bezel-lang/issues/6599) (#6247 part 1). #6050's `Object` leg is a note on [#5704](https://github.com/s8lap/bezel-lang/issues/5704).
+  - `A2`: [#6588](https://github.com/s8lap/bezel-lang/issues/6588) (#6028 part 1, codegen); [#6600](https://github.com/s8lap/bezel-lang/issues/6600) (#6132, sema and codegen). Notes go on [#6020](https://github.com/s8lap/bezel-lang/issues/6020) and [#6069](https://github.com/s8lap/bezel-lang/issues/6069).
+  - `A3`:
+    - [#6589](https://github.com/s8lap/bezel-lang/issues/6589);
+    - [#6590](https://github.com/s8lap/bezel-lang/issues/6590);
+    - [#6591](https://github.com/s8lap/bezel-lang/issues/6591);
+    - [#6592](https://github.com/s8lap/bezel-lang/issues/6592);
+    - [#6593](https://github.com/s8lap/bezel-lang/issues/6593), which carries the five gtest rows;
+    - [#6601](https://github.com/s8lap/bezel-lang/issues/6601).
+
+    Notes go on [#6298](https://github.com/s8lap/bezel-lang/issues/6298) and [#5998](https://github.com/s8lap/bezel-lang/issues/5998).
+  - `A4`:
+    - [#6594](https://github.com/s8lap/bezel-lang/issues/6594);
+    - [#6603](https://github.com/s8lap/bezel-lang/issues/6603), which also carries #6143's test-side pins;
+    - [#6595](https://github.com/s8lap/bezel-lang/issues/6595), which carries the three rows;
+    - [#6596](https://github.com/s8lap/bezel-lang/issues/6596), the adapter-bridged probe;
+    - [#6597](https://github.com/s8lap/bezel-lang/issues/6597), which tightens the tests;
+    - [#6598](https://github.com/s8lap/bezel-lang/issues/6598), the move-only probe.
+  - #6485: a note on [#6482](https://github.com/s8lap/bezel-lang/issues/6482); its pick is unblocked.
+  - The twelve open issues `E` states (#6068, #5946, #6047, #6195, #6225, #5977, #6428, #6483, #6427, #5945, #6006, #6489) get notes. Their compiler work is unchanged.
+
+  *Owner decisions recorded:*
+  - The owner's 2026-10-08 delegation, and the 2026-10-19 directions to rule on the spec issues and to proceed with drafting.
+  - Proposals 0189 and 0192 were accepted as delegated rulings and graduate here.
+  - The five deviations from the recorded recommendations are listed above.
+
+  *Filed:*
+  - [#6573](https://github.com/s8lap/bezel-lang/issues/6573) (`spec-question`). §28.11's lint B, retired at v0.338 on the ground that it was never implemented, is implemented and still emitted. `s28_11_0008`/`0009` are banked `pass` at `warn`, and rationale §5.28 and proposal 0181 §6.2/§6.3 say "never implemented". Decide whether to delete the code or keep it as an out-of-spec tooling warning; the two cases are re-cut either way.
+  - [#6574](https://github.com/s8lap/bezel-lang/issues/6574) (`spec-question`): a box assigned into an already-classified `Object` local.
+  - [#6575](https://github.com/s8lap/bezel-lang/issues/6575) (`spec-question`): §12.1's exact-versus-widening override pair.
+  - [#6576](https://github.com/s8lap/bezel-lang/issues/6576) (`spec-question`): §27.1.1 function-type nullability under variance.
+  - [#6578](https://github.com/s8lap/bezel-lang/issues/6578) (`spec-question`): §35.5's prefix omission at a nested slot of a different choice.
+  - [#6579](https://github.com/s8lap/bezel-lang/issues/6579) (`spec-question`): the mirror of #6432.
+  - [#6580](https://github.com/s8lap/bezel-lang/issues/6580) (`spec-question`): where a type parameter ranks in §2.7 rule 1.
+  - [#6581](https://github.com/s8lap/bezel-lang/issues/6581) (`spec-question`): an `Equals`-declaring enum's constant slot in a destructuring pattern.
+  - [#6582](https://github.com/s8lap/bezel-lang/issues/6582) (`spec-question`): four small follow-ups from `A4`, one of them already moot.
+  - [#6583](https://github.com/s8lap/bezel-lang/issues/6583) (`spec-tracking`): #6247 part 2.
+  - [#6584](https://github.com/s8lap/bezel-lang/issues/6584) (`spec-question`): whether a defaulted parameter changes which `Object` slot an `Equals` fills (from [#6011](https://github.com/s8lap/bezel-lang/issues/6011)'s thread).
+  - [#6585](https://github.com/s8lap/bezel-lang/issues/6585): a measurement issue for [#6522](https://github.com/s8lap/bezel-lang/issues/6522)'s unmeasured lead on other generic positions.
+  - [#6577](https://github.com/s8lap/bezel-lang/issues/6577) and [#6586](https://github.com/s8lap/bezel-lang/issues/6586) (`documentation`).
+
+  *Decided or recorded rather than filed:*
+  - `A3`'s question on a narrowed argument under §14.5 inference is answered by §22.3's existing rule.
+  - `A3`'s note on an `abstract` pair coinciding at an instantiation states a consequence and needs no sentence.
+  - #5998's imported-base arm stays on #5998, as a note.
+  - `A4`'s Guide 02 `const`-copy idiom is left for the guide's next re-trace.
+  - The held rule case `s11_2_0092` (#6111; expected `run`, stdout `2`) is to be banked after a compiler run.
+
+  *Guides:* Guide 06 gets two sentences (#6249, `async` invariant at entry only). No guide pin moves.
+
+  *Corpus:*
+  - The rule corpus stays at 2,927 cases. No case is retired, and no banked verdict, needle or baseline row is touched.
+  - **`rule:` headers refreshed, verdicts unchanged:**
+    - banked (header only): `s11_6_0004` (0189/#6432's §11.6 grant), `s28_1_0004` (`E`'s §28.1 clause 2; was a paraphrase) and `s28_6_0029` (`E`'s §28.6 sentences split its paraphrase; it now quotes the *Transferring* bullet's own fresh-value sentence, the case's method return);
+    - unbanked: `s35_11_0003` and `s35_11_0004` (`E`'s §35.11 respelling).
+
+    Every refreshed quote holds verbatim on the composed text, and no other quote went stale (an all-ellipsis, normalized comparison).
+  - **The doc-example corpus** is not regenerated ([#1380](https://github.com/s8lap/bezel-lang/issues/1380)). `tests/conformance/cases/spec_0062.bzl`, §14.4's `OwningCache<T>` block verbatim, is hand-edited at line 4 to `new OwningArray<T>()`, with its manifest expectation `compiles` kept. This is required before or with #6482's pick, whose rejection of the shorthand would otherwise fail the doc-example sweep on this one case.
+  - At regeneration the corpus also gains four code-generation `error` blocks (`A3`'s #5947 and #5965 fences; `A4`'s #6191 reserved-names block and #6143 lambda pair). It picks up `A2`'s #6132 line, `A4`'s #5929 enum pair (inside an existing §7.3 block), `A3`'s A.4 `Constraint` comment and `A1`'s §5.4 `Remove` comment. The last of these is in `codegen_0020`, comment only.
+  - **Coverage gaps not written** (recorded in the trackers):
+    - #5931's field forms, and the local no-op;
+    - #6050's three `Object` cases;
+    - #6247's `GetEnumerator()` reject;
+    - #6249's entry-only `run`;
+    - 0189's nested-body accept;
+    - #6432's grandparent `private static` pair;
+    - #6028's `string`-receiver run, generic alias head run and `Twin` reject;
+    - #6132's two rejects;
+    - #5947's reject and same-signature accept;
+    - #5964's extension twin of `s14_2_0019`;
+    - #5965's three bound cases;
+    - #6031's class-bound accept;
+    - #6133's three pairs;
+    - #6220's four cases;
+    - #6302's reject;
+    - 0192's cases (proposal §8);
+    - #5993's `b4`;
+    - #6083's four cases;
+    - #6143's five cases;
+    - #6191/#6305's member-kind rejects and static-class accept;
+    - #6054's interpolation run;
+    - #6055's `Feed` run;
+    - #5930's move-only reject.
+
+  *Matrix status after this train* (the v0.336 run files are pinned and not edited; the next re-runs re-quote):
+  - **Found at composition:** borrow-flow R5/C8, R3/C11 and R5/C11, and generics R1/C1 and R4/C1, quote §35.11's "classification-neutral at a runtime-managed substitution and at a value substitution that carries no borrow". `E`'s #6006 sentence makes it "a copyable value substitution" and names the move-only case. Re-quote it. The verdicts are unchanged, since each cell concerns borrow-bearing or owning substitutions, not the borrow-free move-only one.
+  - No other cell loses a fragment. The lanes re-walked their cells' row and column neighbours and found none opened.
 
 ---

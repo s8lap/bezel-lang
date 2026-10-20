@@ -1,7 +1,7 @@
 public class OwningCache<T> where T: class
   private owned _items: OwningArray<T>;
 
-  public constructor() _items := new(); end;
+  public constructor() _items := new OwningArray<T>(); end;
 
   public method Add(owned item: T)
     _items.Add(move item);
