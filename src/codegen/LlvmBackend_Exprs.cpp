@@ -9398,6 +9398,11 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     llvm::Value* elem = lowerExpr(*bin.left);
                     llvm::Value* set  = lowerExpr(*bin.right);
                     if (!elem || !set) return nullptr;
+                    // fix #6541 (§5.1, v0.338): the §5.1 widening admitted at a
+                    // Set<T> element slot must be MATERIALISED before the spill —
+                    // the element is this table's key, and the runtime hashes
+                    // `key_size` bytes off the pointer handed to it.
+                    elem = coerceDictKeyToKeyType(elem, elemTy, bin.left.get());
                     // Spill elem to a stack slot; a record already spilled to ptr.
                     llvm::Value* ep;
                     if (elemIsRecord && elem->getType()->isPointerTy()) {
@@ -9425,6 +9430,12 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 llvm::Value* key  = lowerExpr(*bin.left);
                 llvm::Value* dict = lowerExpr(*bin.right);
                 if (!key || !dict) return nullptr;
+                // fix #6541 (§5.1, v0.338): materialise the §5.1 widening
+                // admitted at the key slot before the spill. `key in dict` IS
+                // `dict.Contains(key)` (stdlib §4.8, §17.5), so this must agree
+                // with the `ContainsKey` encoder — pre-fix the two disagreed
+                // about the same key.
+                key = coerceDictKeyToKeyType(key, keyTy, bin.left.get());
                 if (keyTy) {
                     // Generic (non-string) key: spill to a slot, pass pointer.
                     llvm::Value* kp;

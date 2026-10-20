@@ -902,6 +902,11 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     // dict_object_bare_value_key_indexer_set_4640_test.cpp prove that.
     if (keyTy) {
         k = boxForTarget(k, keyTy, ix.indices[0].value.get());
+        // fix #6541 (§5.1, v0.338): after §8.6 boxing, materialise the §5.1
+        // widening admitted at the key slot before the spill — a `boxForTarget`
+        // no-op (the numeric case) leaves `k` at the SOURCE width, and the
+        // runtime reads `key_size` bytes.
+        k = coerceDictKeyToKeyType(k, keyTy, ix.indices[0].value.get());
     }
     auto* tmpSlot = entryAlloca(ptrTy());
     llvm::Value* found;
@@ -1165,6 +1170,10 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     llvm::Value* kl = nullptr;
     llvm::Value* kw = nullptr;         // fix #4499: storage width rides along
     if (keyTy) {
+        // fix #6541 (§5.1, v0.338): materialise the §5.1 widening admitted at the
+        // key slot before the spill — this is the `move d[k]` twin of the
+        // indexer get, and the twin has the same `key_size` over-read.
+        k = coerceDictKeyToKeyType(k, keyTy, ix.indices[0].value.get());
         keyPtr = k;
         // fix #4640: a freshly-boxed key is already a pointer; the spill arm
         // is skipped for it (k->getType()->isPointerTy()).
@@ -1908,6 +1917,12 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         emitStringRetain(val);
     llvm::Value* vPtr = encodeValue(val);
     if (keyTy) {
+        // fix #6541 (§5.1, v0.338): `d[7] := v` at `Dictionary<long, V>` is the
+        // STORE-side twin of the indexer get — materialise the §5.1 widening
+        // before the spill, or `bz_dict_set_gen`'s `memcpy(kc, key, key_size)`
+        // reads past the slot (the same defect #4640 recorded for the
+        // Object-keyed shape, on the widening axis).
+        k = coerceDictKeyToKeyType(k, keyTy, ix.indices[0].value.get());
         llvm::Value* keyPtr = k;
         // fix #4640: a freshly-boxed key is already a pointer (boxForTarget
         // returned the box pointer); the spill arm is skipped for it

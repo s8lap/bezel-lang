@@ -3049,7 +3049,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // value reaching us as a pointer is already an address; any
                 // scalar/string value (including a string POINTER, whose bytes
                 // are the key) is stored into a fresh slot of its own type.
-                auto elemPtr = [&](llvm::Value* v) -> llvm::Value* {
+                auto elemPtr = [&](llvm::Value* v,
+                                   const ast::Expr* elemExpr = nullptr) -> llvm::Value* {
+                    // fix #6541 (§5.1, v0.338): a Set<T> is this same
+                    // `bz_dict_t*` table, so its ELEMENT is this table's KEY and
+                    // the identical §5.1 widening / `key_size` over-read applies
+                    // (`Set<long>.Add(7)`, `Set<long>.Contains(7)`).
+                    if (elemExpr)
+                        v = coerceDictKeyToKeyType(v, elemTy, elemExpr);
                     if (elemIsRecord && v->getType()->isPointerTy())
                         return v;  // record already spilled to an address
                     llvm::AllocaInst* slot = entryAlloca(v->getType());
@@ -3141,7 +3148,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                         emitStringRetain(item);
                     auto* fn = declareC("bz_dict_set_gen",
                         llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
-                    builder_.CreateCall(fn, {recv, elemPtr(item), sentinel});
+                    builder_.CreateCall(fn, {recv, elemPtr(item, call.args[0].value.get()), sentinel});
                     // fix #6394: the insert is the last read of `recv`; reclaim
                     // the unbound receiver here (§28.3's end-of-full-expression
                     // boundary, which for this arm is its own return).
@@ -3155,7 +3162,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (m == "TryAdd" && call.args.size() == 1 && call.args[0].value) {
                     llvm::Value* item = lowerExpr(*call.args[0].value);
                     if (!item) return nullptr;
-                    llvm::Value* ep = elemPtr(item);
+                    llvm::Value* ep = elemPtr(item, call.args[0].value.get());
                     auto* containsFn = declareC("bz_dict_contains_gen", i1(),
                                                 {ptrTy(), ptrTy()});
                     llvm::Value* already = builder_.CreateCall(
@@ -3194,7 +3201,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* fn = declareC("bz_dict_contains_gen", i1(),
                                         {ptrTy(), ptrTy()});
                     llvm::Value* has =
-                        builder_.CreateCall(fn, {recv, elemPtr(item)}, "set.has");
+                        builder_.CreateCall(fn, {recv, elemPtr(item, call.args[0].value.get())}, "set.has");
                     // fix #6394: the membership query is a PURE BORROW of the
                     // argument (`item`), never of the receiver, so the bool this
                     // arm returns aliases nothing and the reclaim is safe here.
@@ -3214,7 +3221,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                                    : "bz_dict_remove_gen",
                                           i1(), {ptrTy(), ptrTy()});
                     llvm::Value* removed =
-                        builder_.CreateCall(rmFn, {recv, elemPtr(item)}, "set.rm");
+                        builder_.CreateCall(rmFn, {recv, elemPtr(item, call.args[0].value.get())}, "set.rm");
                     // fix #6394: reclaim AFTER the unlink, so the removal has
                     // already resolved the one element's ownership and the
                     // receiver's own release pass cannot discharge it twice —
@@ -8636,7 +8643,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // the byte pointer the generic runtime entry points expect. A record key
         // reaching us as a pointer is already an address; any other value
         // (scalar/enum) is stored into a slot of its natural LLVM type.
-        auto genKeyPtr = [&](llvm::Value* k) -> llvm::Value* {
+        auto genKeyPtr = [&](llvm::Value* k,
+                             const ast::Expr* keyExpr = nullptr) -> llvm::Value* {
+            // fix #6541 (§5.1, v0.338): the §5.1 widening admitted at a key slot
+            // must be MATERIALISED before the spill, or the runtime's
+            // `key_size`-byte read runs off the end of a narrower slot. This is
+            // the ONE encoder every named generic-key member of the isDict block
+            // shares (ContainsKey/Contains/Add/TryAdd/Remove/TryGetValue/
+            // GetOrNull/GetOrAdd), so applying it here covers the whole named
+            // surface at the site that defines the encoding.
+            if (keyExpr)
+                k = coerceDictKeyToKeyType(k, keyTy, keyExpr);
             if (keyIsRecord && k->getType()->isPointerTy())
                 return k;  // record already spilled to an address
             llvm::AllocaInst* slot = entryAlloca(k->getType());
@@ -9351,7 +9368,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (keyTy) {
                 auto* fn = declareC("bz_dict_contains_gen", i1(), {ptrTy(), ptrTy()});
                 llvm::Value* has =
-                    builder_.CreateCall(fn, {recv, genKeyPtr(k)}, "dict.contains");
+                    builder_.CreateCall(fn, {recv, genKeyPtr(k, call.args[0].value.get())}, "dict.contains");
                 // fix #6419: the membership probe is a PURE BORROW of both the
                 // argument (which `bz_dict_contains_gen` hashes and compares by
                 // the lowered key BYTES) and the receiver, so the `bool` this
@@ -9397,7 +9414,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (keyTy) {
                 auto* cf = declareC("bz_dict_contains_gen", i1(),
                                     {ptrTy(), ptrTy()});
-                isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "tryadd.dup");
+                isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k, call.args[0].value.get())}, "tryadd.dup");
             } else {
                 auto [kd0, kl0, kw0] = strDataLen(k);
                 auto* cf = declareC("bz_dict_contains_str", i1(),
@@ -9431,7 +9448,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 auto* fn = declareC("bz_dict_set_gen",
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {recv, genKeyPtr(k), vPtr});
+                builder_.CreateCall(fn, {recv, genKeyPtr(k, call.args[0].value.get()), vPtr});
             } else {
                 auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_set_str",
@@ -9512,7 +9529,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* cf = declareC("bz_dict_contains_gen",
                                         i1(), {ptrTy(), ptrTy()});
                     emitGuardThrow(
-                        builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "add.dup"),
+                        builder_.CreateCall(cf, {recv, genKeyPtr(k, call.args[0].value.get())}, "add.dup"),
                         "ArgumentException");
                 } else {
                     auto [kd0, kl0, kw0] = strDataLen(k);
@@ -9553,7 +9570,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (keyTy) {
                     auto* cf = declareC("bz_dict_contains_gen",
                                         i1(), {ptrTy(), ptrTy()});
-                    isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)},
+                    isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k, call.args[0].value.get())},
                                                 "add.dup");
                 } else {
                     auto [kd0, kl0, kw0] = strDataLen(k);
@@ -9590,7 +9607,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (keyTy) {
                 auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                builder_.CreateCall(fn, {recv, genKeyPtr(k), vPtr});
+                builder_.CreateCall(fn, {recv, genKeyPtr(k, call.args[0].value.get()), vPtr});
                 // fix #1970 / §28.4 / §28.6: for OwningDictionary<K,V>.Add the
                 // value parameter is `owned` and has just been stored into the
                 // dict's table (the duplicate-key branch above already disposed
@@ -9688,12 +9705,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     auto* fn = declareC("bz_dict_remove_gen_disposing", i1(),
                                         {ptrTy(), ptrTy(), ptrTy()});
                     removeResult = builder_.CreateCall(
-                        fn, {recv, genKeyPtr(k), llvm::cast<llvm::Value>(valDisp)},
+                        fn, {recv, genKeyPtr(k, call.args[0].value.get()), llvm::cast<llvm::Value>(valDisp)},
                         "dict.remove");
                 } else {
                     auto* fn = declareC("bz_dict_remove_gen", i1(), {ptrTy(), ptrTy()});
                     removeResult = builder_.CreateCall(
-                        fn, {recv, genKeyPtr(k)}, "dict.remove");
+                        fn, {recv, genKeyPtr(k, call.args[0].value.get())}, "dict.remove");
                 }
                 // fix #6419: the removed value is DISPOSED inside the call
                 // (`_disposing` variant) or never entered the table, and the
@@ -9745,7 +9762,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // #643: bz_dict_pop_value_gen — get-then-remove without disposal.
                 auto* fn = declareC("bz_dict_pop_value_gen", i1(),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(k, call.args[0].value.get()), tmpSlot},
                                             "pv.found");
             } else {
                 auto [kd2, kl2, kw2] = strDataLen(k);
@@ -9817,7 +9834,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (keyTy) {
                 auto* fn = declareC("bz_dict_pop_value_gen", i1(),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot},
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(k, call.args[0].value.get()), tmpSlot},
                                             "tpv.found");
             } else {
                 auto [kd2, kl2, kw2] = strDataLen(k);
@@ -9918,7 +9935,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (keyTy) {
                 auto* fn = declareC("bz_dict_try_get_gen", i1(),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(k, call.args[0].value.get()), tmpSlot});
             } else {
                 auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
@@ -10011,7 +10028,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (keyTy) {
                 auto* fn = declareC("bz_dict_try_get_gen", i1(),
                                     {ptrTy(), ptrTy(), ptrTy()});
-                found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(k, call.args[0].value.get()), tmpSlot});
             } else {
                 auto [kd, kl, kw] = strDataLen(k);
                 auto* fn = declareC("bz_dict_try_get_str", i1(),
@@ -10146,7 +10163,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // Lower the key once, and spill it for the generic-key path.
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
-            llvm::Value* genKey = keyTy ? genKeyPtr(k) : nullptr;
+            llvm::Value* genKey = keyTy ? genKeyPtr(k, call.args[0].value.get()) : nullptr;
             llvm::Value* strKd = nullptr, *strKl = nullptr, *strKw = nullptr;
             if (!keyTy) {
                 auto p = strDataLen(k);

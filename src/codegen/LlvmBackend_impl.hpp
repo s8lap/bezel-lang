@@ -5959,6 +5959,61 @@ private:
                                      absent, strPtr, "key.sel");
     }
 
+    // fix #6541 (spec §5.1, v0.338): a GENERIC (non-string) collection KEY
+    // value converted to the KEY TYPE's own representation before it is spilled
+    // to a slot the runtime hashes by `key_size` bytes.
+    //
+    // The generic-key runtime reads `d->key_size` bytes off the pointer the
+    // codegen hands it (`bz_dict_contains_gen` / `bz_dict_try_get_gen` /
+    // `bz_dict_set_gen`, all funnelling through `bz$valkey$hash`), while every
+    // call site spills `k` at `k->getType()` — the SOURCE expression's width,
+    // which `lowerExpr` derives from the literal/local, not from the key slot.
+    // §5.1 admits `int` → `long` / `float` / `double` / `decimal`, so at
+    // `Dictionary<long, V>` a `Dictionary` literal-free `7` is a legal key whose
+    // slot is 8 bytes wide; the pre-fix spill is `alloca i32` and the runtime
+    // reads 4 bytes of stack past it. MEASURED (issue 6541, base `e0594ff4`),
+    // both a literal and an `int` local:
+    //
+    //     ==2905632==ERROR: AddressSanitizer: stack-buffer-overflow
+    //       READ of size 8 ... partially overflows this variable
+    //         #0 bz$valkey$hash
+    //         #1 bz_dict_try_get_gen bezel_runtime_collections.cpp:1182
+    //
+    // On a plain build the answer then depends on whatever happened to be in
+    // those 4 bytes — MEASURED, the five members DISAGREE about one key:
+    // `Dictionary<long, string> := Add(7L, "K")` read back with an `int`
+    // local gave ContainsKey/`in`/indexer/Remove = present and GetOrNull =
+    // null, and read back with the literal `7` gave all five absent. Both are
+    // the same over-read; §8.3's `a.Equals(b) ⇒ equal hashes` and §4.8's
+    // "GetOrNull: absent → null" are what the widening decides.
+    //
+    // §5.1's CONSTANT NARROWING is the mirror (`Dictionary<byte, V>` read with
+    // the constant `5`) and is MEASURED already correct — `lowerExpr` lowers a
+    // constant to the narrowed width — so no Trunc is emitted here: a
+    // non-constant narrowing is on §5.1's never-implicit list and is rejected
+    // in sema before codegen, and adding an unmeasured Trunc would be a
+    // silent-truncation risk for no measured gain.
+    //
+    // `boxForTarget` (§8.6 Object/interface boxing, #4640) stays at the call
+    // sites that already apply it — it is a no-op for a numeric key, and
+    // widening its reach is a separate call.
+    llvm::Value* coerceDictKeyToKeyType(llvm::Value* k,
+                                        const sema::TypeRef* keyTy,
+                                        const ast::Expr* keyExpr) {
+        if (!k || !keyTy || keyTy->nullable) return k;
+        if (keyTy->kind != sema::TypeRef::Kind::Primitive) return k;
+        llvm::Type* srcTy = k->getType();
+        if (!srcTy->isIntegerTy() || !srcTy->isIntegerTy(1))
+            if (!srcTy->isIntegerTy() && !srcTy->isFloatingPointTy())
+                return k;
+        llvm::Type* want = lowerTypeRef(keyTy);
+        if (!want || want == srcTy) return k;
+        // int → float/double and float → double (§5.1): SIToFP vs UIToFP is
+        // picked from the SOURCE's signedness (issue #410), not the target's.
+        bool srcUns = keyExpr && isUnsignedTargetExpr(*keyExpr);
+        return coerceNumericToType(k, want, srcUns);
+    }
+
     // Return the total byte size of the string data (len * width).
     llvm::Value* loadStringByteSize(llvm::Value* strPtr) {
         llvm::Value* len = loadStringLen(strPtr);

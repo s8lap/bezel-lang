@@ -46899,7 +46899,13 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
 
     // Spill a generic key to a stack slot and return its byte pointer
     // (mirrors the genKeyPtr lambda in tryLowerCollectionInstanceCall).
-    auto spillKey = [&](llvm::Value* k) -> llvm::Value* {
+    auto spillKey = [&](llvm::Value* k,
+                        const ast::Expr* keyExpr = nullptr) -> llvm::Value* {
+        // fix #6541 (§5.1, v0.338): same §5.1 widening materialisation as
+        // genKeyPtr / elemPtr — a `[7: v]` literal over `Dictionary<long, V>`
+        // is the store-side twin of the `ContainsKey(7)` lookup side.
+        if (keyExpr)
+            k = coerceDictKeyToKeyType(k, keyTy, keyExpr);
         if (keyIsRecord && k->getType()->isPointerTy())
             return k;  // record is already spilled to an address
         llvm::AllocaInst* slot = entryAlloca(k->getType());
@@ -46952,7 +46958,7 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         if (keyTy) {
             auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});
-            builder_.CreateCall(fn, {dict, spillKey(k), vPtr});
+            builder_.CreateCall(fn, {dict, spillKey(k, cl->keys[i].get()), vPtr});
         } else {
             // String key: extract data/len from the bz_string struct.
             // fix #6540 (§8.4 / §3.6, v0.338): a `[key: value]` literal over
