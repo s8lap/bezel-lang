@@ -8243,6 +8243,46 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 }
             }
         }
+        // fix #6542 (§17.5, v0.338; §5.1, v0.338; stdlib §9.6): the same
+        // enumeration for the STRING receiver. `String` declares TWO
+        // `Contains` overloads — `Contains(value: string): bool` and
+        // `Contains(value: char): bool` (stdlib §9.6) — so the admitted
+        // left-operand set is the union of the two parameter types, each
+        // under §5.1.
+        //
+        // MEASURED on the pre-fix base, neither spelling was checked and the
+        // program was blamed on the LOWERING arm instead — `1 in "abc"`,
+        // `1.5 in "abc"`, `true in "abc"` and a `byte` in "abc" all reported
+        // "not yet implemented: codegen for this `in` expression form"
+        // (LlvmBackend_Exprs.cpp). Nothing wrong was ADMITTED by that: §5.1's
+        // table lists `char` as a SOURCE only and §4.2's integer-types table
+        // omits `char`, so §5.1's constant narrowing has no `char` target
+        // either (§5.2 makes integer→`char` the explicit `char(n)`
+        // conversion). All four are correctly REJECTED; the defect is the
+        // LAYER, which points the reader at the codegen dispatch instead of
+        // at the conversion check — the message shape that invites "just
+        // implement the arm" as a wrong follow-up. Every LEGAL spelling
+        // already lowers (pinned by
+        // tests/sema/in_over_string_left_operand_6542_test.cpp).
+        //
+        // The `string` overload is admitted by its own identity and is NOT
+        // routed through the `char` check: `string in string` is §9.6's
+        // substring test. `fromExpr` carries §5.1's constant-narrowing clause
+        // and §7.4's narrowing fact, so one spelling is decided identically
+        // here and at the `Contains` call.
+        bool inLeftIsString = inLt &&
+            inLt->kind == TypeRef::Kind::Primitive &&
+            inLt->primitive == PrimitiveType::String;
+        if (be.left && inLt && inRt && !inLeftIsString &&
+            inRt->kind == TypeRef::Kind::Primitive &&
+            inRt->primitive == PrimitiveType::String) {
+            checkAssignable(
+                inLt, ctx_.primitiveTypeRef(PrimitiveType::Char),
+                be.left->span.begin.line != 0 ? be.left->span.begin
+                                              : be.span.begin,
+                "left operand of `in` over a `string` receiver",
+                be.left.get());  // §7.4 / §27.6 — narrowing-aware
+        }
         if (inLt && inLt->nullable && inRt &&
             inRt->kind == TypeRef::Kind::Named &&
             inRt->declaration == ctx_.builtinClassSym("Range") &&
