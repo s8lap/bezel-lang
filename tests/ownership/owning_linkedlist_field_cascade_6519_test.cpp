@@ -105,8 +105,8 @@ namespace {
 // Every one of those guards becomes the sanctioned LOUD form,
 // `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
 // (tests/support/aot_result_asserts.hpp), in the same statement position: the
-// skip is still recognised as an environment condition, but it now MARKS THE
-// ROW FAILED instead of hiding it. The lenient legs' assertions additionally
+// skip is now LOUD — the row FAILS — instead of being absorbed by a guard
+// that reports a clean pass. The lenient legs' assertions additionally
 // now RUN UNCONDITIONALLY rather than being skipped, which is the other half of
 // the strengthening. Every substantive assertion in every row (r.ran and the
 // exitCode pins) stays exactly where it was.

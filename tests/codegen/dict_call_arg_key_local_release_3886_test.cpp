@@ -103,9 +103,8 @@ namespace {
 //
 // Each guard is replaced by the sanctioned LOUD form,
 // `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r))`
-// (tests/support/aot_result_asserts.hpp): the skip is still recognised as an
-// environment condition, but it now MARKS THE ROW FAILED instead of hiding
-// it. That is strictly stronger than the guard it replaces — the row can no
+// (tests/support/aot_result_asserts.hpp): the skip is now LOUD — the row
+// FAILS — instead of being absorbed by a guard that reports a clean pass. That is strictly stronger than the guard it replaces — the row can no
 // longer report green on a machine that never compiled the program — and it
 // leaves every substantive assertion in these eleven rows (r.ran, exitCode,
 // stdoutText) exactly where it was, in the same order.

@@ -91,8 +91,8 @@ namespace {
 // Each guard becomes the sanctioned LOUD form,
 // `BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(...))`
 // (tests/support/aot_result_asserts.hpp), in the same statement position:
-// the skip is still recognised as an environment condition rather than a
-// product failure, but it now MARKS THE ROW FAILED instead of hiding it.
+// the skip is now LOUD — the row FAILS — instead of being absorbed by a
+// guard that reports a clean pass.
 // Every substantive assertion in every row — `r.ran` and the exitCode pins —
 // stays exactly where it was, and the local predicate is deleted so no
 // absorbing shape survives. The guard stays a SEPARATE statement from the

@@ -108,12 +108,28 @@ namespace bezel::test {
 // the "silent skip" defect: the test is green, and it proved nothing. It is
 // counted by scripts/check_toolchain_skip_surface.py as an *absorbing site*.
 //
-// The fix is not to delete the guard — a box genuinely without ASan should not
-// be reported as a product failure — but to make the skip LOUD. `BEZEL_EXPECT_FALSE
-// (checkedToolchainSkipped(r))` inverts the branch: the row still passes where
-// the toolchain is absent, and it FAILS anywhere the skip is being used to
-// paper over a real sanitizer finding, because such a finding is a rejection,
-// not a SKIP.
+// The fix is not to delete the guard but to make the skip LOUD.
+// `BEZEL_EXPECT_FALSE(checkedToolchainSkipped(r))` inverts the branch: the skip
+// is now LOUD — the row FAILS — instead of being absorbed by a guard that
+// reports a clean pass. It also FAILS anywhere the skip is being used to paper
+// over a real sanitizer finding, because such a finding is a rejection, not a
+// SKIP.
+//
+// MEASURED, not asserted: with the toolchain absent the rows carrying this
+// guard are now RED. The toolchain being absent is an environment condition,
+// but a silent skip is indistinguishable from a pass to anything reading the
+// suite's exit status, so the row is deliberately no longer green under it.
+//
+// A PRECONDITION THIS PREDICATE RELIES ON, worth stating because the per-file
+// helpers it replaced did not have it: the deleted local predicates opened
+// with `if (r.ran) return false;`, so they only reported a skip for a result
+// that had NOT run. This one has no such short-circuit — it scans the
+// diagnostics of any result — so it fires in strictly MORE cases. That is
+// safe today and is a strengthening (none of the converted files carries the
+// literal "SKIP" in a program source, and no compiler diagnostic in src/ emits
+// it), but a diagnostic that ever gains that literal would start failing rows
+// for the wrong reason. A caller that must distinguish "no toolchain" from "a
+// rejection whose text happens to contain SKIP" needs its own positive check.
 //
 // Callers must keep the guard as a separate statement from this predicate — the
 // ratchet inspects a call whose bound result reaches a `return` on the strength
