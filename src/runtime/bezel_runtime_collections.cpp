@@ -3225,8 +3225,13 @@ extern "C" void bz_grouping_free(void* grp) {
 // bz_array_free for the outer array.
 extern "C" void* bz_groupby_to_array(void* lazy, int64_t val_esz,
                                       int64_t key_esz,
-                                      void* closure, void* key_fn_ptr) {
+                                      void* closure, void* key_fn_ptr,
+                                      void* key_eq_ptr) {
     typedef void (*key_fn_t)(void*, const void*, void*);
+    // #6532 / stdlib §5 GroupBy: keys are compared by the key type's value
+    // equality (the same trampoline Distinct uses), not by raw bytes — a string
+    // key is a pointer, so memcmp split equal strings with distinct pointers.
+    auto  key_eq = (bz_eq_fn)key_eq_ptr;
     auto  key_fn = (key_fn_t)key_fn_ptr;
     auto* e = (bz_lazy_t*)lazy;
     // Outer array holds bz_grouping_t* pointers.
@@ -3238,7 +3243,8 @@ extern "C" void* bz_groupby_to_array(void* lazy, int64_t val_esz,
         for (int64_t i = 0; i < garr->count; ++i) {
             void** slot = (void**)((char*)garr->data + i * sizeof(void*));
             auto* g = (bz_grouping_t*)(*slot);
-            if (memcmp(g->key_data, key, (size_t)key_esz) == 0) return g;
+            if (key_eq ? key_eq(g->key_data, key) != 0
+                       : memcmp(g->key_data, key, (size_t)key_esz) == 0) return g;
         }
         auto* g = bz_grouping_alloc(val_esz, key_esz, key);
         bz_array_add(groups, &g, sizeof(void*));
