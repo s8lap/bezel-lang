@@ -278,11 +278,26 @@ def _unescape(literal_with_quotes):
 
     Handles \\\\ \\" \\' \\n \\r \\t \\a \\b \\f \\v \\0 and the numeric forms
     \\xHH (greedy, exactly as C++ phase 5 - the escape absorbs every
-    following hex digit, so `"\\x53KIP"` is `SKIP` but `"\\x53AB"` is ONE
-    character) and \\NNN octal (up to three digits). Only enough to decide
-    whether a needle IS the skip marker; an escape form not listed here is
-    left verbatim, which can only fail to CONFIRM - the under-flagging
-    direction this module documents everywhere.
+    following hex digit, so `"\\x53KIP"` and `"\\x053KIP"` are both `SKIP`)
+    and \\NNN octal (at most three digits, so `"\\123KIP"` is `SKIP` while
+    `"\\1234KIP"` is `S4KIP` and `"\\53KIP"` is `+KIP`). Only enough to
+    decide whether a needle IS the skip marker; an escape form not listed
+    here - a UNIVERSAL CHARACTER NAME (`\\uXXXX`, `\\UXXXXXXXX`), a named
+    escape such as `\\e`, or an out-of-range numeric escape - is left
+    verbatim, which can only fail to CONFIRM - the under-flagging direction
+    this module documents everywhere.
+
+    The greedy / capped rules are only ever exercised by literals that
+    clang++ ACCEPTS. An out-of-range numeric escape is ILL-FORMED, not a
+    one-character string: MEASURED with clang++ -std=c++20, `"\\x53AB"`
+    and `"\\x1FF"` fail with `error: hex escape sequence out of range` and
+    `"\\400"` with `error: octal escape sequence out of range`. The
+    `& 0xFF` mask below is what keeps `_unescape` TOTAL on such input -
+    it neither raises nor can it promote an ill-formed spelling to the
+    marker - so leaving those literals unmasked would buy nothing, while
+    dropping the mask would make this function raise instead of merely
+    disagree. The direction is the safe one either way: an unreadable
+    needle fails to CONFIRM.
 
     Without the numeric forms, `"\\x53KIP"` and `"\\123KIP"` are yet two more
     spellings of the same bail-out marker that the confirmation cannot see,
@@ -2636,6 +2651,108 @@ BEZEL_TEST(fixture_suite, c6546_escaped_not_marker) {
     BEZEL_EXPECT_FALSE(r.ran);
 }
 ''')
+        # CORRECTION (review finding F1): an earlier version of the comment
+        # above this fixture claimed `"\\x53AB"` "is ONE character" because
+        # phase 5 absorbs every following hex digit. The greedy PARSE is
+        # right; the conclusion about the value was not. MEASURED with
+        # clang++ -std=c++20: `"\x53AB"` and `"\x1FF"` are REJECTED with
+        # `error: hex escape sequence out of range`, and `"\400"` with
+        # `error: octal escape sequence out of range`. An out-of-range
+        # numeric escape is ILL-FORMED, not a one-character string. The arm
+        # stays because it is genuinely load-bearing - it is the control
+        # that goes RED under an over-eager `OVER_hex_always_SKIP` mutant -
+        # but the honest justification is the one now on `_unescape`: the
+        # `& 0xFF` mask keeps `_unescape` total on ill-formed input, and
+        # that is the safe (fails-to-CONFIRM) direction.
+        #
+        # OCTAL (review finding F3): the four `find("...")` literals above
+        # are all hex or plain, so the OCTAL arm of `_unescape` had no
+        # fixture at all - MEASURED: the mutants `octal_2digit_cap`,
+        # `octal_no_cap` and `OVER_octal_always_SKIP` were all GREEN. The
+        # four fixtures below close that. Each is separately discriminating,
+        # because a set pinning only the greedy reading cannot see a
+        # non-greedy defect and vice versa:
+        #
+        #   `"\123KIP"`   -> `SKIP`     : the marker, octal-spelled. Goes
+        #                                 RED under `octal_2digit_cap`
+        #                                 (which reads `\12` + "3KIP") and
+        #                                 under deleting the octal arm.
+        #   `"\0123KIP"`  -> "\n3KIP"   : a FOURTH octal digit must NOT be
+        #                                 absorbed, so this stays a real
+        #                                 needle and protects. Goes RED
+        #                                 under `octal_no_cap`, which reads
+        #                                 `\0123` (0o123 = 'S') and would
+        #                                 wrongly call it the marker.
+        #   `"\53KIP"`    -> `+KIP`    : a SHORT (two-digit) octal escape is
+        #                                 likewise a real needle. Goes RED
+        #                                 under an over-eager mutant that
+        #                                 resolves every octal escape to
+        #                                 the single character 'S'.
+        #   `"\101"`      -> `A`       : the whole literal is one octal
+        #                                 escape and still is not the marker.
+        #                                 Goes RED under the other over-eager
+        #                                 shape, one that resolves every
+        #                                 octal escape to the string `SKIP`.
+        #
+        # Every value above is MEASURED against clang++ -std=c++20 by
+        # compiling the literal and printing it; each is a literal clang++
+        # ACCEPTS, so the octal cap is exercised by well-formed input only.
+        _mk(root, 'tests/codegen/c6546_octal_marker_test.cpp', '''
+namespace {
+bool c6546SkippedOctal(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("\\123KIP") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_octal_marker) {
+    auto r = runAot("module M;");
+    if (c6546SkippedOctal(r)) return;
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        _mk(root, 'tests/codegen/c6546_octal_three_digit_cap_test.cpp', '''
+namespace {
+bool c6546OctalFourDigitsRealNeedle(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("\\0123KIP") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_octal_three_digit_cap) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(c6546OctalFourDigitsRealNeedle(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        _mk(root, 'tests/codegen/c6546_octal_short_escape_test.cpp', '''
+namespace {
+bool c6546OctalShortEscapeRealNeedle(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("\\53KIP") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_octal_short_escape) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(c6546OctalShortEscapeRealNeedle(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
+        _mk(root, 'tests/codegen/c6546_octal_whole_literal_test.cpp', '''
+namespace {
+bool c6546OctalWholeLiteralRealNeedle(const bezel::test::JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("\\101") != std::string::npos) return true;
+    return false;
+}
+}
+BEZEL_TEST(fixture_suite, c6546_octal_whole_literal) {
+    auto r = runAot("module M;");
+    BEZEL_EXPECT_TRUE(c6546OctalWholeLiteralRealNeedle(r));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+''')
         # Re-measure AFTER the C5 fixtures are added so the post-C5
         # NEGATIVE assertions below (the SKIP-only and non-JitResult
         # helper cases both DO count) can reference a `per_file` that
@@ -2739,12 +2856,39 @@ BEZEL_TEST(fixture_suite, c6546_escaped_not_marker) {
             '`"\\x53KIP"` fixture cannot discriminate this (both readings '
             'agree there), so the greedy case is a SEPARATE arm',
             'tests/codegen/c6546_escaped_greedy_test.cpp' in per_file)
-        chk('#6546 companion CONTROL (load-bearing): `"\\x53AB"` is ONE '
-            'character (C++ phase 5 absorbs every following hex digit), so '
-            'it is NOT the marker and must still protect - without this arm '
-            'a fix that resolved escapes non-greedily would go green on the '
-            'assertion above',
+        chk('#6546 companion CONTROL (load-bearing): an out-of-range hex '
+            'escape is ILL-FORMED, not the marker - MEASURED, clang++ '
+            '-std=c++20 rejects `"\\x53AB"` and `"\\x1FF"` with `error: hex '
+            'escape sequence out of range`. The `& 0xFF` mask keeps '
+            '_unescape total on such input, and it must still fail to '
+            'CONFIRM the marker; without this arm a fix that resolved '
+            'every hex escape to `SKIP` would go green on the assertions '
+            'above',
             'tests/codegen/c6546_escaped_not_marker_test.cpp'
+            not in per_file)
+        chk('#6546 companion (octal): `"\\123KIP"` is `SKIP` written with a '
+            'numeric escape, so it MUST be denied for the same reason - the '
+            'octal arm of _unescape previously had NO fixture, so '
+            '`octal_2digit_cap` was GREEN',
+            'tests/codegen/c6546_octal_marker_test.cpp' in per_file)
+        chk('#6546 companion CONTROL (octal, load-bearing): a C++ octal '
+            'escape takes at most THREE digits, so `"\\0123KIP"` is '
+            '"\\n"+"3KIP" and stays a REAL needle. It is the arm that goes '
+            'RED under `octal_no_cap`, which would absorb the fourth digit '
+            '(0o123 = \'S\') and wrongly read the literal as the marker',
+            'tests/codegen/c6546_octal_three_digit_cap_test.cpp'
+            not in per_file)
+        chk('#6546 companion CONTROL (octal, load-bearing): a two-digit '
+            'octal escape `"\\53KIP"` is `+KIP`, also a REAL needle - this '
+            'is the arm that goes RED under an over-eager mutant resolving '
+            'every octal escape to the character \'S\'',
+            'tests/codegen/c6546_octal_short_escape_test.cpp'
+            not in per_file)
+        chk('#6546 companion CONTROL (octal, load-bearing): a literal that '
+            'is ONE octal escape, `"\\101"` = `A`, is still not the marker - '
+            'this is the arm that goes RED under the other over-eager '
+            'mutant, one resolving every octal escape to the string `SKIP`',
+            'tests/codegen/c6546_octal_whole_literal_test.cpp'
             not in per_file)
         # C1 fixtures: the suppression marker mechanism.
         chk('C1: an AMBIGUOUS-RAN-FALSE-OK marker on the line before a '
@@ -2764,23 +2908,24 @@ BEZEL_TEST(fixture_suite, c6546_escaped_not_marker) {
             'BEZEL_TEST within 8 lines below (e.g. with too many padded '
             'comment lines) does not exempt anything in this file',
             'tests/codegen/marker_no_match_test.cpp' in per_file)
-        chk('exactly 24 unprotected rows across the fixture tree (12 from '
-            'the C4-counted tree + 2 net C5 delta + 3 net #6538 delta + 7 '
+        chk('exactly 25 unprotected rows across the fixture tree (12 from '
+            'the C4-counted tree + 2 net C5 delta + 3 net #6538 delta + 8 '
             'net #6546 delta: every POSITIVE fixture is non-counting by '
             'design - the C5 support-helper case, the #6538 delegation '
             'cases (delegating-to-support-text, two-hop-transitive, and the '
-            'SKIP-substring needle), the #6546 real-needle call site and '
-            'the #6546 escaped-NOT-marker case are all correctly PROTECTED, '
-            'so their rows are removed from the count; every NEGATIVE '
-            'control contributes +1 because its protection claim is '
-            'rejected by the SAME positive-exclusion rule that applies to '
-            'in-file helpers - the C5 SKIP-only helper, the C5 non-JitResult '
-            'helper, the #6538 delegate-to-non-text helper, the #6538 '
-            'SKIP-literal delegation, the #6538 mutually-recursive pair, '
-            'and the seven #6546 skip-marker spellings (named const on each '
-            'rule, adjacent-literal concatenation on each rule, the '
-            'call-site marker, and the two numerically-escaped markers))',
-            total == 24)
+            'SKIP-substring needle), the #6546 real-needle call site, the '
+            '#6546 escaped-NOT-marker case and the three #6546 octal CONTROL '
+            'fixtures are all correctly PROTECTED, so their rows are removed '
+            'from the count; every NEGATIVE control contributes +1 because '
+            'its protection claim is rejected by the SAME positive-exclusion '
+            'rule that applies to in-file helpers - the C5 SKIP-only helper, '
+            'the C5 non-JitResult helper, the #6538 delegate-to-non-text '
+            'helper, the #6538 SKIP-literal delegation, the #6538 '
+            'mutually-recursive pair, and the eight #6546 skip-marker '
+            'spellings (named const on each rule, adjacent-literal '
+            'concatenation on each rule, the call-site marker, the two '
+            'numerically-escaped hex markers, and the octal marker))',
+            total == 25)
         # (Debug prints removed; count was confirmed = 14 via a temp
         # print during the C5 fix - left the count assertion here as
         # the tripwire for any future change that lifts the C5 net.)
