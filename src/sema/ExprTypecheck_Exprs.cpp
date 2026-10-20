@@ -8296,8 +8296,23 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                                            ? inRt->headName()
                                            : std::string_view(
                                                  inRt->aliasResolvedHead);
+            // fix #6535 (§5.1, v0.339; §17.5; stdlib §4.x): the ELEMENT
+            // families join the keyed ones. `x in c` IS `c.Contains(x)` and
+            // `checkBuiltinCollectionCallArgs` already checks that call's
+            // `item: T` slot with this same `checkAssignable`, so `in` draws
+            // the line `Contains` draws. A nullable `T` (`Array<int?>`) makes
+            // the target itself nullable, so v0.270's retained-equality
+            // nullable operand stays admitted. Span buffers and the lazy
+            // enumerables are NOT included (class-T `T?` split, see #6535).
+            bool inElementFamily =
+                inHead == "Array" || inHead == "OwningArray" ||
+                inHead == "Set" || inHead == "OwningSet" ||
+                inHead == "SortedSet" || inHead == "Stack" ||
+                inHead == "OwningStack" || inHead == "Queue" ||
+                inHead == "OwningQueue" || inHead == "LinkedList" ||
+                inHead == "OwningLinkedList";
             if (inHead == "Dictionary" || inHead == "OwningDictionary" ||
-                inHead == "SortedDictionary") {
+                inHead == "SortedDictionary" || inElementFamily) {
                 TypeRef* keyT = inRt->genericArgs[0];
                 bool keyIsBareParam = false;
                 if (keyT && keyT->kind == TypeRef::Kind::Named &&
