@@ -3207,14 +3207,26 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // the stored key (struct/decimal) or crashing codegen's IRBuilder on an
         // invalid sext of a non-integer type (float/double) — mirroring the
         // existing two-selector value-type restriction just below.
-        if (keyTy->isStructTy() || keyTy->isFloatingPointTy()) {
+        //
+        // fix #6501 (§3.6, §8.3, v0.338): an INLINE ARRAY TKey (`[N]T`, an
+        // `llvm::ArrayType`) is the same shape and reached the trampoline's
+        // `CreateSExt(k, i64())` with an aggregate operand ("SExt only operates
+        // on integer", IR verification abort). It cannot take #6271's route
+        // (value hash/equality helpers): the runtime reads the key through the
+        // trampoline's single `int64_t` return and copies at most 8 bytes of it
+        // (`key_buf`, bz_lazy_to_dict), so any aggregate key is unrepresentable
+        // here by ABI, not by the hash. It gets the same clean diagnostic as
+        // the record / `decimal` aggregates above (all of which the
+        // enumeration over key type measured as rejected, not aborting).
+        if (keyTy->isStructTy() || keyTy->isArrayTy() ||
+            keyTy->isFloatingPointTy()) {
             ctx_.diagnostics().report(
                 Severity::Error, call.span.begin,
                 "`ToDictionary`'s key selector currently supports only a "
                 "scalar or reference-typed TKey (int/enum/char/bool/string/"
                 "class) in codegen; a key selector returning a record, "
-                "`decimal`, `float`, or `double` is not yet implemented "
-                "(stdlib \xC2\xA7""5)");
+                "inline array, `decimal`, `float`, or `double` is not "
+                "yet implemented (stdlib \xC2\xA7""5)");
             return llvm::PoisonValue::get(ptrTy());
         }
 
