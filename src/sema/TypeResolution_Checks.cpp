@@ -8066,8 +8066,8 @@ void Resolver::checkHidingAndOverride() {
                 // covers "a non-override instance member ... at any other
                 // parameter list", a method notion) and no `override` can
                 // reach the slot: §12.2's "any inherited member" rule blocks
-                // it, instance or static. A `static class` is left as it was
-                // (spec question, see the #5961 commit body).
+                // it, instance or static. A static field or property of a
+                // `static class` is not blocked (§11.7, #6305 A).
                 if (!dynamic_cast<const MethodSymbol*>(ms) &&
                     (ms->name == "Equals" || ms->name == "GetHashCode" ||
                      ms->name == "ToString")) {
@@ -8098,11 +8098,13 @@ void Resolver::checkHidingAndOverride() {
                     bool objectSig =
                         !objectOwnSignatureMemberOf(tm, ctx_).empty() ||
                         isClassOwnTypeEquals(t, tm, ctx_);
-                    // A `static class` is not exempted by the spec text; the
-                    // normative stdlib declares `public static class Convert`
-                    // with static `ToString(value: int)` overloads, so this
-                    // path leaves static classes as they were (spec question,
-                    // see the #5961 commit body).
+                    // §11.7 (v0.340, #6305 A): a `static class` carries none of
+                    // `Object`'s instance surface, so its static members may take
+                    // any name of that surface (stdlib §2.3's `Convert.ToString`
+                    // overloads); §12.2 blocks a static member of the three names
+                    // only in a class with instances. The static-class check below
+                    // and the hiding check at the end of this loop (fix #6796)
+                    // both apply that exemption.
                     bool staticClass = false;
                     for (std::string_view mod : t->modifiers)
                         if (mod == "static") staticClass = true;
@@ -8142,9 +8144,23 @@ void Resolver::checkHidingAndOverride() {
                         checkObjectSlotOverrideSignature(tm);
                 }
                 if (!hasMod(ms, "override")) {
+                    // fix #6796 (§11.7, §12.2, v0.340): "a `static class` is
+                    // outside this rule" (§12.2), and its static members "may
+                    // take any
+                    // name of that surface, `Equals`, `GetHashCode`, `ToString`
+                    // and `GetType` included" (§11.7). A static member of a
+                    // `static class` at Object's own signature is therefore not
+                    // reported. An instance member of a static class is not
+                    // exempted here: §11.7's member rule rejects it
+                    // (checkStaticClassMember) and this report still stands.
+                    bool staticClassOwn = false;
+                    for (std::string_view mod : t->modifiers)
+                        if (mod == "static") staticClassOwn = true;
+                    const bool staticClassStatic =
+                        staticClassOwn && hasMod(ms, "static");
                     if (auto objName = objectOwnSignatureMemberOf(
                             dynamic_cast<const MethodSymbol*>(ms), ctx_);
-                        !objName.empty()) {
+                        !objName.empty() && !staticClassStatic) {
                         ctx_.diagnostics().report(
                             Severity::Error, ms->declLoc,
                             std::string("member `") + std::string(ms->name) +
