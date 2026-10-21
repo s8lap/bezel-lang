@@ -429,7 +429,7 @@ struct BzTimer {
     std::mutex mtx;
     std::condition_variable cv;
     bool stop = false;
-    std::thread thread;
+    BzThread thread;  // BZ_THREAD_STACK_SIZE stack (#6695)
 
     void run() {
         std::unique_lock<std::mutex> lk(mtx);
@@ -520,7 +520,7 @@ static void bz_timer_ensure() {
     std::lock_guard<std::mutex> lk(g_timer_init_mtx);
     if (g_timer) return;
     auto* t = new BzTimer();
-    t->thread = std::thread([t]{ t->run(); });
+    t->thread = BzThread([t]{ t->run(); });
     g_timer = t;
 }
 

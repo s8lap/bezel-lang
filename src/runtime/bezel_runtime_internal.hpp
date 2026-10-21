@@ -43,6 +43,86 @@
 #include <functional>
 #include <unordered_map>
 #include <unordered_set>
+#include <memory>
+#include <system_error>
+#include <utility>
+
+#include "bezel_thread_stack.h"
+
+// ---- BzThread: every runtime thread, with an explicit stack size ----
+//
+// The subset of std::thread the runtime uses (start a callable, joinable(),
+// join(), move), created through pthread_create with a pthread_attr that sets
+// the stack to BZ_THREAD_STACK_SIZE (bezel_thread_stack.h). std::thread offers
+// no stack-size knob, so it inherits the platform default: RLIMIT_STACK under
+// glibc but a fixed 128 KiB under musl, where a 20000-deep recursion on a
+// Domain.Spawn worker segfaulted (#6695, #6654 spike). Semantics kept from
+// std::thread: a failed create throws std::system_error, and destroying a
+// still-joinable thread calls std::terminate.
+class BzThread {
+public:
+    BzThread() noexcept = default;
+
+    template <class F>
+    explicit BzThread(F&& f) {
+        using Fn = std::decay_t<F>;
+        auto body = std::make_unique<Fn>(std::forward<F>(f));
+        pthread_attr_t attr;
+        int rc = pthread_attr_init(&attr);
+        if (rc == 0) {
+            rc = pthread_attr_setstacksize(&attr, BZ_THREAD_STACK_SIZE);
+            if (rc == 0)
+                rc = pthread_create(&tid_, &attr, &trampoline<Fn>, body.get());
+            pthread_attr_destroy(&attr);
+        }
+        if (rc != 0)
+            throw std::system_error(rc, std::generic_category(),
+                                    "BzThread: pthread_create");
+        body.release();  // the new thread owns it now (trampoline deletes it)
+        joinable_ = true;
+    }
+
+    BzThread(BzThread&& o) noexcept : tid_(o.tid_), joinable_(o.joinable_) {
+        o.joinable_ = false;
+    }
+    BzThread& operator=(BzThread&& o) noexcept {
+        if (joinable_) std::terminate();
+        tid_ = o.tid_;
+        joinable_ = o.joinable_;
+        o.joinable_ = false;
+        return *this;
+    }
+    BzThread(const BzThread&) = delete;
+    BzThread& operator=(const BzThread&) = delete;
+    ~BzThread() {
+        if (joinable_) std::terminate();
+    }
+
+    bool joinable() const noexcept { return joinable_; }
+    void join() {
+        if (!joinable_)
+            throw std::system_error(std::make_error_code(std::errc::invalid_argument),
+                                    "BzThread: join of a non-joinable thread");
+        const int rc = pthread_join(tid_, nullptr);
+        if (rc != 0)
+            throw std::system_error(rc, std::generic_category(),
+                                    "BzThread: pthread_join");
+        joinable_ = false;
+    }
+
+private:
+    // noexcept: an exception escaping the thread body terminates, exactly as
+    // it does from a std::thread's callable.
+    template <class Fn>
+    static void* trampoline(void* p) noexcept {
+        std::unique_ptr<Fn> body(static_cast<Fn*>(p));
+        (*body)();
+        return nullptr;
+    }
+
+    pthread_t tid_{};
+    bool joinable_ = false;
+};
 
 // ---- allocation failure (spec §31.4, v0.226) ----
 //
@@ -281,7 +361,7 @@ struct bz_string_struct {
     int8_t  width;
 };
 struct BzScheduler {
-    std::vector<std::thread> threads;
+    std::vector<BzThread> threads;  // BZ_THREAD_STACK_SIZE stacks (#6695)
     std::queue<std::function<void()>> queue;
     std::mutex mtx;
     std::condition_variable cv;
