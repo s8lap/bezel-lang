@@ -9220,13 +9220,17 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                        st->getType()->getIntegerBitWidth(),
                                        en->getType()->getIntegerBitWidth()});
                 llvm::Type* wTy = builder_.getIntNTy(w);
-                litUnsigned =
-                    (isUnsignedTargetExpr(*bin.left) &&
-                     x->getType()->getIntegerBitWidth() == w) ||
-                    (isUnsignedTargetExpr(*range->lo) &&
-                     st->getType()->getIntegerBitWidth() == w) ||
-                    (isUnsignedTargetExpr(*range->hi) &&
-                     en->getType()->getIntegerBitWidth() == w);
+                // §5.1 (v0.340): a `char` operand converts implicitly to `int`,
+                // and its value (at most U+10FFFF) is non-negative in a signed
+                // i32, so it never forces the unsigned predicates: `c in -5 .. 10`
+                // compares against a negative `int` bound and must stay signed.
+                auto forcesUnsigned = [&](const ast::Expr& e, llvm::Value* v) {
+                    return isUnsignedTargetExpr(e) && !isCharTargetExpr(e) &&
+                           v->getType()->getIntegerBitWidth() == w;
+                };
+                litUnsigned = forcesUnsigned(*bin.left, x) ||
+                              forcesUnsigned(*range->lo, st) ||
+                              forcesUnsigned(*range->hi, en);
                 if (x->getType() != wTy)
                     x = isUnsignedTargetExpr(*bin.left)
                             ? builder_.CreateZExt(x, wTy)

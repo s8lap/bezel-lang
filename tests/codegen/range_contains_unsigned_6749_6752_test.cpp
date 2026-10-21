@@ -133,3 +133,44 @@ BEZEL_TEST(range_contains_unsigned_6749_6752, r6_signed_controls_negative_values
     BEZEL_EXPECT_EQ(r.stdoutText,
         "True\nTrue\nFalse\nTrue\nTrue\nFalse\nTrue\nTrue\n");
 }
+
+// §5.1 (v0.340) conversion table: `char` converts implicitly to `int`, so
+// `c in -5 .. 10` is a Range<int> membership test and a `char` U+0003 is inside
+// it (§16.3). The literal `in` path read `char` as an unsigned operand filling
+// the compare width and compared -5 unsigned (as 4294967291), printing False.
+BEZEL_TEST(range_contains_unsigned_6749_6752, r7_char_in_negative_int_bounds_spec_5_1_16_3) {
+    auto r = runAot(prog(
+        "    var c: char := '\\u0003';\n"
+        "    var z: char := '\\u0000';\n"
+        "    Console.WriteLine(c in -5 .. 10);\n"
+        "    Console.WriteLine(c in -5 ..< 10);\n"
+        "    Console.WriteLine(z in -5 .. 10);\n"
+        "    Console.WriteLine(z in -5 ..< 10);\n"
+        "    Console.WriteLine((-5 .. 10).Contains(c));\n"
+        "    Console.WriteLine((-5 ..< 10).Contains(z));\n"
+        "    var f: char := '\\u00FF';\n"
+        "    Console.WriteLine(f in -5 .. 10);\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "True\nTrue\nTrue\nTrue\nTrue\nTrue\nFalse\n");
+}
+
+// Char-literal bounds (a Range<char>) and a high `char` (U+FFFF) against `int`
+// bounds, through the literal `in` path and the method spelling (§16.3, §17.5).
+BEZEL_TEST(range_contains_unsigned_6749_6752, r8_char_literal_bounds_and_high_char_spec_16_3) {
+    auto r = runAot(prog(
+        "    var q: char := 'q';\n"
+        "    var big: char := 'Q';\n"
+        "    Console.WriteLine(q in 'a' .. 'z');\n"
+        "    Console.WriteLine(q in 'a' ..< 'q');\n"
+        "    Console.WriteLine(big in 'a' .. 'z');\n"
+        "    Console.WriteLine(('a' .. 'z').Contains(q));\n"
+        "    var h: char := '\\uFFFF';\n"
+        "    Console.WriteLine(h in -5 .. 65535);\n"
+        "    Console.WriteLine(h in 0 ..< 65535);\n"
+        "    Console.WriteLine(h in -1 .. 70000);\n"
+        "    Console.WriteLine((-5 .. 65535).Contains(h));\n"
+        "    Console.WriteLine(h in -70000 .. -1);\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+        "True\nFalse\nFalse\nTrue\nTrue\nFalse\nTrue\nTrue\nFalse\n");
+}
