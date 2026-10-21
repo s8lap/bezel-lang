@@ -14348,6 +14348,125 @@ bool Emitter::fillOmittedCtorSlots(const sema::ConstructorSymbol& target,
 }
 
 
+// fix #6704 (§22.10 / §22.8 step 1 / §31.4, v0.339): the built-in-exception
+// base call, shared by the explicit `base(...)` chain (emitChainCall) and the
+// primary-constructor inheritance clause `class C(m): Exception(m)`
+// (emitImplicitBase). A built-in exception has no TypeSymbol, so `baseClassOf`
+// is null for both; only the chain had an arm for it, and the clause form
+// returned early and dropped its arguments (empty `e.Message`).
+void Emitter::emitBuiltinExceptionBaseArgs(
+    const std::vector<ast::CallArgument>& args, llvm::Value* obj) {
+        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* msgVal = lowerExpr(*args[0].value);
+        if (msgVal) {
+            // fix #2902 (§31.1 / §28.9 / §22.8 / §28.1, v0.240): the
+            // exception OWNS its Message, exactly as the direct-`new`
+            // built-in path does (the #1033 contract, LlvmBackend_Exprs2.cpp
+            // — a `+1` producer TRANSFERS its single reference into the
+            // slot; a BORROW is RETAINED so the slot owns an independent
+            // `+1`). This site stored BARE — no retain, no transfer decision
+            // at all — and the two sites disagreeing is why it survived.
+            //
+            // The argument of a `base(m)` chain is normally the user
+            // constructor's own `string` PARAMETER, a borrow whose single
+            // reference belongs to the caller (§28.1). Read off the emitted
+            // `main` for the repro: `new SubEx("m" + i.ToString())` builds a
+            // `+1` temp, calls `bz$App.SubEx$ctor`, and then at `new.cont` —
+            // the very next block — does `call void @bz_string_release(ptr
+            // %str.obj)`. That was the only reference; the Message slot was
+            // left dangling and the next `e.Message` read was a
+            // heap-use-after-free. A literal message hides the whole shape,
+            // because a literal is an immortal sentinel on which both
+            // retain and release are no-ops.
+            //
+            // WHAT THIS DELIBERATELY DOES NOT DO, and why. Owning a
+            // reference does not by itself make the slot exactly-once:
+            // NOTHING releases a user exception subclass's inherited
+            // Message. `vt$<C>` slot 2 is the class's own `bz$<C>$Dispose`,
+            // whose core never touches the §31.4 header, and
+            // `emitBaseDisposeChain` (§28.4 step 3) walks only USER-class
+            // ancestors — a built-in exception base has no `TypeSymbol`, so
+            // the shared `bz$exDisposeMsg` that a directly-constructed
+            // `new Exception(msg)` disposes through is never reached from a
+            // subclass. So this fix converts a use-after-free into a BOUNDED
+            // LEAK (one message string per subclass instance; measured 711
+            // bytes / 40 allocations over the repro's 20 iterations) — the
+            // strictly safer direction, per the recorded #2874 / #2823
+            // reasoning. The residual is tracked as #2951.
+            //
+            // The obvious completion — calling `builtinExceptionDisposeFn_`
+            // from `emitDisposerCore` — was written and MEASURED, and is
+            // BLOCKED by a distinct, pre-existing cross-module defect
+            // (filed as #2950): an IMPORTED class deriving from a built-in
+            // exception is laid out WITHOUT the §31.4 header by the
+            // importer, because `directBuiltinExceptionBase` reads the
+            // `ast::TypeDecl` base list and an imported symbol has no AST —
+            // and sema never puts a built-in base into `baseTypeRefs`
+            // either (TypeResolution_Names.cpp gates that push on
+            // `ref->declaration`, which a built-in lacks), so the module
+            // metadata carries no channel for it at all. Measured for one
+            // `public class MyEx: Exception` with a single `int` field:
+            // exporter `%class.MyEx = type { ptr, ptr, ptr, ptr, ptr, i8,
+            // i32 }` (48 B) vs importer `{ ptr, i8, i32 }` (16 B). Adding
+            // the release made the exporter-compiled disposer hand the
+            // importer's FIELD VALUE to `bz_string_release`: `SEGV on
+            // unknown address 0x2b`, `rdi = 0x13` (the field's value, 19),
+            // in `bz$TsLib2867T1.MyEx2867$DisposeCore` — the existing
+            // xmod_object_tostring_producer_residual_2867 test. Releasing is
+            // only sound once the two modules agree on the layout.
+            if (!isPlusOneStringProducer(args[0].value.get()))
+                emitStringRetain(msgVal);
+            // message_ptr is at byte offset 8 — store directly via byte GEP.
+            llvm::Value* msgSlot = builder_.CreateGEP(
+                i8Ty, obj, builder_.getInt64(kExcMsgOffset));
+            builder_.CreateStore(msgVal, msgSlot);
+        }
+        // §31.4 / #811: the two-argument base overloads, discriminated by
+        // the second argument's static type exactly like the built-in
+        // `new` path (LlvmBackend_Exprs.cpp): a `string` second argument
+        // is ArgumentException's paramName (→ ParamName@32); an exception
+        // second argument is the (message, cause) overload — snapshot the
+        // borrowed cause into CauseChain@24. The user-subclass object
+        // mirrors the full built-in header (classStruct), so these byte
+        // offsets are in-bounds. The cause here is normally the user
+        // ctor's own borrowed parameter — never disposed by this path.
+        if (args.size() >= 2 && args[1].value) {
+            const sema::TypeRef* a1ty = ctx_.exprType(*args[1].value);
+            bool argIsString = a1ty &&
+                a1ty->kind == sema::TypeRef::Kind::Primitive &&
+                a1ty->primitive == sema::PrimitiveType::String;
+            if (argIsString) {
+                llvm::Value* pn = lowerExpr(*args[1].value);
+                if (pn) {
+                    // fix #2902 (§31.4 / §28.9, v0.240): ParamName is the
+                    // same owned string slot under the same retain/transfer
+                    // model as the Message above — and the direct-`new`
+                    // built-in path retains here too.
+                    if (!isPlusOneStringProducer(args[1].value.get()))
+                        emitStringRetain(pn);
+                    llvm::Value* pnSlot = builder_.CreateGEP(
+                        i8Ty, obj,
+                        builder_.getInt64(kExcParamOffset));
+                    builder_.CreateStore(pn, pnSlot);
+                }
+            } else {
+                llvm::Value* cause = lowerExpr(*args[1].value);
+                if (cause) {
+                    bool hasHdr = isBuiltinExceptionType(a1ty) ||
+                        (a1ty && a1ty->declaration &&
+                         hasBuiltinExceptionBase(a1ty->declaration));
+                    llvm::Value* chain = emitExcCauseSnapshot(
+                        cause,
+                        /*causeIsBuiltin=*/hasHdr);
+                    llvm::Value* ccSlot = builder_.CreateGEP(
+                        i8Ty, obj,
+                        builder_.getInt64(kExcCauseOffset));
+                    builder_.CreateStore(chain, ccSlot);
+                }
+            }
+        }
+}
+
 void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                    sema::ConstructorSymbol* cs) {
     const sema::TypeSymbol* targetCls =
@@ -14362,115 +14481,7 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         // direct AST base is a built-in exception.
         if (!isThis && !call->args.empty() && call->args[0].value &&
             hasBuiltinExceptionBase(cs->parent) && currentThis_) {
-            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            llvm::Value* msgVal = lowerExpr(*call->args[0].value);
-            if (msgVal) {
-                // fix #2902 (§31.1 / §28.9 / §22.8 / §28.1, v0.240): the
-                // exception OWNS its Message, exactly as the direct-`new`
-                // built-in path does (the #1033 contract, LlvmBackend_Exprs2.cpp
-                // — a `+1` producer TRANSFERS its single reference into the
-                // slot; a BORROW is RETAINED so the slot owns an independent
-                // `+1`). This site stored BARE — no retain, no transfer decision
-                // at all — and the two sites disagreeing is why it survived.
-                //
-                // The argument of a `base(m)` chain is normally the user
-                // constructor's own `string` PARAMETER, a borrow whose single
-                // reference belongs to the caller (§28.1). Read off the emitted
-                // `main` for the repro: `new SubEx("m" + i.ToString())` builds a
-                // `+1` temp, calls `bz$App.SubEx$ctor`, and then at `new.cont` —
-                // the very next block — does `call void @bz_string_release(ptr
-                // %str.obj)`. That was the only reference; the Message slot was
-                // left dangling and the next `e.Message` read was a
-                // heap-use-after-free. A literal message hides the whole shape,
-                // because a literal is an immortal sentinel on which both
-                // retain and release are no-ops.
-                //
-                // WHAT THIS DELIBERATELY DOES NOT DO, and why. Owning a
-                // reference does not by itself make the slot exactly-once:
-                // NOTHING releases a user exception subclass's inherited
-                // Message. `vt$<C>` slot 2 is the class's own `bz$<C>$Dispose`,
-                // whose core never touches the §31.4 header, and
-                // `emitBaseDisposeChain` (§28.4 step 3) walks only USER-class
-                // ancestors — a built-in exception base has no `TypeSymbol`, so
-                // the shared `bz$exDisposeMsg` that a directly-constructed
-                // `new Exception(msg)` disposes through is never reached from a
-                // subclass. So this fix converts a use-after-free into a BOUNDED
-                // LEAK (one message string per subclass instance; measured 711
-                // bytes / 40 allocations over the repro's 20 iterations) — the
-                // strictly safer direction, per the recorded #2874 / #2823
-                // reasoning. The residual is tracked as #2951.
-                //
-                // The obvious completion — calling `builtinExceptionDisposeFn_`
-                // from `emitDisposerCore` — was written and MEASURED, and is
-                // BLOCKED by a distinct, pre-existing cross-module defect
-                // (filed as #2950): an IMPORTED class deriving from a built-in
-                // exception is laid out WITHOUT the §31.4 header by the
-                // importer, because `directBuiltinExceptionBase` reads the
-                // `ast::TypeDecl` base list and an imported symbol has no AST —
-                // and sema never puts a built-in base into `baseTypeRefs`
-                // either (TypeResolution_Names.cpp gates that push on
-                // `ref->declaration`, which a built-in lacks), so the module
-                // metadata carries no channel for it at all. Measured for one
-                // `public class MyEx: Exception` with a single `int` field:
-                // exporter `%class.MyEx = type { ptr, ptr, ptr, ptr, ptr, i8,
-                // i32 }` (48 B) vs importer `{ ptr, i8, i32 }` (16 B). Adding
-                // the release made the exporter-compiled disposer hand the
-                // importer's FIELD VALUE to `bz_string_release`: `SEGV on
-                // unknown address 0x2b`, `rdi = 0x13` (the field's value, 19),
-                // in `bz$TsLib2867T1.MyEx2867$DisposeCore` — the existing
-                // xmod_object_tostring_producer_residual_2867 test. Releasing is
-                // only sound once the two modules agree on the layout.
-                if (!isPlusOneStringProducer(call->args[0].value.get()))
-                    emitStringRetain(msgVal);
-                // message_ptr is at byte offset 8 — store directly via byte GEP.
-                llvm::Value* msgSlot = builder_.CreateGEP(
-                    i8Ty, currentThis_, builder_.getInt64(kExcMsgOffset));
-                builder_.CreateStore(msgVal, msgSlot);
-            }
-            // §31.4 / #811: the two-argument base overloads, discriminated by
-            // the second argument's static type exactly like the built-in
-            // `new` path (LlvmBackend_Exprs.cpp): a `string` second argument
-            // is ArgumentException's paramName (→ ParamName@32); an exception
-            // second argument is the (message, cause) overload — snapshot the
-            // borrowed cause into CauseChain@24. The user-subclass object
-            // mirrors the full built-in header (classStruct), so these byte
-            // offsets are in-bounds. The cause here is normally the user
-            // ctor's own borrowed parameter — never disposed by this path.
-            if (call->args.size() >= 2 && call->args[1].value) {
-                const sema::TypeRef* a1ty = ctx_.exprType(*call->args[1].value);
-                bool argIsString = a1ty &&
-                    a1ty->kind == sema::TypeRef::Kind::Primitive &&
-                    a1ty->primitive == sema::PrimitiveType::String;
-                if (argIsString) {
-                    llvm::Value* pn = lowerExpr(*call->args[1].value);
-                    if (pn) {
-                        // fix #2902 (§31.4 / §28.9, v0.240): ParamName is the
-                        // same owned string slot under the same retain/transfer
-                        // model as the Message above — and the direct-`new`
-                        // built-in path retains here too.
-                        if (!isPlusOneStringProducer(call->args[1].value.get()))
-                            emitStringRetain(pn);
-                        llvm::Value* pnSlot = builder_.CreateGEP(
-                            i8Ty, currentThis_,
-                            builder_.getInt64(kExcParamOffset));
-                        builder_.CreateStore(pn, pnSlot);
-                    }
-                } else {
-                    llvm::Value* cause = lowerExpr(*call->args[1].value);
-                    if (cause) {
-                        bool hasHdr = isBuiltinExceptionType(a1ty) ||
-                            (a1ty && a1ty->declaration &&
-                             hasBuiltinExceptionBase(a1ty->declaration));
-                        llvm::Value* chain = emitExcCauseSnapshot(
-                            cause,
-                            /*causeIsBuiltin=*/hasHdr);
-                        llvm::Value* ccSlot = builder_.CreateGEP(
-                            i8Ty, currentThis_,
-                            builder_.getInt64(kExcCauseOffset));
-                        builder_.CreateStore(chain, ccSlot);
-                    }
-                }
-            }
+            emitBuiltinExceptionBaseArgs(call->args, currentThis_);
         }
         return;
     }
@@ -15933,7 +15944,20 @@ bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
 void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                                const sema::TypeSymbol* root) {
     const sema::TypeSymbol* b = baseClassOf(cls);
-    if (!b) return;
+    if (!b) {
+        // fix #6704 (§22.10 / §22.8 step 1, v0.339): a built-in exception base
+        // has no TypeSymbol; the inheritance clause's base call still owes its
+        // message / paramName / cause arguments (the explicit `base(...)` chain
+        // already stores them through the same helper).
+        if (obj && hasBuiltinExceptionBase(cls)) {
+            if (const std::vector<ast::CallArgument>* clsBaseArgs =
+                    sema::primaryBaseCtorArgsOf(cls)) {
+                if (!clsBaseArgs->empty() && (*clsBaseArgs)[0].value)
+                    emitBuiltinExceptionBaseArgs(*clsBaseArgs, obj);
+            }
+        }
+        return;
+    }
     // fix #5878 (§22.7, v0.334): "A static constructor runs once before the
     // type's first use." Constructing `b` as a base SUBOBJECT is a first use
     // of `b`, so `b`'s static constructor must run here — before its field

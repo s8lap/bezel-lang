@@ -18815,6 +18815,11 @@ private:
     // initializers ran at the ERASED `T -> i32` layout inside an object allocated
     // at the composed one. From `Leaf` the same walk needs NO seed (a non-generic
     // receiver is the 0 == 0 case) and resolves `U -> int` then `T -> string`.
+    // fix #6704: stores a built-in exception base call's message / paramName /
+    // cause into the inherited §31.4 header slots of `obj`.
+    void emitBuiltinExceptionBaseArgs(
+        const std::vector<ast::CallArgument>& args, llvm::Value* obj);
+
     void emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                           const sema::TypeSymbol* root = nullptr);
 
