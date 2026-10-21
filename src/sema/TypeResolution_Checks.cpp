@@ -4765,6 +4765,66 @@ void Resolver::checkEqualsHashCodePairing() {
     });
 }
 
+// §8.3 (v0.340, proposal 0196, #6725): the `Object`-slot `Equals` declares no
+// default value for its parameter (§22.5). On a class, an `Equals` whose one
+// parameter is the class's own type (`C` or `C?`, `override` or plain) fills
+// the slot, as does `override Equals(other: Object?)`; on a value kind, the
+// own-typed `Equals` fills it (§9.2, §10.5, §35.2) and a nullable `R?` does not,
+// the kind's own type being non-nullable. A default would serve only a direct
+// `x.Equals()` call, while every path to the slot passes one argument, and it
+// splits the boxed member from the declared body: a hash container reaches the
+// body, the box did not (#6725). A value kind's `Object?`/`Object` parameter is
+// rejected by its dispatch-modifier check, so it is not reported again here.
+void Resolver::checkObjectSlotEqualsDefault() {
+    if (!ctx_.module()) return;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        const bool isClass = t->kind == ast::TypeDeclKind::Class;
+        const bool isValueKind = t->kind == ast::TypeDeclKind::Record ||
+                                 t->kind == ast::TypeDeclKind::Enum ||
+                                 t->kind == ast::TypeDeclKind::Choice;
+        if (!isClass && !isValueKind) return;
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms || ms->isOperator || ms->name != "Equals" ||
+                ms->params.size() != 1)
+                continue;
+            // A `static` Equals fills no instance slot (objectSlotEqualsSpelling).
+            bool isStatic = false;
+            for (auto mod : ms->modifiers)
+                if (mod == "static") isStatic = true;
+            if (isStatic) continue;
+            auto* param = dynamic_cast<ParameterSymbol*>(ms->params.front());
+            if (!param || !param->hasDefault) continue;
+            if (isClass) {
+                if (objectOwnSignatureMemberOf(ms, ctx_).empty() &&
+                    !isClassOwnTypeEquals(t, ms, ctx_))
+                    continue;
+            } else {
+                if (!isClassOwnTypeEquals(t, ms, ctx_)) continue;
+                TypeRef* pt = param->declType ? ctx_.resolvedType(*param->declType)
+                                              : param->resolvedDeclType;
+                if (!pt || pt->nullable) continue;
+            }
+            const char* kindWord =
+                t->kind == ast::TypeDeclKind::Class    ? "class"
+                : t->kind == ast::TypeDeclKind::Record ? "record"
+                : t->kind == ast::TypeDeclKind::Enum   ? "enum"
+                                                       : "choice";
+            const char* cite =
+                t->kind == ast::TypeDeclKind::Class    ? "§8.3"
+                : t->kind == ast::TypeDeclKind::Record ? "§8.3, §9.2"
+                : t->kind == ast::TypeDeclKind::Enum   ? "§8.3, §10.5"
+                                                       : "§8.3, §35.2";
+            ctx_.diagnostics().report(
+                Severity::Error, ms->declLoc,
+                std::string("member `Equals` fills the `Object` slot of ") +
+                kindWord + " `" + std::string(t->name) +
+                "` and takes no default value: drop the default on its "
+                "parameter (" + cite + ")");
+        }
+    });
+}
+
 // §25.2 (v0.158, #1338; enum spelling corrected v0.183, #1381/#1582; choices
 // added v0.276, #3333): "A record, enum, or choice that overloads `=`/`<>`
 // with both operands of the declaring type must also declare `Equals(T)` and

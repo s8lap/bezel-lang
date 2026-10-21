@@ -698,6 +698,9 @@ private:
     void checkOperatorGroups();  // §25.2: comparison/equality operator groups
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
     void checkEqualsHashCodePairing();
+    // §8.3 (v0.340, proposal 0196, #6725): the Object-slot `Equals` declares
+    // no default value, on a class in either spelling and on every value kind.
+    void checkObjectSlotEqualsDefault();
     // §25.2 (v0.158, #1338): a record/enum that overloads `=`/`<>` with BOTH
     // operands of the declaring type must also declare `Equals(T)` and
     // `override GetHashCode`.  Heterogeneous-operand overloads are exempt.

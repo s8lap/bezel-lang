@@ -572,6 +572,9 @@ void Resolver::run(const ast::SourceFile& src) {
     checkOperatorGroups();
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.
     checkEqualsHashCodePairing();
+    // §8.3 (v0.340, proposal 0196, #6725): the Object-slot `Equals` takes no
+    // default value, on a class in either spelling and on every value kind.
+    checkObjectSlotEqualsDefault();
     // §25.2 (v0.158, #1338): a record/enum overloading `=`/`<>` (homogeneous
     // operands) must also declare `Equals(T)` + `override GetHashCode`.
     checkEqualityCoDeclaration();
