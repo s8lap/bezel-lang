@@ -24,7 +24,13 @@
 //
 // Not covered here (filed): an imported INTERFACE's generic method through
 // interface dispatch (#6816), §14.5 Agreement on the imported channel
-// (#6817), a nullable i32-payload type argument such as `Show<char?>` (#6818).
+// (#6817).
+//
+// #6818 rows (below): an explicit NULLABLE value type argument (`char?`,
+// `int?`, `Color?`, `long?`), whose argument crosses as the bare payload and
+// so passed both the #5057 carrier check and the i32 test, and any non-`int`
+// type bound only through a constructed formal (`Array<long>`,
+// `Array<string>`, ...), which no width gate sees.
 
 #include <string>
 
@@ -47,6 +53,7 @@ const char* kLib6779 =
     "  public static method ShowA<T>(xs: Array<T>): string => $\"{xs[0]}\";\n"
     "  public static method Pair<T>(a: T, b: T): string => $\"{a}{b}\";\n"
     "  public static method Count<T>(a: T): int => 7;\n"
+    "  public static method D<T>(a: T): string => $\"[{default(T)}]\";\n"
     "end H;\n"
     "public class V\n"
     "  public constructor() end constructor;\n"
@@ -317,4 +324,129 @@ BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, same_module_char_enum_uint_sho
                                 "M.Color M.Color True\n"
                                 "5 5 True\n"
                                 "5 5 True\n"));
+}
+
+// ── #6818: an explicit nullable value type argument ───────────────────────
+// `char?` lowers to the `{i8, i32}` carrier, so the i32 test missed it, but
+// the argument crosses as the bare payload, so #5057's carrier check missed
+// it too. MEASURED on 1dee80c2: `Show<char?>(char(97))` printed 97 and
+// `D<char?>` / `D<int?>(5)` / `D<Color?>` printed [0]; the same-module
+// program prints `a` and [null] (control below). §2.8.2 clause 2, v0.340.
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, show_nullable_char_rejected_at_type_arg_6818) {
+    expectReject("1", "Console.WriteLine(H.Show<char?>(char(97)));",
+                 "char?>(char(97))", "Show", "char?");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, default_nullable_char_rejected_at_type_arg_6818) {
+    expectReject("1", "Console.WriteLine(H.D<char?>(char(97)));",
+                 "char?>(char(97))", "D", "char?");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, default_nullable_int_rejected_at_type_arg_6818) {
+    expectReject("1", "Console.WriteLine(H.D<int?>(5));", "int?>(5)", "D",
+                 "int?");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, default_nullable_enum_rejected_at_type_arg_6818) {
+    expectReject("1", "Console.WriteLine(H.D<Color?>(Color.Green));",
+                 "Color?>(Color.Green)", "D", "Lib6779.Color?");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, default_nullable_long_rejected_at_type_arg_6818) {
+    expectReject("1", "Console.WriteLine(H.D<long?>(5));", "long?>(5)", "D",
+                 "long?");
+}
+
+// A nullable-typed ARGUMENT is still #5057's: `Show<int?>(n)` keeps its
+// carrier diagnostic, at the argument.
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, nullable_int_argument_still_5057_6818) {
+    const std::string app =
+        appSource("1", "var n: int? := 5; Console.WriteLine(H.Show<int?>(n));");
+    JitResult r = runApp(app);
+    BEZEL_EXPECT_FALSE(r.ran);
+    const std::string needle =
+        locOf(app, "n));") + "calling imported generic method `Show` with a "
+        "nullable-value-typed argument (`T?`) that cannot cross the module "
+        "boundary as a bare `int` placeholder";
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, needle.c_str()));
+}
+
+// ── #6818: a non-`int` type bound through a constructed formal ─────────────
+// `Array<T>` is a pointer at every `T`, so no width gate sees the element.
+// MEASURED on 1dee80c2, `ShowA` printed 705032704 for {5000000000L},
+// pointer bits for {"hi"}, 0 for {2.5}, 1 for {true}; explicit
+// `ShowA<long>` / `ShowA<string>` the same. Same-module control below.
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, inferred_array_long_rejected_at_argument_6818) {
+    expectReject("1",
+                 "var xs := new Array<long>(); xs.Add(5000000000L); "
+                 "Console.WriteLine(H.ShowA(xs));",
+                 "xs));", "ShowA", "long");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, inferred_array_string_rejected_at_argument_6818) {
+    expectReject("1",
+                 "var xs := new Array<string>(); xs.Add(\"hi\"); "
+                 "Console.WriteLine(H.ShowA(xs));",
+                 "xs));", "ShowA", "string");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, inferred_array_double_rejected_at_argument_6818) {
+    expectReject("1",
+                 "var xs := new Array<double>(); xs.Add(2.5); "
+                 "Console.WriteLine(H.ShowA(xs));",
+                 "xs));", "ShowA", "double");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, inferred_array_bool_rejected_at_argument_6818) {
+    expectReject("1",
+                 "var xs := new Array<bool>(); xs.Add(true); "
+                 "Console.WriteLine(H.ShowA(xs));",
+                 "xs));", "ShowA", "bool");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, explicit_array_long_rejected_at_argument_6818) {
+    expectReject("1",
+                 "var xs := new Array<long>(); xs.Add(5000000000L); "
+                 "Console.WriteLine(H.ShowA<long>(xs));",
+                 "xs));", "ShowA", "long");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, explicit_array_string_rejected_at_argument_6818) {
+    expectReject("1",
+                 "var xs := new Array<string>(); xs.Add(\"hi\"); "
+                 "Console.WriteLine(H.ShowA<string>(xs));",
+                 "xs));", "ShowA", "string");
+}
+
+// ── #6818 control: the same calls within one module ────────────────────────
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, same_module_nullable_and_array_control_6818) {
+    const std::string src =
+        "module M; "
+        "public enum Color Red, Green; end Color; "
+        "public class H "
+        "  public static method Show<T>(a: T): string => $\"{a}\"; "
+        "  public static method D<T>(a: T): string => $\"[{default(T)}]\"; "
+        "  public static method ShowA<T>(xs: Array<T>): string => $\"{xs[0]}\"; "
+        "end H; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    Console.WriteLine($\"{H.Show<char?>(char(97))} {H.D<char?>(char(97))} {H.D<int?>(5)} {H.D<Color?>(Color.Green)} {H.D<long?>(5)}\"); "
+        "    var xl := new Array<long>(); xl.Add(5000000000L); "
+        "    var xs := new Array<string>(); xs.Add(\"hi\"); "
+        "    var xd := new Array<double>(); xd.Add(2.5); "
+        "    var xb := new Array<bool>(); xb.Add(true); "
+        "    Console.WriteLine($\"{H.ShowA(xl)} {H.ShowA(xs)} {H.ShowA(xd)} {H.ShowA(xb)} {H.ShowA<long>(xl)} {H.ShowA<string>(xs)}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    JitResult r = bezel::test::runAot(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+                    std::string("a [null] [null] [null] [null]\n"
+                                "5000000000 hi 2.5 True 5000000000 hi\n"));
 }

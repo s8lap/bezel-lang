@@ -1262,8 +1262,10 @@ const char* kThirdDep2_5009 =
     "  public method NB3<T>(b: Box3M5009<T>): int where T: IShape3M5009 "
     "    return b.Get().Area() + 120; "
     "  end NB3; "
-    // BUILTIN bounds only: the i32 template is right, so neither is
-    // refused. 45 and 95.
+    // BUILTIN bounds only: the #5009 bound gate refuses neither. NOnly3
+    // (no value parameter) runs and returns 95. NCls3 binds `T` through the
+    // constructed formal `Box3M5009<T>` and is refused by the #6779 gate
+    // since #6818 (see T45).
     "  public method NCls3<T>(b: Box3M5009<T>): int where T: class "
     "    return 45; "
     "  end NCls3; "
@@ -1387,15 +1389,31 @@ BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
     expectThirdReject5009("T44", kThirdNB3_5009, "NB3");
 }
 
-// T45 / T46 — builtin bounds on the direct call keep their values across
+// T45 — flipped by #6818 (§2.8.2 clause 2, v0.340): a `T` bound only
+// through a constructed formal (`Box3M5009<T>`) at a non-`int` type is
+// refused at the argument. The `int` placeholder template reads such a `T`
+// as an `int` whatever the bound: MEASURED on 1dee80c2, the same shape
+// `Cls<T>(b: Box3<T>): string where T: class => $"{b.Get()}"` over
+// `Box3<string>("s")` printed 0 (same-module: s). NCls3's body never reads
+// `T`, so it returned 45 before; the importer cannot see that, which is the
+// posture #1943 and #6779 take for `Count<long>(y)` and `Count<char>('c')`.
+// The one-module value is still pinned by T49.
+// // per §14.1 / §2.8.2, v0.340
+BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
+           third_module_class_bound_through_constructed_formal_is_rejected_6818) {
+    Third5009 r = buildThird5009("T45", kThirdNCls3_5009, /*run=*/false);
+    if (!r.depOk) return;  // dependency toolchain unavailable
+    BEZEL_EXPECT_FALSE(r.success);
+    BEZEL_EXPECT_TRUE(
+        r.err.find("calling imported generic method `NCls3` with a type "
+                   "argument whose representation is not the compiled `int` "
+                   "(i32) placeholder \xE2\x80\x94 here `Dep3A5009T45.Sq3M5009`") !=
+        std::string::npos);
+}
+
+// T46 — a builtin bound with no value parameter keeps its value across
 // three modules.
 // // per §14.1 / §14.2 / §2.8.3 rule 4, v0.307
-BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
-           third_module_class_bound_direct_call_keeps_value) {
-    int rc = runThirdImport5009("T45", kThirdNCls3_5009);
-    if (rc == -2) return;
-    BEZEL_EXPECT_EQ(rc, 45);
-}
 
 BEZEL_TEST(xmod_constraint_dispatch_generic_method_5009,
            third_module_new_only_bound_direct_call_keeps_value) {

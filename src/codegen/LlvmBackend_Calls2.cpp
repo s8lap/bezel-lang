@@ -16897,8 +16897,14 @@ static std::string boundBodyReject5009(std::string_view name,
 //       `int` and runs.
 //   (b) no list: the §14.5 phase-1 binding, unifying each formal with its
 //       argument's static type, through a constructed formal (`Array<T>`)
-//       structurally. A parameter that receives two bindings is §14.5
-//       *Agreement*'s failure (sema's to report), so the gate stands down.
+//       structurally. Any concrete non-`int` binding is reported: through a
+//       constructed formal the container is a pointer at every `T`, so the
+//       width gate never sees a `long`, `string` or `double` element, and
+//       the placeholder body reads it as an `int` (#6818). A parameter that
+//       receives two bindings is §14.5 *Agreement*'s failure (sema's to
+//       report), so the gate stands down.
+//   An explicit nullable value type (`char?`, `int?`) is reported at the
+//   type argument too: its argument crosses as the bare payload (#6818).
 // An explicit `long` with an `int` literal argument (`Count<long>(99)`, the
 // #1943 T5 control) is neither and keeps compiling, as before.
 bool Emitter::rejectNonIntPlaceholderTypeArg6779(
@@ -16916,12 +16922,16 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
         return t && t->kind == sema::TypeRef::Kind::Named && !t->declaration;
     };
     auto report = [&](SourceLocation loc, const sema::TypeRef* t) {
+        // fix #6818: the qualified name of a nullable enum drops its `?`
+        // (`Lib.Color` for `Color?`); the diagnostic must name the shape.
+        std::string tn = spec85TypeRefQualifiedName(t);
+        if (t->nullable && (tn.empty() || tn.back() != '?')) tn += '?';
         ctx_.diagnostics().report(
             Severity::Error, loc,
             "calling imported generic method `" + std::string(ms->name) +
             "` with a type argument whose representation is not the "
             "compiled `int` (i32) placeholder \xE2\x80\x94 here `" +
-            spec85TypeRefQualifiedName(t) + "`, which is not `int` \xE2\x80\x94 "
+            tn + "`, which is not `int` \xE2\x80\x94 "
             "is not yet monomorphized across the module boundary" +
             std::string(virtualCall ? " for a virtual call" : "") +
             " (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #6779): the "
@@ -16960,7 +16970,17 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
                 explicitTs.push_back(t);
                 if (!t || isInt(t) || isOpenTypeParam(t)) continue;
                 llvm::Type* lt = lowerTypeRef(t);
-                if (lt && lt->isIntegerTy(32))
+                // fix #6818 (§2.8.2 clause 2, v0.340): a written NULLABLE
+                // value type (`char?`, `Color?`, `int?`, `long?`) lowers to
+                // the `{i8, X}` carrier, not i32, so the i32 test misses it;
+                // but its argument reaches the slot as the bare payload
+                // (`Show<char?>(char(97))`), never as the carrier #5057
+                // rejects, and the placeholder body then runs `T` as a
+                // non-nullable `int`. MEASURED on 1dee80c2:
+                // `Show<char?>(char(97))` printed 97 (same-module: a),
+                // `D<int?>(5)` with `default(T)` printed [0] (same-module:
+                // [null]).
+                if (lt && (lt->isIntegerTy(32) || isNullableValueTy(t)))
                     return report(ta->span.begin.line ? ta->span.begin
                                                       : callLoc,
                                   t);
@@ -16968,6 +16988,7 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
         }
     }
     if (!argExprs) return false;
+    const bool bound5009 = importedGenericLacksConstraintBody5009(ctx_, ms);
     const std::size_t off =
         isStaticMethod(const_cast<sema::MethodSymbol*>(ms)) ? 0u : 1u;
     auto ownParamIndex = [&](const sema::TypeRef* f) -> std::size_t {
@@ -16977,6 +16998,19 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
                 ms->genericParams[k]->name == f->headName())
                 return k;
         return ms->genericParams.size();
+    };
+    // Whether a constructed formal (`Array<T>`, `Dictionary<T, int>`)
+    // mentions the callee's own type parameter `k` among its arguments, at
+    // any depth: the shapes the inferred arm's unification descends.
+    std::function<bool(const sema::TypeRef*, std::size_t)> constructedMentions =
+        [&](const sema::TypeRef* f, std::size_t k) -> bool {
+        if (!f || f->kind != sema::TypeRef::Kind::Named) return false;
+        for (const sema::TypeRef* ga : f->genericArgs) {
+            if (!ga) continue;
+            if (ownParamIndex(ga) == k || constructedMentions(ga, k))
+                return true;
+        }
+        return false;
     };
     if (explicitList) {
         // An explicit non-`int` binding of a narrower integer (`Eq<short>`)
@@ -16991,7 +17025,32 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
             auto* ps =
                 dynamic_cast<const sema::ParameterSymbol*>(ms->params[pi]);
             const sema::TypeRef* formal = ps ? ps->resolvedDeclType : nullptr;
-            if (!formal || formal->nullable) continue;
+            if (!formal) continue;
+            // fix #6818 (§2.8.2 clause 2, v0.340): a constructed formal
+            // (`Array<T>`) that mentions a parameter written as any concrete
+            // non-`int` type. The container is a pointer at every `T`, so
+            // no width gate sees it, and the placeholder body reads each
+            // element as an `int`. MEASURED on 1dee80c2:
+            // `ShowA<long>(xs)` over {5000000000} printed 705032704,
+            // `ShowA<string>(xs)` printed pointer bits. Reported at the
+            // argument, as the inferred arm below does.
+            if (ownParamIndex(formal) >= ms->genericParams.size()) {
+                const ast::Expr* e = (*argExprs)[ai];
+                if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e))
+                    continue;
+                for (std::size_t k = 0;
+                     k < explicitTs.size() && k < ms->genericParams.size();
+                     ++k) {
+                    const sema::TypeRef* t = explicitTs[k];
+                    if (!t || isInt(t) || isOpenTypeParam(t)) continue;
+                    // The #5009 bound gate right after reports its own,
+                    // more specific diagnostic for a bounded method.
+                    if (constructedMentions(formal, k) && !bound5009)
+                        return report(e->span.begin, t);
+                }
+                continue;
+            }
+            if (formal->nullable) continue;
             const std::size_t k = ownParamIndex(formal);
             if (k >= explicitTs.size()) continue;
             const sema::TypeRef* t = explicitTs[k];
@@ -17023,12 +17082,12 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
     struct Binding {
         const sema::TypeRef* type = nullptr;
         SourceLocation loc;
-        bool bareI32Arg = false; // bare-`T` formal fed an i32 slot value
+        bool bare = false; // bound from a bare-`T` formal
         bool conflict = false;
     };
     std::vector<std::pair<std::string_view, Binding>> binds;
     auto bind = [&](std::string_view name, const sema::TypeRef* t,
-                    SourceLocation loc, bool bareI32Arg) {
+                    SourceLocation loc, bool bare) {
         for (auto& [n, b] : binds) {
             if (n != name) continue;
             if (b.conflict) return;
@@ -17036,10 +17095,10 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
                 spec85TypeRefQualifiedName(t))
                 b.conflict = true;
             else
-                b.bareI32Arg = b.bareI32Arg || bareI32Arg;
+                b.bare = b.bare || bare;
             return;
         }
-        binds.push_back({name, Binding{t, loc, bareI32Arg, false}});
+        binds.push_back({name, Binding{t, loc, bare, false}});
     };
     // Structural descent through a constructed formal (`Array<T>`,
     // `Dictionary<T, int>`): same head, same arity, recurse pairwise.
@@ -17082,11 +17141,10 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
             if (formal->nullable) continue; // `T?` is #5057's carrier
             const sema::TypeRef* t = resolveTypeParamRef(at);
             if (!t) continue;
-            // A bare-`T` value reaches the i32 slot unchanged in width (or
-            // widened to it: `short`, `byte`); anything else is the width
-            // gate's (or #5057's) to report.
-            bind(n, t, e->span.begin,
-                 args[ai] && args[ai]->getType()->isIntegerTy(32));
+            // A bare-`T` value reaches here only at the i32 slot's width
+            // (or widened to it: `short`, `byte`): any other width was the
+            // width gate's (or #5057's) to report, above.
+            bind(n, t, e->span.begin, true);
             continue;
         }
         unify(formal, at, e->span.begin);
@@ -17094,12 +17152,23 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
     for (const auto& [n, b] : binds) {
         const sema::TypeRef* t = b.type;
         if (b.conflict || !t || isInt(t) || isOpenTypeParam(t)) continue;
-        if (b.bareI32Arg) return report(b.loc, t);
-        // A binding reached only through a constructed formal: the element
-        // is stored at its own representation, so only an i32-represented
-        // non-`int` type is read as an `int` by the placeholder body.
-        llvm::Type* lt = lowerTypeRef(t);
-        if (lt && lt->isIntegerTy(32)) return report(b.loc, t);
+        // A binding reached only through a constructed formal (`Array<T>`)
+        // is just as wrong at ANY non-`int` type: the container is a pointer
+        // at every `T`, so no width gate sees it, and the placeholder body
+        // reads each element as an `int` whatever its representation.
+        // MEASURED on 1dee80c2 (fix #6818), `ShowA<T>(xs: Array<T>) =>
+        // $"{xs[0]}"` over `Array<long>` {5000000000} printed 705032704,
+        // over `Array<string>` {"hi"} pointer bits, over `Array<double>`
+        // {2.5} 0, over `Array<bool>` {true} 1.
+        // A method the #5009 bound gate refuses right after this one keeps
+        // that more specific diagnostic for a binding this gate did not
+        // report before #6818 (a non-i32 type reached only through a
+        // constructed formal).
+        if (!b.bare && bound5009) {
+            llvm::Type* lt = lowerTypeRef(t);
+            if (!lt || !lt->isIntegerTy(32)) continue;
+        }
+        return report(b.loc, t);
     }
     return false;
 }
