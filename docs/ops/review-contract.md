@@ -83,7 +83,8 @@ Label every claim MEASURED (you ran it), QUOTED (you read it in the handback) or
 **Harvest list.** With every ACCEPT or ACCEPT-W-NOTES, name the directory holding your probe
 programs and their base and tip outputs, and mark which probes are worth keeping as conformance
 cases, each with the spec sentence that decides its verdict. A harvest lane turns them into
-cases (runbook, *Harvest review probes into the corpus*). Leave the directory in place.
+cases (runbook, *Harvest review probes into the corpus*). Keep the directory under
+`/var/tmp/bezel-scratch/<your-worktree-name>/` and leave it in place.
 
 ## Never
 

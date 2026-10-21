@@ -79,8 +79,8 @@ staging (*runbook, Dual-coordinator runs*).
    evidence goes to the integrator with MEASURED evidence instead: CLAUDE.md sends the
    follow-up to a refuted fix to Opus upfront.
 7. **ACCEPT** is handed to the integrator: one message per pickable item, with the fields below.
-   In the same turn, add the reviewer's harvest list to your harvest queue, and dispatch a harvest
-   lane every 4–6 accepts (runbook, *Harvest review probes into the corpus*).
+   This holds for ACCEPT-W-NOTES too. In the same turn, append the probe directories to the run's
+   `harvest.tsv` (runbook, *Harvest review probes into the corpus*).
 8. **Close and refill.** Append a status row to `claims.tsv` and refill the slot in the same turn.
    Keep the pool at the size in your brief.
 
@@ -99,7 +99,7 @@ One message per pickable item, with these fields in this order:
 - **Behaviour flips**: the grep result, and every flipped test with its new expectation.
 - **Not done**: anything deferred, with its issue number.
 - **Harvest**: the probe directories from the review and the lane, or the harvest commit that
-  already banked them.
+  already added them as cases.
 
 The integrator still runs its own flip grep and `handback_check.sh` before picking. Your evidence
 does not replace its check; it lets the check be quick (*runbook, Move a rule to whoever has a

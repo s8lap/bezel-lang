@@ -954,18 +954,29 @@ over-rejection sweeps, looped ASan shapes. Left in a scratch directory, they gua
 Turned into conformance cases, they run at every gate. The owner asked for this in R30
 (2026-10-14).
 
-- **Trigger.** On every ACCEPT pick, in the same turn, append the review's and the lane's probe
-  directories to the run's harvest queue (the cursor's LATEST block). Dispatch a harvest lane
-  (Haiku-max or Sonnet, `kind=test`, `tests/conformance/rules/` only) once the queue holds 4–6
-  picks, and always before the gate.
+- **Trigger.** On every ACCEPT or ACCEPT-W-NOTES pick, the integrator appends the pick's probe
+  directories (the reviewer's harvest list and the producer's handback name them; both live under
+  `/var/tmp/bezel-scratch/`) to `harvest.tsv`, beside the run's `claims.tsv`, in the same turn as
+  the pick. A peer does the same when it hands an ACCEPT to the integrator. Once the queue holds
+  4–6 picks, and always before the gate, dispatch a harvest lane: a producer at the run's default
+  tier, taking a pool slot, with scope `tests/conformance/rules/cases/` plus the derived
+  `manifest.tsv`.
 - **Verdicts come from the spec.** Each case quotes the sentence that decides it, with section and
-  revision. A shape where the compiler disagrees with the spec becomes a known-divergent case
-  citing an OPEN issue, or it is dropped. A shape under an open `spec-question` gets no case.
-- **No duplicates.** One case per distinct shape × position. Grep `cases/` for the shape first;
-  `corpus.py audit` and `corpus.py lint` show no new entries before handback. A matrix of 1000+
-  cells becomes a committed generator and sweep, not cases.
+  revision. Write the case from the document and triage any disagreement with the compiler as
+  `tests/conformance/rules/README.md` *What to do with the divergences* says: class 1 (the
+  compiler is behind) and class 3 (the document does not settle it) keep the case, citing an OPEN
+  issue; class 2 (the probe itself was wrong) fixes the case. A disagreement is never dropped.
+- **No duplicates.** One case per distinct shape × position. Grep `cases/` for the shape first.
+  Run `corpus.py audit` on the base and on the branch: the branch adds no twin group the base
+  lacks. `corpus.py lint` reports 0 problems. A matrix of 1000+ cells is not harvested as cases;
+  open an issue proposing a generator instead.
+- **Manifest and baseline.** The harvest commit carries its regenerated `manifest.tsv`
+  (`corpus.py build`, as `AUTHORING.md` says), so `corpus.py check` passes on the branch. Two
+  harvest lanes are never in flight at once, so the derived file cannot conflict. Banking
+  `baseline.tsv` rows for the new cases is the integrator's, after the pick (*Corpus rows are
+  banked centrally*); the README's "bank it in the same commit" applies to a fix that closes a
+  divergence, not to a harvest.
 - **Review and pick it like any other commit:** a non-author review, then `pick_stage.sh --kind test`.
-  The integrator alone banks the corpus baseline.
 
 **Lapses.** R30 (2026-10-15): about 20 reviewed fixes were picked without one harvest lane, and the
 owner had to ask. R34 (2026-10-21): 4 picks again went without one, and the owner asked again. In
