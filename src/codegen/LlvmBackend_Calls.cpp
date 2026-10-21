@@ -1026,8 +1026,8 @@ bool Emitter::isListInterfaceName(const sema::TypeRef* rt, bool* outOwning) {
 // list interfaces above — which only Array<T>/OwningArray<T> implement, so an
 // interface-typed receiver is unambiguously the array-backed bz_array_t* — these
 // collection interfaces are implemented by collections with INCOMPATIBLE runtime
-// representations: Array/Stack/Queue (bz_array_t*, count at offset 8),
-// LinkedList (bz_llist_t*, count at offset 16), Dictionary/Set (bz_dict_t*).
+// representations: Array/Stack/Queue (bz_array_t*, count at offset 24 behind
+// the #6776 type tag), LinkedList (bz_llist_t*), Dictionary/Set (bz_dict_t*).
 // The interface-typed receiver erases which concrete backing it holds, the
 // runtime structs share no kind-tag header, and there is no itable wiring these
 // members to the runtime.  So a compile-time "treat as bz_array_t*" assumption is

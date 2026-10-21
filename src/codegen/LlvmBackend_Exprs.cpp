@@ -5733,8 +5733,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // INTERFACE receiver (IReadOnlyCollection<T> / ICollection<T> /
             // IOwningCollection<T>). Unlike the list interfaces, these are
             // implemented by collections with incompatible runtime
-            // representations (Array → bz_array_t* count@8; LinkedList →
-            // bz_llist_t* count@16; Dictionary/Set → bz_dict_t*) and the
+            // representations (Array → bz_array_t*, count@24 behind the #6776
+            // type tag; LinkedList → bz_llist_t*; Dictionary/Set → bz_dict_t*) and the
             // interface-typed receiver erases which one it holds. With no shared
             // kind tag and no collection itable, no single runtime call is sound
             // here (bz_array_len would read garbage for a LinkedList/Dictionary).

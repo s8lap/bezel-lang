@@ -50413,9 +50413,12 @@ llvm::Value* Emitter::builtinExcDescTablePtr() {
 //
 // Each thunk loads the bz.arrayspan from `box+16`, extracts src/start/len.
 // `src` is a bz_array_t* (NOT a raw element pointer). For element access,
-// load src->data (the first field of bz_array_t, at offset 0) to get the
-// raw element buffer, then GEP into that buffer. Length/IsEmpty use `len`
-// directly from the span struct (pre-computed by AsReadOnlySpan/AsSpan).
+// obtain the raw element buffer through the runtime accessor
+// `bz_array_ptr_at(src, 0, 1)`, then GEP into that buffer. Never read a
+// bz_array_t field at a fixed offset: since fix #6776 (§8.2, v0.340) the
+// header is {vtable@0, type_desc@8, data@16, count@24, capacity@32, ...}
+// (80 B), and word 0 is the runtime type tag, not `data`. Length/IsEmpty use
+// `len` directly from the span struct (pre-computed by AsReadOnlySpan/AsSpan).
 llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
                                                    std::string_view head) {
     const auto key = std::make_pair(elemTy, std::string(head));
@@ -50462,8 +50465,8 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
 
     // --- [0] IndexOf(ptr box, elemTy item) → i32 ---
     // Linear scan: return k where src[start+k] == item, else -1.
-    // src is bz_array_t*; its first field (offset 0) is the data pointer
-    // (void* data = the raw element buffer). Load it once at entry.
+    // src is bz_array_t*; its element buffer (`data`, behind the #6776 type
+    // tag) is obtained once at entry through `bz_array_ptr_at`.
     llvm::Function* indexOfFn;
     {
         auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), elemTy}, false);
@@ -50556,9 +50559,17 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
         llvm::IRBuilder<> tb(entryBB);
         auto [sSrc, sStart, sLen] = loadSpan(tb, selfBox);
         auto [oSrc, oStart, oLen] = loadSpan(tb, otherBox);
-        // src = bz_array_t*; data = src->data (element buffer, offset 0).
-        llvm::Value* sData = tb.CreateLoad(ptrTy(), sSrc, "sdata");
-        llvm::Value* oData = tb.CreateLoad(ptrTy(), oSrc, "odata");
+        // src = bz_array_t*; data = src->data. fix #6776 (§8.2, v0.340): the
+        // header opens with its vtable and descriptor words, so `data` is read
+        // through the runtime accessor, as in IndexOf above and the indexer
+        // below. A raw word-0 load here returned the two arrays' (identical)
+        // `bz_array_vtable` words, and every equal-length pair compared EQUAL
+        // (stdlib §4.15: equal length AND equal slots at every position).
+        auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+        llvm::Value* sData = tb.CreateCall(
+            ptrAtFn, {sSrc, tb.getInt64(0), tb.getInt64(1)}, "sdata");
+        llvm::Value* oData = tb.CreateCall(
+            ptrAtFn, {oSrc, tb.getInt64(0), tb.getInt64(1)}, "odata");
         llvm::Value* lenEq = tb.CreateICmpEQ(sLen, oLen, "leneq");
         tb.CreateCondBr(lenEq, loopBB, falseBB);
 
@@ -50619,8 +50630,8 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
     }
 
     // --- [5] Indexer getter (ptr box, i32 i) → elemTy ---
-    // src = bz_array_t*; its first field (offset 0) is the data pointer
-    // (void* data = the raw element buffer). Read data, then GEP into it.
+    // src = bz_array_t*; obtain its element buffer (`data`, behind the #6776
+    // type tag) through `bz_array_ptr_at`, then GEP into it.
     llvm::Function* idxGetFn;
     {
         auto* fnTy = llvm::FunctionType::get(elemTy, {ptrTy(), i32()}, false);

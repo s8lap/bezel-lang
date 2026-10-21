@@ -23629,8 +23629,10 @@ private:
     // a REFERENCE. It is emphatically NOT implied by "lowers to `ptr`", which
     // is why this is a named predicate rather than an `isPointerTy()` test at
     // each site: a closure (§27.5), a `Shared<T>`/`Weak<T>` handle, an
-    // `IGrouping`, a `Subscription` and a nested builtin collection are all
-    // pointer-shaped with NO vtable at offset 0, so dispatching slot 4/5 on
+    // `IGrouping`, a `Subscription` and a nested builtin collection other than
+    // `Array<T>` are all pointer-shaped with NO vtable at offset 0 (since fix
+    // #6776, §8.2 v0.340, `Array<T>`, `StringBuilder` and `Mutex` DO carry a
+    // runtime-owned vtable word there), so dispatching slot 4/5 on
     // one of them would be an indirect call through whatever bytes happen to
     // sit there. `string` is excluded here too — it has its own header and its
     // own §4.6 content equality; `lowerObjectEquals` still copes with a string

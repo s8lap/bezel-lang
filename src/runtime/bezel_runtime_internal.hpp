@@ -295,8 +295,9 @@ static inline void bz_string_init_rc(void* s) {
 // IOwningCollection<T>) whose concrete backing is unknown at the call site
 // cannot pick the matching bz_*_free statically — see
 // LlvmBackend_Calls2.cpp's `isCollectionInterfaceName` arm. The kind field
-// (int64, appended at the END of each struct so existing offsets data@0/
-// count@8/capacity@16 stay put) records which struct the pointer holds, so
+// (int64, appended at the END of each struct so the existing field offsets
+// stay put; for bz_array_t that is kind@64 behind the #6776 type tag, see the
+// struct) records which struct the pointer holds, so
 // the runtime helper bz_runtime_dispose can dispatch on it. Set in each
 // struct's alloc fn (calloc leaves it 0; we overwrite to the explicit tag);
 // 0 is reserved as "untagged" and an untagged pointer is treated as
@@ -397,8 +398,11 @@ struct bz_array_t {
     // must give back". Zero (the calloc default) is byte-for-byte today's
     // behaviour on every other array in the runtime.
     //
-    // APPENDED last so every prior field's offset (data@0 / count@8 /
-    // capacity@16, read at fixed offsets by codegen) is preserved.
+    // APPENDED last so every prior field's offset is preserved. Since fix
+    // #6776 (§8.2, v0.340) the layout is {vtable@0, type_desc@8, data@16,
+    // count@24, capacity@32, disposed@40, mod_count@48, elem_disposer@56,
+    // kind@64, str_key_esz@72} (80 B); codegen reads no field at a fixed
+    // offset (it goes through bz_array_len / bz_array_ptr_at / bz_array_get).
     int64_t str_key_esz;
 };
 typedef struct { char* data; int64_t len; uint8_t width; int64_t rc; } bz_string_hdr;

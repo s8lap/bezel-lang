@@ -41,9 +41,10 @@
 
 #include <string>
 
-#include "support/aot_support.hpp"   // runAotChecked
+#include "support/aot_support.hpp"   // runAot, runAotChecked
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -52,6 +53,16 @@ namespace {
 // value is its stdout, so a wrong rendering or a leak/UAF fails the row.
 std::string checkedOut(const std::string& src) {
     auto r = runAotChecked(src);
+    if (!r.ran) return "<did-not-run>";
+    if (r.exitCode != 0) return "<exit " + std::to_string(r.exitCode) + "> " + r.stdoutText;
+    return r.stdoutText;
+}
+
+// Plain oracle: the program must compile, run and exit 0; the value is its
+// stdout. Used only where a filed, independent leak (#6896) would fail the
+// checked oracle for a reason unrelated to the row.
+std::string plainOut(const std::string& src) {
+    auto r = runAot(src);
     if (!r.ran) return "<did-not-run>";
     if (r.exitCode != 0) return "<exit " + std::to_string(r.exitCode) + "> " + r.stdoutText;
     return r.stdoutText;
@@ -283,12 +294,59 @@ BEZEL_TEST(codegen_object_param_vtableless_builtin_6776,
 
 // stdlib §6.2 (#706) — a Lock taken on a Mutex that is then disposed through
 // `Object` keeps the mutex core alive until the Lock is released: no
-// use-after-free, no double free.
+// use-after-free, no double free. The mutex is MOVED into the `Object` local
+// and disposed explicitly through it while the Lock is still held (a
+// `using var o: Object := mx` alias would leave the disposal on `mx`'s own
+// scope end and never exercise the Object path). MEASURED on 279931c7 (the
+// base), ASan armed: SEGV (a read of address 0x1 in main) before `done` is
+// reached; on the fix: `done`, exit 0, no leak.
 BEZEL_TEST(codegen_object_param_vtableless_builtin_6776,
            mutex_disposed_through_object_while_locked_outlives_lock_6_2) {
     BEZEL_EXPECT_EQ(
-        checkedOut(prog(kShow, loop200("var mx := new Mutex(); var lk := mx.Acquire(); "
-                                       "using var o: Object := mx; Show(o); "
-                                       "lk.Dispose();"))),
-        rep("System.Threading.Mutex\n", 200));
+        checkedOut(prog("", loop200("var mx := new Mutex(); var lk := mx.Acquire(); "
+                                    "var o: Object := move mx; o.Dispose(); "
+                                    "lk.Dispose();") +
+                            " Console.WriteLine(\"done\");")),
+        std::string("done\n"));
+}
+
+// ---------------------------------------------------------------------------
+// stdlib §4.16 / §4.15 — `SequenceEqual` through the `IReadOnlySpan<T>` adapter
+// (§4.16 retires the name, which the compiler still admits; the rule is §4.15's:
+// equal length AND equal slots at every position). The adapter's thunk reads the
+// span source's element buffer; after #6776 moved the buffer pointer behind the
+// runtime type tag, a thunk still reading word 0 compares the two arrays'
+// (identical) vtable words and reports every equal-length pair EQUAL. MEASURED
+// on 0179eed5 (the first #6776 commit): `True True`; on the fix: `False True`.
+//
+// Plain oracle (`runAot`), not the checked one: the adapter box minted for a
+// span argument at an `IReadOnlySpan<T>` parameter leaks 32 B per call on the
+// base and on the fix alike (#6896, filed, independent of this defect), which
+// would fail the leak oracle regardless of what `SequenceEqual` answers. Upgrade
+// to `checkedOut` when #6896 lands.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(codegen_object_param_vtableless_builtin_6776,
+           sequenceequal_through_ireadonlyspan_int_compares_content_4_15) {
+    BEZEL_EXPECT_EQ(
+        plainOut(prog(
+            "  public static method Eq(a: IReadOnlySpan<int>, b: IReadOnlySpan<int>): bool "
+            "    return a.SequenceEqual(b); end Eq; ",
+            "using var a1 := new Array<int>(3); a1.Add(1); a1.Add(2); a1.Add(3); "
+            "using var a2 := new Array<int>(3); a2.Add(1); a2.Add(2); a2.Add(4); "
+            "Console.WriteLine(Eq(a1.AsReadOnlySpan(), a2.AsReadOnlySpan())); "
+            "Console.WriteLine(Eq(a1.AsReadOnlySpan(), a1.AsReadOnlySpan()));")),
+        std::string("False\nTrue\n"));
+}
+
+BEZEL_TEST(codegen_object_param_vtableless_builtin_6776,
+           sequenceequal_through_ireadonlyspan_long_40_elements_compares_content_4_15) {
+    BEZEL_EXPECT_EQ(
+        plainOut(prog(
+            "  public static method Eq(a: IReadOnlySpan<long>, b: IReadOnlySpan<long>): bool "
+            "    return a.SequenceEqual(b); end Eq; ",
+            "using var a1 := new Array<long>(40); using var a2 := new Array<long>(40); "
+            "var i := 0; while i < 40 do a1.Add(i); a2.Add(i * 2); i := i + 1; end while; "
+            "Console.WriteLine(Eq(a1.AsReadOnlySpan(), a2.AsReadOnlySpan())); "
+            "Console.WriteLine(Eq(a1.AsReadOnlySpan(), a1.AsReadOnlySpan()));")),
+        std::string("False\nTrue\n"));
 }
