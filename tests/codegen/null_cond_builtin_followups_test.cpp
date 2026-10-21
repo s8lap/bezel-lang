@@ -66,3 +66,44 @@ BEZEL_TEST(null_cond_builtin_followups, todictionary_local_null_receiver_6679_sp
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "0\n");
 }
+
+// #6680 (§7.5, §4.6, §28.9): `x?.ToString()` on a numeric / char / decimal
+// primitive receiver mints a fresh string the plain local solely owns (the `.`
+// form was reclaimed via isPlusOneStringProducer). Probe s3_dbl_tostring_nc.
+// Looped 100x per receiver kind; stdout asserted (a leak fix must not change it).
+BEZEL_TEST(null_cond_builtin_followups, primitive_tostring_local_no_leak_6680_spec_7_5) {
+    JitResult r = runAotChecked(prog(
+        "  var i := 0; var acc := 0; "
+        "  while i < 100 do "
+        "    var d: double := 1.5; var ds := d?.ToString(); "
+        "    var n: int := 7; var ns := n?.ToString(); "
+        "    var l: long := 70000000000; var ls := l?.ToString(); "
+        "    var c: char := 'a'; var cs := c?.ToString(); "
+        "    var m: decimal := 1.25m; var ms := m?.ToString(); "
+        "    acc := acc + (ds?.Length ?? 0) + (ns?.Length ?? 0) + (ls?.Length ?? 0) "
+        "         + (cs?.Length ?? 0) + (ms?.Length ?? 0); "
+        "    i := i + 1; "
+        "  end; "
+        "  Console.WriteLine(acc); "));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2000\n");
+}
+
+// Nullable primitive receiver (`int?`), non-null and null: the null path leaves
+// a null string in the slot, which the scope-end release tolerates.
+BEZEL_TEST(null_cond_builtin_followups, nullable_primitive_tostring_local_6680_spec_7_5) {
+    JitResult r = runAotChecked(prog(
+        "  var i := 0; var acc := 0; var nulls := 0; "
+        "  while i < 100 do "
+        "    var a: int? := 7; var as1 := a?.ToString(); "
+        "    var b: int? := null; var bs := b?.ToString(); "
+        "    acc := acc + (as1?.Length ?? 0); "
+        "    if bs = null then nulls := nulls + 1; end; "
+        "    i := i + 1; "
+        "  end; "
+        "  Console.WriteLine(acc); Console.WriteLine(nulls); "));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "100\n100\n");
+}

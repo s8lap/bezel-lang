@@ -26040,6 +26040,35 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // emitPrimitiveToString result when it feeds directly into a `+` operand,
     // comparison, or other consumer — fixing the `"ab" + i.ToString()` shape.
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        // fix #6680 (§7.5, §4.6, §28.9, v0.339): the `?.` spelling of the same
+        // numeric/char/decimal `ToString()` (`x?.ToString()`, x: int/double/...,
+        // possibly nullable). lowerNullCondBuiltinCall / lowerNullCondValueSemCall
+        // run the `.` form's emitPrimitiveToString on the non-null path, so the
+        // result is the same fresh rc=1 string (a bare null on the null path,
+        // which every release tolerates). Bool (sentinel), String (identity) and
+        // Object (receiver-shape dependent) stay excluded, as for the `.` form.
+        if (call->args.empty() && call->callee) {
+            if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                    call->callee.get())) {
+                if (ncm->member == "ToString" && ncm->target &&
+                    ncm->typeArgs.empty() && !calleeResolvedBySema(*call, ctx_)) {
+                    auto* tt = ctx_.exprType(*ncm->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
+                        using P = sema::PrimitiveType;
+                        switch (tt->primitive) {
+                            case P::Int: case P::Long: case P::Short:
+                            case P::Byte: case P::SByte: case P::UInt:
+                            case P::ULong: case P::UShort:
+                            case P::Float: case P::Double: case P::Decimal:
+                            case P::Char:
+                                return true;
+                            default:
+                                break;
+                        }
+                    }
+                }
+            }
+        }
         if (call->args.empty() && call->callee) {
             if (auto* ma =
                     dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
