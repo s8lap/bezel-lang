@@ -9,7 +9,7 @@
 //! cites: 17.5, 5.1
 //! expect: reject
 //! diagnostic: implicitly convert
-//! issue: 6535
+//! issue: 6684
 module Conf;
 
 public class Program
