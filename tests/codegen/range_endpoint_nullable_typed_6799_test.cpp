@@ -68,10 +68,12 @@ BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_open_end_reads_null) {
 }
 BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_open_end_untyped_print_is_null) {
     // The issue's repro: the untyped print of an open End is the null text,
-    // not the stored 0.
+    // not the stored 0. Printed through a hole: a `T?` argument to
+    // `Console.WriteLine` is a compile error (#6778, §7.1), and the hole
+    // renders an absent value as `null` (§18.5).
     BEZEL_EXPECT_EQ(outOf(
         "  var lo: int := 3; var o := lo..; "
-        "  Console.WriteLine(o.End); "
+        "  Console.WriteLine($\"{o.End}\"); "
         "  Console.WriteLine(o.ToString()); "),
         "null\nRange(Start: 3, End: null, Step: 1, IsEndInclusive: True, "
         "IsOpenEnded: True, IsEmpty: False)");
@@ -107,20 +109,22 @@ BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_open_ended_ulong_end_nu
 }
 
 // ---- #6801: unsigned endpoints print unsigned ------------------------------
+// The endpoint is `T?`, so it is printed through a hole `$"{r.Start}"`: passed
+// bare to `Console.WriteLine` it is a compile error (#6778, §7.1, v0.340).
 
 BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_ulong_untyped_print_unsigned) {
     BEZEL_EXPECT_EQ(outOf(
         "  var lo: ulong := 9000000000000000000UL; "
         "  var hi: ulong := 11000000000000000000UL; "
         "  var r := lo .. hi; "
-        "  Console.WriteLine(r.Start); Console.WriteLine(r.End); "),
+        "  Console.WriteLine($\"{r.Start}\"); Console.WriteLine($\"{r.End}\"); "),
         "9000000000000000000\n11000000000000000000");
 }
 BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_uint_untyped_print_unsigned) {
     BEZEL_EXPECT_EQ(outOf(
         "  var ulo: uint := 4000000000U; var uhi: uint := 4000000005U; "
         "  var u := ulo .. uhi; "
-        "  Console.WriteLine(u.Start); Console.WriteLine(u.End); "),
+        "  Console.WriteLine($\"{u.Start}\"); Console.WriteLine($\"{u.End}\"); "),
         "4000000000\n4000000005");
 }
 BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_ulong_max_interpolated) {
@@ -133,29 +137,29 @@ BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_ulong_max_interpolated)
 BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_byte_untyped_print) {
     BEZEL_EXPECT_EQ(outOf(
         "  var lo: byte := 100; var hi: byte := 200; var r := lo .. hi; "
-        "  Console.WriteLine(r.Start); Console.WriteLine(r.End); "),
+        "  Console.WriteLine($\"{r.Start}\"); Console.WriteLine($\"{r.End}\"); "),
         "100\n200");
 }
 BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_ushort_untyped_print) {
     BEZEL_EXPECT_EQ(outOf(
         "  var lo: ushort := 100; var hi: ushort := 60000; var r := lo .. hi; "
-        "  Console.WriteLine(r.Start); Console.WriteLine(r.End); "),
+        "  Console.WriteLine($\"{r.Start}\"); Console.WriteLine($\"{r.End}\"); "),
         "100\n60000");
 }
 BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_sbyte_short_long_untyped_print) {
     BEZEL_EXPECT_EQ(outOf(
         "  var a: sbyte := -100; var b: sbyte := 100; var r := a .. b; "
-        "  Console.WriteLine(r.Start); Console.WriteLine(r.End); "
+        "  Console.WriteLine($\"{r.Start}\"); Console.WriteLine($\"{r.End}\"); "
         "  var c: short := -30000; var d: short := 30000; var s := c .. d; "
-        "  Console.WriteLine(s.Start); Console.WriteLine(s.End); "
+        "  Console.WriteLine($\"{s.Start}\"); Console.WriteLine($\"{s.End}\"); "
         "  var e: long := -5000000000L; var f: long := 5000000000L; var t := e .. f; "
-        "  Console.WriteLine(t.Start); Console.WriteLine(t.End); "),
+        "  Console.WriteLine($\"{t.Start}\"); Console.WriteLine($\"{t.End}\"); "),
         "-100\n100\n-30000\n30000\n-5000000000\n5000000000");
 }
 BEZEL_TEST(range_endpoint_nullable_typed_6799, spec_16_3_char_untyped_print) {
     BEZEL_EXPECT_EQ(outOf(
         "  var lo: char := 'a'; var hi: char := 'z'; var r := lo .. hi; "
-        "  Console.WriteLine(r.Start); Console.WriteLine(r.End); "),
+        "  Console.WriteLine($\"{r.Start}\"); Console.WriteLine($\"{r.End}\"); "),
         "a\nz");
 }
 

@@ -208,8 +208,8 @@ BEZEL_TEST(range_unsigned_isempty_6774, stdlib_9_8_byte_top_bit_start_end_values
         "  var lo: byte := 200; "
         "  var hi: byte := 255; "
         "  var r := lo .. hi; "
-        "  Console.WriteLine(r.Start); "
-        "  Console.WriteLine(r.End); "
+        "  Console.WriteLine($\"{r.Start}\"); "
+        "  Console.WriteLine($\"{r.End}\"); "
         "  return 0; "
         "end Main; end C;"),
         "200\n255");
@@ -239,8 +239,8 @@ BEZEL_TEST(range_unsigned_isempty_6774, stdlib_9_8_long_signed_start_end_values)
         "  var hi: long := 5000000000L; "
         "  var r := lo .. hi; "
         "  Console.WriteLine(r.IsEmpty); "
-        "  Console.WriteLine(r.Start); "
-        "  Console.WriteLine(r.End); "
+        "  Console.WriteLine($\"{r.Start}\"); "
+        "  Console.WriteLine($\"{r.End}\"); "
         "  return 0; "
         "end Main; end C;"),
         "False\n-5000000000\n5000000000");
@@ -253,8 +253,8 @@ BEZEL_TEST(range_unsigned_isempty_6774, stdlib_9_8_sbyte_signed_start_end_contro
         "  var lo: sbyte := -100; "
         "  var hi: sbyte := 100; "
         "  var r := lo .. hi; "
-        "  Console.WriteLine(r.Start); "
-        "  Console.WriteLine(r.End); "
+        "  Console.WriteLine($\"{r.Start}\"); "
+        "  Console.WriteLine($\"{r.End}\"); "
         "  return 0; "
         "end Main; end C;"),
         "-100\n100");

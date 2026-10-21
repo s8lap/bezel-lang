@@ -172,7 +172,7 @@ BEZEL_TEST(builtin_out_discard_5289, stack_trypop_and_empty) {
               "Console.WriteLine(s.TryPop(out _)); "
               "Console.WriteLine(s.TryPop(out _)); "
               "var t := new Stack<int>(); t.Push(8); "
-              "Console.WriteLine(t.TryPop(out var x)); Console.WriteLine(x);",
+              "Console.WriteLine(t.TryPop(out var x)); Console.WriteLine(x ?? -1);",
               "True\nFalse\nTrue\n8\n");
 }
 BEZEL_TEST(builtin_out_discard_5289, queue_trydequeue_and_trypeek) {

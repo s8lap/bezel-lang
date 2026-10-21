@@ -350,7 +350,7 @@ BEZEL_TEST(range_dict_key_6207,
     BEZEL_EXPECT_EQ(std::string("6\n7\n"),
                     out("    var d := new Dictionary<Range<int>, Range<int>>();\n"
                         "    d[1..5] := 2..6;\n"
-                        "    Console.WriteLine(d[1..5].End);\n"
+                        "    Console.WriteLine($\"{d[1..5].End}\");\n"
                         "    var c := new Dictionary<Range<char>, int>();\n"
                         "    c[(char(97))..(char(122))] := 7;\n"
                         "    Console.WriteLine(c[(char(97))..(char(122))]);\n"
