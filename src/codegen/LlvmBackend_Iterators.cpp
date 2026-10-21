@@ -749,8 +749,21 @@ Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
 
     // Collect all parameters to capture: `this` (instance methods) then params.
     bool isInstance = !isStaticMethod(ms);
-    if (isInstance)
-        frame.captures.push_back({nullptr, ptrTy()});  // 'this' capture
+    if (isInstance) {
+        // fix #6837 (§9.4, §30.1, v0.340): "An async or iterator member holds
+        // the fixed receiver value in its frame". An enum / primitive-extension
+        // receiver is the bare scalar (CG30), not a pointer to storage, so its
+        // frame field takes the receiver's own LLVM type (the signature's
+        // first parameter); every pointer receiver keeps a `ptr` field.
+        llvm::Type* thisFieldTy = ptrTy();
+        if (isExtensionMethod(ms)) {
+            llvm::Type* et = extensionThisType(ms, /*byPointer=*/nullptr);
+            if (et && !et->isPointerTy()) thisFieldTy = et;
+        } else if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Enum) {
+            thisFieldTy = enumLlvmType(ms->parent);
+        }
+        frame.captures.push_back({nullptr, thisFieldTy});  // 'this' capture
+    }
     for (auto* param : ms->params) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(param);
         if (!ps) continue;

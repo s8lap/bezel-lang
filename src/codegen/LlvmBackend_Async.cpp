@@ -1470,7 +1470,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // symmetric: any frame that registers a borrow releases the
             // borrow, the OWNER's wait unblocks, and a frame whose body has
             // no `this` simply does not touch the side table at all.
-            if (currentThis_) {
+            if (currentThis_ && currentThis_->getType()->isPointerTy()) {  // #6837: a scalar enum/primitive `this` has no borrow to track
                 auto* registerBorrowFn =
                     declareC("bz_register_borrow",
                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
@@ -2031,7 +2031,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // fix #3460: release the borrow on `this` (instance methods).
             // Mirrors emitAsyncComplete; both terminal paths must release so
             // the OWNER's `bz_wait_for_borrows(this)` unblocks.
-            if (currentThis_) {
+            if (currentThis_ && currentThis_->getType()->isPointerTy()) {  // #6837: a scalar enum/primitive `this` has no borrow to track
                 auto* releaseBorrowFn =
                     declareC("bz_release_borrow",
                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
@@ -2448,7 +2448,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         // async-method path above; the matching release runs in
         // emitAsyncComplete (done block) and asynclam.fault, where
         // currentThis_ has been rebound by emitFrameCaptureRestores.
-        if (currentThis_) {
+        if (currentThis_ && currentThis_->getType()->isPointerTy()) {  // #6837: a scalar enum/primitive `this` has no borrow to track
             auto* registerBorrowFn =
                 declareC("bz_register_borrow",
                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
@@ -2792,7 +2792,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             builder_.CreateCall(releaseFn, {outerTask});
             // fix #3460: release the borrow on `this` (async lambdas that
             // captured `this`). Mirrors the success edge in emitAsyncComplete.
-            if (currentThis_) {
+            if (currentThis_ && currentThis_->getType()->isPointerTy()) {  // #6837: a scalar enum/primitive `this` has no borrow to track
                 auto* releaseBorrowFn =
                     declareC("bz_release_borrow",
                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
@@ -6077,7 +6077,7 @@ void Emitter::emitAsyncComplete(llvm::Value* value) {
     // rebound by emitFrameCaptureRestores at the top of the resume fn (the
     // same activation that calls emitAsyncComplete), so it holds the loaded
     // `this` pointer — exactly the object the OWNER is waiting on.
-    if (currentThis_) {
+    if (currentThis_ && currentThis_->getType()->isPointerTy()) {  // #6837: a scalar enum/primitive `this` has no borrow to track
         auto* releaseBorrowFn =
             declareC("bz_release_borrow",
                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
