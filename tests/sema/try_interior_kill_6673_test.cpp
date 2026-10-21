@@ -5,9 +5,13 @@
 // THE RULE. Spec §7.4 (v0.339), "How narrowing is established": "a fact holds
 // at a point only when it holds on every path that reaches it"; "How narrowing
 // is invalidated": "the variable is reassigned from a nullable-typed
-// expression; or the variable is passed as a `ref` or `out` argument". §31.2: a
-// catch arm runs when the protected block was interrupted, at any point of it,
-// and the `finally` runs on every exit of the block and of each arm.
+// expression; or the variable is passed as a `ref` or `out` argument". §31.2
+// (v0.339) says the `finally` "runs whether the protected block completed
+// normally, was exited by an exception (caught or uncaught), or was exited by
+// `return` — or by a `break` or `continue` targeting an enclosing loop". The
+// catch-arm entry is an interpretation, not spec text: a catch arm runs when the
+// protected block was interrupted, at any point of it, and the `finally` runs on
+// every exit of the block and of each arm.
 //
 // So after `s := null; P.Boom(true); s := "y";` inside the block, a catch arm
 // (and anything after the `try` that a falling-through arm reaches) sees the
@@ -1739,6 +1743,28 @@ BEZEL_TEST(sema_try_interior_kill_6673,
       InvalidOperationException => do s := "c"; end,
     end try;
     Console.WriteLine(s.Length);
+    return 0;
+  end Main;
+)bzl"), 0, "1\n");
+}
+
+// The try block forms a lambda that assigns `s` and never invokes it, so the
+// block performs no operation that can transfer control to user code, and `s`
+// keeps its narrowing into the `finally`. §7.4 (v0.339): "Straight-line
+// check-then-use of a captured local (`if x <> null then x.M(); end;` — no call
+// *between* the test and the use) remains accepted." Here the fact comes from
+// the declaration's non-null initializer, not from a null test, so the sentence
+// states the same rule rather than this literal case.
+BEZEL_TEST(sema_try_interior_kill_6673,
+           lambda_formed_in_try_no_call_finally_reads_runs_spec_7_4) {
+    expectRuns(run(R"bzl(
+  public static method Main(): int
+    var s: string? := "x";
+    try
+      const f := lambda() => do s := null; end;
+    finally
+      Console.WriteLine(s.Length);
+    end try;
     return 0;
   end Main;
 )bzl"), 0, "1\n");
