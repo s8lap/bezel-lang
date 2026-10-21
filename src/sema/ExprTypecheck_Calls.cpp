@@ -17423,6 +17423,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // per stdlib §2.2 (v0.340, #6864, #6865): `Min`/`Max`/`Clamp<T>` return
+        // T, so a call whose every argument is the SAME non-nullable primitive
+        // numeric/char type is typed at that type. Only int/long/double/float
+        // and decimal were refined above; a byte, sbyte, short, ushort, uint,
+        // ulong or char call kept the int placeholder (a float call stayed
+        // untyped, read as double by its consumer), so the result printed as
+        // a signed int (a `char` as its code point).
+        if (auto* mma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            if ((mma->member == "Min" || mma->member == "Max" ||
+                 mma->member == "Clamp") &&
+                mma->target && !ce.args.empty()) {
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        mma->target.get())) {
+                    if (tid->name == "Math") {
+                        const TypeRef* first = nullptr;
+                        bool same = true;
+                        for (const auto& arg : ce.args) {
+                            const TypeRef* at =
+                                arg.value ? ctx_.exprType(*arg.value) : nullptr;
+                            if (!at || at->nullable ||
+                                at->kind != TypeRef::Kind::Primitive) {
+                                same = false;
+                                break;
+                            }
+                            if (!first) first = at;
+                            else if (at->primitive != first->primitive) same = false;
+                        }
+                        if (same && first) {
+                            switch (first->primitive) {
+                            case PrimitiveType::Byte: case PrimitiveType::SByte:
+                            case PrimitiveType::Short: case PrimitiveType::UShort:
+                            case PrimitiveType::UInt: case PrimitiveType::ULong:
+                            case PrimitiveType::Char:
+                            case PrimitiveType::Float:   // #6849: was untyped, so a
+                                                         // consumer read it as double
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(first->primitive));
+                                break;
+                            default: break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // #1141 / stdlib §1: Math.Min<T>/Max<T>/Clamp<T> (declared only as
         // `where T: IComparable<T>`) instantiated with a non-numeric VALUE type
         // — a record/enum that implements IComparable<T> (§14.2). The result

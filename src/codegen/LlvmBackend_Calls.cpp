@@ -13388,6 +13388,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                    t->kind == sema::TypeRef::Kind::Primitive &&
                    t->primitive == sema::PrimitiveType::Decimal;
         };
+        // per stdlib §2.2 (v0.340, #6864): Min/Max/Clamp order by T's own
+        // CompareTo, so an unsigned T (byte, ushort, uint, ulong) and char
+        // (a code point) compare unsigned, not with the signed predicate.
+        auto mathOperandIsUnsigned = [&](const ast::Expr* e) -> bool {
+            const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            if (!t || t->kind != sema::TypeRef::Kind::Primitive) return false;
+            using P = sema::PrimitiveType;
+            return t->primitive == P::Byte || t->primitive == P::UShort ||
+                   t->primitive == P::UInt || t->primitive == P::ULong ||
+                   t->primitive == P::Char;
+        };
         // Fails CLOSED: a null result falls through to #2786's guard, which
         // reports a spec-cited Error, rather than to the aborting SIToFP.
         auto emitDecCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
@@ -13702,7 +13713,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (m == "Min") {
                 // Handle int or double operands.
                 if (a->getType()->isIntegerTy()) {
-                    llvm::Value* cmp = builder_.CreateICmpSLT(a, b);
+                    // per stdlib §2.2 (v0.340): ordering is T's own CompareTo,
+                    // so byte/ushort/uint/ulong/char order unsigned (#6864).
+                    llvm::Value* cmp = mathOperandIsUnsigned(call.args[0].value.get())
+                        ? builder_.CreateICmpULT(a, b)
+                        : builder_.CreateICmpSLT(a, b);
                     return builder_.CreateSelect(cmp, a, b, "min.result");
                 } else if (sema::MethodSymbol* cmpMs =
                                comparableCompareTo(call.args[0].value.get())) {
@@ -13733,16 +13748,22 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         rejectNonNumericMathOperand(b))
                         return nullptr;
                     // float/double: use llvm.minnum intrinsic
-                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                    if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
-                    if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                    // per stdlib §2.2 (v0.340): `float` is its own T (#6849);
+                    // the intrinsic runs at the operand's own FP type.
+                    auto* dbl = a->getType()->isFloatTy()
+                        ? llvm::Type::getFloatTy(llvm_)
+                        : llvm::Type::getDoubleTy(llvm_);
+                    if (!a->getType()->isFloatingPointTy()) a = builder_.CreateSIToFP(a, dbl);
+                    if (!b->getType()->isFloatingPointTy()) b = builder_.CreateSIToFP(b, dbl);
                     auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::minnum, {dbl});
                     return builder_.CreateCall(fn, {a, b}, "fmin.result");
                 }
             }
             if (m == "Max") {
                 if (a->getType()->isIntegerTy()) {
-                    llvm::Value* cmp = builder_.CreateICmpSGT(a, b);
+                    llvm::Value* cmp = mathOperandIsUnsigned(call.args[0].value.get())
+                        ? builder_.CreateICmpUGT(a, b)
+                        : builder_.CreateICmpSGT(a, b);
                     return builder_.CreateSelect(cmp, a, b, "max.result");
                 } else if (sema::MethodSymbol* cmpMs =
                                comparableCompareTo(call.args[0].value.get())) {
@@ -13772,9 +13793,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     if (rejectNonNumericMathOperand(a) ||
                         rejectNonNumericMathOperand(b))
                         return nullptr;
-                    auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                    if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
-                    if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                    // per stdlib §2.2 (v0.340): `float` is its own T (#6849);
+                    // the intrinsic runs at the operand's own FP type.
+                    auto* dbl = a->getType()->isFloatTy()
+                        ? llvm::Type::getFloatTy(llvm_)
+                        : llvm::Type::getDoubleTy(llvm_);
+                    if (!a->getType()->isFloatingPointTy()) a = builder_.CreateSIToFP(a, dbl);
+                    if (!b->getType()->isFloatingPointTy()) b = builder_.CreateSIToFP(b, dbl);
                     auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::maxnum, {dbl});
                     return builder_.CreateCall(fn, {a, b}, "fmax.result");
                 }
@@ -13832,10 +13857,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* hi  = lowerExpr(*call.args[2].value);
             if (!val || !lo || !hi) return nullptr;
             if (val->getType()->isIntegerTy()) {
+                const bool uns = mathOperandIsUnsigned(call.args[0].value.get());
                 llvm::Value* clamped = builder_.CreateSelect(
-                    builder_.CreateICmpSLT(val, lo), lo, val);
+                    uns ? builder_.CreateICmpULT(val, lo)
+                        : builder_.CreateICmpSLT(val, lo), lo, val);
                 return builder_.CreateSelect(
-                    builder_.CreateICmpSGT(clamped, hi), hi, clamped, "clamp.result");
+                    uns ? builder_.CreateICmpUGT(clamped, hi)
+                        : builder_.CreateICmpSGT(clamped, hi), hi, clamped, "clamp.result");
             } else if (sema::MethodSymbol* cmpMs =
                            comparableCompareTo(call.args[0].value.get())) {
                 // #1141: non-numeric IComparable<T> → value.CompareTo(lo) < 0 ?
@@ -13891,10 +13919,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     rejectNonNumericMathOperand(lo) ||
                     rejectNonNumericMathOperand(hi))
                     return nullptr;
-                auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (!val->getType()->isDoubleTy()) val = builder_.CreateSIToFP(val, dbl);
-                if (!lo->getType()->isDoubleTy())  lo  = builder_.CreateSIToFP(lo, dbl);
-                if (!hi->getType()->isDoubleTy())  hi  = builder_.CreateSIToFP(hi, dbl);
+                auto* dbl = val->getType()->isFloatTy()
+                    ? llvm::Type::getFloatTy(llvm_)
+                    : llvm::Type::getDoubleTy(llvm_);   // #6849: float stays float
+                if (!val->getType()->isFloatingPointTy()) val = builder_.CreateSIToFP(val, dbl);
+                if (!lo->getType()->isFloatingPointTy())  lo  = builder_.CreateSIToFP(lo, dbl);
+                if (!hi->getType()->isFloatingPointTy())  hi  = builder_.CreateSIToFP(hi, dbl);
                 llvm::Value* clamped = builder_.CreateSelect(
                     builder_.CreateFCmpOLT(val, lo), lo, val);
                 return builder_.CreateSelect(
