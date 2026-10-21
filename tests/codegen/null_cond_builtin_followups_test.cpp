@@ -107,3 +107,35 @@ BEZEL_TEST(null_cond_builtin_followups, nullable_primitive_tostring_local_6680_s
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "100\n100\n");
 }
+
+// #6664 (stdlib §5, §7.5): `a.GroupBy(f)?.ToArray()` never lowered -- the bare
+// GroupBy receiver has no standalone value, so lowerLocalDecl dropped the
+// initializer (`g` NULL, internal #2434 warning, exit 0): wrong output, not a
+// leak. Probe g5. Pre-fix prints "NULL"; the `.` form prints the group count.
+BEZEL_TEST(null_cond_builtin_followups, groupby_toarray_local_6664_spec_7_5) {
+    JitResult r = runAot(prog(
+        "  var a: Array<int> := [1, 2, 3, 4]; "
+        "  var g := a.GroupBy(lambda(x: int) => x mod 2)?.ToArray(); "
+        "  if g = null then Console.WriteLine(\"NULL\"); "
+        "  else Console.WriteLine(g.Count); end; "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "2\n");
+}
+
+// Owning disposal of the groupings (isFreshGroupByToArrayLocal), 100x checked,
+// with the lazy terminals over the same receiver as stdout controls.
+BEZEL_TEST(null_cond_builtin_followups, groupby_toarray_local_no_leak_6664_spec_7_5) {
+    JitResult r = runAotChecked(prog(
+        "  var a: Array<int> := [1, 2, 3, 4, 5]; "
+        "  var i := 0; var acc := 0; "
+        "  while i < 100 do "
+        "    var g := a.GroupBy(lambda(x: int) => x mod 2)?.ToArray(); "
+        "    if g <> null then acc := acc + g.Count; end; "
+        "    acc := acc + (a.GroupBy(lambda(x: int) => x mod 3)?.Count() ?? 0); "
+        "    i := i + 1; "
+        "  end; "
+        "  Console.WriteLine(acc); "));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "500\n");
+}

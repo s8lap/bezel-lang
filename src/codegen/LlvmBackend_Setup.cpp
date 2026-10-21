@@ -37951,11 +37951,23 @@ bool Emitter::isFreshGroupByToArrayLocal(const LocalDeclInitView& view) const {
     // (`xs.GroupBy(sel).ToArray()` over builtins) resolves no symbol on either
     // call, so its reclaim is unchanged.
     if (calleeResolvedBySema(*call, ctx_)) return false;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
-    if (!ma || ma->member != "ToArray" || !ma->target) return false;
-    if (auto* inner = dynamic_cast<const ast::CallExpr*>(ma->target.get()))
+    // fix #6664 (§7.5, stdlib §5): the `?.` spelling `a.GroupBy(f)?.ToArray()`
+    // lowers (lowerNullCondBuiltinCall) to the very same bz_groupby_to_array
+    // result, so it owns its groupings exactly like the `.` form.
+    const ast::Expr* gbTarget = nullptr;
+    std::string_view gbMember;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+        gbTarget = ma->target.get();
+        gbMember = ma->member;
+    } else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                   call->callee.get())) {
+        gbTarget = ncm->target.get();
+        gbMember = ncm->member;
+    }
+    if (!gbTarget || gbMember != "ToArray") return false;
+    if (auto* inner = dynamic_cast<const ast::CallExpr*>(gbTarget))
         if (calleeResolvedBySema(*inner, ctx_)) return false;
-    return isGroupByCall(ma->target.get());
+    return isGroupByCall(gbTarget);
 }
 
 

@@ -20422,9 +20422,20 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     const bool valueResult = isNullableValueTy(callTy);
     sema::TypeRef* innerTy = ctx_.makeTypeRef(*callTy);
     innerTy->nullable = false;
-    llvm::Value* rcv = lowerExpr(*nm.target);
-    if (!rcv) return nullptr;
-    const bool rcvIsPtr = rcv->getType()->isPointerTy();
+    // fix #6664 (stdlib §5, #752, §7.5): a bare `src.GroupBy(f)` receiver cannot
+    // be lowered to a value on its own (only the consumer's structural
+    // interception materializes it: lowerGroupByMaterialize), so the placeholder
+    // idiom below yields nothing and the whole local was dropped (`g` NULL, the
+    // #2434 backstop). It is also never null (a call result of a non-null
+    // source), so the `?.` guard is vacuous: hand the REAL receiver node to the
+    // `.` twin and lift. The node is moved into the twin and moved back after.
+    const bool groupByRcv = isGroupByCall(nm.target.get());
+    llvm::Value* rcv = nullptr;
+    if (!groupByRcv) {
+        rcv = lowerExpr(*nm.target);
+        if (!rcv) return nullptr;
+    }
+    const bool rcvIsPtr = rcv && rcv->getType()->isPointerTy();
     auto* entryBB = builder_.GetInsertBlock();
     auto* accessBB = llvm::BasicBlock::Create(llvm_, "ncbi.access", currentFn_);
     auto* endBB = llvm::BasicBlock::Create(llvm_, "ncbi.end", currentFn_);
@@ -20437,15 +20448,22 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
         builder_.CreateBr(accessBB);
     builder_.SetInsertPoint(accessBB);
 
-    auto placeholder = std::make_unique<ast::IdentifierExpr>();
-    placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
-    ctx_.setExprType(placeholder.get(), const_cast<sema::TypeRef*>(rcvTy));
-    exprValueOverride_[placeholder.get()] = rcv;
-    const ast::Expr* placeholderKey = placeholder.get();
+    auto& mutNm = const_cast<ast::NullCondMemberExpr&>(nm);
+    const ast::Expr* placeholderKey = nullptr;
     auto dotted = std::make_unique<ast::MemberAccessExpr>();
     dotted->span = nm.span;
     dotted->member = nm.member;
-    dotted->target = std::move(placeholder);
+    if (groupByRcv) {
+        dotted->target = std::move(mutNm.target);
+    } else {
+        auto placeholder = std::make_unique<ast::IdentifierExpr>();
+        placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
+        ctx_.setExprType(placeholder.get(), const_cast<sema::TypeRef*>(rcvTy));
+        exprValueOverride_[placeholder.get()] = rcv;
+        placeholderKey = placeholder.get();
+        dotted->target = std::move(placeholder);
+    }
+    ast::MemberAccessExpr* dottedRaw = dotted.get();
     ctx_.setExprType(dotted.get(), innerTy);
     auto synth = std::make_unique<ast::CallExpr>();
     synth->span = call.span;
@@ -20455,7 +20473,8 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     synth->args = std::move(mutCall.args);
     llvm::Value* inner = lowerExpr(*synth);
     mutCall.args = std::move(synth->args);
-    exprValueOverride_.erase(placeholderKey);
+    if (groupByRcv) mutNm.target = std::move(dottedRaw->target);
+    else exprValueOverride_.erase(placeholderKey);
     nullCondGroupingCallSynth_.push_back(std::move(synth));
 
     llvm::Type* nullTy = valueResult
