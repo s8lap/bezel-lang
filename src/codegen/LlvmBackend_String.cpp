@@ -3014,10 +3014,13 @@ llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
     // via the dynamic path, whose `bz_obj_is_string` premise a real string
     // satisfies). Decline rather than narrow.
     if (reassignedOpaqueLocals_.count(ld)) return nullptr;
-    // fix #6753 follow-up (§7.4 / §22.3, v0.340): the same decline for a write
-    // the statement-level set cannot see — from a lambda body, or through a
-    // `ref`/`out` argument. See `opaqueLocalSlotWritten`.
-    if (opaqueLocalSlotWritten(ld)) return nullptr;
+    // fix-forward #6753 (§7.4 / §22.3, v0.340): the narrowing needs POSITIVE
+    // proof that the slot still holds its initializer — a scan of the body
+    // that declares the local, finding no write of any kind (a lambda-body
+    // assignment, a `ref`/`out` argument, a plain reassignment in a body the
+    // set above never scanned). Anything unscanned or unknown declines. See
+    // `opaqueLocalProvablyUnwritten`.
+    if (!opaqueLocalProvablyUnwritten(ld)) return nullptr;
     const sema::TypeRef* srcRt = ctx_.exprType(*ld->initializer);
     if (!isVtableLess(srcRt)) return nullptr;
     // fix #3127 (§8.6 / §8.5): `Range<T>` IS in `kNonHeapReservedBuiltins`

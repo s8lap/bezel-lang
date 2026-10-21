@@ -304,6 +304,9 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         // at review, exactly as retainAssignedStringParams(dd->body, {}) is.
         retainAssignedClosureParams(dd->body, /*params=*/{});
         collectBoxReleaseEligible(dd->body);
+        // fix-forward #6753 (§8.5 / §18.5, v0.340): the `Object`-local
+        // narrowing scans THIS destructor body.
+        setOpaqueSlotScanRoot(&dd->body, nullptr);
         collectBoxCaptureLocals(dd->body);
         collectDefinitelyEscapingLambdas(dd->body);
         // Must run AFTER collectClosureReleaseEligible (uses its result).

@@ -10908,6 +10908,11 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     if (ctx_.isImported(ms)) return;
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return;
+    // fix-forward #6753 (§8.5 / §18.5, v0.340): the scan root for the
+    // `Object`-local narrowing is THIS body — statement list or expression —
+    // set here, BEFORE the async / iterator routing below, so every route
+    // (state machine or plain, block or arrow) scans the body it lowers.
+    setOpaqueSlotScanRoot(ci.stmts, ci.exprBody);
 
     // #817 / §14.2: mark this as an unspecialized generic TEMPLATE body when the
     // method belongs to a generic class or is itself a generic method. emitReturn
@@ -11208,10 +11213,6 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     valueLikeChoiceCallResultReleaseEligible_.clear();
     valueLikeChoiceCallResultReleaseEligibleFn_ = fn;
     boxReleaseEligibleFn_ = fn;
-    // fix #6753 follow-up: an expression-bodied function never reaches
-    // collectBoxReleaseEligible, so drop the previous function's body here.
-    opaqueSlotScanBody_ = nullptr;
-    opaqueSlotWrittenMemo_.clear();
     objectStringReleaseEligibleFn_ = fn;  // fix #2900
     // §27.5 / §28.9 / #672: which +1-box-producer locals are captured by exactly
     // one lambda env, so the owning lambda's envdtor may perform the deferred
@@ -11711,6 +11712,10 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
     currentCaughtExc_ = nullptr;
     currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
+    // fix-forward #6753 (§8.5 / §18.5, v0.340): the `Object`-local narrowing
+    // scans THIS static-constructor body; the synthesized field-init-only
+    // function (no `cd`) has no user body and declines.
+    setOpaqueSlotScanRoot(cd ? &cd->body : nullptr, nullptr);
 
     // fix #529 / §22.7 (part a): establish the entry block FIRST so that
     // builder_ has a valid insert point, then pre-seed propagateBB_ with a
@@ -13001,6 +13006,10 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     unwindIneligible_.clear();
     unwindIneligibleFn_ = fn;
     collectUnwindIneligible(cd->body);
+    // fix-forward #6753 (§8.5 / §18.5, v0.340): the `Object`-local narrowing
+    // scans THIS constructor body (MEASURED before: a reassigned local in a
+    // constructor body rendered as its initializer's builder and SEGVed).
+    setOpaqueSlotScanRoot(&cd->body, nullptr);
     moveOnlyArrayTransferred_.clear();
     moveOnlyArrayTransferredFn_ = fn;
     collectMoveOnlyArrayTransferred(cd->body);  // §15.3 (#747)
@@ -40399,6 +40408,16 @@ struct BoxEscapeWalker {
     // operand).
     bool slotWriteMode = false;
     bool slotWritten = false;
+    // fix-forward #6753 (§7.4 / §8.5 / §18.5 / §22.3, v0.340): two bits
+    // `Emitter::opaqueLocalProvablyUnwritten` reads beside `slotWritten`,
+    // both set in slotWriteMode only. `declSeen`: the walk reached the
+    // target's own LocalDecl, so the scanned root covers the local's scope (a
+    // root that never declares it proves nothing about it). `unknownNode`:
+    // the walk met a node kind this walker does not enumerate, which is not
+    // proven write-free. Neither bit changes `slotWritten`, so the #3447
+    // phase-1 verdicts are untouched.
+    bool declSeen = false;
+    bool unknownNode = false;
     bool escaped = false;
     bool sawManagedAssignment = false;
     bool sawBoxAssignment = false;
@@ -40906,11 +40925,35 @@ struct BoxEscapeWalker {
             return;
         }
         // Leaf literals contain no identifiers — nothing to do.
+        // fix-forward #6753: the slot-write question names the leaves, so a
+        // kind this walker does not enumerate is recorded, not skipped.
+        if (slotWriteMode && !isLeafExpr(e)) unknownNode = true;
+    }
+
+    // fix-forward #6753: the expression kinds with no sub-expression and no
+    // identifier (ast/Node.hpp). `MarkedTransferExpr` carries a name only.
+    static bool isLeafExpr(const ast::Expr* e) {
+        return dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+               dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+               dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+               dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+               dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+               dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+               dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+               dynamic_cast<const ast::UnitExpr*>(e) ||
+               dynamic_cast<const ast::TypeOfExpr*>(e) ||
+               dynamic_cast<const ast::NameOfExpr*>(e) ||
+               dynamic_cast<const ast::DefaultExpr*>(e) ||
+               dynamic_cast<const ast::MarkedTransferExpr*>(e);
     }
 
     void stmt(const ast::Stmt* s) {
         if (!s || escaped) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // fix-forward #6753: the slot-write question records that the
+            // scanned root declares its target (see `declSeen`).
+            if (slotWriteMode && static_cast<const void*>(ld) == target)
+                declSeen = true;
             // Binding the target into ANOTHER local escapes it (the new local may
             // be returned/stored/aliased). Walk the initializer as an escape
             // position — its sub-reads (e.g. `o as T`) are still recognized.
@@ -41164,6 +41207,11 @@ struct BoxEscapeWalker {
             return;
         }
         // BreakStmt / ContinueStmt: no sub-expressions.
+        // fix-forward #6753: any other kind (a LocalTypeDecl today) is not
+        // proven write-free for the slot-write question.
+        if (slotWriteMode && !dynamic_cast<const ast::BreakStmt*>(s) &&
+            !dynamic_cast<const ast::ContinueStmt*>(s))
+            unknownNode = true;
     }
 };
 }  // namespace
@@ -41174,8 +41222,6 @@ void Emitter::collectBoxReleaseEligible(
     boxReleaseEligible_.clear();
     boxReassignedLocals_.clear();  // fix #2960
     reassignedOpaqueLocals_.clear();  // fix #2968
-    opaqueSlotScanBody_ = &body;      // fix #6753 follow-up
-    opaqueSlotWrittenMemo_.clear();
     // fix #2960 / §8.6 / §28.9: consider every non-using Object/interface
     // LocalDecl, not only one whose INITIALIZER is a box. A string/class/null
     // initializer may be followed by `p := <value>`; the assignment then mints
@@ -41418,30 +41464,62 @@ void Emitter::collectBoxReleaseEligible(
     }
 }
 
-// fix #6753 follow-up (§7.4 / §8.5 / §18.5 / §22.3, v0.340): the narrowing in
+// fix-forward #6753 (§7.4 / §8.5 / §18.5 / §22.3, v0.340): the scan root for
+// `opaqueLocalProvablyUnwritten`. Set at every function-emission entry point
+// that lowers a user body: `emitFunctionBody` (which also routes the async and
+// iterator state machines), `emitConstructorBody`, `emitStaticConstructorBody`,
+// the destructor emitter, and `buildSpecializedMethodFn` (saved and restored
+// around its nested emission). A body no entry point names — a field
+// initializer, a synthesized function — keeps whatever root was last set, and
+// the `declSeen` requirement below makes that harmless: a root that does not
+// declare the local proves nothing about it and the narrowing declines. The
+// memo is keyed by LocalDecl and valid for one root only, so it is dropped
+// with every root change.
+void Emitter::setOpaqueSlotScanRoot(
+        const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
+        const ast::Expr* exprBody) {
+    opaqueSlotScanBody_ = stmts;
+    opaqueSlotScanExpr_ = exprBody;
+    opaqueSlotUnwrittenMemo_.clear();
+}
+
+// fix-forward #6753 (§7.4 / §8.5 / §18.5 / §22.3, v0.340): the narrowing in
 // `tryOpaqueSlotBuiltinRender` reads an `Object` local's INITIALIZER type, so
 // it is valid only while the slot still holds that value. A write from a
-// lambda body (`lambda() => do o := "s"; end`) or through `ref o` / `out o`
-// replaces the value without an AssignmentStmt in the enclosing statement
-// list; the narrowing then hands a string to the StringBuilder renderer
-// (MEASURED: SEGV in `bz_strbuilder_to_string`). The #3447 phase-1 walk
-// already answers exactly "can this slot be written": it sets `slotWritten`
-// on an assignment or increment of the local and on a `ref`/`out` argument,
-// and it descends into lambda bodies. A read-only capture is not a write, so
-// it keeps the narrowing.
-bool Emitter::opaqueLocalSlotWritten(const ast::LocalDecl* ld) {
-    if (!ld || !opaqueSlotScanBody_) return false;
-    auto it = opaqueSlotWrittenMemo_.find(ld);
-    if (it != opaqueSlotWrittenMemo_.end()) return it->second;
+// lambda body (`lambda() => do o := "s"; end`), through `ref o` / `out o`, or
+// by a plain `o := "s"` in a body the statement-level set never scanned
+// replaces the value with a string; the narrowing then hands that string to
+// the StringBuilder renderer (MEASURED: SEGV in `bz_strbuilder_to_string`, in
+// constructors, static constructors, async methods, iterators and arrow
+// bodies). This predicate is therefore POSITIVE and fails closed: it returns
+// true only when the #3447 phase-1 walk over the current scan root (a) reached
+// the local's own LocalDecl, so the root covers the local's whole scope — a
+// local can be written only inside the body that declares it, including the
+// lambda bodies the walk descends into — (b) found no write (`slotWritten`:
+// an assignment or increment of the local, or the local under a `ref`/`out`
+// modifier), (c) did not stop early, and (d) met no node kind the walker does
+// not enumerate. Anything unscanned, unknown or stale answers false. A
+// read-only capture is not a write, so it keeps the narrowing.
+bool Emitter::opaqueLocalProvablyUnwritten(const ast::LocalDecl* ld) {
+    if (!ld) return false;
+    if (!opaqueSlotScanBody_ && !opaqueSlotScanExpr_) return false;
+    auto it = opaqueSlotUnwrittenMemo_.find(ld);
+    if (it != opaqueSlotUnwrittenMemo_.end()) return it->second;
     BoxEscapeWalker w{ctx_, static_cast<const void*>(ld),
                       /*assignmentSourceKind=*/{}, /*isKnownBoxReceiver=*/{}};
     w.slotWriteMode = true;
-    for (auto& s : *opaqueSlotScanBody_) {
-        w.stmt(s.get());
-        if (w.slotWritten) break;
+    auto undecidable = [&w] { return w.slotWritten || w.escaped || w.unknownNode; };
+    if (opaqueSlotScanBody_) {
+        for (auto& s : *opaqueSlotScanBody_) {
+            w.stmt(s.get());
+            if (undecidable()) break;
+        }
     }
-    opaqueSlotWrittenMemo_.emplace(ld, w.slotWritten);
-    return w.slotWritten;
+    if (opaqueSlotScanExpr_ && !undecidable())
+        w.expr(opaqueSlotScanExpr_, /*safeRead=*/false);
+    const bool proven = w.declSeen && !undecidable();
+    opaqueSlotUnwrittenMemo_.emplace(ld, proven);
+    return proven;
 }
 
 

@@ -20544,21 +20544,44 @@ private:
     // Two mutation forms are NOT recorded here: assignment to the local from
     // inside a lambda (a §7.4 "mutable capture", or a write to a lambda-body
     // local, which this statement-level walk never descends into) and a write
-    // through a `ref`/`out` argument. `opaqueLocalSlotWritten` below covers
-    // both; `tryOpaqueSlotBuiltinRender` consults it after this set.
+    // through a `ref`/`out` argument. `opaqueLocalProvablyUnwritten` below
+    // covers both; `tryOpaqueSlotBuiltinRender` consults it after this set.
     std::unordered_set<const ast::LocalDecl*> reassignedOpaqueLocals_;
-    // fix #6753 follow-up (§7.4 / §8.5 / §18.5 / §22.3, v0.340): "can this
-    // local's SLOT be written anywhere in the current function body", the
-    // expression-position complement of `reassignedOpaqueLocals_`. Answered by
-    // the #3447 phase-1 slot-write walk (`BoxEscapeWalker` in slotWriteMode),
-    // which sees a `ref`/`out` argument and descends into every lambda body,
-    // over `opaqueSlotScanBody_` (the body `collectBoxReleaseEligible` last
-    // scanned; reset per function by `emitFunctionBody`). A null body answers
-    // "not written" so a function the collector never scanned keeps the
-    // pre-existing narrowing. Memoized per LocalDecl; membership-only.
-    bool opaqueLocalSlotWritten(const ast::LocalDecl* ld);
+    // fix-forward #6753 (§7.4 / §8.5 / §18.5 / §22.3, v0.340): "is this local
+    // PROVABLY never written after its initializer", the positive fact the
+    // narrowing in `tryOpaqueSlotBuiltinRender` needs. Answered by the #3447
+    // phase-1 slot-write walk (`BoxEscapeWalker` in slotWriteMode, which sees
+    // a `ref`/`out` argument and descends into every lambda body) over the
+    // SCAN ROOT: the statement list and/or expression body of the function
+    // being emitted, set by `setOpaqueSlotScanRoot` at each function-emission
+    // entry point. It answers true only when the walk reached the local's own
+    // LocalDecl (so the root covers its scope), found no write, did not stop
+    // early, and met no node kind it does not enumerate. A null root, a root
+    // from another function, or an unscanned body therefore answers FALSE and
+    // the narrowing declines — the pre-#6753 behaviour, correct for a string.
+    // Memoized per LocalDecl; the memo is dropped on every root change.
+    bool opaqueLocalProvablyUnwritten(const ast::LocalDecl* ld);
+    void setOpaqueSlotScanRoot(
+        const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
+        const ast::Expr* exprBody);
     const std::vector<std::unique_ptr<ast::Stmt>>* opaqueSlotScanBody_ = nullptr;
-    std::unordered_map<const ast::LocalDecl*, bool> opaqueSlotWrittenMemo_;
+    const ast::Expr* opaqueSlotScanExpr_ = nullptr;
+    std::unordered_map<const ast::LocalDecl*, bool> opaqueSlotUnwrittenMemo_;
+    // Save/restore of the scan root around a NESTED body emission (a generic
+    // specialization built mid-emission of its caller's body).
+    struct OpaqueSlotScanRootGuard {
+        Emitter& e;
+        const std::vector<std::unique_ptr<ast::Stmt>>* savedBody;
+        const ast::Expr* savedExpr;
+        OpaqueSlotScanRootGuard(
+            Emitter& em, const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
+            const ast::Expr* exprBody)
+            : e(em), savedBody(em.opaqueSlotScanBody_),
+              savedExpr(em.opaqueSlotScanExpr_) {
+            e.setOpaqueSlotScanRoot(stmts, exprBody);
+        }
+        ~OpaqueSlotScanRootGuard() { e.setOpaqueSlotScanRoot(savedBody, savedExpr); }
+    };
     // The function for which boxReleaseEligible_ was computed (mirrors
     // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // inherits no eligibility, so its boxed-value locals just leak (never

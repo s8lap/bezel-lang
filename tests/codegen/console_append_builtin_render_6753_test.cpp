@@ -475,3 +475,228 @@ BEZEL_TEST(codegen_console_append_builtin_6753,
                         "Console.WriteLine(o); Console.WriteLine($\"[{o}]\");")),
                     std::string("viabind\n[viabind]\n"));
 }
+
+// ---------------------------------------------------------------------------
+// Fix-forward #6753 (second review): the narrowing must FAIL CLOSED. Before
+// this change the slot-write scan ran over the body `collectBoxReleaseEligible`
+// last walked, and a body it never walked (an expression-bodied member, a
+// constructor, a static constructor, an async method, an iterator) answered
+// "not written", so a local the body DID reassign, or wrote through a lambda or
+// a `ref` argument, was still narrowed to its initializer's `StringBuilder` and
+// its string was handed to the builder renderer (MEASURED on 66cd27fc, ASan:
+// SEGV in every row below that is not marked CONTROL). The narrowing now needs
+// positive proof: the scan root is the body of the function being emitted, the
+// scan must reach the local's own declaration, and it must find no write.
+//
+// Oracles. Rows whose program is leak-clean at the base (f2f81408, MEASURED
+// under ASan with `detect_leaks=1`) use the checked oracle. Five rows use the
+// plain oracle because their program leaks AT THE BASE for a reason that is not
+// this path: a `StringBuilder` local declared inside a lambda body is never
+// released (#6061; 64 + 512 B from `bz_array_alloc`), and a lambda-valued local
+// in a constructor body leaks its closure (#6766; 64 + 8/16 B). The exact
+// stdout still pins the crash: on 66cd27fc each of those programs dies with
+// SEGV and prints nothing.
+// ---------------------------------------------------------------------------
+namespace {
+// `o` is an `Object` local whose initializer is a `StringBuilder` holding
+// "sbtext": the shape every row below narrows (or must refuse to narrow).
+const char* kObjLocal =
+    "var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+    "var o: Object := sb; ";
+// A `ref` setter inside the class under test.
+const char* kSet = "  static method Set(ref x: Object): () x := \"viaref\"; end Set; ";
+}  // namespace
+
+// §22.2 / §8.5 / stdlib §2.1: an EXPRESSION-BODIED method never reached the
+// statement collector, so its lambda-body local answered "not written".
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           arrow_method_lambda_local_reassigned_renders_its_string_22_2_8_5) {
+    BEZEL_EXPECT_EQ(out(std::string(
+                        "module M; class C "
+                        "  static method Call(f: () -> ()): int f(); return 0; end Call; "
+                        "  static method Run(): int => Call(lambda() => do ") + kObjLocal +
+                        "o := \"inlam\"; Console.WriteLine(o); end); "
+                        "  public static method Main(): int return Run(); end Main; end C;"),
+                    std::string("inlam\n"));
+}
+
+// §22.8 / §8.5 / stdlib §2.1: a FIELD INITIALIZER's lambda is lowered with no
+// body of its own ever scanned; its local is now unprovable and declines.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           field_initializer_lambda_local_reassigned_renders_its_string_22_8_8_5) {
+    BEZEL_EXPECT_EQ(out(std::string(
+                        "module M; class C "
+                        "  private _f: () -> () := lambda() => do ") + kObjLocal +
+                        "o := \"infield\"; Console.WriteLine(o); end; "
+                        "  public method Run(): () _f(); end Run; "
+                        "  public static method Main(): int var c := new C(); c.Run(); "
+                        "return 0; end Main; end C;"),
+                    std::string("infield\n"));
+}
+
+// §23.2 / §8.5 / stdlib §2.1: the expression-bodied PROPERTY twin of the
+// arrow-method row.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           arrow_property_lambda_local_reassigned_renders_its_string_23_2_8_5) {
+    BEZEL_EXPECT_EQ(out(std::string(
+                        "module M; class C "
+                        "  static method Call(f: () -> ()): int f(); return 0; end Call; "
+                        "  public property P: int => Call(lambda() => do ") + kObjLocal +
+                        "o := \"inprop\"; Console.WriteLine(o); end); "
+                        "  public static method Main(): int var c := new C(); return c.P; "
+                        "end Main; end C;"),
+                    std::string("inprop\n"));
+}
+
+// §30.1 / §22.3 / stdlib §2.1: an ASYNC method's body is lowered by the state
+// machine emitter, which never ran the collector; the `ref` write was unseen.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           async_method_ref_written_object_local_renders_its_string_30_1_22_3) {
+    BEZEL_EXPECT_EQ(checkedOut(std::string("module M; class C ") + kSet +
+                        "  static async method Run(): Task<int> " + kObjLocal +
+                        "Set(ref o); Console.WriteLine(o); return 0; end Run; "
+                        "  public static async method Main(): Task<int> return await Run(); "
+                        "end Main; end C;"),
+                    std::string("viaref\n"));
+}
+
+// §29.3 / §22.3 / stdlib §2.1: the ITERATOR twin (the builder is `using var`
+// because an iterator body may not drop an owned local).
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           iterator_ref_written_object_local_renders_its_string_29_3_22_3) {
+    BEZEL_EXPECT_EQ(checkedOut(std::string("module M; class C ") + kSet +
+                        "  static method Gen(): IEnumerable<int> "
+                        "using var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+                        "var o: Object := sb; Set(ref o); Console.WriteLine(o); "
+                        "yield return 1; end Gen; "
+                        "  public static method Main(): int "
+                        "for var x in Gen() do Console.WriteLine(x); end for; "
+                        "return 0; end Main; end C;"),
+                    std::string("viaref\n1\n"));
+}
+
+// §22.12 / §27.5 / stdlib §2.1: a STATIC CONSTRUCTOR body with a closure write.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           static_constructor_closure_written_object_local_renders_its_string_22_12_27_5) {
+    BEZEL_EXPECT_EQ(out(std::string(
+                        "module M; class C "
+                        "  static constructor() ") + kObjLocal +
+                        "var f := lambda() => do o := \"instatic\"; end; f(); "
+                        "Console.WriteLine(o); end constructor; "
+                        "  public static method Main(): int return 0; end Main; end C;"),
+                    std::string("instatic\n"));
+}
+
+// §22.7 / §27.5 / stdlib §2.1: a CONSTRUCTOR body with a closure write.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           constructor_closure_written_object_local_renders_its_string_22_7_27_5) {
+    BEZEL_EXPECT_EQ(out(std::string(
+                        "module M; class C "
+                        "  public constructor() ") + kObjLocal +
+                        "var f := lambda() => do o := \"inctor\"; end; f(); "
+                        "Console.WriteLine(o); end constructor; "
+                        "  public static method Main(): int var c := new C(); return 0; "
+                        "end Main; end C;"),
+                    std::string("inctor\n"));
+}
+
+// §22.7 / §8.5 / stdlib §2.1: a PLAIN reassignment in a constructor body. The
+// statement-level set is filled by the same collector, so it was empty too.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           constructor_reassigned_object_local_renders_its_string_22_7_8_5) {
+    BEZEL_EXPECT_EQ(checkedOut(std::string(
+                        "module M; class C "
+                        "  public constructor() ") + kObjLocal +
+                        "o := \"reassigned\"; Console.WriteLine(o); end constructor; "
+                        "  public static method Main(): int var c := new C(); return 0; "
+                        "end Main; end C;"),
+                    std::string("reassigned\n"));
+}
+
+// §30.1 / §8.5 / stdlib §2.1: a plain reassignment in an async method body.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           async_method_reassigned_object_local_renders_its_string_30_1_8_5) {
+    BEZEL_EXPECT_EQ(checkedOut(std::string(
+                        "module M; class C "
+                        "  static async method Run(): Task<int> ") + kObjLocal +
+                        "o := \"reassigned\"; Console.WriteLine(o); return 0; end Run; "
+                        "  public static async method Main(): Task<int> return await Run(); "
+                        "end Main; end C;"),
+                    std::string("reassigned\n"));
+}
+
+// §30.1 / §22.3 / stdlib §3.1: the `Append(o)` route in an async method.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           async_method_ref_written_object_local_appends_its_string_30_1_3_1) {
+    BEZEL_EXPECT_EQ(checkedOut(std::string("module M; class C ") + kSet +
+                        "  static async method Run(): Task<int> " + kObjLocal +
+                        "Set(ref o); var t := new StringBuilder(); _ := t.Append(o); "
+                        "Console.WriteLine(t.ToString()); return 0; end Run; "
+                        "  public static async method Main(): Task<int> return await Run(); "
+                        "end Main; end C;"),
+                    std::string("viaref\n"));
+}
+
+// §30.1 / §22.3 / §18.5: the interpolation hole in an async method. MEASURED:
+// this program also dies with SEGV at the base (f2f81408), where the hole was
+// the narrowing's only user and no slot-write scan existed at all.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           async_method_ref_written_object_local_interpolates_its_string_30_1_18_5) {
+    BEZEL_EXPECT_EQ(checkedOut(std::string("module M; class C ") + kSet +
+                        "  static async method Run(): Task<int> " + kObjLocal +
+                        "Set(ref o); Console.WriteLine($\"[{o}]\"); return 0; end Run; "
+                        "  public static async method Main(): Task<int> return await Run(); "
+                        "end Main; end C;"),
+                    std::string("[viaref]\n"));
+}
+
+// CONTROL (§30.1 / stdlib §2.1): an async body whose local is NEVER written
+// still narrows — the scan root is set before the async routing, so the state
+// machine's body is scanned and the declaration is seen.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           control_async_method_unwritten_object_local_still_renders_builder_30_1_2_1) {
+    BEZEL_EXPECT_EQ(checkedOut(std::string(
+                        "module M; class C "
+                        "  static async method Run(): Task<int> ") + kObjLocal +
+                        "Console.WriteLine(o); return 0; end Run; "
+                        "  public static async method Main(): Task<int> return await Run(); "
+                        "end Main; end C;"),
+                    std::string("sbtext\n"));
+}
+
+// §14.1 / stdlib §2.1: a generic specialization is built mid-emission of its
+// first caller. Its own body is scanned while it is emitted (written local in
+// `G` declines, unwritten local in `U` narrows, at both instantiations), and the
+// caller's scan root is restored afterwards, so `Main`'s own unwritten local
+// still narrows when `Main` resumes. MEASURED on 66cd27fc: the specialized `G`
+// still narrowed its reassigned local (SEGV, the fault address spelling "ingen"),
+// so this row fails without the fix too; the `U` and `Main` renders are the
+// controls for what fail-closed must keep.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           control_generic_specializations_keep_callers_object_local_rendering_14_1_2_1) {
+    BEZEL_EXPECT_EQ(checkedOut(std::string(
+                        "module M; class C "
+                        "  static method G<T>(x: T): int ") + kObjLocal +
+                        "o := \"ingen\"; Console.WriteLine(o); return 0; end G; "
+                        "  static method U<T>(x: T): int " + kObjLocal +
+                        "Console.WriteLine(o); return 0; end U; "
+                        "  public static method Main(): int "
+                        "var sb0 := new StringBuilder(); _ := sb0.Append(\"main\"); "
+                        "var m: Object := sb0; "
+                        "_ := G<int>(1); _ := G<string>(\"s\"); _ := U<int>(1); _ := U<string>(\"s\"); "
+                        "Console.WriteLine(m); return 0; end Main; end C;"),
+                    std::string("ingen\ningen\nsbtext\nsbtext\nmain\n"));
+}
+
+// CONTROL (§22.2 / §17.15 / stdlib §2.1): an expression body that is a binding
+// atom declares the local in a clause; the scan now covers expression bodies, so
+// the declaration is seen and the (single-assignment) local still narrows.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           control_arrow_method_bind_atom_object_local_still_renders_builder_22_2_17_15) {
+    BEZEL_EXPECT_EQ(checkedOut(
+                        "module M; class C "
+                        "  static method R(): () => (var sb := new StringBuilder(\"sbtext\"); "
+                        "var o: Object := sb; Console.WriteLine(o)); "
+                        "  public static method Main(): int R(); return 0; end Main; end C;"),
+                    std::string("sbtext\n"));
+}

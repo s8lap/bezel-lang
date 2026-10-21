@@ -18722,6 +18722,11 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // returns to it.
     auto savedUnwindIneligible = unwindIneligible_;
     llvm::Function* savedUnwindIneligibleFn = unwindIneligibleFn_;
+    // fix-forward #6753 (§8.5 / §18.5, v0.340): the `Object`-local narrowing
+    // scans THIS specialized body while it is emitted, and the caller's own
+    // root is restored on every exit path (a specialization is built
+    // mid-emission of the body that first calls it).
+    OpaqueSlotScanRootGuard opaqueSlotRootGuard{*this, ci.stmts, ci.exprBody};
     // fix #2807 / #429 / §4.6 / §28.9: the same save/restore for the `var`
     // STRING-local refcount state, for the same reason #1483 needed it for the
     // unwind sets — this wrapper may run MID-EMISSION of an outer body (a lazy
