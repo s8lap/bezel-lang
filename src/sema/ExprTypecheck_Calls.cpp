@@ -13959,6 +13959,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ce.args[0].value->span.begin);
                         }
                     }
+                    // fix #6807 (stdlib §3.1, v0.340): `Insert` has exactly one
+                    // overload, `Insert(index: int, value: string)`. Unlike
+                    // `Append`, there is no `Object`/numeric/value overload, so a
+                    // non-string value is a located rejection; it used to reach
+                    // codegen and die as "IR verification failed" on the
+                    // `bz_sb_insert` parameter type.
+                    if (colName == "StringBuilder" && m == "Insert" &&
+                        ce.args.size() == 2 && ce.args[1].value &&
+                        !ce.args[1].isDiscard) {
+                        TypeRef* vt = ctx_.exprType(*ce.args[1].value);
+                        if (vt && vt->kind != TypeRef::Kind::Error &&
+                            !(vt->kind == TypeRef::Kind::Primitive &&
+                              (vt->primitive == P::String ||
+                               vt->primitive == P::None))) {
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                ce.args[1].value->span.begin,
+                                "no matching overload of `StringBuilder."
+                                "Insert` — the only overload is `Insert(index: "
+                                "int, value: string)`, so the value must be a "
+                                "`string`; render a non-string value with "
+                                "`.ToString()` first (stdlib §3.1)");
+                        }
+                    }
                     // Random instance methods
                     if (colName == "Random") {
                         if (m == "Next")
