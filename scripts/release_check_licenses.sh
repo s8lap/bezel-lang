@@ -5,8 +5,8 @@
 #
 # Usage: release_check_licenses.sh STAGED_ROOT      (the <name>/ directory)
 #
-# The component list is the one MEASURED for #6713 from the link lines and
-# `strings` of a --full release build. Each rule is: a marker string that is
+# The component list is the one MEASURED for #6713 and #6715 from the link
+# lines and `strings` of a --full release build (bezelc static on musl). Each rule is: a marker string that is
 # present in the binary only when the component is linked in, and the licence
 # file that must then exist. A component this table does not know is not
 # detected: extend the table when a library is added to a link.
@@ -15,9 +15,9 @@
 #   bezelc:
 #     (always)                     LLVM 21 (static)       LICENSES/LLVM-LICENSE.TXT
 #     "basic_string::_M_create"    libstdc++, libgcc      LICENSES/gcc-COPYING3, gcc-COPYING.RUNTIME
-#     "Mark Adler"                 zlib-ng (zlib API)     LICENSES/zlib-ng-LICENSE.md
+#     "Mark Adler"                 zlib 1.3.2             LICENSES/zlib-LICENSE
 #     "Src size is incorrect"      zstd                   LICENSES/zstd-LICENSE
-#     static executable            glibc (LGPL-2.1)       README must say so (pending #6715; no text shipped)
+#     "No error information"       musl (strerror(0))     LICENSES/musl-COPYRIGHT
 #   lib/bezel/x86_64-linux-musl/bin/ld.lld:
 #     (always)                     LLVM 17 lld, musl      LLVM-LICENSE.TXT, musl-COPYRIGHT
 #     "basic_string::_M_create"    libstdc++, libgcc      gcc-COPYING3, gcc-COPYING.RUNTIME
@@ -36,7 +36,7 @@ need() {
     FAIL=1
   fi
 }
-# ---- the rule table: DATA, edit here (e.g. #6715 removes the glibc rows) ----
+# ---- the rule table: DATA, edit here ---------------------------------------
 # Each row: ROOT-RELATIVE-LICENCE-DIR | MARKER | FILE | COMPONENT
 #   MARKER  ALWAYS       the component is always linked in
 #           STATIC       the binary is a statically linked executable
@@ -47,9 +47,9 @@ BEZELC_RULES='
 LICENSES|ALWAYS|LLVM-LICENSE.TXT|LLVM (bezelc)
 LICENSES|str:basic_string::_M_create|gcc-COPYING3|libstdc++/libgcc (bezelc)
 LICENSES|str:basic_string::_M_create|gcc-COPYING.RUNTIME|libstdc++/libgcc (bezelc)
-LICENSES|str:Mark Adler|zlib-ng-LICENSE.md|zlib (bezelc)
+LICENSES|str:Mark Adler|zlib-LICENSE|zlib (bezelc)
 LICENSES|str:Src size is incorrect|zstd-LICENSE|zstd (bezelc)
-LICENSES|STATIC|readme:glibc|glibc (bezelc, static; pending #6715)
+LICENSES|str:No error information|musl-COPYRIGHT|musl (bezelc, static)
 '
 LLD_RULES='
 lib/bezel/x86_64-linux-musl/LICENSES|ALWAYS|LLVM-LICENSE.TXT|LLVM (ld.lld, libc++, libunwind, compiler-rt)

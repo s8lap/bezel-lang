@@ -32,17 +32,24 @@
 # <project VERSION from CMakeLists.txt>-<short sha>. It is passed to CMake as
 # BEZEL_VERSION_OVERRIDE so `bezelc --version` matches the tarball name.
 #
+# The fully static bezelc (--full, #6715). bin/bezelc itself is then built in
+# a second pinned Alpine container (3.23, LLVM 21; scripts/release_musl_bezelc.sh),
+# linked fully static against musl: no glibc is linked into it (glibc is
+# LGPL-2.1). The host build then only provides lib/bezel/libbezel_runtime.a,
+# which --link=system links against the USER's glibc.
+#
 # Usage: scripts/release_static.sh [--full] [--allow-dirty] [--no-bundle]
 #                                  [--dl-dir DIR] [--build-dir DIR] [--out DIR]
 #                                  [-j N]
-#   --full         also link bezelc with -static (needs glibc-static and
-#                  libstdc++-static; see the CMake BEZEL_STATIC_RELEASE_FULL).
+#   --full         ship a fully static musl bezelc built in the pinned
+#                  Alpine 3.23 container (needs podman, even with --no-bundle).
 #                  Only a --full bezelc runs in the bare-container smoke test
 #                  (a glibc-linked one needs this machine's glibc floor)
 #   --no-bundle    leave out the self-contained toolchain (no podman needed;
 #                  the tarball then needs clang, as before #6654)
-#   --dl-dir       cache for the sha256-pinned LLVM source tarballs the bundle
-#                  build downloads (default: <repo>/scratch/release-dl)
+#   --dl-dir       cache for the sha256-pinned LLVM source tarballs and licence
+#                  texts the container stages download, and for the Alpine 3.23
+#                  apks (apk-alpine-3.23/) (default: <repo>/scratch/release-dl)
 #   --allow-dirty  package a tree with uncommitted changes (version gets
 #                  a "-dirty" suffix)
 #   --build-dir    default: <repo>/scratch/build-static (build-static-full with --full)
@@ -95,11 +102,20 @@ if [ "$BUNDLE" = 1 ]; then
     command -v "$tool" >/dev/null || die "'$tool' not found on PATH (needed for the self-contained toolchain; --no-bundle skips it)"
   done
 fi
+if [ "$FULL" = ON ]; then
+  for tool in podman curl file readelf; do
+    command -v "$tool" >/dev/null || die "'$tool' not found on PATH (needed for the --full musl bezelc)"
+  done
+fi
 
 # ---- pinned inputs of the self-contained toolchain (#6654) -----------------
 # Images by digest (alpine:3.20 and ubuntu:22.04 as of 2026-10-21); the Alpine
 # package versions are pinned in release_musl_stage.sh.
 ALPINE_IMAGE=docker.io/library/alpine@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
+# The --full bezelc stage (#6715): alpine:3.23 (3.23.6) as of 2026-10-21, used
+# ONLY to build bin/bezelc (3.20 has no LLVM >= 20); the package versions are
+# pinned in release_musl_bezelc.sh. Its LLVM is 21.1.2, the gate's 21.1.8.
+ALPINE_BEZELC_IMAGE=docker.io/library/alpine@sha256:85fe1e81d6758c208f3e1eed4338a1997e19d4be002d4dd32d3100c9a8c010a0
 SMOKE_IMAGE=docker.io/library/ubuntu@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
 LLVM_RELEASE_URL=https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6
 # name sha256 url
@@ -109,6 +125,15 @@ cmake-17.0.6.src.tar.xz 807f069c54dc20cb47b21c1f6acafdd9c649f3ae015609040d6182ca
 libunwind-17.0.6.src.tar.xz 9e7535a353aa862730b4ba38df42e06f6856b40c4cc51b57f27b5046dc21d70d $LLVM_RELEASE_URL/libunwind-17.0.6.src.tar.xz
 zlib-1.3.2-LICENSE e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2 https://raw.githubusercontent.com/madler/zlib/v1.3.2/LICENSE
 zstd-1.5.6-LICENSE 7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8 https://raw.githubusercontent.com/facebook/zstd/v1.5.6/LICENSE
+musl-1.2.5-COPYRIGHT f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5
+"
+# The licence texts of what the --full musl bezelc links (#6715): LLVM 21.1.2,
+# zlib 1.3.2, zstd 1.5.7 and musl 1.2.5, the versions of the pinned Alpine 3.23
+# packages. (The zstd 1.5.7 text is byte-identical to 1.5.6's.)
+FULL_SOURCES="
+llvm-21.1.2-LICENSE.TXT 8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-21.1.2/llvm/LICENSE.TXT
+zlib-1.3.2-LICENSE e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2 https://raw.githubusercontent.com/madler/zlib/v1.3.2/LICENSE
+zstd-1.5.7-LICENSE 7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8 https://raw.githubusercontent.com/facebook/zstd/v1.5.7/LICENSE
 musl-1.2.5-COPYRIGHT f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5
 "
 # Containers are named <prefix>-<role>-<pid> and removed on exit, however the
@@ -140,25 +165,86 @@ fi
 NAME="bezelc-$VERSION-linux-x86_64"
 echo "release_static: version $VERSION -> $NAME.tar.gz"
 
+# ---- pinned downloads -------------------------------------------------------
+# fetch_pinned LIST: download each "name sha256 url" row into $DL_DIR once,
+# sha256-checked; a cached file whose sha256 differs is downloaded again.
+fetch_pinned() {
+  local f sha url
+  mkdir -p "$DL_DIR"
+  while read -r f sha url; do
+    [ -n "$f" ] || continue
+    if ! { [ -f "$DL_DIR/$f" ] && echo "$sha  $DL_DIR/$f" | sha256sum -c --status; }; then
+      echo "release_static: downloading $f"
+      curl -sSfL --retry 3 -o "$DL_DIR/$f.part" "$url" || die "download failed: $url"
+      echo "$sha  $DL_DIR/$f.part" | sha256sum -c --status \
+        || die "sha256 mismatch for $f (expected $sha)"
+      mv "$DL_DIR/$f.part" "$DL_DIR/$f"
+    fi
+  done <<<"$1"
+}
+
 # ---- configure + build -----------------------------------------------------
 mkdir -p "$BUILD_DIR" "$OUT_DIR"
 # Release (no -g): nothing in the tarball needs debug info, and it keeps the
-# runtime archive the user links small.
+# runtime archive the user links small. The host build is never fully static
+# any more: with --full, bin/bezelc comes from the musl stage below and this
+# build provides only the runtime archive for --link=system (#6715).
+HOST_TARGET=bezelc; [ "$FULL" = ON ] && HOST_TARGET=bezel_runtime
 cmake -S "$ROOT" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE=Release \
   -DBEZEL_STATIC_RELEASE=ON \
-  -DBEZEL_STATIC_RELEASE_FULL="$FULL" \
+  -DBEZEL_STATIC_RELEASE_FULL=OFF \
   -DBEZEL_PROGRAM_LINKER=default \
   -DBEZEL_VERSION_OVERRIDE="$VERSION" >"$BUILD_DIR/release-configure.log" 2>&1 \
   || { tail -30 "$BUILD_DIR/release-configure.log" >&2; die "configure failed (log: $BUILD_DIR/release-configure.log)"; }
 grep -E "static release|WARNING" -A2 "$BUILD_DIR/release-configure.log" || true
 
-"$ROOT/scripts/dev_heavy.sh" build cmake --build "$BUILD_DIR" -j"$JOBS" --target bezelc \
+"$ROOT/scripts/dev_heavy.sh" build cmake --build "$BUILD_DIR" -j"$JOBS" --target "$HOST_TARGET" \
   || die "build failed"
 
-BIN="$BUILD_DIR/bezelc"
 RT="$BUILD_DIR/libbezel_runtime.a"
-[ -x "$BIN" ] && [ -f "$RT" ] || die "build produced no bezelc / libbezel_runtime.a"
+[ -f "$RT" ] || die "build produced no libbezel_runtime.a"
+
+# ---- the fully static musl bezelc (--full, #6715) --------------------------
+if [ "$FULL" = ON ]; then
+  fetch_pinned "$FULL_SOURCES"
+  MB_BUILD="$BUILD_DIR/musl-bezelc-build"   # CMake build dir, kept between runs
+  MB_OUT="$BUILD_DIR/musl-bezelc"
+  APK_DIR="$DL_DIR/apk-alpine-3.23"           # the apk cache, kept between runs
+  rm -rf "$MB_OUT"; mkdir -p "$MB_BUILD" "$MB_OUT" "$APK_DIR"
+  C="$CPREFIX-musl-bezelc-$$"; CONTAINERS+=("$C")
+  # Bounded exactly as the toolchain stage below: dev_heavy.sh plus
+  # --cgroup-parent for the slice, and -j"$JOBS" inside the container (see
+  # release_musl_bezelc.sh on the build-token pool). The build dir is mounted
+  # at a distinctive path so the embedded-path check below can look for it.
+  echo "release_static: building the musl bezelc in $ALPINE_BEZELC_IMAGE"
+  "$ROOT/scripts/dev_heavy.sh" build podman run --rm --name "$C" \
+    --cgroup-parent=bezel-heavy.slice --security-opt label=disable \
+    -v "$ROOT:/src:ro" -v "$MB_BUILD:/bezel-musl-build" -v "$MB_OUT:/out" \
+    -v "$APK_DIR:/apkcache" \
+    -e SRC=/src -e BUILD=/bezel-musl-build -e OUT=/out -e APKCACHE=/apkcache \
+    -e JOBS="$JOBS" -e VERSION="$VERSION" \
+    "$ALPINE_BEZELC_IMAGE" sh /src/scripts/release_musl_bezelc.sh >"$BUILD_DIR/musl-bezelc.log" 2>&1 \
+    || { tail -30 "$BUILD_DIR/musl-bezelc.log" >&2; die "musl bezelc build failed (log: $BUILD_DIR/musl-bezelc.log)"; }
+  grep '^musl_bezelc:\|^Alpine clang\|Bezel: ' "$BUILD_DIR/musl-bezelc.log" || true
+  BIN="$MB_OUT/bezelc"
+  [ -x "$BIN" ] && [ -s "$MB_OUT/pins.txt" ] || die "the musl stage produced no bezelc / pins.txt"
+  # Fully static: no program interpreter, no dynamic section at all.
+  file "$BIN" | grep -q 'statically linked' \
+    || { file "$BIN" >&2; die "the musl bezelc is not statically linked"; }
+  RELF=$(readelf -lW "$BIN") || die "readelf -l failed on $BIN"
+  ! grep -q 'INTERP' <<<"$RELF" || die "the musl bezelc has a PT_INTERP"
+  ! grep -q 'DYNAMIC' <<<"$RELF" || die "the musl bezelc has a dynamic section"
+  if strings "$BIN" | grep -qF /bezel-musl-build; then
+    die "bezelc embeds the container build-dir path /bezel-musl-build"
+  fi
+else
+  BIN="$BUILD_DIR/bezelc"
+  [ -x "$BIN" ] || die "build produced no bezelc"
+  if strings "$BIN" | grep -qF "$BUILD_DIR"; then
+    die "bezelc embeds the build-dir path $BUILD_DIR"
+  fi
+fi
 
 # The release binary must not depend on the shared libLLVM or name the build
 # tree's runtime archive.
@@ -173,24 +259,11 @@ NM_UNDEF=$(nm -u "$RT") || die "nm -u failed on $RT, so the __isoc23_ check cann
 if grep -q '__isoc23_' <<<"$NM_UNDEF"; then
   die "libbezel_runtime.a references __isoc23_* (glibc 2.38+ only)"
 fi
-if strings "$BIN" | grep -qF "$BUILD_DIR"; then
-  die "bezelc embeds the build-dir path $BUILD_DIR"
-fi
 
 # ---- the self-contained toolchain (#6654) ----------------------------------
 BUNDLE_OUT="$BUILD_DIR/musl-bundle"
 if [ "$BUNDLE" = 1 ]; then
-  mkdir -p "$DL_DIR"
-  while read -r f sha url; do
-    [ -n "$f" ] || continue
-    if ! { [ -f "$DL_DIR/$f" ] && echo "$sha  $DL_DIR/$f" | sha256sum -c --status; }; then
-      echo "release_static: downloading $f"
-      curl -sSfL --retry 3 -o "$DL_DIR/$f.part" "$url" || die "download failed: $url"
-      echo "$sha  $DL_DIR/$f.part" | sha256sum -c --status \
-        || die "sha256 mismatch for $f (expected $sha)"
-      mv "$DL_DIR/$f.part" "$DL_DIR/$f"
-    fi
-  done <<<"$BUNDLE_SOURCES"
+  fetch_pinned "$BUNDLE_SOURCES"
   rm -rf "$BUNDLE_OUT"; mkdir -p "$BUNDLE_OUT"
   C="$CPREFIX-musl-$$"; CONTAINERS+=("$C")
   # The container's processes are not children of this shell, so dev_heavy.sh's
@@ -225,12 +298,16 @@ if [ -n "$STRIP" ]; then
 fi
 cp "$ROOT/LICENSE" "$STAGE/$NAME/LICENSE"
 
-# ---- licences of what bin/bezelc statically links (#6713) ------------------
-# Measured from the link line and `strings` of a --full build (see
-# release_check_licenses.sh): LLVM and libstdc++/libgcc in every build; with
-# the fully static link also zlib (zlib-ng-compat on Fedora), zstd and glibc
-# (glibc's text is deliberately not shipped: #6715 replaces the glibc link).
-# The texts are the build machine's packages' %license files; the package
+# ---- licences of what bin/bezelc statically links (#6713, #6715) -----------
+# Measured from the link line and `strings` of the build (see
+# release_check_licenses.sh): LLVM and libstdc++/libgcc in every build; the
+# --full musl bezelc also links zlib, zstd and musl. No glibc is linked into a
+# shipped bezelc any more: the --full one is musl, the other links glibc
+# dynamically.
+# Hosted build: the texts are the build machine's packages' %license files.
+# --full: the texts are the pinned upstream files of the Alpine 3.23 package
+# versions (sha256-checked above); the GPL-3 and Runtime Library Exception texts
+# are version-independent, so the build machine's copies serve. The package
 # versions go into LICENSES/README.
 LICDIR="$STAGE/$NAME/LICENSES"
 mkdir -p "$LICDIR"
@@ -239,47 +316,44 @@ lic_copy() { # SRC DSTNAME
   cp "$1" "$LICDIR/$2"
 }
 rpm_of() { rpm -qf "$1" 2>/dev/null || die "no installed package owns $1, so its licence version cannot be recorded"; }
+# pin_of APK: the pinned "name=version" the musl stage installed.
+pin_of() { grep -m1 "^$1=" "$MB_OUT/pins.txt" || die "$MB_OUT/pins.txt pins no $1"; }
 LIC=/usr/share/licenses
-LIC_LLVM=$(rpm_of "$(llvm-config --libdir 2>/dev/null || echo /usr/lib64)/libLLVMSupport.a")
-LIC_GCC=$(rpm_of "$(clang++ -print-file-name=libstdc++.a)")
-lic_copy "$LIC/llvm-static/LICENSE.TXT" LLVM-LICENSE.TXT
 lic_copy "$LIC/gcc/COPYING3" gcc-COPYING3
 lic_copy "$LIC/gcc/COPYING.RUNTIME" gcc-COPYING.RUNTIME
-LIC_ROWS="  LLVM-LICENSE.TXT        LLVM (static): Apache License 2.0 with LLVM Exceptions ($LIC_LLVM)
+if [ "$FULL" = ON ]; then
+  lic_copy "$DL_DIR/llvm-21.1.2-LICENSE.TXT" LLVM-LICENSE.TXT
+  lic_copy "$DL_DIR/zlib-1.3.2-LICENSE" zlib-LICENSE
+  lic_copy "$DL_DIR/zstd-1.5.7-LICENSE" zstd-LICENSE
+  lic_copy "$DL_DIR/musl-1.2.5-COPYRIGHT" musl-COPYRIGHT
+  LIC_ROWS="  LLVM-LICENSE.TXT        LLVM 21.1.2 (static): Apache License 2.0 with LLVM
+                          Exceptions (Alpine $(pin_of llvm21-static))
+  gcc-COPYING3,           libstdc++ and libgcc (static): GPL-3.0 with the GCC Runtime
+  gcc-COPYING.RUNTIME     Library Exception (Alpine $(pin_of gcc), $(pin_of libstdc++-dev))
+  zlib-LICENSE            zlib 1.3.2 (static): zlib License (Alpine $(pin_of zlib-static))
+  zstd-LICENSE            zstd 1.5.7 (static): BSD-3-Clause; zstd is dual BSD / GPLv2
+                          and the BSD terms are used (Alpine $(pin_of zstd-static))
+  musl-COPYRIGHT          musl 1.2.5 (static): MIT (Alpine $(pin_of musl-dev))"
+  LIC_SOURCE="Alpine 3.23 package"
+else
+  LIC_LLVM=$(rpm_of "$(llvm-config --libdir 2>/dev/null || echo /usr/lib64)/libLLVMSupport.a")
+  LIC_GCC=$(rpm_of "$(clang++ -print-file-name=libstdc++.a)")
+  lic_copy "$LIC/llvm-static/LICENSE.TXT" LLVM-LICENSE.TXT
+  LIC_ROWS="  LLVM-LICENSE.TXT        LLVM (static): Apache License 2.0 with LLVM Exceptions ($LIC_LLVM)
   gcc-COPYING3,           libstdc++ and libgcc (static): GPL-3.0 with the GCC Runtime
   gcc-COPYING.RUNTIME     Library Exception ($LIC_GCC)"
-if [ "$FULL" = ON ]; then
-  LIC_ZLIB=$(rpm_of /usr/lib64/libz.a)
-  LIC_ZSTD=$(rpm_of /usr/lib64/libzstd.a)
-  LIC_GLIBC=$(rpm_of /usr/lib64/libc.a)
-  lic_copy "$LIC/zlib-ng/LICENSE.md" zlib-ng-LICENSE.md
-  lic_copy "$LIC/libzstd/LICENSE" zstd-LICENSE
-  LIC_ROWS="$LIC_ROWS
-  zlib-ng-LICENSE.md      zlib (zlib-ng, static): zlib License ($LIC_ZLIB)
-  zstd-LICENSE            zstd (static): BSD-3-Clause; zstd is dual BSD / GPLv2 and
-                          the BSD terms are used ($LIC_ZSTD)
-"
+  LIC_SOURCE="build-machine package"
 fi
 cat >"$LICDIR/README" <<LICEOF
 Third-party components statically linked into bin/bezelc, and their licences.
 (The self-contained toolchain in lib/bezel/x86_64-linux-musl/ has its own
 LICENSES/ directory.)
 
-  file                    component: licence (build-machine package)
+  file                    component: licence ($LIC_SOURCE)
 $LIC_ROWS
 
 bin/bezelc itself is Apache License 2.0 (see ../LICENSE).
 LICEOF
-if [ "$FULL" = ON ]; then
-  cat >>"$LICDIR/README" <<LICEOF
-
-NOTE on glibc: the bin/bezelc in this tarball is still linked fully
-statically against glibc ($LIC_GLIBC), which is licensed under the LGPL-2.1.
-That is an open licensing problem, pending #6715 (the release bezelc will be
-built fully static on musl instead). THIS RELEASE IS NOT TO BE PUBLISHED
-until #6715 lands.
-LICEOF
-fi
 if [ "$BUNDLE" = 1 ]; then
   cp -a "$BUNDLE_OUT/x86_64-linux-musl" "$STAGE/$NAME/lib/bezel/x86_64-linux-musl"
   # The bundled ld.lld statically links the Alpine stage's libstdc++ and libgcc
@@ -305,6 +379,8 @@ if [ -n "$GLIBC_FLOOR" ]; then
   else
     LINKAGE="LLVM and libstdc++ linked in statically and depends dynamically on glibc (needs ${GLIBC_FLOOR/_/ } or newer)"
   fi
+elif [ "$FULL" = ON ]; then
+  LINKAGE="no shared-library dependencies (fully static, against musl 1.2.5)"
 else
   LINKAGE="no shared-library dependencies (fully static)"
 fi
