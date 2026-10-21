@@ -106,11 +106,28 @@ BEZEL_TEST(sema_choice_case_payload_args_6119, null_for_int_payload_rejected_35_
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "is nullable but the target type is non-nullable"));
 }
 
-// R7
+// R7 (#6223, flipped): `var a: A? := new A()` narrows `a` by its declaration
+// initializer (§7.4 v0.339), so passing it to the non-nullable class payload is
+// accepted and runs. The `int?` spelling is deliberately not pinned as accepted
+// here: a nullable-typed `int` payload argument is stored without unwrapping and
+// emits malformed IR for assignment- and null-test-narrowed locals on f9c549e0
+// too (#6646, sibling of #6164), so it cannot run until that is fixed.
+BEZEL_TEST(sema_choice_case_payload_args_6119,
+           declaration_narrowed_nullable_class_into_class_payload_runs_35_3_7_4) {
+    auto r = runAot(prog(
+        "public choice D One(v: A), Two; end D;",
+        "    var a: A? := new A(); var d := D.One(a); case d of One(var v) => Console.WriteLine(v.x), Two => Console.WriteLine(0) end case;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("1\n"));
+}
+
+// R7 rejection kept on a value that is not narrowed (§7.4 v0.339): `null`
+// records no fact, so a nullable value passed to a non-nullable payload still fails.
 BEZEL_TEST(sema_choice_case_payload_args_6119, nullable_for_nonnull_payload_rejected_35_3) {
     auto r = runAot(prog(
         "public choice C One(v: int), Two; end C;",
-        "    var i: int? := 5; var c := C.One(i);"));
+        "    var i: int? := null; var c := C.One(i);"));
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "is nullable but the target type is non-nullable"));

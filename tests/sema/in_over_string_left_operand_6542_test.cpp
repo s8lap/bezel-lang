@@ -165,13 +165,18 @@ end C;
 // one layer deeper, and a much louder failure. The needle is checkAssignable's
 // OWN §7 wording, so it is not the §5.1 string; it is pinned separately so a
 // regression that merged the two messages would be visible.
+// Formerly pinned this rejection on `var c: char? := 'c'`. §7.4 v0.339: that
+// declaration narrows `c` by its initializer, so the `in` operand is non-null and
+// the program runs (declaration_narrowed_char_left_operand_runs_spec_7_4 below).
+// The rejection is pinned here on a value no declaration narrows: `null` records
+// no fact.
 BEZEL_TEST(in_over_string_left_operand_6542,
            nullable_char_left_operand_rejected_at_conversion_site_spec_7) {
     auto r = runAot(R"(
 module M;
 class C
   public static method Main(): int
-    var c: char? := 'c';
+    var c: char? := null;
     Console.WriteLine((c in "abc").ToString());
     return 0;
   end Main;
@@ -183,6 +188,25 @@ end C;
         r, "left operand of `in` over a `string` receiver is nullable but "
            "the target type is non-nullable (\xC2\xA7""7)"));
     BEZEL_EXPECT_FALSE(hasErrorContaining(r, kWrongLayer));
+}
+
+// §7.4 v0.339 (#6223, flipped from the rejection above): the declaration
+// initializer narrows `c`, so the `in` operand is accepted and the answer is True.
+BEZEL_TEST(in_over_string_left_operand_6542,
+           declaration_narrowed_char_left_operand_runs_spec_7_4) {
+    auto r = runAot(R"(
+module M;
+class C
+  public static method Main(): int
+    var c: char? := 'c';
+    Console.WriteLine((c in "abc").ToString());
+    return 0;
+  end Main;
+end C;
+)");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "True\n");
 }
 
 // ===========================================================================

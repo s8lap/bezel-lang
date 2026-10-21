@@ -6110,9 +6110,17 @@ void ExprTC::checkAssignable(
             if (ue->op == "move" && ue->operand)
                 narrowExpr = ue->operand.get();
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(narrowExpr)) {
+            // §7.4 (v0.339, #6223): a declaration initializer narrows a
+            // declared-nullable local (`var x: T? := expr;`, "the declaration's
+            // assignment") and records its fact in `initNarrowed_` alone. Read
+            // it here as isKnownNonNull does, so the local satisfies a
+            // non-nullable target exactly as an assignment-narrowed local does.
             if (Symbol* s = ctx_.exprSymbol(*id))
-                if (nullNarrowed_.count(s)) {
-                    noteNullFactUse(s, /*nullSetOnly=*/true);   // #6114
+                if (nullNarrowed_.count(s) || initNarrowed_.count(s)) {
+                    // A null-set fact keeps the null-set use it always had (#6114);
+                    // an init-only fact is a reliance either set may supply.
+                    const bool nullFact = nullNarrowed_.count(s) > 0;
+                    noteNullFactUse(s, /*nullSetOnly=*/nullFact);   // #6114
                     if (from->kind == TypeRef::Kind::Primitive) {
                         from = ctx_.primitiveTypeRef(from->primitive,
                                                      /*nullable=*/false);
@@ -15427,6 +15435,10 @@ bool ExprTC::valueProvesNonNull(const ast::Expr* value,
     if (valueType && !valueType->nullable) return true;
     if (!value) return false;
     if (dynamic_cast<const ast::NullLiteralExpr*>(value)) return false;
+    // §7.4 (v0.339, #6223): "or `expr` is itself narrowed non-null at that
+    // point" — the same clause for the assignment and for a declaration's
+    // initializer (`var x: T? := expr;`), which both call this predicate.
+    if (isNarrowedNonNullRead(value)) return true;
     return dynamic_cast<const ast::IntLiteralExpr*>(value) ||
            dynamic_cast<const ast::FloatLiteralExpr*>(value) ||
            dynamic_cast<const ast::CharLiteralExpr*>(value) ||

@@ -12701,6 +12701,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         //        may run never or later; #2113's hole, now closed for all
         //        three sets).
         auto saveNullNarrowed = nullNarrowed_;
+        auto saveInitNarrowed = initNarrowed_;   // §7.4 (v0.339, #6223)
         auto saveNarrowings = narrowings_;
         auto saveFieldNarrowed = fieldNarrowed_;
         // §7.4 (v0.236, fix #2597): drop every local-rooted fact on the way IN
@@ -12745,6 +12746,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
             if (isConstLocal(*it)) ++it;
             else it = nullNarrowed_.erase(it);
+        }
+        // §7.4 (v0.339, #6223): the `initNarrowed_` facts (a declaration's and an
+        // assignment's alike) leave the enclosing scope on the same rule. A `var`
+        // local's fact does not reach a lambda formed under it ("Narrowing inside
+        // a lambda body"), so the body reads it at its declared type.
+        for (auto it = initNarrowed_.begin(); it != initNarrowed_.end();) {
+            if (isConstLocal(*it)) ++it;
+            else it = initNarrowed_.erase(it);
         }
         for (auto it = narrowings_.begin(); it != narrowings_.end();) {
             if (isConstLocal(it->first)) ++it;
@@ -13105,6 +13114,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // §7.4 (v0.226, #2113/#2116): restore the enclosing fact sets — facts
         // established inside the (deferred) lambda body never leak out.
         nullNarrowed_ = std::move(saveNullNarrowed);
+        initNarrowed_ = std::move(saveInitNarrowed);   // §7.4 (v0.339, #6223)
         narrowings_ = std::move(saveNarrowings);
         fieldNarrowed_ = std::move(saveFieldNarrowed);
         currentOutPostconds_ = std::move(saveOutPostconds);  // §22.4 (#1585)
