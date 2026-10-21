@@ -754,17 +754,29 @@ BEZEL_TEST(codegen_1044_subint_nullable, long_coalesce_int_default) {
 // constant default (a folded ConstantExpr) survived the earlier endBB
 // placement. Also covers `decimal? ?? <int>` (§5.1 int→decimal widening of the
 // default), which previously mixed a %bz.decimal payload with an i32 PHI value.
-BEZEL_TEST(codegen_1046_coalesce, byte_coalesce_variable_int_default) {
-    BEZEL_EXPECT_TRUE(runs(
-        "var a: byte? := 3; var d: byte := 9; return int(a ?? d);"));
+// Post-#6214 respelling (§7.7/§5.1, v0.339): `byte? ?? int-variable` is ill-typed,
+// so these keep the #1046 payload IntCast (wider nullable left, NARROWER
+// variable right: the rhs value is widened in coal.rhs) with spec-valid programs.
+BEZEL_TEST(codegen_1046_coalesce, short_coalesce_variable_byte_default) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: short? := 3; var d: byte := 9; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "3");
 }
-BEZEL_TEST(codegen_1046_coalesce, byte_null_coalesce_variable_int_default) {
-    BEZEL_EXPECT_TRUE(runs(
-        "var a: byte? := null; var d: byte := 9; return int(a ?? d);"));
+BEZEL_TEST(codegen_1046_coalesce, short_null_coalesce_variable_byte_default) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: short? := null; var d: byte := 9; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "9");
 }
-BEZEL_TEST(codegen_1046_coalesce, byte_coalesce_computed_int_default) {
-    BEZEL_EXPECT_TRUE(runs(
-        "var a: byte? := 3; var x: byte := 4; return int(a ?? byte(x + 5));"));
+BEZEL_TEST(codegen_1046_coalesce, int_null_coalesce_computed_byte_default) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: int? := null; var x: byte := 4; "
+        "Console.WriteLine(a ?? byte(x + 5)); "
+        "end Main; end C;"), "9");
 }
 BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_int_default_present) {
     BEZEL_EXPECT_TRUE(runs("var a: decimal? := 5; return int(a ?? 9);"));
