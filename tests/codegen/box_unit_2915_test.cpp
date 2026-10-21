@@ -73,6 +73,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -81,16 +82,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
 
 namespace {
-
-// Was this JitResult a SKIP (toolchain unavailable) rather than a real failure?
-// A SKIP is reported via ran=false with a diagnostic containing "SKIP" — the
-// same file-local helper the other runAotChecked call sites carry.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 std::string prog(const std::string& body) {
     return "module M; class C public static method Main(): int " + body +
@@ -287,7 +278,7 @@ BEZEL_TEST(codegen_box_unit_2915, boxed_unit_loop_is_leak_clean_spec_28_9) {
         "end; "
         "if acc = 20000 then return 0; end; "
         "return 1;"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

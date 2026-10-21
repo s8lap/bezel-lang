@@ -129,19 +129,6 @@ using bezel::test::runAotChecked;
 using bezel::test::diagnosticMessageContains;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 
-namespace {
-// Native-ASan-in-a-lane-worktree is vacuous (returns a synthetic SKIP
-// diagnostic rather than a real run) — mirrors the identical local helper in
-// arg_position_box_release_2952_test.cpp; only the gate tree's multi-process
-// run makes this row's ASan leg load-bearing.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-}  // namespace
-
 // ── T1 — the discriminant-preservation repro (§35.7/§35.8). Pre-fix: both
 // rows below never reach a real answer — `eqSameCase` prints `False` (the
 // #2434 decline this branch's base, post-#3893, produces), and `eqDiffCase`
@@ -271,7 +258,7 @@ BEZEL_TEST(
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     BEZEL_EXPECT_EQ(plain.stdoutText, std::string("700\n"));
     JitResult r = runAotChecked(kBorrowBearingBoxLoop3900E);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // A leak (box wrapper OR the borrowed Res3900E) or a double-free/UAF on
     // Res3900E's own scope-end disposal flips r.ran false under ASan/LSan.
     BEZEL_EXPECT_TRUE(r.ran);

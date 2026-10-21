@@ -8,6 +8,7 @@
 //   - Owned ⊓ Borrowed      = ERROR (per the spec's asymmetric join)
 
 #include "support/aot_support.hpp"  // runAotChecked — AOT + LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -56,10 +57,7 @@ const char* kNoInitializerOwnedJoin =
 
 BEZEL_TEST(own_join, no_initializer_owned_join_warns_and_autodrops_spec_28_3) {
     auto r = runAotChecked(kNoInitializerOwnedJoin);
-    bool skipped = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) skipped = true;
-    if (skipped) return;  // ASan/LSan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     // Before #3317 this valid program was rejected by the no-initializer
     // exclusion in localDropOnOverwriteCovered; now it compiles and runs
@@ -225,10 +223,7 @@ BEZEL_TEST(own_join, poisoned_no_else_reassign_disposes_prior_owned_value_4329) 
         "    return Counter._n; "
         "  end Main; "
         "end C;");
-    bool skipped = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) skipped = true;
-    if (skipped) return;  // ASan/LSan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: 25 leaks × sizeof(Res) → ASan/LSan reports, exit nonzero.
     // Post-fix: 25 prior-Res(5) + 50 fresh-Res(9) = 75 destructor runs;
     // the program returns Counter._n = 75; no LSan reports.

@@ -108,6 +108,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -116,14 +117,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
 
 namespace {
-
-// ASan toolchain skip-guard (mirrors the other box tests).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // §8.6 — the issue's cardinal repro, widened over the neighbouring types so the
 // fix cannot pass by making the box match EVERYTHING. §15.1: "`[3]int` and
@@ -587,7 +580,7 @@ BEZEL_TEST(codegen_box_inline_array_2804,
     // leg flips r.ran on a leak / double-free / use-after-free, and the exit code
     // independently proves the boxing happened (pre-fix `acc` stays 0 → 1).
     JitResult r = runAotChecked(kBoxLoopSteadyState);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -600,7 +593,7 @@ BEZEL_TEST(codegen_box_inline_array_2804,
     // The `[2]string` payload holds runtime-managed string references, so a
     // box-release that walked the payload would show up here.
     JitResult r = runAotChecked(kMixedBoxAndClassLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

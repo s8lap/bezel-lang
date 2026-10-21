@@ -131,6 +131,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -138,14 +139,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// ASan-toolchain skip-guard (mirrors tests/codegen/indexer_set_producer_rhs_leak_2548_test.cpp).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Shared pair: class-backed implementor behind an interface, with a
 // getter that does NOT allocate (`get => _s` instead of the issue's
@@ -208,7 +201,7 @@ BEZEL_TEST(codegen_compound_assign_interface_indexer_owner_release_2847,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) { BEZEL_EXPECT_TRUE(true); return; }
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);     // LSan-clean after the fix
     BEZEL_EXPECT_TRUE(r.stdoutText.find("bxs") != std::string::npos);
     // The stale "bx" (the pre-set concatenation that should be released)
@@ -258,7 +251,7 @@ BEZEL_TEST(codegen_compound_assign_interface_indexer_owner_release_2847,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) { BEZEL_EXPECT_TRUE(true); return; }
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("byzs") != std::string::npos);
 }
@@ -288,7 +281,7 @@ BEZEL_TEST(codegen_compound_assign_interface_indexer_owner_release_2847,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) { BEZEL_EXPECT_TRUE(true); return; }
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("bxs") != std::string::npos);
 }
@@ -326,7 +319,7 @@ BEZEL_TEST(codegen_compound_assign_interface_indexer_owner_release_2847,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) { BEZEL_EXPECT_TRUE(true); return; }
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // Value: "b" -> get "b" -> + "x" = "bx" -> set "bxs". 5 lines.
     BEZEL_EXPECT_TRUE(r.stdoutText.find("bxs") != std::string::npos);

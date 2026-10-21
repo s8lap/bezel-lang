@@ -59,6 +59,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -71,13 +72,6 @@ namespace {
 std::string prog(const std::string& mainBody) {
     return "module M; class C public static method Main(): int " + mainBody +
            " end Main; end C;";
-}
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
 }
 
 bool has(const std::string& hay, const char* needle) {
@@ -158,7 +152,7 @@ BEZEL_TEST(dictionary_single_3761, dictionary_single_empty_throws_5) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }
@@ -185,7 +179,7 @@ BEZEL_TEST(dictionary_single_3761, dictionary_single_multi_throws_5) {
         "  return 0; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "caught=200"));
 }

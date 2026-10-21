@@ -52,20 +52,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// ASan toolchain skip-guard.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // §11 / §4.6 / §28.9 / #2304: the cardinal repro. An expression-bodied
 // `string` property `Tag => "tag" + "!"` is read in a loop, the result is
@@ -151,7 +144,7 @@ BEZEL_TEST(codegen_string_property_call_local_leak_2304,
     // arm leaks). WITH the fix the property is admitted as a +1 producer
     // and the local's scope end releases the header + data buffer.
     JitResult r = runAotChecked(kStringPropertyLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);
 }
@@ -165,7 +158,7 @@ BEZEL_TEST(codegen_string_property_call_local_leak_2304,
 BEZEL_TEST(codegen_string_property_call_local_leak_2304,
            string_accessor_property_expr_body_does_not_leak_spec_11_4_6_28_9) {
     JitResult r = runAotChecked(kStringAccessorPropertyLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);
 }

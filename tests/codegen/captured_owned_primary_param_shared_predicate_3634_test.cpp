@@ -83,6 +83,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -90,14 +91,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAot;
 
 namespace {
-
-// ASan toolchain skip-guard (matches #2603/#2598/#2587/#3205's test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Disposable class whose destructor bumps a static counter (identical
 // scaffolding to #1543/#1594/#2603/#3205's tests).
@@ -136,7 +129,7 @@ BEZEL_TEST(captured_owned_primary_param_shared_predicate_3634,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);                 // LSan-clean over 500 iterations
     BEZEL_EXPECT_EQ(r.stdoutText, "500\n");   // one disposal per construction
 }
@@ -163,7 +156,7 @@ BEZEL_TEST(captured_owned_primary_param_shared_predicate_3634,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "500\n");
 }

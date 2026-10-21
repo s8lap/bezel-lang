@@ -74,6 +74,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -81,15 +82,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // sum over i in 1..20 of len("ov-{i}") = 9*4 + 11*5 = 91.
 constexpr int kLenSum20 = 91;
@@ -175,7 +167,7 @@ const char* kSelfReassignControl =
 BEZEL_TEST(codegen_alias_local_assignment_reclaim_2806,
            assign_into_already_declared_local_is_released_spec_28_9) {
     JitResult r = runAotChecked(kAssignIntoAlreadyDeclaredLocal);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 751 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -196,7 +188,7 @@ BEZEL_TEST(codegen_alias_local_assignment_reclaim_2806,
 BEZEL_TEST(codegen_alias_local_assignment_reclaim_2806,
            assign_inside_loop_is_released_spec_28_3) {
     JitResult r = runAotChecked(kAssignInsideLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);              // 751 B / 40 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -215,7 +207,7 @@ BEZEL_TEST(codegen_alias_local_assignment_reclaim_2806,
 BEZEL_TEST(codegen_alias_local_assignment_reclaim_2806,
            self_reassign_control_clean_spec_28_3) {
     JitResult r = runAotChecked(kSelfReassignControl);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }

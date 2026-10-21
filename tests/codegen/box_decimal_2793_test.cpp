@@ -74,6 +74,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -82,14 +83,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
 
 namespace {
-
-// ASan toolchain skip-guard (mirrors the other box tests).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // §8.6: the issue's cardinal repro, widened to every neighbouring primitive so
 // the fix cannot pass by making the box match EVERYTHING. Exactly one bit must
@@ -421,7 +414,7 @@ BEZEL_TEST(codegen_box_decimal_2793,
     // / use-after-free; the exit code independently proves the boxing happened
     // (pre-fix `acc` stays 0 and the program returns 1).
     JitResult r = runAotChecked(kDecimalBoxLoopSteadyState);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -433,7 +426,7 @@ BEZEL_TEST(codegen_box_decimal_2793,
     // touched by box-release, while the decimal / int / interface-typed decimal
     // boxes are each released exactly once.
     JitResult r = runAotChecked(kDecimalBoxAndClassMixedLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

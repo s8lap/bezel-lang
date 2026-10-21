@@ -51,16 +51,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 bool diagContains(const JitResult& r, const char* sub) {
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find(sub) != std::string::npos) return true;
@@ -148,7 +138,7 @@ const char* kWhenProducerArm =
 BEZEL_TEST(case_expr_string_result_leak_1934,
            return_case_producer_arm_lsan_clean_spec_19_2) {
     JitResult r = runAotChecked(kReturnProducerArm);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // compiled + LSan-clean (arm string freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // "ab".Length
 }
@@ -160,7 +150,7 @@ BEZEL_TEST(case_expr_string_result_leak_1934,
 BEZEL_TEST(case_expr_string_result_leak_1934,
            mixed_borrow_and_producer_arms_no_uaf_spec_28_3) {
     JitResult r = runAotChecked(kMixedBorrowAndProducerArms);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // no leak (producer arm), no double-free (borrow arm)
     BEZEL_EXPECT_EQ(r.exitCode, 10);  // "ab"(2) + "borrowed"(8)
 }
@@ -172,7 +162,7 @@ BEZEL_TEST(case_expr_string_result_leak_1934,
 BEZEL_TEST(case_expr_string_result_leak_1934,
            bind_then_return_case_result_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kBindThenReturn);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);
 }

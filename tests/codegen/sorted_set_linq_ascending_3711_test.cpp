@@ -114,6 +114,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -122,15 +123,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
 
 namespace {
-
-// A row is SKIPPED (not failed) when the environment cannot build the program
-// at all — the harness's own "SKIP" contract, matching #2726's sibling file.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 std::string prog(const std::string& body) {
     return std::string("module M;\n"
@@ -429,7 +421,7 @@ BEZEL_TEST(sorted_set_linq_ascending_3711,
         "      total := total + t2.Count;\n"
         "    end;\n"
         "    Console.WriteLine($\"total={total}\");"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("total=1800\n"));
 }
@@ -536,7 +528,7 @@ BEZEL_TEST(sorted_set_linq_ascending_3711,
         "      total := total + ll.Count;\n"
         "    end;\n"
         "    Console.WriteLine($\"total={total}\");"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("total=4500\n"));
 }

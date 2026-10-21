@@ -82,6 +82,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -443,9 +444,8 @@ BEZEL_TEST(predeclared_ctor_out_var_string_recipient_3321,
         "  end Main; "
         "end C;");
     if (!r.ran) {
-        // SKIP guard for environments without the ASan link toolchain.
-        for (const auto& d : r.diagnostics.diagnostics())
-            if (d.message.find("SKIP") != std::string::npos) return;
+        // #3733: a toolchain SKIP fails this row (support/aot_result_asserts.hpp).
+        BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
         BEZEL_EXPECT_TRUE(r.ran);
         return;
     }
