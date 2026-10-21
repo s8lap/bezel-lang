@@ -277,7 +277,7 @@ s7_4_0057	pass
 s7_4_0058	pass	
 s7_4_0059	pass	
 s7_4_0060	pass	
-s7_4_0061	fail	#6682
+s7_4_0061	pass	
 s7_4_0062	pass	
 s7_5_0001	pass	
 s7_5_0002	pass	
@@ -2790,10 +2790,9 @@ s7_4_0073	pass
 s7_4_0074	pass	
 s7_4_0075	pass	
 s7_5_0014	pass	
-s7_5_0015	fail	#6664
 s9_2_0033	pass	
-s9_2_0034	fail	#6686
-s11_1_0006	fail	#6704
+s9_2_0034	pass	
+s11_1_0006	pass	
 s17_5_0037	pass	
 s17_5_0038	pass	
 l5_0019	pass	
