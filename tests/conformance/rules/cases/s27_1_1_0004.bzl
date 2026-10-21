@@ -2,9 +2,10 @@
 //! doc: spec
 //! section: 27.1.1
 //! title: a wider-return function value is not usable where a narrower return is expected
-//! rule: The return slot, when of class or interface type, is covariant — the
-//!   value's return type must implicitly reference-convert to the target's; a
-//!   `() -> Animal` value is not usable as `() -> Dog`.
+//! rule: The return slot, when of class or interface type, nullable or not,
+//!   is covariant: the value's return type must reach the target's by a
+//!   reference conversion, its nullable lift or the nullable view of a
+//!   reference type, never the view's reverse
 //! cites: 27.1.1, 5.1, 28.3
 //! expect: reject
 //! diagnostic: return type

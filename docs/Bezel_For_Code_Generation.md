@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.339. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.340. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.339 and `Bezel_Standard_Library.md` v0.339 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.340 and `Bezel_Standard_Library.md` v0.340 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -695,7 +695,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.339 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.340 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1810,6 +1810,7 @@ var first := rows?[0];                                      // WRONG: there is n
 var xs: Array := [10, 20, 30];                              // WRONG: `Array` is not a type
 Registry.n := Registry.n + 1;                               // WRONG inside `class Registry<T>` too: a bare generic name has arity 0 everywhere (§14.1) — `n := n + 1;` or `Registry<T>.n`
 public method Pick<T>(x: T): T => x;                        // WRONG inside `class Box<T>`: a method's type parameter may not reuse an enclosing one's name (§14.1) — `Pick<U>(x: U): U`; an override may rename its base's (§11.2, §12.1)
+public class Item end Item;                                 // WRONG inside `class Outer<Item>`: a nested type may not share the type's own type parameter's name (§14.1) — rename one; a MEMBER may (`public property Item: Item` names the parameter at its type position, the property at a value read)
 var ys := [1, 2, 3];                                        // WRONG: no target type for the literal
 var s := s!;                                                // WRONG wherever a local or parameter `s` is in scope: same block, body top beside a parameter, or any enclosing block, loop or arm body (§21.1) — `var t := s!;`
 for var x in xs do Use(xs.Where(lambda(x) => x > 0)); end;   // WRONG: a lambda parameter, loop variable or arm binding may not reuse an in-scope local's or parameter's name either (§21.1) — `lambda(y) => y > 0`; sibling loops and arms may reuse names
@@ -1862,9 +1863,14 @@ extension Bag<T>
 end;
 var v: IEnumerable<string> := nullableStrings;    // ERROR over an `Array<string?>`: a variant conversion relates arguments by a reference conversion or `T` to `T?`, never `T?` to `T` (§12.9)
 var w: IEnumerable<string?> := strings;           // fine over an `Array<string>`
+var g: () -> string? := f;                        // fine over `f: () -> string`: a return slot takes the nullable view (§27.1.1)
+var k: () -> string := g;                         // ERROR: never the reverse — a call through `k` would hand a `null` to a `string` position
+var p: (string) -> () := h;                       // fine over `h: (string?) -> ()`: a parameter slot runs the other way — `(string) -> ()` to `(string?) -> ()` is the ERROR
+var n: () -> int? := m;                           // ERROR over `m: () -> int`: a value-typed slot is invariant — `int` to `int?` wraps (§27.1.1)
+var r: (ref Dog) -> () := Util.Touch;             // ERROR over `Touch(ref a: Animal)`: formation bridges a conversion at a by-value slot only; a `ref`/`out` slot's type is the callee's exactly (§27.6)
 ```
 
-> §14.2: Appendix A.4's `Constraint ::= … | Type` parses any type as a bound, and the language gives three a meaning — a class, an interface, a type parameter; every other bound is rejected at the declaration. §26.4: the block's `where` clause is the one place a block parameter is constrained. §12.9: nullability is part of a type argument's identity (§7.1); an `out` view widens `T` to `T?` and an `in` view narrows it, and neither reverses.
+> §14.2: Appendix A.4's `Constraint ::= … | Type` parses any type as a bound, and the language gives three a meaning — a class, an interface, a type parameter; every other bound is rejected at the declaration. §26.4: the block's `where` clause is the one place a block parameter is constrained. §12.9: nullability is part of a type argument's identity (§7.1); an `out` view widens `T` to `T?` and an `in` view narrows it, and neither reverses. §27.1.1: a function value's class or interface slot relates by a reference conversion, its nullable lift or the nullable view in the slot's direction, a `string` slot by the view alone (`() -> string` is not `() -> Object`); a value-typed slot, and a `ref` or `out` slot of any type, is invariant. §27.6: method-reference formation bridges a §5.1 conversion at a by-value slot only; a `ref` or `out` slot's type is the callee's exactly.
 
 ### 7.2 Ownership shapes that look fine
 
@@ -2283,7 +2289,7 @@ public enum Color
   public method Equals(other: Color): bool => this = other;   // ERROR: an enum declaring its own `Equals` has no `=` until it overloads it (§10.5, §8.4) — write int(this) = int(other)
   public method GetHashCode(): int => int(this);
 end Color;
-var same := Color.Red = Color.Green;                           // ERROR: declare `operator =`/`<>` (§25.2), or call `.Equals`; a Set<Color> and `case` over Color are fine
+var same := Color.Red = Color.Green;                           // ERROR: declare `operator =`/`<>` (§25.2), or call `.Equals`; a Set<Color>, `case` over Color and a `Pixel(Color.Red, var x)` slot (matched by identity, §10.6) are fine
 
 // In an owning choice `Pool` with `Ready(conns: [4 owned]Conn?)`:
 case this of
@@ -2382,6 +2388,21 @@ end;
 > §9.7 / §15.1.2: a store into a record's settable member (`b.Item := e`, `b.Slots[i] := e`) adds the borrows `e` carries to the record's one source set — a later store never removes one — and is checked as an assignment of the whole record: at a local, rejected where the local is declared in a block that strictly encloses a source's; at a class instance or static field, admitted only in the null-source form, every reference-typed member `null`. Declare the record inside the source's block, or keep the source and build the record where it is used.
 
 ```bezel
+public record Pt(X: int)
+  public method Adder(): (int) -> int => lambda(d: int) => this.X + d;   // fine: `this` is captured BY COPY (§9.4) — Pt holds no borrow, so the closure is capture-free and may be returned or stored
+end Pt;
+public record View(Item: Item)                                           // over a class `Item` with `public Name: string` — View holds a borrow
+  public method Label(): () -> string => lambda() => this.Item.Name;      // ERROR: the copied `this` carries Item's borrow — a closure with a non-empty source set cannot be returned, stored or added to a collection (§28.3)
+  public method Show(): string
+    var f := lambda() => this.Item.Name;
+    return f();                                                          // fine: bound and invoked inside the body
+  end Show;
+end View;
+```
+
+> §9.4 / §28.3: a closure formed in a value-kind member body captures `this` by copy of the fixed receiver value, and contributes what a captured local of the receiver's type contributes — nothing over a type that holds no borrows, the carried borrows' sources otherwise. `var self := this; return lambda() => self.X;` and `return this.Add;` (§27.6) are the same closure in other spellings. A move-only receiver's `this` (an owning choice) is a borrow bounded by the call: a closure over it may be invoked in the body and may not leave it (§28.9). In a record's constructor body the capture is a read of `this`, admitted only once every field that needs an assignment is assigned, and the closure keeps the value as it was then (§22.7).
+
+```bezel
 public static method Show(o: Object)
   Console.WriteLine(o.ToString());
 end Show;
@@ -2451,9 +2472,13 @@ end Money;
 public record Tagged(X: int)
   public method Equals(other: Tagged): bool => X = other.X;   // ERROR: the own-typed Equals is the Object slot and obliges `GetHashCode()` beside it (§8.3)
 end Tagged;
+public record Coin(Amount: int)
+  public method Equals(other: Coin := default(Coin)): bool => Amount = other.Amount;   // ERROR: the Object slot's parameter declares no default (§8.3) — drop it; a class's `Equals(other: C := …)` is rejected the same way
+  public method GetHashCode(): int => Amount;
+end Coin;
 ```
 
-> §12.2: `Object`'s `Equals(Object?)`, `GetHashCode()` and `ToString()` block only their **own signature**, which `override` reaches. A class declares `Equals(a: T, b: T)` and `GetHashCode(value: T)` (`IEqualityComparer<T>`) or `ToString(format: string)` (`IFormattable`) as plain members beside the inherited ones. `Equals(other: T)` at the class's own type is the `Object` slot's second spelling (§8.3): one virtual member, reached by `p.Equals(q)`, `p = q`, a `Set<Point>`, `IEquatable<Point>`, an `Object`-typed receiver or argument (a non-`Point` argument compares unequal) and a subclass operand alike; a subclass overrides it as `override Equals(other: Sub)` or `override Equals(other: Object?)`. It obliges `override GetHashCode()`, to agree with it, as an `Equals` override does (§8.3), and a class writes one spelling of the slot, never both. A static `Equals` stays rejected.
+> §12.2: `Object`'s `Equals(Object?)`, `GetHashCode()` and `ToString()` block only their **own signature**, which `override` reaches. A class declares `Equals(a: T, b: T)` and `GetHashCode(value: T)` (`IEqualityComparer<T>`) or `ToString(format: string)` (`IFormattable`) as plain members beside the inherited ones. `Equals(other: T)` at the class's own type is the `Object` slot's second spelling (§8.3), its parameter declaring no default (`Equals(other: T := …)` is rejected at the declaration, on a value kind too): one virtual member, reached by `p.Equals(q)`, `p = q`, a `Set<Point>`, `IEquatable<Point>`, an `Object`-typed receiver or argument (a non-`Point` argument compares unequal) and a subclass operand alike; a subclass overrides it as `override Equals(other: Sub)` or `override Equals(other: Object?)`. It obliges `override GetHashCode()`, to agree with it, as an `Equals` override does (§8.3), and a class writes one spelling of the slot, never both. A static `Equals` stays rejected.
 
 ```bezel
 public class Point: IEquatable<Point>
@@ -2479,12 +2504,19 @@ end J;
 public class C: B<int>                    // over `class B<T>` declaring `virtual Q<U>(e: U, t: T)` beside `virtual Q<U>(e: U, t: int)`
   public override method Q<V>(e: V, t: int): int => 2;   // ERROR: the override matches two base members at `B<int>` (§12.1); the base pair is legal — derive from a `B<string>`, or rename one
 end C;
+public class ExactSlot: P                 // over `class P` declaring `virtual Q(x: Animal)` beside `virtual Q(x: Animal?)`
+  public override method Q(x: Animal?): int => 3;   // fine: the exact match is the one overridden; `Q(Animal)` keeps P's body (§12.1)
+end ExactSlot;
+public class RefSlot: P2                  // over `class P2` declaring `virtual R(ref x: Animal)`
+  public override method R(ref x: Animal?): int => 4;   // ERROR: the `T`-to-`T?` widening is a by-value parameter's; at `ref`/`out` the type matches exactly (§12.1, §11.2)
+end RefSlot;
 using var g := new G<string>();  g.Q("s");   // ERROR when `G<T>` declares `Q(x: T)` beside `Q(x: string)`: both exact at `G<string>`, ambiguous (§22.6) — a `G<int>` receiver, or distinct names
 if d <> null then L(d); end;                 // fine: `d: Dog?` narrowed is read as `Dog` — exact at `L(Dog)`, converting at `L(Animal)` and at `L(Dog?)` (§22.6, §7.4)
 G(null);                                     // fine at `G(string)` beside `G(string?)`: the nullable one; ERROR at `H(Dog?)` beside `H(Animal?)`, or `string?` beside `Object?`: ambiguous — `var n: Dog? := null; H(n);`
+h.Pick(3);                                   // ERROR at `Pick(byte)` beside `Pick(short)`: `3` is an `int`, and §5.1's narrowing makes both applicable and both converting — write `h.Pick(byte(3))`; beside `Pick(int)` the `int` candidate is exact and wins (§22.6)
 ```
 
-> §11.3: an interface's members, for the clash rule, are those it declares and those it inherits; two declarations at one signature are one member. §12.1: an `override` matches exactly one virtual member of the base as substituted at the derived class's base clause. §22.6: a narrowed read's static type is its non-nullable type (as §7.11 reads it); `null` is applicable at every nullable parameter, at no non-nullable one, and separates no two candidates; two members of a generic type that coincide at the receiver's instantiation are both exact, and the non-generic preference does not apply to them.
+> §11.3: an interface's members, for the clash rule, are those it declares and those it inherits; two declarations at one signature are one member. §12.1: an `override` matches exactly one virtual member of the base as substituted at the derived class's base clause; where it matches one exactly and others only by `T`-to-`T?` widening, it overrides the exact one; that widening, an implementation's under §11.2 too, is a by-value parameter's, a `ref` or `out` parameter's type matching exactly. §22.6: an integer constant is read at its own type (`int` for a literal that fits `int`), and §5.1's constant narrowing is applicability only — a candidate it reaches converts, never exact; a narrowed read's static type is its non-nullable type (as §7.11 reads it); `null` is applicable at every nullable parameter, at no non-nullable one, and separates no two candidates; two members of a generic type that coincide at the receiver's instantiation are both exact, and the non-generic preference does not apply to them.
 
 ### 7.5 Iterators, queries, liveness
 
@@ -2743,6 +2775,29 @@ end Run;
 ```
 
 > §7.4: a lambda body reads its captured variables at their declared types, except a `const` local's fact and a `readonly`-field fact rooted at a `const` local, `this` or a type name; copy to a `const` first, or re-test inside the lambda.
+
+```bezel
+var s: string? := null;
+try
+  s := Fetch();                        // Fetch(): string — `s` is narrowed here
+  Log("fetched");
+finally
+  Console.WriteLine(s.Length);         // ERROR: no fact the protected block establishes reaches a `catch` arm or the `finally` (§7.4)
+end;
+```
+
+> §7.4: every statement of a protected block is a possible throw point for every arm and for the `finally`, so an arm or a `finally` starts from the facts at entry to the block, less anything the block invalidated anywhere. Re-test inside the arm or `finally`. The point *after* a `try` with no arm is reached only through the block's completion, so there `s` keeps the block's final fact:
+
+```bezel
+var s: string? := null;
+try
+  s := Fetch();
+  Log("fetched");
+finally
+  if s <> null then Console.WriteLine(s.Length); end;
+end;
+var n := s.Length;                     // fine: no arm, so only the block's normal completion reaches this point
+```
 
 ### 7.9 Small standard-library mistakes
 

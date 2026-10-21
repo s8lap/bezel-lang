@@ -2,9 +2,11 @@
 //! doc: spec
 //! section: 27.1.1
 //! title: a wider-parameter function value is usable where a narrower one is expected
-//! rule: Parameter slots of class or interface type are contravariant — the
-//!   target's parameter type must implicitly reference-convert to the value's;
-//!   a `(Animal) -> ()` value is usable where `(Dog) -> ()` is expected.
+//! rule: Parameter slots of class or interface type, nullable or not, are
+//!   contravariant: the target's parameter type must reach the value's by a
+//!   reference conversion (§5.1), its nullable lift or the nullable view of a
+//!   reference type, never the view's reverse ... a `(Animal) -> ()` value is
+//!   usable where `(Dog) -> ()` is expected
 //! cites: 27.1.1, 5.1
 //! expect: accept
 module Conf;

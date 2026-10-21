@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.339 — October 2026**
+**Companion to the Bezel Language Specification, v0.340 — October 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1151,7 +1151,7 @@ Auto-imported. String interpolation dispatches a hole's format spec here (langua
 | Floating (`double`, `float`) | `F`/`Fn` fixed-point (n decimals, default 2) · `E`/`En` scientific · `G`/`Gn` general · `P`/`Pn` percent (×100, `%` suffix) · `R` round-trip | `R` and the **no-format `ToString()`** both produce the shortest string that parses back to the identical value — of several such, the one nearest it (round-trip guarantee) |
 | `decimal` | `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` | exact decimal semantics; `G` and the **no-format `ToString()`** both produce the exact shortest form ([§9.3](#sec-decimal)) |
 | `DateTime`, `DateOnly`, `TimeOnly` | pattern strings of `yyyy` `MM` `dd` `HH` `mm` `ss` `fff` plus literal separators | e.g. `yyyy-MM-dd HH:mm:ss`; no-format `ToString()` is ISO 8601 |
-| `TimeSpan` | `c` (constant: `[-][d.]HH:mm:ss[.fffffff]`) | no-format = `c` |
+| `TimeSpan` | `c` (constant: `[-][d.]HH:mm:ss[.fffffff]`) | no-format = `c`; each bracketed part appears only under its condition (*The `TimeSpan` constant form*, below) |
 | `Guid` | `D` (hyphenated, lowercase), `N` (no hyphens) | no-format = `D` |
 | `bool`, `char`, `string` | *(none)* | a format spec on these is a compile error |
 
@@ -1164,6 +1164,8 @@ Auto-imported. String interpolation dispatches a hole's format spec here (langua
 **Temporal patterns: non-specifier characters are literals.** In a temporal pattern (`DateTime`, `DateOnly`, `TimeOnly`), every character that does not begin one of the specifiers above is a **literal**, copied to the output verbatim — `T`, `Z`, `-`, `:`, space, and any other non-specifier character alike; the unrecognized-specifier fault governs malformed runs of the specifier letters (`y` `M` `d` `H` `m` `s` `f`), not literal characters. The temporal specifier vocabulary grows only by recorded ruling, and never in a way that reinterprets a character that passes through as a literal — a new specifier letter would be a breaking change for every pattern using it as a literal, and this section's default answer to such a proposal is no.
 
 **Temporal field widths.** Each of the seven specifiers renders a fixed-width, zero-padded field of exactly its own letter count: `yyyy` four digits (year 42 renders `0042`), `MM`, `dd`, `HH`, `mm`, and `ss` two each (day 5 renders `05`, hour 0 renders `00`), and `fff` three — the millisecond component. A field is never widened, never trimmed, and never grouped; a run of one of the specifier letters at any other length is the malformed run the paragraph above faults.
+
+**The `TimeSpan` constant form.** `c` renders the span's magnitude behind at most one sign: whole days, hours, minutes and seconds, decomposed as the integer components are ([§2.5](#sec-datetime-timespan-dateonly-timeonly)) but unsigned, and the sub-second remainder in ticks. Each bracketed part of `[-][d.]HH:mm:ss[.fffffff]` appears exactly when its condition holds: `-` when the span is negative; `d.`, the whole days in decimal with no padding and then a `.`, when the magnitude is at least one day; and `.fffffff`, a `.` and then the sub-second remainder in ticks as exactly seven zero-padded digits, never trimmed, when that remainder is non-zero. `HH:mm:ss` always appears, each field two zero-padded digits, `HH` running from `00` to `23`. So `TimeSpan.FromMinutes(90.5)` renders `01:30:30`, `TimeSpan.FromDays(1.5)` renders `1.12:00:00`, `TimeSpan.FromMilliseconds(1.5)` renders `00:00:00.0015000`, `-TimeSpan.FromSeconds(90.0)` renders `-00:01:30`, `TimeSpan.Zero` renders `00:00:00`, and `TimeSpan.MinValue` renders `-10675199.02:48:05.4775808`. The no-format `ToString()`, `ToString("c")` and an interpolation hole with or without `:c` produce this one rendering.
 
 <a id="sec-static-abstractions"></a>
 ### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>`, and the collection-literal target pair (#807)

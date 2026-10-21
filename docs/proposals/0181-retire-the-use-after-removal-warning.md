@@ -174,6 +174,8 @@ A diagnostic no compiler has emitted. The guides never taught the shape as a war
 
 A note on #4603 withdrawing the lint-B leg (nothing to implement; nothing to delete, since nothing was built), and listing the five corpus cases of §6.2 for re-heading and the baseline rows for re-banking. Lint A is untouched.
 
+*Currency note (2026-10-21, v0.340, [#6573](https://github.com/s8lap/bezel-lang/issues/6573)).* The premise of §0, §1.3, §2, §4.4, §6.2 and this section — that nothing was built for lint B — was false when written: fix #4603 (`c845af61e`, v0.330) implemented both of proposal 0129's lints, and `s28_11_0008`/`0009` were banked **`pass`** at `expect: warn`, not `fail`. The retirement stands on its other grounds (no verdict moved; the hazard is the checked-mode backstop's; the predicate was narrower than the hazard). The v0.340 train decided (lane `B1`, [#6573](https://github.com/s8lap/bezel-lang/issues/6573)) that the compiler's lint-B code is deleted and the two cases are re-cut to `expect: quiet` — title and `rule:` header to §28.11's replacement sentence, the `diagnostic:` field dropped — in the deleting commit, which re-banks them `pass`; `tests/conformance/rules/README.md`'s banked-docket row for 0129 / #4603 loses the two entries with them.
+
 ---
 
 ## 7. Self-critique
