@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -749,6 +750,14 @@ private:
         std::unordered_map<Symbol*, LoopFactUse> nullSetUses;
         std::unordered_map<Symbol*, LoopFactUse> anySetUses;
         std::unordered_map<Symbol*, LoopFactUse> typeUses;
+        // fix #6835 (§7.4, v0.340): the same bookkeeping for a `readonly`-
+        // field fact, keyed by its (rootId, fieldId) narrowing key. The marker
+        // is a reserved key `(markerId, 0)` inserted into `fieldNarrowed_`
+        // itself, so it rides exactly the joins, drops and `try` filters the
+        // field fact rides. Ordered maps: iteration order reaches diagnostics.
+        using FieldKey = std::pair<std::uint32_t, std::uint32_t>;
+        std::map<FieldKey, FieldKey> fieldMarkers;
+        std::map<FieldKey, LoopFactUse> fieldUses;
     };
     std::vector<LoopFactFrame> loopFactFrames_;
     std::vector<std::unique_ptr<LocalSymbol>> loopFactMarkers_;
@@ -770,6 +779,13 @@ private:
     // null-test set could have supplied it.
     void noteNullFactUse(Symbol* sym, bool nullSetOnly);
     void noteTypeFactUse(Symbol* sym, TypeRef* narrowed);
+    // fix #6835: the readonly-field counterparts. `fieldFactHolds` is the one
+    // read of `fieldNarrowed_` for a use: it answers membership and records
+    // the reliance. Marker ids count down from UINT32_MAX, above every dense
+    // narrowing id, so `dropFieldFactsRooted`'s per-root range never meets one.
+    void confirmFieldFact(const std::pair<std::uint32_t, std::uint32_t>& key);
+    bool fieldFactHolds(const std::pair<std::uint32_t, std::uint32_t>& key);
+    std::uint32_t nextFieldFactMarkerId_ = UINT32_MAX;
     void pushLoopFactFrame();
     // Report every relied-on carried-in fact missing at a back-edge of the
     // innermost loop, then close its frame. `bodyEndIsBackEdge` is false when

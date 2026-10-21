@@ -9133,8 +9133,12 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             // §7.11 / §7.4 (#6758): the PAIR of sema's narrowed-operand
             // admission at a user-defined operator position -- a nullable
             // record operand sema let through is one §7.4 narrowed non-null
-            // (an un-narrowed one is rejected, so this never reads the payload
-            // of a possibly-null box). Its `{i8 hasVal; Record}` box is
+            // on EVERY path reaching the operator: an un-narrowed one is
+            // rejected, and so is one whose fact a path loses -- including a
+            // `readonly`-field fact whose root the loop body reassigns before
+            // the back-edge (#6835, `ExprTC::fieldFactHolds` +
+            // `popLoopFactFrame`). That is the premise under which this never
+            // reads the payload of a possibly-null box. Its `{i8 hasVal; Record}` box is
             // unwrapped to the bare record a non-nullable parameter takes.
             {
                 const ast::Expr* ops[2] = {bin.left.get(), bin.right.get()};

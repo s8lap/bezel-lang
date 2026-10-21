@@ -26037,7 +26037,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // any compiler state on the reject path.
                         auto key = readonlyFieldPathOf(ma.target.get(),
                                                        /*assignIds=*/false);
-                        if (!(key && fieldNarrowed_.count(*key))) {
+                        if (!(key && fieldFactHolds(*key))) {   // #6835
                             // §7.4 (v0.226, #2084): name the branch-correct remedy
                             // explicitly. A mutable field/property read cannot
                             // be narrowed at the use site at all (TOCTOU
@@ -26069,7 +26069,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // returns nullopt and the copy-to-local rejection stands.
                 auto key = readonlyFieldPathOf(ma.target.get(),
                                                /*assignIds=*/false);
-                if (!(key && fieldNarrowed_.count(*key))) {
+                if (!(key && fieldFactHolds(*key))) {   // #6835
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         std::string("member access `.") +

@@ -15828,7 +15828,7 @@ bool ExprTC::isNarrowedNonNullRead(const ast::Expr* e, bool initNarrow) {
     // returns nullopt here and stays a nullable operand, which is the correct
     // answer: §7.4 does not narrow them at all.
     if (auto key = readonlyFieldPathOf(e, /*assignIds=*/false))
-        return fieldNarrowed_.count(*key) > 0;
+        return fieldFactHolds(*key);   // #6835: a reliance, loop-checked
     return false;
 }
 
@@ -16797,6 +16797,32 @@ void ExprTC::noteTypeFactUse(Symbol* sym, TypeRef* narrowed) {
     }
 }
 
+// fix #6835 (§7.4, v0.340): "a fact rides its root (reassigning `v` drops
+// it)", and "a fact holds at a point only when it holds on every path that
+// reaches it" — the loop back-edge included. A `readonly`-field fact that a
+// use inside a loop relies on, carried in from before the loop, is checked at
+// every back-edge by popLoopFactFrame exactly as a local's is (#6114).
+void ExprTC::confirmFieldFact(
+    const std::pair<std::uint32_t, std::uint32_t>& key) {
+    for (auto& f : loopFactFrames_) {
+        auto [it, fresh] = f.fieldMarkers.try_emplace(key);
+        if (fresh) it->second = {nextFieldFactMarkerId_--, 0u};
+        fieldNarrowed_.insert(it->second);
+    }
+}
+
+bool ExprTC::fieldFactHolds(
+    const std::pair<std::uint32_t, std::uint32_t>& key) {
+    if (!fieldNarrowed_.count(key)) return false;
+    for (auto& f : loopFactFrames_) {
+        auto m = f.fieldMarkers.find(key);
+        if (m != f.fieldMarkers.end() && fieldNarrowed_.count(m->second))
+            continue;   // established on this iteration of that loop
+        f.fieldUses.emplace(key, LoopFactUse{factUseLoc_, nullptr});
+    }
+    return true;
+}
+
 void ExprTC::pushLoopFactFrame() { loopFactFrames_.emplace_back(); }
 
 bool ExprTC::loopBodyEndUnreachable(
@@ -16914,6 +16940,35 @@ void ExprTC::popLoopFactFrame(bool bodyEndIsBackEdge,
                 "test `" + std::string(s->name) +
                 "` inside the loop (\xC2\xA7" "12.7, \xC2\xA7" "7.4)");
     }
+    // fix #6835 (§7.4, v0.340): a relied-on `readonly`-field fact must hold
+    // at every back-edge too; reassigning (or `ref`/`out`-passing, or
+    // capture-invalidating) its root anywhere on the way back drops it.
+    for (const auto& [key, use] : frame.fieldUses) {
+        bool holds = !bodyEndIsBackEdge || fieldNarrowed_.count(key) > 0;
+        for (std::size_t i = 0; holds && i < edges.fieldEdges.size(); ++i)
+            if (edges.isContinue[i] && !edges.fieldEdges[i].count(key))
+                holds = false;
+        if (holds) continue;
+        auto nameOf = [&](std::uint32_t id) -> std::string {
+            return id != 0 && id < narrowFactIdSyms_.size() &&
+                           narrowFactIdSyms_[id]
+                       ? std::string(narrowFactIdSyms_[id]->name)
+                       : std::string();
+        };
+        const std::string root = nameOf(key.first);
+        const std::string path =
+            (root.empty() ? std::string() : root + ".") + nameOf(key.second);
+        reports.emplace_back(
+            use.loc,
+            "`" + path +
+                "` is nullable here: the knowledge that this `readonly` "
+                "field is non-null was established before the loop, and the "
+                "loop body invalidates it (the fact rides its root `" + root +
+                "`: a reassignment of it, a `ref`/`out` argument, or a call "
+                "that can reach a closure assigning it) before control "
+                "returns to this point on the next iteration \xE2\x80\x94 "
+                "test `" + path + "` inside the loop (\xC2\xA7" "7.4)");
+    }
     std::sort(reports.begin(), reports.end(),
               [](const auto& a, const auto& b) {
                   if (a.first.line != b.first.line)
@@ -16926,6 +16981,7 @@ void ExprTC::popLoopFactFrame(bool bodyEndIsBackEdge,
         ctx_.diagnostics().report(Severity::Error, loc, std::move(msg));
     for (const auto& [sym, m] : frame.nullMarkers) nullNarrowed_.erase(m);
     for (const auto& [sym, m] : frame.typeMarkers) nullNarrowed_.erase(m);
+    for (const auto& [key, m] : frame.fieldMarkers) fieldNarrowed_.erase(m);
 }
 
 // §7.4 / §8.4 (issue #418): a `<simple var> <> null` / `= null` test proves a
@@ -17151,6 +17207,7 @@ bool ExprTC::narrowFromFieldNullTest(const ast::Expr* cond, bool forTrueBranch) 
     auto key = readonlyFieldPathOf(varSide, /*assignIds=*/true);
     if (!key) return false;
     fieldNarrowed_.insert(*key);
+    confirmFieldFact(*key);   // #6835
     return true;
 }
 
