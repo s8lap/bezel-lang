@@ -16886,14 +16886,19 @@ static std::string boundBodyReject5009(std::string_view name,
 // patterns "match identically regardless of which artifact produced the
 // value". A located reject is the sanctioned fallback.
 //
-// Reads the type argument two ways, both only ever naming a CONCRETE type
-// (a still-unbound caller type parameter, i.e. the caller's own template
-// pass, is skipped):
-//   (a) an explicit call-site type argument that is not `int` but lowers to
-//       the placeholder's i32 (char, enum, uint): no argument need carry it;
-//   (b) an argument at a bare-`T` formal whose type is not `int`: the
-//       narrower integers (`short`, `byte`) reach the i32 slot by widening,
-//       which is why (a) alone misses them.
+// Tests the call's BINDING of each type parameter, never an argument's own
+// type, and only ever a CONCRETE binding (a still-unbound caller type
+// parameter, i.e. the caller's own template pass, is skipped):
+//   (a) an explicit list (§14.5: "When a full explicit list is supplied, no
+//       inference runs"): a written non-`int` type that lowers to the
+//       placeholder's i32 (char, enum, uint) is reported at the type
+//       argument; a written NARROWER integer (`short`, `byte`) at the bare-`T`
+//       argument it widens into the i32 slot. `Show<int>(short(5))` binds
+//       `int` and runs.
+//   (b) no list: the §14.5 phase-1 binding, unifying each formal with its
+//       argument's static type, through a constructed formal (`Array<T>`)
+//       structurally. A parameter that receives two bindings is §14.5
+//       *Agreement*'s failure (sema's to report), so the gate stands down.
 // An explicit `long` with an `int` literal argument (`Count<long>(99)`, the
 // #1943 T5 control) is neither and keeps compiling, as before.
 bool Emitter::rejectNonIntPlaceholderTypeArg6779(
@@ -16926,7 +16931,13 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
             "`int` instantiation, or have it take a non-generic parameter");
         return true;
     };
-    // (a) explicit type arguments.
+    // (a) explicit type arguments. §14.5: "When a full explicit list is
+    // supplied, no inference runs" — the written list IS the binding, so
+    // the arguments' own static types say nothing about `T` (a `short`
+    // argument to `Show<int>` converts to `int` at the argument site, per
+    // §5.1, and the `int` placeholder body is then exactly right).
+    bool explicitList = false;
+    std::vector<const sema::TypeRef*> explicitTs; // index-aligned with genericParams
     if (call) {
         const std::vector<std::unique_ptr<ast::Type>>* tas = nullptr;
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
@@ -16940,12 +16951,13 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
             tas = &id->typeArgs;
         const sema::Symbol* named =
             call->callee ? ctx_.exprSymbol(*call->callee) : nullptr;
-        if (tas && named == ms) {
+        if (tas && !tas->empty() && named == ms) {
+            explicitList = true;
             for (const auto& ta : *tas) {
-                if (!ta) continue;
-                const sema::TypeRef* t = ctx_.resolvedType(*ta);
+                const sema::TypeRef* t = ta ? ctx_.resolvedType(*ta) : nullptr;
                 if (t && !genericSubstSemaTy_.empty())
                     t = substituteTypeRefLocal(t, genericSubstSemaTy_);
+                explicitTs.push_back(t);
                 if (!t || isInt(t) || isOpenTypeParam(t)) continue;
                 llvm::Type* lt = lowerTypeRef(t);
                 if (lt && lt->isIntegerTy(32))
@@ -16955,31 +16967,139 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
             }
         }
     }
-    // (b) arguments at a bare-`T` formal.
     if (!argExprs) return false;
-    const std::size_t off = isStaticMethod(const_cast<sema::MethodSymbol*>(ms)) ? 0u : 1u;
+    const std::size_t off =
+        isStaticMethod(const_cast<sema::MethodSymbol*>(ms)) ? 0u : 1u;
+    auto ownParamIndex = [&](const sema::TypeRef* f) -> std::size_t {
+        if (!isOpenTypeParam(f)) return ms->genericParams.size();
+        for (std::size_t k = 0; k < ms->genericParams.size(); ++k)
+            if (ms->genericParams[k] &&
+                ms->genericParams[k]->name == f->headName())
+                return k;
+        return ms->genericParams.size();
+    };
+    if (explicitList) {
+        // An explicit non-`int` binding of a narrower integer (`Eq<short>`)
+        // is not i32 itself, but its bare-`T` argument is widened into the
+        // i32 slot and the placeholder body then runs it as an `int`.
+        // Reported at that argument. The test is the WRITTEN binding, never
+        // the argument's own type (`Show<int>(short(5))` is an `int` call).
+        for (std::size_t ai = off; ai < args.size() && ai < argExprs->size();
+             ++ai) {
+            const std::size_t pi = ai - off;
+            if (pi >= ms->params.size()) break;
+            auto* ps =
+                dynamic_cast<const sema::ParameterSymbol*>(ms->params[pi]);
+            const sema::TypeRef* formal = ps ? ps->resolvedDeclType : nullptr;
+            if (!formal || formal->nullable) continue;
+            const std::size_t k = ownParamIndex(formal);
+            if (k >= explicitTs.size()) continue;
+            const sema::TypeRef* t = explicitTs[k];
+            if (!t || isInt(t) || isOpenTypeParam(t)) continue;
+            const ast::Expr* e = (*argExprs)[ai];
+            if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e)) continue;
+            // Only a NARROWER integer binding: a wider one (`Count<long>(99)`,
+            // #1943 T5) is the width gate's to judge, not this one's.
+            llvm::Type* lt = lowerTypeRef(t);
+            if (!lt || !lt->isIntegerTy() || lt->getIntegerBitWidth() >= 32)
+                continue;
+            if (args[ai] && args[ai]->getType()->isIntegerTy(32))
+                return report(e->span.begin, t);
+        }
+        return false;
+    }
+    // (b) no explicit list: the INFERRED binding. §14.5 phase 1 unifies each
+    // formal against its argument's static type ("Constant expressions
+    // contribute their static types"), so a bare-`T` formal binds `T` to the
+    // argument's type and a constructed formal (`Array<T>`) binds it
+    // structurally. Bindings are collected per type parameter; a parameter
+    // that receives two different bindings is §14.5's *Agreement* failure —
+    // not this gate's to report, so it stands down for that parameter.
+    auto ownParamName = [&](const sema::TypeRef* f) -> std::string_view {
+        const std::size_t k = ownParamIndex(f);
+        return k < ms->genericParams.size() ? ms->genericParams[k]->name
+                                            : std::string_view{};
+    };
+    struct Binding {
+        const sema::TypeRef* type = nullptr;
+        SourceLocation loc;
+        bool bareI32Arg = false; // bare-`T` formal fed an i32 slot value
+        bool conflict = false;
+    };
+    std::vector<std::pair<std::string_view, Binding>> binds;
+    auto bind = [&](std::string_view name, const sema::TypeRef* t,
+                    SourceLocation loc, bool bareI32Arg) {
+        for (auto& [n, b] : binds) {
+            if (n != name) continue;
+            if (b.conflict) return;
+            if (spec85TypeRefQualifiedName(b.type) !=
+                spec85TypeRefQualifiedName(t))
+                b.conflict = true;
+            else
+                b.bareI32Arg = b.bareI32Arg || bareI32Arg;
+            return;
+        }
+        binds.push_back({name, Binding{t, loc, bareI32Arg, false}});
+    };
+    // Structural descent through a constructed formal (`Array<T>`,
+    // `Dictionary<T, int>`): same head, same arity, recurse pairwise.
+    std::function<void(const sema::TypeRef*, const sema::TypeRef*,
+                       SourceLocation)>
+        unify = [&](const sema::TypeRef* f, const sema::TypeRef* a,
+                    SourceLocation loc) {
+            if (!f || !a) return;
+            std::string_view n = ownParamName(f);
+            if (!n.empty()) {
+                const sema::TypeRef* t = resolveTypeParamRef(a);
+                if (t) bind(n, t, loc, false);
+                return;
+            }
+            if (f->kind != sema::TypeRef::Kind::Named ||
+                a->kind != sema::TypeRef::Kind::Named ||
+                f->genericArgs.empty() ||
+                f->genericArgs.size() != a->genericArgs.size())
+                return;
+            if (!(f->declaration && f->declaration == a->declaration) &&
+                f->headName() != a->headName())
+                return;
+            for (std::size_t i = 0; i < f->genericArgs.size(); ++i)
+                unify(f->genericArgs[i], a->genericArgs[i], loc);
+        };
     for (std::size_t ai = off; ai < args.size() && ai < argExprs->size();
          ++ai) {
         const std::size_t pi = ai - off;
         if (pi >= ms->params.size()) break;
         auto* ps = dynamic_cast<const sema::ParameterSymbol*>(ms->params[pi]);
         const sema::TypeRef* formal = ps ? ps->resolvedDeclType : nullptr;
-        if (!formal || !isOpenTypeParam(formal) || formal->nullable) continue;
-        bool ownParam = false;
-        for (const sema::Symbol* gp : ms->genericParams)
-            if (gp && gp->name == formal->headName()) {
-                ownParam = true;
-                break;
-            }
-        if (!ownParam) continue;
+        if (!formal) continue;
         const ast::Expr* e = (*argExprs)[ai];
+        // §14.5: a bare `null` literal contributes no binding.
         if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e)) continue;
-        const sema::TypeRef* t = resolveTypeParamRef(ctx_.exprType(*e));
-        if (!t || isInt(t) || isOpenTypeParam(t)) continue;
-        // Only a value that reaches the i32 slot unchanged in width: anything
-        // else is the width gate's (or #5057's) to report.
-        if (!args[ai] || !args[ai]->getType()->isIntegerTy(32)) continue;
-        return report(e->span.begin, t);
+        const sema::TypeRef* at = ctx_.exprType(*e);
+        if (!at) continue;
+        std::string_view n = ownParamName(formal);
+        if (!n.empty()) {
+            if (formal->nullable) continue; // `T?` is #5057's carrier
+            const sema::TypeRef* t = resolveTypeParamRef(at);
+            if (!t) continue;
+            // A bare-`T` value reaches the i32 slot unchanged in width (or
+            // widened to it: `short`, `byte`); anything else is the width
+            // gate's (or #5057's) to report.
+            bind(n, t, e->span.begin,
+                 args[ai] && args[ai]->getType()->isIntegerTy(32));
+            continue;
+        }
+        unify(formal, at, e->span.begin);
+    }
+    for (const auto& [n, b] : binds) {
+        const sema::TypeRef* t = b.type;
+        if (b.conflict || !t || isInt(t) || isOpenTypeParam(t)) continue;
+        if (b.bareI32Arg) return report(b.loc, t);
+        // A binding reached only through a constructed formal: the element
+        // is stored at its own representation, so only an i32-represented
+        // non-`int` type is read as an `int` by the placeholder body.
+        llvm::Type* lt = lowerTypeRef(t);
+        if (lt && lt->isIntegerTy(32)) return report(b.loc, t);
     }
     return false;
 }

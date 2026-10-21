@@ -21,6 +21,10 @@
 //
 // The same-module rows are controls: a same-module call is monomorphized and
 // must keep printing the right answer.
+//
+// Not covered here (filed): an imported INTERFACE's generic method through
+// interface dispatch (#6816), §14.5 Agreement on the imported channel
+// (#6817), a nullable i32-payload type argument such as `Show<char?>` (#6818).
 
 #include <string>
 
@@ -40,6 +44,9 @@ const char* kLib6779 =
     "  public static method Id<T>(a: T): Object => a;\n"
     "  public static method Show<T>(a: T): string => $\"{a}\";\n"
     "  public static method Eq<T>(a: T, b: Object): bool => a = b;\n"
+    "  public static method ShowA<T>(xs: Array<T>): string => $\"{xs[0]}\";\n"
+    "  public static method Pair<T>(a: T, b: T): string => $\"{a}{b}\";\n"
+    "  public static method Count<T>(a: T): int => 7;\n"
     "end H;\n"
     "public class V\n"
     "  public constructor() end constructor;\n"
@@ -197,6 +204,29 @@ BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, inferred_byte_rejected_at_argu
                  "b));", "Show", "byte");
 }
 
+// ── Inferred through a constructed formal, and agreeing bare-`T` formals ──
+// (fix-forward: §14.5 phase 1 unifies `Array<T>` against `Array<char>`
+// structurally; MEASURED on 23efeb4a these printed 97 and 1.)
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, inferred_array_char_rejected_at_argument_14_5) {
+    expectReject("1",
+                 "var xs := new Array<char>(); xs.Add('a'); "
+                 "Console.WriteLine(H.ShowA(xs));",
+                 "xs));", "ShowA", "char");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, inferred_array_enum_rejected_at_argument_14_5) {
+    expectReject("1",
+                 "var xs := new Array<Color>(); xs.Add(Color.Green); "
+                 "Console.WriteLine(H.ShowA(xs));",
+                 "xs));", "ShowA", "Lib6779.Color");
+}
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, inferred_pair_char_rejected_at_argument_14_5) {
+    expectReject("1", "Console.WriteLine(H.Pair('a', 'b'));", "'a', 'b'",
+                 "Pair", "char");
+}
+
 // ── A caller's own type parameter, bound at `char` by its specialization ───
 
 BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, caller_type_param_at_char_rejected_14_1) {
@@ -226,6 +256,35 @@ BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, int_control_runs_14_1) {
                "Console.WriteLine($\"{H.Eq<int>(5, o)} {H.Show<int>(5)} "
                "{H.Show(6)} {Go<int>(7)} {new V().VShow<int>(4)}\");"),
         std::string("True 5 6 7 4\n"));
+}
+
+// fix-forward (review of 23efeb4a): with an explicit list the WRITTEN binding
+// decides, never the argument's own type. §14.5: "When a full explicit list
+// is supplied, no inference runs"; the `short`/`byte` argument converts to
+// `int` at the argument site (§5.1) and the `int` placeholder body is right.
+// §2.8.2: cross-module use is not restricted relative to same-module use.
+// MEASURED: 283db84e printed "5", "5", "True"; 23efeb4a rejected all three.
+
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, explicit_int_with_narrower_argument_runs_14_5) {
+    BEZEL_EXPECT_EQ(
+        runOut("3",
+               "var s: short := short(5); "
+               "Console.WriteLine($\"{H.Show<int>(short(5))} {H.Show<int>(s)} "
+               "{H.Eq<int>(byte(3), o)}\");"),
+        std::string("5 5 True\n"));
+}
+
+// `int` through a constructed formal, inferred and explicit, and the #1943
+// T5 control (`Count<long>(99)`: a `long` type argument whose body never
+// reads `T` keeps compiling and printing 7; the `long` explicit list stands
+// down from this gate, and the width gate passes the i32 literal, #6803).
+BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, int_array_and_count_long_control_14_5) {
+    BEZEL_EXPECT_EQ(
+        runOut("1",
+               "var xs := new Array<int>(); xs.Add(4); "
+               "Console.WriteLine($\"{H.ShowA(xs)} {H.ShowA<int>(xs)} "
+               "{H.Pair(1, 2)} {H.Count<long>(99)}\");"),
+        std::string("4 4 12 7\n"));
 }
 
 // ── Controls: the same calls within one module are monomorphized ───────────
