@@ -437,6 +437,25 @@ const sema::TypeSymbol* Emitter::choiceTypeOf(const ast::Expr& e) {
             // three property-accessor call sites set it around the
             // getter's evaluation, exactly as they already do for enum.
             if (currentChoiceMethod_) return currentChoiceMethod_;
+            // fix #6318 (§35.2 / §27.3, v0.340): inside a LAMBDA body
+            // `currentFn_` is the lambda's own function, which none of the
+            // recoveries above can reverse-map to a choice, while the lambda's
+            // captured `this` is restored from its env as the receiver. The
+            // lambda's lexically enclosing type (#5226, recorded by sema for
+            // every lambda formed in a member body) is the receiver choice, so
+            // recover it from there, as currentReceiverRecordType's #6320 arm
+            // does for a record. Without this, `case this of …` in such a lambda
+            // gets no scrutinee type, patternMatches' choice branch never fires,
+            // and the lambda's `case.end` is left unterminated (IR verification
+            // failure). Non-generic only, as that arm is: a generic receiver's
+            // layout could not be recomputed here.
+            if (currentFn_) {
+                auto lit = lambdaFnEnclosingType_.find(currentFn_);
+                if (lit != lambdaFnEnclosingType_.end() && lit->second &&
+                    lit->second->kind == ast::TypeDeclKind::Choice &&
+                    lit->second->genericParams.empty())
+                    return lit->second;
+            }
         }
     }
     const sema::TypeRef* rt = ctx_.exprType(e);
