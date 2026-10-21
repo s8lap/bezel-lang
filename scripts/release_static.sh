@@ -63,7 +63,10 @@ SUFFIX=""; [ "$FULL" = ON ] && SUFFIX="-full"
 [ -n "$OUT_DIR" ] || OUT_DIR="$ROOT/scratch/release$SUFFIX"
 
 [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ] || die "only Linux x86_64 is supported"
-for tool in clang clang++ cmake tar gzip sha256sum; do
+# Every tool a check below relies on must be present here: a missing nm, ldd or
+# strings would otherwise let its guard pass silently, and a missing objdump
+# would make the README claim "fully static".
+for tool in clang clang++ cmake tar gzip sha256sum nm objdump strings ldd; do
   command -v "$tool" >/dev/null || die "'$tool' not found on PATH"
 done
 
@@ -108,12 +111,15 @@ RT="$BUILD_DIR/libbezel_runtime.a"
 
 # The release binary must not depend on the shared libLLVM or name the build
 # tree's runtime archive.
-if command -v ldd >/dev/null && ldd "$BIN" 2>/dev/null | grep -q 'libLLVM'; then
+if ldd "$BIN" 2>/dev/null | grep -q 'libLLVM'; then
   die "bezelc links libLLVM dynamically -- BEZEL_STATIC_RELEASE did not take effect"
 fi
 # Users link the runtime against THEIR glibc: it must not reference the
 # glibc 2.38 C23 strto* entry points (see the BEZEL_STATIC_RELEASE block).
-if nm -u "$RT" 2>/dev/null | grep -q '__isoc23_'; then
+# nm's output is captured first: a failing nm must stop the run, not pass the
+# check, and grep -q on a live pipe can SIGPIPE nm into a false pass.
+NM_UNDEF=$(nm -u "$RT") || die "nm -u failed on $RT, so the __isoc23_ check cannot run"
+if grep -q '__isoc23_' <<<"$NM_UNDEF"; then
   die "libbezel_runtime.a references __isoc23_* (glibc 2.38+ only)"
 fi
 if strings "$BIN" | grep -qF "$BUILD_DIR"; then
@@ -168,9 +174,15 @@ end Program;
 BZL
 (cd "$PROBE" && "$STAGE/$NAME/bin/bezelc" probe.bzl -o probe) \
   || die "the staged compiler could not link a program"
-PROG_GLIBC=$(objdump -T "$PROBE/probe" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1)
-PROG_GLIBCXX=$(objdump -T "$PROBE/probe" | grep -o 'GLIBCXX_[0-9][0-9.]*' | sort -uV | tail -1)
+PROBE_SYMS=$(objdump -T "$PROBE/probe") \
+  || { rm -rf "$PROBE"; die "objdump -T failed on the probe program"; }
 rm -rf "$PROBE"
+PROG_GLIBC=$(grep -o 'GLIBC_[0-9][0-9.]*' <<<"$PROBE_SYMS" | sort -uV | tail -1 || true)
+[ -n "$PROG_GLIBC" ] \
+  || die "could not read the glibc floor of the probe program (objdump -T lists no GLIBC_ symbol versions)"
+# Empty is a valid answer here (the probe may not reference libstdc++); the
+# README below falls back to "libstdc++".
+PROG_GLIBCXX=$(grep -o 'GLIBCXX_[0-9][0-9.]*' <<<"$PROBE_SYMS" | sort -uV | tail -1 || true)
 
 cat >"$STAGE/$NAME/README.md" <<EOF
 # bezelc $VERSION (Linux x86_64)
@@ -196,8 +208,11 @@ So you need:
   ${PROG_GLIBC/_/ } and ${PROG_GLIBCXX:-libstdc++} or newer, at link time and at
   run time, whatever the floor of \`bezelc\` itself.
   - Fedora: \`sudo dnf install clang libstdc++-devel\`
-  - Debian/Ubuntu: \`sudo apt install clang libstdc++-dev\` (or
-    \`libstdc++-<N>-dev\` matching your GCC)
+  - Debian/Ubuntu: \`sudo apt install clang\`. Its dependencies pull in
+    \`libc6-dev\` and \`libstdc++-<N>-dev\`, which supplies the C++ library
+    for \`-lstdc++\`. Do not name \`libstdc++-dev\`: on Ubuntu 22.04 and 24.04
+    it is a virtual package with no installable candidate, so apt refuses
+    the whole command.
 
 ## Layout
 
