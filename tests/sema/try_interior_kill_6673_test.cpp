@@ -4,8 +4,9 @@
 //
 // THE RULE. Spec §7.4 (v0.339), "How narrowing is established": "a fact holds
 // at a point only when it holds on every path that reaches it"; "How narrowing
-// is invalidated": "the variable is reassigned from a nullable-typed
-// expression; or the variable is passed as a `ref` or `out` argument". §31.2
+// is invalidated", two separate bullets: "the variable is reassigned from a
+// nullable-typed expression; or" and "the variable is passed as a `ref`
+// **or `out`** argument (the callee may". §31.2
 // (v0.339) says the `finally` "runs whether the protected block completed
 // normally, was exited by an exception (caught or uncaught), or was exited by
 // `return` — or by a `break` or `continue` targeting an enclosing loop". The
