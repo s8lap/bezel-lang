@@ -1224,6 +1224,72 @@ void ExprTC::checkDeferredProcedureLambdaArgs(
     }
 }
 
+// fix #6227 (§22.6 / §12.9, v0.339): `typeRefEqual` decides a `Named` pair by
+// declaration-pointer identity, and every built-in class or collection ref
+// (`Array`, `Exception`, `ArgumentException`, ...) carries no declaration, so
+// it calls `Array<Exception>` and `Array<ArgumentException>` the same type.
+// This is the same comparison with the head spelling of every
+// declaration-less `Named` node required to agree, at every depth. A node
+// whose head cannot be read on one side is not evidence of a difference (the
+// `overloadSigTypeRefEqual` convention on the declaration side, #6335).
+static bool headsAgreeDeep(const TypeRef* a, const TypeRef* b) {
+    if (!a || !b) return true;
+    switch (a->kind) {
+        case TypeRef::Kind::Named: {
+            if (!a->declaration && !b->declaration) {
+                const std::string_view ha = a->headName();
+                const std::string_view hb = b->headName();
+                if (!ha.empty() && !hb.empty() && ha != hb) return false;
+            }
+            const std::size_t n =
+                std::min(a->genericArgs.size(), b->genericArgs.size());
+            for (std::size_t i = 0; i < n; ++i)
+                if (!headsAgreeDeep(a->genericArgs[i], b->genericArgs[i]))
+                    return false;
+            return true;
+        }
+        case TypeRef::Kind::InlineArray:
+            return headsAgreeDeep(a->arrayElement, b->arrayElement);
+        case TypeRef::Kind::Function: {
+            const std::size_t n =
+                std::min(a->funcParams.size(), b->funcParams.size());
+            for (std::size_t i = 0; i < n; ++i)
+                if (!headsAgreeDeep(a->funcParams[i].type,
+                                    b->funcParams[i].type))
+                    return false;
+            return headsAgreeDeep(a->funcReturn, b->funcReturn);
+        }
+        default:
+            return true;
+    }
+}
+static bool sameTypeBySpelling(const TypeRef* a, const TypeRef* b) {
+    return typeRefEqual(a, b) && headsAgreeDeep(a, b);
+}
+// fix #6227 (§12.9, v0.339): `a` and `b` are two DIFFERENT instantiations of
+// the same generic head, and that head is invariant in its arguments: the
+// built-in `Array`, or a user class or record (the set #6312's
+// `definitelyInapplicable` treats as invariant). Interfaces and delegates may
+// declare `in`/`out` variance and are never judged here.
+static bool differentInvariantInstantiations(const TypeRef* a,
+                                             const TypeRef* b) {
+    if (!a || !b || a->kind != TypeRef::Kind::Named ||
+        b->kind != TypeRef::Kind::Named || a->genericArgs.empty() ||
+        a->genericArgs.size() != b->genericArgs.size() ||
+        a->declaration != b->declaration || a->headName() != b->headName())
+        return false;
+    const bool invariant =
+        a->declaration
+            ? (a->declaration->kind == ast::TypeDeclKind::Class ||
+               a->declaration->kind == ast::TypeDeclKind::Record)
+            : a->headName() == "Array";
+    if (!invariant) return false;
+    for (std::size_t i = 0; i < a->genericArgs.size(); ++i)
+        if (!sameTypeBySpelling(a->genericArgs[i], b->genericArgs[i]))
+            return true;
+    return false;
+}
+
 // fix #6554 (§5.1, v0.338): the integer-primitive predicate, local to this
 // TU. The copy in ExprTypecheck.cpp is file-static, and this file needs the
 // same question answered for the pre-ranking gate below. `char` is excluded
@@ -2541,6 +2607,14 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
             // `T?` body to run for a `T` argument.
             if (d->parent == b->parent && dt && bt &&
                 dt->nullable != bt->nullable)
+                return false;
+            // fix #6227 (§22.6 / §11.3, v0.339): likewise two members of ONE
+            // type whose parameter types differ only inside a built-in
+            // instantiation (`Array<Exception>` beside
+            // `Array<ArgumentException>`) are two overloads.
+            // `overrideParamTypeMatches` compares declaration pointers, null
+            // for every built-in, and dropped the second one before ranking.
+            if (d->parent == b->parent && dt && bt && !headsAgreeDeep(dt, bt))
                 return false;
             // fix #6001 R1 (§12.2 / §12.1, v0.338): a base member declared
             // on a GENERIC base is compared at the instantiation the derived
@@ -4127,12 +4201,18 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             const TypeRef* py = paramTypes[y][i];
             const auto grade = [&](const TypeRef* pt) {
                 if (!at || !pt) return 1;  // can't judge → treat as equal
-                if (typeRefEqual(at, pt)) return 2;
+                // fix #6227: identity by spelling, so `Array<Exception>` is
+                // not `Array<ArgumentException>` (see `sameTypeBySpelling`).
+                if (sameTypeBySpelling(at, pt)) return 2;
                 // §7: a nullable reference does not convert to a non-nullable
                 // target; §12: subtype → supertype does. Both go through the
                 // sanctioned ancestor walk, which resolves built-ins BY NAME
                 // (they carry no TypeSymbol to compare).
                 if (at->nullable && !pt->nullable) return 0;
+                // fix #6227 (§12.9, v0.339): two different instantiations of
+                // one INVARIANT head are not related by any §5.1 conversion,
+                // but the by-name ancestor walk below matches the shared head.
+                if (differentInvariantInstantiations(at, pt)) return 0;
                 return hasNamedAncestor(const_cast<TypeRef*>(at),
                                         namedRefSimpleName(pt))
                            ? 1
@@ -4304,12 +4384,16 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                         // `TypeRef`s are the same pointer, so it cannot serve
                         // as the admissibility test for a built-in class
                         // reference at all.
-                        if (typeRefEqual(at, pt)) continue;
+                        // fix #6227: identity by spelling, and no §5.1
+                        // conversion between two instantiations of one
+                        // invariant head (the `builtinRefPrefers` grade).
+                        if (sameTypeBySpelling(at, pt)) continue;
                         if (at->nullable && !pt->nullable) {
                             admits = false;
                             break;
                         }
-                        if (!hasNamedAncestor(const_cast<TypeRef*>(at),
+                        if (differentInvariantInstantiations(at, pt) ||
+                            !hasNamedAncestor(const_cast<TypeRef*>(at),
                                               namedRefSimpleName(pt)))
                             admits = false;
                     }
