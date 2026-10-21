@@ -9427,7 +9427,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 const sema::TypeRef* elemTy =
                     genericBackingType(rTy, 0, /*isSet=*/true, nullptr);
                 if (elemTy) {
-                    bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
+                    bool elemIsRecord = hashKeyRecordOfRef(elemTy) != nullptr;
                     llvm::Value* elem = lowerExpr(*bin.left);
                     llvm::Value* set  = lowerExpr(*bin.right);
                     if (!elem || !set) return nullptr;
@@ -9459,7 +9459,7 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (isDictTypeName(rTy)) {
                 const sema::TypeRef* keyTy =
                     genericBackingType(rTy, 0, /*isSet=*/false, nullptr);
-                bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+                bool keyIsRecord = keyTy && hashKeyRecordOfRef(keyTy) != nullptr;
                 llvm::Value* key  = lowerExpr(*bin.left);
                 llvm::Value* dict = lowerExpr(*bin.right);
                 if (!key || !dict) return nullptr;

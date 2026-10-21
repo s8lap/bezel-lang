@@ -46754,7 +46754,7 @@ llvm::Value* Emitter::materializeHeapSetLiteral(
     // Sentinel non-null value stored for present elements (same as Set.Add).
     llvm::Value* sentinel = builder_.CreateIntToPtr(builder_.getInt64(1), ptrTy());
 
-    bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
+    bool elemIsRecord = hashKeyRecordOfRef(elemTy) != nullptr;
     // #429 / §28.9: Set<string> co-owns a +1 per element.
     // #602 / §28.11 v0.135: derive string-element classification from
     // elementPolicyFor (RuntimeManaged + string primitive + non-owning Set).
@@ -46836,7 +46836,7 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
     // bool/char/enum/record/float): use the generic-key runtime.  Null → string.
     const sema::TypeRef* keyTy =
         genericBackingType(dictTy, 0, /*isSet=*/false, nullptr);
-    bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+    bool keyIsRecord = keyTy && hashKeyRecordOfRef(keyTy) != nullptr;
 
     // Value type analysis (only valTy is needed now; encodeVal boxes all structs).
     const sema::TypeRef* valTy =

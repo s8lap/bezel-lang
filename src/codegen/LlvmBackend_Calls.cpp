@@ -2961,7 +2961,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         if (isSetName && !lazyTempArr) {
             if (const sema::TypeRef* elemTy =
                     genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)) {
-                bool elemIsRecord = recordTypeOfRef(elemTy) != nullptr;
+                bool elemIsRecord = hashKeyRecordOfRef(elemTy) != nullptr;
                 // fix #3947 (stdlib §4.18, v0.294): `genericBackingType`'s two
                 // "admit regardless of ordering" branches — the auto-hashable
                 // RECORD branch (`recordTypeOfRef`, ~line 360 of
@@ -8503,7 +8503,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 return llvm::PoisonValue::get(resTy);
             }
         }
-        bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+        bool keyIsRecord = keyTy && hashKeyRecordOfRef(keyTy) != nullptr;
         // fix #3947 (stdlib §4.17, v0.294): the `SortedDictionary` twin of the
         // `SortedSet` element check above (this file's Set-family arm) —
         // `keyTy` non-null here says only "hashable enough to route through

@@ -23458,6 +23458,15 @@ private:
     // sequence (e.g. lazy LINQ Distinct) through structural equality.
     const sema::TypeSymbol* recordTypeOfRef(const sema::TypeRef* ref);
 
+    // fix #6219 (§3.6, §9.2, §25.2, v0.338): a BODY record that is not
+    // auto-hashable but declares its own equality (`operator =`/`<>` with
+    // `Equals(T)` / `GetHashCode`) is hashable on the strength of those
+    // members. recordTypeOfRef declines it (and must keep declining it: its 40+
+    // callers include the Set<T> array-backed path and the §8.5 rendering), so
+    // the DICTIONARY key sites ask this instead. Returns the record's
+    // TypeSymbol for such a type, else what recordTypeOfRef returns.
+    const sema::TypeSymbol* hashKeyRecordOfRef(const sema::TypeRef* ref);
+
     // issue #343 / §8.3: build C-ABI trampolines over a record key type's
     // synthesized hash / equality for the generic dict/set runtime variant.
     //   hash: uint64_t(const void* key)  — loads the record struct, hashes it.

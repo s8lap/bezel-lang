@@ -1147,7 +1147,7 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     if (!recv) return nullptr;
     const sema::TypeRef* keyTy =
         genericBackingType(recvTy, 0, /*isSet=*/false, nullptr);
-    bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+    bool keyIsRecord = keyTy && hashKeyRecordOfRef(keyTy) != nullptr;
     // An owning dictionary owns class-typed VALUES (per §28.11 ClassOwned row),
     // so the stored void* is the owned object pointer; no scalar/record decode
     // is needed — the ClassOwned gate above ensures a pointer-sized slot.
@@ -1709,7 +1709,7 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     if (reportSortedElementNeedsCompareTo(recvTy, keyTy, ix.span.begin,
                                           "the `[key]` indexer"))
         return true;
-    bool keyIsRecord = keyTy && recordTypeOfRef(keyTy) != nullptr;
+    bool keyIsRecord = keyTy && hashKeyRecordOfRef(keyTy) != nullptr;
     const sema::TypeRef* valTy =
         (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
                                                    : nullptr;

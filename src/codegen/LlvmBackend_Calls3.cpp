@@ -397,7 +397,7 @@ llvm::Value* Emitter::tryLowerSetAlgebra(std::string_view method,
     if (!otherElem) return nullptr;
     if (lowerTypeRef(otherElem) != lowerTypeRef(selfElemRef))
         return nullptr;  // element LLVM-type mismatch → defer
-    if ((recordTypeOfRef(otherElem) != nullptr) != elemIsRecord)
+    if ((hashKeyRecordOfRef(otherElem) != nullptr) != elemIsRecord)
         return nullptr;  // record-ness mismatch → defer
 
     // Build the snapshot (keys: void**, n: i64) of `other`'s elements.
@@ -447,6 +447,18 @@ llvm::Value* Emitter::tryLowerSetAlgebra(std::string_view method,
     return llvm::ConstantInt::get(i32(), 0);  // unit result for mutators
 }
 
+const sema::TypeSymbol* Emitter::hashKeyRecordOfRef(const sema::TypeRef* ref) {
+    if (const sema::TypeSymbol* rec = recordTypeOfRef(ref)) return rec;
+    if (!ref || ref->nullable || ref->kind != sema::TypeRef::Kind::Named ||
+        !ref->declaration)
+        return nullptr;
+    const sema::TypeSymbol* ts = ref->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return nullptr;
+    // per §9.2 / §25.2: the declared `=`/`<>` pair (with `Equals(T)` and
+    // `GetHashCode`, co-declared by sema) is this record's equality.
+    return sema::recordHasUserDeclaredEquality(ts) ? ts : nullptr;
+}
+
 const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
                                                  unsigned idx, bool isSet,
                                                  uint64_t* byteSize) {
@@ -488,6 +500,19 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
     // other shapes are not wired here.
     bool eligible = false;
     if (recordTypeOfRef(ty)) eligible = true;
+    // fix #6219 (§3.6, §9.2, §25.2, v0.338): a Dictionary key / Set element
+    // that is a body record declaring its own equality. The positional
+    // spelling of the same declarations is `recordTypeOfRef`-eligible above;
+    // the body spelling is not auto-bearing, so a Dictionary key fell to the
+    // STRING fast path and GEP'd the record as a `%bz.string` (IR
+    // verification failure), and a `Set<T>` element fell to the array-backed
+    // scan, which compares records structurally and ignores the declared
+    // `Equals` (measured: `Count` 3 after adding 5, 15, 6 under `X mod 10`).
+    // The sorted containers' identity is `CompareTo` (stdlib §4.17/§4.18).
+    else if (!ty->nullable && hashKeyRecordOfRef(ty) &&
+             !(collTy && (collTy->headName() == "SortedDictionary" ||
+                          collTy->headName() == "SortedSet")))
+        eligible = true;
     else if (isString) eligible = true;  // set element only (dict returned above)
     else if (!ty->nullable && ty->kind == K::Primitive &&
              ty->primitive != sema::PrimitiveType::String &&
@@ -652,7 +677,7 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
 // from its bits. The i32 is zero-extended (the runtime keeps the low 32 bits).
 llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
     // A record key reuses the existing record trampoline (tested path).
-    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty)) {
+    if (const sema::TypeSymbol* rec = hashKeyRecordOfRef(ty)) {
         // issue #462 / §14.1: a GENERIC record key (`Dictionary<Box<string>, V>`)
         // needs the specialized struct layout + concrete per-field hashing inside
         // the trampoline. A no-op for a non-generic record key.
@@ -763,7 +788,7 @@ llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
 // structural record equality (emitStructEquality, §9.1/§9.2 — consistent with
 // the hash), or an integer/float compare for primitives/enums.
 llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
-    if (const sema::TypeSymbol* rec = recordTypeOfRef(ty)) {
+    if (const sema::TypeSymbol* rec = hashKeyRecordOfRef(ty)) {
         // issue #462 / §14.1: a GENERIC record key needs the specialized struct
         // layout + concrete per-field equality inside the trampoline. A no-op for
         // a non-generic record key.
@@ -1653,8 +1678,24 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
             // structural equality (the same machinery Set<record> uses), NOT an
             // ICmp on the aggregate (which LLVM rejects). String fields compare
             // by content, nested records recurse — consistent with the hash.
-            eq = emitStructEquality(a, b, llvm::cast<llvm::StructType>(elemTy),
-                                    elemRec);
+            //
+            // fix #6219 (§3.6, §9.2, §25.2, v0.338): a record that declares its
+            // own `Equals(T)` / `GetHashCode` pair is deduped by THAT pair — the
+            // hash half (buildLinqHashTrampoline -> buildRecordHashTrampoline)
+            // already calls it, and the two must agree (§8.3).
+            llvm::Function* userEq = nullptr;
+            llvm::Function* userHash = nullptr;
+            RecordSubstGuard elemSubst(this, elemRef);
+            if (userValueEqualityPair(elemRec, userEq, userHash)) {
+                llvm::Value* other = fn->getArg(1);
+                if (!userEq->getFunctionType()->getParamType(1)->isPointerTy())
+                    other = b;
+                eq = builder_.CreateCall(userEq->getFunctionType(), userEq,
+                                         {fn->getArg(0), other});
+            } else {
+                eq = emitStructEquality(a, b, llvm::cast<llvm::StructType>(elemTy),
+                                        elemRec);
+            }
         } else if (elemTy->isPointerTy()) {
             // fix #2773 / §8.3 / §8.4 / §4.6: `isPointerTy()` does NOT mean
             // "string" — a class, an interface, `Object` and a boxed value all
@@ -3074,7 +3115,10 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         if (!lazy) return nullptr;
         llvm::Type* elemTy2 = elemLlvmOf(elemRef);
         int64_t esz = lazyElemSize(elemTy2, module_->getDataLayout());
-        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        const sema::TypeSymbol* elemRec = hashKeyRecordOfRef(elemRef);
+        // fix #6219: hashKeyRecordOfRef, not recordTypeOfRef — a body record
+        // with its own equality is a dict-backed Set element now (see
+        // genericBackingType), so it needs its record hash/equality pair.
         llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy2, elemRef, elemRec);
         llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec,
                                                         elemRef);  // #2773
@@ -3246,7 +3290,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // Key hash + equality trampolines for the dict backing — only needed
         // for the generic-key path (a string-mode dict hashes/compares by
         // content itself, like any other Dictionary<string,V>).
-        const sema::TypeSymbol* keyRec = recordTypeOfRef(keyRefSema);
+        const sema::TypeSymbol* keyRec = hashKeyRecordOfRef(keyRefSema);
         llvm::Function* hashTramp = keyIsString
             ? nullptr : buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
         llvm::Function* eqTramp = keyIsString
@@ -3469,7 +3513,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // synthesized structural equality (mirroring Set<record>), not an ICmp
         // on the aggregate. recordTypeOfRef is non-null only for an
         // hashable record element type.
-        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        const sema::TypeSymbol* elemRec = hashKeyRecordOfRef(elemRef);
         llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr, elemRec,
                                                       elemRef);  // #2773
         auto* distFn = declareC("bz_lazy_distinct", ptrTy(), {ptrTy(), ptrTy()});
@@ -3623,7 +3667,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* down = lowerToLazyEnumerator(*call.args[0].value, otherElem);
         if (!down) return nullptr;
         // Build element hash + equality trampolines for the membership dict.
-        const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
+        const sema::TypeSymbol* elemRec = hashKeyRecordOfRef(elemRef);
         llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy, elemRef, elemRec);
         llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy, nullptr, elemRec,
                                                         elemRef);  // #2773
