@@ -11208,6 +11208,10 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     valueLikeChoiceCallResultReleaseEligible_.clear();
     valueLikeChoiceCallResultReleaseEligibleFn_ = fn;
     boxReleaseEligibleFn_ = fn;
+    // fix #6753 follow-up: an expression-bodied function never reaches
+    // collectBoxReleaseEligible, so drop the previous function's body here.
+    opaqueSlotScanBody_ = nullptr;
+    opaqueSlotWrittenMemo_.clear();
     objectStringReleaseEligibleFn_ = fn;  // fix #2900
     // §27.5 / §28.9 / #672: which +1-box-producer locals are captured by exactly
     // one lambda env, so the owning lambda's envdtor may perform the deferred
@@ -40869,6 +40873,16 @@ struct BoxEscapeWalker {
             expr(r->step.get(), /*safeRead=*/false);
             return;
         }
+        // fix #6753 follow-up (§17.15 / §7.4, v0.340): a binding atom
+        // `(var g := lambda() => do o := "s"; end; g())` can hide a write in a
+        // clause or its body. Only the slot-write question descends into it,
+        // so the escape verdicts this walker gives elsewhere are unchanged.
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
+            if (!slotWriteMode) return;
+            for (auto& c : bx->clauses) stmt(c.get());
+            expr(bx->body.get(), /*safeRead=*/false);
+            return;
+        }
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
             // FINDING [1] / §28.9 / §28.3: a lambda captures the local into its
             // heap env, which outlives the scope. Walk the body with inLambda
@@ -41160,6 +41174,8 @@ void Emitter::collectBoxReleaseEligible(
     boxReleaseEligible_.clear();
     boxReassignedLocals_.clear();  // fix #2960
     reassignedOpaqueLocals_.clear();  // fix #2968
+    opaqueSlotScanBody_ = &body;      // fix #6753 follow-up
+    opaqueSlotWrittenMemo_.clear();
     // fix #2960 / §8.6 / §28.9: consider every non-using Object/interface
     // LocalDecl, not only one whose INITIALIZER is a box. A string/class/null
     // initializer may be followed by `p := <value>`; the assignment then mints
@@ -41400,6 +41416,32 @@ void Emitter::collectBoxReleaseEligible(
         if (w.sawManagedAssignment)
             boxReassignedLocals_.insert(static_cast<const void*>(ld));
     }
+}
+
+// fix #6753 follow-up (§7.4 / §8.5 / §18.5 / §22.3, v0.340): the narrowing in
+// `tryOpaqueSlotBuiltinRender` reads an `Object` local's INITIALIZER type, so
+// it is valid only while the slot still holds that value. A write from a
+// lambda body (`lambda() => do o := "s"; end`) or through `ref o` / `out o`
+// replaces the value without an AssignmentStmt in the enclosing statement
+// list; the narrowing then hands a string to the StringBuilder renderer
+// (MEASURED: SEGV in `bz_strbuilder_to_string`). The #3447 phase-1 walk
+// already answers exactly "can this slot be written": it sets `slotWritten`
+// on an assignment or increment of the local and on a `ref`/`out` argument,
+// and it descends into lambda bodies. A read-only capture is not a write, so
+// it keeps the narrowing.
+bool Emitter::opaqueLocalSlotWritten(const ast::LocalDecl* ld) {
+    if (!ld || !opaqueSlotScanBody_) return false;
+    auto it = opaqueSlotWrittenMemo_.find(ld);
+    if (it != opaqueSlotWrittenMemo_.end()) return it->second;
+    BoxEscapeWalker w{ctx_, static_cast<const void*>(ld),
+                      /*assignmentSourceKind=*/{}, /*isKnownBoxReceiver=*/{}};
+    w.slotWriteMode = true;
+    for (auto& s : *opaqueSlotScanBody_) {
+        w.stmt(s.get());
+        if (w.slotWritten) break;
+    }
+    opaqueSlotWrittenMemo_.emplace(ld, w.slotWritten);
+    return w.slotWritten;
 }
 
 

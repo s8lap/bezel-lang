@@ -348,3 +348,130 @@ BEZEL_TEST(codegen_console_append_builtin_6753,
                         "Console.WriteLine(acc);")),
                     std::string("hellohello\n"));
 }
+
+// ---------------------------------------------------------------------------
+// The narrowing declines when the slot is written outside a statement-level
+// assignment (review follow-up to #6753). An `Object` local narrowed through
+// its `StringBuilder` initializer is valid only while the slot still holds
+// that builder. A write from a lambda body (spec §7.4, v0.340: "mutably
+// captured — assigned, or passed as `ref`/`out`, anywhere inside any lambda")
+// or through a `ref`/`out` argument (spec §22.3, v0.340) replaces it with a
+// string. MEASURED at ef6e119d: each row below hands that string to the
+// builder renderer and dies with SEGV in `bz_strbuilder_to_string`. stdlib
+// §2.1 (v0.340): "The `Object` overloads invoke `ToString()`", and spec §8.5
+// (v0.340) gives a `string` its own text, so the expected output is the
+// string that was written.
+// ---------------------------------------------------------------------------
+
+namespace {
+// `Set(ref x)` / `SetOut(out x)` store a string into the caller's `Object`.
+const char* kSetters =
+    "public class H "
+    "public static method Set(ref x: Object): () x := \"viaref\"; end Set; "
+    "public static method SetOut(out x: Object): () x := \"viaout\"; end SetOut; "
+    "end H; ";
+}  // namespace
+
+// §7.4 / stdlib §2.1 / stdlib §3.1: the reviewer's b03 repro. A lambda assigns
+// the captured local; WriteLine and Append both render the new string.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           closure_written_object_local_renders_its_string_7_4_2_1) {
+    BEZEL_EXPECT_EQ(checkedOut(prog(
+                        "var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+                        "var o: Object := sb; "
+                        "var f := lambda() => do o := \"viaclosure\"; end; f(); "
+                        "Console.WriteLine(o); var t := new StringBuilder(); "
+                        "_ := t.Append(o); Console.WriteLine(t.ToString());")),
+                    std::string("viaclosure\nviaclosure\n"));
+}
+
+// §22.3 / stdlib §2.1 / stdlib §3.1: the reviewer's b04 repro, with Append added.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           ref_written_object_local_renders_its_string_22_3_2_1) {
+    BEZEL_EXPECT_EQ(checkedOut(prog(
+                        "var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+                        "var o: Object := sb; H.Set(ref o); "
+                        "Console.WriteLine(o); var t := new StringBuilder(); "
+                        "_ := t.Append(o); Console.WriteLine(t.ToString());",
+                        kSetters)),
+                    std::string("viaref\nviaref\n"));
+}
+
+// §22.3 / stdlib §2.1 / stdlib §3.1: the `out` twin.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           out_written_object_local_renders_its_string_22_3_2_1) {
+    BEZEL_EXPECT_EQ(checkedOut(prog(
+                        "var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+                        "var o: Object := sb; H.SetOut(out o); "
+                        "Console.WriteLine(o); var t := new StringBuilder(); "
+                        "_ := t.Append(o); Console.WriteLine(t.ToString());",
+                        kSetters)),
+                    std::string("viaout\nviaout\n"));
+}
+
+// §18.5 / §7.4: the interpolation hole had the same hole before #6753 (it is the
+// narrowing's original user); the same decline fixes it.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           closure_written_object_local_interpolates_its_string_18_5_7_4) {
+    BEZEL_EXPECT_EQ(checkedOut(prog(
+                        "var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+                        "var o: Object := sb; "
+                        "var f := lambda() => do o := \"viaclosure\"; end; f(); "
+                        "Console.WriteLine($\"[{o}]\");")),
+                    std::string("[viaclosure]\n"));
+}
+
+// §18.5 / §22.3: the `ref` twin of the interpolation row.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           ref_written_object_local_interpolates_its_string_18_5_22_3) {
+    BEZEL_EXPECT_EQ(checkedOut(prog(
+                        "var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+                        "var o: Object := sb; H.Set(ref o); "
+                        "Console.WriteLine($\"[{o}]\");",
+                        kSetters)),
+                    std::string("[viaref]\n"));
+}
+
+// §8.5 / stdlib §2.1: a local declared AND reassigned inside a lambda body. The
+// statement-level set walks only the enclosing function's statements, so it
+// never saw this assignment.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           lambda_body_local_reassigned_renders_its_string_8_5_2_1) {
+    BEZEL_EXPECT_EQ(checkedOut(prog(
+                        "var f := lambda() => do var sb := new StringBuilder(); "
+                        "_ := sb.Append(\"sbtext\"); var o: Object := sb; "
+                        "o := \"inlam\"; Console.WriteLine(o); "
+                        "Console.WriteLine($\"[{o}]\"); end; f();")),
+                    std::string("inlam\n[inlam]\n"));
+}
+
+// CONTROL (§7.4 / stdlib §2.1 / stdlib §3.1): a lambda that only READS the local
+// is not a write, so the narrowing still applies and every route prints the
+// builder's content.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           control_closure_reading_object_local_still_renders_builder_7_4_2_1) {
+    BEZEL_EXPECT_EQ(checkedOut(prog(
+                        "var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+                        "var o: Object := sb; "
+                        "var f := lambda() => do Console.WriteLine(o); end; f(); "
+                        "Console.WriteLine(o); var t := new StringBuilder(); "
+                        "_ := t.Append(o); Console.WriteLine(t.ToString()); "
+                        "Console.WriteLine($\"[{o}]\");")),
+                    std::string("sbtext\nsbtext\nsbtext\n[sbtext]\n"));
+}
+
+// §17.15 / §7.4 / stdlib §2.1: the write sits in a lambda bound inside a binding
+// atom, which the slot-write walk did not descend into before this fix. This row
+// uses the plain oracle: a closure bound in an atom clause leaks its env with no
+// `Object` involved (MEASURED: `(var h := lambda() => do s := "y"; end; h())` over
+// a `string` local), which is #2123 item 3. The stdout comparison still pins the
+// crash: at ef6e119d the program dies with SEGV and prints nothing.
+BEZEL_TEST(codegen_console_append_builtin_6753,
+           bind_atom_closure_written_object_local_renders_its_string_17_15_7_4) {
+    BEZEL_EXPECT_EQ(out(prog(
+                        "var sb := new StringBuilder(); _ := sb.Append(\"sbtext\"); "
+                        "var o: Object := sb; "
+                        "_ := (var h := lambda() => do o := \"viabind\"; end; h()); "
+                        "Console.WriteLine(o); Console.WriteLine($\"[{o}]\");")),
+                    std::string("viabind\n[viabind]\n"));
+}

@@ -20541,18 +20541,24 @@ private:
     // statement of the body). Membership-tested only — never iterated — so it
     // introduces no pointer-keyed iteration-order nondeterminism.
     //
-    // KNOWN RESIDUAL (documented, not silently accepted): two mutation forms
-    // are NOT recorded here — assignment to the local from inside a lambda
-    // that captures it (§7.4's "mutably captured", whose analysis lives in
-    // sema's ExprTC::computeMutablyCaptured and is not plumbed through to
-    // codegen) and mutation through a `ref`/`out` argument. Both are
-    // expression-position mutations this statement-level walk does not see.
-    // When either occurs the narrowing can render the wrong TYPE NAME; it
-    // remains memory-safe (the renderer returns a sentinel-rc literal and
-    // retains nothing), so the #2968 double free stays fixed in all cases.
-    // Tracked as a follow-up; see the definition of
-    // tryOpaqueSlotBuiltinRender.
+    // Two mutation forms are NOT recorded here: assignment to the local from
+    // inside a lambda (a §7.4 "mutable capture", or a write to a lambda-body
+    // local, which this statement-level walk never descends into) and a write
+    // through a `ref`/`out` argument. `opaqueLocalSlotWritten` below covers
+    // both; `tryOpaqueSlotBuiltinRender` consults it after this set.
     std::unordered_set<const ast::LocalDecl*> reassignedOpaqueLocals_;
+    // fix #6753 follow-up (§7.4 / §8.5 / §18.5 / §22.3, v0.340): "can this
+    // local's SLOT be written anywhere in the current function body", the
+    // expression-position complement of `reassignedOpaqueLocals_`. Answered by
+    // the #3447 phase-1 slot-write walk (`BoxEscapeWalker` in slotWriteMode),
+    // which sees a `ref`/`out` argument and descends into every lambda body,
+    // over `opaqueSlotScanBody_` (the body `collectBoxReleaseEligible` last
+    // scanned; reset per function by `emitFunctionBody`). A null body answers
+    // "not written" so a function the collector never scanned keeps the
+    // pre-existing narrowing. Memoized per LocalDecl; membership-only.
+    bool opaqueLocalSlotWritten(const ast::LocalDecl* ld);
+    const std::vector<std::unique_ptr<ast::Stmt>>* opaqueSlotScanBody_ = nullptr;
+    std::unordered_map<const ast::LocalDecl*, bool> opaqueSlotWrittenMemo_;
     // The function for which boxReleaseEligible_ was computed (mirrors
     // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // inherits no eligibility, so its boxed-value locals just leak (never
