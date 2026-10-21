@@ -145,9 +145,8 @@ BEZEL_TEST(procedure_lambda_function_typed_target_6161,
 }
 
 // ACCEPT, constructor overloads `() -> int` / `() -> ()`: the program is valid
-// and must compile and run. Which constructor is picked is NOT pinned here (the
-// base picks the `() -> int` one, contrary to §22.6; a separate resolution
-// defect, reported).
+// and must compile and run. Which constructor is picked is pinned by
+// constructor_overload_procedure_lambda_6243 (the `-> ()` one, §22.6).
 BEZEL_TEST(procedure_lambda_function_typed_target_6161,
            overloaded_constructors_unit_and_value_slots_compile_spec_22_6) {
     auto r = runAot(

@@ -1153,6 +1153,34 @@ ExprTC::ArgMatch ExprTC::classifyArg(const TypeRef* argTy,
     return ArgMatch::NotApplicable;
 }
 
+// fix #6243 (§22.6 *Lambda-literal arguments*, v0.339): "the
+// candidate is applicable at the position when the lambda's inferred return
+// type equals the candidate's return slot, implicitly converts to it, or binds
+// it". A procedure-bodied lambda's inferred return type is `()` (§27.3 *Which
+// block-bodied lambdas return a value*: "a procedure-bodied lambda does not
+// convert to a value-returning function type"), so a candidate whose slot is a
+// concrete value type is inapplicable whatever its parameter types are. The
+// classification is read off the lambda's RECORDED type (`-> ()` exactly when
+// the lambda arm classified the body a procedure; a diverging body keeps its
+// `int` placeholder and is not judged, the #6161 / #6195 exemption). The
+// concrete-slot predicate is #6161's (primitive, or a Named type with a
+// declaration); a type-parameter slot may bind (§14.5 phase 2) and is left to
+// the existing resolution.
+bool ExprTC::procedureLambdaInapplicableAt(const ast::Expr* arg,
+                                           const TypeRef* paramTy) {
+    auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg);
+    if (!lam || lam->isAsync || lam->exprBody || !paramTy ||
+        paramTy->kind != TypeRef::Kind::Function)
+        return false;
+    const TypeRef* lt = ctx_.exprType(*lam);
+    if (!lt || lt->kind != TypeRef::Kind::Function || !lt->funcReturn ||
+        lt->funcReturn->kind != TypeRef::Kind::Unit)
+        return false;
+    const TypeRef* slot = paramTy->funcReturn;
+    return slot && (slot->kind == TypeRef::Kind::Primitive ||
+                    (slot->kind == TypeRef::Kind::Named && slot->declaration));
+}
+
 // fix #6554 (§5.1, v0.338): the integer-primitive predicate, local to this
 // TU. The copy in ExprTypecheck.cpp is file-static, and this file needs the
 // same question answered for the pre-ranking gate below. `char` is excluded
@@ -21485,6 +21513,46 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             decls.swap(fdecls);
             declSyms.swap(fdeclSyms);
             binds.swap(fbinds);
+        }
+        // fix #6243 (§22.6 *Lambda-literal arguments*, v0.339): a
+        // certain-inapplicability filter, like the `ref`/`out` one above — a
+        // procedure-bodied lambda literal rules out every constructor whose
+        // formal at that position returns a concrete value. Before this the
+        // function-typed column left `resolveOverload` `Undecidable`, nothing
+        // was published, and codegen's `ctorForArgs` proxy lowered the FIRST
+        // declared candidate: `K(f: () -> int)` over `K(f: () -> ())`. When
+        // every candidate is ruled out the set is left as it was (the call is
+        // an error; reporting it is #6268's).
+        {
+            std::vector<const ast::ConstructorDecl*> ldecls;
+            std::vector<ConstructorSymbol*> ldeclSyms;
+            std::vector<BindResult> lbinds;
+            for (std::size_t c = 0; c < decls.size(); ++c) {
+                bool ok = true;
+                const auto& params = decls[c]->params;
+                for (std::size_t j = 0; j < params.size() && ok; ++j) {
+                    const int ai = binds[c].paramToArg[j];
+                    if (ai < 0 || !params[j].type) continue;
+                    // The formal at the `new` expression's receiver, as the
+                    // ranking rows below substitute it (`() -> T` on
+                    // `Box<int>` is `() -> int`).
+                    if (procedureLambdaInapplicableAt(
+                            ne.args[static_cast<std::size_t>(ai)].value.get(),
+                            substituteMemberType(
+                                ctx_.resolvedType(*params[j].type), &ne, t)))
+                        ok = false;
+                }
+                if (ok) {
+                    ldecls.push_back(decls[c]);
+                    ldeclSyms.push_back(declSyms[c]);
+                    lbinds.push_back(binds[c]);
+                }
+            }
+            if (!ldecls.empty() && ldecls.size() != decls.size()) {
+                decls.swap(ldecls);
+                declSyms.swap(ldeclSyms);
+                binds.swap(lbinds);
+            }
         }
         if (decls.size() == 1) {
             // §22.3 filtering just above admitted exactly one candidate —

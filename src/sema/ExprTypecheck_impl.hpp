@@ -3934,6 +3934,18 @@ private:
     MethodSymbol* resolveMethodOverload(MethodSymbol* initial,
                                         const ast::CallExpr& ce);
 
+    // fix #6243 (§22.6 *Lambda-literal arguments*, §27.3, v0.339):
+    // is the argument `arg` a procedure-bodied lambda LITERAL (a non-async
+    // block body whose recorded type returns `()`, i.e. §27.3 classified it
+    // a procedure lambda) and `paramTy` a function type whose return slot is
+    // a concrete value type (primitive or declared type)? Then the candidate
+    // owning `paramTy` is certainly INAPPLICABLE at that position: the
+    // lambda's inferred return type `()` neither equals nor implicitly
+    // converts to the slot. A generic-parameter slot is not concrete and is
+    // never judged here (it may bind under §14.5 phase 2).
+    bool procedureLambdaInapplicableAt(const ast::Expr* arg,
+                                       const TypeRef* paramTy);
+
     // fix #6312 (§14.5, §22.6, v0.338): a call whose explicit type-argument
     // list left exactly ONE generic candidate of an overload set, mapped to
     // that candidate. `resolveMethodOverload` returns such a sole survivor
