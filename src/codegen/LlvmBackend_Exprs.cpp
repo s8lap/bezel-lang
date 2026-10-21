@@ -6495,8 +6495,33 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return lowerExceptionInfoField(*ma->target, fieldIdx);
             }
         }
+        // #6757 (§3.6 rule 2 / §14.2, the #5449 ruling): the built-in exception
+        // surface reached through a bare type parameter's bound. The generic
+        // TEMPLATE body (emittingGenericTemplateBody_) is dead: every live call
+        // is a specialization (which clears the flag, Calls2) or an inlined
+        // instantiation with the substitution bound. The template's receiver has
+        // no value to read, so the member lowers to its dead value here, silently.
+        // Without this the placeholder receiver was read as an exception header
+        // (malformed IR, GEP on i32) or fell through to the degrade and its
+        // warnings. A substituted receiver is not affected: resolveTypeParamRef
+        // maps it to the concrete type, which is not a bare parameter.
+        if (ma->target && emittingGenericTemplateBody_ &&
+            ctx_.exprSymbol(*ma) == nullptr &&
+            (ma->member == "Message" || ma->member == "StackTrace" ||
+             ma->member == "ParamName" || ma->member == "CauseChain") &&
+            isBareTypeParamRef(
+                resolveTypeParamRef(ctx_.exprType(*ma->target)))) {
+            if (ma->member == "Message" || ma->member == "StackTrace")
+                return lowerStringLiteral("\"\"", false);
+            return llvm::ConstantPointerNull::get(ptrTy());
+        }
         if (ma->target && ma->member == "Message") {
-            auto* tt = ctx_.exprType(*ma->target);
+            // #6757 (§3.6 rule 2 / §14.2): a receiver typed as a bare type
+            // parameter (`x: T` under `where T: Exception`) resolves to its
+            // concrete type through the active substitution, as every other
+            // receiver does; the gates below then see the built-in or the
+            // user-derived exception it stands for.
+            auto* tt = resolveTypeParamRef(ctx_.exprType(*ma->target));
             // Case A: receiver is a built-in exception TypeRef (no user declaration).
             bool isBuiltinEx = tt && isBuiltinExceptionType(tt);
             // Case B: receiver is a user class that directly inherits a built-in

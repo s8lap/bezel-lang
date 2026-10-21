@@ -26957,6 +26957,33 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "GetHashCode" || ma.member == "GetType" ||
                         ma.member == "ReferenceEquals" || ma.member == "Dispose";
                     if (!isUniversalObjMember) {
+                        // #6757 (§3.6 rule 2 / §14.2, the #5449 ruling): a class
+                        // bound that derives from a built-in exception brings §31.4's
+                        // surface with it (`Message` / `StackTrace` / `CauseChain` on
+                        // `Exception`, `ParamName` on `ArgumentException`). Typed the
+                        // way the `base.` / `this.` arm above types them.
+                        if (std::string_view excBase =
+                                typeParamBuiltinExceptionBase(paramName);
+                            !excBase.empty()) {
+                            switch (builtinExceptionSurfaceMemberOf(excBase,
+                                                                    ma.member)) {
+                                case BuiltinExcMember::Message:
+                                case BuiltinExcMember::StackTrace:
+                                    ctx_.setExprType(
+                                        &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                                    return;
+                                case BuiltinExcMember::ParamName:
+                                    ctx_.setExprType(
+                                        &ma, ctx_.primitiveTypeRef(PrimitiveType::String,
+                                                                   /*nullable=*/true));
+                                    return;
+                                case BuiltinExcMember::CauseChain:
+                                    ctx_.setExprType(&ma, excCauseChainTypeRef());
+                                    return;
+                                case BuiltinExcMember::None:
+                                    break;
+                            }
+                        }
                         ctx_.diagnostics().report(
                             Severity::Error, ma.span.begin,
                             "no member `" + std::string(ma.member) +

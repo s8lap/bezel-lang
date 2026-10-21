@@ -14217,6 +14217,67 @@ bool ExprTC::typeParamHasExceptionBound(std::string_view paramName) {
     return false;
 }
 
+// #6757 (§3.6 rule 2 / §14.2, the #5449 ruling): a bare type parameter's
+// surface is what its class bounds establish, inherited members included.
+// This returns the built-in exception base (§31.4) that a class bound of
+// `paramName` reaches: the built-in itself (`where T: Exception`), a user class
+// deriving from one, or a `where T: U` chain ending in one. "" when none does.
+// `forEachConstraintBound` yields only bounds that carry a declaration, so the
+// built-in bound is found here by name, as `typeParamHasExceptionBound` finds it.
+std::string_view ExprTC::typeParamBuiltinExceptionBase(
+    std::string_view paramName) {
+    const ast::TypeDecl* typeDecl =
+        (currentType_ && currentType_->decl)
+            // SEAM-ACCESSOR: `currentType_` is the type whose body is being
+            // checked, so it is never an import. Its `typeDecl` is null only for
+            // an extension over an imported target, and `extDecl` (always local)
+            // is scanned for the same `paramName` below, so this walk is
+            // import-correct, as in `typeParamHasExceptionBound` (#3152).
+            ? dynamic_cast<const ast::TypeDecl*>(currentType_->decl)
+            : nullptr;
+    const ast::ExtensionDecl* extDecl =
+        (currentExtension_ && currentExtension_->decl)
+            ? dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl)
+            : nullptr;
+    std::unordered_set<std::string_view> visited;
+    std::vector<std::string_view> work{paramName};
+    while (!work.empty()) {
+        std::string_view nm = work.back();
+        work.pop_back();
+        if (!visited.insert(nm).second) continue;
+        std::string_view found;
+        auto scan = [&](const std::vector<ast::GenericConstraint>& gcs) -> bool {
+            for (const auto& gc : gcs) {
+                if (gc.typeParam != nm) continue;
+                for (const auto& item : gc.items) {
+                    if (item.kind != "type" || !item.typeArg) continue;
+                    TypeRef* b = ctx_.resolvedType(*item.typeArg);
+                    if (!b || b->kind != TypeRef::Kind::Named) continue;
+                    if (b->declaration) {
+                        found = builtinExceptionBaseOf(b->declaration);
+                        if (!found.empty()) return true;
+                        continue;
+                    }
+                    std::string_view bn = namedRefSimpleName(b);
+                    if (common::isBuiltinExceptionName(bn)) {
+                        found = bn;
+                        return true;
+                    }
+                    // `where nm: U` — follow the chain (§14.2).
+                    if (!bn.empty() && isEnclosingTypeParamName(bn))
+                        work.push_back(bn);
+                }
+            }
+            return false;
+        };
+        if (currentMethodDecl_ && scan(currentMethodDecl_->genericConstraints))
+            return found;
+        if (typeDecl && scan(typeDecl->genericConstraints)) return found;
+        if (extDecl && scan(extDecl->genericConstraints)) return found;
+    }
+    return {};
+}
+
 void ExprTC::checkThrowableType(const ast::Expr& value) {
     TypeRef* vt = ctx_.exprType(value);
     if (!vt) return;  // unresolved type — don't false-positive

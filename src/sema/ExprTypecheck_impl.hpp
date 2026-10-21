@@ -2959,6 +2959,12 @@ private:
     // alone, never from an instantiation, exactly as §31.2.1 requires.
     bool typeParamHasExceptionBound(std::string_view paramName);
 
+    // #6757 (§3.6 rule 2 / §14.2, the #5449 ruling): the built-in exception
+    // base (§31.4) that a class bound of `paramName` reaches — the built-in
+    // itself, a user class deriving from one, or a `where T: U` chain ending in
+    // one — or "" when none does.
+    std::string_view typeParamBuiltinExceptionBase(std::string_view paramName);
+
     // §5.1 (issue #738): fold `e` to a compile-time integer constant, resolving
     // `const` identifiers through the typecheck scope. Used to decide whether an
     // int initializer/value may implicitly narrow to a narrower integer target

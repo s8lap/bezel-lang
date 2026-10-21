@@ -11294,7 +11294,10 @@ private:
     // each be correct on their own.)
     bool isInheritedExcSurfaceAccess(const ast::MemberAccessExpr* ma) const {
         if (!ma || !ma->target) return false;
-        const sema::TypeRef* rtt = ctx_.exprType(*ma->target);
+        // #6757 (§3.6 rule 2 / §14.2): a bare type-parameter receiver resolves
+        // through the active substitution before the tests below.
+        const sema::TypeRef* rtt =
+            resolveTypeParamRef(ctx_.exprType(*ma->target));
         if (isBuiltinExceptionTypeRef(rtt)) return true;
         if (ctx_.exprSymbol(*ma) != nullptr) return false;
         if (rtt) {
