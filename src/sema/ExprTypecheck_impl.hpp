@@ -1963,6 +1963,9 @@ private:
         const std::vector<std::string_view>& parts);
     // The #5188 different-value-type reject for a pattern already known to
     // name `ts` (record/enum/choice), against the scrutinee's DECLARED type.
+    // §35.5 (v0.340, #6726): the qualified twin of the bare-payload-case
+    // refusal (`Outcome.Fetched` with no parentheses).
+    void rejectBareQualifiedPayloadCase(const ast::NamedPattern* np);
     void rejectOtherValueTypeNamedPattern(const ast::NamedPattern* np,
                                           const TypeSymbol* ts,
                                           const TypeRef* scrutDecl);

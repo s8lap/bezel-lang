@@ -3924,9 +3924,48 @@ bool ExprTC::caseArmsExhaustive(
 void ExprTC::checkNamedSlotNakedName(const ast::PositionalPattern& sp,
                                      TypeRef* fieldTy) {
     // `slotName` is cleared by normalization; `namedSlot` survives it.
-    if (!sp.namedSlot) return;  // positional slot: naked name is a binding
+    if (!sp.namedSlot) {
+        // §35.5 *Case patterns* (v0.340, #6726): a positional slot's naked
+        // name is a binding, but a QUALIFIED name never is (`Wrap(Outer.W)`),
+        // so the bare-payload-case refusal reads it here. A named slot
+        // reaches it through checkTopLevelNamedPattern below.
+        if (auto* qnp =
+                dynamic_cast<const ast::NamedPattern*>(sp.pattern.get()))
+            rejectBareQualifiedPayloadCase(qnp);
+        return;
+    }
     if (auto* np = dynamic_cast<const ast::NamedPattern*>(sp.pattern.get()))
         checkTopLevelNamedPattern(np, fieldTy, fieldTy, /*namedSlot=*/true);
+}
+
+// §35.5 *Case patterns* (v0.340, #6726): "A payload case may not be matched
+// bare: `Fetched` without parentheses is a compile error naming the arity."
+// The prefixed spelling `Outcome.Fetched` / `Outer.W` is the same bare
+// payload-case pattern as `Fetched`; the unprefixed arm of
+// checkTopLevelNamedPattern (1c) refuses it and this is its qualified twin.
+// The prefix names the choice itself, so no scrutinee type is consulted.
+void ExprTC::rejectBareQualifiedPayloadCase(const ast::NamedPattern* np) {
+    if (!np || !np->name || np->name->parts.size() < 2) return;
+    std::vector<std::string_view> prefix(np->name->parts.begin(),
+                                         np->name->parts.end() - 1);
+    TypeSymbol* ts = resolveCasePatternTypeSymbol(prefix);
+    if (!ts || ts->kind != ast::TypeDeclKind::Choice) return;
+    const std::string_view last = np->name->parts.back();
+    for (Symbol* m : ts->members) {
+        auto* cc = dynamic_cast<ChoiceCaseSymbol*>(m);
+        if (!cc || cc->name != last) continue;
+        if (cc->caseDecl && !cc->caseDecl->payload.empty()) {
+            const auto n = cc->caseDecl->payload.size();
+            ctx_.diagnostics().report(
+                Severity::Error, np->span.begin,
+                "Payload case `" + std::string(last) + "` requires a payload "
+                "pattern: write `" + std::string(last) + "(" +
+                std::to_string(n) + " slot" + (n == 1 ? "" : "s") +
+                ")`, or `" + std::string(last) + "(_)` to discard "
+                "(\xC2\xA7""35.5)");
+        }
+        return;
+    }
 }
 
 // §19.3 (#1847): validate a TOP-LEVEL bare-identifier `case`/`when` pattern.
@@ -3959,6 +3998,8 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
     if (np->name->parts.size() != 1) {
         if (TypeSymbol* qts = resolveCasePatternTypeSymbol(np->name->parts))
             rejectOtherValueTypeNamedPattern(np, qts, scrutDecl);
+        else
+            rejectBareQualifiedPayloadCase(np);
         return;
     }
     std::string_view last = np->name->parts.back();
