@@ -2935,6 +2935,27 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     mag == 2147483648ull) {
                     widened = true;  // keep pt == Int; this is int.MinValue.
                 }
+                // fix #6804 (§4.2 target-typed integer constant, §5.1
+                // "Constant narrowing", v0.340): the literal is the immediate
+                // operand of a unary `-`, so the constant being formed is
+                // NEGATIVE (-mag). An unsigned written target cannot hold it,
+                // and typing the literal AT that target made the negation wrap
+                // (`var u: uint := -3_000_000_000;` stored 1294967296) — a
+                // silent truncation §5.1 forbids ("never a silent
+                // truncation"). Type the magnitude as `long` instead, so the
+                // constant keeps its true negative value and §5.1's range
+                // check (the conversion site) rejects it at the unsigned
+                // target — and §22.6 applicability sees `long` hold it and
+                // `ulong` not. A magnitude beyond long's range has no signed
+                // type and stays the literal error below.
+                else if (literalUnderUnaryMinus_ && errno != ERANGE &&
+                         (currentLiteralWideningHint_ == P::UInt ||
+                          currentLiteralWideningHint_ == P::ULong)) {
+                    if (mag <= 9223372036854775807ULL) {
+                        pt = P::Long;
+                        widened = true;
+                    }
+                }
                 // Widen to the declared type when in a typed variable context.
                 else if (currentLiteralWideningHint_ != P::None) {
                     bool fits = false;
