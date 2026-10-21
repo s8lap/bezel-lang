@@ -9886,7 +9886,10 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             if (!e || !v || dynamic_cast<const ast::NullLiteralExpr*>(e))
                 return nullptr;
             if (v->getType()->isPointerTy()) return nullptr;
-            const sema::TypeRef* t = ctx_.exprType(*e);
+            // #6748: inside a generic body the operand's sema type is the bare
+            // `T`; resolve it under the live substitution (§14.1) so a record
+            // `T` operand boxes and compares through the Equals slot (§9.2).
+            const sema::TypeRef* t = resolveTypeParamRef(ctx_.exprType(*e));
             if (!t || isObjectOrInterfaceTarget(t)) return nullptr;
             return (isBoxableValueType(t) || isNullableValueTy(t)) ? t : nullptr;
         };
@@ -9920,6 +9923,16 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             }
         }
     }
+    // #6748 (§14.2, §9.2): the dead abstract-template pass lowers a bare type
+    // parameter operand as the `i32` placeholder, so `a = b` with `b: Object`
+    // reaches the scalar compare as `i32` vs `ptr` and fails IR verification.
+    // The template is never called (every call binds a specialization, which
+    // the arm above handles), so fold the mismatched pair to a constant.
+    if (emittingGenericTemplateBody_ && (bin.op == "=" || bin.op == "<>") &&
+        bin.left && bin.right && l->getType() != r->getType() &&
+        !dynamic_cast<const ast::NullLiteralExpr*>(bin.left.get()) &&
+        !dynamic_cast<const ast::NullLiteralExpr*>(bin.right.get()))
+        return builder_.getInt1(bin.op == "<>");
     bool lUnwrapped_ = false;
     bool rUnwrapped_ = false;
     // §7.11 / #914 / #1117 (proposal 0114, v0.267): the §7.11 lifted-operator
