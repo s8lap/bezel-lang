@@ -17494,11 +17494,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // `string?` argument is rejected instead of silently accepted.
     checkBuiltinStringCallArgs(ce);
 
-    // fix #6782 (§7, §7.3, v0.340): the same §7 check for the built-in members
-    // and statics the string-receiver check above does not reach, against the
-    // declared non-nullable `string` positions in the registry. Its header
-    // carries the measured set.
-    checkBuiltinNullableStringArgs(ce, calleeSym);
+    // fix #6782 (§7, §7.3, v0.340): the same §7 null check for the built-in
+    // members and statics the string-receiver check above does not reach,
+    // against the declared non-nullable positions in the registry.
+    checkBuiltinNullableArgs(ce, calleeSym);
 
     // §22.5 (v0.283, #3398): the BINDING twin of the three per-argument
     // builtin checks around it. Those answer "is this argument's TYPE
@@ -19889,8 +19888,11 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         // overload set: §7 rejects it at every non-nullable target, and the
         // message is the one `StartsWith(null)` already gives. A NON-nullable
         // `Object` is not touched here.
+        // An `Object?` that §7.4 has narrowed non-null is not a null and keeps
+        // its own kind, so this reading adds no type check.
         PrimitiveType argKind = argTy->primitive;
-        if (argTy->nullable && argKind == PrimitiveType::Object)
+        if (argTy->nullable && argKind == PrimitiveType::Object &&
+            !isNarrowedNonNullRead(a.value.get()))
             argKind = PrimitiveType::String;
         PrimitiveType declared = paramKind(i, argKind);
         if (declared == PrimitiveType::None) continue;
@@ -19909,11 +19911,9 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
 // numeric and `bool`/`char` primitives, `StringBuilder`, and the static
 // classes (`int.Parse`, `File.Exists`, `Path.Combine`, `Convert.ToInt32`). A
 // built-in member has no MethodSymbol, so `checkCallArity` never binds its
-// arguments. The declared non-nullable `string` positions come from
-// `common::builtinParamIsNonNullString`. Only an un-narrowed nullable argument,
-// the `null` literal included, is reported here; `checkAssignable` applies the
-// §7.4 narrowing rule through `fromExpr`. A non-nullable argument of the wrong
-// type is a different rule and is not claimed here.
+// arguments. The declared non-nullable positions come from
+// `common::builtinParamIsNonNullable`; the check itself is
+// `reportBuiltinArgIfNullable`, which asks about nullness only.
 static std::string_view primitiveKeywordHead(PrimitiveType p) {
     switch (p) {
         case PrimitiveType::Int:     return "int";
@@ -19926,8 +19926,33 @@ static std::string_view primitiveKeywordHead(PrimitiveType p) {
     }
 }
 
-void ExprTC::checkBuiltinNullableStringArgs(const ast::CallExpr& ce,
-                                            Symbol* calleeSym) {
+// fix #6782 (§7, §7.4, v0.340): report `arg` at a non-nullable built-in
+// parameter iff it is the `null` literal or still nullable after §7.4
+// narrowing. `isNarrowedNonNullRead` is the narrowing query: a guarded or
+// initializer-narrowed local or parameter, a §12.7 type narrowing, and a
+// `readonly` field path ("`readonly` fields narrow", §7.4). No TYPE check is
+// made here: the position may have overloads of several types (`Append(value:
+// Object)`, `StringBuilder(capacity: int)`, `Parse(s: ReadOnlyStringSpan)`),
+// and overload resolution decides type mismatches. The message is the one
+// checkAssignable gives for the same §7 rule.
+void ExprTC::reportBuiltinArgIfNullable(const ast::Expr* arg,
+                                        const std::string& what) {
+    if (!arg) return;
+    const bool isNullLiteral =
+        dynamic_cast<const ast::NullLiteralExpr*>(arg) != nullptr;
+    if (!isNullLiteral) {
+        TypeRef* argTy = ctx_.exprType(*arg);
+        if (!argTy || !argTy->nullable) return;
+        if (isNarrowedNonNullRead(arg)) return;
+    }
+    ctx_.diagnostics().report(
+        Severity::Error, arg->span.begin,
+        std::string("the ") + what +
+            " is nullable but the target type is non-nullable (\xC2\xA7""7)");
+}
+
+void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
+                                      Symbol* calleeSym) {
     // A resolved callee is a user or imported method, whose arguments
     // `checkCallArity` binds and checks (§22.5, §7).
     if (calleeSym) return;
@@ -19961,14 +19986,10 @@ void ExprTC::checkBuiltinNullableStringArgs(const ast::CallExpr& ce,
         // `checkBuiltinNamedArgs`, so the position read here is not trusted.
         if (!a.value || a.isDiscard || !a.modifier.empty() || !a.name.empty())
             continue;
-        if (!common::builtinParamIsNonNullString(head, member, ce.args.size(),
-                                                 i))
+        if (!common::builtinParamIsNonNullable(head, member, ce.args.size(),
+                                               i))
             continue;
-        TypeRef* argTy = ctx_.exprType(*a.value);
-        if (!argTy || !argTy->nullable) continue;
-        checkAssignable(
-            argTy, ctx_.primitiveTypeRef(PrimitiveType::String, /*nullable=*/false),
-            a.value->span.begin, what, a.value.get());
+        reportBuiltinArgIfNullable(a.value.get(), what);
     }
 }
 

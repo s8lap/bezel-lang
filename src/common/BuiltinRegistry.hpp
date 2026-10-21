@@ -668,16 +668,19 @@ std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
 // fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
 // non-nullable target", v0.340): is parameter `position` of the built-in member
 // `typeHead.member` (or of the built-in constructor `typeHead`, when `member` is
-// empty), at `argCount` arguments, declared as a NON-nullable `string`? Sema
-// rejects an un-narrowed nullable argument, the `null` literal included, at
-// such a position. The rows are the standard-library declarations of §2.3,
-// §2.5, §2.6, §3.1, §7.3, §7.4, §9.1–§9.5 and §31.4, transcribed in
-// BuiltinRegistry.cpp. A missed row costs a silently accepted null, never a
-// false rejection. The head is the stdlib or keyword spelling (`int`, `bool`,
-// `Int32`, `Boolean`); the lookup normalizes it.
-bool builtinParamIsNonNullString(std::string_view typeHead,
-                                 std::string_view member,
-                                 std::size_t argCount, std::size_t position);
+// empty), at `argCount` arguments, declared NON-nullable in every overload of
+// that arity? The answer is about nullability only, never about the
+// parameter's type: overloads of different types can share a position
+// (`StringBuilder(initial: string)` / `(capacity: int)`), and sema reports
+// only an argument that is still nullable after §7.4 narrowing there, the
+// `null` literal included, leaving type mismatches to overload resolution. The
+// rows are the standard-library declarations of §2.3, §2.5, §2.6, §3.1, §7.3,
+// §7.4, §9.1–§9.5 and §31.4, transcribed in BuiltinRegistry.cpp. A missed row
+// costs a silently accepted null. The head is the stdlib or keyword spelling
+// (`int`, `bool`, `Int32`, `Boolean`); the lookup normalizes it.
+bool builtinParamIsNonNullable(std::string_view typeHead,
+                               std::string_view member, std::size_t argCount,
+                               std::size_t position);
 
 // fix #3425: does codegen's `lowerNew` arm for `head` lower its arguments
 // through the §22.5 BINDING (by parameter name) rather than by written

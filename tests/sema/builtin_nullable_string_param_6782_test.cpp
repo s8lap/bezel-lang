@@ -16,12 +16,13 @@
 // (§31.4).
 //
 // Each reject row asserts the exact diagnostic text AND the 1-based line and
-// column of the argument, because checkAssignable reports at the argument's
-// begin position. The accept rows are the controls the fix must not reject: the
+// column of the argument, which is where the §7 report is made. The accept rows are the controls the fix must not reject: the
 // parameterless and format-free forms, a narrowed `string?` (§7.4), the
 // nullable-declared `Equals(other: string?)` (§11.2) and
-// `String.IsNullOrWhiteSpace(value: string?)` (stdlib §9.6), and a non-string
-// `StringBuilder(capacity: int)`.
+// `String.IsNullOrWhiteSpace(value: string?)` (stdlib §9.6), a non-string
+// `StringBuilder(capacity: int)`, and the narrowed nullables of the review
+// (below) that reach a non-string overload or are `readonly` fields. Every
+// accept row asserts that NO error is reported.
 
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
@@ -42,11 +43,6 @@ bezel::test::SemaResult parseSemaAll(std::string_view src) {
     }
     return r;
 }
-
-// The §7 "nullable -> non-nullable" fragment every builtin-argument rejection
-// shares (checkAssignable, ExprTypecheck.cpp).
-constexpr const char* kNullableDiag =
-    "is nullable but the target type is non-nullable";
 
 // A one-method program whose body is `body`, followed by `return 0;`.
 std::string program(const char* body) {
@@ -87,11 +83,14 @@ bool rejectsAt(const std::string& src, std::string_view needle,
     return false;
 }
 
-// True iff the program produces no §7 nullable-to-non-nullable diagnostic.
-bool acceptsNullableFree(const std::string& src) {
+// True iff the program produces NO error at all. A false rejection of an
+// accept row need not carry the §7 "nullable" text: the first cut of #6782
+// reported a §5.1 "not implicitly convertible" error at a narrowed argument of
+// a non-string overload, which a "nullable"-text oracle could not see.
+bool acceptsWithoutErrors(const std::string& src) {
     auto r = parseSemaAll(src);
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find(kNullableDiag) != std::string::npos) return false;
+        if (d.severity == bezel::Severity::Error) return false;
     return true;
 }
 
@@ -307,7 +306,7 @@ BEZEL_TEST(sema_builtin_nullable_string_param_6782,
         "var c := new Exception(\"c\"); "
         "var e := new ArgumentException(\"m\", \"p\"); "
         "var f := new InvalidOperationException(\"m\", c);");
-    BEZEL_EXPECT_TRUE(acceptsNullableFree(src));
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(src));
 }
 
 // §7.3 / stdlib: `File.Exists(path: string)`.
@@ -363,7 +362,7 @@ BEZEL_TEST(sema_builtin_nullable_string_param_6782,
     const std::string src = program(
         "var a := TimeSpan.FromSeconds(5.0); var s := a.ToString(); "
         "var c := a.ToString(\"c\");");
-    BEZEL_EXPECT_TRUE(acceptsNullableFree(src));
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(src));
 }
 
 // §7.4 / §27.6: a NARROWED `string?` parameter is a `string` after the null
@@ -374,21 +373,21 @@ BEZEL_TEST(sema_builtin_nullable_string_param_6782,
     const std::string src = withNullableParam(
         "if s = null then return 1; end; "
         "var a := TimeSpan.FromSeconds(1.0); var t := a.ToString(s);");
-    BEZEL_EXPECT_TRUE(acceptsNullableFree(src));
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(src));
 }
 
 // §11.2 (parameter-nullability widening): `Equals(other: string?)` takes null.
 BEZEL_TEST(sema_builtin_nullable_string_param_6782,
            string_equals_null_accepted_s11_2) {
     const std::string src = program("var b := \"abc\".Equals(null);");
-    BEZEL_EXPECT_TRUE(acceptsNullableFree(src));
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(src));
 }
 
 // stdlib §9.6: `IsNullOrWhiteSpace(value: string?)` is declared nullable.
 BEZEL_TEST(sema_builtin_nullable_string_param_6782,
            string_isnullorwhitespace_null_accepted_s9_6) {
     const std::string src = program("var b := String.IsNullOrWhiteSpace(null);");
-    BEZEL_EXPECT_TRUE(acceptsNullableFree(src));
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(src));
 }
 
 // §3.1: `StringBuilder(capacity: int)` takes an int, not a string, and the
@@ -397,12 +396,153 @@ BEZEL_TEST(sema_builtin_nullable_string_param_6782,
            stringbuilder_capacity_and_append_accepted_s3_1) {
     const std::string src = program(
         "var sb := new StringBuilder(16); sb.Append(\"x\");");
-    BEZEL_EXPECT_TRUE(acceptsNullableFree(src));
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(src));
 }
 
 // §7.4 / stdlib: `Path.Combine` with two non-null string literals.
 BEZEL_TEST(sema_builtin_nullable_string_param_6782,
            path_combine_nonnull_accepted_s7_4) {
     const std::string src = program("var p := Path.Combine(\"a\", \"b\");");
-    BEZEL_EXPECT_TRUE(acceptsNullableFree(src));
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(src));
+}
+
+// §31.4: the `cause` of `(message: string, cause: Exception)` is non-nullable
+// too. `new Exception("m", null)` compiled and the program died with SIGSEGV
+// (exit 139) at the snapshot read.
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           exception_cause_null_rejected_s31_4) {
+    const std::string src = program("var e := new Exception(\"m\", null);");
+    BEZEL_EXPECT_TRUE(rejectsAt(
+        src, "null)",
+        "the argument to `Exception` constructor is nullable but the target "
+        "type is non-nullable (§7)"));
+}
+
+// --- Accept rows: §7.4-narrowed arguments at non-string overloads ---------
+//
+// The check reports nullness only. A nullable narrowed non-null by §7.4 is a
+// non-null argument, and at a position whose overloads include a non-string
+// type, overload resolution, not this check, decides the type. The first cut
+// of #6782 ran a `string` assignability check here and falsely rejected each
+// of these with a §5.1 error. Row names carry the review's probe ids.
+
+// §3.1: `Append(value: Object)` with a narrowed `Foo?` (a19).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a19_append_narrowed_object_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class Foo end Foo; class C public static method T(c: bool): "
+        "int var sb := new StringBuilder(); var o: Foo? := (if c then new "
+        "Foo() else null); if o <> null then sb.Append(o); end; return 0; "
+        "end T; end C;"));
+}
+
+// §3.1: `StringBuilder(capacity: int)` with a narrowed `int?` (a48).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a48_ctor_capacity_narrowed_int_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class C public static method T(ni: int?): int if ni <> null "
+        "then var sb := new StringBuilder(ni); sb.Append(\"x\"); end; return 0; "
+        "end T; end C;"));
+}
+
+// §9.1: the radix `ToString` with a narrowed `int?` (a07b).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a07b_int_tostring_radix_narrowed_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class C public static method T(ni: int?): int var n := 255; "
+        "if ni <> null then var s := n.ToString(ni); end; return 0; end T; "
+        "end C;"));
+}
+
+// §3.1: `Append(value: int)` with a narrowed `int?` (a08b).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a08b_append_narrowed_int_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class C public static method T(ni: int?): int var sb := new "
+        "StringBuilder(); if ni <> null then sb.Append(ni); end; return 0; "
+        "end T; end C;"));
+}
+
+// §3.1: `Append(value: double)` with a narrowed `double?` (a40).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a40_append_narrowed_double_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class C public static method T(c: bool): int var dn: double? "
+        ":= (if c then 1.5 else null); var sb := new StringBuilder(); if dn <> "
+        "null then sb.Append(dn); end; return 0; end T; end C;"));
+}
+
+// §3.1: `Append(value: char)` with a narrowed `char?` (a46).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a46_append_narrowed_char_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class C public static method T(c: bool): int var ch: char? "
+        ":= (if c then 'A' else null); var sb := new StringBuilder(); if ch <> "
+        "null then sb.Append(ch); end; return 0; end T; end C;"));
+}
+
+// §9.1: `Parse(s: ReadOnlyStringSpan)` with a narrowed span (a47).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a47_parse_narrowed_span_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class C public static method T(): int const src := \"42\"; "
+        "var sp: ReadOnlyStringSpan? := (if src.Length > 0 then src.AsSpan(0) "
+        "else null); if sp <> null then var n := int.Parse(sp); end; return 0; "
+        "end T; end C;"));
+}
+
+// --- Accept rows: §7.4 "`readonly` fields narrow" -------------------------
+
+// An instance readonly field read through a local (a20).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a20_readonly_field_parse_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class H public readonly F: string?; public constructor(f: "
+        "string?) F := f; end constructor; end H; class C public static method "
+        "T(s: string?): int var h := new H(s); if h.F <> null then var n := "
+        "int.Parse(h.F); end; return 0; end T; end C;"));
+}
+
+// The same field read through `this` (a26).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a26_this_readonly_field_parse_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class H public readonly F: string?; public constructor(f: "
+        "string?) F := f; end constructor; public method P(): int if this.F <> "
+        "null then return int.Parse(this.F); end; return -1; end P; end H;"));
+}
+
+// A `static readonly` field (a42).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a42_static_readonly_field_parse_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class G public static readonly S: string? := \"12\"; end G; "
+        "class C public static method T(): int if G.S <> null then var n := "
+        "int.Parse(G.S); end; return 0; end T; end C;"));
+}
+
+// A readonly field at a standard exception's `message` (a29).
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           a29_readonly_field_exception_message_accepted_s7_4) {
+    BEZEL_EXPECT_TRUE(acceptsWithoutErrors(
+        "module M; class H public readonly F: string?; public constructor(f: "
+        "string?) F := f; end constructor; end H; class C public static method "
+        "T(s: string?): int var h := new H(s); if h.F <> null then using var ex "
+        ":= new Exception(h.F); end; return 0; end T; end C;"));
+}
+
+// The control for the readonly rows: an UN-guarded readonly field read is
+// still nullable, so it is still rejected. Readonly fields are honoured as
+// §7.4 narrowing, not skipped.
+BEZEL_TEST(sema_builtin_nullable_string_param_6782,
+           readonly_field_unguarded_rejected_s7_4) {
+    const std::string src =
+        "module M; class H public readonly F: string?; public constructor(f: "
+        "string?) F := f; end constructor; end H; class C public static method "
+        "T(s: string?): int var h := new H(s); var n := int.Parse(h.F); "
+        "return 0; end T; end C;";
+    BEZEL_EXPECT_TRUE(rejectsAt(
+        src, "h.F);",
+        "the argument to `int.Parse` is nullable but the target type is "
+        "non-nullable (§7)"));
 }

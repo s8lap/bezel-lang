@@ -1726,20 +1726,27 @@ std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
 
 // fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
 // non-nullable target", v0.340): the built-in members and constructors whose
-// parameter at `position` is declared a NON-nullable `string`. Each row is
-// (head, member or "" for a constructor, argument count, position). The
-// `string?` declarations are deliberately absent: `String.IsNullOrWhiteSpace
-// (value: string?)` and the `Equals(other: string?, ignoreCase)` form take
-// null. Standard-library section cited per group.
+// parameter at `position` is declared NON-nullable in EVERY overload of that
+// argument count. Each row is (head, member or "" for a constructor, argument
+// count, position). A row says nothing about the parameter's TYPE: several
+// rows have overloads of different types at the same position
+// (`StringBuilder(initial: string)` and `(capacity: int)`, `Append(value:
+// string)` and `Append(value: Object)`, `Int32.ToString(format: string)` and
+// its radix form, `Parse(s: string)` and `Parse(s: ReadOnlyStringSpan)`), and
+// overload resolution, not this table, decides between them. What the rows
+// share is that no overload at that position takes null. The declarations that
+// do (`String.IsNullOrWhiteSpace(value: string?)`, the `Equals(other:
+// string?, ignoreCase)` form) are deliberately absent. Standard-library
+// section cited per group.
 namespace {
-struct BuiltinNonNullStringParamRow {
+struct BuiltinNonNullableParamRow {
     std::string_view head;
     std::string_view member;
     std::size_t argCount;
     std::size_t position;
 };
 
-constexpr BuiltinNonNullStringParamRow kBuiltinNonNullStringParams[] = {
+constexpr BuiltinNonNullableParamRow kBuiltinNonNullableParams[] = {
     // §2.3 `Convert`: To*(value: string), TryTo*(value: string, out result).
     {"Convert", "ToInt32", 1, 0},   {"Convert", "ToInt64", 1, 0},
     {"Convert", "ToDouble", 1, 0},  {"Convert", "ToDecimal", 1, 0},
@@ -1799,28 +1806,22 @@ constexpr BuiltinNonNullStringParamRow kBuiltinNonNullStringParams[] = {
     {"Boolean", "Parse", 1, 0},         {"Boolean", "TryParse", 2, 0},
     {"Boolean", "ParseOrNull", 1, 0},   {"Char", "Parse", 1, 0},
     {"Char", "TryParse", 2, 0},         {"Char", "ParseOrNull", 1, 0},
-    // §31.4: `TimeoutException(message: string, inner: Exception)`,
-    // `ArgumentException(message: string, paramName: string)` and
-    // `ArgumentOutOfRangeException(message: string, paramName: string)`. The
-    // position-0 `message` of every standard exception's one- and two-argument
-    // forms is the wildcard in `builtinParamIsNonNullString`; position 1 of the
-    // `paramName` pair needs a row.
-    {"TimeoutException", "", 2, 0},
-    {"ArgumentException", "", 2, 1},
-    {"ArgumentOutOfRangeException", "", 2, 0},
-    {"ArgumentOutOfRangeException", "", 2, 1},
+    // §31.4: the standard exception constructors are the wildcard in
+    // `builtinParamIsNonNullable`, not rows.
 };
 }  // namespace
 
-bool builtinParamIsNonNullString(std::string_view typeHead,
-                                 std::string_view member,
-                                 std::size_t argCount, std::size_t position) {
-    // §31.4: every standard exception type's constructor surface begins with
-    // `message: string`: `(message: string)`, and `(message: string, cause:
-    // Exception)`, which a type with no declared constructor carries. The one-
-    // and two-argument forms are therefore non-nullable at position 0.
-    if (member.empty() && (argCount == 1 || argCount == 2) && position == 0 &&
-        isBuiltinExceptionName(typeHead))
+bool builtinParamIsNonNullable(std::string_view typeHead,
+                               std::string_view member, std::size_t argCount,
+                               std::size_t position) {
+    // §31.4: every standard exception type's one- and two-argument
+    // constructors are `(message: string)` and either `(message: string,
+    // cause: Exception)` (the surface of a type that declares no constructor;
+    // `TimeoutException` spells the second `inner: Exception`) or `(message:
+    // string, paramName: string)` (`ArgumentException`,
+    // `ArgumentOutOfRangeException`). No position of any of them is nullable.
+    if (member.empty() && (argCount == 1 || argCount == 2) &&
+        position < argCount && isBuiltinExceptionName(typeHead))
         return true;
     // A primitive receiver or a static call spelled with its keyword (`int.Parse`,
     // `bool.Parse`) names the same stdlib type as the declared head.
@@ -1831,7 +1832,7 @@ bool builtinParamIsNonNullString(std::string_view typeHead,
     else if (head == "double") head = "Double";
     else if (head == "float") head = "Float";
     else if (head == "decimal") head = "Decimal";
-    for (const auto& r : kBuiltinNonNullStringParams)
+    for (const auto& r : kBuiltinNonNullableParams)
         if (r.head == head && r.member == member && r.argCount == argCount &&
             r.position == position)
             return true;

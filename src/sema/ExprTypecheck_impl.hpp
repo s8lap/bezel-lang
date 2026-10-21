@@ -3930,9 +3930,9 @@ private:
     // user type by the caller. // per §22.5 / §17.7, fix #3425
     void checkBuiltinCtorNamedArgs(const ast::NewExpr& ne, const std::string& head);
     // fix #6782 (§7, §7.3, v0.340): the positional twin of the member check
-    // below, for the declared non-nullable `string` parameters of `head`.
-    void checkBuiltinNullableStringCtorArgs(const ast::NewExpr& ne,
-                                            const std::string& head);
+    // below, for the declared non-nullable parameters of `head`.
+    void checkBuiltinNullableCtorArgs(const ast::NewExpr& ne,
+                                      const std::string& head);
 
     // §5.1: is a value of static type `from` implicitly convertible to
     // `to`? Identity is NOT counted here (that is the "exact" relation,
@@ -4426,7 +4426,11 @@ private:
     // fix #6782 (§7, §7.3, v0.340): the member and static twin of the check
     // above, for the built-in receivers and type names it does not claim. A
     // resolved `calleeSym` (user or imported method) is left to checkCallArity.
-    void checkBuiltinNullableStringArgs(const ast::CallExpr& ce, Symbol* calleeSym);
+    void checkBuiltinNullableArgs(const ast::CallExpr& ce, Symbol* calleeSym);
+    // fix #6782 (§7, §7.4, v0.340): the nullness-only report both checks
+    // share: `arg` is the `null` literal or nullable after §7.4 narrowing
+    // (readonly fields included). Never a type check.
+    void reportBuiltinArgIfNullable(const ast::Expr* arg, const std::string& what);
 
     // fix #3398 (spec §22.5 "Optional parameters and named arguments",
     // v0.283; stdlib §1 Conventions — *Window parameters*; §9.6; §3.2):
