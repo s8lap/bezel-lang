@@ -1724,6 +1724,120 @@ std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
     return out;
 }  // per §22.5 / §17.7 / §31.4 / stdlib §2.5 / §3.1 / §4 / §6 / §7.2
 
+// fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
+// non-nullable target", v0.340): the built-in members and constructors whose
+// parameter at `position` is declared a NON-nullable `string`. Each row is
+// (head, member or "" for a constructor, argument count, position). The
+// `string?` declarations are deliberately absent: `String.IsNullOrWhiteSpace
+// (value: string?)` and the `Equals(other: string?, ignoreCase)` form take
+// null. Standard-library section cited per group.
+namespace {
+struct BuiltinNonNullStringParamRow {
+    std::string_view head;
+    std::string_view member;
+    std::size_t argCount;
+    std::size_t position;
+};
+
+constexpr BuiltinNonNullStringParamRow kBuiltinNonNullStringParams[] = {
+    // §2.3 `Convert`: To*(value: string), TryTo*(value: string, out result).
+    {"Convert", "ToInt32", 1, 0},   {"Convert", "ToInt64", 1, 0},
+    {"Convert", "ToDouble", 1, 0},  {"Convert", "ToDecimal", 1, 0},
+    {"Convert", "ToBoolean", 1, 0}, {"Convert", "TryToInt32", 2, 0},
+    {"Convert", "TryToInt64", 2, 0}, {"Convert", "TryToDouble", 2, 0},
+    {"Convert", "TryToDecimal", 2, 0}, {"Convert", "TryToBoolean", 2, 0},
+    // §2.5 `DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`: ToString(format:
+    // string); Parse(s: string), TryParse(s: string, out result), ParseOrNull(s).
+    {"DateTime", "ToString", 1, 0},   {"DateTime", "Parse", 1, 0},
+    {"DateTime", "TryParse", 2, 0},   {"DateTime", "ParseOrNull", 1, 0},
+    {"TimeSpan", "ToString", 1, 0},
+    {"DateOnly", "ToString", 1, 0},   {"DateOnly", "Parse", 1, 0},
+    {"DateOnly", "TryParse", 2, 0},   {"DateOnly", "ParseOrNull", 1, 0},
+    {"TimeOnly", "ToString", 1, 0},   {"TimeOnly", "Parse", 1, 0},
+    {"TimeOnly", "TryParse", 2, 0},   {"TimeOnly", "ParseOrNull", 1, 0},
+    // §2.6 `Guid`: ToString(format: string); Parse / TryParse / ParseOrNull.
+    {"Guid", "ToString", 1, 0},       {"Guid", "Parse", 1, 0},
+    {"Guid", "TryParse", 2, 0},       {"Guid", "ParseOrNull", 1, 0},
+    // §3.1 `StringBuilder`: constructor(initial: string); Append, AppendLine,
+    // AppendFormat(format: string, args), Insert(index, value: string),
+    // Replace(oldValue: string, newValue: string).
+    {"StringBuilder", "", 1, 0},        {"StringBuilder", "Append", 1, 0},
+    {"StringBuilder", "AppendLine", 1, 0},
+    {"StringBuilder", "AppendFormat", 2, 0},
+    {"StringBuilder", "Insert", 2, 1},  {"StringBuilder", "Replace", 2, 0},
+    {"StringBuilder", "Replace", 2, 1},
+    // §7.3 `File`: every path or text parameter.
+    {"File", "ReadAllText", 1, 0},      {"File", "WriteAllText", 2, 0},
+    {"File", "WriteAllText", 2, 1},     {"File", "ReadAllBytes", 1, 0},
+    {"File", "WriteAllBytes", 2, 0},    {"File", "ReadAllLines", 1, 0},
+    {"File", "WriteAllLines", 2, 0},    {"File", "Exists", 1, 0},
+    {"File", "Delete", 1, 0},           {"File", "Copy", 3, 0},
+    {"File", "Copy", 3, 1},             {"File", "Move", 2, 0},
+    {"File", "Move", 2, 1},
+    // §7.4 `Directory` and `Path`.
+    {"Directory", "Exists", 1, 0},      {"Directory", "CreateDirectory", 1, 0},
+    {"Directory", "Delete", 1, 0},      {"Directory", "Delete", 2, 0},
+    {"Directory", "GetFiles", 1, 0},    {"Directory", "GetDirectories", 1, 0},
+    {"Path", "Combine", 2, 0},          {"Path", "Combine", 2, 1},
+    {"Path", "GetFileName", 1, 0},      {"Path", "GetExtension", 1, 0},
+    {"Path", "GetFileNameWithoutExtension", 1, 0},
+    {"Path", "GetDirectoryName", 1, 0}, {"Path", "GetFullPath", 1, 0},
+    // §9.1 `Int32`: ToString(format: string); Parse / TryParse / ParseOrNull,
+    // and the radix overloads Parse(s, radix) and TryParse(s, radix, out).
+    {"Int32", "ToString", 1, 0},        {"Int32", "Parse", 1, 0},
+    {"Int32", "TryParse", 2, 0},        {"Int32", "ParseOrNull", 1, 0},
+    {"Int32", "Parse", 2, 0},           {"Int32", "TryParse", 3, 0},
+    // §9.2 `Double` and `Float`.
+    {"Double", "ToString", 1, 0},       {"Double", "Parse", 1, 0},
+    {"Double", "TryParse", 2, 0},       {"Double", "ParseOrNull", 1, 0},
+    {"Float", "ToString", 1, 0},        {"Float", "Parse", 1, 0},
+    {"Float", "TryParse", 2, 0},        {"Float", "ParseOrNull", 1, 0},
+    // §9.3 `Decimal`.
+    {"Decimal", "ToString", 1, 0},      {"Decimal", "Parse", 1, 0},
+    {"Decimal", "TryParse", 2, 0},      {"Decimal", "ParseOrNull", 1, 0},
+    // §9.4 `Boolean` and §9.5 `Char`: Parse / TryParse / ParseOrNull only.
+    {"Boolean", "Parse", 1, 0},         {"Boolean", "TryParse", 2, 0},
+    {"Boolean", "ParseOrNull", 1, 0},   {"Char", "Parse", 1, 0},
+    {"Char", "TryParse", 2, 0},         {"Char", "ParseOrNull", 1, 0},
+    // §31.4: `TimeoutException(message: string, inner: Exception)`,
+    // `ArgumentException(message: string, paramName: string)` and
+    // `ArgumentOutOfRangeException(message: string, paramName: string)`. The
+    // position-0 `message` of every standard exception's one- and two-argument
+    // forms is the wildcard in `builtinParamIsNonNullString`; position 1 of the
+    // `paramName` pair needs a row.
+    {"TimeoutException", "", 2, 0},
+    {"ArgumentException", "", 2, 1},
+    {"ArgumentOutOfRangeException", "", 2, 0},
+    {"ArgumentOutOfRangeException", "", 2, 1},
+};
+}  // namespace
+
+bool builtinParamIsNonNullString(std::string_view typeHead,
+                                 std::string_view member,
+                                 std::size_t argCount, std::size_t position) {
+    // §31.4: every standard exception type's constructor surface begins with
+    // `message: string`: `(message: string)`, and `(message: string, cause:
+    // Exception)`, which a type with no declared constructor carries. The one-
+    // and two-argument forms are therefore non-nullable at position 0.
+    if (member.empty() && (argCount == 1 || argCount == 2) && position == 0 &&
+        isBuiltinExceptionName(typeHead))
+        return true;
+    // A primitive receiver or a static call spelled with its keyword (`int.Parse`,
+    // `bool.Parse`) names the same stdlib type as the declared head.
+    std::string_view head = typeHead;
+    if (head == "int") head = "Int32";
+    else if (head == "bool") head = "Boolean";
+    else if (head == "char") head = "Char";
+    else if (head == "double") head = "Double";
+    else if (head == "float") head = "Float";
+    else if (head == "decimal") head = "Decimal";
+    for (const auto& r : kBuiltinNonNullStringParams)
+        if (r.head == head && r.member == member && r.argCount == argCount &&
+            r.position == position)
+            return true;
+    return false;
+}  // per §7.3 (v0.340) / stdlib §2.3–§9.5, §31.4, fix #6782
+
 bool isBuiltinCtorLoweredByName(std::string_view head) {
     return contains(kBuiltinCtorLoweredByNameHeads, head);
 }  // per §22.5 / §17.7, fix #3425 (the #3098 `lowerNew` arm)

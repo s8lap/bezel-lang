@@ -3929,6 +3929,10 @@ private:
     // `head` is the resolved built-in type name, already established as NOT a
     // user type by the caller. // per §22.5 / §17.7, fix #3425
     void checkBuiltinCtorNamedArgs(const ast::NewExpr& ne, const std::string& head);
+    // fix #6782 (§7, §7.3, v0.340): the positional twin of the member check
+    // below, for the declared non-nullable `string` parameters of `head`.
+    void checkBuiltinNullableStringCtorArgs(const ast::NewExpr& ne,
+                                            const std::string& head);
 
     // §5.1: is a value of static type `from` implicitly convertible to
     // `to`? Identity is NOT counted here (that is the "exact" relation,
@@ -4419,6 +4423,10 @@ private:
     // covers the INSTANCE-receiver path only) — its former sibling
     // `IsNullOrEmpty` was retired entirely (fix #3854, stdlib §9.6, v0.290).
     void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
+    // fix #6782 (§7, §7.3, v0.340): the member and static twin of the check
+    // above, for the built-in receivers and type names it does not claim. A
+    // resolved `calleeSym` (user or imported method) is left to checkCallArity.
+    void checkBuiltinNullableStringArgs(const ast::CallExpr& ce, Symbol* calleeSym);
 
     // fix #3398 (spec §22.5 "Optional parameters and named arguments",
     // v0.283; stdlib §1 Conventions — *Window parameters*; §9.6; §3.2):

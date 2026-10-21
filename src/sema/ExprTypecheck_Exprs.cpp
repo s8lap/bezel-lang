@@ -1608,6 +1608,34 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
     // built-in head that is NOT a user type, NOT a generic type parameter, and
     // whose §17.7 closed-surface arms above did not already reject the call.
     checkBuiltinCtorNamedArgs(ne, n);
+    // fix #6782 (§7, §7.3, v0.340): the positional §7 check for the declared
+    // non-nullable `string` parameters of this built-in constructor.
+    checkBuiltinNullableStringCtorArgs(ne, n);
+}
+
+// fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
+// non-nullable target", v0.340): the CONSTRUCTOR twin of
+// `checkBuiltinNullableStringArgs`. A built-in constructor has no
+// MethodSymbol, so `new StringBuilder(null)` and `new KeyNotFoundException
+// (null)` were admitted with a null at a declared non-nullable `string`
+// parameter. Named arguments are left to `checkBuiltinCtorNamedArgs`, as in the
+// member twin.
+void ExprTC::checkBuiltinNullableStringCtorArgs(const ast::NewExpr& ne,
+                                                const std::string& head) {
+    const std::string what = "argument to `" + head + "` constructor";
+    for (std::size_t i = 0; i < ne.args.size(); ++i) {
+        const auto& a = ne.args[i];
+        if (!a.value || a.isDiscard || !a.modifier.empty() || !a.name.empty())
+            continue;
+        if (!common::builtinParamIsNonNullString(head, /*member=*/"",
+                                                 ne.args.size(), i))
+            continue;
+        TypeRef* argTy = ctx_.exprType(*a.value);
+        if (!argTy || !argTy->nullable) continue;
+        checkAssignable(
+            argTy, ctx_.primitiveTypeRef(PrimitiveType::String, /*nullable=*/false),
+            a.value->span.begin, what, a.value.get());
+    }
 }
 
 // fix #3425 (spec §22.5 "Optional parameters and named arguments" and §17.7

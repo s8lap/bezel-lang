@@ -17494,6 +17494,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // `string?` argument is rejected instead of silently accepted.
     checkBuiltinStringCallArgs(ce);
 
+    // fix #6782 (§7, §7.3, v0.340): the same §7 check for the built-in members
+    // and statics the string-receiver check above does not reach, against the
+    // declared non-nullable `string` positions in the registry. Its header
+    // carries the measured set.
+    checkBuiltinNullableStringArgs(ce, calleeSym);
+
     // §22.5 (v0.283, #3398): the BINDING twin of the three per-argument
     // builtin checks around it. Those answer "is this argument's TYPE
     // admissible"; none of them asks which PARAMETER an argument binds to,
@@ -19876,13 +19882,93 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
                 "type converts to neither (\xC2\xA7""5.1)");
             continue;
         }
-        PrimitiveType declared = paramKind(i, argTy->primitive);
+        // fix #6782 (§7, §7.3, v0.340): the `null` literal is typed `Object?`,
+        // which is no char|string overload, so `paramKind` returned None at
+        // `Contains`, `Replace`, `Split` and `LastIndexOf` and the null was
+        // never checked. Read a nullable `Object` as the `string` side of that
+        // overload set: §7 rejects it at every non-nullable target, and the
+        // message is the one `StartsWith(null)` already gives. A NON-nullable
+        // `Object` is not touched here.
+        PrimitiveType argKind = argTy->primitive;
+        if (argTy->nullable && argKind == PrimitiveType::Object)
+            argKind = PrimitiveType::String;
+        PrimitiveType declared = paramKind(i, argKind);
         if (declared == PrimitiveType::None) continue;
         TypeRef* paramTy = ctx_.primitiveTypeRef(declared, /*nullable=*/false);
         checkAssignable(
             argTy, paramTy, a.value->span.begin,
             std::string("argument to `string.") + std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
+}
+
+// fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
+// non-nullable target", v0.340): the MEMBER and STATIC twin of
+// `checkBuiltinStringCallArgs`, for the built-in receivers and type names that
+// one leaves alone: the value built-ins (`TimeSpan`, `DateTime`, `Guid`), the
+// numeric and `bool`/`char` primitives, `StringBuilder`, and the static
+// classes (`int.Parse`, `File.Exists`, `Path.Combine`, `Convert.ToInt32`). A
+// built-in member has no MethodSymbol, so `checkCallArity` never binds its
+// arguments. The declared non-nullable `string` positions come from
+// `common::builtinParamIsNonNullString`. Only an un-narrowed nullable argument,
+// the `null` literal included, is reported here; `checkAssignable` applies the
+// §7.4 narrowing rule through `fromExpr`. A non-nullable argument of the wrong
+// type is a different rule and is not claimed here.
+static std::string_view primitiveKeywordHead(PrimitiveType p) {
+    switch (p) {
+        case PrimitiveType::Int:     return "int";
+        case PrimitiveType::Double:  return "double";
+        case PrimitiveType::Float:   return "float";
+        case PrimitiveType::Decimal: return "decimal";
+        case PrimitiveType::Bool:    return "bool";
+        case PrimitiveType::Char:    return "char";
+        default:                     return {};  // `string` has its own check
+    }
+}
+
+void ExprTC::checkBuiltinNullableStringArgs(const ast::CallExpr& ce,
+                                            Symbol* calleeSym) {
+    // A resolved callee is a user or imported method, whose arguments
+    // `checkCallArity` binds and checks (§22.5, §7).
+    if (calleeSym) return;
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt || member.empty()) return;
+    std::string_view head;
+    if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
+        if (recvTy->kind == TypeRef::Kind::Primitive) {
+            head = primitiveKeywordHead(recvTy->primitive);
+        } else if (recvTy->kind == TypeRef::Kind::Named) {
+            if (!recvTy->declaration) {
+                head = recvTy->headName();
+            } else if (!recvTy->declaration->decl) {
+                // A `builtinClassSym` (`TimeSpan`, `Guid`, ...): no AST, and
+                // the registry decides whether the head is claimed at all.
+                head = recvTy->declaration->name;
+            }
+            // Otherwise a user type: its members carry declarations.
+        }
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+        // A static call `Head.M(...)`: the target is a bare type name with no
+        // value type. The registry claims only the names it carries rows for.
+        head = id->name;
+    }
+    if (head.empty()) return;
+    const std::string what = "argument to `" + std::string(head) + "." +
+                             std::string(member) + "`";
+    for (std::size_t i = 0; i < ce.args.size(); ++i) {
+        const auto& a = ce.args[i];
+        // A named argument binds by name, not position: left to
+        // `checkBuiltinNamedArgs`, so the position read here is not trusted.
+        if (!a.value || a.isDiscard || !a.modifier.empty() || !a.name.empty())
+            continue;
+        if (!common::builtinParamIsNonNullString(head, member, ce.args.size(),
+                                                 i))
+            continue;
+        TypeRef* argTy = ctx_.exprType(*a.value);
+        if (!argTy || !argTy->nullable) continue;
+        checkAssignable(
+            argTy, ctx_.primitiveTypeRef(PrimitiveType::String, /*nullable=*/false),
+            a.value->span.begin, what, a.value.get());
     }
 }
 
