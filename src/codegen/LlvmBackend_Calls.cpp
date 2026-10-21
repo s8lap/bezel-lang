@@ -2068,6 +2068,92 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
         return builder_.CreateICmpEQ(el, target);
     }
 
+    // ── 1b. VALUE element that DECLARES ITS OWN EQUALITY (§9.2, §3.6) ──────
+    // fix #6665 (stdlib §4 *Equality search*, §9.2, §3.6, v0.339): the equality
+    // search compares "by `Equals`", and a record or value-like choice that
+    // declares the own-typed `Equals` with its `GetHashCode` has THAT as its
+    // `Equals` (the kind's `Object` slot, §9.2), not the synthesized structural
+    // one. Steps 2 and 6 below hand the value family to `emitValueEquality`,
+    // which compares structurally and never calls the declared member: MEASURED
+    // `Array<B>.Contains(new B(35))` over `B(5)` under an `X mod 10` `Equals`
+    // answered False where `Set<B>.Contains` answered True. The declared pair is
+    // read by `userValueEqualityPair`, the one reader the hash-container
+    // trampolines (#5997) already share, so every equality search agrees with
+    // `Set`/`Dictionary` about which members are the equality.
+    //
+    // `l`/`r` are values of the element's struct type (a spilled operand is
+    // loaded first); both are spilled so the member takes `this` by pointer and
+    // `other` as its lowering wants it (the trampoline's shape).
+    {
+        const sema::TypeSymbol* ets =
+            (ty && ty->kind == K::Named) ? ty->declaration : nullptr;
+        if (ets && (ets->kind == ast::TypeDeclKind::Record ||
+                    ets->kind == ast::TypeDeclKind::Choice)) {
+            RecordSubstGuard elemSubst(this, ty);
+            llvm::Function* userEq = nullptr;
+            llvm::Function* userHash = nullptr;
+            if (userValueEqualityPair(ets, userEq, userHash)) {
+                auto callUserEq = [&](llvm::Value* lv, llvm::Value* rv) {
+                    llvm::Type* vt = lv->getType();
+                    if (vt->isPointerTy()) vt = rv->getType();
+                    if (lv->getType()->isPointerTy())
+                        lv = builder_.CreateLoad(vt, lv);
+                    if (rv->getType()->isPointerTy())
+                        rv = builder_.CreateLoad(vt, rv);
+                    llvm::AllocaInst* lSpill = entryAlloca(vt);
+                    llvm::AllocaInst* rSpill = entryAlloca(vt);
+                    builder_.CreateStore(lv, lSpill);
+                    builder_.CreateStore(rv, rSpill);
+                    llvm::Value* other =
+                        userEq->getFunctionType()->getParamType(1)->isPointerTy()
+                            ? static_cast<llvm::Value*>(rSpill) : rv;
+                    llvm::Value* eq = builder_.CreateCall(
+                        userEq->getFunctionType(), userEq, {lSpill, other});
+                    // §31.2: a throwing `Equals` ends the search at the throw
+                    // and propagates to the enclosing handler, the same
+                    // pending check the class-override arm gets from
+                    // `emitMethodCall` (CG20).
+                    emitPendingCheck();
+                    return eq;
+                };
+                if (!ty->nullable) {
+                    if (el->getType()->isPointerTy() ||
+                        el->getType()->isStructTy())
+                        return callUserEq(el, target);
+                } else if (isNullableValueTy(ty)) {
+                    // §8.4 null-safe: both absent equal, one absent unequal,
+                    // both present -> the declared `Equals`. The member runs
+                    // only when both operands hold a value.
+                    llvm::Value* l = ensureNullableElementValue(ty, el);
+                    llvm::Value* r = ensureNullableElementValue(ty, target);
+                    if (l->getType()->isStructTy() && r->getType()->isStructTy()) {
+                        llvm::Value* lHas = nullablePrimHasValue(l);
+                        llvm::Value* rHas = nullablePrimHasValue(r);
+                        llvm::Value* tagsEq = builder_.CreateICmpEQ(lHas, rHas);
+                        llvm::Value* bothHave = builder_.CreateAnd(lHas, rHas);
+                        auto* callBB = llvm::BasicBlock::Create(
+                            llvm_, "rmi.ue.call", currentFn_);
+                        auto* joinBB = llvm::BasicBlock::Create(
+                            llvm_, "rmi.ue.join", currentFn_);
+                        llvm::BasicBlock* headBB = builder_.GetInsertBlock();
+                        builder_.CreateCondBr(bothHave, callBB, joinBB);
+                        builder_.SetInsertPoint(callBB);
+                        llvm::Value* ce = callUserEq(nullablePrimValue(l),
+                                                     nullablePrimValue(r));
+                        llvm::BasicBlock* callEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(joinBB);
+                        builder_.SetInsertPoint(joinBB);
+                        llvm::PHINode* phi =
+                            builder_.CreatePHI(i1(), 2, "rmi.ue");
+                        phi->addIncoming(tagsEq, headBB);  // not both present
+                        phi->addIncoming(ce, callEnd);
+                        return phi;
+                    }
+                }
+            }
+        }
+    }
+
     // ── 2. NULLABLE VALUE element (§17.5 / §8.4) ───────────────────────────
     // `Array<int?>`, `Set<Color?>`, `Array<P?>`, `Array<Guid?>`, a `T?` span
     // slot: the tagged `{i8 hasValue, T value}` struct. §17.5: "Where the
