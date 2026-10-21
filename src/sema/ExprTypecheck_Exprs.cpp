@@ -11608,6 +11608,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 dynamic_cast<ParameterSymbol*>(asym)) {
                                 narrowings_.erase(asym);
                                 erasePendingTypeFact(asym);  // pending #6083
+                                noteTypeKill(asym);          // #6730
                                 nullNarrowed_.erase(asym);
                                 initNarrowed_.erase(asym);  // init-narrowing (§6.6) also invalidated by out/ref
                                 noteNarrowKill(asym);       // #6673

@@ -465,18 +465,32 @@ private:
     // visit hides the open logs: its stores run when the lambda is invoked,
     // which `capturedKill` accounts for at the call. Insertion-only sets read
     // by membership: no iteration-order dependence (#2116).
+    //
+    // fix #6730 (§7.4 *Narrowing across `try`*, §12.7, v0.340): `typeSyms` is
+    // the §12.7 type-fact counterpart. Any store to a carrier (whatever the
+    // value's nullability) and a `ref`/`out` argument invalidate its type
+    // fact, so they are recorded apart from `syms`, which records only the
+    // stores that invalidate a null fact.
     struct NarrowKillLog {
         std::unordered_set<Symbol*> syms;
+        std::unordered_set<Symbol*> typeSyms;   // #6730
         bool capturedKill = false;   // a call that can reach a capturing closure
     };
     std::vector<NarrowKillLog> narrowKillLogs_;
     void noteNarrowKill(Symbol* s) {
         for (auto& l : narrowKillLogs_) l.syms.insert(s);
     }
+    void noteTypeKill(Symbol* s) {   // #6730
+        for (auto& l : narrowKillLogs_) l.typeSyms.insert(s);
+    }
     bool narrowKilledIn(const NarrowKillLog& log, Symbol* s) const;
     // Erase from `set` every symbol `log` records as invalidated.
     void eraseNarrowKills(std::unordered_set<Symbol*>& set,
                           const NarrowKillLog& log) const;
+    // #6730: erase from `types` every type fact `log` records as invalidated
+    // (a carrier's own entry, and the pending #6083 records keyed for it).
+    void eraseTypeKills(std::unordered_map<Symbol*, TypeRef*>& types,
+                        const NarrowKillLog& log) const;
 
     // §7.4 (v0.182, #1566): the set of local/parameter NAMES that are "mutably
     // captured" — assigned, or passed `ref`/`out`, anywhere inside ANY lambda of

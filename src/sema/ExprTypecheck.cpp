@@ -16362,6 +16362,31 @@ void ExprTC::eraseNarrowKills(std::unordered_set<Symbol*>& set,
     }
 }
 
+// fix #6730: see NarrowKillLog in ExprTypecheck_impl.hpp. A pending #6083
+// record is keyed by a private symbol that carries the carrier's name, so the
+// captured-kill rule (by name) covers it; a store or `ref`/`out` argument is
+// logged against the carrier, whose keys pendingTypeFactKeys_ lists.
+void ExprTC::eraseTypeKills(std::unordered_map<Symbol*, TypeRef*>& types,
+                            const NarrowKillLog& log) const {
+    std::unordered_set<Symbol*> killedKeys;
+    for (Symbol* c : log.typeSyms) {
+        auto pk = pendingTypeFactKeys_.find(c);
+        if (pk == pendingTypeFactKeys_.end()) continue;
+        for (const PendingTypeFactKey& k : pk->second) killedKeys.insert(k.key);
+    }
+    for (auto it = types.begin(); it != types.end();) {
+        Symbol* s = it->first;
+        bool killed = log.typeSyms.count(s) > 0 || killedKeys.count(s) > 0;
+        if (!killed && log.capturedKill && s) {
+            auto* ls = dynamic_cast<LocalSymbol*>(s);
+            killed = !(ls && ls->isConst) &&
+                     mutablyCapturedNames_.count(s->name) > 0;
+        }
+        if (killed) it = types.erase(it);
+        else ++it;
+    }
+}
+
 // §7.4 (issue #2118): join the narrowing state across a loop body's two
 // reaching paths. A loop body may run zero times, so the after-loop state is
 // the INTERSECTION of the entry sets (zero-iteration path) and the current
@@ -23370,6 +23395,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                         narrowings_.erase(tsym);
                         erasePendingTypeFact(tsym);  // pending #6083
+                        noteTypeKill(tsym);          // #6730
                     }
                 }
             }
@@ -25971,7 +25997,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto tryEntryField = fieldNarrowed_;
         auto tryEntryNull = nullNarrowed_;
         auto tryEntryInit = initNarrowed_;
+        const auto tryEntryTypes = narrowings_;   // #6730
         const std::uint64_t tryDropEpoch0 = fieldFactDropEpoch_;
+        // fix #6682 (§7.4 *Narrowing across `try`*, v0.340): "A `break` or
+        // `continue` leaving the block or an arm carries its own path's facts
+        // to its target, as elsewhere, the `finally`'s own statements applying
+        // to them on the way". recordLoopEdgeNarrowing snapshots a jump's
+        // state at the jump, before the `finally` is walked. Mark how many
+        // edges each enclosing loop's collector holds now; the edges past the
+        // mark were recorded by the block or an arm, and the `finally` is
+        // applied to them once it has been walked (below). A loop opened
+        // inside the `try` has popped its collector by then.
+        std::vector<std::size_t> tryEdgeMarks;
+        tryEdgeMarks.reserve(loopEdgeNarrowing_.size());
+        for (const auto& col : loopEdgeNarrowing_)
+            tryEdgeMarks.push_back(col.nullEdges.size());
         // fix #6673 (§7.4, §31.2, v0.339): "a fact holds at a point only when
         // it holds on every path that reaches it". A catch arm is reached from
         // any point of the protected block, and the `finally` from any point of
@@ -26028,9 +26068,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // valid at every interrupt point); otherwise only AMBIENT entry
         // facts (rootId 0 — never droppable) survive. Establishments inside
         // the body never enter (a throw may precede the establishing guard);
-        // the running base is further shrunk by each earlier arm's exit (an
+        // the running base is further shrunk by each earlier arm's guard (an
         // earlier arm's GUARD may evaluate at runtime before a later arm is
-        // tried, so its drops must persist).
+        // tried, so its drops must persist; #6730: its body's need not).
         auto catchRunningField = tryEntryField;
         if (fieldFactDropEpoch_ != tryDropEpoch0)
             catchRunningField.erase(catchRunningField.lower_bound({1u, 0u}),
@@ -26067,6 +26107,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // an interior point that a later store masks at its end.
         eraseNarrowKills(catchRunningNull, bodyKills);
         eraseNarrowKills(catchRunningInit, bodyKills);
+        // fix #6730 (§7.4 *Narrowing across `try`*, v0.340): the §12.7 type
+        // facts get the same arm entry — "the facts that held at entry to the
+        // protected block, less every fact the block invalidates at any
+        // point, and no fact the block establishes reaches them". Before, an
+        // arm was walked in the previous arm's (or the block's) exit state,
+        // so a fact the block established (a pending #6083 record after
+        // `if o is not Dog then return 0; end;`) reached the arm, and an
+        // entry fact invalidated on a path that then left the block (`if c
+        // then a := new Animal(); Boom(); return 0; end;` — the `if` join
+        // keeps the entry fact, since that branch does not fall through)
+        // stayed in force. Keep the entry facts the block's exit holds at the
+        // same type, less those its kill log records (typeSyms).
+        auto catchRunningTypes = tryEntryTypes;
+        for (auto it = catchRunningTypes.begin();
+             it != catchRunningTypes.end();) {
+            auto a = narrowings_.find(it->first);
+            if (a != narrowings_.end() && a->second == it->second) ++it;
+            else it = catchRunningTypes.erase(it);
+        }
+        eraseTypeKills(catchRunningTypes, bodyKills);
+        // The type-fact twins of tryJoinNull (completing exits) and
+        // finJoinNull (every exit), built per arm below.
+        auto tryJoinTypes = narrowings_;
+        auto finJoinTypes = narrowings_;
         // §7.4 #2164: the after-try join is after-body ∩ every catch's
         // exit. Initialized to afterBodyNull once, then shrunken by each
         // arm's exit (the same shape tryJoinField has for the field set,
@@ -26125,6 +26189,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             fieldNarrowed_ = catchRunningField;          // §7.4 #2116
             nullNarrowed_ = catchRunningNull;            // §7.4 #2164
             initNarrowed_ = catchRunningInit;
+            narrowings_ = catchRunningTypes;             // #6730
             // §31.2: a `catch var e: T` arm binds the caught exception
             // to `e` (a borrow of the caught type) in the guard and
             // body scope. The binding's decl anchors on the arm body so
@@ -26177,6 +26242,39 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 ArmGuardFacts guardFacts(*this);
                 if (arm.guard) {
                     visitExpr(*arm.guard);
+                    // fix #6730 (§7.4 *Narrowing across `try`*, §31.2.1,
+                    // v0.340): "a later arm's entry further loses what an
+                    // earlier arm's guard invalidates (a guard runs whether
+                    // or not its arm is then selected)". Only the guard: the
+                    // arm's BODY runs only when the arm is selected, and then
+                    // no later arm of this `try` runs. The state here is the
+                    // guard's exit before its true-facts are seeded, so the
+                    // intersection drops exactly what the guard invalidated.
+                    // Before, the next arm's base was intersected with this
+                    // arm's EXIT, so a body store rejected a later arm's read.
+                    for (auto it = catchRunningNull.begin();
+                         it != catchRunningNull.end();) {
+                        if (nullNarrowed_.count(*it)) ++it;
+                        else it = catchRunningNull.erase(it);
+                    }
+                    for (auto it = catchRunningInit.begin();
+                         it != catchRunningInit.end();) {
+                        if (initNarrowed_.count(*it)) ++it;
+                        else it = catchRunningInit.erase(it);
+                    }
+                    for (auto it = catchRunningField.begin();
+                         it != catchRunningField.end();) {
+                        if (fieldNarrowed_.count(*it)) ++it;
+                        else it = catchRunningField.erase(it);
+                    }
+                    for (auto it = catchRunningTypes.begin();
+                         it != catchRunningTypes.end();) {
+                        auto g = narrowings_.find(it->first);
+                        if (g != narrowings_.end() && g->second == it->second)
+                            ++it;
+                        else
+                            it = catchRunningTypes.erase(it);
+                    }
                     guardFacts.seed(*arm.guard);
                 }
                 // Slice S27: a bare `throw;` is valid inside a catch
@@ -26186,28 +26284,36 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 --catchDepth_;
             }
             currentScope_ = saveScope;
-            // §7.4 #2116: fold this catch arm's exit into the after-try join
-            // AND the next arm's running base.
+            // §7.4 #2116: fold this catch arm's exit into the after-try join.
+            // fix #6730: no longer into the next arm's running base, which
+            // lost this arm's guard effect above; its body's does not reach
+            // a later arm.
             for (auto it = tryJoinField.begin(); it != tryJoinField.end();) {
                 if (fieldNarrowed_.count(*it)) ++it;
                 else it = tryJoinField.erase(it);
             }
-            for (auto it = catchRunningField.begin();
-                 it != catchRunningField.end();) {
-                if (fieldNarrowed_.count(*it)) ++it;
-                else it = catchRunningField.erase(it);
-            }
-            // §7.4 #2164: same after-arm / next-arm intersection for the
-            // local set. tryJoinNull is the after-try join (after-body ∩
-            // every catch exit); catchRunningNull is the next-arm base
-            // (each new arm starts from entry ∩ after-body ∩ earlier
-            // arms' exits, shrinking as arms diverge).
+            auto keepSameTypes =
+                [this](std::unordered_map<Symbol*, TypeRef*>& m) {
+                    for (auto it = m.begin(); it != m.end();) {
+                        auto x = narrowings_.find(it->first);
+                        if (x != narrowings_.end() && x->second == it->second)
+                            ++it;
+                        else
+                            it = m.erase(it);
+                    }
+                };
+            keepSameTypes(finJoinTypes);   // #6730
+            // §7.4 #2164: same after-arm intersection for the local set.
+            // tryJoinNull is the after-try join (after-body ∩ every
+            // completing catch exit).
             if (!armBodyLeaves(arm.body.get())) {   // #6673
                 if (!anyFallThrough) {
                     tryJoinNull = nullNarrowed_;
                     tryJoinInit = initNarrowed_;
+                    tryJoinTypes = narrowings_;   // #6730
                     anyFallThrough = true;
                 } else {
+                    keepSameTypes(tryJoinTypes);  // #6730
                     for (auto it = tryJoinNull.begin();
                          it != tryJoinNull.end();) {
                         if (nullNarrowed_.count(*it)) ++it;
@@ -26227,16 +26333,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             for (auto it = finJoinInit.begin(); it != finJoinInit.end();) {
                 if (initNarrowed_.count(*it)) ++it;
                 else it = finJoinInit.erase(it);
-            }
-            for (auto it = catchRunningNull.begin();
-                 it != catchRunningNull.end();) {
-                if (nullNarrowed_.count(*it)) ++it;
-                else it = catchRunningNull.erase(it);
-            }
-            for (auto it = catchRunningInit.begin();
-                 it != catchRunningInit.end();) {
-                if (initNarrowed_.count(*it)) ++it;
-                else it = catchRunningInit.erase(it);
             }
         }
         // §7.4 (v0.214, #2116 pre-gate review): the FINALLY body runs on every
@@ -26277,6 +26373,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             }
             nullNarrowed_ = std::move(finEntryNull);
             initNarrowed_ = std::move(finEntryInit);
+            // fix #6730: the type facts likewise — the try-entry facts no
+            // point of the block or of an arm invalidated, bounded by every
+            // exit (the arms were walked from their own entry, not threaded).
+            auto finEntryTypes = tryEntryTypes;
+            eraseTypeKills(finEntryTypes, regionKills);
+            for (auto it = finEntryTypes.begin(); it != finEntryTypes.end();) {
+                auto x = finJoinTypes.find(it->first);
+                if (x != finJoinTypes.end() && x->second == it->second) ++it;
+                else it = finEntryTypes.erase(it);
+            }
+            narrowings_ = std::move(finEntryTypes);
         }
         narrowKillLogs_.emplace_back();   // the `finally` block
         // per §31.2: `return` inside a `finally` block is a compile error.
@@ -26314,7 +26421,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // facts survive only if the finally visit fired no drop edge). The
         // finally's exit facts join in: the finally runs to completion on
         // every path that reaches this point.
-        if (fieldFactDropEpoch_ != finDropEpoch0)
+        const bool finFiredDrop = fieldFactDropEpoch_ != finDropEpoch0;
+        const auto finExitField = fieldNarrowed_;   // #6682, below
+        if (finFiredDrop)
             tryJoinField.erase(tryJoinField.lower_bound({1u, 0u}),
                                tryJoinField.end());
         tryJoinField.insert(fieldNarrowed_.begin(), fieldNarrowed_.end());
@@ -26336,11 +26445,54 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // With no completing path the point is unreachable; keep the exit.
         const NarrowKillLog finKills = std::move(narrowKillLogs_.back());
         narrowKillLogs_.pop_back();
+        // fix #6682 (§7.4 *Narrowing across `try`*, §31.2, v0.340): a `break`
+        // or `continue` that left the block or an arm passed through the
+        // `finally` on its way to the loop, so the `finally`'s statements
+        // apply to the edge's facts exactly as to a completing path's: a fact
+        // survives unless the `finally` invalidated it, and what the `finally`
+        // holds at its exit holds. (Its exit facts hold on that edge too: an
+        // entry fact in them was invalidated nowhere in the region, and the
+        // rest the `finally` itself established.) The §12.7 type facts the
+        // same way, through the log's typeSyms (#6730).
+        // `nullNarrowed_` / `initNarrowed_` / `narrowings_` hold the
+        // `finally`'s exit state here.
+        if (!trys->finallyBody.empty()) {
+            const std::size_t nCols =
+                std::min(tryEdgeMarks.size(), loopEdgeNarrowing_.size());
+            for (std::size_t c = 0; c < nCols; ++c) {
+                auto& col = loopEdgeNarrowing_[c];
+                for (std::size_t e = tryEdgeMarks[c]; e < col.nullEdges.size();
+                     ++e) {
+                    eraseNarrowKills(col.nullEdges[e], finKills);
+                    eraseNarrowKills(col.initEdges[e], finKills);
+                    col.nullEdges[e].insert(nullNarrowed_.begin(),
+                                            nullNarrowed_.end());
+                    col.initEdges[e].insert(initNarrowed_.begin(),
+                                            initNarrowed_.end());
+                    eraseTypeKills(col.typeEdges[e], finKills);
+                    col.typeEdges[e].insert(narrowings_.begin(),
+                                            narrowings_.end());
+                    auto& fe = col.fieldEdges[e];
+                    if (finFiredDrop)
+                        fe.erase(fe.lower_bound({1u, 0u}), fe.end());
+                    fe.insert(finExitField.begin(), finExitField.end());
+                }
+            }
+        }
         if (anyFallThrough) {
             eraseNarrowKills(tryJoinNull, finKills);
             eraseNarrowKills(tryJoinInit, finKills);
             nullNarrowed_.insert(tryJoinNull.begin(), tryJoinNull.end());
             initNarrowed_.insert(tryJoinInit.begin(), tryJoinInit.end());
+            // fix #6730 (§7.4 *Narrowing across `try`*, v0.340): "the point
+            // after the statement ... holds the facts common to those exits
+            // ... and the `finally`'s own statements then establish and
+            // invalidate as any straight-line code does" — for the type
+            // facts too. Before, they were the `finally`'s exit as threaded
+            // through every arm, so an arm that left (`return`) still cost
+            // the point after the `try` the facts it invalidated.
+            eraseTypeKills(tryJoinTypes, finKills);
+            narrowings_.insert(tryJoinTypes.begin(), tryJoinTypes.end());
         }
     } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         // §29.9: `yield` is a method-level construct only — `yield return` and
