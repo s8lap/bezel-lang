@@ -29388,6 +29388,21 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // isLinqOperator table (a different question, not a copy).
                     bool isLinqOp =
                         common::isStringLinqOperatorMemberName(ma.member);
+                    // fix #6805 (language spec §27.6, v0.340; stdlib §5): a
+                    // BARE reference to a §5 operator on a string is
+                    // dispatched structurally (no method symbol), so it
+                    // would degrade to a zero function value (#2434); the
+                    // CALL form is typed by typeCall.
+                    if (isLinqOp && &ma != calleeOfCallCtx_) {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            bareStructuralMemberReference("string",
+                                                          ma.member));
+                        return;
+                    }
                     if (!isLinqOp) {
                         // Emit a diagnostic for unrecognized string members.
                         //
@@ -33894,6 +33909,20 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 return;
             }
         }
+    }
+    // fix #6805 (language spec §27.6, v0.340; stdlib §5; the `?.` twin of the
+    // `.` string arm): a bare `s?.<§5 operator>` on a string left the node
+    // untyped, so the local degraded to a zero function value (#2434).
+    if (!member && &nm != calleeOfCallCtx_ && recvTyForDiag &&
+        recvTyForDiag->kind == TypeRef::Kind::Primitive &&
+        recvTyForDiag->primitive == PrimitiveType::String &&
+        common::isStringLinqOperatorMemberName(nm.member)) {
+        SourceLocation loc = nm.span.begin;
+        if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            bareStructuralMemberReference("string", nm.member));
+        return;
     }
     if (!member) {
         // #3019 (§9.2/§9.3/§35.7): the `?.` form of a direct Equals/GetHashCode
