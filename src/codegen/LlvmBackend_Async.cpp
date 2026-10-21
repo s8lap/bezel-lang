@@ -1,3 +1,4 @@
+#include <llvm/ADT/ScopeExit.h>
 #include "codegen/LlvmBackend_impl.hpp"
 
 #include <set>
@@ -1210,6 +1211,25 @@ void Emitter::deferChainedAsyncReturnSource(const ast::Expr* valueExpr) {
 void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                               const CallableInfo& ci) {
     if (!ci.stmts) return;
+    // fix #6837/#6838 (§9.4, §30.1, v0.340): the Resume/MoveNext bodies of an
+    // async/iterator member on an enum (or an extension over one) are emitted
+    // here, not in emitFunctionBody, so `this` needs the same CG30 enum-receiver
+    // wiring (enumTypeOf): without it `int(this)` read an unsigned-backed
+    // value as signed and `case this` arms could not resolve.
+    const sema::TypeSymbol* savedEnumRecv_ = currentEnumMethod_;
+    if (!isStaticMethod(ms)) {
+        if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Enum) {
+            currentEnumMethod_ = ms->parent;
+        } else if (isExtensionMethod(ms) && ms->extensionDecl &&
+                   ms->extensionDecl->targetType) {
+            if (auto* ert = ctx_.resolvedType(*ms->extensionDecl->targetType))
+                if (ert->declaration &&
+                    ert->declaration->kind == ast::TypeDeclKind::Enum)
+                    currentEnumMethod_ = ert->declaration;
+        }
+    }
+    auto restoreEnumRecv_ = llvm::make_scope_exit(
+        [&] { currentEnumMethod_ = savedEnumRecv_; });
     // fix #2895 (§29.3 / §30.1 / §30.7, v0.240): retract the entire
     // suspend/resume frame on every exit (including the diagnostic early
     // returns below). Replaces the partial clear inside the Resume body
@@ -3088,6 +3108,25 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
 void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                                       const CallableInfo& ci) {
     if (!ci.stmts) return;
+    // fix #6837/#6838 (§9.4, §30.1, v0.340): the Resume/MoveNext bodies of an
+    // async/iterator member on an enum (or an extension over one) are emitted
+    // here, not in emitFunctionBody, so `this` needs the same CG30 enum-receiver
+    // wiring (enumTypeOf): without it `int(this)` read an unsigned-backed
+    // value as signed and `case this` arms could not resolve.
+    const sema::TypeSymbol* savedEnumRecv_ = currentEnumMethod_;
+    if (!isStaticMethod(ms)) {
+        if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Enum) {
+            currentEnumMethod_ = ms->parent;
+        } else if (isExtensionMethod(ms) && ms->extensionDecl &&
+                   ms->extensionDecl->targetType) {
+            if (auto* ert = ctx_.resolvedType(*ms->extensionDecl->targetType))
+                if (ert->declaration &&
+                    ert->declaration->kind == ast::TypeDeclKind::Enum)
+                    currentEnumMethod_ = ert->declaration;
+        }
+    }
+    auto restoreEnumRecv_ = llvm::make_scope_exit(
+        [&] { currentEnumMethod_ = savedEnumRecv_; });
     // fix #2895 (§29.3 / §30.1 / §30.7, v0.240): retract the entire
     // suspend/resume frame on every exit from this emitter (the partial
     // clear at ~2767 happens BEFORE the Dispose body and is defensive; this

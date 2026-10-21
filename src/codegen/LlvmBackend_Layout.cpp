@@ -63,7 +63,7 @@ bool Emitter::isUnsignedBinOperand(const ast::BinaryExpr& bin) {
         // §11.8 (v0.176, #807): a T-typed operand under a constraint-operator
         // dispatch — resolve the type parameter to its concrete substitution
         // so a `T = uint/ulong` specialization selects the unsigned ops.
-        return typeRefIsUnsigned(resolveTypeParamRef(ctx_.exprType(*e)));
+        return isUnsignedTargetExpr(*e);
     };
     return unsignedExpr(bin.left.get()) && unsignedExpr(bin.right.get());
 }
@@ -74,6 +74,13 @@ bool Emitter::isUnsignedTargetExpr(const ast::Expr& e) {
     // is that of its underlying primitive (byte/ushort/uint/ulong → unsigned).
     // §11.8 (v0.176, #807): resolve a T-typed operand through the active
     // substitution first (constraint-operator dispatch on T = uint/ulong).
+    // fix #6838 (§5.4, §10.3, v0.340): sema records no exprType for `this`
+    // inside an enum member (CG30), so the signedness of an unsigned-backed
+    // enum receiver (`int(this)` on a byte enum's 200) was read as signed and
+    // sign-extended to -56. Recover the enum the same way enumTypeOf does.
+    if (!ctx_.exprType(e))
+        if (const sema::TypeSymbol* et = enumTypeOf(e))
+            return enumIsUnsigned(et);
     return typeRefIsUnsigned(resolveTypeParamRef(ctx_.exprType(e)));
 }
 
