@@ -1863,6 +1863,40 @@ bool isLinqHashableOperator(std::string_view m) {
            m == "Except"   || m == "Contains" || m == "ToSet";
 }
 
+// fix #6740 (stdlib §5 `IGrouping<TKey, T>`, §4.12, v0.340): the diagnostic
+// for a bare (non-callee) member access `g.<name>` / `g?.<name>` on an
+// `IGrouping<TKey, T>` receiver, or "" when `name` needs no rejection here.
+// `IGrouping` declares exactly one member, `Key`, and inherits
+// `IEnumerable<T>` (§4.12: `GetEnumerator` only) plus §5's operators and
+// `Object`'s members. Every other bare name is undeclared and, left untyped,
+// reached codegen (malformed IR / a statement dropped behind an `internal:`
+// warning). `Count` / `Length` keep #6714's wording. A bare name that IS an
+// operator or an `Object` member is a method reference (§27.6), not an
+// undeclared property, and is left to the existing path.
+std::string igroupingBareMemberReject(std::string_view name) {
+    static const char* const methods[] = {
+        "Aggregate", "All", "Any", "Average", "Concat", "Contains",
+        "Distinct", "ElementAt", "ElementAtOrNull", "Except", "First",
+        "FirstOrNull", "GroupBy", "Intersect", "Last", "LastOrNull", "Max",
+        "MaxOrNull", "Min", "MinOrNull", "OrderBy", "OrderByDescending",
+        "Reverse", "Select", "SelectMany", "Single", "SingleOrNull", "Skip",
+        "SkipWhile", "Sum", "Take", "TakeWhile", "ThenBy", "ThenByDescending",
+        "ToArray", "ToDictionary", "ToSet", "Union", "Where", "Zip",
+        "GetEnumerator", "ToString", "Equals", "GetHashCode", "GetType"};
+    if (name == "Key") return "";
+    if (name == "Count")
+        return "no member `Count` on `IGrouping<TKey, T>`: it declares only "
+               "`Key` and no count property — use the `Count()` operator "
+               "(stdlib §5)";
+    if (name == "Length")
+        return "no member `Length` on `IGrouping<TKey, T>`: it declares only "
+               "`Key` and no length — use the `Count()` operator (stdlib §5)";
+    for (const char* m : methods)
+        if (name == m) return "";
+    return "no member `" + std::string(name) +
+           "` on `IGrouping<TKey, T>`: it declares only `Key` (stdlib §5)";
+}
+
 // fix #3730 (stdlib §4.18 / §26.5 rule 1, v0.286), sharpened after review:
 // whether one of the six `isLinqHashableOperator` operators' applicability
 // gate should run AT ALL for a given (receiver family, operator name) pair.
@@ -26808,25 +26842,35 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctx_.setExprType(&ma, tt->genericArgs[0]);
                 return;
             }
-            // fix #6714 (stdlib §5 `IGrouping<TKey, T>`, §4.12, v0.339):
-            // `IGrouping` declares exactly one member, `Key`, and inherits
-            // `IEnumerable<T>`, which declares no count/length property (the
-            // element count is §5's `Count()` operator). The bare spellings
-            // used to return here untyped and reach codegen (malformed IR).
-            // The call spelling `g.Count()` is the operator and stays accepted.
-            if ((ma.member == "Count" || ma.member == "Length") &&
-                &ma != calleeOfCallCtx_) {
-                auto loc = ma.span.begin;
-                if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
-                ctx_.diagnostics().report(
-                    Severity::Error, loc,
-                    "no member `" + std::string(ma.member) +
-                        "` on `IGrouping<TKey, T>`: it declares only `Key` and "
-                        "no " +
-                        (ma.member == "Count" ? "count property" : "length") +
-                        " — use the `Count()` operator (stdlib §5)");
+            // fix #6714 / #6740 (stdlib §5 `IGrouping<TKey, T>`, §4.12,
+            // v0.340): any bare member other than `Key` (see
+            // `igroupingBareMemberReject`). The call spelling `g.Count()` is
+            // the operator and stays accepted.
+            if (&ma != calleeOfCallCtx_) {
+                std::string msg = igroupingBareMemberReject(ma.member);
+                if (!msg.empty()) {
+                    auto loc = ma.span.begin;
+                    if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                    ctx_.diagnostics().report(Severity::Error, loc, msg);
+                }
             }
             return;
+        }
+        // fix #6740 (stdlib §5, §4.12, v0.340): the IMPORTED `IGrouping`
+        // (ModuleLoader's reconstruction of a builtin: Named, no declaration,
+        // no astNode, name only in `importedName`, §2.5) names the same
+        // one-member interface, so a bare undeclared name is rejected as for
+        // the in-module shape above. `Key` and callee uses are untouched.
+        if (tt && tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+            !tt->astNode && tt->importedName == "IGrouping" &&
+            &ma != calleeOfCallCtx_) {
+            std::string msg = igroupingBareMemberReject(ma.member);
+            if (!msg.empty()) {
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                ctx_.diagnostics().report(Severity::Error, loc, msg);
+                return;
+            }
         }
         if (tt && tt->kind == TypeRef::Kind::Named) {
             targetType = tt->declaration;
@@ -33304,22 +33348,18 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                                            /*nullable=*/true));
             return;
         }
-        // fix #6714 (stdlib §5, §4.12, v0.339): the bare `g?.Count` /
-        // `g?.Length` name no member (IGrouping declares only `Key`; the count
-        // is the `Count()` operator). Left untyped they dropped the enclosing
-        // statement behind an `internal:` warning; reject like the `.` form.
-        if ((nm.member == "Count" || nm.member == "Length") &&
-            &nm != calleeOfCallCtx_) {
-            SourceLocation loc = nm.span.begin;
-            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                "no member `" + std::string(nm.member) +
-                    "` on `IGrouping<TKey, T>`: it declares only `Key` and "
-                    "no " +
-                    (nm.member == "Count" ? "count property" : "length") +
-                    " — use the `Count()` operator (stdlib §5)");
-            return;
+        // fix #6714 / #6740 (stdlib §5, §4.12, v0.340): the bare `g?.<name>`
+        // for any name but `Key` (see `igroupingBareMemberReject`); the `.`
+        // form rejects likewise. Left untyped it dropped the enclosing
+        // statement behind an `internal:` warning.
+        if (&nm != calleeOfCallCtx_) {
+            std::string msg = igroupingBareMemberReject(nm.member);
+            if (!msg.empty()) {
+                SourceLocation loc = nm.span.begin;
+                if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+                ctx_.diagnostics().report(Severity::Error, loc, msg);
+                return;
+            }
         }
     }
     if (!member) {
