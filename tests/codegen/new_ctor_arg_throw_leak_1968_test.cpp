@@ -44,22 +44,13 @@
 //        the immediate arg-throw, LSan-clean, rc=0.
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway (mirrors #1934).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // T1 — the exact #1968 repro: a LATER ctor argument throws; the calloc'd `C` is
 // reclaimed on the arg-eval unwind (no owned transfer needed to reproduce).
@@ -199,7 +190,7 @@ const char* kFirstArgThrows =
 // ── T1: §28.3 — a later ctor argument that throws frees the calloc'd block ────
 BEZEL_TEST(new_ctor_arg_throw_leak_1968, plain_later_arg_throws_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kPlainLaterArgThrows);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // compiled + LSan-clean (obj block freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // exception caught
 }
@@ -207,7 +198,7 @@ BEZEL_TEST(new_ctor_arg_throw_leak_1968, plain_later_arg_throws_lsan_clean_spec_
 // ── T2: §28.3 — raw block freed AND transferred owned arg disposed once ───────
 BEZEL_TEST(new_ctor_arg_throw_leak_1968, owned_arg_plus_later_throw_disposed_once_spec_28_3) {
     JitResult r = runAotChecked(kOwnedArgThenLaterArgThrows);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean: Pair block freed (this fix), owned x disposed once
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // exception caught
 }
@@ -215,7 +206,7 @@ BEZEL_TEST(new_ctor_arg_throw_leak_1968, owned_arg_plus_later_throw_disposed_onc
 // ── T3: §28.3 — successful construction: no double-free / no premature free ───
 BEZEL_TEST(new_ctor_arg_throw_leak_1968, successful_construction_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kSuccessfulConstruction);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean: object constructed + disposed normally
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // _b==7 AND X._n==1 at scope end
 }
@@ -223,7 +214,7 @@ BEZEL_TEST(new_ctor_arg_throw_leak_1968, successful_construction_no_double_free_
 // ── T4: §28.3/§14 — generic inline-ctor path, later arg throws ────────────────
 BEZEL_TEST(new_ctor_arg_throw_leak_1968, generic_later_arg_throws_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kGenericLaterArgThrows);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean on the generic construction path
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -231,7 +222,7 @@ BEZEL_TEST(new_ctor_arg_throw_leak_1968, generic_later_arg_throws_lsan_clean_spe
 // ── T5: §28.3 — the first argument throws: instance freed immediately ─────────
 BEZEL_TEST(new_ctor_arg_throw_leak_1968, first_arg_throws_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kFirstArgThrows);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean (obj block freed on the first-arg throw)
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

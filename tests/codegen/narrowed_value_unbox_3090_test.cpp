@@ -84,6 +84,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -92,20 +93,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
 
 namespace {
-
-// ASan toolchain absence bail-out. The original #3090 file does not define
-// its own copy (the harness's `bezel::test::wasSkipped` exists in OTHER test
-// files where it is locally defined); #3200 introduces ASan-oracle tests
-// and so needs the helper locally. Mirrors the body used in
-// box_inline_array_2804_test.cpp and the rest of the suite — when r.ran is
-// false the test "did not run", and the only legitimate cause the harness
-// recognises for that today is a SKIP diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 int run(const char* src) {
     JitResult r = runAot(src);
@@ -819,7 +806,7 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
         "    return acc mod 256; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // Sum of i from 0..9999 = 49 995 000; 49 995 000 mod 256 = 248 (because
     // 49 995 008 ≡ 0 mod 256, so 49 995 000 ≡ -8 ≡ 248 mod 256). Pre-fix the
@@ -864,7 +851,7 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
         "    return 7; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -892,7 +879,7 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
         "    return 7; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -941,7 +928,7 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
         "    return b[0]; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     bool sawDiag = false;
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find(
@@ -981,7 +968,7 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
         "    return acc mod 256; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // Sum i mod 256 over 10000 iters: 39 full cycles of 0..255 plus a tail of
     // 0..15. Per cycle = 32640; 39 cycles = 1 272 960; tail = 120; total =

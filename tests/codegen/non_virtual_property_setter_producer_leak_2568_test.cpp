@@ -100,20 +100,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// ASan toolchain skip-guard.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // ----------------------------------------------------------------------
 // Probe A — the CARDINAL case: non-virtual CLASS computed-property
@@ -277,7 +270,7 @@ const char* kIndexerClassComputed =
 BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
            class_computed_setter_producer_does_not_leak_spec_23_3_28_9) {
     JitResult r = runAotChecked(kClassComputedProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // LSan-clean (the #2568 leak flips this)
 }
 
@@ -290,7 +283,7 @@ BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
 BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
            class_computed_setter_borrow_remains_clean_spec_23_3_28_9) {
     JitResult r = runAotChecked(kClassComputedBorrow);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -302,7 +295,7 @@ BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
 BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
            class_computed_setter_box_producer_does_not_leak_spec_23_3_28_9) {
     JitResult r = runAotChecked(kClassComputedBoxProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -315,7 +308,7 @@ BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
 BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
            virtual_class_property_still_clean_spec_23_3_28_9) {
     JitResult r = runAotChecked(kVirtualClassComputed);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -327,6 +320,6 @@ BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
 BEZEL_TEST(codegen_non_virtual_property_setter_producer_leak_2568,
            indexer_class_setter_still_clean_spec_23_3_28_9) {
     JitResult r = runAotChecked(kIndexerClassComputed);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }

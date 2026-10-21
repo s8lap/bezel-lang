@@ -60,6 +60,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -67,15 +68,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // The concatenated diagnostic text of a checked run. A leak is a different
 // verdict from a double-free or use-after-free, and r.ran is false for both.
@@ -236,7 +228,7 @@ const char* kBindParameterStringIntoObject =
 BEZEL_TEST(codegen_string_to_object_alias_release_2900,
            bind_string_into_object_in_method_28_9) {
     JitResult r = runAotChecked(kBindStringIntoObjectInMethod);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: 731 B / 40 allocations (20 strings × 2 allocs each).
     // Post-fix: 0 leaks.
     BEZEL_EXPECT_TRUE(r.ran);
@@ -267,7 +259,7 @@ BEZEL_TEST(codegen_string_to_object_alias_release_2900,
 BEZEL_TEST(codegen_string_to_object_alias_release_2900,
            bind_string_into_string_stays_clean_28_9) {
     JitResult r = runAotChecked(kBindStringIntoStringInMethod);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     const std::string t = sanitizerText(r);
     BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);
@@ -287,7 +279,7 @@ BEZEL_TEST(codegen_string_to_object_alias_release_2900,
 BEZEL_TEST(codegen_string_to_object_alias_release_2900,
            bind_and_pass_to_object_arg_releases_28_3) {
     JitResult r = runAotChecked(kBindAndPassToObjectArg);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     const std::string t = sanitizerText(r);
     BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);
@@ -312,7 +304,7 @@ BEZEL_TEST(codegen_string_to_object_alias_release_2900,
 BEZEL_TEST(codegen_string_to_object_alias_release_2900,
            object_alias_reassigned_to_class_skips_string_release_28_6) {
     JitResult r = runAotChecked(kObjectAliasReassignedToClass);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     const std::string t = sanitizerText(r);
     BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);
@@ -337,7 +329,7 @@ BEZEL_TEST(codegen_string_to_object_alias_release_2900,
     // would over-release it (heap-use-after-free). Clean on both sides
     // of the fix; the assertion is a no-regression guard.
     JitResult r = runAotChecked(kBindParameterStringIntoObject);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     const std::string t = sanitizerText(r);
     BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);

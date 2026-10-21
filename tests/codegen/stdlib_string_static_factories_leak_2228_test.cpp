@@ -49,23 +49,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required
-// to build this repo, so a skip is not expected — guard anyway (mirrors
-// #2199 / #1982 / #1988 / #2065).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 }  // namespace
 
@@ -87,7 +77,7 @@ BEZEL_TEST(stdlib_string_static_factories_leak_2228,
         "  return count; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -111,7 +101,7 @@ BEZEL_TEST(stdlib_string_static_factories_leak_2228,
         "  return count; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -137,7 +127,7 @@ BEZEL_TEST(stdlib_string_static_factories_leak_2228,
         "  return count; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -162,7 +152,7 @@ BEZEL_TEST(stdlib_string_static_factories_leak_2228,
         "  return count; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -189,7 +179,7 @@ BEZEL_TEST(stdlib_string_static_factories_leak_2228,
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }

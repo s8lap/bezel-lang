@@ -89,19 +89,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 const char* kImport = "import System.Serialization; ";
 
@@ -139,7 +133,7 @@ BEZEL_TEST(serialization_graph_slot_disposal_2397,
         "  catch SerializationException => return 42; "
         "  end; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // LSan-clean: the Shared handle released exactly once
     BEZEL_EXPECT_EQ(r.exitCode, 42);  // control flow: the throw is still caught correctly
 }
@@ -178,7 +172,7 @@ BEZEL_TEST(serialization_graph_slot_disposal_2397,
         "  catch SerializationException => return 42; "
         "  end; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // LSan-clean: both the Shared and Weak handles released
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -213,7 +207,7 @@ BEZEL_TEST(serialization_graph_slot_disposal_2397,
         "  catch SerializationException => return 42; "
         "  end; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // LSan-clean: Name's string released exactly once
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -260,7 +254,7 @@ BEZEL_TEST(serialization_graph_slot_disposal_2397,
         "  catch SerializationException => return 42; "
         "  end; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // LSan-clean: Label's string released exactly once
     BEZEL_EXPECT_EQ(r.exitCode, 42);  // the truncation must still raise correctly
 }
@@ -296,7 +290,7 @@ BEZEL_TEST(serialization_graph_slot_disposal_2397,
         "  catch SerializationException => return 42; "
         "  end; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // LSan-clean: #2378's tree-mode fix still works
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }

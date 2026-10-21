@@ -59,21 +59,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // (A) `.RemoveFirst()` / `.RemoveLast()` — LlvmBackend_Calls3.cpp, the
 // `isOwning ? llElemPol.disposerThunk : nullptr` sites. Four elements go in (so
@@ -238,7 +230,7 @@ const char* kInteriorLinkedListNodeReleasesElements =
 BEZEL_TEST(codegen_linkedlist_string_release_2692,
      remove_first_last_releases_element_2692) {
     JitResult r = runAotChecked(kRemoveFirstLastReleasesElement);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -248,7 +240,7 @@ BEZEL_TEST(codegen_linkedlist_string_release_2692,
 BEZEL_TEST(codegen_linkedlist_string_release_2692,
      clear_and_remove_release_elements_2692) {
     JitResult r = runAotChecked(kClearAndRemoveReleaseElements);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 20);
 }
@@ -258,7 +250,7 @@ BEZEL_TEST(codegen_linkedlist_string_release_2692,
 BEZEL_TEST(codegen_linkedlist_string_release_2692,
      remove_node_releases_element_2692) {
     JitResult r = runAotChecked(kRemoveNodeReleasesElement);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 71);
 }
@@ -268,7 +260,7 @@ BEZEL_TEST(codegen_linkedlist_string_release_2692,
 BEZEL_TEST(codegen_linkedlist_string_release_2692,
      owned_linkedlist_field_releases_elements_2692) {
     JitResult r = runAotChecked(kOwnedLinkedListFieldReleasesElements);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 80);
 }
@@ -278,7 +270,7 @@ BEZEL_TEST(codegen_linkedlist_string_release_2692,
 BEZEL_TEST(codegen_linkedlist_string_release_2692,
      interior_linkedlist_node_releases_elements_2692) {
     JitResult r = runAotChecked(kInteriorLinkedListNodeReleasesElements);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 60);
 }
