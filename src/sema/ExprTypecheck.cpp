@@ -14348,7 +14348,20 @@ void ExprTC::checkThrowableType(const ast::Expr& value) {
     // been narrowed) is rejected here with the §31.1 "nullability not
     // admitted" diagnostic.
     // // per §31.1, §17.12, Appendix C.5
-    if (isExceptionDerivedClass(vt)) {
+    // fix #6791 (§31.1 / §3.6 rule 2 / §14.2, v0.340): a bare type parameter
+    // whose class bound is `Exception` (or a class deriving from it) is
+    // statically a subtype of an `Exception`-derived class: "A generic body
+    // type-checks under the weakest assumption its constraints establish"
+    // (§3.6 rule 2), and a class bound admits "Non-nullable subtypes of
+    // `SomeClass` (the class itself and its descendants)" (§14.2). Every
+    // admitted substitution is therefore throwable, so the operand rule
+    // applies to it exactly as to the bound class. A `T?` operand keeps the
+    // nullability rule below.
+    const bool exceptionBoundParam =
+        vt->kind == TypeRef::Kind::Named && !vt->declaration &&
+        isEnclosingTypeParamName(namedRefSimpleName(vt)) &&
+        !typeParamBuiltinExceptionBase(namedRefSimpleName(vt)).empty();
+    if (exceptionBoundParam || isExceptionDerivedClass(vt)) {
         if (!vt->nullable) return;
         // An `Exception`-derived NULLABLE operand — admit iff a narrowing
         // fact proves it non-null at this throw site. `exprSymbol` returns a
