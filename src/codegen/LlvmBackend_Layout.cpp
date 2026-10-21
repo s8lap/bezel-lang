@@ -383,6 +383,19 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
             paramMatches(rm->params[0], leftTy, /*exactOnly=*/false) &&
             paramMatches(rm->params[1], rightTy, /*exactOnly=*/false))
             return const_cast<sema::MethodSymbol*>(rm);
+    // fix #6656 (§25.2 / §6.6, v0.339): the structural search above (and the
+    // match it re-runs on the recorded winner) only understands user-declared
+    // Named, primitive and built-in-exception parameters. A STDLIB, interface
+    // or `Object` parameter (`operator +(V, StringBuilder)`, `(V, IEnumerable<int>)`,
+    // `(V, IDisposable)`) matches nothing here, so the statement fell into
+    // emitCompoundOp's integer tail and IR verification failed on a record
+    // handed to llvm.sadd.with.overflow. Sema already ranked the overloads and
+    // recorded the winner; when the search below finds no candidate of its
+    // own, that recorded operator IS the answer.
+    const sema::MethodSymbol* recordedOp = nullptr;
+    if (auto* rm = dynamic_cast<const sema::MethodSymbol*>(recorded))
+        if (rm->isOperator && rm->operatorToken == binOp && rm->params.size() == 2)
+            recordedOp = rm;
     // fix #6004 (§22.6 exact-beats-convert, §25.2): a derived-typed operand
     // matches a base-typed parameter only when no overload takes the operand's
     // OWN type. Pass 1 admits exact matches only (on both operand types);
@@ -418,7 +431,7 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
             return hits.front();
         }
     }
-    return nullptr;
+    return const_cast<sema::MethodSymbol*>(recordedOp);
 }
 
 
@@ -432,7 +445,8 @@ llvm::Value* Emitter::emitCompoundOpTyped(const std::string& op, llvm::Value* l,
                                           const sema::TypeRef* leftTy,
                                           const sema::TypeRef* rightTy, bool fp,
                                           bool uns, bool charTarget,
-                                          bool rUns) {
+                                          bool rUns,
+                                          const sema::Symbol* recorded) {
     // fix #3924 (§6.6/§7.11/§17.6, v0.288): every accessor-mediated compound
     // assignment (block-form property, virtual/interface property, imported
     // indexer) funnels through this ONE function, but each caller lowers `r`
@@ -453,7 +467,7 @@ llvm::Value* Emitter::emitCompoundOpTyped(const std::string& op, llvm::Value* l,
     // unwrapped operand.
     r = unwrapNarrowedNullableOperand(r, rightTy);
     if (sema::MethodSymbol* om =
-            findCompoundOperatorOverload(op, leftTy, rightTy)) {
+            findCompoundOperatorOverload(op, leftTy, rightTy, recorded)) {
         // §25.1 / §25.2: dispatch to the user-defined binary operator with the
         // arguments in SOURCE order {target, value} — the §25.2 in-order match.
         // A failed call DECLINES (returns null) so the caller reports its own

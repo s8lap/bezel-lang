@@ -940,7 +940,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             cur->getType()->isFloatingPointTy(),
                             isUnsignedTargetExpr(*as->target),
                             isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
-                            isUnsignedTargetExpr(*as->value));  // §6.2 #2140 rUns
+                            isUnsignedTargetExpr(*as->value),
+                            ctx_.stmtOperatorSymbol(*as));  // §6.2 #2140 rUns
                         // fix #2586 (§23.3/§28.9/§4.6, v0.236): the VIRTUAL/
                         // INTERFACE compound-assign twin of #2576's non-virtual
                         // fix (lowerPropertyCompound). For a string target,

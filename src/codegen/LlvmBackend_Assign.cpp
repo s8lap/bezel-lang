@@ -3990,7 +3990,8 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     if (!as.target || !as.value) return false;
     std::string op(as.op);
     if (!op.empty() && op.back() == '=') op.pop_back();
-    return lowerIndexerCompoundCore(*as.target, op, as.value.get());
+    return lowerIndexerCompoundCore(*as.target, op, as.value.get(),
+                                    ctx_.stmtOperatorSymbol(as));
 }
 
 
@@ -4011,7 +4012,8 @@ bool Emitter::lowerIndexerIncrDecr(const ast::IncrementStmt& inc) {
 
 bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
                                        const std::string& binOp,
-                                       const ast::Expr* valueExpr) {
+                                       const ast::Expr* valueExpr,
+                                       const sema::Symbol* recorded) {
     auto* ix = dynamic_cast<const ast::IndexExpr*>(&targetExpr);
     if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
         return false;
@@ -4113,7 +4115,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             binOp, cur, rhs, opLeftTy, opRightTy,
             cur->getType()->isFloatingPointTy(),
             isUnsignedTargetExpr(targetExpr),
-            isCharTargetExpr(targetExpr), rhsUnsigned);
+            isCharTargetExpr(targetExpr), rhsUnsigned, recorded);
         if (!newVal) return false;
         auto* setFnTy = setFn->getFunctionType();
         std::vector<llvm::Value*> setArgs;
@@ -4271,7 +4273,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             cur->getType()->isFloatingPointTy(),
             isUnsignedTargetExpr(targetExpr),
             isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
-            rhsUnsigned);                      // §6.2 #2140 rUns
+            rhsUnsigned, recorded);                      // §6.2 #2140 rUns
         if (!newVal) return false;
 
         // --- Call setter with the new value + shared receiver/indices. ---
@@ -4373,7 +4375,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             cur->getType()->isFloatingPointTy(),
             isUnsignedTargetExpr(targetExpr),
             isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
-            rhsUnsigned);                      // §6.2 #2140 rUns
+            rhsUnsigned, recorded);                      // §6.2 #2140 rUns
     };
 
     // Shared by both branches: discharge the +1 references the desugaring
@@ -4917,7 +4919,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         cur->getType()->isFloatingPointTy(),
         isUnsignedTargetExpr(targetExpr),
         isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
-        rhsUnsigned);                      // §6.2 #2140 rUns
+        rhsUnsigned, recorded);                      // §6.2 #2140 rUns
     if (!newVal) return false;
 
     // --- Call setter with the new value and the pre-computed receiver/params. ---
@@ -9069,7 +9071,8 @@ bool Emitter::lowerImportedPropertyCompound(const ast::AssignmentStmt& as) {
     if (!as.target || !as.value) return false;
     std::string op(as.op);
     if (!op.empty() && op.back() == '=') op.pop_back();
-    return lowerImportedPropertyCompoundCore(*as.target, op, as.value.get());
+    return lowerImportedPropertyCompoundCore(*as.target, op, as.value.get(),
+                                            ctx_.stmtOperatorSymbol(as));
 }
 
 
@@ -9085,7 +9088,8 @@ bool Emitter::lowerImportedPropertyIncrDecr(const ast::IncrementStmt& inc) {
 
 bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
                                                 const std::string& binOp,
-                                                const ast::Expr* valueExpr) {
+                                                const ast::Expr* valueExpr,
+                                                const sema::Symbol* recorded) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&targetExpr);
     if (!ma || !ma->target) return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
@@ -9136,7 +9140,7 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
         llvm::Value* newVal = emitCompoundOpTyped(
             binOp, cur, rhs, opLeftTy, opRightTy,
             cur->getType()->isFloatingPointTy(),
-            isUnsignedTargetExpr(*ma), isCharTargetExpr(*ma), rhsUnsigned);
+            isUnsignedTargetExpr(*ma), isCharTargetExpr(*ma), rhsUnsigned, recorded);
         if (!newVal) return false;
         // Write the OWNER's slot with the new value.
         auto* setFnTy = setFn->getFunctionType();
@@ -9331,7 +9335,7 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
         cur->getType()->isFloatingPointTy(),
         isUnsignedTargetExpr(targetExpr),
         isCharTargetExpr(targetExpr),                     // §6.6/§5.2 #1961
-        valueExpr && isUnsignedTargetExpr(*valueExpr));   // §6.2 #2140
+        valueExpr && isUnsignedTargetExpr(*valueExpr), recorded);   // §6.2 #2140
     if (!res) return false;
 
     // --- then the store. ---
@@ -9391,7 +9395,7 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
         cur->getType()->isFloatingPointTy(),
         isUnsignedTargetExpr(*as.target),
         isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
-        isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
+        isUnsignedTargetExpr(*as.value), ctx_.stmtOperatorSymbol(as));  // §6.2 #2140 rUns
     // fix #2576 (§23.3/§28.9/§4.6, v0.236): the COMPOUND-PROPERTY twin of
     // lowerIndexerCompound's #2567 fix (this file, line ~2531-2542), mirrored
     // EXACTLY. `lowerPropertyCompound` desugars `s.Name OP= rhs` to

@@ -6543,7 +6543,11 @@ private:
                                      const sema::TypeRef* leftTy,
                                      const sema::TypeRef* rightTy, bool fp,
                                      bool uns, bool charTarget = false,
-                                     bool rUns = false);
+                                     bool rUns = false,
+                                     // fix #6656: sema's recorded winner for
+                                     // the compound statement, when the caller
+                                     // has one (see findCompoundOperatorOverload).
+                                     const sema::Symbol* recorded = nullptr);
 
     // §7.2/§7.11 (#2888): the PAYLOAD type of the tagged `{i8 hasValue; T}`
     // lowering of a nullable VALUE type, or null when `t` is not that shape.
@@ -7717,7 +7721,8 @@ private:
     // spellings inherit it.
     bool lowerIndexerCompoundCore(const ast::Expr& targetExpr,
                                   const std::string& binOp,
-                                  const ast::Expr* valueExpr);
+                                  const ast::Expr* valueExpr,
+                                  const sema::Symbol* recorded = nullptr);
 
     // fix #2717 / §23.4 / §23.5 / §28.1 / §28.9 (v0.240): the INDEXER twin of
     // #429's ARGUMENT-PASS release (LlvmBackend_Calls2.cpp ~7834). A `+1` string
@@ -8239,7 +8244,8 @@ private:
     bool lowerImportedPropertyIncrDecr(const ast::IncrementStmt& inc);
     bool lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
                                            const std::string& binOp,
-                                           const ast::Expr* valueExpr);
+                                           const ast::Expr* valueExpr,
+                                           const sema::Symbol* recorded = nullptr);
 
     // The LLVM type backing an instance-storage member (field or
     // auto-property).

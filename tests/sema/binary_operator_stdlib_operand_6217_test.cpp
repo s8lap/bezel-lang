@@ -64,16 +64,13 @@ void expectBinaryRuns(const std::string& param, const std::string& setup) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "1001\n");
 }
-// The compound form's codegen does not yet lower a user operator whose
-// right operand is a declaration-less, interface or `Object`-typed value (IR
-// verification, #6656), so its accept rows assert the sema verdict through
-// the gated sema-only typecheck, as #6091's a3-a5 rows do. Not vacuous: the
-// same gate reports the compound rejection rows below.
-void expectCompoundSemaAccepts(const std::string& param,
-                               const std::string& setup) {
-    auto r = bezel::test::parseAndTypecheckGated(compound(param, setup));
-    BEZEL_EXPECT_TRUE(static_cast<bool>(r.sourceFile));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+// fix #6656 (§25.2, §6.6, v0.339): `v += r` runs the same user operator the
+// binary form does. These rows used to assert only the sema verdict because
+// the compound lowering fell into the integer intrinsic (IR verification).
+void expectCompoundRuns(const std::string& param, const std::string& setup) {
+    auto r = runAot(compound(param, setup));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "1001\n");
 }
 void expectCompoundRejected(const std::string& param,
                             const std::string& setup) {
@@ -199,45 +196,45 @@ BEZEL_TEST(binary_operator_stdlib_operand_6217,
 // ---- compound form agrees (§6.6: `x op= e` is `x := x op e`) -------------
 
 BEZEL_TEST(binary_operator_stdlib_operand_6217,
-           c1_compound_sortedset_into_ienumerable_sema_accepts_spec_5_1) {
-    expectCompoundSemaAccepts("IEnumerable<int>",
+           c1_compound_sortedset_into_ienumerable_runs_spec_5_1) {
+    expectCompoundRuns("IEnumerable<int>",
                               "var r := new SortedSet<int>();");
 }
 
 BEZEL_TEST(binary_operator_stdlib_operand_6217,
-           c2_compound_icollection_into_ienumerable_sema_accepts_spec_5_1) {
-    expectCompoundSemaAccepts("IEnumerable<int>",
+           c2_compound_icollection_into_ienumerable_runs_spec_5_1) {
+    expectCompoundRuns("IEnumerable<int>",
                               "var r: ICollection<int> := new Array<int>();");
 }
 
 BEZEL_TEST(binary_operator_stdlib_operand_6217,
-           c3_compound_ireadonlylist_into_ienumerable_sema_accepts_spec_5_1) {
-    expectCompoundSemaAccepts("IEnumerable<int>",
+           c3_compound_ireadonlylist_into_ienumerable_runs_spec_5_1) {
+    expectCompoundRuns("IEnumerable<int>",
                               "var r: IReadOnlyList<int> := new Array<int>();");
 }
 
 BEZEL_TEST(binary_operator_stdlib_operand_6217,
-           c4_compound_span_into_readonly_span_sema_accepts_spec_5_1) {
-    expectCompoundSemaAccepts("ReadOnlySpan<int>",
+           c4_compound_span_into_readonly_span_runs_spec_5_1) {
+    expectCompoundRuns("ReadOnlySpan<int>",
                               "using var buf := new OwningBuffer<int>(4); "
                               "var r := buf.AsSpan();");
 }
 
 BEZEL_TEST(binary_operator_stdlib_operand_6217,
-           c5_compound_owning_array_into_ienumerable_sema_accepts_spec_5_1) {
-    expectCompoundSemaAccepts("IEnumerable<Dog>",
+           c5_compound_owning_array_into_ienumerable_runs_spec_5_1) {
+    expectCompoundRuns("IEnumerable<Dog>",
                               "using var r := new OwningArray<Dog>();");
 }
 
 BEZEL_TEST(binary_operator_stdlib_operand_6217,
-           c6_compound_user_exception_into_exception_sema_accepts_spec_5_1) {
-    expectCompoundSemaAccepts("Exception", "var r := new MyEx(\"e\");");
+           c6_compound_user_exception_into_exception_runs_spec_5_1) {
+    expectCompoundRuns("Exception", "var r := new MyEx(\"e\");");
 }
 
 BEZEL_TEST(binary_operator_stdlib_operand_6217,
-           c7_compound_user_class_into_object_sema_accepts_spec_5_1) {
+           c7_compound_user_class_into_object_runs_spec_5_1) {
     // The binary form's #6005 `Object` rule, now shared.
-    expectCompoundSemaAccepts("Object", "var r := new Dog();");
+    expectCompoundRuns("Object", "var r := new Dog();");
 }
 
 BEZEL_TEST(binary_operator_stdlib_operand_6217,
