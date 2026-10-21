@@ -8017,6 +8017,33 @@ void ExprTC::checkAssignable(
                 "to a base class, an interface it implements, or `Object`");
             return;
         }
+        // fix #6684 (§5.1 "Reference conversions", v0.339; #6073 item 4):
+        // built-in CLASS → a DIFFERENT built-in class. The exception pair is
+        // judged just above and a user-class target by the arms below, but a
+        // pair like `Exception` -> `StringBuilder` (or the reverse) matched
+        // none of them and reached the catch-all accept: `a.Contains(b)` /
+        // `b in a` over `Array<StringBuilder>` with `b: Exception`, and
+        // `F(b)` against `F(s: StringBuilder)`, all compiled. §5.1's list is
+        // closed: a built-in class has a class base only inside the exception
+        // hierarchy (above), and the three implementable interfaces
+        // (`IDisposable`, `IAsyncDisposable`, `IFormattable`) are the only
+        // built-in non-exception types a class may be converted to; both
+        // heads here are non-generic, non-interface built-in classes, so the
+        // pair is neither. Same head set as #6217's operator grade
+        // (`operatorNamedOperandMatch`).
+        if (fromBuiltinClass && toBuiltinClass && fromName != toName &&
+            fromName != "IDisposable" && toName != "IDisposable" &&
+            fromName != "IAsyncDisposable" && toName != "IAsyncDisposable" &&
+            fromName != "IFormattable" && toName != "IFormattable" &&
+            !(common::isBuiltinExceptionName(fromName) &&
+              common::isBuiltinExceptionName(toName))) {
+            reportNotConvertible(
+                "the built-in type `" + std::string(fromName) +
+                "` is not a `" + std::string(toName) +
+                "` \xE2\x80\x94 neither is a base of the other, and \xC2\xA7""5.1 "
+                "has no implicit conversion between unrelated classes");
+            return;
+        }
         // Repro A: built-in class → user class.
         // pending #6083 (#6118): …unless a test of the carrier against the
         // target or a class derived from it is on record — the same two
