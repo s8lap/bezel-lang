@@ -296,6 +296,13 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                      r->getType()->isFloatingPointTy()))
                     r = coerceNumericToType(r, primVal->getType(),
                                             isUnsignedTargetExpr(*bin.right));
+                // #6676 (§7.7, v0.339): a `null` right operand is a nullable
+                // right operand, so the result is `T?`. The literal lowers to
+                // a null pointer; give it the null form of the `{i8, T}`
+                // carrier (hasValue 0) so both PHI incomings share one type.
+                if (!rhsDiv && r->getType()->isPointerTy() &&
+                    llvm::isa<llvm::ConstantPointerNull>(r))
+                    r = llvm::ConstantAggregateZero::get(coalNullableTy);
                 llvm::BasicBlock* rhsEndBB = nullptr;
                 if (!rhsDiv) { rhsEndBB = builder_.GetInsertBlock(); builder_.CreateBr(endBB); }
                 builder_.SetInsertPoint(endBB);

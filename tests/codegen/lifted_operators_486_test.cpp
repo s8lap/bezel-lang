@@ -843,6 +843,23 @@ BEZEL_TEST(codegen_6675_coalesce_unsigned, int_null_signed_byte_still_sign_exten
         "end Main; end C;"), "-5");
 }
 
+// #6676 (§7.7, v0.339): a nullable right operand makes the result `T?`;
+// `int? ?? null` failed IR verification (PHI of i32 vs null).
+BEZEL_TEST(codegen_6676_coalesce_null_rhs, null_left) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: int? := null; var c := a ?? null; "
+        "Console.WriteLine(c is null); "
+        "end Main; end C;"), "True");
+}
+BEZEL_TEST(codegen_6676_coalesce_null_rhs, present_left) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: int? := 7; var c := a ?? null; "
+        "Console.WriteLine(c ?? 0); "
+        "end Main; end C;"), "7");
+}
+
 // #1047 / §5.1 / §7.11: decimal arithmetic with a mixed INTEGER operand
 // (decimal? + int, or int + decimal?) must promote the int to a decimal struct
 // before the bz_decimal_* call. Previously the i32 was stored raw into a decimal
