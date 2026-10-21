@@ -3952,6 +3952,30 @@ static std::string discardAllSlotsSpelling(std::string_view name,
     return out;
 }
 
+// §35.3 (v0.340, #6789): "Construction is qualified ...:
+// `FetchOutcome.NotModified` for a payload-free case (a value expression, not
+// a call), `FetchOutcome.Failed(504, "upstream timeout")` for a payload
+// case." A payload case therefore has only the call form; the bare qualified
+// name `Outcome.Fetched` outside a call's callee denotes no value (§35.3
+// declares no case-constructor function value), and used to compile to a
+// zero-initialized value under warning #2434 with the tag of the FIRST case.
+// The caller passes the access only when it is not the callee of a call.
+void ExprTC::rejectBarePayloadCaseValue(const ChoiceCaseSymbol* cc,
+                                        const ast::MemberAccessExpr& ma) {
+    if (!cc || !cc->caseDecl || cc->caseDecl->payload.empty()) return;
+    auto loc = ma.span.begin;
+    if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+    const auto n = cc->caseDecl->payload.size();
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        "payload case `" + std::string(cc->name) + "` cannot be used as a "
+        "value without its payload: \xC2\xA7""35.3 constructs a payload "
+        "case with the call form (`FetchOutcome.Failed(504, \"upstream "
+        "timeout\")`); write `" + std::string(cc->name) + "(" +
+        std::to_string(n) + " argument" + (n == 1 ? "" : "s") +
+        ")` (\xC2\xA7""35.3)");
+}
+
 // §35.5 *Case patterns* (v0.340, #6726): "A payload case may not be matched
 // bare: `Fetched` without parentheses is a compile error naming the arity."
 // The prefixed spelling `Outcome.Fetched` / `Outer.W` is the same bare

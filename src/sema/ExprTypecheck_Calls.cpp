@@ -33290,6 +33290,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // identical program in one module both compiled. The payload CALL
             // form (`Msg.Code(41)`) was unaffected: it is typed by `typeCall`,
             // not here, which is why only the payload-FREE spelling diverged.
+            if (&ma != calleeOfCallCtx_) rejectBarePayloadCaseValue(cc, ma);
             if (cc->parent) {
                 TypeRef* ct = ctx_.makeTypeRef();
                 ct->kind = TypeRef::Kind::Named;
@@ -33454,6 +33455,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         et->declaration = targetType;
         ctx_.setExprType(&ma, et);
     } else if (dynamic_cast<ChoiceCaseSymbol*>(member) && targetType) {
+        if (&ma != calleeOfCallCtx_)
+            rejectBarePayloadCaseValue(dynamic_cast<ChoiceCaseSymbol*>(member), ma);
         // §35.3 (v0.200, #2044): a qualified case access `Opt.None` or the
         // callee of `Opt.Some(value)` has the choice type. The payload
         // construction lowering itself lands in a follow-up slice; for now

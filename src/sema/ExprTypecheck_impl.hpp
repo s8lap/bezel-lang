@@ -1984,6 +1984,10 @@ private:
     // §35.5 (v0.340, #6726): the qualified twin of the bare-payload-case
     // refusal (`Outcome.Fetched` with no parentheses).
     void rejectBareQualifiedPayloadCase(const ast::NamedPattern* np);
+    // §35.3 (v0.340, #6789): a payload case written bare in value position
+    // (`Outcome.Fetched` outside a call's callee) has no meaning.
+    void rejectBarePayloadCaseValue(const ChoiceCaseSymbol* cc,
+                                    const ast::MemberAccessExpr& ma);
     void rejectOtherValueTypeNamedPattern(const ast::NamedPattern* np,
                                           const TypeSymbol* ts,
                                           const TypeRef* scrutDecl);
