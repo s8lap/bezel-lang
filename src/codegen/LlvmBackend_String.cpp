@@ -4185,9 +4185,9 @@ llvm::Value* Emitter::emitRangeToString(llvm::Value* rangeVal,
     //     point, so the i64 slot is truncated for it.
     //   * `ulong` — §10.3-style width: a value above `long.MaxValue` printed
     //     through `%lld` renders NEGATIVE. `%llu` is the same bits read right.
-    // Every other admitted T (byte/sbyte/short/ushort/int/uint/long) renders
-    // identically through the signed-64 path, so they share it rather than
-    // growing a per-width arm that could drift.
+    // sbyte/short/int/long render through the signed-64 path (their slot is
+    // sign-extended); byte/ushort/uint are re-zero-extended from their width
+    // in `endpointStr` below (#6800).
     const P elemPrim =
         (resolvedElem && resolvedElem->kind == sema::TypeRef::Kind::Primitive)
             ? resolvedElem->primitive
@@ -4277,6 +4277,16 @@ llvm::Value* Emitter::emitRangeToString(llvm::Value* rangeVal,
         llvm::Value* payload =
             (endpointPrim == P::Char) ? builder_.CreateTrunc(v, i32(), "rts.cp")
                                       : v;
+        // §8.5 (#6800): byte, ushort and uint endpoints are stored
+        // sign-extended; re-zero-extend from the element width so a value
+        // above the signed maximum of its width renders as itself.
+        if (elemPrim == P::Byte || elemPrim == P::UShort || elemPrim == P::UInt) {
+            const unsigned nb = elemPrim == P::Byte     ? 8u
+                                : elemPrim == P::UShort ? 16u
+                                                        : 32u;
+            payload = builder_.CreateZExt(
+                builder_.CreateTrunc(v, builder_.getIntNTy(nb)), i64(), "rts.epzx");
+        }
         llvm::Value* valStr = emitPrimitiveToString(payload, endpointPrim);
         auto* valEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
