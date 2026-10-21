@@ -1677,6 +1677,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         call->args.size() == 1 && call->args[0].value) {
                         llvm::Value* rv = lowerExpr(*ma->target);
                         llvm::Value* x  = lowerExpr(*call->args[0].value);
+                        // fix-forward #6853 (§17.5, §7.4, v0.340): the same
+                        // unwrap `x in r` takes — sema admits a nullable
+                        // argument here only when §7.4 narrowed it non-null
+                        // (checkBuiltinCollectionCallArgs), and its `{i8, T}`
+                        // box must reach the compares as the scalar.
+                        if (x) x = unwrapNarrowedNullableOperand(
+                                   x, call->args[0].value.get());
                         if (rv && x) {
                             // §16.3 (v0.162, fix #1340): Contains = nonempty AND
                             // within-extent AND endOk. Step affects membership only
@@ -1688,7 +1695,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             // shared with `x in r` and honours the element type's
                             // signedness (see emitRangeContains).
                             return emitRangeContains(
-                                rv, x, isUnsignedTargetExpr(*call->args[0].value), tt);
+                                rv, x, isUnsignedTargetExpr(*call->args[0].value), tt,
+                                // fix-forward #6853 (§17.5, v0.340): a literal
+                                // receiver restores each endpoint by its own type.
+                                dynamic_cast<const ast::RangeExpr*>(ma->target.get()));
                         }
                     }
                     if (tt && tt->kind == sema::TypeRef::Kind::Primitive) {
@@ -9319,7 +9329,9 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 llvm::Value* rv = lowerExpr(*bin.right);
                 if (!x || !rv) return nullptr;
                 // fix #6749 / #6752 (§16.3, v0.339): shared with `r.Contains(x)`.
-                return emitRangeContains(rv, x, isUnsignedTargetExpr(*bin.left), rTy);
+                return emitRangeContains(
+                    rv, x, isUnsignedTargetExpr(*bin.left), rTy,
+                    dynamic_cast<const ast::RangeExpr*>(bin.right.get()));
             }
         }
         // §17.5/§4.6: `c in s` — char membership test in a string.
@@ -11011,41 +11023,51 @@ namespace bezel::codegen {
 // The Range struct stores every endpoint in an i64 (see the RangeExpr lowering,
 // which SIGN-extends), so the element type's signedness must be restored here:
 // an unsigned element narrower than 64 bits is re-zero-extended from its own
-// width, and a `ulong` element compares with the unsigned predicates (and unsigned
-// open-side sentinels). `x` is widened by its own signedness, so a `byte` 200 is
-// 200 and not -56.
+// width, and a `ulong` element is read unsigned. `x` is widened by its own
+// signedness, so a `byte` 200 is 200 and not -56.
+//
+// fix-forward #6853 (§17.5, §16.6, v0.340): every comparison is made on the
+// MATHEMATICAL values, in i128, so an operand whose type differs from `T` in
+// signedness (admitted against a constant-endpoint range literal by
+// sema's rangeLiteralAdmitsIntegerOperand: `n: long in 0..100`, `u: ulong in
+// 31..`, `n: long in 5UL..`) is never reinterpreted: a `ulong` above
+// `long`'s range is not negative and a negative `long` is not huge. For a
+// LITERAL receiver (`lit`) each endpoint is restored by its OWN type's
+// signedness, so `0 .. 3000000000U` keeps its `uint` end at 3000000000.
 llvm::Value* Emitter::emitRangeContains(llvm::Value* rv, llvm::Value* x,
                                         bool xUnsigned,
-                                        const sema::TypeRef* rangeTy) {
+                                        const sema::TypeRef* rangeTy,
+                                        const ast::RangeExpr* lit) {
     const sema::TypeRef* elem =
         (rangeTy && !rangeTy->genericArgs.empty())
             ? resolveTypeParamRef(rangeTy->genericArgs[0]) : nullptr;
-    const bool elemUns = typeRefIsUnsigned(elem);
-    unsigned elemBits = 64;
-    if (elemUns) {
-        if (llvm::Type* et = lowerTypeRef(elem); et && et->isIntegerTy())
-            elemBits = et->getIntegerBitWidth();
-    }
-    const bool u64 = elemUns && elemBits == 64;
 
     llvm::Value* st   = builder_.CreateExtractValue(rv, {0u}, "rc.st");
     llvm::Value* en   = builder_.CreateExtractValue(rv, {1u}, "rc.en");
     llvm::Value* step = builder_.CreateExtractValue(rv, {2u}, "rc.step");
     llvm::Value* flg  = builder_.CreateExtractValue(rv, {3u}, "rc.flg");
-    if (elemUns && elemBits < 64) {
-        llvm::Type* eTy = builder_.getIntNTy(elemBits);
-        st = builder_.CreateZExt(builder_.CreateTrunc(st, eTy), i64(), "rc.stz");
-        en = builder_.CreateZExt(builder_.CreateTrunc(en, eTy), i64(), "rc.enz");
-    }
-    llvm::Value* xW = x->getType() == i64()
-                          ? x
-                          : (xUnsigned ? builder_.CreateZExt(x, i64(), "rc.xw")
-                                       : builder_.CreateSExt(x, i64(), "rc.xw"));
+    llvm::Type* wTy = builder_.getInt128Ty();
+    // Restore an endpoint's mathematical value from its i64 slot: by the
+    // literal endpoint's own type when `lit` names it, else by `T`.
+    auto widenEnd = [&](llvm::Value* v64, const ast::Expr* ep,
+                        const char* nm) -> llvm::Value* {
+        const sema::TypeRef* et = (lit && ep) ? ctx_.exprType(*ep) : elem;
+        if (!typeRefIsUnsigned(et)) return builder_.CreateSExt(v64, wTy, nm);
+        unsigned b = 64;
+        if (llvm::Type* t = lowerTypeRef(et); t && t->isIntegerTy())
+            b = t->getIntegerBitWidth();
+        if (b < 64) v64 = builder_.CreateTrunc(v64, builder_.getIntNTy(b));
+        return builder_.CreateZExt(v64, wTy, nm);
+    };
+    st = widenEnd(st, lit ? lit->lo.get() : nullptr, "rc.stw");
+    en = widenEnd(en, lit ? lit->hi.get() : nullptr, "rc.enw");
+    llvm::Value* xW = xUnsigned ? builder_.CreateZExt(x, wTy, "rc.xw")
+                                : builder_.CreateSExt(x, wTy, "rc.xw");
     using P = llvm::CmpInst;
-    const P::Predicate pLE = u64 ? P::ICMP_ULE : P::ICMP_SLE;
-    const P::Predicate pGE = u64 ? P::ICMP_UGE : P::ICMP_SGE;
-    const P::Predicate pGT = u64 ? P::ICMP_UGT : P::ICMP_SGT;
-    const P::Predicate pLT = u64 ? P::ICMP_ULT : P::ICMP_SLT;
+    const P::Predicate pLE = P::ICMP_SLE;
+    const P::Predicate pGE = P::ICMP_SGE;
+    const P::Predicate pGT = P::ICMP_SGT;
+    const P::Predicate pLT = P::ICMP_SLT;
     // §16.3 (v0.162, fix #1496): a null endpoint (flags bit 1 = startOpen, bit 2
     // = endOpen) imposes NO bound on its side; `st`/`en` hold a fake 0 there, so
     // they are excluded from the direction/extent computation.
@@ -11063,10 +11085,10 @@ llvm::Value* Emitter::emitRangeContains(llvm::Value* rv, llvm::Value* x,
     llvm::Value* asc      = builder_.CreateICmp(pLE, st, en, "rc.asc");
     llvm::Value* loClosed = builder_.CreateSelect(asc, st, en, "rc.loc");
     llvm::Value* hiClosed = builder_.CreateSelect(asc, en, st, "rc.hic");
-    llvm::Value* negInf = u64 ? builder_.getInt64(0)
-                              : builder_.getInt64(std::numeric_limits<int64_t>::min());
-    llvm::Value* posInf = u64 ? builder_.getInt64(std::numeric_limits<uint64_t>::max())
-                              : builder_.getInt64(std::numeric_limits<int64_t>::max());
+    llvm::Value* negInf = llvm::ConstantInt::get(
+        wTy, llvm::APInt::getSignedMinValue(128));
+    llvm::Value* posInf = llvm::ConstantInt::get(
+        wTy, llvm::APInt::getSignedMaxValue(128));
     llvm::Value* lo = builder_.CreateSelect(
         startOpen, negInf, builder_.CreateSelect(closedR, loClosed, st), "rc.lo");
     llvm::Value* hi = builder_.CreateSelect(

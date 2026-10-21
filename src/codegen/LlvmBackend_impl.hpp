@@ -5186,7 +5186,8 @@ private:
     // expression (an IdentifierExpr whose lsym->declType is Range). Returns
     // the struct value `{ i64 start, i64 end, i64 step, i8 flags }`.
     llvm::Value* emitRangeContains(llvm::Value* rv, llvm::Value* x,
-                                   bool xUnsigned, const sema::TypeRef* rangeTy);
+                                   bool xUnsigned, const sema::TypeRef* rangeTy,
+                                   const ast::RangeExpr* lit = nullptr);
 
     llvm::Value* loadRangeStruct(const ast::Expr& target) {
         llvm::Value* v = lowerExpr(target);

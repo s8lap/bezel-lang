@@ -20518,7 +20518,16 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         recvTy->declaration == ctx_.builtinClassSym("Range") &&
         !recvTy->genericArgs.empty() && recvTy->genericArgs[0] &&
         recvTy->genericArgs[0]->kind == TypeRef::Kind::Primitive) {
-        if (TypeRef* argTy = ctx_.exprType(*ce.args[0].value))
+        TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+        // fix-forward #6853 (§17.5, §16.6, v0.340): `x in c` IS this call, so
+        // a constant-endpoint range LITERAL receiver admits the same integer
+        // operands the `in` check does (rangeLiteralAdmitsIntegerOperand).
+        if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
+            !(argTy->nullable &&
+              !isNarrowedNonNullRead(ce.args[0].value.get())) &&
+            rangeLiteralAdmitsIntegerOperand(recvExpr, argTy->primitive))
+            return;
+        if (argTy)
             checkAssignable(argTy, recvTy->genericArgs[0],
                             ce.args[0].value->span.begin,
                             "argument to `Range<T>.Contains`",

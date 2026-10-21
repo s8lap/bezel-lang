@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -5450,6 +5451,91 @@ TypeRef* ExprTC::narrowIntConstantToTarget(const ast::Expr* fromExpr,
     // §7.2's wrap (#2903).
     ctx_.setExprType(const_cast<ast::Expr*>(fromExpr), to);
     return to;
+}
+
+// fix-forward #6853 (§17.5, §16.6, §16.2, §5.1, v0.340). §17.5: "`x in c`
+// *is* the call `c.Contains(x)`", admitted "under the ordinary conversion
+// rules (§5.1)"; §16.6: a range pattern "**agrees exactly with `in`**", and
+// §19.3 admits a range pattern over every integer scrutinee whose bounds are
+// in its comparison class (`case n of 0..100` over a `long`). The spec does
+// not say whether a range LITERAL's `T` is fixed by its endpoints alone or
+// adapts to the `in` operand the way §16.2's fully open `..` takes `T` from
+// its position. Interpretation implemented (spec-question #6897, mixed
+// endpoints #6887): for a literal whose present endpoints are ALL
+// compile-time constants, an integer operand of type `O` is admitted when
+//   (B) every endpoint's value fits `O` (the literal is read as a
+//       `Range<O>`, as a `case` range pattern is read at its scrutinee's
+//       type) — a `char` endpoint counts when `char` widens to `O`; or
+//   (A) the endpoints' types share a §5.1 widening target `C` and `O`
+//       widens to `C` (a mixed-endpoint literal read at its common type:
+//       `u in 0 .. 5000000000L` with `u: uint`).
+// `u in -5 .. 10` with `u: uint` stays rejected: `-5` fits no `uint` (B)
+// and `uint` does not widen to `int` (A). A range VALUE (a variable, field
+// or call result) never reaches this: its static type fixes `T`.
+bool ExprTC::rangeLiteralAdmitsIntegerOperand(const ast::Expr* recv,
+                                              PrimitiveType operand) {
+    auto* re = dynamic_cast<const ast::RangeExpr*>(recv);
+    if (!re || (!re->lo && !re->hi)) return false;
+    if (!isIntegerPrimitiveType(operand)) return false;
+    // Mathematical value of an integer constant endpoint; a `ulong` constant
+    // above `long`'s range folds to its two's-complement `long long`.
+    auto fitsOperand = [&](__int128 v) {
+        switch (operand) {
+            case PrimitiveType::SByte:  return v >= -128 && v <= 127;
+            case PrimitiveType::Byte:   return v >= 0 && v <= 255;
+            case PrimitiveType::Short:  return v >= -32768 && v <= 32767;
+            case PrimitiveType::UShort: return v >= 0 && v <= 65535;
+            case PrimitiveType::Int:
+                return v >= -2147483648LL && v <= 2147483647LL;
+            case PrimitiveType::UInt:   return v >= 0 && v <= 4294967295LL;
+            case PrimitiveType::Long:
+                return v >= (__int128)std::numeric_limits<long long>::min() &&
+                       v <= (__int128)std::numeric_limits<long long>::max();
+            case PrimitiveType::ULong:
+                return v >= 0 &&
+                       v <= (__int128)std::numeric_limits<unsigned long long>::max();
+            default: return false;
+        }
+    };
+    bool allFit = true;
+    std::vector<PrimitiveType> endTypes;
+    for (const ast::Expr* ep : {re->lo.get(), re->hi.get()}) {
+        if (!ep) continue;
+        const TypeRef* et = ctx_.exprType(*ep);
+        if (!et || et->kind != TypeRef::Kind::Primitive || et->nullable)
+            return false;
+        if (et->primitive == PrimitiveType::Char) {
+            // A `char` endpoint must be a literal (a compile-time constant
+            // code point); it converts to `O` by §5.1 widening or not at all.
+            if (!dynamic_cast<const ast::CharLiteralExpr*>(ep)) return false;
+            if (!primitiveImplicitlyWidens(PrimitiveType::Char, operand))
+                allFit = false;
+            endTypes.push_back(et->primitive);
+            continue;
+        }
+        if (!isIntegerPrimitiveType(et->primitive)) return false;
+        auto cv = foldIntConstExprTC(*ep);
+        if (!cv) return false;  // not all-constant: the endpoints fix `T`
+        __int128 v = *cv;
+        if (et->primitive == PrimitiveType::ULong && *cv < 0)
+            v = (__int128)(unsigned long long)*cv;
+        if (!fitsOperand(v)) allFit = false;
+        endTypes.push_back(et->primitive);
+    }
+    if (allFit) return true;  // (B)
+    // (A): the narrowest integer type every endpoint type widens to.
+    static const PrimitiveType order[] = {
+        PrimitiveType::SByte, PrimitiveType::Byte,  PrimitiveType::Short,
+        PrimitiveType::UShort, PrimitiveType::Int,  PrimitiveType::UInt,
+        PrimitiveType::Long,  PrimitiveType::ULong};
+    for (PrimitiveType c : order) {
+        bool common = true;
+        for (PrimitiveType e : endTypes)
+            if (e != c && !primitiveImplicitlyWidens(e, c)) common = false;
+        if (!common) continue;
+        return operand == c || primitiveImplicitlyWidens(operand, c);
+    }
+    return false;
 }
 
 // §14.1 (#2926) — see the declaration comment. The type-parameter names in

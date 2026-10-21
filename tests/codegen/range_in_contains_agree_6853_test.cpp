@@ -100,3 +100,49 @@ BEZEL_TEST(range_in_contains_agree_6853, narrow_operands_widen_into_int_range_sp
     BEZEL_EXPECT_EQ(r.stdoutText,
         "True\nTrue\nFalse\nFalse\nTrue\nTrue\n");
 }
+
+// fix-forward #6853 (§17.5, §16.3 Normative formula, §16.6, v0.340): an
+// operand admitted against a constant-endpoint literal whose `T` differs from
+// its own type in signedness is compared on the MATHEMATICAL values. A `ulong`
+// above `long`'s range is not negative (`in 31 ..` holds, `in ..< 5` does
+// not), a negative `long` is not huge (`in 5UL ..` does not hold), and a
+// `uint` end above `int`'s range keeps its value (`0 .. 3000000000U`).
+BEZEL_TEST(range_in_contains_agree_6853, cross_signedness_literal_operands_spec_16_3) {
+    auto r = runAot(prog(
+        "    var g: ulong := 18446744073709551615UL;\n"
+        "    Console.WriteLine($\"{g in 31 ..} {(31 ..).Contains(g)} {g in ..< 5} {(..< 5).Contains(g)}\");\n"
+        "    g := 9223372036854775808UL;\n"
+        "    Console.WriteLine($\"{g in 10 ..} {(10 ..).Contains(g)} {g in 0 .. 10}\");\n"
+        "    var l: long := -1;\n"
+        "    Console.WriteLine($\"{l in 5UL ..} {(5UL ..).Contains(l)} {l in 5UL .. 10UL}\");\n"
+        "    l := 7;\n"
+        "    Console.WriteLine($\"{l in 5UL ..} {(5UL .. 10UL).Contains(l)}\");\n"
+        "    var i: int := 5;\n"
+        "    Console.WriteLine($\"{i in 0 .. 3000000000U} {(0 .. 3000000000U).Contains(i)}\");\n"
+        "    i := -1;\n"
+        "    Console.WriteLine($\"{i in 0 .. 3000000000U} {(0 .. 3000000000U).Contains(i)}\");\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+        "True True False False\n"
+        "True True False\n"
+        "False False False\n"
+        "True True\n"
+        "True True\n"
+        "False False\n");
+}
+
+// fix-forward #6853 (§17.5, §7.4, v0.340): `(lo .. hi).Contains(m)` over a
+// §7.4-narrowed nullable agrees with `m in lo .. hi` — both see the scalar.
+BEZEL_TEST(range_in_contains_agree_6853, narrowed_nullable_contains_agrees_with_in_spec_17_5) {
+    auto r = runAot(prog(
+        "    var m: int? := 3;\n"
+        "    if m <> null then\n"
+        "      Console.WriteLine($\"{m in 1 .. 5} {(1 .. 5).Contains(m)} {(4 .. 5).Contains(m)}\");\n"
+        "    end;\n"
+        "    var k: long? := 6;\n"
+        "    if k <> null then\n"
+        "      Console.WriteLine($\"{k in 1 .. 6} {(1 .. 6).Contains(k)} {(1 ..< 6).Contains(k)}\");\n"
+        "    end;\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "True True False\nTrue True False\n");
+}

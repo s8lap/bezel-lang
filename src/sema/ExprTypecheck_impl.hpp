@@ -2307,6 +2307,15 @@ private:
     TypeRef* narrowIntConstantToTarget(const ast::Expr* fromExpr,
                                        TypeRef* from, TypeRef* to);
 
+    // fix-forward #6853 (§17.5, §16.6, §5.1, v0.340): is `recv` a range
+    // LITERAL whose present endpoints are all compile-time constants and which
+    // admits an integer operand of primitive type `operand` that does not
+    // convert to the literal's element type? Interpretation recorded on
+    // spec-question #6897 (see the definition). False for anything else, so
+    // the caller's ordinary §5.1 check against `T` still decides.
+    bool rangeLiteralAdmitsIntegerOperand(const ast::Expr* recv,
+                                          PrimitiveType operand);
+
     // §25.2 "the ordinary argument rules" / §5.1 "Constant narrowing" (#5063,
     // v0.307): does a PRIMITIVE operand of static type `at` (from expression
     // `operandExpr`, when known) match a PRIMITIVE operator/parameter type

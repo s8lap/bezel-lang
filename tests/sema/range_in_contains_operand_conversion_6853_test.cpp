@@ -67,18 +67,96 @@ BEZEL_TEST(range_in_contains_operand_conversion_6853, uint_contains_call_spec_5_
     BEZEL_EXPECT_TRUE(hasErrorContaining(r, kCallSite));
 }
 
-// `long` and `ulong` are wider than the `int` element: never implicit.
+// fix-forward #6853 (§17.5, §16.6, §19.3, v0.340; spec-question #6897):
+// against a range LITERAL whose endpoints are all constants, a `long` /
+// `ulong` operand is ADMITTED when every endpoint fits its type — the literal
+// adapts to the operand as `case n of 0 .. 10` does over a `long` (§16.6: a
+// range pattern "agrees exactly with `in`"). Membership is decided on the
+// mathematical values: boundaries, values outside, negative values, and a
+// `long`/`ulong` value beyond `int`'s range. This row pinned a REJECTION on
+// `d6a86161`; the base `b470e397` accepted these programs with these answers.
 BEZEL_TEST(range_in_contains_operand_conversion_6853, long_and_ulong_into_int_range_spec_5_1) {
     auto r1 = runAot(prog(
         "    var l: long := 3;\n"
-        "    Console.WriteLine(l in 0 .. 10);\n"));
+        "    Console.WriteLine(l in 0 .. 10);\n"
+        "    Console.WriteLine((0 .. 10).Contains(l));\n"
+        "    l := 0;\n"
+        "    Console.WriteLine($\"{l in 0 .. 10} {l in 0 ..< 10} {(0 .. 10).Contains(l)}\");\n"
+        "    l := 10;\n"
+        "    Console.WriteLine($\"{l in 0 .. 10} {l in 0 ..< 10} {(0 ..< 10).Contains(l)}\");\n"
+        "    l := -1;\n"
+        "    Console.WriteLine($\"{l in 0 .. 10} {l in -5 .. 10} {(-5 .. 10).Contains(l)} {l in ..< 0} {l in 31 ..}\");\n"
+        "    l := 5000000000;\n"
+        "    Console.WriteLine($\"{l in 0 .. 10} {(0 .. 10).Contains(l)} {l in 31 ..} {(31 ..).Contains(l)}\");\n"
+        "    l := -5000000000;\n"
+        "    Console.WriteLine($\"{l in -5 .. 10} {l in ..< 0} {(..< 0).Contains(l)}\");\n"));
+    BEZEL_EXPECT_TRUE(r1.ran);
+    BEZEL_EXPECT_EQ(r1.stdoutText,
+        "True\nTrue\n"
+        "True True True\n"
+        "True False False\n"
+        "False True True True False\n"
+        "False False True True\n"
+        "False True True\n");
+    auto r2 = runAot(prog(
+        "    var g: ulong := 3;\n"
+        "    Console.WriteLine((0 .. 10).Contains(g));\n"
+        "    Console.WriteLine(g in 0 .. 10);\n"
+        "    g := 11;\n"
+        "    Console.WriteLine($\"{g in 0 .. 10} {(0 .. 10).Contains(g)}\");\n"
+        "    g := 18446744073709551615UL;\n"
+        "    Console.WriteLine($\"{g in 0 .. 10} {(0 .. 10).Contains(g)} {g in 31 ..} {(31 ..).Contains(g)} {g in ..< 5}\");\n"));
+    BEZEL_EXPECT_TRUE(r2.ran);
+    BEZEL_EXPECT_EQ(r2.stdoutText,
+        "True\nTrue\n"
+        "False False\n"
+        "False False True True False\n");
+}
+
+// The range VALUE forms stay rejected: a variable's, a field's, a parameter's
+// or a call result's static type `Range<int>` fixes `T`, and `long` / `ulong`
+// do not convert to `int` (§5.1). Only a constant-endpoint LITERAL adapts.
+BEZEL_TEST(range_in_contains_operand_conversion_6853, long_and_ulong_into_int_range_value_rejected_spec_5_1) {
+    auto r1 = runAot(prog(
+        "    var r := 0 .. 10;\n"
+        "    var l: long := 3;\n"
+        "    Console.WriteLine(l in r);\n"));
     BEZEL_EXPECT_FALSE(r1.ran);
     BEZEL_EXPECT_TRUE(hasErrorContaining(r1, kInSite));
     auto r2 = runAot(prog(
+        "    var r := 0 .. 10;\n"
         "    var g: ulong := 3;\n"
-        "    Console.WriteLine((0 .. 10).Contains(g));\n"));
+        "    Console.WriteLine(r.Contains(g));\n"));
     BEZEL_EXPECT_FALSE(r2.ran);
     BEZEL_EXPECT_TRUE(hasErrorContaining(r2, kCallSite));
+    auto r3 = runAot(
+        "module Conf;\n"
+        "public class Program\n"
+        "  private static Window: Range<int> := 0 .. 10;\n"
+        "  public static method Make(): Range<int>\n"
+        "    return 0 .. 10;\n"
+        "  end Make;\n"
+        "  public static method Test(r: Range<int>, l: long): bool\n"
+        "    return l in r;\n"
+        "  end Test;\n"
+        "  public static method Main()\n"
+        "    var l: long := 3;\n"
+        "    Console.WriteLine(l in Window);\n"
+        "    Console.WriteLine(Make().Contains(l));\n"
+        "    Console.WriteLine(Test(0 .. 10, l));\n"
+        "  end Main;\n"
+        "end Program;\n");
+    BEZEL_EXPECT_FALSE(r3.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r3, kInSite));
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r3, kCallSite));
+    // A literal whose endpoint is not a constant has its `T` fixed by that
+    // endpoint's type, like a value.
+    auto r4 = runAot(prog(
+        "    var hi: int := 10;\n"
+        "    var l: long := 3;\n"
+        "    Console.WriteLine(l in 0 .. hi);\n"));
+    BEZEL_EXPECT_FALSE(r4.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r4, kInSite));
 }
 
 // A `double` operand: pre-fix this died in LLVM IR verification.
@@ -89,13 +167,53 @@ BEZEL_TEST(range_in_contains_operand_conversion_6853, double_operand_rejected_at
     BEZEL_EXPECT_TRUE(hasErrorContaining(r, kInSite));
 }
 
-// A signed operand against an unsigned element type.
+// fix-forward #6853 (§17.5, §16.6, v0.340; spec-question #6897): an `int`
+// operand against the constant literal `1U .. 10U` is ADMITTED — both
+// endpoints fit `int` — and a negative operand is simply outside. This row
+// pinned a REJECTION on `d6a86161`; the base accepted it with these answers.
 BEZEL_TEST(range_in_contains_operand_conversion_6853, int_into_uint_range_spec_5_1) {
     auto r = runAot(prog(
         "    var i: int := 3;\n"
-        "    Console.WriteLine(i in 1U .. 10U);\n"));
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r, kInSite));
+        "    Console.WriteLine(i in 1U .. 10U);\n"
+        "    Console.WriteLine((1U .. 10U).Contains(i));\n"
+        "    i := -1;\n"
+        "    Console.WriteLine($\"{i in 1U .. 10U} {(1U .. 10U).Contains(i)} {i in 5U ..}\");\n"
+        "    i := 10;\n"
+        "    Console.WriteLine($\"{i in 1U .. 10U} {i in 1U ..< 10U} {(1U ..< 10U).Contains(i)}\");\n"
+        "    i := -2147483648;\n"
+        "    Console.WriteLine($\"{i in 0U .. 10U} {i in 5U ..}\");\n"
+        "    i := 2147483647;\n"
+        "    Console.WriteLine($\"{i in 0U .. 10U} {i in 5U ..} {(5U ..).Contains(i)}\");\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+        "True\nTrue\n"
+        "False False False\n"
+        "True False False\n"
+        "False False\n"
+        "False True True\n");
+}
+
+// The range VALUE form stays rejected: `Range<uint>` fixes `T`, and §5.1 makes
+// `int -> uint` never implicit. So does a literal with an endpoint the operand
+// cannot hold (`-5` fits no `uint`), the issue's repro 2 shape at `Contains`.
+BEZEL_TEST(range_in_contains_operand_conversion_6853, int_into_uint_range_value_rejected_spec_5_1) {
+    auto r1 = runAot(prog(
+        "    var r := 1U .. 10U;\n"
+        "    var i: int := 3;\n"
+        "    Console.WriteLine(i in r);\n"));
+    BEZEL_EXPECT_FALSE(r1.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r1, kInSite));
+    auto r2 = runAot(prog(
+        "    var r := 1U .. 10U;\n"
+        "    var i: int := 3;\n"
+        "    Console.WriteLine(r.Contains(i));\n"));
+    BEZEL_EXPECT_FALSE(r2.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r2, kCallSite));
+    auto r3 = runAot(prog(
+        "    var u: uint := 3;\n"
+        "    Console.WriteLine((-5 .. 10).Contains(u));\n"));
+    BEZEL_EXPECT_FALSE(r3.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r3, kCallSite));
 }
 
 // CONTROLS: the admitted conversions keep compiling and agree — widening into

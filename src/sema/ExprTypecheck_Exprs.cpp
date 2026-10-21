@@ -8616,7 +8616,13 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
             inRt->declaration == ctx_.builtinClassSym("Range") &&
             !inRt->genericArgs.empty() && inRt->genericArgs[0] &&
             inRt->genericArgs[0]->kind == TypeRef::Kind::Primitive &&
-            !(inLt->nullable && !isNarrowedNonNullRead(be.left.get()))) {
+            !(inLt->nullable && !isNarrowedNonNullRead(be.left.get())) &&
+            // fix-forward #6853 (§17.5, §16.6, v0.340): a constant-endpoint
+            // range LITERAL adapts to an integer operand whose type every
+            // endpoint fits (see rangeLiteralAdmitsIntegerOperand).
+            !(inLt->kind == TypeRef::Kind::Primitive &&
+              rangeLiteralAdmitsIntegerOperand(be.right.get(),
+                                               inLt->primitive))) {
             checkAssignable(
                 inLt, inRt->genericArgs[0],
                 be.left->span.begin.line != 0 ? be.left->span.begin
