@@ -24167,6 +24167,59 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 bool isShift = (as->op == "<<=" || as->op == ">>=");
                 bool isBitwise = (as->op == "&=" || as->op == "|=" ||
                                   as->op == "^=");
+                // fix #6834 (§5.1 "Constant narrowing", §6.2, §6.6, v0.340):
+                // a literal-derived right operand is exempt from the "no
+                // implicit conversion either way" pair test above because
+                // constant narrowing lets the constant adopt the TARGET's
+                // type -- but only "to any integer type whose range contains
+                // its value"; "a constant whose value does not fit the
+                // target's range is a compile error at the conversion site --
+                // never a silent truncation". The exemption never asked
+                // whether the value fits, so `u += -3_000_000_000` (u: ulong)
+                // adopted the constant at `ulong` and wrapped it to
+                // 18446744070709551617. Ask it here. A shift's count is not
+                // promoted (§6.5) and is excluded; a pair with a widening
+                // relation does not adopt (R is the wider type and the §6.6
+                // checked write-back decides at run time).
+                auto adoptedConstantOutOfRange = [&]() -> bool {
+                    if (isShift) return false;
+                    if (tTy->nullable || rTy->nullable) return false;
+                    auto isInt = [](P p) {
+                        switch (p) {
+                            case P::Byte: case P::SByte: case P::Short:
+                            case P::UShort: case P::Int: case P::UInt:
+                            case P::Long: case P::ULong:
+                                return true;
+                            default: return false;
+                        }
+                    };
+                    if (!isInt(tTy->primitive) || !isInt(rTy->primitive) ||
+                        tTy->primitive == rTy->primitive ||
+                        primitiveWidens(tTy->primitive, rTy->primitive) ||
+                        primitiveWidens(rTy->primitive, tTy->primitive) ||
+                        !isLitDerived(as->value.get()))
+                        return false;
+                    auto cv = foldIntConstExprTC(*as->value);
+                    if (!cv || fitsInIntType(*cv, tTy->primitive))
+                        return false;
+                    ctx_.diagnostics().report(
+                        Severity::Error, as->value->span.begin,
+                        std::string("compound assignment `") +
+                        std::string(as->op) + "`: the constant `" +
+                        std::to_string(*cv) + "` does not fit `" +
+                        spellN(tTy) + "` -- `" + spellN(tTy) + " " +
+                        std::string(as->op.substr(0, as->op.size() - 1)) +
+                        " " + spellN(rTy) + "` has no implicit conversion "
+                        "between the operand types (\xC2\xA7""6.2), so the "
+                        "constant can only be admitted by constant narrowing, "
+                        "and a constant outside the target's range is a "
+                        "compile error at the conversion site, never a silent "
+                        "truncation (\xC2\xA7""5.1, \xC2\xA7""6.6, v0.340)");
+                    return true;
+                };
+                if (adoptedConstantOutOfRange()) {
+                    // reported; the pair checks below would only repeat it.
+                } else
                 // fix #4808 (§25/§8.1/§6.6, v0.307): Object has no arithmetic
                 // or bitwise operators defined. Check before the
                 // shift/bitwise/arithmetic split — Object is not integer-kind,

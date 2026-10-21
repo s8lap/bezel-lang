@@ -9786,6 +9786,47 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
             // not a `T?` — the same normalization the binary path performs.
             ot = operandStaticTypeAt(ue.operand.get(), ot);
         }
+        // fix #6834 (§4.2 suffixes, §6.1 checked unary `-`, §17.14 constant
+        // evaluation, v0.340): a `U`/`UL`-suffixed literal has type `uint` /
+        // `ulong`, and unary `-` on an unsigned operand is checked -- the
+        // mathematical result -m is not representable for m > 0, so the
+        // negation faults. §17.14: a fault in a constant expression "is a
+        // compile error at the constant expression, never a deferred runtime
+        // fault". Before this, `-3_000_000_000U` at `uint` stored 1294967296
+        // and `-3_000_000_000UL` at `ulong` stored 18446744070709551616 (the
+        // negation wrapped). `-0U` is 0 and stays. Parentheses group without
+        // a node, so `-(3U)` is this same shape. Only the literal operand is
+        // decided here; a non-literal constant operand is not (see #6834's
+        // follow-up).
+        if (op == "-" && ue.operand) {
+            if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(
+                    ue.operand.get())) {
+                bool hasU = false;
+                for (char c : il->text)
+                    if (c == 'u' || c == 'U') hasU = true;
+                unsigned long long mag = 0;
+                if (hasU && intLiteralMagnitude(il->text, mag) &&
+                    errno != ERANGE && mag != 0 &&
+                    // a literal already rejected at formation (§4.2) is not
+                    // reported a second time.
+                    !(ot && ot->kind == TypeRef::Kind::Primitive &&
+                      ot->primitive == PrimitiveType::UInt &&
+                      mag > 4294967295ULL)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ue.span.begin,
+                        std::string("unary `-` on the unsigned constant `") +
+                        std::string(il->text) + "` has no representable "
+                        "result: -" + std::to_string(mag) + " is outside `" +
+                        (ot && ot->kind == TypeRef::Kind::Primitive &&
+                                 ot->primitive == PrimitiveType::ULong
+                             ? "ulong"
+                             : "uint") +
+                        "`'s range, and a constant expression that faults is "
+                        "a compile error, never a deferred run-time fault "
+                        "(\xC2\xA7""6.1, \xC2\xA7""17.14, v0.340)");
+                }
+            }
+        }
         if (ot) ctx_.setExprType(&ue, ot);
         return;
     }
