@@ -2308,9 +2308,9 @@ private:
                                        TypeRef* from, TypeRef* to);
 
     // fix-forward #6853 (§17.5, §16.6, §5.1, v0.340): is `recv` a range
-    // LITERAL whose present endpoints are all compile-time constants and which
-    // admits an integer operand of primitive type `operand` that does not
-    // convert to the literal's element type? Interpretation recorded on
+    // LITERAL that admits an integer operand of primitive type `operand` that
+    // does not convert to the literal's element type (every endpoint's type
+    // widens to it, or all endpoints are constants that fit it)? Interpretation recorded on
     // spec-question #6897 (see the definition). False for anything else, so
     // the caller's ordinary §5.1 check against `T` still decides.
     bool rangeLiteralAdmitsIntegerOperand(const ast::Expr* recv,

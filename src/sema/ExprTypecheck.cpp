@@ -5461,8 +5461,11 @@ TypeRef* ExprTC::narrowIntConstantToTarget(const ast::Expr* fromExpr,
 // not say whether a range LITERAL's `T` is fixed by its endpoints alone or
 // adapts to the `in` operand the way §16.2's fully open `..` takes `T` from
 // its position. Interpretation implemented (spec-question #6897, mixed
-// endpoints #6887): for a literal whose present endpoints are ALL
-// compile-time constants, an integer operand of type `O` is admitted when
+// endpoints #6887): against a range LITERAL, an integer operand of type `O`
+// is admitted when
+//   (W) every present endpoint's static type is `O` or widens to it under
+//       §5.1, constant or not (`n: long in 0 .. hi`, `hi: int`); or, when
+//       the present endpoints are ALL compile-time constants,
 //   (B) every endpoint's value fits `O` (the literal is read as a
 //       `Range<O>`, as a `case` range pattern is read at its scrutinee's
 //       type) — a `char` endpoint counts when `char` widens to `O`; or
@@ -5477,6 +5480,27 @@ bool ExprTC::rangeLiteralAdmitsIntegerOperand(const ast::Expr* recv,
     auto* re = dynamic_cast<const ast::RangeExpr*>(recv);
     if (!re || (!re->lo && !re->hi)) return false;
     if (!isIntegerPrimitiveType(operand)) return false;
+    // (W) Constant or not: every present endpoint's static type is `O` or
+    // widens to it under §5.1, so every endpoint value is an `O` value and the
+    // literal is read as a `Range<O>` (`n: long in 0 .. hi` with `hi: int`).
+    // `u: uint in lo .. 10` with `lo: int` is not: `int` does not widen to
+    // `uint`, and a non-constant `lo` cannot satisfy (B) below either.
+    {
+        bool allWiden = true;
+        for (const ast::Expr* ep : {re->lo.get(), re->hi.get()}) {
+            if (!ep) continue;
+            const TypeRef* et = ctx_.exprType(*ep);
+            if (!et || et->kind != TypeRef::Kind::Primitive || et->nullable ||
+                (et->primitive != operand &&
+                 !primitiveImplicitlyWidens(et->primitive, operand)) ||
+                (et->primitive != PrimitiveType::Char &&
+                 !isIntegerPrimitiveType(et->primitive))) {
+                allWiden = false;
+                break;
+            }
+        }
+        if (allWiden) return true;
+    }
     // Mathematical value of an integer constant endpoint; a `ulong` constant
     // above `long`'s range folds to its two's-complement `long long`.
     auto fitsOperand = [&](__int128 v) {

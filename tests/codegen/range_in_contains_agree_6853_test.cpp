@@ -146,3 +146,29 @@ BEZEL_TEST(range_in_contains_agree_6853, narrowed_nullable_contains_agrees_with_
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "True True False\nTrue True False\n");
 }
+
+// fix-forward #6853 (§17.5, §5.1, v0.340; #6897 rule W): a range LITERAL
+// whose endpoints are NOT constants is admitted against a `long` operand when
+// every endpoint's static type (`int`) widens to `long`, and membership is
+// decided on the values: boundaries, just outside, a negative `long`, and a
+// `long` beyond `int`'s range. Base `b470e397` accepted this shape;
+// `11650ee3` rejected it.
+BEZEL_TEST(range_in_contains_agree_6853, long_against_variable_int_endpoint_literal_spec_5_1) {
+    auto r = runAot(prog(
+        "    var lo: int := -5;\n"
+        "    var hi: int := 100;\n"
+        "    var a: Array<long> := [-5000000000L, -6L, -5L, -1L, 0L, 100L, 101L, 5000000000L];\n"
+        "    for var n in a do\n"
+        "      Console.WriteLine($\"{n} {n in lo .. hi} {(lo .. hi).Contains(n)} {n in lo ..< hi} {n in 0 .. hi} {n in lo ..} {n in .. hi}\");\n"
+        "    end;\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+        "-5000000000 False False False False False True\n"
+        "-6 False False False False False True\n"
+        "-5 True True True False True True\n"
+        "-1 True True True False True True\n"
+        "0 True True True True True True\n"
+        "100 True True False True True True\n"
+        "101 False False False False True False\n"
+        "5000000000 False False False False True False\n");
+}

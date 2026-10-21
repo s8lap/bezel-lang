@@ -115,7 +115,7 @@ BEZEL_TEST(range_in_contains_operand_conversion_6853, long_and_ulong_into_int_ra
 
 // The range VALUE forms stay rejected: a variable's, a field's, a parameter's
 // or a call result's static type `Range<int>` fixes `T`, and `long` / `ulong`
-// do not convert to `int` (§5.1). Only a constant-endpoint LITERAL adapts.
+// do not convert to `int` (§5.1). Only a range LITERAL adapts (#6897).
 BEZEL_TEST(range_in_contains_operand_conversion_6853, long_and_ulong_into_int_range_value_rejected_spec_5_1) {
     auto r1 = runAot(prog(
         "    var r := 0 .. 10;\n"
@@ -149,14 +149,25 @@ BEZEL_TEST(range_in_contains_operand_conversion_6853, long_and_ulong_into_int_ra
     BEZEL_EXPECT_FALSE(r3.ran);
     BEZEL_EXPECT_TRUE(hasErrorContaining(r3, kInSite));
     BEZEL_EXPECT_TRUE(hasErrorContaining(r3, kCallSite));
-    // A literal whose endpoint is not a constant has its `T` fixed by that
-    // endpoint's type, like a value.
-    auto r4 = runAot(prog(
-        "    var hi: int := 10;\n"
-        "    var l: long := 3;\n"
-        "    Console.WriteLine(l in 0 .. hi);\n"));
-    BEZEL_EXPECT_FALSE(r4.ran);
-    BEZEL_EXPECT_TRUE(hasErrorContaining(r4, kInSite));
+}
+
+// A range LITERAL with a NON-constant endpoint is admitted only when every
+// endpoint's static type widens to the operand's (§5.1, #6897 rule W): `int`
+// does not widen to `uint`, so `u in lo .. 10` with `lo: int` stays rejected
+// at `in` and at `Contains`.
+BEZEL_TEST(range_in_contains_operand_conversion_6853, uint_against_variable_int_endpoint_literal_rejected_spec_5_1) {
+    auto r1 = runAot(prog(
+        "    var lo: int := 0;\n"
+        "    var u: uint := 3;\n"
+        "    Console.WriteLine(u in lo .. 10);\n"));
+    BEZEL_EXPECT_FALSE(r1.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r1, kInSite));
+    auto r2 = runAot(prog(
+        "    var lo: int := 0;\n"
+        "    var u: uint := 3;\n"
+        "    Console.WriteLine((lo .. 10).Contains(u));\n"));
+    BEZEL_EXPECT_FALSE(r2.ran);
+    BEZEL_EXPECT_TRUE(hasErrorContaining(r2, kCallSite));
 }
 
 // A `double` operand: pre-fix this died in LLVM IR verification.
