@@ -2566,12 +2566,20 @@ private:
     // or bare-implicit-this). Used by the four construction-window
     // carve-out sites to narrow the instance-readonly carve-out from
     // `inConstructor_` alone to `inConstructor_ && thisRooted`; the
-    // static-readonly carve-out is preserved unchanged (per-instance vs
-    // per-type does not reach it, v0.270 records the case as open).
+    // static-readonly window is decided by isReadonlyStoreWindowOpen
+    // (§22.8, v0.340, #6852), not here.
     // Mirrors PureBodyWalker::targetRootSymbol's chain-walk shape but
     // adds the bare-implicit-this spelling check (FieldSymbol of
     // currentType_) the PureChecker walk does not.
     bool isThisRootedLValueTarget(const ast::Expr& target) const;
+
+    // §22.8 / §23.1 (v0.340, #6852): the single assignable-window predicate
+    // for a `readonly` field or auto-property, consulted by every store form
+    // (`:=`, compound assignment, `++`/`--`, `ref`/`out` binding). The rule is
+    // stated at its definition in ExprTypecheck.cpp.
+    bool isReadonlyStoreWindowOpen(const ast::Expr& target,
+                                   const TypeSymbol* declaring,
+                                   bool isStatic) const;
 
     // Slice S7: diagnose assignment to a readonly field outside the
     // declaring class's constructor. Tracks only the `this.<field>`

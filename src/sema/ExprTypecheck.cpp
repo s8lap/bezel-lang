@@ -9296,11 +9296,10 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
 // `checkLValueChainNotCallBased` does not distinguish from any other
 // base).
 //
-// Static readonly carve-outs are NOT narrowed by this helper — the
-// per-instance ruling does not reach them, and v0.270 records the
-// "instance constructor may assign a `static readonly` field" case as
-// open. The four call sites handle the static-vs-instance split
-// themselves (`isStatic ? inConstructor_ : inConstructor_ && thisRooted`).
+// Static readonly members are not decided by this helper: the per-instance
+// rule does not reach them. isReadonlyStoreWindowOpen (§22.8, v0.340, #6852)
+// owns the static-vs-instance split and the lambda and declaring-type
+// conditions for all four call sites.
 bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
     // Walk the lvalue chain (MemberAccessExpr / IndexExpr /
     // PostfixBangExpr) to find the chain's base — same shape as
@@ -9359,6 +9358,39 @@ bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
     if (auto* ps = dynamic_cast<PropertySymbol*>(sym))
         return ps->parent == currentType_;
     return false;
+}
+
+// §22.8 / §23.1 (v0.340, #6852): the assignable window of a `readonly` field
+// or auto-property. Every store form consults it: `:=`, compound assignment,
+// `++`/`--` (§17.6) and binding to a `ref`/`out` parameter (§22.3). §22.8:
+// a `readonly` field "may be assigned only in a field initializer or in a
+// constructor body", and "the window is lexical and does not include a nested
+// function body", so a lambda written inside a constructor is outside it. The
+// context is per-instance, not per-type:
+//  - an INSTANCE member is assignable only through an lvalue chain rooted at
+//    `this`, in an instance constructor body (isThisRootedLValueTarget, which
+//    also requires the member to belong to the current type);
+//  - a `static readonly` member is assignable "only in its own static field
+//    initializer or in the declaring type's **static** constructor body", so
+//    it needs the declaring type's own static constructor. An instance
+//    constructor of the declaring type is not a site ("no `new C()` writes
+//    `C._s`"), and neither is a static constructor of any other type: a
+//    derived class, a nested type, an unrelated class or an extension.
+// §23.1 gives an auto-property the same window ("admitted only through `this`
+// for an instance auto-property, or in the declaring type's own static
+// initialization for a `static readonly` one"). The instance-value spelling
+// `h.S` of a static member never reaches this predicate: §22.12 rejects it at
+// name resolution. The field-initializer window that §22.8 names is not
+// opened here, as on base; whether a readonly member may be bound inside its
+// own initializer is a spec question this change does not decide.
+bool ExprTC::isReadonlyStoreWindowOpen(const ast::Expr& target,
+                                       const TypeSymbol* declaring,
+                                       bool isStatic) const {
+    if (!inConstructor_ || inLambda_) return false;
+    if (isStatic)
+        return inStaticMember_ && declaring != nullptr &&
+               declaring == currentType_;
+    return !inStaticMember_ && isThisRootedLValueTarget(target);
 }
 
 // §9.4 (v0.236, #2309; follow-up §9.4 "Value receivers are borrows", v0.307):
@@ -9687,9 +9719,9 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     // other instance's readonly field — a per-type carve-out that
     // falsified §7.4's narrowing licence. Narrowed here: for an
     // INSTANCE readonly field, the carve-out fires only if the chain
-    // is this-rooted; for a static readonly field, the carve-out is
-    // preserved unchanged (per-instance vs per-type does not reach
-    // it, v0.270 records the case as open). Pre-fix: also didn't track
+    // is this-rooted; for a static readonly field, the window is the
+    // declaring type's static constructor (§22.8, v0.340). Pre-fix: also
+    // didn't track
     // WHICH type's constructor we were in, so an unrelated class D's
     // constructor body writing `c._f` (where `_f` is C's readonly) was
     // also accepted; the same this-rooted check rejects that shape
@@ -9759,30 +9791,12 @@ void ExprTC::checkReadonlyFieldWriteTarget(const ast::Expr& target,
         fs->parent->kind == ast::TypeDeclKind::Record) {
         return;
     }
-    if (inConstructor_) {
-        bool isStatic = false;
-        for (auto mod : fs->modifiers)
-            if (mod == "static") { isStatic = true; break; }
-        // fix #5638/#5651 (§22.8, v0.334): the `isStatic` arm previously
-        // returned early for ANY constructor (instance or static), but a
-        // static readonly field is assignable only in a STATIC constructor —
-        // an instance constructor writing a static field is a compile error.
-        // Require `inStaticMember_` (set when visiting a static constructor
-        // body).  Separately, the spec's assignment window is lexical and does
-        // not include a nested lambda body: a lambda written inside a
-        // constructor is outside every assignment window (§22.8), so an
-        // assignment inside it is rejected regardless of constructor context.
-        // Require `!inLambda_` for both arms.
-        //
-        // Additionally, `isThisRootedLValueTarget` returns true for bare static
-        // field names (since `fs->parent == currentType_` holds for static
-        // fields too), so the `isThisRootedLValueTarget` arm must also exclude
-        // static fields — a static field is never `this`-rooted regardless of
-        // the bare-name resolution behaviour.
-        if ((!inLambda_ && inStaticMember_ && isStatic) ||
-            (!inLambda_ && !isStatic && isThisRootedLValueTarget(target)))
-            return;
-    }
+    // §22.8 / §23.1 (v0.340, #6852): the shared assignable window. The rule
+    // lives in isReadonlyStoreWindowOpen.
+    bool isStatic = false;
+    for (auto mod : fs->modifiers)
+        if (mod == "static") { isStatic = true; break; }
+    if (isReadonlyStoreWindowOpen(target, fs->parent, isStatic)) return;
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
     // initializer or a constructor body; assignment/increment anywhere
     // else is a compile error. Resolve the target's field symbol directly
@@ -10036,8 +10050,8 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         // construction-window carve-out fires only if the chain is
         // this-rooted (the same `isThisRootedLValueTarget` rule the
         // field branch uses); for a `static readonly` auto-property
-        // the carve-out is preserved (per-instance vs per-type does
-        // not reach it, v0.270 records the case as open).
+        // the window is the declaring type's static constructor (§22.8,
+        // v0.340, #6852; isReadonlyStoreWindowOpen).
         //
         // fix #4276 (§23.1, v0.298): `isThisRootedLValueTarget`'s
         // explicit-`this.P` branch does not check the property's own
@@ -10059,9 +10073,22 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         bool propIsStatic = false;
         for (auto mod : pd->modifiers)
             if (mod == "static") { propIsStatic = true; break; }
-        bool readonlyAllowed;
-        if (propIsStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
+        const bool readonlyAllowed =
+            isReadonlyStoreWindowOpen(target, ps->parent, propIsStatic);
+        // #6852: the window the pre-fix gate admitted (any constructor for a
+        // static member; a this-rooted write in a constructor for an instance
+        // one). A write it admitted that the §13.6 setter check forbids keeps
+        // that check's message, which #6727 pins; the readonly message is
+        // reserved for the writes this fix newly rejects.
+        const bool preFixAdmitted =
+            inConstructor_ && (propIsStatic || isThisRootedLValueTarget(target));
+        const auto reportReadonlyWrite = [&] {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot " + verb + "readonly property `" + propName +
+                "` outside a field initializer or constructor (" + cite +
+                "§23.1)");
+        };
         if (!hasSetter) {
             // #2851: `propName` is empty for an indexer (its symbol name is
             // the synthetic ".this"), so name the construct rather than
@@ -10074,12 +10101,8 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
                        "§23.3)")
                     : ("cannot " + verb + "read-only property `" + propName +
                        "` — it has no setter (" + cite + "§23.3)"));
-        } else if (isReadonlyAuto && !readonlyAllowed) {
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                "cannot " + verb + "readonly property `" + propName +
-                "` outside a field initializer or constructor (" + cite +
-                "§23.1)");
+        } else if (isReadonlyAuto && !readonlyAllowed && !preFixAdmitted) {
+            reportReadonlyWrite();
         } else if (hasSetter) {
             // §13.6 (#747 R42): a property write must respect the SETTER
             // accessor's visibility, which may be more restrictive than the
@@ -10121,6 +10144,8 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
                     "cannot " + verb + "property `" + propName +
                     "` — its setter is not accessible here (" + cite +
                     "§13.6)");
+            } else if (isReadonlyAuto && !readonlyAllowed) {
+                reportReadonlyWrite();
             }
         }
     } else {
@@ -10412,6 +10437,16 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
             checkRefOutFieldOperand(*fs, target, kind);
             return;
         }
+        // §22.3 / §23.1 (v0.340, #6852): a bare name that resolves to a
+        // property is the same store as `this.P` or `T.P`, which the
+        // member-access arm below already checks. Without this arm a bare
+        // `ref P` or `out P` skipped checkRefOutPropertyOperand entirely, so
+        // a readonly auto-property could be bound to a ref/out parameter from
+        // any method.
+        if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
+            checkRefOutPropertyOperand(*ps, target, kind);
+            return;
+        }
         if (dynamic_cast<ConstMemberSymbol*>(sym)) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
@@ -10501,9 +10536,9 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     // AND only through an lvalue chain rooted at `this`. For an
     // INSTANCE readonly field the carve-out narrows from
     // `inConstructor_` alone to `inConstructor_ && this-rooted`; for
-    // a STATIC readonly field the carve-out is preserved (per-instance
-    // vs per-type does not reach it, v0.270 records the case as
-    // open). `checkRefOutFieldOperand` is the ref/out twin of the
+    // a STATIC readonly field the window is the declaring type's static
+    // constructor (§22.8, v0.340, #6852; isReadonlyStoreWindowOpen).
+    // `checkRefOutFieldOperand` is the ref/out twin of the
     // `:=`-target `checkReadonlyAssignment` above.
     //
     // fix #4276 (§22.3 / §22.8, v0.298): mirrors that same-named fix's
@@ -10515,9 +10550,8 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     // folds `currentType_ == fs.parent` into `isThisRootedLValueTarget`
     // itself, so this call site no longer carries the redundant conjunct.
     if (isReadonly) {
-        bool readonlyAllowed;
-        if (isStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
+        const bool readonlyAllowed =
+            isReadonlyStoreWindowOpen(target, fs.parent, isStatic);
         if (!readonlyAllowed) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
@@ -10718,23 +10752,30 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     // the `:=`-target `checkPropertyWriteTarget` narrowing above. For
     // an INSTANCE readonly auto-property the carve-out narrows from
     // `inConstructor_` alone to `inConstructor_ && this-rooted`; for
-    // a `static readonly` auto-property the carve-out is preserved
-    // (per-instance vs per-type does not reach it, v0.270 records the
-    // case as open).
+    // a `static readonly` auto-property the window is the declaring type's
+    // static constructor (§23.1, v0.340, #6852; isReadonlyStoreWindowOpen).
     //
     // fix #4276 (§22.3 / §23.1, v0.298): the ref/out twin of
     // `checkPropertyWriteTarget`'s same-numbered fix. fix #4297
     // (§22.3/§23.1, v0.298) folds `currentType_ == ps.parent` into
     // `isThisRootedLValueTarget` itself, so this call site no longer
     // carries the redundant conjunct.
+    // #6852: the pre-fix window (any constructor for a static member; a
+    // this-rooted write in a constructor for an instance one). A write it
+    // admitted that the §13.6 check below forbids keeps that check's message,
+    // which #6727 pins; the readonly message is reserved for the writes this
+    // fix newly rejects, reported after the setter check.
+    bool readonlyAllowed = true;
+    bool preFixAdmitted = false;
     if (isReadonlyAuto) {
         bool propIsStatic = false;
         for (auto mod : pd->modifiers)
             if (mod == "static") { propIsStatic = true; break; }
-        bool readonlyAllowed;
-        if (propIsStatic) readonlyAllowed = inConstructor_;
-        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
-        if (!readonlyAllowed) {
+        readonlyAllowed =
+            isReadonlyStoreWindowOpen(target, ps.parent, propIsStatic);
+        preFixAdmitted =
+            inConstructor_ && (propIsStatic || isThisRootedLValueTarget(target));
+        if (!readonlyAllowed && !preFixAdmitted) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
                 std::string("a `") + kind + "` argument must be a property "
@@ -10781,6 +10822,13 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
             std::string("a `") + kind + "` argument must be a property "
             "with an accessible setter — its setter is not accessible "
             "here (§22.3 / §13.6)");
+    } else if (!readonlyAllowed) {
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `") + kind + "` argument must be a property "
+            "with an accessible setter — this readonly property's setter "
+            "may be used only in a field initializer or constructor (§22.3 "
+            "/ §23.1)");
     }
 }
 
