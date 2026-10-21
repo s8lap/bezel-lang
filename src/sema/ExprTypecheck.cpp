@@ -16158,6 +16158,24 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType,
     } else {
         nullNarrowed_.erase(sym);
         initNarrowed_.erase(sym);
+        noteNarrowKill(sym);   // #6673
+    }
+}
+
+// fix #6673: see NarrowKillLog in ExprTypecheck_impl.hpp.
+bool ExprTC::narrowKilledIn(const NarrowKillLog& log, Symbol* s) const {
+    if (log.syms.count(s)) return true;
+    if (!log.capturedKill || !s) return false;
+    if (auto* ls = dynamic_cast<LocalSymbol*>(s); ls && ls->isConst)
+        return false;
+    return mutablyCapturedNames_.count(s->name) > 0;
+}
+
+void ExprTC::eraseNarrowKills(std::unordered_set<Symbol*>& set,
+                              const NarrowKillLog& log) const {
+    for (auto it = set.begin(); it != set.end();) {
+        if (narrowKilledIn(log, *it)) it = set.erase(it);
+        else ++it;
     }
 }
 
@@ -18614,6 +18632,7 @@ void ExprTC::computeMutablyCaptured(
 // for the remainder of its scope, across calls and `await`s.
 void ExprTC::invalidateCapturedNarrowings() {
     if (mutablyCapturedNames_.empty()) return;
+    for (auto& l : narrowKillLogs_) l.capturedKill = true;   // #6673
     for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
         Symbol* s = *it;
         if (s && mutablyCapturedNames_.count(s->name) &&
@@ -25770,6 +25789,28 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto tryEntryNull = nullNarrowed_;
         auto tryEntryInit = initNarrowed_;
         const std::uint64_t tryDropEpoch0 = fieldFactDropEpoch_;
+        // fix #6673 (§7.4, §31.2, v0.339): "a fact holds at a point only when
+        // it holds on every path that reaches it". A catch arm is reached from
+        // any point of the protected block, and the `finally` from any point of
+        // the block or of an arm, each carrying the state at THAT point. Two
+        // kill logs (NarrowKillLog): the region's (block + arms, for the
+        // `finally` entry) and the block's (for the arm entry). An entry fact
+        // either log records was invalidated somewhere in it, so it does not
+        // hold on every such path, whatever the region's exit state says.
+        narrowKillLogs_.emplace_back();   // region: block + catch arms
+        narrowKillLogs_.emplace_back();   // protected block
+        // A statement (list) whose end is unreachable contributes no path to
+        // the point after the `try` (a `return`, `throw`, rethrow, `break` or
+        // `continue` leaves it); its exit state joins nothing there.
+        auto armBodyLeaves = [&](const ast::Stmt* st) {
+            if (!st) return false;
+            if (dynamic_cast<const ast::BreakStmt*>(st) ||
+                dynamic_cast<const ast::ContinueStmt*>(st))
+                return true;
+            if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(st))
+                return loopBodyEndUnreachable(dob->body);
+            return stmtAlwaysExits(*st);
+        };
         {
             // per §21.6 / §21.1 (#5334, the #5314 residual): the PROTECTED
             // BLOCK of a `try` is a statement block (A.6 TryStmt), sibling to
@@ -25790,6 +25831,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto tryJoinField = afterBodyField;
         auto afterBodyNull = nullNarrowed_;
         auto afterBodyInit = initNarrowed_;
+        const NarrowKillLog bodyKills = std::move(narrowKillLogs_.back());
+        narrowKillLogs_.pop_back();
+        const bool bodyFallsThrough = !loopBodyEndUnreachable(trys->body);
         // Catch-arm running base (#2116 pre-gate review, hardened): the body
         // can be interrupted at ANY point, and the exit-state intersection
         // entry ∩ after-body is BLIND to an interior drop that a later
@@ -25836,12 +25880,23 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (afterBodyInit.count(*it)) ++it;
             else it = catchRunningInit.erase(it);
         }
+        // fix #6673: ... and minus every entry fact the block invalidated at
+        // an interior point that a later store masks at its end.
+        eraseNarrowKills(catchRunningNull, bodyKills);
+        eraseNarrowKills(catchRunningInit, bodyKills);
         // §7.4 #2164: the after-try join is after-body ∩ every catch's
         // exit. Initialized to afterBodyNull once, then shrunken by each
         // arm's exit (the same shape tryJoinField has for the field set,
         // just without drop-edge carving).
         auto tryJoinNull = afterBodyNull;
         auto tryJoinInit = afterBodyInit;
+        // fix #6673: only the paths that complete normally reach the point
+        // after the `try`; `anyFallThrough` says whether tryJoin* holds one.
+        // `finJoin*` intersects EVERY exit (the `finally` runs on the leaving
+        // ones too) — a safety bound on the `finally` entry below.
+        bool anyFallThrough = bodyFallsThrough;
+        auto finJoinNull = afterBodyNull;
+        auto finJoinInit = afterBodyInit;
         for (const auto& arm : trys->catches) {
             // §31.2.1/§12.7/§2.8.3 rule 4 (#1939): the CATCH-surface copy of the
             // #2006/#2012/#2018 erasure guard. §31.2.1: an arm "matches any
@@ -25964,18 +26019,36 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // every catch exit); catchRunningNull is the next-arm base
             // (each new arm starts from entry ∩ after-body ∩ earlier
             // arms' exits, shrinking as arms diverge).
-            for (auto it = tryJoinNull.begin(); it != tryJoinNull.end();) {
+            if (!armBodyLeaves(arm.body.get())) {   // #6673
+                if (!anyFallThrough) {
+                    tryJoinNull = nullNarrowed_;
+                    tryJoinInit = initNarrowed_;
+                    anyFallThrough = true;
+                } else {
+                    for (auto it = tryJoinNull.begin();
+                         it != tryJoinNull.end();) {
+                        if (nullNarrowed_.count(*it)) ++it;
+                        else it = tryJoinNull.erase(it);
+                    }
+                    for (auto it = tryJoinInit.begin();
+                         it != tryJoinInit.end();) {
+                        if (initNarrowed_.count(*it)) ++it;
+                        else it = tryJoinInit.erase(it);
+                    }
+                }
+            }
+            for (auto it = finJoinNull.begin(); it != finJoinNull.end();) {
                 if (nullNarrowed_.count(*it)) ++it;
-                else it = tryJoinNull.erase(it);
+                else it = finJoinNull.erase(it);
+            }
+            for (auto it = finJoinInit.begin(); it != finJoinInit.end();) {
+                if (initNarrowed_.count(*it)) ++it;
+                else it = finJoinInit.erase(it);
             }
             for (auto it = catchRunningNull.begin();
                  it != catchRunningNull.end();) {
                 if (nullNarrowed_.count(*it)) ++it;
                 else it = catchRunningNull.erase(it);
-            }
-            for (auto it = tryJoinInit.begin(); it != tryJoinInit.end();) {
-                if (initNarrowed_.count(*it)) ++it;
-                else it = tryJoinInit.erase(it);
             }
             for (auto it = catchRunningInit.begin();
                  it != catchRunningInit.end();) {
@@ -25999,6 +26072,30 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                     finallyEntryField.end());
         fieldNarrowed_ = std::move(finallyEntryField);
         const std::uint64_t finDropEpoch0 = fieldFactDropEpoch_;
+        // fix #6673 (§7.4, §31.2, v0.339): the local sets get the same
+        // `finally` entry — the try-entry facts that no point of the block or
+        // of an arm invalidated (and, as a bound, that every exit carries).
+        // Before, the `finally` was walked in the last arm's (or the block's)
+        // exit state, which an interrupted or early-exit path never had.
+        const NarrowKillLog regionKills = std::move(narrowKillLogs_.back());
+        narrowKillLogs_.pop_back();
+        {
+            auto finEntryNull = tryEntryNull;
+            auto finEntryInit = tryEntryInit;
+            eraseNarrowKills(finEntryNull, regionKills);
+            eraseNarrowKills(finEntryInit, regionKills);
+            for (auto it = finEntryNull.begin(); it != finEntryNull.end();) {
+                if (finJoinNull.count(*it)) ++it;
+                else it = finEntryNull.erase(it);
+            }
+            for (auto it = finEntryInit.begin(); it != finEntryInit.end();) {
+                if (finJoinInit.count(*it)) ++it;
+                else it = finEntryInit.erase(it);
+            }
+            nullNarrowed_ = std::move(finEntryNull);
+            initNarrowed_ = std::move(finEntryInit);
+        }
+        narrowKillLogs_.emplace_back();   // the `finally` block
         // per §31.2: `return` inside a `finally` block is a compile error.
         // Track finally-body nesting so the ReturnStmt handler can reject it.
         // per §21.5/§31.2 (v0.182, #1578): also record `loopDepth_` as it
@@ -26047,8 +26144,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // local set has no drop-edge carving — apply the same
         // intersection-only discipline (matches the §7.4 join the if-stmt
         // and case-stmt handlers already apply).
-        nullNarrowed_.insert(tryJoinNull.begin(), tryJoinNull.end());
-        initNarrowed_.insert(tryJoinInit.begin(), tryJoinInit.end());
+        //
+        // fix #6673: that union resurrected a fact the `finally` invalidated
+        // (`finally s := null; end try;` left `s` narrowed). A completing path
+        // carries tryJoin*, then runs the `finally`: a joined fact survives
+        // unless the `finally` invalidated it (its kill log), and what the
+        // `finally` itself established on every path (its exit state) holds.
+        // With no completing path the point is unreachable; keep the exit.
+        const NarrowKillLog finKills = std::move(narrowKillLogs_.back());
+        narrowKillLogs_.pop_back();
+        if (anyFallThrough) {
+            eraseNarrowKills(tryJoinNull, finKills);
+            eraseNarrowKills(tryJoinInit, finKills);
+            nullNarrowed_.insert(tryJoinNull.begin(), tryJoinNull.end());
+            initNarrowed_.insert(tryJoinInit.begin(), tryJoinInit.end());
+        }
     } else if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
         // §29.9: `yield` is a method-level construct only — `yield return` and
         // `yield break` are both forbidden inside a lambda. Without this the

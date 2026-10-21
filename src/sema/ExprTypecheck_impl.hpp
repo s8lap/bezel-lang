@@ -453,6 +453,31 @@ private:
     // single-threaded walk — no determinism impact.
     std::uint64_t fieldFactDropEpoch_ = 0;
 
+    // fix #6673 (§7.4 "How narrowing is invalidated", §31.2, v0.339): the
+    // local-set counterpart of the drop epoch above, kept per symbol. Each open
+    // `try` region pushes a log; every invalidating form (narrowOnAssignment's
+    // nullable store, a `ref`/`out` argument, invalidateCapturedNarrowings)
+    // records into EVERY open log. A catch arm or the `finally` can be entered
+    // from any point of the region it guards, so an entry fact the region
+    // invalidated anywhere does not hold there, even when a later store
+    // re-established it before the region's end (`s := null; Boom(); s :=
+    // "y";` — the exit-state intersection cannot see that). A lambda body's
+    // visit hides the open logs: its stores run when the lambda is invoked,
+    // which `capturedKill` accounts for at the call. Insertion-only sets read
+    // by membership: no iteration-order dependence (#2116).
+    struct NarrowKillLog {
+        std::unordered_set<Symbol*> syms;
+        bool capturedKill = false;   // a call that can reach a capturing closure
+    };
+    std::vector<NarrowKillLog> narrowKillLogs_;
+    void noteNarrowKill(Symbol* s) {
+        for (auto& l : narrowKillLogs_) l.syms.insert(s);
+    }
+    bool narrowKilledIn(const NarrowKillLog& log, Symbol* s) const;
+    // Erase from `set` every symbol `log` records as invalidated.
+    void eraseNarrowKills(std::unordered_set<Symbol*>& set,
+                          const NarrowKillLog& log) const;
+
     // §7.4 (v0.182, #1566): the set of local/parameter NAMES that are "mutably
     // captured" — assigned, or passed `ref`/`out`, anywhere inside ANY lambda of
     // the enclosing method body. Computed once per body (computeMutablyCaptured)

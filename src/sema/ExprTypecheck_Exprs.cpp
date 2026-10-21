@@ -11610,6 +11610,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 erasePendingTypeFact(asym);  // pending #6083
                                 nullNarrowed_.erase(asym);
                                 initNarrowed_.erase(asym);  // init-narrowing (§6.6) also invalidated by out/ref
+                                noteNarrowKill(asym);       // #6673
                                 // §7.4 v0.214 (#2085/#2116): the callee may
                                 // rebind the ref/out local, so any `local._f`
                                 // facts riding it no longer hold.
@@ -12741,6 +12742,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // callable, entered with every non-`const` local fact dropped.
         auto saveLoopFactFrames = std::move(loopFactFrames_);
         loopFactFrames_.clear();
+        // fix #6673 (§7.4, v0.339): the body's stores run when the lambda is
+        // invoked, not here — hide the enclosing `try` regions' kill logs (the
+        // invocation is the call invalidateCapturedNarrowings records).
+        auto saveNarrowKillLogs = std::move(narrowKillLogs_);
+        narrowKillLogs_.clear();
         int saveCatch = catchDepth_;
         // per §21.5/§31.2 (v0.182, #1578): a lambda is its own callable, so a
         // `break`/`continue` inside it can only ever target a loop declared
@@ -13250,6 +13256,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         loopLabelStack_ = std::move(saveLoopLabels);  // §21.5 (v0.201)
         loopEdgeNarrowing_ = std::move(saveLoopEdges);  // §7.4 (#2152)
         loopFactFrames_ = std::move(saveLoopFactFrames);   // #6114
+        narrowKillLogs_ = std::move(saveNarrowKillLogs);   // #6673
         catchDepth_ = saveCatch;
         finallyLoopBoundary_ = saveFinallyLoopBoundary;
         finallyDepth_ = saveFinallyDepth;  // per §21.7 (#1589)
