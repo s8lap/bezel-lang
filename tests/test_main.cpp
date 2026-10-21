@@ -407,6 +407,23 @@ int main(int argc, char** argv) {
               << " skip(s) (clang unavailable for the ASan link — see"
                  " tests/support/aot_support.hpp runAotCheckedImpl)\n";
 
+    // #6706: under BEZEL_AOT_LINK=self-contained, how many AOT builds linked
+    // through the musl bundle and how many stayed on the system link, by
+    // reason. Printed only with the knob on, so a default run's output is
+    // unchanged; with it on it prints even at 0 0 0, which confirms the knob
+    // was read. A separate line, like its neighbours, so the legacy summary
+    // regex is untouched.
+    if (::bezel::test::aotLinkSelfContained()) {
+        std::cout << "SELF-CONTAINED LINK: "
+                  << ::bezel::test::selfContainedLinkRuns().load()
+                  << " run(s), "
+                  << ::bezel::test::selfContainedSanitizedOnSystem().load()
+                  << " sanitized run(s) kept on system link, "
+                  << ::bezel::test::selfContainedDivergentOnSystem().load()
+                  << " marked-divergent run(s) kept on system link (see"
+                     " tests/support/aot_link_mode.hpp)\n";
+    }
+
     // per #3012 Phase 2a: ALSO emit a structured JSON shard summary to the path
     // named by BEZEL_SHARD_SUMMARY (off unless set). The legacy summary line
     // above is UNCHANGED and remains the gate's authoritative source; this JSON

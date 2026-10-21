@@ -174,6 +174,7 @@
 #include "test_harness.hpp"              // currentTestFailed() — the #3007 trip
 #include "support/codegen_support.hpp"   // JitResult + codegen::CodegenOptions
 #include "support/force_sanitize.hpp"    // the ONE BEZEL_AOT_FORCE_SANITIZE parse
+#include "support/aot_link_mode.hpp"     // BEZEL_AOT_LINK / _BUNDLE_DIR (#6706)
 #include "support/scratch_dir.hpp"      // cacheDir/scratchBase/keepArtifacts/reapAgeSec
 #include "driver/Driver.hpp"             // Driver::compileFile (the AOT path)
 
@@ -1375,6 +1376,62 @@ inline CompileStatus forkedDriverStep(Work&& work,
     return rejectFrom(std::move(err), code);
 }
 
+// ── The self-contained link knob (#6706) ───────────────────────────────────
+// BEZEL_AOT_LINK=self-contained + BEZEL_AOT_BUNDLE_DIR (support/aot_link_mode.hpp
+// has the contract). Every helper below is a no-op when the knob is off, so the
+// default path calls nothing new on the Driver and no key moves.
+
+// The bundle directory, absolute and validated (bin/ld.lld must exist). Fatal,
+// not a fallback, when it is missing: the operator asked for musl.
+inline const std::string& selfContainedBundleDir() {
+    static const std::string* v = new std::string([] {
+        const std::string& d = aotBundleDirEnv();
+        if (d.empty())
+            link_mode_detail::fatal(
+                "BEZEL_AOT_LINK=self-contained needs BEZEL_AOT_BUNDLE_DIR (a "
+                "staged lib/bezel/x86_64-linux-musl; #6706)");
+        std::error_code ec;
+        fs::path p = fs::absolute(fs::path(d), ec).lexically_normal();
+        if (ec || !fs::is_regular_file(p / "bin" / "ld.lld", ec))
+            link_mode_detail::fatal("BEZEL_AOT_BUNDLE_DIR='" + d +
+                                    "' has no bin/ld.lld (#6706)");
+        std::string s = p.string();
+        while (s.size() > 1 && s.back() == '/') s.pop_back();
+        return s;
+    }());
+    return *v;
+}
+
+// True when THIS build links self-contained: the knob is on, the build is not
+// sanitized (ASan has no musl runtime; the driver rejects the pair), and no
+// BEZEL_SELF_CONTAINED_DIVERGES marker is active.
+inline bool useSelfContainedLink(const codegen::CodegenOptions& opts) {
+    return aotLinkSelfContained() && !opts.sanitizeAddress &&
+           selfContainedDivergenceDepth() == 0;
+}
+
+// Count one build request under the knob, in the PARENT (a forked child's count
+// would be lost), and validate the bundle there too, so a bad bundle aborts the
+// test binary rather than reading as a compile crash in a child.
+inline void noteLinkModeBuild(const codegen::CodegenOptions& opts) {
+    if (!aotLinkSelfContained()) return;
+    if (opts.sanitizeAddress)
+        selfContainedSanitizedOnSystem().fetch_add(1, std::memory_order_relaxed);
+    else if (selfContainedDivergenceDepth() != 0)
+        selfContainedDivergentOnSystem().fetch_add(1, std::memory_order_relaxed);
+    else {
+        (void)selfContainedBundleDir();
+        selfContainedLinkRuns().fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// Point a Driver that is about to LINK at the bundle. Untouched (LinkMode::System,
+// the Driver's own default) whenever useSelfContainedLink is false.
+inline void applyLinkMode(Driver& driver, const codegen::CodegenOptions& opts) {
+    if (useSelfContainedLink(opts))
+        driver.setLinkMode(LinkMode::SelfContained, selfContainedBundleDir());
+}
+
 // Compile+link in ONE forked driver call — the un-split path, used whenever the
 // two-level cache is not in play (cache disabled, no sound identity, or the
 // crash-hook affordance armed). Byte-for-byte the pre-split behaviour.
@@ -1385,6 +1442,7 @@ inline CompileStatus forkedCompile(const std::string& srcPath,
     return forkedDriverStep(
         [&] {
             Driver driver;
+            applyLinkMode(driver, opts);  // #6706; no-op by default
             return driver.compileFile(srcPath, exePath, /*deps=*/{}, opts)
                 .success;
         },
@@ -1416,6 +1474,7 @@ inline CompileStatus forkedLink(const std::string& objectPath,
     return forkedDriverStep(
         [&] {
             Driver driver;
+            applyLinkMode(driver, opts);  // #6706; no-op by default
             return driver.linkExecutableObject(objectPath, exePath, /*deps=*/{},
                                                opts);
         },
@@ -2203,6 +2262,20 @@ inline std::string withEnvironment(std::string mode, std::string_view envText) {
 // hash INPUT, so every key's SHA-256 shifts and pre-#3006 entries (built under
 // an untracked toolchain) are orphaned — never hit, no collision — and GC'd,
 // which is the property a bump would buy. See BuildIdentity for the rationale.
+// #6706: the link-mode key component, defined after toHex below.
+inline std::string linkModeKeyText(const codegen::CodegenOptions& opts);
+
+// PURE, like withEnvironment: `mode` UNCHANGED when `linkText` is empty (every
+// system-link build), else `mode` + "lk:" + linkText + ";". Pinned both ways in
+// aot_link_mode_6706_test.
+inline std::string withLinkMode(std::string mode, std::string_view linkText) {
+    if (linkText.empty()) return mode;
+    mode += "lk:";
+    mode.append(linkText);
+    mode += ';';
+    return mode;
+}
+
 inline std::string modeString(const codegen::CodegenOptions& opts) {
     std::string s = "k2;";
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
@@ -2231,7 +2304,10 @@ inline std::string modeString(const codegen::CodegenOptions& opts) {
     // default), so this component alone never moves a key. The KE key still
     // moves — by the `;cc=` bit above, which orphans the pre-#2877 store on
     // purpose. See cacheKeyEnvironment for why the fold is conditional anyway.
-    return withEnvironment(std::move(s), cacheKeyEnvironment());
+    // #6706: the link mode, folded in ONLY for a self-contained build, so the
+    // default KE key is exactly what it was.
+    return withLinkMode(withEnvironment(std::move(s), cacheKeyEnvironment()),
+                        linkModeKeyText(opts));
 }
 
 inline std::string toHex(const std::array<uint8_t, 32>& d) {
@@ -2242,6 +2318,73 @@ inline std::string toHex(const std::array<uint8_t, 32>& d) {
         s[2 * i + 1] = k[d[i] & 0xF];
     }
     return s;
+}
+
+// #6706: the identity of a self-contained bundle — SHA-256 over every regular
+// file under it (sorted relative path, size, content hash). Every file the link
+// reads (ld.lld, musl's crt and libc.a, libc++, the musl-built runtime) is in
+// there, so two bundles that could link different bytes never share a key. ~35
+// MB hashed once per process. Fatal when a file cannot be read: an unidentified
+// bundle cannot be keyed soundly, and the knob was asked for explicitly.
+inline std::string bundleIdentityFrom(const std::string& dir) {
+    std::vector<std::string> rels;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end;
+         it.increment(ec)) {
+        std::error_code e2;
+        if (it->is_regular_file(e2))
+            rels.push_back(fs::relative(it->path(), dir, e2).generic_string());
+    }
+    if (ec || rels.empty())
+        link_mode_detail::fatal("cannot list the bundle at '" + dir + "' (#6706)");
+    std::sort(rels.begin(), rels.end());
+    llvm::SHA256 h;
+    for (const std::string& rel : rels) {
+        std::array<uint8_t, 32> d{};
+        const std::string full = dir + "/" + rel;
+        if (!sha256File(full, d))
+            link_mode_detail::fatal("cannot read bundle file '" + full + "' (#6706)");
+        h.update(llvm::StringRef(rel.data(), rel.size() + 1));  // with the NUL
+        h.update(llvm::ArrayRef<uint8_t>(d.data(), d.size()));
+    }
+    return toHex(h.final());
+}
+
+inline const std::string& selfContainedBundleIdentity() {
+    static const std::string* v =
+        new std::string(bundleIdentityFrom(selfContainedBundleDir()));
+    return *v;
+}
+
+// The self-contained recipe with its per-invocation paths and the bundle PATH
+// abstracted (the bundle's CONTENT is keyed by its identity instead), the
+// analogue of Driver::linkRecipeSignature for this mode. Derived from
+// Driver::selfContainedLinkArgs, the function that runs the link, so a recipe
+// change moves the key.
+inline std::string selfContainedRecipeSignatureFor(std::string_view bundleId) {
+    std::string s = "sc;";
+    for (const std::string& a : Driver::selfContainedLinkArgs(
+             "<OBJ>", "<EXE>", /*extraObjects=*/{}, "<BUNDLE>")) {
+        s += a;
+        s += '\x1f';
+    }
+    s += ";bundle=";
+    s.append(bundleId);
+    s += ';';
+    return s;
+}
+
+inline const std::string& selfContainedRecipeSignature() {
+    static const std::string* v = new std::string(
+        selfContainedRecipeSignatureFor(selfContainedBundleIdentity()));
+    return *v;
+}
+
+// The KE component: "" for every system-link build (the default, a sanitized
+// build under the knob, a marked divergence), so those keys do not move.
+inline std::string linkModeKeyText(const codegen::CodegenOptions& opts) {
+    if (!useSelfContainedLink(opts)) return {};
+    return "sc=" + selfContainedBundleIdentity();
 }
 
 // The full cache key hex, or "" when no sound compiler identity is available
@@ -2450,8 +2593,12 @@ inline std::string computeLinkKey(const std::array<uint8_t, 32>& objectHash,
                                   const codegen::CodegenOptions& opts) {
     const BuildIdentity& id = buildIdentity();
     if (!id.usable || !id.splitUsable) return {};
+    // #6706: a self-contained build keys on its own recipe + bundle identity.
     return composeLinkKey(objectHash, id.runtime,
-                          linkRecipeSignature(opts.sanitizeAddress), id.toolchain);
+                          useSelfContainedLink(opts)
+                              ? selfContainedRecipeSignature()
+                              : linkRecipeSignature(opts.sanitizeAddress),
+                          id.toolchain);
 }
 
 // Per-process hit/miss counters (a hit is served from the cache; a miss ran the
@@ -3014,6 +3161,8 @@ inline CompileStatus cachedCompile(std::string_view source,
                                    const std::string& exePath,
                                    const codegen::CodegenOptions& opts,
                                    const std::string& ccErrPath) {
+    noteLinkModeBuild(opts);  // #6706: count + validate in the parent; no-op by default
+
     // The crash-isolation regression test (aot_crash_isolation_test.cpp) arms
     // BEZEL_AOT_TEST_CRASH_HOOK to force the forked compile CHILD to SIGSEGV and
     // asserts the isolated ran=false. That fault is injected INSIDE the real
@@ -3228,6 +3377,7 @@ inline CompileStatus forkedCompileWithDeps(const std::string& srcPath,
     return forkedDriverStep(
         [&] {
             Driver driver;
+            applyLinkMode(driver, opts);  // #6706; no-op by default
             return driver.compileFile(srcPath, exePath, deps, opts).success;
         },
         exePath, "executable", ccErrPath);
@@ -4120,6 +4270,7 @@ inline JitResult runAotModulesImpl(const std::vector<ModuleSource>& modules,
     }
 
     const std::string entryCcErr = (fs::path(wd.path) / "cc.err").string();
+    aot_detail::noteLinkModeBuild(opts);  // #6706; no-op by default
     aot_detail::CompileStatus cc = aot_detail::forkedCompileWithDeps(
         srcPaths[entryIndex], exePath, deps, opts, entryCcErr);
     if (cc.outcome != aot_detail::CompileOutcome::Ok) {

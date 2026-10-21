@@ -91,6 +91,49 @@ valid Bezel, don't work around the AOT check.**
 > `scripts/leak_census.baseline`. `strict` fails the row. Neither is on by
 > default, and neither replaces putting a leak row on `runAotChecked`.
 
+### The self-contained (musl) link leg (#6706)
+
+A release `bezelc` links programs through its own bundle (`--link=self-contained`:
+a static `ld.lld`, musl, libc++ and a musl-built runtime, #6654), not through the
+host clang and glibc. To run the suite's programs that way, stage a bundle and
+set two variables:
+
+```
+BEZEL_AOT_LINK=self-contained BEZEL_AOT_BUNDLE_DIR=<dir>/x86_64-linux-musl \
+  scripts/agent_check.sh --area ownership _
+```
+
+The bundle comes from `scripts/release_static.sh` (its `musl-bundle/` in the
+build dir) or from `scripts/release_musl_stage.sh` run alone in the pinned Alpine
+container. Stage it from the tree under test: its `libbezel_runtime.a` is built
+from that tree's `src/runtime`, and a stale bundle fails links on any newly
+added runtime symbol. Every `runAot*` then links through
+`Driver::LinkMode::SelfContained` against that bundle (`tests/support/aot_link_mode.hpp`).
+The cache key carries the mode and a hash of every file in the bundle, so musl
+and glibc products never alias. With the variables unset (or
+`BEZEL_AOT_LINK=system`) nothing changes: same link command, same cache keys,
+same output (`aot_link_mode_6706_test`). A bad value or a bundle without
+`bin/ld.lld` aborts the binary. It never falls back to the system link.
+
+Two kinds of build stay on the system link under the knob, and both are counted:
+sanitized builds (`runAotChecked*`, `BEZEL_AOT_FORCE_SANITIZE`), because ASan
+has no musl runtime, and builds inside a `BEZEL_SELF_CONTAINED_DIVERGES(issue,
+"reason")` scope. Each run prints
+`SELF-CONTAINED LINK: N run(s), M sanitized run(s) kept on system link, D
+marked-divergent run(s) kept on system link`. Add a divergence marker only for a
+test that was MEASURED to diverge because of a libc difference, and give it the
+issue that records it. A divergence that is a real bug gets an issue and stays
+red. `git grep BEZEL_SELF_CONTAINED_DIVERGES tests/` lists the markers. The
+current list:
+
+| Test | Issue | Reason |
+|---|---|---|
+| `ffi_acceptance_32.dlopen_dlclose_handle_32_7` | #6762 | a static musl program cannot `dlopen` glibc's `libc.so.6` |
+| `ffi_acceptance_32.full_path_library_name_32_3` | #6762 | the same, by full path |
+
+Known real bugs that this leg catches and that stay red under it: #6761
+(`Math.Round` does not link because musl has no `roundeven`).
+
 ### Diagnostic tests → lit + FileCheck (`tests/lit/*.bzl`)
 
 Reject/accept **diagnostic** tests live as `.bzl` files with `// RUN:` directives

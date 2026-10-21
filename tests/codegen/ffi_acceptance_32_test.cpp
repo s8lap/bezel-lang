@@ -260,6 +260,9 @@ BEZEL_TEST(ffi_acceptance_32, string_from_cstring_pointer_32_6) {
 // §32.7: dlopen loads a library and returns a handle; dlclose releases it.
 // The handle is non-zero on success.
 BEZEL_TEST(ffi_acceptance_32, dlopen_dlclose_handle_32_7) {
+    // MEASURED divergence (#6762): a static musl program cannot dlopen glibc's
+    // libc.so.6, so this row stays on the system link under BEZEL_AOT_LINK.
+    BEZEL_SELF_CONTAINED_DIVERGES(6762, "dlopen of glibc's libc.so.6");
     auto r = runAot(
         "module M; "
         "extern \"libdl\" public method dlopen(filename: CString, flags: int): IntPtr; end; "
@@ -422,6 +425,8 @@ BEZEL_TEST(ffi_acceptance_32, single_field_record_typed_handle_32_13) {
 // §32.3: A full path library name bypasses runtime resolution.
 BEZEL_TEST(ffi_acceptance_32, full_path_library_name_32_3) {
     // dlopen a full path to libc.so.6.
+    // MEASURED divergence (#6762): see dlopen_dlclose_handle_32_7.
+    BEZEL_SELF_CONTAINED_DIVERGES(6762, "dlopen of glibc's /lib64/libc.so.6");
     auto r = runAot(
         "module M; "
         "extern \"libdl\" public method dlopen(filename: IntPtr, flags: int): IntPtr; end; "

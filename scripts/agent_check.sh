@@ -280,7 +280,7 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
     if [ "$r" -eq 124 ]; then rc=124; elif [ "$r" -ne 0 ] && [ "$rc" -ne 124 ]; then rc=1; fi
   done
   {
-    cat "${sl[@]}" | grep -a -vE '^[0-9]+ passed, [0-9]+ failed|^(NATIVE SANITIZER( INFRA)?|CHECKED TOOLCHAIN|INFRA): [0-9]+ '
+    cat "${sl[@]}" | grep -a -vE '^[0-9]+ passed, [0-9]+ failed|^(NATIVE SANITIZER( INFRA)?|CHECKED TOOLCHAIN|INFRA|SELF-CONTAINED LINK): [0-9]+ '
     cat "${sl[@]}" | awk '
       /^[0-9]+ passed, [0-9]+ failed/ { p += $1; fl += $3
         for (j = 2; j <= NF; j++) if ($j == "total") tot = $(j-1) }
@@ -288,13 +288,20 @@ run_sharded() {  # $1 filter $2 bin $3 shards $4 merged-log
         k = $0; sub(/: .*/, "", k)
         if (!(k in line)) { line[k] = $0; order[++no] = k }
         v = $0; sub(/^[^:]*: /, "", v); sub(/ .*/, "", v); cnt[k] += v }
+      # #6706: this line carries THREE counts; sum each one positionally.
+      /^SELF-CONTAINED LINK: [0-9]+ / { scl = $0; nsc = 0
+        for (j = 1; j <= NF; j++) if ($j ~ /^[0-9]+$/) sc[++nsc] += $j }
       END {
         filt = tot - p - fl
         printf "\n%d passed, %d failed", p, fl
         if (filt > 0) printf ", %d filtered", filt
         printf ", %d total\n", tot
         for (q = 1; q <= no; q++) { k = order[q]; l = line[k]
-          sub(/: [0-9]+ /, ": " cnt[k] " ", l); print l } }'
+          sub(/: [0-9]+ /, ": " cnt[k] " ", l); print l }
+        if (scl != "") { n = split(scl, w, " "); m = 0; o = ""
+          for (j = 1; j <= n; j++) { if (w[j] ~ /^[0-9]+$/) w[j] = sc[++m]
+            o = o (j > 1 ? " " : "") w[j] }
+          print o } }'
   } | tee "$out"
   return "$rc"
 }
