@@ -8604,6 +8604,26 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 "left operand of `in` over a `string` receiver",
                 be.left.get());  // §7.4 / §27.6 — narrowing-aware
         }
+        // fix #6853 (§5.1, v0.340; §17.5, v0.340; §16.3, v0.340): for a RANGE
+        // receiver `x in r` IS `r.Contains(x)` over stdlib §9.8's
+        // `Contains(value: T)`, so the left operand is admitted exactly when it
+        // converts to the range's element type `T` under §5.1 (constant
+        // narrowing included). Before this check `u in -5 .. 10` with
+        // `u: uint` (no implicit `uint -> int`), a `long` or a `double` reached
+        // codegen unchecked. An un-narrowed nullable operand keeps the dedicated
+        // diagnostic below, so it is not reported twice.
+        if (be.left && inLt && inRt && inRt->kind == TypeRef::Kind::Named &&
+            inRt->declaration == ctx_.builtinClassSym("Range") &&
+            !inRt->genericArgs.empty() && inRt->genericArgs[0] &&
+            inRt->genericArgs[0]->kind == TypeRef::Kind::Primitive &&
+            !(inLt->nullable && !isNarrowedNonNullRead(be.left.get()))) {
+            checkAssignable(
+                inLt, inRt->genericArgs[0],
+                be.left->span.begin.line != 0 ? be.left->span.begin
+                                              : be.span.begin,
+                "left operand of `in` over a `Range<T>`",
+                be.left.get());  // §7.4 / §27.6 — narrowing-aware
+        }
         if (inLt && inLt->nullable && inRt &&
             inRt->kind == TypeRef::Kind::Named &&
             inRt->declaration == ctx_.builtinClassSym("Range") &&

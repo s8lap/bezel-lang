@@ -20501,6 +20501,30 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     auto [recvExpr, m] = builtinInstanceCallee(ce.callee.get());
     if (!recvExpr) return;
     TypeRef* recvTy = ctx_.exprType(*recvExpr);
+    // fix #6853 (§5.1, v0.340; §17.5, v0.340; §16.3, v0.340; stdlib §9.8):
+    // `Range<T>.Contains(value: T)` declares a plain, NON-nullable `value: T`,
+    // and `x in r` IS that call (§17.5), so the argument is admitted exactly
+    // when it converts to `T` under §5.1 — the same check the `in` operator
+    // makes (ExprTypecheck_Exprs.cpp, `op == "in"`). A `Range` TypeRef carries
+    // `declaration = builtinClassSym("Range")`, so it takes the user-type
+    // early-out below and its argument was NEVER checked: a `uint` (no
+    // implicit `uint -> int`), a `long` or a `double` reached codegen against
+    // an `int` range. The nullable case keeps its dedicated diagnostic in
+    // `in` (and is §7's check here), so the narrowing-aware `checkAssignable`
+    // serves both.
+    if (m == "Contains" && ce.args.size() == 1 && ce.args[0].value &&
+        !ce.args[0].isDiscard && recvTy &&
+        recvTy->kind == TypeRef::Kind::Named &&
+        recvTy->declaration == ctx_.builtinClassSym("Range") &&
+        !recvTy->genericArgs.empty() && recvTy->genericArgs[0] &&
+        recvTy->genericArgs[0]->kind == TypeRef::Kind::Primitive) {
+        if (TypeRef* argTy = ctx_.exprType(*ce.args[0].value))
+            checkAssignable(argTy, recvTy->genericArgs[0],
+                            ce.args[0].value->span.begin,
+                            "argument to `Range<T>.Contains`",
+                            ce.args[0].value.get());
+        return;
+    }
     if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
         recvTy->declaration)  // user types have a MethodSymbol → checkCallArity ran
         return;

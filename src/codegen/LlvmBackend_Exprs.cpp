@@ -9292,93 +9292,21 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // value, so we intercept before the general lowerExpr path.
     if (bin.op == "in") {
         if (!bin.left || !bin.right) return nullptr;
-        auto* range = dynamic_cast<const ast::RangeExpr*>(bin.right.get());
-        if (range && range->lo && range->hi && !range->step) {
-            llvm::Value* x  = lowerExpr(*bin.left);
-            // §17.5 / §7.11 (v0.286, #3298): the PAIR — sema rejects a
-            // NON-narrowed nullable left operand at a range receiver
-            // (ExprTypecheck_Exprs.cpp, `op == "in"`), so a nullable-typed
-            // operand reaching here is one §7.4 narrowed non-null and its
-            // `{i8, T}` box must be unwrapped to the scalar the comparisons
-            // below need. Without the unwrap this emitted `icmp {i8,i32}, i32`
-            // and died in IR verification.
-            x = unwrapNarrowedNullableOperand(x, bin.left.get());
-            llvm::Value* st = lowerExpr(*range->lo);
-            llvm::Value* en = lowerExpr(*range->hi);
-            if (!x || !st || !en) return nullptr;
-            bool litUnsigned = false;
-            // fix #6683 (§5.1, v0.339; §17.5): `b in 1 .. 5` with `b: byte` has an
-            // i8 left operand against i32 literal bounds; bring all three to the
-            // widest integer width first (zero-extend an unsigned left operand,
-            // sign-extend the rest) so no ICmp sees mixed widths.
-            if (x->getType()->isIntegerTy() && st->getType()->isIntegerTy() &&
-                en->getType()->isIntegerTy()) {
-                unsigned w = std::max({x->getType()->getIntegerBitWidth(),
-                                       st->getType()->getIntegerBitWidth(),
-                                       en->getType()->getIntegerBitWidth()});
-                llvm::Type* wTy = builder_.getIntNTy(w);
-                // §5.1 (v0.340): a `char` operand converts implicitly to `int`,
-                // and its value (at most U+10FFFF) is non-negative in a signed
-                // i32, so it never forces the unsigned predicates: `c in -5 .. 10`
-                // compares against a negative `int` bound and must stay signed.
-                auto forcesUnsigned = [&](const ast::Expr& e, llvm::Value* v) {
-                    return isUnsignedTargetExpr(e) && !isCharTargetExpr(e) &&
-                           v->getType()->getIntegerBitWidth() == w;
-                };
-                litUnsigned = forcesUnsigned(*bin.left, x) ||
-                              forcesUnsigned(*range->lo, st) ||
-                              forcesUnsigned(*range->hi, en);
-                if (x->getType() != wTy)
-                    x = isUnsignedTargetExpr(*bin.left)
-                            ? builder_.CreateZExt(x, wTy)
-                            : builder_.CreateSExt(x, wTy);
-                if (st->getType() != wTy)
-                    st = isUnsignedTargetExpr(*range->lo)
-                             ? builder_.CreateZExt(st, wTy)
-                             : builder_.CreateSExt(st, wTy);
-                if (en->getType() != wTy)
-                    en = isUnsignedTargetExpr(*range->hi)
-                             ? builder_.CreateZExt(en, wTy)
-                             : builder_.CreateSExt(en, wTy);
-            }
-            // fix #6749 / #6752 (§16.3, v0.339): the extent test is unsigned when an
-            // unsigned operand already fills the compare width (`uint`, `ulong`, or
-            // `byte` against `byte` bounds): the value above the signed midpoint
-            // would otherwise read as negative. An unsigned operand that was
-            // zero-extended into a wider signed width is non-negative there, so the
-            // signed predicates stay correct for it.
-            using P = llvm::CmpInst;
-            const P::Predicate pLE = litUnsigned ? P::ICMP_ULE : P::ICMP_SLE;
-            const P::Predicate pGE = litUnsigned ? P::ICMP_UGE : P::ICMP_SGE;
-            const P::Predicate pLT = litUnsigned ? P::ICMP_ULT : P::ICMP_SLT;
-            // §16.3 (v0.162, fix #1340): a stepless literal uses default step=1
-            // (ascending). Contains = nonempty AND within-extent AND endOk.
-            // Ascending IsEmpty: closed → Start > End; half-open → Start >= End.
-            // A reversed literal like `50 in 100..0` returns false (empty range).
-            llvm::Value* asc = builder_.CreateICmp(pLE, st, en);
-            llvm::Value* lo  = builder_.CreateSelect(asc, st, en);
-            llvm::Value* hi  = builder_.CreateSelect(asc, en, st);
-            llvm::Value* inR = builder_.CreateAnd(
-                builder_.CreateICmp(pGE, x, lo), builder_.CreateICmp(pLE, x, hi));
-            if (range->inclusive) {
-                // nonempty (ascending closed): Start <= End.
-                llvm::Value* notEmpty = builder_.CreateICmp(pLE, st, en, "ri.ne");
-                return builder_.CreateAnd(notEmpty, inR, "ri.res");
-            }
-            // half-open: nonempty (ascending): Start < End; also exclude End.
-            llvm::Value* notEmpty = builder_.CreateICmp(pLT, st, en, "ri.ne");
-            return builder_.CreateAnd(
-                notEmpty,
-                builder_.CreateAnd(inR, builder_.CreateICmpNE(x, en)), "ri.res");
-        }
         // fix #499 / §9.8: `x in r` where r is a Range-typed variable, OR
-        // (fix #1496) a RangeExpr literal the closed-literal fast path above
-        // didn't handle (open-ended, or carrying a step). Load/construct the
+        // (fix #1496) a RangeExpr literal. fix #6853 (§17.5, v0.340; §16.3,
+        // v0.340): the closed, stepless literal had its own inline lowering
+        // that re-derived the compare width and signedness from the THREE
+        // operand expressions (any unsigned-looking operand made the extent test
+        // unsigned), while `r.Contains(x)` keys on the range's element type `T`.
+        // The two disagreed for `-1 in -5 .. 10U` (`in` false, `Contains` true).
+        // Every `in` over a range now lowers through `emitRangeContains`, the
+        // one definition `Contains` uses (§17.5: `x in c` IS `c.Contains(x)`).
+        // Load/construct the
         // { i64 start, i64 end, i64 step, i8 flags } struct and compute
         // Contains(x) per §16.3 v0.162: nonempty AND within-extent AND endOk.
         // Step determines emptiness/direction; open-ended sides are never
         // empty (flags bits 1/2).
-        if (bin.right && !(range && range->lo && range->hi && !range->step)) {
+        if (bin.right) {
             auto* rTy = ctx_.exprType(*bin.right);
             if (isRangeType(rTy)) {
                 llvm::Value* x  = lowerExpr(*bin.left);
