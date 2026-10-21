@@ -153,6 +153,11 @@ for l in pthread rt dl m; do printf '!<arch>\n' >"$B/lib$l.a"; done
 # ---- 4. licenses -------------------------------------------------------------
 cp "$W/lld/LICENSE.TXT" "$B/LICENSES/LLVM-LICENSE.TXT"
 cp "$DL/musl-1.2.5-COPYRIGHT" "$B/LICENSES/musl-COPYRIGHT"
+# bin/ld.lld statically links the zlib and zstd archives of the pinned Alpine
+# packages (zlib-static, zstd-static; #6713). Their notices are the pinned
+# upstream LICENSE files of those versions (sha256-checked by release_static.sh).
+cp "$DL/zlib-1.3.2-LICENSE" "$B/LICENSES/zlib-LICENSE"
+cp "$DL/zstd-1.5.6-LICENSE" "$B/LICENSES/zstd-LICENSE"
 cat >"$B/LICENSES/README" <<'EOF'
 Third-party components bundled in this directory:
 
@@ -161,6 +166,15 @@ Third-party components bundled in this directory:
                                   libunwind, compiler-rt): Apache License 2.0
                                   with LLVM Exceptions, see LLVM-LICENSE.TXT
   crt1.o crti.o crtn.o libc.a     musl 1.2.5: MIT, see musl-COPYRIGHT
+  bin/ld.lld (statically linked)  zlib 1.3.2: zlib License, see zlib-LICENSE
+                                  zstd 1.5.6: BSD-3-Clause (zstd is dual
+                                  BSD / GPLv2; the BSD terms are used),
+                                  see zstd-LICENSE
+  bin/ld.lld (statically linked)  libstdc++ and libgcc (Alpine gcc
+                                  13.2.1_git20240309; the stage's clang++
+                                  links them statically): GPL-3.0 with the
+                                  GCC Runtime Library Exception, see
+                                  gcc-COPYING3 and gcc-COPYING.RUNTIME
 
 Programs bezelc links in self-contained mode contain parts of musl, libc++,
 libc++abi, libunwind and compiler-rt.

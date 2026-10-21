@@ -107,6 +107,8 @@ BUNDLE_SOURCES="
 lld-17.0.6.src.tar.xz 4ac13125616dc44905b85820aa403d27ec1226329b7f674daeb5f5584c6f0b22 $LLVM_RELEASE_URL/lld-17.0.6.src.tar.xz
 cmake-17.0.6.src.tar.xz 807f069c54dc20cb47b21c1f6acafdd9c649f3ae015609040d6182cab01140f4 $LLVM_RELEASE_URL/cmake-17.0.6.src.tar.xz
 libunwind-17.0.6.src.tar.xz 9e7535a353aa862730b4ba38df42e06f6856b40c4cc51b57f27b5046dc21d70d $LLVM_RELEASE_URL/libunwind-17.0.6.src.tar.xz
+zlib-1.3.2-LICENSE e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2 https://raw.githubusercontent.com/madler/zlib/v1.3.2/LICENSE
+zstd-1.5.6-LICENSE 7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8 https://raw.githubusercontent.com/facebook/zstd/v1.5.6/LICENSE
 musl-1.2.5-COPYRIGHT f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5
 "
 # Containers are named <prefix>-<role>-<pid> and removed on exit, however the
@@ -222,9 +224,75 @@ if [ -n "$STRIP" ]; then
   "$STRIP" --strip-debug "$STAGE/$NAME/lib/bezel/libbezel_runtime.a"
 fi
 cp "$ROOT/LICENSE" "$STAGE/$NAME/LICENSE"
+
+# ---- licences of what bin/bezelc statically links (#6713) ------------------
+# Measured from the link line and `strings` of a --full build (see
+# release_check_licenses.sh): LLVM and libstdc++/libgcc in every build; with
+# the fully static link also zlib (zlib-ng-compat on Fedora), zstd and glibc
+# (glibc's text is deliberately not shipped: #6715 replaces the glibc link).
+# The texts are the build machine's packages' %license files; the package
+# versions go into LICENSES/README.
+LICDIR="$STAGE/$NAME/LICENSES"
+mkdir -p "$LICDIR"
+lic_copy() { # SRC DSTNAME
+  [ -s "$1" ] || die "licence file $1 not found (is the package installed?)"
+  cp "$1" "$LICDIR/$2"
+}
+rpm_of() { rpm -qf "$1" 2>/dev/null || die "no installed package owns $1, so its licence version cannot be recorded"; }
+LIC=/usr/share/licenses
+LIC_LLVM=$(rpm_of "$(llvm-config --libdir 2>/dev/null || echo /usr/lib64)/libLLVMSupport.a")
+LIC_GCC=$(rpm_of "$(clang++ -print-file-name=libstdc++.a)")
+lic_copy "$LIC/llvm-static/LICENSE.TXT" LLVM-LICENSE.TXT
+lic_copy "$LIC/gcc/COPYING3" gcc-COPYING3
+lic_copy "$LIC/gcc/COPYING.RUNTIME" gcc-COPYING.RUNTIME
+LIC_ROWS="  LLVM-LICENSE.TXT        LLVM (static): Apache License 2.0 with LLVM Exceptions ($LIC_LLVM)
+  gcc-COPYING3,           libstdc++ and libgcc (static): GPL-3.0 with the GCC Runtime
+  gcc-COPYING.RUNTIME     Library Exception ($LIC_GCC)"
+if [ "$FULL" = ON ]; then
+  LIC_ZLIB=$(rpm_of /usr/lib64/libz.a)
+  LIC_ZSTD=$(rpm_of /usr/lib64/libzstd.a)
+  LIC_GLIBC=$(rpm_of /usr/lib64/libc.a)
+  lic_copy "$LIC/zlib-ng/LICENSE.md" zlib-ng-LICENSE.md
+  lic_copy "$LIC/libzstd/LICENSE" zstd-LICENSE
+  LIC_ROWS="$LIC_ROWS
+  zlib-ng-LICENSE.md      zlib (zlib-ng, static): zlib License ($LIC_ZLIB)
+  zstd-LICENSE            zstd (static): BSD-3-Clause; zstd is dual BSD / GPLv2 and
+                          the BSD terms are used ($LIC_ZSTD)
+"
+fi
+cat >"$LICDIR/README" <<LICEOF
+Third-party components statically linked into bin/bezelc, and their licences.
+(The self-contained toolchain in lib/bezel/x86_64-linux-musl/ has its own
+LICENSES/ directory.)
+
+  file                    component: licence (build-machine package)
+$LIC_ROWS
+
+bin/bezelc itself is Apache License 2.0 (see ../LICENSE).
+LICEOF
+if [ "$FULL" = ON ]; then
+  cat >>"$LICDIR/README" <<LICEOF
+
+NOTE on glibc: the bin/bezelc in this tarball is still linked fully
+statically against glibc ($LIC_GLIBC), which is licensed under the LGPL-2.1.
+That is an open licensing problem, pending #6715 (the release bezelc will be
+built fully static on musl instead). THIS RELEASE IS NOT TO BE PUBLISHED
+until #6715 lands.
+LICEOF
+fi
 if [ "$BUNDLE" = 1 ]; then
   cp -a "$BUNDLE_OUT/x86_64-linux-musl" "$STAGE/$NAME/lib/bezel/x86_64-linux-musl"
+  # The bundled ld.lld statically links the Alpine stage's libstdc++ and libgcc
+  # (measured: .comment "GCC: (Alpine 13.2.1_git20240309)", __gxx_personality).
+  # The GPL-3 and Runtime Library Exception texts are version-independent, so
+  # the build machine's copies (staged above) serve; the bundle README names
+  # the Alpine gcc version.
+  cp "$LICDIR/gcc-COPYING3" "$LICDIR/gcc-COPYING.RUNTIME" \
+    "$STAGE/$NAME/lib/bezel/x86_64-linux-musl/LICENSES/"
 fi
+
+"$ROOT/scripts/release_check_licenses.sh" "$STAGE/$NAME" \
+  || die "a statically linked component has no licence file in the staged tree"
 
 GLIBC_FLOOR=$(objdump -T "$STAGE/$NAME/bin/bezelc" 2>/dev/null \
   | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1 || true)
