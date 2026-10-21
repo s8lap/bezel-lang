@@ -11844,6 +11844,13 @@ private:
     // (bezel_runtime_collections.cpp) for the runtime-side mirror.
     llvm::Value* emitCharRangeStep(llvm::Value* cur, llvm::Value* step);
 
+    // §16.4 (v0.340, #6802): advance a counted range loop's working value by
+    // the signed 64-bit `step64`, in the element type's own signedness. Returns
+    // the next value and sets `*ok` false when it would fall outside the
+    // element type's range (iteration then stops silently, no wrap).
+    llvm::Value* emitRangeAdvance(llvm::Value* cur, llvm::Value* step64,
+                                  bool isUns, llvm::Value** ok);
+
     // CG22: a checked add/sub/mul via the with-overflow intrinsic; raises
     // OverflowException when the operation overflows (§6.1).
     llvm::Value* emitCheckedArith(llvm::Intrinsic::ID id, llvm::Value* l,

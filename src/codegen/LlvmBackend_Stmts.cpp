@@ -7622,8 +7622,114 @@ llvm::Value* Emitter::emitCharRangeStep(llvm::Value* cur, llvm::Value* step) {
 }
 
 
+// §16.4 (v0.340, #6802): see declaration. `Step` is a signed 64-bit integer
+// and "iteration stops silently, raising no OverflowException, before the first
+// value that would ... fall outside T's representable range", so the advance
+// is overflow-checked in the element type's signedness and never wraps.
+llvm::Value* Emitter::emitRangeAdvance(llvm::Value* cur, llvm::Value* step64,
+                                       bool isUns, llvm::Value** ok) {
+    llvm::Type* curTy = cur->getType();
+    unsigned w = curTy->getIntegerBitWidth();
+    auto* wideTy = i64();
+    llvm::Value* next;
+    llvm::Value* fits;
+    if (w < 64) {
+        llvm::Value* wide = isUns ? builder_.CreateZExt(cur, wideTy)
+                                  : builder_.CreateSExt(cur, wideTy);
+        auto* r = builder_.CreateBinaryIntrinsic(
+            llvm::Intrinsic::sadd_with_overflow, wide, step64);
+        llvm::Value* sum = builder_.CreateExtractValue(r, {0u});
+        llvm::Value* ov = builder_.CreateExtractValue(r, {1u});
+        llvm::Value* inRange;
+        if (isUns) {
+            inRange = builder_.CreateICmpULE(
+                sum, llvm::ConstantInt::get(
+                         wideTy, llvm::APInt::getMaxValue(w).getZExtValue()));
+        } else {
+            llvm::Value* narrow = builder_.CreateTrunc(sum, curTy);
+            inRange = builder_.CreateICmpEQ(
+                builder_.CreateSExt(narrow, wideTy), sum);
+        }
+        fits = builder_.CreateAnd(builder_.CreateNot(ov), inRange);
+        next = builder_.CreateTrunc(sum, curTy);
+    } else if (isUns) {
+        llvm::Value* neg = builder_.CreateICmpSLT(step64, builder_.getInt64(0));
+        llvm::Value* mag = builder_.CreateSelect(
+            neg, builder_.CreateSub(builder_.getInt64(0), step64), step64);
+        auto* ad = builder_.CreateBinaryIntrinsic(
+            llvm::Intrinsic::uadd_with_overflow, cur, mag);
+        auto* sb = builder_.CreateBinaryIntrinsic(
+            llvm::Intrinsic::usub_with_overflow, cur, mag);
+        next = builder_.CreateSelect(neg, builder_.CreateExtractValue(sb, {0u}),
+                                     builder_.CreateExtractValue(ad, {0u}));
+        llvm::Value* ov = builder_.CreateSelect(
+            neg, builder_.CreateExtractValue(sb, {1u}),
+            builder_.CreateExtractValue(ad, {1u}));
+        fits = builder_.CreateNot(ov);
+    } else {
+        auto* r = builder_.CreateBinaryIntrinsic(
+            llvm::Intrinsic::sadd_with_overflow, cur, step64);
+        next = builder_.CreateExtractValue(r, {0u});
+        fits = builder_.CreateNot(builder_.CreateExtractValue(r, {1u}));
+    }
+    *ok = fits;
+    return next;
+}
+
+
 bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     auto* range = dynamic_cast<const ast::RangeExpr*>(fs.iterable.get());
+
+    // §16.4 / §16.5 (v0.340, #6802): the loop works in the element type's own
+    // width and signedness. `char` keeps signed predicates (code points are
+    // small and its step is the surrogate-gap bijection).
+    auto elemOf = [&](const sema::TypeRef* rangeTy, llvm::Type*& eTy,
+                      bool& eUns) {
+        const sema::TypeRef* er = rangeTy && !rangeTy->genericArgs.empty()
+                                      ? rangeTy->genericArgs[0] : nullptr;
+        if (er && er->kind == sema::TypeRef::Kind::Primitive &&
+            er->primitive != sema::PrimitiveType::Char) {
+            llvm::Type* t = lowerTypeRef(er);
+            if (t && t->isIntegerTy() && t->getIntegerBitWidth() >= 8) {
+                eTy = t;
+                eUns = typeRefIsUnsigned(er);
+            }
+        }
+    };
+    // Bound test: ascending cur <=/< hi, descending cur >=/> hi (`desc` is an
+    // i1), in the element's signedness.
+    auto inBounds = [&](llvm::Value* cur, llvm::Value* hi, llvm::Value* desc,
+                        llvm::Value* incl, bool uns) -> llvm::Value* {
+        using P = llvm::CmpInst;
+        auto pr = [&](P::Predicate u, P::Predicate sg) { return uns ? u : sg; };
+        llvm::Value* aLE = builder_.CreateICmp(pr(P::ICMP_ULE, P::ICMP_SLE), cur, hi);
+        llvm::Value* aLT = builder_.CreateICmp(pr(P::ICMP_ULT, P::ICMP_SLT), cur, hi);
+        llvm::Value* dGE = builder_.CreateICmp(pr(P::ICMP_UGE, P::ICMP_SGE), cur, hi);
+        llvm::Value* dGT = builder_.CreateICmp(pr(P::ICMP_UGT, P::ICMP_SGT), cur, hi);
+        llvm::Value* asc = builder_.CreateSelect(incl, aLE, aLT);
+        llvm::Value* dsc = builder_.CreateSelect(incl, dGE, dGT);
+        return builder_.CreateSelect(desc, dsc, asc);
+    };
+    // Increment block body: advance `slot`, or leave the loop silently when
+    // the next value would fall outside the element type (§16.4).
+    auto advance = [&](llvm::Value* slot, llvm::Type* ty, llvm::Value* step64,
+                       bool uns, bool isChar, llvm::BasicBlock* condBB,
+                       llvm::BasicBlock* endBB) {
+        llvm::Value* v = builder_.CreateLoad(ty, slot);
+        if (isChar) {
+            llvm::Value* st = builder_.CreateTrunc(step64, ty);
+            builder_.CreateStore(emitCharRangeStep(v, st), slot);
+            builder_.CreateBr(condBB);
+            return;
+        }
+        llvm::Value* ok = nullptr;
+        llvm::Value* nx = emitRangeAdvance(v, step64, uns, &ok);
+        auto* storeBB = llvm::BasicBlock::Create(llvm_, "rng.adv", currentFn_);
+        builder_.CreateCondBr(ok, storeBB, endBB);
+        builder_.SetInsertPoint(storeBB);
+        builder_.CreateStore(nx, slot);
+        builder_.CreateBr(condBB);
+    };
 
     // fix #499 / §9.8 / §16.5: `for var i in r` where r is a Range-typed
     // variable (not an inline RangeExpr literal). Load the stored struct and
@@ -7649,11 +7755,18 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         llvm::Value* flags8 = builder_.CreateExtractValue(rv, {3u}, "rfv.flg");
         llvm::Value* incl   = builder_.CreateTrunc(flags8, i1(), "rfv.incl");
 
-        // Truncate to i32 for the loop variable (int Range). This matches the
-        // behavior of the inline-literal path which uses lo->getType() = i32.
-        llvm::Value* lo   = builder_.CreateTrunc(lo64, i32(), "rfv.lo32");
-        llvm::Value* hi   = builder_.CreateTrunc(hi64, i32(), "rfv.hi32");
-        llvm::Value* step = builder_.CreateTrunc(step64, i32(), "rfv.step32");
+        // The loop variable has the element type's width and signedness
+        // (§16.5, v0.340, #6802); an unresolved element keeps the int loop.
+        llvm::Type* eTy = i32();
+        bool eUns = false;
+        elemOf(iterTy, eTy, eUns);
+        auto narrowTo = [&](llvm::Value* v64, const char* n) -> llvm::Value* {
+            return eTy->getIntegerBitWidth() == 64
+                       ? v64 : builder_.CreateTrunc(v64, eTy, n);
+        };
+        llvm::Value* lo   = narrowTo(lo64, "rfv.lo32");
+        llvm::Value* hi   = narrowTo(hi64, "rfv.hi32");
+        llvm::Value* step = step64;
 
         // §16.4: the iteration direction is determined by the step's SIGN.
         // Unlike the inline-literal path below (where the step is a compile-time
@@ -7668,15 +7781,15 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         // ascending comparison — both miscompiling `5..1 step -1` into an empty
         // loop and turning `1..5 step -1` into a non-terminating descent.)
         llvm::Value* stepNeg =
-            builder_.CreateICmpSLT(step, builder_.getInt32(0), "rfv.desc");
+            builder_.CreateICmpSLT(step, builder_.getInt64(0), "rfv.desc");
 
         // #1243 §21.4: use a hidden counter (rfvCounter) so that assignment to
         // the loop variable in the body does not alter the iteration count.
         // rfvVar is the body-visible slot; it is reloaded from rfvCounter at
         // the top of each iteration so each iteration starts with the correct
         // value regardless of what the body wrote to i.
-        llvm::AllocaInst* rfvCounter = entryAlloca(i32());
-        llvm::AllocaInst* rfvVar     = entryAlloca(i32());
+        llvm::AllocaInst* rfvCounter = entryAlloca(eTy);
+        llvm::AllocaInst* rfvVar     = entryAlloca(eTy);
         locals_[&fs] = rfvVar;
         builder_.CreateStore(lo, rfvCounter);
 
@@ -7701,35 +7814,25 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(condBB);
-        llvm::Value* cur = builder_.CreateLoad(i32(), rfvCounter);
+        llvm::Value* cur = builder_.CreateLoad(eTy, rfvCounter);
         // Direction-aware bound check: pick the ascending (cur <=/< hi) or
         // descending (cur >=/> hi) comparison by the runtime step sign, using
         // the incl flag from the struct for the </<= vs <=/>= choice.
-        llvm::Value* ascLE  = builder_.CreateICmpSLE(cur, hi);
-        llvm::Value* ascLT  = builder_.CreateICmpSLT(cur, hi);
-        llvm::Value* asc    = builder_.CreateSelect(incl, ascLE, ascLT);
-        llvm::Value* descGE = builder_.CreateICmpSGE(cur, hi);
-        llvm::Value* descGT = builder_.CreateICmpSGT(cur, hi);
-        llvm::Value* desc   = builder_.CreateSelect(incl, descGE, descGT);
-        llvm::Value* cond   = builder_.CreateSelect(stepNeg, desc, asc, "rfv.cond");
+        llvm::Value* cond = inBounds(cur, hi, stepNeg, incl, eUns);
         builder_.CreateCondBr(cond, bodyBB, endBB);
 
         builder_.SetInsertPoint(bodyBB);
         // #1243: copy hidden counter into the per-iteration loop variable so
         // the body starts each iteration with the right value of i.
         builder_.CreateStore(
-            builder_.CreateLoad(i32(), rfvCounter, "rfv.iv"), rfvVar);
+            builder_.CreateLoad(eTy, rfvCounter, "rfv.iv"), rfvVar);
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
         bool term = lowerForBody(fs);
         loopStack_.pop_back();
         if (!term) builder_.CreateBr(incBB);
 
         builder_.SetInsertPoint(incBB);
-        llvm::Value* v = builder_.CreateLoad(i32(), rfvCounter);
-        llvm::Value* nextV = isCharRange ? emitCharRangeStep(v, step)
-                                          : builder_.CreateAdd(v, step);
-        builder_.CreateStore(nextV, rfvCounter);
-        builder_.CreateBr(condBB);
+        advance(rfvCounter, eTy, step, eUns, isCharRange, condBB, endBB);
 
         builder_.SetInsertPoint(endBB);
         return true;
@@ -7739,6 +7842,20 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     llvm::Value* lo = lowerExpr(*range->lo);
     llvm::Value* hi = lowerExpr(*range->hi);
     if (!lo || !hi) return false;
+    // §16.5 (v0.340, #6802): the counter is the element type's width and
+    // signedness. Endpoints of another width (a literal against a typed bound)
+    // convert by their own signedness.
+    llvm::Type* eTy = lo->getType();
+    bool eUns = false;
+    {
+        auto* it = ctx_.exprType(*fs.iterable);
+        elemOf(it, eTy, eUns);
+        if (lo->getType()->isIntegerTy() && hi->getType()->isIntegerTy() &&
+            eTy->isIntegerTy()) {
+            lo = builder_.CreateIntCast(lo, eTy, !isUnsignedTargetExpr(*range->lo));
+            hi = builder_.CreateIntCast(hi, eTy, !isUnsignedTargetExpr(*range->hi));
+        }
+    }
 
     // §16.3 (v0.183, #1586): the literal-range counted loop below must match
     // emitCharRangeStep's surrogate-gap-skipping increment for Range<char>,
@@ -7750,7 +7867,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         litIterTy->genericArgs[0]->primitive == sema::PrimitiveType::Char;
 
     // §16.4: resolve the step (default = 1; negative steps descend).
-    llvm::Value* stepVal = llvm::ConstantInt::get(lo->getType(), 1);
+    llvm::Value* stepVal = llvm::ConstantInt::get(i64(), 1);  // signed 64-bit (§16.3)
     bool descending = false;
     if (range->step) {
         llvm::Value* s = lowerExpr(*range->step);
@@ -7763,8 +7880,11 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
             // time; a non-constant step must pick it at runtime by the step's
             // sign. Emit a direction-aware loop, mirroring the Range-VARIABLE path
             // above (previously this case bailed to the "not implemented" catch-all).
-            if (s->getType() != lo->getType())
-                s = builder_.CreateSExtOrTrunc(s, lo->getType());
+            // `Step` is a signed 64-bit integer (§16.3).
+            if (s->getType() != i64())
+                s = isUnsignedTargetExpr(*range->step)
+                        ? builder_.CreateZExtOrTrunc(s, i64())
+                        : builder_.CreateSExtOrTrunc(s, i64());
             // §16.4 (v0.242, #3052): the range EXPRESSION is right here — the
             // inline `lo..hi step s` of a `for` header — so this IS the
             // construction site, and a computed zero step raises
@@ -7774,13 +7894,13 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
             // constant-step-0 case never reaches here (sema rejects it, and
             // the `cs && cs->isZero()` early return above declines anyway).
             emitGuardThrow(builder_.CreateICmpEQ(
-                               s, llvm::ConstantInt::get(lo->getType(), 0), "rf.step0"),
+                               s, llvm::ConstantInt::get(i64(), 0), "rf.step0"),
                            "OverflowException");
             llvm::Value* stepNeg = builder_.CreateICmpSLT(
-                s, llvm::ConstantInt::get(lo->getType(), 0), "rf.desc");
+                s, llvm::ConstantInt::get(i64(), 0), "rf.desc");
             // #1243 §21.4: hidden counter + body-visible var (per rfv path above).
-            llvm::AllocaInst* rfCounter = entryAlloca(lo->getType());
-            llvm::AllocaInst* rfVar     = entryAlloca(lo->getType());
+            llvm::AllocaInst* rfCounter = entryAlloca(eTy);
+            llvm::AllocaInst* rfVar     = entryAlloca(eTy);
             locals_[&fs] = rfVar;
             builder_.CreateStore(lo, rfCounter);
             auto* condBB = llvm::BasicBlock::Create(llvm_, "rf.cond", currentFn_);
@@ -7789,38 +7909,33 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
             auto* endBB  = llvm::BasicBlock::Create(llvm_, "rf.end",  currentFn_);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(condBB);
-            llvm::Value* cur = builder_.CreateLoad(lo->getType(), rfCounter);
-            llvm::Value* asc = range->inclusive
-                ? builder_.CreateICmpSLE(cur, hi)
-                : builder_.CreateICmpSLT(cur, hi);
-            llvm::Value* desc = range->inclusive
-                ? builder_.CreateICmpSGE(cur, hi)
-                : builder_.CreateICmpSGT(cur, hi);
-            llvm::Value* cond =
-                builder_.CreateSelect(stepNeg, desc, asc, "rf.cnd");
+            llvm::Value* cur = builder_.CreateLoad(eTy, rfCounter);
+            llvm::Value* cond = inBounds(
+                cur, hi, stepNeg, builder_.getInt1(range->inclusive), eUns);
             builder_.CreateCondBr(cond, bodyBB, endBB);
             builder_.SetInsertPoint(bodyBB);
             // #1243: copy hidden counter into the per-iteration loop variable.
             builder_.CreateStore(
-                builder_.CreateLoad(lo->getType(), rfCounter, "rf.iv"), rfVar);
+                builder_.CreateLoad(eTy, rfCounter, "rf.iv"), rfVar);
             loopStack_.push_back({incBB, endBB, disposeStack_.size()});
             bool term = lowerForBody(fs);
             loopStack_.pop_back();
             if (!term) builder_.CreateBr(incBB);
             builder_.SetInsertPoint(incBB);
-            llvm::Value* v = builder_.CreateLoad(lo->getType(), rfCounter);
-            llvm::Value* nextV =
-                isCharRange ? emitCharRangeStep(v, s) : builder_.CreateAdd(v, s);
-            builder_.CreateStore(nextV, rfCounter);
-            builder_.CreateBr(condBB);
+            advance(rfCounter, eTy, s, eUns, isCharRange, condBB, endBB);
             builder_.SetInsertPoint(endBB);
             return true;
         }
-        stepVal = cs;
-        descending = cs->getValue().isNegative();
+        // A constant step is sign-extended (zero-extended for an unsigned
+        // operand) to the signed 64-bit `Step`.
+        stepVal = llvm::ConstantInt::get(
+            i64(), isUnsignedTargetExpr(*range->step)
+                       ? cs->getValue().zextOrTrunc(64) : cs->getValue().sextOrTrunc(64));
+        descending = cs->getValue().isNegative() &&
+                     !isUnsignedTargetExpr(*range->step);
     }
 
-    llvm::AllocaInst* slot = entryAlloca(lo->getType());
+    llvm::AllocaInst* slot = entryAlloca(eTy);
     // §29.3: in an iterator method, map the loop variable to a struct field.
     if (smStateStruct_ && smSelf_) {
         auto fit = smLocalFields_.find(&fs);
@@ -7848,16 +7963,11 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         // Re-evaluate hi here so it picks up any saved/restored values.
         llvm::Value* hiVal = lowerExpr(*range->hi);
         if (!hiVal) hiVal = hi;  // fallback to pre-computed value
-        llvm::Value* cond;
-        if (descending) {
-            cond = range->inclusive
-                       ? builder_.CreateICmpSGE(cur, hiVal)
-                       : builder_.CreateICmpSGT(cur, hiVal);
-        } else {
-            cond = range->inclusive
-                       ? builder_.CreateICmpSLE(cur, hiVal)
-                       : builder_.CreateICmpSLT(cur, hiVal);
-        }
+        else if (hiVal->getType() != eTy && hiVal->getType()->isIntegerTy())
+            hiVal = builder_.CreateIntCast(
+                hiVal, eTy, !isUnsignedTargetExpr(*range->hi));
+        llvm::Value* cond = inBounds(cur, hiVal, builder_.getInt1(descending),
+                                     builder_.getInt1(range->inclusive), eUns);
         builder_.CreateCondBr(cond, bodyBB, endBB);
         builder_.SetInsertPoint(bodyBB);
         loopStack_.push_back({incBB, endBB, disposeStack_.size()});
@@ -7865,11 +7975,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         loopStack_.pop_back();
         if (!term) builder_.CreateBr(incBB);
         builder_.SetInsertPoint(incBB);
-        llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
-        llvm::Value* next = isCharRange ? emitCharRangeStep(v, stepVal)
-                                         : builder_.CreateAdd(v, stepVal);
-        builder_.CreateStore(next, slot);
-        builder_.CreateBr(condBB);
+        advance(slot, eTy, stepVal, eUns, isCharRange, condBB, endBB);
         builder_.SetInsertPoint(endBB);
         return true;
     }
@@ -7880,7 +7986,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     // 'slot' directly because it must survive yield via smAllocaToField_ and
     // adding a second frame field would require smLocalFields_ to reserve an
     // extra entry per range ForStmt (deferred to a follow-up).
-    llvm::AllocaInst* varSlot = entryAlloca(lo->getType());
+    llvm::AllocaInst* varSlot = entryAlloca(eTy);
     locals_[&fs] = varSlot;
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "for.cond", currentFn_);
@@ -7894,16 +8000,8 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     // Descending: i >= hi (inclusive `..`) or i > hi (half-open `..<`).
     builder_.SetInsertPoint(condBB);
     llvm::Value* cur = builder_.CreateLoad(slot->getAllocatedType(), slot);
-    llvm::Value* cond;
-    if (descending) {
-        cond = range->inclusive
-                   ? builder_.CreateICmpSGE(cur, hi)
-                   : builder_.CreateICmpSGT(cur, hi);
-    } else {
-        cond = range->inclusive
-                   ? builder_.CreateICmpSLE(cur, hi)
-                   : builder_.CreateICmpSLT(cur, hi);
-    }
+    llvm::Value* cond = inBounds(cur, hi, builder_.getInt1(descending),
+                                 builder_.getInt1(range->inclusive), eUns);
     builder_.CreateCondBr(cond, bodyBB, endBB);
 
     // body: `continue` targets incBB, `break` targets endBB.
@@ -7921,11 +8019,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     // §16.3 (v0.183, #1586): for a Range<char>, step across the surrogate gap
     // instead of plain addition (emitCharRangeStep).
     builder_.SetInsertPoint(incBB);
-    llvm::Value* v = builder_.CreateLoad(slot->getAllocatedType(), slot);
-    llvm::Value* next = isCharRange ? emitCharRangeStep(v, stepVal)
-                                     : builder_.CreateAdd(v, stepVal);
-    builder_.CreateStore(next, slot);
-    builder_.CreateBr(condBB);
+    advance(slot, eTy, stepVal, eUns, isCharRange, condBB, endBB);
 
     builder_.SetInsertPoint(endBB);
     return true;
