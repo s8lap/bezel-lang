@@ -26788,7 +26788,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctx_.setExprType(&ma, tt->genericArgs[0]);
                 return;
             }
-            // Further IGrouping properties (if needed) go here.
+            // fix #6714 (stdlib §5 `IGrouping<TKey, T>`, §4.12, v0.339):
+            // `IGrouping` declares exactly one member, `Key`, and inherits
+            // `IEnumerable<T>`, which declares no count/length property (the
+            // element count is §5's `Count()` operator). The bare spellings
+            // used to return here untyped and reach codegen (malformed IR).
+            // The call spelling `g.Count()` is the operator and stays accepted.
+            if ((ma.member == "Count" || ma.member == "Length") &&
+                &ma != calleeOfCallCtx_) {
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "no member `" + std::string(ma.member) +
+                        "` on `IGrouping<TKey, T>`: it declares only `Key` and "
+                        "no " +
+                        (ma.member == "Count" ? "count property" : "length") +
+                        " — use the `Count()` operator (stdlib §5)");
+            }
             return;
         }
         if (tt && tt->kind == TypeRef::Kind::Named) {
@@ -33265,6 +33282,23 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             ctx_.setExprType(
                 &nm, ctx_.primitiveTypeRef(PrimitiveType::Int,
                                            /*nullable=*/true));
+            return;
+        }
+        // fix #6714 (stdlib §5, §4.12, v0.339): the bare `g?.Count` /
+        // `g?.Length` name no member (IGrouping declares only `Key`; the count
+        // is the `Count()` operator). Left untyped they dropped the enclosing
+        // statement behind an `internal:` warning; reject like the `.` form.
+        if ((nm.member == "Count" || nm.member == "Length") &&
+            &nm != calleeOfCallCtx_) {
+            SourceLocation loc = nm.span.begin;
+            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "no member `" + std::string(nm.member) +
+                    "` on `IGrouping<TKey, T>`: it declares only `Key` and "
+                    "no " +
+                    (nm.member == "Count" ? "count property" : "length") +
+                    " — use the `Count()` operator (stdlib §5)");
             return;
         }
     }
