@@ -24453,7 +24453,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // re-applied to the WINNER only.
                 enum class Q { Inapplicable, Exact, Converting };
                 auto qualityOf = [&](const ast::Expr* operandExpr,
-                                     TypeRef* operandTy,
+                                     TypeRef* operandTy, MethodSymbol* m,
                                      Symbol* paramSym) -> Q {
                     auto* ps = dynamic_cast<ParameterSymbol*>(paramSym);
                     if (!ps) return Q::Inapplicable;
@@ -24472,10 +24472,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // TypeSymbol, e.g. StringBuilder) reaches the
                             // `Object` root by an implicit reference
                             // conversion, so it is an applicable operand.
+                            // fix #6217: the binary form's rule (#6005),
+                            // shared, so the two forms agree.
                             if (pt->primitive == PrimitiveType::Object &&
-                                operandTy->kind == TypeRef::Kind::Named &&
-                                !operandTy->declaration &&
-                                implicitlyConvertible(operandTy, pt))
+                                operatorOperandReachesObject(operandTy, pt))
                                 return Q::Converting;
                             return Q::Inapplicable;
                         }
@@ -24494,72 +24494,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     if (pt->kind != TypeRef::Kind::Named ||
                         operandTy->kind != TypeRef::Kind::Named)
                         return Q::Inapplicable;
-                    // fix #6091 (§6.6/§25.2, v0.338): a declaration-less
-                    // stdlib class on either side (StringBuilder, Exception)
-                    // has no TypeSymbol, so the pointer tests below cannot
-                    // grade it. Grade it as the binary operator path does
-                    // (classifyArg, #5862): Exact, Convert, or inapplicable.
-                    // Before the #6091 entry change this operand never
-                    // reached this check, and `v += sb` was accepted.
-                    if (!pt->declaration || !operandTy->declaration) {
-                        // typeRefEqual compares declaration pointers only, so
-                        // two declaration-less stdlib classes of different
-                        // names (StringBuilder vs Exception) would both read
-                        // as Exact. Outside the built-in exception hierarchy,
-                        // which classifyArg grades by name, such a pair is
-                        // never convertible (§5.1: no stdlib subtyping).
-                        // fix #6091 (v0.338; stdlib Array/LinkedList/Set/Stack/
-                        // Queue declarations in Bezel_Standard_Library.md): a
-                        // declaration-less standard collection class converts
-                        // to a standard collection interface it implements,
-                        // with the same element type (Array<int> into
-                        // IEnumerable<int>, ICollection<int>, IReadOnlyList<int>).
-                        // The binary operator path accepts these by declaration
-                        // pointer equality, so the compound path must too. The
-                        // table lists only borrowing collections; owning ones
-                        // carry ownership obligations and are not admitted here.
-                        auto stdlibCollectionConverts = [](const TypeRef* from,
-                                                           const TypeRef* to) {
-                            if (from->declaration || to->declaration) return false;
-                            if (from->genericArgs.size() != to->genericArgs.size())
-                                return false;
-                            if (from->genericArgs.size() == 1 &&
-                                !typeRefEqual(from->genericArgs[0], to->genericArgs[0]))
-                                return false;
-                            std::string_view c = namedRefSimpleName(from);
-                            std::string_view i = namedRefSimpleName(to);
-                            if (c == "Array")
-                                return i == "IList" || i == "ICollection" ||
-                                       i == "IReadOnlyList" ||
-                                       i == "IReadOnlyCollection" || i == "IEnumerable";
-                            if (c == "LinkedList" || c == "Set")
-                                return i == "ICollection" ||
-                                       i == "IReadOnlyCollection" || i == "IEnumerable";
-                            if (c == "Stack" || c == "Queue")
-                                return i == "IReadOnlyCollection" || i == "IEnumerable";
-                            return false;
-                        };
-                        // fix #6091 (§6.6/§25.2, v0.338): differing stdlib names
-                        // are never convertible except through the table above
-                        // or the built-in exception hierarchy (classifyArg).
-                        if (!pt->declaration && !operandTy->declaration &&
-                            !isBuiltinExceptionRef(pt) &&
-                            namedRefSimpleName(pt) !=
-                                namedRefSimpleName(operandTy))
-                            return stdlibCollectionConverts(operandTy, pt)
-                                       ? Q::Converting
-                                       : Q::Inapplicable;
-                        switch (classifyArg(operandTy, pt)) {
-                            case ArgMatch::Exact:
-                                return sameNull ? Q::Exact : Q::Converting;
-                            case ArgMatch::Convert: return Q::Converting;
-                            case ArgMatch::NotApplicable: return Q::Inapplicable;
-                        }
+                    // fix #6217 (§25.2, §5.1, v0.339): graded by the
+                    // ordinary argument rule, shared with findBinaryOperator
+                    // so the compound and binary forms agree by construction.
+                    // It replaces #6091's name table, which admitted only
+                    // Array/LinkedList/Set/Stack/Queue into five collection
+                    // interfaces (rejecting `SortedSet<int>`,
+                    // `ICollection<int>` -> `IEnumerable<int>`, `Span<int>` ->
+                    // `ReadOnlySpan<int>`, a user exception -> `Exception`).
+                    std::unordered_set<std::string_view> opTypeParams;
+                    if (m && m->parent)
+                        for (Symbol* gp : m->parent->genericParams)
+                            if (gp) opTypeParams.insert(gp->name);
+                    switch (operatorNamedOperandMatch(operandTy, pt,
+                                                      opTypeParams)) {
+                        case ArgMatch::Exact:
+                            return sameNull ? Q::Exact : Q::Converting;
+                        case ArgMatch::Convert: return Q::Converting;
+                        case ArgMatch::NotApplicable: return Q::Inapplicable;
                     }
-                    if (pt->declaration == operandTy->declaration)
-                        return sameNull ? Q::Exact : Q::Converting;
-                    if (isSubtype(operandTy->declaration, pt->declaration))
-                        return Q::Converting;
                     return Q::Inapplicable;
                 };
                 struct Ranked5205 { MethodSymbol* m; bool e0, e1; };
@@ -24578,9 +24531,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     for (MethodSymbol* m :
                          collectInheritedOperators(decl, binOp, 2)) {
                         if (m->params.size() < 2) continue;
-                        Q q0 = qualityOf(nullptr, tTy, m->params[0]);
+                        Q q0 = qualityOf(nullptr, tTy, m, m->params[0]);
                         if (q0 == Q::Inapplicable) continue;
-                        Q q1 = qualityOf(as->value.get(), rTy, m->params[1]);
+                        Q q1 = qualityOf(as->value.get(), rTy, m, m->params[1]);
                         if (q1 == Q::Inapplicable) continue;
                         app.push_back({m, q0 == Q::Exact, q1 == Q::Exact});
                     }

@@ -3871,6 +3871,28 @@ private:
     enum class ArgMatch { NotApplicable, Convert, Exact };
     ArgMatch classifyArg(const TypeRef* argTy, const TypeRef* paramTy);
 
+    // fix #6217 (§25.2 "A derived-typed operand satisfies a base-typed
+    // parameter by the ordinary argument rules", §5.1 reference conversions,
+    // v0.339): grade a NAMED operand `at` against a NAMED operator parameter
+    // `pt` — Exact, Convert, or NotApplicable — with the conversion check an
+    // ordinary call `F(p: pt)` applies to its argument (`checkAssignable`,
+    // run silently), so an operator and a call agree on the pair. Shared by
+    // findBinaryOperator and the compound-assignment Named-target search.
+    // `opTypeParams` are the operator's declaring type's generic parameter
+    // names: a parameter mentioning one is left to `genericArgsConsistent`'s
+    // unification (the pre-#6217 declaration-pointer grade).
+    ArgMatch operatorNamedOperandMatch(
+        TypeRef* at, TypeRef* pt,
+        const std::unordered_set<std::string_view>& opTypeParams);
+    // fix #6217: does `checkAssignable(from, to)` admit the conversion? Run
+    // with no source expression and with every diagnostic it reports
+    // discarded, so the probe has no effect on the program's diagnostics.
+    bool conversionAdmittedQuietly(TypeRef* from, TypeRef* to,
+                                   SourceLocation loc);
+    // fix #6005 / #6217 (§5.1, §22.6): may a NAMED operand `at` take an
+    // `Object` operator parameter `pt`? Shared by both operator searches.
+    bool operatorOperandReachesObject(TypeRef* at, TypeRef* pt);
+
     // §22.6 type-based overload resolution over a set of candidate
     // callables sharing the call's arity and binding all-positional.
     enum class OverloadOutcome {

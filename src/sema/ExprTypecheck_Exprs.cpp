@@ -6506,6 +6506,120 @@ bool ExprTC::primitiveOperandMatchesParam(const ast::Expr* operandExpr,
            narrowed->primitive == pt->primitive;
 }
 
+bool ExprTC::conversionAdmittedQuietly(TypeRef* from, TypeRef* to,
+                                       SourceLocation loc) {
+    // The engine is set aside whole and restored whole: nothing the probe
+    // reports (error or warning) reaches the program's diagnostics.
+    DiagnosticEngine saved = std::move(ctx_.diagnostics());
+    ctx_.diagnostics() = DiagnosticEngine{};
+    checkAssignable(from, to, loc, "operand", /*fromExpr=*/nullptr);
+    const bool admitted = !ctx_.diagnostics().hasErrors();
+    ctx_.diagnostics() = std::move(saved);
+    return admitted;
+}
+
+// fix #6005 (§22.6 / §5.1, v0.338), shared by #6217: a NAMED operand reaching
+// an `Object` operator parameter by the ordinary reference conversion,
+// restricted to REFERENCE declarations (§4.6) — a class or an interface, or a
+// built-in exception class. A value kind (enum, record, choice) reaches
+// `Object` only by boxing, which operator lowering does not perform, so it
+// stays inapplicable; so does a declaration-less built-in class other than an
+// exception (`StringBuilder`, `Array<int>`), which the binary form never
+// admitted. Both are narrower than an ordinary call, which admits them.
+bool ExprTC::operatorOperandReachesObject(TypeRef* at, TypeRef* pt) {
+    if (!at || at->kind != TypeRef::Kind::Named) return false;
+    const bool refOperand =
+        at->declaration
+            ? (at->declaration->kind == ast::TypeDeclKind::Class ||
+               at->declaration->kind == ast::TypeDeclKind::Interface)
+            : isBuiltinExceptionRef(at);
+    return refOperand && implicitlyConvertible(at, pt);
+}
+
+// fix #6217 (§25.2, §5.1, v0.339): see the declaration comment
+// (ExprTypecheck_impl.hpp). §25.2: "A derived-typed operand satisfies a
+// base-typed parameter by the ordinary argument rules"; §5.1 lists those
+// rules' reference conversions (identity, class to base class, a type to an
+// interface it implements, interface to extended interface, §12.9 variance).
+// Before this, a declaration-less stdlib type on both sides read as Exact by
+// `nullptr == nullptr` and generic arguments were never compared, so
+// `IEnumerable<int> <- StringBuilder`, `Array<int> <- Array<string>` and
+// `Box<string> <- Box<int>` all selected the operator.
+ExprTC::ArgMatch ExprTC::operatorNamedOperandMatch(
+    TypeRef* at, TypeRef* pt,
+    const std::unordered_set<std::string_view>& opTypeParams) {
+    if (!at || !pt || at->kind != TypeRef::Kind::Named ||
+        pt->kind != TypeRef::Kind::Named)
+        return ArgMatch::NotApplicable;
+    const bool sameNullability = at->nullable == pt->nullable;
+    // fix #5862 (§22.6 / §31.4, v0.338): a built-in exception parameter is
+    // graded by name, exactly as `classifyArg` does for a call argument.
+    if (isBuiltinExceptionRef(pt)) return classifyArg(at, pt);
+    auto byDeclaration = [&]() {
+        if (pt->declaration == at->declaration)
+            return sameNullability ? ArgMatch::Exact : ArgMatch::Convert;
+        if (pt->declaration && at->declaration &&
+            isSubtype(at->declaration, pt->declaration))
+            return ArgMatch::Convert;
+        return ArgMatch::NotApplicable;
+    };
+    // Two declared, non-generic types: the declaration pointers are the whole
+    // identity, and `isSubtype` is the class-to-base / interface relation.
+    if (pt->declaration && at->declaration && pt->genericArgs.empty() &&
+        at->genericArgs.empty())
+        return byDeclaration();
+    // A parameter naming the operator's own type parameters is matched by
+    // `genericArgsConsistent`'s unification (#1270), and a type still naming
+    // an enclosing scope's type parameter is not judged here (§14.1, the
+    // `checkAssignable` stance): both keep the declaration grade.
+    if ((!opTypeParams.empty() &&
+         refOutParamTypeMentionsTypeParam(pt, opTypeParams)) ||
+        mentionsUnsubstitutedTypeParam(at) ||
+        mentionsUnsubstitutedTypeParam(pt))
+        return byDeclaration();
+    // A declaration-less stdlib type implements no user-declared type, and
+    // `at`'s declaration-less operand reaching a declared parameter is
+    // outside what the probe below may admit (its residual accepts, #6073).
+    if (pt->declaration && !at->declaration) return byDeclaration();
+    // Identity, generic arguments and declaration-less heads included.
+    {
+        TypeRef aligned = *at;
+        aligned.nullable = pt->nullable;
+        if (functionSlotTypeRefEqual(&aligned, pt))
+            return sameNullability ? ArgMatch::Exact : ArgMatch::Convert;
+    }
+    // Two declaration-less built-in heads that differ. `checkAssignable`
+    // admits several such pairs through its conservative catch-all, not by a
+    // §5.1 rule (#6073 item 4: built-in exception -> `StringBuilder` and
+    // `StringBuilder` -> `IEnumerable<int>` compile as calls). The pre-#6217
+    // compound check (#6091) rejects them for an operator, and §5.1 has no
+    // such conversion: a built-in CLASS has a class base only inside the
+    // exception hierarchy (graded by name above when `pt` is an exception),
+    // and a non-generic built-in class implements no generic interface
+    // (`string`, the one that does, is a primitive here). The class heads
+    // are the #4733 predicate (`checkAssignable`'s built-in class gate)
+    // minus the three implementable interfaces that table also carries.
+    if (!at->declaration && !pt->declaration &&
+        at->headName() != pt->headName()) {
+        auto isBuiltinClassHead = [](std::string_view n) {
+            return !n.empty() &&
+                   (common::isHeapPointerReferenceBuiltin(n) ||
+                    common::isBuiltinExceptionName(n)) &&
+                   !common::isBuiltinInterfaceHead(n) && n != "IDisposable" &&
+                   n != "IAsyncDisposable" && n != "IFormattable";
+        };
+        if (isBuiltinClassHead(at->headName()) &&
+            (isBuiltinClassHead(pt->headName()) ||
+             (at->genericArgs.empty() && !pt->genericArgs.empty())))
+            return ArgMatch::NotApplicable;
+    }
+    // Everything else: the ordinary argument rule itself.
+    if (at->nullable && !pt->nullable) return ArgMatch::NotApplicable;
+    return conversionAdmittedQuietly(at, pt, SourceLocation{})
+               ? ArgMatch::Convert
+               : ArgMatch::NotApplicable;
+}
+
 // §25: the user-defined `static operator <op>` method that applies to a
 // binary expression, if either operand's type (class or record) — OR a base
 // class of that type (§25.2, v0.181, #1562) — declares one. `=`/`<>` on
@@ -6638,7 +6752,9 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     // success) and the operand's type is restored, so every candidate is
     // measured against the operand's original static type. The winner's
     // narrowing is re-applied once, below.
-    auto quality = [&](const ast::Expr* operand, Symbol* paramSym) -> Quality {
+    auto quality = [&](const ast::Expr* operand, MethodSymbol* m,
+                       std::size_t pos) -> Quality {
+        Symbol* paramSym = m->params[pos];
         TypeRef* pt = paramTypeOf(paramSym);
         TypeRef* at = const_cast<TypeRef*>(staticTypeOf(operand));
         if (!pt || !at) return Quality::Inapplicable;
@@ -6654,22 +6770,19 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
             // base-typed parameter by the ordinary argument rules (an
             // implicit reference conversion, §5.1).
             if (at->kind != TypeRef::Kind::Named) return Quality::Inapplicable;
-            // fix #5862 (§22.6 / §31.4, v0.338): a built-in exception class
-            // has no declaration, so the pointer tests below call every pair
-            // of them Exact. Grade it by name, exactly as `classifyArg` does
-            // for a call argument.
-            if (isBuiltinExceptionRef(pt)) {
-                switch (classifyArg(at, pt)) {
-                    case ArgMatch::Exact: return Quality::Exact;
-                    case ArgMatch::Convert: return Quality::Converting;
-                    case ArgMatch::NotApplicable: return Quality::Inapplicable;
-                }
+            // fix #6217 (§25.2, §5.1, v0.339): graded by the ordinary
+            // argument rule, shared with the compound-assignment search
+            // (operatorNamedOperandMatch; it keeps #5862's by-name grade of
+            // a built-in exception parameter).
+            std::unordered_set<std::string_view> opTypeParams;
+            if (m->parent)
+                for (Symbol* gp : m->parent->genericParams)
+                    if (gp) opTypeParams.insert(gp->name);
+            switch (operatorNamedOperandMatch(at, pt, opTypeParams)) {
+                case ArgMatch::Exact: return Quality::Exact;
+                case ArgMatch::Convert: return Quality::Converting;
+                case ArgMatch::NotApplicable: return Quality::Inapplicable;
             }
-            if (pt->declaration == at->declaration)
-                return sameNullability ? Quality::Exact : Quality::Converting;
-            if (pt->declaration && at->declaration &&
-                isSubtype(at->declaration, pt->declaration))
-                return Quality::Converting;
             return Quality::Inapplicable;
         }
         if (pt->kind == TypeRef::Kind::Primitive) {
@@ -6689,15 +6802,9 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
                 // (enum, record, choice) reaches Object only by boxing, which
                 // operator lowering does not perform, so it stays
                 // Inapplicable (the pre-#6005 rejection).
-                const bool refOperand =
-                    at->declaration
-                        ? (at->declaration->kind == ast::TypeDeclKind::Class ||
-                           at->declaration->kind ==
-                               ast::TypeDeclKind::Interface)
-                        : isBuiltinExceptionRef(at);
+                // fix #6217: shared with the compound-assignment search.
                 if (pt->primitive == PrimitiveType::Object &&
-                    at->kind == TypeRef::Kind::Named && refOperand &&
-                    implicitlyConvertible(at, pt))
+                    operatorOperandReachesObject(at, pt))
                     return Quality::Converting;
                 return Quality::Inapplicable;
             }
@@ -6735,9 +6842,9 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         std::vector<Ranked> app;
         for (MethodSymbol* m : candidatesOn(operand)) {
             if (!m || !genericArgsConsistent(m)) continue;
-            Quality q0 = quality(be.left.get(), m->params[0]);
+            Quality q0 = quality(be.left.get(), m, 0);
             if (q0 == Quality::Inapplicable) continue;
-            Quality q1 = quality(be.right.get(), m->params[1]);
+            Quality q1 = quality(be.right.get(), m, 1);
             if (q1 == Quality::Inapplicable) continue;
             app.push_back({m, q0 == Quality::Exact, q1 == Quality::Exact});
         }
@@ -6754,8 +6861,8 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         std::string candidates;
         for (MethodSymbol* m : candidatesOn(operand)) {
             if (!m || !genericArgsConsistent(m)) continue;
-            if (quality(be.left.get(), m->params[0]) == Quality::Inapplicable ||
-                quality(be.right.get(), m->params[1]) == Quality::Inapplicable)
+            if (quality(be.left.get(), m, 0) == Quality::Inapplicable ||
+                quality(be.right.get(), m, 1) == Quality::Inapplicable)
                 continue;
             auto spell = [&](Symbol* p) {
                 TypeRef* t = paramTypeOf(p);
