@@ -2099,7 +2099,7 @@ llvm::Value* Emitter::lowerGroupByMaterialize(const ast::CallExpr& srcCall) {
     // #6532 / #6657: key equality is the key type's value equality (as
     // Distinct's); a float/double key takes the §4.3.1 reflexive compare.
     llvm::Value* keyEq = buildLinqTrampoline(3, keyElemTy, nullptr,
-                                             recordTypeOfRef(keyElemRef),
+                                             hashKeyRecordOfRef(keyElemRef),
                                              keyElemRef);
     auto* gbFn = declareC("bz_groupby_to_array", ptrTy(),
         {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy()});

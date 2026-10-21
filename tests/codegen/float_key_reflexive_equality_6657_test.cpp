@@ -110,3 +110,153 @@ BEZEL_TEST(float_key_reflexive_equality_6657, distinct_and_toset_float_compile_a
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "distinct 3 toset 3\n");
 }
+
+// Fix-forward #6657 (merge with #6219): GroupBy's key-equality trampoline uses
+// hashKeyRecordOfRef, as Distinct / ToSet do, so a body record with user
+// Equals / GetHashCode / `=` groups by that equality (spec §25.2, §9.2, v0.339;
+// float keys §4.3.1, v0.339). Without it GroupBy gave 4 groups instead of 2.
+
+BEZEL_TEST(float_key_reflexive_equality_6657, groupby_body_record_user_equality_groups_with_distinct_toset_spec_25_2) {
+    JitResult r = runAot(R"BZ(module P;
+import System.Collections.Linq;
+public record B
+  public readonly property X: int;
+  public constructor(x: int)
+    X := x;
+  end constructor;
+  public method Equals(other: B): bool => (X mod 10) = (other.X mod 10);
+  public method GetHashCode(): int => (X mod 10) + 500;
+  public static method operator =(a: B, b: B): bool =>
+    (a.X mod 10) = (b.X mod 10);
+  public static method operator <>(a: B, b: B): bool =>
+    (a.X mod 10) <> (b.X mod 10);
+end B;
+public class Program
+  public static method Main()
+    using var a := new Array<B>();
+    a.Add(new B(5)); a.Add(new B(15)); a.Add(new B(6)); a.Add(new B(25));
+    var gc := 0; var first := 0;
+    for var g in a.GroupBy(lambda(v) => v) do
+      if gc = 0 then first := g.Key.X; end;
+      Console.WriteLine("group key " + g.Key.X.ToString() + " n=" + g.Count().ToString());
+      gc := gc + 1;
+    end;
+    var dc := 0; for var v in a.Distinct() do dc := dc + 1; end;
+    using var ts := a.ToSet();
+    Console.WriteLine("groups " + gc.ToString() + " distinct " + dc.ToString() + " toset " + ts.Count.ToString());
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "group key 5 n=3\ngroup key 6 n=1\ngroups 2 distinct 2 toset 2\n");
+}
+
+BEZEL_TEST(float_key_reflexive_equality_6657, groupby_positional_record_user_equality_groups_with_distinct_toset_spec_25_2) {
+    JitResult r = runAot(R"BZ(module P;
+import System.Collections.Linq;
+public record B(X: int)
+  public method Equals(other: B): bool => (X mod 10) = (other.X mod 10);
+  public method GetHashCode(): int => (X mod 10) + 500;
+  public static method operator =(a: B, b: B): bool =>
+    (a.X mod 10) = (b.X mod 10);
+  public static method operator <>(a: B, b: B): bool =>
+    (a.X mod 10) <> (b.X mod 10);
+end B;
+public class Program
+  public static method Main()
+    using var a := new Array<B>();
+    a.Add(new B(5)); a.Add(new B(15)); a.Add(new B(6)); a.Add(new B(25));
+    var gc := 0; var first := 0;
+    for var g in a.GroupBy(lambda(v) => v) do
+      if gc = 0 then first := g.Key.X; end;
+      Console.WriteLine("group key " + g.Key.X.ToString() + " n=" + g.Count().ToString());
+      gc := gc + 1;
+    end;
+    var dc := 0; for var v in a.Distinct() do dc := dc + 1; end;
+    using var ts := a.ToSet();
+    Console.WriteLine("groups " + gc.ToString() + " distinct " + dc.ToString() + " toset " + ts.Count.ToString());
+  end Main;
+end Program;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "group key 5 n=3\ngroup key 6 n=1\ngroups 2 distinct 2 toset 2\n");
+}
+
+BEZEL_TEST(float_key_reflexive_equality_6657, union_intersect_except_double_reflexive_spec_4_3_1) {
+    JitResult r = runAot(R"BZ(module M;
+import System.Collections.Linq;
+class C
+  public static method Main(): int
+    using var a := new Array<double>();
+    a.Add(BitConverter.Int64BitsToDouble(0L)); a.Add(BitConverter.Int64BitsToDouble(9221120237041090560L)); a.Add(1.5);
+    using var b := new Array<double>();
+    b.Add(BitConverter.Int64BitsToDouble(-9223372036854775808L)); b.Add(BitConverter.Int64BitsToDouble(9221120237041090851L)); b.Add(2.5);
+    var u := 0; for var v in a.Union(b) do u := u + 1; end;
+    var i := 0; for var v in a.Intersect(b) do i := i + 1; end;
+    var e := 0; for var v in a.Except(b) do e := e + 1; end;
+    Console.WriteLine("Union " + u.ToString() + " Intersect " + i.ToString() + " Except " + e.ToString());
+    return 0;
+  end Main;
+end C;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "Union 4 Intersect 2 Except 1\n");
+}
+
+BEZEL_TEST(float_key_reflexive_equality_6657, union_intersect_except_float_reflexive_spec_4_3_1) {
+    JitResult r = runAot(R"BZ(module M;
+import System.Collections.Linq;
+class C
+  public static method Main(): int
+    using var a := new Array<float>();
+    a.Add(BitConverter.Int32BitsToFloat(0)); a.Add(BitConverter.Int32BitsToFloat(2143289344)); a.Add(BitConverter.Int32BitsToFloat(1069547520));
+    using var b := new Array<float>();
+    b.Add(BitConverter.Int32BitsToFloat(-2147483648)); b.Add(BitConverter.Int32BitsToFloat(2143289635)); b.Add(BitConverter.Int32BitsToFloat(1075838976));
+    var u := 0; for var v in a.Union(b) do u := u + 1; end;
+    var i := 0; for var v in a.Intersect(b) do i := i + 1; end;
+    var e := 0; for var v in a.Except(b) do e := e + 1; end;
+    Console.WriteLine("Union " + u.ToString() + " Intersect " + i.ToString() + " Except " + e.ToString());
+    return 0;
+  end Main;
+end C;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "Union 4 Intersect 2 Except 1\n");
+}
+
+BEZEL_TEST(float_key_reflexive_equality_6657, first_occurrence_representative_key_double_spec_4_3_1) {
+    JitResult r = runAot(R"BZ(module M;
+import System.Collections.Linq;
+record R(x: double, n: int);
+class C
+  public static method Main(): int
+    using var a := new Array<double>();
+    a.Add(BitConverter.Int64BitsToDouble(-9223372036854775808L));
+    a.Add(BitConverter.Int64BitsToDouble(0L));
+    a.Add(BitConverter.Int64BitsToDouble(9221120237041090851L));
+    a.Add(BitConverter.Int64BitsToDouble(9221120237041090560L));
+    a.Add(BitConverter.Int64BitsToDouble(4609434218613702656L));
+    a.Add(BitConverter.Int64BitsToDouble(0L));
+    for var g in a.GroupBy(lambda(v) => v) do
+      Console.WriteLine("GroupBy key=" + (BitConverter.DoubleToInt64Bits(g.Key)).ToString() + " n=" + g.Count().ToString());
+    end;
+    for var v in a.Distinct() do
+      Console.WriteLine("Distinct " + (BitConverter.DoubleToInt64Bits(v)).ToString());
+    end;
+    using var ts := a.ToSet();
+    Console.WriteLine("ToSet count " + ts.Count.ToString());
+    for var v in ts do
+      Console.WriteLine("ToSet " + (BitConverter.DoubleToInt64Bits(v)).ToString());
+    end;
+    return 0;
+  end Main;
+end C;
+)BZ");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, "GroupBy key=-9223372036854775808 n=3\nGroupBy key=9221120237041090851 n=2\nGroupBy key=4609434218613702656 n=1\nDistinct -9223372036854775808\nDistinct 9221120237041090851\nDistinct 4609434218613702656\nToSet count 3\nToSet -9223372036854775808\nToSet 9221120237041090851\nToSet 4609434218613702656\n");
+}
