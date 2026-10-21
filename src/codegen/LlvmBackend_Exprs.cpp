@@ -109,6 +109,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     noteFnAtObjectChildren(e);   // #5978: see `fnAtObject_`
     if (checkedDisposal_) noteCdBenignChildren(e);   // #4602
     llvm::Value* v = lowerExprInner(e);
+    // fix #6674 (§7.4 / §22.6, v0.339): "a read of a binding §7.4 has
+    // narrowed non-null is of its non-nullable type". Sema admitted this read
+    // of a nullable value-type binding at a non-nullable target and recorded
+    // it (SemaContext::markNarrowedValueRead), while the read itself still
+    // loads the declared `{i8 hasValue; T}` carrier. Extract the payload once,
+    // here, so every consumer (call and `new` arguments, collection keys and
+    // elements, `in`, function-value arguments, `Equals`, ...) receives the
+    // `T` sema typed it at, instead of each lowering site repeating the unwrap
+    // or passing the carrier on (the tag byte read as the key, an `{i8, T}`
+    // copied into a `T` component). Only the exact carrier of the read's own
+    // sema type is unwrapped, so a site that already received a bare `T` is
+    // untouched, and the per-site `unwrapNarrowedNullable` calls stay no-ops.
+    if (v && ctx_.hasNarrowedValueReads() && ctx_.isNarrowedValueRead(e))
+        if (const sema::TypeRef* rt = ctx_.exprType(e))
+            if (isNullableValueTy(rt) && !isNullableUnitTy(rt) &&
+                v->getType() == nullableValueStructTy(rt))
+                v = nullablePrimValue(v);
     // fix #5978 (§12.7 *Function-typed targets*, v0.338): `e` formed the
     // freshest closure cell — record the function type it was formed at.
     if (v && v == lastFreshFnCell_) {
@@ -2097,7 +2114,16 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     return lowerValueSemUniversalEquals(
                                         tt, lhs, *call);
                                 }
-                                llvm::Value* lhs = lowerExpr(*ma->target);
+                                // fix #6674 (§7.4, v0.339): a receiver §7.4
+                                // narrowed non-null (`k.Equals(5)` over
+                                // `k: int?`) still loads its `{i8, T}`
+                                // carrier; sema rejects the member access on
+                                // an un-narrowed one ("Member access ... on a
+                                // nullable value are compile errors unless
+                                // the compiler has narrowed it"), so the
+                                // payload is the receiver's value here.
+                                llvm::Value* lhs = unwrapNarrowedNullableOperand(
+                                    lowerExpr(*ma->target), ma->target.get());
                                 llvm::Value* rhs = lowerExpr(*call->args[0].value);
                                 if (!lhs || !rhs) return nullptr;
                                 if (lhs->getType() != rhs->getType()) {

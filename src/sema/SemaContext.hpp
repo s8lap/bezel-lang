@@ -527,6 +527,26 @@ public:
     allMethodRefFormations() const {
         return methodRefFormations_;
     }
+    // fix #6674 (§7.4 / §22.6, v0.339): a read of a nullable VALUE-type
+    // binding (`k` with `k: int?`, a record or an enum `?`) that §7.4 has
+    // narrowed non-null, at a position where `checkAssignable` admitted it
+    // against a NON-nullable target. §22.6: "a read of a binding §7.4 has
+    // narrowed non-null is of its non-nullable type". Sema keeps the read's
+    // exprType at the declared `T?` (null tests and `is` on the variable read
+    // it), so the narrowing must reach codegen through this table: there the
+    // read still loads the declared `{i8 hasValue; T}` carrier, and
+    // `Emitter::lowerExpr` extracts the payload for every expression named
+    // here. Keyed like `methodRefFormations_`; carried by every re-parse path.
+    void markNarrowedValueRead(const ast::Expr* e) {
+        if (e) narrowedValueReads_.insert(e);
+    }
+    bool isNarrowedValueRead(const ast::Expr& e) const {
+        return narrowedValueReads_.count(&e) > 0;
+    }
+    bool hasNarrowedValueReads() const { return !narrowedValueReads_.empty(); }
+    const std::unordered_set<const ast::Expr*>& allNarrowedValueReads() const {
+        return narrowedValueReads_;
+    }
     // §14.1/#783: iterate all AST-type→TypeRef and expr→TypeRef entries. Used by
     // ModuleLoader to COPY a re-parsed generic method body's resolved/expr types
     // from the fresh context into the main context, so codegen's per-instantiation
@@ -1327,6 +1347,8 @@ private:
     // fix #5208 (§27.6, v0.313): see `setMethodRefFormation` above.
     std::unordered_map<const ast::Expr*, MethodRefFormation>
         methodRefFormations_;
+    // fix #6674 (§7.4 / §22.6, v0.339): see `markNarrowedValueRead` above.
+    std::unordered_set<const ast::Expr*> narrowedValueReads_;
     // fix #3628 (§22.15 rule 6 / §25.1 / §17.6, v0.286): resolved §25
     // operator for a STATEMENT operator form (`a += b`, `t++`). See
     // `setStmtOperatorSymbol`/`stmtOperatorSymbol` above.

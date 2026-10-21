@@ -6121,6 +6121,18 @@ void ExprTC::checkAssignable(
                     // an init-only fact is a reliance either set may supply.
                     const bool nullFact = nullNarrowed_.count(s) > 0;
                     noteNullFactUse(s, /*nullSetOnly=*/nullFact);   // #6114
+                    // fix #6674 (§22.6, v0.339): "a read of a binding §7.4 has
+                    // narrowed non-null is of its non-nullable type". Publish
+                    // the read so codegen extracts the payload of the value
+                    // carrier it still loads (SemaContext::markNarrowedValueRead).
+                    // Not a type parameter's `T?` (declaration == nullptr): at a
+                    // `T := int?` substitution the carrier IS the value (#4899).
+                    // Nor a boxing target (`Object`, an interface): the box
+                    // site reads the carrier at the read's declared `T?`.
+                    if ((from->kind == TypeRef::Kind::Primitive ||
+                         from->declaration) &&
+                        !isBoxingTargetType(to))
+                        ctx_.markNarrowedValueRead(id);
                     if (from->kind == TypeRef::Kind::Primitive) {
                         from = ctx_.primitiveTypeRef(from->primitive,
                                                      /*nullable=*/false);
