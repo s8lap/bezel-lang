@@ -17281,7 +17281,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     TypeRef* rcvTy = ctx_.makeTypeRef(*rt);
                     rcvTy->nullable = false;
                     auto ph = std::make_unique<ast::IdentifierExpr>();
-                    ph->name = ncm->member;
+                    ph->name = "<nullcond-receiver>";  // unspellable: must not alias a user local (#6681)
                     ph->span = ncm->target->span;
                     ctx_.setExprType(ph.get(), rcvTy);
                     auto dotted = std::make_unique<ast::MemberAccessExpr>();

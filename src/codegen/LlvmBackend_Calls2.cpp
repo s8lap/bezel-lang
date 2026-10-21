@@ -20438,7 +20438,7 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     builder_.SetInsertPoint(accessBB);
 
     auto placeholder = std::make_unique<ast::IdentifierExpr>();
-    placeholder->name = nm.member;
+    placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
     ctx_.setExprType(placeholder.get(), const_cast<sema::TypeRef*>(rcvTy));
     exprValueOverride_[placeholder.get()] = rcv;
     const ast::Expr* placeholderKey = placeholder.get();
