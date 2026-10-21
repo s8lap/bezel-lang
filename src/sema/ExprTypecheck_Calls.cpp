@@ -2140,6 +2140,59 @@ bool returnCarriesParametricRecord(
 }
 
 
+// fix #6770 (§22.6, v0.340): "The compiler reports the error and cites the
+// candidate overloads". A candidate is cited by its parameter types AS
+// SPELLED: the last segment of a named type (as before), then its generic
+// arguments and its `?` marker, so two instantiations of one head
+// (`F(IReadOnlyList<Animal>)` / `F(IReadOnlyList<Dog>)`) and `long` / `long?`
+// read as different candidates. An inline array and a function type were
+// printed as `?`; they are spelled too.
+static std::string spelledTypeForSignature(const ast::Type* t) {
+    if (!t) return "?";
+    std::string s;
+    switch (t->kind) {
+        case ast::TypeKind::Named: {
+            if (!t->name || t->name->parts.empty()) return "?";
+            s = std::string(t->name->parts.back());
+            if (!t->genericArgs.empty()) {
+                s += '<';
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += spelledTypeForSignature(t->genericArgs[i].get());
+                }
+                s += '>';
+            }
+            break;
+        }
+        case ast::TypeKind::Unit:
+            s = "()";
+            break;
+        case ast::TypeKind::InlineArray:
+            s = t->arrayOwned ? "[N owned]" : "[N]";
+            s += spelledTypeForSignature(t->arrayElement.get());
+            break;
+        case ast::TypeKind::Function: {
+            s = "(";
+            for (std::size_t i = 0; i < t->funcParams.size(); ++i) {
+                if (i) s += ", ";
+                const auto& fp = t->funcParams[i];
+                if (!fp.modifier.empty()) {
+                    s += std::string(fp.modifier);
+                    s += ' ';
+                }
+                s += spelledTypeForSignature(fp.type.get());
+            }
+            s += ") -> ";
+            if (t->funcReturnOwned) s += "owned ";
+            s += spelledTypeForSignature(t->funcReturn.get());
+            if (t->nullable) s = "(" + s + ")";
+            break;
+        }
+    }
+    if (t->nullable) s += '?';
+    return s;
+}
+
 // A printable signature for a method candidate, e.g. "F(int, long)".
 std::string methodSignatureString(std::string_view name,
                                   const std::vector<ast::Param>& params) {
@@ -2150,11 +2203,7 @@ std::string methodSignatureString(std::string_view name,
         if (!first) s += ", ";
         first = false;
         if (!p.modifier.empty()) { s += std::string(p.modifier); s += ' '; }
-        // The parameter's source type name, if it's a simple named type.
-        if (p.type && p.type->name && !p.type->name->parts.empty())
-            s += std::string(p.type->name->parts.back());
-        else
-            s += "?";
+        s += spelledTypeForSignature(p.type.get());
     }
     s += ')';
     return s;
@@ -2178,10 +2227,7 @@ std::string methodSignatureString(std::string_view name,
         std::string_view mod = formalParamModifier(ms, j);
         if (!mod.empty()) { s += std::string(mod); s += ' '; }
         if (const ast::Type* at = formalParamDeclType(ms, j)) {
-            if (at->name && !at->name->parts.empty())
-                s += std::string(at->name->parts.back());
-            else
-                s += "?";
+            s += spelledTypeForSignature(at);
             continue;
         }
         if (const TypeRef* rt = formalParamResolvedType(ms, j))
