@@ -1387,6 +1387,35 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     for (const auto& m : td.members) {
         if (auto* nt =
                 dynamic_cast<const ast::NestedTypeMember*>(m.get())) {
+            // fix #6728 (§14.1 *Type-parameter names*, §11.6, v0.340): a type
+            // may not declare a nested type named like one of its own type
+            // parameters, whatever the nested type's arity: the parameter has
+            // no qualified spelling, so the nested type would silently replace
+            // it in this body's scope. Rejected at the nested declaration, and
+            // the registration below is skipped so the parameter stays the
+            // name's meaning in the body and no use of it cascades.
+            if (nt->decl) {
+                bool clashesWithParam = false;
+                for (const auto& g : td.genericParams) {
+                    if (g.name == nt->decl->name) {
+                        clashesWithParam = true;
+                        break;
+                    }
+                }
+                if (clashesWithParam) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nt->decl->span.begin,
+                        std::string("nested type `") +
+                            std::string(nt->decl->name) +
+                            "` takes the name of its enclosing type's type "
+                            "parameter `" + std::string(nt->decl->name) +
+                            "`; a type may not declare a nested type named "
+                            "like one of its own type parameters, whatever the "
+                            "nested type's arity \xe2\x80\x94 rename one of "
+                            "the two (\xc2\xa7""14.1, v0.340)");
+                    continue;
+                }
+            }
             if (nt->decl && tsym) {
                 // Find the NestedTypeSymbol in the outer type's member list.
                 NestedTypeSymbol* nts = nullptr;
