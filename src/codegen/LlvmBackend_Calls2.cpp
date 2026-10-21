@@ -14891,6 +14891,39 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         formalTy->declaration)
                         continue;  // not a bare type parameter
                     args[ai] = boxForTarget(args[ai], formalTy, argExprs[ai]);
+                    // fix #6900 (§14.1 / §5.1, v0.340): `buildOrderedArgs`
+                    // lowered the argument before `T` was bound, so an int
+                    // literal passed to `a: T` at `T = long` / `double` /
+                    // `decimal` / `byte` is still an i32. The specialization
+                    // takes its signature from `args[i]->getType()`, so the
+                    // body ran at i32 (4000000000 overflowed; `Div<double>`
+                    // divided integers; the double return failed IR verify).
+                    // Convert to the bound primitive: widening per §5.1, or
+                    // the §5.2 literal-fit narrowing for an in-range literal.
+                    if (const sema::TypeRef* bound =
+                            resolveTypeParamRef(formalTy);
+                        bound && bound != formalTy && !bound->nullable &&
+                        bound->kind == sema::TypeRef::Kind::Primitive) {
+                        llvm::Value* a = args[ai];
+                        llvm::Type* want = lowerTypeRef(bound);
+                        if (want && a->getType() != want &&
+                            (a->getType()->isIntegerTy() ||
+                             a->getType()->isFloatingPointTy()) &&
+                            !a->getType()->isIntegerTy(1)) {
+                            if (a->getType()->isIntegerTy() &&
+                                want->isIntegerTy() && !want->isIntegerTy(1) &&
+                                want->getIntegerBitWidth() <
+                                    a->getType()->getIntegerBitWidth()) {
+                                // only a constant literal narrows implicitly
+                                if (llvm::isa<llvm::ConstantInt>(a))
+                                    args[ai] = builder_.CreateTrunc(a, want);
+                            } else {
+                                args[ai] = coerceNumericToType(
+                                    a, want,
+                                    isUnsignedTargetExpr(*argExprs[ai]));
+                            }
+                        }
+                    }
                 }
             }
         }
