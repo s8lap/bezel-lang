@@ -407,6 +407,21 @@ public:
         enclosingCtor_ = cs;
     }
 
+    // fix #6630 / #6634 (§28.3 sink rule, §9.4, v0.340): the type whose
+    // INSTANCE member body is being analysed (null for a static member, an
+    // extension body, or any run with no receiver). A lambda in such a body
+    // that captures the receiver — `this`/`base`, or an implicit-`this` member
+    // reference — contributes the receiver to its source set by kind (§28.3's
+    // producers table, the `this` row): a class receiver is borrowed (source:
+    // caller); a copyable value receiver is captured by copy (§9.4 *The
+    // receiver value is fixed at the call*) and contributes what a captured
+    // local of its type does — the sources of the borrows it carries, nothing
+    // for a type that holds no borrows. Set by `checkMember` before `run`. The
+    // sink leg judges only a receiver that carries a borrow
+    // (receiverCarriesBorrowForSink): a class or interface, or a record or
+    // choice that holds borrows (§9.7, §35.4); tracker #6721.
+    void setReceiverType(sema::TypeSymbol* ts) { receiverType_ = ts; }
+
     // fix #5252 (§23.3 / §28.3, v0.313): the implicit `value` parameter of a
     // `set(owned)` accessor whose body is being analysed (null for every
     // other body). Sema records it as a `LocalSymbol` anchored on the
@@ -4313,6 +4328,30 @@ private:
     // parameter that is itself the destination). // per §27.5, §28.6
     void checkRefOutLambdaCaptureOnStore(const ast::AssignmentStmt& as);
 
+    // fix #6630 / #6634 (§28.3 *Announcement-erasing positions (the sink
+    // rule)*, §9.4, v0.340): the receiver-capture leg of the sink rule. A
+    // lambda literal (directly, or as an arm of a conditional) that captures
+    // the receiver of this instance body has a non-empty source set, so it
+    // may not be stored in a field, a property or indexer, any collection, or
+    // through an `out`/`ref` parameter, nor returned from the method. Returns
+    // the capturing identifier (`this`, `base`, or the implicit-`this` member
+    // name) of the first such lambda in `e`, or null.
+    const ast::IdentifierExpr* receiverCaptureIn(const ast::Expr& e) const;
+    // True when the receiver's `this` carries a borrow the sink rule judges:
+    // a class or interface receiver, or a borrow-bearing record or choice
+    // (§9.7, §35.4). A borrow-free value receiver's copy contributes nothing
+    // (§9.4, v0.340).
+    bool receiverCarriesBorrowForSink() const;
+    // Reports the sink-rule rejection for a receiver capture at `site`
+    // (`what` names the position, e.g. "returned from the method").
+    void reportReceiverCaptureAtSink(const ast::IdentifierExpr& id,
+                                     const std::string& what);
+    // The collection channel: `.Add`/`.Insert`/… on any builtin collection.
+    void checkReceiverCaptureCollectionStore(const ast::CallExpr& call);
+    // The assignment channel: a field / property / indexer / collection-slot
+    // store, or a write through an `out`/`ref` parameter.
+    void checkReceiverCaptureOnStore(const ast::AssignmentStmt& as);
+
     // §9.7: true when `rt` is a record type that holds at least one
     // borrow-carrying field of a non-runtime-managed type (a class/
     // interface reference field, an inline array of reference elements,
@@ -4724,6 +4763,11 @@ private:
     // moved-from state tracking rather than re-classifying the expression.
     // fix #3751: see setEnclosingCtor above.
     const sema::ConstructorSymbol* enclosingCtor_ = nullptr;
+    // fix #6630 / #6634: see setReceiverType above.
+    sema::TypeSymbol* receiverType_ = nullptr;
+    // fix #6630 / #6634: widens collectIdentifiersIn to every Expr-bearing
+    // kind for the receiver-capture leg only (see collectIdentifiersIn).
+    mutable bool deepCaptureWalk_ = false;
     // fix #5252: see setOwnedAccessorValue above.
     sema::Symbol* ownedAccessorValue_ = nullptr;
 

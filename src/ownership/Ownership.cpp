@@ -1846,6 +1846,10 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
         }
     }
     checkBorrowReturnedThroughOwningType(exprBody);
+    // fix #6634 (§28.3 sink rule, §9.4, v0.340): `M(): () -> T => lambda() =>
+    // this.x` returns the lambda exactly as the block form's `return` does.
+    if (const ast::IdentifierExpr* cap = receiverCaptureIn(exprBody))
+        reportReceiverCaptureAtSink(*cap, "returned from the method");
     // fix #4428 (§9.7, v0.301): the `=>` expression-body sibling of the
     // block-body `handleReturn -> checkRecordBorrowEscapesOnReturn` call.
     // Mirrors the block-body return-site coverage so an expression-bodied
@@ -8757,6 +8761,9 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
     // but ref/out captures are a SEPARATE source not covered by §28.3 scope-
     // bound locals, so we always run this check regardless of flagged386). // per §27.5, §28.6
     checkRefOutLambdaCaptureOnStore(as);
+    // fix #6630 / #6634 (§28.3 sink rule, §9.4, v0.340): the receiver-capture
+    // twin — a lambda capturing `this` stored into a function-typed holder.
+    checkReceiverCaptureOnStore(as);
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S5): a loop-carried
     // accumulation `prev := Math.Max(prev, cur)` whose contributing source is a
     // scope-bound owned local declared inside the loop body — a source that does
@@ -9803,6 +9810,11 @@ void MethodOwnership::handleReturn(const ast::Expr& e) {
     // whole returned expression. Neither check marks any local disposed;
     // they only diagnose. The discharge handling below is unchanged.
     checkClosureEscapesOnReturn(e);       // D1: §28.9 closure capture escape
+    // fix #6634 (§28.3 sink rule, §9.4, v0.340): a returned lambda that
+    // captures the receiver. Inert for a lambda body's own `return` (a
+    // lambda-body run never has a receiver type set).
+    if (const ast::IdentifierExpr* cap = receiverCaptureIn(e))
+        reportReceiverCaptureAtSink(*cap, "returned from the method");
     checkRecordBorrowEscapesOnReturn(e);  // D2: §9.7 borrow-bearing record
     // #1066 / §9.7 (v0.153): `return new Bag([…])` from a temporary is a
     // dangling borrow exactly as a local-decl initializer is.
@@ -11497,6 +11509,11 @@ void MethodOwnership::scanLambdaBodyBorrowStores(const ast::Stmt& s) {
             // costs nothing. `fromLambdaBody=true` triggers the enclosing-
             // frame retry so a captured owned local resolves as a source.
             checkIndexerSetBorrowStoreEscape(*as, /*fromLambdaBody=*/true);
+            // fix #6630 (§28.3 sink rule, v0.340): a receiver-capturing lambda
+            // stored from inside a lambda body still captures the METHOD's
+            // receiver (the lambda-body pre-pass runs on the method's own
+            // instance, so `receiverType_` is the method's).
+            checkReceiverCaptureOnStore(*as);
         }
         // §28.11 storing-method-CALL sink — see fix #3799 above. Walk the
         // statement's expression-bearing positions and call the check on every
@@ -11505,6 +11522,7 @@ void MethodOwnership::scanLambdaBodyBorrowStores(const ast::Stmt& s) {
         // same reason as above.
         forEachBorrowStoreCallInStmt(cur, [this](const ast::CallExpr& call) {
             checkCollectionBorrowStoreEscape(call, /*fromLambdaBody=*/true);
+            checkReceiverCaptureCollectionStore(call);  // fix #6630, see above
             // fix #5145 (§28.3, v0.330): the call-site `ref` / plain-`out`
             // recipient check, reachable from inside a lambda body for the same
             // reason as its two siblings above — the statement walks do not
@@ -16617,6 +16635,17 @@ static void runOwnedSetterBody(const ast::PropertyDecl& pd,
 // type — defined after checkOwnedFieldDA, further down this file.
 void checkNoCtorScreenForType(const ast::TypeDecl& td, sema::SemaContext& ctx);
 
+// fix #6630 / #6634 (§28.3 sink rule, §9.4, v0.340): the TypeSymbol sema
+// registered for `td` (null for no enclosing type — an extension body).
+static sema::TypeSymbol* receiverTypeSymbolOf(const ast::TypeDecl* td,
+                                              sema::SemaContext& ctx) {
+    if (!td) return nullptr;
+    for (const auto& s : ctx.symbols())
+        if (s->decl == td)
+            if (auto* ts = dynamic_cast<sema::TypeSymbol*>(s.get())) return ts;
+    return nullptr;
+}
+
 void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                  const ast::TypeDecl* enclosingType = nullptr,
                  const ast::ExtensionDecl* enclosingExtension = nullptr) {
@@ -16677,8 +16706,14 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                     inheritedBareTypeParamSourcePositions(*md, selfMs, ctx);
             }
         }
+        // fix #6630 / #6634 (§28.3 sink rule, §9.4, v0.340): the receiver
+        // type of an INSTANCE method, for the receiver-capture sink leg.
+        sema::TypeSymbol* receiverType =
+            methodIsStatic(*md) ? nullptr
+                                : receiverTypeSymbolOf(enclosingType, ctx);
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodOwnership mo(ctx);
+            mo.setReceiverType(receiverType);
             // #2073 / §28.10: a method body is "generic" for lint purposes
             // when EITHER the method declares its own `<T>` parameters OR the
             // enclosing type is generic (`class C<T> method M(c: T) using var
@@ -16709,6 +16744,7 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
             // handleReturn, which would introduce unrelated new diagnostics
             // on expression bodies). // per §28.3, §5.11
             MethodOwnership mo(ctx);
+            mo.setReceiverType(receiverType);
             mo.runExprBodyOwningReturnCheck(
                 *md->exprBody, paramSymsOf(m, ctx),
                 md->returnType.get(), md->returnOwned, methodIsAsync(*md),
@@ -16727,6 +16763,10 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         // `owned` parameter chained into an `owned` slot was neither marked
         // moved-from nor marker-checked — a measured heap-use-after-free.
         mo.setEnclosingCtor(ctorSymbolOf(m, ctx));
+        // fix #6630 (§28.3 sink rule, v0.340): a constructor body has a
+        // receiver too (a static constructor does not).
+        if (!cd->isStatic)
+            mo.setReceiverType(receiverTypeSymbolOf(enclosingType, ctx));
         mo.run(cd->body, paramSymsOf(m, ctx));
     } else if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
         MethodOwnership mo(ctx);

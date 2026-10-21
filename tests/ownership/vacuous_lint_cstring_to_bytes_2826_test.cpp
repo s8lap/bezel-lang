@@ -263,16 +263,24 @@ BEZEL_TEST(vacuous_lint_cstring_to_bytes_2826,
         "module M; "
         "class Cfg "
         "  private owned _bytes: Array<byte>; "
-        "  public ToBytes: () -> Array<byte>; "
+        "  public ToBytes: (Array<byte>) -> Array<byte>; "
         "  public constructor() "
         "    _bytes := new Array<byte>(4); "
-        "    ToBytes := lambda() => _bytes; "
+        // fix #6630 (§28.3 sink rule, v0.340): the stored lambda neither reads
+        // `_bytes` (a field-stored closure that captures the receiver is
+        // rejected at the store) nor mints a fresh array (a fresh owned value
+        // at a concrete class-return slot is rejected by §28.3 *Concrete-slot
+        // function bodies*). It returns a borrow of its own parameter, which
+        // that slot admits. What this row pins is the CALL through a
+        // function-typed field named `ToBytes`, which the body does not affect.
+        "    ToBytes := lambda(a: Array<byte>) => a; "
         "  end constructor; "
         "  destructor end destructor; "
         "end Cfg; "
         "class C public static method Main(): int "
         "  using var cfg := new Cfg(); "
-        "  const b := cfg.ToBytes(); "
+        "  var src := new Array<byte>(4); "
+        "  const b := cfg.ToBytes(src); "
         "  return b.Count; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

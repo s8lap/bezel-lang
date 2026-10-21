@@ -19,7 +19,9 @@
 //        reference, and `this` added to a borrowing collection (§28.3's
 //        borrowed-field store rule / §28.11 — the K4.3 trust-admitted stores).
 //        Each runs plain checked AND under generated-code ASan: a missing mark
-//        frees the block and the ASan leg reports the use-after-free.
+//        frees the block and the ASan leg reports the use-after-free. Row 3
+//        (the lambda capture) is a REJECTION since #6630: a closure over
+//        `this` stored in a collection breaks §28.3's sink rule (v0.340).
 //   6.   An unescaped fresh local's block is freed: the ASan/LSan leg finds no
 //        leak (before this fix every one of the 200 blocks was quarantined and
 //        leaked — fail-without).
@@ -106,10 +108,18 @@ const char* kRegistry =
     "  end constructor;\n"
     "  public method Attach(r: Registry)\n"
     "    r.Keep(this);\n"
-    "  end Attach;\n"
+    "  end Attach;\n";
+
+// fix #6630 (§28.3 sink rule, v0.340): row 3's `Hook` — a lambda capturing
+// `this` stored into a collection — is now rejected at the store, so it is
+// spliced into row 3's program only (escapeProgram's `extraWidgetMembers`)
+// instead of every row's shared Widget.
+const char* kHookMember =
     "  public method Hook(r: Registry)\n"
     "    r.Fns().Add(lambda(): string => GetLabel());\n"
-    "  end Hook;\n"
+    "  end Hook;\n";
+
+const char* kRegistryTail =
     "  public method HookBound(r: Registry)\n"
     "    r.Fns().Add(GetLabel);\n"
     "  end HookBound;\n"
@@ -123,8 +133,9 @@ const char* kRegistry =
 
 // `body` runs inside `do … end` with `reg` in scope; the owner `w` is released
 // at the block's end, then `probe` reads through the escaped borrow.
-std::string escapeProgram(const std::string& body, const std::string& probe) {
-    return std::string(kRegistry) +
+std::string escapeProgram(const std::string& body, const std::string& probe,
+                          const std::string& extraWidgetMembers = "") {
+    return std::string(kRegistry) + extraWidgetMembers + kRegistryTail +
         "public class Program\n"
         "  public static method Main()\n"
         "    using var reg := new Registry();\n"
@@ -229,10 +240,28 @@ BEZEL_TEST(codegen_checked_disposal_bounded_retention_4602,
            spec_28_2_escaped_lambda_capture_read_after_release_faults) {
     // §27.5: the env holds `this` past the frame; the capture is marked at
     // env construction.
-    expectEscapedFaults(escapeProgram(
+    //
+    // fix #6630 (§28.3 sink rule, v0.340): this retention kind no longer
+    // compiles. A closure over `this` has a non-empty source set (§9.4; the
+    // producers table's `this` row), and "a function value may not be stored
+    // … in any collection" while its set is non-empty, so the store in `Hook`
+    // is rejected before any program runs. The row now pins that rejection;
+    // the escape mark the row exercised is reachable for a `this` capture only
+    // through a `scoped` parameter (§28.14).
+    const std::string src = escapeProgram(
         "      var w := new Widget();\n"
         "      w.Hook(reg);\n",
-        "reg.Fns()[0]()"));
+        "reg.Fns()[0]()", kHookMember);
+    auto r = runAotCheckedDisposal(src);
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sinkRule = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("closure stored in a collection (`.Add(...)`) "
+                           "captures the receiver (`GetLabel` reads `this`)") !=
+                std::string::npos &&
+            d.message.find("(§28.3 sink rule, v0.340") != std::string::npos)
+            sinkRule = true;
+    BEZEL_EXPECT_TRUE(sinkRule);
 }
 
 

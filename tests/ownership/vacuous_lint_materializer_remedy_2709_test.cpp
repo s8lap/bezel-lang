@@ -283,16 +283,24 @@ BEZEL_TEST(vacuous_lint_materializer_2709,
         "module M; "
         "class Cfg "
         "  private owned _items: Array<string>; "
-        "  public Split: (string) -> Array<string>; "
+        "  public Split: (Array<string>) -> Array<string>; "
         "  public constructor() "
         "    _items := new Array<string>(); _items.Add(\"x\"); "
-        "    Split := lambda(s: string) => _items; "
+        // fix #6630 (§28.3 sink rule, v0.340): the stored lambda neither reads
+        // `_items` (a field-stored closure that captures the receiver is
+        // rejected at the store) nor mints a fresh array (a fresh owned value
+        // at a concrete class-return slot is rejected by §28.3 *Concrete-slot
+        // function bodies*). It returns a borrow of its own parameter, which
+        // that slot admits. What this row pins is the CALL through a
+        // function-typed field named `Split`, which the body does not affect.
+        "    Split := lambda(a: Array<string>) => a; "
         "  end constructor; "
         "  destructor end destructor; "
         "end Cfg; "
         "class C public static method Main(): int "
         "  using var cfg := new Cfg(); "
-        "  const parts := cfg.Split(\"a,b\"); "
+        "  var src := new Array<string>(); src.Add(\"a\"); src.Add(\"b\"); "
+        "  const parts := cfg.Split(src); "
         "  return parts.Count; "
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

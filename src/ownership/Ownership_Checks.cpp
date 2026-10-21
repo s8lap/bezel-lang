@@ -2160,6 +2160,9 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // rejected at the store site. See the declaration comment for the
         // full rule; independent of the §28.6 capability check above.
         checkCollectionBorrowStoreEscape(*call);
+        // fix #6630 (§28.3 sink rule, v0.340): a receiver-capturing lambda
+        // stored into any builtin collection.
+        checkReceiverCaptureCollectionStore(*call);
         // fix #5145 (§28.3 *A `ref` or plain `out` location outlives the
         // call*, v0.330): the CALLER's half of the rule that
         // checkBorrowStoreEscape's `Dest::OutParam` leg enforces inside the
@@ -4329,6 +4332,57 @@ void MethodOwnership::collectIdentifiersIn(
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
         collectLambdaIdentifiers(*lam, out);
         return;
+    }
+    // fix #6630 / #6634 (§28.3 sink rule, v0.340): the receiver-capture leg
+    // walks the remaining Expr-bearing kinds as well — `case this of …` is
+    // the canonical choice-receiver capture, and `$"{_s}"` / `with` /
+    // collection literals / ranges / `bind` reach the receiver as surely.
+    // Gated so the walk's other consumers keep their measured behaviour (the
+    // same gaps for a captured parameter or local are #6653).
+    if (deepCaptureWalk_) {
+        if (auto* cse = dynamic_cast<const ast::CaseExpr*>(&e)) {
+            if (cse->scrutinee) collectIdentifiersIn(*cse->scrutinee, out);
+            for (const auto& arm : cse->arms) {
+                if (arm.guard) collectIdentifiersIn(*arm.guard, out);
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                    if (arm.exprBody) collectIdentifiersIn(*arm.exprBody, out);
+                } else {
+                    for (const auto& st : arm.stmts)
+                        if (st) collectIdentifiersInStmt(*st, out);
+                }
+            }
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+            for (const auto& part : is->parts)
+                if (part.expr) collectIdentifiersIn(*part.expr, out);
+            return;
+        }
+        if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+            if (we->source) collectIdentifiersIn(*we->source, out);
+            for (const auto& ia : we->assigns)
+                if (ia.value) collectIdentifiersIn(*ia.value, out);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+            for (const auto& k : cl->keys)
+                if (k) collectIdentifiersIn(*k, out);
+            for (const auto& v : cl->elements)
+                if (v) collectIdentifiersIn(*v, out);
+            return;
+        }
+        if (auto* re = dynamic_cast<const ast::RangeExpr*>(&e)) {
+            if (re->lo) collectIdentifiersIn(*re->lo, out);
+            if (re->hi) collectIdentifiersIn(*re->hi, out);
+            if (re->step) collectIdentifiersIn(*re->step, out);
+            return;
+        }
+        if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+            for (const auto& c : bx->clauses)
+                if (c && c->initializer) collectIdentifiersIn(*c->initializer, out);
+            if (bx->body) collectIdentifiersIn(*bx->body, out);
+            return;
+        }
     }
     // Other expression forms carry no identifier that could be a tracked
     // method-scope local capture (literals, default/typeof/nameof, …).
@@ -7126,6 +7180,227 @@ void MethodOwnership::checkRefOutLambdaCaptureOnStore(
                 }
             }
             return;  // one diagnostic per assignment is enough
+        }
+    }
+}
+
+// fix #6630 / #6634 (§28.3 *Announcement-erasing positions (the sink rule)*,
+// §9.4, v0.340): the receiver-capture leg of the closure bullet's sink rule.
+//
+// §28.3 provenance clause 1: a lambda literal contributes "a captured borrowed
+// local or parameter that binding's source". What a captured receiver
+// contributes depends on its kind (§28.3's producers table, the `this` row):
+// for a class or interface `this` is "Borrowed (source: caller)"; for a
+// copyable value kind §9.4 (*The receiver value is fixed at the call*) has a
+// closure formed in the body capture "the fixed receiver value by copy", and
+// the capture "contributes to the closure's source set exactly what a captured
+// local of the receiver's type contributes": nothing where the type holds no
+// borrows (§3.6), the sources of the borrows the value carries where it holds
+// them. So a closure that captures a class receiver, or a value receiver that
+// holds borrows — explicitly (`this`, `base`, `case this of …`) or through an
+// implicit-`this` member reference (`_s`, `GetLabel()`) — has a non-empty set,
+// and "while its source set is non-empty, a function value may not be stored
+// in a field, in any collection, in a property or indexer, or through an
+// `out` or `ref` parameter, may not be returned from the enclosing method".
+// Its only storage route is a `scoped` parameter (§28.14), which this leg
+// never sees: a `scoped` formal is an argument position, not a store.
+//
+// Scope (recorded): the leg judges the function value only where a lambda
+// LITERAL stands at the sink (or is an arm of a conditional there). A
+// function-typed local traced to such a lambda, a method reference over
+// `this`, an extension body's receiver, and the holders this leg does not
+// enumerate (a getter's return, a record-component or choice-payload argument,
+// `with`, a collection-literal element) are not reached here — #6652.
+//
+// Receiver kinds (§9.4 / §28.3, v0.340; tracker #6721): the leg rejects a
+// CLASS or INTERFACE receiver's `this`, and a value receiver (record, choice)
+// whose type holds borrows — §9.7's closure bullet, with "record" read as
+// "record or choice" (§35.4), reaches the copied `this` as well (#6630). A
+// value receiver whose type holds no borrows, and every enum, contributes
+// nothing, so its closure is capture-free and goes wherever a capture-free
+// function value goes (receiverCarriesBorrowForSink below).
+bool MethodOwnership::receiverCarriesBorrowForSink() const {
+    if (!receiverType_) return false;
+    if (receiverType_->kind == ast::TypeDeclKind::Class ||
+        receiverType_->kind == ast::TypeDeclKind::Interface)
+        return true;
+    // §9.4 (v0.340): a copyable value receiver's `this` is captured by copy
+    // and contributes what a captured local of its type contributes — nothing
+    // for a type that holds no borrows (§3.6), so such a receiver is not
+    // judged here (tracker #6721).
+    sema::TypeRef self;
+    self.kind = sema::TypeRef::Kind::Named;
+    self.declaration = receiverType_;
+    if (receiverType_->kind == ast::TypeDeclKind::Record) {
+        if (isBorrowBearingRecordOrSpan(&self)) return true;
+        // §9.7: "Reference-typed fields in records are always borrows", and a
+        // body record's components are its auto-properties (§9.2; §9.1 calls
+        // the positional ones auto-properties too, in §23.1's sense). The
+        // shared classifier walks fields only (sema::anyRecordStorageField's
+        // recorded scope), so #6630's own record repro — `public readonly
+        // property W: Widget;` — reads as borrow-free there. This leg reads
+        // every instance storage member, auto-properties included, with the
+        // same field-level predicate. The classifier's gap is #6708.
+        bool carries = false;
+        std::unordered_set<const sema::TypeRef*> seen;
+        seen.insert(&self);
+        sema::recordStorageMembers(
+            receiverType_, ctx_, [&](const sema::RecordStorageMember& rsm) {
+                if (rsm.type && recordFieldIsBorrowCarrying(rsm.type, seen,
+                                                            nullptr)) {
+                    carries = true;
+                    return false;  // stop
+                }
+                return true;
+            });
+        return carries;
+    }
+    if (receiverType_->kind == ast::TypeDeclKind::Choice)
+        return isBorrowBearingChoice(&self);
+    return false;  // enum: carries no borrow
+}
+
+const ast::IdentifierExpr* MethodOwnership::receiverCaptureIn(
+    const ast::Expr& e) const {
+    if (!receiverCarriesBorrowForSink()) return nullptr;
+    std::vector<const ast::LambdaExpr*> lambdas;
+    std::function<void(const ast::Expr&)> findLambdas =
+        [&](const ast::Expr& x) {
+            if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&x)) {
+                lambdas.push_back(lam);
+                return;
+            }
+            if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&x)) {
+                if (cd->thenValue) findLambdas(*cd->thenValue);
+                if (cd->elseValue) findLambdas(*cd->elseValue);
+            }
+        };
+    findLambdas(e);
+    for (const ast::LambdaExpr* lam : lambdas) {
+        std::vector<const ast::IdentifierExpr*> ids;
+        deepCaptureWalk_ = true;
+        collectLambdaIdentifiers(*lam, ids);
+        deepCaptureWalk_ = false;
+        for (const ast::IdentifierExpr* id : ids) {
+            if (id->name == "this" || id->name == "base") return id;
+            sema::Symbol* sym = ctx_.exprSymbol(*id);
+            auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
+            if (!ms) continue;
+            // Only an INSTANCE field, property, method or event read bare is
+            // an implicit-`this` access; a constant, enum constant, choice
+            // case, nested type or static member names no receiver.
+            if (!dynamic_cast<sema::FieldSymbol*>(ms) &&
+                !dynamic_cast<sema::PropertySymbol*>(ms) &&
+                !dynamic_cast<sema::MethodSymbol*>(ms) &&
+                !dynamic_cast<sema::EventSymbol*>(ms))
+                continue;
+            bool isStatic = false;
+            for (std::string_view mod : ms->modifiers)
+                if (mod == "static" || mod == "const") isStatic = true;
+            if (isStatic) continue;
+            return id;
+        }
+    }
+    return nullptr;
+}
+
+void MethodOwnership::reportReceiverCaptureAtSink(
+    const ast::IdentifierExpr& id, const std::string& what) {
+    const bool explicitThis = id.name == "this" || id.name == "base";
+    std::string kind;
+    switch (receiverType_->kind) {
+        case ast::TypeDeclKind::Class: kind = "class"; break;
+        case ast::TypeDeclKind::Interface: kind = "interface"; break;
+        case ast::TypeDeclKind::Record: kind = "record"; break;
+        case ast::TypeDeclKind::Choice: kind = "choice"; break;
+        case ast::TypeDeclKind::Enum: kind = "enum"; break;
+        default: kind = "type"; break;
+    }
+    const char* article =
+        (kind == "interface" || kind == "enum") ? "an " : "a ";
+    const bool valueKind = receiverType_->kind != ast::TypeDeclKind::Class &&
+                           receiverType_->kind != ast::TypeDeclKind::Interface;
+    report(Severity::Error, id.span.begin,
+           std::string("closure ") + what + " captures " +
+           (explicitThis ? std::string("`") + std::string(id.name) + "`"
+                         : std::string("the receiver (`") +
+                               std::string(id.name) + "` reads `this`)") +
+           " — in an instance member of " + article + kind +
+           (valueKind ? ", the closure captures a copy of the receiver "
+                        "value and the copy carries the borrows that value "
+                        "holds (§9.4, §9.7)"
+                      : ", `this` is a borrow whose source is the caller's "
+                        "object") +
+           ", so the closure's source set is non-empty, and a function value "
+           "with a non-empty source set may not be stored in a field, in any "
+           "collection, in a property or indexer, or through an `out` or "
+           "`ref` parameter, nor returned from the enclosing method (§28.3 "
+           "sink rule, v0.340; copy the data the closure needs into a local "
+           "and capture that, or pass the closure to a `scoped` parameter, "
+           "§28.14)");
+}
+
+void MethodOwnership::checkReceiverCaptureOnStore(
+    const ast::AssignmentStmt& as) {
+    if (!receiverType_ || as.op != ":=" || !as.target || !as.value) return;
+    // §28.3 *Function-typed holders* (v0.339): "a field (a `scoped` field
+    // excepted)" — a `scoped` field stores under §28.14's storage-bounded
+    // admission instead, judged by that section's own checks.
+    if (scopedFieldReadArg(*as.target, nullptr)) return;
+    // The function-typed holders of §28.3 reached by an assignment: a member
+    // chain (`obj.f`, `this.P`, a record component), a bare field or property
+    // name (implicit `this`), any indexer or collection slot, and an
+    // `out`/`ref` parameter's location. A plain local is not a holder.
+    std::string what;
+    if (dynamic_cast<const ast::MemberAccessExpr*>(as.target.get())) {
+        what = "stored in a field or property";
+    } else if (dynamic_cast<const ast::IndexExpr*>(as.target.get())) {
+        what = "stored in an indexer or collection slot";
+    } else if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                   as.target.get())) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (dynamic_cast<sema::FieldSymbol*>(sym) ||
+            dynamic_cast<sema::PropertySymbol*>(sym)) {
+            what = std::string("stored in `") + std::string(id->name) + "`";
+        } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            if (ps->modifier == "out" || ps->modifier == "ref")
+                what = std::string("written through the `") +
+                       std::string(ps->modifier) + "` parameter `" +
+                       std::string(id->name) + "`";
+        }
+    }
+    if (what.empty()) return;
+    if (const ast::IdentifierExpr* cap = receiverCaptureIn(*as.value))
+        reportReceiverCaptureAtSink(*cap, what);
+}
+
+void MethodOwnership::checkReceiverCaptureCollectionStore(
+    const ast::CallExpr& call) {
+    if (!receiverType_ || !call.callee) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return;
+    const std::string_view m = ma->member;
+    const bool storing = m == "Add" || m == "Insert" || m == "TryAdd" ||
+                         m == "AddFirst" || m == "AddLast" ||
+                         m == "AddBefore" || m == "AddAfter" || m == "Push" ||
+                         m == "Enqueue";
+    // (`GetOrAdd`'s factory is invoked, not stored: its RESULT is the stored
+    // value, so a receiver-capturing factory lambda is not this leg's.)
+    if (!storing) return;
+    // A builtin collection (a Named TypeRef with no user declaration, cf.
+    // checkCollectionBorrowStoreEscape). "Any collection" — a local one
+    // included — is a function-typed holder (§28.3), so the receiver's own
+    // scope is not consulted.
+    const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+        return;
+    for (const ast::CallArgument& a : call.args) {
+        if (!a.value) continue;
+        if (const ast::IdentifierExpr* cap = receiverCaptureIn(*a.value)) {
+            reportReceiverCaptureAtSink(
+                *cap, std::string("stored in a collection (`.") +
+                          std::string(m) + "(...)`)");
+            return;
         }
     }
 }

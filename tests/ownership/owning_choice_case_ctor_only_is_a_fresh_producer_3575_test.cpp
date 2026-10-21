@@ -68,7 +68,7 @@ namespace {
 // payload is a class with a COUNTING destructor so "disposed exactly once"
 // is checkable, wrapped in a class whose `owned` field of that choice type is
 // the storage every read spelling borrows from.
-const char* kDecls =
+const char* kCoreDecls =
     "public class Resource "
     "  private _n: int; "
     "  public constructor(n: int) _n := n; end constructor; "
@@ -78,7 +78,16 @@ const char* kDecls =
     "public choice Bundle "
     "  Ready(owned r: Resource), "
     "  Empty; "
-    "end Bundle; "
+    "end Bundle; ";
+
+// The class whose `owned` field every READ spelling borrows from. Kept apart
+// from kCoreDecls since #6630 (§28.3 sink rule, v0.340): its constructor's
+// `_fetch := lambda() => _h` stores a closure that captures the receiver into
+// a field, which the sink rule now rejects at the store. The three READ rows
+// below are rejects whose §28.8 needle is still asserted on their own; the
+// POSITIVE row needs a program that is legal apart from the transfer under
+// test, so it is built without Box (progNoBox).
+const char* kBoxDecls =
     "public class Box "
     // `owned` field of the owning choice: the storage every read borrows.
     "  public owned _h: Bundle; "
@@ -93,15 +102,26 @@ const char* kDecls =
     "  public method Get(): Bundle => _h; "
     // The `owned` sink that discharges the produced local on its own.
     "  public method Take(owned h: Bundle) end; "
-    "end Box; "
-    // The `owned` sink the POSITIVE row transfers a genuine construction into.
+    "end Box; ";
+
+// The `owned` sink the POSITIVE row transfers a genuine construction into.
+const char* kSinkDecls =
     "public class Sink "
     "  public constructor() end constructor; "
     "  public method Put(owned h: Bundle) end; "
     "end Sink; ";
 
 std::string prog(const char* body) {
-    return std::string("module M; ") + kDecls +
+    return std::string("module M; ") + kCoreDecls + kBoxDecls + kSinkDecls +
+           "public class C "
+           "  public static method Main(): int " + body +
+           "  end Main; "
+           "end C;";
+}
+
+// The same program without Box — see kBoxDecls.
+std::string progNoBox(const char* body) {
+    return std::string("module M; ") + kCoreDecls + kSinkDecls +
            "public class C "
            "  public static method Main(): int " + body +
            "  end Main; "
@@ -190,7 +210,7 @@ BEZEL_TEST(owning_choice_case_ctor_only_is_a_fresh_producer_3575,
     // by the sink that took the obligation. `checkedToolchainSkipped` is
     // checked first so a toolchain skip cannot satisfy the `ran` assertion
     // vacuously.
-    auto r = runAot(prog(
+    auto r = runAot(progNoBox(
         "var b := Bundle.Ready(new Resource(42)); "
         "var s := new Sink(); "
         "s.Put(move b); "

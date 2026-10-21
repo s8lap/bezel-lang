@@ -261,25 +261,34 @@ BEZEL_TEST(sema_record_ctor_observation_gate_4014,
 // observation ("is not gated by rule 1"). The lambda is bound but never
 // invoked before the field is assigned — must be ACCEPTED even though the
 // field is still unassigned at the capture site. 42 round-trips (the lambda
-// is invoked only after construction completes, in `Main`).
+// is invoked only after `Extra` is assigned).
+//
+// fix #6630 (§28.3 sink rule, v0.340): the lambda is bound to a LOCAL and
+// invoked after the assignment, rather than stored into a function-typed
+// property and invoked from `Main`. A property slot assigned a function value
+// is a function-typed holder (§28.3 *Function-typed holders*), and this
+// record carries a borrow (its `Extra: Widget4014`, §9.7), so a closure over
+// its `this` has a non-empty source set and the former spelling is now
+// rejected at the store; rule 3's question — capture before assignment is not
+// an observation — is the same on the local.
 BEZEL_TEST(sema_record_ctor_observation_gate_4014,
            lambda_capture_of_this_before_field_assigned_accepted_spec_22_7) {
     BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
         "public record RecordObsLambda4014 "
         "  public readonly property Extra: Widget4014; "
-        "  public readonly property Deferred: () -> int; "
+        "  public readonly property Cached: int; "
         "  public method Peek(): int return Extra.Render(); end Peek; "
         "  public constructor(w: Widget4014) "
-        "    Deferred := lambda(): int => this.Peek(); "
+        "    var deferred := lambda(): int => this.Peek(); "
         "    Extra := w; "
+        "    Cached := deferred(); "
         "  end constructor; "
         "end RecordObsLambda4014; "
         "class C "
         "  public static method Main(): int "
         "    var w := new Widget4014(42); "
         "    var c := new RecordObsLambda4014(w); "
-        "    var f := c.Deferred; "
-        "    return f(); "
+        "    return c.Cached; "
         "  end Main; "
         "end C;"),
         42);

@@ -411,23 +411,30 @@ BEZEL_TEST(codegen_generic, ref_param_in_spec_inorder) {
 }
 
 // Test: closures capture 'this' for instance field access — §21.5/CG60
+//
+// fix #6630 / #6634 (§28.3 sink rule, v0.340): the closures are bound to a
+// LOCAL and invoked inside the method. The former spelling RETURNED them
+// (`MakeAdder(w): (int) -> ()`), and a closure over `this` has a non-empty
+// source set (the producers table's `this` row), so "may not be
+// returned from the enclosing method" now rejects it; the v0.298 changelog
+// (#4154) names "a closure over `this` returned" as closed. The capture of
+// `this` for a field read-modify-write is the same either way.
 BEZEL_TEST(codegen_generic, closure_captures_this_field) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class Acc "
         "  public Total: int := 0; "
         "  public constructor() end constructor; "
-        "  public method MakeAdder(w: int): (int) -> () "
-        "    return lambda(x: int) => do Total := Total + x * w; end; "
-        "  end MakeAdder; "
+        "  public method Apply(w: int, v: int) "
+        "    var add := lambda(x: int) => do Total := Total + x * w; end; "
+        "    add(v); "
+        "  end Apply; "
         "  destructor end destructor; "
         "end Acc; "
         "class Program "
         "  public static method Main(): int "
         "    using var a := new Acc(); "
-        "    var add1 := a.MakeAdder(1); "
-        "    var add2 := a.MakeAdder(2); "
-        "    add1(10); add2(5); add1(3); "
+        "    a.Apply(1, 10); a.Apply(2, 5); a.Apply(1, 3); "
         "    return a.Total; "  // 10*1 + 5*2 + 3*1 = 23
         "  end Main; "
         "end Program;"), 23);
