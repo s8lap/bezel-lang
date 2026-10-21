@@ -1,10 +1,11 @@
 // fix #6656 (§25.2 "Resolution", §6.6 "Compound assignments", v0.339).
 //
-// §6.6: "`x op= e` is `x := x op e`" with the target evaluated once; §25.1: "the
-// compound forms desugar mechanically to read-modify-write using the underlying
-// binary operator's overload". §25.2: "A derived-typed operand satisfies a
-// base-typed parameter by the ordinary argument rules" (parameters are matched
-// "by the ordinary argument rules", §5.1).
+// §6.6: "the statement `x op= e` is equivalent to `x := x op e` with the target
+// evaluated **once**"; §25.1: "the compound forms desugar mechanically to
+// read-modify-write using the underlying binary operator's overload". §25.2: "A
+// derived-typed operand satisfies a base-typed parameter by the ordinary
+// argument rules" (parameters are matched "by the ordinary argument rules",
+// §25.2).
 //
 // THE DEFECT (MEASURED on 15d9937e): `v += r` over `operator +(v: V, p: P)` with
 // P a stdlib type, an interface or `Object` passed sema and then died in IR
