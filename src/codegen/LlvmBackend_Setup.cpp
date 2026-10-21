@@ -15941,6 +15941,10 @@ bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
 }
 
 
+// fix #6741: defined in LlvmBackend_Exprs2.cpp (`ctorChainsViaThis`, §22.8: a
+// `this(...)`-chaining constructor skips steps 0 and 2).
+bool ctorChainsViaThisExported(const sema::ConstructorSymbol* cs);
+
 void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                                const sema::TypeSymbol* root) {
     const sema::TypeSymbol* b = baseClassOf(cls);
@@ -16339,6 +16343,29 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                         if (!baseClauseClosureArgs.empty())
                             unwindTarget_ = closureArgUnwindCleanup(
                                 baseClauseClosureArgs);
+                        // fix #6741 (§22.10 / §22.8 step 0-1, v0.340): the
+                        // inheritance-clause twin of #4584's `!isThis` half
+                        // in `emitChainCall`. `bce.cs`'s OWN leading
+                        // `base(...)` may bind the PRIMARY list of ITS base
+                        // (`class C : A` with `constructor(x) base(x + "!")`
+                        // over `class A(m)`); nothing writes those slots
+                        // unless `prePopulateBasePositionalFields` reaches
+                        // them, and the entry walk stops at the first base
+                        // without a primary list of its own (`b`), so for
+                        // `class D(m) : C(m)` it never examined `A`.
+                        // `!b->hasPositionalFields` is the #4584 question: if
+                        // `b` HAS a list, the entry walk reached it and
+                        // already lowered these expressions (one evaluation,
+                        // §22.5). A `this(...)`-chaining `bce.cs` is covered
+                        // by emitChainCall's hop. Values, not by-ref addresses.
+                        if (!b->hasPositionalFields &&
+                            !ctorChainsViaThisExported(bce.cs)) {
+                            std::vector<llvm::Value*> bcArgVals(
+                                args.begin() + 1, args.end());
+                            prePopulateBasePositionalFields(
+                                b, obj, bcArgVals, bce.cs,
+                                /*ctorArgsByRefAbi=*/false);
+                        }
                         builder_.CreateCall(bce.fn, args);
                         unwindTarget_ = savedBCUnwind;
                         if (!diverged_) {

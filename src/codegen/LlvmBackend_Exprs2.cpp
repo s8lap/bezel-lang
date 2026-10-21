@@ -4886,6 +4886,12 @@ bool ctorChainsViaThis(const sema::ConstructorSymbol* cs) {
 
 }  // namespace
 
+// fix #6741: the same predicate for `emitImplicitBase` (LlvmBackend_Setup.cpp),
+// exported so that file does not add a second AST read of a constructor body.
+bool ctorChainsViaThisExported(const sema::ConstructorSymbol* cs) {
+    return ctorChainsViaThis(cs);
+}
+
 // fix #3777 (§22.5 "Optional parameters and named arguments" / §22.10 "primary
 // constructors" / §22.8 step 0, v0.286): the ONE materialization of a §22.10
 // positional parameter's §22.5 default. Extracted verbatim from
