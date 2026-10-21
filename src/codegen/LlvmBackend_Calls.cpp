@@ -505,6 +505,38 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         // own — one write site, one discharge site.
         releaseRender = true;
     }
+    // fix #6753 (stdlib §2.1 / §3.1 / §8.1, v0.340): a DECLARATION-LESS built-in
+    // class (`StringBuilder`, `Array<T>`, `Mutex`, ...) has no arm in the chain
+    // below, so it fell through to the raw-write fallback and its plain runtime
+    // struct was read as a `%bz.string`. `isVtableLessBuiltinClassName` names
+    // exactly those heads (a reserved built-in class that is not an interface
+    // head). A user class carries a declaration and a generic `T` is in no
+    // builtin table, so neither is admitted.
+    auto isVtablelessBuiltinRef = [](const sema::TypeRef* rt) -> bool {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        std::string_view n = builtinTypeName(rt);
+        return !n.empty() && common::isVtableLessBuiltinClassName(n);
+    };
+    // fix #6753 (§8.1 / §18.5, v0.340): an `Object`-typed LOCAL whose initializer
+    // is a vtable-less built-in class (`var o: Object := sb; Console.WriteLine(o);`)
+    // reached `lowerObjectToString`, whose `bz_obj_is_string` premise is false for
+    // such a struct. The §18.5 hole already narrows through the initializer
+    // (`tryOpaqueSlotBuiltinRender`); the console takes the same narrowing so
+    // `Console.WriteLine(o)` and `$"{o}"` agree. The helper declines for every
+    // other shape (a reassigned local, a parameter, a user class, a real string),
+    // which keeps those on their existing lowering. Its result is a fresh +1 for
+    // `StringBuilder` and a sentinel literal for the other classes; the shared
+    // discharge after the write covers both.
+    if (argTy && strPtr == arg &&
+        argTy->kind == sema::TypeRef::Kind::Primitive &&
+        argTy->primitive == sema::PrimitiveType::Object) {
+        if (llvm::Value* r = tryOpaqueSlotBuiltinRender(
+                arg, argTy, call.args[0].value.get())) {
+            strPtr = r;
+            releaseRender = true;
+        }
+    }
     // `strPtr == arg` — i.e. no conversion has happened yet. The nullable-value
     // branch above is the one path that leaves this block with a converted
     // `strPtr`, and it must NOT be re-converted: `emitPrimitiveToString` on the
@@ -558,7 +590,12 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             if (freshFnArg) emitClosureRelease(arg);
             releaseRender = true;
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
-                   argTy->declaration) {
+                   (argTy->declaration || isVtablelessBuiltinRef(argTy))) {
+            // fix #6753 (stdlib §2.1 / §3.1, v0.340): admits the declaration-less
+            // vtable-less classes too. `emitValueToString` renders them (a `T?`
+            // through its nullable-ref arm, a `StringBuilder` by its content, the
+            // other classes by their qualified name), so a null `StringBuilder?`
+            // prints "null" and a `StringBuilder` is no longer read as a string.
             // fix #2878 (§8.5 / §28.3 / §28.9, v0.240): route the whole Named
             // arm through `emitValueToString` and discharge the result with
             // `releaseRender = true`. The previous ad-hoc member walk had
@@ -606,8 +643,38 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             // spelling reaches; the console arm joining it is the fix. The
             // pre-fix `tryLowerConsoleCall` comment "N places, one rule" was
             // already the diagnosis — the cure is one renderer in one place.
-            strPtr = emitValueToString(arg, argTy);
-            if (!strPtr) return false;
+            // fix #6753 (§18.5 / stdlib §3.1, v0.340): a NULLABLE declaration-less
+            // class (`StringBuilder?`) is a plain pointer with a real null, but
+            // `isNullableRefTy` admits only declared classes, so `emitValueToString`
+            // would render the null receiver's empty content instead of the §18.5
+            // text "null". Branch on the pointer here, as its nullable-ref arm does.
+            if (argTy->nullable && !argTy->declaration &&
+                arg->getType()->isPointerTy()) {
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    arg, llvm::ConstantPointerNull::get(ptrTy()), "wln.vl.isnull");
+                auto* liveBB = llvm::BasicBlock::Create(llvm_, "wln.vl.live", currentFn_);
+                auto* nullBB = llvm::BasicBlock::Create(llvm_, "wln.vl.null", currentFn_);
+                auto* endBB  = llvm::BasicBlock::Create(llvm_, "wln.vl.end", currentFn_);
+                builder_.CreateCondBr(isNull, nullBB, liveBB);
+                builder_.SetInsertPoint(liveBB);
+                sema::TypeRef liveTy = *argTy;
+                liveTy.nullable = false;
+                llvm::Value* liveStr = emitValueToString(arg, &liveTy);
+                auto* liveEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(nullBB);
+                llvm::Value* nullStr = lowerStringLiteral("\"null\"", false);
+                auto* nullEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(endBB);
+                builder_.SetInsertPoint(endBB);
+                auto* phi = builder_.CreatePHI(ptrTy(), 2, "wln.vl.str");
+                phi->addIncoming(liveStr, liveEnd);
+                phi->addIncoming(nullStr, nullEnd);
+                strPtr = phi;
+            } else {
+                strPtr = emitValueToString(arg, argTy);
+                if (!strPtr) return false;
+            }
             // fix #2878 / §28.9: every `emitValueToString` arm returns either a
             // fresh +1 producer (the minting class override, the synthesized
             // record/choice field listing, the interface vtable dispatch, the
@@ -10534,6 +10601,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     if (isStrBld) {
         constexpr int64_t SB_ESZ = 8;  // pointer-sized elements (string ptrs)
 
+        // fix #6753 (stdlib §3.1, v0.340): the declaration-less vtable-less
+        // predicate `tryLowerConsoleCall` uses (see its `isVtablelessBuiltinRef`).
+        auto isVtablelessBuiltinRef = [](const sema::TypeRef* rt) -> bool {
+            if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+                return false;
+            std::string_view n = builtinTypeName(rt);
+            return !n.empty() && common::isVtableLessBuiltinClassName(n);
+        };
         // Helper: coerce value to string. Returns the string pointer AND, via
         // the out-param, whether it was freshly RENDERED (a +1 producer: a
         // primitive formatted via emitPrimitiveToString, or an Object/class
@@ -10543,10 +10618,59 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                          bool* rendered) -> llvm::Value* {
             if (!v) return nullptr;
             auto* rt = expr ? ctx_.exprType(*expr) : nullptr;
+            // fix #6753 (stdlib §3.1 / §8.1, v0.340): an Object-typed LOCAL narrows
+            // through its initializer exactly as the console does (see
+            // `tryLowerConsoleCall`). Every other Object value keeps the dynamic
+            // path below.
+            if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
+                rt->primitive == sema::PrimitiveType::Object && expr) {
+                if (llvm::Value* r = tryOpaqueSlotBuiltinRender(v, rt, expr)) {
+                    if (rendered) *rendered = true;
+                    return r;
+                }
+            }
             if (rt && rt->kind == sema::TypeRef::Kind::Primitive &&
                 rt->primitive != sema::PrimitiveType::String) {
                 if (rendered) *rendered = true;
                 return emitPrimitiveToString(v, rt->primitive);
+            }
+            // fix #6753 (stdlib §3.1, v0.340): a declaration-less vtable-less class
+            // (a StringBuilder argument, `Array<T>`, `Mutex`, ...) renders through
+            // the one renderer. `lowerObjectToString` would read its plain runtime
+            // struct as a `%bz.string`.
+            if (rt && isVtablelessBuiltinRef(rt) && v->getType()->isPointerTy()) {
+                // fix #6753 (§18.5, v0.340): a nullable receiver renders its null as
+                // "null", as the Object? path already does, not as an empty string.
+                llvm::Value* r = nullptr;
+                if (rt->nullable) {
+                    llvm::Value* isNull = builder_.CreateICmpEQ(
+                        v, llvm::ConstantPointerNull::get(ptrTy()), "sb.app.isnull");
+                    auto* liveBB = llvm::BasicBlock::Create(llvm_, "sb.app.live", currentFn_);
+                    auto* nullBB = llvm::BasicBlock::Create(llvm_, "sb.app.null", currentFn_);
+                    auto* endBB  = llvm::BasicBlock::Create(llvm_, "sb.app.end", currentFn_);
+                    builder_.CreateCondBr(isNull, nullBB, liveBB);
+                    builder_.SetInsertPoint(liveBB);
+                    sema::TypeRef liveTy = *rt;
+                    liveTy.nullable = false;
+                    llvm::Value* liveStr = emitValueToString(v, &liveTy);
+                    auto* liveEnd = builder_.GetInsertBlock();
+                    builder_.CreateBr(endBB);
+                    builder_.SetInsertPoint(nullBB);
+                    llvm::Value* nullStr = lowerStringLiteral("\"null\"", false);
+                    auto* nullEnd = builder_.GetInsertBlock();
+                    builder_.CreateBr(endBB);
+                    builder_.SetInsertPoint(endBB);
+                    auto* phi = builder_.CreatePHI(ptrTy(), 2, "sb.app.str");
+                    phi->addIncoming(liveStr, liveEnd);
+                    phi->addIncoming(nullStr, nullEnd);
+                    r = phi;
+                } else {
+                    r = emitValueToString(v, rt);
+                }
+                if (r) {
+                    if (rendered) *rendered = true;
+                    return r;
+                }
             }
             // #1185 / stdlib §3.1: "Append(value: Object) = Append(value.
             // ToString())". An Object/class arg is converted via lowerObjectToString
