@@ -6231,6 +6231,73 @@ void ExprTC::checkAssignable(
         to->primitive == PrimitiveType::Object) {
         return;
     }
+    // fix #6797 (§2.13 `Type` class, §5.1 implicit conversions, v0.340): the
+    // builtin `Type` is NOMINAL. §2.13: "A `Type` value is obtained from the
+    // `typeof(T)` operator … or from `value.GetType()` … for the runtime type
+    // of a value." Its values come from those two producers,
+    // so a `Type` location admits a `Type` value, or `null` into `Type?` (§5.1
+    // "Nullable conversions", §7), and nothing else. Before this arm `Type` was
+    // in neither builtin table (kHeapPointerReferenceBuiltins,
+    // kNonHeapReservedBuiltins), and `var t: Type := 5;` compiled. The
+    // Object-source arm further down (#6023) leaves a declaration-less built-in
+    // target that is not an exception on its permissive path (#6073), so it
+    // would admit an `Object` source too; this arm must sit above it.
+    //
+    // The predicate keys on the RESOLVED type, not the spelling. A user-declared
+    // `Type` is a declaration with its own rules and is left as it was: §2.3
+    // does not settle a top-level user `class Type`. A type parameter named
+    // `Type` is excluded by `freeTypeParamNames` and by `isInScopeTypeParam`:
+    // §2.3's core-types row says a nested type or type parameter named `Object`
+    // shadows that core type, and this arm reads the same rule for `Type` (an
+    // interpretation: the row's sentence names only `Object`).
+    auto isBuiltinTypeRef = [&](const TypeRef* t) {
+        if (!t || t->kind != TypeRef::Kind::Named) return false;
+        if (t->declaration && isUserDeclaredTypeSym(t->declaration)) return false;
+        const std::string_view head = t->aliasResolvedHead.empty()
+                                          ? namedRefSimpleName(t)
+                                          : t->aliasResolvedHead;
+        if (head != "Type") return false;
+        if (freeTypeParamNames && freeTypeParamNames->count("Type")) return false;
+        return !isInScopeTypeParam("Type");
+    };
+    if (isBuiltinTypeRef(to)) {
+        if (from->kind == TypeRef::Kind::Error) return;  // no cascade
+        if (isBuiltinTypeRef(from)) {
+            // A `Type` value: identity. Nullability follows §7 as for any name.
+            if (from->nullable && !to->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("the ") + what +
+                    " is nullable but the target type is non-nullable (§7)");
+            }
+            return;
+        }
+        // `null`. Only an expression-less probe (conversionAdmittedQuietly,
+        // fromExpr == nullptr) cannot see the literal; there a nullable
+        // `Object` is the only shape `null` takes, so it is admitted into
+        // `Type?` and the checked path, which has the expression, decides.
+        const bool nullSource =
+            fromExpr ? dynamic_cast<const ast::NullLiteralExpr*>(fromExpr) != nullptr
+                     : (from->kind == TypeRef::Kind::Primitive &&
+                        from->primitive == PrimitiveType::Object &&
+                        from->nullable);
+        if (nullSource) {
+            if (to->nullable) return;  // `null → Type?`
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what +
+                " is nullable but the target type is non-nullable (§7)");
+            return;
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("the ") + what +
+            " has a type that is not implicitly convertible to `Type` "
+            "(§2.13, §5.1): the builtin `Type` is nominal, and its values come "
+            "only from `typeof(T)` (§17.10) or `GetType()` (§8.2), so only a "
+            "`Type` value, or `null` for `Type?` (§7), is assignable to it");
+        return;
+    }
     // §3 / §5.1 / §8.6 / issue #3115, extended by issue #5023 (scope =
     // VALUE-TYPED targets only): an `Object`-typed SOURCE (a class
     // reference or a §8.6 box pointer) admits NO implicit conversion to
