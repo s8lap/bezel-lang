@@ -139,3 +139,54 @@ BEZEL_TEST(null_cond_builtin_followups, groupby_toarray_local_no_leak_6664_spec_
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "500\n");
 }
+
+// fix-forward #6664 (§7.5, v0.339: "`x?.M` returns null if `x` is null; otherwise
+// it performs the access"; "If any segment of a chain is null, ... the whole
+// chain's result is `null`"). The #6664 bare-GroupBy path was syntactic, so a USER
+// method named `GroupBy` with a nullable result lost its `?.` guard. Probes g8,
+// g8b. Pre-fix: g8 printed 0 for the Count line; g8b printed -6 plus a warning.
+namespace {
+std::string userGroupByProg(const char* decl, const char* ret) {
+    return std::string("module M;\n") + decl +
+           "class C\n  public static method Main(): int\n"
+           "    using var u := new U();\n"
+           "    Console.WriteLine(u.GroupBy(lambda(x: int) => x)?.Count() ?? -5);\n"
+           "    var t := u.GroupBy(lambda(x: int) => x)?.ToArray();\n"
+           "    Console.WriteLine(t?.Count ?? -6);\n"
+           "    return 0;\n  end Main;\nend C;\n" + ret;
+}
+}  // namespace
+
+BEZEL_TEST(null_cond_builtin_followups, user_groupby_null_keeps_guard_6664_spec_7_5) {
+    JitResult r = runAot(userGroupByProg(
+        "class U\n  public method GroupBy(f: (int) -> int): Array<int>?\n"
+        "    return null;\n  end GroupBy;\nend U;\n", ""));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "-5\n-6\n");
+}
+
+BEZEL_TEST(null_cond_builtin_followups, user_groupby_nonnull_6664_spec_7_5) {
+    JitResult r = runAot(
+        "module M;\n"
+        "class U\n  public method GroupBy(f: (int) -> int): Array<int>?\n"
+        "    return [10, 20, 30];\n  end GroupBy;\nend U;\n"
+        "class C\n  public static method Main(): int\n"
+        "    using var u := new U();\n"
+        "    Console.WriteLine(u.GroupBy(lambda(x: int) => x)?.Count() ?? -5);\n"
+        "    Console.WriteLine(u.GroupBy(lambda(x: int) => x)?.First() ?? -5);\n"
+        "    var t := u.GroupBy(lambda(x: int) => x)?.ToArray();\n"
+        "    Console.WriteLine(t?.Count ?? -6);\n"
+        "    return 0;\n  end Main;\nend C;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "3\n10\n3\n");
+}
+
+// Extension method named GroupBy on a user class (spec §26.1), null result.
+BEZEL_TEST(null_cond_builtin_followups, user_groupby_extension_null_6664_spec_7_5) {
+    JitResult r = runAot(userGroupByProg(
+        "class U\nend U;\n"
+        "extension U\n  public method GroupBy(f: (int) -> int): Array<int>?\n"
+        "    return null;\n  end GroupBy;\nend extension;\n", ""));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "-5\n-6\n");
+}

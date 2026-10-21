@@ -20429,7 +20429,12 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     // #2434 backstop). It is also never null (a call result of a non-null
     // source), so the `?.` guard is vacuous: hand the REAL receiver node to the
     // `.` twin and lift. The node is moved into the twin and moved back after.
-    const bool groupByRcv = isGroupByCall(nm.target.get());
+    // A user-declared `GroupBy` (sema resolved the callee to a symbol; the
+    // stdlib one has none) keeps the ordinary `?.` guard: its result may be null.
+    bool userGroupBy = false;
+    if (auto* gbCall = dynamic_cast<const ast::CallExpr*>(nm.target.get()))
+        userGroupBy = gbCall->callee && ctx_.exprSymbol(*gbCall->callee) != nullptr;
+    const bool groupByRcv = !userGroupBy && isGroupByCall(nm.target.get());
     llvm::Value* rcv = nullptr;
     if (!groupByRcv) {
         rcv = lowerExpr(*nm.target);
