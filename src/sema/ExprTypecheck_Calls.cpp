@@ -1336,6 +1336,22 @@ static bool isIntegerParamForOverload(const TypeRef* pt) {
            isIntegerPrimitiveTypeForOverload(pt->primitive);
 }
 
+// fix-forward #6722 (§4.2, §5.1, §22.6, v0.340): a target-typed integer
+// constant "participates in overload-resolution applicability on the same
+// terms (§22.6): `f(3_000_000_000)` against `f(long)` and `f(double)` selects
+// `f(long)`, the `double` candidate being inapplicable because the constant
+// is admitted at integer targets only" (§4.2); "a non-integer target remain[s]
+// the §4.2 error" (§5.1). The literal is typed from a widening hint (`long`),
+// whose ordinary §5.1 widening would otherwise admit it at `double`, `float`,
+// `decimal` or `Object`. A nullable integer target (`long?`) is an integer
+// target through §5.1's nullable lifting ("constant narrowing participates
+// for a present constant value"). Only a primitive target is judged here; a
+// class target is already unreachable from an integer type.
+static bool isNonIntegerTargetForTargetTypedConstant(const TypeRef* pt) {
+    return pt && pt->kind == TypeRef::Kind::Primitive &&
+           !isIntegerPrimitiveTypeForOverload(pt->primitive);
+}
+
 // §22.6: "the call is **ambiguous** and is a compile error. The compiler
 // reports the error and cites the candidate overloads". The one message text,
 // shared by the ranked grid (`resolveOverload`) and the undecided-grid arm of
@@ -1651,6 +1667,11 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                 isIntegerParamForOverload(paramTypes[c][i]) &&
                 isTargetTypedIntConstantArg(argExprs[i]))
                 m = ArgMatch::Convert;
+            // fix-forward #6722 (§4.2): integer targets only.
+            if (m != ArgMatch::NotApplicable && i < argExprs.size() &&
+                isNonIntegerTargetForTargetTypedConstant(paramTypes[c][i]) &&
+                isTargetTypedIntConstantArg(argExprs[i]))
+                m = ArgMatch::NotApplicable;
             grid[c][i] = m;
             if (m == ArgMatch::NotApplicable) res.applicable[c] = false;
         }
@@ -4370,6 +4391,10 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 // type); "a candidate the narrowing reaches *converts*".
                 if (at != argTypes[i] && argTypes[i]) return 1;
                 if (targetTypedCol[i] && isIntegerParamForOverload(pt)) return 1;
+                // fix-forward #6722 (§4.2): integer targets only.
+                if (targetTypedCol[i] &&
+                    isNonIntegerTargetForTargetTypedConstant(pt))
+                    return 0;
                 // fix #6227: identity by spelling, so `Array<Exception>` is
                 // not `Array<ArgumentException>` (see `sameTypeBySpelling`).
                 if (sameTypeBySpelling(at, pt)) return 2;
@@ -4504,7 +4529,10 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                     if (!at || !pt || !argTypes[i]) return kUnknown;
                     // fix #6722: a §5.1 narrowing made this row → converts.
                     if (at != argTypes[i]) return kConv;
-                    if (targetTypedCol[i]) return kUnknown;
+                    if (targetTypedCol[i])
+                        return isNonIntegerTargetForTargetTypedConstant(pt)
+                                   ? kNA
+                                   : kUnknown;
                     if (sameTypeBySpelling(at, pt)) {
                         if (at->nullable == pt->nullable) return kExact;
                         return pt->nullable ? kConv : kNA;

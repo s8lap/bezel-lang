@@ -190,3 +190,70 @@ BEZEL_TEST(overload_int_constant_static_type_6722,
     BEZEL_EXPECT_EQ(prints(ctorProg("int", "byte")), "1\n");
     BEZEL_EXPECT_TRUE(rejectedAmbiguous(ctorProg("byte", "short"), "new T"));
 }
+
+// fix-forward (§4.2, v0.340): "`f(3_000_000_000)` against `f(long)` and
+// `f(double)` selects `f(long)`, the `double` candidate being inapplicable
+// because the constant is admitted at integer targets only"; §5.1: "a
+// non-integer target remain[s] the §4.2 error". The literal is typed `long`
+// from the widening hint, and that `long` widened to every non-integer
+// primitive, so each pair below was reported ambiguous. Reviewer probes:
+// /var/tmp/bezel-scratch/r34-ovl3rv/{p,p2}/ (s_wide_long_double,
+// w_long_float, w_long_decimal, w_long_object, w_ulong_double,
+// w_neg_long_double, w_two_arg, u_ctor_wide_long_double, u_instance_overload).
+// Integer candidate declared FIRST only: with the non-integer candidate first
+// the literal takes no widening hint at all and is rejected as "does not fit
+// in `int`" before resolution runs, on staging as here (filed separately).
+BEZEL_TEST(overload_int_constant_static_type_6722,
+           target_typed_constant_is_inapplicable_at_non_integer_spec_4_2) {
+    for (const char* other : {"double", "float", "decimal", "Object"}) {
+        BEZEL_EXPECT_EQ(prints(pickProg(std::string("long,") + other,
+                                        "C.Pick(3_000_000_000)")),
+                        "1\n");
+    }
+    BEZEL_EXPECT_EQ(prints(pickProg("ulong,double", "C.Pick(3_000_000_000)")),
+                    "1\n");
+    // A negative literal (§4.2's beyond-`int` magnitude under unary `-`).
+    BEZEL_EXPECT_EQ(prints(pickProg("long,double", "C.Pick(-3_000_000_000)")),
+                    "1\n");
+}
+
+BEZEL_TEST(overload_int_constant_static_type_6722,
+           target_typed_constant_non_integer_two_arg_ctor_instance_spec_4_2) {
+    const std::string twoArg = R"bzl(module M;
+static class S
+  public static method F(a: long, b: int): int => 1;
+  public static method F(a: double, b: int): int => 2;
+end S;
+class P public static method Main(): int
+  Console.WriteLine(S.F(3_000_000_000, 1));
+  return 0; end Main; end P;
+)bzl";
+    const std::string ctor = R"bzl(module M;
+class T
+  public v: int;
+  public constructor(x: long) v := 1; end constructor;
+  public constructor(x: double) v := 2; end constructor;
+end T;
+class P public static method Main(): int
+  var t := new T(3_000_000_000);
+  Console.WriteLine(t.v);
+  return 0; end Main; end P;
+)bzl";
+    const std::string instance = R"bzl(module M;
+class C
+  public constructor() end;
+  public method G(x: byte): int => 1;
+  public method G(x: int): int => 2;
+  public method H(x: long): int => 1;
+  public method H(x: double): int => 2;
+end C;
+class P public static method Main(): int
+  var c := new C();
+  Console.WriteLine(c.G(3));
+  Console.WriteLine(c.H(3_000_000_000));
+  return 0; end Main; end P;
+)bzl";
+    BEZEL_EXPECT_EQ(prints(twoArg), "1\n");
+    BEZEL_EXPECT_EQ(prints(ctor), "1\n");
+    BEZEL_EXPECT_EQ(prints(instance), "2\n1\n");
+}
