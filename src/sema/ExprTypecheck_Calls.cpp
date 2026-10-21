@@ -1942,6 +1942,27 @@ bool isLinqHashableOperator(std::string_view m) {
            m == "Except"   || m == "Contains" || m == "ToSet";
 }
 
+// fix #6784 (language spec §27.6, v0.340; stdlib §5; mirror of
+// #2470/#2492/#2537): the diagnostic for a BARE (non-call) reference to a
+// stdlib §5 member of `IGrouping<K, T>` / `IEnumerable<T>` that the compiler
+// dispatches structurally (no real method symbol): `var f: () -> int :=
+// g.First;` left the reference untyped and codegen degraded the local to a
+// zero function value (#2434), so calling it SEGV'd. Until a function value
+// can be formed for the structural member, the formation is rejected,
+// located, never a crash.
+std::string bareStructuralMemberReference(std::string_view head,
+                                          std::string_view member) {
+    return "a bare reference to `" + std::string(member) +
+           "` (language spec \xC2\xA7""27.6) is not yet supported on `" +
+           std::string(head) + "` (stdlib \xC2\xA7""5, #6784): `" +
+           std::string(member) +
+           "` is a stdlib \xC2\xA7""5 member the compiler dispatches "
+           "structurally rather than through a real method symbol, so no "
+           "function value can be formed for it yet -- call it directly "
+           "instead (`." + std::string(member) +
+           "(...)`) or wrap it in a lambda";
+}
+
 // fix #6740 (stdlib §5 `IGrouping<TKey, T>`, §4.12, v0.340): the diagnostic
 // for a bare (non-callee) member access `g.<name>` / `g?.<name>` on an
 // `IGrouping<TKey, T>` receiver, or "" when `name` needs no rejection here.
@@ -1951,7 +1972,7 @@ bool isLinqHashableOperator(std::string_view m) {
 // reached codegen (malformed IR / a statement dropped behind an `internal:`
 // warning). `Count` / `Length` keep #6714's wording. A bare name that IS an
 // operator or an `Object` member is a method reference (§27.6), not an
-// undeclared property, and is left to the existing path.
+// undeclared property: fix #6784 rejects it with a distinct message.
 std::string igroupingBareMemberReject(std::string_view name) {
     static const char* const methods[] = {
         "Aggregate", "All", "Any", "Average", "Concat", "Contains",
@@ -1970,8 +1991,11 @@ std::string igroupingBareMemberReject(std::string_view name) {
     if (name == "Length")
         return "no member `Length` on `IGrouping<TKey, T>`: it declares only "
                "`Key` and no length — use the `Count()` operator (stdlib §5)";
+    // fix #6784: a bare §5 operator / Object member is a method reference
+    // (§27.6) with no formable function value; rejected, never a zero value.
     for (const char* m : methods)
-        if (name == m) return "";
+        if (name == m)
+            return bareStructuralMemberReference("IGrouping<K, T>", name);
     return "no member `" + std::string(name) +
            "` on `IGrouping<TKey, T>`: it declares only `Key` (stdlib §5)";
 }
@@ -29999,6 +30023,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             "(borrowing) instead");
                         return;
                     }
+                }
+            }
+        }
+        // #6784 (language spec §27.6, v0.340; stdlib §5; mirror of
+        // #2470/#2492/#2537): a BARE reference to a stdlib §5 LINQ operator
+        // on an `IEnumerable<T>` receiver has the same no-MethodSymbol shape
+        // as the builtin collections below (the `IGrouping` spelling is
+        // rejected in its own member-access arm); the CALL form is exempted
+        // via calleeOfCallCtx_.
+        if (ma.target && !ctx_.exprType(ma) && &ma != calleeOfCallCtx_) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->headName() == "IEnumerable" &&
+                    common::isBuiltinCollectionLinqOperatorName(ma.member)) {
+                    auto loc = ma.span.begin;
+                    if (loc.line == 0 && ma.target)
+                        loc = ma.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        bareStructuralMemberReference("IEnumerable<T>",
+                                                      ma.member));
+                    return;
                 }
             }
         }
