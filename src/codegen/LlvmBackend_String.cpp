@@ -1424,11 +1424,12 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // (e.g. Insert's `sext ... to i64`). No-op for a plain int.
         //
         // ⚠ This helper is NOT the single funnel for the string int-parameter
-        // family: it has six uses (AsSpan's start/length, Substring pos 0,
-        // Insert pos 0, Remove pos 0). PadLeft/PadRight/PadCenter's width
-        // (~:2152) and padChar, Remove's count (~:2446), Repeat's n (~:2173),
-        // Substring's length (~:1868) and IndexOf's startIndex (~:1744/:1794)
-        // still lower via a raw `lowerExpr` and retain the #2614 defect — so
+        // family. Its uses are AsSpan's start/length, Substring pos 0, Insert
+        // pos 0, Remove pos 0, and (fix #6562) IndexOf's startIndex in both of
+        // its 2-arg arms. PadLeft/PadRight/PadCenter's width (~:2152) and
+        // padChar, Remove's count (~:2446), Repeat's n (~:2173) and Substring's
+        // length (~:1868) still lower via a raw `lowerExpr` and retain the
+        // #2614 defect — so
         // `s.Substring(n)` compiles while `s.Substring(0, n)` still ICEs.
         // Audited with per-site file:line and per-site confidence in #2625.
         //
@@ -1831,12 +1832,14 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
                 argTy->primitive == sema::PrimitiveType::Char) {
                 // fix #6547: same narrowed-`char?` unwrap as Contains above.
-                // (The `startIndex` operand's own narrowing hole is the #2614
-                // int-parameter family, audited separately; out of this fix.)
+                // fix #6562: startIndex goes through getIntArg, which unwraps a
+                // flow-narrowed `int?` to its payload (§7.4). Sema gates this
+                // position (checkBuiltinStringCallArgs' intPos), so an
+                // un-narrowed `int?` is rejected before codegen.
                 llvm::Value* needle = unwrapNarrowedNullableOperand(
                     lowerExpr(*call.args[0].value), call.args[0].value.get());
                 if (!needle) return nullptr;
-                llvm::Value* startV = lowerExpr(*call.args[1].value);
+                llvm::Value* startV = getIntArg(1);
                 if (!startV) return nullptr;
                 // Normalize startV to i64 for the loop counter / bounds check.
                 llvm::Value* start64 = startV->getType()->isIntegerTy(64)
@@ -1886,7 +1889,8 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
             llvm::Value* sub = lowerExpr(*call.args[0].value);
             if (!sub) return nullptr;
-            llvm::Value* startVal = lowerExpr(*call.args[1].value);
+            // fix #6562: startIndex via getIntArg (narrowed `int?` unwrap, §7.4).
+            llvm::Value* startVal = getIntArg(1);
             if (!startVal) return nullptr;
             // Normalize start to i64 for the runtime.
             if (!startVal->getType()->isIntegerTy(64))

@@ -19119,6 +19119,26 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         if (!a.modifier.empty()) continue;
         TypeRef* argTy = ctx_.exprType(*a.value);
         if (!argTy || argTy->kind != TypeRef::Kind::Primitive) continue;
+        // fix #6562 (§9.6, §5.1): `string.IndexOf`'s search value at position
+        // 0 is declared `char` or `string` and nothing else (stdlib §9.6 lists
+        // exactly those two overloads). §5.1 converts neither int, bool, byte,
+        // short, long, float nor Object to either, and a nullable or narrowed
+        // `int?` is no exception: narrowing removes only the null case. Before
+        // this gate `paramKind` returned None for these, so the argument was
+        // never checked and reached codegen as malformed IR (plain or narrowed
+        // `int?`) or an ICE (un-narrowed `int?`). A dedicated message is used
+        // instead of checkAssignable's generic one, which would name `string`
+        // as the target when the overload set is `char` or `string`.
+        if (m == "IndexOf" && i == 0 &&
+            argTy->primitive != PrimitiveType::Char &&
+            argTy->primitive != PrimitiveType::String) {
+            ctx_.diagnostics().report(
+                Severity::Error, a.value->span.begin,
+                "`string.IndexOf` takes its search value at position 0 as a "
+                "`char` or a `string` (stdlib \xC2\xA7""9.6); the argument's "
+                "type converts to neither (\xC2\xA7""5.1)");
+            continue;
+        }
         PrimitiveType declared = paramKind(i, argTy->primitive);
         if (declared == PrimitiveType::None) continue;
         TypeRef* paramTy = ctx_.primitiveTypeRef(declared, /*nullable=*/false);
