@@ -325,6 +325,7 @@ void ExprTC::run(const ast::SourceFile& src) {
     for (const auto& decl : src.topDecls) {
         if (!decl) continue;
         visitTopDecl(*decl);
+        drainDeferredLocalTypes();
     }
     // fix #3044 (§17.11 / §3.6 rule 2, v0.242): every `default(T)` obligation
     // and every generic-method instantiation has now been seen, in whatever
@@ -17394,6 +17395,54 @@ void ExprTC::dropCondSpoiled(const ast::Expr* node) {
     }
 }
 
+// §21.10 (v0.340): check the member bodies of every local type queued by
+// visitStmt, in a scope chain without the enclosing body's locals/parameters.
+void ExprTC::drainDeferredLocalTypes() {
+    while (!deferredLocalTypes_.empty()) {
+        auto d = std::move(deferredLocalTypes_.front());
+        deferredLocalTypes_.erase(deferredLocalTypes_.begin());
+        Scope* const saveRoot = localTypeRootScope_;
+        Scope* const saveScope = currentScope_;
+        auto saveNames = std::move(localTypeEnclosingNames_);
+        localTypeRootScope_ = d->root.get();
+        localTypeEnclosingNames_ = std::move(d->enclosing);
+        currentScope_ = d->root.get();
+        visitTopDecl(*d->decl->decl);
+        currentScope_ = saveScope;
+        localTypeRootScope_ = saveRoot;
+        localTypeEnclosingNames_ = std::move(saveNames);
+    }
+}
+
+// §21.10 (v0.340): "The locals and parameters of the bodies enclosing the
+// declaration ... are not in scope anywhere inside it. ... A bare name there in
+// a position §2.7 rule 1 resolves ... that the local type's own locals,
+// parameters and members do not bind, and that is spelled like a local or
+// parameter in scope at the declaration, is a compile error naming this rule,
+// even where §2.7 would go on to find a member of a type enclosing the local
+// type, a module declaration, an imported name, an alias or a module prefix; a
+// compile-time `const` local is no exception."
+bool ExprTC::reportEnclosingLocalNamedInLocalType(
+    const ast::IdentifierExpr& id) {
+    if (!localTypeRootScope_ ||
+        !localTypeEnclosingNames_.count(std::string_view(id.name)))
+        return false;
+    for (Scope* sc = currentScope_; sc && sc != localTypeRootScope_;
+         sc = sc->parent)
+        if (sc->names.count(std::string_view(id.name))) return false;
+    if (currentType_ && lookupMember(currentType_, id.name)) return false;
+    ctx_.diagnostics().report(
+        Severity::Error, id.span.begin,
+        std::string("`") + std::string(id.name) +
+            "` names a local or parameter of the body that declares this "
+            "local type; the enclosing body's locals and parameters are not "
+            "in scope inside a local type, and a `const` local is no "
+            "exception (§21.10). Pass the value in as a field or an "
+            "argument, or declare a constant as a static member of the "
+            "local type");
+    return true;
+}
+
 void ExprTC::visitTopDecl(const ast::TopDecl& d) {
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(&d)) {
         TypeSymbol* tsym = nullptr;
@@ -18232,7 +18281,7 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
         if (td->kind == ast::TypeDeclKind::Class &&
             td->hasPositionalFields) {
             Scope posScope;
-            posScope.parent = moduleScope_.get();
+            posScope.parent = declRootScope();
             if (currentType_) {
                 for (Symbol* mem : currentType_->members) {
                     if (auto* fs = dynamic_cast<FieldSymbol*>(mem)) {
@@ -19111,7 +19160,7 @@ void ExprTC::runMethodBody(
     const std::vector<Symbol*>* paramSyms,
     const std::vector<ast::ContractClause>* clauses) {
     Scope methodScope;
-    methodScope.parent = moduleScope_.get();
+    methodScope.parent = declRootScope();   // §21.10: a local type's bodies
     if (paramSyms) {
         for (std::size_t i = 0;
              i < params.size() && i < paramSyms->size(); ++i) {
@@ -22492,13 +22541,53 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // Allocate a fresh ScopeId for the local type's region; its member
         // scope is created inside collectTypeDecl. The enclosing type path is
         // empty (local types are not nested inside another type).
-        ScopeId localTypeScope = ctx_.newScope();
-        TypeSymbol* tsym =
-            collectTypeDecl(*localType->decl, ctx_, localTypeScope, {});
+        //
+        // The Resolver pass has already created this declaration's symbol and
+        // registered it in the module's children (the one codegen emits and the
+        // one every resolved TypeRef names). Reuse it: a second symbol would
+        // carry its own member and parameter symbols, which no body check and
+        // no emitted function would agree on (§21.10, v0.340).
+        TypeSymbol* tsym = nullptr;
+        if (ctx_.module()) {
+            for (Symbol* child : ctx_.module()->children) {
+                auto* ts = dynamic_cast<TypeSymbol*>(child);
+                if (ts && ts->isLocalType && ts->decl == localType->decl.get()) {
+                    tsym = ts;
+                    break;
+                }
+            }
+        }
+        if (!tsym) {
+            ScopeId localTypeScope = ctx_.newScope();
+            tsym = collectTypeDecl(*localType->decl, ctx_, localTypeScope, {});
+        }
         // Register the type name in ExprTC's identifier-lookup scope so that
         // lookupName finds it when the type is referenced in an expression.
         if (currentScope_ && tsym) {
             currentScope_->names[tsym->name] = tsym;
+        }
+        // §21.10 (v0.340): the local type's member bodies are type-checked
+        // too, after the enclosing top-level declaration, in a chain that
+        // sees only the type names in scope here.
+        if (tsym) {
+            auto d = std::make_unique<DeferredLocalType>();
+            d->decl = localType;
+            d->root = std::make_unique<Scope>();
+            d->root->parent = moduleScope_.get();
+            for (Scope* sc = currentScope_; sc && sc != moduleScope_.get();
+                 sc = sc->parent) {
+                for (const auto& [n, sym] : sc->names) {
+                    if (!sym) continue;
+                    if (dynamic_cast<TypeSymbol*>(sym) ||
+                        dynamic_cast<TypeAliasSymbol*>(sym))
+                        d->root->names.emplace(n, sym);
+                    else
+                        d->enclosing.insert(n);
+                }
+            }
+            // A type name the root carries is not a local to forbid.
+            for (const auto& [n, sym] : d->root->names) d->enclosing.erase(n);
+            deferredLocalTypes_.push_back(std::move(d));
         }
     } else if (auto* lc =
                    dynamic_cast<const ast::LocalConstDecl*>(&s)) {

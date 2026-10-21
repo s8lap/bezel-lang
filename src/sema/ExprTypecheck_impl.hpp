@@ -299,6 +299,26 @@ private:
     SemaContext& ctx_;
     std::unique_ptr<Scope> moduleScope_;
     Scope* currentScope_ = nullptr;
+    // §21.10 (v0.340): a local type's member bodies are checked after the
+    // enclosing top-level declaration (so the enclosing body's per-body state
+    // is not clobbered), in a scope chain that sees NO local or parameter of
+    // the bodies enclosing the declaration. `root` holds only the type names
+    // in scope at the declaration (the local type itself and earlier local
+    // types); `enclosing` is the set of local/parameter names the rule makes a
+    // compile error to name from inside.
+    struct DeferredLocalType {
+        const ast::LocalTypeDecl* decl = nullptr;
+        std::unique_ptr<Scope> root;
+        std::unordered_set<std::string_view> enclosing;
+    };
+    std::vector<std::unique_ptr<DeferredLocalType>> deferredLocalTypes_;
+    Scope* localTypeRootScope_ = nullptr;
+    std::unordered_set<std::string_view> localTypeEnclosingNames_;
+    void drainDeferredLocalTypes();
+    Scope* declRootScope() {
+        return localTypeRootScope_ ? localTypeRootScope_ : moduleScope_.get();
+    }
+    bool reportEnclosingLocalNamedInLocalType(const ast::IdentifierExpr& id);
     TypeSymbol* currentType_ = nullptr;
     // §26.1: the ExtensionSymbol whose members are being type-checked, or null
     // outside an extension block. An extension method's params live on the

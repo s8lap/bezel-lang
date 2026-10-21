@@ -628,9 +628,9 @@ BEZEL_TEST(enclosing_member_bare_type_name,
     expectAccepted(
         "public class Holder public method M(): int "
         "record Pair(A: int, B: int) "
-        "  public method Twin(): Pair return Pair(1, 2); end Twin; "
+        "  public method Twin(): Pair return new Pair(1, 2); end Twin; "
         "  public method Merge(other: Pair): Pair "
-        "    return Pair(other.A + 1, other.B + 1); "
+        "    return new Pair(other.A + 1, other.B + 1); "
         "  end Merge; "
         "end Pair; "
         "var p := new Pair(1, 2); return p.Merge(p.Twin()).A; "

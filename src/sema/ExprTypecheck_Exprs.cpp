@@ -2014,6 +2014,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // §2.3 diagnostic stands without an "unresolved identifier"
             // double-error.
         }
+        if (reportEnclosingLocalNamedInLocalType(*id)) return;
         Symbol* sym =
             lookupName(id->name,
                        /*memberBeforeModuleType=*/&e != maTargetHint_);
