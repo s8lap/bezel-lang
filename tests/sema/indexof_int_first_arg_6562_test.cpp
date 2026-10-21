@@ -96,12 +96,13 @@ BEZEL_TEST(sema_indexof_int_arg_6562, narrowed_int_q_search_value_rejected) {
     BEZEL_EXPECT_TRUE(hasError(r, kFirstPositionDiag));
 }
 
-// An un-narrowed `int?` gets the same dedicated message and NOT the §7 wording.
+// An un-narrowed `int?` (`:= null`: a non-null declaration initializer narrows,
+// §7.4 v0.339, #6223) gets the same dedicated message and NOT the §7 wording.
 // Narrowing could not fix this call, so a §7 "nullable" message would name the
 // wrong remedy.
 BEZEL_TEST(sema_indexof_int_arg_6562, unnarrowed_int_q_search_value_rejected) {
     auto r = parseSemaAll(prog(
-        "    var n: int? := 1;\n"
+        "    var n: int? := null;\n"
         "    Console.WriteLine(\"abc\".IndexOf(n).ToString());\n"));
     BEZEL_EXPECT_TRUE(hasError(r, kFirstPositionDiag));
     BEZEL_EXPECT_FALSE(hasError(r, kNullableDiag));
@@ -162,8 +163,20 @@ BEZEL_TEST(sema_indexof_int_arg_6562,
 BEZEL_TEST(sema_indexof_int_arg_6562,
            unnarrowed_int_q_start_index_still_rejected_spec_7) {
     auto r = parseSemaAll(prog(
-        "    var n: int? := 1;\n"
+        "    var n: int? := null;\n"
         "    Console.WriteLine(\"abc\".IndexOf('b', n).ToString());\n"));
     BEZEL_EXPECT_TRUE(hasError(r, kNullableDiag));
     BEZEL_EXPECT_FALSE(hasError(r, kFirstPositionDiag));
+}
+
+// Control (§7.4, v0.339): a declaration `var n: int? := 1;` is the
+// declaration's assignment, so it narrows `n` non-null exactly as `n := 1;`
+// does (#6223). The startIndex read at position 1 is therefore admitted; the
+// `:= null` row above is the genuinely un-narrowed form (#6693).
+BEZEL_TEST(sema_indexof_int_arg_6562,
+           declaration_narrowed_int_q_start_index_accepted_spec_7_4) {
+    auto r = parseSemaAll(prog(
+        "    var n: int? := 1;\n"
+        "    Console.WriteLine(\"abc\".IndexOf('b', n).ToString());\n"));
+    BEZEL_EXPECT_FALSE(hasAnyError(r));
 }
