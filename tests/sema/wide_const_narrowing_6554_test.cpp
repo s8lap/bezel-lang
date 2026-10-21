@@ -276,7 +276,7 @@ BEZEL_TEST(wide_const_narrowing_6554,
     BEZEL_EXPECT_EQ(
         out("    const N: long := 250;\n"
             "    var q: byte? := N;\n"
-            "    Console.WriteLine($\"{q ?? -1}\");\n"
+            "    Console.WriteLine($\"{q ?? 0}\");\n"
             "    return 0;\n"),
         "250\n");
 }

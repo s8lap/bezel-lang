@@ -756,15 +756,15 @@ BEZEL_TEST(codegen_1044_subint_nullable, long_coalesce_int_default) {
 // default), which previously mixed a %bz.decimal payload with an i32 PHI value.
 BEZEL_TEST(codegen_1046_coalesce, byte_coalesce_variable_int_default) {
     BEZEL_EXPECT_TRUE(runs(
-        "var a: byte? := 3; var d: int := 9; return int(a ?? d);"));
+        "var a: byte? := 3; var d: byte := 9; return int(a ?? d);"));
 }
 BEZEL_TEST(codegen_1046_coalesce, byte_null_coalesce_variable_int_default) {
     BEZEL_EXPECT_TRUE(runs(
-        "var a: byte? := null; var d: int := 9; return int(a ?? d);"));
+        "var a: byte? := null; var d: byte := 9; return int(a ?? d);"));
 }
 BEZEL_TEST(codegen_1046_coalesce, byte_coalesce_computed_int_default) {
     BEZEL_EXPECT_TRUE(runs(
-        "var a: byte? := 3; var x: int := 4; return int(a ?? (x + 5));"));
+        "var a: byte? := 3; var x: byte := 4; return int(a ?? byte(x + 5));"));
 }
 BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_int_default_present) {
     BEZEL_EXPECT_TRUE(runs("var a: decimal? := 5; return int(a ?? 9);"));

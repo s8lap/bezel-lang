@@ -69,7 +69,7 @@ BEZEL_TEST(sema_field_initializer_assignability_accept_2926, integer_widths_5_1)
         "    if int(b._ui) = 3        then acc := acc + 1; end; "
         "    if int(b._ul) = 3        then acc := acc + 1; end; "
         "    if b._l       = 3        then acc := acc + 1; end; "
-        "    if (b._bq ?? -1) = 200   then acc := acc + 1; end; "
+        "    if (b._bq ?? 0) = 200   then acc := acc + 1; end; "
         "    if (b._sq ?? -1) = 30000 then acc := acc + 1; end; "
         "    return acc; "
         "  end Main; "
@@ -162,7 +162,7 @@ BEZEL_TEST(sema_field_initializer_assignability_accept_2926, static_and_property
         "    if b.P3 is null         then acc := acc + 1; end; "
         "    if (b.P4 ?? -1) = 30000 then acc := acc + 1; end; "
         "    if int(Box.SR)  = 250   then acc := acc + 1; end; "
-        "    if (Box.SQ ?? -1) = 200 then acc := acc + 1; end; "
+        "    if (Box.SQ ?? 0) = 200 then acc := acc + 1; end; "
         "    return acc; "
         "  end Main; "
         "end M;"), 6);

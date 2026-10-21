@@ -9006,6 +9006,21 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         if (be.right)
             if (TypeRef* rt = ctx_.exprType(*be.right))
                 rhsNullable = rt->nullable;
+        // fix #6214 (§7.7, v0.339): "for a left operand of type `T?`, the
+        // right operand must be implicitly convertible (§5.1) to `T` or to
+        // `T?`". Target `T?` admits both (anything convertible to `T` is
+        // convertible to `T?`). A `null` right operand is the null literal
+        // (typed nullable Object), admitted by `T?`, and a `throw`/`return`
+        // right operand carries no value type (§17.12), so both skip.
+        if (lt && lt->nullable && !lhsIsNullLiteral && be.right &&
+            !dynamic_cast<const ast::NullLiteralExpr*>(be.right.get())) {
+            if (TypeRef* rt = ctx_.exprType(*be.right)) {
+                checkAssignable(rt, lt, be.right->span.begin.line != 0
+                                            ? be.right->span.begin
+                                            : be.span.begin,
+                                "right operand of `??`", be.right.get());
+            }
+        }
         if (lt && !lhsIsNullLiteral) {
             if (lt->nullable && !rhsNullable) {
                 TypeRef* nn = ctx_.makeTypeRef(*lt);

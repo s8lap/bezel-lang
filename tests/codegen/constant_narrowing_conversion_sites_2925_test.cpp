@@ -151,7 +151,7 @@ BEZEL_TEST(codegen_constant_narrowing_sites_2925, return_value_5_1) {
         "    if int(M.RetConst()) = 42    then acc := acc + 2;  end; "
         "    if int(M.RetFold())  = 42    then acc := acc + 4;  end; "
         "    if int(M.RetArrow()) = 77    then acc := acc + 8;  end; "
-        "    if (M.RetQ()  ?? -1) = 200   then acc := acc + 16; end; "
+        "    if (M.RetQ()  ?? 0) = 200   then acc := acc + 16; end; "
         "    if (M.RetSQ() ?? -1) = 20001 then acc := acc + 32; end; "
         "    return acc; "
         "  end Main; "
@@ -348,7 +348,7 @@ BEZEL_TEST(codegen_constant_narrowing_sites_2925, local_and_assignment_accept_co
         "    if int(b) = 3 then acc := acc + 1; end; "
         "    if int(c) = 3 then acc := acc + 2; end; "
         "    if int(d) = 250 then acc := acc + 4; end; "
-        "    if (q ?? -1) = 200 then acc := acc + 8; end; "
+        "    if (q ?? 0) = 200 then acc := acc + 8; end; "
         "    return acc; "
         "  end Main; "
         "end M;"), 15);
