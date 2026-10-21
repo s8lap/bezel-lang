@@ -13542,14 +13542,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 }
                 // Use llvm intrinsics for common math ops. §2.2: one-argument
                 // Round is BANKER'S ROUNDING (round half to even) — that is
-                // llvm.roundeven (IEEE 754 roundToNearestTiesToEven), NOT
-                // llvm.round (which rounds halves away from zero).
+                // llvm.rint (IEEE 754 roundToNearestTiesToEven in the default
+                // FP environment, which Bezel never changes), NOT llvm.round
+                // (halves away from zero). rint rather than roundeven (#6761):
+                // musl 1.2.5 has no libm `roundeven`, so the static release
+                // link failed; `rint` exists in glibc and musl.
                 llvm::Intrinsic::ID iid =
                     m == "Sqrt"     ? llvm::Intrinsic::sqrt :
                     m == "Floor"    ? llvm::Intrinsic::floor :
                     m == "Ceiling"  ? llvm::Intrinsic::ceil :
                     m == "Truncate" ? llvm::Intrinsic::trunc :
-                                      llvm::Intrinsic::roundeven;
+                                      llvm::Intrinsic::rint;
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
                 if (!arg->getType()->isDoubleTy())
                     arg = builder_.CreateSIToFP(arg, dbl);
@@ -13654,8 +13657,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateCall(powFn, {a, b}, "pow.result");
             }
             // §2.2: Math.Round(x, digits): double — banker's rounding to `digits`
-            // fractional digits. Compute roundeven(x * 10^digits) / 10^digits,
-            // where 10^digits is libc pow(10, digits). roundeven gives the same
+            // fractional digits. Compute rint(x * 10^digits) / 10^digits,
+            // where 10^digits is libc pow(10, digits). rint gives the same
             // round-half-to-even semantics as the one-argument form.
             if (m == "Round") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
@@ -13673,7 +13676,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     powFn, {llvm::ConstantFP::get(dbl, 10.0), digD}, "round.scale");
                 llvm::Value* scaled = builder_.CreateFMul(a, scale, "round.scaled");
                 auto* reFn = llvm::Intrinsic::getDeclaration(
-                    module_.get(), llvm::Intrinsic::roundeven, {dbl});
+                    module_.get(), llvm::Intrinsic::rint, {dbl});
                 llvm::Value* rounded = builder_.CreateCall(reFn, {scaled}, "round.re");
                 return builder_.CreateFDiv(rounded, scale, "round.result");
             }
