@@ -4207,14 +4207,38 @@ llvm::Value* Emitter::emitRangeToString(llvm::Value* rangeVal,
 
     // §16.3's emptiness, mirroring the `IsEmpty` member-access lowering:
     // direction is set by the step's sign; an open-ended range is never empty.
+    // The endpoint compare takes the element's signedness (#6774): the slots
+    // hold sign-extended endpoints, so an unsigned narrow element is
+    // re-zero-extended from its own width first, and a ulong compares unsigned.
+    llvm::Value* cmpSt = st;
+    llvm::Value* cmpEn = en;
+    llvm::CmpInst::Predicate pGT = llvm::CmpInst::ICMP_SGT;
+    llvm::CmpInst::Predicate pGE = llvm::CmpInst::ICMP_SGE;
+    llvm::CmpInst::Predicate pLT = llvm::CmpInst::ICMP_SLT;
+    llvm::CmpInst::Predicate pLE = llvm::CmpInst::ICMP_SLE;
+    if (isUnsignedPrim(elemPrim)) {
+        pGT = llvm::CmpInst::ICMP_UGT;
+        pGE = llvm::CmpInst::ICMP_UGE;
+        pLT = llvm::CmpInst::ICMP_ULT;
+        pLE = llvm::CmpInst::ICMP_ULE;
+        const unsigned nb = elemPrim == P::Byte     ? 8u
+                            : elemPrim == P::UShort ? 16u
+                            : elemPrim == P::ULong  ? 64u
+                                                    : 32u;  // UInt, Char
+        if (nb < 64) {
+            llvm::Type* eTy = builder_.getIntNTy(nb);
+            cmpSt = builder_.CreateZExt(builder_.CreateTrunc(st, eTy), i64(), "rts.stz");
+            cmpEn = builder_.CreateZExt(builder_.CreateTrunc(en, eTy), i64(), "rts.enz");
+        }
+    }
     llvm::Value* stepNeg = builder_.CreateICmpSLT(
         step, llvm::ConstantInt::get(i64(), 0), "rts.stepNeg");
     llvm::Value* emptyAsc = builder_.CreateSelect(
-        incl, builder_.CreateICmpSGT(st, en), builder_.CreateICmpSGE(st, en),
-        "rts.ea");
+        incl, builder_.CreateICmp(pGT, cmpSt, cmpEn),
+        builder_.CreateICmp(pGE, cmpSt, cmpEn), "rts.ea");
     llvm::Value* emptyDesc = builder_.CreateSelect(
-        incl, builder_.CreateICmpSLT(st, en), builder_.CreateICmpSLE(st, en),
-        "rts.ed");
+        incl, builder_.CreateICmp(pLT, cmpSt, cmpEn),
+        builder_.CreateICmp(pLE, cmpSt, cmpEn), "rts.ed");
     llvm::Value* dirEmpty =
         builder_.CreateSelect(stepNeg, emptyDesc, emptyAsc, "rts.direm");
     llvm::Value* isEmpty = builder_.CreateSelect(

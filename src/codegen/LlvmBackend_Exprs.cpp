@@ -4578,17 +4578,45 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::Value* rv = lowerExpr(*ma->target);
                 if (!rv) return nullptr;
                 const auto& mbr = ma->member;
-                if (mbr == "Start") {
-                    // §9.8: Start is T? (nullable). For the value-in-var case we
-                    // return the i64 lo field directly, cast to i32 (int range).
-                    // TODO: open-ended ranges (bit 1 of flags) should return null.
-                    llvm::Value* lo = builder_.CreateExtractValue(rv, {0u}, "r.start");
-                    // Narrow to i32 for int-range Start (T = int → i32).
-                    return builder_.CreateTrunc(lo, i32(), "r.start.i32");
+                // §16.3 (#6774): the element type T fixes how each endpoint is
+                // read. The Range struct stores every endpoint sign-extended to
+                // i64, so an unsigned narrow T (byte, ushort, uint, char) is
+                // re-zero-extended from its own width before it is read or
+                // compared, and a ulong endpoint keeps its raw 64 bits and is
+                // compared with unsigned predicates.
+                const sema::TypeRef* relem =
+                    tt->genericArgs.empty() ? nullptr
+                                            : resolveTypeParamRef(tt->genericArgs[0]);
+                const bool relemUns = typeRefIsUnsigned(relem);
+                unsigned relemBits = 0;  // 0: the element type did not resolve
+                if (relem) {
+                    if (llvm::Type* et = lowerTypeRef(relem); et && et->isIntegerTy())
+                        relemBits = et->getIntegerBitWidth();
                 }
-                if (mbr == "End") {
-                    llvm::Value* hi = builder_.CreateExtractValue(rv, {1u}, "r.end");
-                    return builder_.CreateTrunc(hi, i32(), "r.end.i32");
+                if (mbr == "Start" || mbr == "End") {
+                    // §9.8: Start/End are T? (nullable). An open-ended side still
+                    // reads its stored 0 sentinel here (the TODO for null, not
+                    // part of #6774). A long or ulong endpoint is carried at its
+                    // full i64 width (ulong as raw bits). Every narrower T is
+                    // carried at i32, as before: byte and ushort zero-extended,
+                    // the signed narrow types sign-extended, uint and int and
+                    // char truncated. uint stays i32 on purpose: a uint consumer
+                    // (an argument, a return) is typed i32, and widening it broke
+                    // valid programs, so an UNTYPED print of a uint at or above
+                    // 2^31 still prints signed (filed as a residual, not fixed here).
+                    const unsigned idx = mbr == "Start" ? 0u : 1u;
+                    llvm::Value* raw = builder_.CreateExtractValue(
+                        rv, {idx}, mbr == "Start" ? "r.start" : "r.end");
+                    if (relemBits == 0)
+                        return builder_.CreateTrunc(raw, i32(), "r.endpoint.i32");
+                    const bool wide = relemBits == 64;
+                    const unsigned outBits = wide ? 64 : 32;
+                    llvm::Value* v =
+                        builder_.CreateTrunc(raw, builder_.getIntNTy(relemBits));
+                    if (relemBits == outBits) return v;
+                    llvm::Type* outTy = builder_.getIntNTy(outBits);
+                    return relemUns ? builder_.CreateZExt(v, outTy, "r.endpoint.zx")
+                                    : builder_.CreateSExt(v, outTy, "r.endpoint.sx");
                 }
                 if (mbr == "Step") {
                     // §9.8: Step is long (i64).
@@ -4630,12 +4658,28 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     llvm::Value* step = builder_.CreateExtractValue(rv, {2u}, "r.step");
                     llvm::Value* flg  = builder_.CreateExtractValue(rv, {3u}, "r.flg");
                     llvm::Value* incl = builder_.CreateTrunc(flg, i1(), "r.incl");
+                    // §16.3 (#6774): the endpoints are compared in the element
+                    // type's order. An unsigned narrow T is re-zero-extended from
+                    // its width first; a ulong T compares its raw bits unsigned.
+                    if (relemUns && relemBits != 0 && relemBits < 64) {
+                        llvm::Type* eTy = builder_.getIntNTy(relemBits);
+                        st = builder_.CreateZExt(builder_.CreateTrunc(st, eTy), i64(), "r.stz");
+                        en = builder_.CreateZExt(builder_.CreateTrunc(en, eTy), i64(), "r.enz");
+                    }
+                    const llvm::CmpInst::Predicate pGT =
+                        relemUns ? llvm::CmpInst::ICMP_UGT : llvm::CmpInst::ICMP_SGT;
+                    const llvm::CmpInst::Predicate pGE =
+                        relemUns ? llvm::CmpInst::ICMP_UGE : llvm::CmpInst::ICMP_SGE;
+                    const llvm::CmpInst::Predicate pLT =
+                        relemUns ? llvm::CmpInst::ICMP_ULT : llvm::CmpInst::ICMP_SLT;
+                    const llvm::CmpInst::Predicate pLE =
+                        relemUns ? llvm::CmpInst::ICMP_ULE : llvm::CmpInst::ICMP_SLE;
                     llvm::Value* stepNeg = builder_.CreateICmpSLT(
                         step, llvm::ConstantInt::get(i64(), 0), "r.stepNeg");
-                    llvm::Value* ascIncl  = builder_.CreateICmpSGT(st, en, "r.ai");
-                    llvm::Value* ascHalf  = builder_.CreateICmpSGE(st, en, "r.ah");
-                    llvm::Value* descIncl = builder_.CreateICmpSLT(st, en, "r.di");
-                    llvm::Value* descHalf = builder_.CreateICmpSLE(st, en, "r.dh");
+                    llvm::Value* ascIncl  = builder_.CreateICmp(pGT, st, en, "r.ai");
+                    llvm::Value* ascHalf  = builder_.CreateICmp(pGE, st, en, "r.ah");
+                    llvm::Value* descIncl = builder_.CreateICmp(pLT, st, en, "r.di");
+                    llvm::Value* descHalf = builder_.CreateICmp(pLE, st, en, "r.dh");
                     llvm::Value* emptyAsc =
                         builder_.CreateSelect(incl, ascIncl, ascHalf, "r.ea");
                     llvm::Value* emptyDesc =
