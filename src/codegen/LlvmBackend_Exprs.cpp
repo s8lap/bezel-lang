@@ -964,8 +964,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // which would render raw tick/day counts (§2.5/§2.18).
                     if (rt && rt->kind == sema::TypeRef::Kind::Named) {
                         std::string_view bn = builtinTypeName(rt);
+                        // fix #6806: DateTime joins the list (§8.5, §2.5).
                         if (bn == "TimeSpan" || bn == "DateOnly" ||
-                            bn == "TimeOnly" || bn == "Guid")
+                            bn == "TimeOnly" || bn == "Guid" ||
+                            bn == "DateTime")
                             pv = emitValueToString(ev, rt);
                     }
                     // fix #2913 (spec §8.5 inline-array row / §18.5, v0.240):

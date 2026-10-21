@@ -3184,6 +3184,18 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
             auto* fn = declareC("bz_timespan_to_string_c", ptrTy(), {i64()});
             return builder_.CreateCall(fn, {val}, "ts.str");
         }
+        // fix #6806 (stdlib §2.5 / §8.5, v0.340): DateTime's ToString is
+        // "yyyy-MM-ddTHH:mm:ss" (#1114). This function is the one renderer
+        // every hole, record component, nullable payload and StringBuilder
+        // argument bottoms out in, and it had no DateTime arm, so each printed
+        // the raw tick count.
+        if (bn == "DateTime" && val->getType()->isIntegerTy(64)) {
+            llvm::Value* fmtStr =
+                lowerStringLiteral("\"yyyy-MM-ddTHH:mm:ss\"", false);
+            auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
+                                {i64(), ptrTy()});
+            return builder_.CreateCall(fn, {val, fmtStr}, "dt.str");
+        }
         if (bn == "DateOnly" && val->getType()->isIntegerTy()) {
             llvm::Value* dn = val->getType()->isIntegerTy(32)
                 ? val : builder_.CreateTrunc(val, i32());

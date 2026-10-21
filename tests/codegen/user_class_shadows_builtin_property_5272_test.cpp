@@ -240,7 +240,7 @@ BEZEL_TEST(user_class_shadows_builtin_property_5272, builtin_math_tau_still_lowe
 
 BEZEL_TEST(user_class_shadows_builtin_property_5272,
            builtin_datetime_max_value_still_lowers) {
-    expectOut("", "Console.WriteLine(DateTime.MaxValue);", "3155378975999999999\n");
+    expectOut("", "Console.WriteLine(DateTime.MaxValue);", "9999-12-31T23:59:59\n");
 }
 
 BEZEL_TEST(user_class_shadows_builtin_property_5272,

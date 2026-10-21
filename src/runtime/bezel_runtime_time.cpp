@@ -316,7 +316,7 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
     // Max output: every char can expand to at most 4 digits (yyyy) + separators.
     int outCap = (int)(flen * 4 + 4);
     if (outCap < 32) outCap = 32;
-    char* out = (char*)malloc((size_t)outCap);
+    char* out = (char*)malloc((size_t)outCap + 1);
     int pos = 0;
 
     for (int64_t i = 0; i < flen; ) {
@@ -364,6 +364,9 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
         i = j;
     }
 
+    // fix #6806: NUL-terminate. The aligned-hole path (`$"{dt,21}"`) hands
+    // `data` to a `%s` snprintf, which read past the unterminated buffer.
+    out[pos] = '\0';
     // Build bz_string header (§4.6 layout: data/len/width/rc at offsets 0/8/16/24).
     bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
     sh->data  = out;

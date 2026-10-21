@@ -10693,16 +10693,6 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (rt && rt->kind != sema::TypeRef::Kind::Primitive &&
                 !v->getType()->isPointerTy()) {
                 if (rendered) *rendered = true;
-                if (!rt->nullable && rt->kind == sema::TypeRef::Kind::Named &&
-                    builtinTypeName(rt) == "DateTime" &&
-                    v->getType()->isIntegerTy(64)) {
-                    // stdlib §2.5 (#1114): DateTime.ToString() = "yyyy-MM-ddTHH:mm:ss".
-                    llvm::Value* fmtStr = lowerStringLiteral(
-                        "\"yyyy-MM-ddTHH:mm:ss\"", false);
-                    auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
-                                        {i64(), ptrTy()});
-                    return builder_.CreateCall(fn, {v, fmtStr}, "sb.dt.str");
-                }
                 if (llvm::Value* r = emitValueToString(v, rt)) return r;
             }
             if (v->getType()->isPointerTy()) return v;
