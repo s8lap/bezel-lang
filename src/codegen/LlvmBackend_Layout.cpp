@@ -6858,6 +6858,14 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
             // fix #5237 (§27.6, v0.313): record-declared method, by-copy env.
             thisLoadTy = recordStruct(ms->parent);
             recordEnv = true;
+        } else if (!isExtensionMethod(ms) && ms->parent &&
+                   ms->parent->kind == ast::TypeDeclKind::Enum && origFn &&
+                   !origFn->getArg(0)->getType()->isPointerTy()) {
+            // fix #6836 (§9.4, §27.6, v0.340): an ENUM-declared method's `this`
+            // is the bare scalar of the underlying type (CG30), and the env
+            // holds that value by copy (buildMethodClosureCell stores
+            // receiverVal verbatim) — load the scalar, not a pointer.
+            thisLoadTy = origFn->getArg(0)->getType();
         }
         llvm::Value* loadedThis = builder_.CreateLoad(thisLoadTy, envPtrArg);
         if (recordEnv) {
