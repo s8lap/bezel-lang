@@ -2776,3 +2776,24 @@ l10_5_0002	fail	divergence
 l10_5_0003	pass	
 l10_6_0001	fail	divergence
 l10_6_0002	pass	
+s7_4_0063	pass	
+s7_4_0064	pass	
+s7_4_0065	pass	
+s7_4_0066	pass	
+s7_4_0067	pass	
+s7_4_0068	pass	
+s7_4_0069	pass	
+s7_4_0070	pass	
+s7_4_0071	pass	
+s7_4_0072	pass	
+s7_4_0073	pass	
+s7_4_0074	pass	
+s7_4_0075	pass	
+s7_5_0014	pass	
+s7_5_0015	fail	#6664
+s9_2_0033	pass	
+s9_2_0034	fail	#6686
+s11_1_0006	fail	#6704
+s17_5_0037	pass	
+s17_5_0038	pass	
+l5_0019	pass	
