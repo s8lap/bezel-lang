@@ -37748,6 +37748,29 @@ static bool calleeResolvedBySema(const ast::CallExpr& call,
 }
 
 
+// fix #6679 (§7.5, stdlib §5, v0.339): the `?.` spelling of the #1028 dictionary
+// materializer local -- `var d := a?.ToDictionary(k)`. On the non-null path
+// lowerNullCondBuiltinCall lowers the `.` twin, so the local solely owns the same
+// fresh `Dictionary<K,V>`; on the null path the slot is a null pointer (the
+// scope-end bz_dict_free tolerates it, as the nullable ToArray local does).
+// Deliberately LOCAL-INITIALIZER ONLY: the unbound-temp sites that share
+// isFreshOwnerlessDictMaterializerExpr (chained `?.`, discarded results) are the
+// inherited general-`?.` family and stay as they were.
+static bool isNullCondToDictionaryInit(const sema::SemaContext& ctx,
+                                       const ast::Expr* e) {
+    if (!e) return false;
+    const sema::TypeRef* rt = ctx.exprType(*e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (rt->headName() != "Dictionary") return false;
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call || !call->callee) return false;
+    if (calleeResolvedBySema(*call, ctx)) return false;
+    auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(call->callee.get());
+    return ncm && ncm->member == "ToDictionary" && ncm->typeArgs.empty();
+}
+
+
 // #1003 / stdlib §5 / §28: is `ld` a plain `var` binding a FRESHLY-MATERIALIZED
 // borrowing `Array<T>` from a LINQ/copy materializer call (`ToArray` / `Sorted`
 // / `Reversed`) or a §28.3 range-slice INDEX (`arr[r]` per #2753)? These are
@@ -38978,7 +39001,9 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // #1028: a plain `var d := src.ToDictionary(...)` — a fresh
             // `owned Dictionary<K,V>` materializer the local solely owns. Excluded:
             // a `using var` (disposed via registerUsingDisposal → would double-free).
-            else if (!v.isUsing && isFreshOwnerlessDictMaterializerExpr(v.init))
+            else if (!v.isUsing &&
+                     (isFreshOwnerlessDictMaterializerExpr(v.init) ||
+                      isNullCondToDictionaryInit(ctx_, v.init)))
                 dictCandidates.push_back(node);
             // #2142 / §28.9 / §28.11: a plain `var s: Set<T> := [ ... ]` — a
             // dict-backed collection literal whose backing the local solely

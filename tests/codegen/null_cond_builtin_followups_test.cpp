@@ -32,3 +32,37 @@ BEZEL_TEST(null_cond_builtin_followups, unrelated_local_named_like_member_6681_s
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "4\n-9\n");
 }
+
+// #6679 (§7.5, stdlib §5, §28.3): `var d := a?.ToDictionary(..)` is a fresh
+// dictionary the plain local solely owns; the `.` form and `using var` already
+// reclaimed it. Probe s5_todict_local_nc. Looped 100x; output asserted too.
+BEZEL_TEST(null_cond_builtin_followups, todictionary_local_no_leak_6679_spec_7_5) {
+    JitResult r = runAotChecked(prog(
+        "  var i := 0; var acc := 0; "
+        "  while i < 100 do "
+        "    var a: Array<int>? := [1, 2, 3]; "
+        "    var d := a?.ToDictionary(lambda(x: int) => x, lambda(x: int) => x * 2); "
+        "    if d <> null then acc := acc + d.Count; end; "
+        "    i := i + 1; "
+        "  end; "
+        "  Console.WriteLine(acc); "));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "300\n");
+}
+
+// Null receiver: the slot stays null; the scope-end reclaim must tolerate it.
+BEZEL_TEST(null_cond_builtin_followups, todictionary_local_null_receiver_6679_spec_7_5) {
+    JitResult r = runAotChecked(prog(
+        "  var i := 0; var hits := 0; "
+        "  while i < 100 do "
+        "    var a: Array<int>? := null; "
+        "    var d := a?.ToDictionary(lambda(x: int) => x, lambda(x: int) => x); "
+        "    if d <> null then hits := hits + 1; end; "
+        "    i := i + 1; "
+        "  end; "
+        "  Console.WriteLine(hits); "));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "0\n");
+}
