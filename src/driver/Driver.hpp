@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "codegen/LlvmBackend.hpp"
@@ -30,8 +31,45 @@ struct Dependency {
     std::string objectPath;
 };
 
+// How the executable build links (#6654). `System` is the hosted recipe of
+// linkCommandLine: `clang` from PATH against the host's glibc and libstdc++
+// (the dev build, the test suite, and --sanitize=address). `SelfContained`
+// links a FULLY STATIC executable with the toolchain bundle a release tarball
+// ships next to bezelc (selfContainedLinkArgs): a static ld.lld, musl,
+// libc++/libc++abi/libunwind, compiler-rt builtins and a libbezel_runtime.a
+// built against them, so neither clang nor any -dev package is needed.
+enum class LinkMode { System, SelfContained };
+
 class Driver {
 public:
+    // Select the link recipe linkExecutableObject runs. The default is
+    // LinkMode::System, so a Driver nobody configures (every test harness)
+    // links exactly as before. `bundleDir` is the self-contained toolchain
+    // directory (selfContainedBundleDir() for bezelc itself); it is ignored in
+    // System mode.
+    void setLinkMode(LinkMode mode, std::string bundleDir = {}) {
+        linkMode_ = mode;
+        bundleDir_ = std::move(bundleDir);
+    }
+
+    // The self-contained toolchain bundle next to this executable:
+    // <dir of the real executable>/../lib/bezel/x86_64-linux-musl, or "" when
+    // the executable path cannot be determined. Computed in every build; only
+    // a release tarball populates it.
+    static std::string selfContainedBundleDir();
+
+    // True when selfContainedBundleDir() names an existing directory — the
+    // condition under which bezelc defaults to LinkMode::SelfContained.
+    static bool selfContainedBundlePresent();
+
+    // The self-contained link as an argv vector (argv[0] is the bundle's
+    // ld.lld), the single definition of that recipe. Pure: it reads no file,
+    // so a test can build it against any directory.
+    static std::vector<std::string> selfContainedLinkArgs(
+        const std::string& objectPath, const std::string& exePath,
+        const std::vector<std::string>& extraObjects,
+        const std::string& bundleDir);
+
     // Compiles a single source file identified by path. The file is read, then
     // handed through the phase pipeline. Diagnostics are printed to stderr.
     // When `outputPath` is non-empty and the front-end produces no errors, a
@@ -146,6 +184,10 @@ public:
                                 const std::string& objectPath,
                                 const std::vector<Dependency>& deps = {},
                                 const codegen::CodegenOptions& opts = {});
+
+private:
+    LinkMode linkMode_ = LinkMode::System;
+    std::string bundleDir_;
 };
 
 } // namespace bezel

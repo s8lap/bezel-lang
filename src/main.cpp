@@ -5,6 +5,7 @@
 // only enough to route a file path into the driver.
 
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,7 @@ void printUsage(std::ostream& out) {
            "[--checked-contracts] "
            "[--sanitize=address] [--experimental-scoped-await-bind] "
            "[--report-trust-admissions] "
+           "[--link=self-contained|system] "
            "<source-file>\n"
            "  -c                 compile to a native object (a library, §2.4) "
            "with embedded\n"
@@ -72,7 +74,15 @@ void printUsage(std::ostream& out) {
            "code is\n"
            "                     caught at the access (JIT→AOT memory net); "
            "executable\n"
-           "                     builds only (not -c)\n"
+           "                     builds only (not -c); needs --link=system\n"
+           "  --link=self-contained\n"
+           "                     link a fully static executable with the toolchain\n"
+           "                     bundle in <prefix>/lib/bezel/x86_64-linux-musl (a\n"
+           "                     static ld.lld, musl, libc++): no clang or -dev\n"
+           "                     packages needed. The default when that bundle\n"
+           "                     exists next to bezelc, as in a release tarball\n"
+           "  --link=system      link with `clang` from PATH against the host's\n"
+           "                     glibc and libstdc++. The default otherwise\n"
            "  --experimental-scoped-await-bind\n"
            "                     PROTOTYPE (proposal 0082 §3, issue #3048; not a\n"
            "                     language feature): admit `var x := await\n"
@@ -126,6 +136,9 @@ int main(int argc, char** argv) {
     bool sawCheckedDisposal = false;
     bool sawUncheckedDisposal = false;
     std::vector<bezel::Dependency> deps;
+    // #6654: the link recipe. Unset = the default, resolved below once every
+    // argument is known (self-contained when the bundle is next to bezelc).
+    std::optional<bezel::LinkMode> linkMode;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
         if (arg == "--version") {
@@ -200,6 +213,19 @@ int main(int argc, char** argv) {
             codegenOpts.sanitizeAddress = true;
             continue;
         }
+        if (arg.rfind("--link=", 0) == 0) {
+            const std::string mode = arg.substr(std::string("--link=").size());
+            if (mode == "self-contained") {
+                linkMode = bezel::LinkMode::SelfContained;
+            } else if (mode == "system") {
+                linkMode = bezel::LinkMode::System;
+            } else {
+                std::cerr << "bezelc: error: unknown link mode '" << mode
+                          << "' (expected 'self-contained' or 'system')\n";
+                return 2;
+            }
+            continue;
+        }
         if (arg.rfind("--sanitize=", 0) == 0) {
             std::cerr << "bezelc: error: unsupported sanitizer '"
                       << arg.substr(std::string("--sanitize=").size())
@@ -251,9 +277,40 @@ int main(int argc, char** argv) {
                      "(library object)\n";
         return 2;
     }
+    // #6654: resolve the link mode. `-c` performs no link, so it neither
+    // probes for the bundle nor validates a --link choice.
+    bezel::Driver driver;
+    if (!compileObjectOnly) {
+        const bezel::LinkMode mode =
+            linkMode.value_or(bezel::Driver::selfContainedBundlePresent()
+                                  ? bezel::LinkMode::SelfContained
+                                  : bezel::LinkMode::System);
+        if (mode == bezel::LinkMode::SelfContained) {
+            // AddressSanitizer has no musl runtime; the ASan link is the
+            // system (clang) recipe's `-fsanitize=address`.
+            if (codegenOpts.sanitizeAddress) {
+                std::cerr << "bezelc: error: --sanitize=address is not supported "
+                             "by the self-contained (musl) link; pass "
+                             "--link=system to link with clang and the ASan "
+                             "runtime\n";
+                return 2;
+            }
+            const std::string bundle = bezel::Driver::selfContainedBundleDir();
+            if (!bezel::Driver::selfContainedBundlePresent()) {
+                std::cerr << "bezelc: error: --link=self-contained: no "
+                             "self-contained toolchain at '"
+                          << bundle
+                          << "' (a release tarball ships it in "
+                             "lib/bezel/x86_64-linux-musl); pass --link=system "
+                             "to link with clang\n";
+                return 2;
+            }
+            driver.setLinkMode(mode, bundle);
+        }
+    }
     if (outputPath.empty()) outputPath = defaultOutput(inputPath);
 
-    bezel::Driver driver;
+
     const bezel::CompileResult result =
         compileObjectOnly
             ? driver.compileObject(inputPath, outputPath, deps, codegenOpts)

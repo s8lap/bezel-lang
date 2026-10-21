@@ -36,6 +36,9 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
+
+#include "runtime/bezel_thread_stack.h"
 
 namespace bezel {
 
@@ -369,6 +372,78 @@ std::string Driver::linkCommandLine(const std::string& objectPath,
     return cmd;
 }
 
+// ---- the self-contained link (#6654) ---------------------------------------
+//
+// A release tarball ships, next to bin/bezelc, a toolchain bundle that links a
+// FULLY STATIC executable with no host compiler and no -dev packages:
+//
+//   lib/bezel/x86_64-linux-musl/
+//     bin/ld.lld                       a static ld.lld (no dynamic deps)
+//     crt1.o crti.o crtn.o libc.a      musl
+//     libc++.a libc++abi.a libunwind.a LLVM's C++ runtime
+//     libclang_rt.builtins-x86_64.a    compiler-rt builtins
+//     libpthread.a librt.a libdl.a libm.a  musl's empty stubs, which the
+//                                      archives' dependent-library hints name
+//     libbezel_runtime.a               the runtime built against all of the above
+//
+// scripts/release_static.sh assembles it. The recipe is the one the #6654 spike
+// measured: there is no compiler driver, hence no crtbegin/crtend (musl and
+// lld need neither: init_array, and lld defines __dso_handle).
+namespace {
+constexpr const char* kSelfContainedTriple = "x86_64-linux-musl";
+}  // namespace
+
+std::string Driver::selfContainedBundleDir() {
+    // The same anchor-and-real-path lookup as the release build's
+    // runtimeLibraryPath, so a symlink to bin/bezelc on PATH still finds it.
+    static int anchor;
+    const std::string exe = llvm::sys::fs::getMainExecutable(
+        nullptr, reinterpret_cast<void*>(&anchor));
+    if (exe.empty()) return {};
+    llvm::SmallString<256> p(llvm::sys::path::parent_path(exe));
+    llvm::sys::path::append(p, "..", "lib", "bezel", kSelfContainedTriple);
+    llvm::sys::path::remove_dots(p, /*remove_dot_dot=*/true);
+    return std::string(p);
+}
+
+bool Driver::selfContainedBundlePresent() {
+    const std::string dir = selfContainedBundleDir();
+    return !dir.empty() && llvm::sys::fs::is_directory(dir);
+}
+
+std::vector<std::string> Driver::selfContainedLinkArgs(
+    const std::string& objectPath, const std::string& exePath,
+    const std::vector<std::string>& extraObjects, const std::string& bundleDir) {
+    auto in = [&bundleDir](const char* name) {
+        llvm::SmallString<256> p(bundleDir);
+        llvm::sys::path::append(p, name);
+        return std::string(p);
+    };
+    std::vector<std::string> args = {
+        in("bin/ld.lld"),
+        "-static",
+        // The static archives carry dependent-library hints (pthread, rt, dl)
+        // that musl satisfies with the bundle's empty archives.
+        "-L" + bundleDir,
+        // musl takes a thread's DEFAULT stack size from PT_GNU_STACK; this
+        // covers threads the runtime does not create itself (the ones it does
+        // create already ask for BZ_THREAD_STACK_SIZE, #6695).
+        "-z", "stack-size=" + std::to_string(BZ_THREAD_STACK_SIZE),
+        "--eh-frame-hdr",  // libunwind finds the unwind tables through it
+        "-z", "noexecstack",
+        "-o", exePath,
+        in("crt1.o"),
+        in("crti.o"),
+        objectPath,
+    };
+    for (const std::string& obj : extraObjects) args.push_back(obj);
+    for (const char* lib : {"libbezel_runtime.a", "libc++.a", "libc++abi.a",
+                            "libunwind.a", "libc.a",
+                            "libclang_rt.builtins-x86_64.a", "crtn.o"})
+        args.push_back(in(lib));
+    return args;
+}
+
 // A path-independent fingerprint of the link recipe, for cache keying. It is the
 // real command line with its three PATH inputs replaced by placeholders:
 //   * the object and executable paths are per-invocation temporaries — the
@@ -398,6 +473,26 @@ bool Driver::linkExecutableObject(const std::string& objectPath,
     std::vector<std::string> depObjects;
     for (const Dependency& dep : deps)
         if (!dep.objectPath.empty()) depObjects.push_back(dep.objectPath);
+    if (linkMode_ == LinkMode::SelfContained) {
+        // #6654: run the bundle's ld.lld directly, from an argv vector rather
+        // than a shell line, so an install path with spaces or shell
+        // metacharacters links too. main.cpp has already rejected
+        // --sanitize=address in this mode (ASan does not support musl).
+        const std::vector<std::string> args =
+            selfContainedLinkArgs(objectPath, exePath, depObjects, bundleDir_);
+        std::vector<llvm::StringRef> argv(args.begin(), args.end());
+        std::string why;
+        const int rc = llvm::sys::ExecuteAndWait(args.front(), argv,
+                                                 /*Env=*/std::nullopt,
+                                                 /*Redirects=*/{},
+                                                 /*SecondsToWait=*/0,
+                                                 /*MemoryLimit=*/0, &why);
+        if (rc == 0) return true;
+        std::cerr << "bezelc: link error";
+        if (!why.empty()) std::cerr << ": " << why;
+        std::cerr << "\n";
+        return false;
+    }
     const std::string cmd = linkCommandLine(objectPath, exePath, depObjects,
                                             opts.sanitizeAddress,
                                             runtimeLibraryPath());
