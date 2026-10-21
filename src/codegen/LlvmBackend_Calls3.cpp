@@ -1734,6 +1734,12 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
                 // §8.3 default and is always memory-safe.
                 if (!eq) eq = builder_.CreateICmpEQ(a, b);
             }
+        } else if (elemTy->isFloatingPointTy()) {
+            // fix #6657 (§4.3.1, v0.339): `=` on float/double is reflexive —
+            // NaN = NaN, -0.0 = +0.0. emitValueEquality's floating arm is
+            // `oeq OR both-NaN`; the ICmp below is ill-formed on a float
+            // operand (Distinct/ToSet over double aborted bezelc).
+            eq = emitValueEquality(a, b, elemRef);
         } else if (elemTy->isStructTy() || elemTy->isArrayTy()) {
             // fix #6271 (§3.6 / §15.1.2, v0.338): a STRUCT- or ARRAY-shaped
             // element — a value-builtin like `Guid` ({i64,i64}), or an
@@ -2090,13 +2096,11 @@ llvm::Value* Emitter::lowerGroupByMaterialize(const ast::CallExpr& srcCall) {
     }
     if (!closure) return nullptr;
     llvm::Function* keyTramp = buildLinqTrampoline(1, valElemTy, keyElemTy);
-    // #6532: key equality is the key type's value equality (as Distinct's).
-    // A floating-point key keeps the byte compare: the kind-3 trampoline's
-    // fallback is an integer ICmp, which is ill-formed on float/double.
-    llvm::Value* keyEq = keyElemTy->isFloatingPointTy()
-        ? static_cast<llvm::Value*>(llvm::ConstantPointerNull::get(ptrTy()))
-        : buildLinqTrampoline(3, keyElemTy, nullptr,
-                              recordTypeOfRef(keyElemRef), keyElemRef);
+    // #6532 / #6657: key equality is the key type's value equality (as
+    // Distinct's); a float/double key takes the §4.3.1 reflexive compare.
+    llvm::Value* keyEq = buildLinqTrampoline(3, keyElemTy, nullptr,
+                                             recordTypeOfRef(keyElemRef),
+                                             keyElemRef);
     auto* gbFn = declareC("bz_groupby_to_array", ptrTy(),
         {ptrTy(), i64(), i64(), ptrTy(), ptrTy(), ptrTy()});
     llvm::Value* groups = builder_.CreateCall(gbFn,
