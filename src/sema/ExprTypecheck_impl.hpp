@@ -2739,6 +2739,20 @@ private:
     std::string extensionNameBlockedNote(const TypeRef* receiver,
                                          std::string_view name);
 
+    // fix #6814 / narrow #6784 / #6805 (language spec §27.6, §26.5, v0.340):
+    // the diagnostic for a BARE (non-call) reference `e.<name>` /
+    // `e?.<name>` to a stdlib §5 operator that `receiver` dispatches
+    // structurally (no method symbol), or "" when no rejection applies —
+    // including when a user extension member named `name` applies to
+    // `receiver` (§26.5 rules 2-3: that extension is what the reference
+    // resolves to, §27.6 admits extension-method references). The one
+    // decision every bare-operator arm (string `.`, the interface table `.`,
+    // and the `?.` table) reads.
+    std::string bareStructuralOperatorReject(const TypeRef* receiver,
+                                             std::string_view name,
+                                             bool nullCond,
+                                             SourceLocation loc);
+
     // §26.1 / §26.5: bind a resolved extension member to the member-access
     // expression — set its exprSymbol and the access's exprType. For a method
     // this is the §27.6 method-reference function type (the CallExpr handler

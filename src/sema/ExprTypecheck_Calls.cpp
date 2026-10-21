@@ -25675,6 +25675,34 @@ TypeRef* ExprTC::applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
     return out;
 }
 
+// fix #6814 / narrow #6784 / #6805 (language spec §27.6, §26.5, v0.340): see
+// the declaration. §26.5 rule 2 searches "extension blocks on `x`'s type,
+// base types, or implemented interfaces", and rule 3 prefers "extensions on
+// the most specific type", so a user `extension IList<int>` member `Last` is
+// what `il.Last` names at an `IList<int>` receiver (more specific than §5's
+// `extension IEnumerable<T>`), and §27.6 forms a receiver-qualified
+// reference to it ("`v.Scaled` over `extension Vec`, the member resolved on
+// the value exactly as the call `v.Scaled()` is"). The probe is the silent
+// (no-ambiguity-report) lookup the arms' later extension paths re-run with
+// reporting on; §5's own operators are not in that table, so only a user
+// extension suppresses the rejection.
+std::string ExprTC::bareStructuralOperatorReject(const TypeRef* receiver,
+                                                 std::string_view name,
+                                                 bool nullCond,
+                                                 SourceLocation loc) {
+    if (!receiver) return "";
+    bool isOp = receiver->kind == TypeRef::Kind::Primitive
+                    ? common::isStringLinqOperatorMemberName(name)
+                    : common::isBuiltinCollectionLinqOperatorName(name);
+    if (!isOp) return "";
+    std::string recv = structuralLinqReceiverName(receiver, nullCond, name);
+    if (recv.empty()) return "";
+    if (lookupExtensionMember(receiver, name, nullptr, loc,
+                              /*reportAmbiguity=*/false))
+        return "";
+    return bareStructuralMemberReference(recv, name);
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // §16.3 / stdlib §9.8 (#6798): `Range<T>.Start` and `.End` are `T?`
     // ("a `null` endpoint indicates the range is open-ended on that side").
@@ -29445,11 +29473,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         auto loc = ma.span.begin;
                         if (loc.line == 0 && ma.target)
                             loc = ma.target->span.begin;
-                        ctx_.diagnostics().report(
-                            Severity::Error, loc,
-                            bareStructuralMemberReference("string",
-                                                          ma.member));
-                        return;
+                        std::string msg = bareStructuralOperatorReject(
+                            tt, ma.member, /*nullCond=*/false, loc);
+                        if (!msg.empty()) {
+                            ctx_.diagnostics().report(Severity::Error, loc,
+                                                      msg);
+                            return;
+                        }
                     }
                     if (!isLinqOp) {
                         // Emit a diagnostic for unrecognized string members.
@@ -30293,19 +30323,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // `ReadOnlySpan<T>` receiver has the same no-MethodSymbol shape as the
         // builtin collections below (the `IGrouping` spelling is rejected in
         // its own member-access arm); the CALL form is exempted via
-        // calleeOfCallCtx_.
-        if (ma.target && !ctx_.exprType(ma) && &ma != calleeOfCallCtx_ &&
-            common::isBuiltinCollectionLinqOperatorName(ma.member)) {
-            std::string recv = structuralLinqReceiverName(
-                ctx_.exprType(*ma.target), /*nullCond=*/false, ma.member);
-            if (!recv.empty() && recv != "string") {
+        // calleeOfCallCtx_. A same-named user extension that applies to the
+        // receiver (§26.5) is not rejected: the §26.5 extension lookup below
+        // types the reference (bareStructuralOperatorReject). The string
+        // receiver is decided by its own arm above.
+        if (ma.target && !ctx_.exprType(ma) && &ma != calleeOfCallCtx_) {
+            const TypeRef* tt = ctx_.exprType(*ma.target);
+            if (tt && tt->kind == TypeRef::Kind::Named) {
                 auto loc = ma.span.begin;
                 if (loc.line == 0 && ma.target)
                     loc = ma.target->span.begin;
-                ctx_.diagnostics().report(
-                    Severity::Error, loc,
-                    bareStructuralMemberReference(recv, ma.member));
-                return;
+                std::string msg = bareStructuralOperatorReject(
+                    tt, ma.member, /*nullCond=*/false, loc);
+                if (!msg.empty()) {
+                    ctx_.diagnostics().report(Severity::Error, loc, msg);
+                    return;
+                }
             }
         }
         // #2537 (sibling of #2536; mirror of #2470/#2492; stdlib
@@ -33962,21 +33995,15 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     // `.` arms, #6784 covered only IGrouping here): a bare `e?.<§5 operator>`
     // on a receiver that dispatches the operator structurally left the node
     // untyped, so the local degraded to a zero function value (#2434).
+    // A same-named user extension (§26.5) already set `member` above; the
+    // shared decision re-checks it (bareStructuralOperatorReject).
     if (!member && &nm != calleeOfCallCtx_ && recvTyForDiag) {
-        bool isOp = recvTyForDiag->kind == TypeRef::Kind::Primitive
-                        ? common::isStringLinqOperatorMemberName(nm.member)
-                        : common::isBuiltinCollectionLinqOperatorName(
-                              nm.member);
-        std::string recv =
-            isOp ? structuralLinqReceiverName(recvTyForDiag, /*nullCond=*/true,
-                                       nm.member)
-                 : std::string();
-        if (!recv.empty()) {
-            SourceLocation loc = nm.span.begin;
-            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
-            ctx_.diagnostics().report(
-                Severity::Error, loc,
-                bareStructuralMemberReference(recv, nm.member));
+        SourceLocation loc = nm.span.begin;
+        if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+        std::string msg = bareStructuralOperatorReject(
+            recvTyForDiag, nm.member, /*nullCond=*/true, loc);
+        if (!msg.empty()) {
+            ctx_.diagnostics().report(Severity::Error, loc, msg);
             return;
         }
     }

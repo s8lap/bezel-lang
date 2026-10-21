@@ -181,3 +181,115 @@ BEZEL_TEST(collection_bare_operator_reference_reject_6814,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n"));
 }
+
+// ---- A same-named user extension wins (§26.5 rules 2-3, §27.6) ----
+// §27.6 admits a receiver-qualified extension-method reference, "the member
+// resolved on the value exactly as the call `v.Scaled()` is (§26.5)". A user
+// `extension IList<int>` is more specific than §5's `extension
+// IEnumerable<T>` at an `IList<int>` receiver (§26.5.1), so `e.Last` names
+// the user member and is not the structural-operator rejection. The rejected
+// first cut of #6814 reported §27.6 on these before extension lookup.
+namespace {
+JitResult runUserLast(const std::string& head, const std::string& body) {
+    return runAot(
+        "module M; extension " + head +
+        " public method Last(a: int): int return a + 1; end Last; end; "
+        "public class M public static method Main(): int "
+        "  var a: Array<int> := [1, 2, 3]; " + body + " return 0; "
+        "end Main; end M;");
+}
+void expectUserLastPrints6(const std::string& ty) {
+    JitResult r = runUserLast(
+        ty, "var e: " + ty + " := a; var g: (int) -> int := e.Last; "
+            "Console.WriteLine(g(5));");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("6\n"));
+}
+}  // namespace
+
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_ilist_last_reference_prints_6_spec_26_5) {
+    expectUserLastPrints6("IList<int>");
+}
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_ireadonlylist_last_reference_prints_6_spec_26_5) {
+    expectUserLastPrints6("IReadOnlyList<int>");
+}
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_icollection_last_reference_prints_6_spec_26_5) {
+    expectUserLastPrints6("ICollection<int>");
+}
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_ireadonlycollection_last_reference_prints_6_spec_26_5) {
+    expectUserLastPrints6("IReadOnlyCollection<int>");
+}
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_span_last_reference_prints_6_spec_26_5) {
+    JitResult r = runUserLast(
+        "Span<int>", "var e: Span<int> := a.AsSpan(); "
+                     "var g: (int) -> int := e.Last; Console.WriteLine(g(5));");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("6\n"));
+}
+// An inferred target: the user member's own signature is the formed type.
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_ilist_inferred_reference_prints_6_spec_27_6) {
+    JitResult r = runUserLast(
+        "IList<int>", "var e: IList<int> := a; var g := e.Last; "
+                      "Console.WriteLine(g(5));");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("6\n"));
+}
+// Control: a non-§5 name on IList was never the rejection's business.
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_ilist_non_operator_name_prints_6_spec_26_5) {
+    JitResult r = runAot(
+        "module M; extension IList<int> "
+        "public method Foo(a: int): int return a + 1; end Foo; end; "
+        "public class M public static method Main(): int "
+        "  var a: Array<int> := [1, 2, 3]; var e: IList<int> := a; "
+        "  var g: (int) -> int := e.Foo; Console.WriteLine(g(5)); return 0; "
+        "end Main; end M;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("6\n"));
+}
+// An extension on a DIFFERENT instantiation does not apply to `IList<int>`
+// (§26.5 rule 2's unification), so both spellings stay rejected.
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_other_element_type_still_rejected_spec_27_6) {
+    for (const char* body :
+         {"var e: IList<int> := a; var g: (int) -> int := e.Last; ",
+          "var e: IList<int>? := a; var g := e?.Last; "}) {
+        JitResult r = runUserLast("IList<string>", body);
+        BEZEL_EXPECT_FALSE(r.ran);
+        BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+        BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+            r, "a bare reference to `Last` (language spec \xC2\xA7"
+               "27.6) is not yet supported on `IList<T>`"));
+    }
+}
+// §26.5.1's own example: a user `extension IEnumerable<int>` member `First()`
+// and §5's `extension IEnumerable<T>` `First()` have identical substituted
+// heads, so the reference, like the call, is §26.5 rule 4's ambiguity, not
+// the structural-operator rejection (narrow #6784: the `.` IEnumerable arm
+// reported §27.6 before extension lookup).
+BEZEL_TEST(collection_bare_operator_reference_reject_6814,
+           user_extension_ienumerable_first_reference_ambiguous_spec_26_5_1) {
+    JitResult r = runAot(
+        "module M; extension IEnumerable<int> "
+        "public method First(): int return 9; end First; end; "
+        "public class M public static method Main(): int "
+        "  var a: Array<int> := [1, 2, 3]; var e: IEnumerable<int> := a; "
+        "  var g: () -> int := e.First; Console.WriteLine(g()); return 0; "
+        "end Main; end M;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        r, "ambiguous extension member `First`"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(
+        r, "a bare reference to `First` (language spec"));
+}
