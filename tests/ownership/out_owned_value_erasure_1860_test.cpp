@@ -46,6 +46,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"        // runAot / runAotChecked
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"  // parseAndCheckOwnership + hasAutoDropWarning
 #include "test_harness.hpp"
 
@@ -56,14 +57,6 @@ using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
@@ -107,7 +100,7 @@ std::string valueMain(const std::string& outForm) {
 BEZEL_TEST(out_owned_value_erasure_1860,
            value_out_using_var_runs_clean_spec_28_10) {
     JitResult r = runAotChecked(valueMain("out using var"));
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // no segfault, no bogus dispose of a value
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("got 5") != std::string::npos);
@@ -142,7 +135,7 @@ BEZEL_TEST(out_owned_value_erasure_1860,
 BEZEL_TEST(out_owned_value_erasure_1860,
            value_out_var_runs_clean_spec_28_10) {
     JitResult r = runAotChecked(valueMain("out var"));
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("got 5") != std::string::npos);
@@ -172,7 +165,7 @@ BEZEL_TEST(out_owned_value_erasure_1860,
         "    return 0; "
         "  end Main; "
         "end P;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);  // no leak, no double-free, no use-after-free
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("got conn 9") != std::string::npos);

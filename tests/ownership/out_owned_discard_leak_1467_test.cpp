@@ -32,22 +32,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "runAotChecked: SKIP" diagnostic. clang
-// is required to build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Count non-overlapping occurrences of `needle` in `hay`.
 int countOccurrences(const std::string& hay, const std::string& needle) {
@@ -121,7 +112,7 @@ BEZEL_TEST(ownership_out_owned_discard_1467,
     // WITHOUT the fix the produced Res(5) is neither disposed nor reclaimed — a
     // direct leak flips r.ran to false and "RES-DISPOSED-5" never appears.
     JitResult r = runAotChecked(kOutUnderscoreDiscardsOwned);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     // Clean run under LSan (the #1467 direct leak would flip this false) and the
     // disposal introduced no double-free / use-after-free.
@@ -156,7 +147,7 @@ BEZEL_TEST(ownership_out_owned_discard_1467,
     // #1467 fix records ONLY discard slots, so this transfer is unaffected — a
     // stray dispose of x would double-free (r.ran false).
     JitResult r = runAotChecked(kOutOwnedVarBindingTransfers);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

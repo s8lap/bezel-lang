@@ -61,6 +61,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAot / runAotChecked — the AOT oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -72,17 +73,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked AOT run is SKIPPED (not failed) when the ASan link toolchain is
-// absent — lane worktrees in this project have the ASan runtime unavailable;
-// the gate tree has it (mirrors explicit_dispose_borrow_became_owned_leak_
-// 4246_test.cpp's own helper).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 const char* kPrelude =
     "module M; "
@@ -157,7 +147,7 @@ BEZEL_TEST(lambda_reassign_explicit_dispose_reclaimed_slot_4270,
         "  i := i + 1; "
         "end; "
         "return acc;"));
-    if (wasSkipped(jr)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // Pre-fix: the stale sticky bit makes the second y.Dispose() free x's
     // live object; x.Dispose() then use-after-frees it. jr.ran becomes
     // false with an ASan heap-use-after-free report. Post-fix: the reset
@@ -219,7 +209,7 @@ BEZEL_TEST(lambda_reassign_explicit_dispose_reclaimed_slot_4270,
         "  return 0; "
         "end; "
         "return f() + Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // MEASURED: exit=2 (Res(1) reclaimed once via the first y.Dispose(),
     // Res(5) reclaimed once via x.Dispose(); the second y.Dispose() is a
@@ -261,7 +251,7 @@ BEZEL_TEST(lambda_reassign_explicit_dispose_reclaimed_slot_4270,
         "  i := i + 1; "
         "end; "
         "return acc;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // Pre-fix: same stale-bit hazard as test A, reached via a member-access
     // rebind instead of a bare-identifier one — the reset this fix adds
     // does not branch on RHS shape, so both axes must be fixed together.

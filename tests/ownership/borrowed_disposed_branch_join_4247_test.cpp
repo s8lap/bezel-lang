@@ -165,13 +165,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // The join-mismatch diagnostic text this fix's `checkRead` widening
 // produces — the stable substring every reject row below asserts.
 const char* kJoinMismatchNeedle =
@@ -484,7 +477,7 @@ BEZEL_TEST(borrowed_disposed_branch_join_4247,
         "  i := i + 1; "
         "end; "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // 100 iterations: 50 taken-arm iterations dispose 2 objects each
     // (Res(1) + Res(5)), 50 not-taken-arm iterations dispose 1 (Res(5) via
@@ -510,7 +503,7 @@ BEZEL_TEST(borrowed_disposed_branch_join_4247,
         "end; "
         "x.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 2);  // Res(1) [taken arm] + Res(5) [x]
 }
@@ -530,7 +523,7 @@ BEZEL_TEST(borrowed_disposed_branch_join_4247,
         "x.Dispose(); "
         "z.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 2);  // x and z, independently
 }
@@ -605,7 +598,7 @@ BEZEL_TEST(borrowed_disposed_branch_join_4247,
         "end; "
         "x.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 2);  // Res(1) [i=1 iteration] + Res(5) [x]
 }

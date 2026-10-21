@@ -36,20 +36,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAotChecked
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
@@ -86,7 +79,7 @@ BEZEL_TEST(owned_bare_t_using_var_binding_1817,
         "    return v; "
         "  end Main; "
         "end P;");
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);            // no spurious dispose, no crash
     BEZEL_EXPECT_EQ(r.exitCode, 5);      // the erased value round-trips
 }
@@ -113,7 +106,7 @@ BEZEL_TEST(owned_bare_t_using_var_binding_1817,
         "    return 0; "
         "  end Main; "
         "end P;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     // Substring (not "hi\n"): Console.NewLine is platform-dependent.
@@ -148,7 +141,7 @@ BEZEL_TEST(owned_bare_t_using_var_binding_1817,
         "    return 0; "
         "  end Main; "
         "end P;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);                                   // no leak, no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D7"), 1);   // disposed once

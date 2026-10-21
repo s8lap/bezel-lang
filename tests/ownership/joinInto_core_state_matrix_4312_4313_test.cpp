@@ -143,13 +143,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // The MovedFrom-state plain read diagnostic — what a MovedFrom⊓Disposed
 // merge's subsequent read now hits (checkRead's `state == MovedFrom` arm).
 const char* kMovedFromReadNeedle =
@@ -707,7 +700,7 @@ BEZEL_TEST(joinInto_core_state_matrix_4312_4313,
         "x.Dispose(); "
         "z.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 2);  // x and z, independently disposed
 }
@@ -752,7 +745,7 @@ BEZEL_TEST(joinInto_core_state_matrix_4312_4313,
         "  i := i + 1; "
         "end; "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // Every iteration discharges exactly TWO Res objects: Res(5) once
     // (`.Dispose()` on the cond-true arm, or `Sink.Take(move x)`'s own
@@ -781,7 +774,7 @@ BEZEL_TEST(joinInto_core_state_matrix_4312_4313,
         "  i := i + 1; "
         "end; "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     BEZEL_EXPECT_TRUE(jr.ran);
     // 100 iterations: 50 taken-arm iterations discharge 2 objects (Res(1)
     // via Sink.Take's internal Dispose + Res(5) via x.Dispose()), 50

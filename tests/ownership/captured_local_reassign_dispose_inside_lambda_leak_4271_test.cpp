@@ -70,6 +70,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAot / runAotChecked — the AOT oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
@@ -81,18 +82,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked AOT run is SKIPPED (not failed) when the ASan link toolchain
-// is absent — lane worktrees in this project may lack the ASan
-// runtime. The ASan/LSan oracle is what the gate tree runs in `gate.sh`
-// --full. Distinguishes "environment can't run this" (skip) from
-// "the program is dirty" (fail).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 const char* kPrelude =
     "module M; "
@@ -165,7 +154,7 @@ BEZEL_TEST(captured_local_reassign_dispose_inside_lambda_leak_4271,
         "end; "
         "x.Dispose(); "
         "return acc;"));
-    if (wasSkipped(jr)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // Pre-fix: seed absent; `states_` empty during body walk;
     // AssignmentStmt arm finds no entry to update;
     // `markExplicitDisposeReclaimIfReassignedBorrow` stamps nothing;
@@ -232,7 +221,7 @@ BEZEL_TEST(captured_local_reassign_dispose_inside_lambda_leak_4271,
         "  return 0; "
         "end; "
         "return outer();"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // Pre-fix: nested-lambda seed site is the same one missing (the
     // outer-scope fix in
     // `applyUsingVarBorrowPinInLambdas` is necessary but NOT
@@ -273,7 +262,7 @@ BEZEL_TEST(captured_local_reassign_dispose_inside_lambda_leak_4271,
         "f(); "
         "x.Dispose(); "
         "return Counter.Dropped;"));
-    if (wasSkipped(jr)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
     // MEASURED POST-FIX: 2 dispatches (Res(5) reclaimed via
     // x.Dispose(); Res(9) reclaimed via y.Dispose()), and
     // Counter.Dropped is the return value. Pre-fix: same dispatch

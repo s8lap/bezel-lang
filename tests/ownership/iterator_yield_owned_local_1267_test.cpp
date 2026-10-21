@@ -59,6 +59,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"        // runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"  // parseAndCheckOwnership — diag pins
 #include "test_harness.hpp"
 
@@ -67,15 +68,6 @@ using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
@@ -160,7 +152,7 @@ const char* kRejectNeedle = "cannot yield `using var`";
 BEZEL_TEST(iterator_yield_owned_local_1267,
            using_var_yield_owning_iterator_rejected_spec_29_2) {
     JitResult r = runAotChecked(kUsingVarYieldSync);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(sawDiagnostic(r, kRejectNeedle));
     // A rejected program never runs — so the double-dispose is unreachable.
@@ -219,7 +211,7 @@ BEZEL_TEST(iterator_yield_owned_local_1267,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);  // no double-free / leak (ASan+LSan)
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "dispose 1"), 1);
@@ -241,7 +233,7 @@ BEZEL_TEST(iterator_yield_owned_local_1267,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "dispose 1"), 1);
@@ -295,7 +287,7 @@ BEZEL_TEST(iterator_yield_owned_local_1267,
         "    return Box.live - Box.dead; "   // 0 iff every Box disposed once
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -326,7 +318,7 @@ BEZEL_TEST(iterator_yield_owned_local_1267,
         "    return Box.live - Box.dead; "   // 0 iff each disposed exactly once
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

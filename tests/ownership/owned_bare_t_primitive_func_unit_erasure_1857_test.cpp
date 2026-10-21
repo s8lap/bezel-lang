@@ -43,6 +43,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"        // runAot / runAotChecked
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/ownership_support.hpp"  // parseAndCheckOwnership + hasAutoDropWarning
 #include "test_harness.hpp"
 
@@ -54,14 +55,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 }  // namespace
 
@@ -196,7 +189,7 @@ BEZEL_TEST(owned_bare_t_primitive_func_unit_erasure_1857,
         "    return 0; "
         "  end Main; "
         "end P;");
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     // The erased Object round-trips through the runtime without any
@@ -267,7 +260,7 @@ BEZEL_TEST(owned_bare_t_primitive_func_unit_erasure_1857,
         "    return 0; "
         "  end Main; "
         "end P;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     // The destructive payload's destructor ran exactly once.

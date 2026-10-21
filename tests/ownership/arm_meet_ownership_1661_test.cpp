@@ -38,20 +38,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"  // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
@@ -138,7 +131,7 @@ std::string kPlainVarOwnedMeetExplicitDispose =
 BEZEL_TEST(ownership_arm_meet_1661,
            if_expr_owned_meet_using_var_disposes_once_spec_28_3) {
     JitResult r = runAotChecked(kIfExprOwnedMeetUsingVar);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // WITHOUT the fix: LSan direct leak (never disposed) → r.ran false.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -159,7 +152,7 @@ BEZEL_TEST(ownership_arm_meet_1661,
 BEZEL_TEST(ownership_arm_meet_1661,
            case_expr_owned_meet_using_var_disposes_once_spec_28_3) {
     JitResult r = runAotChecked(kCaseExprOwnedMeetUsingVar);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D7"), 1);
@@ -173,7 +166,7 @@ BEZEL_TEST(ownership_arm_meet_1661,
 BEZEL_TEST(ownership_arm_meet_1661,
            typed_borrowed_meet_using_var_pins_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kTypedBorrowedMeetUsingVarPins);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // WITHOUT the fix: heap-use-after-free double-free of Res(7) → r.ran false.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -187,7 +180,7 @@ BEZEL_TEST(ownership_arm_meet_1661,
 BEZEL_TEST(ownership_arm_meet_1661,
            plain_var_owned_meet_explicit_dispose_no_leak_spec_28_3) {
     JitResult r = runAotChecked(kPlainVarOwnedMeetExplicitDispose);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // WITHOUT the fix: destructor ran but the block was never reclaimed → LSan
     // direct leak → r.ran false.
     BEZEL_EXPECT_TRUE(r.ran);
