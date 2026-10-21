@@ -26425,7 +26425,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // per-type dispatch, LlvmBackend_Calls.cpp) to a runtime that mints a fresh
     // heap `bz.string` at rc := 1:
     //   DateTime.ToString()       / .ToString(format) → bz_datetime_to_string_fmt
-    //   TimeSpan.ToString()                           → inline malloc + initStringRc
+    //   TimeSpan.ToString() / .ToString(format)    → bz_timespan_to_string_c / _fmt
     //   DateOnly.ToString()                           → bz_datetime_to_string_fmt
     //   TimeOnly.ToString()                           → bz_timeonly_to_string
     // all rc = 1. These are Named value types, NOT Primitives, so the numeric-
@@ -26444,7 +26444,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // from the scope-end release (its +1 then leaks — the safe direction). Only the
     // no-arg overload (all four) and DateTime's ToString(format) are recognized:
     // those are the ONLY ToString forms lowerCall lowers to a +1 producer for these
-    // types (TimeSpan/DateOnly/TimeOnly have no format overload).
+    // types (TimeSpan: bz_timespan_to_string_fmt, #6720; DateOnly/TimeOnly have none).
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->callee) {
             if (auto* ma =
@@ -26461,8 +26461,9 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         // DateTime.ToString(format): the SAME rc=1
                         // bz_datetime_to_string_fmt runtime; TimeSpan/DateOnly/
                         // TimeOnly have no format overload.
-                        if (call->args.size() == 1 && bn == "DateTime")
-                            return true;
+                        if (call->args.size() == 1 &&
+                            (bn == "DateTime" || bn == "TimeSpan"))
+                            return true;  // TimeSpan: #6720 bz_timespan_to_string_fmt
                         // #1989 / stdlib §2.6/§2.18: Guid.ToString(format) — the
                         // format overload lowers (LlvmBackend_Calls.cpp Guid block)
                         // to bz_guid_to_string_fmt, which mints the SAME fresh rc=1

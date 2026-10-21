@@ -72,7 +72,7 @@ BEZEL_TEST(codegen_timespan_compar_fromticks_1357, from_ticks_one_second) {
 }
 
 // stdlib §2.5 / #1357: TimeSpan.ToString — returns a non-empty string.
-// The format is "d.hh:mm:ss"; we just verify it is non-empty.
+// The format is the `c` form (§2.18); the exact text is pinned in timespan_tostring_c_form_6720.
 BEZEL_TEST(codegen_timespan_compar_fromticks_1357, tostring_nonempty) {
     BEZEL_EXPECT_EQ(run(prog(
         "var ts := TimeSpan.FromSeconds(90.0); "

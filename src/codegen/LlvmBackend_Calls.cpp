@@ -15783,56 +15783,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                             builder_.CreateICmpSLT(ticks, other), i32(), "ts.cmp.lt");
                         return builder_.CreateSub(gt, lt, "ts.cmp");
                     }
-                    // ToString(): string — emit "d.hh:mm:ss" format.
+                    // per stdlib §2.5 / §2.18 (v0.340, #6720): ToString() is the
+                    // `c` rendering `[-][d.]HH:mm:ss[.fffffff]`, the same runtime as
+                    // the interpolation hole; mints a fresh rc=1 string.
                     if (mname == "ToString" && call.args.empty()) {
-                        // Build "±d.hh:mm:ss" via snprintf in a stack buffer.
-                        auto* i32s  = llvm::Type::getInt32Ty(llvm_);
-                        llvm::Value* dS  = entryAlloca(i32s);
-                        llvm::Value* hS  = entryAlloca(i32s);
-                        llvm::Value* miS = entryAlloca(i32s);
-                        llvm::Value* sS  = entryAlloca(i32s);
-                        llvm::Value* msS = entryAlloca(i32s);
-                        auto* compFn = declareC("bz_timespan_components",
-                            llvm::Type::getVoidTy(llvm_),
-                            {i64(), ptrTy(), ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-                        builder_.CreateCall(compFn, {ticks, dS, hS, miS, sS, msS});
-                        llvm::Value* days  = builder_.CreateLoad(i32s, dS, "ts.d");
-                        llvm::Value* hours = builder_.CreateLoad(i32s, hS, "ts.h");
-                        llvm::Value* mins  = builder_.CreateLoad(i32s, miS, "ts.mi");
-                        llvm::Value* secs  = builder_.CreateLoad(i32s, sS, "ts.s");
-                        // Use snprintf to format; 64-byte buffer is ample.
-                        auto* i8t = llvm::Type::getInt8Ty(llvm_);
-                        auto* buf64 = entryAlloca(llvm::ArrayType::get(i8t, 64));
-                        llvm::Value* bufPtr = builder_.CreateGEP(
-                            llvm::ArrayType::get(i8t, 64), buf64,
-                            {builder_.getInt64(0), builder_.getInt64(0)});
-                        auto* snpFn = module_->getFunction("snprintf");
-                        if (!snpFn) {
-                            auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), i64(), ptrTy()}, true);
-                            snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
-                        }
-                        unsigned sidTS = stringLiteralIdx_++;
-                        llvm::Constant* fmtTS = llvm::ConstantDataArray::getString(llvm_, "%d.%02d:%02d:%02d", true);
-                        auto* fmtGV = new llvm::GlobalVariable(*module_, fmtTS->getType(), true,
-                            llvm::GlobalValue::PrivateLinkage, fmtTS, ".bz.ts.fmt." + std::to_string(sidTS));
-                        fmtGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-                        llvm::Value* written = builder_.CreateCall(snpFn,
-                            {bufPtr, builder_.getInt64(64), fmtGV, days, hours, mins, secs});
-                        auto* mallocFn2 = declareC("malloc", ptrTy(), {i64()});
-                        auto* memcpyFn2 = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-                        llvm::Value* len2 = builder_.CreateSExt(written, i64());
-                        llvm::Value* dataSz2 = builder_.CreateAdd(len2, builder_.getInt64(1));
-                        llvm::Value* dataCopy2 = builder_.CreateCall(mallocFn2, {dataSz2}, "ts.str.data");
-                        builder_.CreateCall(memcpyFn2, {dataCopy2, bufPtr, len2});
-                        llvm::Value* nulPtr2 = builder_.CreateGEP(i8t, dataCopy2, len2);
-                        builder_.CreateStore(llvm::ConstantInt::get(i8t, 0), nulPtr2);
-                        uint64_t strBytesTS = module_->getDataLayout().getTypeAllocSize(stringType());
-                        llvm::Value* strObj2 = builder_.CreateCall(mallocFn2, {builder_.getInt64(strBytesTS)}, "ts.str.obj");
-                        builder_.CreateStore(dataCopy2, builder_.CreateStructGEP(stringType(), strObj2, 0));
-                        builder_.CreateStore(len2, builder_.CreateStructGEP(stringType(), strObj2, 1));
-                        builder_.CreateStore(llvm::ConstantInt::get(i8t, 1), builder_.CreateStructGEP(stringType(), strObj2, 2));
-                        initStringRc(strObj2);
-                        return strObj2;
+                        auto* fn = declareC("bz_timespan_to_string_c", ptrTy(), {i64()});
+                        return builder_.CreateCall(fn, {ticks}, "ts.tostr");
+                    }
+                    // ToString(format): only `c` is a TimeSpan specifier; any other
+                    // raises FormatException (§2.18 strict-fault).
+                    if (mname == "ToString" && call.args.size() == 1 &&
+                        call.args[0].value) {
+                        llvm::Value* fmtStr = lowerExpr(*call.args[0].value);
+                        if (!fmtStr) return nullptr;
+                        auto* fn = declareC("bz_timespan_to_string_fmt", ptrTy(),
+                                            {i64(), ptrTy()});
+                        llvm::Value* res = builder_.CreateCall(fn, {ticks, fmtStr},
+                                                               "ts.tostr.fmt");
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            res, llvm::Constant::getNullValue(ptrTy()), "ts.fmt.null");
+                        emitGuardThrow(isNull, "FormatException");
+                        return res;
                     }
                 }
             }

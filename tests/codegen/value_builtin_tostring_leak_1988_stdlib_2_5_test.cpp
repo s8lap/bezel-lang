@@ -15,7 +15,7 @@
 // Named value types lowers (LlvmBackend_Calls.cpp per-type dispatch) to a runtime
 // that mints a fresh heap `bz.string` at rc := 1 — a genuine +1 producer:
 //   DateTime.ToString() / .ToString(format) → bz_datetime_to_string_fmt (rc=1)
-//   TimeSpan.ToString()                      → inline malloc + initStringRc (rc=1)
+//   TimeSpan.ToString()                      → bz_timespan_to_string_c (rc=1)
 //   DateOnly.ToString()                      → bz_datetime_to_string_fmt (rc=1)
 //   TimeOnly.ToString()                      → bz_timeonly_to_string (rc=1)
 // But `isPlusOneStringProducer` (LlvmBackend_Setup.cpp) recognized only the numeric
@@ -112,7 +112,7 @@ BEZEL_TEST(value_builtin_tostring_leak_1988,
            timespan_tostring_noarg_lsan_clean_stdlib_2_5) {
     JitResult r = runAotChecked(loopCount(
         "var v := TimeSpan.FromSeconds(90.0); ",
-        "v.ToString()", "0.00:01:30"));
+        "v.ToString()", "00:01:30"));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);

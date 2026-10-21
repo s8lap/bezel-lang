@@ -782,9 +782,12 @@ static const int64_t TICKS_PER_DAY    = 864000000000LL;  // 86400 * 10_000_000
 extern "C" void* bz_timespan_to_string_c(int64_t ticks) {
     char buf[48];
     int pos = 0;
-    int64_t t = ticks;
-    if (t < 0) { buf[pos++] = '-'; t = -t; }
-    int64_t days = t / TICKS_PER_DAY; t %= TICKS_PER_DAY;
+    // Magnitude in uint64_t: negating long.MinValue in int64_t is signed
+    // overflow (#6720); the unsigned negate is well defined.
+    uint64_t u = (uint64_t)ticks;
+    if (ticks < 0) { buf[pos++] = '-'; u = 0 - u; }
+    int64_t days = (int64_t)(u / (uint64_t)TICKS_PER_DAY); u %= (uint64_t)TICKS_PER_DAY;
+    int64_t t = (int64_t)u;
     int64_t hh   = t / TICKS_PER_HOUR; t %= TICKS_PER_HOUR;
     int64_t mm   = t / TICKS_PER_MINUTE; t %= TICKS_PER_MINUTE;
     int64_t ss   = t / TICKS_PER_SECOND; t %= TICKS_PER_SECOND;
@@ -798,13 +801,23 @@ extern "C" void* bz_timespan_to_string_c(int64_t ticks) {
     return bz_make_string(buf, pos);
 }
 
+// stdlib §2.5 / §2.18 (v0.340, #6720): TimeSpan.ToString(format). `c` is the
+// only specifier; anything else returns nullptr (caller raises FormatException).
+extern "C" void* bz_timespan_to_string_fmt(int64_t ticks, const void* fmt_p) {
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    if (!fh || !fh->data || fh->width != 1 || fh->len != 1 || fh->data[0] != 'c')
+        return nullptr;
+    return bz_timespan_to_string_c(ticks);
+}
+
 void bz_timespan_components(int64_t ticks,
                              int32_t* days, int32_t* hours,
                              int32_t* minutes, int32_t* seconds,
                              int32_t* ms) {
     // Preserve sign: work with absolute value, then negate if negative.
     int32_t sign = (ticks < 0) ? -1 : 1;
-    int64_t t = (ticks < 0) ? -ticks : ticks;
+    // uint64_t magnitude: -long.MinValue is signed overflow (#6720).
+    int64_t t = (ticks < 0) ? (int64_t)(0 - (uint64_t)ticks) : ticks;
     int64_t d   = t / TICKS_PER_DAY;
     t %= TICKS_PER_DAY;
     int64_t h   = t / TICKS_PER_HOUR;
