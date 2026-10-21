@@ -320,7 +320,13 @@ BEZEL_TEST(xmod_using_var_imported_cstring_2812,
     bezel::module::Fixture2812 f(
         "Raw",
         "RawBytes",
-        "return RawBytes.From(\"hello\");");
+        // stdlib §10.3: `From(buffer: Array<byte>)`. This row used to pass
+        // the string "hello", which sema admits unchecked (#6920). It ran only
+        // because offset 8 of a `bz_string` lined up with
+        // `bz_array_t.count`; #6776's type tag broke that, and ASan caught
+        // `bz_rawbytes_from` mallocing 2^63-1. The lint under test reads
+        // only the importer's `using var c := L.make()`, never this body.
+        "return RawBytes.From([104, 101, 108, 108, 111]);");
     std::string stderrText;
     int rc = bezel::module::runCrossModule(f, "Raw", &stderrText);
     BEZEL_EXPECT_TRUE(rc >= 0);
