@@ -22420,11 +22420,22 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // marks disposed, drops the Mutex object's core ref).
     {
         bool isMx = false;
+        // fix-forward #6776 (§6.2 / §28.3 / §2.5, v0.340): no astNode gate. A
+        // `using var x := Lib.MakeMutex();` whose type is INFERRED from an
+        // imported factory's `owned Mutex` return carries an astNode-less
+        // TypeRef (the wire puts the name on `importedName`; `headName()`
+        // reads both, per 78d28fd2), so the gate declared it "not a Mutex", no
+        // disposal entry was registered, and the Mutex leaked at scope end —
+        // pre-#6776 as well (MEASURED at 4bf709ff: 4,800 B / 100 allocs per
+        // 100 iterations; at 78d28fd2 the tagged Mutex is two allocations, so
+        // 8,800 B / 200). The same-module `new Mutex()` spelling and the
+        // annotated `using var x: Mutex := …` spelling are clean on the same
+        // binaries, so the gate was the whole defect. `!rt->declaration` still
+        // excludes a user class that happens to be named `Mutex`. The #2374
+        // astNode-gate audit lists this pattern; this is one site of it.
         auto isMutexTypeName = [](const sema::TypeRef* rt) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
-                   !rt->declaration && rt->astNode && rt->astNode->name &&
-                   !rt->astNode->name->parts.empty() &&
-                   rt->headName() == "Mutex";
+                   !rt->declaration && rt->headName() == "Mutex";
         };
         if (ld->type)
             isMx = isMutexTypeName(ctx_.resolvedType(*ld->type));
@@ -33386,12 +33397,41 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(arrBB);
     }
+    // fix-forward #6776 (§28.7 / stdlib §4.10 / §4.18, v0.340): the drop-on-
+    // overwrite twin of emitOwnedFieldDisposals' #6270 arm. A `Set<T>` /
+    // `SortedSet<T>` field whose element is generic-dict-eligible holds a
+    // bz_dict_t* (genericBackingType; SortedSet's `T: IComparable<T>` admits no
+    // class element, so it always does), yet `isDict` is the Dictionary family
+    // only, so the displaced table went to bz_array_free: before #6776 a leak
+    // of its order array and keys (the structs shared a prefix); since the
+    // tagged bz_array_t layout (§8.2) a read of `data` off the table's
+    // `capacity` word. MEASURED on 78d28fd2, ASan armed: `_s := new Set<int>()`
+    // in a method SEGV'd in bz_array_free (plain: `free(): invalid pointer`,
+    // rc 134); SortedSet<int> and Set<string> the same. Free it exactly as the
+    // scope-end arm does: release a string element's +1 (held as a KEY), then
+    // bz_dict_free with no value disposer (a Set's values are sentinels). The
+    // owning family and an array-backed Set keep the free below.
+    bool setDictBacked = collTy && !isLL && !isDict &&
+        (collTy->headName() == "Set" || collTy->headName() == "SortedSet") &&
+        genericBackingType(collTy, 0, /*isSet=*/true, nullptr) != nullptr;
+    if (setDictBacked) {
+        if (collElem && !collElem->nullable &&
+            collElem->kind == sema::TypeRef::Kind::Primitive &&
+            collElem->primitive == sema::PrimitiveType::String) {
+            auto* relFn = declareC("bz_set_string_keys_release",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(relFn, {oldVal});
+        }
+        auto* dfn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
+                             {ptrTy(), ptrTy()});
+        builder_.CreateCall(dfn, {oldVal, llvm::ConstantPointerNull::get(ptrTy())});
+        builder_.CreateBr(contBB);
     // #2608: drop-on-overwrite twin of the scope-end site in
     // LlvmBackend_Disposal.cpp. The DISPLACED backing of an `owned` field typed
     // by a borrowing list interface may itself be owning (stdlib §4.3 — the
     // read-only list interfaces are shared by both hierarchies), so consult the
     // construction-time header disposer rather than assuming borrowing.
-    if (!isLL && !isDict && !elemDisp && isBorrowingListInterfaceName(collTy)) {
+    } else if (!isLL && !isDict && !elemDisp && isBorrowingListInterfaceName(collTy)) {
         auto* dynFn = declareC("bz_array_free_dynamic",
                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(dynFn, {oldVal});
@@ -46835,8 +46875,27 @@ Emitter::Disposal Emitter::buildCollectionTempDisposal(
         (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
     // fix #5328 item 4 (§15.4 / §28.3, v0.313): same importedName-vs-astNode
     // issue as the isOwning fix above — use builtinTypeName here too.
+    //
+    // fix-forward #6776 (§28.3 / §28.8 / stdlib §4.18, v0.340): `SortedSet`
+    // joins the set-family test. `SortedSet<T>` is hash-backed at construction
+    // for every generic-dict-eligible `T` (the same `genericBackingType` gate),
+    // exactly as `Set<T>` is, and the two explicit-Dispose arms in this file
+    // (the `isSetFamilyHead` / `isSetName` tests near `freeIsDict`) already
+    // name all three heads. This builder did not, so every one of its twelve
+    // callers — the §28.8 owned-parameter auto-drop (`registerUnwindOwnedParam`),
+    // the async-frame capture release (#6368), the temp-receiver and
+    // literal-argument disposals — freed a `SortedSet<int>` / `SortedSet<string>`
+    // table through `bz_array_free`. Before #6776 moved `bz_array_t`'s fields
+    // that only leaked the table (the dict prefix aliased the old array header);
+    // now it reads `data` off the dict's `capacity` word. MEASURED on 78d28fd2,
+    // ASan armed, 100 iterations: `method Sink(owned v: SortedSet<int>)` called
+    // as `Sink(move x)` → SEGV in bz_array_free from the callee's scope end;
+    // `SortedSet<string>` the same (pre-#6776: rc 134). The `Set<T>` twin was
+    // already routed here and is clean on the same binary, so the head test
+    // was the whole defect.
     std::string_view setName = builtinTypeName(collTy);
-    bool isSetName = (setName == "Set" || setName == "OwningSet");
+    bool isSetName = (setName == "Set" || setName == "OwningSet" ||
+                      setName == "SortedSet");
     bool setDictBacked = isSetName &&
         genericBackingType(collTy, 0, /*isSet=*/true, nullptr) != nullptr;
     if (setDictBacked) {

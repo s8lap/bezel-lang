@@ -1814,9 +1814,18 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // T=int). Free it exactly as a `using var` Set local does: release
             // a string element's +1 (held as a KEY), then bz_dict_free with no
             // value disposer (a Set's values are sentinels). Narrow: the
-            // borrowing `Set` head only; an array-backed Set (class, interface
-            // or nullable element) and the owning family keep the free below.
-            if (!isLL && !isDict && builtinTypeName(it->collTy) == "Set" &&
+            // borrowing `Set` / `SortedSet` heads only; an array-backed Set
+            // (class, interface or nullable element) and the owning family
+            // keep the free below.
+            // fix-forward #6776 (stdlib §4.18, v0.340): `SortedSet` joins the
+            // arm. It is always hash-backed (`T: IComparable<T>` admits no
+            // class element), so the same misroute applied; MEASURED on
+            // 78d28fd2, ASan armed: an `owned _s: SortedSet<int>` field SEGV'd
+            // in bz_array_free at its owner's scope end (before #6776 the same
+            // misroute leaked, like the Set case this arm was added for).
+            if (!isLL && !isDict &&
+                (builtinTypeName(it->collTy) == "Set" ||
+                 builtinTypeName(it->collTy) == "SortedSet") &&
                 genericBackingType(it->collTy, 0, /*isSet=*/true, nullptr)) {
                 if (collElem && !collElem->nullable &&
                     collElem->kind == sema::TypeRef::Kind::Primitive &&
@@ -7532,6 +7541,22 @@ void Emitter::disposeDisplacedCollectionLocal(const ast::Expr* target,
         }
     }
     if (!entry) return;  // no registered disposal entry (e.g. borrow-typed local)
+    // fix-forward #6776 (§28.7 / stdlib §4.10 / §4.18, v0.340): the REGISTERED
+    // entry's kind decides the free, not the local's head name. A `Set<T>` or
+    // `SortedSet<T>` whose element is generic-dict-eligible is bz_dict_t*-backed
+    // at construction (genericBackingType) and its scope-end entry records that
+    // (`d.dict`, the local-decl Set arm in LlvmBackend_Setup.cpp), but the head
+    // name alone reads as array-backed (isArrayBackedCollectionName lists both),
+    // so this site bz_array_free'd the hash table. Before #6776 the two structs
+    // shared a {ptr, count, capacity} prefix and the misroute only leaked the
+    // table's order array and keys; with the tagged bz_array_t layout (§8.2)
+    // the free reads `data` off the table's `capacity` word. MEASURED on
+    // 78d28fd2, ASan armed: `var l := new Set<int>(); l := new Set<int>();`
+    // SEGV in bz_array_free (plain build: `free(): invalid pointer`, rc 134);
+    // `SortedSet<int>` and `Set<string>` the same. The dict arm below is the
+    // one the scope-end pass takes for this very entry, so the displaced table
+    // is freed exactly as the final one is.
+    if (entry->dict) isDict = true;
     llvm::Value* old = builder_.CreateLoad(ptrTy(), addr, "coll.reassign.old");
     llvm::Value* nullp = llvm::ConstantPointerNull::get(ptrTy());
     llvm::Value* live = builder_.CreateICmpNE(old, nullp, "coll.reassign.live");
