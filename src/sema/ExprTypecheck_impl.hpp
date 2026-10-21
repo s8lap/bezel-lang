@@ -3951,6 +3951,18 @@ private:
     // receiver, interface chain; the method's own type parameters excluded).
     const TypeRef* formalTypeAtReceiver(const TypeRef* pt, MethodSymbol* cand,
                                         const ast::Expr* recvTarget);
+    // fix #6268 (§27.3 / §22.6, v0.339): procedure lambda literals whose
+    // §27.3 target check the lambda arm DEFERRED because the threaded formal
+    // belonged to one member of an overload set (`pendingLambdaTargetAmbiguous_`).
+    // The call / `new` site checks each against the formal of the candidate
+    // overload resolution finally CHOSE (`checkDeferredProcedureLambdaArgs`).
+    std::unordered_set<const ast::LambdaExpr*> deferredProcedureLambdas_;
+    // `formalTypeAt(j)` is the chosen candidate's declared type of formal j;
+    // `paramToArg` its §22.5 binding of the call's arguments.
+    void checkDeferredProcedureLambdaArgs(
+        const std::vector<ast::CallArgument>& args,
+        const std::vector<int>& paramToArg,
+        const std::function<const TypeRef*(std::size_t)>& formalTypeAt);
 
     // fix #6312 (§14.5, §22.6, v0.338): a call whose explicit type-argument
     // list left exactly ONE generic candidate of an overload set, mapped to

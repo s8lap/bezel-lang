@@ -1192,6 +1192,38 @@ bool ExprTC::procedureLambdaInapplicableAt(const ast::Expr* arg,
                     (slot->kind == TypeRef::Kind::Named && slot->declaration));
 }
 
+// fix #6268 (§27.3 / §22.6, v0.339): the lambda arm suppresses #6161's §27.3
+// target check when the formal it was threaded came from one member of an
+// overload set (`pendingLambdaTargetAmbiguous_`), because that formal is not
+// necessarily the resolution's pick. Once the call site knows its CHOSEN
+// candidate, the check runs here against that candidate's formal — so a
+// procedure lambda reaching a value-returning slot is rejected whether the
+// callee had several same-name candidates of other arities, an override
+// chain, or a same-name extension for another receiver.
+void ExprTC::checkDeferredProcedureLambdaArgs(
+    const std::vector<ast::CallArgument>& args,
+    const std::vector<int>& paramToArg,
+    const std::function<const TypeRef*(std::size_t)>& formalTypeAt) {
+    if (deferredProcedureLambdas_.empty()) return;
+    for (std::size_t j = 0; j < paramToArg.size(); ++j) {
+        const int ai = paramToArg[j];
+        if (ai < 0 || static_cast<std::size_t>(ai) >= args.size()) continue;
+        auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+            args[static_cast<std::size_t>(ai)].value.get());
+        if (!lam) continue;
+        auto it = deferredProcedureLambdas_.find(lam);
+        if (it == deferredProcedureLambdas_.end()) continue;
+        deferredProcedureLambdas_.erase(it);
+        if (!procedureLambdaInapplicableAt(lam, formalTypeAt(j))) continue;
+        ctx_.diagnostics().report(
+            Severity::Error, lam->span.begin,
+            "a procedure-bodied lambda (no path executes a "
+            "value-carrying `return`) does not convert to a "
+            "function type whose return type is a value "
+            "(\xc2\xa7""27.3)");
+    }
+}
+
 // fix #6554 (§5.1, v0.338): the integer-primitive predicate, local to this
 // TU. The copy in ExprTypecheck.cpp is file-static, and this file needs the
 // same question answered for the pre-ranking gate below. `char` is excluded
@@ -3225,7 +3257,8 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // fell to whatever the per-path fallback chose (the first declared
     // `() -> int` overload, for `M(f: () -> int)` declared before
     // `M(f: () -> ())`). When EVERY candidate is eliminated the set is left
-    // as it was (the call is an error; reporting it is #6268's).
+    // as it was: the call is an error, which the §27.3 check reports against
+    // the chosen candidate (`checkDeferredProcedureLambdaArgs`, #6268).
     {
         const ast::Expr* lamRecv = callReceiverTarget(ce);
         std::vector<MethodSymbol*> lc;
@@ -6159,6 +6192,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         if (chosen && chosen != ms0) {
             ctx_.setExprSymbol(ce.callee.get(), chosen);
             calleeSym = chosen;
+        }
+        // fix #6268 (§27.3 / §22.6, v0.339): the deferred procedure-lambda
+        // target check, against the formal of the candidate chosen above.
+        if (chosen && !deferredProcedureLambdas_.empty()) {
+            BindResult cb = bindArgsToParams(
+                sema::FormalsView::of(*chosen), ce.args, ce.span.begin,
+                /*calleeDesc=*/std::string(), /*emit=*/false);
+            if (cb.ok)
+                checkDeferredProcedureLambdaArgs(
+                    ce.args, cb.paramToArg,
+                    [&](std::size_t j) -> const TypeRef* {
+                        const ast::Type* dt =
+                            sema::formalParamDeclType(*chosen, j);
+                        return formalTypeAtReceiver(
+                            dt ? ctx_.resolvedType(*dt)
+                               : sema::formalParamResolvedType(*chosen, j),
+                            chosen, callReceiverTarget(ce));
+                    });
         }
     }
     // fix #5641 (§15.1 / §14.2): when calleeSym is null (TryPop, TryPeek, etc.
@@ -21552,8 +21603,23 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     "names, or takes fewer arguments (§22.5, §22.6)");
             return;
         }
+        // fix #6268 (§27.3 / §22.6, v0.339): the deferred procedure-lambda
+        // target check against candidate `c`'s formals, once `c` is the
+        // constructor this `new` resolves to.
+        auto checkDeferredLambdasAgainst = [&](std::size_t c) {
+            const auto& cps = decls[c]->params;
+            checkDeferredProcedureLambdaArgs(
+                ne.args, binds[c].paramToArg,
+                [&](std::size_t j) -> const TypeRef* {
+                    return j < cps.size() && cps[j].type
+                               ? substituteMemberType(
+                                     ctx_.resolvedType(*cps[j].type), &ne, t)
+                               : nullptr;
+                });
+        };
         if (decls.size() == 1) {
             if (emitModifierMismatch(decls[0]->params, binds[0])) return;
+            checkDeferredLambdasAgainst(0);
             // fix #4853 (§22.5 / §22.6 stage 1, v0.307): the §22.5 binder
             // admitted exactly one candidate, so it is the call's constructor
             // (checkArgsAgainstParams below rejects the program if it is not
@@ -21630,8 +21696,8 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // function-typed column left `resolveOverload` `Undecidable`, nothing
         // was published, and codegen's `ctorForArgs` proxy lowered the FIRST
         // declared candidate: `K(f: () -> int)` over `K(f: () -> ())`. When
-        // every candidate is ruled out the set is left as it was (the call is
-        // an error; reporting it is #6268's).
+        // every candidate is ruled out the call is an error, reported by the
+        // §27.3 check against the first candidate (#6268).
         {
             std::vector<const ast::ConstructorDecl*> ldecls;
             std::vector<ConstructorSymbol*> ldeclSyms;
@@ -21657,7 +21723,9 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     lbinds.push_back(binds[c]);
                 }
             }
-            if (!ldecls.empty() && ldecls.size() != decls.size()) {
+            if (ldecls.empty()) {
+                checkDeferredLambdasAgainst(0);
+            } else if (ldecls.size() != decls.size()) {
                 decls.swap(ldecls);
                 declSyms.swap(ldeclSyms);
                 binds.swap(lbinds);
@@ -21666,6 +21734,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         if (decls.size() == 1) {
             // §22.3 filtering just above admitted exactly one candidate —
             // publish it exactly as the pre-filter single-candidate arm does.
+            checkDeferredLambdasAgainst(0);
             ctx_.setResolvedNewCtor(&ne.args, declSyms[0]);
             checkArgsAgainstParams(
                 decls[0]->params, ne.args, ne.span.begin,
@@ -21810,8 +21879,10 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             return;
         }
         if (newRes.outcome == OverloadOutcome::Resolved &&
-            newRes.winnerIndex < declSyms.size())
+            newRes.winnerIndex < declSyms.size()) {
+            checkDeferredLambdasAgainst(newRes.winnerIndex);
             ctx_.setResolvedNewCtor(&ne.args, declSyms[newRes.winnerIndex]);
+        }
         return;
     }
     if (ctors.empty()) {

@@ -13252,6 +13252,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         "function type whose return type is a value "
                         "(\xc2\xa7""27.3)");
                 }
+                // fix #6268 (§27.3 / §22.6, v0.339): the target came from ONE
+                // member of an overload set; the call / `new` site re-runs
+                // this check against the candidate resolution chooses
+                // (`checkDeferredProcedureLambdaArgs`).
+                if (lamTargetRet && lamTargetAmbiguous && !lam->isAsync &&
+                    !lamHasValueReturn && !lamDiverges)
+                    deferredProcedureLambdas_.insert(lam);
                 // §27.3 (v0.226, #2107): the divergent-return error fires only
                 // when the lambda has NEITHER a return-type ascription NOR a
                 // target return type (lamTargetRet), AND the body has ≥2 value
