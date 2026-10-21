@@ -4318,6 +4318,17 @@ private:
     // dispatch whose receiver is a concrete generic-interface instantiation
     // uses it to select that instantiation's itab (bz_itable_lookup_inst).
     const sema::TypeRef* pendingIfaceRecvTy_ = nullptr;
+    // fix #6779 (§14.1 / §2.8.3 rule 4, v0.340): the call expression lowerCall
+    // (or lowerNullCondCall) is about to hand to emitMethodCall, so the #1943
+    // gate can read its explicit type-argument list. Same lifetime as
+    // pendingIfaceRecvTy_: set immediately before the call, consumed (cleared)
+    // at emitMethodCall's entry.
+    const ast::CallExpr* pendingMethodCallExpr_ = nullptr;
+    // fix #6779: see the definition in LlvmBackend_Calls2.cpp.
+    bool rejectNonIntPlaceholderTypeArg6779(
+        const sema::MethodSymbol* ms, const std::vector<llvm::Value*>& args,
+        const std::vector<const ast::Expr*>* argExprs,
+        const ast::CallExpr* call, SourceLocation callLoc, bool virtualCall);
     // §24 (#477 B7): per-class event-accessor functions (emit-once cache),
     // keyed by the class's own instance EventSymbol.
     std::unordered_map<const sema::EventSymbol*, llvm::Function*>

@@ -15453,6 +15453,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             call.callee.get()))
         if (rma->target)
             pendingIfaceRecvTy_ = ctx_.exprType(*rma->target);
+    // fix #6779: and the call itself, for the #1943 gate's type arguments.
+    pendingMethodCallExpr_ = &call;
     // fix #5244 / #5262 (§4.6 / §28.9, v0.313): CALLER-SIDE PIN for a
     // borrowed by-value `string` / `string?` argument. See
     // emitBorrowedStringArgPins for the full rationale. #5262 measured the
@@ -16867,6 +16869,121 @@ static std::string boundBodyReject5009(std::string_view name,
            std::string(virtualCall ? ", or make it non-virtual" : "");
 }
 
+// fix #6779 (§14.1 / §2.8.2 / §2.8.3 rule 4, v0.340): the #1943 width gate
+// compares LLVM types, so it lets through every type argument that ALSO
+// lowers to (or is coerced to) the i32 placeholder: `char`, an enum, `uint`,
+// `short`, `byte`. The defining module's template then runs with the value
+// as an `int`, and wherever the body depends on what `T` IS the answer is
+// silently wrong. MEASURED on 283db84e: `H.Show<char>('a')` printed 97,
+// `H.Eq<char|Color|uint|short>(v, o)` with an equal boxed payload printed
+// False. §14.1 makes the call an instantiation site at its explicit or
+// inferred type arguments; §2.8.2 clause 2 requires that an external
+// instantiation "behaves identically to a same-module instantiation", and
+// "An implementation unable to carry some body shape in its interface
+// format must reject the export, or the import, with a diagnostic naming
+// the shape; it must not alter the instantiation's semantics." §2.8.3
+// rule 4 makes the boxed value's runtime type part of that: `is` tests and
+// patterns "match identically regardless of which artifact produced the
+// value". A located reject is the sanctioned fallback.
+//
+// Reads the type argument two ways, both only ever naming a CONCRETE type
+// (a still-unbound caller type parameter, i.e. the caller's own template
+// pass, is skipped):
+//   (a) an explicit call-site type argument that is not `int` but lowers to
+//       the placeholder's i32 (char, enum, uint): no argument need carry it;
+//   (b) an argument at a bare-`T` formal whose type is not `int`: the
+//       narrower integers (`short`, `byte`) reach the i32 slot by widening,
+//       which is why (a) alone misses them.
+// An explicit `long` with an `int` literal argument (`Count<long>(99)`, the
+// #1943 T5 control) is neither and keeps compiling, as before.
+bool Emitter::rejectNonIntPlaceholderTypeArg6779(
+        const sema::MethodSymbol* ms, const std::vector<llvm::Value*>& args,
+        const std::vector<const ast::Expr*>* argExprs,
+        const ast::CallExpr* call, SourceLocation callLoc, bool virtualCall) {
+    if (!ms || !ctx_.isImported(ms) || ms->genericParams.empty() ||
+        emittingGenericTemplateBody_)
+        return false;
+    auto isInt = [](const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Primitive &&
+               t->primitive == sema::PrimitiveType::Int && !t->nullable;
+    };
+    auto isOpenTypeParam = [](const sema::TypeRef* t) {
+        return t && t->kind == sema::TypeRef::Kind::Named && !t->declaration;
+    };
+    auto report = [&](SourceLocation loc, const sema::TypeRef* t) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "calling imported generic method `" + std::string(ms->name) +
+            "` with a type argument whose representation is not the "
+            "compiled `int` (i32) placeholder \xE2\x80\x94 here `" +
+            spec85TypeRefQualifiedName(t) + "`, which is not `int` \xE2\x80\x94 "
+            "is not yet monomorphized across the module boundary" +
+            std::string(virtualCall ? " for a virtual call" : "") +
+            " (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 / #1943, #6779): the "
+            "method's body was compiled in its defining module against the "
+            "`int` placeholder, so it would box, format and compare the value "
+            "as an `int`. Call it within the module that defines it, use an "
+            "`int` instantiation, or have it take a non-generic parameter");
+        return true;
+    };
+    // (a) explicit type arguments.
+    if (call) {
+        const std::vector<std::unique_ptr<ast::Type>>* tas = nullptr;
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call->callee.get()))
+            tas = &ma->typeArgs;
+        else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                     call->callee.get()))
+            tas = &ncm->typeArgs;
+        else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                     call->callee.get()))
+            tas = &id->typeArgs;
+        const sema::Symbol* named =
+            call->callee ? ctx_.exprSymbol(*call->callee) : nullptr;
+        if (tas && named == ms) {
+            for (const auto& ta : *tas) {
+                if (!ta) continue;
+                const sema::TypeRef* t = ctx_.resolvedType(*ta);
+                if (t && !genericSubstSemaTy_.empty())
+                    t = substituteTypeRefLocal(t, genericSubstSemaTy_);
+                if (!t || isInt(t) || isOpenTypeParam(t)) continue;
+                llvm::Type* lt = lowerTypeRef(t);
+                if (lt && lt->isIntegerTy(32))
+                    return report(ta->span.begin.line ? ta->span.begin
+                                                      : callLoc,
+                                  t);
+            }
+        }
+    }
+    // (b) arguments at a bare-`T` formal.
+    if (!argExprs) return false;
+    const std::size_t off = isStaticMethod(const_cast<sema::MethodSymbol*>(ms)) ? 0u : 1u;
+    for (std::size_t ai = off; ai < args.size() && ai < argExprs->size();
+         ++ai) {
+        const std::size_t pi = ai - off;
+        if (pi >= ms->params.size()) break;
+        auto* ps = dynamic_cast<const sema::ParameterSymbol*>(ms->params[pi]);
+        const sema::TypeRef* formal = ps ? ps->resolvedDeclType : nullptr;
+        if (!formal || !isOpenTypeParam(formal) || formal->nullable) continue;
+        bool ownParam = false;
+        for (const sema::Symbol* gp : ms->genericParams)
+            if (gp && gp->name == formal->headName()) {
+                ownParam = true;
+                break;
+            }
+        if (!ownParam) continue;
+        const ast::Expr* e = (*argExprs)[ai];
+        if (!e || dynamic_cast<const ast::NullLiteralExpr*>(e)) continue;
+        const sema::TypeRef* t = resolveTypeParamRef(ctx_.exprType(*e));
+        if (!t || isInt(t) || isOpenTypeParam(t)) continue;
+        // Only a value that reaches the i32 slot unchanged in width: anything
+        // else is the width gate's (or #5057's) to report.
+        if (!args[ai] || !args[ai]->getType()->isIntegerTy(32)) continue;
+        return report(e->span.begin, t);
+    }
+    return false;
+}
+
 llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             std::vector<llvm::Value*>& args,
                             bool baseQualified,
@@ -16884,6 +17001,9 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // fix #5115: consume the receiver type lowerCall recorded (if any).
     const sema::TypeRef* ifaceRecvTy = pendingIfaceRecvTy_;
     pendingIfaceRecvTy_ = nullptr;
+    // fix #6779: consume the call expression lowerCall recorded (if any).
+    const ast::CallExpr* callExpr = pendingMethodCallExpr_;
+    pendingMethodCallExpr_ = nullptr;
     // fix #4963 (§5.1 `S → T → T?` / §14.1, v0.307): under an active generic
     // substitution a formal declared `T?` (or a bare `T` bound to a nullable
     // value type, #4830 case C) is not a nullable value type until it is
@@ -17775,6 +17895,13 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 if (fnTy->getReturnType()->isVoidTy()) return nullptr;
                 return llvm::PoisonValue::get(fnTy->getReturnType());
             }
+            // fix #6779: the same width, a different type.
+            if (rejectNonIntPlaceholderTypeArg6779(ms, args, argExprs,
+                                                   callExpr, callLoc,
+                                                   /*virtualCall=*/true)) {
+                if (fnTy->getReturnType()->isVoidTy()) return nullptr;
+                return llvm::PoisonValue::get(fnTy->getReturnType());
+            }
         }
         // fix #5009 fix-forward 4 (§14.1 / §2.8.3 rule 4, v0.307): the width
         // gate above only sees a type argument that crosses as an ARGUMENT. A
@@ -18164,6 +18291,10 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                 "monomorphization lands");
             return llvm::PoisonValue::get(callee->getReturnType());
         }
+        // fix #6779: the same width, a different type.
+        if (rejectNonIntPlaceholderTypeArg6779(ms, args, argExprs, callExpr,
+                                               callLoc, /*virtualCall=*/false))
+            return llvm::PoisonValue::get(callee->getReturnType());
     }
     // fix #5009 fix-forward 5 (§14.1 / §2.8.3 rule 4, v0.307): the direct-call
     // sibling of the slot-call gate in the virtual arm above. The width gate
@@ -21574,6 +21705,7 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     auto savedNcSubst = genericSubst_;
     auto savedNcSemaTy = genericSubstSemaTy_;
     applyMethodGenericSubst(call, ms);
+    pendingMethodCallExpr_ = &call;  // fix #6779: see lowerCall
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs,
                                     call.span.begin);
     genericSubst_ = std::move(savedNcSubst);
