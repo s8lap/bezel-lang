@@ -7946,6 +7946,70 @@ void Resolver::checkHidingAndOverride() {
             }
             auto* ms = dynamic_cast<MemberSymbol*>(m);
             if (!ms || ms->name.empty()) continue;
+            // fix #6729 (§12.2, §11.7, §8.1, v0.340): `GetType` and
+            // `ReferenceEquals` are inherited members of every class, and
+            // "`GetType` and `ReferenceEquals` block as every other inherited
+            // member does" (§12.2). They have no `override` escape (`GetType`
+            // is non-virtual; `ReferenceEquals` is static), so a class with
+            // instances may declare no member of either name, static or not,
+            // whatever its kind. A static class carries no instance surface
+            // (§11.7): its static `GetType` is admitted, while its static
+            // `ReferenceEquals` is blocked, as a static member of an inherited
+            // name is everywhere (§12.2's static clause). Its instance members
+            // are the §11.7 rule's (checkStaticClassMember), not reported here.
+            if (ms->name == "GetType" || ms->name == "ReferenceEquals") {
+                bool staticClassG = false;
+                for (std::string_view mod : t->modifiers)
+                    if (mod == "static") staticClassG = true;
+                const bool staticMemberG = hasMod(ms, "static");
+                // Blocked in a class with instances, whatever the member's
+                // kind or static-ness. In a static class only a static
+                // `ReferenceEquals` is blocked (§11.7): its static `GetType`
+                // is admitted, and its instance members are §11.7's rule.
+                const bool blockedG =
+                    !staticClassG ||
+                    (ms->name == "ReferenceEquals" && staticMemberG);
+                if (blockedG) {
+                    // Kind words follow the Object-trio path's convention.
+                    std::string_view kindG = "member ";
+                    if (dynamic_cast<const PropertySymbol*>(ms))
+                        kindG = "property ";
+                    else if (dynamic_cast<const FieldSymbol*>(ms))
+                        kindG = "field ";
+                    else if (dynamic_cast<const NestedTypeSymbol*>(ms))
+                        kindG = "nested type ";
+                    else if (staticMemberG)
+                        kindG = "static member ";
+                    if (ms->name == "GetType") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string(kindG) + "`GetType` hides the "
+                            "inherited `Object.GetType`; hiding is forbidden "
+                            "\xe2\x80\x94 `GetType` is non-virtual, so "
+                            "`override` is not available either: choose a "
+                            "different name (\xC2\xA7""12.2, \xC2\xA7""8.2)");
+                    } else if (staticClassG) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string(kindG) + "`ReferenceEquals` hides the "
+                            "inherited `Object.ReferenceEquals`; `Object`'s "
+                            "static `ReferenceEquals` is inherited by a static "
+                            "class as by every class, and a static member of "
+                            "that name is blocked there (\xC2\xA7""11.7, "
+                            "\xC2\xA7""12.2)");
+                    } else {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ms->declLoc,
+                            std::string(kindG) + "`ReferenceEquals` hides the "
+                            "inherited `Object.ReferenceEquals`; hiding is "
+                            "forbidden \xe2\x80\x94 `ReferenceEquals` is "
+                            "static, so `override` is not available either: "
+                            "choose a different name (\xC2\xA7""12.2, "
+                            "\xC2\xA7""8.1)");
+                    }
+                    continue;
+                }
+            }
             auto it = baseMembers.find(ms->name);
             if (it == baseMembers.end()) {
                 // fix #2984 (§12.2 / §31.4, v0.240): no USER ancestor declares
