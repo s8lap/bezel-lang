@@ -7256,8 +7256,24 @@ bool MethodOwnership::receiverCarriesBorrowForSink() const {
         return carries;
     }
     if (receiverType_->kind == ast::TypeDeclKind::Choice)
-        return isBorrowBearingChoice(&self);
+        return receiverIsMoveOnlyChoice() || isBorrowBearingChoice(&self);
     return false;  // enum: carries no borrow
+}
+
+// fix #6721 (§9.4, v0.340): "In a move-only receiver's member body a lambda's
+// capture is §28.9's move-only capture — a borrow of the in-place storage,
+// bounded by the call — and such a closure may not outlive the activation."
+// An owning-classified choice (§35.4) is the move-only value kind a member
+// body can be declared on (§15.3). Read on the declaration: a generic choice's
+// per-instantiation classification is not judged here (#6767).
+bool MethodOwnership::receiverIsMoveOnlyChoice() const {
+    if (!receiverType_ || receiverType_->kind != ast::TypeDeclKind::Choice)
+        return false;
+    sema::TypeRef self;
+    self.kind = sema::TypeRef::Kind::Named;
+    self.declaration = receiverType_;
+    auto verdict = common::classifyChoiceType(&self, ctx_);
+    return verdict && *verdict == common::ChoiceClassification::Owning;
 }
 
 const ast::IdentifierExpr* MethodOwnership::receiverCaptureIn(
@@ -7326,11 +7342,16 @@ void MethodOwnership::reportReceiverCaptureAtSink(
                          : std::string("the receiver (`") +
                                std::string(id.name) + "` reads `this`)") +
            " — in an instance member of " + article + kind +
-           (valueKind ? ", the closure captures a copy of the receiver "
-                        "value and the copy carries the borrows that value "
-                        "holds (§9.4, §9.7)"
-                      : ", `this` is a borrow whose source is the caller's "
-                        "object") +
+           (receiverIsMoveOnlyChoice()
+                ? " that is move-only (an owning-classified choice, §35.4), "
+                  "the closure's capture of `this` is a borrow of the "
+                  "receiver's in-place storage, bounded by the call (§9.4, "
+                  "§28.9)"
+            : valueKind ? ", the closure captures a copy of the receiver "
+                          "value and the copy carries the borrows that value "
+                          "holds (§9.4, §9.7)"
+                        : ", `this` is a borrow whose source is the caller's "
+                          "object") +
            ", so the closure's source set is non-empty, and a function value "
            "with a non-empty source set may not be stored in a field, in any "
            "collection, in a property or indexer, or through an `out` or "

@@ -17,10 +17,12 @@
 //   and not `abstract`." This rule's hazard — a derived override running over
 //   not-yet-initialized fields — genuinely requires inheritance to exist.
 //
-//   Rule 3: capturing `this` in a lambda is NOT itself an observation ("is
-//   not gated by rule 1"); only an admitted closure's INVOCATION before
-//   construction completes would be one (a residual this file does not
-//   reach).
+//   Rule 3: capturing a CLASS's `this` in a lambda is NOT itself an
+//   observation ("is not gated by rule 1"). v0.340 adds: "In a value kind's
+//   constructor body the capture is instead a copy of the value under
+//   construction (§9.4), so it observes at capture: it is a whole-value read
+//   of `this` and rule 1 gates it as one" — fix #6721; see the two lambda
+//   rows below.
 //
 // Before this fix, `DefiniteAssignment.cpp`'s `runRecordConstructor`
 // (fix #4001/#2207) tracked `fieldsNeedingInit_`/`assignedFields_` for a
@@ -62,8 +64,9 @@
 // `instance_method_call_after_field_assigned_accepted_spec_22_7` and
 // `override_record_method_after_assignment_accepted` (field already assigned
 // — the gate was never going to fire either way);
-// `lambda_capture_of_this_before_field_assigned_accepted_spec_22_7` (rule 3:
-// capture is never gated by rule 1, pre- or post-fix);
+// `lambda_capture_of_this_before_field_assigned_accepted_spec_22_7` (rule 3
+// as it read before v0.340; fix #6721 flipped it to the REJECT row
+// `lambda_capture_of_this_before_field_assigned_rejected_spec_22_7_rule_3`);
 // `field_initializer_satisfies_gate_at_entry_accepted_spec_22_7` (the field
 // carries an initializer, so it was never in `fieldsNeedingInit_` regardless
 // of `recordCtorMode_` reaching `gateObservation`);
@@ -257,23 +260,20 @@ BEZEL_TEST(sema_record_ctor_observation_gate_4014,
         42);
 }
 
-// §22.7 rule 3: capturing `this` in a lambda is NOT itself a synchronous
-// observation ("is not gated by rule 1"). The lambda is bound but never
-// invoked before the field is assigned — must be ACCEPTED even though the
-// field is still unassigned at the capture site. 42 round-trips (the lambda
-// is invoked only after `Extra` is assigned).
-//
-// fix #6630 (§28.3 sink rule, v0.340): the lambda is bound to a LOCAL and
-// invoked after the assignment, rather than stored into a function-typed
-// property and invoked from `Main`. A property slot assigned a function value
-// is a function-typed holder (§28.3 *Function-typed holders*), and this
-// record carries a borrow (its `Extra: Widget4014`, §9.7), so a closure over
-// its `this` has a non-empty source set and the former spelling is now
-// rejected at the store; rule 3's question — capture before assignment is not
-// an observation — is the same on the local.
+// §22.7 rule 3 (v0.340): "In a value kind's constructor body the capture is
+// instead a copy of the value under construction (§9.4), so it observes at
+// capture: it is a whole-value read of `this` and rule 1 gates it as one,
+// admitted where every field the gate names is definitely assigned, the
+// closure holding the value as of its formation." The lambda below captures
+// `this` before the non-nullable `Extra` is assigned, so its formation is
+// rejected (fix #6721). Before v0.340 this row was the ACCEPT row
+// `lambda_capture_of_this_before_field_assigned_accepted_spec_22_7` (rule 3
+// then read "capturing `this` ... is not gated by rule 1" for every kind);
+// with §9.4's by-copy capture the accepted program would invoke `Peek` over a
+// copy whose `Extra` is still the null watermark.
 BEZEL_TEST(sema_record_ctor_observation_gate_4014,
-           lambda_capture_of_this_before_field_assigned_accepted_spec_22_7) {
-    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
+           lambda_capture_of_this_before_field_assigned_rejected_spec_22_7_rule_3) {
+    auto r = runAot(std::string(kWidget4014) +
         "public record RecordObsLambda4014 "
         "  public readonly property Extra: Widget4014; "
         "  public readonly property Cached: int; "
@@ -288,6 +288,63 @@ BEZEL_TEST(sema_record_ctor_observation_gate_4014,
         "  public static method Main(): int "
         "    var w := new Widget4014(42); "
         "    var c := new RecordObsLambda4014(w); "
+        "    return c.Cached; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a lambda capturing `this`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "before non-nullable field `Extra`"));
+}
+
+// The same capture through a BARE instance-member read (§9.4: "a lambda that
+// names `this`, explicitly or through a bare member read resolving to the
+// receiver") is the same whole-value read — rejected the same way.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           lambda_bare_member_capture_before_field_assigned_rejected_spec_22_7_rule_3) {
+    auto r = runAot(std::string(kWidget4014) +
+        "public record RecordObsLambdaBare4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public readonly property Cached: int; "
+        "  public method Peek(): int return Extra.Render(); end Peek; "
+        "  public constructor(w: Widget4014) "
+        "    var deferred := lambda(): int => Peek(); "
+        "    Extra := w; "
+        "    Cached := deferred(); "
+        "  end constructor; "
+        "end RecordObsLambdaBare4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsLambdaBare4014(w); "
+        "    return c.Cached; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "a lambda capturing `this`"));
+}
+
+// Rule 3's admitted case: the capture formed AFTER every gated field is
+// assigned. The closure holds the value as of its formation; 42 round-trips.
+// fix #6630 (§28.3 sink rule, v0.340): bound to a LOCAL and invoked in the
+// body — this record carries a borrow (its `Extra: Widget4014`, §9.7), so a
+// closure over its `this` may not be stored in a function-typed property.
+BEZEL_TEST(sema_record_ctor_observation_gate_4014,
+           lambda_capture_of_this_after_field_assigned_accepted_spec_22_7_rule_3) {
+    BEZEL_EXPECT_EQ(runProg(std::string(kWidget4014) +
+        "public record RecordObsLambdaAfter4014 "
+        "  public readonly property Extra: Widget4014; "
+        "  public readonly property Cached: int; "
+        "  public method Peek(): int return Extra.Render(); end Peek; "
+        "  public constructor(w: Widget4014) "
+        "    Extra := w; "
+        "    var deferred := lambda(): int => this.Peek(); "
+        "    Cached := deferred(); "
+        "  end constructor; "
+        "end RecordObsLambdaAfter4014; "
+        "class C "
+        "  public static method Main(): int "
+        "    var w := new Widget4014(42); "
+        "    var c := new RecordObsLambdaAfter4014(w); "
         "    return c.Cached; "
         "  end Main; "
         "end C;"),

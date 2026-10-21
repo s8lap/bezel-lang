@@ -850,6 +850,10 @@ private:
     // lambda and the program SIGSEGVs at runtime — #747 R42). Saved/restored
     // (not just set) so nested lambdas behave correctly.
     bool inLambda_ = false;
+    // fix #6721 (§9.4 / §22.7, v0.340): the outermost lambda being visited
+    // inside a record constructor body (instance), or null. An identifier in
+    // its body that names the receiver marks it on the SemaContext.
+    const ast::LambdaExpr* ctorLambdaRoot_ = nullptr;
 
     // §22.16 (v0.240, #2942): true while visiting a contract clause's
     // expression (`requires` / `ensures`). Used by the IdentifierExpr

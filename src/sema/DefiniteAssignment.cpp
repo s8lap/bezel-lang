@@ -2189,6 +2189,14 @@ private:
             // lambda's `out`-parameter set and body are analyzed
             // independently — capturing semantics (the wider closure-DA
             // problem) are deliberately out of scope here.
+            // fix #6721 (§9.4 / §22.7 rule 3, v0.340): "In a value kind's
+            // constructor body the same copy is a whole-value read of `this`
+            // under §22.7 rule 1" — a lambda here that names the receiver
+            // copies it at formation, so rule 1 gates the formation.
+            if (recordCtorMode_ && ctx_.ctorLambdaCapturesThis(*lam))
+                gateObservation(lam->span.begin,
+                                "a lambda capturing `this`, which copies the "
+                                "receiver value at formation (§9.4)");
             if (hasOutParam(lam->params)) {
                 MethodDA da(ctx_);
                 if (lam->isBlockBody) {

@@ -1622,6 +1622,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // cannot introduce a double free; the worst arithmetic error is a
         // surviving leak. Disjoint from `freeCellInEnvdtor` by construction.
         bool                   retainCellInEnv = false;
+        // fix #6721 (§9.4, v0.340, *The receiver value is fixed at the call*):
+        // non-null when this is the `this` capture of a COPYABLE value-kind
+        // receiver (a record, or a choice that is not owning-classified). The
+        // env field then holds a fresh heap cell carrying a copy of the
+        // receiver value — "a closure formed in a copyable value kind's member
+        // body captures the fixed receiver value by copy into its heap capture
+        // cell" — whose string members the capture retained, and the envdtor
+        // releases them and frees the cell, as for a captured value local.
+        // Null for a class receiver (`this` is a borrow of the object, §28.9)
+        // and for a move-only receiver (§9.4: a borrow of in-place storage
+        // bounded by the call; the escape is rejected in ownership).
+        const sema::TypeRef*   thisCopyTy = nullptr;
     };
     std::vector<CaptureEntry> captures;
 
@@ -3050,6 +3062,44 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         ce.sym = nullptr;
         ce.decl = nullptr;
         ce.isThis = true;
+        // fix #6721 (§9.4, v0.340): a copyable value receiver is captured BY
+        // COPY. `currentThis_` is the address of the receiver's in-place
+        // storage (CG29) — the caller's slot, or a temporary bounded by the
+        // call — so storing it raw left an escaping closure reading a dead
+        // frame (stack-use-after-return). Copy the value into a heap cell the
+        // env owns; the body binds `this` to the cell exactly as it bound the
+        // receiver address, so member reads lower unchanged.
+        if (const sema::TypeRef* copyTy = thisCaptureCopyType()) {
+            RecordSubstGuard subst(this, copyTy);
+            const sema::TypeSymbol* rts = copyTy->declaration;
+            llvm::StructType* st =
+                rts->kind == ast::TypeDeclKind::Choice ? choiceStruct(rts)
+                                                       : recordStruct(rts);
+            if (st) {
+                const llvm::DataLayout& dl = module_->getDataLayout();
+                uint64_t sz = dl.getTypeAllocSize(st);
+                llvm::Value* cell = builder_.CreateCall(
+                    callocFn(), {builder_.getInt64(1),
+                                 builder_.getInt64(sz ? sz : 1)},
+                    "this.copy");
+                llvm::Value* v = builder_.CreateLoad(st, currentThis_,
+                                                     "this.copy.val");
+                builder_.CreateStore(v, cell);
+                // The cell owns its string members (§9.4: the capture
+                // contributes what a captured local of the receiver's type
+                // contributes) — retain them; the envdtor releases them.
+                if (rts->kind == ast::TypeDeclKind::Choice)
+                    emitValueLikeChoiceActiveCaseStrRelease(
+                        cell, rts, copyTy, /*retain=*/true);
+                else
+                    emitRecordStringFieldRetains_impl(cell, copyTy);
+                ce.envValue = cell;
+                ce.thisCopyTy = copyTy;
+                // The choice retain walk is tag-switched (new blocks): the
+                // restore below must land after it, as for boxing above.
+                savedBB = builder_.GetInsertBlock();
+            }
+        }
         captures.push_back(ce);
     }
 
@@ -4195,7 +4245,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // marked where it is lowered.
             if (checkedDisposal_) {
                 if (ce.isThis) {
-                    emitCdMarkEscaped(ce.envValue);
+                    // fix #6721: a by-copy cell is the env's own block, not a
+                    // class instance — nothing to mark.
+                    if (!ce.thisCopyTy) emitCdMarkEscaped(ce.envValue);
                 } else if (ce.valTy && ce.valTy->isPointerTy() &&
                            (!ce.semaTy || cdMarkableType(ce.semaTy))) {
                     builder_.CreateCall(
@@ -4262,7 +4314,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     {
         bool hasNonThisCapture = false;
         for (const auto& ce : captures)
-            if (!ce.isThis) { hasNonThisCapture = true; break; }
+            if (!ce.isThis || ce.thisCopyTy) {  // fix #6721: the copy cell
+                hasNonThisCapture = true;          // is freed by the envdtor
+                break;
+            }
 
         if (!hasNonThisCapture || envFieldTys.empty()) {
             initClosureEnvdtor(closureObj); // null — no env cells to free
@@ -4324,6 +4379,28 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
             for (std::size_t i = 0; i < captures.size(); ++i) {
                 const CaptureEntry& ce = captures[i];
+                if (ce.isThis && ce.thisCopyTy) {
+                    // fix #6721 (§9.4, v0.340): release the by-copy receiver
+                    // cell's string members (retained at the capture) and free
+                    // the cell. This env is its only holder.
+                    llvm::Value* fld = builder_.CreateStructGEP(
+                        envTyD, envArg, static_cast<unsigned>(i));
+                    llvm::Value* cell =
+                        builder_.CreateLoad(ptrTy(), fld, "this.copy");
+                    {
+                        RecordSubstGuard subst(this, ce.thisCopyTy);
+                        const sema::TypeSymbol* rts =
+                            ce.thisCopyTy->declaration;
+                        if (rts->kind == ast::TypeDeclKind::Choice)
+                            emitValueLikeChoiceActiveCaseStrRelease(
+                                cell, rts, ce.thisCopyTy, /*retain=*/false);
+                        else
+                            emitRecordStringFieldReleases_impl(
+                                cell, ce.thisCopyTy);
+                    }
+                    builder_.CreateCall(freeFn(), {cell});
+                    continue;
+                }
                 if (ce.isThis) continue;
                 // Load cell pointer from env slot.
                 llvm::Value* fld = builder_.CreateStructGEP(

@@ -1758,6 +1758,32 @@ void ExprTC::normalizeAliasQualifiedBuiltinHead(
 }
 
 void ExprTC::visitExpr(const ast::Expr& e) {
+    // fix #6721 (§9.4, v0.340): inside a lambda formed in a record constructor
+    // body, an identifier naming the receiver — `this`/`base`, or a bare
+    // instance member of the record — makes the lambda's capture a copy of
+    // `this`. Judged on exit, once the identifier is resolved.
+    struct CtorLambdaThisNote {
+        ExprTC* tc; const ast::IdentifierExpr* id;
+        ~CtorLambdaThisNote() {
+            if (!id || !tc->ctorLambdaRoot_) return;
+            bool names = id->name == "this" || id->name == "base";
+            if (!names) {
+                auto* ms = dynamic_cast<MemberSymbol*>(tc->ctx_.exprSymbol(*id));
+                if (ms && ms->parent == tc->currentType_ &&
+                    (dynamic_cast<FieldSymbol*>(ms) ||
+                     dynamic_cast<PropertySymbol*>(ms) ||
+                     dynamic_cast<MethodSymbol*>(ms) ||
+                     dynamic_cast<EventSymbol*>(ms))) {
+                    names = true;
+                    for (std::string_view mod : ms->modifiers)
+                        if (mod == "static" || mod == "const") names = false;
+                }
+            }
+            if (names) tc->ctx_.markCtorLambdaCapturesThis(tc->ctorLambdaRoot_);
+        }
+    } ctorLambdaThisNote{this, ctorLambdaRoot_
+                                   ? dynamic_cast<const ast::IdentifierExpr*>(&e)
+                                   : nullptr};
     // fix #4698 (§2.2, v0.313): normalize `Alias.Builtin.…` heads to the bare
     // built-in before any consumer classifies the expression.
     if (auto* nma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
@@ -12782,6 +12808,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // nested lambdas.
         bool saveInLambda = inLambda_;
         inLambda_ = true;
+        // fix #6721: the outermost lambda of a record constructor body.
+        const ast::LambdaExpr* saveCtorLambdaRoot = ctorLambdaRoot_;
+        if (!ctorLambdaRoot_ && inConstructor_ && !inStaticMember_ &&
+            currentType_ && currentType_->kind == ast::TypeDeclKind::Record)
+            ctorLambdaRoot_ = lam;
         // §22.16 (v0.240, #2942): a lambda body is its own callable, not a
         // clause context. The contextual-keyword diagnostic for `result` /
         // `old` is meaningless inside a lambda (a lambda has no return value
@@ -13251,6 +13282,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         inBindAtom_ = saveInBindAtom;  // §17.15 (#2098)
         inIteratorMethod_ = saveIter;
         inLambda_ = saveInLambda;
+        ctorLambdaRoot_ = saveCtorLambdaRoot;  // fix #6721
         inContractClause_ = saveInContractClause;
         currentClauseKind_ = saveClauseKind;
         loopDepth_ = saveLoop;

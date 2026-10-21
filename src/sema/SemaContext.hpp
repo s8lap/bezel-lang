@@ -544,6 +544,18 @@ public:
         return narrowedValueReads_.count(&e) > 0;
     }
     bool hasNarrowedValueReads() const { return !narrowedValueReads_.empty(); }
+    // fix #6721 (§9.4 / §22.7 rule 3, v0.340): a lambda formed in a record
+    // constructor body whose body names `this` — explicitly or through a bare
+    // instance-member read resolving to the receiver. Its capture copies the
+    // receiver value at formation, a whole-value read of `this` that §22.7
+    // rule 1 gates (DefiniteAssignment). Recorded by ExprTC on the OUTERMOST
+    // such lambda (a nested lambda's capture is taken from the outer one's).
+    void markCtorLambdaCapturesThis(const ast::LambdaExpr* l) {
+        if (l) ctorLambdasCapturingThis_.insert(l);
+    }
+    bool ctorLambdaCapturesThis(const ast::LambdaExpr& l) const {
+        return ctorLambdasCapturingThis_.count(&l) > 0;
+    }
     const std::unordered_set<const ast::Expr*>& allNarrowedValueReads() const {
         return narrowedValueReads_;
     }
@@ -1349,6 +1361,7 @@ private:
         methodRefFormations_;
     // fix #6674 (§7.4 / §22.6, v0.339): see `markNarrowedValueRead` above.
     std::unordered_set<const ast::Expr*> narrowedValueReads_;
+    std::unordered_set<const ast::LambdaExpr*> ctorLambdasCapturingThis_;  // #6721
     // fix #3628 (§22.15 rule 6 / §25.1 / §17.6, v0.286): resolved §25
     // operator for a STATEMENT operator form (`a += b`, `t++`). See
     // `setStmtOperatorSymbol`/`stmtOperatorSymbol` above.

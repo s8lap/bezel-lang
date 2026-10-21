@@ -9280,10 +9280,18 @@ bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
                                       const SourceLocation& loc) {
     if (!currentType_ || currentType_->kind != ast::TypeDeclKind::Record)
         return false;
-    if (inConstructor_) return false;
-    if (!currentMethodDecl_) return false;
-    for (auto mod : currentMethodDecl_->modifiers)
-        if (mod == "static") return false;
+    // fix #6721 (§9.4, v0.340): "the store rejection above reads a lambda body
+    // inside the member body as the member body, and one inside a value
+    // kind's constructor body as a member body too, a function value
+    // outliving the construction window (§22.8)". The constructor body itself
+    // stays exempt; a lambda body formed in it does not.
+    const bool ctorLambda = inConstructor_ && inLambda_ && !inStaticMember_;
+    if (inConstructor_ && !ctorLambda) return false;
+    if (!ctorLambda) {
+        if (!currentMethodDecl_) return false;
+        for (auto mod : currentMethodDecl_->modifiers)
+            if (mod == "static") return false;
+    }
 
     if (!isThisRootedLValueTarget(target)) return false;
 
@@ -9300,6 +9308,12 @@ bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
         if (ps->parent != currentType_ || !ps->isAutoProperty) return false;
     } else {
         return false;
+    }
+    if (ctorLambda) {
+        // A static member is not the receiver's storage.
+        if (auto* ms = dynamic_cast<MemberSymbol*>(sym))
+            for (std::string_view mod : ms->modifiers)
+                if (mod == "static") return false;
     }
 
     // Walk the chain for class/interface-typed hops BEFORE the terminal
@@ -9322,6 +9336,18 @@ bool ExprTC::checkRecordReceiverStore(const ast::Expr& target,
         verb = "increment/decrement";
     } else {
         verb = "store";
+    }
+    if (ctorLambda) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("cannot ") + verb +
+            " to the receiver's own storage in a lambda body inside a record "
+            "constructor — the lambda captures a copy of `this` and is read "
+            "as a member body, a function value outliving the construction "
+            "window, so a store that would land in the receiver's own "
+            "storage is a compile error (§9.4, §22.8, v0.340); assign the "
+            "member in the constructor body itself");
+        return true;
     }
     ctx_.diagnostics().report(
         Severity::Error, loc,

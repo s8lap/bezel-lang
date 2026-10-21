@@ -8478,6 +8478,13 @@ private:
     // in methodFns_, then fall back to currentSpecMethodSymbol_ for a
     // specialized generic body that is not registered there.
     const sema::TypeSymbol* currentReceiverRecordType();
+    // fix #6721 (§9.4, v0.340): the receiver type a lambda's `this` capture
+    // COPIES — a record, or a choice that is not owning-classified (§35.4),
+    // read per instantiation under the active substitution (§3.6 rule 2).
+    // Null when the receiver is a class, a move-only value, or its type (or a
+    // generic argument of it) cannot be recovered; the capture then stores
+    // the receiver address as before.
+    const sema::TypeRef* thisCaptureCopyType();
 
     // fix #2972 (§12.3 / §11 / §31.4, v0.240): true when `e` is the `this` or
     // `base` receiver keyword (Appendix A gives both as PrimaryExpr spellings

@@ -2842,6 +2842,33 @@ const sema::TypeSymbol* Emitter::currentReceiverRecordType() {
 }
 
 
+// fix #6721 (§9.4, v0.340) — see the declaration.
+const sema::TypeRef* Emitter::thisCaptureCopyType() {
+    const sema::TypeSymbol* ts = currentReceiverRecordType();
+    if (!ts) return nullptr;
+    auto ref = std::make_unique<sema::TypeRef>();
+    ref->kind = sema::TypeRef::Kind::Named;
+    ref->declaration = const_cast<sema::TypeSymbol*>(ts);
+    const std::vector<std::string_view> gp = sema::genericParamNames(ts);
+    for (std::string_view n : gp) {
+        auto it = genericSubstSemaTy_.find(n);
+        if (it == genericSubstSemaTy_.end() || !it->second ||
+            isBareTypeParamRef(it->second))
+            return nullptr;
+        ref->genericArgs.push_back(const_cast<sema::TypeRef*>(it->second));
+    }
+    if (ts->kind == ast::TypeDeclKind::Choice) {
+        auto verdict = common::classifyChoiceType(ref.get(), ctx_);
+        if (!verdict || *verdict == common::ChoiceClassification::Owning)
+            return nullptr;
+    } else if (ts->kind != ast::TypeDeclKind::Record) {
+        return nullptr;
+    }
+    descArena_.push_back(std::move(ref));
+    return descArena_.back().get();
+}
+
+
 // fix #6320 (§9.4, v0.338): an address position over `this` (a member-access
 // target, a method-call receiver, a `with` source) keeps the receiver ADDRESS
 // (CG29); every other expression lowers as a value.

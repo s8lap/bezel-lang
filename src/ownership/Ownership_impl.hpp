@@ -4342,6 +4342,7 @@ private:
     // (§9.7, §35.4). A borrow-free value receiver's copy contributes nothing
     // (§9.4, v0.340).
     bool receiverCarriesBorrowForSink() const;
+    bool receiverIsMoveOnlyChoice() const;
     // Reports the sink-rule rejection for a receiver capture at `site`
     // (`what` names the position, e.g. "returned from the method").
     void reportReceiverCaptureAtSink(const ast::IdentifierExpr& id,
