@@ -7409,10 +7409,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // the expression is well-typed. Codegen defers the implementation (the
     // runtime type-descriptor table is not yet emitted); intercepted here to
     // emit a clean error instead of silently returning garbage or crashing.
+    // §11.7 / §12.2 (#6763): a static class may declare its own static
+    // `GetType`, and that declaration is a member of the class, not the
+    // universal `Object.GetType`. Sema has bound the callee to the declared
+    // MethodSymbol (it types the call as that member's return type), so only
+    // a callee with no declared symbol is the universal member refused here.
     if (call.args.empty() && call.callee) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
-            if (ma->member == "GetType") {
+            if (ma->member == "GetType" &&
+                !dynamic_cast<sema::MethodSymbol*>(
+                    ctx_.exprSymbol(*call.callee))) {
                 ctx_.diagnostics().report(
                     Severity::Error, call.span.begin,
                     "`GetType()` is not yet implemented in codegen: the runtime "

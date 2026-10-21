@@ -11,9 +11,9 @@
 // included", while "`Object`'s **static** `ReferenceEquals` ... is inherited by a
 // static class as by every class, and §12.2's static-member clause blocks a
 // static of that name there as anywhere." The accept rows are the controls: a
-// static class's static `GetType` (compile-only; a `V.GetType()` call hits the
-// separate codegen limitation of #487, pinned by the lit track, not here) and the
-// `Object`-slot overrides, which the rule admits.
+// static class's static `GetType` (compile-only; codegen runs a `V.GetType()`
+// call since #6763, pinned in tests/codegen/static_class_gettype_6763_test.cpp,
+// not here) and the `Object`-slot overrides, which the rule admits.
 
 #include <string>
 
@@ -387,8 +387,8 @@ end Program;
 
 // Accept control (§11.7, #6729): "its static members may take any name of that
 // surface, `Equals`, `GetHashCode`, `ToString` and `GetType` included". A static
-// class's static `GetType`. Compile-only: Main does not call it (a `V.GetType()`
-// call is the separate codegen limitation, #487).
+// class's static `GetType`. Compile-only: Main does not call it (codegen runs a
+// `V.GetType()` call since #6763; see tests/codegen/static_class_gettype_6763_test.cpp).
 BEZEL_TEST(object_gettype_refeq_hiding_6729,
            static_gettype_on_static_class_accepted_spec_11_7) {
     auto r = runAot(R"(
