@@ -681,6 +681,15 @@ void* bz_decimal_to_string(const bz_decimal_t* a);
 // Round(digits: int) — result written to *out.
 void bz_decimal_round(const bz_decimal_t* a, int32_t digits, bz_decimal_t* out);
 
+// Floor / Ceiling / Truncate (stdlib §2.2, Math.Floor/Ceiling/Truncate at
+// decimal) — the integral value of *a, toward negative infinity, positive
+// infinity and zero, written to *out. Exact and never faults: a fraction that
+// is dropped leaves a magnitude at most one above |*a|, which is not outside
+// the 96-bit mantissa range (see dec_integral in bezel_runtime_decimal_guid.cpp).
+void bz_decimal_floor(const bz_decimal_t* a, bz_decimal_t* out);
+void bz_decimal_ceiling(const bz_decimal_t* a, bz_decimal_t* out);
+void bz_decimal_truncate(const bz_decimal_t* a, bz_decimal_t* out);
+
 // Literal parse at compile-time (called by runtime init for MinValue/MaxValue).
 // Takes a null-terminated C string.
 // per fix #521: ove_vtable/fe_vtable may be nullptr for compile-time use

@@ -16779,6 +16779,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // fix #6297 (stdlib §2.2, §4.4): the decimal overloads. `Abs(decimal)`,
+        // `Floor`/`Ceiling`/`Truncate(decimal)` and the `Min`/`Max`/`Clamp<T>`
+        // selectors at T = decimal all return decimal, so the call takes the
+        // arguments' decimal type. Before this, Abs kept its int placeholder and
+        // the rounding members their double, and the selectors were left
+        // untyped: `var y := Math.Abs(x)` was an int, so a decimal result reached
+        // codegen with a type the consumer did not expect (malformed IR).
+        // Every value argument must be decimal, so a mixed call is left as it
+        // was. Sign (int at every operand type), DivRem and Round (no decimal
+        // overload in stdlib §2.2) are not touched.
+        if (auto* dma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            const bool decimalSame =
+                dma->member == "Abs" || dma->member == "Floor" ||
+                dma->member == "Ceiling" || dma->member == "Truncate" ||
+                dma->member == "Min" || dma->member == "Max" ||
+                dma->member == "Clamp";
+            if (decimalSame && dma->target && !ce.args.empty()) {
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        dma->target.get())) {
+                    if (tid->name == "Math") {
+                        bool allDecimal = true;
+                        for (const auto& arg : ce.args) {
+                            const TypeRef* at =
+                                arg.value ? ctx_.exprType(*arg.value) : nullptr;
+                            if (!at || at->nullable ||
+                                at->kind != TypeRef::Kind::Primitive ||
+                                at->primitive != PrimitiveType::Decimal)
+                                allDecimal = false;
+                        }
+                        if (allDecimal)
+                            ctx_.setExprType(
+                                &ce, ctx_.primitiveTypeRef(PrimitiveType::Decimal));
+                    }
+                }
+            }
+        }
         // #1141 / stdlib §1: Math.Min<T>/Max<T>/Clamp<T> (declared only as
         // `where T: IComparable<T>`) instantiated with a non-numeric VALUE type
         // — a record/enum that implements IComparable<T> (§14.2). The result

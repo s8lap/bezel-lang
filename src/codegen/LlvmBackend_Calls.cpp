@@ -13313,6 +13313,30 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         {arg->getType()});
                     return builder_.CreateCall(fabsFn, {arg}, "abs.result");
                 }
+                // fix #6297 (stdlib §2.2 `Abs(x: decimal): decimal`): a decimal
+                // is a STRUCT, so the integer MinValue/negate path below emitted
+                // `icmp`/`sub` on `%bz.decimal` (malformed IR). |x| is the
+                // runtime negation when x < 0, else x itself. bz_decimal_neg is
+                // the helper unary `-` already uses, and it cannot overflow:
+                // decimal's range is symmetric about zero (stdlib §9.3).
+                if (arg->getType() == decimalStructType()) {
+                    llvm::Value* cmp = emitDecCmp(
+                        arg, llvm::Constant::getNullValue(arg->getType()));
+                    if (!cmp) return nullptr;
+                    llvm::Value* isNeg = builder_.CreateICmpSLT(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    llvm::AllocaInst* slot = entryAlloca(arg->getType());
+                    llvm::AllocaInst* out = entryAlloca(arg->getType());
+                    builder_.CreateStore(arg, slot);
+                    auto* negFn = declareC("bz_decimal_neg",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy(), ptrTy()});
+                    builder_.CreateCall(negFn, {slot, out});
+                    llvm::Value* neg = builder_.CreateLoad(arg->getType(), out,
+                                                           "abs.dec.neg");
+                    return builder_.CreateSelect(isNeg, neg, arg,
+                                                 "abs.dec.result");
+                }
                 // Abs for int/long — check MinValue first (#1231 / §6.1):
                 // |int.MinValue| and |long.MinValue| are not representable as
                 // int/long respectively, so raise OverflowException per the
@@ -13340,6 +13364,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 auto* zero32 = llvm::ConstantInt::get(i32Ty, 0);
                 auto* one32  = llvm::ConstantInt::getSigned(i32Ty, 1);
                 auto* neg132 = llvm::ConstantInt::getSigned(i32Ty, -1);
+                // fix #6297 (stdlib §2.2 `Sign<T>` with T = decimal, §2.19): a
+                // decimal is a STRUCT, so the integer compare below is ill-typed
+                // for it. The sign is bz_decimal_cmp against zero, normalised to
+                // -1/0/+1 the way the integer path normalises its compares.
+                if (arg->getType() == decimalStructType()) {
+                    llvm::Value* cmp = emitDecCmp(
+                        arg, llvm::Constant::getNullValue(arg->getType()));
+                    if (!cmp) return nullptr;
+                    llvm::Value* isNeg = builder_.CreateICmpSLT(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    llvm::Value* isPos = builder_.CreateICmpSGT(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    llvm::Value* s1 =
+                        builder_.CreateSelect(isPos, one32, zero32, "sgn.dec.1");
+                    return builder_.CreateSelect(isNeg, neg132, s1,
+                                                 "sgn.dec.result");
+                }
                 if (arg->getType()->isFloatingPointTy()) {
                     // FP path: use ordered FCmp so NaN → 0 (neither negative nor positive).
                     auto* zeroFP = llvm::Constant::getNullValue(arg->getType());
@@ -13393,6 +13434,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateNot(builder_.CreateOr(isNaN, isInf), "isfinite");
             }
             if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round" || m == "Truncate") {
+                // fix #6297 (stdlib §2.2 `Floor`/`Ceiling`/`Truncate(x: decimal)
+                // : decimal`): a decimal is a STRUCT, so the double intrinsic
+                // below would `sitofp` it. The integral value is computed by the
+                // runtime, exactly, and cannot fault (decimal's range endpoints
+                // are integral).
+                if (arg->getType() == decimalStructType() &&
+                    (m == "Floor" || m == "Ceiling" || m == "Truncate")) {
+                    const char* fnName =
+                        m == "Floor"   ? "bz_decimal_floor" :
+                        m == "Ceiling" ? "bz_decimal_ceiling" :
+                                         "bz_decimal_truncate";
+                    llvm::AllocaInst* slot = entryAlloca(arg->getType());
+                    llvm::AllocaInst* out = entryAlloca(arg->getType());
+                    builder_.CreateStore(arg, slot);
+                    auto* fn = declareC(fnName, llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy(), ptrTy()});
+                    builder_.CreateCall(fn, {slot, out});
+                    return builder_.CreateLoad(arg->getType(), out,
+                                               std::string(m) + ".dec.result");
+                }
                 // Use llvm intrinsics for common math ops. §2.2: one-argument
                 // Round is BANKER'S ROUNDING (round half to even) — that is
                 // llvm.roundeven (IEEE 754 roundToNearestTiesToEven), NOT

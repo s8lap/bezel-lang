@@ -1295,6 +1295,41 @@ extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
     dec_store(out, m, (uint32_t)digits, dec_sign(a), nullptr);
 }
 
+// Floor / Ceiling / Truncate (stdlib §2.2, Math.Floor/Ceiling/Truncate at
+// decimal). The value is sign * M / 10^s: Q = M / 10^s is the integral part of
+// its magnitude and R = M % 10^s the discarded fraction. The result is Q, moved
+// one step away from zero when R is non-zero and the direction points away from
+// zero (down for a negative value under floor, up for a positive one under
+// ceiling). Truncate never moves it. Q + 1 <= (2^96 - 1) / 10 + 1 when R is
+// non-zero, so the result stays in 96 bits and dec_store cannot overflow.
+enum class DecIntegral { Floor, Ceiling, Truncate };
+static void dec_integral(const bz_decimal_t* a, DecIntegral how,
+                         bz_decimal_t* out) {
+    const uint32_t s = dec_scale(a);
+    const int neg = dec_sign(a);
+    const __uint128_t m = dec_mantissa(a);
+    __uint128_t q = m / kPow10[s];
+    const bool fractional = (m % kPow10[s]) != 0;
+    if (fractional && ((how == DecIntegral::Floor && neg) ||
+                       (how == DecIntegral::Ceiling && !neg)))
+        q += 1;
+    // Scale 0: the result is integral, so dec_store only normalises the sign
+    // of a zero (no negative zero).
+    dec_store(out, q, 0, neg, nullptr);
+}
+
+extern "C" void bz_decimal_floor(const bz_decimal_t* a, bz_decimal_t* out) {
+    dec_integral(a, DecIntegral::Floor, out);
+}
+
+extern "C" void bz_decimal_ceiling(const bz_decimal_t* a, bz_decimal_t* out) {
+    dec_integral(a, DecIntegral::Ceiling, out);
+}
+
+extern "C" void bz_decimal_truncate(const bz_decimal_t* a, bz_decimal_t* out) {
+    dec_integral(a, DecIntegral::Truncate, out);
+}
+
 // ---------------------------------------------------------------------------
 // Guid (stdlib §2.6) — 128-bit globally unique identifier.
 // Representation: { uint64_t lo, uint64_t hi } (matches LLVM { i64, i64 }).
