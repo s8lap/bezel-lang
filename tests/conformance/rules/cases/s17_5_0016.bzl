@@ -8,6 +8,7 @@
 //! cites: 17.5, 5.1
 //! expect: reject
 //! diagnostic: nullable
+//! issue: 6535
 module Conf;
 
 public class Program

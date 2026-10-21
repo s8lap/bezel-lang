@@ -289,8 +289,8 @@ s7_7_0011	pass
 s7_7_0012	pass	
 s7_7_0013	pass	
 s7_7_0014	pass	
-s7_7_0015	fail	#6675
-s7_7_0016	fail	#6675
+s7_7_0015	pass	
+s7_7_0016	pass	
 s7_8_0001	pass	
 s7_8_0002	pass	
 s7_9_0001	pass	
@@ -947,7 +947,7 @@ s17_5_0012	pass
 s17_5_0013	pass	
 s17_5_0014	pass	
 s17_5_0015	pass	
-s17_5_0016	fail	divergence
+s17_5_0016	fail	#6535
 s17_5_0017	pass	
 s17_5_0018	pass	
 s17_5_0019	pass	
