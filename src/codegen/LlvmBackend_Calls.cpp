@@ -13390,8 +13390,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // per stdlib §2.2 (v0.340, #6864): Min/Max/Clamp order by T's own
         // CompareTo, so an unsigned T (byte, ushort, uint, ulong) and char
         // (a code point) compare unsigned, not with the signed predicate.
+        // Inside a generic body the operand is typed `T`: resolve it through
+        // the active substitution so `T = uint` orders unsigned (#6908).
         auto mathOperandIsUnsigned = [&](const ast::Expr* e) -> bool {
-            const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            const sema::TypeRef* t =
+                e ? resolveTypeParamRef(ctx_.exprType(*e)) : nullptr;
             if (!t || t->kind != sema::TypeRef::Kind::Primitive) return false;
             using P = sema::PrimitiveType;
             return t->primitive == P::Byte || t->primitive == P::UShort ||
