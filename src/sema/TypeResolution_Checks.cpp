@@ -1239,8 +1239,11 @@ static bool isObjectVirtualReplacementMember(
         // Valid: Equals(E) where E is the owner type. `Equals(Object?)` is
         // not admitted: §9.2 / §10.5 / §35.2 (v0.338) reject it on every
         // value kind, so objectSlotEqualsSpelling reports it instead.
+        // fix #6746 (§9.2, §10.5, §35.2, v0.340): the kind's own type is
+        // non-nullable, so `override Equals(other: R?)` is not the admitted
+        // signature; a plain `Equals(other: R?)` is an ordinary member.
         if (paramTy->kind == TypeRef::Kind::Named &&
-            paramTy->declaration == owner)
+            paramTy->declaration == owner && !paramTy->nullable)
             return true;
         return false;
     }
