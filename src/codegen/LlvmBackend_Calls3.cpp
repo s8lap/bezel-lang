@@ -2033,12 +2033,16 @@ llvm::Function* Emitter::buildZipTrampoline(llvm::Type* aTy, llvm::Type* bTy,
 
 // stdlib §5 (#651/#752): is `e` a `GroupBy(keySelector)` call — a CallExpr whose
 // callee is a MemberAccessExpr with member "GroupBy" and exactly one argument?
-bool Emitter::isGroupByCall(const ast::Expr* e) {
+bool Emitter::isGroupByCall(const ast::Expr* e) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(e);
     if (!call || !call->callee || call->args.size() != 1 || !call->args[0].value)
         return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
-    return ma && ma->member == "GroupBy" && ma->target;
+    if (!ma || ma->member != "GroupBy" || !ma->target) return false;
+    // fix #6711 (§7.5, stdlib §5, v0.339): a USER-declared `GroupBy` (sema
+    // resolved the callee to a symbol; the stdlib one has none) is an ordinary
+    // call, not the intrinsic. Every syntactic GroupBy site shares this gate.
+    return ctx_.exprSymbol(*call->callee) == nullptr;
 }
 
 llvm::Value* Emitter::lowerGroupByMaterialize(const ast::CallExpr& srcCall) {

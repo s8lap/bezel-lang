@@ -24216,7 +24216,7 @@ private:
     // exactly one argument? Used to intercept the GroupBy shape in
     // lowerToLazyEnumerator and the scalar-terminal path (#1924). Member so both
     // LlvmBackend_Calls3.cpp and LlvmBackend_Calls.cpp can call it.
-    static bool isGroupByCall(const ast::Expr* e);
+    bool isGroupByCall(const ast::Expr* e) const;
 
     // stdlib §5: build a trampoline LLVM function the runtime can call to
     // invoke a Bezel closure on a type-erased element. `kind`:
