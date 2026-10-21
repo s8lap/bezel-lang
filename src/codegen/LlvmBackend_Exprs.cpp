@@ -9881,6 +9881,9 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         // `Object = someClass` on their existing reference paths — `string` is
         // a reference type (§4.6) that keeps its bare `bz_string*` in an
         // `Object` slot, and a class pointer coerced to `Object` never boxes.
+        // Storage for a synthesized `T?` / `int?` operand type (below); only
+        // one operand is ever the boxed one, so one slot serves both calls.
+        sema::TypeRef boxTyStore;
         auto boxableOperand =
             [&](const ast::Expr* e, llvm::Value* v) -> const sema::TypeRef* {
             if (!e || !v || dynamic_cast<const ast::NullLiteralExpr*>(e))
@@ -9889,7 +9892,33 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             // #6748: inside a generic body the operand's sema type is the bare
             // `T`; resolve it under the live substitution (§14.1) so a record
             // `T` operand boxes and compares through the Equals slot (§9.2).
-            const sema::TypeRef* t = resolveTypeParamRef(ctx_.exprType(*e));
+            const sema::TypeRef* raw = ctx_.exprType(*e);
+            const sema::TypeRef* t = resolveTypeParamRef(raw);
+            // A `T?` operand resolves to the bare substitution; keep the `?`
+            // (fix #568's nullableTypeParamConcrete) so the tagged `{i8, T}`
+            // carrier boxes as the nullable value it is.
+            if (raw && t && t != raw && raw->nullable &&
+                nullableTypeParamConcrete(raw, boxTyStore))
+                t = &boxTyStore;
+            // #6748 fix-forward (§14.1, §9.2): the unspecialized template body
+            // lowers a bare `T` as the `i32` placeholder (`T?` as `{i8, i32}`),
+            // and that template is NOT dead: an importing module binds
+            // `Eq<int>` (and a virtual slot of `Box<int>`) to it, `int` being
+            // the only width the #1943 gate lets cross the boundary. Box the
+            // placeholder as the `int` it carries there, so the comparison is
+            // the one `T = int` makes.
+            if (emittingGenericTemplateBody_ && t &&
+                t->kind == sema::TypeRef::Kind::Named && !t->declaration &&
+                templateGenericParamNames_.count(t->headName())) {
+                const bool nullableT = t->nullable;
+                boxTyStore = *ctx_.primitiveTypeRef(sema::PrimitiveType::Int);
+                boxTyStore.nullable = nullableT;
+                t = &boxTyStore;
+                if (!(nullableT ? isNullableValueTy(t) &&
+                                      v->getType() == nullableValueStructTy(t)
+                                : v->getType()->isIntegerTy(32)))
+                    return nullptr;
+            }
             if (!t || isObjectOrInterfaceTarget(t)) return nullptr;
             return (isBoxableValueType(t) || isNullableValueTy(t)) ? t : nullptr;
         };
@@ -9923,16 +9952,6 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             }
         }
     }
-    // #6748 (§14.2, §9.2): the dead abstract-template pass lowers a bare type
-    // parameter operand as the `i32` placeholder, so `a = b` with `b: Object`
-    // reaches the scalar compare as `i32` vs `ptr` and fails IR verification.
-    // The template is never called (every call binds a specialization, which
-    // the arm above handles), so fold the mismatched pair to a constant.
-    if (emittingGenericTemplateBody_ && (bin.op == "=" || bin.op == "<>") &&
-        bin.left && bin.right && l->getType() != r->getType() &&
-        !dynamic_cast<const ast::NullLiteralExpr*>(bin.left.get()) &&
-        !dynamic_cast<const ast::NullLiteralExpr*>(bin.right.get()))
-        return builder_.getInt1(bin.op == "<>");
     bool lUnwrapped_ = false;
     bool rUnwrapped_ = false;
     // §7.11 / #914 / #1117 (proposal 0114, v0.267): the §7.11 lifted-operator
