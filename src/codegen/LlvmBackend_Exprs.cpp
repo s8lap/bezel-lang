@@ -9227,6 +9227,29 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             llvm::Value* st = lowerExpr(*range->lo);
             llvm::Value* en = lowerExpr(*range->hi);
             if (!x || !st || !en) return nullptr;
+            // fix #6683 (§5.1, v0.339; §17.5): `b in 1 .. 5` with `b: byte` has an
+            // i8 left operand against i32 literal bounds; bring all three to the
+            // widest integer width first (zero-extend an unsigned left operand,
+            // sign-extend the rest) so no ICmp sees mixed widths.
+            if (x->getType()->isIntegerTy() && st->getType()->isIntegerTy() &&
+                en->getType()->isIntegerTy()) {
+                unsigned w = std::max({x->getType()->getIntegerBitWidth(),
+                                       st->getType()->getIntegerBitWidth(),
+                                       en->getType()->getIntegerBitWidth()});
+                llvm::Type* wTy = builder_.getIntNTy(w);
+                if (x->getType() != wTy)
+                    x = isUnsignedTargetExpr(*bin.left)
+                            ? builder_.CreateZExt(x, wTy)
+                            : builder_.CreateSExt(x, wTy);
+                if (st->getType() != wTy)
+                    st = isUnsignedTargetExpr(*range->lo)
+                             ? builder_.CreateZExt(st, wTy)
+                             : builder_.CreateSExt(st, wTy);
+                if (en->getType() != wTy)
+                    en = isUnsignedTargetExpr(*range->hi)
+                             ? builder_.CreateZExt(en, wTy)
+                             : builder_.CreateSExt(en, wTy);
+            }
             // §16.3 (v0.162, fix #1340): a stepless literal uses default step=1
             // (ascending). Contains = nonempty AND within-extent AND endOk.
             // Ascending IsEmpty: closed → Start > End; half-open → Start >= End.

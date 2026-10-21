@@ -5017,6 +5017,12 @@ llvm::Value* Emitter::boxMembershipQuery(llvm::Value* v,
     lastBoxMint_ = nullptr;
     v = boxForTarget(v, elemTy, queryExpr);
     lastBoxMint_ = saved;
+    // fix #6683 (§5.1 v0.339, §17.5): `x in c` is `c.Contains(x)`, so a
+    // numeric query that sema admitted by implicit WIDENING (`float` into
+    // `Array<double>`, `int` into `Array<long>`/`Array<double>`, `byte` into
+    // `Array<int>`) is converted to the element type once, here, before any
+    // per-element compare. A no-op for every non-primitive / equal-width pair.
+    v = coerceDictKeyToKeyType(v, elemTy, queryExpr);
     return v;
 }
 
