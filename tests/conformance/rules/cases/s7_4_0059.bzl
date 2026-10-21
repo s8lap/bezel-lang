@@ -5,6 +5,8 @@
 //! rule: "a fact holds at a point only when it holds on every path that reaches it" ([§7.4]). "Any
 //!   exception may propagate from any method call." ([§31.3]). The arm is reached from the call
 //!   that follows `s := null`, so `s` is null when the arm reads it.
+//!   "every statement of the block is a possible throw point for every `catch` arm and for the
+//!   `finally`" ([§7.4]).
 //! cites: 7.4, 31.3
 //! expect: reject
 //! diagnostic: nullable

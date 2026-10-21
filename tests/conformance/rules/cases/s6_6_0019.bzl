@@ -7,7 +7,7 @@
 //!   expression" ([§25.2]): no overload accepts a `StringBuilder` for `IA`.
 //! cites: 6.6, 25.2
 //! expect: reject
-//! diagnostic: applicable operator
+//! diagnostic: no applicable
 //! issue: 6656
 module Conf;
 

@@ -7,7 +7,7 @@
 //!   parameter.
 //! cites: 25.2, 5.1
 //! expect: reject
-//! diagnostic: applicable operator
+//! diagnostic: is not defined for type
 //! issue: 6217
 module Conf;
 
