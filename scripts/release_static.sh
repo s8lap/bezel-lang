@@ -10,7 +10,16 @@
 # runtime archive found relative to the executable (../lib/bezel/). It never
 # touches build/.
 #
-# What the installed compiler needs at run time (Driver::linkCommandLine):
+# The self-contained toolchain (#6654). The tarball also ships
+# lib/bezel/x86_64-linux-musl/: a static ld.lld, musl, libc++/libc++abi/
+# libunwind, compiler-rt builtins and a libbezel_runtime.a built against them
+# (scripts/release_musl_stage.sh builds it in a pinned Alpine container, via
+# podman). When it is present, bezelc's default link (--link=self-contained,
+# Driver::selfContainedLinkArgs) produces FULLY STATIC executables with nothing
+# installed: no clang, no -dev packages, nothing on the target either.
+#
+# The hosted link stays available as --link=system (and is required for
+# --sanitize=address). It needs, at run time (Driver::linkCommandLine):
 #   * `clang` on PATH -- bezelc emits an object with its built-in LLVM, then
 #     shells out to `clang <obj> -o <exe> -lm -lpthread <runtime.a> -lstdc++`;
 #   * libstdc++ development files (libstdc++.so for -lstdc++) and the C
@@ -23,10 +32,17 @@
 # <project VERSION from CMakeLists.txt>-<short sha>. It is passed to CMake as
 # BEZEL_VERSION_OVERRIDE so `bezelc --version` matches the tarball name.
 #
-# Usage: scripts/release_static.sh [--full] [--allow-dirty]
-#                                  [--build-dir DIR] [--out DIR] [-j N]
+# Usage: scripts/release_static.sh [--full] [--allow-dirty] [--no-bundle]
+#                                  [--dl-dir DIR] [--build-dir DIR] [--out DIR]
+#                                  [-j N]
 #   --full         also link bezelc with -static (needs glibc-static and
-#                  libstdc++-static; see the CMake BEZEL_STATIC_RELEASE_FULL)
+#                  libstdc++-static; see the CMake BEZEL_STATIC_RELEASE_FULL).
+#                  Only a --full bezelc runs in the bare-container smoke test
+#                  (a glibc-linked one needs this machine's glibc floor)
+#   --no-bundle    leave out the self-contained toolchain (no podman needed;
+#                  the tarball then needs clang, as before #6654)
+#   --dl-dir       cache for the sha256-pinned LLVM source tarballs the bundle
+#                  build downloads (default: <repo>/scratch/release-dl)
 #   --allow-dirty  package a tree with uncommitted changes (version gets
 #                  a "-dirty" suffix)
 #   --build-dir    default: <repo>/scratch/build-static (build-static-full with --full)
@@ -42,11 +58,15 @@ OUT_DIR=""
 JOBS=8
 FULL=OFF
 ALLOW_DIRTY=0
+BUNDLE=1
+DL_DIR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --full) FULL=ON ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
+    --no-bundle) BUNDLE=0 ;;
+    --dl-dir) DL_DIR="$2"; shift ;;
     --build-dir) BUILD_DIR="$2"; shift ;;
     --out) OUT_DIR="$2"; shift ;;
     -j) JOBS="$2"; shift ;;
@@ -61,6 +81,7 @@ die() { echo "release_static: $*" >&2; exit 1; }
 SUFFIX=""; [ "$FULL" = ON ] && SUFFIX="-full"
 [ -n "$BUILD_DIR" ] || BUILD_DIR="$ROOT/scratch/build-static$SUFFIX"
 [ -n "$OUT_DIR" ] || OUT_DIR="$ROOT/scratch/release$SUFFIX"
+[ -n "$DL_DIR" ] || DL_DIR="$ROOT/scratch/release-dl"
 
 [ "$(uname -s)-$(uname -m)" = "Linux-x86_64" ] || die "only Linux x86_64 is supported"
 # Every tool a check below relies on must be present here: a missing nm, ldd or
@@ -69,6 +90,34 @@ SUFFIX=""; [ "$FULL" = ON ] && SUFFIX="-full"
 for tool in clang clang++ cmake tar gzip sha256sum nm objdump strings ldd; do
   command -v "$tool" >/dev/null || die "'$tool' not found on PATH"
 done
+if [ "$BUNDLE" = 1 ]; then
+  for tool in podman curl file; do
+    command -v "$tool" >/dev/null || die "'$tool' not found on PATH (needed for the self-contained toolchain; --no-bundle skips it)"
+  done
+fi
+
+# ---- pinned inputs of the self-contained toolchain (#6654) -----------------
+# Images by digest (alpine:3.20 and ubuntu:22.04 as of 2026-10-21); the Alpine
+# package versions are pinned in release_musl_stage.sh.
+ALPINE_IMAGE=docker.io/library/alpine@sha256:c64c687cbea9300178b30c95835354e34c4e4febc4badfe27102879de0483b5e
+SMOKE_IMAGE=docker.io/library/ubuntu@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
+LLVM_RELEASE_URL=https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6
+# name sha256 url
+BUNDLE_SOURCES="
+lld-17.0.6.src.tar.xz 4ac13125616dc44905b85820aa403d27ec1226329b7f674daeb5f5584c6f0b22 $LLVM_RELEASE_URL/lld-17.0.6.src.tar.xz
+cmake-17.0.6.src.tar.xz 807f069c54dc20cb47b21c1f6acafdd9c649f3ae015609040d6182cab01140f4 $LLVM_RELEASE_URL/cmake-17.0.6.src.tar.xz
+libunwind-17.0.6.src.tar.xz 9e7535a353aa862730b4ba38df42e06f6856b40c4cc51b57f27b5046dc21d70d $LLVM_RELEASE_URL/libunwind-17.0.6.src.tar.xz
+musl-1.2.5-COPYRIGHT f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af https://git.musl-libc.org/cgit/musl/plain/COPYRIGHT?h=v1.2.5
+"
+# Containers are named <prefix>-<role>-<pid> and removed on exit, however the
+# script ends.
+CPREFIX=${BEZEL_RELEASE_CONTAINER_PREFIX:-bezel-release}
+CONTAINERS=()
+cleanup_containers() {
+  local c
+  for c in "${CONTAINERS[@]}"; do podman rm -f "$c" >/dev/null 2>&1 || true; done
+}
+trap cleanup_containers EXIT
 
 # ---- version ---------------------------------------------------------------
 cd "$ROOT"
@@ -126,6 +175,41 @@ if strings "$BIN" | grep -qF "$BUILD_DIR"; then
   die "bezelc embeds the build-dir path $BUILD_DIR"
 fi
 
+# ---- the self-contained toolchain (#6654) ----------------------------------
+BUNDLE_OUT="$BUILD_DIR/musl-bundle"
+if [ "$BUNDLE" = 1 ]; then
+  mkdir -p "$DL_DIR"
+  while read -r f sha url; do
+    [ -n "$f" ] || continue
+    if ! { [ -f "$DL_DIR/$f" ] && echo "$sha  $DL_DIR/$f" | sha256sum -c --status; }; then
+      echo "release_static: downloading $f"
+      curl -sSfL --retry 3 -o "$DL_DIR/$f.part" "$url" || die "download failed: $url"
+      echo "$sha  $DL_DIR/$f.part" | sha256sum -c --status \
+        || die "sha256 mismatch for $f (expected $sha)"
+      mv "$DL_DIR/$f.part" "$DL_DIR/$f"
+    fi
+  done <<<"$BUNDLE_SOURCES"
+  rm -rf "$BUNDLE_OUT"; mkdir -p "$BUNDLE_OUT"
+  C="$CPREFIX-musl-$$"; CONTAINERS+=("$C")
+  # The container's processes are not children of this shell, so dev_heavy.sh's
+  # scope cannot hold them: --cgroup-parent puts them in the same capped slice.
+  # The repo is mounted read-only; label=disable avoids relabelling it.
+  "$ROOT/scripts/dev_heavy.sh" build podman run --rm --name "$C" \
+    --cgroup-parent=bezel-heavy.slice --security-opt label=disable \
+    -v "$ROOT:/src:ro" -v "$DL_DIR:/dl:ro" -v "$BUNDLE_OUT:/out" \
+    -e SRC=/src -e DL=/dl -e OUT=/out -e JOBS="$JOBS" \
+    "$ALPINE_IMAGE" sh /src/scripts/release_musl_stage.sh >"$BUILD_DIR/musl-bundle.log" 2>&1 \
+    || { tail -30 "$BUILD_DIR/musl-bundle.log" >&2; die "self-contained toolchain build failed (log: $BUILD_DIR/musl-bundle.log)"; }
+  grep '^musl_stage:\|^LLD ' "$BUILD_DIR/musl-bundle.log" || true
+  for f in bin/ld.lld crt1.o crti.o crtn.o libc.a libc++.a libc++abi.a libunwind.a \
+           libclang_rt.builtins-x86_64.a libpthread.a librt.a libdl.a libm.a \
+           libbezel_runtime.a LICENSES/README; do
+    [ -e "$BUNDLE_OUT/x86_64-linux-musl/$f" ] || die "the toolchain bundle has no $f"
+  done
+  file "$BUNDLE_OUT/x86_64-linux-musl/bin/ld.lld" | grep -q 'statically linked' \
+    || die "the bundled ld.lld is not statically linked"
+fi
+
 # ---- assemble --------------------------------------------------------------
 STAGE="$OUT_DIR/stage"
 rm -rf "$STAGE"
@@ -138,6 +222,9 @@ if [ -n "$STRIP" ]; then
   "$STRIP" --strip-debug "$STAGE/$NAME/lib/bezel/libbezel_runtime.a"
 fi
 cp "$ROOT/LICENSE" "$STAGE/$NAME/LICENSE"
+if [ "$BUNDLE" = 1 ]; then
+  cp -a "$BUNDLE_OUT/x86_64-linux-musl" "$STAGE/$NAME/lib/bezel/x86_64-linux-musl"
+fi
 
 GLIBC_FLOOR=$(objdump -T "$STAGE/$NAME/bin/bezelc" 2>/dev/null \
   | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1 || true)
@@ -172,8 +259,8 @@ public class Program
   end Main;
 end Program;
 BZL
-(cd "$PROBE" && "$STAGE/$NAME/bin/bezelc" probe.bzl -o probe) \
-  || die "the staged compiler could not link a program"
+(cd "$PROBE" && "$STAGE/$NAME/bin/bezelc" --link=system probe.bzl -o probe) \
+  || die "the staged compiler could not link a program with --link=system"
 PROBE_SYMS=$(objdump -T "$PROBE/probe") \
   || { rm -rf "$PROBE"; die "objdump -T failed on the probe program"; }
 rm -rf "$PROBE"
@@ -183,20 +270,23 @@ PROG_GLIBC=$(grep -o 'GLIBC_[0-9][0-9.]*' <<<"$PROBE_SYMS" | sort -uV | tail -1 
 # Empty is a valid answer here (the probe may not reference libstdc++); the
 # README below falls back to "libstdc++".
 PROG_GLIBCXX=$(grep -o 'GLIBCXX_[0-9][0-9.]*' <<<"$PROBE_SYMS" | sort -uV | tail -1 || true)
+if [ "$BUNDLE" = 1 ]; then
+  # The default link of the staged tree is the self-contained one, and what it
+  # links is fully static: no PT_INTERP, no NEEDED.
+  mkdir -p "$PROBE"
+  cp "$ROOT/scripts/release_smoke/hello.bzl" "$PROBE/probe.bzl"
+  (cd "$PROBE" && "$STAGE/$NAME/bin/bezelc" probe.bzl -o probe) \
+    || die "the staged compiler could not link a program with its bundled toolchain"
+  file "$PROBE/probe" | grep -q 'statically linked' \
+    || { file "$PROBE/probe" >&2; die "the self-contained link did not produce a static executable"; }
+  ! objdump -p "$PROBE/probe" | grep -q NEEDED \
+    || die "the self-contained executable has NEEDED entries"
+  rm -rf "$PROBE"
+fi
 
-cat >"$STAGE/$NAME/README.md" <<EOF
-# bezelc $VERSION (Linux x86_64)
-
-The Bezel compiler. \`bin/bezelc\` has $LINKAGE.
-${NEEDED:+Shared libraries it loads:
-$NEEDED
-}
-## Requirements
-
-\`bezelc\` compiles a \`.bzl\` file to a native object with its built-in LLVM
-backend, then links the executable by running \`clang\` from \`PATH\`:
-
-    clang <obj> -o <exe> -lm -lpthread <prefix>/lib/bezel/libbezel_runtime.a -lstdc++
+# The README's requirements depend on whether the tarball ships the
+# self-contained toolchain.
+HOSTED_REQS="    clang <obj> -o <exe> -lm -lpthread <prefix>/lib/bezel/libbezel_runtime.a -lstdc++
 
 So you need:
 
@@ -212,12 +302,49 @@ So you need:
     \`libc6-dev\` and \`libstdc++-<N>-dev\`, which supplies the C++ library
     for \`-lstdc++\`. Do not name \`libstdc++-dev\`: on Ubuntu 22.04 and 24.04
     it is a virtual package with no installable candidate, so apt refuses
-    the whole command.
+    the whole command."
+if [ "$BUNDLE" = 1 ]; then
+  REQS="By default it links with the toolchain bundled in
+\`lib/bezel/x86_64-linux-musl/\` (\`--link=self-contained\`): a static
+\`ld.lld\`, musl 1.2.5, LLVM 17's libc++/libc++abi/libunwind and compiler-rt
+builtins. **Nothing needs to be installed**, neither to compile nor to run:
+the executables it produces are fully static (no shared libraries, no
+dynamic loader), so they run on any x86_64 Linux. Threads get an 8 MiB stack.
+
+### \`--link=system\`
+
+\`bezelc --link=system\` instead links with \`clang\` from \`PATH\` against the
+host's glibc and libstdc++, which is also the only link that supports
+\`--sanitize=address\` (AddressSanitizer has no musl runtime):
+
+$HOSTED_REQS"
+  LAYOUT_BUNDLE="
+    lib/bezel/x86_64-linux-musl/  the self-contained toolchain (see its LICENSES/)"
+  LAYOUT_RT="the Bezel runtime for --link=system"
+else
+  REQS="It links the executable by running \`clang\` from \`PATH\`:
+
+$HOSTED_REQS"
+  LAYOUT_BUNDLE=""
+  LAYOUT_RT="the Bezel runtime, found relative to bin/"
+fi
+
+cat >"$STAGE/$NAME/README.md" <<EOF
+# bezelc $VERSION (Linux x86_64)
+
+The Bezel compiler. \`bin/bezelc\` has $LINKAGE.
+${NEEDED:+Shared libraries it loads:
+$NEEDED
+}
+## Requirements
+
+\`bezelc\` compiles a \`.bzl\` file to a native object with its built-in LLVM
+backend, then links the executable. $REQS
 
 ## Layout
 
     bin/bezelc                    the compiler
-    lib/bezel/libbezel_runtime.a  the Bezel runtime, found relative to bin/
+    lib/bezel/libbezel_runtime.a  $LAYOUT_RT$LAYOUT_BUNDLE
     LICENSE                       Apache License 2.0
 
 Keep \`bin/\` and \`lib/\` together. Symlinking \`bin/bezelc\` into \`PATH\` is
@@ -240,22 +367,32 @@ tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$MTIME" \
 (cd "$OUT_DIR" && sha256sum "$NAME.tar.gz" >"$NAME.tar.gz.sha256")
 rm -rf "$STAGE"
 
-# ---- smoke test: the extracted binary runs and finds its runtime -----------
+# ---- smoke test: the extracted tarball builds and runs real programs -------
+# scripts/release_smoke/: hello, a 20000-deep recursion on a Domain.Spawn
+# worker, exceptions, Task.Delay, decimal/DateTime formatting -- each checked
+# for its exact stdout and exit code 0 (release_smoke/run.sh).
 SMOKE="$OUT_DIR/smoke"
 rm -rf "$SMOKE"; mkdir -p "$SMOKE"
 tar -C "$SMOKE" -xzf "$TARBALL"
-"$SMOKE/$NAME/bin/bezelc" --version
-cat >"$SMOKE/hello.bzl" <<'BZL'
-module Smoke;
-
-public class Program
-  public static method Main()
-    Console.WriteLine("hello from bezel");
-  end Main;
-end Program;
-BZL
-(cd "$SMOKE" && "$SMOKE/$NAME/bin/bezelc" hello.bzl -o hello && ./hello) \
-  || die "smoke test failed: the extracted compiler could not build hello.bzl"
+cp -r "$ROOT/scripts/release_smoke" "$SMOKE/release_smoke"
+STATIC_FLAG=""; [ "$BUNDLE" = 1 ] && STATIC_FLAG="--static"
+echo "release_static: smoke test on this machine"
+sh "$SMOKE/release_smoke/run.sh" $STATIC_FLAG "$SMOKE/$NAME/bin/bezelc" "$SMOKE/out-host" \
+  || die "smoke test failed on this machine"
+if [ "$BUNDLE" = 1 ]; then
+  if [ "$FULL" = ON ]; then
+    # The point of the bundle: a bare machine with no compiler, no -dev
+    # packages and no network compiles and runs them.
+    echo "release_static: smoke test in a bare $SMOKE_IMAGE container (no compiler)"
+    C="$CPREFIX-smoke-$$"; CONTAINERS+=("$C")
+    podman run --rm --name "$C" --network=none --security-opt label=disable \
+      -v "$SMOKE:/w" "$SMOKE_IMAGE" \
+      sh /w/release_smoke/run.sh --static --no-compiler "/w/$NAME/bin/bezelc" /w/out-container \
+      || die "smoke test failed in the bare container"
+  else
+    echo "release_static: bare-container smoke test skipped: bezelc is linked against this machine's glibc (use --full)"
+  fi
+fi
 rm -rf "$SMOKE"
 
 echo "release_static: wrote $TARBALL ($(du -h "$TARBALL" | cut -f1))"
