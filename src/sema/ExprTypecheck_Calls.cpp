@@ -25939,6 +25939,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     }
                     return;
                 }
+                // fix #6842 (§7.4 / §22.6, v0.340; stdlib §2.5): the receiver
+                // of a member access that passed the gate above is a read of
+                // a binding §7.4 has narrowed non-null, so it is "of its
+                // non-nullable type". For the date/time value builtins
+                // (DateTime, TimeSpan, DateOnly, TimeOnly), whose member
+                // lowerings take the bare scalar, publish the read so codegen
+                // extracts the payload of the {i8 hasValue; T} carrier it
+                // still loads (SemaContext::markNarrowedValueRead); otherwise
+                // the carrier reached bz_datetime_to_string_fmt & co. and
+                // failed IR verification.
+                if (isSimpleVar && declaredNullable &&
+                    dt->kind == TypeRef::Kind::Named &&
+                    (dt->headName() == "DateTime" ||
+                     dt->headName() == "TimeSpan" ||
+                     dt->headName() == "DateOnly" ||
+                     dt->headName() == "TimeOnly"))
+                    ctx_.markNarrowedValueRead(tid);
                 // per §7.4 (#862): a bare identifier resolving to a FIELD or
                 // PROPERTY is never narrowable — fields can be reassigned by
                 // another thread between the null check and the use (TOCTOU).
