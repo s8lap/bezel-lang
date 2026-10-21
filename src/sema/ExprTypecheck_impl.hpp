@@ -3934,7 +3934,7 @@ private:
     MethodSymbol* resolveMethodOverload(MethodSymbol* initial,
                                         const ast::CallExpr& ce);
 
-    // fix #6243 (§22.6 *Lambda-literal arguments*, §27.3, v0.339):
+    // fix #6243 / #6258 (§22.6 *Lambda-literal arguments*, §27.3, v0.339):
     // is the argument `arg` a procedure-bodied lambda LITERAL (a non-async
     // block body whose recorded type returns `()`, i.e. §27.3 classified it
     // a procedure lambda) and `paramTy` a function type whose return slot is
@@ -3945,6 +3945,12 @@ private:
     // never judged here (it may bind under §14.5 phase 2).
     bool procedureLambdaInapplicableAt(const ast::Expr* arg,
                                        const TypeRef* paramTy);
+    // The formal type `pt` of `cand` at a call whose receiver expression is
+    // `recvTarget` (null: unqualified), substituted the way the
+    // single-candidate argument check does (receiver arguments, constraint
+    // receiver, interface chain; the method's own type parameters excluded).
+    const TypeRef* formalTypeAtReceiver(const TypeRef* pt, MethodSymbol* cand,
+                                        const ast::Expr* recvTarget);
 
     // fix #6312 (§14.5, §22.6, v0.338): a call whose explicit type-argument
     // list left exactly ONE generic candidate of an overload set, mapped to

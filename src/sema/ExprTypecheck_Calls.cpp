@@ -1153,7 +1153,18 @@ ExprTC::ArgMatch ExprTC::classifyArg(const TypeRef* argTy,
     return ArgMatch::NotApplicable;
 }
 
-// fix #6243 (§22.6 *Lambda-literal arguments*, v0.339): "the
+// The receiver expression of a member call (`r.M(...)` / `r?.M(...)`), else
+// null.
+static const ast::Expr* callReceiverTarget(const ast::CallExpr& ce) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        return ma->target.get();
+    if (auto* ncm =
+            dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get()))
+        return ncm->target.get();
+    return nullptr;
+}
+
+// fix #6243 / #6258 (§22.6 *Lambda-literal arguments*, v0.339): "the
 // candidate is applicable at the position when the lambda's inferred return
 // type equals the candidate's return slot, implicitly converts to it, or binds
 // it". A procedure-bodied lambda's inferred return type is `()` (§27.3 *Which
@@ -2683,10 +2694,40 @@ bool ownedParamAdmits(OwnedArgClass cls, std::string_view paramModifier) {
     return true;
 }
 
+// The formal type `pt` of `cand` as seen at a call whose receiver is
+// `recvTarget` (null for an unqualified call): the substitutions the
+// single-candidate argument check applies (`checkArgsAgainstParams`). Factored
+// out of `resolveMethodOverload`'s ranking (`paramTypeAtReceiver`) so the
+// fix #6268 deferred §27.3 check judges the same substituted slot.
+const TypeRef* ExprTC::formalTypeAtReceiver(const TypeRef* pt,
+                                            MethodSymbol* cand,
+                                            const ast::Expr* recvTarget) {
+    TypeSymbol* par = cand->parent;
+    if (!pt || !par || par->genericParams.empty()) return pt;
+    std::unordered_set<std::string_view> ownGenerics;
+    for (Symbol* gp : cand->genericParams)
+        if (gp) ownGenerics.insert(gp->name);
+    TypeRef* sub = substituteMemberType(const_cast<TypeRef*>(pt),
+                                        recvTarget, par, &ownGenerics);
+    if (!recvTarget) return sub;
+    auto cs = constraintReceiverSubst(recvTarget, par);
+    if (cs.empty()) {
+        const TypeRef* rt = ctx_.exprType(*recvTarget);
+        if (rt && rt->declaration && rt->declaration != par &&
+            rt->declaration->kind == ast::TypeDeclKind::Interface &&
+            !ancestorGenericSubst(rt, rt->declaration, par,
+                                  /*throughInterfaces=*/true, cs,
+                                  &ownGenerics))
+            cs.clear();
+    }
+    for (std::string_view own : ownGenerics) cs.erase(own);
+    return cs.empty() ? sub : substituteReturnType(sub, cs);
+}
+
 // §22.6 method-overload resolution; see header for contract.
 MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                                             const ast::CallExpr& ce) {
-    if (!initial || !initial->parent) return initial;
+    if (!initial) return initial;
 
     // §12.1/§22.6 (#1090): the candidate set is every same-name overload on the
     // receiver's class hierarchy, not just the one class `lookupMember` stopped
@@ -2694,7 +2735,53 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // a valid call to it is mis-rejected. Most-derived first so first-wins
     // arity selection still honours §22.6 closer-wins.
     std::vector<MethodSymbol*> overloads;
-    collectHierarchyOverloads(initial->parent, initial->name, overloads);
+    bool extensionFilterOnly = false;
+    if (initial->parent) {
+        collectHierarchyOverloads(initial->parent, initial->name, overloads);
+    } else if (initial->extensionDecl) {
+        // fix #6258 / #5987 (§26.5 / §22.6, v0.339): an EXTENSION method has
+        // no parent type, so this function used to return the member
+        // `lookupExtensionMember` picked — the FIRST same-name, same-arity
+        // member of the selected block, never ranked by argument type. §26.5
+        // selects the block (most specific receiver); the same-name members
+        // of that one block are then an ordinary §22.6 overload set. Type-
+        // based RANKING is scoped to a block over a CLOSED, non-generic target
+        // (no generic constraints, no type arguments): a generic block's
+        // formals mention its free type variables, which this function's
+        // receiver substitution (`paramTypeAtReceiver`, keyed on `parent`)
+        // does not bind. Such a block runs only the certain-evidence filters
+        // below (binding, `ref`/`out`, `owned`, procedure lambda) and then
+        // keeps the first surviving member (`extensionFilterOnly`).
+        const ast::ExtensionDecl* xd = initial->extensionDecl;
+        const TypeRef* xt =
+            xd->targetType ? ctx_.resolvedType(*xd->targetType) : nullptr;
+        if (!xd->genericConstraints.empty() || !xt ||
+            !xt->genericArgs.empty() ||
+            (xt->kind != TypeRef::Kind::Primitive &&
+             !(xt->kind == TypeRef::Kind::Named && xt->declaration)))
+            extensionFilterOnly = true;
+        const ExtensionSymbol* block = nullptr;
+        auto owns = [&](const ExtensionSymbol* e) {
+            return e && std::find(e->members.begin(), e->members.end(),
+                                  static_cast<Symbol*>(initial)) !=
+                            e->members.end();
+        };
+        if (ctx_.module())
+            for (Symbol* child : ctx_.module()->children)
+                if (auto* e = dynamic_cast<ExtensionSymbol*>(child))
+                    if (owns(e)) { block = e; break; }
+        if (!block)
+            for (ExtensionSymbol* e : importedExtensions_)
+                if (owns(e)) { block = e; break; }
+        if (!block) return initial;
+        for (Symbol* m : block->members)
+            if (auto* o = dynamic_cast<MethodSymbol*>(m))
+                if (o->name == initial->name && !o->isOperator)
+                    overloads.push_back(o);
+        if (overloads.size() < 2) return initial;
+    } else {
+        return initial;
+    }
     if (overloads.empty()) overloads.push_back(initial);
 
     bool hasNamed = false;
@@ -3130,6 +3217,52 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             binds.swap(ob);
         }
     }
+    // fix #6243 / #6258 (§22.6 *Lambda-literal arguments*, v0.339): a
+    // procedure-bodied lambda literal makes every candidate whose formal at
+    // that position returns a concrete value INAPPLICABLE — the same
+    // certain-evidence filter as the `ref`/`out` one above. Before this the
+    // function-typed column left §22.6 ranking `Undecidable`, and the pick
+    // fell to whatever the per-path fallback chose (the first declared
+    // `() -> int` overload, for `M(f: () -> int)` declared before
+    // `M(f: () -> ())`). When EVERY candidate is eliminated the set is left
+    // as it was (the call is an error; reporting it is #6268's).
+    {
+        const ast::Expr* lamRecv = callReceiverTarget(ce);
+        std::vector<MethodSymbol*> lc;
+        std::vector<BindResult> lb;
+        for (std::size_t c = 0; c < cands.size(); ++c) {
+            bool ok = true;
+            const std::size_t np = sema::formalParamCount(*cands[c]);
+            for (std::size_t j = 0; j < np && ok; ++j) {
+                const int ai = binds[c].paramToArg[j];
+                if (ai < 0) continue;
+                const ast::Type* dt = sema::formalParamDeclType(*cands[c], j);
+                const TypeRef* pt = formalTypeAtReceiver(
+                    dt ? ctx_.resolvedType(*dt)
+                       : sema::formalParamResolvedType(*cands[c], j),
+                    cands[c], lamRecv);
+                if (procedureLambdaInapplicableAt(
+                        ce.args[static_cast<std::size_t>(ai)].value.get(), pt))
+                    ok = false;
+            }
+            if (ok) {
+                lc.push_back(cands[c]);
+                lb.push_back(binds[c]);
+            }
+        }
+        if (!lc.empty() && lc.size() != cands.size()) {
+            cands.swap(lc);
+            binds.swap(lb);
+        }
+    }
+    // fix #6258: a generic extension block is filtered, never ranked (see
+    // `extensionFilterOnly` above) — keep `lookupExtensionMember`'s pick when
+    // it survived the filters, else the first surviving member.
+    if (extensionFilterOnly) {
+        if (std::find(cands.begin(), cands.end(), initial) != cands.end())
+            return initial;
+        return cands.front();
+    }
     // fix #6312 (§22.6 stage 3, §14.5, v0.338): a candidate returned here
     // as the only one left is not judged against its substituted signature
     // below, and `checkCallArity` skips the per-argument check for a generic
@@ -3378,12 +3511,7 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // the case `narrowIntConstantToTarget` already supports (literals + local /
     // module consts); bundling #2986 would risk regressing this fix when the
     // member-const resolver changes.
-    const ast::Expr* recvTarget = nullptr;
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
-        recvTarget = ma->target.get();
-    else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
-                 ce.callee.get()))
-        recvTarget = ncm->target.get();
+    const ast::Expr* recvTarget = callReceiverTarget(ce);
     // The three substitutions the single-candidate argument check applies
     // (`checkArgsAgainstParams`), in its order: the receiver's own arguments
     // (`substituteMemberType`, which also walks a base CLASS chain), a bare
@@ -3393,26 +3521,7 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // parameters shadow the type's and are excluded, as there.
     auto paramTypeAtReceiver = [&](const TypeRef* pt,
                                    MethodSymbol* cand) -> const TypeRef* {
-        TypeSymbol* par = cand->parent;
-        if (!pt || !par || par->genericParams.empty()) return pt;
-        std::unordered_set<std::string_view> ownGenerics;
-        for (Symbol* gp : cand->genericParams)
-            if (gp) ownGenerics.insert(gp->name);
-        TypeRef* sub = substituteMemberType(const_cast<TypeRef*>(pt),
-                                            recvTarget, par, &ownGenerics);
-        if (!recvTarget) return sub;
-        auto cs = constraintReceiverSubst(recvTarget, par);
-        if (cs.empty()) {
-            const TypeRef* rt = ctx_.exprType(*recvTarget);
-            if (rt && rt->declaration && rt->declaration != par &&
-                rt->declaration->kind == ast::TypeDeclKind::Interface &&
-                !ancestorGenericSubst(rt, rt->declaration, par,
-                                      /*throughInterfaces=*/true, cs,
-                                      &ownGenerics))
-                cs.clear();
-        }
-        for (std::string_view own : ownGenerics) cs.erase(own);
-        return cs.empty() ? sub : substituteReturnType(sub, cs);
+        return formalTypeAtReceiver(pt, cand, recvTarget);
     };
     for (std::size_t c = 0; c < cands.size(); ++c) {
         const std::size_t np = sema::formalParamCount(*cands[c]);
