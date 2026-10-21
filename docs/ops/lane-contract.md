@@ -114,6 +114,8 @@ SPECIFIC to its assignment.*
 21. Report: branch, SHAs in order with what each contains, files touched, exact spec citations, the
     fail-without/pass-with proof per row, filters run with their `N passed, 0 failed` counts, the
     item 19a matrix result, every flipped test, and everything deferred with its issue number.
+    Name the directory holding your probe programs: an accepted fix's probes are harvested into
+    the conformance corpus (runbook, *Harvest review probes into the corpus*).
     Label each claim MEASURED (you ran it), QUOTED (you read it) or HYPOTHESIS.
 22. **A denied tool call is reported, not routed around.** Say what was denied and carry on with
     the rest; never ask your coordinator or another agent to perform it for you.

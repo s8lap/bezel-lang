@@ -945,6 +945,32 @@ nothing could kill it by session. The reviewer then launched its own sweep of th
 two ran at once, and the kill was refused as not verifiably this session's. Hence `kill -0` on every PID before handback,
 including detached children.
 
+### Harvest review probes into the corpus
+
+*Added 2026-10-21 (R34), at the owner's request, after the same lapse happened twice.*
+
+Reviewers and producers write dozens of probe programs per fix: base/tip matrices,
+over-rejection sweeps, looped ASan shapes. Left in a scratch directory, they guard nothing.
+Turned into conformance cases, they run at every gate. The owner asked for this in R30
+(2026-10-14).
+
+- **Trigger.** On every ACCEPT pick, in the same turn, append the review's and the lane's probe
+  directories to the run's harvest queue (the cursor's LATEST block). Dispatch a harvest lane
+  (Haiku-max or Sonnet, `kind=test`, `tests/conformance/rules/` only) once the queue holds 4–6
+  picks, and always before the gate.
+- **Verdicts come from the spec.** Each case quotes the sentence that decides it, with section and
+  revision. A shape where the compiler disagrees with the spec becomes a known-divergent case
+  citing an OPEN issue, or it is dropped. A shape under an open `spec-question` gets no case.
+- **No duplicates.** One case per distinct shape × position. Grep `cases/` for the shape first;
+  `corpus.py audit` and `corpus.py lint` show no new entries before handback. A matrix of 1000+
+  cells becomes a committed generator and sweep, not cases.
+- **Review and pick it like any other commit:** a non-author review, then `pick_stage.sh --kind test`.
+  The integrator alone banks the corpus baseline.
+
+**Lapses.** R30 (2026-10-15): about 20 reviewed fixes were picked without one harvest lane, and the
+owner had to ask. R34 (2026-10-21): 4 picks again went without one, and the owner asked again. In
+both runs the rule lived only in a memory file, so this section and CLAUDE.md now state it.
+
 ### Commits
 
 End every commit message with exactly one trailer line and nothing else — no
