@@ -8077,9 +8077,12 @@ void Resolver::checkHidingAndOverride() {
                     if (!staticClassF || !hasMod(ms, "static")) {
                         ctx_.diagnostics().report(
                             Severity::Error, ms->declLoc,
-                            std::string(dynamic_cast<const PropertySymbol*>(ms)
-                                            ? "property `"
-                                            : "field `") +
+                            std::string(
+                                dynamic_cast<const PropertySymbol*>(ms)
+                                    ? "property `"
+                                : dynamic_cast<const NestedTypeSymbol*>(ms)
+                                    ? "nested type `"
+                                    : "field `") +
                             std::string(ms->name) +
                             "` hides the inherited `Object." +
                             std::string(ms->name) +
