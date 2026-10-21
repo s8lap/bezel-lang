@@ -10758,6 +10758,49 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             return op == "=" ? eq : builder_.CreateNot(eq);
         }
     }
+    // #6686 / #6210 ruling (§8.4, §25.2, §9.2, v0.339): `=` / `<>` between a
+    // record/choice value and an operand of a DIFFERENT type (a class, an int,
+    // another shape) has no applicable overload, so §25.2 hands it to §8.4's
+    // `a.Equals(b)`, which through the Object slot answers "unequal without the
+    // body running" (§9.2). Both operands were already evaluated above (their
+    // side effects ran); fold to the constant, disposing an owned class
+    // temporary. The struct-equality arm below would otherwise compare the left
+    // struct against a right operand of a different LLVM type and crash. A
+    // nullable-value operand, a null literal and a same-LLVM-type pair are
+    // untouched.
+    if ((op == "=" || op == "<>") && bin.left && bin.right &&
+        l->getType() != r->getType() &&
+        (l->getType()->isStructTy() || r->getType()->isStructTy()) &&
+        !dynamic_cast<const ast::NullLiteralExpr*>(bin.left.get()) &&
+        !dynamic_cast<const ast::NullLiteralExpr*>(bin.right.get())) {
+        auto isNullableShape = [&](llvm::Value* v, const ast::Expr* e) {
+            if (auto* t = ctx_.exprType(*e))
+                if (isNullableValueTy(t) || t->nullable) return true;
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(v->getType()))
+                return st->getNumElements() >= 1 &&
+                       st->getElementType(0) == nullablePrimHasValTy();
+            return false;
+        };
+        auto isRecOrChoice = [&](const ast::Expr* e) {
+            auto* t = ctx_.exprType(*e);
+            return t && t->kind == sema::TypeRef::Kind::Named &&
+                   t->declaration &&
+                   (t->declaration->kind == ast::TypeDeclKind::Record ||
+                    t->declaration->kind == ast::TypeDeclKind::Choice);
+        };
+        auto isOwnedClassTemp = [&](const ast::Expr* e) {
+            return isFreshOwnedClassProducer(e);
+        };
+        if (!isNullableShape(l, bin.left.get()) &&
+            !isNullableShape(r, bin.right.get()) &&
+            (isRecOrChoice(bin.left.get()) || isRecOrChoice(bin.right.get()))) {
+            if (isOwnedClassTemp(bin.left.get()) && l->getType()->isPointerTy())
+                emitDisposeAndReclaim(l);
+            if (isOwnedClassTemp(bin.right.get()) && r->getType()->isPointerTy())
+                emitDisposeAndReclaim(r);
+            return builder_.getInt1(op == "<>");
+        }
+    }
     // CG29b (§8.3): records compare structurally — dispatch before the
     // scalar integer path (ICmp doesn't accept struct operands). Recover the
     // record's declared type from either operand so per-field comparison knows
