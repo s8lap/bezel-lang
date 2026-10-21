@@ -256,7 +256,8 @@ BEZEL_TEST(sema_choice_case_payload_args_6119, exact_int_payload_runs_35_3) {
 BEZEL_TEST(sema_choice_case_payload_args_6119, int_into_nullable_payload_runs_35_3_5_1) {
     auto r = runAot(prog(
         "public choice C One(v: int?), Two; end C;",
-        "    var c := C.One(5); case c of One(var v) => Console.WriteLine(v), Two => Console.WriteLine(0) end case;"));
+        // #6778 (§7.1, v0.340): the `int?` binding coalesces at `WriteLine`.
+        "    var c := C.One(5); case c of One(var v) => Console.WriteLine(v ?? -1), Two => Console.WriteLine(0) end case;"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\n"));

@@ -249,8 +249,11 @@ BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, virtual_char_rejected_at_type_
 }
 
 BEZEL_TEST(xmod_generic_method_i32_type_arg_6779, null_conditional_char_rejected_at_type_arg_14_1) {
+    // #6778 (§7.5, §7.1, v0.340): a `?.` result is nullable, so it coalesces
+    // at `WriteLine`'s non-nullable parameter; the type argument is the
+    // rejection under test.
     expectReject("1",
-                 "var v: V? := new V(); Console.WriteLine(v?.VShow<char>('q'));",
+                 "var v: V? := new V(); Console.WriteLine(v?.VShow<char>('q') ?? \"\");",
                  "char>('q')", "VShow", "char");
 }
 

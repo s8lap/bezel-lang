@@ -107,14 +107,16 @@ std::string u2() {
 
 // §5.3 "null stays null": a null `decimal?` lifts to a null `float?`, and the
 // conversion must not run on the null payload.
+// #6778 (§7.1, §18.5, v0.340): the null result prints through a hole, since
+// `WriteLine`'s parameter is non-nullable and the hole renders `null`.
 std::string u3() {
     return main0("var n: decimal? := null; var nf := float?(n); "
-                 "Console.WriteLine(nf = null); Console.WriteLine(nf); ");
+                 "Console.WriteLine(nf = null); Console.WriteLine($\"{nf}\"); ");
 }
 
 std::string u4() {
     return main0("var n: decimal? := null; var nd := double?(n); "
-                 "Console.WriteLine(nd = null); Console.WriteLine(nd); ");
+                 "Console.WriteLine(nd = null); Console.WriteLine($\"{nd}\"); ");
 }
 
 // ── (b) explicit `T(x)` in a generic instantiated at T = decimal ────────────

@@ -400,7 +400,9 @@ BEZEL_TEST(dict_range_key_6527,
     BEZEL_EXPECT_EQ(
         std::string("AA\nTrue AA\nTrue\nFalse\n"),
         out("    var d: Dictionary<int, string> := [0: \"AA\"];\n"
-            "    Console.WriteLine(d.GetOrNull(0));\n"
+            // #6778 (§7.1, §18.5, v0.340): the `string?` result prints
+            // through a hole at `WriteLine`'s non-nullable parameter.
+            "    Console.WriteLine($\"{d.GetOrNull(0)}\");\n"
             "    var ok := d.TryGetValue(0, out var v);\n"
             "    Console.WriteLine($\"{ok} {v}\");\n"
             "    Console.WriteLine((0 in d).ToString());\n"

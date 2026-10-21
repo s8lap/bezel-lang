@@ -104,6 +104,11 @@
 // `Object`-returning method transfers a `+1` string, which #2865 declined to
 // guess at for the box spelling for the same reason. Filed, not guessed.
 
+// #6778 (owner ruling, §5.1, §22.6, v0.340): an un-narrowed `Object?` is not
+// `Object`, so the null arm (`on`, `o12`) prints through §18.5's
+// interpolation hole, which renders the same `null`. The old spelling is a
+// reject row in tests/codegen/console_nullable_arg_6778_test.cpp.
+
 #include <string>
 
 #include "support/aot_support.hpp"
@@ -205,7 +210,9 @@ const char* kSentinelRenderArms =
     "      Console.WriteLine(ol); "
     "      Console.WriteLine(ob); "
     "      Console.WriteLine(oe); "
-    "      Console.WriteLine(on); "
+    // #6778 (§5.1, §22.6, v0.340): an un-narrowed `Object?` is not `Object`;
+    // the null arm prints through §18.5's hole, which renders `null`.
+    "      Console.WriteLine($\"{on}\"); "
     "      var churn: string := \"c\" + k.ToString(); "
     "      t := t + churn.Length - churn.Length + 1; "
     "      k := k + 1; "
@@ -361,7 +368,10 @@ const char* kRenderedTextUnchanged =
     "    Console.WriteLine(o1); Console.WriteLine(o2); Console.WriteLine(o3); "
     "    Console.WriteLine(o4); Console.WriteLine(o5); Console.WriteLine(o6); "
     "    Console.WriteLine(o7); Console.WriteLine(o8); Console.WriteLine(o9); "
-    "    Console.WriteLine(o10); Console.WriteLine(o11); Console.WriteLine(o12); "
+    "    Console.WriteLine(o10); Console.WriteLine(o11); "
+    // #6778 (§5.1, §22.6, v0.340): `o12` is an un-narrowed `Object?`; it
+    // prints through §18.5's hole, which renders the same `null`.
+    "    Console.WriteLine($\"{o12}\"); "
     "    return 0; "
     "  end Main; "
     "end C2875F;";

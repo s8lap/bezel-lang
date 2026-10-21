@@ -9562,6 +9562,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.primitiveTypeRef(PrimitiveType::Object),
                             ce.args[0].value->span.begin);
                     }
+                    // fix #6778 (§7.1, §5.1, §22.6, v0.340; stdlib §2.1,
+                    // §7.4): every one-argument overload of these members is
+                    // non-nullable, so a `null` literal or a `T?` that §7.4
+                    // has not narrowed has no applicable overload. The three
+                    // spellings are one destination (`Console.Write` "is"
+                    // `Console.Out.Write`), so all read the `TextWriter` rows.
+                    // The one parameter is declared `value`, so a named
+                    // `value := x` binds the same position. Any other name
+                    // binds no parameter, which this arm does not yet
+                    // reject (#6882).
+                    if (nargs == 1 && ce.args[0].value &&
+                        !ce.args[0].isDiscard && ce.args[0].modifier.empty() &&
+                        (ce.args[0].name.empty() ||
+                         ce.args[0].name == "value") &&
+                        common::builtinParamIsNonNullable("TextWriter", mbr,
+                                                          nargs, 0)) {
+                        std::string spelled = "Console.";
+                        if (auto* innerMA =
+                                dynamic_cast<const ast::MemberAccessExpr*>(
+                                    consoleMA->target.get()))
+                            spelled += std::string(innerMA->member) + ".";
+                        spelled += std::string(mbr);
+                        reportBuiltinArgIfNullable(
+                            ce.args[0].value.get(),
+                            "argument to `" + spelled + "`");
+                    }
                     if (!arityOk) {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,

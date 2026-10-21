@@ -95,6 +95,29 @@ std::string wrap(const std::string& body) {
     return std::string(kModulePrefix) + body + kModuleSuffix;
 }
 
+// #6778 (§7.1, §22.6, v0.340): true iff `src` is rejected with the §7 text at
+// the argument of the first `call` (the position just past its `(`).
+bool rejectsNullableConsoleArg(const std::string& src, const std::string& call,
+                               const std::string& callee) {
+    const std::size_t at = src.find(call);
+    if (at == std::string::npos) return false;
+    const std::size_t arg = at + call.find('(') + 1;
+    std::size_t line = 1, lineStart = 0;
+    for (std::size_t i = 0; i < arg; ++i)
+        if (src[i] == '\n') { ++line; lineStart = i + 1; }
+    const std::string want =
+        ":" + std::to_string(line) + ":" + std::to_string(arg - lineStart + 1) +
+        ": the argument to `" + callee +
+        "` is nullable but the target type is non-nullable (\xC2\xA7" "7)";
+    auto r = runAot(src);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(want) != std::string::npos)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 // --- #583: Console.WriteLine(int? = 42) must print "42\n" ---
@@ -107,12 +130,14 @@ BEZEL_TEST(codegen_writeline_nullable_583, int_nullable_non_null_prints_value) {
     BEZEL_EXPECT_EQ(out, std::string("42\n"));
 }
 
-// A null int? must print "null\n" (matching string interpolation §18.5 /
-// emitValueToString's null branch).
-BEZEL_TEST(codegen_writeline_nullable_583, int_nullable_null_prints_null) {
-    std::string out = compileAndCapture(wrap(
-        "var x: int? := null; Console.WriteLine(x); return 0;"));
-    BEZEL_EXPECT_EQ(out, std::string("null\n"));
+// A null int? at `Console.WriteLine` used to print "null\n". Owner ruling on
+// #6778 (§7.1, §22.6, v0.340; stdlib §2.1): `WriteLine`'s parameter is
+// non-nullable, so an un-narrowed `int?` is a compile error; the
+// interpolation hole `$"{x}"` is the remedy that renders `null` (§18.5).
+BEZEL_TEST(codegen_writeline_nullable_583, int_nullable_null_rejected_6778_7_1) {
+    BEZEL_EXPECT_TRUE(rejectsNullableConsoleArg(
+        wrap("var x: int? := null; Console.WriteLine(x); return 0;"),
+        "Console.WriteLine(x)", "Console.WriteLine"));
 }
 
 // JIT regression: exit code must be reachable (program must not crash / IR-fail).
@@ -139,11 +164,12 @@ BEZEL_TEST(codegen_writeline_nullable_581, bool_nullable_false_prints_false) {
     BEZEL_EXPECT_EQ(out, std::string("False\n"));
 }
 
-// A null bool? must print "null\n".
-BEZEL_TEST(codegen_writeline_nullable_581, bool_nullable_null_prints_null) {
-    std::string out = compileAndCapture(wrap(
-        "var y: bool? := null; Console.WriteLine(y); return 0;"));
-    BEZEL_EXPECT_EQ(out, std::string("null\n"));
+// A null bool? at `Console.WriteLine` used to print "null\n"; it is now a
+// compile error (owner ruling on #6778; §7.1, §22.6, v0.340).
+BEZEL_TEST(codegen_writeline_nullable_581, bool_nullable_null_rejected_6778_7_1) {
+    BEZEL_EXPECT_TRUE(rejectsNullableConsoleArg(
+        wrap("var y: bool? := null; Console.WriteLine(y); return 0;"),
+        "Console.WriteLine(y)", "Console.WriteLine"));
 }
 
 // JIT: bool? must not IR-crash.

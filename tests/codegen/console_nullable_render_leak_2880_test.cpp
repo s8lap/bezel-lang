@@ -72,6 +72,13 @@
 // reproduced here in isolation while probing. Every record below is int-only so
 // the oracle observes this defect and not that one.
 
+// #6778 (owner ruling, §7.1, §22.6, v0.340): a null-initialized `T?` has no
+// applicable Write/WriteLine overload, so the absent values in (B) and (E)
+// print through §18.5's interpolation hole, which renders the same `null`.
+// The narrowed (initializer-bound) values keep reaching the console branch.
+// The old spelling is a reject row in
+// tests/codegen/console_nullable_arg_6778_test.cpp.
+
 #include <string>
 
 #include "support/aot_support.hpp"
@@ -170,13 +177,16 @@ const char* kSentinelAndNullArms =
     "      var nr: Pt2880B?    := null; "
     "      Console.WriteLine(nb); "
     "      Console.WriteLine(ne); "
-    "      Console.WriteLine(ni); "
-    "      Console.Write(nn); "
+    // #6778 (§7.1, §22.6, v0.340): a null-initialized `T?` is not narrowed,
+    // so it has no applicable Write/WriteLine overload; the absent values
+    // print through §18.5's hole, which renders the same `null`.
+    "      Console.WriteLine($\"{ni}\"); "
+    "      Console.Write($\"{nn}\"); "
     "      Console.WriteLine(); "
-    "      Console.WriteLine(nd); "
-    "      Console.WriteLine(nc); "
-    "      Console.WriteLine(nm); "
-    "      Console.WriteLine(nr); "
+    "      Console.WriteLine($\"{nd}\"); "
+    "      Console.WriteLine($\"{nc}\"); "
+    "      Console.WriteLine($\"{nm}\"); "
+    "      Console.WriteLine($\"{nr}\"); "
     "      t := t + int(ne!) + 1; "
     "      if ni <> null or nn <> null or nd <> null or nc <> null or "
     "         nm <> null or nr <> null then t := t + 1000; end; "
@@ -290,8 +300,10 @@ const char* kRenderedTextUnchanged =
     "    Console.WriteLine(nr); "
     "    Console.WriteLine(ns); "
     "    Console.WriteLine(nt); "
-    "    Console.WriteLine(nn); "
-    "    Console.WriteLine(nz); "
+    // #6778 (§7.1, §22.6, v0.340): the two null-initialized values print
+    // through §18.5's hole, which renders the same `null`.
+    "    Console.WriteLine($\"{nn}\"); "
+    "    Console.WriteLine($\"{nz}\"); "
     "    Console.Write(ni); "
     "    Console.WriteLine(); "
     "    return 41; "

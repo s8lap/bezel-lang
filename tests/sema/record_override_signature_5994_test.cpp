@@ -190,7 +190,9 @@ BEZEL_TEST(record_override_signature_5994,
         "class Program "
         "  public static method Main(): int "
         "    var a := new P(3); "
-        "    Console.WriteLine(a.ToString()); "
+        // #6778 (§7.1, §22.6, v0.340): the `string?` result is not
+        // `WriteLine`'s non-nullable `string`, so the read coalesces.
+        "    Console.WriteLine(a.ToString() ?? \"null\"); "
         "    return 0; "
         "  end Main; "
         "end Program;");
@@ -211,7 +213,9 @@ BEZEL_TEST(record_override_signature_5994,
         "class Program "
         "  public static method Main(): int "
         "    var a := new P(3); "
-        "    Console.WriteLine(a.GetHashCode()); "
+        // #6778 (§7.1, §22.6, v0.340): the `int?` result coalesces at
+        // `WriteLine`'s non-nullable parameter.
+        "    Console.WriteLine(a.GetHashCode() ?? -1); "
         "    return 0; "
         "  end Main; "
         "end Program;");
@@ -232,7 +236,9 @@ BEZEL_TEST(record_override_signature_5994,
         "class Program "
         "  public static method Main(): int "
         "    var a := new P(3); "
-        "    Console.WriteLine(a.Equals(new P(3))); "
+        // #6778 (§7.1, §22.6, v0.340): the `bool?` result coalesces at
+        // `WriteLine`'s non-nullable parameter.
+        "    Console.WriteLine(a.Equals(new P(3)) ?? false); "
         "    return 0; "
         "  end Main; "
         "end Program;");

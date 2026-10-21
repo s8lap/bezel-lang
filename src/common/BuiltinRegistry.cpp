@@ -1806,6 +1806,15 @@ constexpr BuiltinNonNullableParamRow kBuiltinNonNullableParams[] = {
     {"Boolean", "Parse", 1, 0},         {"Boolean", "TryParse", 2, 0},
     {"Boolean", "ParseOrNull", 1, 0},   {"Char", "Parse", 1, 0},
     {"Char", "TryParse", 2, 0},         {"Char", "ParseOrNull", 1, 0},
+    // §7.4 `TextWriter`, and §2.1 `Console`, whose `Write`/`WriteLine` "are"
+    // `Console.Out.Write`/`WriteLine`: every one-argument overload (`string`,
+    // `Object`, `char`, `bool`, the numeric primitives) is non-nullable, so
+    // an un-narrowed `T?` or a `null` literal has no applicable overload
+    // (§7.1, §5.1, §22.6, v0.340; owner ruling on #6778). The `Console`
+    // spellings are checked against these rows by the `Console` arm of
+    // `typeCall`; an interpolated string (whose holes render `null`, §18.5)
+    // is a non-nullable `string` and is not affected.
+    {"TextWriter", "Write", 1, 0},      {"TextWriter", "WriteLine", 1, 0},
     // §31.4: the standard exception constructors are the wildcard in
     // `builtinParamIsNonNullable`, not rows.
 };

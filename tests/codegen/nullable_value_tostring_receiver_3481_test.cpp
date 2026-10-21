@@ -382,7 +382,9 @@ BEZEL_TEST(nullable_value_tostring_receiver_3481, null_conditional_spelling_cont
     BEZEL_EXPECT_EQ(runAotOut(plain(
         "  var v: int? := 12345; "
         "  var a: string? := v?.ToString(); "
-        "  Console.WriteLine(a); "
+        // #6778 (§7.5, §18.5, v0.340): `a` is a `?.` result, nullable, so it
+        // prints through a hole at `WriteLine`'s non-nullable parameter.
+        "  Console.WriteLine($\"{a}\"); "
         "  return 0; ")),
         "12345");
 }

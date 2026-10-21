@@ -85,9 +85,13 @@ BEZEL_TEST(iface_conformance_generic_property_type_6130, nested_generic_matches_
         "end Main; end C;", "56\n");
 }
 BEZEL_TEST(iface_conformance_generic_property_type_6130, nullable_under_substitution_matches_spec_11_2) {
-    expectAccept(withMain(
+    // #6778 (§7.1, v0.340): the `int?` read coalesces at `WriteLine`.
+    std::string src = withMain(
         "public interface I<T> readonly property Value: T?; end I; " +
-        klass("I<int>", "int?", "52"), "I<int>"), "52\n");
+        klass("I<int>", "int?", "52"), "I<int>");
+    const std::string print = "Console.WriteLine(s.Value);";
+    src.replace(src.find(print), print.size(), "Console.WriteLine(s.Value ?? -1);");
+    expectAccept(src, "52\n");
 }
 BEZEL_TEST(iface_conformance_generic_property_type_6130, read_write_satisfies_read_only_spec_11_2) {
     // §11.2: "A read-write member satisfies a read-only interface member of the

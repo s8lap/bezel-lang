@@ -39,6 +39,14 @@
 //   T=record (value): value → record render, null → "null"
 //   T=enum (value): value → enum name, null → "null"
 
+// #6778 (owner ruling, §7.1, §5.1, §22.6, v0.340): every one-argument
+// `WriteLine` overload is non-nullable, so an un-narrowed `T?` argument is a
+// compile error. The generic bodies below therefore narrow `q` before the call
+// (the carrier still reaches the console lowering, now narrowed) and print the
+// absent case as the literal `null`; the expected stdout is unchanged. The old
+// un-narrowed spelling is a reject row in
+// tests/codegen/console_nullable_arg_6778_test.cpp.
+
 #include <string>
 
 #include "support/aot_support.hpp"
@@ -55,7 +63,10 @@ const char* kIntProgram =
     "class G "
     "  public static method Show<T>(v: T?) "
     "    var q: T? := v; "
-    "    Console.WriteLine(q); "
+    // #6778 (§7.1, §22.6, v0.340): an un-narrowed `T?` has no applicable
+    // `WriteLine` overload, so the carrier reaches the call narrowed.
+    "    if q <> null then Console.WriteLine(q); "
+    "    else Console.WriteLine(\"null\"); end; "
     "  end Show; "
     "end G; "
     "class P "
@@ -72,7 +83,10 @@ const char* kLongProgram =
     "class G "
     "  public static method Show<T>(v: T?) "
     "    var q: T? := v; "
-    "    Console.WriteLine(q); "
+    // #6778 (§7.1, §22.6, v0.340): an un-narrowed `T?` has no applicable
+    // `WriteLine` overload, so the carrier reaches the call narrowed.
+    "    if q <> null then Console.WriteLine(q); "
+    "    else Console.WriteLine(\"null\"); end; "
     "  end Show; "
     "end G; "
     "class P "
@@ -89,7 +103,10 @@ const char* kBoolProgram =
     "class G "
     "  public static method Show<T>(v: T?) "
     "    var q: T? := v; "
-    "    Console.WriteLine(q); "
+    // #6778 (§7.1, §22.6, v0.340): an un-narrowed `T?` has no applicable
+    // `WriteLine` overload, so the carrier reaches the call narrowed.
+    "    if q <> null then Console.WriteLine(q); "
+    "    else Console.WriteLine(\"null\"); end; "
     "  end Show; "
     "end G; "
     "class P "
@@ -115,7 +132,8 @@ const char* kNonGenericIntProgram =
     "    var q: int? := 5; "
     "    Console.WriteLine(q); "
     "    var n: int? := null; "
-    "    Console.WriteLine(n); "
+    // #6778 (§7.1, §22.6, v0.340): the absent value prints through a hole.
+    "    Console.WriteLine($\"{n}\"); "
     "    return 0; "
     "  end Main; "
     "end P;";
@@ -182,7 +200,10 @@ const char* kGenericRecordEnumProgram =
     "class G "
     "  public static method Show<T>(v: T?) "
     "    var q: T? := v; "
-    "    Console.WriteLine(q); "
+    // #6778 (§7.1, §22.6, v0.340): an un-narrowed `T?` has no applicable
+    // `WriteLine` overload, so the carrier reaches the call narrowed.
+    "    if q <> null then Console.WriteLine(q); "
+    "    else Console.WriteLine(\"null\"); end; "
     "  end Show; "
     "end G; "
     "class P "
@@ -207,7 +228,10 @@ const char* kGenericStringProgram =
     "class G "
     "  public static method Show<T>(v: T?) "
     "    var q: T? := v; "
-    "    Console.WriteLine(q); "
+    // #6778 (§7.1, §22.6, v0.340): an un-narrowed `T?` has no applicable
+    // `WriteLine` overload, so the carrier reaches the call narrowed.
+    "    if q <> null then Console.WriteLine(q); "
+    "    else Console.WriteLine(\"null\"); end; "
     "  end Show; "
     "end G; "
     "class P "

@@ -106,6 +106,29 @@ const char* kDClass =
     "  public override method ToString(): string => \"dd\"; "
     "end D; ";
 
+// #6778 (§7.1, §22.6, v0.340): true iff `src` is rejected with the §7 text at
+// the argument of the first `call` (the position just past its `(`).
+bool rejectsNullableConsoleArg(const std::string& src, const std::string& call,
+                               const std::string& callee) {
+    const std::size_t at = src.find(call);
+    if (at == std::string::npos) return false;
+    const std::size_t arg = at + call.find('(') + 1;
+    std::size_t line = 1, lineStart = 0;
+    for (std::size_t i = 0; i < arg; ++i)
+        if (src[i] == '\n') { ++line; lineStart = i + 1; }
+    const std::string want =
+        ":" + std::to_string(line) + ":" + std::to_string(arg - lineStart + 1) +
+        ": the argument to `" + callee +
+        "` is nullable but the target type is non-nullable (\xC2\xA7" "7)";
+    auto r = runAot(src);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(want) != std::string::npos)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -192,11 +215,16 @@ BEZEL_TEST(codegen_console_append_builtin_6753,
 // overloads; the `Object?` null path already prints "null" (interpretation,
 // recorded in the commit body), and this row keeps the nullable `StringBuilder?`
 // path on the same text. Before the fix it printed an empty line.
+//
+// Owner ruling on #6778 (§7.1, §22.6, v0.340; stdlib §2.1): `WriteLine`'s
+// `Object` parameter is non-nullable, so this un-narrowed `StringBuilder?` is
+// now a compile error rather than a rendered "null"; the §18.5 hole is the
+// remedy that renders `null`.
 BEZEL_TEST(codegen_console_append_builtin_6753,
-           writeline_nullable_stringbuilder_null_renders_null_8_5) {
-    BEZEL_EXPECT_EQ(out(prog(
-                        "var n: StringBuilder? := null; Console.WriteLine(n);")),
-                    std::string("null\n"));
+           writeline_nullable_stringbuilder_null_rejected_6778_7_1) {
+    BEZEL_EXPECT_TRUE(rejectsNullableConsoleArg(
+        prog("var n: StringBuilder? := null; Console.WriteLine(n);"),
+        "Console.WriteLine(n)", "Console.WriteLine"));
 }
 
 // Spec §8.5, v0.340: "For classes: the type's qualified name". `Array<T>` declares

@@ -74,9 +74,12 @@ BEZEL_TEST(iface_conformance_generic_base_nongeneric_iface_6179, direct_generic_
     ), "ok\n");
 }
 BEZEL_TEST(iface_conformance_generic_base_nongeneric_iface_6179, nullable_instantiation_matches_nullable_property_spec_11_2) {
-    expectAccept(prog("int?",
-        "public class K: B<int?>, N public constructor() base(62); end constructor; end K; "
-    ), "62\n");
+    // #6778 (§7.1, v0.340): the `int?` read coalesces at `WriteLine`.
+    std::string src = prog("int?",
+        "public class K: B<int?>, N public constructor() base(62); end constructor; end K; ");
+    const std::string print = "Console.WriteLine(s.Value);";
+    src.replace(src.find(print), print.size(), "Console.WriteLine(s.Value ?? -1);");
+    expectAccept(src, "62\n");
 }
 BEZEL_TEST(iface_conformance_generic_base_nongeneric_iface_6179, two_level_generic_base_matches_spec_11_2) {
     expectAccept(prog("int",

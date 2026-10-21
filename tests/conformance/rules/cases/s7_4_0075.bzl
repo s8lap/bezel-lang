@@ -24,8 +24,8 @@ class C
     var d := new Dictionary<int, int>();
     for var g in a.GroupBy(lambda(x: int) => x) do
       var h: IGrouping<int, int>? := g;
-      Console.WriteLine(h?.Count());
-      Console.WriteLine(h?.Key);
+      Console.WriteLine($"{h?.Count()}");
+      Console.WriteLine($"{h?.Key}");
       d.Add(g.Key, g.Count());
     end;
     Console.WriteLine(d.Count);
