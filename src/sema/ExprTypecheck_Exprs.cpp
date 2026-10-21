@@ -5499,6 +5499,27 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         }
                     }
                 }
+                // fix #6893 (stdlib §4.4, v0.340): `Array<T>` declares exactly
+                // `()`, `(capacity: int)` and `(size: int, fill: T)` -- no
+                // copying constructor -- so the one-argument form's argument
+                // must be int-like. It was never compared with `int`, and
+                // codegen sign-extended whatever pointer it got. A collection
+                // literal is rejected by the #2725 arm above (skip it here so
+                // the same argument is not diagnosed twice).
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    rt->headName() == "Array" && ne->args.size() == 1 &&
+                    ne->args[0].value &&
+                    !dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        ne->args[0].value.get())) {
+                    checkAssignable(
+                        ctx_.exprType(*ne->args[0].value),
+                        ctx_.primitiveTypeRef(PrimitiveType::Int),
+                        ne->args[0].value->span.begin,
+                        "capacity argument of the `Array<T>` constructor",
+                        ne->args[0].value.get());
+                }
                 // stdlib §4.4 v0.165 (#1375): the sized-fill constructor
                 // `Array<T>(size: int, fill: T)` requires `fill` to be
                 // assignable to the element type T (and `size` to be int-like).
