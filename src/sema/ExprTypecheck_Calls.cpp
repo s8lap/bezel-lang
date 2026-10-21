@@ -1336,6 +1336,46 @@ static bool isIntegerParamForOverload(const TypeRef* pt) {
            isIntegerPrimitiveTypeForOverload(pt->primitive);
 }
 
+// §22.6: "the call is **ambiguous** and is a compile error. The compiler
+// reports the error and cites the candidate overloads". The one message text,
+// shared by the ranked grid (`resolveOverload`) and the undecided-grid arm of
+// `resolveMethodOverload` (fix #6702).
+static std::string overloadAmbiguityMessage(
+    const std::string& calleeDesc, const std::vector<std::string>& candNames,
+    const std::vector<std::size_t>& appl, const std::vector<bool>& fillsDefault,
+    const std::string& extraNote) {
+    std::string msg = "ambiguous call to " + calleeDesc +
+                      ": no overload is unambiguously better (§22.6); "
+                      "candidates:";
+    for (std::size_t c : appl) {
+        msg += "\n  ";
+        msg += (c < candNames.size() ? candNames[c] : std::string("(overload)"));
+    }
+    // §22.6 defaulted-arity tie-break (v0.181, #1561): when every remaining
+    // candidate fills one or more defaults, the tie is over which omitted
+    // parameter(s) the caller meant — an explicit cast at a supplied
+    // position cannot distinguish candidates that already agree there, so
+    // the remedy is to supply the disambiguating optional argument(s)
+    // explicitly (by position or by name, §22.5) instead of casting.
+    bool allFillDefaults = !appl.empty();
+    for (std::size_t c : appl)
+        if (c >= fillsDefault.size() || !fillsDefault[c]) {
+            allFillDefaults = false;
+            break;
+        }
+    if (allFillDefaults) {
+        msg += "\nsupply the omitted optional argument(s) explicitly (§22.5) "
+               "so only one candidate's defaults apply — an explicit cast "
+               "cannot resolve a tie between candidates that differ only in "
+               "which defaults are filled";
+    } else {
+        msg += "\nadd an explicit cast (§5.2) so exactly one candidate is an "
+               "exact match";
+    }
+    msg += extraNote;
+    return msg;
+}
+
 // §22.6 overload resolution among same-arity, all-positional candidates.
 ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<std::vector<const TypeRef*>>& paramTypes,
@@ -1800,33 +1840,10 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
 
     // §22.6 step 3: no candidate is unambiguously better → ambiguous,
     // cite the applicable candidates.
-    std::string msg = "ambiguous call to " + calleeDesc +
-                      ": no overload is unambiguously better (§22.6); "
-                      "candidates:";
-    for (std::size_t c : appl) {
-        msg += "\n  ";
-        msg += (c < candNames.size() ? candNames[c] : std::string("(overload)"));
-    }
-    // §22.6 defaulted-arity tie-break (v0.181, #1561): when every remaining
-    // candidate fills one or more defaults, the tie is over which omitted
-    // parameter(s) the caller meant — an explicit cast at a supplied
-    // position cannot distinguish candidates that already agree there, so
-    // the remedy is to supply the disambiguating optional argument(s)
-    // explicitly (by position or by name, §22.5) instead of casting.
-    bool allFillDefaults = !appl.empty();
-    for (std::size_t c : appl)
-        if (!fillsDefault[c]) { allFillDefaults = false; break; }
-    if (allFillDefaults) {
-        msg += "\nsupply the omitted optional argument(s) explicitly (§22.5) "
-               "so only one candidate's defaults apply — an explicit cast "
-               "cannot resolve a tie between candidates that differ only in "
-               "which defaults are filled";
-    } else {
-        msg += "\nadd an explicit cast (§5.2) so exactly one candidate is an "
-               "exact match";
-    }
-    msg += extraNote;
-    ctx_.diagnostics().report(Severity::Error, loc, msg);
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        overloadAmbiguityMessage(calleeDesc, candNames, appl, fillsDefault,
+                                 extraNote));
     res.outcome = OverloadOutcome::Ambiguous;
     return res;
 }
@@ -4455,6 +4472,123 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                             "requiring a conversion that §5.1 does not admit "
                             "as implicit (§14.5, §22.6)" + extNote);
                     return arityFallback();
+                }
+            }
+            // fix #6702 (§22.6, v0.340): "two candidates that both require an
+            // implicit conversion at the same position are **equally ranked**
+            // there, regardless of which conversion each uses" and "If no
+            // candidate is unambiguously better — ... because the remaining
+            // candidates all rely on implicit conversions that this rule
+            // treats as equally ranked — the call is **ambiguous** and is a
+            // compile error. The compiler reports the error and cites the
+            // candidate overloads; it never silently selects one." The two
+            // blocks below never report: a co-equal pair fell through to the
+            // first-declared candidate (`F(IReadOnlyList<Animal>)` beside
+            // `F(IReadOnlyList<Dog>)` on an `Array<Dog>`), and an `Object`
+            // parameter, which the by-name ancestor walk does not reach from
+            // a built-in collection, graded inapplicable, so `F(Object)`
+            // beside `F(IEnumerable<int>)` on an `Array<int>` selected the
+            // second. Rank here on CERTAIN cells only: every cell of every
+            // candidate is Exact / Convert / NotApplicable by a rule that
+            // cannot be wrong, or this block declines and the arms below
+            // keep their selection. Declines too on a generic candidate, a
+            // defaulted or named binding, and a row spelled with a type
+            // parameter (the §22.6 tie-breaks that separate those are not
+            // re-derived here).
+            {
+                enum : int { kUnknown = -1, kNA = 0, kConv = 1, kExact = 2 };
+                const auto certainCell = [&](std::size_t c,
+                                             std::size_t i) -> int {
+                    const TypeRef* at = argTypeRows[c][i];
+                    const TypeRef* pt = paramTypes[c][i];
+                    if (!at || !pt || !argTypes[i]) return kUnknown;
+                    // fix #6722: a §5.1 narrowing made this row → converts.
+                    if (at != argTypes[i]) return kConv;
+                    if (targetTypedCol[i]) return kUnknown;
+                    if (sameTypeBySpelling(at, pt)) {
+                        if (at->nullable == pt->nullable) return kExact;
+                        return pt->nullable ? kConv : kNA;
+                    }
+                    // §7: no implicit nullable → non-nullable conversion.
+                    if (at->nullable && !pt->nullable) return kNA;
+                    if (differentInvariantInstantiations(at, pt)) return kNA;
+                    switch (genericHeadReach(at, pt, nullptr)) {
+                        case GenericHeadReach::Converts: return kConv;
+                        case GenericHeadReach::OtherArgs: return kNA;
+                        case GenericHeadReach::Unknown: break;
+                    }
+                    if (at->kind == TypeRef::Kind::Primitive &&
+                        pt->kind == TypeRef::Kind::Primitive) {
+                        switch (classifyArg(at, pt)) {
+                            case ArgMatch::Exact: return kExact;
+                            case ArgMatch::Convert: return kConv;
+                            case ArgMatch::NotApplicable: return kNA;
+                        }
+                    }
+                    // §5.1 reference conversions: every class reference
+                    // converts to the root `Object`, and to a non-generic
+                    // ancestor the §12 walk finds.
+                    if (at->kind == TypeRef::Kind::Named &&
+                        pt->kind == TypeRef::Kind::Primitive &&
+                        pt->primitive == PrimitiveType::Object)
+                        return kConv;
+                    if (at->kind == TypeRef::Kind::Named &&
+                        pt->kind == TypeRef::Kind::Named &&
+                        pt->genericArgs.empty() &&
+                        hasNamedAncestor(const_cast<TypeRef*>(at),
+                                         namedRefSimpleName(pt)))
+                        return kConv;
+                    return kUnknown;
+                };
+                bool certain = !hasNamed && cands.size() >= 2;
+                std::vector<std::size_t> appl;
+                std::vector<std::vector<int>> cell(cands.size());
+                for (std::size_t c = 0; c < cands.size() && certain; ++c) {
+                    if (!cands[c]->genericParams.empty() || fillsDefault[c] ||
+                        spelledWithTypeParam[c] ||
+                        paramTypes[c].size() != argTypes.size() ||
+                        argTypeRows[c].size() != argTypes.size()) {
+                        certain = false;
+                        break;
+                    }
+                    bool na = false, unknown = false;
+                    for (std::size_t i = 0; i < argTypes.size(); ++i) {
+                        const int g = certainCell(c, i);
+                        cell[c].push_back(g);
+                        if (g == kNA) na = true;
+                        if (g == kUnknown) unknown = true;
+                    }
+                    if (na) continue;
+                    if (unknown) certain = false;
+                    else appl.push_back(c);
+                }
+                if (certain && appl.size() >= 2) {
+                    // §22.6: "unambiguously better than another when it is
+                    // better-or-equal on every argument position and
+                    // strictly better (an exact match where the other
+                    // converts) on at least one".
+                    const auto better = [&](std::size_t x, std::size_t y) {
+                        bool strict = false;
+                        for (std::size_t i = 0; i < argTypes.size(); ++i) {
+                            if (cell[x][i] < cell[y][i]) return false;
+                            if (cell[x][i] > cell[y][i]) strict = true;
+                        }
+                        return strict;
+                    };
+                    std::size_t winner = cands.size();
+                    for (std::size_t x : appl) {
+                        bool all = true;
+                        for (std::size_t y : appl)
+                            if (x != y && !better(x, y)) { all = false; break; }
+                        if (all) { winner = x; break; }
+                    }
+                    if (winner != cands.size()) return cands[winner];
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        overloadAmbiguityMessage(
+                            std::string("`") + std::string(initial->name) + "`",
+                            candNames, appl, fillsDefault, extNote));
+                    return cands[appl.front()];
                 }
             }
             // fix #5859 (§22.6 / §5.1 / §31.4, v0.334): `Undecidable` also
