@@ -23273,6 +23273,14 @@ static bool isNestedWithin(const TypeSymbol* inner, const TypeSymbol* outer) {
     return false;
 }
 
+// §11.6 / §13.1 (#6727): shared by checkMemberVisibility and the property
+// setter-visibility paths in ExprTypecheck.cpp so the two cannot drift.
+bool ExprTC::nestingGrantsAccess(const TypeSymbol* declaring) const {
+    return currentType_ && declaring && currentType_ != declaring &&
+           (isNestedWithin(currentType_, declaring) ||
+            isNestedWithin(declaring, currentType_));
+}
+
 bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
                                    std::string_view memberName,
                                    SourceLocation loc,
@@ -23294,10 +23302,7 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
     // (directly or transitively). Field/method access is a plain offset/call in
     // codegen (visibility is a sema-only concept), so this is purely lifting a
     // false rejection.
-    if (currentType_ && currentType_ != declaring &&
-        (isNestedWithin(currentType_, declaring) ||
-         isNestedWithin(declaring, currentType_)))
-        return false;
+    if (nestingGrantsAccess(declaring)) return false;
 
     // internal — allowed iff the member is in the same module (not imported).
     // §13.4: `internal` = code in the same module. An imported symbol is by

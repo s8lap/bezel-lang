@@ -9967,7 +9967,9 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
             }
             TypeSymbol* declaring = ps->parent;
             bool bad = false;
-            if (sv == ast::Visibility::Private)
+            if (nestingGrantsAccess(declaring)) {
+                // §11.6 / §13.1 (#6727): lexical nesting grant.
+            } else if (sv == ast::Visibility::Private)
                 bad = (currentType_ != declaring);
             else if (sv == ast::Visibility::Protected)
                 bad = !(currentType_ == declaring ||
@@ -10618,7 +10620,9 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     }
     TypeSymbol* declaring = ps.parent;
     bool bad = false;
-    if (sv == ast::Visibility::Private)
+    if (nestingGrantsAccess(declaring)) {
+        // §11.6 / §13.1 (#6727): lexical nesting grant.
+    } else if (sv == ast::Visibility::Private)
         bad = (currentType_ != declaring);
     else if (sv == ast::Visibility::Protected)
         bad = !(currentType_ == declaring ||

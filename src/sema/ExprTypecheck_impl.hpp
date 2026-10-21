@@ -4776,6 +4776,9 @@ private:
                                std::string_view memberName,
                                SourceLocation loc,
                                const TypeRef* receiver = nullptr);
+    // §11.6 / §13.1 (#6727): lexical nesting grant, mutual between a type and
+    // the types its body encloses at any depth; siblings excluded.
+    bool nestingGrantsAccess(const TypeSymbol* declaring) const;
 
     // §7.5 null-conditional member access `x?.M`. Resolves the member on
     // the target's (non-nullable) type exactly like `.`, but the result
