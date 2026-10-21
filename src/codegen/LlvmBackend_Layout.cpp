@@ -4122,6 +4122,42 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             return nullptr;
         }
     }
+    // narrow #6755 (§12.7 / §17.4 / §8.6, v0.339): a NON-GENERIC vtable-less
+    // builtin class target (StringBuilder, Random, Stopwatch, Mutex, ...). Like
+    // the collections above these are sealed, non-boxed, and carry no runtime
+    // descriptor, so every such test used to bail silently (`o is Random` on a
+    // `Random`-typed `o` degraded to #3079's "argument failed to lower"). When
+    // the OPERAND's own static type is ITSELF such a builtin the answer is
+    // static: sealed means the runtime type is the static type, so a match
+    // needs the same head and a non-null value (§12.7: null is an instance of
+    // no type). An Object/interface carrier erases the head and there is no
+    // runtime tag to read (the #5059/#4885 gap), so that shape still falls
+    // through to the bail below -- the issue's headline repro, kept open.
+    if (!targetDesc && obj->getType()->isPointerTy() &&
+        rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+        rt->genericArgs.empty() &&
+        vtablelessBuiltinReleaseIsKnown(rt->headName())) {
+        const sema::TypeRef* operandTy = operandStaticTy();
+        if (operandTy && operandTy->kind == sema::TypeRef::Kind::Named &&
+            !operandTy->declaration && operandTy->genericArgs.empty() &&
+            vtablelessBuiltinReleaseIsKnown(operandTy->headName())) {
+            const bool sameTy = operandTy->headName() == rt->headName();
+            llvm::Value* nonNull = builder_.CreateICmpNE(
+                obj, llvm::ConstantPointerNull::get(ptrTy()),
+                "is.vtless.nonnull");
+            llvm::Value* holds = sameTy ? nonNull : builder_.getInt1(false);
+            if (te.op == "is") { releaseFreshBoxTemp(); return holds; }
+            if (te.op == "is not") {
+                releaseFreshBoxTemp();
+                return builder_.CreateXor(holds, builder_.getInt1(true));
+            }
+            if (te.op == "as") {
+                if (!sameTy) return llvm::ConstantPointerNull::get(ptrTy());
+                return builder_.CreateSelect(
+                    holds, obj, llvm::ConstantPointerNull::get(ptrTy()));
+            }
+        }
+    }
     if (!targetDesc) {
         // #2775: a CONCRETE target with no runtime descriptor means the
         // compiler has no runtime tag for it — an internal limitation, not a
