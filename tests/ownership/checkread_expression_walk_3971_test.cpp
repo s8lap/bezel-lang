@@ -361,7 +361,7 @@ BEZEL_TEST(checkread_expression_walk_3971,
 BEZEL_TEST(checkread_expression_walk_3971,
            range_endpoint_read_after_move_rejected_28_3) {
     expectMovedOutOnce(std::string(kConsumed) +
-                       "var r := x.tag..3; return t + r.Start;");
+                       "var r := x.tag..3; return t + r.Start!;");
 }
 
 BEZEL_TEST(checkread_expression_walk_3971,
@@ -654,7 +654,7 @@ BEZEL_TEST(checkread_expression_walk_3971,
         "var r := a.tag..7; "
         "var cnt := 0; "
         "for var i in a.tag..7 do cnt := cnt + 1; end; "
-        "return r.Start + cnt;"));
+        "return r.Start! + cnt;"));
     BEZEL_EXPECT_TRUE(jr.ran);
     BEZEL_EXPECT_EQ(jr.exitCode, 8);
 }

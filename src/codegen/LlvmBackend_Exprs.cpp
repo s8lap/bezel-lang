@@ -4607,6 +4607,27 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     const unsigned idx = mbr == "Start" ? 0u : 1u;
                     llvm::Value* raw = builder_.CreateExtractValue(
                         rv, {idx}, mbr == "Start" ? "r.start" : "r.end");
+                    // §16.3 / stdlib §9.8 (#6798, #6799): sema types the read
+                    // as `T?`. Yield the tagged {i8 hasValue, T} at the
+                    // element's own width: the side's open-ended flag (bit 1
+                    // Start, bit 2 End) selects null, so a byte/ushort/uint/
+                    // ulong endpoint reaches its consumer at its real type.
+                    if (const sema::TypeRef* nty = ctx_.exprType(e);
+                        nty && isNullableValueTy(nty) && relemBits != 0) {
+                        llvm::StructType* nst = nullableValueStructTy(nty);
+                        llvm::Value* flg = builder_.CreateExtractValue(rv, {3u}, "r.flg");
+                        llvm::Value* open = builder_.CreateICmpNE(
+                            builder_.CreateAnd(flg, llvm::ConstantInt::get(
+                                flg->getType(), mbr == "Start" ? 2 : 4)),
+                            llvm::ConstantInt::get(flg->getType(), 0), "r.open");
+                        llvm::Value* has = builder_.CreateZExt(
+                            builder_.CreateNot(open), nullablePrimHasValTy(), "r.has");
+                        llvm::Value* pv = builder_.CreateTrunc(
+                            raw, nst->getElementType(1), "r.ep.nat");
+                        llvm::Value* res = builder_.CreateInsertValue(
+                            llvm::UndefValue::get(nst), has, {0u});
+                        return builder_.CreateInsertValue(res, pv, {1u});
+                    }
                     if (relemBits == 0)
                         return builder_.CreateTrunc(raw, i32(), "r.endpoint.i32");
                     const bool wide = relemBits == 64;

@@ -25558,6 +25558,26 @@ TypeRef* ExprTC::applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
 }
 
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
+    // §16.3 / stdlib §9.8 (#6798): `Range<T>.Start` and `.End` are `T?`
+    // ("a `null` endpoint indicates the range is open-ended on that side").
+    // Range has no user member table, so the ordinary lookup never typed
+    // them and every consumer was accepted unchecked. Type the read as
+    // the nullable form of the element type; codegen yields the tagged
+    // `{i8, T}` with a real null for an open side (#6799).
+    if (ma.target && (ma.member == "Start" || ma.member == "End")) {
+        if (auto* tt = ctx_.exprType(*ma.target)) {
+            if (tt->kind == TypeRef::Kind::Named && tt->declaration &&
+                tt->declaration == ctx_.builtinClassSym("Range") &&
+                tt->genericArgs.size() == 1 && tt->genericArgs[0] &&
+                tt->genericArgs[0]->kind == TypeRef::Kind::Primitive) {
+                auto* et = ctx_.makeTypeRef();
+                *et = *tt->genericArgs[0];
+                et->nullable = true;
+                ctx_.setExprType(&ma, et);
+                return;
+            }
+        }
+    }
     // fix #4961 (spec §28.14, v0.307): "forming a method reference over
     // a capture-free-register position is a compile error". The capture-free
     // register covers `ISharedEvent<T>.Subscribe` and

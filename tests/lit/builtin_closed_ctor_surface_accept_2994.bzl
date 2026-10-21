@@ -113,7 +113,7 @@ class ACC
     var dt := new DateTime(2024, 1, 2);
     using var buf := new OwningBuffer<int>(4);
     var rg := 0..5;
-    total := total + dt.Day + rg.End;
+    total := total + dt.Day + rg.End!;
 
     Console.WriteLine(total);
     return 0;

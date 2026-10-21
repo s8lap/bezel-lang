@@ -392,7 +392,7 @@ BEZEL_TEST(builtin_closed_ctor_surface_2994,
         "  var dt := new DateTime(2024, 1, 2); "
         "  using var buf := new OwningBuffer<int>(4); "
         "  var rg := 0..5; "
-        "  return dt.Day + rg.End; "
+        "  return dt.Day + rg.End!; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(7, r.exitCode);                        // 2 + 5

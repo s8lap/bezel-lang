@@ -131,7 +131,7 @@ BEZEL_TEST(codegen_range_in_var_499, start_property) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 3..7; "
-        "  return r.Start; "
+        "  return r.Start!; "
         "end Main; end C;"), 3);
 }
 
@@ -140,7 +140,7 @@ BEZEL_TEST(codegen_range_in_var_499, end_property) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 3..7; "
-        "  return r.End; "
+        "  return r.End!; "
         "end Main; end C;"), 7);
 }
 

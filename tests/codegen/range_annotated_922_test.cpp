@@ -36,7 +36,7 @@ BEZEL_TEST(codegen_range_annotated_922, annotated_start_plus_end) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 3..9; "
-        "  return r.Start + r.End; "
+        "  return r.Start! + r.End!; "
         "end Main; end C;"), 12);
 }
 
@@ -100,7 +100,7 @@ BEZEL_TEST(codegen_range_annotated_922, annotated_start_member) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 7..11; "
-        "  return r.Start; "
+        "  return r.Start!; "
         "end Main; end C;"), 7);
 }
 
@@ -108,7 +108,7 @@ BEZEL_TEST(codegen_range_annotated_922, annotated_end_member) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r: Range<int> := 7..11; "
-        "  return r.End; "
+        "  return r.End!; "
         "end Main; end C;"), 11);
 }
 
@@ -129,6 +129,6 @@ BEZEL_TEST(codegen_range_annotated_922, inferred_start_end_regression) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  var r := 3..9; "
-        "  return r.Start + r.End; "
+        "  return r.Start! + r.End!; "
         "end Main; end C;"), 12);
 }
