@@ -4192,6 +4192,69 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             }
         }
     }
+    // fix #6776 (§8.2 / §12.7 / stdlib §3.1, v0.340): a vtable-less built-in
+    // at an Object / interface location now carries a runtime type tag (word 0
+    // is one of the runtime-owned vtables, see bz_obj_is_string), so a test
+    // against one of those types is decidable here instead of falling to the
+    // #2775 "dropped" bail below.
+    //  (a) the NON-generic StringBuilder / Mutex: their descriptor is the
+    //      runtime's (`bz_sb_desc` / `bz_mutex_desc`); the ordinary,
+    //      string-guarded emitIsA walk below compares it by address.
+    //  (b) an array-backed GENERIC built-in (Array<Dog>, OwningArray<T> …)
+    //      with concrete arguments: compare the per-instantiation descriptor
+    //      codegen stamped at construction (bz_array_inst_desc, null for a
+    //      non-array, a StringBuilder, a string, a class instance and an
+    //      unstamped runtime-produced array) against this module's own copy
+    //      — the LinkOnceODR symbols fold to one address at link time. This
+    //      is the arm that answers #4926's Object carrier (`o: Object := a;
+    //      o is Array<char>`).
+    //  Both arms are confined to an operand whose static type is `Object` or
+    //  a bare type parameter: those hold the built-in ITSELF (§3.1 / §5.1,
+    //  representation-preserving). An INTERFACE-typed operand (`e:
+    //  IEnumerable<char> := a`) holds the caller-materialised adapter object
+    //  instead (MEASURED: `(o1: Object := a).Equals(o2: Object := e)` is
+    //  false), whose tag is not the array's, so for it the #2775 "dropped"
+    //  bail below stays — a diagnosed drop, not a confident wrong `false`
+    //  (the #5077 lesson; tests/lit/type_test_covariant_interface_carrier_warns_5077.bzl).
+    const bool operandHoldsValueItself = [&] {
+        const sema::TypeRef* opTy = resolveTypeParamRef(operandStaticTy());
+        if (!opTy) return false;
+        if (opTy->kind == sema::TypeRef::Kind::Primitive)
+            return opTy->primitive == sema::PrimitiveType::Object;
+        return opTy->kind == sema::TypeRef::Kind::Named && !opTy->declaration &&
+               opTy->genericArgs.empty() &&
+               !isBuiltinTypeRefName(opTy->headName());  // a still-bare T
+    }();
+    //  The target is a vtable-less built-in when it has no declaration, or a
+    //  builtinClassSym one (null decl, no module: FrozenArray<T>, #3249).
+    const bool targetIsVtablelessBuiltin =
+        rt->kind == sema::TypeRef::Kind::Named &&
+        (!rt->declaration ||
+         (!rt->declaration->decl && rt->declaration->moduleName.empty()));
+    if (!targetDesc && operandHoldsValueItself && obj->getType()->isPointerTy() &&
+        targetIsVtablelessBuiltin) {
+        if (rt->genericArgs.empty()) {
+            targetDesc = runtimeBuiltinDescriptorFor(builtinTypeName(rt));
+        } else if (targetArgsConcrete &&
+                   common::isArrayBackedCollectionName(builtinTypeName(rt))) {
+            if (llvm::GlobalVariable* inst = builtinInstanceDescriptorFor(rt)) {
+                llvm::Value* hit = builder_.CreateICmpEQ(
+                    builder_.CreateCall(
+                        declareC("bz_array_inst_desc", ptrTy(), {ptrTy()}),
+                        {obj}, "is.arrdesc"),
+                    inst, "is.arrinst");
+                if (te.op == "is") { releaseFreshBoxTemp(); return hit; }
+                if (te.op == "is not") {
+                    releaseFreshBoxTemp();
+                    return builder_.CreateXor(hit, builder_.getInt1(true));
+                }
+                if (te.op == "as")
+                    return builder_.CreateSelect(
+                        hit, obj, llvm::ConstantPointerNull::get(ptrTy()),
+                        "as.arrinst");
+            }
+        }
+    }
     if (!targetDesc) {
         // #2775: a CONCRETE target with no runtime descriptor means the
         // compiler has no runtime tag for it — an internal limitation, not a
@@ -4548,6 +4611,111 @@ llvm::Value* Emitter::emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc
     result->addIncoming(builder_.getInt1(false), bodyBB);    // hit null
     result->addIncoming(builder_.getInt1(true), matchBB);    // matched
     return result;
+}
+
+// fix #6776 (§8.2 / §12.7 / stdlib §3.1 / §6.2, v0.340): see the declaration.
+// The two descriptors are `extern "C" void* bz_sb_desc[2]` /
+// `bz_mutex_desc[2]` in bezel_runtime_refcounting.cpp; this module only
+// references them (getOrInsertGlobal), exactly as the fnval arm references
+// bz_fnval_vtable, so the address every module compares is the runtime's one.
+llvm::GlobalVariable* Emitter::runtimeBuiltinDescriptorFor(
+        std::string_view head) {
+    const char* sym = nullptr;
+    if (head == "StringBuilder") sym = "bz_sb_desc";
+    else if (head == "Mutex") sym = "bz_mutex_desc";
+    else return nullptr;
+    auto* ty = llvm::ArrayType::get(ptrTy(), 2);
+    return llvm::cast<llvm::GlobalVariable>(module_->getOrInsertGlobal(sym, ty));
+}
+
+bool Emitter::typeRefIsRuntimeConcrete(const sema::TypeRef* t) const {
+    if (!t) return false;
+    using K = sema::TypeRef::Kind;
+    switch (t->kind) {
+    case K::Primitive:
+    case K::Unit:
+        return true;
+    case K::InlineArray:
+        return typeRefIsRuntimeConcrete(t->arrayElement);
+    case K::Function:
+        for (const auto& p : t->funcParams)
+            if (!typeRefIsRuntimeConcrete(p.type)) return false;
+        return !t->funcReturn || typeRefIsRuntimeConcrete(t->funcReturn);
+    case K::Named:
+        // A declaration-less Named head that is not a reserved built-in name
+        // is a bare type parameter (the isBareTypeParamRef shape).
+        if (!t->declaration && !isBuiltinTypeRefName(t->headName()))
+            return false;
+        for (const sema::TypeRef* a : t->genericArgs)
+            if (!typeRefIsRuntimeConcrete(a)) return false;
+        return true;
+    default:
+        return false;
+    }
+}
+
+llvm::GlobalVariable* Emitter::builtinInstanceDescriptorFor(
+        const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    // A declaration is admitted only when it is a builtinClassSym (null decl
+    // AND no originating module — the FrozenArray<T> shape, #3249; an
+    // imported user class has a module), which builtinTypeName names.
+    if (rt->declaration &&
+        (rt->declaration->decl || !rt->declaration->moduleName.empty()))
+        return nullptr;
+    if (!genericSubstSemaTy_.empty())
+        rt = substituteTypeRefLocal(rt, genericSubstSemaTy_);
+    if (!rt) return nullptr;
+    std::string_view bn = builtinTypeName(rt);
+    if (bn.empty() || !common::isArrayBackedCollectionName(bn)) return nullptr;
+    if (!typeRefIsRuntimeConcrete(rt)) return nullptr;
+    sema::TypeRef bare = *rt;
+    bare.nullable = false;
+    const std::string rendered = vtablelessBuiltinQualifiedName(bn, &bare);
+    auto it = builtinInstDescs_.find(rendered);
+    if (it != builtinInstDescs_.end()) return it->second;
+    // The symbol is a pure function of the rendered name (hex-escaped like
+    // the `bz$fnsig$` descriptors'), so two modules' LinkOnceODR definitions
+    // of one instantiation fold to one address at link time.
+    std::string sym = "btd$builtin$";
+    static const char* const hex = "0123456789abcdef";
+    for (unsigned char c : rendered) {
+        const bool plain = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                           (c >= 'A' && c <= 'Z') || c == '_' || c == '.';
+        if (plain) {
+            sym += static_cast<char>(c);
+        } else {
+            sym += '$';
+            sym += hex[c >> 4];
+            sym += hex[c & 15];
+        }
+    }
+    std::string lexeme = "\"";
+    for (char c : rendered) {
+        if (c == '"' || c == '\\') lexeme += '\\';
+        lexeme += c;
+    }
+    lexeme += "\"";
+    llvm::Constant* nameStr =
+        llvm::cast<llvm::Constant>(lowerStringLiteral(lexeme, false));
+    auto* arrTy = llvm::ArrayType::get(ptrTy(), 3);
+    auto* gv = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::LinkOnceODRLinkage, nullptr, sym);
+    gv->setInitializer(llvm::ConstantArray::get(
+        arrTy, {gv, llvm::ConstantPointerNull::get(ptrTy()), nameStr}));
+    builtinInstDescs_[rendered] = gv;
+    return gv;
+}
+
+void Emitter::stampBuiltinTypeDesc(llvm::Value* arr, const sema::TypeRef* rt) {
+    if (!arr || !arr->getType()->isPointerTy()) return;
+    llvm::GlobalVariable* d = builtinInstanceDescriptorFor(rt);
+    if (!d) return;
+    builder_.CreateCall(
+        declareC("bz_array_set_type_desc", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy(), ptrTy()}),
+        {arr, d});
 }
 
 

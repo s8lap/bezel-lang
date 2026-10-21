@@ -58,14 +58,28 @@ void* bz_ioe_vtable = nullptr;
 // never hands to codegen, so the no-op is defensive rather than
 // observable. // per §28.9 / §28.2
 // ---------------------------------------------------------------------------
+// fix #6776 (§8.2, v0.340): a bz_array_t now opens with its vtable word
+// (bz_array_vtable, or bz_sb_vtable for a StringBuilder's parts array), so
+// the array probe is a word-0 compare; the `kind` field moved to offset 64
+// and is no longer what identifies an array. bz_llist_t still carries its
+// kind at offset 48 and bz_dict_t at 88; neither can alias the array probe
+// (a list's word 0 is its head pointer, a dict's its bucket pointer) and an
+// array's offset 48 is now `mod_count`, a non-negative counter that can
+// never equal the negative LLIST sentinel.
+static inline bool bz_word0_is_array(void* p) {
+    void* word0;
+    memcpy(&word0, p, sizeof(void*));
+    return word0 == (void*)bz_array_vtable || word0 == (void*)bz_sb_vtable;
+}
+
 extern "C" void bz_runtime_dispose(void* p, void (*dispose_elem)(void*)) {
     if (!p) return;
-    // Probe offset 48 first — both bz_array_t and bz_llist_t carry the
-    // kind here. The negative sentinel values rule out a bz_dict_t
-    // false-positive (its order_count at offset 56 is non-negative).
+    if (bz_word0_is_array(p)) { bz_array_free(p, dispose_elem); return; }
+    // Probe offset 48 — bz_llist_t carries the kind here. The negative
+    // sentinel value rules out a bz_dict_t false-positive (its `order`
+    // pointer sits at offset 48).
     int64_t k48 = 0;
     memcpy(&k48, (uint8_t*)p + 48, sizeof(int64_t));
-    if (k48 == BZ_RUNTIME_KIND_ARRAY) { bz_array_free(p, dispose_elem); return; }
     if (k48 == BZ_RUNTIME_KIND_LLIST) { bz_llist_free(p, dispose_elem); return; }
     // bz_dict_t's kind lives at offset 88 (struct ends at 96). Reading
     // there is safe — the alloc sized the struct for it.
@@ -77,9 +91,9 @@ extern "C" void bz_runtime_dispose(void* p, void (*dispose_elem)(void*)) {
 
 extern "C" int64_t bz_runtime_kind(void* p) {
     if (!p) return BZ_RUNTIME_KIND_NONE;
+    if (bz_word0_is_array(p)) return BZ_RUNTIME_KIND_ARRAY;
     int64_t k48 = 0;
     memcpy(&k48, (uint8_t*)p + 48, sizeof(int64_t));
-    if (k48 == BZ_RUNTIME_KIND_ARRAY) return k48;
     if (k48 == BZ_RUNTIME_KIND_LLIST) return k48;
     int64_t k88 = 0;
     memcpy(&k88, (uint8_t*)p + 88, sizeof(int64_t));
@@ -237,6 +251,7 @@ void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
     // claiming capacity over a NULL buffer and the first add wrote through it.
     auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
     if (!arr) bz_alloc_fail("Array<T> header");
+    arr->vtable = (void*)bz_array_vtable;  // fix #6776 (§8.2): identity at allocation
     arr->kind = BZ_RUNTIME_KIND_ARRAY;  // fix #3026
     if (initial_cap > 0) {
         arr->data = calloc((size_t)initial_cap, (size_t)elem_size);
@@ -260,6 +275,8 @@ int64_t bz_array_capacity(void* arrp) {
 // for i in 0..<n without requiring Add() first. All n elements are calloc'd to 0.
 void* bz_array_alloc_count_n(int64_t elem_size, int64_t n) {
     auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
+    if (!arr) bz_alloc_fail("Array<T> header");
+    arr->vtable = (void*)bz_array_vtable;  // fix #6776 (§8.2): identity at allocation
     arr->kind = BZ_RUNTIME_KIND_ARRAY;  // fix #3026
     if (n > 0) {
         arr->data = calloc((size_t)n, (size_t)elem_size);
@@ -895,6 +912,11 @@ void* bz_array_copy(void* arrp, int64_t elem_size) {
     auto* src = (bz_array_t*)arrp;
     if (!src) return bz_array_alloc(elem_size, 0);
     auto* dst = (bz_array_t*)bz_array_alloc(elem_size, src->count);
+    // fix #6776 (§8.2): a copy is a new instance of the SAME instantiation —
+    // carry the source's per-instantiation descriptor (codegen re-stamps the
+    // one producer whose result type can differ, the §4.19 copying
+    // construction).
+    dst->type_desc = src->type_desc;
     if (src->count > 0 && src->data) {
         memcpy(dst->data, src->data, (size_t)(src->count * elem_size));
         dst->count = src->count;
@@ -912,6 +934,7 @@ void* bz_array_slice(void* arrp, int64_t start, int64_t end, int64_t elem_size) 
     int64_t count = end - start;
     if (count < 0) count = 0;
     auto* dst = (bz_array_t*)bz_array_alloc(elem_size, count > 0 ? count : 0);
+    if (src) dst->type_desc = src->type_desc;  // fix #6776 (§8.2): same Array<T>
     if (count > 0 && src && src->data) {
         memcpy(dst->data, (char*)src->data + start * elem_size,
                (size_t)(count * elem_size));

@@ -1590,7 +1590,8 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // leak: on a user class word 0 is a vtable pointer, so `arr->data`,
             // `arr->count` and `arr->elem_disposer` are all read OFF THE VTABLE.
             // That is why neither `bz_array_free_dynamic` nor the #3026
-            // `kind`-tag probe (`bz_runtime_dispose`, which reads offset 48/88)
+            // `kind`-tag probe (`bz_runtime_dispose`, which reads word 0 and
+            // offsets 48/88)
             // helps — #3026's tag lives inside the very struct the value does
             // not have, so probing it is an out-of-bounds read of a user object
             // that is smaller than the offset.
@@ -1621,9 +1622,11 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // slot admits a closed population — which is exactly this one, and by
             // the same argument #417's own site records: in an `IList<int>` slot the
             // only values admitted are (a) a concrete built-in collection, whose
-            // word 0 is `arr->data` — a heap pointer, never a listed vtable (and
-            // NULL for an empty backing, which the null-terminator loop stops at,
-            // so it answers "string", i.e. the array arm) — and (b) a user class
+            // word 0 is the runtime's own array vtable since #6776 (before that
+            // `arr->data` — a heap pointer, never a listed vtable, so it
+            // answered "string", i.e. the array arm; now it answers "not a
+            // string" and the `bz_obj_is_tagged_builtin` test below keeps it on
+            // the array arm) — and (b) a user class
             // declaring the head, whose vtable IS registered (user and imported
             // classes alike; see LlvmBackend_Setup.cpp's registration, and #1843's
             // finalizeVtableTable for the lazily-created specialized vtables).
@@ -1651,10 +1654,21 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                                           {ptrTy(), ptrTy()});
                 llvm::Value* isStr = builder_.CreateCall(
                     isStrFn, {val, vtableTablePtr()}, "collif.isstr");
-                // bz_obj_is_string answers "not a string" (== 0) exactly when
-                // word 0 is a registered vtable, i.e. a user class instance.
-                llvm::Value* isVtable =
-                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+                // bz_obj_is_string answers "not a string" (== 0) when word 0 is
+                // a registered vtable, i.e. a user class instance — and, since
+                // #6776 (§8.2, v0.340), when it is the runtime's own array
+                // vtable, so the class arm is additionally gated on NOT being a
+                // tagged built-in: the array arm below applies the STATIC
+                // element policy the header's `elem_disposer` does not carry
+                // for a borrowing `Array<string>` (the #2603 rows).
+                auto* taggedFn = declareC("bz_obj_is_tagged_builtin", i32(),
+                                          {ptrTy()});
+                llvm::Value* notTagged = builder_.CreateICmpEQ(
+                    builder_.CreateCall(taggedFn, {val}, "collif.tagged"),
+                    builder_.getInt32(0));
+                llvm::Value* isVtable = builder_.CreateAnd(
+                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0)),
+                    notTagged);
                 llvm::Value* live = builder_.CreateICmpNE(
                     val, llvm::ConstantPointerNull::get(ptrTy()));
                 llvm::Value* isUserClass =
@@ -9226,8 +9240,9 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // (The ENUMERABLE heads `IEnumerable<T>` / `IOwningEnumerable<T>`
             // are deliberately NOT routed here: an enumerable argument is
             // materialised by the CALLER into a vtable-backed enumerator
-            // wrapper whose vtable is UNREGISTERED and whose offset 48 carries
-            // no kind tag, so this pair would neither free it nor mis-free it —
+            // wrapper whose vtable is UNREGISTERED, is none of the runtime's
+            // built-in vtables (#6776), and whose offset 48 carries no kind
+            // tag, so this pair would neither free it nor mis-free it —
             // it would leave it, and the wrapper's own owner is the caller.
             // `registerUnwindOwnedParam` records the measurement and why.)
             //
@@ -9248,14 +9263,17 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // `emitDisposeAndReclaim`, so the object's own `owned` fields are
             // discharged by its destructor rather than reinterpreted as an
             // array. `bz_runtime_dispose` (#3026) then dispatches the remaining
-            // population on the kind tag at offset 48 (bz_array_t /
-            // bz_llist_t) and offset 88 (bz_dict_t), calling the matching
-            // `bz_*_free`. Soundness of the second half here rests on the same
+            // population on word 0 (bz_array_t: one of the runtime's built-in
+            // vtables since #6776) and the kind tag at offset 48 (bz_llist_t)
+            // / offset 88 (bz_dict_t), calling the matching `bz_*_free`.
+            // Soundness of the second half here rests on the same
             // closed-population argument #6402 records: a concrete built-in
-            // collection's word 0 is `arr->data` — a heap pointer, never a
-            // listed vtable (and NULL for an empty backing, which the
-            // null-terminator scan stops at, so it answers "string") — and a
-            // user class declaring the head has a REGISTERED vtable (user and
+            // collection's word 0 is either a runtime-owned built-in vtable
+            // (bz_array_t, #6776) or `arr->data` — a heap pointer (and NULL
+            // for an empty backing, which the null-terminator scan stops at,
+            // so it answers "string") — never a vtable LISTED in this module's
+            // table — and a user class declaring the head has a REGISTERED
+            // vtable (user and
             // imported classes alike, with #1843's `finalizeVtableTable`
             // covering lazily-created specialized vtables), so it is routed
             // away above and never reaches the kind probe. There is no
@@ -9279,8 +9297,18 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                           {ptrTy(), ptrTy()});
                 llvm::Value* isStr = builder_.CreateCall(
                     isStrFn, {arr, vtableTablePtr()}, "colliface.isstr");
-                llvm::Value* isVtable =
-                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+                // fix #6776 (§8.2, v0.340): a tagged bz_array_t answers "not a
+                // string" too, so the class arm is additionally gated on NOT
+                // being a tagged built-in; the kind probe below then frees it
+                // with the STATIC element disposer, as before the tag.
+                auto* taggedFn = declareC("bz_obj_is_tagged_builtin", i32(),
+                                          {ptrTy()});
+                llvm::Value* notTagged = builder_.CreateICmpEQ(
+                    builder_.CreateCall(taggedFn, {arr}, "colliface.tagged"),
+                    builder_.getInt32(0));
+                llvm::Value* isVtable = builder_.CreateAnd(
+                    builder_.CreateICmpEQ(isStr, builder_.getInt32(0)),
+                    notTagged);
                 llvm::Value* notNull = builder_.CreateICmpNE(
                     arr, llvm::ConstantPointerNull::get(ptrTy()));
                 llvm::Value* isUserClass = builder_.CreateAnd(

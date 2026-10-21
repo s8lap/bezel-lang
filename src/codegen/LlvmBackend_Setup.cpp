@@ -6545,6 +6545,10 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
     }
     auto bit = builtinDesc_.find(std::string(last));
     if (bit != builtinDesc_.end()) return bit->second;
+    // fix #6776 (§8.2 / §19.3, v0.340): `case o of StringBuilder` / `of
+    // Mutex` — the runtime-owned descriptor of a tagged vtable-less built-in
+    // (the callers' string guard still runs first).
+    if (llvm::GlobalVariable* rb = runtimeBuiltinDescriptorFor(last)) return rb;
     // §19.3 / §8.6 (#1945): a value-builtin type-test target (DateTime/TimeSpan/
     // DateOnly/TimeOnly/Guid) resolves to its box descriptor (primBoxDesc_), so a
     // concrete `case o of DateTime` / `o is DateTime` runs a real is-a against a
@@ -33355,10 +33359,18 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
                                   {ptrTy(), ptrTy()});
         llvm::Value* isStr = builder_.CreateCall(
             isStrFn, {oldVal, vtableTablePtr()}, "ocf.collif.isstr");
-        // bz_obj_is_string answers "not a string" (== 0) exactly when word 0 is
-        // a REGISTERED vtable, i.e. a user class instance.
-        llvm::Value* isVtable =
-            builder_.CreateICmpEQ(isStr, builder_.getInt32(0));
+        // bz_obj_is_string answers "not a string" (== 0) when word 0 is a
+        // REGISTERED vtable, i.e. a user class instance — and, since #6776
+        // (§8.2, v0.340), when it is the runtime's own array vtable, so the
+        // class arm is additionally gated on NOT being a tagged built-in: the
+        // array arm below applies the STATIC element policy the header's
+        // `elem_disposer` does not carry for a borrowing `Array<string>`.
+        auto* taggedFn = declareC("bz_obj_is_tagged_builtin", i32(), {ptrTy()});
+        llvm::Value* notTagged = builder_.CreateICmpEQ(
+            builder_.CreateCall(taggedFn, {oldVal}, "ocf.collif.tagged"),
+            builder_.getInt32(0));
+        llvm::Value* isVtable = builder_.CreateAnd(
+            builder_.CreateICmpEQ(isStr, builder_.getInt32(0)), notTagged);
         llvm::Value* notNull = builder_.CreateICmpNE(
             oldVal, llvm::ConstantPointerNull::get(ptrTy()));
         llvm::Value* isUserClass =
@@ -45833,6 +45845,7 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
     llvm::Value* arr = builder_.CreateCall(
         allocFn, {builder_.getInt64(esz), builder_.getInt64(cap)}, "clit.arr");
+    stampBuiltinTypeDesc(arr, collTy);  // fix #6776 (§8.2): the type tag
     // fix #2635 (#2608 residual) / §28.11 / stdlib §4.3: a COLLECTION-LITERAL
     // -constructed owning array is an owning array like any other, but #2608
     // stamped the element disposer only at the `new` arm in lowerNew, so an
@@ -46893,6 +46906,7 @@ llvm::Value* Emitter::materializeArrayBackedSetLiteral(
     auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
     llvm::Value* arr = builder_.CreateCall(
         allocFn, {builder_.getInt64(esz), builder_.getInt64(cap)}, "slit.arr");
+    stampBuiltinTypeDesc(arr, setTy);  // fix #6776 (§8.2): the type tag
     // fix #2635 (#2608 residual): the array-backed `OwningSet<T>` literal is
     // the second construction site that skipped the stamp. Tagged here for
     // CONSISTENCY of the invariant "an owning bz_array_t is always tagged at
@@ -50468,8 +50482,12 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
 
         llvm::IRBuilder<> tb(entryBB);
         auto [src, start, len] = loadSpan(tb, boxArg);
-        // src = bz_array_t*; data = src->data (element buffer, offset 0).
-        llvm::Value* data = tb.CreateLoad(ptrTy(), src, "data");
+        // src = bz_array_t*; data = src->data. fix #6776 (§8.2, v0.340): the
+        // header opens with its vtable and descriptor words, so `data` is read
+        // through the runtime accessor, not at offset 0.
+        llvm::Value* data = tb.CreateCall(
+            declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()}),
+            {src, tb.getInt64(0), tb.getInt64(1)}, "data");
         tb.CreateBr(loopBB);
 
         tb.SetInsertPoint(loopBB);
@@ -50615,7 +50633,10 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
         llvm::IRBuilder<> tb(bb);
         auto [src, start, len] = loadSpan(tb, boxArg);
         (void)len;
-        llvm::Value* data   = tb.CreateLoad(ptrTy(), src, "data");
+        // fix #6776 (§8.2, v0.340): `data` through the accessor, as above.
+        llvm::Value* data   = tb.CreateCall(
+            declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()}),
+            {src, tb.getInt64(0), tb.getInt64(1)}, "data");
         llvm::Value* offset = tb.CreateAdd(start, idxArg, "off");
         llvm::Value* ep     = tb.CreateGEP(elemTy, data, {offset}, "ep");
         llvm::Value* val    = tb.CreateLoad(elemTy, ep, "v");

@@ -1447,10 +1447,36 @@ void bz_string_release(void* s);
 // pointer at word 0. `vtable_table` is a null-terminated array of all the
 // vtable/box-vtable/exception-vtable globals codegen emitted for this program;
 // `obj` is a string iff it is non-null and `obj`'s first word is NOT one of
-// those vtables. Returns 1 (string) / 0 (not a string / null). The scan is
-// O(#vtables); the table is tiny (one entry per emitted type) and the call is
-// only on the rare `is/as/ToString string-through-Object` path.
+// those vtables, nor one of the runtime's own (bz_fnval_vtable; since #6776
+// the Array / StringBuilder / Mutex vtables, see bz_array_inst_desc below).
+// Returns 1 (string) / 0 (not a string / null). The scan is O(#vtables); the
+// table is tiny (one entry per emitted type) and the call is only on the rare
+// `is/as/ToString string-through-Object` path.
 int32_t bz_obj_is_string(void* obj, void** vtable_table);
+
+// fix #6776: 1 iff `obj` is non-null and its word 0 is one of the runtime's
+// three built-in vtables (Array-backed bz_array_t, StringBuilder, Mutex). The
+// owned-field / collection-interface disposal sites AND this with
+// `bz_obj_is_string == 0` to tell a user class instance (slot-2 Dispose +
+// reclaim) from a tagged built-in (the typed free with the static element
+// policy) — the split that `bz_obj_is_string == 0` alone made before the tag.
+int32_t bz_obj_is_tagged_builtin(void* obj);
+
+// fix #6776 (§8.1 / §8.2 / §12.7 / stdlib §2.1 / §3.1, v0.340): the runtime
+// type tag of the vtable-less built-ins that reach `Object` representation-
+// preservingly (§3.1 / §5.1). Every bz_array_t and every Mutex now opens with
+// a runtime-owned vtable in the class slot layout, so `o.ToString()` /
+// `Equals` / `GetHashCode` / `using var o: Object` dispatch through the same
+// vtable path a class instance uses. `bz_sb_tag` retags the parts array a
+// `new StringBuilder` allocates (word 0 := the StringBuilder vtable);
+// `bz_array_set_type_desc` stamps the per-instantiation descriptor codegen
+// emits (`btd$builtin$<qualified name>`) into the header at a construction
+// site whose static type is known, which `o is Array<int>` reads back through
+// `bz_array_inst_desc` (null for a null, a non-array — including a
+// StringBuilder, a string or a class instance — and an unstamped array).
+void  bz_sb_tag(void* arr);
+void  bz_array_set_type_desc(void* arr, void* desc);
+void* bz_array_inst_desc(void* obj);
 
 // §8.3 (v0.204, #2055): assigned identity hash. The class-default
 // `GetHashCode` and the box-default identity hash call this helper instead of
@@ -2309,7 +2335,10 @@ void bz_owned_buffer_get_span(void* buf, const uint8_t** data_out, int64_t* len_
 // ---------------------------------------------------------------------------
 // Mutex and Lock runtime (stdlib §6.2, issue #647)
 //
-// Mutex: non-recursive POSIX mutex with refcounted core (bz_mutex_t*).
+// Mutex: non-recursive POSIX mutex. The Mutex value is a tagged HANDLE
+//        (bz_mutex_t*: word 0 = bz_mutex_vtable since #6776, so it carries its
+//        §8.2 runtime identity through `Object`) over a refcounted core
+//        (bz_mutex_core_t) that outlives the handle while a Lock holds it.
 // Lock:  owned guard (bz_lock_t*) returned by acquire/try_acquire.
 //
 // Recursiveness (recorded decision — §6.2 is silent):
@@ -2319,7 +2348,8 @@ void bz_owned_buffer_get_span(void* buf, const uint8_t** data_out, int64_t* len_
 // All extern "C" (no mangling — the JIT-mangling lesson from #632).
 // ---------------------------------------------------------------------------
 
-// Allocate a new Mutex. Returns bz_mutex_t* (core_refs = 1 for the Mutex object).
+// Allocate a new Mutex. Returns the bz_mutex_t* handle (its core has
+// core_refs = 1 for the Mutex object).
 void* bz_mutex_new(void);
 
 // Block until the mutex is available; return an owned bz_lock_t*. Per §6.2

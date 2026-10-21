@@ -36,6 +36,17 @@
 // `interface_carrier_invariant_ilist_mismatched_element_type_...` row below
 // for Case B's still-decisive invariant path.
 //
+// UPDATE — fix #6776 (§8.2 / §12.7, v0.340): the positive runtime tag the
+// next paragraph says "does not exist yet" now exists (word 0 of a bz_array_t
+// is the runtime-owned `bz_array_vtable`, plus a per-instantiation descriptor
+// codegen stamps at construction; see bezel_runtime_refcounting.cpp), so the
+// OBJECT carrier is decided: `object_carrier_decided_by_runtime_tag_spec_12_7_6776`
+// below answers `true`. The matching-element INTERFACE carrier is still
+// `false` through the #2775 bail, for a different reason than the tag: an
+// interface-typed location holds the caller-materialised adapter object, not
+// the array itself, so its word 0 is not the array's tag. The paragraph below
+// describes the pre-#6776 state and is kept as the record of it.
+//
 // NOT covered here (still genuinely ambiguous, UNCHANGED behavior): an
 // Object carrier, or a MATCHING-element-type interface carrier — exactly the
 // issue's own headline repro (`e: IEnumerable<char> := a; e is Array<char>`;
@@ -235,8 +246,10 @@ BEZEL_TEST(codegen_type_test_4926,
 // §12.7 (#4926 — documents what this narrow fix does NOT decide): a
 // matching-element-type INTERFACE carrier erases exactly the information
 // Case A/B need. Behavior is UNCHANGED by this fix (still `false`, no
-// crash) — the issue's own headline repro stays open pending a positive
-// runtime collection-kind tag (#5059 / #4885).
+// crash). Still `false` after fix #6776 too, for a different reason: the
+// tag now exists on the array, but an interface-typed location holds the
+// caller-materialised adapter object, not the array (see the header's
+// UPDATE), so the test still takes the #2775 "dropped" bail.
 BEZEL_TEST(codegen_type_test_4926,
            interface_carrier_matching_element_type_stays_ambiguous_unchanged_spec_12_7) {
     BEZEL_EXPECT_EQ(runAotOut(
@@ -252,12 +265,15 @@ BEZEL_TEST(codegen_type_test_4926,
         "end C;"), std::string("false"));
 }
 
-// §12.7 (#4926 — Object-carrier control, unchanged): an Object carrier
-// erases everything; Case A/B both require the operand's static type to be
-// a collection or a collection-element interface, never bare Object, so
-// this stays exactly as before this fix (`false`, no crash).
+// §12.7 / §8.2 (#4926 — Object carrier, DECIDED by fix #6776, v0.340): an
+// Object carrier erases the static type, but since #6776 the array itself
+// carries its runtime identity (word 0 = `bz_array_vtable`, descriptor =
+// this module's `Array<char>` instantiation), so `o is Array<char>` is a
+// real runtime test and answers `true`. Before #6776 this row pinned
+// `false` as "unchanged, undecidable" (see the header); the flip is the
+// issue's own headline repro being answered.
 BEZEL_TEST(codegen_type_test_4926,
-           object_carrier_stays_ambiguous_unchanged_spec_12_7) {
+           object_carrier_decided_by_runtime_tag_spec_12_7_6776) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; "
         "public class C "
@@ -268,7 +284,7 @@ BEZEL_TEST(codegen_type_test_4926,
         "    else Console.WriteLine(\"false\"); end; "
         "    return 0; "
         "  end Main; "
-        "end C;"), std::string("false"));
+        "end C;"), std::string("true"));
 }
 
 // §12.7 / §9.6 (#4909 control — same lowerTypeTest function, must stay

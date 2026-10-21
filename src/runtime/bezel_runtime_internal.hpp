@@ -238,6 +238,26 @@ static const int64_t BZ_CLOSURE_OBJVIEW_OFFSET = 48;
 // side-table entry only for a cell that has one.
 static const int64_t BZ_CLOSURE_HASHED_OFFSET = 41;
 extern "C" void* bz_fnval_vtable[6];
+// fix #6776 (§8.1 / §8.2 / §12.7, v0.340): the runtime-owned vtables of the
+// vtable-less built-ins that reach `Object` representation-preservingly
+// (§3.1 / §5.1). Defined once, in bezel_runtime_refcounting.cpp, so their
+// addresses are process-wide and `bz_obj_is_string` recognises them without a
+// per-module `bz$vtable$table` entry (the same reason bz_fnval_vtable lives
+// here). Slot layout is the class vtable's: [desc, itmap, Dispose, ToString,
+// Equals, GetHashCode]. `bz_*_desc` is each one's self-only descriptor chain
+// (`{self, nullptr}`), the address `o is StringBuilder` / `o is Mutex`
+// compares against; `bz_builtin_itmap` is the shared empty interface map.
+extern "C" void* bz_builtin_itmap[1];
+extern "C" void* bz_array_desc[2];
+extern "C" void* bz_array_vtable[6];
+extern "C" void* bz_sb_desc[2];
+extern "C" void* bz_sb_vtable[6];
+extern "C" void* bz_mutex_desc[2];
+extern "C" void* bz_mutex_vtable[6];
+// bz_mutex_vtable's Dispose slot (bezel_runtime_sync.cpp): the class-protocol
+// twin of bz_mutex_dispose — releases the Mutex's core reference and leaves
+// the handle for the caller's reclaim step instead of freeing it itself.
+extern "C" void bz_mutex_obj_dispose(void* mutex);
 // Either view of a function value -> the cell base. A cell base's word 0 is a
 // code pointer and can never equal the vtable's address.
 static inline void* bz_closure_base(void* c) {
@@ -290,6 +310,33 @@ constexpr int64_t BZ_RUNTIME_KIND_LLIST = -2;  //   on bz_runtime_dispose in
 constexpr int64_t BZ_RUNTIME_KIND_DICT  = -3;  //   bezel_runtime_collections.cpp
 
 struct bz_array_t {
+    // fix #6776 (§8.1 / §8.2 / §12.7 / stdlib §2.1, v0.340): the runtime type
+    // identity of an array-backed built-in, in the two-word header shape every
+    // `Object` operation already reads. §8.2 fixes "runtime type identity at
+    // allocation" for every heap object, built-ins included, and §3.1/§5.1 make
+    // the pass of a class value to `Object` representation-preserving — so an
+    // `Array<T>` / `StringBuilder` reaching an `Object` slot must present a
+    // vtable at word 0 like any class instance does. Before this, word 0 was
+    // `data` and `bz_obj_is_string`'s negative test ("not a listed vtable")
+    // read every such value as a bare string: `o.ToString()` printed the
+    // backing store's bytes and then string-released the header (#6776's
+    // garbage / SIGSEGV / double free).
+    //   word 0: `bz_array_vtable` (set by every header producer here), or
+    //           `bz_sb_vtable` once codegen's `new StringBuilder` tags it —
+    //           slots [desc, itmap, Dispose, ToString, Equals, GetHashCode]
+    //           like a class vtable (LlvmBackend_impl.hpp's kToStringSlot…).
+    //   word 1: the per-INSTANTIATION descriptor codegen stamps at a
+    //           construction site whose type is statically known
+    //           (`btd$builtin$<qualified name>`, see bz_array_set_type_desc),
+    //           or NULL for a runtime-produced array (Split, ToArray, …) that
+    //           carries only the kind-level tag. `o is Array<int>` compares it
+    //           by address; the ToString default reads the rendered name
+    //           stored after the descriptor's null terminator.
+    // Codegen never reads the fields below at fixed offsets (bz_array_data /
+    // bz_array_len / bz_array_ptr_at are the accessors), so the shift is
+    // runtime-internal. bz_runtime_dispose's kind probe reads word 0 first.
+    void*   vtable;
+    void*   type_desc;
     void*   data;       // heap buffer holding count*elem_size bytes
     int64_t count;
     int64_t capacity;
@@ -315,13 +362,13 @@ struct bz_array_t {
     // still passes its statically-derived disposer to bz_array_free and ignores
     // this field. NULL (calloc-zeroed) means "borrowing / no element disposal",
     // i.e. exactly today's behavior — so an untagged array can never be
-    // over-disposed by the dynamic path. APPENDED last: data@0/count@8/capacity@16
-    // are read at fixed offsets by codegen and must not move.
+    // over-disposed by the dynamic path. (Until #6776 the header comment here
+    // claimed codegen read data/count/capacity at fixed offsets; the one such
+    // reader, the BinaryDeserializer span unpack, now calls bz_array_data.)
     void (*elem_disposer)(void*);
     // fix #3026: kind tag, see comment on the BZ_RUNTIME_KIND_* constants
-    // above. APPENDED last so every prior field's offset is preserved
-    // (existing codegen reads data@0 / count@8 / capacity@16 at fixed
-    // offsets; this field lives at the new end-of-struct offset).
+    // above. bz_runtime_dispose identifies an array by its word-0 vtable since
+    // #6776 and reads this field for the llist/dict probes only.
     int64_t kind;
     // fix #6550 / §28.11 / §28.9 / §9.7 (v0.338): the element STRIDE at which
     // this array co-owns a +1 ref-counted `string` at struct field 0 of every

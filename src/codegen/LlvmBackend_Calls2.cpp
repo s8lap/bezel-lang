@@ -416,6 +416,17 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
     llvm::Value* copy = builder_.CreateCall(
         copyFn, {src, builder_.getInt64(esz)}, "farr.copy");
+    // fix #6776 (§8.2): bz_array_copy carried the SOURCE's instantiation tag
+    // (an Array<T>'s); the result is a FrozenArray<T> — re-stamp it, or clear
+    // the carried tag when this instantiation is not runtime-concrete here.
+    if (builtinInstanceDescriptorFor(resTy)) {
+        stampBuiltinTypeDesc(copy, resTy);
+    } else {
+        builder_.CreateCall(
+            declareC("bz_array_set_type_desc", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy(), ptrTy()}),
+            {copy, llvm::ConstantPointerNull::get(ptrTy())});
+    }
 
     // #429 / §4.6 / §28.9: a copied Array<string> independently co-owns a +1
     // per element. Retain each so the FrozenArray can release symmetrically
@@ -6535,13 +6546,13 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         //
         // The runtime foundation (see
         // bezel_runtime_internal.hpp's BZ_RUNTIME_KIND_*
-        // constants + the kind field appended to each struct)
-        // is a negative-int64 sentinel at offset 48 for
-        // bz_array_t / bz_llist_t (both structs append the
-        // tag at the same offset so the runtime helper
-        // `bz_runtime_dispose` can probe ONE offset) and at
-        // offset 88 for bz_dict_t. The runtime helper probes
-        // offset 48 first (a bz_dict_t's order_count at
+        // constants + the kind field appended to each struct):
+        // since #6776 a bz_array_t is identified by its word-0
+        // vtable (bz_array_vtable / bz_sb_vtable); the others
+        // carry a negative-int64 sentinel, at offset 48 for
+        // bz_llist_t and at offset 88 for bz_dict_t. The
+        // runtime helper `bz_runtime_dispose` tests word 0
+        // first, then offset 48 (a bz_dict_t's order_count at
         // offset 56 is non-negative and cannot collide with
         // the negative sentinels), then offset 88 for the
         // dict.

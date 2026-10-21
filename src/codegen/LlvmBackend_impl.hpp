@@ -3990,6 +3990,10 @@ private:
     // cell instruction reads as null rather than as whatever value is later
     // allocated at its address.
     std::unordered_map<std::string, llvm::Constant*> fnSigDescs_;
+    // fix #6776: per-module per-INSTANTIATION descriptors of the array-backed
+    // built-ins (`btd$builtin$<qualified name>`), keyed by the rendered name
+    // (builtinInstanceDescriptorFor).
+    std::unordered_map<std::string, llvm::GlobalVariable*> builtinInstDescs_;
     llvm::WeakVH lastFreshFnCell_;
     // fix #5943: the cell `lowerExpr` most recently stamped — i.e. returned
     // by its own forming expression. A consumer that resets this, lowers an
@@ -11868,6 +11872,36 @@ private:
     // type-descriptor array (vtable[0])? Null operand → false. Returns i1.
     llvm::Value* emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc);
 
+    // fix #6776 (§8.2 / §12.7 / stdlib §3.1 / §6.2, v0.340): the runtime type
+    // identity of the vtable-less built-ins that reach `Object`
+    // representation-preservingly (§3.1 / §5.1). The runtime owns their
+    // vtables (bz_array_vtable / bz_sb_vtable / bz_mutex_vtable, in the class
+    // slot layout) and the descriptors of the two NON-generic ones;
+    // runtimeBuiltinDescriptorFor returns this module's external reference to
+    // `bz_sb_desc` / `bz_mutex_desc` for `o is StringBuilder`, `o as Mutex`
+    // and `case o of StringBuilder` (null for any other name), which the
+    // ordinary emitIsA chain walk then compares by address.
+    llvm::GlobalVariable* runtimeBuiltinDescriptorFor(std::string_view head);
+    // The per-INSTANTIATION descriptor of an array-backed generic built-in
+    // (`Array<int>`, `OwningArray<M.Cell>`, `Stack<string>` …): a LinkOnceODR
+    // `btd$builtin$<qualified name>` = {self, null, name-literal}, created on
+    // first use and cached in builtinInstDescs_. Codegen stamps it into the
+    // bz_array_t header at every construction site whose static type is
+    // known (stampBuiltinTypeDesc → bz_array_set_type_desc), `o is
+    // Array<int>` compares it by address (bz_array_inst_desc), and the
+    // runtime's default ToString renders the name after the chain's null
+    // terminator — the same text emitVtablelessBuiltinToString renders
+    // statically (vtablelessBuiltinQualifiedName). Returns null when `rt` is
+    // not such a type or any type argument is still a bare type parameter
+    // after genericSubstSemaTy_ substitution (the array then carries only the
+    // runtime's kind-level tag).
+    llvm::GlobalVariable* builtinInstanceDescriptorFor(const sema::TypeRef* rt);
+    void stampBuiltinTypeDesc(llvm::Value* arr, const sema::TypeRef* rt);
+    // Whether `t` names a runtime-concrete type: no bare type parameter at any
+    // depth (generic arguments, inline-array element, function parameters and
+    // return). A type with a bare parameter has no single descriptor.
+    bool typeRefIsRuntimeConcrete(const sema::TypeRef* t) const;
+
     // §8.6 / §8.5 / §9.6 (#417, #946/#947/#948): the fixed vtable slot indices
     // of the uniform Object virtual members. Layout: [0]=td, [1]=itmap,
     // [2]=Dispose, [3]=ToString, [4]=Equals(Object?), [5]=GetHashCode,
@@ -11955,6 +11989,13 @@ private:
     // ahead of `lowerObjectToString`, whose `bz_obj_is_string` premise these
     // receivers violate. See the definition for the measured failure.
     llvm::Value* emitVtablelessBuiltinToString(llvm::Value* val,
+                                               const sema::TypeRef* rt);
+    // fix #6776: the §8.5 qualified name emitVtablelessBuiltinToString
+    // renders for the vtable-less built-in `bn` at `rt`
+    // (`System.Collections.Generic.Array<int>`), shared with the
+    // per-instantiation descriptor (builtinInstanceDescriptorFor) so the
+    // static and the through-`Object` renderings of one value agree.
+    std::string vtablelessBuiltinQualifiedName(std::string_view bn,
                                                const sema::TypeRef* rt);
 
     // fix #2969 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): for an interpolation

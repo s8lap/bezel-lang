@@ -5,13 +5,23 @@
 // ---------------------------------------------------------------------------
 // Mutex and Lock runtime (stdlib §6.2, issue #647)
 //
-// bz_mutex_t — a POSIX mutex with a refcounted core.
+// bz_mutex_t — the Mutex object's handle; bz_mutex_core_t — the POSIX mutex
+// with its refcounted core.
+//
+// fix #6776 (§8.2 / §3.1 / §5.1, v0.340): the handle opens with a vtable word
+// (bz_mutex_vtable, bezel_runtime_refcounting.cpp) so a Mutex passed to an
+// `Object` parameter — representation-preserving per §3.1/§5.1 — dispatches
+// the uniform Object operations like a class instance instead of being read
+// as a bare string by bz_obj_is_string (the issue's double free). Codegen
+// never reads a Mutex's fields, so the split of the handle from the core is
+// runtime-internal: every entry point still takes the handle.
 //
 // Lifetime via reference counting (mirrors fix #634 / bz_channel_t):
 //
-//   Every holder that can dereference a bz_mutex_t* acquires +1 on core_refs
-//   and releases -1 when done; the last release (core_refs → 0) destroys the
-//   pthread_mutex and deletes the struct.
+//   Every holder that can dereference the core acquires +1 on core_refs and
+//   releases -1 when done; the last release (core_refs → 0) destroys the
+//   pthread_mutex, frees the handle it still owns (see below) and deletes the
+//   core.
 //
 //   Holders and their acquire / release sites:
 //     - Mutex object: bz_mutex_new acquires +1 (starts at 1);
@@ -20,7 +30,20 @@
 //       bz_lock_release releases -1 after releasing the pthread_mutex.
 //
 //   This prevents bz_mutex_dispose from destroying the core while a live
-//   Lock handle still holds a bz_mutex_t* (UAF-safe: Lock outliving Mutex).
+//   Lock still holds it (UAF-safe: Lock outliving Mutex).
+//
+//   Two release protocols share the core (fix #6776):
+//     - the TYPED path (`using var m := new Mutex()`, explicit `.Dispose()`,
+//       an owned Mutex field): bz_mutex_dispose, unchanged API. The core owns
+//       the handle (`core->handle`) and frees it with its last reference, so
+//       the handle stays readable for as long as any Lock holds the core —
+//       the #706 concurrent-Dispose guarantee is preserved verbatim.
+//     - the CLASS protocol (`using var o: Object := new Mutex()`, an owned
+//       interface slot): emitDisposeAndReclaim calls vtable slot 2,
+//       bz_mutex_obj_dispose, and then reclaims the handle itself (free, or
+//       the checked-mode quarantine). bz_mutex_obj_dispose therefore detaches
+//       the handle from the core (`core->handle = nullptr`) before dropping
+//       the Mutex's reference, so the core's last release frees only itself.
 //
 // Recursiveness (documented choice, not specified by §6.2):
 //   NON-RECURSIVE (PTHREAD_MUTEX_ERRORCHECK). A second pthread_mutex_lock or
@@ -33,30 +56,45 @@
 //   released flag (§28.2 exactly-once release).
 // ---------------------------------------------------------------------------
 
-struct bz_mutex_t {
+struct bz_mutex_t;
+
+struct bz_mutex_core_t {
     pthread_mutex_t     mtx;
     // per #647 (mirrors #634): refcount — Mutex object holds +1, each Lock holds +1.
     // Last release (core_refs → 0) calls pthread_mutex_destroy and deletes.
     std::atomic<int>    core_refs{1};
+    // fix #6776: the handle this core was created for, freed with the core's
+    // last reference on the typed path; bz_mutex_obj_dispose nulls it when
+    // the class protocol's reclaim step frees the handle instead.
+    bz_mutex_t*         handle = nullptr;
+};
+
+// The Mutex object (fix #6776): calloc'd, plain data, freed by free() —
+// either by the core's last release or by codegen's reclaim step.
+struct bz_mutex_t {
+    void*             vtable;     // bz_mutex_vtable
+    void*             type_desc;  // unused (non-generic); keeps the bz_array_t header shape
+    bz_mutex_core_t*  core;
     // disposed flag: set atomically by bz_mutex_dispose so concurrent Dispose
     // calls from two domains are safe (§28.2 / fix #706 — TOCTOU double-free).
-    // exchange(true) ensures exactly one caller proceeds to core_release.
-    std::atomic<bool>   disposed{false};
+    // The exchange ensures exactly one caller proceeds to core_release.
+    int32_t           disposed;
 };
 
 struct bz_lock_t {
-    bz_mutex_t* mutex;   // borrowed (+ core_refs held)
-    bool        released; // idempotent flag (§28.2)
+    bz_mutex_core_t* core;     // borrowed (+ core_refs held)
+    bool             released; // idempotent flag (§28.2)
 };
 
-static void mutex_core_ref(bz_mutex_t* m) {
-    m->core_refs.fetch_add(1, std::memory_order_relaxed);
+static void mutex_core_ref(bz_mutex_core_t* c) {
+    c->core_refs.fetch_add(1, std::memory_order_relaxed);
 }
 
-static void mutex_core_release(bz_mutex_t* m) {
-    if (m->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        pthread_mutex_destroy(&m->mtx);
-        delete m;
+static void mutex_core_release(bz_mutex_core_t* c) {
+    if (c->core_refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        pthread_mutex_destroy(&c->mtx);
+        free(c->handle);   // null once the class protocol reclaimed it (#6776)
+        delete c;
     }
 }
 
@@ -67,15 +105,20 @@ extern "C" {
 // The non-recursive choice (PTHREAD_MUTEX_ERRORCHECK) is the documented
 // stdlib §6.2 choice — see the file-header note.
 void* bz_mutex_new(void) {
-    auto* m = new bz_mutex_t();
+    auto* c = new bz_mutex_core_t();
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     // PTHREAD_MUTEX_ERRORCHECK: prevents deadlock on self-lock; EDEADLK returned
     // instead of blocking, which maps cleanly to TryAcquire → null.
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK);
-    pthread_mutex_init(&m->mtx, &attr);
+    pthread_mutex_init(&c->mtx, &attr);
     pthread_mutexattr_destroy(&attr);
     // core_refs already 1 (Mutex object ref) via the in-struct initializer.
+    auto* m = (bz_mutex_t*)calloc(1, sizeof(bz_mutex_t));
+    if (!m) bz_alloc_fail("Mutex");
+    m->vtable = (void*)bz_mutex_vtable;  // fix #6776 (§8.2): identity at allocation
+    m->core = c;
+    c->handle = m;
     return m;
 }
 
@@ -83,7 +126,7 @@ void* bz_mutex_new(void) {
 // bz_lock_t*. The lock struct acquires a core ref (+1) so the mutex core
 // stays alive even if the Mutex object is disposed before the Lock is released.
 void* bz_mutex_acquire(void* mp) {
-    auto* m = (bz_mutex_t*)mp;
+    auto* m = ((bz_mutex_t*)mp)->core;
     pthread_mutex_lock(&m->mtx);  // blocking; non-recursive → always enters if not held
     mutex_core_ref(m);             // Lock holds a ref on the core
     auto* lk = new bz_lock_t{m, false};
@@ -97,7 +140,7 @@ void* bz_mutex_acquire(void* mp) {
 // the timeout null path — enabling the TryAcquire-while-held test shape
 // from the file-header note.
 void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
-    auto* m = (bz_mutex_t*)mp;
+    auto* m = ((bz_mutex_t*)mp)->core;
     int rc;
     if (timeout_ms <= 0) {
         // Zero / negative timeout: try without waiting.
@@ -137,12 +180,12 @@ void bz_lock_release(void* lkp) {
     auto* lk = (bz_lock_t*)lkp;
     if (lk->released) return;          // idempotent (§28.2)
     lk->released = true;
-    pthread_mutex_unlock(&lk->mutex->mtx);
+    pthread_mutex_unlock(&lk->core->mtx);
     // Release the core ref the Lock holds; may destroy the mutex if the Mutex
     // object was already disposed (Lock-outlives-Mutex scenario).
-    bz_mutex_t* m = lk->mutex;
+    bz_mutex_core_t* c = lk->core;
     delete lk;          // free the bz_lock_t struct
-    mutex_core_release(m);
+    mutex_core_release(c);
 }
 
 // §6.2: Mutex.Dispose — dispose the Mutex object.  Marks disposed (for
@@ -157,8 +200,21 @@ void bz_lock_release(void* lkp) {
 void bz_mutex_dispose(void* mp) {
     if (!mp) return;
     auto* m = (bz_mutex_t*)mp;
-    if (m->disposed.exchange(true)) return;  // already disposed → no-op (fix #706)
-    mutex_core_release(m);  // drop the Mutex object's own ref
+    if (__atomic_exchange_n(&m->disposed, 1, __ATOMIC_ACQ_REL))
+        return;  // already disposed → no-op (fix #706)
+    mutex_core_release(m->core);  // drop the Mutex object's own ref; frees the handle last
+}
+
+// fix #6776: bz_mutex_vtable slot 2 — the class-protocol Dispose (see the
+// file header). The caller (emitDisposeAndReclaim's reclaim step, or the
+// static-owned atexit sweep) frees the handle, so detach it from the core
+// before dropping the Mutex's reference. Idempotent like bz_mutex_dispose.
+void bz_mutex_obj_dispose(void* mp) {
+    if (!mp) return;
+    auto* m = (bz_mutex_t*)mp;
+    if (__atomic_exchange_n(&m->disposed, 1, __ATOMIC_ACQ_REL)) return;
+    m->core->handle = nullptr;
+    mutex_core_release(m->core);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +294,7 @@ static bz_task_t* mutex_make_faulted_task(void* oce_vtable) {
 // Fast path (trylock succeeds): already-done task with the lock pointer.
 // Slow path (contested): pool worker blocks, then completes the task.
 void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
-    auto* m = (bz_mutex_t*)mp;
+    auto* m = ((bz_mutex_t*)mp)->core;
     auto* s = (bz_cancel_state_t*)token;
 
     // Pre-cancel check.
@@ -301,7 +357,7 @@ void* bz_mutex_acquire_async(void* mp, void* token, void* oce_vtable) {
 // Result is a bz_lock_t* on success, or a null void* on timeout.
 void* bz_mutex_try_acquire_async(void* mp, int64_t timeout_ms,
                                   void* token, void* oce_vtable) {
-    auto* m = (bz_mutex_t*)mp;
+    auto* m = ((bz_mutex_t*)mp)->core;
     auto* s = (bz_cancel_state_t*)token;
 
     // Pre-cancel check (takes priority over timeout).

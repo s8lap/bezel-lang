@@ -7478,6 +7478,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             builder_.CreateCall(relFn, {initClosure});
                         }
                     }
+                    stampBuiltinTypeDesc(buf, rt);  // fix #6776 (§8.2)
                     return buf;
                 }
                 // per stdlib §4.4 v0.165 (#1375): Array<T>(size: int, fill: T)
@@ -7549,6 +7550,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         builder_.CreateBr(hdrBB);
                         builder_.SetInsertPoint(doneBB);
                     }
+                    stampBuiltinTypeDesc(buf, rt);  // fix #6776 (§8.2)
                     return buf;
                 }
                 // stdlib §4.4/§4.5 (#741): the `constructor(capacity: int)` arg
@@ -7582,6 +7584,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         arr,
                         rt->genericArgs.empty() ? nullptr : rt->genericArgs[0],
                         common::isOwningPrefixedName(colName));
+                    // fix #6776 (§8.2): the per-instantiation type tag, read back by
+                    // `o is Array<T>` and the through-`Object` ToString.
+                    stampBuiltinTypeDesc(arr, rt);
                     return arr;
                 };
                 if (!ne.args.empty() && ne.args[0].value) {
@@ -7737,6 +7742,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
                 llvm::Value* sb = builder_.CreateCall(allocFn,
                     {builder_.getInt64(SB_ESZ), builder_.getInt64(64)});
+                // fix #6776 (§8.2 / stdlib §3.1, v0.340): retag the parts array as a
+                // StringBuilder (word 0 := bz_sb_vtable) so that through `Object` it
+                // renders its text and disposes its +1 parts (bz_sb_vtable's slots)
+                // instead of being read as a bare string by bz_obj_is_string.
+                builder_.CreateCall(
+                    declareC("bz_sb_tag", llvm::Type::getVoidTy(llvm_), {ptrTy()}),
+                    {sb});
                 // Fix #531 (§3.1): new StringBuilder(initial: string) — if a string
                 // arg is present, append it as the first part via bz_array_add,
                 // reusing the same IR sequence as Append(string) in Calls.cpp.
@@ -8473,9 +8485,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // array's data field. Use bz_owned_buffer_get_span to unpack.
                 // Actually: spanSource returns the bz_array_t* (the "source" ptr in
                 // the span struct). We need to get arr->data from it.
-                // bz_array_t layout: {void* data, i64 count, i64 capacity, i8 disposed}
-                // data is at offset 0.
-                llvm::Value* arrData = builder_.CreateLoad(ptrTy(), dataPtr,
+                // fix #6776 (§8.2, v0.340): the header now opens with its vtable and
+                // descriptor words (bezel_runtime_internal.hpp), so read `data`
+                // through the runtime accessor instead of at a fixed offset 0
+                // (the JsonDeserializer twin below and the IReadOnlySpan
+                // adapter thunks in LlvmBackend_Setup.cpp read it the same way).
+                llvm::Value* arrData = builder_.CreateCall(
+                    declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()}),
+                    {dataPtr, builder_.getInt64(0), builder_.getInt64(1)},
                     "bindeser.data");
                 // Apply the span start offset (usually 0, but can be non-zero).
                 llvm::Value* startI32 = spanStart(spanVal);
@@ -8540,7 +8557,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     if (!spanVal) return nullptr;
                     llvm::Value* dataPtr = spanSource(spanVal);
                     llvm::Value* lenI32  = spanLength(spanVal);
-                    llvm::Value* arrData = builder_.CreateLoad(ptrTy(), dataPtr, "jder.data");
+                    // fix #6776 (§8.2, v0.340): `data` is no longer word 0 of
+                    // bz_array_t (the vtable and descriptor words precede it),
+                    // so read it through the runtime accessor, as the binary
+                    // deserializer above does.
+                    llvm::Value* arrData = builder_.CreateCall(
+                        declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()}),
+                        {dataPtr, builder_.getInt64(0), builder_.getInt64(1)},
+                        "jder.data");
                     llvm::Value* startI32 = spanStart(spanVal);
                     llvm::Value* startI64 = builder_.CreateZExt(startI32, i64(), "jder.s64");
                     llvm::Value* lenI64   = builder_.CreateZExt(lenI32, i64(), "jder.l64");

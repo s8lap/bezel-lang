@@ -165,13 +165,144 @@ extern "C" void bz_string_release(void* s) {
     free(s);
 }
 
+// ---------------------------------------------------------------------------
+// fix #6776 (§8.1 / §8.2 / §8.5 / §12.7 / stdlib §2.1 / §3.1, v0.340): the
+// runtime-owned vtables of the vtable-less built-ins that reach `Object`.
+//
+// §8.2 fixes every heap object's runtime type identity at allocation, and
+// §3.1/§5.1 pass a class value to an `Object` parameter representation-
+// preservingly (no box). A StringBuilder, an Array<T> or a Mutex at `Object`
+// is therefore the same pointer the typed code holds, and every uniform
+// `Object` operation (ToString / Equals / GetHashCode / Dispose through
+// `using var o: Object`, `o is T`, `o as T`) reads ITS word 0 as a vtable.
+// Until this fix these three had no vtable word at all: `bz_obj_is_string`
+// below, a NEGATIVE test ("word 0 is not a listed vtable"), answered "string"
+// for them, so `Console.WriteLine(o)` printed the array's backing-store bytes
+// as text and then string-released the header (garbage output, SIGSEGV in
+// bz_array_free, "attempting double-free" for Mutex — the issue's m19/m22).
+//
+// The fix gives each one a real vtable in the class slot layout
+// [desc, itmap, Dispose, ToString, Equals, GetHashCode] (CG35 / #946–#948;
+// LlvmBackend_impl.hpp's kToStringSlot…) so the existing class dispatch
+// simply works, and turns `bz_obj_is_string` POSITIVE for them. The vtables
+// are runtime-owned (not codegen-emitted) for the same reason bz_fnval_vtable
+// is: a per-module `bz$vtable$table` cannot list another module's globals,
+// and an Array<int> built in module A is tested in module B.
+//
+// Dispose (slot 2) follows the CLASS protocol: it releases the object's
+// contents and leaves the header for the caller's reclaim step
+// (emitDisposeAndReclaim → free, or the checked-mode quarantine). For the two
+// bz_array_t-backed kinds that is exactly bz_array_mark_disposed — elements
+// released, backing store freed, `disposed` set, header kept — so a checked
+// build's use-after-dispose guard keeps working through `Object` too. The
+// typed release paths (bz_array_free, bz_mutex_dispose) are unchanged.
+//
+// ToString (slot 3) returns a +1 string: StringBuilder renders its text (the
+// stdlib §3.1 override), the other two the §8.5 default — the qualified type
+// name, read for an array from the per-instantiation descriptor codegen
+// stamps at construction (word 1; `btd$builtin$<name>` = {self, null, name})
+// so `Array<int>` renders `System.Collections.Generic.Array<int>` exactly as
+// the static emitVtablelessBuiltinToString does. A runtime-produced array
+// (Split, ToArray, …) has no stamp and renders the head alone. Equals (slot
+// 4) and GetHashCode (slot 5) are the §8.3 reference-identity defaults, which
+// is what the stdlib declares for all three (no override).
+// ---------------------------------------------------------------------------
+extern "C" void* bz_builtin_itmap[1] = { nullptr };
+
+static void bz_array_obj_dispose(void* o) {
+    bz_array_mark_disposed(o, ((bz_array_t*)o)->elem_disposer);
+}
+static void bz_sb_obj_dispose(void* o) {
+    // The builder's parts are +1 strings (the static release passes the same
+    // bz_string_release thunk, LlvmBackend_Disposal.cpp's StringBuilder arm).
+    bz_array_mark_disposed(o, bz_string_release);
+}
+static void* bz_array_obj_tostring(void* o) {
+    void* desc = ((bz_array_t*)o)->type_desc;
+    if (desc) {
+        // Past the chain's null terminator: the rendered name as the string
+        // LITERAL codegen emitted (rc sentinel, never freed), returned as-is
+        // like bz_fnval_obj_tostring returns its descriptor's name.
+        void* n = ((void**)desc)[2];
+        if (n) return n;
+    }
+    static const char name[] = "System.Collections.Generic.Array";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
+}
+static void* bz_sb_obj_tostring(void* o) {
+    char* data = nullptr;
+    int64_t len = 0;
+    bz_strbuilder_to_string(o, &data, &len);
+    void* s = bz_make_string(data ? data : "", len);
+    free(data);
+    return s;
+}
+static void* bz_mutex_obj_tostring(void*) {
+    static const char name[] = "System.Threading.Mutex";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
+}
+static bool bz_builtin_obj_equals(void* a, void* b) { return a == b; }
+static int32_t bz_builtin_obj_hash(void* o) { return bz_obj_identity_hash(o); }
+
+extern "C" void* bz_array_desc[2] = { (void*)bz_array_desc, nullptr };
+extern "C" void* bz_array_vtable[6] = {
+    (void*)bz_array_desc, (void*)bz_builtin_itmap,
+    (void*)bz_array_obj_dispose, (void*)bz_array_obj_tostring,
+    (void*)bz_builtin_obj_equals, (void*)bz_builtin_obj_hash,
+};
+extern "C" void* bz_sb_desc[2] = { (void*)bz_sb_desc, nullptr };
+extern "C" void* bz_sb_vtable[6] = {
+    (void*)bz_sb_desc, (void*)bz_builtin_itmap,
+    (void*)bz_sb_obj_dispose, (void*)bz_sb_obj_tostring,
+    (void*)bz_builtin_obj_equals, (void*)bz_builtin_obj_hash,
+};
+extern "C" void* bz_mutex_desc[2] = { (void*)bz_mutex_desc, nullptr };
+extern "C" void* bz_mutex_vtable[6] = {
+    (void*)bz_mutex_desc, (void*)bz_builtin_itmap,
+    (void*)bz_mutex_obj_dispose, (void*)bz_mutex_obj_tostring,
+    (void*)bz_builtin_obj_equals, (void*)bz_builtin_obj_hash,
+};
+
+static inline bool bz_word0_is_builtin_vtable(void* word0) {
+    return word0 == (void*)bz_array_vtable || word0 == (void*)bz_sb_vtable ||
+           word0 == (void*)bz_mutex_vtable;
+}
+
+// fix #6776: codegen's hooks onto the tags above. `bz_sb_tag` retags the
+// bz_array_t a `new StringBuilder` allocates (word 0 := bz_sb_vtable);
+// `bz_array_set_type_desc` stamps the per-instantiation descriptor into word
+// 1 at a construction site whose static type is known; `bz_array_inst_desc`
+// reads it back for `o is Array<int>` — null for a non-array (including a
+// StringBuilder, a string or a class instance) and for an unstamped array.
+extern "C" void bz_sb_tag(void* arr) {
+    if (arr) ((bz_array_t*)arr)->vtable = (void*)bz_sb_vtable;
+}
+extern "C" void bz_array_set_type_desc(void* arr, void* desc) {
+    if (!arr) return;
+    void* word0;
+    memcpy(&word0, arr, sizeof(void*));
+    if (word0 != (void*)bz_array_vtable) return;  // only a bz_array_t has the slot
+    ((bz_array_t*)arr)->type_desc = desc;
+}
+extern "C" void* bz_array_inst_desc(void* o) {
+    if (!o) return nullptr;
+    void* word0;
+    memcpy(&word0, o, sizeof(void*));
+    if (word0 != (void*)bz_array_vtable) return nullptr;
+    return ((bz_array_t*)o)->type_desc;
+}
+
 // §8.6 / §12.7 (#417): is the Object-typed value `obj` a string? A string in an
 // Object slot is a bare bz_string* (word 0 = char* data); a class / boxed value
 // / built-in exception has a vtable pointer at word 0. `vtable_table` is the
 // null-terminated array codegen emits listing every vtable/box-vtable global.
 // `obj` is a string iff it is non-null and its first word is NOT one of those
-// vtables. (Runtime-internal vtables — IEnumerator state machines — are never
-// stored in a plain Object slot, so omitting them from the table is sound.)
+// vtables, nor one of the runtime's own (bz_fnval_vtable and, since #6776, the
+// three built-in vtables above). (Runtime-internal vtables — IEnumerator state
+// machines — are never stored in a plain Object slot, so omitting them from the
+// table is sound. The vtable-less built-ins NOT yet tagged — LinkedList,
+// Dictionary, the dict-backed sets, Semaphore, Random, … — still fall through
+// to "string" here; that residual is tracked separately.)
 extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
     if (!obj) return 0;
     void* word0;
@@ -181,11 +312,30 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
     // table lists. Before this it was a bare closure cell whose word 0 is a
     // code pointer, so it was answered "string" here.
     if (word0 == (void*)bz_fnval_vtable) return 0;
+    // fix #6776: likewise the runtime-owned built-in vtables (see above).
+    if (bz_word0_is_builtin_vtable(word0)) return 0;
     if (vtable_table) {
         for (void** p = vtable_table; *p != nullptr; ++p)
             if (*p == word0) return 0;   // a known vtable → not a string
     }
     return 1;                            // not a vtable → a string
+}
+
+// fix #6776: is `obj` one of the three built-ins tagged above (word 0 is
+// bz_array_vtable / bz_sb_vtable / bz_mutex_vtable)? The owned-field and
+// collection-interface disposal sites split "user class instance" (slot-2
+// Dispose + reclaim) from "array-backed built-in" (the typed free with the
+// STATIC element policy, which the header's `elem_disposer` does not carry
+// for a borrowing `Array<string>`); before #6776 that split was
+// `bz_obj_is_string == 0` alone, because an untagged bz_array_t answered
+// "string". A tagged one answers "not a string" now, so those sites AND this
+// test to keep the built-in on its typed arm. Returns 1 (tagged built-in) /
+// 0 (anything else, including null).
+extern "C" int32_t bz_obj_is_tagged_builtin(void* obj) {
+    if (!obj) return 0;
+    void* word0;
+    memcpy(&word0, obj, sizeof(void*));
+    return bz_word0_is_builtin_vtable(word0) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

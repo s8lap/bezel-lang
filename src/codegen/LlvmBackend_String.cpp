@@ -2845,6 +2845,16 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
     // through the head lookup with no `<args>` — the table lookup is the
     // only place the module path lives, so a missing entry surfaces as the
     // bare head, not a wrong rendering.
+    // fix #6776: the rendering is shared with the per-instantiation runtime
+    // descriptor (builtinInstanceDescriptorFor), so that `Console.WriteLine(a)`
+    // and `Console.WriteLine(o)` for `o: Object := a` print the same text.
+    return lowerStringLiteral(
+        std::string("\"") + vtablelessBuiltinQualifiedName(bn, rt) + "\"",
+        false);
+}
+
+std::string Emitter::vtablelessBuiltinQualifiedName(std::string_view bn,
+                                                    const sema::TypeRef* rt) {
     std::string_view mod = common::builtinClassModulePathOf(bn);
     std::string rendered;
     if (rt && !rt->genericArgs.empty()) {
@@ -2865,7 +2875,7 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
     } else {
         rendered = std::string(bn);
     }
-    return lowerStringLiteral(std::string("\"") + rendered + "\"", false);
+    return rendered;
 }
 
 
