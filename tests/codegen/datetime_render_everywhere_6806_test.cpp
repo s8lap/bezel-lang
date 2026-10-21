@@ -14,8 +14,10 @@
 // buffer) and prints the last rendering plus the number of iterations that
 // disagreed with the literal expected text.
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -85,15 +87,40 @@ BEZEL_TEST(codegen_datetime_render_6806, record_in_hole) {
               std::string("P(At: ") + kWant + ", N: " + kWant + ")");
 }
 
-// stdlib §3.1: Append(DateTime?) is Append(value.ToString()) (present and absent).
-BEZEL_TEST(codegen_datetime_render_6806, stringbuilder_append_nullable) {
+// stdlib §3.1 declares Append(value: Object), a non-nullable parameter, so an
+// un-narrowed DateTime? argument is a §7 compile error (#6782). This row first
+// asserted the render of `sb.Append(a)` for `a: DateTime?`; it is now the reject
+// control (refs #6881).
+BEZEL_TEST(codegen_datetime_render_6806, stringbuilder_append_nullable_rejected) {
+    auto r = runAot(
+        "module M; class H public static method AppendNullable("
+        "a: DateTime?): string "
+        "  var sb := new StringBuilder(); sb.Append(a); return sb.ToString(); "
+        "end AppendNullable; "
+        "public static method Main(): int return 0; end Main; end H; ");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(
+        bezel::test::failedAtCompileTimeWithRealLocation(r) &&
+        bezel::test::diagnosticMessageContains(
+            r, "the argument to `StringBuilder.Append` is nullable but the "
+               "target type is non-nullable (§7)"));
+}
+
+// stdlib §3.1: Append(value) is Append(value.ToString()) for a NARROWED
+// DateTime? (guarded parameter, present and absent) and a declaration-narrowed
+// local (§7.4).
+BEZEL_TEST(codegen_datetime_render_6806, stringbuilder_append_narrowed_nullable) {
     expectOut(std::string(kRec) +
-                  "class H public static method AppendNullable("
+                  "class H public static method AppendNarrowed("
                   "a: DateTime?, b: DateTime?): string "
-                  "  var sb := new StringBuilder(); sb.Append(a); sb.Append(\"|\"); "
-                  "sb.Append(b); return sb.ToString(); end AppendNullable; end H; ",
-              "H.AppendNullable(n, z)",
-              std::string(kWant) + "|null");
+                  "  var sb := new StringBuilder(); "
+                  "  if a <> null then sb.Append(a); end; sb.Append(\"|\"); "
+                  "  if b <> null then sb.Append(b); end; "
+                  "  var d: DateTime? := DateTime.FromTicks(637000000000000000L); "
+                  "  sb.Append(\"|\"); sb.Append(d); "
+                  "  return sb.ToString(); end AppendNarrowed; end H; ",
+              "H.AppendNarrowed(n, z)",
+              std::string(kWant) + "||" + kWant);
 }
 
 // §8.5 / stdlib §3.1: a generic body rendering a T = DateTime value, through
