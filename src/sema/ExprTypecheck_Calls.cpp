@@ -17210,6 +17210,76 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             else if (ncm->member == "Equals" && ce.args.size() == 1)
                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         }
+        // fix #6529 (stdlib §4.4 / §5, §7.5, v0.338): `a?.First()`,
+        // `src?.Count()`, `a?.Sum()`, `a?.ToArray()` … — a `?.` CALL naming a
+        // built-in / LINQ member on a declaration-less head. The member-access
+        // typing that types those calls (resolveMemberAccess + this function's
+        // MemberAccessExpr-callee arms) is keyed on a `.` callee, so the `?.`
+        // call stayed UNTYPED and codegen dropped the enclosing store (#2961 /
+        // #2491, exit 0, wrong answer). §7.5: the result is the `.` form's
+        // result, lifted to nullable. Type the `.` TWIN: a synthetic call whose
+        // callee target is a placeholder carrying the receiver's (non-nullable)
+        // type, the real argument nodes lent to it, then lift below. Speculative:
+        // anything it reports is discarded, and a twin that reports an error
+        // leaves the call untyped exactly as before.
+        //
+        // `Drain` is deliberately NOT typed here: `a?.Drain()` on an owning
+        // collection is the #2767 / #2756 population whose §21.1 `const`
+        // rejection ("deferred-activation producer", tests/ownership/
+        // nullcond_drain_alias_2767_test.cpp) is keyed on the call being
+        // UNTYPED — a typed `Drain()` is an Owned frame (stdlib §4.5, #4795) and
+        // would swap that diagnostic for the generic owned-production one.
+        // Left as it was; filed as a sibling.
+        if (!ctx_.exprType(ce) && !calleeSym && ncm->target &&
+            ncm->typeArgs.empty() && ncm->member != "Drain") {
+            if (TypeRef* rt = ctx_.exprType(*ncm->target)) {
+                const bool builtinHead =
+                    (rt->kind == TypeRef::Kind::Named && !rt->declaration) ||
+                    (rt->kind == TypeRef::Kind::Primitive &&
+                     rt->primitive == PrimitiveType::String);
+                if (builtinHead) {
+                    const std::size_t mark =
+                        ctx_.diagnostics().diagnostics().size();
+                    const std::size_t errsBefore =
+                        ctx_.diagnostics().errorCount();
+                    TypeRef* rcvTy = ctx_.makeTypeRef(*rt);
+                    rcvTy->nullable = false;
+                    auto ph = std::make_unique<ast::IdentifierExpr>();
+                    ph->name = ncm->member;
+                    ph->span = ncm->target->span;
+                    ctx_.setExprType(ph.get(), rcvTy);
+                    auto dotted = std::make_unique<ast::MemberAccessExpr>();
+                    dotted->span = ncm->span;
+                    dotted->member = ncm->member;
+                    dotted->target = std::move(ph);
+                    const ast::MemberAccessExpr* dottedPtr = dotted.get();
+                    auto synth = std::make_unique<ast::CallExpr>();
+                    synth->span = ce.span;
+                    synth->callee = std::move(dotted);
+                    auto& mutCe = const_cast<ast::CallExpr&>(ce);
+                    synth->args = std::move(mutCe.args);
+                    {
+                        const ast::Expr* savedCallee = calleeOfCallCtx_;
+                        const std::ptrdiff_t savedArity = currentCallArity_;
+                        calleeOfCallCtx_ = dottedPtr;
+                        currentCallArity_ =
+                            static_cast<std::ptrdiff_t>(synth->args.size());
+                        resolveMemberAccess(*dottedPtr);
+                        calleeOfCallCtx_ = savedCallee;
+                        currentCallArity_ = savedArity;
+                    }
+                    typeCall(*synth);
+                    TypeRef* twinTy = ctx_.exprType(*synth);
+                    mutCe.args = std::move(synth->args);
+                    const bool clean =
+                        ctx_.diagnostics().errorCount() == errsBefore;
+                    ctx_.diagnostics().rollbackTo(mark);
+                    if (clean && twinTy && twinTy->kind != TypeRef::Kind::Function)
+                        ctx_.setExprType(&ce, twinTy);
+                    nullCondBuiltinSynth_.push_back(std::move(synth));
+                }
+            }
+        }
         if (auto* ct = ctx_.exprType(ce)) {
             if (!ct->nullable && ct->kind != TypeRef::Kind::Unit) {
                 TypeRef* nn = ctx_.makeTypeRef(*ct);

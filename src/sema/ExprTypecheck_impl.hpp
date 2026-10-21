@@ -538,6 +538,10 @@ private:
     // call. Saved/restored around each callee visit (a nested call sets
     // the OUTER arity while the inner call's own arity is in flight).
     std::ptrdiff_t currentCallArity_ = -1;
+    // fix #6529: keep-alive for the synthetic `.`-form calls typeCall builds to
+    // type a built-in / LINQ `?.` call (their exprType entries are keyed on the
+    // node addresses, which must outlive the pass).
+    std::vector<std::unique_ptr<ast::CallExpr>> nullCondBuiltinSynth_;
     // §11.8: one synthesized GenericParamSymbol marker per type-parameter
     // name, attached as the exprSymbol of a `T` member-access receiver so
     // resolveMemberAccess (and codegen) can identify the receiver kind.

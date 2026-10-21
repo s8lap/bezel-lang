@@ -34,6 +34,15 @@ public:
     const std::vector<Diagnostic>& diagnostics() const { return diagnostics_; }
     bool hasErrors() const { return errorCount_ > 0; }
     std::size_t errorCount() const { return errorCount_; }
+    // fix #6529: a speculative typing pass (sema re-types a `?.` call as its `.`
+    // twin) discards whatever it reported. `rollbackTo(n)` drops every
+    // diagnostic recorded after `diagnostics().size() == n`.
+    void rollbackTo(std::size_t n) {
+        while (diagnostics_.size() > n) {
+            if (diagnostics_.back().severity == Severity::Error) --errorCount_;
+            diagnostics_.pop_back();
+        }
+    }
 
 private:
     std::vector<Diagnostic> diagnostics_;

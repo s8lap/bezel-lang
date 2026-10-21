@@ -1962,6 +1962,7 @@ private:
     // callee) so the `?.` form reaches the SAME `bz_grouping_count` lowering
     // the `.` form uses via tryLowerBuiltinClassCall. Owned by the function
     // for the whole codegen run; see nullCondCountSynth_ above.
+    // fix #6529 reuses it for the general built-in `?.` call.
     std::vector<std::unique_ptr<ast::CallExpr>> nullCondGroupingCallSynth_;
     // §27.7.1 (v0.180, #1544): cached property-getter-reference thunk per
     // property symbol — the SAME #1170 stability reasoning as methodThunks_
@@ -25083,6 +25084,10 @@ private:
     // discarded) and reference-returning calls (result is the nullable
     // pointer, null when the receiver was null). Value-typed returns need a
     // nullable-value representation and are deferred.
+    // fix #6529: `recv?.Member(args)` over a declaration-less built-in / LINQ
+    // member (no MethodSymbol). See the definition in LlvmBackend_Calls2.cpp.
+    llvm::Value* lowerNullCondBuiltinCall(const ast::CallExpr& call,
+                                          const ast::NullCondMemberExpr& nm);
     llvm::Value* lowerNullCondCall(const ast::CallExpr& call,
                                    const ast::NullCondMemberExpr& nm);
 

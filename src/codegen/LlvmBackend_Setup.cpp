@@ -37794,9 +37794,26 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         // freeing it double-frees whatever the receiver owns. See
         // `calleeResolvedBySema` above.
         if (calleeResolvedBySema(*call, ctx_)) return false;
-        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
-        if (!ma) return false;
-        std::string_view mm = ma->member;
+        // fix #6529 (§7.5, stdlib §5): the `?.` spelling (`a?.ToArray()`) mints
+        // the SAME fresh array on its non-null path (lowerNullCondBuiltinCall
+        // lowers the `.` twin) and a bare null on the other, so the local owns
+        // exactly what the `.` form's local owns. A NullCondMemberExpr shares
+        // the target/member fields; the null-receiver path leaves a null
+        // pointer in the slot, which the scope-end reclaim already tolerates
+        // for a nullable local.
+        const ast::Expr* maTarget = nullptr;
+        std::string_view mm;
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+            maTarget = ma->target.get();
+            mm = ma->member;
+        } else if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                       call->callee.get())) {
+            maTarget = ncm->target.get();
+            mm = ncm->member;
+        } else {
+            return false;
+        }
         // fix #4308 sibling: `xs.GroupBy(...).ToArray()` static-types as
         // `Array<IGrouping>` but lowerGroupByMaterialize returns the OWNING
         // bz_groupby_to_array result directly (Calls3.cpp ~2485), so the
@@ -37806,8 +37823,7 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         // family). Exclude it here so the candidate lands in a separate
         // OWNING disposal registration that uses elementPolicyFor(el, true)
         // (the groupingFreeThunk branch, identical to the `using var` path).
-        if (mm == "ToArray" && ma->target &&
-            isGroupByCall(ma->target.get()))
+        if (mm == "ToArray" && maTarget && isGroupByCall(maTarget))
             return false;
         // #1027 / stdlib §9.6: `string.Split(...)` returns a fresh `owned Array<string>`
         // whose substrings are created at rc=1 (the array is their sole owner). A plain

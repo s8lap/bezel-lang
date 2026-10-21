@@ -20403,6 +20403,94 @@ llvm::Value* Emitter::emitInlineGenericMethod(
 }
 
 
+// fix #6529 (stdlib §4.4 / §5, §7.5, v0.338): see the call site in
+// lowerNullCondCall. The receiver is lowered once and null-checked; the
+// non-null path lowers a synthetic `.` call (placeholder receiver + the call's
+// own argument nodes, lent and handed back) through the ordinary builtin / LINQ
+// path, and the result is lifted to `T?` (a bare nullable pointer for a
+// reference result, the tagged {i8 hasValue; T} struct for a value result).
+llvm::Value* Emitter::lowerNullCondBuiltinCall(
+    const ast::CallExpr& call, const ast::NullCondMemberExpr& nm) {
+    const sema::TypeRef* callTy = ctx_.exprType(call);
+    const sema::TypeRef* rcvTy = ctx_.exprType(*nm.target);
+    // sema must have typed the call as a present-able `T?`; otherwise there is
+    // nothing to lift to (void / untyped) and the old nullptr result stands.
+    if (!callTy || !callTy->nullable || !rcvTy) return nullptr;
+    // A nullable VALUE receiver (`int?`, record?) is a tagged struct and is not
+    // this fix's population.
+    if (isNullableValueTy(rcvTy)) return nullptr;
+    const bool valueResult = isNullableValueTy(callTy);
+    sema::TypeRef* innerTy = ctx_.makeTypeRef(*callTy);
+    innerTy->nullable = false;
+    llvm::Value* rcv = lowerExpr(*nm.target);
+    if (!rcv) return nullptr;
+    const bool rcvIsPtr = rcv->getType()->isPointerTy();
+    auto* entryBB = builder_.GetInsertBlock();
+    auto* accessBB = llvm::BasicBlock::Create(llvm_, "ncbi.access", currentFn_);
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "ncbi.end", currentFn_);
+    // A non-pointer receiver (a Span view) is a non-nullable VALUE: never null.
+    if (rcvIsPtr)
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(rcv, llvm::ConstantPointerNull::get(ptrTy())),
+            endBB, accessBB);
+    else
+        builder_.CreateBr(accessBB);
+    builder_.SetInsertPoint(accessBB);
+
+    auto placeholder = std::make_unique<ast::IdentifierExpr>();
+    placeholder->name = nm.member;
+    ctx_.setExprType(placeholder.get(), const_cast<sema::TypeRef*>(rcvTy));
+    exprValueOverride_[placeholder.get()] = rcv;
+    const ast::Expr* placeholderKey = placeholder.get();
+    auto dotted = std::make_unique<ast::MemberAccessExpr>();
+    dotted->span = nm.span;
+    dotted->member = nm.member;
+    dotted->target = std::move(placeholder);
+    ctx_.setExprType(dotted.get(), innerTy);
+    auto synth = std::make_unique<ast::CallExpr>();
+    synth->span = call.span;
+    synth->callee = std::move(dotted);
+    ctx_.setExprType(synth.get(), innerTy);
+    auto& mutCall = const_cast<ast::CallExpr&>(call);
+    synth->args = std::move(mutCall.args);
+    llvm::Value* inner = lowerExpr(*synth);
+    mutCall.args = std::move(synth->args);
+    exprValueOverride_.erase(placeholderKey);
+    nullCondGroupingCallSynth_.push_back(std::move(synth));
+
+    llvm::Type* nullTy = valueResult
+        ? static_cast<llvm::Type*>(nullableValueStructTy(callTy))
+        : static_cast<llvm::Type*>(ptrTy());
+    const bool shapeOk = inner &&
+        (valueResult ? !inner->getType()->isPointerTy() &&
+                           !inner->getType()->isVoidTy()
+                     : inner->getType()->isPointerTy());
+    if (!shapeOk) {
+        // Unrecognised shape: close the CFG validly and keep the old
+        // "lowered to nothing" result (the #2491 backstop still reports it).
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return nullptr;
+    }
+    llvm::Value* wrapped = inner;
+    if (valueResult && inner->getType() != nullTy)
+        wrapped = wrapNullableValue(callTy, inner);
+    auto* accessEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+    builder_.SetInsertPoint(endBB);
+    if (!rcvIsPtr) return wrapped;
+    auto* phi = builder_.CreatePHI(nullTy, 2);
+    phi->addIncoming(valueResult
+                         ? static_cast<llvm::Value*>(
+                               llvm::ConstantAggregateZero::get(
+                                   llvm::cast<llvm::StructType>(nullTy)))
+                         : static_cast<llvm::Value*>(
+                               llvm::ConstantPointerNull::get(ptrTy())),
+                     entryBB);
+    phi->addIncoming(wrapped, accessEnd);
+    return phi;
+}
+
 llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                                const ast::NullCondMemberExpr& nm) {
     // fix #2345 / §22.3 / §22.4: pre-create any inline `out var x` slot
@@ -20975,6 +21063,22 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             igcPhi->addIncoming(igcWrapped, igcAccessEnd);
             return igcPhi;
         }
+    }
+    // fix #6529 (stdlib §4.4 / §5, §7.5, v0.338): `a?.Count()`, `a?.First()`,
+    // `a?.Sum()`, `src?.Count()` … — a `?.` CALL naming a built-in / LINQ
+    // member on a declaration-less head (Array, Dictionary, string, Span, a lazy
+    // IEnumerable). sema types the call `T?` (§7.5: result always nullable), but
+    // such a member carries no MethodSymbol (`ms` is null), so this function
+    // returned nullptr before any lowering and the enclosing store was dropped
+    // at exit 0 (#2961/#2491 backstop). Same class as #6512 above.
+    //
+    // Lower the receiver ONCE; a null receiver yields null, otherwise run the
+    // `.` form's own lowering over a synthetic `.` call whose target is a pinned
+    // placeholder carrying the already-lowered receiver (the #6512 pattern), the
+    // call's own argument nodes lent to it, then wrap the result as `T?`.
+    if (!ms && nm.target && nm.typeArgs.empty() && !nm.member.empty()) {
+        if (llvm::Value* r = lowerNullCondBuiltinCall(call, nm)) return r;
+        return nullptr;
     }
     if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;
     llvm::FunctionType* fnTy = methodFnType(ms);
