@@ -290,4 +290,66 @@ BEZEL_TEST(imported_ienumerable_count_length_clause_6504,
     BEZEL_EXPECT_EQ(r.exitCode, 3);
 }
 
+// ===========================================================================
+// fix-forward #6776 (§2.5; stdlib §4.19, §3.1; v0.340): the `.Length` LOWERING
+// of an imported builtin receiver, on the receivers the rows above do not
+// cover.
+//
+// An imported builtin reaches codegen astNode-less, its head only in
+// `importedName`. The string-fallback `.Length` arm in LlvmBackend_Exprs.cpp
+// took that for a degenerate TypeRef and read `%bz.string` field 1 (offset 8)
+// of the receiver. On a `bz_array_t` that was `count` until #6776 moved it
+// behind the `{vtable, type_desc}` tag, which is why
+// `imported_owningbuffer_length_property_resolves_spec_4_14` above went red
+// at fbd74955 (exit 64). MEASURED at fbd74955 with these two programs:
+// FrozenArray `.Length` exited 128, StringBuilder `.Length` exited 0. With the
+// fix they exit 4 and 5. The StringBuilder value was wrong before #6776 too:
+// offset 8 was the PART count, 1.
+constexpr const char* kLibLen6776 =
+    "module LibLen6776; "
+    "public class Maker6776 "
+    "  public method MakeFrozen(): owned FrozenArray<int> "
+    "    var a: Array<int> := [4, 5, 6, 7]; "
+    "    return FrozenArray<int>.From(a); "
+    "  end MakeFrozen; "
+    "  public method MakeSB(): owned StringBuilder "
+    "    var sb := new StringBuilder(\"abcde\"); "
+    "    return sb; "
+    "  end MakeSB; "
+    "end Maker6776;";
+
+static std::string lenImporter6776(const std::string& body) {
+    return "module AppLen6776; "
+           "import LibLen6776; "
+           "class CLen6776 public static method Main(): int "
+           "  using var m := new Maker6776(); "
+           "  " + body + " "
+           "end Main; end CLen6776;";
+}
+
+// stdlib §4.19: `public readonly property Length: int` on `FrozenArray<T>`,
+// read through a BOUND imported local. Four elements, so the answer is 4.
+BEZEL_TEST(imported_ienumerable_count_length_clause_6504,
+           imported_frozenarray_length_reads_element_count_6776_spec_4_19) {
+    auto r = test::runAotModules(
+        {{"LibLen6776", kLibLen6776},
+         {"AppLen6776",
+          lenImporter6776("using var f := m.MakeFrozen(); return f.Length;")}},
+        "AppLen6776");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 4);
+}
+
+// stdlib §3.1: `StringBuilder.Length: int` is the character count, read on an
+// UNBOUND imported temporary. "abcde", so the answer is 5.
+BEZEL_TEST(imported_ienumerable_count_length_clause_6504,
+           imported_stringbuilder_length_reads_char_count_6776_spec_3_1) {
+    auto r = test::runAotModules(
+        {{"LibLen6776", kLibLen6776},
+         {"AppLen6776", lenImporter6776("return m.MakeSB().Length;")}},
+        "AppLen6776");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 5);
+}
+
 }  // namespace bezel::module

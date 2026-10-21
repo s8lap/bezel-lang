@@ -4312,10 +4312,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // category-defect taxonomy mandates. // per §4.6 (v0.240)
             auto isStringFallbackTarget = [&]() -> bool {
                 if (!tt) return true;  // unknown type — nothing safer to do
-                if (!tt->astNode || !tt->astNode->name ||
-                    tt->astNode->name->parts.empty())
-                    return true;       // degenerate TypeRef; no name to consult
-                return false;
+                // fix-forward #6776 (§2.5, stdlib §4.14/§4.19/§3.1, v0.340):
+                // an IMPORTED builtin receiver (`l.MakeBuffer().Length` with
+                // `MakeBuffer(): owned OwningBuffer<int>` in another module)
+                // reaches codegen astNode-less with its head only in
+                // `importedName` (ModuleLoader convert(), §2.5). That is a
+                // name to consult, not a degenerate TypeRef — and a string is
+                // never `Kind::Named` (it is `Primitive::String`). Treating it
+                // as degenerate read the `bz_array_t` header at `%bz.string`
+                // field 1 (offset 8): `count` before #6776, the runtime type
+                // descriptor after it, so `.Length` returned 64/128.
+                // `headName()` covers astNode, alias head and importedName.
+                if (!tt->headName().empty()) return false;
+                return true;           // degenerate TypeRef; no name to consult
             };
             if (ma->member == "Length" && isStringFallbackTarget() &&
                 (!tt ||
@@ -5568,9 +5577,12 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (ma->target && (ma->member == "Length" || ma->member == "Count")) {
             auto* tt = ctx_.exprType(*ma->target);
             // StringBuilder.Length: sum of all part lengths.
+            // fix-forward #6776 (§2.5, stdlib §3.1, v0.340): `headName()`
+            // alone, so an IMPORTED `StringBuilder` (astNode-less, head in
+            // `importedName`) reaches this arm too instead of the string
+            // fallback's field-1 read.
             bool isSB = (tt && tt->kind == sema::TypeRef::Kind::Named &&
-                         !tt->declaration && tt->astNode && tt->astNode->name &&
-                         !tt->astNode->name->parts.empty() &&
+                         !tt->declaration &&
                          tt->headName() == "StringBuilder");
             if (isSB) {
                 llvm::Value* sb = lowerExpr(*ma->target);
