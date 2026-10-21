@@ -147,15 +147,16 @@ BEZEL_TEST(sema_overload_const_arg_2985,
         0);
 }
 
-// §5.1 / §22.6 (#2985): the `Pick(3)` shape against `Pick(byte)` / `Pick(int)`
-// — DECLARATION ORDER MATTERS for which overload wins. With Pick(byte) FIRST,
-// the per-candidate loop narrows 3 to byte against Pick(byte); the loop then
-// moves on to Pick(int), where the (now-byte) argument is converted to int
-// (byte widens to int per §5.1). The resolver sees byte=Exact / int=Convert
-// and unambiguously picks byte (returns 11). The reverse declaration order
-// would pick int (returns 99). This test pins the byte-first decision — see
-// the order-dependence comment in ExprTypecheck_Calls.cpp's resolveMethod-
-// Overload for the rationale and the constraint this fix accepts.
+// §5.1 / §22.6: the `Pick(3)` shape against `Pick(byte)` / `Pick(int)`, with
+// `Pick(byte)` declared FIRST. #2985 pinned `Pick(byte)` here (11), because
+// the per-candidate loop narrowed 3 to byte and graded that cell Exact.
+//
+// fix #6722 (§22.6 *The argument's static type*, v0.340) FLIPPED it: the
+// literal is read at its static type `int`, and §5.1's constant narrowing
+// "enters resolution as an *applicability* rule only: a candidate the
+// narrowing reaches *converts* at that position, never exact". "`M(3)`
+// against `M(int)` beside `M(byte)` selects `M(int)`" — 99, in either order.
+// (The test name is the #2985 one, kept so the flip is traceable.)
 BEZEL_TEST(sema_overload_const_arg_2985,
            byte_first_int_second_picks_byte_spec_5_1_22_6) {
     BEZEL_EXPECT_EQ(run(
@@ -164,24 +165,18 @@ BEZEL_TEST(sema_overload_const_arg_2985,
         "  public static method Pick(x: int): int => 99; "
         "  public static method Main(): int "
         "    var n: int := C.Pick(3); "
-        "    if n = 11 then return 0; else return 1; end; "
+        "    if n = 99 then return 0; else return 1; end; "
         "  end Main; "
         "end C;"),
         0);
 }
 
-// §5.1 / §22.6 (#2985): the SYMMETRIC test — `Pick(int)` declared first,
-// then `Pick(byte)`. The loop narrows 3 to int against Pick(int) (no-op:
-// int → int is identity, narrowIntConstantToTarget's target filter only
-// fires for narrower-integer targets). Move on to Pick(byte): the int
-// argument narrows to byte. Resolver sees int=Exact / byte=Exact → ambiguous
-// is the §22.6 conclusion — but our fix's order-dependent narrowing means
-// the LAST applied narrowing wins, so byte stays byte. Both are exact;
-// `unambiguouslyBetter` requires strict-better on at least one arg; none
-// exists → AMBIGUOUS. (This is the documented order-dependence caveat: the
-// spec doesn't say what to do when both narrower-integer overloads fit a
-// constant, and we picked "last-declared wins" by deferring to the recorded
-// type's most-recent narrow.)
+// §5.1 / §22.6: the SYMMETRIC test — `Pick(int)` declared first, then
+// `Pick(byte)`. The call is NOT ambiguous (the test name is #2985's, kept so
+// history stays traceable): per §22.6 v0.340 (fix #6722) the literal `3` is
+// read at its static type `int`, so `Pick(int)` is the exact match and
+// `Pick(byte)`, reached only by §5.1's constant narrowing, converts. "`M(3)`
+// against `M(int)` beside `M(byte)` selects `M(int)`".
 BEZEL_TEST(sema_overload_const_arg_2985,
            int_first_byte_second_is_ambiguous_spec_5_1_22_6) {
     auto r = parseSemaAll(
@@ -193,12 +188,7 @@ BEZEL_TEST(sema_overload_const_arg_2985,
         "    return n; "
         "  end Main; "
         "end C;");
-    // The fix's recorded order-dependence: int → byte narrowing fires LAST
-    // (because Pick(byte) is the second candidate iterated), so the arg type
-    // ends up byte. Both candidates see byte: Pick(int) sees byte→int (a
-    // Convert, not Exact), Pick(byte) sees byte→byte (Exact). byte wins
-    // unambiguously — this is what the resolver does. Pinned here so future
-    // reshuffles don't silently change it.
+    // Accepted: `Pick(int)` is exact (#6722 pins the selected value).
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

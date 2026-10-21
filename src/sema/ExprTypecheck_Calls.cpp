@@ -1308,6 +1308,34 @@ static bool isIntegerPrimitiveTypeForOverload(PrimitiveType p) {
     }
 }
 
+// fix #6722 (§22.6 *The argument's static type*, §4.2, v0.340): "A
+// target-typed integer constant (§4.2) has no static type of its own and,
+// like the `null` literal, is graded alike — converting, as above — at every
+// integer candidate whose range holds it: `f(3_000_000_000)` against
+// `f(long)` beside `f(ulong)` is ambiguous". The literal is typed from the
+// first candidate's widening hint, so that type is no evidence of an exact
+// match. §4.2: an unsuffixed literal beyond `int`'s range (the magnitude
+// 2^31 under a unary `-` is `int.MinValue`, and stays `int`).
+static bool isTargetTypedIntConstantArg(const ast::Expr* e) {
+    unsigned long long limit = 2147483647ull;
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e); u && u->op == "-") {
+        e = u->operand.get();
+        limit = 2147483648ull;
+    }
+    auto* il = dynamic_cast<const ast::IntLiteralExpr*>(e);
+    if (!il) return false;
+    for (char ch : il->text)
+        if (ch == 'l' || ch == 'L' || ch == 'u' || ch == 'U') return false;
+    unsigned long long mag = 0;
+    if (!intLiteralMagnitude(il->text, mag)) return false;
+    return errno == ERANGE || mag > limit;
+}
+
+static bool isIntegerParamForOverload(const TypeRef* pt) {
+    return pt && pt->kind == TypeRef::Kind::Primitive &&
+           isIntegerPrimitiveTypeForOverload(pt->primitive);
+}
+
 // §22.6 overload resolution among same-arity, all-positional candidates.
 ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<std::vector<const TypeRef*>>& paramTypes,
@@ -1470,19 +1498,13 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                 // fixture, which is exactly the blind spot that let #6554
                 // through review.
                 //
-                // The GRADE each cell computes here is correct and is left
-                // exactly as it was: restoring the recorded type between
-                // cells (the full restore-and-re-measure shape
-                // ExprTypecheck_Exprs.cpp:6711 uses for binary operators)
-                // was MEASURED to change resolution on `Pick(int)` vs
-                // `Pick(byte)` for an `int`-sourced constant — it turns a
-                // call that resolved into "ambiguous call to `Pick`: no
-                // overload is unambiguously better (§22.6)". Restoring
-                // changes what a LATER cell sees, so it re-decides §22.6
-                // ties that this branch did not ask to re-decide. The
-                // narrow repair is therefore to leave grading alone and
-                // publish the winner's narrowing ONCE, after ranking — see
-                // `publishWinnerNarrowing` below.
+                // #6561 left grading order-dependent and published the
+                // winner's narrowing ONCE, after ranking — see
+                // `publishWinnerNarrowing` below. Since #6722 the recorded
+                // type is restored before every cell (below): with an
+                // `int`-sourced re-type graded Exact, the restore had turned
+                // `Pick(int)` / `Pick(byte)` ambiguous; v0.340 grades that
+                // re-type Convert, so `Pick(int)` is the identity winner.
                 //
                 // narrowIntConstantToTarget's signature takes TypeRef* (the
                 // #2925 mutating re-typing variant); both argTypes[i] and
@@ -1491,6 +1513,16 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                 // function may setExprType on the expression when the rule
                 // applies (a side effect that the existing pre-pass already
                 // documents); the AST itself is not touched.
+                // fix #6722 (§22.6, §5.1, v0.340): every cell is graded from
+                // the argument's own static type. Without this restore a cell
+                // saw the previous cell's re-type, and
+                // `narrowIntConstantToTarget` (which re-types only an
+                // expression whose recorded type IS `from`) declined: the
+                // second of `Pick(short)` / `Pick(byte)` on an `int` constant
+                // was graded inapplicable, and the first-declared won.
+                if (argTypes[i])
+                    ctx_.setExprType(const_cast<ast::Expr*>(argExprs[i]),
+                                     const_cast<TypeRef*>(argTypes[i]));
                 argTy = narrowIntConstantToTarget(
                     argExprs[i],
                     const_cast<TypeRef*>(argTypes[i]),
@@ -1563,12 +1595,21 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
             //
             // because `Log(int)` won the tie and returned `int`. Capping the
             // re-typed cell at Convert restores §22.6's Exact-beats-Convert
-            // ranking, so the identity match wins in EITHER order. The cap is
-            // scoped to the `from` type the pre-pass actually re-typed, so
-            // #2985's `int`-sourced rows are bit-for-bit unaffected: an
-            // `int` source (a literal, or `const k: int`) is exempt.
-            if (m == ArgMatch::Exact && narrowFired && narrowFromPrim &&
-                *narrowFromPrim != PrimitiveType::Int)
+            // ranking, so the identity match wins in EITHER order.
+            //
+            // fix #6722 (§22.6 *The argument's static type*, v0.340): the cap
+            // applies to an `int` source too. "A compile-time integer
+            // constant ... is read at its own static type too — `int` for an
+            // unsuffixed literal that fits `int` ... — and §5.1's constant
+            // narrowing enters resolution as an *applicability* rule only: a
+            // candidate the narrowing reaches *converts* at that position,
+            // never exact". So `M(3)` against `M(int)` / `M(byte)` selects
+            // `M(int)`, and against `M(byte)` / `M(short)` is ambiguous.
+            if (m == ArgMatch::Exact && narrowFired && narrowFromPrim)
+                m = ArgMatch::Convert;
+            if (m == ArgMatch::Exact && i < argExprs.size() &&
+                isIntegerParamForOverload(paramTypes[c][i]) &&
+                isTargetTypedIntConstantArg(argExprs[i]))
                 m = ArgMatch::Convert;
             grid[c][i] = m;
             if (m == ArgMatch::NotApplicable) res.applicable[c] = false;
@@ -3664,6 +3705,9 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // constant still falls through (narrowIntConstantToTarget returns `from`
     // unchanged when `fitsInIntType` is false), so an ambiguity remains
     // diagnosable when a narrower candidate truly does not fit.
+    // fix #6722 (§22.6, v0.340) supersedes this: each candidate re-types from
+    // the argument's own type, the ranking grades from that type, and a
+    // re-typed cell CONVERTS, so two narrower-integer candidates are ambiguous.
     //
     // OUT OF SCOPE — qualified const `C.GK` (filed as #2986). foldIntConstExprTC
     // only resolves local/module consts through `lookupName`; a class member
@@ -3684,6 +3728,19 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                                    MethodSymbol* cand) -> const TypeRef* {
         return formalTypeAtReceiver(pt, cand, recvTarget);
     };
+    // fix #6722 (§22.6 *The argument's static type*, §5.1, v0.340): "A
+    // compile-time integer constant ... is read at its own static type too",
+    // and the narrowing "enters resolution as an *applicability* rule only".
+    // The re-type below MUTATES the argument's recorded type, so without a
+    // restore candidate `c` was narrowed from whatever candidate `c-1` left
+    // behind (`Pick(300)` against `Pick(byte)` / `Pick(short)` found NO
+    // applicable candidate in that order). Each candidate now re-types from
+    // the argument's OWN recorded type, and that type is restored after the
+    // loop, so §22.6 grades every candidate against the same static type.
+    std::unordered_map<const ast::Expr*, TypeRef*> pristineArgType;
+    for (const auto& a : ce.args)
+        if (a.value) pristineArgType.emplace(a.value.get(),
+                                             ctx_.exprType(*a.value));
     for (std::size_t c = 0; c < cands.size(); ++c) {
         const std::size_t np = sema::formalParamCount(*cands[c]);
         for (std::size_t j = 0; j < np; ++j) {
@@ -3738,6 +3795,12 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 carg->modifier == "out var" ||
                 carg->modifier == "out using var" ||
                 carg->modifier == "out owned var";
+            // fix #6722: start from the argument's own type, never a
+            // previous candidate's re-type (see `pristineArgType`).
+            if (carg && carg->value)
+                if (auto it = pristineArgType.find(carg->value.get());
+                    it != pristineArgType.end() && it->second)
+                    ctx_.setExprType(carg->value.get(), it->second);
             if (!skipNarrow && carg && carg->value && pt) {
                 // narrowIntConstantToTarget re-types the expression via
                 // ctx_.setExprType when the rule applies; the subsequent
@@ -3791,6 +3854,11 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
         }
         candNames[c] = methodSignatureString(initial->name, *cands[c]);
     }
+    // fix #6722: leave every argument at its own static type. A row above
+    // keeps its candidate's re-type; the ranking below grades from the
+    // restored type, and the winner's re-type is published after it.
+    for (const auto& [e, t] : pristineArgType)
+        if (t) ctx_.setExprType(e, t);
     // fix #6001 (§22.6 / §14.1, v0.338), recorded interpretation pending
     // #6220(c): when a candidate spelled with the type's parameter
     // (`Q(x: T)` on `G<T>`) substitutes to EXACTLY the signature of a
@@ -3853,7 +3921,18 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // names). If a candidate's bound-parameter shape (length, or which
     // argument fills each column) differs, §22.6 ranking over a non-uniform
     // shape is outside the worked examples; fall back to arity/first-bind.
-    const std::vector<const TypeRef*>& argTypes = argTypeRows[0];
+    // fix #6722: the shared column is each argument's OWN static type, not
+    // candidate 0's re-typed row (§22.6 *The argument's static type*).
+    std::vector<const TypeRef*> argTypes = argTypeRows[0];
+    for (std::size_t i = 0; i < argTypes.size(); ++i) {
+        const int ai = argIdxRows[0][i];
+        if (ai < 0 || static_cast<std::size_t>(ai) >= ce.args.size() ||
+            !ce.args[static_cast<std::size_t>(ai)].value)
+            continue;
+        auto it = pristineArgType.find(
+            ce.args[static_cast<std::size_t>(ai)].value.get());
+        if (it != pristineArgType.end() && it->second) argTypes[i] = it->second;
+    }
     for (std::size_t c = 0; c < cands.size(); ++c) {
         if (argIdxRows[c].size() != argIdxRows[0].size())
             return arityFallback();
@@ -4243,6 +4322,14 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // candidate the argument actually matches, and it can only ever do so
     // when exactly ONE candidate matches — never emitting a diagnostic of
     // its own, so no call that compiles today can start failing.
+    // fix #6722: which columns carry §4.2's target-typed integer constant.
+    std::vector<bool> targetTypedCol(argTypes.size(), false);
+    for (std::size_t i = 0; i < argTypes.size(); ++i) {
+        const int ai = argIdxRows[0][i];
+        if (ai >= 0 && static_cast<std::size_t>(ai) < ce.args.size())
+            targetTypedCol[i] = isTargetTypedIntConstantArg(
+                ce.args[static_cast<std::size_t>(ai)].value.get());
+    }
     auto builtinRefPrefers = [&](std::size_t x, std::size_t y) -> bool {
         // `x` is strictly better than `y` iff every argument position `x`
         // binds EXACTLY is at least as good in `y`, and one position is
@@ -4257,11 +4344,15 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             for (Symbol* g : cands[c]->genericParams)
                 if (g) freeNames.insert(g->name);
         for (std::size_t i = 0; i < argTypes.size(); ++i) {
-            const TypeRef* at = argTypeRows[x][i];
-            const TypeRef* px = paramTypes[x][i];
-            const TypeRef* py = paramTypes[y][i];
-            const auto grade = [&](const TypeRef* pt) {
+            const auto grade = [&](std::size_t c) {
+                const TypeRef* at = argTypeRows[c][i];
+                const TypeRef* pt = paramTypes[c][i];
                 if (!at || !pt) return 1;  // can't judge → treat as equal
+                // fix #6722 (§22.6, v0.340): a §5.1 constant narrowing made
+                // this candidate's row (it differs from the argument's own
+                // type); "a candidate the narrowing reaches *converts*".
+                if (at != argTypes[i] && argTypes[i]) return 1;
+                if (targetTypedCol[i] && isIntegerParamForOverload(pt)) return 1;
                 // fix #6227: identity by spelling, so `Array<Exception>` is
                 // not `Array<ArgumentException>` (see `sameTypeBySpelling`).
                 if (sameTypeBySpelling(at, pt)) return 2;
@@ -4291,8 +4382,8 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                            ? 1
                            : 0;
             };
-            const int gx = grade(px);
-            const int gy = grade(py);
+            const int gx = grade(x);
+            const int gy = grade(y);
             if (gx < gy) return false;
             if (gx > gy) anyStrict = true;
         }
@@ -22047,6 +22138,11 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 // §5.1 constant-narrowing case (the worked example in §5.1 names
                 // it directly). See the resolveMethodOverload block above for the
                 // full rationale and the order-dependence caveat.
+                // fix #6722 (§22.6, v0.340): the row keeps this candidate's
+                // re-type, and the argument's own recorded type is restored,
+                // so `resolveOverload` grades every candidate from it.
+                TypeRef* ownTy =
+                    carg && carg->value ? ctx_.exprType(*carg->value) : nullptr;
                 if (carg && carg->value && pt && carg->modifier.empty()) {
                     (void)narrowIntConstantToTarget(
                         carg->value.get(),
@@ -22058,6 +22154,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                         ? ctx_.exprType(*carg->value)
                         : nullptr);
                 argIdxRows[c].push_back(ai);
+                if (ownTy) ctx_.setExprType(carg->value.get(), ownTy);
             }
             candNames[c] = std::string("new ") + std::string(t->name) +
                            methodSignatureString("", params);
@@ -22679,11 +22776,10 @@ void ExprTC::checkImportedNewExprArgs(
                                   ? substituteMemberType(ps->resolvedDeclType,
                                                          &ne, t)
                                   : nullptr;
-                const ast::CallArgument& carg =
-                    ne.args[static_cast<std::size_t>(ai)];
-                if (carg.value && pt)
-                    (void)narrowIntConstantToTarget(
-                        carg.value.get(), ctx_.exprType(*carg.value), pt);
+                // fix #6722 (§22.6, v0.340): no per-candidate re-type here.
+                // It left the LAST candidate's narrowing as the argument type
+                // every candidate was then graded from; `resolveOverload`
+                // re-types per cell from the argument's own type instead.
                 byArg[static_cast<std::size_t>(ai)] = pt;
             }
             paramTypes[c].swap(byArg);

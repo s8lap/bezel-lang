@@ -70,9 +70,14 @@
 // fix, every program below compiles, runs and prints the SAME value — the
 // selection is unchanged, and only the malformed-IR rejection is removed. The
 // rows are a fix-forward's "no behaviour flip" evidence, not a new ranking.
+//
+// SUPERSEDED IN PART by #6722 (§22.6 v0.340): the selection is no longer
+// declaration-order dependent. The two-narrower pairs are now `ambiguous
+// call`, and the trios select the `int` candidate; each flipped row says so.
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"  // runAot
 #include "test_harness.hpp"
 
@@ -117,6 +122,14 @@ std::string prints(const std::string& src) {
     return r.stdoutText;
 }
 
+// fix #6722 (§22.6 v0.340): the call must be REJECTED as ambiguous — a
+// compile error at the call, never a silent pick.
+bool rejectedAmbiguous(const std::string& src) {
+    auto r = runAot(src);
+    return failedAtCompileTimeWithRealLocation(r) && !r.ran &&
+           diagnosticMessageContains(r, "ambiguous call to `Pick`");
+}
+
 }  // namespace
 
 // ── The issue's own repro, in BOTH orders (the pair is the test) ───────────
@@ -125,22 +138,26 @@ std::string prints(const std::string& src) {
 // is not confined to the wide-source population #6554 opened, so a fix that
 // only handled wide sources would leave every row below red.
 
+// fix #6722 (§22.6 *The argument's static type*, v0.340) FLIPPED these two
+// rows from `1` to `ambiguous call`: `N` is read at its static type `int`, and
+// §5.1's constant narrowing "enters resolution as an *applicability* rule
+// only: a candidate the narrowing reaches *converts* at that position, never
+// exact". Both candidates convert, so neither declaration order may select
+// one (§22.6: "it never silently selects one").
 BEZEL_TEST(overload_narrow_order_6561,
            two_narrower_int_candidates_wider_declared_first_spec_5_1) {
     // `short` declared FIRST. On 1c5191ab: "IR verification failed".
-    BEZEL_EXPECT_EQ(prints(pickProg("M6561a", "short,byte",
-                                    "Console.WriteLine($\"{C.Pick(N)}\");")),
-                    "1\n");
+    BEZEL_EXPECT_TRUE(rejectedAmbiguous(pickProg(
+        "M6561a", "short,byte", "Console.WriteLine($\"{C.Pick(N)}\");")));
 }
 
 BEZEL_TEST(overload_narrow_order_6561,
            two_narrower_int_candidates_narrower_declared_first_spec_5_1) {
     // The mirror. On 1c5191ab this ALREADY passed (prints 1) — it is the
     // control arm that proves the pair isolates DECLARATION ORDER rather
-    // than the shape, and it must stay green.
-    BEZEL_EXPECT_EQ(prints(pickProg("M6561b", "byte,short",
-                                    "Console.WriteLine($\"{C.Pick(N)}\");")),
-                    "1\n");
+    // than the shape. Since #6722 both orders are ambiguous.
+    BEZEL_EXPECT_TRUE(rejectedAmbiguous(pickProg(
+        "M6561b", "byte,short", "Console.WriteLine($\"{C.Pick(N)}\");")));
 }
 
 // ── Three candidates: the same disagreement, one more cell to lose it in ──
@@ -149,26 +166,30 @@ BEZEL_TEST(overload_narrow_order_6561,
 // with malformed IR, because `short` wins (first-declared, all cells
 // converting) and the LAST cell leaves `byte` recorded. The two rows whose
 // first declaration is `byte` are the controls.
+//
+// fix #6722 (§22.6, v0.340) FLIPPED the first three rows: `int` is the
+// identity candidate, the only exact one, so every order prints the `int`
+// candidate's position (3, 2, 3; the fourth row's `int` is already 1).
 
 BEZEL_TEST(overload_narrow_order_6561,
            trio_wider_candidate_first_short_byte_int_spec_5_1) {
     BEZEL_EXPECT_EQ(prints(pickProg("M6561c", "short,byte,int",
                                     "Console.WriteLine($\"{C.Pick(N)}\");")),
-                    "1\n");
+                    "3\n");
 }
 
 BEZEL_TEST(overload_narrow_order_6561,
            trio_wider_candidate_first_short_int_byte_spec_5_1) {
     BEZEL_EXPECT_EQ(prints(pickProg("M6561d", "short,int,byte",
                                     "Console.WriteLine($\"{C.Pick(N)}\");")),
-                    "1\n");
+                    "2\n");
 }
 
 BEZEL_TEST(overload_narrow_order_6561,
            trio_narrower_candidate_first_byte_short_int_control_spec_5_1) {
     BEZEL_EXPECT_EQ(prints(pickProg("M6561e", "byte,short,int",
                                     "Console.WriteLine($\"{C.Pick(N)}\");")),
-                    "1\n");
+                    "3\n");
 }
 
 BEZEL_TEST(overload_narrow_order_6561,
