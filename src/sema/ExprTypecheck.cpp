@@ -9967,8 +9967,14 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
             }
             TypeSymbol* declaring = ps->parent;
             bool bad = false;
-            if (nestingGrantsAccess(declaring)) {
-                // §11.6 / §13.1 (#6727): lexical nesting grant.
+            // §11.6 / §13.1 (#6727): lexical nesting grant. Withheld in an
+            // extension body (§26.3: an extension block has no declaring
+            // class, it sees only the extended type's public API) and for a
+            // `static readonly` auto-property, which §23.1 admits only in the
+            // declaring type's own static initialization — never from an
+            // enclosing or nested type's code.
+            if (!currentExtension_ && !(isReadonlyAuto && propIsStatic) &&
+                nestingGrantsAccess(declaring)) {
             } else if (sv == ast::Visibility::Private)
                 bad = (currentType_ != declaring);
             else if (sv == ast::Visibility::Protected)
@@ -10620,8 +10626,15 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     }
     TypeSymbol* declaring = ps.parent;
     bool bad = false;
-    if (nestingGrantsAccess(declaring)) {
-        // §11.6 / §13.1 (#6727): lexical nesting grant.
+    bool isStaticReadonlyAuto = false;
+    if (isReadonlyAuto)
+        for (auto mod : pd->modifiers)
+            if (mod == "static") { isStaticReadonlyAuto = true; break; }
+    // §11.6 / §13.1 (#6727): lexical nesting grant, withheld in an extension
+    // body (§26.3) and for a `static readonly` auto-property (§23.1) — the
+    // twin of checkPropertyWriteTarget's clause.
+    if (!currentExtension_ && !isStaticReadonlyAuto &&
+        nestingGrantsAccess(declaring)) {
     } else if (sv == ast::Visibility::Private)
         bad = (currentType_ != declaring);
     else if (sv == ast::Visibility::Protected)

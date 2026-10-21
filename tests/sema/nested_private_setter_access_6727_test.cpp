@@ -172,6 +172,105 @@ constexpr const char* kOutsideToNested =
     "  destructor end destructor;\n"
     "end Other;\n";
 
+// §26.3 (v0.340): "Extension members see only the extended type's public
+// API"; an extension block has no declaring class, so §11.6's nesting grant
+// does not reach a nested type's `private set` from an extension body even
+// though the extension extends the enclosing type (reviewer probe p09).
+constexpr const char* kExtensionToNested =
+    "module M;\n"
+    "public class Outer\n"
+    "  public class Inner\n"
+    "    public property P: int private set;\n"
+    "    destructor end destructor;\n"
+    "  end Inner;\n"
+    "  destructor end destructor;\n"
+    "end Outer;\n"
+    "extension Outer\n"
+    "  public method Poke(i: Outer.Inner)\n"
+    "    i.P := 1;\n"
+    "  end Poke;\n"
+    "end;\n"
+    "public class Entry\n"
+    "  public static method Main(): int\n"
+    "    using var o := new Outer();\n"
+    "    using var i := new Outer.Inner();\n"
+    "    o.Poke(i);\n"
+    "    Console.WriteLine(i.P);\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "  destructor end destructor;\n"
+    "end Entry;\n";
+
+// The `out`-operand twin (checkRefOutPropertyOperand).
+constexpr const char* kExtensionToNestedOut =
+    "module M;\n"
+    "public class Outer\n"
+    "  public class Inner\n"
+    "    public property P: int private set;\n"
+    "    destructor end destructor;\n"
+    "  end Inner;\n"
+    "  public static method Fill(out n: int) n := 1; end Fill;\n"
+    "  destructor end destructor;\n"
+    "end Outer;\n"
+    "extension Outer\n"
+    "  public method Poke(i: Outer.Inner)\n"
+    "    Outer.Fill(out i.P);\n"
+    "  end Poke;\n"
+    "end;\n"
+    "public class Entry\n"
+    "  public static method Main(): int return 0; end Main;\n"
+    "  destructor end destructor;\n"
+    "end Entry;\n";
+
+// §23.1 (v0.340): a `static readonly` auto-property is admitted "in the
+// declaring type's own static initialization" only; an ENCLOSING type's
+// instance constructor is not that, so the nesting grant must not open the
+// nested type's `private` setter to it (reviewer probe p14b; the tip of the
+// first #6727 commit accepted it and printed 5).
+constexpr const char* kEnclosingCtorToNestedStaticReadonly =
+    "module M;\n"
+    "public class Outer\n"
+    "  public class Inner\n"
+    "    private static readonly property SR: int := 0;\n"
+    "    public static method Peek(): int return SR; end Peek;\n"
+    "    destructor end destructor;\n"
+    "  end Inner;\n"
+    "  public constructor()\n"
+    "    Inner.SR := 5;\n"
+    "  end constructor;\n"
+    "  public static method Main(): int\n"
+    "    using var o := new Outer();\n"
+    "    Console.WriteLine(Inner.Peek());\n"
+    "    return 0;\n"
+    "  end Main;\n"
+    "  destructor end destructor;\n"
+    "end Outer;\n";
+
+// The `out`-operand twin.
+constexpr const char* kEnclosingCtorToNestedStaticReadonlyOut =
+    "module M;\n"
+    "public class Outer\n"
+    "  public class Inner\n"
+    "    private static readonly property SR: int := 0;\n"
+    "    destructor end destructor;\n"
+    "  end Inner;\n"
+    "  public static method Fill(out n: int) n := 5; end Fill;\n"
+    "  public constructor()\n"
+    "    Fill(out Inner.SR);\n"
+    "  end constructor;\n"
+    "  public static method Main(): int return 0; end Main;\n"
+    "  destructor end destructor;\n"
+    "end Outer;\n";
+
+// Pins the exact diagnostic at its real `<line>:<col>` (the location prefix
+// the driver prints in a rejected compile's captured stderr).
+void expectRejectedAt(const char* src, const char* locAndMessage) {
+    JitResult r = runAot(src);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, locAndMessage));
+}
+
 void expectRejected(const char* src) {
     JitResult r = runAot(src);
     BEZEL_EXPECT_FALSE(r.ran);
@@ -247,4 +346,33 @@ BEZEL_TEST(nested_private_setter_access_6727, cross_module_private_set_rejected_
     JitResult r = runAotModules({ModuleSource{"Lib", lib}, ModuleSource{"App", app}}, "App");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "its setter is not accessible here"));
+}
+
+// §26.3 (v0.340): no nesting grant in an extension body.
+BEZEL_TEST(nested_private_setter_access_6727, extension_body_to_nested_private_set_rejected_spec_26_3) {
+    expectRejectedAt(kExtensionToNested,
+                     ":11:5: cannot assign to property `P` — its setter is not "
+                     "accessible here (§13.6)");
+}
+
+BEZEL_TEST(nested_private_setter_access_6727, extension_body_out_operand_of_nested_private_set_rejected_spec_26_3) {
+    expectRejectedAt(kExtensionToNestedOut,
+                     ":12:20: a `out` argument must be a property with an "
+                     "accessible setter — its setter is not accessible here "
+                     "(§22.3 / §13.6)");
+}
+
+// §23.1 (v0.340): no nesting grant for a `static readonly` write outside the
+// declaring type's own static initialization.
+BEZEL_TEST(nested_private_setter_access_6727, enclosing_ctor_to_nested_private_static_readonly_rejected_spec_23_1) {
+    expectRejectedAt(kEnclosingCtorToNestedStaticReadonly,
+                     ":9:5: cannot assign to property `SR` — its setter is not "
+                     "accessible here (§13.6)");
+}
+
+BEZEL_TEST(nested_private_setter_access_6727, enclosing_ctor_out_operand_of_nested_private_static_readonly_rejected_spec_23_1) {
+    expectRejectedAt(kEnclosingCtorToNestedStaticReadonlyOut,
+                     ":9:14: a `out` argument must be a property with an "
+                     "accessible setter — its setter is not accessible here "
+                     "(§22.3 / §13.6)");
 }
