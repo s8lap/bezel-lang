@@ -2241,6 +2241,53 @@ static std::string spelledTypeForSignature(const ast::Type* t) {
     return s;
 }
 
+// fix #6871 (§22.6, v0.340): the resolved-`TypeRef` twin of the function above,
+// for an IMPORTED candidate that has no AST parameter list. One spelling for
+// every candidate: the `?` marker FOLLOWS the type (`long?`), as the AST
+// spelling prints it; `typeNameForDiag` prefixes it, which is its own
+// convention for the other diagnostics and is left alone.
+static std::string spelledResolvedTypeForSignature(const TypeRef* t) {
+    if (!t) return "?";
+    std::string s;
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            s = primitiveSpellingForDiag(t->primitive);
+            break;
+        case TypeRef::Kind::Function:
+            s = "(fn ...)";
+            break;
+        case TypeRef::Kind::InlineArray:
+            s = t->arrayOwned ? "[N owned]" : "[N]";
+            s += spelledResolvedTypeForSignature(t->arrayElement);
+            break;
+        case TypeRef::Kind::Unit:
+            s = "()";
+            break;
+        case TypeRef::Kind::Named: {
+            std::string_view nm;
+            if (t->declaration && !t->declaration->decl)
+                nm = t->declaration->name;
+            else if (!t->declaration && t->astNode && t->astNode->name &&
+                     !t->astNode->name->parts.empty())
+                nm = t->headName();
+            else if (t->declaration)
+                nm = t->declaration->name;
+            s.append(nm.data(), nm.size());
+            if (!t->genericArgs.empty()) {
+                s += '<';
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += spelledResolvedTypeForSignature(t->genericArgs[i]);
+                }
+                s += '>';
+            }
+            break;
+        }
+    }
+    if (t->nullable) s += '?';
+    return s;
+}
+
 // A printable signature for a method candidate, e.g. "F(int, long)".
 std::string methodSignatureString(std::string_view name,
                                   const std::vector<ast::Param>& params) {
@@ -2279,7 +2326,7 @@ std::string methodSignatureString(std::string_view name,
             continue;
         }
         if (const TypeRef* rt = formalParamResolvedType(ms, j))
-            s += typeNameForDiag(rt);
+            s += spelledResolvedTypeForSignature(rt);
         else
             s += "?";
     }
