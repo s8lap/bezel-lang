@@ -1963,6 +1963,54 @@ std::string bareStructuralMemberReference(std::string_view head,
            "(...)`) or wrap it in a lambda";
 }
 
+// fix #6805 (language spec §27.6, v0.340; stdlib §5; #6784's siblings): the
+// display name of a receiver type whose stdlib §5 LINQ operators are
+// dispatched structurally (no method symbol) AND that no other arm already
+// rejects a bare reference on, or "" for any other type. `nullCond` widens
+// the set to the builtin collections the `.` spelling rejects in its own
+// per-family arms (#2470/#2492/#2537), because the `?.` spelling has no such
+// arm. User declarations never match: they carry a `declaration`.
+std::string structuralLinqReceiverName(const TypeRef* t, bool nullCond,
+                                       std::string_view member) {
+    if (!t) return "";
+    if (t->kind == TypeRef::Kind::Primitive &&
+        t->primitive == PrimitiveType::String)
+        return "string";
+    if (t->kind != TypeRef::Kind::Named || t->declaration) return "";
+    std::string_view h = t->headName();
+    // Heads whose `.` and `?.` spellings both reach here (single type arg).
+    static constexpr std::string_view kInterfaceHeads[] = {
+        "IEnumerable", "IList", "IReadOnlyList", "ICollection",
+        "IReadOnlyCollection", "Span", "ReadOnlySpan", "IOwningList",
+        "IOwningCollection", "IOwningEnumerable"};
+    // Concrete collections: only `?.` reaches here, the `.` spelling is
+    // rejected by their own per-family arms (#2470/#2492/#2537).
+    static constexpr std::string_view kConcreteHeads[] = {
+        "Array", "Stack", "Queue", "Set", "OwningArray", "OwningStack",
+        "OwningQueue", "OwningSet"};
+    static constexpr std::string_view kMapHeads[] = {
+        "Dictionary", "SortedDictionary", "OwningDictionary"};
+    // stdlib §4.7 / §4.18: `First` / `Last` are declared PROPERTIES of the
+    // linked lists and `SortedSet<T>`, not the §5 operators.
+    static constexpr std::string_view kPropertyHeads[] = {
+        "LinkedList", "OwningLinkedList", "SortedSet"};
+    auto in = [&](const auto& tbl) {
+        for (std::string_view x : tbl)
+            if (x == h) return true;
+        return false;
+    };
+    if (in(kInterfaceHeads)) return std::string(h) + "<T>";
+    if (nullCond) {
+        if (in(kConcreteHeads)) return std::string(h) + "<T>";
+        if (in(kMapHeads)) return std::string(h) + "<K, V>";
+        if (in(kPropertyHeads))
+            return member == "First" || member == "Last"
+                       ? std::string()
+                       : std::string(h) + "<T>";
+    }
+    return "";
+}
+
 // fix #6740 (stdlib §5 `IGrouping<TKey, T>`, §4.12, v0.340): the diagnostic
 // for a bare (non-callee) member access `g.<name>` / `g?.<name>` on an
 // `IGrouping<TKey, T>` receiver, or "" when `name` needs no rejection here.
@@ -30238,26 +30286,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
-        // #6784 (language spec §27.6, v0.340; stdlib §5; mirror of
+        // #6784 / #6805 (language spec §27.6, v0.340; stdlib §5; mirror of
         // #2470/#2492/#2537): a BARE reference to a stdlib §5 LINQ operator
-        // on an `IEnumerable<T>` receiver has the same no-MethodSymbol shape
-        // as the builtin collections below (the `IGrouping` spelling is
-        // rejected in its own member-access arm); the CALL form is exempted
-        // via calleeOfCallCtx_.
-        if (ma.target && !ctx_.exprType(ma) && &ma != calleeOfCallCtx_) {
-            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
-                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                    tt->headName() == "IEnumerable" &&
-                    common::isBuiltinCollectionLinqOperatorName(ma.member)) {
-                    auto loc = ma.span.begin;
-                    if (loc.line == 0 && ma.target)
-                        loc = ma.target->span.begin;
-                    ctx_.diagnostics().report(
-                        Severity::Error, loc,
-                        bareStructuralMemberReference("IEnumerable<T>",
-                                                      ma.member));
-                    return;
-                }
+        // on an `IEnumerable<T>` / `IList<T>` / `IReadOnlyList<T>` /
+        // `ICollection<T>` / `IReadOnlyCollection<T>` / `Span<T>` /
+        // `ReadOnlySpan<T>` receiver has the same no-MethodSymbol shape as the
+        // builtin collections below (the `IGrouping` spelling is rejected in
+        // its own member-access arm); the CALL form is exempted via
+        // calleeOfCallCtx_.
+        if (ma.target && !ctx_.exprType(ma) && &ma != calleeOfCallCtx_ &&
+            common::isBuiltinCollectionLinqOperatorName(ma.member)) {
+            std::string recv = structuralLinqReceiverName(
+                ctx_.exprType(*ma.target), /*nullCond=*/false, ma.member);
+            if (!recv.empty() && recv != "string") {
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target)
+                    loc = ma.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    bareStructuralMemberReference(recv, ma.member));
+                return;
             }
         }
         // #2537 (sibling of #2536; mirror of #2470/#2492; stdlib
@@ -33911,18 +33959,26 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         }
     }
     // fix #6805 (language spec §27.6, v0.340; stdlib §5; the `?.` twin of the
-    // `.` string arm): a bare `s?.<§5 operator>` on a string left the node
+    // `.` arms, #6784 covered only IGrouping here): a bare `e?.<§5 operator>`
+    // on a receiver that dispatches the operator structurally left the node
     // untyped, so the local degraded to a zero function value (#2434).
-    if (!member && &nm != calleeOfCallCtx_ && recvTyForDiag &&
-        recvTyForDiag->kind == TypeRef::Kind::Primitive &&
-        recvTyForDiag->primitive == PrimitiveType::String &&
-        common::isStringLinqOperatorMemberName(nm.member)) {
-        SourceLocation loc = nm.span.begin;
-        if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
-        ctx_.diagnostics().report(
-            Severity::Error, loc,
-            bareStructuralMemberReference("string", nm.member));
-        return;
+    if (!member && &nm != calleeOfCallCtx_ && recvTyForDiag) {
+        bool isOp = recvTyForDiag->kind == TypeRef::Kind::Primitive
+                        ? common::isStringLinqOperatorMemberName(nm.member)
+                        : common::isBuiltinCollectionLinqOperatorName(
+                              nm.member);
+        std::string recv =
+            isOp ? structuralLinqReceiverName(recvTyForDiag, /*nullCond=*/true,
+                                       nm.member)
+                 : std::string();
+        if (!recv.empty()) {
+            SourceLocation loc = nm.span.begin;
+            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                bareStructuralMemberReference(recv, nm.member));
+            return;
+        }
     }
     if (!member) {
         // #3019 (§9.2/§9.3/§35.7): the `?.` form of a direct Equals/GetHashCode
