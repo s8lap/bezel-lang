@@ -3057,7 +3057,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // value (it is not reassignable, so no shared cell is needed).
     if (currentThis_ != nullptr) {
         CaptureEntry ce;
-        ce.valTy = ptrTy();
+        // fix #6768 (§9.4, v0.340): an ENUM (or primitive-extension) receiver
+        // is the bare scalar, not a pointer to storage (CG30), so "captures
+        // the fixed receiver value by copy" is the scalar itself in the env
+        // field — typed as the scalar, restored as the scalar. Pointer
+        // receivers keep a `ptr` field.
+        ce.valTy = currentThis_->getType();
         ce.envValue = currentThis_;
         ce.sym = nullptr;
         ce.decl = nullptr;
@@ -3107,8 +3112,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // its cell pointer; the `this` capture stores the receiver pointer.
     std::vector<llvm::Type*> envFieldTys;
     for (const auto& ce : captures) {
-        (void)ce;
-        envFieldTys.push_back(ptrTy());
+        // fix #6768: a scalar `this` (enum receiver) is stored by value.
+        envFieldTys.push_back(ce.isThis && ce.valTy ? ce.valTy : ptrTy());
     }
 
     // §30.6 (#488): an `async` lambda's closure entry function ALWAYS returns a
@@ -3273,7 +3278,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 envTy, envPtr, static_cast<unsigned>(i));
             // The env field holds a pointer: the shared cell (boxed captures)
             // or the receiver (`this`).
-            llvm::Value* ptrVal = builder_.CreateLoad(ptrTy(), fieldPtr);
+            llvm::Value* ptrVal = builder_.CreateLoad(
+                ce.isThis && ce.valTy ? ce.valTy : ptrTy(), fieldPtr);
             if (ce.isThis) {
                 // Restore 'this' from the captured receiver pointer.
                 currentThis_ = ptrVal;
@@ -4247,7 +4253,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 if (ce.isThis) {
                     // fix #6721: a by-copy cell is the env's own block, not a
                     // class instance — nothing to mark.
-                    if (!ce.thisCopyTy) emitCdMarkEscaped(ce.envValue);
+                    if (!ce.thisCopyTy && ce.envValue->getType()->isPointerTy())
+                        emitCdMarkEscaped(ce.envValue);
                 } else if (ce.valTy && ce.valTy->isPointerTy() &&
                            (!ce.semaTy || cdMarkableType(ce.semaTy))) {
                     builder_.CreateCall(
