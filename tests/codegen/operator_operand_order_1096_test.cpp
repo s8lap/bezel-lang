@@ -133,9 +133,15 @@ BEZEL_TEST(operator_operand_order_1096, first_overload_still_resolves_1131) {
 BEZEL_TEST(operator_operand_order_1096, nullable_user_operator_rejected_not_crash_1132) {
     auto r = runAot(
         std::string(VEC) +
-        "class Mn public static method Main(): int "
-        "  var a: Vec? := new Vec(1, 2); "
-        "  var c := a + a; "                               // Vec? + Vec? — deferred
+        "class Mn "
+        "  public static method Pick(): Vec? return new Vec(1, 2); end Pick; "
+        "  public static method Main(): int "
+        // #6758 (§7.4 declaration initializer, §7.11, v0.340): `var a: Vec? :=
+        // new Vec(1, 2);` narrows `a` non-null, so `a + a` is now accepted;
+        // the operand here comes from a nullable-typed call, so it is NOT
+        // narrowed and stays the §7.11 reject this row pins.
+        "  var a: Vec? := Pick(); "
+        "  var c := a + a; "                               // Vec? + Vec? — not narrowed
         "  return 0; "
         "end Main; end Mn;");
     // fix #3895 (issue #3892): the row's own name says "not crash" — a bare

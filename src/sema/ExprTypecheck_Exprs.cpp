@@ -6718,8 +6718,20 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
     // through any other route is untouched.
     sema::TypeRef thisRefStorage;
     auto staticTypeOf = [&](const ast::Expr* operand) -> const sema::TypeRef* {
-        if (const sema::TypeRef* t = operand ? ctx_.exprType(*operand) : nullptr)
+        if (const sema::TypeRef* t = operand ? ctx_.exprType(*operand) : nullptr) {
+            // §7.11 (v0.340): "an operand that §7.4 has narrowed non-null is a
+            // non-nullable operand and the ordinary operator applies to it
+            // unchanged" -- the user-defined-operator position included (#6758).
+            // `=`/`<>` are null-safe by §8.4 and read the declared type.
+            if (t->nullable && t->kind == sema::TypeRef::Kind::Named &&
+                be.op != "=" && be.op != "<>" && isNarrowedNonNullRead(operand)) {
+                sema::TypeRef* nn = ctx_.makeTypeRef();
+                *nn = *t;
+                nn->nullable = false;
+                return nn;
+            }
             return t;
+        }
         auto* id = operand
                        ? dynamic_cast<const ast::IdentifierExpr*>(operand)
                        : nullptr;
@@ -7528,6 +7540,9 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                 if (!operand) return false;
                 const TypeRef* t = ctx_.exprType(*operand);
                 if (!t || !t->nullable) return false;
+                // §7.11 / §7.4 (#6758): a narrowed-non-null operand is a
+                // non-nullable operand here.
+                if (isNarrowedNonNullRead(operand)) return false;
                 TypeSymbol* ts = memberTargetType(operand);
                 if (!ts || (ts->kind != ast::TypeDeclKind::Record &&
                             ts->kind != ast::TypeDeclKind::Class))

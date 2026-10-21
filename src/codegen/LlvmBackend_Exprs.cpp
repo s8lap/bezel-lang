@@ -9130,6 +9130,32 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             llvm::Value* ol = lowerExpr(*bin.left);
             llvm::Value* orr = lowerExpr(*bin.right);
             if (!ol || !orr) return nullptr;
+            // §7.11 / §7.4 (#6758): the PAIR of sema's narrowed-operand
+            // admission at a user-defined operator position -- a nullable
+            // record operand sema let through is one §7.4 narrowed non-null
+            // (an un-narrowed one is rejected, so this never reads the payload
+            // of a possibly-null box). Its `{i8 hasVal; Record}` box is
+            // unwrapped to the bare record a non-nullable parameter takes.
+            {
+                const ast::Expr* ops[2] = {bin.left.get(), bin.right.get()};
+                llvm::Value* vals[2] = {ol, orr};
+                for (int i = 0; i < 2; ++i) {
+                    const sema::TypeRef* t = ctx_.exprType(*ops[i]);
+                    auto* ps = i < static_cast<int>(opm->params.size())
+                                   ? dynamic_cast<sema::ParameterSymbol*>(
+                                         opm->params[i])
+                                   : nullptr;
+                    const sema::TypeRef* pt =
+                        !ps ? nullptr
+                            : ps->declType ? ctx_.resolvedType(*ps->declType)
+                                           : ps->resolvedDeclType;
+                    if (t && pt && !pt->nullable && isNullableValueTy(t) &&
+                        vals[i]->getType()->isStructTy())
+                        vals[i] = nullablePrimValue(vals[i]);
+                }
+                ol = vals[0];
+                orr = vals[1];
+            }
             std::vector<llvm::Value*> args{ol, orr};
             // #1059: an operator overload on a GENERIC record/class is a
             // (non-generic) static method whose parameter / return types use the
