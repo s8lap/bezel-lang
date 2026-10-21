@@ -8269,9 +8269,9 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
         // above falls through for any reason (shouldn't, after #2553), refuse
         // the array-backed iteration here and return false so the generic
         // for-handlers take over instead of miscompiling.
-        if (!litArrAddr && iterTy && iterTy->astNode && iterTy->astNode->name &&
-            !iterTy->astNode->name->parts.empty() &&
-            iterTy->headName() == "SortedSet") {
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
+        if (!litArrAddr && iterTy && iterTy->headName() == "SortedSet") {
             return false;
         }
         if (!litArrAddr && isCollectionTypeName(iterTy)) {
@@ -8313,8 +8313,9 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             // `IOwningEnumerable<T>` path (an interface-typed source, so this
             // `isCollectionTypeName` dispatch never matches it) is untouched
             // by this fix.
-            bool isStackFamily = iterTy && iterTy->astNode &&
-                iterTy->astNode->name && !iterTy->astNode->name->parts.empty() &&
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate. An IMPORTED
+            // Stack (astNode-less, head in `importedName`) pops top-first too.
+            bool isStackFamily = iterTy &&
                 (iterTy->headName() == "Stack" ||
                  iterTy->headName() == "OwningStack");
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -8597,8 +8598,9 @@ bool Emitter::emitGenericKeyTableFor(const ast::ForStmt& fs,
 bool Emitter::lowerDictBackedSetFor(const ast::ForStmt& fs) {
     if (!fs.iterable) return false;
     auto* iterTy = ctx_.exprType(*fs.iterable);
-    if (!iterTy || !iterTy->astNode || !iterTy->astNode->name ||
-        iterTy->astNode->name->parts.empty() || iterTy->declaration)
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate. An IMPORTED Set
+    // (astNode-less, head in `importedName`) is the same bz_dict_t* table.
+    if (!iterTy || iterTy->headName().empty() || iterTy->declaration)
         return false;
     auto n = iterTy->headName();
     if (n != "Set" && n != "OwningSet" &&
@@ -9130,9 +9132,9 @@ bool Emitter::lowerDictEntryFor(const ast::ForStmt& fs) {
     // fix #1426 / stdlib §4.17: for SortedDictionary, sort keys and values
     // together in ascending key order before the loop.  O(n log n) per
     // enumeration (hash-backing limitation; ordered rep rides #545).
-    if (dictTy && dictTy->astNode && dictTy->astNode->name &&
-        !dictTy->astNode->name->parts.empty() &&
-        dictTy->headName() == "SortedDictionary") {
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
+    if (dictTy && dictTy->headName() == "SortedDictionary") {
         if (useGen) {
             const sema::TypeRef* kTy =
                 genericBackingType(dictTy, 0, /*isSet=*/false, nullptr);

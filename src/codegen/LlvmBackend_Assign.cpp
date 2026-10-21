@@ -1082,9 +1082,9 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         {
             const sema::TypeRef* arrEl =
                 (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool arrIsOwning =
-                recvTy->astNode && recvTy->astNode->name &&
-                !recvTy->astNode->name->parts.empty() &&
                 common::isOwningPrefixedName(recvTy->headName());
             if (!elementPolicyFor(arrEl, arrIsOwning).disposerThunk) return nullptr;
         }
@@ -1136,10 +1136,10 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     const sema::TypeRef* dictMoveValTy =
         (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
                                                     : nullptr;
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
     bool owningDict =
-        recvTy && recvTy->astNode && recvTy->astNode->name &&
-        !recvTy->astNode->name->parts.empty() &&
-        recvTy->headName() == "OwningDictionary" &&
+        recvTy && recvTy->headName() == "OwningDictionary" &&
         elementPolicyFor(dictMoveValTy, /*owningFamily=*/true).cat ==
             ElementPolicy::Category::ClassOwned;
     if (!owningDict) return nullptr;
@@ -1590,14 +1590,14 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 !recvTy->astNode->name->parts.empty() &&
                 common::isOwningPrefixedName(recvTy->headName());
             ElementPolicy arrPol = elementPolicyFor(arrEl, arrIsOwning);
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool isStrElemArr =
                 !arrIsOwning &&
                 arrPol.cat == ElementPolicy::Category::RuntimeManaged &&
                 arrEl && !arrEl->nullable &&
                 arrEl->kind == sema::TypeRef::Kind::Primitive &&
                 arrEl->primitive == sema::PrimitiveType::String &&
-                recvTy->astNode && recvTy->astNode->name &&
-                !recvTy->astNode->name->parts.empty() &&
                 [](std::string_view n){
                     // #2598: IList<T> is array-backed + borrowing (issue #401),
                     // same bz_array_set ABI as Array<T>; admitted alongside the
@@ -1631,9 +1631,9 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         // by §4.2's constraint, so the shared vtable thunk is correct).
         const sema::TypeRef* arrEl2 =
             (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
         bool arrIsOwning2 =
-            recvTy->astNode && recvTy->astNode->name &&
-            !recvTy->astNode->name->parts.empty() &&
             common::isOwningPrefixedName(recvTy->headName());
         {
             llvm::Function* elemDisp =
@@ -1875,10 +1875,10 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // overwrite path directly from elementPolicyFor (covers class AND interface
     // value types, as well as Shared<T>/Weak<T> handles — batch 3 wired this
     // path; batch 4 removes the last stale reference to deleted helpers).
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
     bool dictIsOwning2 =
-        recvTy && recvTy->astNode && recvTy->astNode->name &&
-        !recvTy->astNode->name->parts.empty() &&
-        recvTy->headName() == "OwningDictionary";
+        recvTy && recvTy->headName() == "OwningDictionary";
     const sema::TypeRef* dictValTy2 =
         (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
                                                     : nullptr;
@@ -5391,14 +5391,14 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             !recvTy->astNode->name->parts.empty() &&
             common::isOwningPrefixedName(recvTy->headName());
         ElementPolicy sArrPol = elementPolicyFor(sArrEl, sArrIsOwning);
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
         bool isStrElemArr =
             !sArrIsOwning &&
             sArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
             sArrEl && !sArrEl->nullable &&
             sArrEl->kind == sema::TypeRef::Kind::Primitive &&
             sArrEl->primitive == sema::PrimitiveType::String &&
-            recvTy->astNode && recvTy->astNode->name &&
-            !recvTy->astNode->name->parts.empty() &&
             [](std::string_view n){
                 // #2598: IList<T> is array-backed + borrowing (issue #401),
                 // same bz_array_set ABI as Array<T>; admitted alongside the
@@ -5441,9 +5441,9 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     {
         const sema::TypeRef* ixEl =
             (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
         bool ixIsOwning =
-            recvTy->astNode && recvTy->astNode->name &&
-            !recvTy->astNode->name->parts.empty() &&
             common::isOwningPrefixedName(recvTy->headName());
         llvm::Function* elemDisp =
             elementPolicyFor(ixEl, ixIsOwning).disposerThunk;

@@ -6383,12 +6383,11 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
     // (the Set-family misclassification in lowerToLazyEnumerator
     // / kArrayBackedCollections is a separate problem with a
     // different scope of consumer #1426/#2693/#2721 touches).
-    bool isSetName = recvTy && recvTy->astNode &&
-        recvTy->astNode->name &&
-        !recvTy->astNode->name->parts.empty() &&
-        (recvTy->headName() == "Set" ||
-         recvTy->headName() == "OwningSet" ||
-         recvTy->headName() == "SortedSet");
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
+    bool isSetName = recvTy && (recvTy->headName() == "Set" ||
+                                recvTy->headName() == "OwningSet" ||
+                                recvTy->headName() == "SortedSet");
     bool dictBackedSet = isSetName &&
         genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)
             != nullptr;
@@ -6422,9 +6421,9 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             const sema::TypeRef* llElem =
                 (!recvTy->genericArgs.empty())
                     ? recvTy->genericArgs[0] : nullptr;
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool llIsOwning =
-                recvTy->astNode && recvTy->astNode->name &&
-                !recvTy->astNode->name->parts.empty() &&
                 common::isOwningPrefixedName(recvTy->headName());
             ElementPolicy llElemPol =
                 elementPolicyFor(llElem, llIsOwning);
@@ -6627,9 +6626,9 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             const sema::TypeRef* arrElem =
                 (!recvTy->genericArgs.empty())
                     ? recvTy->genericArgs[0] : nullptr;
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool arrIsOwning =
-                recvTy->astNode && recvTy->astNode->name &&
-                !recvTy->astNode->name->parts.empty() &&
                 common::isOwningPrefixedName(recvTy->headName());
             ElementPolicy arrElemPol =
                 elementPolicyFor(arrElem, arrIsOwning);
@@ -6684,9 +6683,9 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             const sema::TypeRef* dictVal =
                 (recvTy->genericArgs.size() > 1)
                     ? recvTy->genericArgs[1] : nullptr;
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool dictIsOwning =
-                recvTy->astNode && recvTy->astNode->name &&
-                !recvTy->astNode->name->parts.empty() &&
                 recvTy->headName() == "OwningDictionary";
             llvm::Function* valDisp =
                 elementPolicyFor(dictVal, dictIsOwning).disposerThunk;

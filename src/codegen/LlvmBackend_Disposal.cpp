@@ -1728,9 +1728,9 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // element has a null declaration → Value policy → elements leak. A
             // no-op outside a substitution (the shared disposer keeps the bare T).
             collElem = resolveTypeParamRef(collElem);
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool collIsOwning =
-                it->collTy->astNode && it->collTy->astNode->name &&
-                !it->collTy->astNode->name->parts.empty() &&
                 (common::isOwningPrefixedName(it->collTy->headName()) ||
                  // #2606 / stdlib §4.5: IOwningList<T> is the OWNING list
                  // interface — its elements are owned by the holder — but
@@ -1740,13 +1740,13 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                  isOwningListInterfaceName(it->collTy));
             ElementPolicy fieldCollPol = elementPolicyFor(collElem, collIsOwning);
             llvm::Function* elemDisp = fieldCollPol.disposerThunk;
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             if (!elemDisp && !isDict &&
                     fieldCollPol.cat == ElementPolicy::Category::RuntimeManaged &&
                     collElem && collElem->kind == sema::TypeRef::Kind::Primitive &&
                     collElem->primitive == sema::PrimitiveType::String &&
                     !collElem->nullable &&
-                    it->collTy->astNode && it->collTy->astNode->name &&
-                    !it->collTy->astNode->name->parts.empty() &&
                     [](std::string_view n){
                         // #2603 / issue #401: IList<T>/IReadOnlyList<T> are
                         // array-backed + borrowing (same bz_array_t* + per-
@@ -6638,8 +6638,9 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // widening with no double-free: `Dictionary`'s own behavior for every V
     // kind is UNCHANGED (this touches only the head-name test, not the
     // boxed-struct predicate below it), verified byte-identical vs parent.
-    if (!dictTy || !dictTy->astNode || !dictTy->astNode->name ||
-        dictTy->astNode->name->parts.empty())
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
+    if (!dictTy || dictTy->headName().empty())
         return nullptr;
     if (!isBoxedValueDictHeadName(dictTy->headName())) return nullptr;
     if (dictTy->genericArgs.size() <= 1) return nullptr;

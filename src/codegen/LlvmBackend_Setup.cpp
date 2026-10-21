@@ -21764,13 +21764,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             if (const sema::TypeRef* dt = dictTypeOfLocal(ld)) {
                 Disposal d{it->second, nullptr};
                 d.dict = true;
+                // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+                // (astNode-less, head in `importedName`) must match the same arm.
                 bool dictIsOwning =
-                    dt->astNode && dt->astNode->name &&
-                    !dt->astNode->name->parts.empty() &&
                     dt->headName() == "OwningDictionary";
+                // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+                // (astNode-less, head in `importedName`) must match the same arm.
                 bool isSetNameD =
-                    dt->astNode && dt->astNode->name &&
-                    !dt->astNode->name->parts.empty() &&
                     dt->headName() == "Set";
                 auto isStrKey = [&]() {
                     if (dt->genericArgs.empty() || !dt->genericArgs[0]) return false;
@@ -21834,9 +21834,9 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 d.linkedList = true;
                 const sema::TypeRef* llEl =
                     (!llTy->genericArgs.empty()) ? llTy->genericArgs[0] : nullptr;
+                // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+                // (astNode-less, head in `importedName`) must match the same arm.
                 bool llIsOwning =
-                    llTy->astNode && llTy->astNode->name &&
-                    !llTy->astNode->name->parts.empty() &&
                     common::isOwningPrefixedName(llTy->headName());
                 d.collectionElemDisposer =
                     elementPolicyFor(llEl, llIsOwning).disposerThunk;
@@ -21891,13 +21891,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                                el->kind == sema::TypeRef::Kind::Primitive &&
                                el->primitive == sema::PrimitiveType::String;
                     };
+                    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+                    // (astNode-less, head in `importedName`) must match the same arm.
                     bool collIsOwning =
-                        collTy->astNode && collTy->astNode->name &&
-                        !collTy->astNode->name->parts.empty() &&
                         common::isOwningPrefixedName(collTy->headName());
+                    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+                    // (astNode-less, head in `importedName`) must match the same arm.
                     bool isSetName =
-                        collTy->astNode && collTy->astNode->name &&
-                        !collTy->astNode->name->parts.empty() &&
                         (collTy->headName() == "Set" ||
                          collTy->headName() == "OwningSet" ||
                          collTy->headName() == "SortedSet");
@@ -22838,9 +22838,9 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         {
             const sema::TypeRef* llEl =
                 (!llTy->genericArgs.empty()) ? llTy->genericArgs[0] : nullptr;
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool llIsOwning =
-                llTy->astNode && llTy->astNode->name &&
-                !llTy->astNode->name->parts.empty() &&
                 common::isOwningPrefixedName(llTy->headName());
             d.collectionElemDisposer =
                 elementPolicyFor(llEl, llIsOwning).disposerThunk;
@@ -22945,13 +22945,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                        el->kind == sema::TypeRef::Kind::Primitive &&
                        el->primitive == sema::PrimitiveType::String;
             };
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool collIsOwning =
-                collTy->astNode && collTy->astNode->name &&
-                !collTy->astNode->name->parts.empty() &&
                 common::isOwningPrefixedName(collTy->headName());
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool isSetName =
-                collTy->astNode && collTy->astNode->name &&
-                !collTy->astNode->name->parts.empty() &&
                 (collTy->headName() == "Set" ||
                  collTy->headName() == "OwningSet" ||
                  // stdlib §4.18 (#1426): SortedSet shares the bz_dict_t* rep.
@@ -23068,13 +23068,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         d.dict = true;
         // Set<string>: elements are KEYS — pre-free key release, not a val disposer.
         // #602 / §28.11 v0.135: use elementPolicyFor for the is-string-element test.
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
         bool dictIsOwning =
-            dictTy->astNode && dictTy->astNode->name &&
-            !dictTy->astNode->name->parts.empty() &&
             dictTy->headName() == "OwningDictionary";
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
         bool isSetNameD =
-            dictTy->astNode && dictTy->astNode->name &&
-            !dictTy->astNode->name->parts.empty() &&
             dictTy->headName() == "Set";
         auto isStrKey = [&]() {
             if (dictTy->genericArgs.empty() || !dictTy->genericArgs[0]) return false;
@@ -23189,11 +23189,11 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // sentinel-safe) and frees the backing array. Mutators that flatten-and-reset
     // (Insert/Remove/Replace) release the old parts themselves (bz_sb_reset_to).
     {
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
         auto isSbName = [](const sema::TypeRef* rt) {
             return rt && rt->kind == sema::TypeRef::Kind::Named &&
-                   !rt->declaration && rt->astNode && rt->astNode->name &&
-                   !rt->astNode->name->parts.empty() &&
-                   rt->headName() == "StringBuilder";
+                   !rt->declaration && rt->headName() == "StringBuilder";
         };
         bool isSB = false;
         if (ld->type) isSB = isSbName(ctx_.resolvedType(*ld->type));
@@ -27446,8 +27446,9 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         if (!target || (member != "FirstKey" && member != "LastKey"))
             return false;
         const sema::TypeRef* tt = ctx_.exprType(*target);
-        if (!tt || tt->kind != sema::TypeRef::Kind::Named || !tt->astNode ||
-            !tt->astNode->name || tt->astNode->name->parts.empty() ||
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
+        if (!tt || tt->kind != sema::TypeRef::Kind::Named ||
             tt->headName() != "SortedDictionary")
             return false;
         if (tt->genericArgs.empty() || !tt->genericArgs[0]) return false;
@@ -29562,10 +29563,10 @@ struct StringEscapeWalker {
         if (!ma || !ma->target) return false;
         if (ma->member != "Append" && ma->member != "AppendLine") return false;
         const sema::TypeRef* rt = ctx.exprType(*ma->target);
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
         return rt && rt->kind == sema::TypeRef::Kind::Named &&
-               !rt->declaration && rt->astNode && rt->astNode->name &&
-               !rt->astNode->name->parts.empty() &&
-               rt->headName() == "StringBuilder";
+               !rt->declaration && rt->headName() == "StringBuilder";
     }
 
     // #1994 / stdlib §2.1 / §7.4 / §4.6 / §28.3 / §28.9 (v0.197):
@@ -33235,10 +33236,10 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
             : ((collTy && !collTy->genericArgs.empty())
                    ? collTy->genericArgs[0]
                    : nullptr);
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
     bool collIsOwning =
-        collTy && collTy->astNode && collTy->astNode->name &&
-        !collTy->astNode->name->parts.empty() &&
-        (common::isOwningPrefixedName(collTy->headName()) ||
+        collTy && (common::isOwningPrefixedName(collTy->headName()) ||
          // #2606 / stdlib §4.5: IOwningList<T> is the OWNING list interface,
          // but isOwningPrefixedName("IOwningList") is false — consult the
          // interface recognizer (matches owned OwningArray<T>).
@@ -33257,9 +33258,9 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
             collElem->kind == sema::TypeRef::Kind::Primitive &&
             collElem->primitive == sema::PrimitiveType::String &&
             !collElem->nullable &&
-            collTy && collTy->astNode && collTy->astNode->name &&
-            !collTy->astNode->name->parts.empty() &&
-            [](std::string_view n){
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
+            collTy && [](std::string_view n){
                 // fix #2692: LinkedList joins the list — the drop-on-overwrite
                 // twin of the scope-end site in LlvmBackend_Disposal.cpp. Since
                 // #2686 every LinkedList insert path takes the element's +1, so
@@ -46892,10 +46893,10 @@ llvm::Value* Emitter::materializeArrayBackedSetLiteral(
     const sema::TypeRef* elemRef =
         (!setTy->genericArgs.empty()) ? setTy->genericArgs[0] : nullptr;
     if (!elemRef) return nullptr;
-    std::string_view name = setTy->astNode && setTy->astNode->name &&
-                            !setTy->astNode->name->parts.empty()
-                                ? setTy->headName()
-                                : std::string_view{};
+    // fix-forward #6776 (§2.5, v0.340): `headName()` with no astNode gate. An
+    // IMPORTED formal's `OwningSet<T>` (astNode-less, head in `importedName`,
+    // the #5328 shape routed here by builtinTypeName) must read as owning too.
+    std::string_view name = setTy->headName();
     bool owning = common::isOwningPrefixedName(name);
     llvm::Function* dupDisposer =
         elementPolicyFor(elemRef, owning).disposerThunk;

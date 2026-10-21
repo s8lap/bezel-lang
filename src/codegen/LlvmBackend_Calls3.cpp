@@ -384,9 +384,9 @@ llvm::Value* Emitter::tryLowerSetAlgebra(std::string_view method,
 
     // Determine `other`'s element type and whether it is a same-typed dict-backed
     // Set (whose key table we can snapshot directly) or some other IEnumerable<T>.
-    bool otherIsSet = otherTy && otherTy->astNode && otherTy->astNode->name &&
-                      !otherTy->astNode->name->parts.empty() &&
-                      !otherTy->declaration &&
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
+    bool otherIsSet = otherTy && !otherTy->declaration &&
                       (otherTy->headName() == "Set" ||
                        otherTy->headName() == "OwningSet") &&
                       genericBackingType(otherTy, 0, /*isSet=*/true, nullptr);
@@ -2759,11 +2759,11 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // Calls2.cpp:6231, Exprs.cpp:4364, and Setup.cpp:15101 / 16034 / 23682.
     elemRef = (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
                                                        : nullptr;
-    if (recvTy && recvTy->astNode && recvTy->astNode->name &&
-        !recvTy->astNode->name->parts.empty() &&
-        (recvTy->headName() == "Set" ||
-         recvTy->headName() == "OwningSet" ||
-         recvTy->headName() == "SortedSet")) {
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
+    if (recvTy && (recvTy->headName() == "Set" ||
+                   recvTy->headName() == "OwningSet" ||
+                   recvTy->headName() == "SortedSet")) {
         uint64_t ksz = 0;
         if (genericBackingType(recvTy, 0, /*isSet=*/true, &ksz)) {
             // fix #3711 (stdlib §4.18 / §5, v0.286): a SortedSet<T> receiver
@@ -3769,9 +3769,9 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
 
     // Element size for this instantiation.
     int64_t esz = collectionElemSize(recvTy);
-    bool isOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
-                    !recvTy->astNode->name->parts.empty() &&
-                    recvTy->headName() == "OwningLinkedList";
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
+    bool isOwning = recvTy && recvTy->headName() == "OwningLinkedList";
 
     llvm::Value* recv = lowerExpr(*ma->target);
     if (!recv) return nullptr;

@@ -5553,10 +5553,11 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "IsReadOnly") {
             auto* tt = ctx_.exprType(*ma->target);
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             std::string_view cn =
                 (tt && tt->kind == sema::TypeRef::Kind::Named &&
-                 !tt->declaration && tt->astNode && tt->astNode->name &&
-                 !tt->astNode->name->parts.empty())
+                 !tt->declaration)
                     ? tt->headName()
                     : std::string_view();
             if (cn == "Array" || cn == "OwningArray" ||
@@ -5683,9 +5684,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // issues #343 / D8 / §4.10: a Set is dict-backed (records,
                 // primitives, AND strings — see lowerNew), so its Count comes
                 // from bz_dict_count, not the array length.
-                bool isSetName = tt->astNode && tt->astNode->name &&
-                                 !tt->astNode->name->parts.empty() &&
-                                 (tt->headName() == "Set" ||
+                // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+                // (astNode-less, head in `importedName`) must match the same arm.
+                bool isSetName = (tt->headName() == "Set" ||
                                   tt->headName() == "OwningSet" ||
                                   // stdlib §4.18 (#1426): SortedSet<T> shares
                                   // the generic-key hash table (bz_dict_t*).
@@ -5812,8 +5813,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             bool isSortedDictMember = (ma->member == "FirstKey" || ma->member == "LastKey");
             if (isSortedSetMember || isSortedDictMember) {
                 auto* tt = ctx_.exprType(*ma->target);
-                if (tt && !tt->declaration && tt->astNode && tt->astNode->name &&
-                    !tt->astNode->name->parts.empty()) {
+                // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+                // (astNode-less, head in `importedName`) must match the same arm.
+                if (tt && !tt->declaration) {
                     auto tyn = tt->headName();
                     bool isSortedSet  = isSortedSetMember  && tyn == "SortedSet";
                     bool isSortedDict = isSortedDictMember && tyn == "SortedDictionary";
@@ -6027,9 +6029,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (ma->target && ma->member == "Capacity") {
             auto* tt = ctx_.exprType(*ma->target);
             auto headName = [&](const sema::TypeRef* t) -> std::string_view {
-                return (t && t->astNode && t->astNode->name &&
-                        !t->astNode->name->parts.empty())
-                           ? t->headName() : std::string_view{};
+                // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+                // (astNode-less, head in `importedName`) must match the same arm.
+                return t ? t->headName() : std::string_view{};
             };
             std::string_view cn = headName(tt);
             bool isArrayBacked =
@@ -9423,10 +9425,10 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         // the left operand is the element to look up.
         if (bin.right) {
             auto* rTy = ctx_.exprType(*bin.right);
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             bool isSetRHS = rTy && rTy->kind == sema::TypeRef::Kind::Named &&
-                            !rTy->declaration && rTy->astNode &&
-                            rTy->astNode->name &&
-                            !rTy->astNode->name->parts.empty() &&
+                            !rTy->declaration &&
                             (rTy->headName() == "Set" ||
                              rTy->headName() == "OwningSet");
             if (isSetRHS) {

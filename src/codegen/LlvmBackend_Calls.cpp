@@ -2511,9 +2511,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     bool isArr  = isCollectionTypeName(recvTy) || isBorrowingListIface;
     bool isDict = isDictTypeName(recvTy);
     // Check for StringBuilder
-    bool isStrBld = (recvTy && recvTy->astNode && recvTy->astNode->name &&
-                     !recvTy->astNode->name->parts.empty() &&
-                     recvTy->headName() == "StringBuilder");
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
+    bool isStrBld = (recvTy && recvTy->headName() == "StringBuilder");
 
     // §28.6 / §28.11 (v0.213, axiom A8 retired, #2081): `.DisposeElements()` is
     // gone from the collection surface. Sema (ExprTypecheck_Calls) rejects it on
@@ -2613,11 +2613,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // receiver heads. Hoisted here by fix #3735 from the dict-backed member
     // arms below — it is now read by BOTH the §5 eager-terminal materialize
     // decision immediately below and those arms, one spelling for one fact.
-    bool isSetName = recvTy && recvTy->astNode && recvTy->astNode->name &&
-                     !recvTy->astNode->name->parts.empty() &&
-                     (recvTy->headName() == "Set" ||
-                      recvTy->headName() == "OwningSet" ||
-                      recvTy->headName() == "SortedSet");
+    // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+    // (astNode-less, head in `importedName`) must match the same arm.
+    bool isSetName = recvTy && (recvTy->headName() == "Set" ||
+                                recvTy->headName() == "OwningSet" ||
+                                recvTy->headName() == "SortedSet");
     // fix #3735 / stdlib §4.10 / §4.18 / §5 (v0.286): a DICT-BACKED Set-family
     // receiver (`Set<T>`/`OwningSet<T>` over a record/primitive/enum/choice/
     // string/decimal element, and every `SortedSet<T>`) at a §5 EAGER terminal.
@@ -6661,9 +6661,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         const sema::TypeRef* arrElemRef =
             (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
                                                      : nullptr;
-        bool arrIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
-                           !recvTy->astNode->name->parts.empty() &&
-                           (common::isOwningPrefixedName(recvTy->headName()));
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
+        bool arrIsOwning = recvTy && common::isOwningPrefixedName(recvTy->headName());
         const ElementPolicy arrElemPol =
             elementPolicyFor(arrElemRef, arrIsOwning);
         // Convenience predicates derived from the policy (replacing the old
@@ -6892,9 +6892,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // below on a BORROWING class-element set — Array<T>/Stack<T>/Queue<T>
         // (which share the generic Add/Push/Enqueue handler further down)
         // must keep their plain-append behavior.
-        bool isBorrowingSetRecv = recvTy && recvTy->astNode &&
-            recvTy->astNode->name && !recvTy->astNode->name->parts.empty() &&
-            recvTy->headName() == "Set";
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
+        bool isBorrowingSetRecv = recvTy && recvTy->headName() == "Set";
         // stdlib §4.10 / §8.3 (#837): OwningSet<T>.Add(owned item) for class-typed
         // T DEDUPLICATES — on a duplicate (per T's equality contract, honouring a
         // user `Equals` override) it silently disposes the passed item rather than
@@ -8136,11 +8136,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.SetInsertPoint(foundBB);
             // top (Stack) vs front (Queue): TryPop → Stack top (len-1);
             // TryDequeue → Queue front (0); TryPeek → by the receiver kind.
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             std::string_view cn =
-                (recvTy && recvTy->astNode && recvTy->astNode->name &&
-                 !recvTy->astNode->name->parts.empty())
-                    ? recvTy->headName()
-                    : std::string_view{};
+                recvTy ? recvTy->headName() : std::string_view{};
             bool isStack = cn.find("Stack") != std::string_view::npos;
             bool front = (m == "TryDequeue") ? true
                        : (m == "TryPop")     ? false
@@ -8409,10 +8408,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // radius (it also governs ToArray/ToSet/ExceptWith/for-in) and is
             // deliberately not widened from here.
             const sema::TypeRef* srcTy = ctx_.exprType(*call.args[0].value);
+            // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+            // (astNode-less, head in `importedName`) must match the same arm.
             std::string_view srcHead =
-                (srcTy && srcTy->astNode && srcTy->astNode->name &&
-                 !srcTy->astNode->name->parts.empty())
-                    ? srcTy->headName() : std::string_view{};
+                srcTy ? srcTy->headName() : std::string_view{};
             bool srcIsSetFamily = srcHead == "Set" || srcHead == "OwningSet" ||
                                   srcHead == "SortedSet";
             bool srcIsArrayBacked =
@@ -8751,9 +8750,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // §28.11 table.  Their heap-boxing is a STORAGE encoding detail (inttoptr
         // cannot hold an aggregate), not an element-slot lifecycle decision.  We
         // keep dictValueBoxFreer calls unchanged (batch 3 / #602 follow-on).
-        bool dictValIsOwning = recvTy && recvTy->astNode && recvTy->astNode->name &&
-                               !recvTy->astNode->name->parts.empty() &&
-                               (common::isOwningPrefixedName(recvTy->headName()));
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
+        bool dictValIsOwning = recvTy && common::isOwningPrefixedName(recvTy->headName());
         const ElementPolicy dictValPol =
             elementPolicyFor(valTy, dictValIsOwning);
         // Convenience predicate: is this a borrowing Dictionary<K, string>?
@@ -10492,9 +10491,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // Throws InvalidOperationException if the dict is empty (§4.17).
         // Only meaningful on SortedDictionary; regular Dictionary has no such
         // property and sema rejects it there.
-        bool isSortedDictRecv = recvTy && recvTy->astNode && recvTy->astNode->name &&
-                                !recvTy->astNode->name->parts.empty() &&
-                                recvTy->headName() == "SortedDictionary";
+        // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
+        // (astNode-less, head in `importedName`) must match the same arm.
+        bool isSortedDictRecv = recvTy && recvTy->headName() == "SortedDictionary";
         if (isSortedDictRecv && (m == "FirstKey" || m == "LastKey") &&
             call.args.empty()) {
             bool isMax = (m == "LastKey");

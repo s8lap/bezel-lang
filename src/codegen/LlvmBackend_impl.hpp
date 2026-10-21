@@ -14250,9 +14250,16 @@ private:
     // was deleted (batch 4) since its only use was this helper.
     void emitArrayRetainStringsIfStringArray(const sema::TypeRef* collTy,
                                              llvm::Value* arr) {
-        if (!arr || !collTy || !collTy->astNode || !collTy->astNode->name ||
-            collTy->astNode->name->parts.empty()) return;
-        std::string_view cn = collTy->astNode->name->parts[0];
+        if (!arr || !collTy) return;
+        // fix-forward #6776 (§2.5, v0.340): an IMPORTED `Array<string>`
+        // (astNode-less, head in `importedName`) must be retained too. A
+        // syntax-backed TypeRef keeps its literal `parts[0]` read.
+        std::string_view cn =
+            collTy->astNode
+                ? (collTy->astNode->name && !collTy->astNode->name->parts.empty()
+                       ? collTy->astNode->name->parts[0]
+                       : std::string_view{})
+                : collTy->headName();
         if (cn != "Array" && cn != "Stack" && cn != "Queue") return;
         if (collTy->genericArgs.empty() || !collTy->genericArgs[0]) return;
         const sema::TypeRef* el = collTy->genericArgs[0];
