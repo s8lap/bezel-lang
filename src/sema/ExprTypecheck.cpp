@@ -11238,6 +11238,51 @@ static bool typeArgIdentical(
 //     (Array<T>→…→IEnumerable<T>) or user-declared subtype chain — followed by
 //     recursion into each shared type parameter per its own variance.
 // Returns false on a genuine mismatch; the caller reports the §5.1 error.
+//
+// fix #6699 (§12.9, §5.1, v0.339): is `toArg` a built-in exception class that
+// `fromArg` reaches by §5.1's "class to base class, transitively"? The
+// built-in exceptions carry no TypeSymbol, so neither arm below relates
+// `ArgumentException` (or a user `MyErr: Exception`) to `Exception`: the
+// built-in arm walks only the collection-interface table and the mixed arm
+// rejects outright. The walk follows a user class's resolved bases and its
+// declared built-in base (`nonSymbolBaseRefsOf`), then the built-in table
+// (`common::builtinExceptionParentOf`, the one #6023's scalar arm of
+// `checkAssignable` reads). A nullable `fromArg` reaches only a nullable
+// `toArg`: §12.9 admits the nullable lift and the nullable view, "never its
+// reverse".
+static bool typeArgReachesBuiltinException(const TypeRef* fromArg,
+                                           const TypeRef* toArg) {
+    if (toArg->declaration || !toArg->genericArgs.empty()) return false;
+    if (fromArg->nullable && !toArg->nullable) return false;
+    const std::string_view toName = namedTypeSimpleName(toArg);
+    if (toName.empty() || !common::isBuiltinExceptionName(toName))
+        return false;
+    std::vector<const TypeRef*> queue{fromArg};
+    std::unordered_set<const TypeSymbol*> seen;
+    std::size_t guard = 0;
+    while (!queue.empty() && ++guard < 256) {
+        const TypeRef* cur = queue.back();
+        queue.pop_back();
+        if (!cur || cur->kind != TypeRef::Kind::Named ||
+            !cur->genericArgs.empty())
+            continue;
+        if (!cur->declaration) {
+            std::size_t depth = 0;
+            for (std::string_view n = namedTypeSimpleName(cur);
+                 !n.empty() && depth < 64;
+                 n = common::builtinExceptionParentOf(n), ++depth)
+                if (n == toName) return true;
+            continue;
+        }
+        if (!seen.insert(cur->declaration).second) continue;
+        for (const TypeRef* b : cur->declaration->baseTypeRefs)
+            queue.push_back(b);
+        for (const TypeRef* b : nonSymbolBaseRefsOf(cur->declaration))
+            queue.push_back(b);
+    }
+    return false;
+}
+
 static bool typeArgCovariantAssignable(
     const TypeRef* fromArg, const TypeRef* toArg,
     bool (*isSubtypeFn)(TypeSymbol*, TypeSymbol*),
@@ -11261,6 +11306,8 @@ static bool typeArgCovariantAssignable(
     if (fromArg->kind != TypeRef::Kind::Named ||
         toArg->kind != TypeRef::Kind::Named)
         return false;
+    // fix #6699: a built-in exception base (see above).
+    if (typeArgReachesBuiltinException(fromArg, toArg)) return true;
     // Same base (same declaration, or same builtin name): the base is invariant
     // or variant per its own kind — recurse into arguments via
     // variantGenericAssignable, which reads the declared/hardcoded variance and
