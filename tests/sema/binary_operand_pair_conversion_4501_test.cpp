@@ -293,7 +293,11 @@ BEZEL_TEST(sema_binary_operand_pair_4501,
         " var u: ulong := 3000000000; var v: uint := 7; "
         " if u < 1000 then return 1; end; "
         " if v > 1000 then return 2; end; "
-        " if u < 0 - 5 then return 3; end; "
+        // fix #6868 (§5.1, v0.340): this row used `0 - 5` (-5, outside
+        // ulong's range), which constant narrowing does not admit -- "a
+        // constant whose value does not fit the target's range is a compile
+        // error". An in-range literal-derived expression keeps the escape.
+        " if u < 7 - 5 then return 3; end; "
         " return 42; "));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);

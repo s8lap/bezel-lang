@@ -412,15 +412,30 @@ BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// Guard: typed ulong var `>` a LITERAL-DERIVED binary expression (e.g. `0 - 5`)
-// must NOT be rejected — both sides of the nested expression are literals.
+// Guard: typed ulong var `>` a LITERAL-DERIVED binary expression (e.g.
+// `10 - 5`) must NOT be rejected — both sides of the nested expression are
+// literals and the value 5 is in ulong's range.
 BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
            ulong_var_gt_literal_derived_expr_not_rejected) {
     auto r = parseSema(
         "module M; class C public static method Main(): int "
         "  var u: ulong := 10; "
-        "  return (if u > 0 - 5 then 1 else 0); end Main; end C;");
+        "  return (if u > 10 - 5 then 1 else 0); end Main; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// fix #6868 (§5.1, v0.340): BEHAVIOR FLIP of the row that used to pin
+// `ulong > 0 - 5` as accepted. The literal-derived expression's value is -5;
+// §5.1: "A constant whose value does not fit the target's range is a compile
+// error at the conversion site -- never a silent truncation" (the old accept
+// compared against 18446744073709551611).
+BEZEL_TEST(uint_vs_literal_compare_still_ok_1204,
+           ulong_var_gt_negative_literal_derived_expr_rejected_5_1) {
+    auto r = parseSema(
+        "module M; class C public static method Main(): int "
+        "  var u: ulong := 10; "
+        "  return (if u > 0 - 5 then 1 else 0); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // Guard: same-type comparison (int vs int) must remain valid.

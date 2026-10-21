@@ -35,7 +35,7 @@ static bool isFreeGenericTypeVarRef(
 // narrower integer target type? Used to gate implicit literal/constant
 // narrowing (an out-of-range constant is a §5.1 error, not silent truncation).
 // Returns true for any type that is not one of the gated narrower targets.
-static bool fitsInIntType(long long v, PrimitiveType t) {
+bool fitsInIntType(long long v, PrimitiveType t) {
     switch (t) {
         case PrimitiveType::SByte:  return v >= -128 && v <= 127;
         case PrimitiveType::Byte:   return v >= 0 && v <= 255;

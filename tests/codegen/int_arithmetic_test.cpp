@@ -118,12 +118,15 @@ BEZEL_TEST(codegen_1049_unsigned_compare, ulong_ge_small_literal) {
     BEZEL_EXPECT_EQ(runBody(
         "var u: ulong := 18000000000000000000; return (if (u >= 5) then 1 else 0);"), 1);
 }
-// No-regression: a small unsigned vs a NEGATIVE constant keeps the signed
-// compare (`u > -5` is true), and small unsigned vs a larger positive literal
-// is still correctly false.
+// No-regression: a small unsigned vs a literal-derived constant compares by
+// value, and small unsigned vs a larger positive literal is still correctly
+// false. fix #6868 (§5.1, v0.340): this row used `0 - 5` (-5), which is
+// outside ulong's range and is now a compile error ("a constant whose value
+// does not fit the target's range"), so the constant is 5; the rejection is
+// pinned in tests/sema (negative_constant_binary_operand_6868).
 BEZEL_TEST(codegen_1049_unsigned_compare, ulong_small_gt_negative_literal) {
     BEZEL_EXPECT_EQ(runBody(
-        "var u: ulong := 10; return (if (u > 0 - 5) then 1 else 0);"), 1);
+        "var u: ulong := 10; return (if (u > 10 - 5) then 1 else 0);"), 1);
 }
 BEZEL_TEST(codegen_1049_unsigned_compare, uint_small_gt_large_literal_false) {
     BEZEL_EXPECT_EQ(runBody(

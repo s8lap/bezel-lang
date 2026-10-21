@@ -57,6 +57,10 @@ bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
 
 // Parses an integer literal (decimal, hex 0x, octal 0o, binary 0b) and returns
 // its magnitude. Used to check exit-code overflow (§33.3) for Main(): int.
+// §5.1 (#738): defined in ExprTypecheck.cpp; shared with the operand-pair
+// constant-narrowing escape (fix #6868).
+bool fitsInIntType(long long v, PrimitiveType t);
+
 inline bool intLiteralMagnitude(std::string_view text, unsigned long long& out) {
     int base = 10;
     std::size_t i = 0;

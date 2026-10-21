@@ -7122,12 +7122,40 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
                     return false;
             }
         };
+        // fix #6868 (§5.1 "Constant narrowing", §6.2, v0.340): the constant
+        // adopts the other operand's type only "to any integer type whose
+        // range contains its value"; "a constant whose value does not fit the
+        // target's range is a compile error at the conversion site -- never a
+        // silent truncation". The escape never asked, so `ulong + -3` wrapped
+        // to 18446744073709551614. Ask it: this pair has no widening relation
+        // either way (checked above), so adoption is the only admission, and
+        // a folded value outside the other operand's range is reported. A
+        // literal that does not fold (a `ulong` above LLONG_MAX) is not
+        // decided here.
+        auto adoptionOutOfRange = [&](const ast::Expr* constExpr,
+                                      const TypeRef* target) -> bool {
+            auto cv = foldIntConstExprTC(*constExpr);
+            if (!cv || fitsInIntType(*cv, target->primitive)) return false;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "operator `" + std::string(op) + "`: the constant `" +
+                std::to_string(*cv) + "` does not fit `" +
+                primitiveSpelling(target->primitive) + "` -- `" +
+                primitiveSpelling(lt->primitive) + "` and `" +
+                primitiveSpelling(rt->primitive) + "` have no implicit "
+                "conversion between the operand types (\xC2\xA7""6.2), so the "
+                "constant can only be admitted by constant narrowing, and a "
+                "constant outside the target's range is a compile error at "
+                "the conversion site, never a silent truncation "
+                "(\xC2\xA7""5.1, v0.340)");
+            return true;
+        };
         if (isLiteralDerivedExpr(leftExpr) &&
             isTrueIntegerType(rt->primitive))
-            return false;
+            return adoptionOutOfRange(leftExpr, rt);
         if (isLiteralDerivedExpr(rightExpr) &&
             isTrueIntegerType(lt->primitive))
-            return false;
+            return adoptionOutOfRange(rightExpr, lt);
     }
     const bool bothNumeric = isPromotablePrimitive(lt->primitive) &&
                              isPromotablePrimitive(rt->primitive);
