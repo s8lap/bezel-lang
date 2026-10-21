@@ -4195,6 +4195,13 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
         // strictly better — §22.6's own "better than" relation, restricted to
         // the Exact/Convert distinction these built-in references support.
         bool anyStrict = false;
+        // A candidate's own method type parameters are free in its row
+        // (an unbound inference leaves `IEnumerable<V>`), so they never
+        // count as a type-argument mismatch.
+        std::unordered_set<std::string_view> freeNames;
+        for (std::size_t c : {x, y})
+            for (Symbol* g : cands[c]->genericParams)
+                if (g) freeNames.insert(g->name);
         for (std::size_t i = 0; i < argTypes.size(); ++i) {
             const TypeRef* at = argTypeRows[x][i];
             const TypeRef* px = paramTypes[x][i];
@@ -4213,6 +4220,18 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                 // one INVARIANT head are not related by any §5.1 conversion,
                 // but the by-name ancestor walk below matches the shared head.
                 if (differentInvariantInstantiations(at, pt)) return 0;
+                // fix-forward #6227 (§22.6, §12.9, v0.339): a generic `pt`
+                // is graded by the INSTANTIATIONS of its head that `at`
+                // reaches. The by-name walk below ignores type arguments
+                // (`Box<int>` reaches `IBox<string>`) and does not follow
+                // the built-in collection table at all (`Array<int>` does
+                // not reach `IEnumerable<int>`), so the two candidates
+                // `IEnumerable<int>` / `IEnumerable<string>` tied.
+                switch (genericHeadReach(at, pt, &freeNames)) {
+                    case GenericHeadReach::Converts: return 1;
+                    case GenericHeadReach::OtherArgs: return 0;
+                    case GenericHeadReach::Unknown: break;
+                }
                 return hasNamedAncestor(const_cast<TypeRef*>(at),
                                         namedRefSimpleName(pt))
                            ? 1
@@ -4392,7 +4411,16 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
                             admits = false;
                             break;
                         }
-                        if (differentInvariantInstantiations(at, pt) ||
+                        if (differentInvariantInstantiations(at, pt)) {
+                            admits = false;
+                            break;
+                        }
+                        // fix-forward #6227: the same instantiation-aware
+                        // grade for a generic `pt` (`builtinRefPrefers`).
+                        const GenericHeadReach reach =
+                            genericHeadReach(at, pt, nullptr);
+                        if (reach == GenericHeadReach::Converts) continue;
+                        if (reach == GenericHeadReach::OtherArgs ||
                             !hasNamedAncestor(const_cast<TypeRef*>(at),
                                               namedRefSimpleName(pt)))
                             admits = false;

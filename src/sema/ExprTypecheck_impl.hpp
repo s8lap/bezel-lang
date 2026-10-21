@@ -1699,6 +1699,22 @@ private:
         const TypeRef* from, const TypeRef* to,
         const std::unordered_set<std::string_view>* freeNames);
 
+    // fix-forward #6227 (§22.6, §12.9, v0.339): how `from` reaches the head of
+    // the generic `to` (a built-in interface by name, a user generic by
+    // declaration), judged on the INSTANTIATIONS it reaches. `OtherArgs`: only
+    // at instantiations that do not convert to `to` under §12.9 (`Array<int>`
+    // against `IEnumerable<string>`, `Box<int>` against `IBox<string>`) — the
+    // certain-mismatch half of `checkAssignable`'s generic-interface arms.
+    // `Converts`: a built-in `from` whose §26.5 table reaches a conforming
+    // instantiation (`Array<int>` → `IEnumerable<int>`), which the by-name
+    // `hasNamedAncestor` walk does not follow. `Unknown` otherwise (no
+    // instantiation found, or a closure that is not completely modeled).
+    // Used by §22.6's built-in-reference ranking (ExprTypecheck_Calls.cpp).
+    enum class GenericHeadReach { Unknown, Converts, OtherArgs };
+    GenericHeadReach genericHeadReach(
+        const TypeRef* from, const TypeRef* to,
+        const std::unordered_set<std::string_view>* freeNames);
+
     // §14.1/§14.5 phase 1 (#785, #850, #896, #4089/#4183): structurally
     // unify a value parameter's declared type (`pt`, AST) against the call
     // argument's resolved type (`argTy`), binding each method type

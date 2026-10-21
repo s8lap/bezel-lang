@@ -11773,6 +11773,62 @@ bool ExprTC::userTypeBuiltinInstantiationConverts(
     return sawUnmodeled;
 }
 
+// fix-forward #6227 (§22.6, §12.9, v0.339): see the header comment. Each
+// OtherArgs verdict is the certain-mismatch half of the matching
+// `checkAssignable` arm, so a candidate graded inapplicable here is one the
+// per-argument §5.1 check rejects anyway; every shape that arm leaves to its
+// conservative accept answers Unknown.
+ExprTC::GenericHeadReach ExprTC::genericHeadReach(
+    const TypeRef* from, const TypeRef* to,
+    const std::unordered_set<std::string_view>* freeNames) {
+    using R = GenericHeadReach;
+    if (!from || !to || from->kind != TypeRef::Kind::Named ||
+        to->kind != TypeRef::Kind::Named || to->genericArgs.empty())
+        return R::Unknown;
+    if (!to->declaration) {
+        const std::string_view toName = namedTypeSimpleName(to);
+        if (toName.empty()) return R::Unknown;
+        if (from->declaration)
+            return userTypeImplementsBuiltinIface(const_cast<TypeRef*>(from),
+                                                  toName) &&
+                           !userTypeBuiltinInstantiationConverts(from, to,
+                                                                 freeNames)
+                       ? R::OtherArgs
+                       : R::Unknown;
+        // Both built-in: only a `from` whose interface set the §26.5 table
+        // captures completely (#1851), so no unmodeled path can reach the
+        // head at another instantiation.
+        if (from->genericArgs.empty() ||
+            !builtinBorrowingCollectionFullyModeled(namedTypeSimpleName(from)))
+            return R::Unknown;
+        std::vector<TypeRef*> impls;
+        std::vector<std::unique_ptr<TypeRef>> owned;
+        collectBuiltinAncestorInstantiationsOf(from, toName, impls, owned);
+        if (impls.empty()) return R::Unknown;
+        for (TypeRef* impl : impls)
+            if (variantGenericAssignable(impl, to, isSubtype, freeNames))
+                return R::Converts;
+        return R::OtherArgs;
+    }
+    // A user-declared generic `to` (`IBox<T>`): the #4892 arm of
+    // `checkAssignable`.
+    if (!from->declaration) return R::Unknown;
+    if (from->declaration == to->declaration)
+        return from->genericArgs.size() == to->genericArgs.size() &&
+                       !variantGenericAssignable(from, to, isSubtype,
+                                                 freeNames)
+                   ? R::OtherArgs
+                   : R::Unknown;
+    if (!isSubtype(from->declaration, to->declaration)) return R::Unknown;
+    std::vector<TypeRef*> impls;
+    collectAncestorInstantiationsOf(from, to->declaration, impls);
+    if (impls.empty()) return R::Unknown;
+    for (TypeRef* impl : impls)
+        if (variantGenericAssignable(impl, to, isSubtype, freeNames))
+            return R::Unknown;
+    return R::OtherArgs;
+}
+
 // §19.3/§19.5/§5.1/§12.9 (v0.197, #1920): see the header comment. The
 // interface-scrutinee counterpart of typeTestGenericInstantiationImpossible,
 // reasoning over the pattern class's conforming interface instantiations rather
