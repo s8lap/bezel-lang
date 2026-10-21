@@ -3938,6 +3938,20 @@ void ExprTC::checkNamedSlotNakedName(const ast::PositionalPattern& sp,
         checkTopLevelNamedPattern(np, fieldTy, fieldTy, /*namedSlot=*/true);
 }
 
+// §35.5 *Case patterns* (v0.340, #6787): a payload case is matched "with the
+// case's exact payload arity", and `_` discards "per slot", so the spelling
+// that matches a payload while ignoring it has one `_` per payload slot:
+// `W(_)` for a one-slot case, `W(_, _)` for a two-slot one. The bare-case
+// hint used to offer `W(_)` for every arity, a pattern the arity rule refuses.
+static std::string discardAllSlotsSpelling(std::string_view name,
+                                           std::size_t slots) {
+    std::string out(name);
+    out += "(";
+    for (std::size_t i = 0; i < slots; ++i) out += i ? ", _" : "_";
+    out += ")";
+    return out;
+}
+
 // §35.5 *Case patterns* (v0.340, #6726): "A payload case may not be matched
 // bare: `Fetched` without parentheses is a compile error naming the arity."
 // The prefixed spelling `Outcome.Fetched` / `Outer.W` is the same bare
@@ -3961,8 +3975,8 @@ void ExprTC::rejectBareQualifiedPayloadCase(const ast::NamedPattern* np) {
                 "Payload case `" + std::string(last) + "` requires a payload "
                 "pattern: write `" + std::string(last) + "(" +
                 std::to_string(n) + " slot" + (n == 1 ? "" : "s") +
-                ")`, or `" + std::string(last) + "(_)` to discard "
-                "(\xC2\xA7""35.5)");
+                ")`, or `" + discardAllSlotsSpelling(last, n) +
+                "` to discard (\xC2\xA7""35.5)");
         }
         return;
     }
@@ -4032,8 +4046,9 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
                 "pattern: write `" + std::string(last) + "(" +
                 std::to_string(cc->caseDecl->payload.size()) + " slot" +
                 (cc->caseDecl->payload.size() == 1 ? "" : "s") +
-                ")`, or `" + std::string(last) + "(_)` to discard "
-                "(\xC2\xA7""35.5)");
+                ")`, or `" + discardAllSlotsSpelling(
+                    last, cc->caseDecl->payload.size()) +
+                "` to discard (\xC2\xA7""35.5)");
         }
         return;  // payload-free: valid; payload-carrying: reported above
     }
@@ -16018,6 +16033,23 @@ void ExprTC::bindNestedDestructuringNames(
                 normalizeNamedDestructureSlots(ndMut, memberNames, ndHead,
                                                nd->span.begin);
             }
+        }
+        // §35.5 *Case patterns* (v0.340, #6787): "A payload case is matched by
+        // a positional destructuring pattern `CaseName(slot, ...)` with the
+        // case's exact payload arity." The top-level callers check this; the
+        // nested walk did not, so `Wrap(W(_))` over a two-slot `W` compiled
+        // and matched by tag.
+        if (ndChoiceCase && ndChoiceCase->caseDecl &&
+            nd->subPatterns.size() != ndChoiceCase->caseDecl->payload.size()) {
+            const std::string_view hd = nd->typeName->parts.back();
+            ctx_.diagnostics().report(
+                Severity::Error, nd->span.begin,
+                "case-destructuring pattern `" + std::string(hd) +
+                "(...)` binds " + std::to_string(nd->subPatterns.size()) +
+                " slot(s) but case `" + std::string(hd) + "` has " +
+                std::to_string(ndChoiceCase->caseDecl->payload.size()) +
+                " payload field(s); the slot count must match "
+                "(\xC2\xA7""35.5)");
         }
         for (std::size_t i = 0; i < nd->subPatterns.size(); ++i) {
             const auto& s = nd->subPatterns[i];
