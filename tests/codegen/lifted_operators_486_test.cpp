@@ -789,6 +789,60 @@ BEZEL_TEST(codegen_1046_coalesce, decimal_coalesce_variable_int_default_null) {
         "var a: decimal? := null; var d: int := 7; return int(a ?? d);"));
 }
 
+// #6675 (§7.7 "the result has type T when the right operand converts to T",
+// §5.1 widening preserves the value, v0.339): the #1046 payload IntCast widened
+// the right operand with isSigned=true regardless of its type, so an UNSIGNED
+// narrower default was sign-extended (`int? ?? byte 200` printed -56).
+BEZEL_TEST(codegen_6675_coalesce_unsigned, int_null_byte_200) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: int? := null; var d: byte := 200; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "200");
+}
+BEZEL_TEST(codegen_6675_coalesce_unsigned, int_null_ushort_60000) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: int? := null; var d: ushort := 60000; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "60000");
+}
+BEZEL_TEST(codegen_6675_coalesce_unsigned, long_null_uint_3e9) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: long? := null; var d: uint := 3000000000; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "3000000000");
+}
+BEZEL_TEST(codegen_6675_coalesce_unsigned, short_null_byte_200) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: short? := null; var d: byte := 200; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "200");
+}
+BEZEL_TEST(codegen_6675_coalesce_unsigned, int_present_byte_200) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: int? := 5; var d: byte := 200; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "5");
+}
+BEZEL_TEST(codegen_6675_coalesce_unsigned, long_present_uint_3e9) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: long? := 7; var d: uint := 3000000000; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "7");
+}
+BEZEL_TEST(codegen_6675_coalesce_unsigned, int_null_signed_byte_still_sign_extends) {
+    BEZEL_EXPECT_EQ(runAotOut(
+        "module M; class C public static method Main() "
+        "var a: int? := null; var d: sbyte := -5; "
+        "Console.WriteLine(a ?? d); "
+        "end Main; end C;"), "-5");
+}
+
 // #1047 / §5.1 / §7.11: decimal arithmetic with a mixed INTEGER operand
 // (decimal? + int, or int + decimal?) must promote the int to a decimal struct
 // before the bz_decimal_* call. Previously the i32 was stored raw into a decimal

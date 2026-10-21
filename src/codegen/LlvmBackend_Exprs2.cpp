@@ -264,8 +264,12 @@ llvm::Value* Emitter::lowerCoalesce(const ast::BinaryExpr& bin) {
                 if (!rhsDiv && r->getType()->isIntegerTy()) {
                     if (primVal->getType()->isIntegerTy() &&
                         primVal->getType() != r->getType()) {
-                        r = builder_.CreateIntCast(r, primVal->getType(),
-                                                   /*isSigned=*/true);
+                        // #6675: widen by the SOURCE (right operand) type's
+                        // signedness — a `byte`/`ushort`/`uint` default must
+                        // zero-extend (§5.1 widening preserves the value).
+                        r = builder_.CreateIntCast(
+                            r, primVal->getType(),
+                            /*isSigned=*/!isUnsignedTargetExpr(*bin.right));
                     } else if (primVal->getType() == decimalStructType()) {
                         const sema::TypeRef* rt = ctx_.exprType(*bin.right);
                         sema::PrimitiveType rp =
