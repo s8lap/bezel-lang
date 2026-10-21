@@ -15950,6 +15950,38 @@ void ExprTC::bindNestedDestructuringNames(
                                            ? nd->typeName->parts.back()
                                            : std::string_view{})
                       : nullptr;
+        // §35.5 *Case patterns* (v0.340, #6788): "a nested head names a case
+        // of the choice that types the slot". When the slot is typed by a
+        // choice, a head that is not one of THAT choice's cases (a case of
+        // another choice, a qualified head whose prefix is another choice,
+        // or any other name) cannot match any value of the slot.
+        if (ndScrutTy && nd->typeName && !nd->typeName->parts.empty() &&
+            ndScrutTy->kind == TypeRef::Kind::Named &&
+            ndScrutTy->declaration &&
+            ndScrutTy->declaration->kind == ast::TypeDeclKind::Choice) {
+            bool wrongChoice = !ndChoiceCase;
+            if (ndChoiceCase && nd->typeName->parts.size() >= 2) {
+                std::vector<std::string_view> prefix(
+                    nd->typeName->parts.begin(), nd->typeName->parts.end() - 1);
+                TypeSymbol* pts = resolveCasePatternTypeSymbol(prefix);
+                if (pts && pts != ndScrutTy->declaration) wrongChoice = true;
+            }
+            if (wrongChoice) {
+                std::string headText;
+                for (std::size_t k = 0; k < nd->typeName->parts.size(); ++k) {
+                    if (k) headText += ".";
+                    headText += std::string(nd->typeName->parts[k]);
+                }
+                ctx_.diagnostics().report(
+                    Severity::Error, nd->span.begin,
+                    "nested pattern head `" + headText +
+                    "` is not a case of `" +
+                    std::string(ndScrutTy->declaration->name) +
+                    "`, the choice that types this slot (\xC2\xA7""35.5: "
+                    "\"a nested head names a case of the choice that types "
+                    "the slot\")");
+            }
+        }
         std::vector<FieldSymbol*> ndFields =
             ndChoiceCase ? std::vector<FieldSymbol*>{}
                          : fieldsOfRecord(nd->typeName.get());
