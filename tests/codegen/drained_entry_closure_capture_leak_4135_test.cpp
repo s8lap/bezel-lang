@@ -39,6 +39,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -50,13 +51,6 @@ namespace {
 int run(const std::string& src) {
     auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
-}
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
 }
 
 bool has(const std::string& hay, const char* needle) {
@@ -134,7 +128,7 @@ BEZEL_TEST(drained_entry_closure_capture_leak_4135,
 BEZEL_TEST(drained_entry_closure_capture_leak_4135,
            string_key_value_captured_escaping_closure_leak_free) {
     JitResult r = runAotChecked(makeDrainedEntryClosureProgram());
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=5500"));
 }

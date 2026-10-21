@@ -40,22 +40,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Count non-overlapping occurrences of `needle` in `hay`.
 int countOccurrences(const std::string& hay, const std::string& needle) {
@@ -140,7 +131,7 @@ const char* kTemporarySourceTrailingStmt =
 BEZEL_TEST(owning_enumerable_closure_capture_leak_1864,
            concrete_multi_element_trailing_stmt_lsan_clean_spec_29_2) {
     JitResult r = runAotChecked(kConcreteTrailingStmt);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);            // compiled + LSan-clean (closure cell freed)
     BEZEL_EXPECT_EQ(r.exitCode, 3);      // 1 + 2
     // Each yielded element disposed exactly once — a double-free would also flip
@@ -152,7 +143,7 @@ BEZEL_TEST(owning_enumerable_closure_capture_leak_1864,
 BEZEL_TEST(owning_enumerable_closure_capture_leak_1864,
            temporary_source_trailing_stmt_lsan_clean_spec_29_1) {
     JitResult r = runAotChecked(kTemporarySourceTrailingStmt);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 3);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "D1"), 1);

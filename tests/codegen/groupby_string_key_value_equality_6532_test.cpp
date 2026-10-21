@@ -16,6 +16,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -23,13 +24,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 const char* kProg =
     "module M; "
@@ -97,7 +91,7 @@ const char* kFresh =
 BEZEL_TEST(groupby_string_key_value_equality_6532,
            literal_string_int_record_keys_merge_lsan_clean_stdlib_5) {
     JitResult r = runAotChecked(kProg);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText,

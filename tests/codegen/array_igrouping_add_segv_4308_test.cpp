@@ -34,6 +34,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
@@ -42,13 +43,6 @@ using bezel::test::runAotChecked;
 using bezel::test::JitResult;
 
 namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // The verbatim filed repro (#4308): a `for var g in xs.GroupBy(...)` driving
 // `groups.Add(g)` on a borrowing `Array<IGrouping<int, int>>`, with
@@ -122,7 +116,7 @@ BEZEL_TEST(array_igrouping_add_segv_4308, for_in_add_count_clean_exit) {
 // lazy's bz_groupby_free_groups. Post-fix both runs exit 2 cleanly.
 BEZEL_TEST(array_igrouping_add_segv_4308, for_in_add_count_clean_exit_asan) {
     JitResult r = runAotChecked(kForInAdd);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);
 }

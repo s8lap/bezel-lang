@@ -41,24 +41,11 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
-
-namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// the helper returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-}  // namespace
 
 // ===========================================================================
 // A — #1864 sync-iterator residual (DEFENSIVE only). The #1864 sync-iterator
@@ -94,7 +81,7 @@ BEZEL_TEST(codegen_2305_closure_arg_residuals,
         "    return total; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);  // (0+1) + (1+1) + (2+1) = 1+2+3 = 6
 }
@@ -127,7 +114,7 @@ BEZEL_TEST(codegen_2305_closure_arg_residuals,
         "    return b.V; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -160,7 +147,7 @@ BEZEL_TEST(codegen_2305_closure_arg_residuals,
         "    return s.N; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);
 }

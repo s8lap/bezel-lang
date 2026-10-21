@@ -30,20 +30,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // The exact #1846 repro: string key + a distinct scalar (int) value selector,
 // with an INFERRED-type local (no `: Dictionary<...>` annotation — that would
@@ -103,7 +96,7 @@ const char* kLazySourceStringKeyIntValue =
 BEZEL_TEST(todict_two_selector_inferred_type_1846,
            string_key_int_value_lookup_spec_5) {
     JitResult r = runAotChecked(kStringKeyIntValueInferred);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);          // no SIGSEGV on lookup (ASan-clean)
     BEZEL_EXPECT_EQ(r.exitCode, 5);    // 2 + 3
     BEZEL_EXPECT_TRUE(r.stdoutText.find("2") != std::string::npos);
@@ -116,7 +109,7 @@ BEZEL_TEST(todict_two_selector_inferred_type_1846,
 BEZEL_TEST(todict_two_selector_inferred_type_1846,
            absent_key_throws_knf_not_segv_spec_4_8) {
     JitResult r = runAotChecked(kAbsentKeyThrowsCleanly);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("knf") != std::string::npos);
@@ -129,7 +122,7 @@ BEZEL_TEST(todict_two_selector_inferred_type_1846,
 BEZEL_TEST(todict_two_selector_inferred_type_1846,
            lazy_source_string_key_int_value_spec_5) {
     JitResult r = runAotChecked(kLazySourceStringKeyIntValue);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);    // 2 + 4
 }

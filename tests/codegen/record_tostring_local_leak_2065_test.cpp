@@ -56,22 +56,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "runAotChecked: SKIP" diagnostic.
-// clang is required to build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // §8.5 / §9.1 / §4.6 / §28.9 / #2065: the issue's exact pattern. A zero-field
 // positional record `r`, then `r.ToString()` is assigned to the inferred local
@@ -114,7 +105,7 @@ BEZEL_TEST(codegen_record_tostring_local_leak_2065,
     // local is a +1 producer (transfer at bind, no retain) and the scope-end
     // release drops rc 1→0 (no leak, no double-free).
     JitResult r = runAotChecked(kRecordToStringLocalLoop);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);   // LSan-clean (the #2065 leak would flip this)
 }

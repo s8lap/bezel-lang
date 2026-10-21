@@ -42,21 +42,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // #1389 item 1 repro (using var / scope-end dispose path, §28.10): each loop
 // iteration builds a fresh ArgumentException `inner`, chains it as the cause
@@ -126,7 +118,7 @@ const char* kPlainExceptionNoCauseLoop =
 BEZEL_TEST(codegen_exception_causechain_leak_1389,
            causechain_reclaimed_using_var_scope_end_31_4_28_9) {
     JitResult r = runAotChecked(kCauseChainUsingVarLoop);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     // Clean run under LSan (the #1389 leak would flip this false), and no
     // UAF/double-free from the fix (also flips r.ran false).
@@ -142,7 +134,7 @@ BEZEL_TEST(codegen_exception_causechain_leak_1389,
 BEZEL_TEST(codegen_exception_causechain_leak_1389,
            causechain_reclaimed_catch_arm_dispose_31_1_31_2_5) {
     JitResult r = runAotChecked(kCauseChainCatchArmLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -156,7 +148,7 @@ BEZEL_TEST(codegen_exception_causechain_leak_1389,
 BEZEL_TEST(codegen_exception_causechain_leak_1389,
            plain_exception_no_cause_still_clean_31_4) {
     JitResult r = runAotChecked(kPlainExceptionNoCauseLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

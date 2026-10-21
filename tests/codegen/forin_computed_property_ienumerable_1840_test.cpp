@@ -24,24 +24,11 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
-
-namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // // per §29.2, §28.5 (issue #1840)
@@ -71,7 +58,7 @@ BEZEL_TEST(forin_computed_property_ienumerable_1840,
         "  using var h := new Holder(); return h.Sum(); "
         "end Main; end C2;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);      // compiled + LSan-clean (source frame freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 60); // 10 + 20 + 30
 }
@@ -96,7 +83,7 @@ BEZEL_TEST(forin_computed_property_ienumerable_1840,
         "  return s; "
         "end Main; end C2;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);  // 2 + 5
 }
@@ -127,7 +114,7 @@ BEZEL_TEST(forin_computed_property_ienumerable_1840,
         "  return 0; "
         "end Main; end C2;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);     // LSan-clean (source frame freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     // stdoutText carries the captured program stdout; the printed "600"

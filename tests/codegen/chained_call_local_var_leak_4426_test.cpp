@@ -47,19 +47,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — ASan/LSan AOT harness
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::runAotChecked;
 using bezel::test::JitResult;
 
 namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Disposal-counted class: `_n` is the live count.
 // v0.221 §22.12 rule 2 form (iii) rejects mutable static primitives,
@@ -97,7 +91,7 @@ std::string chainedCallProgram() {
 BEZEL_TEST(chained_call_local_var_leak_4426,
            chained_call_local_var_single_shot_leak_free_4426) {
     JitResult r = runAotChecked(chainedCallProgram());
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -123,7 +117,7 @@ BEZEL_TEST(chained_call_local_var_leak_4426,
         "  end Main; "
         "end C4239;";
     JitResult r = runAotChecked(prog);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

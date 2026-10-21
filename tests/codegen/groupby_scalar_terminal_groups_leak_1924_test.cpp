@@ -37,22 +37,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // The exact #1924 repro: `GroupBy(lambda).Count()` PLUS `GroupBy(lambda).Any()`
 // — two independent bare-GroupBy scalar-terminal sites (480 bytes / 20 allocs
@@ -123,7 +114,7 @@ const char* kLazySourceCount =
 BEZEL_TEST(groupby_scalar_terminal_groups_leak_1924,
            bare_groupby_count_and_any_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kCountAndAny);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);         // compiled + LSan-clean (both sites' groups freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 12);  // Count()=2, Any()=true → 2 + 10
 }
@@ -131,7 +122,7 @@ BEZEL_TEST(groupby_scalar_terminal_groups_leak_1924,
 BEZEL_TEST(groupby_scalar_terminal_groups_leak_1924,
            bare_groupby_aggregate_seed_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kAggregateSeed);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);  // 0 + (1+2) + (0+3)
 }
@@ -139,7 +130,7 @@ BEZEL_TEST(groupby_scalar_terminal_groups_leak_1924,
 BEZEL_TEST(groupby_scalar_terminal_groups_leak_1924,
            groupby_over_lazy_source_count_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kLazySourceCount);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // Where(x>1) → GroupBy(x mod 2) → 2 groups
 }

@@ -18,23 +18,12 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — the AOT oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
-
-namespace {
-// A checked run is SKIPPED (not failed) when the ASan toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-}  // namespace
 
 // A sendable class item with a static destructor-counting oracle.
 // Static field Item._n: ctor +1, dtor -1. After two sends + last-sender
@@ -100,7 +89,7 @@ BEZEL_TEST(channel_double_dispose_idempotent_4357,
         "    return 42; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;            // ASan toolchain unavailable — skip
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);             // no UAF / double-free
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }

@@ -47,20 +47,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// ASan toolchain skip-guard.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // §8.6 / §28.9 / #2304: a static method that ALWAYS returns a boxable value
 // (so the boxForTarget at its return site always mints a fresh rc=1 box)
@@ -133,7 +126,7 @@ BEZEL_TEST(codegen_box_object_call_local_leak_2304,
     // srcTy as the target when ld->type is null, admits the call, the bind
     // transfers the +1, and the scope-end release frees it exactly once.
     JitResult r = runAotChecked(kBoxObjectCallInferredLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);   // LSan-clean (the #2304 leak would flip this)
 }
@@ -147,7 +140,7 @@ BEZEL_TEST(codegen_box_object_call_local_leak_2304,
 BEZEL_TEST(codegen_box_object_call_local_leak_2304,
            object_call_inferred_instance_does_not_leak_spec_8_6_28_9) {
     JitResult r = runAotChecked(kBoxObjectCallInferredInstanceLoop);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);
 }

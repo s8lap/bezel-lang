@@ -40,22 +40,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway (mirrors #1934).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // (A) The exact #1982 repro: `var s := g.ToString()` on a plain non-nullable
 // Guid, consumed non-escaping. Pre-fix the minted canonical string leaked (69
@@ -118,7 +109,7 @@ const char* kParseOnly =
 BEZEL_TEST(guid_tostring_leak_1982,
            bind_tostring_length_lsan_clean_stdlib_2_6) {
     JitResult r = runAotChecked(kBindToStringLength);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // compiled + LSan-clean (result freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 36); // canonical dashed form length
 }
@@ -129,7 +120,7 @@ BEZEL_TEST(guid_tostring_leak_1982,
 BEZEL_TEST(guid_tostring_leak_1982,
            bind_tostring_value_lsan_clean_stdlib_2_6) {
     JitResult r = runAotChecked(kBindToStringValue);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);  // Empty renders the all-zero canonical form
 }
@@ -141,7 +132,7 @@ BEZEL_TEST(guid_tostring_leak_1982,
 BEZEL_TEST(guid_tostring_leak_1982,
            parse_tostring_round_trip_lsan_clean_stdlib_2_6) {
     JitResult r = runAotChecked(kParseToStringRoundTrip);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 99);  // round-trips to the same canonical string
 }
@@ -153,7 +144,7 @@ BEZEL_TEST(guid_tostring_leak_1982,
 BEZEL_TEST(guid_tostring_leak_1982,
            parse_only_lsan_clean_stdlib_2_6) {
     JitResult r = runAotChecked(kParseOnly);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }

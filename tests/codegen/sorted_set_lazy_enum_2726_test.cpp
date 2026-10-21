@@ -46,21 +46,11 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
-
-namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-}  // namespace
 
 // The §28.2 shape under test: an explicit `.Dispose()` on a `using var`, so
 // the explicit release (§28.2) and the §28.3 scope-exit auto-drop both reach
@@ -80,7 +70,7 @@ BEZEL_TEST(sorted_set_dispose_3360, sorted_set_dispose_does_not_leak_28_2) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

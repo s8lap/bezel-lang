@@ -57,22 +57,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "runAotChecked: SKIP" diagnostic.
-// clang is required to build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // §9.1 / §4.6 / §28.9 / #2066: the issue's pattern, multi-field. A 3-field
 // positional record `r`, then `r.ToString()` is assigned to the inferred
@@ -138,7 +129,7 @@ BEZEL_TEST(codegen_record_tostring_intermediate_concat_leak_2066,
     // false. WITH the fix the intermediates are released mid-chain (no leak,
     // no double-free).
     JitResult r = runAotChecked(kRecordToStringMultiFieldLoop);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);   // LSan-clean (the #2066 leak would flip this)
 }
@@ -153,7 +144,7 @@ BEZEL_TEST(codegen_record_tostring_string_field_no_double_free_2066,
     // heap-use-after-free → r.ran false. WITH the borrow guard the string
     // field is left alone; only the int field's +1 ToString is released.
     JitResult r = runAotChecked(kRecordToStringStringFieldLoop);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
 
     BEZEL_EXPECT_TRUE(r.ran);   // no double-free / no leak
 }

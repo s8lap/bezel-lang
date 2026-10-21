@@ -36,22 +36,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // The exact #1914 (a) repro shape: a bare `for var g in strings.GroupBy((s) =>
 // int.Parse(s))` — the selector is a plain LAMBDA — with a body that USES each
@@ -111,7 +102,7 @@ const char* kForInGroupByValueUse =
 BEZEL_TEST(groupby_forin_groups_leak_1914,
            forin_bare_groupby_lambda_selector_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kForInGroupByLambdaSelector);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // compiled + LSan-clean (groups freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // "1","1","2" → two distinct keys
 }
@@ -119,7 +110,7 @@ BEZEL_TEST(groupby_forin_groups_leak_1914,
 BEZEL_TEST(groupby_forin_groups_leak_1914,
            forin_bare_groupby_key_and_count_use_lsan_clean_spec_5) {
     JitResult r = runAotChecked(kForInGroupByValueUse);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);  // (1+2) + (0+3)
 }

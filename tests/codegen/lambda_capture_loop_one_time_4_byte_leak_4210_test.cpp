@@ -34,22 +34,12 @@
 //   PASS-WITH:    zero leaks
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
-
-namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-}  // namespace
 
 // per spec §27.5 / §28.9 / #4210: the verbatim reproducer from the issue.
 // ASan reports a 4-byte leak from `calloc` in `main` for the captured local's
@@ -78,7 +68,7 @@ BEZEL_TEST(lambda_capture_loop_one_time_4_byte_leak_4210, verbatim_reproducer) {
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // no leaks
 }
@@ -105,7 +95,7 @@ BEZEL_TEST(lambda_capture_loop_one_time_4_byte_leak_4210, no_loop_non_escaping_c
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -131,7 +121,7 @@ BEZEL_TEST(lambda_capture_loop_one_time_4_byte_leak_4210, two_sequential_non_esc
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -153,7 +143,7 @@ BEZEL_TEST(lambda_capture_loop_one_time_4_byte_leak_4210, int_capture_returns_co
         "    return sum; "  // 0+1+2+...+9 = 45
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 45);
 }

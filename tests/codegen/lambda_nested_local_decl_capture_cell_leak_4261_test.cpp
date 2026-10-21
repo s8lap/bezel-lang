@@ -35,22 +35,11 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — ASan/LSan AOT harness
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
-
-namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
-}  // namespace
 
 // ── Row A: TWO lambdas both capture `f`; inner reassigns `f` (100× loop).
 // `f` and `outer` are declared OUTSIDE the loop to avoid shadowing leaks.
@@ -80,7 +69,7 @@ BEZEL_TEST(lambda_nested_local_decl_capture_cell_leak_4261,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-existing leak: LSan → exitCode=-1
 }
 
@@ -107,7 +96,7 @@ BEZEL_TEST(lambda_nested_local_decl_capture_cell_leak_4261,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-existing leak: LSan → exitCode=-1
 }
 
@@ -126,7 +115,7 @@ BEZEL_TEST(lambda_nested_local_decl_capture_cell_leak_4261,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
