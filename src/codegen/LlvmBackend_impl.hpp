@@ -5174,6 +5174,9 @@ private:
     // fix #499 / §9.8: load the Range struct from the slot of a range-typed
     // expression (an IdentifierExpr whose lsym->declType is Range). Returns
     // the struct value `{ i64 start, i64 end, i64 step, i8 flags }`.
+    llvm::Value* emitRangeContains(llvm::Value* rv, llvm::Value* x,
+                                   bool xUnsigned, const sema::TypeRef* rangeTy);
+
     llvm::Value* loadRangeStruct(const ast::Expr& target) {
         llvm::Value* v = lowerExpr(target);
         if (!v) return nullptr;
