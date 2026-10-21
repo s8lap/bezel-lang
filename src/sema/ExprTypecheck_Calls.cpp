@@ -1155,6 +1155,53 @@ ExprTC::ArgMatch ExprTC::classifyArg(const TypeRef* argTy,
 
 // The receiver expression of a member call (`r.M(...)` / `r?.M(...)`), else
 // null.
+// fix #6920 (stdlib §3.2/§2.6/§2.7/§7.3/§10.1/§10.3, v0.340): the builtin
+// byte-buffer parameters (`Encoding.GetString(bytes)`, `Guid.FromByteArray`,
+// `Random.NextBytes`, `File.WriteAllBytes`, `CString.FromBytes`,
+// `RawBytes.From`) were typed by member NAME only; the argument was never
+// compared with the declared `Array<byte>` (or, where §3.2/§7.3 declare a span
+// twin, `ReadOnlySpan<byte>`/`ReadOnlyArraySpan<byte>`) parameter, so a
+// `string`/`int`/`Set` reached a runtime entry expecting a `bz_array_t*`.
+// Returns true when `t` is DEFINITELY not an admissible byte buffer. An
+// unknown or opaque type is admitted (this is a reject-only gate, never a
+// new accept): only primitives, user types, and builtin heads that are
+// neither an array nor a span are refused, and an `Array`/span whose element
+// type is a known non-`byte` primitive.
+static bool byteBufferArgRejected(const TypeRef* t, bool allowSpan) {
+    if (!t) return false;
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            return t->primitive != PrimitiveType::None;
+        case TypeRef::Kind::Named: {
+            std::string_view h = t->headName();
+            if (h.empty()) return false;
+            bool arr = (h == "Array" || h == "OwningArray");
+            bool span = allowSpan &&
+                        (h == "ReadOnlySpan" || h == "Span" ||
+                         h == "ReadOnlyArraySpan" || h == "ArraySpan");
+            if (arr || span) {
+                if (!t->genericArgs.empty() && t->genericArgs[0] &&
+                    t->genericArgs[0]->kind == TypeRef::Kind::Primitive &&
+                    t->genericArgs[0]->primitive != PrimitiveType::None &&
+                    t->genericArgs[0]->primitive != PrimitiveType::Byte)
+                    return true;
+                return false;
+            }
+            static const std::initializer_list<std::string_view> kBad = {
+                "Set", "SortedSet", "Dictionary", "SortedDictionary", "Stack",
+                "Queue", "LinkedList", "List", "OwningSet", "OwningStack",
+                "OwningQueue", "OwningLinkedList", "OwningDictionary",
+                "OwningBuffer", "String", "Guid", "DateTime", "TimeSpan",
+                "Random"};
+            for (auto b : kBad)
+                if (h == b) return true;
+            return false;
+        }
+        default:
+            return false;
+    }
+}
+
 static const ast::Expr* callReceiverTarget(const ast::CallExpr& ce) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
         return ma->target.get();
@@ -11493,6 +11540,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             "length))`");
                         return;
                     } else if (m == "GetString" || m == "Name") {
+                        // fix #6920 (stdlib §3.2, v0.340): the one-argument
+                        // GetString takes Array<byte> or a byte span.
+                        if (m == "GetString" && ce.args.size() == 1 &&
+                            ce.args[0].value) {
+                            const TypeRef* bt = ctx_.exprType(*ce.args[0].value);
+                            if (byteBufferArgRejected(bt, true)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error,
+                                    ce.args[0].value->span.begin,
+                                    "`Encoding.GetString` expects `Array<byte>`, "
+                                    "`ReadOnlySpan<byte>` or "
+                                    "`ReadOnlyArraySpan<byte>` (stdlib "
+                                    "\xC2\xA7""3.2); got `" +
+                                        collectionLiteralTargetSpelling(bt) +
+                                        "` (#6920)");
+                                return;
+                            }
+                        }
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
                     }
                 }
@@ -14148,6 +14213,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "int, value: string)`, so the value must be a "
                                 "`string`; render a non-string value with "
                                 "`.ToString()` first (stdlib §3.1)");
+                        }
+                    }
+                    // fix #6920 (v0.340): builtin byte-buffer parameters are
+                    // checked against their declared type (see
+                    // byteBufferArgRejected).
+                    {
+                        struct ByteArgSite {
+                            std::string_view cls, method;
+                            std::size_t argc, idx;
+                            bool span;
+                            const char* sig;
+                            const char* sec;
+                        };
+                        static const ByteArgSite kSites[] = {
+                            {"RawBytes", "From", 1, 0, false,
+                             "Array<byte>", "10.3"},
+                            {"CString", "FromBytes", 1, 0, false,
+                             "Array<byte>", "10.1"},
+                            {"Guid", "FromByteArray", 1, 0, false,
+                             "Array<byte>", "2.6"},
+                            {"Random", "NextBytes", 1, 0, false,
+                             "Array<byte>", "2.7"},
+                            {"File", "WriteAllBytes", 2, 1, true,
+                             "Array<byte> or ReadOnlySpan<byte>", "7.3"},
+                        };
+                        for (const auto& st : kSites) {
+                            if (colName != st.cls || m != st.method ||
+                                ce.args.size() != st.argc ||
+                                !ce.args[st.idx].value)
+                                continue;
+                            const TypeRef* bt = ctx_.exprType(*ce.args[st.idx].value);
+                            if (byteBufferArgRejected(bt, st.span)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error,
+                                    ce.args[st.idx].value->span.begin,
+                                    "`" + std::string(st.cls) + "." +
+                                        std::string(st.method) +
+                                        "` expects `" + st.sig +
+                                        "` (stdlib \xC2\xA7" + st.sec +
+                                        "); got `" +
+                                        collectionLiteralTargetSpelling(bt) +
+                                        "` (#6920)");
+                                return;
+                            }
                         }
                     }
                     // Random instance methods
