@@ -2251,6 +2251,35 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
     return false;
 }
 
+// §3.6 (hashable row, *declaring user equality*), §9.2, App. C (v0.340, #6745):
+// a record that declares its own-typed `Equals` (the `Object` slot, §9.2) with
+// the `GetHashCode` §8.3 obliges beside it is hashable, "whether or not an
+// `=`/`<>` overload accompanies them". Deliberately a separate predicate from
+// recordHasUserDeclaredEquality: that one decides whether `=`/`<>` are legal on
+// the record, and without an overload they stay §9.2's compile error.
+bool recordDeclaresUserEqualsPair(const TypeSymbol* rec,
+                                  const SemaContext& ctx) {
+    if (!rec) return false;
+    bool hasEquals = false, hasHash = false;
+    for (const Symbol* m : rec->members) {
+        auto* meth = dynamic_cast<const MethodSymbol*>(m);
+        if (!meth || meth->isOperator) continue;
+        if (meth->name == "Equals" && meth->params.size() == 1) {
+            auto* p = dynamic_cast<ParameterSymbol*>(meth->params[0]);
+            const TypeRef* pt =
+                !p ? nullptr
+                   : (p->declType ? ctx.resolvedType(*p->declType)
+                                  : p->resolvedDeclType);
+            if (pt && pt->kind == TypeRef::Kind::Named && !pt->nullable &&
+                pt->declaration == rec)
+                hasEquals = true;
+        } else if (meth->name == "GetHashCode" && meth->params.empty()) {
+            hasHash = true;
+        }
+    }
+    return hasEquals && hasHash;
+}
+
 // §35.7 (v0.200, #2044) / v0.210 (#2083): a choice is auto-hashable
 // iff (a) its §35.4 classification is ValueLike AND (b) every payload field of
 // every case is a §9.2 admissible component type — with "another auto-
@@ -2484,9 +2513,11 @@ bool isEqualityBearing(const TypeRef* ty, SemaContext& ctx) {
         // admissibility check; the blind `return true` was the pre-#1383 bug.
         if (recordIsPositional(ts))
             return isPositionalRecordEqualityBearing(ts, ctx) ||
-                   recordHasUserDeclaredEquality(ts);
+                   recordHasUserDeclaredEquality(ts) ||
+                   recordDeclaresUserEqualsPair(ts, ctx);
         return isAutoEqualityBearingBodyRecord(ts, ctx) ||
-               recordHasUserDeclaredEquality(ts);
+               recordHasUserDeclaredEquality(ts) ||
+               recordDeclaresUserEqualsPair(ts, ctx);
     }
     // §35.7 (v0.210/v0.214, #2083/#2087): a CHOICE is hashable exactly
     // when it is auto-hashable — i.e. value-like with all case payloads

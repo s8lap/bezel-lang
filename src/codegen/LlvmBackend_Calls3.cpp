@@ -456,7 +456,11 @@ const sema::TypeSymbol* Emitter::hashKeyRecordOfRef(const sema::TypeRef* ref) {
     if (ts->kind != ast::TypeDeclKind::Record) return nullptr;
     // per §9.2 / §25.2: the declared `=`/`<>` pair (with `Equals(T)` and
     // `GetHashCode`, co-declared by sema) is this record's equality.
-    return sema::recordHasUserDeclaredEquality(ts) ? ts : nullptr;
+    // per §3.6 / App. C (v0.340, #6745): so is a declared own-typed
+    // `Equals` with `GetHashCode`, with or without the overload.
+    return (sema::recordHasUserDeclaredEquality(ts) ||
+            sema::recordDeclaresUserEqualsPair(ts, ctx_))
+               ? ts : nullptr;
 }
 
 const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,

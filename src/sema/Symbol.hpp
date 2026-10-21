@@ -1861,6 +1861,8 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
 // valid on it (they dispatch to the user's member), so it must be excluded
 // from the §9.2 non-auto-equality compile error. Returns false for null.
 bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
+// §3.6 / App. C (v0.340, #6745): own-typed `Equals` + `GetHashCode` declared.
+bool recordDeclaresUserEqualsPair(const TypeSymbol* rec, const SemaContext& ctx);
 
 // §3.6 / §35.7 (v0.276, #3333): does this choice declare its own equality
 // surface — a HOMOGENEOUS `=`/`<>` overload alongside the §25.2 co-declared
