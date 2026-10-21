@@ -15218,16 +15218,40 @@ void ExprTC::checkCasePatternConstantRanges(
         // §5.1 narrowing gate is never reached for them. Falling through
         // keeps a single code path.
     }
-    long long lo = 0, hi = 0;
-    if (!caseIntScrutineeRange(scrutTy->primitive, lo, hi)) return;
+    // §5.1 / §19.3 (#6916): the 64-bit scrutinees get the same gate. `lo`/`hi`
+    // are __int128 so `ulong`'s [0, 2^64-1] is representable; a constant
+    // whose static type is `ulong` folds to a wrapped (negative) long long
+    // above 2^63-1 and is read back as its unsigned value.
+    __int128 lo = 0, hi = 0;
+    {
+        long long l32 = 0, h32 = 0;
+        if (caseIntScrutineeRange(scrutTy->primitive, l32, h32)) {
+            lo = l32; hi = h32;
+        } else if (scrutTy->primitive == PrimitiveType::ULong) {
+            lo = 0; hi = (__int128)std::numeric_limits<unsigned long long>::max();
+        } else if (scrutTy->primitive == PrimitiveType::Long) {
+            lo = std::numeric_limits<long long>::min();
+            hi = std::numeric_limits<long long>::max();
+        } else {
+            return;
+        }
+    }
     auto checkConst = [&](const ast::Expr* c) {
         if (!c) return;
         std::optional<long long> v = foldIntConstExprTC(*c);
         if (!v) return;  // non-constant / non-integer: not gated here
-        if (*v < lo || *v > hi)
+        const TypeRef* ct = ctx_.exprType(*c);
+        const bool unsignedWrap = *v < 0 && ct &&
+            ct->kind == TypeRef::Kind::Primitive && !ct->nullable &&
+            ct->primitive == PrimitiveType::ULong;
+        const __int128 mv = unsignedWrap
+            ? (__int128)(unsigned long long)*v : (__int128)*v;
+        if (mv < lo || mv > hi)
             ctx_.diagnostics().report(
                 Severity::Error, c->span.begin,
-                "the `case` pattern constant `" + std::to_string(*v) +
+                "the `case` pattern constant `" +
+                (unsignedWrap ? std::to_string((unsigned long long)*v)
+                              : std::to_string(*v)) +
                 "` has a type that is not implicitly convertible to the "
                 "scrutinee type (§5.1) — the value does not fit the "
                 "scrutinee's integer range and would otherwise be silently "
