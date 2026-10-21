@@ -1519,6 +1519,26 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
                 argTy = nn;
             }
             ArgMatch m = classifyArg(argTy, paramTypes[c][i]);
+            // fix #6709 (§22.6, §12.9, §5.1, v0.339): `implicitlyConvertible`
+            // grades a declared `from` against a declared generic `to` by the
+            // HEADS alone (`isSubtype(DogBox, IBox)`), so `DogBox: Box<Dog>`
+            // was a Convert at `IBox<string>` too, and `F(IBox<Dog>)` beside
+            // `F(IBox<string>)` was reported ambiguous. A type converts to a
+            // generic interface only at an instantiation it reaches, varied
+            // only per §12.9 — `checkAssignable`'s #4892 arm, whose
+            // certain-mismatch half `genericHeadReach` reports as OtherArgs.
+            // A candidate with method type parameters of its own is left
+            // alone: its row may still name them free (an unbound `T`), and
+            // this grid has no list of them.
+            if (m == ArgMatch::Convert && argTy && paramTypes[c][i] &&
+                argTy->kind == TypeRef::Kind::Named && argTy->declaration &&
+                paramTypes[c][i]->kind == TypeRef::Kind::Named &&
+                paramTypes[c][i]->declaration &&
+                !paramTypes[c][i]->genericArgs.empty() &&
+                !(c < isGeneric.size() && isGeneric[c]) &&
+                genericHeadReach(argTy, paramTypes[c][i], nullptr) ==
+                    GenericHeadReach::OtherArgs)
+                m = ArgMatch::NotApplicable;
             // fix #6554 (§5.1 "Constant narrowing" + §22.6, v0.338): §5.1 says
             // the rule "participates in overload-resolution APPLICABILITY
             // (§22.6)" — it never says the resulting cell is an EXACT match.
