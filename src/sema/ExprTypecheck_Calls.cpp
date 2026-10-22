@@ -17771,12 +17771,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // `Console.WriteLine(Math.Max<byte>(b, N))` renders a
                         // byte, not the signed int the first operand's
                         // placeholder gave.
+                        bool explicitTTyped = false;
                         if (mma->typeArgs.size() == 1 && mma->typeArgs[0]) {
                             TypeRef* eT = ctx_.resolvedType(*mma->typeArgs[0]);
                             if (eT && !eT->nullable &&
                                 eT->kind == TypeRef::Kind::Primitive &&
-                                isMinMaxNumericOrChar(eT->primitive))
+                                isMinMaxNumericOrChar(eT->primitive)) {
                                 ctx_.setExprType(&ce, eT);
+                                explicitTTyped = true;
+                            }
                         }
                         const TypeRef* first = nullptr;
                         bool same = true;
@@ -17791,7 +17794,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (!first) first = at;
                             else if (at->primitive != first->primitive) same = false;
                         }
-                        if (same && first) {
+                        // fix #6958 follow-up (stdlib §2.2, §14.5, v0.340):
+                        // the operand-type fallback below types only an
+                        // inferred call. Under an explicit list T is bound and
+                        // codegen yields a T-typed value, so same-typed
+                        // operands of another type (`Max<double>(i, j)` with
+                        // int i, j) must not retype the call to theirs.
+                        if (same && first && !explicitTTyped) {
                             switch (first->primitive) {
                             case PrimitiveType::Byte: case PrimitiveType::SByte:
                             case PrimitiveType::Short: case PrimitiveType::UShort:
