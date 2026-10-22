@@ -15,6 +15,9 @@ matrix".
 Tags are ordered: a LATER compiler is compared against every EARLIER one, and a
 cell where it is worse is printed. Exit status: 0 no cell got worse, 1 at least
 one did, 2 usage or infrastructure error (library would not compile, no cells).
+A cell that timed out (compile or run, retried once) on either side is
+inconclusive: it is listed apart and counted in the summary, and it is neither
+worse nor better, so it cannot change the exit status.
 
 Each cell is one generated program (type x operation x {loc, app}). `loc_` is a
 single module; `app_` imports the same helpers from a separately compiled library
@@ -23,8 +26,10 @@ different codegen routes. Every Main runs its operation `--iterations` times
 (default 100) in a while loop so that a per-iteration leak is unmistakable, and
 is built with `--sanitize=address`. Classes, best to worst:
 CLEAN (rc 0, no sanitizer report) > LEAK(bytes/allocs) (LeakSanitizer only) >
-CRASH (rc != 0, ASan error, timeout) > CF (did not compile). "Worse" means a
-lower class, or, when both ran to completion, different stdout or a bigger leak.
+CRASH (rc != 0, ASan error) > CF (did not compile). TIMEOUT (a compile or a run
+exceeded its limit on the retry too) is inconclusive and ranked nowhere. "Worse"
+means a lower class, or, when both ran to completion, different stdout or a leak
+that grew past the jitter tolerance (LEAK_* below).
 
 Generation is deterministic (fixed ordering, no randomness). All scratch lives
 under --out, never /tmp. Layout: OUT/programs/*.bzl, OUT/<tag>/ (exe, logs),
@@ -41,8 +46,13 @@ import re
 import subprocess
 import sys
 
-CF, CRASH, LEAK, CLEAN = 'CF', 'CRASH', 'LEAK', 'CLEAN'
-TIER = {CF: 0, CRASH: 1, LEAK: 2, CLEAN: 3}
+CF, CRASH, LEAK, CLEAN, TIMEOUT = 'CF', 'CRASH', 'LEAK', 'CLEAN', 'TIMEOUT'
+TIER = {CF: 0, CRASH: 1, LEAK: 2, CLEAN: 3}   # TIMEOUT has no tier: it is inconclusive
+CLASSES = (CF, CRASH, LEAK, CLEAN, TIMEOUT)
+# Leak jitter tolerance: LSan totals move ~1% between identical runs (3465B/198 vs 3500B/200).
+LEAK_BYTES_PCT = 110        # bytes: the later leak must be at least 110% of the reference ...
+LEAK_BYTES_MIN_GROWTH = 64  # ... and at least 64 bytes more
+LEAK_ALLOCS_PCT = 110       # allocations: the later count must be at least 110% (exceeds by 10%)
 
 # ---------------------------------------------------------------------------
 # Generator
@@ -356,6 +366,15 @@ def classify(compiled, rc, err, compile_msg=''):
 
 
 def run_cell(bezelc, odir, progdir, name, has_lib, timeout, run_timeout):
+    """One cell. A timeout says something about the box, not the compiler, so a compile
+    or run that exceeds its limit is retried once; a second timeout makes it TIMEOUT."""
+    row = _run_cell_once(bezelc, odir, progdir, name, has_lib, timeout, run_timeout)
+    if row[1] == TIMEOUT:
+        row = _run_cell_once(bezelc, odir, progdir, name, has_lib, timeout, run_timeout)
+    return row
+
+
+def _run_cell_once(bezelc, odir, progdir, name, has_lib, timeout, run_timeout):
     prog = f'{progdir}/{name}.bzl'
     exe = f'{odir}/{name}.exe'
     cmd = [bezelc, '--sanitize=address']
@@ -364,23 +383,22 @@ def run_cell(bezelc, odir, progdir, name, has_lib, timeout, run_timeout):
     cmd += ['-o', exe, prog]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors='replace')
-        ok, clog = p.returncode == 0, p.stdout + p.stderr
     except subprocess.TimeoutExpired:
-        ok, clog = False, 'compile timeout'
+        return name, TIMEOUT, 'compile timeout', ''
+    clog = p.stdout + p.stderr
     _write(f'{odir}/{name}.clog', clog)
-    if not ok:
+    if p.returncode != 0:
         first = next((ln for ln in clog.splitlines() if ln.strip() and 'warning' not in ln), '')
         first = re.sub(r'^[^ ]*:\d+:\d+: ', '', first)[:140]
         return name, CF, first, ''
     try:
         r = subprocess.run([exe], capture_output=True, text=True, timeout=run_timeout, errors='replace')
-        rc, out, err = r.returncode, r.stdout, r.stderr
     except subprocess.TimeoutExpired:
-        rc, out, err = 124, '', 'timeout'
-    _write(f'{odir}/{name}.out', out)
-    _write(f'{odir}/{name}.err', err)
-    cls, det = classify(True, rc, err)
-    return name, cls, det, uniq_c(out)
+        return name, TIMEOUT, 'run timeout', ''
+    _write(f'{odir}/{name}.out', r.stdout)
+    _write(f'{odir}/{name}.err', r.stderr)
+    cls, det = classify(True, r.returncode, r.stderr)
+    return name, cls, det, uniq_c(r.stdout)
 
 
 def uniq_c(text):
@@ -430,9 +448,26 @@ def _leak(detail):
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
+def _label(cell):
+    """'CLASS' or 'CLASS/detail' for a (class, detail, stdout) cell, as the report prints it."""
+    return f'{cell[0]}{"/" + cell[1] if cell[1] else ""}'
+
+
+def _leak_grew(old, new):
+    """True when leak `new` is bigger than leak `old` (each (bytes, allocs)) past the tolerance.
+    Integer arithmetic, so a growth of exactly 10% is not lost to float rounding."""
+    (ob, oa), (nb, na) = old, new
+    bytes_grew = nb * 100 >= ob * LEAK_BYTES_PCT and nb - ob >= LEAK_BYTES_MIN_GROWTH
+    allocs_grew = na > oa and na * 100 >= oa * LEAK_ALLOCS_PCT
+    return bytes_grew or allocs_grew
+
+
 def worse(prev, cur):
     """Why `cur` is worse than `prev` (cells are (class, detail, stdout)), or ''.
-    A reference that never ran to completion (CF/CRASH) cannot be regressed from."""
+    A reference that never ran to completion (CF/CRASH) cannot be regressed from.
+    A TIMEOUT on either side is inconclusive, so never worse (compare() lists it)."""
+    if TIMEOUT in (prev[0], cur[0]):
+        return ''
     tp, tc = TIER[prev[0]], TIER[cur[0]]
     if tp < TIER[LEAK]:
         return ''
@@ -440,41 +475,64 @@ def worse(prev, cur):
         return f'{cur[0]} {cur[1]}'.strip()
     if cur[2] != prev[2]:
         return f'stdout {prev[2][:40]!r} -> {cur[2][:40]!r}'
-    if tc == TIER[LEAK]:
-        (pb, pa), (cb, ca) = _leak(prev[1]), _leak(cur[1])
-        if cb > pb or ca > pa:
-            return f'MORE-LEAK {prev[1]} -> {cur[1]}'
+    if tc == TIER[LEAK] and _leak_grew(_leak(prev[1]), _leak(cur[1])):
+        return f'MORE-LEAK {prev[1]} -> {cur[1]}'
+    return ''
+
+
+def better(prev, cur):
+    """Why `cur` is better than `prev`, or ''. The mirror of worse(): a class rise counts, and
+    a leak counts only when it shrank past the same tolerance, so jitter is not better either."""
+    if TIMEOUT in (prev[0], cur[0]):
+        return ''
+    tp, tc = TIER[prev[0]], TIER[cur[0]]
+    if tc > tp:
+        return f'{cur[0]} {cur[1]}'.strip()
+    if tc == tp == TIER[LEAK] and cur[2] == prev[2] and _leak_grew(_leak(cur[1]), _leak(prev[1])):
+        return f'LESS-LEAK {prev[1]} -> {cur[1]}'
     return ''
 
 
 def compare(tags, tables):
-    """-> (report text, number of worse cells). Each later tag vs every earlier tag."""
+    """-> (report text, number of worse cells, number of cells with a timeout in some compiler).
+    Each later tag vs every earlier tag. A cell that timed out on either side of a pair is
+    listed as inconclusive for that pair, and is neither worse nor better."""
     lines = []
     keys = sorted(set().union(*[t.keys() for t in tables]))
     for tag, t in zip(tags, tables):
-        c = {k: 0 for k in TIER}
+        c = {k: 0 for k in CLASSES}
         for k in keys:
             c[t.get(k, (CF,))[0]] += 1
-        lines.append(f'{tag}: CF {c[CF]}  CRASH {c[CRASH]}  LEAK {c[LEAK]}  CLEAN {c[CLEAN]}')
+        lines.append(f'{tag}: CF {c[CF]}  CRASH {c[CRASH]}  LEAK {c[LEAK]}  CLEAN {c[CLEAN]}  TIMEOUT {c[TIMEOUT]}')
     nworse = 0
     for j in range(1, len(tags)):
         for i in range(j):
-            bad = []
+            bad, inconc, nbetter = [], [], 0
             for k in keys:
                 if k not in tables[i]:
                     continue
-                w = worse(tuple(tables[i][k]), tuple(tables[j].get(k, (CF, 'missing', ''))))
+                p = tuple(tables[i][k])
+                q = tuple(tables[j].get(k, (CF, 'missing', '')))
+                if TIMEOUT in (p[0], q[0]):
+                    inconc.append((k, p, q))
+                    continue
+                w = worse(p, q)
                 if w:
-                    bad.append((k, w))
+                    bad.append((k, p, w))
+                if better(p, q):
+                    nbetter += 1
             nworse += len(bad)
             lines.append(f'\n== {tags[j]} vs {tags[i]}: {len(bad)} cell(s) WORSE')
-            for k, w in bad:
-                p = tables[i][k]
-                lines.append(f'  {k:34s} {tags[i]}={p[0]}{"/" + p[1] if p[1] else ""}  ->  {tags[j]}: {w}')
-            better = [k for k in keys if k in tables[i] and k in tables[j]
-                      and TIER[tables[j][k][0]] > TIER[tables[i][k][0]]]
-            lines.append(f'== {tags[j]} vs {tags[i]}: {len(better)} cell(s) better (class rose)')
-    return '\n'.join(lines), nworse
+            for k, p, w in bad:
+                lines.append(f'  {k:34s} {tags[i]}={_label(p)}  ->  {tags[j]}: {w}')
+            lines.append(f'== {tags[j]} vs {tags[i]}: {nbetter} cell(s) better '
+                         '(class rose, or a leak shrank past the tolerance)')
+            lines.append(f'== {tags[j]} vs {tags[i]}: {len(inconc)} cell(s) INCONCLUSIVE '
+                         '(timed out; neither worse nor better)')
+            for k, p, q in inconc:
+                lines.append(f'  {k:34s} {tags[i]}={_label(p)}  ->  {tags[j]}={_label(q)}')
+    timed_out = {k for k in keys if any(t.get(k, (CF,))[0] == TIMEOUT for t in tables)}
+    return '\n'.join(lines), nworse, len(timed_out)
 
 
 def main(argv=None):
@@ -487,11 +545,13 @@ def main(argv=None):
                     'type key, type text (e.g. Set, SortedSet, Mutex) and op name; any match selects')
     ap.add_argument('--scope', choices=('loc', 'app'), help='only same-module or only cross-module cells')
     ap.add_argument('--iterations', type=int, default=100, help='loop count inside each program')
-    ap.add_argument('--timeout', type=int, default=300, help='per-cell compile timeout (s)')
-    ap.add_argument('--run-timeout', type=int, default=60, help='per-cell run timeout (s)')
+    ap.add_argument('--timeout', type=int, default=300, help='per-cell compile timeout (s); retried once, then TIMEOUT')
+    ap.add_argument('--run-timeout', type=int, default=60, help='per-cell run timeout (s); retried once, then TIMEOUT')
     ap.add_argument('--list', action='store_true', help='print the selected cell names and exit')
     ap.add_argument('--generate-only', action='store_true', help='write the programs and exit')
     a = ap.parse_args(argv)
+    if a.jobs < 1:
+        ap.error(f'--jobs must be at least 1 (got {a.jobs})')
 
     if a.list:
         for c in cells(a.filter, a.scope):
@@ -523,7 +583,9 @@ def main(argv=None):
         print(f'[{tag}] running {len(cs)} cells ...', flush=True)
         tables.append(run_compiler(tag, path, a.out, progdir, [c[0] for c in cs],
                                    a.jobs, a.timeout, a.run_timeout))
-    report, nworse = compare(tags, tables)
+    report, nworse, ninconc = compare(tags, tables)
+    report += (f'\nINCONCLUSIVE: {ninconc} cell(s) timed out in at least one compiler (after the retry); '
+               'not counted as worse or better')
     _write(f'{a.out}/report.txt', report + '\n')
     print(report)
     if nworse:

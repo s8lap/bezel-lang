@@ -25,11 +25,14 @@ done
 if [ $lib = 1 ]; then : > "$out"; exit 0; fi
 case "$FAKE_MODE" in
   cf) echo "$src:1:1: error: nope" >&2; exit 1;;
+  chang) exec sleep 30;;
 esac
 case "$FAKE_MODE" in
   leak) body='echo 1; echo "ERROR: LeakSanitizer: detected memory leaks" >&2; echo "SUMMARY: AddressSanitizer: 16 byte(s) leaked in 2 allocation(s)." >&2; exit 1';;
   crash) body='echo "ERROR: AddressSanitizer: SEGV on unknown address" >&2; exit 1';;
   out) body='echo 2';;
+  hang) body='exec sleep 30';;
+  flaky) body='if [ ! -e "$0.seen" ]; then : > "$0.seen"; exec sleep 30; fi; echo 1';;
   *) body='echo 1';;
 esac
 printf '#!/bin/bash\n%s\n' "$body" > "$out"; chmod +x "$out"
@@ -81,10 +84,57 @@ class RegressionMatrixTest(unittest.TestCase):
         self.assertTrue(rm.worse(clean, leak))
         self.assertTrue(rm.worse(leak, crash))
         self.assertTrue(rm.worse(clean, (rm.CLEAN, '', '2')))                 # stdout drift
-        self.assertTrue(rm.worse(leak, (rm.LEAK, '32B/2', '1')))              # bigger leak
+        self.assertTrue(rm.worse(leak, (rm.LEAK, '3000B/2', '1')))            # bigger leak (tolerance: see below)
+        self.assertEqual(rm.worse(leak, (rm.LEAK, '32B/2', '1')), '')        # +16B is under the 64-byte floor: jitter
         self.assertEqual(rm.worse(leak, (rm.LEAK, '8B/1', '1')), '')
         self.assertEqual(rm.worse(crash, (rm.CF, 'x', '')), '')               # reference never ran
         self.assertEqual(rm.worse(leak, clean), '')
+
+    def test_leak_growth_past_tolerance_is_worse(self):
+        clean = (rm.CLEAN, '', '1')
+        self.assertTrue(rm.worse(clean, (rm.LEAK, '16B/2', '1')))                          # 0 -> N
+        self.assertTrue(rm.worse((rm.LEAK, '1000B/10', '1'), (rm.LEAK, '2000B/10', '1')))  # bytes doubled
+        self.assertTrue(rm.worse((rm.LEAK, '1000B/10', '1'), (rm.LEAK, '2000B/20', '1')))  # bytes and allocs doubled
+        self.assertTrue(rm.worse((rm.LEAK, '16B/2', '1'), (rm.LEAK, '16B/4', '1')))        # allocs doubled
+        self.assertTrue(rm.worse((rm.LEAK, '100B/100', '1'), (rm.LEAK, '100B/110', '1')))  # allocs +10% exactly
+        self.assertEqual(rm.worse((rm.LEAK, '100B/100', '1'), (rm.LEAK, '100B/109', '1')), '')  # +9% is jitter
+
+    def test_leak_jitter_is_neither_worse_nor_better(self):
+        # measured on two identical compilers: 3465B/198 and 3500B/200 (about 1% apart)
+        a, b = (rm.LEAK, '3465B/198', '1'), (rm.LEAK, '3500B/200', '1')
+        for p, q in ((a, b), (b, a)):
+            self.assertEqual(rm.worse(p, q), '')
+            self.assertEqual(rm.better(p, q), '')
+
+    def test_leak_shrink_past_tolerance_is_better(self):
+        big, small = (rm.LEAK, '2000B/20', '1'), (rm.LEAK, '1000B/10', '1')
+        self.assertTrue(rm.better(big, small))                                             # the mirror of a doubling
+        self.assertTrue(rm.better((rm.LEAK, '16B/2', '1'), (rm.CLEAN, '', '1')))           # a class rise
+        self.assertEqual(rm.better(big, (rm.LEAK, '1000B/10', '2')), '')                   # stdout drift is not better
+        self.assertEqual(rm.worse(big, small), '')                                         # and a shrink is not worse
+
+    def test_timeout_is_inconclusive_not_worse_or_better(self):
+        clean = (rm.CLEAN, '', '1')
+        for t in ((rm.TIMEOUT, 'run timeout', ''), (rm.TIMEOUT, 'compile timeout', '')):
+            for p, q in ((clean, t), (t, clean), (t, (rm.CF, 'x', ''))):
+                self.assertEqual(rm.worse(p, q), '')
+                self.assertEqual(rm.better(p, q), '')
+        report, nworse, ninconc = rm.compare(['ref', 'new'],
+                                             [{'c': clean}, {'c': (rm.TIMEOUT, 'run timeout', '')}])
+        self.assertEqual((nworse, ninconc), (0, 1))
+        self.assertIn('new=TIMEOUT/run timeout', report)
+
+    def test_jobs_below_one_is_a_usage_error(self):
+        # validated before any work, so only --jobs is wrong: exit 2, no traceback
+        for jobs in ('0', '-3'):
+            with self.subTest(jobs=jobs), tempfile.TemporaryDirectory() as d:
+                r = subprocess.run([sys.executable, str(ROOT / 'scripts/regression_matrix.py'),
+                                    '--out', f'{d}/out', '--filter', 'Mutex', '--scope', 'loc',
+                                    '--jobs', jobs, '--bezelc', 'ref=/bin/true', '--bezelc', 'new=/bin/true'],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn('--jobs', r.stderr)
+                self.assertNotIn('Traceback', r.stderr)
 
     def _run(self, d, modes, *extra):
         fake = pathlib.Path(d) / 'fakebezelc'
@@ -119,6 +169,23 @@ class RegressionMatrixTest(unittest.TestCase):
             r = self._run(d, [('ref', 'ok'), ('new', 'out')])          # stdout drift
             self.assertEqual(r.returncode, 1)
             self.assertIn('stdout', r.stdout)
+
+    def test_timeouts_are_retried_once_then_inconclusive_end_to_end(self):
+        # flaky: the first run hangs and the retry passes. hang: every run hangs. chang: every compile hangs.
+        with tempfile.TemporaryDirectory() as d:
+            r = self._run(d, [('ref', 'ok'), ('flaky', 'flaky'), ('hang', 'hang'), ('chang', 'chang')],
+                          '--timeout', '2', '--run-timeout', '1', '--jobs', '32')   # one wave of cells
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)      # a timeout is never a verdict
+            rows = {t: [ln.split('\t') for ln in pathlib.Path(d, 'out', f'{t}.tsv').read_text().splitlines()]
+                    for t in ('ref', 'flaky', 'hang', 'chang')}
+            self.assertTrue(rows['flaky'])
+            self.assertTrue(all(row[1] == 'CLEAN' for row in rows['flaky']))            # the retry passed
+            self.assertTrue(rows['hang'])
+            self.assertTrue(all(row[1:3] == ['TIMEOUT', 'run timeout'] for row in rows['hang']))
+            self.assertTrue(rows['chang'])
+            self.assertTrue(all(row[1:3] == ['TIMEOUT', 'compile timeout'] for row in rows['chang']))
+            timed = {row[0] for t in rows for row in rows[t] if row[1] == 'TIMEOUT'}
+            self.assertRegex(r.stdout, rf'INCONCLUSIVE: {len(timed)} cell\(s\)')
 
 
 if __name__ == '__main__':

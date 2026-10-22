@@ -102,10 +102,26 @@ every suite missed and that only a generated pre/tip/fix ASan matrix caught.
 It generates, deterministically, one program per (type x operation x {`loc_` same
 module, `app_` cross-module through a `-c` library}), builds each with every
 compiler you name under `--sanitize=address`, runs it (the operation loops 100x in
-the program), and classifies the cell CLEAN / LEAK(bytes/allocs) / CRASH / CF plus
-stdout. Compilers are ordered; each later one is compared with every earlier one,
-the cells where it is **worse** (lower class, different stdout, bigger leak) are
-printed, and the exit status is 1 if there are any (2 on a usage or setup error).
+the program), and classifies the cell CLEAN / LEAK(bytes/allocs) / CRASH / CF /
+TIMEOUT plus stdout. Compilers are ordered; each later one is compared with every
+earlier one, the cells where it is **worse** (lower class, different stdout, or a
+leak that grew past the tolerance below) are printed, and the exit status is 1 if
+there are any (2 on a usage or setup error; `--jobs` below 1 is a usage error).
+
+**TIMEOUT is inconclusive.** A compile or a run that exceeds `--timeout` or
+`--run-timeout` is retried once; if the retry times out too, the cell is TIMEOUT.
+A TIMEOUT is never worse and never better, on either side of a comparison, so it
+cannot fail a run. Each pair lists its inconclusive cells, and the summary prints
+their count (`INCONCLUSIVE: n`). On a loaded box, re-run those cells on their own
+(`--filter`) before reading anything into them.
+
+**Leak jitter tolerance.** LSan totals move about 1% between identical runs
+(measured: 3465B/198 against 3500B/200), so a leak growth is worse only when the
+class changes (0 to N: CLEAN to LEAK), or, within LEAK, the bytes are at least 110%
+of the reference and at least 64 bytes more, or the allocation count exceeds the
+reference by at least 10%. "Better" is the mirror: a leak that shrank past the same
+thresholds is better, and jitter is neither. The thresholds are the `LEAK_*`
+constants in the script.
 
 ```
 scripts/regression_matrix.py --out /var/tmp/bezel-scratch/<lane>/mx --jobs 8 \
