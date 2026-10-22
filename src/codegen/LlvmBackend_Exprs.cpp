@@ -9267,6 +9267,14 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 genericSubstSemaTy_ = std::move(nsem);
                 break;
             }
+            // §5.1 / §7.11 (#6901): a bare record operand at a `T?` formal
+            // (`p + new Pt(4, 4)` against `operator +(a: Pt?, b: Pt?)`) is
+            // wrapped to the `{i8, T}` carrier the formal takes. The unwrap
+            // half already ran in the #6758 block above.
+            fitUserOperatorArgs(
+                opm, args,
+                {ctx_.exprType(*bin.left), ctx_.exprType(*bin.right)},
+                /*unwrap=*/false);
             llvm::Value* res =
                 emitMethodCall(opm, args, /*baseQualified=*/false);
             genericSubst_ = std::move(savedOpSubst);
