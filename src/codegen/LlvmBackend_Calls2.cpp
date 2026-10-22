@@ -332,7 +332,73 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     // the caller's local owns the storage. The conditional/match fresh
     // shape is reached only when the conditional/match IS the direct
     // argument (no binding local).
-    std::function<bool(const ast::Expr*)> hasFreshStorage =
+    // fix #6983 follow-up (§28.3, §27.3, v0.340): is every value a lambda
+    // literal returns a fresh owned producer? Expression body: its value.
+    // Block body: every `return E;` (no nested lambda is entered); a returned
+    // bare local counts only when it is a non-`using` local of the lambda with
+    // a fresh initializer that is provably never written. Fail-closed: a
+    // statement kind the walk does not enumerate, or no return at all, is
+    // "not fresh" (a borrow: leak-safe, never a use-after-free).
+    std::function<bool(const ast::Expr*)> hasFreshStorage;
+    auto returnValueFresh = [&](const ast::Expr* e) -> bool {
+        if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            auto* rl = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*rid));
+            auto* rd = rl ? dynamic_cast<const ast::LocalDecl*>(rl->decl)
+                          : nullptr;
+            return rd && !rd->isUsing && rd->initializer &&
+                   hasFreshStorage(rd->initializer.get()) &&
+                   opaqueLocalProvablyUnwritten(rd);
+        }
+        return hasFreshStorage(e);
+    };
+    std::function<bool(const ast::Stmt*, bool&, bool&)> returnsFresh =
+        [&](const ast::Stmt* st, bool& sawReturn, bool& ok) -> bool {
+        if (!st || !ok) return ok;
+        auto body = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v) {
+            for (const auto& b : v) returnsFresh(b.get(), sawReturn, ok);
+        };
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(st)) {
+            if (rs->value) {
+                sawReturn = true;
+                if (!returnValueFresh(rs->value.get())) ok = false;
+            }
+        } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(st)) {
+            body(ifs->ifBranch.body);
+            for (const auto& el : ifs->elifBranches) body(el.body);
+            body(ifs->elseBody);
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(st)) {
+            body(ws->body);
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(st)) {
+            body(fs->body);
+        } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(st)) {
+            body(db->body);
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(st)) {
+            body(ts->body);
+            for (const auto& arm : ts->catches)
+                returnsFresh(arm.body.get(), sawReturn, ok);
+            body(ts->finallyBody);
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(st)) {
+            for (const auto& arm : cs->arms) body(arm.stmts);
+        } else if (!dynamic_cast<const ast::LocalDecl*>(st) &&
+                   !dynamic_cast<const ast::LocalConstDecl*>(st) &&
+                   !dynamic_cast<const ast::ExpressionStmt*>(st) &&
+                   !dynamic_cast<const ast::AssignmentStmt*>(st) &&
+                   !dynamic_cast<const ast::ThrowStmt*>(st) &&
+                   !dynamic_cast<const ast::BreakStmt*>(st) &&
+                   !dynamic_cast<const ast::ContinueStmt*>(st) &&
+                   !dynamic_cast<const ast::IncrementStmt*>(st) &&
+                   !dynamic_cast<const ast::DiscardStmt*>(st)) {
+            ok = false;  // unknown statement kind: cannot enumerate returns
+        }
+        return ok;
+    };
+    auto lambdaBodyFresh = [&](const ast::LambdaExpr& lam) -> bool {
+        if (!lam.isBlockBody) return hasFreshStorage(lam.exprBody.get());
+        bool sawReturn = false, ok = true;
+        for (const auto& st : lam.stmts) returnsFresh(st.get(), sawReturn, ok);
+        return ok && sawReturn;
+    };
+    hasFreshStorage =
         [&](const ast::Expr* e) -> bool {
         if (!e) return false;
         if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
@@ -383,24 +449,31 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
                         if (ft->funcReturnOwned) return true;
                         // A lambda LITERAL's own function type never carries
                         // the `owned` marker (sema's LambdaExpr arm leaves
-                        // funcReturnOwned unset), so a `const f := lambda() =>
-                        // <owned producer>` is judged by its expression body:
-                        // fresh iff the body is. Any other plain function
-                        // value returns a borrow.
+                        // funcReturnOwned unset), so a local function value
+                        // declared as a lambda literal is judged by the
+                        // lambda's body: fresh iff EVERY returned value is. A
+                        // `const` cannot be reassigned; a `var` qualifies only
+                        // when provably never written (opaqueLocalProvably-
+                        // Unwritten, fail-closed). Anything else, or a body the
+                        // walk cannot enumerate, is a borrow.
                         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                                 ce->callee.get()))
                             if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
-                                    ctx_.exprSymbol(*id)))
-                                if (loc->isConst)
-                                    if (auto* lcd = dynamic_cast<
-                                            const ast::LocalConstDecl*>(
-                                            loc->decl))
-                                        if (auto* lam = dynamic_cast<
-                                                const ast::LambdaExpr*>(
-                                                lcd->value.get()))
-                                            if (!lam->isBlockBody)
-                                                return hasFreshStorage(
-                                                    lam->exprBody.get());
+                                    ctx_.exprSymbol(*id))) {
+                                const ast::LambdaExpr* lam = nullptr;
+                                if (auto* lcd = dynamic_cast<
+                                        const ast::LocalConstDecl*>(loc->decl))
+                                    lam = dynamic_cast<const ast::LambdaExpr*>(
+                                        lcd->value.get());
+                                else if (auto* ld = dynamic_cast<
+                                             const ast::LocalDecl*>(loc->decl))
+                                    if (!ld->isUsing &&
+                                        opaqueLocalProvablyUnwritten(ld))
+                                        lam = dynamic_cast<
+                                            const ast::LambdaExpr*>(
+                                            ld->initializer.get());
+                                if (lam) return lambdaBodyFresh(*lam);
+                            }
                         return false;
                     }
             }

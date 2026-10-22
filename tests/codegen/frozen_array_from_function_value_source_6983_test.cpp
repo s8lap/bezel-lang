@@ -112,3 +112,59 @@ BEZEL_TEST(frozen_array_from_function_value_source_6983,
         "Console.WriteLine($\"{x.Length} {x[1]}\");")),
         repeatLine("3 by", 100));
 }
+
+// Review rows (the #6983 review of 16481d33): a lambda literal bound to a
+// local is judged by its BODY, for `var` as well as `const`, expression body or
+// block body; a `var` written after its declaration is a borrow.
+
+// Row 5 — `var f := lambda() => <owned producer>` (the idiomatic spelling).
+BEZEL_TEST(frozen_array_from_function_value_source_6983,
+           var_lambda_expression_body_owned_stays_fresh_spec_28_3) {
+    expectClean(runAotChecked(program(
+        "var f := lambda() => M.MkArr(); "
+        "using var x := FrozenArray<string>.From(f()); "
+        "Console.WriteLine($\"{x.Length} {x[1]}\");")),
+        repeatLine("3 by", 100));
+}
+
+// Row 6 — `const f := lambda() => do return <owned producer>; end`.
+BEZEL_TEST(frozen_array_from_function_value_source_6983,
+           const_lambda_block_body_owned_stays_fresh_spec_28_3) {
+    expectClean(runAotChecked(program(
+        "const f := lambda() => do return M.MkArr(); end; "
+        "using var x := FrozenArray<string>.From(f()); "
+        "Console.WriteLine($\"{x.Length} {x[1]}\");")),
+        repeatLine("3 by", 100));
+}
+
+// Row 7 — block body returning an owned local.
+BEZEL_TEST(frozen_array_from_function_value_source_6983,
+           var_lambda_block_body_returning_owned_local_stays_fresh_spec_28_3) {
+    expectClean(runAotChecked(program(
+        "var f := lambda() => do var a := M.MkArr(); return a; end; "
+        "using var x := FrozenArray<string>.From(f()); "
+        "Console.WriteLine($\"{x.Length}\");")),
+        repeatLine("3", 100));
+}
+
+// Row 8 — a block body that returns a borrow is a borrow.
+BEZEL_TEST(frozen_array_from_function_value_source_6983,
+           var_lambda_block_body_returning_borrow_spec_28_3) {
+    expectClean(runAotChecked(program(
+        "using var h := new Prov(); var f := lambda() => do return h.Xs; end; "
+        "using var x := FrozenArray<string>.From(f()); "
+        "Console.WriteLine($\"{x.Length} {h.Xs[1]}\");")),
+        repeatLine("2 f2", 100));
+}
+
+// Row 9 — a `var` reassigned from an owned lambda to a borrow lambda stays a
+// borrow (the final value is the borrow; a write makes the decl untrusted).
+BEZEL_TEST(frozen_array_from_function_value_source_6983,
+           reassigned_var_lambda_ending_borrow_is_borrow_spec_28_3) {
+    expectClean(runAotChecked(program(
+        "using var h := new Prov(); var f := lambda() => M.MkArr(); "
+        "f := lambda() => h.Xs; "
+        "using var x := FrozenArray<string>.From(f()); "
+        "Console.WriteLine($\"{x.Length} {h.Xs[1]}\");")),
+        repeatLine("2 f2", 100));
+}
