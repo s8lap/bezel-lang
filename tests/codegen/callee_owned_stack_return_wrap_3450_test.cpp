@@ -140,6 +140,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -147,15 +148,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
@@ -218,7 +210,7 @@ BEZEL_TEST(callee_owned_stack_return_wrap_3450,
 BEZEL_TEST(callee_owned_stack_return_wrap_3450,
            callee_owned_stack_return_does_not_free_the_backing_early_28_9) {
     JitResult r = runAotChecked(kIntStackRepro);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix on 0c5ecd1: AddressSanitizer SEGV on unknown address 0x11, READ,
     // in bz$stackenum$i32$Current. `r.ran` is also the no-leak and
     // no-double-free assertion: the backing is now freed exactly once, by the
@@ -305,7 +297,7 @@ BEZEL_TEST(callee_owned_stack_return_wrap_3450,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix on 0c5ecd1 this cell SEGV'd on both compilers: the owning-head
     // drain divert fired inside `wrapStackAsIEnumerator`, and the
     // `freeCollectionSourceNow` that followed it freed the array the drain
@@ -345,7 +337,7 @@ BEZEL_TEST(callee_owned_stack_return_wrap_3450,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     // Identical on both sides of the fix — this arm's non-stack leaf is
     // untouched.
@@ -382,7 +374,7 @@ BEZEL_TEST(callee_owned_stack_return_wrap_3450,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "order=123"));
 }
@@ -429,7 +421,7 @@ BEZEL_TEST(callee_owned_stack_return_wrap_3450,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // `r.ran` false here means LSan reported the retained +1 per element that a
     // null disposer never releases (or an ASan fault from the pre-fix
     // freed-backing walk).

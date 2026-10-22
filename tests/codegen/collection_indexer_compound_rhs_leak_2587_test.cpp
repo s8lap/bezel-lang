@@ -70,20 +70,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAotChecked — AOT + ASan/LSan oracle
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// ASan toolchain skip-guard (matches the #2576 / #2567 test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // ----------------------------------------------------------------------
 // Probe A — CARDINAL: Array<string> compound += producer-RHS string concat.
@@ -226,7 +219,7 @@ const char* kPropertyCompound =
 BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
            array_string_compound_producer_rhs_does_not_leak_spec_23_3_28_9) {
     JitResult r = runAotChecked(kArrayCompoundProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);           // LSan-clean (the #2587 leak flips this)
     BEZEL_EXPECT_EQ(r.exitCode, 75);    // 24395 mod 256 — independent value check
 }
@@ -241,7 +234,7 @@ BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
 BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
            array_string_compound_borrow_remains_clean_spec_23_3_28_9) {
     JitResult r = runAotChecked(kArrayCompoundBorrow);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -254,7 +247,7 @@ BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
 BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
            array_int_compound_unaffected_spec_23_3_28_9) {
     JitResult r = runAotChecked(kArrayCompoundInt);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 86);    // 4950 mod 256
 }
@@ -268,7 +261,7 @@ BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
 BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
            user_indexer_compound_remains_clean_2567_spec_23_3_28_9) {
     JitResult r = runAotChecked(kUserIndexerCompound);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -280,6 +273,6 @@ BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
 BEZEL_TEST(codegen_collection_indexer_compound_rhs_leak_2587,
            property_compound_remains_clean_2576_spec_23_3_28_9) {
     JitResult r = runAotChecked(kPropertyCompound);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
 }

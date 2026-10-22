@@ -59,6 +59,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -66,15 +67,6 @@ using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Every program below returns sum over i in 1..20 of len("v-{i}")
 //   = 9*3 + 11*4 = 71.
@@ -266,7 +258,7 @@ void maybeDumpDiagnostics(const char* testName, const JitResult& r) {
 BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
            inlined_record_ctor_reassigning_string_param_spec_28_3) {
     JitResult r = runAotChecked(kInlinedRecordCtorReassignsStringParam);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));   // ASan toolchain unavailable fails the row (#3733)
     maybeDumpDiagnostics("reassigning_string_param_spec_28_3", r);
     BEZEL_EXPECT_TRUE(r.ran);          // no use-after-free AND no leak
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
@@ -291,7 +283,7 @@ BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
 BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
            inlined_record_ctor_assigns_param_to_string_field_spec_28_3) {
     JitResult r = runAotChecked(kInlinedRecordCtorAssignsParamToStringField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     maybeDumpDiagnostics("assigns_param_to_string_field_spec_28_3", r);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
@@ -303,7 +295,7 @@ BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
 BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
            inlined_record_ctor_reassigns_and_assigns_to_field_spec_28_3) {
     JitResult r = runAotChecked(kInlinedRecordCtorReassignsAndAssignsToField);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     maybeDumpDiagnostics("reassigns_and_assigns_to_field_spec_28_3", r);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
@@ -315,7 +307,7 @@ BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
 BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
            inlined_record_ctor_compound_concat_on_string_param_spec_4_6) {
     JitResult r = runAotChecked(kInlinedRecordCtorCompoundConcatOnStringParam);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     maybeDumpDiagnostics("compound_concat_on_string_param_spec_4_6", r);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);
@@ -328,7 +320,7 @@ BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
 BEZEL_TEST(codegen_build_record_value_caller_borrow_2720,
            inlined_record_ctor_never_assigns_takes_no_retain_spec_28_9) {
     JitResult r = runAotChecked(kInlinedRecordCtorNeverAssignsTakesNoRetain);
-    if (wasSkipped(r)) return;   // a spurious retain would leak here
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));   // a spurious retain would leak here
     maybeDumpDiagnostics("never_assigns_takes_no_retain_spec_28_9", r);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpected);

@@ -60,21 +60,13 @@
 #include <string>
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // =====================================================================
 // The issue's repro, byte-identical. A block-bodied (`get => do … end`)
@@ -254,7 +246,7 @@ const char* kBlockBodiedMultiStatement =
 BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
            block_bodied_string_producer_return_does_not_leak_spec_23_3) {
     JitResult r = runAotChecked(kBlockBodiedProducer);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));   // ASan toolchain unavailable fails the row (#3733)
     BEZEL_EXPECT_TRUE(r.ran);          // no LSan leak
     BEZEL_EXPECT_EQ(r.exitCode, 111);
 }
@@ -266,7 +258,7 @@ BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
 BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
            expression_bodied_twin_still_clean_spec_23_3) {
     JitResult r = runAotChecked(kExpressionBodiedProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 111);
 }
@@ -280,7 +272,7 @@ BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
 BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
            block_bodied_concat_producer_return_does_not_leak_spec_23_3) {
     JitResult r = runAotChecked(kBlockBodiedConcatProducer);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 111);
 }
@@ -294,7 +286,7 @@ BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
 BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
            block_bodied_borrow_return_still_borrows_spec_23_3) {
     JitResult r = runAotChecked(kBlockBodiedBorrow);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 71);
 }
@@ -310,7 +302,7 @@ BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
 BEZEL_TEST(codegen_block_bodied_getter_producer_2704,
            block_bodied_multi_statement_body_stays_in_borrow_path_spec_23_3) {
     JitResult r = runAotChecked(kBlockBodiedMultiStatement);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 71);
 }

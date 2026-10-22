@@ -112,6 +112,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -120,13 +121,6 @@ using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
 namespace {
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 std::string out(const JitResult& r) {
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
@@ -390,7 +384,7 @@ BEZEL_TEST(codegen_console_object_over_release_2875,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);   // pre-fix: 134 (free(): invalid pointer)
     JitResult r = runAotChecked(kClassThroughObject);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -406,7 +400,7 @@ BEZEL_TEST(codegen_console_object_over_release_2875,
     for (int i = 0; i < 21; ++i) expected += "abcd\n";
     BEZEL_EXPECT_TRUE(out(plain) == expected);   // pre-fix: one line, then empties
     JitResult r = runAotCheckedLenient(kStringThroughObject);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);   // pre-fix: SEGV in bz_string_to_utf8z
 }
@@ -419,7 +413,7 @@ BEZEL_TEST(codegen_console_object_over_release_2875,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);   // pre-fix: 134
     JitResult r = runAotChecked(kSentinelRenderArms);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -437,7 +431,7 @@ BEZEL_TEST(codegen_console_object_over_release_2875,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kMintingArmsReleasedOnce);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -458,7 +452,7 @@ BEZEL_TEST(codegen_console_object_over_release_2875,
     BEZEL_EXPECT_TRUE(out(plain).find("\nname\nabcd\npqrs\nself\n") !=
                       std::string::npos);
     JitResult r = runAotCheckedLenient(kOverReleaseAxes);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }

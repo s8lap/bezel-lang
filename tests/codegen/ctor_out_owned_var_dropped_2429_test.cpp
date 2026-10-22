@@ -65,23 +65,13 @@
 // per §22.4, §28.3, §28.8, #2411, #2429, #1387, #860
 
 #include "support/aot_support.hpp"   // runAot / runAotChecked — AOT + ASan/LSan
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
 using bezel::test::runAotChecked;
 
 namespace {
-
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic — guard
-// so an environment gap does not masquerade as this fix's own regression
-// (mirrors #1934 / the #1833 / #2411 tests' identical guard).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
 
 // Res — owned instance, destructor decrements a static counter read after
 // disposal: Res.alive == 0 at the end proves exactly-once disposal of every
@@ -134,7 +124,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "    return Res.alive; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     // Pre-fix: LSan flags the undischarged `n` as a Direct leak, so the
     // ASan-checked run itself fails (r.ran == false) even though the
     // ordinary (non-ASan) compile succeeded with no diagnostic at all.
@@ -170,7 +160,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "    return Res.alive; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -207,7 +197,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "    return Res.alive; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -240,7 +230,7 @@ BEZEL_TEST(ctor_out_owned_var_dropped_2429,
         "    return Res.alive; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -283,7 +273,7 @@ BEZEL_TEST(
         "    return Res.alive; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     // Res.alive settles at 0: +1/+1 mint (a, b), -1 explicit (x==a), -1

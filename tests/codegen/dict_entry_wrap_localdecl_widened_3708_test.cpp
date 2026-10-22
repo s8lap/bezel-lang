@@ -65,6 +65,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"  // checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -74,13 +75,6 @@ namespace {
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
-}
-
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
 }
 
 // (Never put a C++ `//` comment inside these literals: it is lexed as Bezel
@@ -129,7 +123,7 @@ BEZEL_TEST(dict_entry_wrap_localdecl_widened_3708,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "keys=3 total=4"));
 }
@@ -166,7 +160,7 @@ BEZEL_TEST(dict_entry_wrap_localdecl_widened_3708,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "reds=1 total=30"));
 }
@@ -204,7 +198,7 @@ BEZEL_TEST(dict_entry_wrap_localdecl_widened_3708,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "keys=6 present=2"));
 }
@@ -253,7 +247,7 @@ BEZEL_TEST(dict_entry_wrap_localdecl_widened_3708,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1600"));
 }
@@ -296,7 +290,7 @@ BEZEL_TEST(dict_entry_wrap_localdecl_widened_3708,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "keys=1200 present=400"));
 }
