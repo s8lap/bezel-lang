@@ -19058,7 +19058,7 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
                 callsNamedTypeSimpleName(pt));
             continue;
         }
-        checkAssignable(ctx_.exprType(*a.value), pt,
+        checkAssignableRangeSite(ctx_.exprType(*a.value), pt,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(ai + 1),
                         a.value.get(),  // per §7.4 / §27.6 (#1191)
@@ -22114,6 +22114,10 @@ void ExprTC::checkArgsAgainstParams(
                 *cl, paramTy, &calleeFreeParamNames);
         }
         TypeRef* argTy_ = ctx_.exprType(*a.value);
+        // fix #6998 review: a call argument admits `Range<T>` ->
+        // `IEnumerable<T>`; a record field / choice payload does not (#7029).
+        RangeIEnumSite rangeSite(
+            *this, rangeIEnumArgsAreFieldStores_ ? nullptr : a.value.get());
         checkAssignable(argTy_,
                         paramTy,
                         a.value->span.begin,
@@ -22463,10 +22467,15 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 // (narrowIntConstantToTarget), which checkArgsAgainstParams
                 // below calls per argument — so the hand-written pre-pass here,
                 // with its own third copy of the range table, is gone.
+                // fix #6998 review (#7029): positional record fields are
+                // stores, not call arguments.
+                bool savedFieldStores = rangeIEnumArgsAreFieldStores_;
+                rangeIEnumArgsAreFieldStores_ = true;
                 checkArgsAgainstParams(
                     fields, ne.args, ne.span.begin,
                     std::string("`new ") + std::string(t->name) + "`",
                     &ne, t);
+                rangeIEnumArgsAreFieldStores_ = savedFieldStores;
             } else {
                 checkPositionalNewArgsFromSymbols(ne, t);
             }
@@ -22692,7 +22701,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     const ast::CallArgument& a =
                         ne.args[static_cast<std::size_t>(b.paramToArg[j])];
                     if (!a.value) continue;
-                    checkAssignable(ctx_.exprType(*a.value),
+                    checkAssignableRangeSite(ctx_.exprType(*a.value),
                                     p->resolvedDeclType,
                                     a.value->span.begin,
                                     desc + ": argument " +
@@ -23906,7 +23915,7 @@ void ExprTC::checkImportedNewExprArgs(
         // non-generic imported ctor is untouched. §2.8.3 rule 4: the same
         // program must type the same way whichever artifact declared the type.
         TypeRef* formal = substituteMemberType(p->resolvedDeclType, &ne, t);
-        checkAssignable(ctx_.exprType(*a.value), formal,
+        checkAssignableRangeSite(ctx_.exprType(*a.value), formal,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(j + 1),
                         a.value.get());  // per §7.4 / §27.6 (#1191)

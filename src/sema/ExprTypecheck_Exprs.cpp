@@ -6540,10 +6540,15 @@ void ExprTC::checkChoiceCaseConstruction(const ast::CallExpr& ce) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
         target = ma->target.get();
     if (!target && !cts->genericParams.empty()) return;
+    // fix #6998 review (#7029): a choice payload is a store, not a call
+    // argument, so it does not admit `Range<T>` -> `IEnumerable<T>`.
+    bool savedFieldStores = rangeIEnumArgsAreFieldStores_;
+    rangeIEnumArgsAreFieldStores_ = true;
     checkArgsAgainstParams(ccs->caseDecl->payload, ce.args, ce.span.begin,
                            "case `" + std::string(cts->name) + "." +
                                std::string(ccs->name) + "`",
                            target, cts);
+    rangeIEnumArgsAreFieldStores_ = savedFieldStores;
 }
 
 // §17.1 result-type table for binary operators. Slice 3c covers the
@@ -13656,6 +13661,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // check.
         if (hasAscription && !ascriptionIsUnit && lam->exprBody &&
             returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_) {
+            RangeIEnumSite rangeSite(
+                *this, inAsyncContext_ ? nullptr : lam->exprBody.get());  // #7029
             checkAssignable(ctx_.exprType(*lam->exprBody), currentReturnType_,
                             lam->exprBody->span.begin, "returned value",
                             lam->exprBody.get());

@@ -1499,6 +1499,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             retSemaTy = expectedRetSema;
         }
     }
+    // fix #6998 review (§16.3, §5.1, §27.6, v0.340): a lambda whose body yields
+    // a `Range<T>` (`lambda() => 1..3`, or a block `return 1..3;`) at an
+    // `IEnumerable<T>` return slot. Sema target-types the fresh lambda and
+    // admits the conversion, but the body-derived return type is the by-value
+    // `%bz.range` struct while every caller of the `() -> IEnumerable<T>`
+    // value reads a `ptr` (SEGV in `lam$N`). The target's return slot is
+    // authoritative here, as for the nullable carrier above; both emit paths
+    // then wrap the range (boxForTarget's Range arm) against `retSemaTy`.
+    if (retSemaTy && expectedRetSema &&
+        isRangeToIEnumerableCoercion(retSemaTy, expectedRetSema)) {
+        retSemaTy = expectedRetSema;
+        retTy = lowerTypeRef(retSemaTy);
+    }
     // Also try to resolve via genericSubst_ when the sema return type is
     // an unresolved named generic param (e.g. C in Curried<A,B,C>).
     if (retTy == i32() && lam.exprBody) {
@@ -4044,6 +4057,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // fix #2925: `coerceInitializerToSlot` — §5.1's narrowing
                 // direction as well as its widening one, for the same reason
                 // as the method arrow-body and ReturnStmt sites.
+                // fix #6998 review: a `Range<T>` body at an `IEnumerable<T>`
+                // return slot (retSemaTy, see the derivation above) becomes the
+                // owning enumerator the caller disposes.
+                if (retSemaTy && isRangeToIEnumerableCoercion(
+                                     ctx_.exprType(*lam.exprBody), retSemaTy))
+                    v = boxForTarget(v, retSemaTy, lam.exprBody.get());
                 if (v->getType() != retTy)
                     v = coerceExprValueToSlot(
                         v, retTy, lam.exprBody.get(),

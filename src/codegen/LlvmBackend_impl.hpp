@@ -13135,6 +13135,15 @@ private:
     llvm::Value* wrapRangeAsOwnedIEnumerable(
         llvm::Value* rangeVal, const sema::TypeRef* rangeTy,
         const sema::TypeRef* iEnumTy);
+    // fix #6998 review (§16.3, §5.1, v0.340): is `src` -> `dst` the builtin
+    // `Range<T>` -> vtable-backed `IEnumerable<T>` coercion? Keyed on the
+    // builtin symbol (`isRangeType`, #6973), never the spelling, so a user
+    // `class Range: IEnumerable<int>` keeps the user-class wrap.
+    bool isRangeToIEnumerableCoercion(const sema::TypeRef* src,
+                                      const sema::TypeRef* dst) {
+        return isRangeType(src) && !src->nullable &&
+               isVtableBackedIEnumerableType(dst);
+    }
     llvm::Value* drainLazyPipelineToOwnedIEnumerable(
         llvm::Value* lazyVal, const sema::TypeRef* iEnumTy);
 

@@ -4854,6 +4854,20 @@ llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
     // reason. #2901's type-parameter resolution below is null-`v`-safe: it
     // reads only `declTy`.
     if (!declTy || !init) return v;
+    // fix #6998 review (§16.3, §5.1, v0.340): a `Range<T>` value reaching an
+    // `IEnumerable<T>` location (§16.3: `Range<T>` implements `IEnumerable<T>`).
+    // Sema admits the conversion only where the owning frame has a disposal
+    // edge — local initializer, call argument, non-`async` return, including a
+    // lambda's — and rejects it elsewhere (#7029); this function is the
+    // coercion the argument and return sites already call. The by-value
+    // `%bz.range` struct has no vtable — passing it raw put 32 bytes where a
+    // pointer was read — so it becomes the same owning enumerator the
+    // local-decl arm builds. Not a box: `lastBoxMint_` is untouched, so no
+    // caller releases it with `bz_box_release`. An already-pointer value was
+    // wrapped by an earlier call and passes through.
+    if (v && !v->getType()->isPointerTy() &&
+        isRangeToIEnumerableCoercion(ctx_.exprType(*init), declTy))
+        return wrapRangeAsOwnedIEnumerable(v, ctx_.exprType(*init), declTy);
     // fix #2901 (§8.6 / §14.1, v0.240): resolve a bare TYPE-PARAMETER target
     // through the active monomorphization before classifying it. §8.6 states,
     // verbatim: "When a value type is used where `Object` (or an interface

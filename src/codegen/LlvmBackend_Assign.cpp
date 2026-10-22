@@ -10063,12 +10063,16 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     }
     // fix #6998 (§16.3, §5.1, v0.340): a `Range<T>` value widened to
     // `IEnumerable<T>` (argument, local-decl init, RETURN).
-    // (A range expression's synthesized type carries the builtin Range symbol
-    // but no AST head, so `an` is empty there: test the symbol too.)
-    if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
-        (an == "Range" ||
-         (actualTy->declaration && actualTy->declaration->name == "Range"))) {
+    // fix #6998 review: keyed on the builtin symbol (`isRangeType`, #6973),
+    // not the spelling — a same-module `class Range: IEnumerable<int>` matched
+    // the old `name == "Range"` test and had `extractvalue` applied to its
+    // class pointer (a compiler SEGV); it now reaches the user-class arm. A
+    // POINTER value was already wrapped by `boxForTarget` (which every
+    // argument/return site runs first); it is still a fresh owning frame the
+    // site must dispose, so report the wrap without minting a second one.
+    if (isRangeToIEnumerableCoercion(actualTy, targetTy)) {
         if (outWrapMade) *outWrapMade = true;
+        if (v->getType()->isPointerTy()) return v;
         return wrapRangeAsOwnedIEnumerable(v, actualTy, targetTy);
     }
     // fix #3695 (stdlib §4.18 / stdlib §4.1 / §29.2 / §28.3, v0.286): SortedSet<T>'s arm of the

@@ -7247,8 +7247,26 @@ void ExprTC::checkAssignable(
             to->headName() == "IEnumerable") {
             if (from->genericArgs.size() == 1 && to->genericArgs.size() == 1 &&
                 from->genericArgs[0] && to->genericArgs[0] &&
-                typeRefEqual(from->genericArgs[0], to->genericArgs[0]))
+                typeRefEqual(from->genericArgs[0], to->genericArgs[0])) {
+                // fix #6998 review (§16.3, §5.1, v0.340; #7029): admitted only
+                // where codegen's owning enumerator frame has a disposal edge
+                // (`rangeIEnumSiteExpr_`). An assignment, a field, a
+                // borrowing-collection element etc. stored the raw 32-byte
+                // range in a pointer slot (stack overflow / SEGV); with a wrap
+                // it leaked every frame. Reject there, not silently miscompile.
+                if (fromExpr && fromExpr == rangeIEnumSiteExpr_) return;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("the ") + what + " converts a `Range<T>` to "
+                    "`IEnumerable<T>` (\xc2\xa7""16.3), which is not yet "
+                    "supported at this position; it is supported only as a "
+                    "local declaration's initializer, a method or constructor "
+                    "argument, or a returned value outside an `async` body (issue "
+                    "#7029) \xe2\x80\x94 "
+                    "declare `var e: IEnumerable<T> := a..b;` and iterate `e`, "
+                    "or keep the value typed `Range<T>`");
                 return;
+            }
             reportNotConvertible();
             return;
         }
@@ -20418,6 +20436,8 @@ void ExprTC::runMethodBody(
             isTaskShapedRef(ctx_.exprType(*exprBody));
         if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_ &&
             !section30_5OwnsPosition) {
+            RangeIEnumSite rangeSite(
+                *this, inAsyncContext_ ? nullptr : exprBody);  // #7029
             checkAssignable(
                 ctx_.exprType(*exprBody), currentReturnType_,
                 exprBody->span.begin, "returned value",
@@ -23221,7 +23241,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // — the same rule now applies at every §5.1 conversion site, so
                 // this arm no longer carries its own copy.
                 if (ld->initializer) {
-                    checkAssignable(
+                    checkAssignableRangeSite(
                         ctx_.exprType(*ld->initializer),
                         lsym->declType, ld->initializer->span.begin,
                         std::string("initializer for `") +
@@ -23824,6 +23844,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // Slice T3: a returned value must be primitive-assignable to
         // the callable's return type.
         if (!forgotAwait30_6 && rs->value && returnCtx_ == ReturnCtx::ValueMethod) {
+            // fix #6998 review (#7029): an `async` body's result is stored
+            // into the task frame, not handed to the caller as a fresh
+            // return: no `Range<T>` -> `IEnumerable<T>` there.
+            RangeIEnumSite rangeSite(
+                *this, inAsyncContext_ ? nullptr : rs->value.get());
             checkAssignable(
                 ctx_.exprType(*rs->value), currentReturnType_,
                 rs->value->span.begin, "returned value",

@@ -18352,7 +18352,14 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (declType) {
         sema::TypeRef* declTy0 = ctx_.resolvedType(*declType);
         llvm::Value* uv = unitValueForTarget(v, declTy0, init);
-        v = (uv != v) ? uv : boxForTarget(v, declTy0, init);
+        // fix #6998 review (§16.3, §5.1, v0.340): a `Range<T>` initializer of
+        // an `IEnumerable<T>` local is wrapped by the coercion below, whose
+        // `preIterWrap` comparison arms the scope-end dispose; letting
+        // boxForTarget wrap it first would hide the mint from that test.
+        if (uv != v)
+            v = uv;
+        else if (!isRangeToIEnumerableCoercion(ctx_.exprType(*init), declTy0))
+            v = boxForTarget(v, declTy0, init);
     }
     // §29.2 (#552): when a user class (implementing IEnumerable<T>) is assigned
     // to a local declared as IEnumerable<T>, wrap it in a thin sm-compatible
@@ -18593,11 +18600,11 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     v = wrapOwnedArrayAsIEnumerable(v, declTR);
                 else
                     v = wrapArrayAsIEnumerable(v, declTR);
-            } else if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
-                       (initTR->headName() == "Range" ||
-                        (initTR->declaration &&
-                         initTR->declaration->name == "Range"))) {
+            } else if (isRangeToIEnumerableCoercion(initTR, declTR) &&
+                       !v->getType()->isPointerTy()) {
                 // fix #6998 (§16.3, §5.1, v0.340): `Range<T>` -> IEnumerable<T>.
+                // fix #6998 review: keyed on the builtin symbol (#6973), so a
+                // user `class Range` takes the user-class arm below.
                 v = wrapRangeAsOwnedIEnumerable(v, initTR, declTR);
             } else if (initIsDictSet) {
                 // fix #1069 / stdlib §4.10 / §5: snapshot the hash table's element

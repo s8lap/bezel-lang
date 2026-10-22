@@ -4088,6 +4088,39 @@ private:
     // discarded, so the probe has no effect on the program's diagnostics.
     bool conversionAdmittedQuietly(TypeRef* from, TypeRef* to,
                                    SourceLocation loc);
+    // fix #6998 review (§16.3, §5.1, v0.340): the source expression whose
+    // `Range<T>` -> `IEnumerable<T>` conversion `checkAssignable` may admit,
+    // because its position gives codegen's owning enumerator frame a
+    // disposal edge: a local declaration's initializer, a method/constructor
+    // argument, a returned value (method or lambda; not `async`). Keyed on
+    // the expression itself, so a nested check (a lambda body, a
+    // conditional's leaves) never inherits the admission. Every other
+    // position rejects the conversion, naming #7029. Set only through
+    // `RangeIEnumSite`, which restores the previous value.
+    const ast::Expr* rangeIEnumSiteExpr_ = nullptr;
+    struct RangeIEnumSite {
+        const ast::Expr*& slot;
+        const ast::Expr* saved;
+        RangeIEnumSite(ExprTC& tc, const ast::Expr* admitted)
+            : slot(tc.rangeIEnumSiteExpr_), saved(tc.rangeIEnumSiteExpr_) {
+            slot = admitted;
+        }
+        ~RangeIEnumSite() { slot = saved; }
+    };
+    // True while checkArgsAgainstParams binds a record's positional FIELDS
+    // or a choice case's PAYLOAD: those arguments are stored in the value,
+    // not borrowed for a call, so they do not admit the conversion.
+    bool rangeIEnumArgsAreFieldStores_ = false;
+    // `checkAssignable` at a position that admits `Range<T>` ->
+    // `IEnumerable<T>` (see `rangeIEnumSiteExpr_`).
+    void checkAssignableRangeSite(
+        TypeRef* from, TypeRef* to, SourceLocation loc,
+        const std::string& what, const ast::Expr* fromExpr = nullptr,
+        const std::unordered_set<std::string_view>* freeTypeParamNames =
+            nullptr) {
+        RangeIEnumSite site(*this, fromExpr);
+        checkAssignable(from, to, loc, what, fromExpr, freeTypeParamNames);
+    }
     // fix #6005 / #6217 (§5.1, §22.6): may a NAMED operand `at` take an
     // `Object` operator parameter `pt`? Shared by both operator searches.
     bool operatorOperandReachesObject(TypeRef* at, TypeRef* pt);

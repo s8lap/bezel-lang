@@ -3734,6 +3734,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 llvm::Value* uv = unitValueForTarget(v, rnTy, rs->value.get());
                 v = (uv != v) ? uv : boxForTarget(v, rnTy, rs->value.get());
             }
+        // fix #6998 review (§16.3, §5.1, v0.340): a lambda has no return-type
+        // NODE, only its `retSemaTy` (currentLambdaReturnSemaTy_). A block
+        // lambda's `return 1..3;` at an `IEnumerable<T>` return slot is
+        // wrapped here exactly as the node-keyed arm above wraps a method's.
+        if (!returnReprTypeNode() && rs->value && v &&
+            currentLambdaReturnSemaTy_ &&
+            isRangeToIEnumerableCoercion(ctx_.exprType(*rs->value),
+                                         currentLambdaReturnSemaTy_))
+            v = boxForTarget(v, currentLambdaReturnSemaTy_, rs->value.get());
         // §29.2 / §4.3 (#1310): a value returned as `IEnumerable<T>` must be a
         // vtable-backed enumerator, not a raw bz_array_t* / class instance — the
         // caller's for-in and its scope-end iterEnumDispose both dispatch through
