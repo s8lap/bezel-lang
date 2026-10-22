@@ -1,10 +1,14 @@
 // Spec-derived regression test for issue #6970.
 //
 // Spec §19.5 (v0.340): "A bare type pattern `T` matches only non-null values."
-// §12.7 (v0.340): null is an instance of no type, so `v is R` over a null `v` is
-// false. §3.6 rule 2 / §19.3: a generic body decides per instantiation, so
-// `v is Object` at T = string? must give the answer the non-generic
-// `var n: string? := null; n is Object` gives.
+// §19.3 (v0.340), type parameters as pattern types: "all type-pattern rules
+// then apply to the substituted type, including the null rule". §3.6 rule 2: a
+// generic body decides per instantiation, so `v is Object` at T = string? must
+// give the answer the non-generic `var n: string? := null; n is Object` gives.
+//
+// A NULLABLE target (`v is string?`, `v is Object?`) is out of scope: the spec
+// does not decide `null is T?` (spec-question #7032). The guard rows at the end
+// pin those answers as UNCHANGED from origin/main, generic and non-generic.
 //
 // THE DEFECT. lowerTypeTest's string-operand arm read the `?` from the raw
 // operand type only. At `v: T` with T = string? the `?` sits on the substitution
@@ -113,4 +117,39 @@ BEZEL_TEST(codegen_is_object_generic_nullable_6970, nongeneric_agrees) {
             " Console.WriteLine(s is Object); Console.WriteLine(s is string); "
             " return 0; end Main; end C;"),
         std::string("False\nFalse\nTrue\nTrue\n"));
+}
+
+// GUARD rows (#7032, spec-question): a nullable target keeps the answer it had
+// before #6970, generic and non-generic. These rows cannot fail without the
+// fix by construction (they pin the unchanged pre-fix behaviour); they fail if
+// the #6970 predicate widens to a nullable target before #7032 is ruled. The
+// generic and non-generic null answers disagree today; #7032 asks which is
+// right, and the ruling will flip one pair.
+BEZEL_TEST(codegen_is_object_generic_nullable_6970, guard_nullable_target_generic_7032) {
+    BEZEL_EXPECT_EQ(
+        out(prog("string?",
+                 "Console.WriteLine(G<string?>(null)); "
+                 "Console.WriteLine(G<string?>(\"hi\")); "
+                 "Console.WriteLine(N<string?>(null)); "
+                 "Console.WriteLine(N<string?>(\"hi\"));")),
+        std::string("True\nTrue\nFalse\nFalse\n"));
+    BEZEL_EXPECT_EQ(
+        out(prog("Object?",
+                 "Console.WriteLine(G<string?>(null)); "
+                 "Console.WriteLine(G<string?>(\"hi\")); "
+                 "Console.WriteLine(N<string?>(null)); "
+                 "Console.WriteLine(N<string?>(\"hi\"));")),
+        std::string("True\nTrue\nFalse\nFalse\n"));
+}
+
+BEZEL_TEST(codegen_is_object_generic_nullable_6970, guard_nullable_target_nongeneric_7032) {
+    BEZEL_EXPECT_EQ(
+        out("module M; class C public static method Main(): int "
+            " var n: string? := null; var s: string? := \"hi\"; "
+            " Console.WriteLine(n is string?); Console.WriteLine(n is Object?); "
+            " Console.WriteLine(s is string?); Console.WriteLine(s is Object?); "
+            " Console.WriteLine(n is not string?); Console.WriteLine(n is not Object?); "
+            " Console.WriteLine(s is not string?); Console.WriteLine(s is not Object?); "
+            " return 0; end Main; end C;"),
+        std::string("False\nFalse\nTrue\nTrue\nTrue\nTrue\nFalse\nFalse\n"));
 }

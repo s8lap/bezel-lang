@@ -3843,12 +3843,18 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         (te.op == "is" || te.op == "is not" || te.op == "as")) {
         const bool instance = stringIsInstanceOf(rt);
         llvm::Value* holds = builder_.getInt1(instance);
-        // fix #6970 (§19.5, §12.7, v0.340): the `?` may sit on the operand
+        // fix #6970 (§19.5, §19.3, v0.340): the `?` may sit on the operand
         // (`v: string?`) or on the substitution (`v: T` at T = string?), where
         // resolveTypeParamRef returns the substitution's own TypeRef and the
-        // raw operand type carries no `?`. Read both, as #5234 does below: null
-        // is an instance of no type, so `v is Object` is false for a null v.
-        if (instance && (opTyRaw->nullable || opTyResolved->nullable))
+        // raw operand type carries no `?`. A bare type pattern matches only
+        // non-null values (§19.5), and at a generic body the rules apply to
+        // the substituted type (§19.3), so read the substitution's `?` too for
+        // a NON-nullable target (`v is Object`, `v is string`). A nullable
+        // target (`v is string?`) keeps its pre-#6970 answer: the spec does
+        // not decide `null is T?` (spec-question #7032).
+        const bool substNullable =
+            opTyResolved->nullable && !(rt && rt->nullable);
+        if (instance && (opTyRaw->nullable || substNullable))
             holds = builder_.CreateICmpNE(
                 obj, llvm::ConstantPointerNull::get(ptrTy()), "is.str.nonnull");
         if (te.op == "is") return holds;
@@ -3860,7 +3866,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             return llvm::Constant::getNullValue(nullableValueStructTy(&tmp));
         }
         if (!instance) return llvm::ConstantPointerNull::get(ptrTy());
-        return (opTyRaw->nullable || opTyResolved->nullable)
+        return opTyRaw->nullable
             ? builder_.CreateSelect(holds, obj,
                                     llvm::ConstantPointerNull::get(ptrTy()))
             : obj;
