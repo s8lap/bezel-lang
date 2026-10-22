@@ -4,62 +4,21 @@
 
 Memory management in general-purpose languages is still a trade-off. Manual management is fast but easy to get wrong: a missed free leaks, an early one corrupts memory. Garbage collection and automatic reference counting remove those errors, but they cost time and memory at run time, and a collector adds pauses. Bezel takes a third route. The compiler knows, for every object, where it is created, who owns it, and the exact point at which it is released. It inserts the release itself, on the normal path and when an exception passes through. The effect is close to C++'s RAII, except that the compiler checks the rules instead of leaving them to discipline. There is no collector, no hidden reference count on any class you write (only the opt-in `Shared<T>` counts), and no pause.
 
-```bezel
-module Example;
+**Try it:** a prebuilt compiler for Linux x86-64 is on the [releases page](https://github.com/s8lap/bezel-lang/releases). It is a single static download with its own linker, so nothing else needs to be installed ([Getting started](#getting-started)).
 
-public class Connection(host: string)
-  public readonly property Host: string := host;
-  public method Send(text: string)
-    Console.WriteLine($"{Host} <- {text}");
-  end Send;
-end Connection;
-
-public class Program
-  public static method Connect(host: string): owned Connection   // `owned`: the caller gets a new object
-    return new Connection(host);
-  end Connect;
-
-  public static method Retire(owned c: Connection)                // takes ownership...
-    c.Send("goodbye");
-  end Retire;                                                     // ...and disposes it here
-
-  public static method Main()
-    using var db := Connect("db");          // owned by this block, disposed at its end
-    var view := db;                         // a borrow: nothing copied, nothing transferred
-    view.Send("hello");
-
-    var cache := Connect("cache");
-    Retire(move cache);                     // a transfer is always written down
-  end Main;
-end Program;
-```
-
-> **Status: experimental.** The language design is close to settled and is written down in full; the compiler implements most of it and is still being brought up to the specification. Expect rough edges, and expect the language to change. There are no stability guarantees yet.
->
-> Most of the language already works. The remaining bugs are mostly memory errors where two features meet, and each one is tracked in the issue tracker. A few current examples:
-> - an owning collection created directly in an argument list leaks when a later argument throws ([#6670](https://github.com/s8lap/bezel-lang/issues/6670));
-> - a lambda that captures a string and is passed to a constructor leaks its capture cell when the calling method declares another local ([#6628](https://github.com/s8lap/bezel-lang/issues/6628));
-> - a plain `var` local holding an `Array<string?>` is never reclaimed, so its storage and every element leak ([#6516](https://github.com/s8lap/bezel-lang/issues/6516));
-> - a user-defined operator whose parameter is a standard collection interface crashes when its body uses the operand ([#6655](https://github.com/s8lap/bezel-lang/issues/6655)).
-
-## How memory management works
-
-The rules are in [chapter 28 of the specification](docs/Bezel_Language_Spec.md#sec-resource-management). They are long because they are precise, but most of their weight falls on the compiler, which tracks ownership through every statement. The programmer meets three ownership keywords, plus `using var` for a local disposed at the end of its block:
-
-- **`owned`** marks a slot that holds ownership: a parameter that takes it, a return type that hands it to the caller, or a field that holds it until it is replaced or its object is disposed.
-- **`move`** transfers ownership out of a named variable at a use site, for example into an `owned` parameter. Where the destination itself announces the transfer, such as a `return` or a store into an `owned` field, no marker is written. Either way, every transfer is visible in the source.
-- **`scoped`** marks a parameter, usually a callback, that the callee may keep rather than only use during the call. What it keeps lives no longer than an object the compiler can see, such as a `using var` local or `this`, so a lambda passed there may still capture borrowed locals declared before that object; until the object goes away, those locals cannot be moved, reassigned or disposed ([§28.14](docs/Bezel_Language_Spec.md#sec-scoped-callback-parameters)).
-
-A local initialized with a new object (`new`, or a call whose return type is `owned`) owns it. Every other reference is a **borrow**: a reference passed around without transferring ownership. The compiler checks that no borrow outlives what it borrows, so a dangling reference is a compile-time error.
-
-Only an object's owner may dispose it ([§28.6](docs/Bezel_Language_Spec.md#sec-who-may-dispose)). Calling `Dispose()` runs the object's cleanup, its destructor, and marks it disposed. It does not free the memory. The memory is always released by code the compiler inserts at the owner's release point: the end of a scope, the overwrite of a field, the disposal of the object that holds it. Using an object after it has been disposed raises `DisposedAccessException` in the default build instead of reading freed memory.
-
-Apart from `Shared<T>`, reference counting appears only where the runtime owns a value's lifetime: strings, boxed values and function values such as closures ([§28.9](docs/Bezel_Language_Spec.md#sec-runtime-managed-types)). The specification leaves that mechanism to the runtime, and the current one counts references. Shared ownership is never implicit: a program that wants it says so with `Shared<T>`, which counts its handles, and `Weak<T>` ([§28.13](docs/Bezel_Language_Spec.md#sec-shared-ownership)).
-
-## A longer example
+## A first look
 
 Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#'s, and its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design, built around ownership. The program below has a sum type (`choice`), `case` and `if` used as expressions, a function value, and lambdas passed to query operators:
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-example-dark.svg">
+  <img alt="A Bezel program: a Shape choice with Circle, Rectangle and Dot cases, an Area method written as a case expression, and a Main method that describes each shape with a lambda and sums their areas with Where, Select and Sum." src="docs/images/readme-example-light.svg">
+</picture>
+
+<details>
+<summary>The same program as text</summary>
+
+<!-- readme-example: editors/vscode/tools/readme-example.js renders this block as docs/images/readme-example-{light,dark}.svg -->
 ```bezel
 module Shapes;
 
@@ -98,7 +57,36 @@ public class Program
 end Program;
 ```
 
+</details>
+
 Adding a case to `Shape` makes both `case` expressions fail to compile until they handle it. [A Tour of Bezel](docs/Bezel_Tour.md) walks through the rest of the language.
+
+**Status: experimental.** The language design is close to settled and is written down in full; the compiler implements most of it and is still being brought up to the specification. Expect rough edges, and expect the language to change. There are no stability guarantees yet.
+
+Most of the language already works. The remaining bugs are mostly memory errors where two features meet, and each one is tracked in the issue tracker. A few current examples:
+- an owning collection created directly in an argument list leaks when a later argument throws ([#6670](https://github.com/s8lap/bezel-lang/issues/6670));
+- a lambda that captures a string and is passed to a constructor leaks its capture cell when the calling method declares another local ([#6628](https://github.com/s8lap/bezel-lang/issues/6628));
+- a plain `var` local holding an `Array<string?>` is never reclaimed, so its storage and every element leak ([#6516](https://github.com/s8lap/bezel-lang/issues/6516));
+- a user-defined operator whose parameter is a standard collection interface crashes when its body uses the operand ([#6655](https://github.com/s8lap/bezel-lang/issues/6655)).
+
+## How memory management works
+
+The rules are in [chapter 28 of the specification](docs/Bezel_Language_Spec.md#sec-resource-management). They are long because they are precise, but most of their weight falls on the compiler, which tracks ownership through every statement. The programmer meets three ownership keywords, plus `using var` for a local disposed at the end of its block:
+
+- **`owned`** marks a slot that holds ownership: a parameter that takes it, a return type that hands it to the caller, or a field that holds it until it is replaced or its object is disposed.
+- **`move`** transfers ownership out of a named variable at a use site, for example into an `owned` parameter. Where the destination itself announces the transfer, such as a `return` or a store into an `owned` field, no marker is written. Either way, every transfer is visible in the source.
+- **`scoped`** marks a parameter, usually a callback, that the callee may keep rather than only use during the call. What it keeps lives no longer than an object the compiler can see, such as a `using var` local or `this`, so a lambda passed there may still capture borrowed locals declared before that object; until the object goes away, those locals cannot be moved, reassigned or disposed ([§28.14](docs/Bezel_Language_Spec.md#sec-scoped-callback-parameters)).
+
+A local initialized with a new object (`new`, or a call whose return type is `owned`) owns it. Every other reference is a **borrow**: a reference passed around without transferring ownership. The compiler checks that no borrow outlives what it borrows, so a dangling reference is a compile-time error.
+
+Only an object's owner may dispose it ([§28.6](docs/Bezel_Language_Spec.md#sec-who-may-dispose)). Calling `Dispose()` runs the object's cleanup, its destructor, and marks it disposed. It does not free the memory. The memory is always released by code the compiler inserts at the owner's release point: the end of a scope, the overwrite of a field, the disposal of the object that holds it. Using an object after it has been disposed raises `DisposedAccessException` in the default build instead of reading freed memory.
+
+**Where reference counting is used.** No class you write is ever reference-counted. The specification lets the runtime manage four kinds of value by whatever mechanism it chooses: strings, `Type` tokens, boxed values and function values ([§28.9](docs/Bezel_Language_Spec.md#sec-runtime-managed-types)). It asks for counting only where a program opts in, with `Shared<T>` and `Weak<T>` ([§28.13](docs/Bezel_Language_Spec.md#sec-shared-ownership)). The current compiler and runtime count references in these places:
+
+- strings, boxed values and closures (`Type` tokens are interned and never freed);
+- the cell holding a variable that a lambda captures, but only when the compiler cannot prove where the lambda's environment dies, for example when a capturing lambda is passed to another method. The last holder frees the cell;
+- `Shared<T>` and `Weak<T>` handles;
+- runtime internals that never appear as user objects: tasks, cancellation token sources, and the shared cores of `Semaphore` and the atomics.
 
 ## Why Bezel
 
@@ -109,12 +97,19 @@ Adding a case to `Shape` makes both `case` expressions fail to compile until the
 
 ## Getting started
 
-Bezel builds on Linux with clang and LLVM 21. It is developed and tested on Fedora; other platforms are untested ([#446](https://github.com/s8lap/bezel-lang/issues/446)).
+**Prebuilt compiler.** Download the archive for the latest build from the [releases page](https://github.com/s8lap/bezel-lang/releases) (Linux x86-64; builds are pre-releases for now). `bin/bezelc` is fully static and links programs with the toolchain bundled beside it, and the programs it produces are fully static too, so they run on any x86-64 Linux. The archive's own `README.md` covers the options, such as `--link=system` for AddressSanitizer builds.
+
+```sh
+tar xzf bezelc-<version>-linux-x86_64.tar.gz
+export PATH="$PWD/bezelc-<version>-linux-x86_64/bin:$PATH"
+```
+
+**From source.** Bezel builds on Linux with clang and LLVM 21. It is developed and tested on Fedora; other platforms are untested ([#446](https://github.com/s8lap/bezel-lang/issues/446)).
 
 ```sh
 sudo dnf install cmake clang llvm llvm-devel      # LLVM 21
 cmake -B build -DCMAKE_CXX_COMPILER=clang++
-cmake --build build -j$(nproc)
+cmake --build build -j$(nproc)                    # the compiler is build/bezelc
 ```
 
 Write `hello.bzl`:
@@ -133,7 +128,7 @@ end Program;
 and run it:
 
 ```sh
-./build/bezelc hello.bzl -o hello && ./hello
+bezelc hello.bzl -o hello && ./hello
 ```
 
 `Main`'s return value becomes the exit code. Libraries compile separately and are imported by their object file: `bezelc -c lib.bzl -o lib.o`, then `bezelc app.bzl --import lib.o -o app`.
@@ -179,6 +174,10 @@ cmake --build build --target check-lit      # the diagnostic suite (needs lit an
 scripts/gate.sh                             # both, with a combined total
 scripts/check_docs.sh                       # the documentation checks
 ```
+
+## Acknowledgements
+
+Bezel was built with [Claude](https://www.anthropic.com/claude), Anthropic's AI model, working through Claude Code under the project owner's direction. Claude wrote most of the specification text, the compiler, its runtime and its tests, and reviewed its own work through independent review passes; the commits it wrote carry a `Co-Authored-By: Claude` trailer. The project owner directs the design and decides what lands.
 
 ## License
 
