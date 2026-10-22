@@ -13401,6 +13401,55 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                    t->primitive == P::UInt || t->primitive == P::ULong ||
                    t->primitive == P::Char;
         };
+        // fix #6948 (spec §14.5, §5.1, v0.340): with an explicit type list
+        // `Math.Max<T>(a, b)` every argument converts to T at the call site (a
+        // literal or `const` constant-narrows, a non-literal widens by §5.1).
+        // The lowering used the operands' own LLVM types, so `Max<long>(l, i)`
+        // compared i64 with i32 (verifier failure). `mathExplicitT` is the
+        // resolved T when it is a numeric primitive, else null (no list, or a
+        // non-primitive T: the existing arms handle those). The comparison
+        // signedness is T's own, and an operand converts by ITS source type's
+        // signedness (zext/uitofp for unsigned, sext/sitofp otherwise).
+        const sema::TypeRef* mathExplicitT = nullptr;
+        if ((m == "Min" || m == "Max" || m == "Clamp") &&
+            ma->typeArgs.size() == 1 && ma->typeArgs[0]) {
+            const sema::TypeRef* ta =
+                resolveTypeParamRef(ctx_.resolvedType(*ma->typeArgs[0]));
+            if (ta && !ta->nullable && ta->kind == sema::TypeRef::Kind::Primitive &&
+                ta->primitive != sema::PrimitiveType::Decimal &&
+                ta->primitive != sema::PrimitiveType::String &&
+                ta->primitive != sema::PrimitiveType::Bool)
+                mathExplicitT = ta;
+        }
+        auto mathConvertToT = [&](llvm::Value* v, const ast::Expr* e)
+                -> llvm::Value* {
+            if (!mathExplicitT || !v) return v;
+            llvm::Type* dst = lowerTypeRef(mathExplicitT);
+            llvm::Type* src = v->getType();
+            if (!dst || src == dst) return v;
+            const sema::TypeRef* st =
+                e ? resolveTypeParamRef(ctx_.exprType(*e)) : nullptr;
+            const bool srcUns = st && typeRefIsUnsigned(st);
+            if (src->isIntegerTy() && dst->isIntegerTy()) {
+                if (src->getIntegerBitWidth() < dst->getIntegerBitWidth())
+                    return srcUns ? builder_.CreateZExt(v, dst, "mm.conv")
+                                  : builder_.CreateSExt(v, dst, "mm.conv");
+                return builder_.CreateTrunc(v, dst, "mm.conv");
+            }
+            if (src->isIntegerTy() && dst->isFloatingPointTy())
+                return srcUns ? builder_.CreateUIToFP(v, dst, "mm.conv")
+                              : builder_.CreateSIToFP(v, dst, "mm.conv");
+            if (src->isFloatingPointTy() && dst->isFloatingPointTy())
+                return src->getPrimitiveSizeInBits() < dst->getPrimitiveSizeInBits()
+                    ? builder_.CreateFPExt(v, dst, "mm.conv")
+                    : builder_.CreateFPTrunc(v, dst, "mm.conv");
+            return v;
+        };
+        // Unsigned ordering predicate: T's own under an explicit list.
+        auto mathUnsignedCmp = [&](const ast::Expr* firstArg) -> bool {
+            return mathExplicitT ? typeRefIsUnsigned(mathExplicitT)
+                                 : mathOperandIsUnsigned(firstArg);
+        };
         // Fails CLOSED: a null result falls through to #2786's guard, which
         // reports a spec-cited Error, rather than to the aborting SIToFP.
         auto emitDecCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
@@ -13723,12 +13772,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* a = lowerExpr(*call.args[0].value);
             llvm::Value* b = lowerExpr(*call.args[1].value);
             if (!a || !b) return nullptr;
+            a = mathConvertToT(a, call.args[0].value.get());   // #6948
+            b = mathConvertToT(b, call.args[1].value.get());
             if (m == "Min") {
                 // Handle int or double operands.
                 if (a->getType()->isIntegerTy()) {
                     // per stdlib §2.2 (v0.340): ordering is T's own CompareTo,
                     // so byte/ushort/uint/ulong/char order unsigned (#6864).
-                    llvm::Value* cmp = mathOperandIsUnsigned(call.args[0].value.get())
+                    llvm::Value* cmp = mathUnsignedCmp(call.args[0].value.get())
                         ? builder_.CreateICmpULT(a, b)
                         : builder_.CreateICmpSLT(a, b);
                     return builder_.CreateSelect(cmp, a, b, "min.result");
@@ -13774,7 +13825,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
             if (m == "Max") {
                 if (a->getType()->isIntegerTy()) {
-                    llvm::Value* cmp = mathOperandIsUnsigned(call.args[0].value.get())
+                    llvm::Value* cmp = mathUnsignedCmp(call.args[0].value.get())
                         ? builder_.CreateICmpUGT(a, b)
                         : builder_.CreateICmpSGT(a, b);
                     return builder_.CreateSelect(cmp, a, b, "max.result");
@@ -13869,8 +13920,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* lo  = lowerExpr(*call.args[1].value);
             llvm::Value* hi  = lowerExpr(*call.args[2].value);
             if (!val || !lo || !hi) return nullptr;
+            val = mathConvertToT(val, call.args[0].value.get());   // #6948
+            lo  = mathConvertToT(lo, call.args[1].value.get());
+            hi  = mathConvertToT(hi, call.args[2].value.get());
             if (val->getType()->isIntegerTy()) {
-                const bool uns = mathOperandIsUnsigned(call.args[0].value.get());
+                const bool uns = mathUnsignedCmp(call.args[0].value.get());
                 llvm::Value* clamped = builder_.CreateSelect(
                     uns ? builder_.CreateICmpULT(val, lo)
                         : builder_.CreateICmpSLT(val, lo), lo, val);
