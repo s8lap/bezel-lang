@@ -7189,7 +7189,8 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
         // literal that does not fold (a `ulong` above LLONG_MAX) is not
         // decided here.
         auto adoptionOutOfRange = [&](const ast::Expr* constExpr,
-                                      const TypeRef* target) -> bool {
+                                      const TypeRef* target,
+                                      bool report = true) -> bool {
             std::string shown;
             if (isLiteralDerivedExpr(constExpr)) {
                 auto cv = foldIntConstExprTC(*constExpr);
@@ -7215,6 +7216,7 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
                 shown = big ? std::to_string(static_cast<unsigned long long>(*tv))
                             : std::to_string(static_cast<long long>(*tv));
             }
+            if (!report) return true;
             ctx_.diagnostics().report(
                 Severity::Error, loc,
                 "operator `" + std::string(op) + "`: the constant `" + shown +
@@ -7278,12 +7280,31 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
                                  const_cast<TypeRef*>(target));
             return false;
         };
-        if (isTrueIntegerType(rt->primitive) &&
-            isConstantSource(leftExpr, lt, rt))
+        // A literal-derived operand is decided first, exactly as before
+        // #6914: in `U - 1` (U: a `uint` const above int's range) the literal
+        // `1` adopts `uint`; trying the named `U` against `int` first
+        // rejected a valid program (#6914 review). A named constant is then
+        // tried only against a non-literal other operand, and adopts only
+        // when its value fits; when both operands are named constants the
+        // one that fits adopts. Only when no candidate fits is the §5.1
+        // range error reported.
+        if (isLiteralDerivedExpr(leftExpr) &&
+            isTrueIntegerType(rt->primitive))
+            return adoptionOutOfRange(leftExpr, rt);
+        if (isLiteralDerivedExpr(rightExpr) &&
+            isTrueIntegerType(lt->primitive))
+            return adoptionOutOfRange(rightExpr, lt);
+        const bool leftSource = isTrueIntegerType(rt->primitive) &&
+                                isConstantSource(leftExpr, lt, rt);
+        const bool rightSource = isTrueIntegerType(lt->primitive) &&
+                                 isConstantSource(rightExpr, rt, lt);
+        if (leftSource && !adoptionOutOfRange(leftExpr, rt, /*report=*/false))
             return adopt(leftExpr, lt, rt);
-        if (isTrueIntegerType(lt->primitive) &&
-            isConstantSource(rightExpr, rt, lt))
+        if (rightSource &&
+            !adoptionOutOfRange(rightExpr, lt, /*report=*/false))
             return adopt(rightExpr, rt, lt);
+        if (leftSource) return adoptionOutOfRange(leftExpr, rt);
+        if (rightSource) return adoptionOutOfRange(rightExpr, lt);
     }
     const bool bothNumeric = isPromotablePrimitive(lt->primitive) &&
                              isPromotablePrimitive(rt->primitive);

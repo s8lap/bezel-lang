@@ -116,3 +116,48 @@ BEZEL_TEST(named_constant_operand_narrowing_6914,
                                "has no implicit conversion between operand "
                                "types `ulong` and `int`"));
 }
+
+// #6914 review: a named constant whose value does NOT fit the other operand's
+// type must not pre-empt a literal-derived operand that does. In `U - 1`
+// (U: a `uint` const above int's range) the literal `1` adopts `uint` (§5.1),
+// as it did before the fix; the first #6914 attempt tried `U` against `int`
+// first and rejected every row here with "the constant `4000000000` does not
+// fit `int`". Probes: /var/tmp/bezel-scratch/r34-6869-rv/p/ (q1, q2, q5, r1,
+// r2, r4, r6, r7, q6).
+BEZEL_TEST(named_constant_operand_narrowing_6914,
+           literal_operand_adopts_before_out_of_range_named_constant_spec_5_1) {
+    BEZEL_EXPECT_EQ(prints("", "const U: uint := 3000000000U; var v: uint := 5U; "
+                               "Console.WriteLine(U + v); "
+                               "Console.WriteLine(U > v); "
+                               "Console.WriteLine(U > 5);"),
+                    std::string("3000000005\nTrue\nTrue\n"));
+    BEZEL_EXPECT_EQ(prints("", "const U: uint := 4000000000U; "
+                               "Console.WriteLine(U - 1); "
+                               "Console.WriteLine(U + 1); "
+                               "Console.WriteLine(U > 1);"),
+                    std::string("3999999999\n4000000001\nTrue\n"));
+    BEZEL_EXPECT_EQ(prints("", "const U: uint := 4000000000U; "
+                               "Console.WriteLine(U * 1); "
+                               "Console.WriteLine(U = 4000000000U); "
+                               "Console.WriteLine(U <> 1);"),
+                    std::string("4000000000\nTrue\nTrue\n"));
+    BEZEL_EXPECT_EQ(prints("private const U: uint := 4000000000U;",
+                           "Console.WriteLine(U - 1); "
+                           "Console.WriteLine(U >> 1); "
+                           "Console.WriteLine(U & 255);"),
+                    std::string("3999999999\n2000000000\n0\n"));
+    BEZEL_EXPECT_EQ(prints("", "const U: uint := 4000000000U; "
+                               "var u: uint := 4000000000U; "
+                               "Console.WriteLine(u > U - 1);"),
+                    std::string("True\n"));
+    BEZEL_EXPECT_EQ(prints("", "const U: uint := 4000000000U; "
+                               "const W: uint := U - 1; Console.WriteLine(W);"),
+                    std::string("3999999999\n"));
+    BEZEL_EXPECT_EQ(prints("", "const U: uint := 4000000000U; "
+                               "Console.WriteLine(U > 1 and U < 4000000001U);"),
+                    std::string("True\n"));
+    // Two named constants: the one whose value fits adopts (`V` -> `uint`).
+    BEZEL_EXPECT_EQ(prints("", "const U: uint := 4000000000U; const V: int := 5; "
+                               "Console.WriteLine(U + V);"),
+                    std::string("4000000005\n"));
+}
