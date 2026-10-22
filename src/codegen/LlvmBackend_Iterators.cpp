@@ -111,9 +111,67 @@ void Emitter::reserveCaseBindingSlots(
             }
     for (const auto* bp : bps) {
         if (bp->name == "_") continue;
-        llvm::Type* ty = tys[bp] ? lowerTypeRef(tys[bp]) : ptrTy();
-        out.push_back({bp, ty});
+        // #7006 fix-forward: the shared slot rule, not a bare lowerTypeRef —
+        // a unit-typed binding needs unitStorageTy (#3453), a lambda-captured
+        // one the ptr widening + pre-box record (#808/#3484).
+        out.push_back({bp, suspendLocalSlotTy(bp, nullptr, nullptr, tys[bp])});
     }
+}
+
+// #461 / #3453 / #3527 / #808 / #3484 (§30.1, §29.3, §4.7): the frame SLOT
+// type for a suspend-live local. Hoisted out of collectSuspendLocals (#7006
+// fix-forward) so reserveCaseBindingSlots derives a case binding's slot by
+// the SAME rule (unit storage, captured-local widening, pre-box record); the
+// rationale for each step is at the call site's comment and inline below.
+llvm::Type* Emitter::suspendLocalSlotTy(const ast::Node* node,
+                                         const ast::Type* declType,
+                                         const ast::Expr* init,
+                                         const sema::TypeRef* knownRt) {
+    llvm::Type* ty = ptrTy();
+    if (knownRt) {
+        ty = lowerTypeRef(knownRt);
+    } else if (declType) {
+        if (auto* rt = ctx_.resolvedType(*declType)) ty = lowerTypeRef(rt);
+    } else if (init) {
+        if (auto* rt = ctx_.exprType(*init)) ty = lowerTypeRef(rt);
+    }
+    // fix #3453 (§4.7 / §30.1 / §29.3, v0.283): a frame field is a STRUCT
+    // MEMBER, and `void` is not a legal one. `lowerTypeRef` answers `void`
+    // for exactly one thing — the unit type's `Kind::Unit` arm (§4.7, "the
+    // type with exactly one value"); every other arm answers a sized type.
+    // A `var u: () := ();` in an `async` body or an iterator body therefore
+    // planned a `void` field here, and the first `DataLayout` query over the
+    // finished struct (`getTypeAllocSize(stateStructTy)`, the frame's
+    // `calloc` size) executed LLVM's `llvm_unreachable` inside
+    // `StructLayout::StructLayout` — a `ud2` in a release LLVM, so `bezelc`
+    // died of SIGILL with NO DIAGNOSTIC OF ANY SEVERITY (measured rc=132 on
+    // ef339fa for a unit local in an async body, in an iterator body, in an
+    // async body containing a lambda, and for the §21.1 `const` spelling).
+    //
+    // §4.7 gives the unit type exactly one value, so it carries no
+    // information and one inert byte is a faithful slot. This is the SAME
+    // substitution `entryAlloca` makes structurally for the local's own
+    // alloca and `lowerParamType`/`lowerParamTypeRef` make at the signature
+    // — asked here rather than re-derived, and asked at the ONE place both
+    // state-machine frame builders (`buildStateMachineFrame` and
+    // `emitAsyncLambda`'s own layout) decide a local's slot type, so neither
+    // can drift. The two MUST agree: the per-suspend spill stores
+    // `alloca->getAllocatedType()` bytes into this field, and `entryAlloca`
+    // already gives the unit local an `i8` alloca.
+    ty = unitStorageTy(ty);  // fix #3527: the shared spelling
+    if (frameCapturedLocals_.count(static_cast<const void*>(node))) {
+        // fix #3484 follow-up (§27.5 / §30.1, v0.283): remember what the
+        // field WOULD have been. #808 widens this one to ptr because
+        // lowerLambda MOVES it onto the cell holder; the pre-boxing alloca
+        // is then left with no field, and #3484 made that alloca the
+        // fall-back address a null holder reads. buildStateMachineFrame
+        // gives it a field of this exact type so the fall-back survives a
+        // suspension. Precise type, not ptr — a record/value-struct local
+        // spilled into a ptr-width field is the #461 overflow.
+        frameLocalPreBoxTy_[node] = ty;
+        ty = ptrTy();
+    }
+    return ty;
 }
 
 void Emitter::collectSuspendLocals(
@@ -145,51 +203,7 @@ void Emitter::collectSuspendLocals(
     auto frameSlotTy = [&](const ast::Node* node, const ast::Type* declType,
                            const ast::Expr* init,
                            const sema::TypeRef* knownRt = nullptr) -> llvm::Type* {
-        llvm::Type* ty = ptrTy();
-        if (knownRt) {
-            ty = lowerTypeRef(knownRt);
-        } else if (declType) {
-            if (auto* rt = ctx_.resolvedType(*declType)) ty = lowerTypeRef(rt);
-        } else if (init) {
-            if (auto* rt = ctx_.exprType(*init)) ty = lowerTypeRef(rt);
-        }
-        // fix #3453 (§4.7 / §30.1 / §29.3, v0.283): a frame field is a STRUCT
-        // MEMBER, and `void` is not a legal one. `lowerTypeRef` answers `void`
-        // for exactly one thing — the unit type's `Kind::Unit` arm (§4.7, "the
-        // type with exactly one value"); every other arm answers a sized type.
-        // A `var u: () := ();` in an `async` body or an iterator body therefore
-        // planned a `void` field here, and the first `DataLayout` query over the
-        // finished struct (`getTypeAllocSize(stateStructTy)`, the frame's
-        // `calloc` size) executed LLVM's `llvm_unreachable` inside
-        // `StructLayout::StructLayout` — a `ud2` in a release LLVM, so `bezelc`
-        // died of SIGILL with NO DIAGNOSTIC OF ANY SEVERITY (measured rc=132 on
-        // ef339fa for a unit local in an async body, in an iterator body, in an
-        // async body containing a lambda, and for the §21.1 `const` spelling).
-        //
-        // §4.7 gives the unit type exactly one value, so it carries no
-        // information and one inert byte is a faithful slot. This is the SAME
-        // substitution `entryAlloca` makes structurally for the local's own
-        // alloca and `lowerParamType`/`lowerParamTypeRef` make at the signature
-        // — asked here rather than re-derived, and asked at the ONE place both
-        // state-machine frame builders (`buildStateMachineFrame` and
-        // `emitAsyncLambda`'s own layout) decide a local's slot type, so neither
-        // can drift. The two MUST agree: the per-suspend spill stores
-        // `alloca->getAllocatedType()` bytes into this field, and `entryAlloca`
-        // already gives the unit local an `i8` alloca.
-        ty = unitStorageTy(ty);  // fix #3527: the shared spelling
-        if (frameCapturedLocals_.count(static_cast<const void*>(node))) {
-            // fix #3484 follow-up (§27.5 / §30.1, v0.283): remember what the
-            // field WOULD have been. #808 widens this one to ptr because
-            // lowerLambda MOVES it onto the cell holder; the pre-boxing alloca
-            // is then left with no field, and #3484 made that alloca the
-            // fall-back address a null holder reads. buildStateMachineFrame
-            // gives it a field of this exact type so the fall-back survives a
-            // suspension. Precise type, not ptr — a record/value-struct local
-            // spilled into a ptr-width field is the #461 overflow.
-            frameLocalPreBoxTy_[node] = ty;
-            ty = ptrTy();
-        }
-        return ty;
+        return suspendLocalSlotTy(node, declType, init, knownRt);
     };
     for (const auto& s : body) {
         if (!s) continue;

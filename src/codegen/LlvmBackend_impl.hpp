@@ -16083,6 +16083,12 @@ private:
     void reserveCaseBindingSlots(
         const std::vector<const ast::BindingPattern*>& bps,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
+    // §30.1 / §29.3 / §4.7: a suspend-live local's frame-slot type (shared by
+    // collectSuspendLocals and reserveCaseBindingSlots).
+    llvm::Type* suspendLocalSlotTy(const ast::Node* node,
+                                   const ast::Type* declType,
+                                   const ast::Expr* init,
+                                   const sema::TypeRef* knownRt);
     // fix #5253: every bare-identifier pre-declared `out` argument in `body`.
     void collectByRefArgIdents(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
