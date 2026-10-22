@@ -14415,7 +14415,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // vtable — a jump to a null pc. Same wrap, same lazy-pipeline
                 // ownership, same scope-end disposal of the wrapper frame
                 // (`wrapMade`) as the local-callee arm (#2298/#1069/#1923).
-                if (!byRef && formalTy && v->getType()->isPointerTy()) {
+                // fix #6998 review 2 (§16.3, §5.1, v0.340): a by-value
+                // `Range<T>` struct at an imported `IEnumerable<T>` formal is
+                // wrapped here too (wrapAsIEnumerableForTarget's Range arm
+                // builds the owning enumerator and reports `wrapMade`); the
+                // pointer gate alone passed the raw `%bz.range` to the callee
+                // (IR verification failure).
+                if (!byRef && formalTy &&
+                    (v->getType()->isPointerTy() ||
+                     isRangeToIEnumerableCoercion(ctx_.exprType(*a.value),
+                                                  formalTy))) {
                     bool lazyArgWrapped =
                         formalTy->kind == sema::TypeRef::Kind::Named &&
                         !formalTy->declaration &&

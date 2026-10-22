@@ -302,3 +302,106 @@ REJECT_ROW(async_return_rejected_spec_16_3,
     "public static async method Main(): Task<int> "
     "var e := await Get(); var s := 0; for var x in e do s += x; end; "
     "Console.WriteLine($\"{s}\"); return 0; end Main; end M;")
+
+// REVIEW 2 FIX-FORWARD (§16.3, §5.1, v0.340): an IMPORTED callee. Sema admitted
+// a `Range<T>` argument at an imported method's / constructor's
+// `IEnumerable<T>` formal, but the imported-call lowering wraps only pointer
+// arguments, so the raw `%bz.range` struct reached the callee and every row
+// below failed with "Call parameter type does not match function signature"
+// (IR verification). The imported METHOD arm now wraps the range like the
+// local-callee arm (owning enumerator, disposed at the end of the call's full
+// expression). The imported CONSTRUCTOR lowering has no `IEnumerable<T>`
+// argument wrap at all, so there the conversion is rejected naming #7029.
+namespace {
+
+const char* kImpLib =
+    "module Lib6998; "
+    "public class K "
+    "  public static method Sum(xs: IEnumerable<int>): int "
+    "    var n := 0; for var x in xs do n += x; end; return n; "
+    "  end Sum; "
+    "  public method Isum(xs: IEnumerable<int>): int "
+    "    var n := 0; for var x in xs do n += x; end; return n; "
+    "  end Isum; "
+    "  public static method Gen<T>(xs: IEnumerable<T>): int "
+    "    var n := 0; for var x in xs do n += 1; end; return n; "
+    "  end Gen; "
+    "end K; "
+    "public class Kc "
+    "  public n: int := 0; "
+    "  public constructor(xs: IEnumerable<int>) "
+    "    for var x in xs do n += x; end; "
+    "  end constructor; "
+    "end Kc; ";
+
+JitResult runImp(const std::string& body) {
+    std::vector<bezel::test::ModuleSource> mods;
+    mods.push_back({"Lib6998", kImpLib});
+    mods.push_back({"M6998imp",
+                    "module M6998imp; import Lib6998; "
+                    "public class M public static method Main(): int " +
+                        body + " return 0; end Main; end M;"});
+    return bezel::test::runAotModulesChecked(std::move(mods), "M6998imp");
+}
+
+}  // namespace
+
+// Pre-fix: IR verification failure (`%bz.range` at the imported `ptr` formal).
+// The 100x loop leaks the drained array per iteration if the wrapper's
+// disposal is not registered.
+BEZEL_TEST(codegen_range_to_ienumerable_6998,
+           imported_static_method_range_argument_spec_16_3) {
+    JitResult r = runImp(
+        "var t := 0; var i := 0; "
+        "while i < 100 do t += K.Sum(1..4); i += 1; end; "
+        "var r: Range<int> := 2..5; "
+        "Console.WriteLine($\"{t} {K.Sum(r)}\");");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("1000 14\n"));
+}
+
+BEZEL_TEST(codegen_range_to_ienumerable_6998,
+           imported_instance_method_range_argument_spec_16_3) {
+    JitResult r = runImp(
+        "var k := new K(); var t := 0; var i := 0; "
+        "while i < 100 do t += k.Isum(1..3); i += 1; end; "
+        "Console.WriteLine($\"{t}\");");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("600\n"));
+}
+
+BEZEL_TEST(codegen_range_to_ienumerable_6998,
+           imported_generic_method_range_argument_spec_16_3) {
+    JitResult r = runImp(
+        "var t := 0; var i := 0; "
+        "while i < 100 do t += K.Gen<int>(1..4); i += 1; end; "
+        "Console.WriteLine($\"{t} {K.Gen<int>(3..9)}\");");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("400 7\n"));
+}
+
+// Control (already worked pre-fix): the local-declaration site.
+BEZEL_TEST(codegen_range_to_ienumerable_6998,
+           imported_static_method_ienumerable_local_control_spec_16_3) {
+    JitResult r = runImp(
+        "var e: IEnumerable<int> := 1..4; Console.WriteLine($\"{K.Sum(e)}\");");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("10\n"));
+}
+
+// Pre-fix: IR verification failure at `bz$Lib6998.Kc$ctor`. Now the #7029
+// rejection (the imported-constructor lowering has no wrap).
+BEZEL_TEST(codegen_range_to_ienumerable_6998,
+           imported_constructor_range_argument_rejected_spec_16_3) {
+    JitResult r = runImp(
+        "var k := new Kc(1..4); Console.WriteLine($\"{k.n}\");");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "converts a `Range<T>` to `IEnumerable<T>`"));
+    BEZEL_EXPECT_TRUE(
+        bezel::test::diagnosticMessageContains(r, "issue #7029"));
+}

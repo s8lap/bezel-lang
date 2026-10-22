@@ -22701,7 +22701,10 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     const ast::CallArgument& a =
                         ne.args[static_cast<std::size_t>(b.paramToArg[j])];
                     if (!a.value) continue;
-                    checkAssignableRangeSite(ctx_.exprType(*a.value),
+                    // fix #6998 review 2 (#7029): an imported constructor is
+                    // not a `Range<T>` -> `IEnumerable<T>` site; see
+                    // checkImportedNewExprArgs.
+                    checkAssignable(ctx_.exprType(*a.value),
                                     p->resolvedDeclType,
                                     a.value->span.begin,
                                     desc + ": argument " +
@@ -23915,7 +23918,13 @@ void ExprTC::checkImportedNewExprArgs(
         // non-generic imported ctor is untouched. §2.8.3 rule 4: the same
         // program must type the same way whichever artifact declared the type.
         TypeRef* formal = substituteMemberType(p->resolvedDeclType, &ne, t);
-        checkAssignableRangeSite(ctx_.exprType(*a.value), formal,
+        // fix #6998 review 2 (§16.3, §5.1, v0.340; #7029): NOT a
+        // `Range<T>` -> `IEnumerable<T>` site. The imported-constructor
+        // lowering hand-builds its argument list and has no `IEnumerable<T>`
+        // argument wrap at all, so an admitted range reached the callee as the
+        // raw `%bz.range` struct (IR verification failure); it is rejected
+        // with the #7029 diagnostic instead.
+        checkAssignable(ctx_.exprType(*a.value), formal,
                         a.value->span.begin,
                         desc + ": argument " + std::to_string(j + 1),
                         a.value.get());  // per §7.4 / §27.6 (#1191)
