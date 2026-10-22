@@ -33,6 +33,8 @@ npm install --no-save vscode-textmate@9 vscode-oniguruma@2
 node test/tokenize.js          # tokenizes every bezel block in docs/ and every .bzl test program
 MARKDOWN_GRAMMAR=<path to VS Code's markdown.tmLanguage> node test/markdown.js
                                # checks the injection marks exactly the bezel fences in docs/ as Bezel
+node tools/readme-example.js   # re-renders the repository README's example as docs/images/readme-example-*.svg
+                               # (GitHub cannot highlight Bezel; --check reports stale images)
 npx @vscode/vsce package       # builds bezel-lang-<version>.vsix
 code --install-extension bezel-lang-0.2.0.vsix
 ```

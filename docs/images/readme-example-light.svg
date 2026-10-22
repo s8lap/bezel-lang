@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="713" height="1028" viewBox="0 0 713 1028" role="img" aria-label="Bezel code example">
+<rect width="100%" height="100%" rx="6" fill="#f6f8fa"/>
+<text font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.6" xml:space="preserve" fill="#1f2328">
+<tspan x="16" y="28"><tspan fill="#cf222e">module</tspan> <tspan fill="#8250df">Shop</tspan>;</tspan>
+<tspan x="16" y="48"></tspan>
+<tspan x="16" y="68"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">record</tspan> <tspan fill="#8250df">Product</tspan>(<tspan fill="#8250df">Sku</tspan>: <tspan fill="#cf222e">string</tspan>, <tspan fill="#8250df">Price</tspan>: <tspan fill="#cf222e">decimal</tspan>, <tspan fill="#8250df">Stock</tspan>: <tspan fill="#cf222e">int</tspan>);</tspan>
+<tspan x="16" y="88"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">record</tspan> <tspan fill="#8250df">Order</tspan>(<tspan fill="#8250df">Sku</tspan>: <tspan fill="#cf222e">string</tspan>, <tspan fill="#8250df">Qty</tspan>: <tspan fill="#cf222e">int</tspan>);</tspan>
+<tspan x="16" y="108"></tspan>
+<tspan x="16" y="128"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">choice</tspan> <tspan fill="#8250df">Outcome</tspan></tspan>
+<tspan x="16" y="148">    <tspan fill="#8250df">Charged</tspan>(amount: <tspan fill="#cf222e">decimal</tspan>),</tspan>
+<tspan x="16" y="168">    <tspan fill="#8250df">UnknownSku</tspan>(sku: <tspan fill="#cf222e">string</tspan>),</tspan>
+<tspan x="16" y="188">    <tspan fill="#8250df">OutOfStock</tspan>(left: <tspan fill="#cf222e">int</tspan>);</tspan>
+<tspan x="16" y="208"><tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Outcome</tspan>;</tspan>
+<tspan x="16" y="228"></tspan>
+<tspan x="16" y="248"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">class</tspan> <tspan fill="#8250df">Inventory</tspan>(products: <tspan fill="#8250df">Array</tspan>&lt;<tspan fill="#8250df">Product</tspan>&gt;)</tspan>
+<tspan x="16" y="268">    <tspan fill="#cf222e">private</tspan> <tspan fill="#cf222e">owned</tspan> _bySku: <tspan fill="#8250df">Dictionary</tspan>&lt;<tspan fill="#cf222e">string</tspan>, <tspan fill="#8250df">Product</tspan>&gt; :=</tspan>
+<tspan x="16" y="288">        products.<tspan fill="#8250df">ToDictionary</tspan>(<tspan fill="#cf222e">lambda</tspan>(p) =&gt; p.<tspan fill="#8250df">Sku</tspan>);</tspan>
+<tspan x="16" y="308">    <tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">method</tspan> <tspan fill="#8250df">Place</tspan>(order: <tspan fill="#8250df">Order</tspan>): <tspan fill="#8250df">Outcome</tspan></tspan>
+<tspan x="16" y="328">        <tspan fill="#cf222e">var</tspan> p := _bySku.<tspan fill="#8250df">GetOrNull</tspan>(order.<tspan fill="#8250df">Sku</tspan>);</tspan>
+<tspan x="16" y="348">        <tspan fill="#cf222e">if</tspan> p = <tspan fill="#0550ae">null</tspan> <tspan fill="#cf222e">then</tspan></tspan>
+<tspan x="16" y="368">            <tspan fill="#cf222e">return</tspan> <tspan fill="#8250df">UnknownSku</tspan>(order.<tspan fill="#8250df">Sku</tspan>);</tspan>
+<tspan x="16" y="388">        <tspan fill="#cf222e">elif</tspan> p.<tspan fill="#8250df">Stock</tspan> &lt; order.<tspan fill="#8250df">Qty</tspan> <tspan fill="#cf222e">then</tspan></tspan>
+<tspan x="16" y="408">            <tspan fill="#cf222e">return</tspan> <tspan fill="#8250df">OutOfStock</tspan>(p.<tspan fill="#8250df">Stock</tspan>);</tspan>
+<tspan x="16" y="428">        <tspan fill="#cf222e">end</tspan>;</tspan>
+<tspan x="16" y="448">        _bySku[p.<tspan fill="#8250df">Sku</tspan>] := p <tspan fill="#cf222e">with</tspan>(<tspan fill="#8250df">Stock</tspan> := p.<tspan fill="#8250df">Stock</tspan> - order.<tspan fill="#8250df">Qty</tspan>);  <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> an updated copy</tspan></tspan>
+<tspan x="16" y="468">        <tspan fill="#cf222e">return</tspan> <tspan fill="#8250df">Charged</tspan>(p.<tspan fill="#8250df">Price</tspan> * order.<tspan fill="#8250df">Qty</tspan>);</tspan>
+<tspan x="16" y="488">    <tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Place</tspan>;</tspan>
+<tspan x="16" y="508"></tspan>
+<tspan x="16" y="528">    <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> A fresh array, so the return type says `owned`: the caller now holds it.</tspan></tspan>
+<tspan x="16" y="548">    <tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">method</tspan> <tspan fill="#8250df">LowStock</tspan>(below: <tspan fill="#cf222e">int</tspan>): <tspan fill="#cf222e">owned</tspan> <tspan fill="#8250df">Array</tspan>&lt;<tspan fill="#cf222e">string</tspan>&gt; =&gt;</tspan>
+<tspan x="16" y="568">        _bySku.<tspan fill="#8250df">Where</tspan>(<tspan fill="#cf222e">lambda</tspan>(e) =&gt; e.<tspan fill="#8250df">Value</tspan>.<tspan fill="#8250df">Stock</tspan> &lt; below).<tspan fill="#8250df">Select</tspan>(<tspan fill="#cf222e">lambda</tspan>(e) =&gt; e.<tspan fill="#8250df">Key</tspan>)</tspan>
+<tspan x="16" y="588">            .<tspan fill="#8250df">ToArray</tspan>();</tspan>
+<tspan x="16" y="608"><tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Inventory</tspan>;</tspan>
+<tspan x="16" y="628"></tspan>
+<tspan x="16" y="648"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">class</tspan> <tspan fill="#8250df">Program</tspan></tspan>
+<tspan x="16" y="668">    <tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">static</tspan> <tspan fill="#cf222e">method</tspan> <tspan fill="#8250df">Main</tspan>()</tspan>
+<tspan x="16" y="688">        <tspan fill="#cf222e">using</tspan> <tspan fill="#cf222e">var</tspan> shop := <tspan fill="#cf222e">new</tspan> <tspan fill="#8250df">Inventory</tspan>([</tspan>
+<tspan x="16" y="708">            <tspan fill="#cf222e">new</tspan> <tspan fill="#8250df">Product</tspan>(<tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">pen</tspan><tspan fill="#0a3069">"</tspan>, <tspan fill="#0550ae">1.25m</tspan>, <tspan fill="#0550ae">40</tspan>),</tspan>
+<tspan x="16" y="728">            <tspan fill="#cf222e">new</tspan> <tspan fill="#8250df">Product</tspan>(<tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">pad</tspan><tspan fill="#0a3069">"</tspan>, <tspan fill="#0550ae">3.50m</tspan>, <tspan fill="#0550ae">6</tspan>),</tspan>
+<tspan x="16" y="748">            <tspan fill="#cf222e">new</tspan> <tspan fill="#8250df">Product</tspan>(<tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">mug</tspan><tspan fill="#0a3069">"</tspan>, <tspan fill="#0550ae">8.00m</tspan>, <tspan fill="#0550ae">3</tspan>)</tspan>
+<tspan x="16" y="768">        ]);</tspan>
+<tspan x="16" y="788">        <tspan fill="#cf222e">var</tspan> orders: <tspan fill="#8250df">Array</tspan>&lt;<tspan fill="#8250df">Order</tspan>&gt; :=</tspan>
+<tspan x="16" y="808">            [<tspan fill="#cf222e">new</tspan> <tspan fill="#8250df">Order</tspan>(<tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">pen</tspan><tspan fill="#0a3069">"</tspan>, <tspan fill="#0550ae">10</tspan>), <tspan fill="#cf222e">new</tspan> <tspan fill="#8250df">Order</tspan>(<tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">ink</tspan><tspan fill="#0a3069">"</tspan>, <tspan fill="#0550ae">1</tspan>), <tspan fill="#cf222e">new</tspan> <tspan fill="#8250df">Order</tspan>(<tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">pad</tspan><tspan fill="#0a3069">"</tspan>, <tspan fill="#0550ae">7</tspan>)];</tspan>
+<tspan x="16" y="828">        <tspan fill="#cf222e">for</tspan> <tspan fill="#cf222e">var</tspan> order <tspan fill="#cf222e">in</tspan> orders <tspan fill="#cf222e">do</tspan></tspan>
+<tspan x="16" y="848">            <tspan fill="#cf222e">var</tspan> verdict := (<tspan fill="#cf222e">case</tspan> shop.<tspan fill="#8250df">Place</tspan>(order) of</tspan>
+<tspan x="16" y="868">                <tspan fill="#8250df">Charged</tspan>(<tspan fill="#cf222e">var</tspan> amount) =&gt; <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">charged </tspan><tspan fill="#0a3069">{</tspan>amount:<tspan fill="#8250df">F2</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>,</tspan>
+<tspan x="16" y="888">                <tspan fill="#8250df">UnknownSku</tspan>(<tspan fill="#cf222e">var</tspan> sku) =&gt; <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">refused, no product '</tspan><tspan fill="#0a3069">{</tspan>sku<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">'</tspan><tspan fill="#0a3069">"</tspan>,</tspan>
+<tspan x="16" y="908">                <tspan fill="#8250df">OutOfStock</tspan>(<tspan fill="#cf222e">var</tspan> left) =&gt; <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">refused, only </tspan><tspan fill="#0a3069">{</tspan>left<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069"> left</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
+<tspan x="16" y="928">            <tspan fill="#8250df">Console</tspan>.<tspan fill="#8250df">WriteLine</tspan>(<tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">{</tspan>order.<tspan fill="#8250df">Qty</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069"> x </tspan><tspan fill="#0a3069">{</tspan>order.<tspan fill="#8250df">Sku</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">: </tspan><tspan fill="#0a3069">{</tspan>verdict<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
+<tspan x="16" y="948">        <tspan fill="#cf222e">end</tspan>;</tspan>
+<tspan x="16" y="968">        <tspan fill="#8250df">Console</tspan>.<tspan fill="#8250df">WriteLine</tspan>(<tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">running low: </tspan><tspan fill="#0a3069">{</tspan><tspan fill="#8250df">String</tspan>.<tspan fill="#8250df">Join</tspan>(<tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">, </tspan><tspan fill="#0a3069">"</tspan>, shop.<tspan fill="#8250df">LowStock</tspan>(<tspan fill="#0550ae">10</tspan>))<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
+<tspan x="16" y="988">    <tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Main</tspan>;</tspan>
+<tspan x="16" y="1008"><tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Program</tspan>;</tspan>
+</text>
+</svg>
