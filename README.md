@@ -2,13 +2,17 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-Memory management in general-purpose languages is still a trade-off. Manual management is fast but easy to get wrong: a missed free leaks, an early one corrupts memory. Garbage collection and automatic reference counting remove those errors, but they cost time and memory at run time, and a collector adds pauses. Bezel takes a third route. The compiler knows, for every object, where it is created, who owns it, and the exact point at which it is released. It inserts the release itself, on the normal path and when an exception passes through. The effect is close to C++'s RAII, except that the compiler checks the rules instead of leaving them to discipline. There is no collector, no hidden reference count on any class you write (only the opt-in `Shared<T>` counts), and no pause.
+Manual memory management is easy to get wrong, and garbage collection and automatic reference counting cost time and memory at run time. Bezel takes a third route. The compiler knows, for every object, where it is created, who owns it, and the exact point at which it is released, and it inserts the release itself, on the normal path and when an exception passes through. The effect is close to C++'s RAII, except that the compiler checks the rules instead of leaving them to discipline. There is no collector and no hidden reference count on any class you write (only the opt-in `Shared<T>` counts), and the guarantees hold in multi-threaded programs too.
 
-**Try it:** a prebuilt compiler for Linux x86-64 is on the [releases page](https://github.com/s8lap/bezel-lang/releases). It is a single static download with its own linker, so nothing else needs to be installed ([Getting started](#getting-started)).
+## Status: experimental, expect things to break
+
+**The compiler is not reliable yet. When you write Bezel code today, expect arbitrary things to break at any moment:** correct programs rejected, the compiler crashing, wrong output, and leaks or memory errors in the generated program. The front-page example below needed three compiler fixes before it ran as written.
+
+The language design is close to settled and is written down in full. The compiler implements most of it and is still being brought up to the specification. Its bugs are mostly where two features meet, such as a lambda passed to a constructor or an exception thrown while a call's arguments are being evaluated, and each known one is tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The language itself may still change, and there are no stability guarantees.
 
 ## A first look
 
-Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#'s, and its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design, built around ownership. The program below is a small shop: two records, a sum type (`choice`) for the outcome of an order, a class that owns a dictionary and hands its caller a new array, and lambdas passed to query operators:
+Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#'s, and its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design, built around ownership.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-example-dark.svg">
@@ -76,9 +80,7 @@ end Program;
 
 It prints `10 x pen: charged 12.50`, `1 x ink: refused, no product 'ink'`, `7 x pad: refused, only 6 left` and `running low: pad, mug`. Adding a case to `Outcome` makes the `case` expression in `Main` fail to compile until it handles the new case. [A Tour of Bezel](docs/Bezel_Tour.md) walks through the rest of the language.
 
-**Status: experimental.** The language design is close to settled and is written down in full; the compiler implements most of it and is still being brought up to the specification. Expect rough edges, and expect the language to change. There are no stability guarantees yet.
-
-Most of the language already works. The remaining bugs are mostly leaks and crashes where two features meet, such as a lambda passed to a constructor or an exception thrown while a call's arguments are being evaluated. Each one is tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues).
+**Try it:** a prebuilt compiler for Linux x86-64 is on the [releases page](https://github.com/s8lap/bezel-lang/releases). It is a single static download with its own linker, so nothing else needs to be installed ([Getting started](#getting-started)).
 
 ## How memory management works
 
@@ -114,6 +116,8 @@ The call is accepted because `conn` is declared before `timer`, so it is dispose
 
 Only an object's owner may dispose it ([§28.6](docs/Bezel_Language_Spec.md#sec-who-may-dispose)). Calling `Dispose()` runs the object's cleanup, its destructor, and marks it disposed. It does not free the memory. The memory is always released by code the compiler inserts at the owner's release point: the end of a scope, the overwrite of a field, the disposal of the object that holds it. Using an object after it has been disposed raises `DisposedAccessException` in the default build instead of reading freed memory.
 
+**Threads.** The guarantees hold in multi-threaded programs, through **execution domains** ([§30.13](docs/Bezel_Language_Spec.md#sec-runtime-model), [§30.14](docs/Bezel_Language_Spec.md#sec-multiple-domains)). Code inside a domain runs one piece at a time, so it never races with itself, and domains run in parallel on separate threads but share no mutable state. A value crosses from one domain to another only by being moved, so the sender statically loses access to it, or as an immutable value such as a string or a copy. Only *sendable* types may cross at all, and the compiler checks every crossing. That rules out data races by construction, with one documented limit: an alias made before the move and kept out of the compiler's sight, such as a borrow stored in another object's field or held by a pending task, is the programmer's responsibility.
+
 **Where reference counting is used.** No class you write is ever reference-counted. The specification lets the runtime manage four kinds of value by whatever mechanism it chooses: strings, `Type` tokens, boxed values and function values ([§28.9](docs/Bezel_Language_Spec.md#sec-runtime-managed-types)). It asks for counting only where a program opts in, with `Shared<T>` and `Weak<T>` ([§28.13](docs/Bezel_Language_Spec.md#sec-shared-ownership)). The current compiler and runtime count references in these places:
 
 - strings, boxed values and closures (`Type` tokens are interned and never freed);
@@ -123,7 +127,7 @@ Only an object's owner may dispose it ([§28.6](docs/Bezel_Language_Spec.md#sec-
 
 ## Why Bezel
 
-- **Memory safety without a collector.** Every object has exactly one owner and is disposed exactly once. Using a moved-out value and keeping a borrow past its owner are compile-time errors; a resource is never dropped without being disposed; where a stale reference can still arise at run time, the default build fails with an exception instead of corrupting memory.
+- **Memory safety without a collector, across threads too.** Every object has exactly one owner and is disposed exactly once, and execution domains keep those guarantees in multi-threaded code. Using a moved-out value and keeping a borrow past its owner are compile-time errors; a resource is never dropped without being disposed; where a stale reference can still arise at run time, the default build fails with an exception instead of corrupting memory.
 - **No null surprises.** A class type is non-nullable unless it is written with `?`: a `Connection` always holds an object, a `Connection?` may hold `null` ([§7](docs/Bezel_Language_Spec.md#sec-nullability-2)). The compiler enforces the difference at every assignment, argument and return, and calling a member on a `Connection?` is a compile error until a check such as `if c <> null then` has narrowed it. A non-nullable field must be initialized where it is declared or by every constructor ([§7.9](docs/Bezel_Language_Spec.md#sec-definite-assignment-for-non-nullable-fields)). Absence is handled explicitly with `?.`, `??` and `??=`, and `!` asserts presence, raising `NullReferenceException` if the value is null.
 - **Ownership you can read.** The declaration says who owns a slot (`owned` on a parameter, a return type or a field); the use site, or the `owned` slot it stores into, says when ownership moves (`move`). An assignment never transfers anything silently.
 - **Familiar everywhere else.** Classes, interfaces, generics, records, enums, sum types (`choice`) with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions, and contracts (`requires`/`ensures`) — in a syntax that reads like the Pascal family with the type system of C#.
@@ -177,6 +181,7 @@ bezelc hello.bzl -o hello && ./hello
 | [Standard library](docs/Bezel_Standard_Library.md) | every type and member; if a name is not there, it does not exist |
 | [Language specification](docs/Bezel_Language_Spec.md) | the normative reference, with the full grammar and the compiler-enforced invariants |
 | [Design rationale](docs/Bezel_Design_Rationale.md) | why each decision was made, and what was declined |
+| [Design proposals](docs/proposals/README.md) | how the language was argued into shape: about 190 proposals, accepted, declined and pending, each with the alternatives it weighed |
 
 `scripts/build_book.py` builds the same documents into a searchable site, one page per chapter; it is published to GitHub Pages once Pages is enabled for the repository.
 
