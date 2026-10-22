@@ -6877,6 +6877,15 @@ MethodSymbol* ExprTC::findBinaryOperator(const ast::BinaryExpr& be) {
         // the payload (lowerNullSafeRecordEquality).
         if (at->nullable && !pt->nullable && be.op != "=" && be.op != "<>")
             return Quality::Inapplicable;
+        // fix #6939 (§5.1, §7.11, v0.340): the `null` literal converts to any
+        // `T?` ("For any type T, T implicitly converts to T?"), so at a
+        // NULLABLE Named formal it is an applicable (Converting) operand.
+        // Its context-free type is `Object?`, which the Named arm below
+        // would class Inapplicable. A non-nullable formal was already
+        // rejected above (the §7.11 nullable-operand error).
+        if (pt->nullable && pt->kind == TypeRef::Kind::Named && operand &&
+            dynamic_cast<const ast::NullLiteralExpr*>(operand))
+            return Quality::Converting;
         const bool sameNullability = at->nullable == pt->nullable;
         if (pt->kind == TypeRef::Kind::Named) {
             // §25.2 (v0.181, #1562): a derived-typed operand satisfies a
