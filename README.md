@@ -71,11 +71,7 @@ Adding a case to `Shape` makes both `case` expressions fail to compile until the
 
 **Status: experimental.** The language design is close to settled and is written down in full; the compiler implements most of it and is still being brought up to the specification. Expect rough edges, and expect the language to change. There are no stability guarantees yet.
 
-Most of the language already works. The remaining bugs are mostly memory errors where two features meet, and each one is tracked in the issue tracker. A few current examples:
-- an owning collection created directly in an argument list leaks when a later argument throws ([#6670](https://github.com/s8lap/bezel-lang/issues/6670));
-- a lambda that captures a string and is passed to a constructor leaks its capture cell when the calling method declares another local ([#6628](https://github.com/s8lap/bezel-lang/issues/6628));
-- a plain `var` local holding an `Array<string?>` is never reclaimed, so its storage and every element leak ([#6516](https://github.com/s8lap/bezel-lang/issues/6516));
-- a user-defined operator whose parameter is a standard collection interface crashes when its body uses the operand ([#6655](https://github.com/s8lap/bezel-lang/issues/6655)).
+Most of the language already works. The remaining bugs are mostly leaks and crashes where two features meet, such as a lambda passed to a constructor or an exception thrown while a call's arguments are being evaluated. Each one is tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues).
 
 ## How memory management works
 
