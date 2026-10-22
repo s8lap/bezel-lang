@@ -7271,11 +7271,18 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
         // types, so without the re-type `u > K` (u: uint above int's range,
         // K: an int const 7) compared signed and printed False. A literal-
         // derived operand keeps its existing typing (unchanged here).
+        //
+        // fix #6984/#6981 (§5.1, §6.2, v0.340): a LITERAL-derived operand
+        // that adopts is re-typed too, in either operand position. Left as
+        // `int`, `1 + u` (u: uint) typed the sum `int` from the LEFT operand
+        // and printed -294967295, and `u / 2` / `u mod 7` / `u + 2000000000`
+        // lowered as signed (the operation's signedness is the common type's,
+        // unsigned only when BOTH operand types are), so `4000000000u / 2`
+        // printed 4147483648 and a uint overflow went undetected.
         auto adopt = [&](const ast::Expr* constExpr, const TypeRef* ownType,
                          const TypeRef* target) -> bool {
             if (adoptionOutOfRange(constExpr, target)) return true;
-            if (!isLiteralDerivedExpr(constExpr) &&
-                ctx_.exprType(*constExpr) == ownType)
+            if (ctx_.exprType(*constExpr) == ownType)
                 ctx_.setExprType(const_cast<ast::Expr*>(constExpr),
                                  const_cast<TypeRef*>(target));
             return false;
@@ -7288,12 +7295,39 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
         // when its value fits; when both operands are named constants the
         // one that fits adopts. Only when no candidate fits is the §5.1
         // range error reported.
+        //
+        // Two literal-derived operands (`3UL + 2`, `1 + 3UL`): it is the
+        // unsuffixed `int` literal that is "untyped" and adopts the other's
+        // type (§5.1, §4.2); the suffixed literal keeps its own. Only when the
+        // `int` literal does not fit (`3U + -1`) does the other literal adopt
+        // `int` instead, if its value fits -- "the one that fits adopts", as
+        // for two named constants below. Without this the LEFT literal always
+        // adopted first and re-typed `3UL` to `int` in `3UL + 2`.
+        if (isLiteralDerivedExpr(leftExpr) &&
+            isLiteralDerivedExpr(rightExpr)) {
+            const bool lInt = lt->primitive == PrimitiveType::Int;
+            const bool rInt = rt->primitive == PrimitiveType::Int;
+            if (rInt && !lInt && isTrueIntegerType(lt->primitive)) {
+                if (!adoptionOutOfRange(rightExpr, lt, /*report=*/false))
+                    return adopt(rightExpr, rt, lt);
+                if (!adoptionOutOfRange(leftExpr, rt, /*report=*/false))
+                    return adopt(leftExpr, lt, rt);
+                return adoptionOutOfRange(rightExpr, lt);
+            }
+            if (lInt && !rInt && isTrueIntegerType(rt->primitive)) {
+                if (!adoptionOutOfRange(leftExpr, rt, /*report=*/false))
+                    return adopt(leftExpr, lt, rt);
+                if (!adoptionOutOfRange(rightExpr, lt, /*report=*/false))
+                    return adopt(rightExpr, rt, lt);
+                return adoptionOutOfRange(leftExpr, rt);
+            }
+        }
         if (isLiteralDerivedExpr(leftExpr) &&
             isTrueIntegerType(rt->primitive))
-            return adoptionOutOfRange(leftExpr, rt);
+            return adopt(leftExpr, lt, rt);
         if (isLiteralDerivedExpr(rightExpr) &&
             isTrueIntegerType(lt->primitive))
-            return adoptionOutOfRange(rightExpr, lt);
+            return adopt(rightExpr, rt, lt);
         const bool leftSource = isTrueIntegerType(rt->primitive) &&
                                 isConstantSource(leftExpr, lt, rt);
         const bool rightSource = isTrueIntegerType(lt->primitive) &&
@@ -9254,6 +9288,16 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
                     return;
             }
         }
+        // fix #6984 (§6.2, v0.340): an adopting LEFT operand (`1 + u`, `V + U`)
+        // was re-typed to the right operand's type above, so the left operand's
+        // recorded type is now the common type. Reading it keeps the result
+        // symmetric with the right-adopter form (`u + 1`).
+        if (lt && be.left && be.right)
+            if (TypeRef* lAdopted = ctx_.exprType(*be.left))
+                if (lAdopted != lt && lAdopted->kind == TypeRef::Kind::Primitive &&
+                    !lAdopted->nullable && rtNorm &&
+                    lAdopted->primitive == rtNorm->primitive)
+                    lt = lAdopted;
         // The result follows the (normalized) left operand: `lt` is already
         // the non-nullable T for a §7.4-narrowed operand, so the both-narrowed
         // `int? + int?` case and the mixed narrowed/non-nullable case take one
