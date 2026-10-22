@@ -3688,6 +3688,26 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
             }
         }
     }
+    // fix #6907 (§14.1 / §2.8.2 clause 2 / §8.3, v0.340): `x.GetHashCode()` on a
+    // bare `T` receiver inside the UNSPECIALIZED template body. The #1091 arm
+    // above needs an active substitution, and the template has none, so the call
+    // degraded to a zero-initialized slot. The template is not dead for an
+    // IMPORTED generic method of a non-generic class: the importing module binds
+    // `Hash2<int>` to it, `int` being the only binding the #1943 / #6779 / #6818
+    // gates let cross the boundary (the #6748 box-as-int precedent in
+    // lowerBinary). So the i32 placeholder is the `int` it carries there; hash it
+    // as one, the call a same-module `T = int` instantiation makes.
+    if (isGetHashCode && emittingGenericTemplateBody_ &&
+        genericSubstSemaTy_.empty() &&
+        recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
+        !recvTy->nullable && templateGenericParamNames_.count(recvTy->headName())) {
+        if (llvm::Value* recv = lowerExpr(*ma->target)) {
+            if (recv->getType()->isIntegerTy(32))
+                return lowerValueSemMethodOn(
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Int), recv, call,
+                    member);
+        }
+    }
     // #2469 (§8.5/§14.1/§14.2): ToString on a bare unconstrained generic type
     // parameter `T` substituted with a RECORD or ENUM at this instantiation.
     // #1091 above deliberately left ToString out of the genericSubstSemaTy_
