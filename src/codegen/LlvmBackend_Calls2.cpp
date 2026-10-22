@@ -17011,6 +17011,7 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
     // §5.1, and the `int` placeholder body is then exactly right).
     bool explicitList = false;
     std::vector<const sema::TypeRef*> explicitTs; // index-aligned with genericParams
+    std::vector<SourceLocation> explicitLocs;     // index-aligned with explicitTs
     if (call) {
         const std::vector<std::unique_ptr<ast::Type>>* tas = nullptr;
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
@@ -17031,6 +17032,8 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
                 if (t && !genericSubstSemaTy_.empty())
                     t = substituteTypeRefLocal(t, genericSubstSemaTy_);
                 explicitTs.push_back(t);
+                explicitLocs.push_back(ta->span.begin.line ? ta->span.begin
+                                                           : callLoc);
                 if (!t || isInt(t) || isOpenTypeParam(t)) continue;
                 llvm::Type* lt = lowerTypeRef(t);
                 // fix #6818 (§2.8.2 clause 2, v0.340): a written NULLABLE
@@ -17076,6 +17079,37 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
         return false;
     };
     if (explicitList) {
+        // fix #6899 (§14.5 / §14.1 / §2.8.2 clause 2, v0.340): a written
+        // concrete non-`int` VALUE binding of a parameter that NO formal mentions
+        // (`DefB<bool>()`, whose body is `$"{default(T)}"`). No argument carries
+        // the binding across, so neither the width gate nor the per-argument
+        // arms above and below ever see it, and the placeholder body runs `T`
+        // as the `int` it was compiled against: MEASURED on c0a1928b,
+        // `U.DefB<bool>()` printed 0 (same-module: False). The body is not
+        // available importer-side to say whether it depends on `T`, so the
+        // binding is reported, as every other non-`int` binding is.
+        for (std::size_t k = 0;
+             k < explicitTs.size() && k < ms->genericParams.size(); ++k) {
+            const sema::TypeRef* t = explicitTs[k];
+            if (!t || isInt(t) || isOpenTypeParam(t)) continue;
+            // A REFERENCE binding (class, interface, `string`) is a pointer in
+            // every instantiation, and the #5009 T37 row pins `Tag<Sq>(40)`
+            // over a `where T: class` method as not refused; only a VALUE
+            // binding changes the representation the placeholder body ran.
+            llvm::Type* lt0 = lowerTypeRef(t);
+            if (!lt0 || lt0->isPointerTy()) continue;
+            bool mentioned = false;
+            for (std::size_t pi = 0; pi < ms->params.size() && !mentioned; ++pi) {
+                auto* ps =
+                    dynamic_cast<const sema::ParameterSymbol*>(ms->params[pi]);
+                const sema::TypeRef* formal = ps ? ps->resolvedDeclType : nullptr;
+                if (!formal) { mentioned = true; break; }  // unknown: stand down
+                mentioned = ownParamIndex(formal) == k ||
+                            constructedMentions(formal, k);
+            }
+            if (!mentioned && !bound5009)
+                return report(explicitLocs[k], t);
+        }
         // An explicit non-`int` binding of a narrower integer (`Eq<short>`)
         // is not i32 itself, but its bare-`T` argument is widened into the
         // i32 slot and the placeholder body then runs it as an `int`.
