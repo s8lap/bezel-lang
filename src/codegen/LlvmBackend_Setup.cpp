@@ -17235,6 +17235,10 @@ bool Emitter::emitReturn(llvm::Function* fn, llvm::Value* v) {
                     }
                 }
             }
+            // fix #7049: the same layout-identical reinterpret as the
+            // direct-ret path below, before the dead-template null stub.
+            if (emittingGenericTemplateBody_ && v && v->getType() != retTy)
+                v = reinterpretToType(v, retTy);
             if (emittingGenericTemplateBody_ && v && v->getType() != retTy)
                 v = llvm::Constant::getNullValue(retTy);
             builder_.CreateStore(v, ensuresResultSlot_);
@@ -17339,6 +17343,18 @@ bool Emitter::emitReturn(llvm::Function* fn, llvm::Value* v) {
         // `ret null` for the dead template. Gated on the flag so a genuine
         // return-coercion bug in a non-generic method (or a live specialization)
         // still fails loudly at the verifier rather than being silently nulled.
+        //
+        // fix #7049 (§14.1, §2.4, §2.8.2, v0.340): the template body is NOT
+        // always dead. An exported generic METHOD's placeholder body is the
+        // one an importing module calls for an `int` instantiation, so the
+        // null stub silently returned a zeroed value there (`Opt<T>.Some(x)`
+        // built as `choice.Opt$spec0` against a `choice.Opt` return →
+        // `Wrap<int>(5)` read back 0). When the two are layout-identical
+        // aggregates the value is the same bits under another struct name:
+        // reinterpret it instead, and keep the null stub only for a
+        // genuinely irreconcilable layout.
+        if (emittingGenericTemplateBody_ && v && v->getType() != retTy)
+            v = reinterpretToType(v, retTy);
         if (emittingGenericTemplateBody_ && v && v->getType() != retTy)
             v = llvm::Constant::getNullValue(retTy);
         builder_.CreateRet(v ? v : llvm::Constant::getNullValue(retTy));
