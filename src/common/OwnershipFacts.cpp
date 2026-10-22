@@ -1045,7 +1045,7 @@ bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
     if (!dynamic_cast<const ast::RangeExpr*>(idx)) {
         const sema::TypeRef* it = ctx.exprType(*idx);
         if (!it || it->kind != sema::TypeRef::Kind::Named || !it->declaration ||
-            it->declaration->name != "Range")
+            !it->declaration->isBuiltinRangeSym())
             return false;
     }
     // (c) And sema must in fact have typed the whole index expression as the

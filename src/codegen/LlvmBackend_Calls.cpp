@@ -2568,7 +2568,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // range-membership lowering and is intentionally not range-materialized here.
     bool isRangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                        recvTy->declaration &&
-                       recvTy->declaration->name == "Range" && m != "Contains";
+                       recvTy->declaration->isBuiltinRangeSym() && m != "Contains";
     bool isArrTerminal =
         m == "Count" || m == "Sum" || m == "Aggregate" || m == "Average" ||
         m == "Min" || m == "Max" || m == "First" || m == "Single" ||

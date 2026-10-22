@@ -2685,7 +2685,7 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // `%bz.range` { i64 start, i64 end, i64 step, i8 flags } struct.
     bool isRangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                        recvTy->declaration &&
-                       recvTy->declaration->name == "Range";
+                       recvTy->declaration->isBuiltinRangeSym();
     if (isRangeRecv) {
         elemRef = (recvTy && !recvTy->genericArgs.empty())
                       ? recvTy->genericArgs[0] : nullptr;
@@ -2913,7 +2913,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // Enumerator wraps it via bz_lazy_from_range, so admit it here too.
     bool rangeRecv = recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                      recvTy->declaration &&
-                     recvTy->declaration->name == "Range";
+                     recvTy->declaration->isBuiltinRangeSym();
     // issue #995 / stdlib §5 / §29.11: a vtable-backed IEnumerable<T> receiver
     // (interface-typed local/param, or a yield-method result) — lowerToLazy-
     // Enumerator materializes it into an Array<T> via the iterator vtable, so the
@@ -3612,7 +3612,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         bool rangeInner = retSemaType &&
                           retSemaType->kind == sema::TypeRef::Kind::Named &&
                           retSemaType->declaration &&
-                          retSemaType->declaration->name == "Range";
+                          retSemaType->declaration->isBuiltinRangeSym();
         // §16.3 (v0.183, #1586): T = char for the selector's Range<T> result.
         bool rangeInnerIsChar = rangeInner && !retSemaType->genericArgs.empty() &&
             retSemaType->genericArgs[0] &&

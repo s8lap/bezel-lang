@@ -5186,8 +5186,7 @@ private:
         return rt &&
                rt->kind == sema::TypeRef::Kind::Named &&
                rt->declaration &&
-               !rt->declaration->decl &&
-               rt->declaration->name == "Range";
+               rt->declaration->isBuiltinRangeSym();
     }
 
     // fix #499 / §9.8: load the Range struct from the slot of a range-typed

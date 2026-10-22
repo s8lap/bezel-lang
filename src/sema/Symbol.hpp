@@ -215,6 +215,14 @@ struct TypeSymbol : Symbol {
     // TypeSymbol with no real module (builtins materialized on demand,
     // ts->decl == nullptr); those are never part of the cross-module ABI.
     std::string moduleName;
+    // fix #6973 (§2.8, §9.8, v0.340): true only for the compiler-intrinsic
+    // `Range<T>` TypeSymbol (`SemaContext::builtinClassSym("Range")`). An
+    // IMPORTED user `record Range(...)` is also decl-less (no AST), so the bare
+    // spelling `name == "Range" && !decl` cannot tell it from the builtin; the
+    // builtin is the one with NO declaring module (see `moduleName`).
+    bool isBuiltinRangeSym() const {
+        return name == "Range" && decl == nullptr && moduleName.empty();
+    }
     // fix #3529 / §11.6 / §2.8.3 rule 3: the dotted path of this type's
     // ENCLOSING types, outermost-first, EXCLUDING the type's own name
     // ("Outer1" for `Outer1.Ord`; "A.B" for `A.B.C`). Empty for a top-level

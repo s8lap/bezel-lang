@@ -965,7 +965,8 @@ bool Emitter::isNullableValueStructBuiltinTy(const sema::TypeRef* rt) {
         n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
         n == "ReadOnlyStringSpan") return true;
     // §9.8 — Range<T> with its {i64,i64,i64,i8} struct shape.
-    if (n == "Range") return true;
+    if (n == "Range")
+        return !rt->declaration || rt->declaration->isBuiltinRangeSym();
     // §2.15 — JsonOptions, the 5-field compiler-known value record.
     if (n == "JsonOptions") return true;
     // §31.4 — ExceptionInfo, the {ptr,ptr,ptr} causechain element.
@@ -1186,8 +1187,7 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // where flags bit 0 = IsEndInclusive (1 = `..`, 0 = `..<`).
             // Using i64 for start/end (independent of T's width) keeps the
             // struct layout uniform across Range<int>/Range<long>/etc.
-            if (rt->declaration && !rt->declaration->decl &&
-                rt->declaration->name == "Range") {
+            if (rt->declaration && rt->declaration->isBuiltinRangeSym()) {
                 return rangeStructType();
             }
             // §3 stdlib: collection and IO built-in classes (no user TypeDecl).
