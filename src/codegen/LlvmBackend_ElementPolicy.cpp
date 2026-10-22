@@ -295,6 +295,32 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         };
     }
 
+    // fix #6923 (§28.11, stdlib §4.2, v0.340): two more built-in element
+    // kinds an OWNING slot must dispose, which the arms above miss because
+    // they carry no user TypeDecl and are not in either name list:
+    //   * `Set<T>` / `SortedSet<T>` — excluded from the borrowing list for
+    //     their dynamic backing; borrowingCollectionDisposerThunk now decides
+    //     that backing per type (buildCollectionTempDisposal), so the set
+    //     heads route there too;
+    //   * a vtable-less built-in class (Mutex, StringBuilder, ...), released
+    //     the way its `using var` auto-drop releases it — that arm sits below
+    //     the Task-family and TaskCompletionSource arms, which keep their own
+    //     thunks.
+    // Narrowed to the owning family: the borrowing family's slot is a borrow
+    // with no disposal (§28.11), which the Value row below already gives.
+    // `builtinTypeName` reads both the syntax-backed and the imported
+    // (astNode-less) spelling, and is empty for a user or imported user type.
+    if (owningFamily && elemTy && elemTy->kind == sema::TypeRef::Kind::Named) {
+        const std::string_view bn = builtinTypeName(elemTy);
+        if (bn == "Set" || bn == "SortedSet")
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                borrowingCollectionDisposerThunk(elemTy, bn),
+                /*retainRelease=*/false
+            };
+    }
+
     // §30.5 / §28.11 (#1889): an owning collection of Task-family values
     // (Task / Task<T> / OwningTask<T>) owns each task frame, and disposing the
     // collection must also dispose the unconsumed class result and the fault
@@ -373,6 +399,19 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
             /*disposerThunk=*/nullptr,
             /*retainRelease=*/false
         };
+    }
+
+    // fix #6923 (§28.11, v0.340): the vtable-less built-in half of the arm
+    // above the Task-family arm (see there).
+    if (owningFamily && elemTy && elemTy->kind == sema::TypeRef::Kind::Named) {
+        const std::string_view bn = builtinTypeName(elemTy);
+        if (!bn.empty() && vtablelessBuiltinReleaseIsKnown(bn))
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                vtablelessBuiltinElementDisposerThunk(elemTy, bn),
+                /*retainRelease=*/false
+            };
     }
 
     bool isSharedWeakElem = isSharedOrWeak(elemTy);

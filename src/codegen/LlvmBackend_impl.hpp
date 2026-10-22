@@ -3171,6 +3171,10 @@ private:
     // leaked per stored element (issue #4054, measured 56 B × 801 + 64 B ×
     // 801 = 96,120 B at 800 iterations).
     std::map<const sema::TypeRef*, llvm::Function*> borrowingCollectionDisposerThunks_;
+    // fix #6923 (§28.11, v0.340): per-element-type thunks for an Owning outer
+    // holding a VTABLE-LESS built-in class (OwningArray<Mutex>,
+    // OwningDictionary<K, StringBuilder>); see vtablelessBuiltinElementDisposerThunk.
+    std::map<const sema::TypeRef*, llvm::Function*> vtablelessBuiltinElementDisposerThunks_;
     // fix #1889 / §28.6 / §30.5: per-Task-family-type element thunks for owning
     // collections of Task / Task<T> / OwningTask<T>. Each thunk runs the complete
     // non-blocking task drop protocol (fault_obj prelude, per-T result_disposer
@@ -14196,14 +14200,21 @@ private:
     // built-in collection held in an OWNING slot (e.g. the Array<int> inside
     // an OwningArray<Array<int>>). Calls the matching runtime free fn
     // (bz_array_free / bz_llist_free / bz_dict_free, selected from collName)
-    // with NULL inner disposer — the borrow family does not own its elements,
-    // so the recursive element-axis resolution nestedCollectionDisposerThunk
-    // performs is fixed at NULL here. `collName` is the borrow-family head
-    // string already known to the caller (it is the std::optional returned by
-    // the isBorrowingBuiltinCollection detection lambda in elementPolicyFor),
-    // avoiding a second head-name decode. Cached per element TypeRef*.
+    // with the borrowing-family element disposer — the borrow family does not
+    // own its CLASS elements, so the recursive owning-family resolution
+    // nestedCollectionDisposerThunk performs does not apply. fix #6923: the
+    // free and the element disposer are `buildCollectionTempDisposal`'s for
+    // the same type (string elements released, dict-backed Set/SortedSet
+    // freed as tables, OwningBuffer<C> slots disposed). `collName` names the
+    // thunk. Cached per element TypeRef*.
     llvm::Function* borrowingCollectionDisposerThunk(const sema::TypeRef* elemCollTy,
                                                      std::string_view collName);
+    // fix #6923 (§28.11, v0.340): void(void*) thunk that releases a vtable-less
+    // built-in class element (`classifyVtablelessBuiltinRelease(bn) != None`)
+    // held in an OWNING slot, through the same `emitVtablelessBuiltinRelease`
+    // call its `using var` scope-exit auto-drop and explicit Dispose() use.
+    llvm::Function* vtablelessBuiltinElementDisposerThunk(const sema::TypeRef* elemTy,
+                                                          std::string_view bn);
     // fix #1889 / §28.6 / §30.5: void(void*) thunk for a Task / Task<T> /
     // OwningTask<T> element of an owning collection (e.g. OwningArray<OwningTask<T>>).
     // Runs the same complete non-blocking disposal protocol as a task local / an

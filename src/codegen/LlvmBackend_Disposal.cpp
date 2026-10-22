@@ -5843,36 +5843,42 @@ llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elem
 // fix #4054 / §28.11 / §28.9: void(void*) thunk that frees a BORROWING
 // built-in collection held in an OWNING slot (e.g. the Array<int> inside
 // an OwningArray<Array<int>>). Mirrors nestedCollectionDisposerThunk above
-// in shape (own IRBuilder, null check, call free fn, return void; cached per
-// inner TypeRef*) but is fixed at NULL for the inner disposer — the borrow
-// family does not own its elements, so passing the recursive inner-element
-// disposer (what nestedCollectionDisposerThunk does for the OWNING case)
-// would double-free values whose real owner is elsewhere.
+// in shape (null check, call free fn, return void; cached per inner
+// TypeRef*). The borrow family does not own its CLASS elements, so passing
+// the recursive owning-family element disposer (what
+// nestedCollectionDisposerThunk does for the OWNING case) would double-free
+// values whose real owner is elsewhere.
 //
-// Free-fn selection (mirrors nestedCollectionDisposerThunk's, with SortedSet
-// / Set excluded — they have dynamic backing, see #2726):
-//   Array / Stack / Queue / OwningBuffer / FrozenArray → bz_array_free
-//   LinkedList                                          → bz_llist_free
-//   Dictionary / SortedDictionary                       → bz_dict_free
+// fix #6923 (§28.11 / §28.9, stdlib §4.2, v0.340): the free is now the one
+// `buildCollectionTempDisposal` decides for the same type — the decision
+// point every owned-temporary, owned-parameter and literal-argument
+// disposal of a built-in collection already reads — instead of a second,
+// narrower table that only knew `bz_array_free` / `bz_llist_free` /
+// `bz_dict_free` with a NULL inner disposer. The narrow table was wrong in
+// three ways, all MEASURED (ASan/LSan, 100 iterations, two nested elements
+// per iteration, same-module and cross-module alike):
+//   * a `Set<T>` / `SortedSet<T>` element was not routed here at all (the
+//     element-policy arm excluded them for their dynamic backing), so the
+//     whole nested table leaked (85,600 B for `OwningArray<Set<int>>`);
+//   * a `string`-element borrowing collection co-owns a +1 per element
+//     (§28.11's shared-reference column; §28.9), so a NULL inner disposer
+//     leaked every string (`OwningArray<Array<string>>`: 21,000 B; the same
+//     for Stack / Queue / LinkedList / Dictionary<K, string> /
+//     SortedDictionary<K, string>);
+//   * an `OwningBuffer<C>` element owns its class slots (stdlib §4.14), so a
+//     NULL inner disposer leaked every slot (`OwningArray<OwningBuffer<Item>>`:
+//     9,600 B).
+// The class-element case is unchanged: buildCollectionTempDisposal reads the
+// borrowing-family element policy, which yields no disposer for a class
+// element of a borrowing collection.
 //
-// `collName` is the head name already known to the caller (the std::optional
-// returned by the isBorrowingBuiltinCollection detection lambda in
-// elementPolicyFor), avoiding a second head-name decode here.
+// `collName` names the thunk only (debuggability).
 llvm::Function* Emitter::borrowingCollectionDisposerThunk(
         const sema::TypeRef* elemCollTy, std::string_view collName) {
     // Cache hit.
     auto it = borrowingCollectionDisposerThunks_.find(elemCollTy);
     if (it != borrowingCollectionDisposerThunks_.end()) return it->second;
 
-    bool isLL   = (collName == "LinkedList");
-    bool isDict = (collName == "Dictionary" || collName == "SortedDictionary");
-
-    const char* freeName = isLL ? "bz_llist_free"
-                         : isDict ? "bz_dict_free"
-                         : "bz_array_free";
-
-    // Build the thunk: void(void* innerCollPtr) { if(!ptr) return;
-    //                                              freeFn(ptr, null); }
     auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                          {ptrTy()}, /*isVarArg=*/false);
     // fix #3548: name from the type's §2.8.3 rule 3 identity
@@ -5886,28 +5892,101 @@ llvm::Function* Emitter::borrowingCollectionDisposerThunk(
     }
     auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
                                       thunkName, module_.get());
+    // Cache BEFORE deciding the free: the decision below can recurse into
+    // this function for a nested value type (dictValueBoxFreer's #5106 arm).
+    borrowingCollectionDisposerThunks_[elemCollTy] = fn;
     llvm::Argument* ptr = &*fn->args().begin();
     auto* entry  = llvm::BasicBlock::Create(llvm_, "entry",    fn);
     auto* freeBB = llvm::BasicBlock::Create(llvm_, "coll.free", fn);
     auto* retBB  = llvm::BasicBlock::Create(llvm_, "coll.ret",  fn);
     llvm::IRBuilder<> b(entry);
+    // buildCollectionTempDisposal keys its entry on an alloca; give it one in
+    // the thunk (it only reads the type and builds element thunks — it emits
+    // nothing at the slot).
+    llvm::AllocaInst* slot = b.CreateAlloca(ptrTy(), nullptr, "coll.slot");
+    b.CreateStore(ptr, slot);
+    const Disposal d = buildCollectionTempDisposal(slot, elemCollTy);
     // Null-guard (mirrors nestedCollectionDisposerThunk).
     b.CreateCondBr(
         b.CreateICmpEQ(ptr, llvm::ConstantPointerNull::get(ptrTy())),
         retBB, freeBB);
     b.SetInsertPoint(freeBB);
-    // Inner disposer is FIXED at NULL (the borrow family does not own its
-    // elements; see header).
-    auto* freeFn = declareC(freeName,
-                            llvm::Type::getVoidTy(llvm_),
-                            {ptrTy(), ptrTy()});
-    b.CreateCall(freeFn,
-        {ptr, llvm::ConstantPointerNull::get(ptrTy())});
+    llvm::Value* nullp = llvm::ConstantPointerNull::get(ptrTy());
+    auto voidFn = [&](const char* name, unsigned nargs) {
+        std::vector<llvm::Type*> ps(nargs, ptrTy());
+        return declareC(name, llvm::Type::getVoidTy(llvm_), ps);
+    };
+    if (d.dict) {
+        // Dictionary / SortedDictionary / dict-backed Set / SortedSet: the
+        // same sequence the scope-end dict arm emits (string KEYS released
+        // first for a string-element set, then the table with its value
+        // disposer).
+        if (d.dictStringKeys)
+            b.CreateCall(voidFn("bz_set_string_keys_release", 1), {ptr});
+        if (d.dictKeyDisposer)
+            b.CreateCall(voidFn("bz_set_coll_keys_dispose", 2),
+                         {ptr, d.dictKeyDisposer});
+        b.CreateCall(voidFn("bz_dict_free", 2),
+                     {ptr, d.dictValueDisposer ? d.dictValueDisposer : nullp});
+    } else if (d.linkedList) {
+        b.CreateCall(voidFn("bz_llist_free", 2),
+                     {ptr, d.collectionElemDisposer ? d.collectionElemDisposer
+                                                    : nullp});
+    } else {
+        b.CreateCall(voidFn("bz_array_free", 2),
+                     {ptr, d.collectionElemDisposer ? d.collectionElemDisposer
+                                                    : nullp});
+    }
     b.CreateBr(retBB);
     b.SetInsertPoint(retBB);
     b.CreateRetVoid();
+    return fn;
+}
 
-    borrowingCollectionDisposerThunks_[elemCollTy] = fn;
+
+// fix #6923 (§28.11, v0.340): void(void*) thunk that releases one VTABLE-LESS
+// built-in class element (Mutex, StringBuilder, Stopwatch, ... — every name
+// `classifyVtablelessBuiltinRelease` classifies) held in an OWNING slot.
+// §28.11's owned-slot column: the collection's `Dispose()` (and `Clear()`,
+// `Remove*`, indexer-set) "disposes every live element". These built-ins have
+// no user TypeDecl, so elementPolicyFor's declaration-based class arm never
+// saw them and they took the Value row — a NULL disposer, and every nested
+// element leaked (MEASURED: `OwningArray<Mutex>` 17,600 B and
+// `OwningArray<StringBuilder>` 118,400 B over 100 iterations of two elements).
+// The release is the SAME `emitVtablelessBuiltinRelease` call the `using var`
+// scope-exit auto-drop and the explicit `Dispose()` arm emit for the type.
+// Built in a private function with builder_/currentFn_ swapped (the
+// taskElementDisposerThunk pattern), because the release emits through
+// builder_. Cached per element TypeRef*.
+llvm::Function* Emitter::vtablelessBuiltinElementDisposerThunk(
+        const sema::TypeRef* elemTy, std::string_view bn) {
+    auto it = vtablelessBuiltinElementDisposerThunks_.find(elemTy);
+    if (it != vtablelessBuiltinElementDisposerThunks_.end()) return it->second;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    // fix #3548 convention: a deterministic name from the type's identity.
+    std::string name = "bz$builtinElemRelease$" + mangleTypeRefForSymbol(elemTy);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      name, module_.get());
+    vtablelessBuiltinElementDisposerThunks_[elemTy] = fn;
+    llvm::Argument* obj = &*fn->args().begin();
+    auto* entry  = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* relBB  = llvm::BasicBlock::Create(llvm_, "b.rel", fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "b.ret", fn);
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    builder_.CreateCondBr(
+        builder_.CreateICmpEQ(obj, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, relBB);
+    builder_.SetInsertPoint(relBB);
+    emitVtablelessBuiltinRelease(bn, obj);
+    builder_.CreateBr(retBB);
+    builder_.SetInsertPoint(retBB);
+    builder_.CreateRetVoid();
+    currentFn_ = savedFn;
+    builder_.restoreIP(savedIP);
     return fn;
 }
 
@@ -6134,6 +6213,20 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
     // `OwningTaskCompletionSource`) and what handles each now.
     if (!common::isPatternAResultCollectionHead(collName)) {
         return nullptr;
+    }
+    // fix #6923 (§30.5, §28.11, stdlib §4.10 / §4.18, v0.340): a Set<T> /
+    // SortedSet<T> is DICT-backed for a hashable T (array-backed only for a
+    // class element), so the kind dispatch below — which sends it to
+    // bz_array_free — freed a bz_dict_t as a bz_array_t: an ASan SEGV in
+    // free at the `Task<Set<int>>` result's teardown. The borrowing-collection
+    // free thunk decides the backing the way every scope-end disposal does
+    // (buildCollectionTempDisposal), releasing string keys before
+    // bz_dict_free; reuse it.
+    if (collName == "Set" || collName == "SortedSet") {
+        llvm::Function* fn =
+            borrowingCollectionDisposerThunk(resultCollTy, collName);
+        patternAResultCollectionDisposers_[resultCollTy] = fn;
+        return fn;
     }
 
     // KIND DISPATCH — reached only for an agreed member — decides which
