@@ -10924,7 +10924,14 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     // to emitStructEquality's null-recTy shape-compare, which compares every
     // payload slot including the inactive-case `undef` slots (spurious
     // inequality, and an undef-read for pointer payloads).
-    if ((op == "=" || op == "<>") && l->getType()->isStructTy()) {
+    // fix #6980 (§8.4, v0.340): a struct left operand against a NON-struct right
+    // operand (the `null` literal, a `ptr`) is not structural equality: "`null =
+    // nonNull` and `nonNull = null` are `false`", decided before any operator or
+    // field comparison runs. Leave it to the null-literal guard below, which
+    // already answers `null = p`; entering this block extracted fields from a
+    // `ptr` and crashed the compiler.
+    if ((op == "=" || op == "<>") && l->getType()->isStructTy() &&
+        r->getType()->isStructTy()) {
         const sema::TypeSymbol* recTy = nullptr;
         const sema::TypeRef* recTyRef = nullptr;
         const sema::TypeSymbol* choTy = nullptr;
@@ -10997,14 +11004,25 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             bool rIsPtr = r->getType()->isPointerTy();
             if (lIsPtr && rIsPtr) {
                 // Both pointer — compare normally (fall through).
-            } else if (lIsPtr) {
-                // Left is ptr (the null literal), right is non-ptr value type —
-                // the non-ptr value can never be null: `= null` is always false,
-                // `<> null` is always true. Same as the symmetric rIsPtr case.
-                return builder_.getInt1(op == "<>");
-            } else if (rIsPtr) {
-                // Right is ptr (the null literal), left is non-ptr — non-ptr
-                // can never be null: = null is always false, <> null is true.
+            } else if (lIsPtr || rIsPtr) {
+                // One side is the null-literal ptr, the other a non-ptr value
+                // type that can never be null: `= null` is always false,
+                // `<> null` is always true (§8.4, v0.340).
+                // fix #6980 / #6940 (§28.3 "Unbound owned temporaries"): a
+                // fresh record construction on the value side (`new Pt(..) =
+                // null`) is never bound, so release its string members here.
+                const ast::Expr* ve = lIsPtr ? bin.right.get() : bin.left.get();
+                llvm::Value* vv = lIsPtr ? r : l;
+                const sema::TypeRef* vt = ve ? ctx_.exprType(*ve) : nullptr;
+                if (vt && vv->getType()->isStructTy() &&
+                    vt->kind == sema::TypeRef::Kind::Named && vt->declaration &&
+                    isRecordWithStringFieldsTypeRef(vt) &&
+                    isFreshRecordConstructionOfExactType(ve, vt->declaration)) {
+                    RecordSubstGuard nullEqSubst(this, vt);
+                    llvm::AllocaInst* slot = entryAlloca(vv->getType());
+                    builder_.CreateStore(vv, slot);
+                    emitRecordStringFieldReleases(slot, vt);
+                }
                 return builder_.getInt1(op == "<>");
             } else {
                 // Neither is a ptr — both are value types (shouldn't be null).
