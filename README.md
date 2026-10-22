@@ -6,9 +6,7 @@ Manual memory management is easy to get wrong, and garbage collection and automa
 
 ## Status: experimental, expect things to break
 
-**The compiler is not reliable yet. When you write Bezel code today, expect arbitrary things to break at any moment:** correct programs rejected, the compiler crashing, wrong output, and leaks or memory errors in the generated program. The front-page example below needed three compiler fixes before it ran as written.
-
-The language design is close to settled and is written down in full. The compiler implements most of it and is still being brought up to the specification. Its bugs are mostly where two features meet, such as a lambda passed to a constructor or an exception thrown while a call's arguments are being evaluated, and each known one is tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The language itself may still change, and there are no stability guarantees.
+**The compiler is not reliable yet: expect arbitrary things to break at any moment while you write Bezel code.** The language design is close to settled and written down in full, and the compiler is still being brought up to it. Known bugs are tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The language may still change, and there are no stability guarantees.
 
 ## A first look
 
