@@ -230,6 +230,13 @@ void Emitter::collectSuspendLocals(
                 out.push_back({fs->iterable.get(), ptrTy()});  // enumerator
                 out.push_back({fs->iterable.get(), ptrTy()});  // source (+1)
             }
+            // §29.3 / §16.4 (#6904): a range literal with a step expression
+            // may need its (runtime) step to survive a yield; reserve an i64
+            // slot keyed on the RangeExpr. Unwired (inert padding) when the
+            // step turns out constant.
+            if (auto* re = dynamic_cast<const ast::RangeExpr*>(
+                    fs->iterable.get()))
+                if (re->step) out.push_back({re, i64()});
             collectSuspendLocals(fs->body, out);
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
             collectSuspendLocals(ws->body, out);

@@ -7869,6 +7869,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     // §16.4: resolve the step (default = 1; negative steps descend).
     llvm::Value* stepVal = llvm::ConstantInt::get(i64(), 1);  // signed 64-bit (§16.3)
     bool descending = false;
+    llvm::AllocaInst* rtStepSlot = nullptr;  // §29.3 (#6904): SM runtime step
     if (range->step) {
         llvm::Value* s = lowerExpr(*range->step);
         if (!s) return false;
@@ -7896,6 +7897,17 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
             emitGuardThrow(builder_.CreateICmpEQ(
                                s, llvm::ConstantInt::get(i64(), 0), "rf.step0"),
                            "OverflowException");
+            if (smStateStruct_) {
+                // §29.3 (#6904): in a state machine the step SSA value is
+                // computed in the block that first reaches the loop, which
+                // does not dominate the resume path into `for.cond`/`for.inc`.
+                // Keep it in a frame-backed slot (spilled/restored across
+                // yields) and reload it where it is used; the SM loop below
+                // consumes `rtStepSlot`.
+                rtStepSlot = entryAlloca(i64());
+                builder_.CreateStore(s, rtStepSlot);
+                mapSuspendLocalSlot(range, rtStepSlot);
+            } else {
             llvm::Value* stepNeg = builder_.CreateICmpSLT(
                 s, llvm::ConstantInt::get(i64(), 0), "rf.desc");
             // #1243 §21.4: hidden counter + body-visible var (per rfv path above).
@@ -7925,14 +7937,17 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
             advance(rfCounter, eTy, s, eUns, isCharRange, condBB, endBB);
             builder_.SetInsertPoint(endBB);
             return true;
+            }
         }
         // A constant step is sign-extended (zero-extended for an unsigned
         // operand) to the signed 64-bit `Step`.
+        if (cs) {
         stepVal = llvm::ConstantInt::get(
             i64(), isUnsignedTargetExpr(*range->step)
                        ? cs->getValue().zextOrTrunc(64) : cs->getValue().sextOrTrunc(64));
         descending = cs->getValue().isNegative() &&
                      !isUnsignedTargetExpr(*range->step);
+        }
     }
 
     llvm::AllocaInst* slot = entryAlloca(eTy);
@@ -7966,7 +7981,12 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         else if (hiVal->getType() != eTy && hiVal->getType()->isIntegerTy())
             hiVal = builder_.CreateIntCast(
                 hiVal, eTy, !isUnsignedTargetExpr(*range->hi));
-        llvm::Value* cond = inBounds(cur, hiVal, builder_.getInt1(descending),
+        llvm::Value* descV = builder_.getInt1(descending);
+        if (rtStepSlot)  // §16.4: direction by the runtime step's sign
+            descV = builder_.CreateICmpSLT(
+                builder_.CreateLoad(i64(), rtStepSlot),
+                llvm::ConstantInt::get(i64(), 0), "rf.desc");
+        llvm::Value* cond = inBounds(cur, hiVal, descV,
                                      builder_.getInt1(range->inclusive), eUns);
         builder_.CreateCondBr(cond, bodyBB, endBB);
         builder_.SetInsertPoint(bodyBB);
@@ -7975,6 +7995,7 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         loopStack_.pop_back();
         if (!term) builder_.CreateBr(incBB);
         builder_.SetInsertPoint(incBB);
+        if (rtStepSlot) stepVal = builder_.CreateLoad(i64(), rtStepSlot);
         advance(slot, eTy, stepVal, eUns, isCharRange, condBB, endBB);
         builder_.SetInsertPoint(endBB);
         return true;
