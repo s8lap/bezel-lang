@@ -1679,6 +1679,10 @@ private:
     // Null outside a method/operator signature; an operator declares no generic
     // parameters, so the OperatorDecl branch nulls it as well.
     const std::vector<ast::GenericParam>* currentMethodGenericParams_ = nullptr;
+    // fix #6968 (§21.10, §11.6, v0.340): the generic parameters of the TYPE
+    // declaration whose body resolveTypeDecl is walking (null in a local
+    // type's own walk, which declares none).
+    const std::vector<ast::GenericParam>* currentTypeDeclGenericParams_ = nullptr;
 
     // §21.10 (v0.334): true while resolving the members of a LOCAL type
     // declaration (`record`/`enum` in statement position). §21.10 forbids such

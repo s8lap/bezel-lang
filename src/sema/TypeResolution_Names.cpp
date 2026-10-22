@@ -1442,6 +1442,11 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     // restores its enclosing type's value on exit.
     TypeSymbol* savedOuter = currentOuterType_;
     if (tsym) currentOuterType_ = tsym;
+    // fix #6968: the type declaration whose body is being resolved (see
+    // resolveNamed's §21.10 arm).
+    const std::vector<ast::GenericParam>* savedTypeDeclParams =
+        currentTypeDeclGenericParams_;
+    currentTypeDeclGenericParams_ = &td.genericParams;
     // fix #6383 follow-up (§2.7 "Through nesting", v0.338): pair this body's
     // scope with the type that owns it, so `lookupBareTypeName` can tell a
     // scope that CARRIED a name from a type that DECLARES one. Pushed and
@@ -1848,6 +1853,7 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
     // Enum constants don't carry types syntactically (their `:= value`
     // is a Const expression; types come from the underlying-int).
     currentOuterType_ = savedOuter;  // §14.2: restore enclosing-type context
+    currentTypeDeclGenericParams_ = savedTypeDeclParams;
     // fix #6383 follow-up (§2.7 "Through nesting", v0.338): `resolveTypeDecl`
     // has a single exit (verified: every `return` between the body-scope push
     // above and here belongs to a lambda or a switch arm), so this pop is
@@ -3935,6 +3941,18 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             bool ownLocalMethodParam = false;
             if (inLocalTypeMembers_ && currentMethodGenericParams_) {
                 for (const auto& gp : *currentMethodGenericParams_)
+                    if (gp.name == first) {
+                        ownLocalMethodParam = true;
+                        break;
+                    }
+            }
+            // fix #6968 (§21.10, §11.6, v0.340): a generic type NESTED in a
+            // local type "follows its own rules" (§11.6), so its own `<T>` is
+            // not an enclosing parameter. resolveTypeDecl records the
+            // declaration being walked; the local-type walk clears it.
+            if (inLocalTypeMembers_ && !ownLocalMethodParam &&
+                currentTypeDeclGenericParams_) {
+                for (const auto& gp : *currentTypeDeclGenericParams_)
                     if (gp.name == first) {
                         ownLocalMethodParam = true;
                         break;
@@ -6353,6 +6371,10 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         const std::vector<ast::GenericParam>* savedEnclosingMethodParams =
             currentMethodGenericParams_;
         currentMethodGenericParams_ = nullptr;
+        // fix #6968: a local type declares no type parameters of its own.
+        const std::vector<ast::GenericParam>* savedTypeDeclParams =
+            currentTypeDeclGenericParams_;
+        currentTypeDeclGenericParams_ = nullptr;
         // #6910 (§21.10 + §9.6): a local record's interface list is part of
         // its declaration ("interface implementation (§9.6) ... computed by
         // their existing rules from the declaration"), but this walk never
@@ -6397,7 +6419,8 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
             resolveMember(*m, &typeScope);
         }
         currentMethodGenericParams_ = savedEnclosingMethodParams;
-            inLocalTypeMembers_ = savedInLocal;
+        currentTypeDeclGenericParams_ = savedTypeDeclParams;
+        inLocalTypeMembers_ = savedInLocal;
         typeBodyScopes_.pop_back();
         return;
     }
