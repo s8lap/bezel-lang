@@ -13624,9 +13624,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     return builder_.CreateSelect(isNeg, neg132, s1, "sgn.result");
                 }
                 // Integer path (int or long): compute in arg's native width then trunc/sext to i32.
+                // per stdlib §2.2 (v0.340, #6925): "-1, 0, or 1: two `<` tests against
+                // T.Zero()". No unsigned value is `< Zero`, and `Zero < x` holds for every
+                // non-zero x, so an unsigned operand takes the unsigned compare: the signed
+                // predicate read the sign bit of 4000000000u (and of byte 200) and gave -1.
+                // mathOperandIsUnsigned resolves a type parameter through the active
+                // substitution (#6908), so Sign<T> at an unsigned T is covered too.
+                const bool uns = mathOperandIsUnsigned(call.args[0].value.get());
                 llvm::Value* zero = llvm::ConstantInt::get(arg->getType(), 0);
-                llvm::Value* isNeg = builder_.CreateICmpSLT(arg, zero, "sgn.neg");
-                llvm::Value* isPos = builder_.CreateICmpSGT(arg, zero, "sgn.pos");
+                llvm::Value* isNeg = uns
+                    ? builder_.getFalse()
+                    : builder_.CreateICmpSLT(arg, zero, "sgn.neg");
+                llvm::Value* isPos = uns
+                    ? builder_.CreateICmpUGT(arg, zero, "sgn.pos")
+                    : builder_.CreateICmpSGT(arg, zero, "sgn.pos");
                 llvm::Value* one = llvm::ConstantInt::get(arg->getType(), 1);
                 llvm::Value* negOne = llvm::ConstantInt::getSigned(arg->getType(), -1);
                 llvm::Value* s1 = builder_.CreateSelect(isPos, one, zero, "sgn.1");
