@@ -91,6 +91,40 @@ valid Bezel, don't work around the AOT check.**
 > `scripts/leak_census.baseline`. `strict` fails the row. Neither is on by
 > default, and neither replaces putting a leak row on `runAotChecked`.
 
+### Regression matrix (`scripts/regression_matrix.py`)
+
+Run this **by hand, before picking** any change to runtime object layout,
+disposal, or retain/release (collection runtime structs, drop/dispose emission,
+owned field/param/local release, move/adopt paths). It is not a gate phase and is
+not wired into `gate*.sh`. The #6776 layout change shipped three regressions that
+every suite missed and that only a generated pre/tip/fix ASan matrix caught.
+
+It generates, deterministically, one program per (type x operation x {`loc_` same
+module, `app_` cross-module through a `-c` library}), builds each with every
+compiler you name under `--sanitize=address`, runs it (the operation loops 100x in
+the program), and classifies the cell CLEAN / LEAK(bytes/allocs) / CRASH / CF plus
+stdout. Compilers are ordered; each later one is compared with every earlier one,
+the cells where it is **worse** (lower class, different stdout, bigger leak) are
+printed, and the exit status is 1 if there are any (2 on a usage or setup error).
+
+```
+scripts/regression_matrix.py --out /var/tmp/bezel-scratch/<lane>/mx --jobs 8 \
+    --bezelc ref=/path/to/reference/bezelc --bezelc new=build/bezelc \
+    [--filter Set,SortedSet,relocal] [--scope loc|app]
+```
+
+The reference is the compiler from before the change (build one at the parent
+commit; a Set/SortedSet-only run is about 45 s per compiler at `--jobs 8`, the
+full 1960-cell matrix about 110 s per compiler). `--filter` takes comma-separated
+substrings matched against the type key, the type text (`Set`, `Mutex`,
+`OwningDictionary`) and the operation name; `--list` prints the selected cells.
+Everything lands under `--out` (programs, per-compiler exes and logs, `<tag>.tsv`,
+`report.txt`). A cell that already crashed in the reference cannot regress; read
+its CRASH/CF count in the summary line too. Self-test:
+`python3 -m unittest discover -s scripts/gate/tests -p test_regression_matrix.py`
+(also run by `pregate.sh`'s selftests phase). Extend the generator only with types
+and members that exist in `Bezel_Standard_Library.md`.
+
 ### The self-contained (musl) link leg (#6706)
 
 A release `bezelc` links programs through its own bundle (`--link=self-contained`:
