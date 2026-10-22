@@ -25280,6 +25280,8 @@ private:
     bool caseScrutRereadable(const ast::Expr* e, int depth = 0);
 
     llvm::Value* lowerCaseExpr(const ast::CaseExpr& ce);
+    void bindCaseArmSlot(const ast::BindingPattern* bp, llvm::Value* scrut,
+                         const sema::TypeRef* scrutTy, llvm::Value* pm);
 
     // §17.15 / K8.5 (v0.216, #2098): the binding atom `(var x := E; body)`.
     // Pushes a dedicated dispose scope (the ATOM boundary), lowers each

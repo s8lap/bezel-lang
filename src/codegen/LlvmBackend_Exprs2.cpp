@@ -12816,6 +12816,80 @@ llvm::Value* Emitter::buildRecordValue(
 }
 
 
+// Shared by lowerCaseExpr and lowerCaseStmt (#6985): fill the local slot of a
+// BindingPattern arm. `scrut` is this arm's case-test value, `pm` its match
+// condition. Per §19.3 / §19.5 (#738) and §8.6 (#746) the bound name has the
+// pattern's type: a typed binding over a nullable value binds the unwrapped
+// payload; over a boxed reference it binds the unboxed value.
+void Emitter::bindCaseArmSlot(const ast::BindingPattern* bp, llvm::Value* scrut,
+                              const sema::TypeRef* scrutTy, llvm::Value* pm) {
+    // #738 / §19.5: a typed binding `var n: T` over a nullable VALUE
+    // scrutinee `T?` binds the UNWRAPPED value (the {hasValue,T} struct's
+    // T field), not the struct — the bound name has type T. (The match
+    // condition, hasValue, is computed in patternMatches.) An
+    // unconstrained `var x` keeps the whole nullable value.
+    const sema::TypeRef* btyRef =
+        bp->type ? ctx_.resolvedType(*bp->type) : nullptr;
+    if (bp->type && scrutTy && isNullableValueTy(scrutTy) &&
+        scrut->getType()->isStructTy()) {
+        llvm::Value* inner = nullablePrimValue(scrut);
+        llvm::AllocaInst* slot = entryAlloca(inner->getType());
+        builder_.CreateStore(inner, slot);
+        if (!disposeStack_.empty())
+            recordDeclScopeDepth(bp);  // fix #4523
+        locals_[bp] = slot;
+        mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
+    // fix #2915: Kind::Unit is excluded EXPLICITLY rather than by
+    // isBoxableValueType (which now admits it — §4.7/§8.6 — so a boxed
+    // `()` has a runtime identity). This arm allocas and loads
+    // `lowerTypeRef(btyRef)`, and the unit type lowers to LLVM `void`:
+    // neither an `alloca void` nor a `load void` is constructible, and
+    // this arm has no `void`→`i8` placeholder substitution of the kind
+    // lowerLocalDecl applies (#1619). A `var u: ()` typed binding
+    // therefore keeps EXACTLY its pre-fix lowering.
+    } else if (btyRef && isBoxableValueType(btyRef) &&
+               btyRef->kind != sema::TypeRef::Kind::Unit &&
+               scrut->getType()->isPointerTy()) {
+        // #746 / §19.3 / §8.6: a typed binding `var n: T` where T is a
+        // boxable VALUE type (int/bool/long/enum/record) over a BOXED
+        // reference scrutinee (`Object`/`Object?` — `scrut` is a box
+        // pointer) binds the UNBOXED value, not the raw box pointer.
+        // Without this, `n` was the box ptr, so arithmetic/branch/field
+        // access on it emitted ptr-vs-value IR (the IR_FAIL cluster) or
+        // GEP'd off the scrutinee slot (the record WRONG_VALUE case).
+        // The unbox is a payload deref (box + 2 words, like the `as`
+        // unbox); guard it on `pm` (the isa-check), which is true only
+        // when scrut is a non-null T — the binding store runs before the
+        // match branch, so an unguarded deref would fault on a null/
+        // mismatched scrutinee (a typed binding never matches null).
+        llvm::Type* valTy = lowerTypeRef(btyRef);
+        llvm::AllocaInst* slot = entryAlloca(valTy);
+        builder_.CreateStore(llvm::Constant::getNullValue(valTy), slot);
+        auto* ubBB = llvm::BasicBlock::Create(llvm_, "tb.unbox", currentFn_);
+        auto* ubContBB =
+            llvm::BasicBlock::Create(llvm_, "tb.unbox.cont", currentFn_);
+        builder_.CreateCondBr(pm, ubBB, ubContBB);
+        builder_.SetInsertPoint(ubBB);
+        llvm::Value* payload = builder_.CreateGEP(
+            ptrTy(), scrut, {builder_.getInt32(2)}, "tb.unbox.ptr");
+        builder_.CreateStore(
+            builder_.CreateLoad(valTy, payload, "tb.unbox"), slot);
+        builder_.CreateBr(ubContBB);
+        builder_.SetInsertPoint(ubContBB);
+        if (!disposeStack_.empty())
+            recordDeclScopeDepth(bp);  // fix #4523
+        locals_[bp] = slot;
+        mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
+    } else {
+        llvm::AllocaInst* slot = entryAlloca(scrut->getType());
+        builder_.CreateStore(scrut, slot);
+        if (!disposeStack_.empty())
+            recordDeclScopeDepth(bp);  // fix #4523
+        locals_[bp] = slot;
+        mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
+    }
+}
+
 llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     // §19 / §A (#727): a scrutinee-less `case cond => ... end` is an ordered
     // boolean-condition chain — each arm's "pattern" is a bool expression and
@@ -13019,71 +13093,7 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
         // (pattern-test) block, before we branch to the guard or body.
         if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
                            arm.pattern.get())) {
-            // #738 / §19.5: a typed binding `var n: T` over a nullable VALUE
-            // scrutinee `T?` binds the UNWRAPPED value (the {hasValue,T} struct's
-            // T field), not the struct — the bound name has type T. (The match
-            // condition, hasValue, is computed in patternMatches.) An
-            // unconstrained `var x` keeps the whole nullable value.
-            const sema::TypeRef* btyRef =
-                bp->type ? ctx_.resolvedType(*bp->type) : nullptr;
-            if (bp->type && scrutTy && isNullableValueTy(scrutTy) &&
-                scrut->getType()->isStructTy()) {
-                llvm::Value* inner = nullablePrimValue(scrut);
-                llvm::AllocaInst* slot = entryAlloca(inner->getType());
-                builder_.CreateStore(inner, slot);
-                if (!disposeStack_.empty())
-                    recordDeclScopeDepth(bp);  // fix #4523
-                locals_[bp] = slot;
-                mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
-            // fix #2915: Kind::Unit is excluded EXPLICITLY rather than by
-            // isBoxableValueType (which now admits it — §4.7/§8.6 — so a boxed
-            // `()` has a runtime identity). This arm allocas and loads
-            // `lowerTypeRef(btyRef)`, and the unit type lowers to LLVM `void`:
-            // neither an `alloca void` nor a `load void` is constructible, and
-            // this arm has no `void`→`i8` placeholder substitution of the kind
-            // lowerLocalDecl applies (#1619). A `var u: ()` typed binding
-            // therefore keeps EXACTLY its pre-fix lowering.
-            } else if (btyRef && isBoxableValueType(btyRef) &&
-                       btyRef->kind != sema::TypeRef::Kind::Unit &&
-                       scrut->getType()->isPointerTy()) {
-                // #746 / §19.3 / §8.6: a typed binding `var n: T` where T is a
-                // boxable VALUE type (int/bool/long/enum/record) over a BOXED
-                // reference scrutinee (`Object`/`Object?` — `scrut` is a box
-                // pointer) binds the UNBOXED value, not the raw box pointer.
-                // Without this, `n` was the box ptr, so arithmetic/branch/field
-                // access on it emitted ptr-vs-value IR (the IR_FAIL cluster) or
-                // GEP'd off the scrutinee slot (the record WRONG_VALUE case).
-                // The unbox is a payload deref (box + 2 words, like the `as`
-                // unbox); guard it on `pm` (the isa-check), which is true only
-                // when scrut is a non-null T — the binding store runs before the
-                // match branch, so an unguarded deref would fault on a null/
-                // mismatched scrutinee (a typed binding never matches null).
-                llvm::Type* valTy = lowerTypeRef(btyRef);
-                llvm::AllocaInst* slot = entryAlloca(valTy);
-                builder_.CreateStore(llvm::Constant::getNullValue(valTy), slot);
-                auto* ubBB = llvm::BasicBlock::Create(llvm_, "tb.unbox", currentFn_);
-                auto* ubContBB =
-                    llvm::BasicBlock::Create(llvm_, "tb.unbox.cont", currentFn_);
-                builder_.CreateCondBr(pm, ubBB, ubContBB);
-                builder_.SetInsertPoint(ubBB);
-                llvm::Value* payload = builder_.CreateGEP(
-                    ptrTy(), scrut, {builder_.getInt32(2)}, "tb.unbox.ptr");
-                builder_.CreateStore(
-                    builder_.CreateLoad(valTy, payload, "tb.unbox"), slot);
-                builder_.CreateBr(ubContBB);
-                builder_.SetInsertPoint(ubContBB);
-                if (!disposeStack_.empty())
-                    recordDeclScopeDepth(bp);  // fix #4523
-                locals_[bp] = slot;
-                mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
-            } else {
-                llvm::AllocaInst* slot = entryAlloca(scrut->getType());
-                builder_.CreateStore(scrut, slot);
-                if (!disposeStack_.empty())
-                    recordDeclScopeDepth(bp);  // fix #4523
-                locals_[bp] = slot;
-                mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
-            }
+            bindCaseArmSlot(bp, scrut, scrutTy, pm);
         }
         // fix #1254 / §19.3 / §14.1: for a destructuring arm over a concrete
         // generic record (e.g. `Wrapper(x) => x.v` where w: Wrapper<Item>),

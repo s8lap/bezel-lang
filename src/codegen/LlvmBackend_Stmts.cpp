@@ -12682,12 +12682,9 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         // would address the freed bytes.
         if (auto* bp = dynamic_cast<const ast::BindingPattern*>(
                            arm.pattern.get())) {
-            llvm::AllocaInst* slot = entryAlloca(armScrut->getType());
-            builder_.CreateStore(armScrut, slot);
-            if (!disposeStack_.empty())
-                recordDeclScopeDepth(bp);  // fix #4523
-            locals_[bp] = slot;
-            mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
+            // #6985 / §19.3, §8.6: same typed-binding unbox / nullable
+            // unwrap as the expression form.
+            bindCaseArmSlot(bp, armScrut, scrutTy, pm);
         }
         if (arm.guard) {
             auto* guardBB = llvm::BasicBlock::Create(
