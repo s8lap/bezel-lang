@@ -2,7 +2,15 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-The compiler tracks who owns every heap object and frees it at a point it knows statically: on the normal path and when an exception passes through, with no collector, no pauses and no `Dispose`/`finally`/`defer` plumbing. Borrowing lets code pass references around without transferring ownership, and the compiler checks that no borrow outlives what it borrows.
+Correct memory management in general-purpose programming is an unsolved problem. Manual memory management is prone to coding errors, and approaches like GC or ARC add significant overhead at runtime. Bezel lets the programmer write code where the compiler knows when and where to dispose every object. This is similar to RAII and carries no runtime overhead.
+
+The ownership rules are written down in chapter 28 of the language spec. The rules may look complicated, yet most of this complexity is on the compiler tracking ownership rather than the programmer. Only three keywords are present that help with memory management: owned that signifies an owned object, move that moves ownership, and scoped that helps manage the memory of variables captured in lambdas.
+
+The rules of the language only let the owner of an object dispose it. Calling Dispose on an object only calls its destructor. The backing memory is always freed by the calls the compiler inserts statically. Borrowing lets code pass references around without transferring ownership, and the compiler checks that no borrow outlives what it borrows. The compiler makes use of reference counting only in rare places like special closure shapes.
+
+Bezel looks a lot like Pascal and C#. The look of Bezel and its library names superficially resemble .NET, but is quite different from it.
+
+The current state of the compiler is that the specification is ahead of implementation. Most of the language already works. The issue tracker records bugs and gaps for memory problems that mostly live on the intersections of various language features. (Claude, could you specify a few examples?).
 
 ```bezel
 module Example;
