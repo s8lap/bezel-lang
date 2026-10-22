@@ -555,56 +555,16 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     }
     const auto& op = un.op;
 
-    // §7.11 Lifted unary operators: `-` and `~` on nullable value types.
-    // When the operand is a nullable value type (int?, long?, …):
-    //   - Result is T? (null when operand is null).
-    //   - The underlying op (incl. OverflowException for `-`) runs ONLY when
-    //     the operand is present (conditional branch).
-    if ((op == "-" || op == "~") && un.operand) {
-        const sema::TypeRef* ot = ctx_.exprType(*un.operand);
-        if (ot && isNullableValueTy(ot) && v->getType()->isStructTy()) {
-            llvm::Value* tag     = nullablePrimHasValue(v);
-            llvm::Value* payload = nullablePrimValue(v);
-            auto* entryBB = builder_.GetInsertBlock();
-            auto* opBB    = llvm::BasicBlock::Create(llvm_, "uneg.op",  currentFn_);
-            auto* mergeBB = llvm::BasicBlock::Create(llvm_, "uneg.end", currentFn_);
-            builder_.CreateCondBr(tag, opBB, mergeBB);
-
-            builder_.SetInsertPoint(opBB);
-            llvm::Value* result = nullptr;
-            if (op == "-") {
-                if (payload->getType()->isFloatingPointTy()) {
-                    result = builder_.CreateFNeg(payload);
-                } else {
-                    if (payload->getType()->isIntegerTy() &&
-                        !payload->getType()->isIntegerTy(1)) {
-                        emitGuardThrow(
-                            builder_.CreateICmpEQ(payload, minIntLike(payload)),
-                            "OverflowException");
-                    }
-                    result = builder_.CreateNeg(payload);
-                }
-            } else { // op == "~"
-                result = builder_.CreateNot(payload);
-            }
-            auto* opEndBB = builder_.GetInsertBlock();
-            builder_.CreateBr(mergeBB);
-
-            builder_.SetInsertPoint(mergeBB);
-            // PHI first (required to be at top of block).
-            auto* phi = builder_.CreatePHI(payload->getType(), 2, "uneg.val");
-            phi->addIncoming(llvm::Constant::getNullValue(payload->getType()),
-                             entryBB);
-            phi->addIncoming(result, opEndBB);
-            llvm::Value* resTag = builder_.CreateZExt(
-                tag, nullablePrimHasValTy(), "uneg.tag");
-            auto* st = nullableValueStructTy(ot);
-            llvm::Value* res = builder_.CreateInsertValue(
-                llvm::UndefValue::get(st), resTag, {0u});
-            res = builder_.CreateInsertValue(res, phi, {1u});
-            return res;
-        }
-    }
+    // fix #6954 (§7.11, §7.4, v0.340): no operator lifts to a nullable type, so
+    // a `-`/`~`/`+` operand whose static type is `T?` reaches codegen only once
+    // §7.4 narrowed it non-null (sema rejects the un-narrowed form: "does not
+    // lift over `T?`"), and the expression's type is then the plain `T`. The
+    // narrowed read keeps its declared `{i8 hasValue; T}` carrier, so unwrap it
+    // and let the ordinary `T` operator below run. The old lifted arm built a
+    // `T?` result that its `T` consumer printed as the has-value flag (`1`) or
+    // rejected in IR.
+    if ((op == "-" || op == "~" || op == "+") && un.operand)
+        v = unwrapNarrowedNullableOperand(v, un.operand.get());
 
     // fix #5137 (§7.11, v0.313): the §7.11 'no three-valued logic' gate at
     // `not` (src/sema/ExprTypecheck_Exprs.cpp ~7959) admits a `bool?`
