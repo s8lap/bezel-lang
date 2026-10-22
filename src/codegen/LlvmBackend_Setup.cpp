@@ -91,8 +91,71 @@ std::string Emitter::functionName(sema::MethodSymbol* ms) {
     // extended (target) type so distinct `extension`s don't collide and a
     // class method `bz$<Class>$M` never aliases an extension `M`.
     if (isExtensionMethod(ms)) {
+        // fix #6946 (§26.4 / §26.6 / §2.8.3 rule 3, v0.340): one symbol per
+        // extension BLOCK. Mangling by the head name alone gave
+        // `extension Box<int>` and `extension Box<long>` (or a module A's
+        // `extension L.K` and L's own `extension K`) one `Foo` symbol: across
+        // modules a duplicate-symbol link failure, within one module LLVM's
+        // uniquifier renaming the second `Foo.2` in DEFINITION order, an order
+        // an importer (which sees only the exported blocks) cannot reproduce,
+        // so it bound another block's body. The head's ARGUMENT spelling and
+        // the extension's own declaring module both enter the name. The
+        // spelling reads the resolved TypeRef only (a declared type by its
+        // module-qualified mangled name, a built-in head by its last segment,
+        // a free block-level variable by its identifier), so the exporter and
+        // the importer's synthesized head (ModuleLoader's extension pass)
+        // compute the same string; `<`, `,`, `>`, `?` and `@` never occur in
+        // an identifier, so it is injective.
+        auto argSpelling = [](auto& self,
+                              const sema::TypeRef* t) -> std::string {
+            if (!t) return "v";
+            std::string s;
+            if (t->kind == sema::TypeRef::Kind::Named) {
+                if (t->declaration) {
+                    s = mangledTypeName(t->declaration);
+                } else {
+                    std::string_view h = t->aliasResolvedHead;
+                    if (h.empty() && t->astNode && t->astNode->name &&
+                        !t->astNode->name->parts.empty())
+                        h = t->astNode->name->parts.back();
+                    if (h.empty()) h = t->importedName;
+                    if (auto dot = h.rfind('.'); dot != std::string_view::npos)
+                        h.remove_prefix(dot + 1);
+                    s = std::string(h);
+                }
+                if (!t->genericArgs.empty()) {
+                    s += "<";
+                    for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                        if (i) s += ",";
+                        s += self(self, t->genericArgs[i]);
+                    }
+                    s += ">";
+                }
+            } else {
+                sema::TypeRef bare = *t;
+                bare.nullable = false;
+                s = mangleTypeRefForSymbol(&bare);
+            }
+            if (t->nullable) s += "?";
+            return s;
+        };
+        std::string extMod;
+        if (sema::ExtensionSymbol* extSym =
+                ctx_.extensionSymbolOf(ms->extensionDecl))
+            extMod = extSym->moduleName;
         std::string tgt = "?";
+        std::string args;
         if (const ast::Type* tt = ms->extensionDecl->targetType.get()) {
+            const sema::TypeRef* rt = ctx_.resolvedType(*tt);
+            if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                !rt->genericArgs.empty()) {
+                args = "<";
+                for (std::size_t i = 0; i < rt->genericArgs.size(); ++i) {
+                    if (i) args += ",";
+                    args += argSpelling(argSpelling, rt->genericArgs[i]);
+                }
+                args += ">";
+            }
             // #1488 / fix #2335 (§2.8.3 rule 3 / §26, v0.315): when the target
             // resolves to a real declared type (class/interface/record — anything
             // with a TypeSymbol), qualify by its declaring module so two modules
@@ -103,21 +166,27 @@ std::string Emitter::functionName(sema::MethodSymbol* ms) {
             // so two modules each declaring `public extension int { method Foo() }`
             // produce distinct `bz$ext$<module>.int$Foo` symbols rather than
             // colliding at link time.
-            if (const sema::TypeRef* rt = ctx_.resolvedType(*tt);
-                rt && rt->declaration) {
-                return "bz$ext$" + mangledTypeName(rt->declaration) + "$" +
-                       std::string(ms->name);
+            if (rt && rt->declaration) {
+                // fix #6946: an extension declared OUTSIDE the target's module
+                // is prefixed `<extModule>@`; the target's own module keeps the
+                // historical spelling.
+                std::string pre;
+                if (!extMod.empty() && extMod != rt->declaration->moduleName)
+                    pre = extMod + "@";
+                return "bz$ext$" + pre + mangledTypeName(rt->declaration) +
+                       args + "$" + std::string(ms->name);
             }
             if (tt->name && !tt->name->parts.empty())
                 tgt = std::string(tt->name->parts.back());
+            // An importer's synthesized head is a single spelled segment;
+            // keep only its head name (the arguments are `args`).
+            if (auto lt = tgt.find('<'); lt != std::string::npos)
+                tgt.erase(lt);
         }
         // fix #2335: for primitive/builtin targets, qualify with the extension's
         // declaring module (not the target's, which has no module of its own).
-        if (sema::ExtensionSymbol* extSym =
-                ctx_.extensionSymbolOf(ms->extensionDecl))
-            if (!extSym->moduleName.empty())
-                tgt = extSym->moduleName + "." + tgt;
-        return "bz$ext$" + tgt + "$" + std::string(ms->name);
+        if (!extMod.empty()) tgt = extMod + "." + tgt;
+        return "bz$ext$" + tgt + args + "$" + std::string(ms->name);
     }
     std::string cls = ms->parent ? mangledTypeName(ms->parent) : "";
     // §25: an operator's name is empty; build a unique, collision-free
