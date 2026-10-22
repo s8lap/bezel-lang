@@ -17737,6 +17737,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             case PrimitiveType::Short: case PrimitiveType::UShort:
                             case PrimitiveType::UInt: case PrimitiveType::ULong:
                             case PrimitiveType::Char:
+                            case PrimitiveType::Int: case PrimitiveType::Long: case PrimitiveType::Double:
                             case PrimitiveType::Float:   // #6849: was untyped, so a
                                                          // consumer read it as double
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(first->primitive));
