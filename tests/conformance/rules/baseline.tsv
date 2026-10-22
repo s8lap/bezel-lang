@@ -285,6 +285,18 @@ s7_4_0061	pass
 s7_4_0062	pass	
 s7_4_0094	pass	
 s7_4_0095	pass	
+s7_4_0096	pass	
+s7_4_0097	pass	
+s7_4_0098	pass	
+s7_4_0099	pass	
+s7_4_0100	pass	
+s7_4_0101	pass	
+s7_4_0102	pass	
+s7_4_0103	pass	
+s7_4_0104	pass	
+s7_4_0105	pass	
+s7_4_0106	pass	
+s7_4_0107	pass	
 s7_5_0001	pass	
 s7_5_0002	pass	
 s7_5_0003	pass	
@@ -416,6 +428,11 @@ s8_6_0007	pass	#5659
 s8_6_0008	pass	
 s8_6_0010	pass	#5659
 s8_6_0011	pass	
+s8_7_0001	pass	
+s8_7_0002	pass	
+s8_7_0003	pass	
+s8_7_0004	pass	
+s8_7_0005	pass	
 s9_1_0001	pass	
 s9_1_0002	pass	
 s9_1_0003	pass	
@@ -799,6 +816,9 @@ s13_7_0004	pass
 s13_7_0005	pass	
 s13_7_0006	pass	
 s14_1_0001	pass	
+s14_1_0005	pass	
+s14_1_0006	pass	
+s14_1_0007	pass	
 s14_2_0001	pass	
 s14_2_0002	pass	
 s14_2_0003	pass	
@@ -840,6 +860,7 @@ s14_2_0083	pass
 s14_2_0084	pass	
 s14_2_0085	pass	
 s14_2_0086	pass	
+s14_2_0087	pass	
 s14_4_0001	pass	
 s14_4_0002	pass	
 s14_4_0003	pass	
@@ -942,6 +963,9 @@ s16_3_0003	fail	divergence
 s16_3_0004	pass	
 s16_3_0005	pass	
 s16_3_0006	pass	
+s16_3_0007	pass	
+s16_3_0008	fail	divergence
+s16_3_0009	fail	divergence
 s16_4_0001	pass	
 s16_4_0002	pass	
 s16_4_0003	pass	
@@ -1164,6 +1188,17 @@ s19_3_0069	pass
 s19_3_0070	pass	
 s19_3_0071	pass	
 s19_3_0072	pass	
+s19_3_0076	pass	
+s19_3_0077	pass	
+s19_3_0078	pass	
+s19_3_0079	pass	
+s19_3_0080	pass	
+s19_3_0081	pass	
+s19_3_0082	pass	
+s19_3_0083	pass	
+s19_3_0084	pass	
+s19_3_0085	pass	
+s19_3_0086	pass	
 s19_4_0001	pass	
 s19_4_0032	pass	
 s19_4_0033	pass	
@@ -1294,6 +1329,10 @@ s22_5_0005	pass
 s22_5_0006	pass	divergence
 s22_5_0007	pass	
 s22_5_0008	pass	
+s22_5_0009	pass	
+s22_5_0010	pass	
+s22_5_0011	pass	
+s22_5_0012	pass	
 s22_6_0001	pass	
 s22_6_0002	pass	
 s22_6_0003	pass	
@@ -1383,6 +1422,11 @@ s22_10_0016	pass
 s22_10_0017	pass	
 s22_10_0018	pass	
 s22_10_0019	pass	
+s22_10_0023	pass	
+s22_10_0024	pass	
+s22_10_0025	pass	
+s22_10_0026	pass	
+s22_10_0027	pass	
 s22_11_0001	pass	
 s22_11_0002	pass	
 s22_11_0003	pass	
@@ -1483,6 +1527,7 @@ s22_16_0026	pass
 s22_16_0027	pass	
 s22_16_0028	pass	
 s22_16_0029	pass	
+s22_16_0030	pass	
 s23_1_0001	pass	
 s23_1_0002	pass	
 s23_1_0003	pass	
@@ -1657,6 +1702,14 @@ s27_6_0017	pass
 s27_6_0018	pass	
 s27_6_0019	pass	
 s27_6_0020	pass	
+s27_6_0021	pass	
+s27_6_0022	pass	
+s27_6_0023	pass	
+s27_6_0024	pass	
+s27_6_0025	pass	
+s27_6_0026	pass	
+s27_6_0027	pass	
+s27_6_0028	pass	
 s27_7_0001	pass	
 s27_7_0002	pass	
 s27_7_0003	pass	
@@ -1787,6 +1840,10 @@ s28_3_0120	pass
 s28_3_0147	pass	
 s28_3_0203	pass	
 s28_3_0204	pass	
+s28_3_0205	fail	divergence
+s28_3_0206	fail	divergence
+s28_3_0207	pass	
+s28_3_0208	pass	
 s28_4_0001	pass	
 s28_4_0002	pass	
 s28_4_0003	pass	
@@ -2060,6 +2117,11 @@ s30_2_0001	pass
 s30_2_0002	pass	
 s30_2_0003	pass	
 s30_2_0004	pass	
+s30_2_0006	pass	
+s30_2_0007	pass	
+s30_2_0008	pass	
+s30_2_0009	pass	
+s30_2_0010	pass	
 s30_3_0001	pass	
 s30_3_0002	pass	
 s30_3_0003	pass	
@@ -2105,6 +2167,7 @@ s30_7_0008	pass
 s30_7_0009	fail	compiled but spec rejects this (Object-typed await using crosses yield)
 s30_7_0010	pass	
 s30_7_0011	pass	
+s30_7_0012	pass	
 s30_8_0001	pass	
 s30_8_0002	pass	
 s30_9_0001	pass	
@@ -2322,6 +2385,29 @@ s35_3_0005	pass
 s35_3_0006	pass	
 s35_3_0007	pass	
 s35_3_0008	pass	
+s35_3_0009	fail	divergence
+s35_3_0010	pass	
+s35_3_0011	pass	
+s35_3_0012	pass	
+s35_3_0013	pass	
+s35_3_0014	pass	
+s35_3_0015	pass	
+s35_3_0016	pass	
+s35_3_0017	pass	
+s35_3_0018	pass	
+s35_3_0019	pass	
+s35_3_0020	pass	
+s35_3_0021	pass	
+s35_3_0022	pass	
+s35_3_0023	pass	
+s35_3_0024	pass	
+s35_3_0025	pass	
+s35_3_0026	pass	
+s35_3_0027	pass	
+s35_3_0028	pass	
+s35_3_0029	pass	
+s35_3_0030	pass	
+s35_3_0031	pass	
 s35_4_0001	pass	
 s35_4_0002	pass	
 s35_4_0003	pass	
@@ -2502,6 +2588,12 @@ l3_2_0002	pass
 l3_2_0003	pass	
 l3_2_0004	pass	
 l3_2_0005	pass	
+l3_2_0006	pass	
+l3_2_0007	pass	
+l3_2_0008	pass	
+l3_2_0009	pass	
+l3_2_0010	pass	
+l3_2_0011	pass	
 l3_3_0001	pass	
 l3_3_0002	pass	
 l3_3_0003	pass	
@@ -2817,6 +2909,14 @@ l9_6_0009	pass
 l9_6_0010	pass	
 l9_8_0001	fail	divergence
 l9_8_0003	pass	
+l9_8_0004	pass	
+l9_8_0005	pass	
+l9_8_0006	pass	
+l9_8_0007	pass	
+l9_8_0008	pass	
+l9_8_0009	pass	
+l9_8_0010	pass	
+l9_8_0011	pass	
 l9_9_0001	pass	
 l9_9_0002	fail	divergence
 l10_0_0001	pass	
