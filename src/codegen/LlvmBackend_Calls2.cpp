@@ -48,13 +48,35 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     if (sg != "UTF8" && sg != "UTF16" && sg != "UTF32" && sg != "ASCII")
         return nullptr;
 
+    // fix #6979 (stdlib §3.2, v0.340): a `ReadOnlyStringSpan` source lowers to
+    // the {ptr,i32,i32} %bz.arrayspan VALUE, not a string pointer. The
+    // bz_encoding_*_{get_bytes,get_byte_count,write_bytes} entries take a
+    // string, so a span source is materialized to a fresh +1 string
+    // (bz_str_substring, code-point window) which `release` frees after the
+    // runtime call. A genuine `string` passes through untouched.
+    llvm::Value* ownedSrc = nullptr;
+    auto asEncString = [&](llvm::Value* v) -> llvm::Value* {
+        if (!isStringSpanValue(v)) return v;
+        auto* sub = declareC("bz_str_substring", ptrTy(), {ptrTy(), i64(), i64()});
+        llvm::Value* src = builder_.CreateExtractValue(v, {0u}, "enc.ss.src");
+        llvm::Value* st = builder_.CreateExtractValue(v, {1u}, "enc.ss.st");
+        llvm::Value* ln = builder_.CreateExtractValue(v, {2u}, "enc.ss.len");
+        ownedSrc = builder_.CreateCall(
+            sub, {src, builder_.CreateSExt(st, i64()),
+                  builder_.CreateSExt(ln, i64())}, "enc.ss.str");
+        return ownedSrc;
+    };
+    auto releaseSrc = [&] { if (ownedSrc) emitStringRelease(ownedSrc); };
+
     // GetBytes(s): owned Array<byte>.  Returns null on failure for strict
     // encodings; codegen adds emitGuardThrow(null_check, "FormatException").
     if (m == "GetBytes" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* strPtr = lowerExpr(*call.args[0].value);
         if (!strPtr) return nullptr;
+        strPtr = asEncString(strPtr);
         auto* fn = declareC(getBytesName.c_str(), ptrTy(), {ptrTy()});
         llvm::Value* result = builder_.CreateCall(fn, {strPtr}, "enc.bytes");
+        releaseSrc();
         if (canFail) {
             // Null return → FormatException (stdlib §3.2 v0.136 error model).
             llvm::Value* isNull = builder_.CreateICmpEQ(
@@ -69,6 +91,7 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
     if (m == "GetByteCount" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* strPtr = lowerExpr(*call.args[0].value);
         if (!strPtr) return nullptr;
+        strPtr = asEncString(strPtr);
         std::string cntFnName = "bz_encoding_" +
             (sg == "UTF8"  ? std::string("utf8")  :
              sg == "UTF16" ? std::string("utf16") :
@@ -76,6 +99,7 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
                              std::string("ascii")) + "_get_byte_count";
         auto* cntFn = declareC(cntFnName.c_str(), i64(), {ptrTy()});
         llvm::Value* cnt = builder_.CreateCall(cntFn, {strPtr}, "enc.cnt");
+        releaseSrc();
         // ASCII: -1 means a code point > U+007F → FormatException (§3.2 v0.136).
         if (sg == "ASCII") {
             llvm::Value* isFail =
@@ -100,6 +124,7 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         llvm::Value* strPtr  = lowerExpr(*call.args[strArgIdx].value);
         llvm::Value* spanVal = lowerExpr(*call.args[spanArgIdx].value);
         if (!strPtr || !spanVal) return nullptr;
+        strPtr = asEncString(strPtr);
         // Count bytes needed.
         std::string cntFnName = "bz_encoding_" +
             (sg == "UTF8"  ? std::string("utf8")  :
@@ -142,6 +167,7 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         auto* wrtFn = declareC(wrtFnName.c_str(),
             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
         builder_.CreateCall(wrtFn, {strPtr, rawPtr});
+        releaseSrc();
         // Return bytes written as int (truncated from i64).
         return builder_.CreateTrunc(needed, i32(), "enc.sp.written");
     }
