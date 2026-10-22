@@ -2081,7 +2081,22 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
                     methodScope.names[g.name] = nullptr;
                     continue;
                 }
+                // fix #6965 (§11.6 "Nested types of a generic type", §14.1,
+                // §21.10, v0.340): the enclosing method's and enclosing
+                // types' type parameters are NOT in scope in a type nested
+                // in a local type, so a method of it may reuse their names.
+                methodScope.names[g.name] = nullptr;
+                continue;
             }
+            // fix #6965 (§11.6, v0.340): "Because the name is not in scope, a
+            // nested type, or a method of one, may declare a type parameter
+            // spelled like an enclosing type's (§14.1)." The type's OWN
+            // parameters are checked just below via currentOuterType_; the
+            // scope walk after it would reach the ENCLOSING types' scopes,
+            // which §11.6 puts out of scope. A nested type's symbol carries a
+            // non-empty enclosingTypePath.
+            const bool methodOfNestedType =
+                currentOuterType_ && !currentOuterType_->enclosingTypePath.empty();
             // Check against enclosing type's generic params (currentOuterType_ is
             // set when inside a type; null for extensions at module scope).
             if (currentOuterType_) {
@@ -2102,7 +2117,7 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             // head's params live there (parent == extScope).  Skip the immediate
             // type's typeScope when currentOuterType_ is set (already checked
             // via currentOuterType_->genericParams) to avoid double-reporting.
-            for (Scope* s = parent; s; s = s->parent) {
+            for (Scope* s = parent; s && !methodOfNestedType; s = s->parent) {
                 if (currentOuterType_ && s == parent) continue;
                 auto it = s->names.find(g.name);
                 if (it != s->names.end()) {
@@ -6382,7 +6397,7 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
             resolveMember(*m, &typeScope);
         }
         currentMethodGenericParams_ = savedEnclosingMethodParams;
-        inLocalTypeMembers_ = savedInLocal;
+            inLocalTypeMembers_ = savedInLocal;
         typeBodyScopes_.pop_back();
         return;
     }
