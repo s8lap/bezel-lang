@@ -9780,6 +9780,12 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
             return;
         }
     }
+    if (dynamic_cast<const ast::IndexExpr*>(as.target.get())) {
+        // §22.8 (v0.340, #6972): element store into a readonly inline array.
+        checkReadonlyFieldWriteTarget(*as.target, as.span.begin,
+                                      /*incOp=*/nullptr);
+        return;
+    }
     auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*as.target));
     if (!fs) return;
     // §9.1 / §9.4 (v0.236, #2309): a positional RECORD's auto-generated
@@ -9910,6 +9916,42 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
 void ExprTC::checkReadonlyFieldWriteTarget(const ast::Expr& target,
                                             const SourceLocation& loc,
                                             const char* incOp) {
+    // §22.8 (v0.340, #6972): an element store `F[i] := e` into a `readonly`
+    // inline-array field writes the field's own storage. Inside a constructor
+    // that store is admitted only on the constructor's own instance, `this.F`
+    // or the bare `F`, exactly like `F := e`; `this.Next.F[i]` is "another
+    // value's `readonly` storage held in a ... field". Outside a constructor
+    // the element store is not decided here (spec question, #6972 follow-up).
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&target)) {
+        if (inConstructor_ && !inStaticMember_ && ix->target) {
+            const ast::Expr* bp = ix->target.get();
+            // `F[i][j]`: peel nested element hops to the field itself.
+            while (auto* inner = dynamic_cast<const ast::IndexExpr*>(bp))
+                if (inner->target) bp = inner->target.get(); else break;
+            const ast::Expr& base = *bp;
+            auto* bfs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(base));
+            const TypeRef* bt = ctx_.exprType(base);
+            if (bfs && bt && bt->kind == TypeRef::Kind::InlineArray &&
+                !isDirectThisMemberTarget(base)) {
+                bool ro = false, st = false;
+                for (auto mod : bfs->modifiers) {
+                    if (mod == "readonly") ro = true;
+                    if (mod == "static") st = true;
+                }
+                if (ro && !st) {
+                    const std::string verb =
+                        incOp ? "increment/decrement " : "assign to ";
+                    const std::string cite = incOp ? "§17.6 / " : "";
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "cannot " + verb + "readonly field `" +
+                        std::string(bfs->name) +
+                        "` outside the declaring class's constructor (" +
+                        cite + "§22.8)");
+                }
+            }
+        }
+    }
     auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(target));
     if (!fs) return;
     if (fs->posParam && fs->parent &&
