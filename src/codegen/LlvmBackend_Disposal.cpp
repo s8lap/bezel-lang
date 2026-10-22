@@ -1771,9 +1771,16 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                         // RuntimeManaged test above already fails (and sema
                         // rejects `OwningLinkedList<string>` outright — stdlib
                         // §4.2 / §14.4, #1327).
+                        //
+                        // fix #6924 (stdlib §4.19, §28.11, v0.340): FrozenArray
+                        // joins too. Its copying `From(items: Array<string>)`
+                        // now takes the per-element +1 for a borrowed source
+                        // and inherits it from an owned one, so an `owned`
+                        // FrozenArray<string> field releases its elements here
+                        // exactly as a scope-end local does.
                         return n == "Array" || n == "Stack" || n == "Queue" ||
                                n == "IList" || n == "IReadOnlyList" ||
-                               n == "LinkedList";
+                               n == "LinkedList" || n == "FrozenArray";
                     }(it->collTy->headName()))
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp
@@ -7291,11 +7298,12 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
                    head == "LinkedList" ||
                    // fix #3249 (§4.19, v0.186): FrozenArray<T> shares the
                    // borrowing collection's string-element contract — its
-                   // From(items: Array<T>) copying construction calls
-                   // emitArrayRetainStringsIfStringArray at the call site
-                   // (tryLowerFrozenArrayCall, LlvmBackend_Calls2.cpp), so the
-                   // matching release here is a balanced thunk, not a
-                   // double-free.
+                   // From(items: Array<T>) copying construction takes (for a
+                   // borrowed source) or inherits (for an owned one) the +1
+                   // per string at the call site (tryLowerFrozenArrayCall,
+                   // LlvmBackend_Calls2.cpp — fix #6924: until then the
+                   // borrowed-source retain was a no-op), so the matching
+                   // release here is a balanced thunk, not a double-free.
                    head == "FrozenArray");
         if (!childDisposer && isStrElem(childTy) && strChildRetainedAtConstruction)
             childDisposer = stringElementReleaseThunk();

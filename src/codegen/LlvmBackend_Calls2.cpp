@@ -428,11 +428,46 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
             {copy, llvm::ConstantPointerNull::get(ptrTy())});
     }
 
-    // #429 / §4.6 / §28.9: a copied Array<string> independently co-owns a +1
-    // per element. Retain each so the FrozenArray can release symmetrically
-    // at its own free. Retain is null/sentinel-safe; a non-string element
-    // type is a no-op.
-    emitArrayRetainStringsIfStringArray(resTy, copy);
+    // fix #6924 (§28.11, §28.9, stdlib §4.19, v0.340): a FrozenArray<string>
+    // co-owns a +1 per element and releases it at its own free. The shared
+    // helper `emitArrayRetainStringsIfStringArray` recognises only the
+    // Array/Stack/Queue heads, so the call it used to make here with the
+    // FrozenArray result type was a no-op and a BORROWED source's strings were
+    // shared without a retain: the source's owner and the FrozenArray each
+    // released the same +1 (heap-use-after-free / over-release abort).
+    // Retain only for a borrowed source. An owned source (literal, call
+    // result, `move`) is freed below with a NULL element disposer, which hands
+    // its +1 per string to the copy; retaining there too would leak one per
+    // element. Nullable `string?` elements are not co-owned (the same
+    // exclusion the shared helper and the array disposal make).
+    //
+    // The copy's header also records the string release as its element
+    // disposer, for EVERY source: a FrozenArray<string> co-owns its elements
+    // whichever way it was built, and the header is what a disposal that does
+    // not know the static type reads (`o.Dispose()` through `Object` —
+    // bz_array_obj_dispose — and bz_array_free_dynamic). Without it, the
+    // retain above turns `var o: Object := move frozen; o.Dispose()` from a
+    // free that happened to balance (the source's owner paid the only +1)
+    // into a leak of one string per element.
+    const sema::TypeRef* frozenEl =
+        (resTy && !resTy->genericArgs.empty()) ? resTy->genericArgs[0]
+                                               : nullptr;
+    const bool frozenStringElems =
+        frozenEl && !frozenEl->nullable &&
+        frozenEl->kind == sema::TypeRef::Kind::Primitive &&
+        frozenEl->primitive == sema::PrimitiveType::String;
+    if (frozenStringElems && !sourceOwnedHere) {
+        builder_.CreateCall(
+            declareC("bz_array_retain_strings", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {copy});
+    }
+    if (frozenStringElems) {
+        builder_.CreateCall(
+            declareC("bz_array_set_elem_disposer",
+                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}),
+            {copy, stringElementReleaseThunk()});
+    }
 
     // §28.3: free the source storage ONLY when ownership transferred into the
     // call (literal / `move` / explicit `owned` modifier). The source's

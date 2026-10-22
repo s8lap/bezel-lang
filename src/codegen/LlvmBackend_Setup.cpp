@@ -33281,9 +33281,13 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
                 // OwningLinkedList cannot reach here (owning-family string is
                 // the Value row, so the RuntimeManaged test above fails; sema
                 // rejects the instantiation anyway — stdlib §4.2 / §14.4 #1327).
+                // fix #6924 (stdlib §4.19, §28.11, v0.340): FrozenArray<string>
+                // co-owns its elements too (its copying From takes or
+                // inherits the +1), so the displaced value of an overwritten
+                // `owned` FrozenArray<string> field releases them.
                 return n == "Array" || n == "Stack" || n == "Queue" ||
                        n == "IList" || n == "IReadOnlyList" ||
-                       n == "LinkedList";
+                       n == "LinkedList" || n == "FrozenArray";
             }(collTy->headName()))
         elemDisp = stringElementReleaseThunk();
 
