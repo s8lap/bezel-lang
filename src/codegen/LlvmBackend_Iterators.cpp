@@ -246,6 +246,12 @@ void Emitter::collectSuspendLocals(
             collectSuspendLocals(fs->body, out);
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
             collectSuspendLocals(ws->body, out);
+        } else if (auto* cas = dynamic_cast<const ast::CaseStmt*>(s.get())) {
+            // §29.3 / §19 (#6951): locals and loop variables declared in a
+            // block-form `case` arm live across a yield like any other
+            // nested-body local and need their frame fields.
+            for (const auto& arm : cas->arms)
+                collectSuspendLocals(arm.stmts, out);
         } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
             collectSuspendLocals(ifs->ifBranch.body, out);
             for (const auto& el : ifs->elifBranches)
