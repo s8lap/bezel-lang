@@ -3866,7 +3866,20 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             // `declaration = nullptr` and an unspecialized layout, so every
             // instantiation shares one struct and the first one's field layout
             // is what later stores corrupt.
-            if (inLocalTypeMembers_) {
+            // fix #6911: a generic METHOD declared on the local type binds its
+            // OWN type parameters, which are not "enclosing" ones. The local
+            // walk below nulls `currentMethodGenericParams_` for everything but
+            // a member method (whose `resolveMember` sets it to that method's
+            // parameters), so a hit here is the local type's own method `<T>`.
+            bool ownLocalMethodParam = false;
+            if (inLocalTypeMembers_ && currentMethodGenericParams_) {
+                for (const auto& gp : *currentMethodGenericParams_)
+                    if (gp.name == first) {
+                        ownLocalMethodParam = true;
+                        break;
+                    }
+            }
+            if (inLocalTypeMembers_ && !ownLocalMethodParam) {
                 ctx_.diagnostics().report(
                     Severity::Error, t.span.begin,
                     std::string("local type references the enclosing "
@@ -6273,6 +6286,12 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         typeBodyScopes_.emplace_back(&typeScope, tsym);
         const bool savedInLocal = inLocalTypeMembers_;
         inLocalTypeMembers_ = true;
+        // #6911 (§21.10): the ENCLOSING method's generic parameters are not the
+        // local type's own; only a member method's `resolveMember` re-installs
+        // its own list, so clear the enclosing one for the whole walk.
+        const std::vector<ast::GenericParam>* savedEnclosingMethodParams =
+            currentMethodGenericParams_;
+        currentMethodGenericParams_ = nullptr;
         for (const auto& pf : localType->decl->positionalFields) {
             if (pf.type) resolveType(*pf.type, &typeScope);
             if (pf.defaultValue)
@@ -6287,6 +6306,7 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
             if (!m) continue;
             resolveMember(*m, &typeScope);
         }
+        currentMethodGenericParams_ = savedEnclosingMethodParams;
         inLocalTypeMembers_ = savedInLocal;
         typeBodyScopes_.pop_back();
         return;
