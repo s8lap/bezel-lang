@@ -9512,6 +9512,36 @@ static bool isDirectThisMemberTarget(const ast::Expr& target) {
     return dynamic_cast<const ast::IdentifierExpr*>(&target) != nullptr;
 }
 
+// §22.8 (v0.340, #6972/#6986/#6987): an element target `F[i]` (or `F[i][j]`)
+// of a `readonly` instance inline-array field F, reached in a constructor
+// but outside the constructor's write window: through anything but the
+// constructor's own `this.F` / bare `F` (another value's storage, #6972,
+// #6986), or from a lambda body formed in the constructor (#6987: the write
+// window "does not include a nested function body"). Returns F, else null.
+// Outside a constructor the element store is not decided (spec question,
+// #6982) and yields null.
+FieldSymbol* ExprTC::readonlyInlineArrayElementOutsideWindow(
+        const ast::Expr& target) {
+    auto* ix = dynamic_cast<const ast::IndexExpr*>(&target);
+    if (!ix || !inConstructor_ || inStaticMember_ || !ix->target)
+        return nullptr;
+    const ast::Expr* bp = ix->target.get();
+    // `F[i][j]`: peel nested element hops to the field itself.
+    while (auto* inner = dynamic_cast<const ast::IndexExpr*>(bp))
+        if (inner->target) bp = inner->target.get(); else break;
+    const ast::Expr& base = *bp;
+    auto* bfs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(base));
+    const TypeRef* bt = ctx_.exprType(base);
+    if (!bfs || !bt || bt->kind != TypeRef::Kind::InlineArray) return nullptr;
+    if (isDirectThisMemberTarget(base) && !inLambda_) return nullptr;
+    bool ro = false, st = false;
+    for (auto mod : bfs->modifiers) {
+        if (mod == "readonly") ro = true;
+        if (mod == "static") st = true;
+    }
+    return (ro && !st) ? bfs : nullptr;
+}
+
 bool ExprTC::isReadonlyStoreWindowOpen(const ast::Expr& target,
                                        const TypeSymbol* declaring,
                                        bool isStatic) const {
@@ -9928,35 +9958,16 @@ void ExprTC::checkReadonlyFieldWriteTarget(const ast::Expr& target,
     // or the bare `F`, exactly like `F := e`; `this.Next.F[i]` is "another
     // value's `readonly` storage held in a ... field". Outside a constructor
     // the element store is not decided here (spec question, #6972 follow-up).
-    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&target)) {
-        if (inConstructor_ && !inStaticMember_ && ix->target) {
-            const ast::Expr* bp = ix->target.get();
-            // `F[i][j]`: peel nested element hops to the field itself.
-            while (auto* inner = dynamic_cast<const ast::IndexExpr*>(bp))
-                if (inner->target) bp = inner->target.get(); else break;
-            const ast::Expr& base = *bp;
-            auto* bfs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(base));
-            const TypeRef* bt = ctx_.exprType(base);
-            if (bfs && bt && bt->kind == TypeRef::Kind::InlineArray &&
-                !isDirectThisMemberTarget(base)) {
-                bool ro = false, st = false;
-                for (auto mod : bfs->modifiers) {
-                    if (mod == "readonly") ro = true;
-                    if (mod == "static") st = true;
-                }
-                if (ro && !st) {
-                    const std::string verb =
-                        incOp ? "increment/decrement " : "assign to ";
-                    const std::string cite = incOp ? "§17.6 / " : "";
-                    ctx_.diagnostics().report(
-                        Severity::Error, loc,
-                        "cannot " + verb + "readonly field `" +
-                        std::string(bfs->name) +
-                        "` outside the declaring class's constructor (" +
-                        cite + "§22.8)");
-                }
-            }
-        }
+    if (auto* bfs = readonlyInlineArrayElementOutsideWindow(target)) {
+        const std::string verb =
+            incOp ? "increment/decrement " : "assign to ";
+        const std::string cite = incOp ? "§17.6 / " : "";
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "cannot " + verb + "readonly field `" +
+            std::string(bfs->name) +
+            "` outside the declaring class's constructor (" +
+            cite + "§22.8)");
     }
     auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(target));
     if (!fs) return;
@@ -10660,6 +10671,17 @@ void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
         Symbol* sym = ctx_.exprSymbol(target);
         if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
             checkRefOutPropertyOperand(*ps, target, kind);
+            return;
+        }
+        // §22.8 (v0.340, #6986/#6987): a ref/out binding of a readonly
+        // inline-array element is a write path, like the direct store.
+        if (auto* bfs = readonlyInlineArrayElementOutsideWindow(target)) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be an "
+                "element of readonly field `" + std::string(bfs->name) +
+                "` outside the declaring class's constructor (§22.3 / "
+                "§22.8)");
         }
         return;
     }

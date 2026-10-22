@@ -2668,6 +2668,8 @@ private:
     // Shared by the Identifier and MemberAccess cases of
     // checkRefOutOperandCategory: readonly-outside-context (§22.8) and
     // mutable-static-rule-2 (§22.12) for a field operand.
+    FieldSymbol* readonlyInlineArrayElementOutsideWindow(
+        const ast::Expr& target);
     void checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
                                  const char* kind);
     // §9.4 (v0.236 / v0.307 "Value receivers are borrows"): in a record
