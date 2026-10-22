@@ -13801,18 +13801,87 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     // ({hasValue, T}) tests its flag. A slot that cannot be null yields nullptr
     // (no test). An untyped `var a` and a naked `a` are not typed and are not
     // routed here (they bind null, §19.3).
-    auto typedSlotNonNull = [&](const ast::BindingPattern* vbp, llvm::Value* v,
-                                const sema::TypeRef* ty) -> llvm::Value* {
-        if (!vbp || !vbp->type) return nullptr;
-        if (v->getType()->isPointerTy())
-            return builder_.CreateICmpNE(
-                v, llvm::ConstantPointerNull::get(ptrTy()), "slot.nonnull");
+    // #7003/#7004 (§19.5, v0.340): the typed binding's full test and bound value
+    // for a SLOT. The test is the one a top-level `case x of var n: T` applies
+    // (the BindingPattern branch of this function, reached by recursion with
+    // the slot's static type): a runtime type test for a class, interface,
+    // exception or boxed value type, hasValue of a nullable carrier, non-null
+    // for `Object`/`string`. When that branch has no answer the #7002 non-null
+    // test remains. The bound value mirrors lowerCaseExpr's top-level typed
+    // binding: a `T?` carrier binds its UNWRAPPED payload, and a boxed
+    // `Object` slot tested against a value type `var n: int` binds the
+    // UNBOXED value (guarded by the test, so a null or mismatched box is never
+    // dereferenced). A reference binding keeps the slot pointer. An untyped
+    // `var a` and a naked name are not routed here (they bind null, §19.3).
+    struct SlotBind {
+        llvm::Value* test = nullptr;   // nullptr = no test
+        llvm::Value* bound = nullptr;  // value stored into the binding slot
+    };
+    // `guard` (when non-null) is the condition under which the slot value is
+    // meaningful (a choice payload slot is live only when the tag matched): the
+    // test, which walks the value's descriptor, runs only then.
+    auto typedSlotBind = [&](const ast::BindingPattern* vbp, llvm::Value* v,
+                             const sema::TypeRef* ty,
+                             llvm::Value* guard = nullptr) -> SlotBind {
+        SlotBind r;
+        r.bound = v;
+        if (!vbp || !vbp->type) return r;
         const sema::TypeRef* resolved = resolveTypeParamRef(ty);
-        const bool nullable =
+        const bool nullableSlot =
             (ty && ty->nullable) || (resolved && resolved->nullable);
-        if (nullable && v->getType()->isStructTy())
-            return nullablePrimHasValue(v);
-        return nullptr;
+        llvm::BasicBlock* guardPre = nullptr;
+        llvm::BasicBlock* guardJoin = nullptr;
+        if (guard) {
+            guardPre = builder_.GetInsertBlock();
+            auto* testBB =
+                llvm::BasicBlock::Create(llvm_, "slot.test", currentFn_);
+            guardJoin =
+                llvm::BasicBlock::Create(llvm_, "slot.test.join", currentFn_);
+            builder_.CreateCondBr(guard, testBB, guardJoin);
+            builder_.SetInsertPoint(testBB);
+        }
+        r.test = patternMatches(vbp, v, nullptr, false, ty);
+        if (!r.test) {
+            if (v->getType()->isPointerTy())
+                r.test = builder_.CreateICmpNE(
+                    v, llvm::ConstantPointerNull::get(ptrTy()), "slot.nonnull");
+            else if (nullableSlot && v->getType()->isStructTy())
+                r.test = nullablePrimHasValue(v);
+        }
+        if (guard) {
+            llvm::BasicBlock* testEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(guardJoin);
+            builder_.SetInsertPoint(guardJoin);
+            auto* gphi = builder_.CreatePHI(i1(), 2);
+            gphi->addIncoming(builder_.getInt1(false), guardPre);
+            gphi->addIncoming(r.test ? r.test : builder_.getInt1(true), testEnd);
+            r.test = gphi;
+        }
+        if (nullableSlot && v->getType()->isStructTy()) {
+            r.bound = nullablePrimValue(v);
+        } else if (v->getType()->isPointerTy() && r.test) {
+            const sema::TypeRef* bty = ctx_.resolvedType(*vbp->type);
+            if (bty && isBoxableValueType(bty) &&
+                bty->kind != sema::TypeRef::Kind::Unit) {
+                llvm::Type* valTy = lowerTypeRef(bty);
+                llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+                auto* ubBB = llvm::BasicBlock::Create(llvm_, "slot.unbox", currentFn_);
+                auto* contBB =
+                    llvm::BasicBlock::Create(llvm_, "slot.unbox.cont", currentFn_);
+                builder_.CreateCondBr(r.test, ubBB, contBB);
+                builder_.SetInsertPoint(ubBB);
+                llvm::Value* payload = builder_.CreateGEP(
+                    ptrTy(), v, {builder_.getInt32(2)}, "slot.unbox.ptr");
+                llvm::Value* loaded = builder_.CreateLoad(valTy, payload, "slot.unbox.val");
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+                auto* phi = builder_.CreatePHI(valTy, 2);
+                phi->addIncoming(loaded, ubBB);
+                phi->addIncoming(llvm::Constant::getNullValue(valTy), preBB);
+                r.bound = phi;
+            }
+        }
+        return r;
     };
     // fix #5232 (§19.3, v0.313): the scrutinee may be a TYPE PARAMETER (a bare
     // Named TypeRef with no declaration), which §19.3 says is decided PER
@@ -13947,9 +14016,17 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(
                                                sp.pattern.get())) {
+                                // #7003/#7004 (§19.5): a typed binding is a type
+                                // test and binds the unwrapped/unboxed value.
+                                SlotBind sb = typedSlotBind(
+                                    vbp, fv,
+                                    common::substitutedChoicePayloadType(
+                                        cc->caseDecl->payload[i], choiceTy,
+                                        scrutTy, ctx_),
+                                    matched);
                                 llvm::AllocaInst* slot =
-                                    entryAlloca(fv->getType());
-                                builder_.CreateStore(fv, slot);
+                                    entryAlloca(sb.bound->getType());
+                                builder_.CreateStore(sb.bound, slot);
                                 // §19.3 / §27.5: a case-arm binding owns its
                                 // capture-cell lifetime at the arm scope, not at
                                 // the nested block that first captures it.
@@ -13957,13 +14034,8 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                     recordDeclScopeDepth(vbp);  // fix #4523
                                 locals_[vbp] = slot;
                                 mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
-                                // #7002 (§19.5): a typed binding is a non-null test.
-                                if (llvm::Value* nn = typedSlotNonNull(
-                                        vbp, fv,
-                                        common::substitutedChoicePayloadType(
-                                            cc->caseDecl->payload[i], choiceTy,
-                                            scrutTy, ctx_)))
-                                    matched = builder_.CreateAnd(matched, nn);
+                                if (sb.test)
+                                    matched = builder_.CreateAnd(matched, sb.test);
                             } else if (sp.pattern) {
                                 // fix #3902 / §35.5: a REFUTABLE payload slot
                                 // (constant, range, relational, alternative
@@ -15989,14 +16061,16 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     mapSuspendLocalSlot(sp.nakedAnchor.get(), slot);  // §29.3 (#6976)
                 } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                                sp.pattern.get())) {
-                    llvm::AllocaInst* slot = entryAlloca(fv->getType());
-                    builder_.CreateStore(fv, slot);
+                    // #7003/#7004 (§19.5): a typed binding is a type test and
+                    // binds the unwrapped/unboxed value.
+                    SlotBind sb = typedSlotBind(
+                        vbp, fv, recordMemberTypeResolved(fields[i]));
+                    llvm::AllocaInst* slot = entryAlloca(sb.bound->getType());
+                    builder_.CreateStore(sb.bound, slot);
                     locals_[vbp] = slot;
                     mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
-                    // #7002 (§19.5): a typed binding is a non-null test.
-                    if (llvm::Value* nn = typedSlotNonNull(
-                            vbp, fv, recordMemberTypeResolved(fields[i])))
-                        innerMatched = builder_.CreateAnd(innerMatched, nn);
+                    if (sb.test)
+                        innerMatched = builder_.CreateAnd(innerMatched, sb.test);
                 } else if (sp.pattern) {
                     // fix #3899 / §14.1 / §19.3: `recordMemberTypeResolved`
                     // (not the bare `recordMemberType`) so a generic-record
@@ -16113,14 +16187,16 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 // §19.3: `Pt(var x, var y)` — equivalent to bare form.
                 // Sema sets lsym->decl = vbp (the BindingPattern node), so
                 // key the slot on vbp to match localSlot()'s lookup.
-                llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
-                builder_.CreateStore(fieldVal, slot);
+                // #7003/#7004 (§19.5): a typed binding is a type test and
+                // binds the unwrapped/unboxed value.
+                SlotBind sb = typedSlotBind(
+                    vbp, fieldVal, recordMemberTypeResolved(fields[i]));
+                llvm::AllocaInst* slot = entryAlloca(sb.bound->getType());
+                builder_.CreateStore(sb.bound, slot);
                 locals_[vbp] = slot;
                 mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
-                // #7002 (§19.5): a typed binding is a non-null test.
-                if (llvm::Value* nn = typedSlotNonNull(
-                        vbp, fieldVal, recordMemberTypeResolved(fields[i])))
-                    matched = builder_.CreateAnd(matched, nn);
+                if (sb.test)
+                    matched = builder_.CreateAnd(matched, sb.test);
             } else if (sp.pattern) {
                 // Non-binding sub-pattern: check it against the field value.
                 // §19.3 / fix #615: resolve the field's declared type so that
