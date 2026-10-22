@@ -75,9 +75,31 @@ The rules are in [chapter 28 of the specification](docs/Bezel_Language_Spec.md#s
 
 - **`owned`** marks a slot that holds ownership: a parameter that takes it, a return type that hands it to the caller, or a field that holds it until it is replaced or its object is disposed.
 - **`move`** transfers ownership out of a named variable at a use site, for example into an `owned` parameter. Where the destination itself announces the transfer, such as a `return` or a store into an `owned` field, no marker is written. Either way, every transfer is visible in the source.
-- **`scoped`** marks a parameter, usually a callback, that the callee may keep rather than only use during the call. What it keeps lives no longer than an object the compiler can see, such as a `using var` local or `this`, so a lambda passed there may still capture borrowed locals declared before that object; until the object goes away, those locals cannot be moved, reassigned or disposed ([§28.14](docs/Bezel_Language_Spec.md#sec-scoped-callback-parameters)).
+- **`scoped`** lets a method keep something it was given, typically a callback, beyond the call. See below.
 
 A local initialized with a new object (`new`, or a call whose return type is `owned`) owns it. Every other reference is a **borrow**: a reference passed around without transferring ownership. The compiler checks that no borrow outlives what it borrows, so a dangling reference is a compile-time error.
+
+**What `scoped` is for.** A lambda is only safe while everything it captured is still alive. By default, a method that receives a lambda may call it but may not keep it: storing it in a field, in a collection or in a returned closure is a compile error, because the method's signature says nothing about how long the captured values live. Declaring the parameter `scoped` says *"I will keep this for as long as the object that stores it lives"*, and the compiler then checks the caller's side:
+
+```bezel
+class Timer
+  private scoped _onTick: (() -> ())?;              // a scoped field: it can be invoked, replaced or cleared, never read out
+  public method OnTick(scoped handler: () -> ())
+    _onTick := handler;                              // allowed: stored in the object that received it
+  end OnTick;
+  public method Tick()
+    _onTick?();                                      // call the handler if one is set
+  end Tick;
+end Timer;
+
+using var conn := new Connection("db");              // declared before the timer
+using var timer := new Timer();
+timer.OnTick(lambda() => conn.Send("ping"));         // the lambda borrows conn; timer stores the lambda
+timer.Tick();
+// while timer lives, conn cannot be moved, reassigned or disposed
+```
+
+The call is accepted because `conn` is declared before `timer`, so it is disposed after `timer` at the end of the block. If the two `using var` lines are swapped, the call is rejected and the message names `conn`. If `timer` is a plain `var` with no fixed end, only lambdas that capture nothing are accepted. The same mechanism lets an object keep a borrowed object rather than a lambda (`new Statement(scoped account)`), and the standard library uses it for event subscriptions and for `TaskScope.Spawn` ([§28.14](docs/Bezel_Language_Spec.md#sec-scoped-callback-parameters); [Guide 1](docs/Bezel_Guide_01_Memory_and_Ownership.md) has more).
 
 Only an object's owner may dispose it ([§28.6](docs/Bezel_Language_Spec.md#sec-who-may-dispose)). Calling `Dispose()` runs the object's cleanup, its destructor, and marks it disposed. It does not free the memory. The memory is always released by code the compiler inserts at the owner's release point: the end of a scope, the overwrite of a field, the disposal of the object that holds it. Using an object after it has been disposed raises `DisposedAccessException` in the default build instead of reading freed memory.
 
