@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>   // std::strtof — fix #5194 (§4.3, v0.312)
 #include <algorithm>  // std::find — for static-method detection via modifiers
+#include <limits>     // fix #6914: std::numeric_limits
 #include <unordered_set>
 
 // §4.3/§4.4 (v0.190, #1781): decimal literal range-check at formation reuses the
@@ -7189,12 +7190,35 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
         // decided here.
         auto adoptionOutOfRange = [&](const ast::Expr* constExpr,
                                       const TypeRef* target) -> bool {
-            auto cv = foldIntConstExprTC(*constExpr);
-            if (!cv || fitsInIntType(*cv, target->primitive)) return false;
+            std::string shown;
+            if (isLiteralDerivedExpr(constExpr)) {
+                auto cv = foldIntConstExprTC(*constExpr);
+                if (!cv || fitsInIntType(*cv, target->primitive)) return false;
+                shown = std::to_string(*cv);
+            } else {
+                // fix #6914: a named constant is read through the typed
+                // evaluator, which keeps a `ulong` above LLONG_MAX exact and
+                // reaches `int.MaxValue`.
+                auto tv = constIntValueTC(*constExpr);
+                if (!tv) {
+                    auto cv = foldIntConstExprTC(*constExpr);
+                    if (!cv) return false;
+                    tv = *cv;
+                }
+                const bool big = *tv > static_cast<__int128>(
+                                           std::numeric_limits<long long>::max());
+                if (!big && fitsInIntType(static_cast<long long>(*tv),
+                                          target->primitive))
+                    return false;
+                if (big && target->primitive == PrimitiveType::ULong)
+                    return false;
+                shown = big ? std::to_string(static_cast<unsigned long long>(*tv))
+                            : std::to_string(static_cast<long long>(*tv));
+            }
             ctx_.diagnostics().report(
                 Severity::Error, loc,
-                "operator `" + std::string(op) + "`: the constant `" +
-                std::to_string(*cv) + "` does not fit `" +
+                "operator `" + std::string(op) + "`: the constant `" + shown +
+                "` does not fit `" +
                 primitiveSpelling(target->primitive) + "` -- `" +
                 primitiveSpelling(lt->primitive) + "` and `" +
                 primitiveSpelling(rt->primitive) + "` have no implicit "
@@ -7205,12 +7229,61 @@ bool ExprTC::reportNoImplicitConversionBetweenOperands(
                 "(\xC2\xA7""5.1, v0.340)");
             return true;
         };
-        if (isLiteralDerivedExpr(leftExpr) &&
-            isTrueIntegerType(rt->primitive))
-            return adoptionOutOfRange(leftExpr, rt);
-        if (isLiteralDerivedExpr(rightExpr) &&
-            isTrueIntegerType(lt->primitive))
-            return adoptionOutOfRange(rightExpr, lt);
+        // fix #6914 (§5.1 "Constant narrowing", v0.340): the source is "an
+        // expression of integer type that is a compile-time constant" -- a
+        // named const (`private const K: int := 7;`, a local `const`, a
+        // qualified `T.K`, `int.MaxValue`) and any constant expression over
+        // them, not only a tree of integer literals. A named constant's own
+        // type must be an integer type (a `char` const is a §4.5 kind, not a
+        // §5.1 integer source); a `static readonly` field or a variable does
+        // not fold and stays rejected.
+        //
+        // Scoped to a constant whose own type is no wider than the type it
+        // adopts (`int` const vs `ulong`/`uint`, `uint` const vs `int`): the
+        // re-typed operand's lowered value is then never wider than its
+        // recorded type, which the integer-operation lowering widens by. A
+        // WIDER constant (`ulong` const vs `sbyte`) re-typed narrower reached
+        // codegen as an i64 value under an i8 type ("Type too small for
+        // SExt"); it keeps the §6.2 rejection here (deferred).
+        auto intWidth = [](PrimitiveType p) {
+            switch (p) {
+                case PrimitiveType::Byte:  case PrimitiveType::SByte:  return 8;
+                case PrimitiveType::Short: case PrimitiveType::UShort: return 16;
+                case PrimitiveType::Int:   case PrimitiveType::UInt:   return 32;
+                default:                                               return 64;
+            }
+        };
+        auto isConstantSource = [&](const ast::Expr* e, const TypeRef* ownType,
+                                    const TypeRef* target) -> bool {
+            if (isLiteralDerivedExpr(e)) return true;
+            if (!e || !ownType || ownType->kind != TypeRef::Kind::Primitive ||
+                ownType->nullable || !isTrueIntegerType(ownType->primitive) ||
+                intWidth(ownType->primitive) > intWidth(target->primitive))
+                return false;
+            return foldIntConstExprTC(*e).has_value() ||
+                   constIntValueTC(*e).has_value();
+        };
+        // A named constant that fits adopts the other operand's type the way
+        // narrowIntConstantToTarget re-types any §5.1 constant: codegen reads
+        // an operation's signedness and widening from the operands' recorded
+        // types, so without the re-type `u > K` (u: uint above int's range,
+        // K: an int const 7) compared signed and printed False. A literal-
+        // derived operand keeps its existing typing (unchanged here).
+        auto adopt = [&](const ast::Expr* constExpr, const TypeRef* ownType,
+                         const TypeRef* target) -> bool {
+            if (adoptionOutOfRange(constExpr, target)) return true;
+            if (!isLiteralDerivedExpr(constExpr) &&
+                ctx_.exprType(*constExpr) == ownType)
+                ctx_.setExprType(const_cast<ast::Expr*>(constExpr),
+                                 const_cast<TypeRef*>(target));
+            return false;
+        };
+        if (isTrueIntegerType(rt->primitive) &&
+            isConstantSource(leftExpr, lt, rt))
+            return adopt(leftExpr, lt, rt);
+        if (isTrueIntegerType(lt->primitive) &&
+            isConstantSource(rightExpr, rt, lt))
+            return adopt(rightExpr, rt, lt);
     }
     const bool bothNumeric = isPromotablePrimitive(lt->primitive) &&
                              isPromotablePrimitive(rt->primitive);
