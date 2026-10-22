@@ -28140,8 +28140,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // statement-position form is exempt from the §19.6 non-
         // exhaustiveness warning, unlike CaseExpr's checkCaseExhaustiveness
         // caller) and the §5.1 pattern-range side-check is skipped here
-        // since checkCasePatternConstantRanges runs it explicitly two lines
-        // below regardless of this verdict. // per §19.6, v0.298, #4139
+        // since checkCasePatternConstantRanges runs it explicitly after the
+        // arm walk (#6988) regardless of this verdict. // per §19.6, v0.298, #4139
         const_cast<ast::CaseStmt*>(cs)->noMatchEdgeStaticallyDead =
             caseArmsExhaustive(cs->arms, cs->scrutinee.get(), exhaustScrutTy,
                                 s.span.begin, /*quiet=*/true);
@@ -28156,10 +28156,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // takes the same intrinsic-ordering rule as the CaseExpr site — one
         // shared checker, so the two spellings of `case` cannot drift apart.
         checkOrderingPatternsOverUnorderedScrutinee(scrutTy, cs->arms, cs->scrutinee.get());
-        // §5.1 / §19 (#1153): reject an out-of-range integer pattern literal
-        // (statement-position `case` is exempt from exhaustiveness but not from
-        // the literal-range gate — codegen would otherwise truncate it).
-        checkCasePatternConstantRanges(cs->arms, scrutTy);
         // §10.6 (#772): bare enum member names may be used throughout a `case`
         // over an enum scrutinee, including arm bodies. Inject the scrutinee
         // enum's constants for the arm bodies (the statement-position analogue
@@ -28273,9 +28269,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     dynamic_cast<const ast::RelOpPattern*>(arm.pattern.get())) {
                 if (rop->expr) visitExpr(*rop->expr);
             }
+            // §19.3 / §A.8 (#6988): a range pattern's bounds are constant
+            // operands, typed here as the CaseExpr arm walk types them. The
+            // §5.1 gate (checkCasePatternConstantRanges) runs after this walk
+            // and reads each bound's recorded type, so a `ulong` bound at or
+            // above 2^63 is read back as its unsigned value (§5.1, v0.340).
+            if (auto* rangep =
+                    dynamic_cast<const ast::RangePattern*>(arm.pattern.get())) {
+                if (auto* rng = dynamic_cast<const ast::RangeExpr*>(
+                        rangep->rangeExpr.get())) {
+                    if (rng->lo) visitExpr(*rng->lo);
+                    if (rng->hi) visitExpr(*rng->hi);
+                }
+            }
             // §19.3 (v0.183, #1584): a heterogeneous alternative list — type the
-            // constant and relational members' operand exprs (mirroring the
-            // top-level treatment) so codegen can lower a variable operand.
+            // constant, relational and range members' operand exprs (mirroring
+            // the top-level treatment) so codegen can lower a variable operand.
             if (auto* ap =
                     dynamic_cast<const ast::AltPattern*>(arm.pattern.get())) {
                 for (const auto& m : ap->members) {
@@ -28288,6 +28297,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                    dynamic_cast<const ast::RelOpPattern*>(
                                        m.get())) {
                         if (mrop->expr) visitExpr(*mrop->expr);
+                    } else if (auto* mrng =
+                                   dynamic_cast<const ast::RangePattern*>(
+                                       m.get())) {
+                        if (auto* rng = dynamic_cast<const ast::RangeExpr*>(
+                                mrng->rangeExpr.get())) {
+                            if (rng->lo) visitExpr(*rng->lo);
+                            if (rng->hi) visitExpr(*rng->hi);
+                        }
                     }
                 }
             }
@@ -29302,9 +29319,18 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope
         inEnumScrutineeCaseArms_ = savedEnumArms;
         // §19.3 (v0.334, #5870): the arm loop above registered every arm
-        // binding and typed every guard and body, so the rule runs here — the
-        // LAST statement of the handler, scopes restored.
+        // binding and typed every guard and body, so the rule runs here, with
+        // scopes restored.
         checkMoveOnlyPayloadBindingWritePoints(cs->scrutinee.get(), cs->arms);
+        // §5.1 / §19 (#1153, #6988): reject an out-of-range integer pattern
+        // literal (statement-position `case` is exempt from exhaustiveness but
+        // not from the literal-range gate — codegen would otherwise truncate
+        // it). The gate runs after the arm walk, as the CaseExpr gate does
+        // (checkCaseExhaustiveness), so each bound's recorded type is read; a
+        // `ulong` bound at or above 2^63 is then not mistaken for the folded
+        // negative value `-1`. The gate takes the declared scrutTy, as the
+        // CaseExpr gate does; each bound's own recorded type decides the read.
+        checkCasePatternConstantRanges(cs->arms, scrutTy);
     }
     // Break, Continue have no expressions.
 }
