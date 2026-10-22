@@ -414,6 +414,19 @@ struct Loader {
                     sema::SemaContext::isSynthesizedBuiltinInterfaceName(
                         mt.namedName))
                     ref->declaration = ctx.builtinInterfaceSym(mt.namedName);
+                // fix #6905 (§2.5 / §16.5, v0.340): the same identity rule for
+                // `Range<T>`. A LOCAL `Range<T>`, whether annotated or inferred
+                // from a range expression, carries
+                // `declaration = builtinClassSym("Range")`
+                // (TypeResolution_Names.cpp, ExprTypecheck_Exprs.cpp), and every
+                // Range check in sema and codegen (`isRangeType`, the `in`
+                // operand typing, Contains/ToString/.Start, for-in) keys on that
+                // pointer. An imported `Range<uint>` came back declaration-less,
+                // so `for var x in Lib.MakeR(…)` was "not yet implemented",
+                // `r.Contains(x)` produced no value and `r.Start` read 0.
+                // `importedName` stays set, as for the interface twin above.
+                if (ref->declaration == nullptr && mt.namedName == "Range")
+                    ref->declaration = ctx.builtinClassSym("Range");
                 // fix #3540 (§11.6 / §2.8.3 rule 3, v0.285): still unbound.
                 // It may simply be a name this loader can never resolve (a
                 // builtin like `Task` or `Array<T>` has no exported user type,
