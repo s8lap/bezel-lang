@@ -4516,6 +4516,41 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                 }
             }
+            // fix #7001 (stdlib §3.2, v0.340): the singletons as VALUES. An
+            // `Encoding` held in a local, parameter or field is an i32 kind
+            // tag (the default lowering of a builtin class type; 0 UTF8, 1 UTF16, 2 UTF32, 3 ASCII);
+            // `.Name` on such a value selects the label from the tag. Before
+            // this the `Encoding.UTF8` value failed to lower (null), so `.Name`
+            // through a variable printed nothing. The direct
+            // `Encoding.UTF8.Name` shape above is untouched.
+            {
+                static const char* const kEncMembers[] = {"UTF8", "UTF16", "UTF32", "ASCII"};
+                static const char* const kEncLabels[] = {"utf-8", "utf-16le", "utf-32le", "us-ascii"};
+                auto* encIdV = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+                if (encIdV && encIdV->name == "Encoding" &&
+                    !receiverIsUserType(*ma->target)) {
+                    for (int k = 0; k < 4; ++k) {
+                        if (ma->member != kEncMembers[k]) continue;
+                        return builder_.getInt32(k);
+                    }
+                }
+                if (cn == "Encoding" && ma->member == "Name") {
+                    llvm::Value* encV = lowerExpr(*ma->target);
+                    if (!encV) return nullptr;
+                    llvm::Value* kind = encV;
+                    if (!kind->getType()->isIntegerTy(32)) return nullptr;
+                    llvm::Value* res = lowerStringLiteral(
+                        std::string("\"") + kEncLabels[3] + "\"", false);
+                    for (int k = 2; k >= 0; --k) {
+                        llvm::Value* lbl = lowerStringLiteral(
+                            std::string("\"") + kEncLabels[k] + "\"", false);
+                        res = builder_.CreateSelect(
+                            builder_.CreateICmpEQ(kind, builder_.getInt32(k)),
+                            lbl, res, "enc.name");
+                    }
+                    return res;
+                }
+            }
             // fix #5013 (§2.7, §6.1, v0.307): a module-qualified
             // (`System.Threading.CancellationToken.None`) or alias-qualified
             // (`<alias>.CancellationToken.None`) receiver is not a bare
