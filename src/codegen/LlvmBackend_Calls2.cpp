@@ -384,6 +384,13 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     auto returnValueFresh = [&](const ast::Expr* e) -> bool {
         if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             auto* rl = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*rid));
+            // A returned `const` local (ast::LocalConstDecl) is never fresh:
+            // per §21.1 *Runtime const locals* its initializer must not be an
+            // owned production, so the binding holds a value, a runtime-
+            // managed value, null or a borrow, never a disposal obligation.
+            // It is judged a borrow explicitly, not by falling through.
+            if (rl && dynamic_cast<const ast::LocalConstDecl*>(rl->decl))
+                return false;
             auto* rd = rl ? dynamic_cast<const ast::LocalDecl*>(rl->decl)
                           : nullptr;
             return rd && lambdaOwnLocals.count(rd) && !rd->isUsing &&

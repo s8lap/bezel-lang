@@ -179,3 +179,33 @@ BEZEL_TEST(frozen_array_from_function_value_source_6983,
         "Console.WriteLine($\"{x.Length} {g[1]}\");")),
         repeatLine("3 by", 100));
 }
+
+// §21.1 rows (v0.340, the #3591 LOCALDECL-only walker ratchet on
+// returnValueFresh): a `const` local never holds an owned production (§21.1
+// *Runtime const locals*), so a block-body lambda returning one returns a
+// borrow and FrozenArray.From must copy, not take, its storage. These pin the
+// const arm's borrow verdict. They pass on the pre-change code too: the arm
+// makes an implicit fall-through explicit and changes no conforming program.
+
+// Row 11 — the lambda returns a `const` borrow of a captured holder's field.
+BEZEL_TEST(frozen_array_from_function_value_source_6983,
+           block_body_returning_const_borrow_local_is_borrow_spec_21_1) {
+    expectClean(runAotChecked(program(
+        "using var h := new Prov(); "
+        "var f := lambda() => do const b := h.Xs; return b; end; "
+        "using var x := FrozenArray<string>.From(f()); "
+        "Console.WriteLine($\"{x.Length} {x[1]} {h.Xs[1]}\");")),
+        repeatLine("2 f2 f2", 100));
+}
+
+// Row 12 — the lambda returns a `const` alias of a CAPTURED outer owned local;
+// the outer scope still owns and disposes it.
+BEZEL_TEST(frozen_array_from_function_value_source_6983,
+           block_body_returning_const_alias_of_captured_owned_is_borrow_spec_21_1) {
+    expectClean(runAotChecked(program(
+        "var g := M.MkArr(); "
+        "var f := lambda() => do const b := g; return b; end; "
+        "using var x := FrozenArray<string>.From(f()); "
+        "Console.WriteLine($\"{x.Length} {g[1]}\");")),
+        repeatLine("3 by", 100));
+}
