@@ -14806,6 +14806,32 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
     // circuit to `true` here, or `var c: Circle` would wrongly match a
     // non-Circle scrutinee and the arm's member accesses would read it as
     // a Circle. (Slot registration still happens in the arm-body preamble.)
+    // #6952 (§19.3, §19.5, v0.340): the test a bare `Object` type pattern and
+    // the `var x: Object` typed binding apply. `Object` is a compiler intrinsic
+    // (§8.1), so its descriptor is the builtin root `btd$Object`. The descriptor
+    // walk further below does not reach that root for a string, a boxed value,
+    // an array or a user class with no declared base, although §8.1 makes every
+    // type derive from `Object`. The test is therefore the non-null test, the
+    // answer `o is Object` gives for a reference (lowerTypeTest's `Object` arm,
+    // §12.7; §19.5: a bare type pattern matches only non-null values). A nullable
+    // VALUE carrier ({hasValue, T}: a generic `v: T?`, or `v: T` at T=int?)
+    // matches only a present value; a non-nullable value is an Object, the
+    // per-instantiation answer of §19.3 for `is Object`.
+    auto objectPatternTest = [&](llvm::Value* v,
+                                 const sema::TypeRef* ty) -> llvm::Value* {
+        if (v->getType()->isPointerTy())
+            return builder_.CreateICmpNE(
+                v, llvm::ConstantPointerNull::get(ptrTy()), "objpat.nonnull");
+        // The `?` may sit on the operand (`v: T?`) or on the substitution
+        // (`v: T` at T=int?): resolveTypeParamRef returns the substitution's
+        // own TypeRef, so read both, as lowerTypeTest's opTyResolved does (#5234).
+        const sema::TypeRef* resolved = resolveTypeParamRef(ty);
+        const bool nullable =
+            (ty && ty->nullable) || (resolved && resolved->nullable);
+        if (nullable && v->getType()->isStructTy())
+            return nullablePrimHasValue(v);
+        return builder_.getInt1(true);
+    };
     // CG43: a bare qualified name `E.Red` parses as a NamedPattern; when
     // the scrutinee is an enum, resolve it to that enum's constant and
     // test equality.
@@ -14868,6 +14894,12 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         // §19.3/§19.5: type-test pattern on a class/interface scrutinee.
         if (llvm::GlobalVariable* desc =
                 descriptorForPatternName(np->name.get())) {
+            // #6952: the descriptor IS the builtin root's, so no user type of
+            // that name shadows it (a nested user `Object` keeps its own
+            // descriptor and takes the is-a path below).
+            if (auto bo = builtinDesc_.find(std::string("Object"));
+                bo != builtinDesc_.end() && desc == bo->second)
+                return objectPatternTest(scrut, scrutTy);
             // sweep #7: a class/interface type-test only matches a heap object
             // that carries a vtable/descriptor (a class, an interface, or
             // Object). Against a value-type primitive (e.g. an `int` scrutinee →
@@ -15584,6 +15616,20 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 // scrutinee path is handled by the isNullableVal branch above
                 // and never reaches here.
                 if (rt->kind == sema::TypeRef::Kind::Primitive) {
+                    // #6952 (§19.5, v0.340): `var x: Object` over a REFERENCE
+                    // scrutinee (`Object?` included) binds the non-null values,
+                    // the same test `is Object` applies (objectPatternTest
+                    // above). The shared `scrutIsSamePrim` gate below answers
+                    // false for a nullable `Object?`, which is the defect. A
+                    // VALUE scrutinee keeps the existing path, which #6969 covers:
+                    // at `T=int?` a `var x: Object` binding over the value prints
+                    // `other`, and sema rejects the non-nullable form at the
+                    // instantiation site (§19.3, "Type parameters as pattern
+                    // types"); the nullable form is accepted there, which #6969
+                    // records as a defect.
+                    if (rt->primitive == sema::PrimitiveType::Object &&
+                        scrut->getType()->isPointerTy())
+                        return objectPatternTest(scrut, scrutTy);
                     // §3.3 per-instantiation (#1473): inside a monomorphized
                     // generic body a type-parameter scrutinee's exprType is
                     // still the placeholder param ref (Kind::Named, no
