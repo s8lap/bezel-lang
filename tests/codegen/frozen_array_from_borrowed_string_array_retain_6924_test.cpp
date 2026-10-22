@@ -208,3 +208,84 @@ BEZEL_TEST(frozen_array_from_borrowed_string_array_retain_6924,
     expectClean(bezel::test::runAotModulesChecked(std::move(mods), "App"),
                 repeatLine("by cz ax f1", 100));
 }
+
+// ---- follow-up (reviewer F1): the same copy made INSIDE A GENERIC BODY. -----
+// `resTy` there is FrozenArray<T>; deciding string-ness from the uninstantiated
+// `T` skipped the retain/stamp while a non-generic holder's disposal (which sees
+// FrozenArray<string>) released: "refcount over-release (string)" abort at
+// d8d42847, clean at c0a1928b. The element is now resolved through the active
+// substitution, so T = string behaves like the non-generic path.
+namespace {
+constexpr const char* kGenLib =
+    "public class M\n"
+    "  public static method MkArr(): owned Array<string>\n"
+    "    var a := new Array<string>(); a.Add(\"a\" + \"x\"); a.Add(\"b\" + \"y\"); "
+    "a.Add(\"c\" + \"z\");\n"
+    "    return a;\n"
+    "  end MkArr;\n"
+    "end M;\n"
+    "public class G\n"
+    "  public static method Freeze<T>(a: Array<T>): owned FrozenArray<T>\n"
+    "    return FrozenArray<T>.From(a);\n"
+    "  end Freeze;\n"
+    "  public static method FreezeOwned<T>(owned a: Array<T>): owned FrozenArray<T>\n"
+    "    return FrozenArray<T>.From(move a);\n"
+    "  end FreezeOwned;\n"
+    "end G;\n"
+    "public class Holder<T>\n"
+    "  private owned _f: FrozenArray<T>;\n"
+    "  public constructor(a: Array<T>) _f := FrozenArray<T>.From(a); end constructor;\n"
+    "  public method Len(): int return _f.Length; end Len;\n"
+    "end Holder;\n"
+    "public class H3\n"
+    "  private owned _f: FrozenArray<string>;\n"
+    "  public constructor(a: Array<string>) _f := G.Freeze<string>(a); end constructor;\n"
+    "  public method Len(): int return _f.Length; end Len;\n"
+    "end H3;\n";
+
+std::string genProgram(const std::string& body) {
+    return std::string("module Loc;\n") + kGenLib + mainLoop(body);
+}
+}  // namespace
+
+BEZEL_TEST(frozen_array_from_borrowed_string_array_retain_6924,
+           generic_fn_into_owned_field_spec_28_11) {
+    expectClean(runAotChecked(genProgram(
+        "using var a := M.MkArr(); using var h := new H3(a); "
+        "Console.WriteLine($\"{h.Len()} {a[1]}\");")),
+        repeatLine("3 by", 100));
+}
+
+BEZEL_TEST(frozen_array_from_borrowed_string_array_retain_6924,
+           generic_holder_owned_field_spec_28_11) {
+    expectClean(runAotChecked(genProgram(
+        "using var a := M.MkArr(); using var h := new Holder<string>(a); "
+        "Console.WriteLine($\"{h.Len()} {a[1]}\");")),
+        repeatLine("3 by", 100));
+}
+
+BEZEL_TEST(frozen_array_from_borrowed_string_array_retain_6924,
+           generic_fn_borrowed_local_spec_stdlib_4_19) {
+    expectClean(runAotChecked(genProgram(
+        "using var a := M.MkArr(); using var x := G.Freeze<string>(a); "
+        "Console.WriteLine($\"{x.Length} {x[2]} {a[2]}\");")),
+        repeatLine("3 cz cz", 100));
+}
+
+BEZEL_TEST(frozen_array_from_borrowed_string_array_retain_6924,
+           generic_fn_owned_source_takes_no_extra_retain_spec_stdlib_4_19) {
+    expectClean(runAotChecked(genProgram(
+        "using var x := G.FreezeOwned<string>(M.MkArr()); "
+        "var b := M.MkArr(); using var y := G.FreezeOwned<string>(move b); "
+        "Console.WriteLine($\"{x.Length} {x[0]} {y[2]}\");")),
+        repeatLine("3 ax cz", 100));
+}
+
+BEZEL_TEST(frozen_array_from_borrowed_string_array_retain_6924,
+           generic_fn_int_element_control_spec_stdlib_4_19) {
+    expectClean(runAotChecked(genProgram(
+        "using var a := new Array<int>(); a.Add(7); a.Add(8); "
+        "using var x := G.Freeze<int>(a); using var h := new Holder<int>(a); "
+        "Console.WriteLine($\"{x.Length} {x[1]} {h.Len()}\");")),
+        repeatLine("2 8 2", 100));
+}

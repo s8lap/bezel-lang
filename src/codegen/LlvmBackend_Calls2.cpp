@@ -449,9 +449,14 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     // retain above turns `var o: Object := move frozen; o.Dispose()` from a
     // free that happened to balance (the source's owner paid the only +1)
     // into a leak of one string per element.
+    // In a generic body the element is `T`; decide string-ness from the
+    // instantiated type (genericSubstSemaTy_), so `T = string` retains and
+    // stamps exactly like the non-generic path (the holder's disposal sees
+    // the instantiated FrozenArray<string> and releases).
     const sema::TypeRef* frozenEl =
-        (resTy && !resTy->genericArgs.empty()) ? resTy->genericArgs[0]
-                                               : nullptr;
+        (resTy && !resTy->genericArgs.empty())
+            ? resolveTypeParamRef(resTy->genericArgs[0])
+            : nullptr;
     const bool frozenStringElems =
         frozenEl && !frozenEl->nullable &&
         frozenEl->kind == sema::TypeRef::Kind::Primitive &&
