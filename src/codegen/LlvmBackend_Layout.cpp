@@ -3843,7 +3843,12 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         (te.op == "is" || te.op == "is not" || te.op == "as")) {
         const bool instance = stringIsInstanceOf(rt);
         llvm::Value* holds = builder_.getInt1(instance);
-        if (instance && opTyRaw->nullable)
+        // fix #6970 (§19.5, §12.7, v0.340): the `?` may sit on the operand
+        // (`v: string?`) or on the substitution (`v: T` at T = string?), where
+        // resolveTypeParamRef returns the substitution's own TypeRef and the
+        // raw operand type carries no `?`. Read both, as #5234 does below: null
+        // is an instance of no type, so `v is Object` is false for a null v.
+        if (instance && (opTyRaw->nullable || opTyResolved->nullable))
             holds = builder_.CreateICmpNE(
                 obj, llvm::ConstantPointerNull::get(ptrTy()), "is.str.nonnull");
         if (te.op == "is") return holds;
@@ -3855,7 +3860,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             return llvm::Constant::getNullValue(nullableValueStructTy(&tmp));
         }
         if (!instance) return llvm::ConstantPointerNull::get(ptrTy());
-        return opTyRaw->nullable
+        return (opTyRaw->nullable || opTyResolved->nullable)
             ? builder_.CreateSelect(holds, obj,
                                     llvm::ConstantPointerNull::get(ptrTy()))
             : obj;
