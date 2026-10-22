@@ -17732,6 +17732,37 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     if (ae != lit) ctx_.setExprType(lit, T);
                                 }
                             }
+                            // fix #6959 (spec §14.5, §5.1, v0.340): with an
+                            // explicit list each argument converts to T at its
+                            // conversion site, so an operand whose type is not
+                            // T must be implicitly convertible to it (§5.1
+                            // widening, or an in-range constant narrowing,
+                            // retyped by checkAssignable). A non-constant
+                            // `int` for `byte`, or `98` for `char`, is the
+                            // same error `var x: byte := i;` / `var x: char
+                            // := 98;` reports.
+                            if (T && !T->nullable &&
+                                T->kind == TypeRef::Kind::Primitive &&
+                                isMinMaxNumericOrChar(T->primitive)) {
+                                for (const auto& arg : ce.args) {
+                                    const ast::Expr* ae = arg.value.get();
+                                    if (!ae) continue;
+                                    TypeRef* at = ctx_.exprType(*ae);
+                                    if (!at || at->kind != TypeRef::Kind::Primitive ||
+                                        at->primitive == T->primitive || at->nullable)
+                                        continue;
+                                    const auto errsBefore =
+                                        ctx_.diagnostics().errorCount();
+                                    checkAssignable(
+                                        at, T, ae->span.begin,
+                                        "argument to `Math." +
+                                            std::string(mma->member) + "<" +
+                                            rangeElementTypeName(T) + ">`",
+                                        ae);
+                                    if (ctx_.diagnostics().errorCount() != errsBefore)
+                                        return;
+                                }
+                            }
                         }
                         // fix #6958 (stdlib §2.2, §14.5, v0.340): an explicit
                         // list binds T, and the call's type is T whatever the
