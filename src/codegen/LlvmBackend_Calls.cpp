@@ -13381,7 +13381,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // uses — `bz_decimal_cmp` on two struct slots, returning -1/0/+1, the
         // same path a plain `x < 2m` takes (LlvmBackend_Exprs2.cpp:7431's
         // decCmp). So Math.Min and the `<` operator agree by construction.
+        // fix #6974 (spec §14.5, §5.1, v0.340): under `Min/Max/Clamp<decimal>`
+        // every operand converts to decimal at its conversion site, so the
+        // operands are decimal values whatever their own sema type (`int` `2`
+        // in `Math.Max<decimal>(2, 3.5m)`).
+        bool mathTIsDecimal = false;
+        if ((m == "Min" || m == "Max" || m == "Clamp") &&
+            ma->typeArgs.size() == 1 && ma->typeArgs[0]) {
+            const sema::TypeRef* dt =
+                resolveTypeParamRef(ctx_.resolvedType(*ma->typeArgs[0]));
+            mathTIsDecimal = dt && !dt->nullable &&
+                dt->kind == sema::TypeRef::Kind::Primitive &&
+                dt->primitive == sema::PrimitiveType::Decimal;
+        }
         auto isDecimalArg = [&](const ast::Expr* e) -> bool {
+            if (mathTIsDecimal) return true;
             const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
             return t && !t->nullable &&
                    t->kind == sema::TypeRef::Kind::Primitive &&
@@ -13416,7 +13430,6 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             const sema::TypeRef* ta =
                 resolveTypeParamRef(ctx_.resolvedType(*ma->typeArgs[0]));
             if (ta && !ta->nullable && ta->kind == sema::TypeRef::Kind::Primitive &&
-                ta->primitive != sema::PrimitiveType::Decimal &&
                 ta->primitive != sema::PrimitiveType::String &&
                 ta->primitive != sema::PrimitiveType::Bool)
                 mathExplicitT = ta;
@@ -13430,6 +13443,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             const sema::TypeRef* st =
                 e ? resolveTypeParamRef(ctx_.exprType(*e)) : nullptr;
             const bool srcUns = st && typeRefIsUnsigned(st);
+            // fix #6974: an integer or char operand reaches a decimal T through
+            // the same §5.1 widening the `decimal(x)` cast and the binary
+            // operators use (emitIntToDecimal honours unsigned sources).
+            if (dst == decimalStructType()) {
+                if (!src->isIntegerTy()) return v;
+                llvm::AllocaInst* slot = entryAlloca(dst);
+                emitIntToDecimal(v, st && st->kind == sema::TypeRef::Kind::Primitive
+                                        ? st->primitive : sema::PrimitiveType::Int,
+                                 slot);
+                return builder_.CreateLoad(dst, slot, "mm.dec.conv");
+            }
             if (src->isIntegerTy() && dst->isIntegerTy()) {
                 if (src->getIntegerBitWidth() < dst->getIntegerBitWidth())
                     return srcUns ? builder_.CreateZExt(v, dst, "mm.conv")

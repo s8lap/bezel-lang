@@ -17818,14 +17818,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         bool explicitTTyped = false;
                         if (mma->typeArgs.size() == 1 && mma->typeArgs[0]) {
                             TypeRef* eT = ctx_.resolvedType(*mma->typeArgs[0]);
-                            // decimal is excluded: codegen's explicit-T
-                            // conversion does not cover it (#6974), so typing
-                            // the call `decimal` would read a raw integer as a
-                            // decimal; it keeps its operand-derived type.
+                            // fix #6974: decimal T too; codegen converts
+                            // each operand to decimal (mathConvertToT).
                             if (eT && !eT->nullable &&
                                 eT->kind == TypeRef::Kind::Primitive &&
-                                isMinMaxNumericOrChar(eT->primitive) &&
-                                eT->primitive != PrimitiveType::Decimal) {
+                                isMinMaxNumericOrChar(eT->primitive)) {
                                 ctx_.setExprType(&ce, eT);
                                 explicitTTyped = true;
                             }
