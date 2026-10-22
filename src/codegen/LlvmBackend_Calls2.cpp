@@ -340,12 +340,16 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     // statement kind the walk does not enumerate, or no return at all, is
     // "not fresh" (a borrow: leak-safe, never a use-after-free).
     std::function<bool(const ast::Expr*)> hasFreshStorage;
+    // LocalDecls declared as statements of the lambda body being walked: a
+    // returned local outside this set is a CAPTURE (owned by the outer scope).
+    std::unordered_set<const ast::LocalDecl*> lambdaOwnLocals;
     auto returnValueFresh = [&](const ast::Expr* e) -> bool {
         if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             auto* rl = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*rid));
             auto* rd = rl ? dynamic_cast<const ast::LocalDecl*>(rl->decl)
                           : nullptr;
-            return rd && !rd->isUsing && rd->initializer &&
+            return rd && lambdaOwnLocals.count(rd) && !rd->isUsing &&
+                   rd->initializer &&
                    hasFreshStorage(rd->initializer.get()) &&
                    opaqueLocalProvablyUnwritten(rd);
         }
@@ -357,6 +361,8 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
         auto body = [&](const std::vector<std::unique_ptr<ast::Stmt>>& v) {
             for (const auto& b : v) returnsFresh(b.get(), sawReturn, ok);
         };
+        if (auto* ld0 = dynamic_cast<const ast::LocalDecl*>(st))
+            lambdaOwnLocals.insert(ld0);
         if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(st)) {
             if (rs->value) {
                 sawReturn = true;
@@ -395,6 +401,7 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
     auto lambdaBodyFresh = [&](const ast::LambdaExpr& lam) -> bool {
         if (!lam.isBlockBody) return hasFreshStorage(lam.exprBody.get());
         bool sawReturn = false, ok = true;
+        lambdaOwnLocals.clear();
         for (const auto& st : lam.stmts) returnsFresh(st.get(), sawReturn, ok);
         return ok && sawReturn;
     };

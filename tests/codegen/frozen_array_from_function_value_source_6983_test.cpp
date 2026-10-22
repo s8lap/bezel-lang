@@ -168,3 +168,14 @@ BEZEL_TEST(frozen_array_from_function_value_source_6983,
         "Console.WriteLine($\"{x.Length} {h.Xs[1]}\");")),
         repeatLine("2 f2", 100));
 }
+
+// Row 10 — review of d467bd53: a block-body lambda returning a CAPTURED outer
+// owned local returns a borrow of that local; the outer scope still owns it.
+BEZEL_TEST(frozen_array_from_function_value_source_6983,
+           var_lambda_block_body_returning_captured_owned_local_is_borrow_spec_28_3) {
+    expectClean(runAotChecked(program(
+        "var g := M.MkArr(); var f := lambda() => do return g; end; "
+        "using var x := FrozenArray<string>.From(f()); "
+        "Console.WriteLine($\"{x.Length} {g[1]}\");")),
+        repeatLine("3 by", 100));
+}
