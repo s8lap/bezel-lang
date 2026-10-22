@@ -8115,6 +8115,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (ncm->target && ms->parent)
                         rt = substituteMemberType(rt, ncm->target.get(),
                                                   ms->parent);
+                } else if (dynamic_cast<const ast::IdentifierExpr*>(
+                               ce.callee.get()) &&
+                           ms->parent && !ms->parent->genericParams.empty()) {
+                    // fix #6996 (§14.1, v0.340): a BARE callee is an implicit
+                    // `this.` call; an inherited generic-base method's return
+                    // type needs the base instantiation's substitution just as
+                    // the `this.M()` form gets (null target = implicit `this`,
+                    // the #989 field-arm convention).
+                    rt = substituteMemberType(rt, nullptr, ms->parent);
                 }
                 // per §14.1/§14.2 (issue #509): EXPLICIT method-level type
                 // arguments supplied at the call site (e.g. `Identity<int>(v)`
@@ -9156,6 +9165,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         recvTarget = iNcm->target.get();
                     if (recvTarget)
                         callTy = substituteMemberType(callTy, recvTarget,
+                                                     ms->parent);
+                    else if (dynamic_cast<const ast::IdentifierExpr*>(
+                                 ce.callee.get()))
+                        // fix #6996 (§14.1, v0.340): bare callee = implicit
+                        // `this` (null target), as the local arm.
+                        callTy = substituteMemberType(callTy, nullptr,
                                                      ms->parent);
                 }
                 // The #783 and #1937 declines below deliberately read the
