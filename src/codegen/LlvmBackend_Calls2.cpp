@@ -374,6 +374,35 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
                 if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
                         ctx_.exprSymbol(*ce->callee)))
                     return sema::methodReturnsOwned(*ms, ctx_);
+                // fix #6983 (§28.3, §27.1, v0.340): a call through a FUNCTION
+                // VALUE is fresh iff the callee's function type declares an
+                // `owned` return slot (`() -> owned T`); a plain return slot
+                // returns a borrow.
+                if (const sema::TypeRef* ft = ctx_.exprType(*ce->callee))
+                    if (ft->kind == sema::TypeRef::Kind::Function) {
+                        if (ft->funcReturnOwned) return true;
+                        // A lambda LITERAL's own function type never carries
+                        // the `owned` marker (sema's LambdaExpr arm leaves
+                        // funcReturnOwned unset), so a `const f := lambda() =>
+                        // <owned producer>` is judged by its expression body:
+                        // fresh iff the body is. Any other plain function
+                        // value returns a borrow.
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                ce->callee.get()))
+                            if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                                    ctx_.exprSymbol(*id)))
+                                if (loc->isConst)
+                                    if (auto* lcd = dynamic_cast<
+                                            const ast::LocalConstDecl*>(
+                                            loc->decl))
+                                        if (auto* lam = dynamic_cast<
+                                                const ast::LambdaExpr*>(
+                                                lcd->value.get()))
+                                            if (!lam->isBlockBody)
+                                                return hasFreshStorage(
+                                                    lam->exprBody.get());
+                        return false;
+                    }
             }
             return true;
         }
