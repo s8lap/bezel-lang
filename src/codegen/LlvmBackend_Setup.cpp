@@ -18593,6 +18593,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     v = wrapOwnedArrayAsIEnumerable(v, declTR);
                 else
                     v = wrapArrayAsIEnumerable(v, declTR);
+            } else if (initTR && initTR->kind == sema::TypeRef::Kind::Named &&
+                       (initTR->headName() == "Range" ||
+                        (initTR->declaration &&
+                         initTR->declaration->name == "Range"))) {
+                // fix #6998 (§16.3, §5.1, v0.340): `Range<T>` -> IEnumerable<T>.
+                v = wrapRangeAsOwnedIEnumerable(v, initTR, declTR);
             } else if (initIsDictSet) {
                 // fix #1069 / stdlib §4.10 / §5: snapshot the hash table's element
                 // keys (bz_lazy_from_set) and drain them into a fresh array behind

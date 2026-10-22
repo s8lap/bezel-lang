@@ -10061,6 +10061,16 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
             return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
         }
     }
+    // fix #6998 (§16.3, §5.1, v0.340): a `Range<T>` value widened to
+    // `IEnumerable<T>` (argument, local-decl init, RETURN).
+    // (A range expression's synthesized type carries the builtin Range symbol
+    // but no AST head, so `an` is empty there: test the symbol too.)
+    if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
+        (an == "Range" ||
+         (actualTy->declaration && actualTy->declaration->name == "Range"))) {
+        if (outWrapMade) *outWrapMade = true;
+        return wrapRangeAsOwnedIEnumerable(v, actualTy, targetTy);
+    }
     // fix #3695 (stdlib §4.18 / stdlib §4.1 / §29.2 / §28.3, v0.286): SortedSet<T>'s arm of the
     // §29.2 wrap grid — MISSING ENTIRELY until this commit. A `SortedSet<T>`
     // coerced to `IEnumerable<T>` (an argument, a local-decl init, a method
@@ -11312,6 +11322,45 @@ llvm::Value* Emitter::drainLazyPipelineToOwnedIEnumerable(
     llvm::Value* arr = builder_.CreateCall(
         toArrFn, {lazyVal, builder_.getInt64(esz)}, "lazy.mat");
     return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
+}
+
+// fix #6998 (§16.3, §5.1, v0.340): a `Range<T>` is a compiler-intrinsic record
+// implementing `IEnumerable<T>`; its lowered value is the by-value
+// `%bz.range { i64 start, i64 end, i64 step, i8 flags }` struct, which has no
+// vtable. Coercing it to `IEnumerable<T>` builds the lazy range source (the
+// same one the LINQ receiver path uses, including the open-ended
+// InvalidOperationException guard and the char-stepping flag) and drains it into
+// a fresh array behind an OWNING enumerator, exactly as the dict-backed Set arm
+// does. The range is a value, so there is no source to free or alias.
+llvm::Value* Emitter::wrapRangeAsOwnedIEnumerable(
+        llvm::Value* rangeVal, const sema::TypeRef* rangeTy,
+        const sema::TypeRef* iEnumTy) {
+    const sema::TypeRef* elemRef =
+        (rangeTy && !rangeTy->genericArgs.empty()) ? rangeTy->genericArgs[0]
+                                                   : nullptr;
+    llvm::Type* et = elemRef ? lowerTypeRef(elemRef) : i32();
+    // Element stride: the same mapping as Calls3's lazyElemSize (a Range
+    // element is an integer type or char, §16.3).
+    int64_t esz = 8;
+    if (et->isIntegerTy(32)) esz = 4;
+    else if (et->isIntegerTy(8)) esz = 1;
+    else if (et->isIntegerTy(16)) esz = 2;
+    llvm::Value* start = builder_.CreateExtractValue(rangeVal, {0u}, "rng.start");
+    llvm::Value* end   = builder_.CreateExtractValue(rangeVal, {1u}, "rng.end");
+    llvm::Value* step  = builder_.CreateExtractValue(rangeVal, {2u}, "rng.step");
+    llvm::Value* flags = builder_.CreateExtractValue(rangeVal, {3u}, "rng.flags");
+    if (elemRef && elemRef->kind == sema::TypeRef::Kind::Primitive &&
+        elemRef->primitive == sema::PrimitiveType::Char)
+        flags = builder_.CreateOr(flags, builder_.getInt8(0x8), "rng.flg.char");
+    llvm::Value* isOpen = builder_.CreateICmpNE(
+        builder_.CreateAnd(flags, builder_.getInt8(6)), builder_.getInt8(0),
+        "rng.open");
+    emitGuardThrow(isOpen, "InvalidOperationException");
+    auto* fn = declareC("bz_lazy_from_range", ptrTy(),
+        {i64(), i64(), i64(), llvm::Type::getInt8Ty(llvm_), i64()});
+    llvm::Value* lazy = builder_.CreateCall(
+        fn, {start, end, step, flags, builder_.getInt64(esz)}, "lazy.range");
+    return drainLazyPipelineToOwnedIEnumerable(lazy, iEnumTy);
 }
 
 // fix #5612 / §29.11 item 3 (v0.333): the ARGUMENT-position counterpart of

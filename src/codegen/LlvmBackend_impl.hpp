@@ -13130,6 +13130,11 @@ private:
     // local (#1911) or a returned value the caller owns (#1916). `iEnumTy` is the
     // target `IEnumerable<T>` type; its genericArgs[0] supplies the element
     // stride. Shared by lowerLocalDecl and wrapAsIEnumerableForTarget.
+    // fix #6998 (§16.3, §5.1, v0.340): `Range<T>` value -> owning
+    // `IEnumerable<T>` wrapper (lazy range source drained into a fresh array).
+    llvm::Value* wrapRangeAsOwnedIEnumerable(
+        llvm::Value* rangeVal, const sema::TypeRef* rangeTy,
+        const sema::TypeRef* iEnumTy);
     llvm::Value* drainLazyPipelineToOwnedIEnumerable(
         llvm::Value* lazyVal, const sema::TypeRef* iEnumTy);
 

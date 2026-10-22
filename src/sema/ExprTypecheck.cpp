@@ -7236,6 +7236,22 @@ void ExprTC::checkAssignable(
     if (from->kind == TypeRef::Kind::Named &&
         to->kind == TypeRef::Kind::Named &&
         !to->genericArgs.empty() && !to->declaration) {
+        // fix #6998 (§16.3, §5.1, v0.340): `Range<T>` is a compiler-intrinsic
+        // record that implements `IEnumerable<T>`, but its synthesized symbol
+        // carries no base list, so the user-conformance walk below found no
+        // `IEnumerable` and rejected. Admit exactly `Range<T>` →
+        // `IEnumerable<T>` (same element type; a record is a value type, so
+        // no variance applies, §12.9).
+        if (from->declaration &&
+            from->declaration == ctx_.builtinClassSym("Range") &&
+            to->headName() == "IEnumerable") {
+            if (from->genericArgs.size() == 1 && to->genericArgs.size() == 1 &&
+                from->genericArgs[0] && to->genericArgs[0] &&
+                typeRefEqual(from->genericArgs[0], to->genericArgs[0]))
+                return;
+            reportNotConvertible();
+            return;
+        }
         // §11 / §12.9 / §5.1 (#1935): a USER-declared `from` (non-null
         // declaration) reaching a BUILTIN generic interface `to` must actually
         // implement `to`'s base interface — nominal conformance, verified by
