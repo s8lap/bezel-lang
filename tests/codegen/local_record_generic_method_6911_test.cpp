@@ -10,6 +10,7 @@
 #include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
 using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAotChecked;
 
@@ -59,6 +60,7 @@ BEZEL_TEST(local_record_generic_method_6911, spec_21_10_enclosing_param_in_field
         "public static method Main(): int return Go<int>(1); end Main; end C; ");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "enclosing generic parameter"));
 }
 // ... and in a signature of the local record's own generic method.
 BEZEL_TEST(local_record_generic_method_6911, spec_21_10_enclosing_param_in_own_method_signature_still_rejected) {
@@ -69,4 +71,5 @@ BEZEL_TEST(local_record_generic_method_6911, spec_21_10_enclosing_param_in_own_m
         "public static method Main(): int return Go<int>(1); end Main; end C; ");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "enclosing generic parameter"));
 }
