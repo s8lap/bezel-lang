@@ -6292,6 +6292,35 @@ void Resolver::resolveTypesInStmt(const ast::Stmt& s, Scope* scope) {
         const std::vector<ast::GenericParam>* savedEnclosingMethodParams =
             currentMethodGenericParams_;
         currentMethodGenericParams_ = nullptr;
+        // #6910 (§21.10 + §9.6): a local record's interface list is part of
+        // its declaration ("interface implementation (§9.6) ... computed by
+        // their existing rules from the declaration"), but this walk never
+        // resolved it, so `tsym->baseTypes` stayed empty and every conversion
+        // to, or IComparable<T> requirement on, the local record failed.
+        // Mirror the interface half of `resolveTypeDecl`'s header loop: record
+        // each resolved base on the symbol. A local enum's first item may be
+        // its §10.3 underlying primitive, which is not a base (left as before).
+        if (tsym) {
+            std::size_t baseIdx = 0;
+            for (const auto& bt : localType->decl->baseTypes) {
+                const std::size_t idx = baseIdx++;
+                if (!bt) continue;
+                const bool savedSig = inMemberSignature_;
+                inMemberSignature_ = true;
+                TypeRef* ref = resolveType(*bt, &typeScope);
+                inMemberSignature_ = savedSig;
+                if (!ref) continue;
+                if (localType->decl->kind == ast::TypeDeclKind::Enum &&
+                    idx == 0 && ref->kind == TypeRef::Kind::Primitive)
+                    continue;
+                if (ref->kind == TypeRef::Kind::Named && ref->declaration) {
+                    tsym->baseTypes.push_back(ref->declaration);
+                    tsym->baseTypeRefs.push_back(ref);
+                } else {
+                    tsym->nonSymbolBaseRefs.push_back(ref);
+                }
+            }
+        }
         for (const auto& pf : localType->decl->positionalFields) {
             if (pf.type) resolveType(*pf.type, &typeScope);
             if (pf.defaultValue)
