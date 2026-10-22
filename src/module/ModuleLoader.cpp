@@ -4649,6 +4649,10 @@ static bool parseAndAttachMethodBody(
     // backing source + AST alive (string_view fields point into them), plus the
     // fresh context + diagnostics that own the copied TypeRefs.
     importedMs->decl = parsedMdBase;
+    // fix #6947 (§17.11 / §2.8.2 clause 1, v0.340): carry the body's
+    // unconstrained `default(T)` uses to the importer (see SemaContext).
+    if (const auto* names = freshCtx.unconstrainedDefaultParamsOfOwner(parsedMdBase))
+        mainCtx.setImportedUnconstrainedDefaultParams(importedMs, *names);
     // fix #5009: binding is proven above; LOWERING is not. Mark the body so
     // codegen escalates an INTERNAL lowering degrade inside it to the #1943
     // reject (emitInlineGenericMethod).

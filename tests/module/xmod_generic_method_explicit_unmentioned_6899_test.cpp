@@ -47,20 +47,22 @@ JitResult runImported(const std::string& call) {
 
 }  // namespace
 
-BEZEL_TEST(xmod_generic_method_explicit_unmentioned_6899, bool_binding_rejected_at_type_argument_spec_14_5) {
+// #6947 flip: the exporter now ships the body of a method with an unmentioned
+// type parameter, so the call is instantiated per binding (same-module value,
+// spec §2.8.2 clause 1) instead of refused at the type argument. These two rows
+// pinned the #6899 reject; they now pin the same-module value.
+BEZEL_TEST(xmod_generic_method_explicit_unmentioned_6899, bool_binding_runs_with_same_module_value_spec_14_5) {
     JitResult r = runImported("U.DefB<bool>()");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
-        r, "App.bzl:5:30: calling imported generic method `DefB` with a type "
-           "argument whose representation is not the compiled `int` (i32) "
-           "placeholder \xE2\x80\x94 here `bool`, which is not `int`"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
 }
 
-BEZEL_TEST(xmod_generic_method_explicit_unmentioned_6899, long_binding_rejected_at_type_argument_spec_14_5) {
+BEZEL_TEST(xmod_generic_method_explicit_unmentioned_6899, long_binding_runs_with_same_module_value_spec_14_5) {
     JitResult r = runImported("U.DefB<long>()");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
-        r, "here `long`, which is not `int`"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
 }
 
 // Control: the placeholder is `int`, so an `int` binding is exactly right.

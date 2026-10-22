@@ -943,6 +943,36 @@ public:
         return constraintRouteBodies_.count(ms) != 0;
     }
 
+    // fix #6947 (§17.11 / §2.8.2 clause 1, v0.340): the type parameters whose
+    // UNCONSTRAINED `default(T)` the body of a method takes. The ExprTC pass
+    // that checks a method body records them per owner decl (owner = the
+    // ast::MethodDecl); ModuleLoader copies the set of a re-parsed imported
+    // body onto the imported MethodSymbol so the importing pass can discharge
+    // the same per-instantiation obligation a same-module call does.
+    void noteUnconstrainedDefaultParam(const void* ownerDecl,
+                                       std::string param) {
+        auto& v = unconstrainedDefaultParamsByOwner_[ownerDecl];
+        for (const auto& e : v)
+            if (e == param) return;
+        v.push_back(std::move(param));
+    }
+    const std::vector<std::string>*
+    unconstrainedDefaultParamsOfOwner(const void* ownerDecl) const {
+        auto it = unconstrainedDefaultParamsByOwner_.find(ownerDecl);
+        return it == unconstrainedDefaultParamsByOwner_.end() ? nullptr
+                                                              : &it->second;
+    }
+    void setImportedUnconstrainedDefaultParams(const Symbol* ms,
+                                               std::vector<std::string> names) {
+        importedUnconstrainedDefaultParams_[ms] = std::move(names);
+    }
+    const std::vector<std::string>*
+    importedUnconstrainedDefaultParams(const Symbol* ms) const {
+        auto it = importedUnconstrainedDefaultParams_.find(ms);
+        return it == importedUnconstrainedDefaultParams_.end() ? nullptr
+                                                               : &it->second;
+    }
+
     // Is `s` an imported (externally-defined) symbol? Codegen consults this to
     // emit an external declaration rather than a definition.
     bool isImported(const Symbol* s) const {
@@ -1396,6 +1426,11 @@ private:
         importedExtensionsByDecl_;
     std::unordered_set<Symbol*> imported_;
     std::unordered_set<const Symbol*> constraintRouteBodies_;  // fix #5009
+    // fix #6947
+    std::unordered_map<const void*, std::vector<std::string>>
+        unconstrainedDefaultParamsByOwner_;
+    std::unordered_map<const Symbol*, std::vector<std::string>>
+        importedUnconstrainedDefaultParams_;
     std::vector<std::unique_ptr<std::string>> internedStrings_;
     std::unordered_map<const Symbol*, TypeRef*> importedReturnTypes_;
     std::unordered_set<const Symbol*> importedReturnOwned_;

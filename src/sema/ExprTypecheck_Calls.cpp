@@ -7533,6 +7533,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // Every binding is recorded, constrained or not: the
                 // obligation comes from the BODY, not from the
                 // constraint list this loop walks.
+                // fix #6947 (§17.11 / §2.8.2 clause 1, v0.340): an IMPORTED
+                // method's body was checked in the loader's fresh context, so
+                // its unconstrained `default(T)` uses are not in this pass's
+                // table; replay them so the join judges the binding exactly as
+                // for a same-module call.
+                if (md && ms)
+                    if (const auto* names =
+                            ctx_.importedUnconstrainedDefaultParams(ms))
+                        for (const auto& nm : *names)
+                            recordDefaultTypeParamUse(md, nm, ce.span.begin,
+                                                      /*unconstrained=*/true);
                 for (const auto& sb : subst) {
                     if (!sb.second) continue;
                     recordGenericInstantiationSite(

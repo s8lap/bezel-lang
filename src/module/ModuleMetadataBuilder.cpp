@@ -554,6 +554,26 @@ bool isReturnOnlyGenericMethod(const ast::MethodDecl& md) {
     return false;
 }
 
+// fix #6947 (§17.11 / §2.8.2 / §14.1, v0.340): true when `md` declares its OWN
+// type parameters and at least one is mentioned in NO formal parameter (the
+// `DefB<T>(): string => $"{default(T)}"` shape; the return need not mention it).
+// No argument carries such a binding across the boundary, so the call can only
+// run the template compiled against the `int` placeholder: `DefB<string>()`
+// printed 0 where the same-module call is rejected as not defaultable. Shipping
+// the body routes the call through the importer's per-instantiation
+// monomorphization, so the same-module verdict applies (§2.8.2 clause 1).
+bool hasUnmentionedGenericParam(const ast::MethodDecl& md) {
+    if (md.genericParams.empty()) return false;
+    std::unordered_set<std::string_view> names;
+    for (const auto& gp : md.genericParams)
+        if (!gp.name.empty()) names.insert(gp.name);
+    if (names.empty()) return false;
+    std::unordered_set<std::string_view> boundByArg;
+    for (const auto& p : md.params)
+        astTypeMentionsNames(p.type.get(), names, boundByArg);
+    return boundByArg.size() < names.size();
+}
+
 // fix #5009 (§14.1 / §14.2 / §2.8.3 rule 2, v0.307): true when `md` declares
 // its OWN type parameters and a `where` clause gives one of them a TYPE bound
 // (`where T: IShape`, `where T: IComparable<T>`) or `new()`. Those are exactly
@@ -1569,8 +1589,14 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 !(m.parent &&
                   m.parent->kind == ast::TypeDeclKind::Interface) &&
                 isConstraintUsingGenericMethod(*md, ctx);
+            const bool isUnmentionedParam =
+                !(m.parent &&
+                  m.parent->kind == ast::TypeDeclKind::Interface) &&
+                !hasModifier(md->modifiers, "abstract") &&
+                hasUnmentionedGenericParam(*md);
             if ((isGenericType || isNonGenericClassRecordReturn ||
-                 isReturnOnlyGeneric || isConstraintUsingGeneric) &&
+                 isReturnOnlyGeneric || isConstraintUsingGeneric ||
+                 isUnmentionedParam) &&
                 !source.empty() &&
                 md->span.begin.offset < md->span.end.offset &&
                 md->span.end.offset <= source.size()) {

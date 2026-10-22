@@ -331,6 +331,12 @@ void ExprTC::run(const ast::SourceFile& src) {
     // fix #3044 (§17.11 / §3.6 rule 2, v0.242): every `default(T)` obligation
     // and every generic-method instantiation has now been seen, in whatever
     // source order they appeared. Join them.
+    // fix #6947 (§17.11, v0.340): publish the unconstrained `default(T)` uses
+    // so ModuleLoader can carry them onto an imported method re-parsed from
+    // shipped body text.
+    for (const auto& u : defaultTypeParamUses_)
+        if (u.unconstrained)
+            ctx_.noteUnconstrainedDefaultParam(u.owner, u.param);
     checkDeferredDefaultInstantiations();
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): the same join for
     // `x as T`, over the same instantiation records.
