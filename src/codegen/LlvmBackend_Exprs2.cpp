@@ -14084,12 +14084,38 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                         sema::PrimitiveType::String) {
                                     subIsStr = true;
                                 }
+                                // §19.5 (v0.340): the payload slot of a case is
+                                // live only when the tag matched; another
+                                // case's slot holds no valid value. The nested
+                                // pattern runs behind `matched` (which carries
+                                // this level's tag test and every earlier
+                                // slot's test), so a nested level's typed-slot
+                                // descriptor walk never sees an inactive
+                                // slot's garbage pointer. Bindings live in
+                                // entry allocas and are read only by the arm
+                                // body, which runs only when the arm matched.
+                                llvm::BasicBlock* subPre =
+                                    builder_.GetInsertBlock();
+                                auto* subBB = llvm::BasicBlock::Create(
+                                    llvm_, "choice.slot.sub", currentFn_);
+                                auto* subJoin = llvm::BasicBlock::Create(
+                                    llvm_, "choice.slot.sub.join", currentFn_);
+                                builder_.CreateCondBr(matched, subBB, subJoin);
+                                builder_.SetInsertPoint(subBB);
                                 llvm::Value* subMatch = patternMatches(
                                     sp.pattern.get(), fv, subEnumTy, subIsStr,
                                     fieldTy);
-                                if (subMatch)
-                                    matched =
-                                        builder_.CreateAnd(matched, subMatch);
+                                llvm::BasicBlock* subEnd =
+                                    builder_.GetInsertBlock();
+                                builder_.CreateBr(subJoin);
+                                builder_.SetInsertPoint(subJoin);
+                                auto* subPhi = builder_.CreatePHI(i1(), 2);
+                                subPhi->addIncoming(builder_.getInt1(false),
+                                                    subPre);
+                                subPhi->addIncoming(
+                                    subMatch ? subMatch : builder_.getInt1(true),
+                                    subEnd);
+                                matched = subPhi;
                             }
                         }
                     }
