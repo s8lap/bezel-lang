@@ -2018,6 +2018,33 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         currentMethodDecl_ = md;
         Scope methodScope;
         methodScope.parent = parent;
+        // fix #6934 (§14.1 "Type-parameter names", §21.10, v0.340): classify
+        // the method's IMMEDIATE enclosing type for the reuse check below.
+        //  - A direct member of a LOCAL type: §14.1 exempts "at a method of a
+        //    local type, an enclosing method's or type's [type parameter],
+        //    which is not in scope in a local type's declaration (§21.10's
+        //    no-reference restriction)". A local type declares no type
+        //    parameters of its own (§21.10 Restrictions (v1)), so only the
+        //    own-list duplicate check applies. The local-type walk in
+        //    resolveTypesInStmt pushes (its body scope, its LocalType symbol),
+        //    so `parent` is that scope exactly when the method is its member.
+        //  - A member of a type NESTED in a local type: the walk never sets
+        //    currentOuterType_ to that nested type (it stays the type
+        //    enclosing the method that declares the local type), so the
+        //    enclosing-type check below compares against the wrong type and
+        //    the scope walk skips `parent` — the nested type's OWN type
+        //    parameters. Check `parent`'s generic-parameter markers first.
+        bool directLocalTypeMember = false;
+        bool nestedInLocalType = false;
+        if (inLocalTypeMembers_) {
+            if (!typeBodyScopes_.empty() &&
+                typeBodyScopes_.back().first == parent &&
+                typeBodyScopes_.back().second &&
+                typeBodyScopes_.back().second->isLocalType)
+                directLocalTypeMember = true;
+            else
+                nestedInLocalType = true;
+        }
         for (std::size_t i = 0; i < md->genericParams.size(); ++i) {
             const auto& g = md->genericParams[i];
             // §14.1 / §26.4 / App. C.1 (fix #5393, #5227, #5257, #5264;
@@ -2034,6 +2061,25 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
                             std::string(g.name) +
                             "` in this type-parameter list (§14.1, v0.314)");
                     break;
+                }
+            }
+            // fix #6934: see the classification above the loop.
+            if (directLocalTypeMember) {
+                methodScope.names[g.name] = nullptr;
+                continue;
+            }
+            if (nestedInLocalType && parent) {
+                auto own = parent->names.find(g.name);
+                // nullptr is the generic-parameter marker (a nested type's
+                // entry is its NestedTypeSymbol*).
+                if (own != parent->names.end() && own->second == nullptr) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, md->span.begin,
+                        "type parameter `" + std::string(g.name) +
+                            "` reuses the name of a type parameter in "
+                            "enclosing scope; rename one of them (§14.1, v0.314)");
+                    methodScope.names[g.name] = nullptr;
+                    continue;
                 }
             }
             // Check against enclosing type's generic params (currentOuterType_ is
