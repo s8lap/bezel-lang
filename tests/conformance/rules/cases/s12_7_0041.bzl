@@ -1,11 +1,10 @@
 //! case: s12_7_0041
 //! doc: spec
 //! section: 12.7
-//! title: an is test on an Object-typed local answers for the runtime type of a StringBuilder or a Random
-//! rule: "`is T` tests whether a value is an instance of `T` and produces `bool`" ([§12.7]). A local typed `Object` that holds a `StringBuilder` is an instance of `StringBuilder` and not of `Random`; the local holding a `Random` is an instance of `Random` and not of `StringBuilder`, so the four tests are true, false, true, false.
+//! title: an is test on an Object-typed local answers for the runtime type of a StringBuilder
+//! rule: "`is T` tests whether a value is an instance of `T` and produces `bool`" ([§12.7]). A local typed `Object` that holds a `StringBuilder` is an instance of `StringBuilder`, and the local holding a `Random` is not, so the two tests are true, false.
 //! cites: 17.4
 //! expect: run
-//! issue: 6755
 //! notes: the Random shape (o1 is Random, o2 is Random) is removed until #6755 lands; the two tests that remain are true and false.
 //! output: True
 //!   False

@@ -2,7 +2,7 @@
 //! doc: spec
 //! section: 22.10
 //! title: inheritance-clause base call forwards the paramName to a built-in argument exception
-//! rule: "When a class with a primary constructor has a base class, the base call appears in the inheritance clause" ([§22.10]). The base call is the clause's argument list, so R's message and paramName reach `ArgumentOutOfRangeException`'s `(message, paramName)` form; "public readonly property ParamName: string?;" ([§31.4]) is the property that form supplies, and the `ArgumentException` arm reads it back.
+//! rule: "When a class with a primary constructor has a base class, the base call appears in the inheritance clause" ([§22.10]). The base call is the clause's argument list, so R's paramName reaches `ArgumentOutOfRangeException`'s `(message, paramName)` form; "public readonly property ParamName: string?;" ([§31.4]) is the property that form supplies, and the `ArgumentException` arm reads it back.
 //! cites: 31.4
 //! expect: run
 //! output: bad=0
