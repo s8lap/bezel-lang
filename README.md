@@ -8,11 +8,11 @@ Memory management in general-purpose languages is still a trade-off. Manual mana
 
 ## A first look
 
-Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#'s, and its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design, built around ownership. The program below has a sum type (`choice`), `case` and `if` used as expressions, a function value, and lambdas passed to query operators:
+Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#'s, and its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design, built around ownership. The program below is a small shop: two records, a sum type (`choice`) for the outcome of an order, a class that owns a dictionary and hands its caller a new array, and lambdas passed to query operators:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-example-dark.svg">
-  <img alt="A Bezel program: a Shape choice with Circle, Rectangle and Dot cases, an Area method written as a case expression, and a Main method that describes each shape with a lambda and sums their areas with Where, Select and Sum." src="docs/images/readme-example-light.svg">
+  <img alt="A Bezel program: a shop with Product and Order records, an Outcome choice with Charged, UnknownSku and OutOfStock cases, an Inventory class that owns a dictionary of products, and a Main method that places orders and prints each outcome." src="docs/images/readme-example-light.svg">
 </picture>
 
 <details>
@@ -20,54 +20,61 @@ Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment
 
 <!-- readme-example: editors/vscode/tools/readme-example.js renders this block as docs/images/readme-example-{light,dark}.svg -->
 ```bezel
-module Shapes;
+module Shop;
 
-// A sum type: each value is exactly one of the cases.
-public choice Shape
-    Circle(radius: double),
-    Rectangle(width: double, height: double),
-    Dot;  // a case with no payload
-end Shape;
+public record Product(Sku: string, Price: decimal, Stock: int);
+public record Order(Sku: string, Qty: int);
+
+public choice Outcome
+    Charged(amount: decimal),
+    UnknownSku(sku: string),
+    OutOfStock(left: int);
+end Outcome;
+
+public class Inventory(products: Array<Product>)
+    private owned _bySku: Dictionary<string, Product> :=
+        products.ToDictionary(lambda(p) => p.Sku);
+    public method Place(order: Order): Outcome
+        var p := _bySku.GetOrNull(order.Sku);
+        if p = null then
+            return UnknownSku(order.Sku);
+        elif p.Stock < order.Qty then
+            return OutOfStock(p.Stock);
+        end;
+        _bySku[p.Sku] := p with(Stock := p.Stock - order.Qty);  // an updated copy
+        return Charged(p.Price * order.Qty);
+    end Place;
+
+    // A fresh array, so the return type says `owned`: the caller now holds it.
+    public method LowStock(below: int): owned Array<string> =>
+        _bySku.Where(lambda(e) => e.Value.Stock < below).Select(lambda(e) => e.Key)
+            .ToArray();
+end Inventory;
 
 public class Program
-    // `case` as an expression. The compiler checks that every case is covered.
-    public static method Area(s: Shape): double => (case s of
-        Circle(var r) => Math.Pi * r * r,
-        Rectangle(var w, var h) => w * h,
-        Dot => 0.0);
-
     public static method Main()
-        var shapes: Array<Shape> := [
-            Shape.Circle(1.0),
-            Shape.Rectangle(2.0, 3.0),
-            Shape.Dot,
-            Shape.Rectangle(4.0, 4.0)
-        ];
-
-        // A function value. The lambda's parameter type comes from the declared type.
-        var describe: (Shape) -> string := lambda(s) => (case s of
-            Circle(var r) => $"circle of radius {r}",
-            Rectangle(var w, var h) =>
-                (if w = h then $"square of side {w}" else $"rectangle {w} by {h}"),
-            Dot => "dot");
-
-        for var s in shapes do
-            Console.WriteLine($"{describe(s)}: area {Area(s):F2}");
+        using var shop := new Inventory([
+            new Product("pen", 1.25m, 40),
+            new Product("pad", 3.50m, 6),
+            new Product("mug", 8.00m, 3)
+        ]);
+        var orders: Array<Order> :=
+            [new Order("pen", 10), new Order("ink", 1), new Order("pad", 7)];
+        for var order in orders do
+            var verdict := (case shop.Place(order) of
+                Charged(var amount) => $"charged {amount:F2}",
+                UnknownSku(var sku) => $"refused, no product '{sku}'",
+                OutOfStock(var left) => $"refused, only {left} left");
+            Console.WriteLine($"{order.Qty} x {order.Sku}: {verdict}");
         end;
-
-        // The first lambda captures the local `threshold`.
-        var threshold := 5.0;
-        var large := shapes.Where(lambda(s) => Area(s) > threshold).Count();
-        var total := shapes.Select(lambda(s) => Area(s)).Sum();
-        Console.WriteLine($"{large} of {shapes.Count} shapes exceed {threshold}");
-        Console.WriteLine($"total area {total:F2}");
+        Console.WriteLine($"running low: {String.Join(", ", shop.LowStock(10))}");
     end Main;
 end Program;
 ```
 
 </details>
 
-Adding a case to `Shape` makes both `case` expressions fail to compile until they handle it. [A Tour of Bezel](docs/Bezel_Tour.md) walks through the rest of the language.
+It prints `10 x pen: charged 12.50`, `1 x ink: refused, no product 'ink'`, `7 x pad: refused, only 6 left` and `running low: pad, mug`. Adding a case to `Outcome` makes the `case` expression in `Main` fail to compile until it handles the new case. [A Tour of Bezel](docs/Bezel_Tour.md) walks through the rest of the language.
 
 **Status: experimental.** The language design is close to settled and is written down in full; the compiler implements most of it and is still being brought up to the specification. Expect rough edges, and expect the language to change. There are no stability guarantees yet.
 
