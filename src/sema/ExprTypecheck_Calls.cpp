@@ -579,6 +579,21 @@ std::string ExprTC::ofTypeRemovedMessage(const TypeRef* srcElem,
            "`Where` and an `is` test (spec §12.7) instead.";
 }
 
+// #6958/#6959: the primitive T types a `Math.Min/Max/Clamp<T>` explicit list
+// converts its arguments to (numeric and char; not bool/string/object).
+static bool isMinMaxNumericOrChar(PrimitiveType p) {
+    switch (p) {
+    case PrimitiveType::Byte: case PrimitiveType::SByte:
+    case PrimitiveType::Short: case PrimitiveType::UShort:
+    case PrimitiveType::Int: case PrimitiveType::UInt:
+    case PrimitiveType::Long: case PrimitiveType::ULong:
+    case PrimitiveType::Float: case PrimitiveType::Double:
+    case PrimitiveType::Decimal: case PrimitiveType::Char:
+        return true;
+    default: return false;
+    }
+}
+
 // §5.1: implicit-conversion predicate used by §22.6 overload resolution.
 // Identity is NOT a §5.1 conversion (it is the "exact" relation), so a
 // pair of equal types returns false here. Conservative on everything the
@@ -17717,6 +17732,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     if (ae != lit) ctx_.setExprType(lit, T);
                                 }
                             }
+                        }
+                        // fix #6958 (stdlib §2.2, §14.5, v0.340): an explicit
+                        // list binds T, and the call's type is T whatever the
+                        // operands' own types (they convert to T at their
+                        // conversion sites), so
+                        // `Console.WriteLine(Math.Max<byte>(b, N))` renders a
+                        // byte, not the signed int the first operand's
+                        // placeholder gave.
+                        if (mma->typeArgs.size() == 1 && mma->typeArgs[0]) {
+                            TypeRef* eT = ctx_.resolvedType(*mma->typeArgs[0]);
+                            if (eT && !eT->nullable &&
+                                eT->kind == TypeRef::Kind::Primitive &&
+                                isMinMaxNumericOrChar(eT->primitive))
+                                ctx_.setExprType(&ce, eT);
                         }
                         const TypeRef* first = nullptr;
                         bool same = true;

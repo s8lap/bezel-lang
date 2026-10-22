@@ -68,3 +68,25 @@ BEZEL_TEST(math_minmax_result_type_6949, clamp_int_to_string) {
         "var i: int := 50; Console.WriteLine(Math.Clamp(i, 1, 9).ToString());"),
         std::string("9\n"));
 }
+
+// fix #6958 -- an explicit list types the call as T (stdlib §2.2, §14.5).
+BEZEL_TEST(math_minmax_result_type_6958, byte_const_operand_prints_unsigned) {
+    BEZEL_EXPECT_EQ(stdoutOf(
+        "const N: int := 200; var b: byte := byte(3); "
+        "Console.WriteLine(Math.Max<byte>(b, N));"),
+        std::string("200\n"));
+}
+BEZEL_TEST(math_minmax_result_type_6958, byte_const_operand_to_string_and_var) {
+    BEZEL_EXPECT_EQ(stdoutOf(
+        "const N: int := 250; var b: byte := byte(3); "
+        "Console.WriteLine(Math.Max<byte>(b, N).ToString()); "
+        "var x := Math.Max<byte>(b, N); Console.WriteLine(x);"),
+        std::string("250\n250\n"));
+}
+BEZEL_TEST(math_minmax_result_type_6958, long_with_int_operand_direct) {
+    BEZEL_EXPECT_EQ(stdoutOf(
+        "var l: long := 5000000000L; var i: int := 7; "
+        "Console.WriteLine(Math.Max<long>(i, l)); "
+        "Console.WriteLine(Math.Min<long>(i, l));"),
+        std::string("5000000000\n7\n"));
+}
