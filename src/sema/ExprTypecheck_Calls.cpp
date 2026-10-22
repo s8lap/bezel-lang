@@ -28333,10 +28333,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // array types that declare it (Array<T>/OwningArray<T>, stdlib §4.4).
         if (ma.target && (ma.member == "Count" || ma.member == "Capacity")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
+                // fix #6921 (§2.5, v0.340): the imported shape (no astNode,
+                // head in `importedName`) as well. Once `x[1]` of an imported
+                // `OwningArray<Array<int>>` is typed, `x[1].Count.ToString()`
+                // reaches here with an astNode-less `Array<int>`; untyped, that
+                // call "produced no value" (and so did `a.Count.ToString()`
+                // on an imported `Array<int>` local).
                 bool isBuiltinColl =
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                    tt->astNode && tt->astNode->name &&
-                    !tt->astNode->name->parts.empty();
+                    ((tt->astNode && tt->astNode->name &&
+                      !tt->astNode->name->parts.empty()) ||
+                     (!tt->astNode && !tt->importedName.empty()));
                 std::string_view cn = isBuiltinColl
                     ? std::string_view(tt->headName())
                     : std::string_view();

@@ -3871,9 +3871,17 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 //     `[i: int]: T`; the element type is T = genericArgs[0], the
                 //     same position as Array<T>. (No collection interface
                 //     declares a key-indexer, so dictionaries are concrete-only.)
+                //   * fix #6921 (§2.5, v0.340): an IMPORTED builtin collection
+                //     (`M.OA()` returning `owned OwningArray<Item>`) carries
+                //     its head in `importedName` and has no astNode. Gating on
+                //     the astNode alone left `x[0]` UNTYPED, so `x[0].N`
+                //     lowered to nothing and `var z: int := x[0]` compiled.
+                //     The astNode-less imported shape is admitted here; the
+                //     local shape is unchanged.
                 else if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                         tt->astNode && tt->astNode->name &&
-                         !tt->astNode->name->parts.empty()) {
+                         ((tt->astNode && tt->astNode->name &&
+                           !tt->astNode->name->parts.empty()) ||
+                          (!tt->astNode && !tt->importedName.empty()))) {
                     std::string_view cn = tt->headName();
                     // issue #545: __Buffer<T>[i] → T (genericArgs[0]).
                     if ((cn == "__Buffer" || cn == "Buffer") && !tt->genericArgs.empty() &&
