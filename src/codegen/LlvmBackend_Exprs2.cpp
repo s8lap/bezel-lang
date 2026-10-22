@@ -15146,6 +15146,24 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 patTy->primitive != scrutTyResolved->primitive)
                 return builder_.getInt1(false);
         }
+        // §19.3 / §19.5 (#6888, v0.340): a bare primitive type pattern over an
+        // `Object` scrutinee is a RUNTIME type test (the same test as `o is T`,
+        // §12.7 — "a bare type pattern T matches only non-null values" is a
+        // necessary condition, not the whole test). It routes through the
+        // test the typed-binding form already uses: the positive string
+        // classification for `string`, the box-descriptor walk for a value
+        // primitive.
+        if (tp->type && scrutTyResolved &&
+            scrutTyResolved->kind == sema::TypeRef::Kind::Primitive &&
+            scrutTyResolved->primitive == sema::PrimitiveType::Object &&
+            scrut->getType()->isPointerTy()) {
+            const sema::TypeRef* patTy = ctx_.resolvedType(*tp->type);
+            if (patTy && patTy->kind == sema::TypeRef::Kind::Primitive &&
+                patTy->primitive != sema::PrimitiveType::Object)
+                if (llvm::Value* m = emitTypeParamPatternTest(
+                        patTy, scrut, scrutTyResolved, tp->span.begin))
+                    return m;
+        }
         // §19.5 (#760): "A bare type pattern T matches only non-null values."
         // A nullable runtime-managed-reference scrutinee (`string?`, a function
         // type, a boxed value) is a *pointer*, not the tagged struct the
