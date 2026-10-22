@@ -4963,6 +4963,25 @@ bool ctorChainsViaThisExported(const sema::ConstructorSymbol* cs) {
     return ctorChainsViaThis(cs);
 }
 
+// fix #7046 (§22.10 / §22.5 / §15.4, v0.340) — see the declaration comment in
+// LlvmBackend_impl.hpp. Same ownership rule as the positional-argument arm of
+// `storePrimaryCtorPositionalArgs` (#7042).
+llvm::Value* Emitter::lowerPositionalSlotLiteral(const ast::Expr& e,
+                                                 const sema::FieldSymbol* fs,
+                                                 const sema::TypeRef* fldTy) {
+    auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(&e);
+    if (!lit || !fs || !fldTy) return nullptr;
+    llvm::Value* v = materializeCollectionLiteralForArg(lit, fldTy);
+    if (v && !(fs->posParam && fs->posParam->modifier == "owned") &&
+        !disposeStack_.empty()) {
+        llvm::AllocaInst* litSlot = entryAlloca(v->getType());
+        builder_.CreateStore(v, litSlot);
+        if (smStateStruct_) asyncHandlerSpillSlots_.push_back(litSlot);
+        disposeStack_.back().push_back(buildCollectionTempDisposal(litSlot, fldTy));
+    }
+    return v;
+}
+
 // fix #3777 (§22.5 "Optional parameters and named arguments" / §22.10 "primary
 // constructors" / §22.8 step 0, v0.286): the ONE materialization of a §22.10
 // positional parameter's §22.5 default. Extracted verbatim from
@@ -4996,13 +5015,25 @@ llvm::Value* Emitter::positionalParamDefaultValue(
         // local — evaluate under the outer substitution, with
         // `currentThis_ = obj` so earlier primary-ctor params resolve through
         // their captured slots.
+        // fix #7046: a collection-literal default (`ys: Array<int> := [7, 8]`)
+        // is materialized against the parameter's declared type, resolved
+        // under the constructed type's own substitution (active on entry).
+        const bool defaultIsLit =
+            dynamic_cast<const ast::CollectionLiteralExpr*>(
+                fs.posParam->defaultValue.get()) != nullptr;
+        const sema::TypeRef* litFldTy =
+            defaultIsLit ? recordMemberTypeResolved(&fs) : nullptr;
         llvm::Value* savedThisForArg = currentThis_;
         currentThis_ = obj;
         auto posSubst = genericSubst_;
         auto posSemaTy = genericSubstSemaTy_;
         genericSubst_ = outerSubst;
         genericSubstSemaTy_ = outerSemaTy;
-        llvm::Value* defaultV = lowerExpr(*fs.posParam->defaultValue);
+        llvm::Value* defaultV =
+            defaultIsLit
+                ? lowerPositionalSlotLiteral(*fs.posParam->defaultValue, &fs,
+                                             litFldTy)
+                : lowerExpr(*fs.posParam->defaultValue);
         genericSubst_ = std::move(posSubst);
         genericSubstSemaTy_ = std::move(posSemaTy);
         currentThis_ = savedThisForArg;
@@ -5838,7 +5869,18 @@ void Emitter::prePopulateBasePositionalFields(
         for (std::size_t ai = 0; ai < baseArgs->size(); ++ai) {
             const auto& arg = (*baseArgs)[ai];
             if (!arg.value) { baseArgVals.clear(); baseArgExprs.clear(); break; }
-            llvm::Value* v = lowerExpr(*arg.value);
+            // fix #7046 (§22.10 / §15.4, v0.340): a collection literal clause
+            // argument is materialized against the slot §22.5 binds it to.
+            llvm::Value* v = nullptr;
+            if (dynamic_cast<const ast::CollectionLiteralExpr*>(arg.value.get())) {
+                const std::size_t fi = fieldForArg(ai);
+                if (fi < basePosFields.size())
+                    v = lowerPositionalSlotLiteral(
+                        *arg.value, basePosFields[fi],
+                        recordMemberTypeResolved(basePosFields[fi]));
+            } else {
+                v = lowerExpr(*arg.value);
+            }
             // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the inheritance-clause
             // face of the same gap — see the `storePrimaryCtorPositionalArgs`
             // site above. A null `v` here used to ABANDON the whole
@@ -6000,7 +6042,18 @@ void Emitter::prePopulateBasePositionalFields(
                 for (std::size_t ai = 0; ai < chainCall->args.size(); ++ai) {
                     const auto& arg = chainCall->args[ai];
                     if (!arg.value) { baseArgVals.clear(); baseArgExprs.clear(); break; }
-                    llvm::Value* v = lowerExpr(*arg.value);
+                    // fix #7046 (§22.10 / §15.4, v0.340): a collection literal clause
+                    // argument is materialized against the slot §22.5 binds it to.
+                    llvm::Value* v = nullptr;
+                    if (dynamic_cast<const ast::CollectionLiteralExpr*>(arg.value.get())) {
+                        const std::size_t fi = fieldForArg(ai);
+                        if (fi < basePosFields.size())
+                            v = lowerPositionalSlotLiteral(
+                                *arg.value, basePosFields[fi],
+                                recordMemberTypeResolved(basePosFields[fi]));
+                    } else {
+                        v = lowerExpr(*arg.value);
+                    }
                     // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the explicit
                     // `base(...)`-chain face of the same gap — same reasoning
                     // and same pairing as the primaryBaseCtorArgs loop above.

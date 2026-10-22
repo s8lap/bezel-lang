@@ -25402,6 +25402,19 @@ private:
         const sema::TypeSymbol* base,
         const std::vector<ast::CallArgument>& args);
 
+    // fix #7046 (§22.10 / §22.5 / §15.4, v0.340): a collection literal that
+    // reaches a positional parameter's slot through a channel other than
+    // `new`'s argument list (a `:= [..]` default, a base-clause / `base(...)`
+    // argument). `lowerExpr` returns null for a `CollectionLiteralExpr`, so
+    // those sites left the slot calloc-zero (an EMPTY collection). Materializes
+    // `e` against `fldTy` (the slot's declared type, resolved by the caller
+    // under the constructed type's substitution) and, for a non-`owned`
+    // parameter, registers the unbound-temporary scope-exit disposal (the
+    // #7042 rule). Null when `e` is not a literal or `fldTy` is null.
+    llvm::Value* lowerPositionalSlotLiteral(const ast::Expr& e,
+                                            const sema::FieldSymbol* fs,
+                                            const sema::TypeRef* fldTy);
+
     // fix #3777 (§22.5 / §22.10 / §22.8 step 0, v0.286): the ONE §22.5 default
     // materialization for a §22.10 positional parameter — the LOCAL `:= Expr`
     // on `posParam->defaultValue`, or the IMPORTED rendered text on
