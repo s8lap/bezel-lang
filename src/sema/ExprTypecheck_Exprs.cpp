@@ -9938,7 +9938,13 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         // a node, so `-(3U)` is this same shape. Only the literal operand is
         // decided here; a non-literal constant operand is not (see #6834's
         // follow-up).
-        if (op == "-" && ue.operand) {
+        //
+        // fix #6913 (§17.14 "Evaluation", v0.340): not in an operand a
+        // constant short-circuits (`if false then -3U else 1U`, `false and
+        // (-3U > 0U)`): it "is not evaluated at compile time and contributes
+        // no fault". Reported at the first stamped location (a unary operand
+        // of a binary operator has no span of its own and printed `0:0`).
+        if (op == "-" && ue.operand && constDeadOperandDepth_ == 0) {
             if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(
                     ue.operand.get())) {
                 bool hasU = false;
@@ -9952,8 +9958,9 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                     !(ot && ot->kind == TypeRef::Kind::Primitive &&
                       ot->primitive == PrimitiveType::UInt &&
                       mag > 4294967295ULL)) {
+                    constFaulted_.insert(&ue);
                     ctx_.diagnostics().report(
-                        Severity::Error, ue.span.begin,
+                        Severity::Error, constFaultLoc(ue),
                         std::string("unary `-` on the unsigned constant `") +
                         std::string(il->text) + "` has no representable "
                         "result: -" + std::to_string(mag) + " is outside `" +
@@ -10165,6 +10172,22 @@ TypeRef* ExprTC::recoverChoiceThisScrutTy(const ast::Expr* scrutinee,
 void ExprTC::visitChildren(const ast::Expr& e) {
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
         if (be->left) visitExpr(*be->left);
+        // fix #6913 (§17.14 "Evaluation", §17.2, v0.340): "the boolean
+        // operators' short-circuiting (an operand that would not be evaluated
+        // at run time is not evaluated at compile time and contributes no
+        // fault)". When the left operand is the constant that decides the
+        // result (`false and …`, `true or …`), the right operand is visited
+        // with the evaluation-fault reports off; it is still type-checked.
+        bool deadRight = false;
+        if ((be->op == "and" || be->op == "or") && be->left && be->right)
+            if (auto lv = foldBoolConstTC(*be->left))
+                deadRight = (*lv == (be->op == "or"));
+        if (deadRight) ++constDeadOperandDepth_;
+        struct DeadRightGuard {
+            int& depth;
+            bool on;
+            ~DeadRightGuard() { if (on) --depth; }
+        } deadRightGuard{constDeadOperandDepth_, deadRight};
         // §7.4 (v0.226, #2212): in `A and B`, `B` is checked under `A`'s
         // true-facts — "x <> null and x.Length > 0" is well-typed. Narrowing
         // is otherwise established only by collectNarrowings AFTER the
@@ -12691,6 +12714,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         auto entryNullNarrowed = nullNarrowed_;
         auto entryInit = initNarrowed_;
         auto entryFieldNarrowed = fieldNarrowed_;
+        // fix #6913 (§17.14 "Evaluation", §20, v0.340): §20's short-circuiting
+        // -- the branch a constant condition does not select "is not
+        // evaluated at compile time and contributes no fault". It is still
+        // type-checked; only the evaluation-fault reports are off.
+        std::optional<bool> constCond;
+        if (ce->condition) constCond = foldBoolConstTC(*ce->condition);
+        const bool thenDead = constCond && !*constCond;
+        const bool elseDead = constCond && *constCond;
         // §28.3 A7 (v0.209, #2080): an if-expression BRANCH is a marked-
         // transfer admission position — announce the exact child node.
         const ast::Expr* savedSlot = markedArmSlot_;
@@ -12712,7 +12743,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/true);
             markedArmSlot_ = ce->thenValue.get();
+            if (thenDead) ++constDeadOperandDepth_;
             visitExpr(*ce->thenValue);
+            if (thenDead) --constDeadOperandDepth_;
             thenExitNull = nullNarrowed_;
             thenExitInit = initNarrowed_;
             thenExitNarrowings = narrowings_;
@@ -12726,7 +12759,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/false);
             markedArmSlot_ = ce->elseValue.get();
+            if (elseDead) ++constDeadOperandDepth_;
             visitExpr(*ce->elseValue);
+            if (elseDead) --constDeadOperandDepth_;
         }
         markedArmSlot_ = savedSlot;
         // The live sets hold the else branch's exit (or, for a branch-less

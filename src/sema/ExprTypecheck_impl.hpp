@@ -3050,6 +3050,44 @@ private:
     // (a literal/arithmetic/const may; a variable or call result may not).
     std::optional<long long> foldIntConstExprTC(const ast::Expr& e);
 
+    // fix #6869 / #6913 / #6915 (§17.14 "Evaluation", §6.1, v0.340): the TYPED
+    // evaluation of an integer constant expression. §17.14: "A constant
+    // expression is evaluated at compile time under the same semantics the
+    // expression has at run time -- §6.1 checked integer arithmetic", and an
+    // evaluation fault "is a compile error at the constant expression, never a
+    // deferred runtime fault". foldIntConstExprTC is untyped (unchecked
+    // `long long`, ulong above LLONG_MAX declined), so it cannot see that
+    // `-C` with `C: uint` or `1U - 2U` has no `uint` result.
+    //
+    // `constIntValueTC(e)` is the exact value of `e` (each node read at the
+    // static type sema recorded for it, which is the type the run-time
+    // operation has) when `e` is an integer constant expression whose
+    // evaluation does not fault; nullopt otherwise (not constant, not
+    // integer-typed, or faulting). `checkConstEvalFault(e)` runs once per
+    // unary/binary node after it is typed and reports the node's own fault
+    // (operands that already faulted are not re-reported; the node is marked
+    // faulted instead, `constFaulted_`).
+    std::optional<__int128> constIntValueTC(const ast::Expr& e, int depth = 0);
+    void checkConstEvalFault(const ast::Expr& e);
+    std::unordered_set<const ast::Expr*> constFaulted_;
+    // §17.14 (v0.340): "§20's and the boolean operators' short-circuiting (an
+    // operand that would not be evaluated at run time is not evaluated at
+    // compile time and contributes no fault)". >0 while visiting an operand a
+    // constant has decided is not evaluated: the right operand of `and` whose
+    // left is the constant `false` (of `or`: `true`), the `then` branch of an
+    // `(if c …)` whose condition is the constant `false`, the `else` branch
+    // when it is `true`. Every §17.14 evaluation-fault report consults it.
+    int constDeadOperandDepth_ = 0;
+    // The value of a `bool` constant expression (literal, `not`, `and`/`or`,
+    // an integer or `bool` comparison, a `bool` const reference, an
+    // `(if …)`), or nullopt. Decides the dead operands above.
+    std::optional<bool> foldBoolConstTC(const ast::Expr& e, int depth = 0);
+    // A diagnostic location for `e`: its own span when the parser stamped
+    // one, else the first stamped location among its leading operands (a
+    // unary or binary node reached through the precedence climber carries no
+    // span of its own, which printed `0:0`, #6913).
+    SourceLocation constFaultLoc(const ast::Expr& e);
+
     // fix #4801 (§5.2 / §17.14 / §6.3 / §6.4, v0.307): the floating/decimal
     // sibling of foldIntConstExprTC. Folds a §17.14 constant expression whose
     // static type is `float`, `double`, `decimal` or an integer type to its

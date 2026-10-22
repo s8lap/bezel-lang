@@ -15325,17 +15325,25 @@ void ExprTC::checkCasePatternConstantRanges(
 //   * `const n: int := K; var a: [n]int := [7, 8, 9];` — LOCAL: compiles.
 //     IMPORTED base: `arraySizeValue` stayed -1 and codegen emitted MALFORMED IR
 //     ("Invalid indices for GEP pointer type!", IR verification failed).
+// The AST initializer of a SAME-MODULE const symbol (a local `const` or a
+// class `ConstDecl`); null for an imported const, which has no AST and is
+// read off its ConstMemberSymbol instead (fix #3230 below). One accessor so
+// foldConstIdentTC and foldBoolConstTC (fix #6913) share one AST read.
+static const ast::Expr* sameModuleConstInitializer(const Symbol* s) {
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
+        return lc->value.get();
+    if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
+        return cd->value.get();
+    return nullptr;
+}
+
 std::optional<long long> ExprTC::foldConstIdentTC(std::string_view name,
                                                   int depth) {
     // fix #4856: inside a followed class-const initializer, look names up in
     // value position, as the declaration-site visit did.
     Symbol* s = lookupName(name, foldInDeclScope_);
     if (!s) return std::nullopt;
-    const ast::Expr* val = nullptr;
-    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
-        val = lc->value.get();
-    else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
-        val = cd->value.get();
+    const ast::Expr* val = sameModuleConstInitializer(s);
     if (val)
         // fix #4856 (§17.14 / §2.8.3, v0.307): a class const's initializer is
         // folded in its DECLARING scope, not the use site's.
@@ -15439,6 +15447,249 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
             cms, [&] { return foldIntConst(*cd->value, resolve, 1); });
     }
     return foldIntConst(e, resolve, 0);
+}
+
+// fix #6869 / #6913 / #6915 (§17.14, §6.1, §4.2, v0.340): see the contract
+// in ExprTypecheck_impl.hpp. The range table is §4.2's.
+namespace {
+bool constEvalIntPrim(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Byte: case P::SByte: case P::Short: case P::UShort:
+        case P::Int:  case P::UInt:  case P::Long:  case P::ULong:
+            return true;
+        default:
+            return false;
+    }
+}
+__int128 constEvalMin(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::SByte: return -128;
+        case P::Short: return -32768;
+        case P::Int:   return -2147483648LL;
+        case P::Long:  return static_cast<__int128>(INT64_MIN);
+        default:       return 0;  // the unsigned types
+    }
+}
+__int128 constEvalMax(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Byte:   return 255;
+        case P::SByte:  return 127;
+        case P::Short:  return 32767;
+        case P::UShort: return 65535;
+        case P::Int:    return 2147483647LL;
+        case P::UInt:   return 4294967295LL;
+        case P::Long:   return static_cast<__int128>(INT64_MAX);
+        default:        return static_cast<__int128>(UINT64_MAX);  // ULong
+    }
+}
+std::string constEvalI128ToString(__int128 v) {
+    if (v == 0) return "0";
+    const bool neg = v < 0;
+    unsigned __int128 m = neg ? static_cast<unsigned __int128>(-(v + 1)) + 1
+                              : static_cast<unsigned __int128>(v);
+    std::string s;
+    while (m != 0) {
+        s.push_back(static_cast<char>('0' + static_cast<int>(m % 10)));
+        m /= 10;
+    }
+    if (neg) s.push_back('-');
+    return std::string(s.rbegin(), s.rend());
+}
+}  // namespace
+
+SourceLocation ExprTC::constFaultLoc(const ast::Expr& e) {
+    const ast::Expr* cur = &e;
+    while (cur) {
+        if (cur->span.begin.line != 0) return cur->span.begin;
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(cur))
+            cur = u->operand.get();
+        else if (auto* b = dynamic_cast<const ast::BinaryExpr*>(cur))
+            cur = b->left.get();
+        else
+            break;
+    }
+    return e.span.begin;
+}
+
+std::optional<__int128> ExprTC::constIntValueTC(const ast::Expr& e,
+                                                int depth) {
+    if (depth > 256) return std::nullopt;
+    if (constFaulted_.count(&e)) return std::nullopt;
+    const TypeRef* t = ctx_.exprType(e);
+    if (!t || t->kind != TypeRef::Kind::Primitive || t->nullable ||
+        !constEvalIntPrim(t->primitive))
+        return std::nullopt;
+    const PrimitiveType p = t->primitive;
+    // A value outside the node's own type is no value: either the node
+    // faults (checkConstEvalFault reports it) or it was already rejected.
+    auto fit = [&](__int128 v) -> std::optional<__int128> {
+        if (v < constEvalMin(p) || v > constEvalMax(p)) return std::nullopt;
+        return v;
+    };
+    if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
+        unsigned long long mag = 0;
+        if (!intLiteralMagnitude(il->text, mag) || errno == ERANGE)
+            return std::nullopt;
+        return fit(static_cast<__int128>(mag));
+    }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (!u->operand) return std::nullopt;
+        // §4.2 boundary carve-out: the immediate literal operand of unary `-`
+        // is read as its negation (`-2147483648` is int.MinValue); its
+        // magnitude alone need not fit.
+        if (u->op == "-")
+            if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(
+                    u->operand.get())) {
+                unsigned long long mag = 0;
+                if (!intLiteralMagnitude(il->text, mag) || errno == ERANGE)
+                    return std::nullopt;
+                return fit(-static_cast<__int128>(mag));
+            }
+        auto v = constIntValueTC(*u->operand, depth + 1);
+        if (!v) return std::nullopt;
+        if (u->op == "+") return fit(*v);
+        if (u->op == "-") return fit(-*v);
+        if (u->op == "~") {
+            // §6.5: for signed types `~x = -(x + 1)`; for an unsigned type the
+            // complement within its width.
+            if (constEvalMin(p) < 0) return fit(-(*v + 1));
+            return fit(constEvalMax(p) - *v);
+        }
+        return std::nullopt;
+    }
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (!b->left || !b->right) return std::nullopt;
+        const std::string_view op = b->op;
+        const bool arith = op == "+" || op == "-" || op == "*" || op == "/" ||
+                           op == "mod" || op == "%";
+        const bool bitwise = op == "&" || op == "|" || op == "^";
+        if (!arith && !bitwise) return std::nullopt;  // shifts: §6.5's check
+        auto l = constIntValueTC(*b->left, depth + 1);
+        if (!l) return std::nullopt;
+        auto r = constIntValueTC(*b->right, depth + 1);
+        if (!r) return std::nullopt;
+        if (op == "+") return fit(*l + *r);
+        if (op == "-") return fit(*l - *r);
+        if (op == "*") {
+            // both operands are within 64 bits, so the product fits 128.
+            return fit(*l * *r);
+        }
+        if (op == "/") {
+            if (*r == 0) return std::nullopt;
+            return fit(*l / *r);  // §6.1: truncates toward zero, as C++ does
+        }
+        if (op == "mod" || op == "%") {
+            if (*r == 0) return std::nullopt;
+            return fit(*l % *r);  // §6.1: follows the dividend's sign
+        }
+        // Bitwise on in-range values: two's complement on the wider
+        // representation agrees with the operand width.
+        if (*l < 0 || *r < 0) {
+            if (constEvalMin(p) == 0) return std::nullopt;
+        }
+        if (op == "&") return fit(*l & *r);
+        if (op == "|") return fit(*l | *r);
+        return fit(*l ^ *r);
+    }
+    if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (!c->condition) return std::nullopt;
+        auto cv = foldBoolConstTC(*c->condition);
+        if (!cv) return std::nullopt;
+        const ast::Expr* arm = *cv ? c->thenValue.get() : c->elseValue.get();
+        if (!arm) return std::nullopt;
+        auto v = constIntValueTC(*arm, depth + 1);
+        if (!v) return std::nullopt;
+        return fit(*v);
+    }
+    // A primitive wrapper constant (`uint.MaxValue`, stdlib §1).
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+            const PrimitiveType wp = primitiveFromName(id->name);
+            if (constEvalIntPrim(wp) && wp == p) {
+                if (ma->member == "MaxValue") return constEvalMax(p);
+                if (ma->member == "MinValue") return constEvalMin(p);
+            }
+        }
+    }
+    // A `const` reference (bare or qualified): its value through the shared
+    // untyped fold, read at the reference's type (a `ulong` above LLONG_MAX
+    // comes back as its bit pattern).
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        auto v = foldIntConstExprTC(e);
+        if (!v) return std::nullopt;
+        __int128 w = *v;
+        if (p == PrimitiveType::ULong && w < 0)
+            w += static_cast<__int128>(UINT64_MAX) + 1;
+        return fit(w);
+    }
+    return std::nullopt;
+}
+
+std::optional<bool> ExprTC::foldBoolConstTC(const ast::Expr& e, int depth) {
+    if (depth > 64) return std::nullopt;
+    if (auto* bl = dynamic_cast<const ast::BoolLiteralExpr*>(&e))
+        return bl->value;
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (u->op != "not" || !u->operand) return std::nullopt;
+        auto v = foldBoolConstTC(*u->operand, depth + 1);
+        if (!v) return std::nullopt;
+        return !*v;
+    }
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (!b->left || !b->right) return std::nullopt;
+        const std::string_view op = b->op;
+        if (op == "and" || op == "or") {
+            const bool isOr = op == "or";
+            auto l = foldBoolConstTC(*b->left, depth + 1);
+            if (!l) return std::nullopt;
+            if (*l == isOr) return isOr;  // short-circuit: right not evaluated
+            return foldBoolConstTC(*b->right, depth + 1);
+        }
+        if (op == "<" || op == ">" || op == "<=" || op == ">=" || op == "=" ||
+            op == "<>") {
+            auto li = constIntValueTC(*b->left);
+            auto ri = constIntValueTC(*b->right);
+            if (li && ri) {
+                if (op == "<") return *li < *ri;
+                if (op == ">") return *li > *ri;
+                if (op == "<=") return *li <= *ri;
+                if (op == ">=") return *li >= *ri;
+                if (op == "=") return *li == *ri;
+                return *li != *ri;
+            }
+            if (op == "=" || op == "<>") {
+                auto lb = foldBoolConstTC(*b->left, depth + 1);
+                auto rb = foldBoolConstTC(*b->right, depth + 1);
+                if (lb && rb) return (op == "=") == (*lb == *rb);
+            }
+        }
+        return std::nullopt;
+    }
+    if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (!c->condition) return std::nullopt;
+        auto cv = foldBoolConstTC(*c->condition, depth + 1);
+        if (!cv) return std::nullopt;
+        const ast::Expr* arm = *cv ? c->thenValue.get() : c->elseValue.get();
+        if (!arm) return std::nullopt;
+        return foldBoolConstTC(*arm, depth + 1);
+    }
+    // A `bool` const reference: follow its initializer where it was declared
+    // (fix #4856's discipline). A runtime local const's initializer does not
+    // fold (its leaves are not constants), so it never decides an operand.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+        Symbol* s = lookupName(id->name, foldInDeclScope_);
+        if (!s) return std::nullopt;
+        const ast::Expr* val = sameModuleConstInitializer(s);
+        if (!val) return std::nullopt;
+        return inConstDeclScope(
+            s, [&] { return foldBoolConstTC(*val, depth + 1); });
+    }
+    return std::nullopt;
 }
 
 // §17.14 (v0.184, #1688): same identifier resolution as foldIntConstExprTC
