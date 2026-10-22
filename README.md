@@ -2,15 +2,7 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-Correct memory management in general-purpose programming is an unsolved problem. Manual memory management is prone to coding errors, and approaches like GC or ARC add significant overhead at runtime. Bezel lets the programmer write code where the compiler knows when and where to dispose every object. This is similar to RAII and carries no runtime overhead.
-
-The ownership rules are written down in chapter 28 of the language spec. The rules may look complicated, yet most of this complexity is on the compiler tracking ownership rather than the programmer. Only three keywords are present that help with memory management: owned that signifies an owned object, move that moves ownership, and scoped that helps manage the memory of variables captured in lambdas.
-
-The rules of the language only let the owner of an object dispose it. Calling Dispose on an object only calls its destructor. The backing memory is always freed by the calls the compiler inserts statically. Borrowing lets code pass references around without transferring ownership, and the compiler checks that no borrow outlives what it borrows. The compiler makes use of reference counting only in rare places like special closure shapes.
-
-Bezel looks a lot like Pascal and C#. The look of Bezel and its library names superficially resemble .NET, but is quite different from it.
-
-The current state of the compiler is that the specification is ahead of implementation. Most of the language already works. The issue tracker records bugs and gaps for memory problems that mostly live on the intersections of various language features. (Claude, could you specify a few examples?).
+Memory management in general-purpose languages is still a trade-off. Manual management is fast but easy to get wrong: a missed free leaks, an early one corrupts memory. Garbage collection and automatic reference counting remove those errors, but they cost time and memory at run time, and a collector adds pauses. Bezel takes a third route. The compiler knows, for every object, where it is created, who owns it, and the exact point at which it is released. It inserts the release itself, on the normal path and when an exception passes through. The effect is close to C++'s RAII, except that the compiler checks the rules instead of leaving them to discipline. There is no collector, no reference count on any class you write, and no pause.
 
 ```bezel
 module Example;
@@ -43,6 +35,70 @@ end Program;
 ```
 
 > **Status: experimental.** The language design is close to settled and is written down in full; the compiler implements most of it and is still being brought up to the specification. Expect rough edges, and expect the language to change. There are no stability guarantees yet.
+>
+> Most of the language already works. The remaining bugs are mostly memory errors where two features meet, and each one is tracked in the issue tracker. A few current examples:
+> - an owned collection passed as an argument leaks when a later argument throws ([#6670](https://github.com/s8lap/bezel-lang/issues/6670));
+> - a lambda that captures a string and is passed to a constructor leaks its capture cell ([#6628](https://github.com/s8lap/bezel-lang/issues/6628));
+> - a plain `var` local holding an `Array<string?>` is never reclaimed, so its storage and every element leak ([#6516](https://github.com/s8lap/bezel-lang/issues/6516));
+> - a user-defined operator whose parameter is a standard collection interface crashes when its body uses the operand ([#6655](https://github.com/s8lap/bezel-lang/issues/6655)).
+
+## How memory management works
+
+The rules are in [chapter 28 of the specification](docs/Bezel_Language_Spec.md#sec-resource-management). They are long because they are precise, but most of their weight falls on the compiler, which tracks ownership through every statement. The programmer meets three keywords:
+
+- **`owned`** marks a slot that holds ownership: a parameter that takes it, a return type that hands it to the caller, or a field that keeps it for the life of its object.
+- **`move`** transfers ownership at a use site. An existing object never changes hands without it, so every transfer is visible in the source.
+- **`scoped`** marks a callback parameter that the callee may store rather than only call. The stored callback lives no longer than the object that stores it, so a lambda passed there may still capture borrowed locals: the compiler checks that everything it captures outlives that object ([§28.14](docs/Bezel_Language_Spec.md#sec-scoped-callback-parameters)).
+
+Everything else is a **borrow**: a reference passed around without transferring ownership. The compiler checks that no borrow outlives what it borrows, so a dangling reference is a compile-time error.
+
+Only an object's owner may dispose it ([§28.6](docs/Bezel_Language_Spec.md#sec-who-may-dispose)). Calling `Dispose()` runs the object's cleanup, its destructor, and marks it disposed. It does not free the memory. The memory is always released by code the compiler inserts at the owner's release point: the end of a scope, the overwrite of a field, the disposal of the object that holds it. Using an object after it has been disposed raises `DisposedAccessException` in the default build instead of reading freed memory.
+
+Reference counting appears only where the runtime owns a value's lifetime: strings, boxed values and function values such as closures ([§28.9](docs/Bezel_Language_Spec.md#sec-runtime-managed-types)). The specification leaves the mechanism to the runtime, and the current one counts references. Shared ownership is never implicit. A program that wants it says so with `Shared<T>` and `Weak<T>` ([§28.13](docs/Bezel_Language_Spec.md#sec-shared-ownership)).
+
+## A longer example
+
+Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#'s, and its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design, built around ownership. The program below has a sum type (`choice`), `case` and `if` used as expressions, a function value, and lambdas passed to query operators:
+
+```bezel
+module Shapes;
+
+public choice Shape                                  // a sum type: each value is exactly one case
+  Circle(radius: double),
+  Rectangle(width: double, height: double),
+  Dot;                                               // a case with no payload
+end Shape;
+
+public class Program
+  // `case` as an expression; the compiler checks that every case is covered
+  public static method Area(s: Shape): double => (case s of
+    Circle(var r)           => Math.Pi * r * r,
+    Rectangle(var w, var h) => w * h,
+    Dot                     => 0.0);
+
+  public static method Main()
+    var shapes: Array<Shape> := [Shape.Circle(1.0), Shape.Rectangle(2.0, 3.0),
+                                 Shape.Dot, Shape.Rectangle(4.0, 4.0)];
+
+    // A function value; the lambda's parameter type comes from the declared type
+    var describe: (Shape) -> string := lambda(s) => (case s of
+      Circle(var r)           => $"circle of radius {r}",
+      Rectangle(var w, var h) => (if w = h then $"square of side {w}" else $"rectangle {w} by {h}"),
+      Dot                     => "dot");
+
+    for var s in shapes do
+      Console.WriteLine($"{describe(s)}: area {Area(s):F2}");
+    end;
+
+    var threshold := 5.0;                            // captured by the first lambda below
+    var large := shapes.Where(lambda(s) => Area(s) > threshold).Count();
+    var total := shapes.Select(lambda(s) => Area(s)).Sum();
+    Console.WriteLine($"{large} of {shapes.Count} shapes exceed {threshold}; total area {total:F2}");
+  end Main;
+end Program;
+```
+
+Adding a case to `Shape` makes both `case` expressions fail to compile until they handle it. [A Tour of Bezel](docs/Bezel_Tour.md) walks through the rest of the language.
 
 ## Why Bezel
 
