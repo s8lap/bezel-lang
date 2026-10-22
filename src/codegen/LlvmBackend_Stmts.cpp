@@ -2511,8 +2511,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // result back.
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
                     std::vector<llvm::Value*> args{cur, rhs};
+                    // fix #6831 (§6.6, §7.11, §7.4, v0.340): a §7.4-narrowed
+                    // nullable record operand (target or value) reaches a
+                    // non-nullable formal as its payload, the binary form's
+                    // #6758 unwrap; the result is stored back into a `T?`
+                    // target as the carrier (§5.1).
+                    const sema::TypeRef* tgtTy6831 = ctx_.exprType(*as->target);
+                    fitUserOperatorArgs(
+                        opMethod, args,
+                        {tgtTy6831, ctx_.exprType(*as->value)},
+                        /*unwrap=*/true);
                     llvm::Value* res = emitMethodCall(
                         opMethod, args, /*baseQualified=*/false);
+                    if (res && tgtTy6831 && isNullableValueTy(tgtTy6831) &&
+                        res->getType() != elemTy)
+                        res = wrapArgForNullableValueFormal(res, tgtTy6831);
                     if (res) {
                         // §28.7 / §17.6 (#1831): a user-defined compound
                         // `target OP= value` (e.g. `_c += k` where

@@ -24523,6 +24523,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 operandStaticTypeAt(as->target.get(), ctx_.exprType(*as->target));
             TypeRef* rTy =
                 operandStaticTypeAt(as->value.get(), ctx_.exprType(*as->value));
+            // fix #6831 (§6.6, §7.11, §7.4, v0.340): the same reading for a
+            // NAMED operand (`operandStaticTypeAt` is primitive-only). §6.6
+            // desugars `a += p` to `a := a + p`, and §7.11: "an operand that
+            // §7.4 has narrowed non-null is a non-nullable operand and the
+            // ordinary operator applies to it unchanged" -- the user-defined
+            // operator search below included, as findBinaryOperator's
+            // `staticTypeOf` reads it (#6758).
+            auto narrowNamed6831 = [&](const ast::Expr* e,
+                                       TypeRef* t) -> TypeRef* {
+                if (!t || !t->nullable || t->kind != TypeRef::Kind::Named ||
+                    !isNarrowedNonNullRead(e))
+                    return t;
+                TypeRef* nn = ctx_.makeTypeRef();
+                *nn = *t;
+                nn->nullable = false;
+                return nn;
+            };
+            tTy = narrowNamed6831(as->target.get(), tTy);
+            rTy = narrowNamed6831(as->value.get(), rTy);
             using P = PrimitiveType;
             // Diagnostic-only spelling of a primitive type; mirrors
             // primitiveSpelling (ExprTypecheck_Exprs.cpp, anonymous

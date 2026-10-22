@@ -481,6 +481,9 @@ llvm::Value* Emitter::emitCompoundOpTyped(const std::string& op, llvm::Value* l,
         // diagnostic; falling through to emitCompoundOp would abort the compile
         // on malformed IR, which is the very defect this arm exists to remove.
         std::vector<llvm::Value*> args{l, r};
+        // fix #6831 (§6.6, §7.11, §7.4, v0.340): a §7.4-narrowed nullable
+        // record operand reaches a non-nullable formal as its payload.
+        fitUserOperatorArgs(om, args, {leftTy, rightTy}, /*unwrap=*/true);
         return emitMethodCall(om, args, /*baseQualified=*/false);
     }
     return emitCompoundOp(op, l, r, fp, uns, charTarget, rUns);

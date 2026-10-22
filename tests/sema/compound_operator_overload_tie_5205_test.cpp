@@ -91,9 +91,14 @@ BEZEL_TEST(sema_compound_operator_overload_tie_5205,
            t6_nullable_target_rejected_spec_7_11) {
     auto r = runAot(
         std::string(kTwoOps) +
+        // fix #6831 (§7.4, §7.11, v0.340): the target comes from a
+        // nullable-typed call, so it is genuinely un-narrowed. The former
+        // `var v: V? := new V(1)` is narrowed by its initializer (§7.4's
+        // declaration form) and is now admitted, as `v := v + s` is (#6758).
         "public class Program "
+        "  public static method Pick(): V? return new V(1); end Pick; "
         "  public static method Main(): int "
-        "    var v: V? := new V(1); var s: short := 7; v += s; "
+        "    var v: V? := Pick(); var s: short := 7; v += s; "
         "    return 0; "
         "  end Main; "
         "end Program;");

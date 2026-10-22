@@ -5137,6 +5137,12 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             if (opMethod) {
                 // §25.1: desugar to get → overload call → set.
                 std::vector<llvm::Value*> args{cur, rhs};
+                // fix #6831 (§6.6, §7.11, §7.4, v0.340): a §7.4-narrowed
+                // nullable record RHS reaches a non-nullable formal as its
+                // payload (the #6758 unwrap of the binary form).
+                fitUserOperatorArgs(opMethod, args,
+                                    {valTy, ctx_.exprType(*as.value)},
+                                    /*unwrap=*/true);
                 llvm::Value* res =
                     emitMethodCall(opMethod, args, /*baseQualified=*/false);
                 if (!res) return false;
@@ -5311,6 +5317,10 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             // (`arr[Idx()] += …`) and violating §17.6 "evaluated exactly once"
             // (#1299): the get read one slot and the set wrote another.
             std::vector<llvm::Value*> args{cur, rhs};
+            // fix #6831 (§6.6, §7.11, §7.4, v0.340): see the dict branch.
+            fitUserOperatorArgs(opMethod, args,
+                                {elemTyRef, ctx_.exprType(*as.value)},
+                                /*unwrap=*/true);
             newVal = emitMethodCall(opMethod, args, /*baseQualified=*/false);
             if (!newVal) return false;
         }
