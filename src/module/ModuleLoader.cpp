@@ -784,7 +784,8 @@ struct Loader {
         const std::string_view tdName = ctx.internString(td.name);
         std::string qn;
         qn.reserve(parent.qualifiedTypeName().size() + 1 + tdName.size());
-        qn = parent.qualifiedTypeName();
+        // fix #7011: the pass-1 shell is keyed by the ARITY path.
+        qn = parent.arityEnclosingPath();
         if (!qn.empty()) qn += '.';
         qn += std::string(tdName);
         sema::TypeSymbol* t = nullptr;
@@ -6232,6 +6233,16 @@ bool metadataDescriptionsAgree(const ModuleMetadata& lhs,
 static void registerNestedTypeShells(
     const MetaTypeDecl& td, sema::SemaContext& ctx, sema::TypeSymbol& parent,
     std::unordered_map<std::string, sema::TypeSymbol*>& localTypes) {
+    // fix #7011 (§11.6 / §2.8.3 rule 3, v0.340): pass 1 runs BEFORE pass 2
+    // fills `parent.genericParams`, so `parent.arityEnclosingPath()` would
+    // drop the `.<arity>` segment of a GENERIC enclosing type ("G.N" instead
+    // of the exporter's "G.1.N") and a signature naming that nested type
+    // never bound. Take the arity from the metadata declaration instead.
+    const std::string parentPath =
+        td.genericParams.empty()
+            ? parent.qualifiedTypeName()
+            : parent.qualifiedTypeName() + "." +
+                  std::to_string(td.genericParams.size());
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::NestedType || !mm.nestedType) continue;
         const MetaTypeDecl& ntd = *mm.nestedType;
@@ -6250,7 +6261,7 @@ static void registerNestedTypeShells(
         // as its enclosing type (§11.6 — nesting is not a separate module).
         t->moduleName = parent.moduleName;
         // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): enclosing-type path.
-        t->enclosingTypePath = parent.arityEnclosingPath();
+        t->enclosingTypePath = parentPath;
         localTypes[t->qualifiedTypeName()] = t;
         ctx.registerImportedType(parent.moduleName, t);
         // Recurse: a §11.6 type may itself contain nested types.
