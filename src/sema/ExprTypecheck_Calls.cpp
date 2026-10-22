@@ -20940,6 +20940,12 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         recvTy->declaration == ctx_.builtinClassSym("Range") &&
         !recvTy->genericArgs.empty() && recvTy->genericArgs[0] &&
         recvTy->genericArgs[0]->kind == TypeRef::Kind::Primitive) {
+        // fix #6999 (§27.5, stdlib §9.8, v0.340): `Contains` is declared
+        // `: bool`. `Range` has no MethodSymbol, so nothing typed the call;
+        // an untyped lambda expression body then fell to lowerLambda's `i32`
+        // return fallback and `ret i1` failed IR verification.
+        if (!ctx_.exprType(ce))
+            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
         // fix-forward #6853 (§17.5, §16.6, v0.340): `x in c` IS this call, so
         // a constant-endpoint range LITERAL receiver admits the same integer
