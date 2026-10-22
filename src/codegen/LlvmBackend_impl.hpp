@@ -22505,6 +22505,18 @@ private:
                                    const sema::TypeRef* fieldTy);
 
     llvm::Value* lowerBinary(const ast::BinaryExpr& bin);
+    // §7.11 / §7.4 / §5.1 (#6830, #6831, #6901): fit each argument of a
+    // user-defined operator call to its FORMAL's nullable-value shape.
+    // `argTys[i]` is the operand's declared sema type. A nullable-value
+    // operand (`{i8, T}` carrier) reaching a non-nullable formal is one sema
+    // admitted only because §7.4 narrowed it, so its payload is extracted
+    // (when `unwrap`); a bare operand reaching a nullable-value formal
+    // (`T` → `T?`, §5.1) is wrapped. Run after the operator's generic
+    // substitution is installed, so a generic formal lowers specialized.
+    void fitUserOperatorArgs(const sema::MethodSymbol* opm,
+                             std::vector<llvm::Value*>& args,
+                             const std::vector<const sema::TypeRef*>& argTys,
+                             bool unwrap);
     // §8.4 (#848): null-safe `=`/`<>` for a record overloading `operator =`/`<>`
     // when an operand is nullable (`T?`) or the `null` literal.
     llvm::Value* lowerNullSafeRecordEquality(const ast::BinaryExpr& bin,

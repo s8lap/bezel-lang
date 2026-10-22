@@ -9545,6 +9545,38 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
             if (auto* rt = ctx_.importedReturnType(opm))
                 ctx_.setExprType(&ue, rt);
         }
+        // fix #6830 (§7.11, §7.4, v0.340): "A user-declared `operator` on a
+        // record or class type ... is likewise not defined on a nullable
+        // operand: such an operand at a user-defined-operator position is the
+        // same compile error, naming the same remedies." The binary form's
+        // gate (`nullableUserOperand` in typeBinaryRules) has the twin here:
+        // a nullable operand reaching a non-nullable formal is rejected unless
+        // §7.4 has narrowed it, in which case it "is a non-nullable operand
+        // and the ordinary operator applies to it unchanged". A `T?` formal
+        // takes the nullable operand as an ordinary argument, as the binary
+        // candidate search's nullability gate admits it.
+        if (ue.operand) {
+            const TypeRef* ot = ctx_.exprType(*ue.operand);
+            auto* ps = opm->params.empty()
+                           ? nullptr
+                           : dynamic_cast<ParameterSymbol*>(opm->params[0]);
+            const TypeRef* pt =
+                !ps ? nullptr
+                    : ps->declType ? ctx_.resolvedType(*ps->declType)
+                                   : ps->resolvedDeclType;
+            if (ot && ot->nullable && ot->kind == TypeRef::Kind::Named &&
+                !(pt && pt->nullable) &&
+                !isNarrowedNonNullRead(ue.operand.get())) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ue.span.begin,
+                    std::string("operator `") + std::string(op) +
+                    "` is not defined on a nullable value type — narrow first "
+                    "(`x <> null and …` (\xC2\xA7""7.4), `??` (\xC2\xA7""7.7), "
+                    "or `!` (\xC2\xA7""7.8)); user-defined operators do not "
+                    "lift over `T?` (\xC2\xA7""7.11, v0.267)");
+                return;
+            }
+        }
         // per §7.4 (v0.182, #1566): a user-defined unary operator is a call that
         // can transfer control to user code — invalidate mutably-captured
         // narrowings (its operand was already visited under the prior narrowing).

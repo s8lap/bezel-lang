@@ -474,6 +474,11 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                     genericSubstSemaTy_ = std::move(nsem);
                 }
             }
+            // §7.11 / §7.4 (#6830): sema admits a nullable record operand at a
+            // non-nullable formal only once §7.4 has narrowed it, so its
+            // `{i8, T}` carrier is unwrapped here; a `T?` formal takes the
+            // carrier (§5.1).
+            fitUserOperatorArgs(opm, args, {opTy}, /*unwrap=*/true);
             llvm::Value* result =
                 emitMethodCall(opm, args, /*baseQualified=*/false);
             genericSubst_       = std::move(savedOpSubst);

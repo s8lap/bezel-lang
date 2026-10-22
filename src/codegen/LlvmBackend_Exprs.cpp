@@ -9077,6 +9077,49 @@ llvm::Value* Emitter::lowerNullSafeRecordEquality(const ast::BinaryExpr& bin,
 }
 
 
+void Emitter::fitUserOperatorArgs(
+        const sema::MethodSymbol* opm, std::vector<llvm::Value*>& args,
+        const std::vector<const sema::TypeRef*>& argTys, bool unwrap) {
+    if (!opm) return;
+    for (std::size_t i = 0; i < args.size() && i < argTys.size() &&
+                            i < opm->params.size();
+         ++i) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(opm->params[i]);
+        const sema::TypeRef* pt =
+            !ps ? nullptr
+                : ps->declType ? ctx_.resolvedType(*ps->declType)
+                               : ps->resolvedDeclType;
+        const sema::TypeRef* t = argTys[i];
+        llvm::Value* v = args[i];
+        if (!pt || !t || !v) continue;
+        if (!pt->nullable) {
+            // §7.11 / §7.4: the narrowed-non-null operand's carrier, unwrapped
+            // exactly as #6758 does for the binary form.
+            // The carrier is recognised by its SHAPE against the formal's
+            // lowered type as well: a compound assignment into a narrowed
+            // `T?` target coerces a bare `T` value to the target's carrier
+            // before the operator is found (`p += a`, #6831).
+            if (!unwrap || !v->getType()->isStructTy()) continue;
+            bool carrier = isNullableValueTy(t) &&
+                           v->getType() == nullableValueStructTy(t);
+            if (!carrier) {
+                auto* st = llvm::cast<llvm::StructType>(v->getType());
+                llvm::Type* want = lowerTypeRef(pt);
+                carrier = want && st != want && st->getNumElements() == 2 &&
+                          st->getElementType(0) == nullablePrimHasValTy() &&
+                          st->getElementType(1) == want;
+            }
+            if (carrier) args[i] = nullablePrimValue(v);
+            continue;
+        }
+        // §5.1 "For any type T, T implicitly converts to T?": a bare value (or
+        // the `null` literal) at a `T?` formal becomes the `{i8, T}` carrier.
+        // A no-op when the argument already is the carrier.
+        if (isNullableValueTy(pt))
+            args[i] = wrapArgForNullableValueFormal(v, pt);
+    }
+}
+
 llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     if (!bin.left || !bin.right) return nullptr;
     // CG: short-circuit `and`/`or` (§17) — the right operand is
