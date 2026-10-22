@@ -22,38 +22,46 @@ Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment
 ```bezel
 module Shapes;
 
-public choice Shape                                  // a sum type: each value is exactly one case
-  Circle(radius: double),
-  Rectangle(width: double, height: double),
-  Dot;                                               // a case with no payload
+// A sum type: each value is exactly one of the cases.
+public choice Shape
+    Circle(radius: double),
+    Rectangle(width: double, height: double),
+    Dot;  // a case with no payload
 end Shape;
 
 public class Program
-  // `case` as an expression; the compiler checks that every case is covered
-  public static method Area(s: Shape): double => (case s of
-    Circle(var r)           => Math.Pi * r * r,
-    Rectangle(var w, var h) => w * h,
-    Dot                     => 0.0);
+    // `case` as an expression. The compiler checks that every case is covered.
+    public static method Area(s: Shape): double => (case s of
+        Circle(var r) => Math.Pi * r * r,
+        Rectangle(var w, var h) => w * h,
+        Dot => 0.0);
 
-  public static method Main()
-    var shapes: Array<Shape> := [Shape.Circle(1.0), Shape.Rectangle(2.0, 3.0),
-                                 Shape.Dot, Shape.Rectangle(4.0, 4.0)];
+    public static method Main()
+        var shapes: Array<Shape> := [
+            Shape.Circle(1.0),
+            Shape.Rectangle(2.0, 3.0),
+            Shape.Dot,
+            Shape.Rectangle(4.0, 4.0)
+        ];
 
-    // A function value; the lambda's parameter type comes from the declared type
-    var describe: (Shape) -> string := lambda(s) => (case s of
-      Circle(var r)           => $"circle of radius {r}",
-      Rectangle(var w, var h) => (if w = h then $"square of side {w}" else $"rectangle {w} by {h}"),
-      Dot                     => "dot");
+        // A function value. The lambda's parameter type comes from the declared type.
+        var describe: (Shape) -> string := lambda(s) => (case s of
+            Circle(var r) => $"circle of radius {r}",
+            Rectangle(var w, var h) =>
+                (if w = h then $"square of side {w}" else $"rectangle {w} by {h}"),
+            Dot => "dot");
 
-    for var s in shapes do
-      Console.WriteLine($"{describe(s)}: area {Area(s):F2}");
-    end;
+        for var s in shapes do
+            Console.WriteLine($"{describe(s)}: area {Area(s):F2}");
+        end;
 
-    var threshold := 5.0;                            // captured by the first lambda below
-    var large := shapes.Where(lambda(s) => Area(s) > threshold).Count();
-    var total := shapes.Select(lambda(s) => Area(s)).Sum();
-    Console.WriteLine($"{large} of {shapes.Count} shapes exceed {threshold}; total area {total:F2}");
-  end Main;
+        // The first lambda captures the local `threshold`.
+        var threshold := 5.0;
+        var large := shapes.Where(lambda(s) => Area(s) > threshold).Count();
+        var total := shapes.Select(lambda(s) => Area(s)).Sum();
+        Console.WriteLine($"{large} of {shapes.Count} shapes exceed {threshold}");
+        Console.WriteLine($"total area {total:F2}");
+    end Main;
 end Program;
 ```
 

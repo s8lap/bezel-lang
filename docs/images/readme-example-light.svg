@@ -1,40 +1,48 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="861" height="728" viewBox="0 0 861 728" role="img" aria-label="Bezel code example">
+<svg xmlns="http://www.w3.org/2000/svg" width="738" height="888" viewBox="0 0 738 888" role="img" aria-label="Bezel code example">
 <rect width="100%" height="100%" rx="6" fill="#f6f8fa"/>
 <text font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace" font-size="13.6" xml:space="preserve" fill="#1f2328">
 <tspan x="16" y="28"><tspan fill="#cf222e">module</tspan> <tspan fill="#8250df">Shapes</tspan>;</tspan>
 <tspan x="16" y="48"></tspan>
-<tspan x="16" y="68"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">choice</tspan> <tspan fill="#8250df">Shape</tspan>                                  <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> a sum type: each value is exactly one case</tspan></tspan>
-<tspan x="16" y="88">  <tspan fill="#8250df">Circle</tspan>(radius: <tspan fill="#cf222e">double</tspan>),</tspan>
-<tspan x="16" y="108">  <tspan fill="#8250df">Rectangle</tspan>(width: <tspan fill="#cf222e">double</tspan>, height: <tspan fill="#cf222e">double</tspan>),</tspan>
-<tspan x="16" y="128">  <tspan fill="#8250df">Dot</tspan>;                                               <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> a case with no payload</tspan></tspan>
-<tspan x="16" y="148"><tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Shape</tspan>;</tspan>
-<tspan x="16" y="168"></tspan>
-<tspan x="16" y="188"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">class</tspan> <tspan fill="#8250df">Program</tspan></tspan>
-<tspan x="16" y="208">  <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> `case` as an expression; the compiler checks that every case is covered</tspan></tspan>
-<tspan x="16" y="228">  <tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">static</tspan> <tspan fill="#cf222e">method</tspan> <tspan fill="#8250df">Area</tspan>(s: <tspan fill="#8250df">Shape</tspan>): <tspan fill="#cf222e">double</tspan> =&gt; (<tspan fill="#cf222e">case</tspan> s of</tspan>
-<tspan x="16" y="248">    <tspan fill="#8250df">Circle</tspan>(<tspan fill="#cf222e">var</tspan> r)           =&gt; <tspan fill="#8250df">Math</tspan>.<tspan fill="#8250df">Pi</tspan> * r * r,</tspan>
-<tspan x="16" y="268">    <tspan fill="#8250df">Rectangle</tspan>(<tspan fill="#cf222e">var</tspan> w, <tspan fill="#cf222e">var</tspan> h) =&gt; w * h,</tspan>
-<tspan x="16" y="288">    <tspan fill="#8250df">Dot</tspan>                     =&gt; <tspan fill="#0550ae">0.0</tspan>);</tspan>
-<tspan x="16" y="308"></tspan>
-<tspan x="16" y="328">  <tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">static</tspan> <tspan fill="#cf222e">method</tspan> <tspan fill="#8250df">Main</tspan>()</tspan>
-<tspan x="16" y="348">    <tspan fill="#cf222e">var</tspan> shapes: <tspan fill="#8250df">Array</tspan>&lt;<tspan fill="#8250df">Shape</tspan>&gt; := [<tspan fill="#8250df">Shape</tspan>.<tspan fill="#8250df">Circle</tspan>(<tspan fill="#0550ae">1.0</tspan>), <tspan fill="#8250df">Shape</tspan>.<tspan fill="#8250df">Rectangle</tspan>(<tspan fill="#0550ae">2.0</tspan>, <tspan fill="#0550ae">3.0</tspan>),</tspan>
-<tspan x="16" y="368">                                 <tspan fill="#8250df">Shape</tspan>.<tspan fill="#8250df">Dot</tspan>, <tspan fill="#8250df">Shape</tspan>.<tspan fill="#8250df">Rectangle</tspan>(<tspan fill="#0550ae">4.0</tspan>, <tspan fill="#0550ae">4.0</tspan>)];</tspan>
-<tspan x="16" y="388"></tspan>
-<tspan x="16" y="408">    <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> A function value; the lambda's parameter type comes from the declared type</tspan></tspan>
-<tspan x="16" y="428">    <tspan fill="#cf222e">var</tspan> describe: (<tspan fill="#8250df">Shape</tspan>) -&gt; <tspan fill="#cf222e">string</tspan> := <tspan fill="#cf222e">lambda</tspan>(s) =&gt; (<tspan fill="#cf222e">case</tspan> s of</tspan>
-<tspan x="16" y="448">      <tspan fill="#8250df">Circle</tspan>(<tspan fill="#cf222e">var</tspan> r)           =&gt; <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">circle of radius </tspan><tspan fill="#0a3069">{</tspan>r<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>,</tspan>
-<tspan x="16" y="468">      <tspan fill="#8250df">Rectangle</tspan>(<tspan fill="#cf222e">var</tspan> w, <tspan fill="#cf222e">var</tspan> h) =&gt; (<tspan fill="#cf222e">if</tspan> w = h <tspan fill="#cf222e">then</tspan> <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">square of side </tspan><tspan fill="#0a3069">{</tspan>w<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan> <tspan fill="#cf222e">else</tspan> <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">rectangle </tspan><tspan fill="#0a3069">{</tspan>w<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069"> by </tspan><tspan fill="#0a3069">{</tspan>h<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>),</tspan>
-<tspan x="16" y="488">      <tspan fill="#8250df">Dot</tspan>                     =&gt; <tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">dot</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
-<tspan x="16" y="508"></tspan>
-<tspan x="16" y="528">    <tspan fill="#cf222e">for</tspan> <tspan fill="#cf222e">var</tspan> s <tspan fill="#cf222e">in</tspan> shapes <tspan fill="#cf222e">do</tspan></tspan>
-<tspan x="16" y="548">      <tspan fill="#8250df">Console</tspan>.<tspan fill="#8250df">WriteLine</tspan>(<tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">{</tspan>describe(s)<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">: area </tspan><tspan fill="#0a3069">{</tspan><tspan fill="#8250df">Area</tspan>(s):<tspan fill="#8250df">F2</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
-<tspan x="16" y="568">    <tspan fill="#cf222e">end</tspan>;</tspan>
-<tspan x="16" y="588"></tspan>
-<tspan x="16" y="608">    <tspan fill="#cf222e">var</tspan> threshold := <tspan fill="#0550ae">5.0</tspan>;                            <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> captured by the first lambda below</tspan></tspan>
-<tspan x="16" y="628">    <tspan fill="#cf222e">var</tspan> large := shapes.<tspan fill="#8250df">Where</tspan>(<tspan fill="#cf222e">lambda</tspan>(s) =&gt; <tspan fill="#8250df">Area</tspan>(s) &gt; threshold).<tspan fill="#8250df">Count</tspan>();</tspan>
-<tspan x="16" y="648">    <tspan fill="#cf222e">var</tspan> total := shapes.<tspan fill="#8250df">Select</tspan>(<tspan fill="#cf222e">lambda</tspan>(s) =&gt; <tspan fill="#8250df">Area</tspan>(s)).<tspan fill="#8250df">Sum</tspan>();</tspan>
-<tspan x="16" y="668">    <tspan fill="#8250df">Console</tspan>.<tspan fill="#8250df">WriteLine</tspan>(<tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">{</tspan>large<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069"> of </tspan><tspan fill="#0a3069">{</tspan>shapes.<tspan fill="#8250df">Count</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069"> shapes exceed </tspan><tspan fill="#0a3069">{</tspan>threshold<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">; total area </tspan><tspan fill="#0a3069">{</tspan>total:<tspan fill="#8250df">F2</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
-<tspan x="16" y="688">  <tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Main</tspan>;</tspan>
-<tspan x="16" y="708"><tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Program</tspan>;</tspan>
+<tspan x="16" y="68"><tspan fill="#59636e">//</tspan><tspan fill="#59636e"> A sum type: each value is exactly one of the cases.</tspan></tspan>
+<tspan x="16" y="88"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">choice</tspan> <tspan fill="#8250df">Shape</tspan></tspan>
+<tspan x="16" y="108">    <tspan fill="#8250df">Circle</tspan>(radius: <tspan fill="#cf222e">double</tspan>),</tspan>
+<tspan x="16" y="128">    <tspan fill="#8250df">Rectangle</tspan>(width: <tspan fill="#cf222e">double</tspan>, height: <tspan fill="#cf222e">double</tspan>),</tspan>
+<tspan x="16" y="148">    <tspan fill="#8250df">Dot</tspan>;  <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> a case with no payload</tspan></tspan>
+<tspan x="16" y="168"><tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Shape</tspan>;</tspan>
+<tspan x="16" y="188"></tspan>
+<tspan x="16" y="208"><tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">class</tspan> <tspan fill="#8250df">Program</tspan></tspan>
+<tspan x="16" y="228">    <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> `case` as an expression. The compiler checks that every case is covered.</tspan></tspan>
+<tspan x="16" y="248">    <tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">static</tspan> <tspan fill="#cf222e">method</tspan> <tspan fill="#8250df">Area</tspan>(s: <tspan fill="#8250df">Shape</tspan>): <tspan fill="#cf222e">double</tspan> =&gt; (<tspan fill="#cf222e">case</tspan> s of</tspan>
+<tspan x="16" y="268">        <tspan fill="#8250df">Circle</tspan>(<tspan fill="#cf222e">var</tspan> r) =&gt; <tspan fill="#8250df">Math</tspan>.<tspan fill="#8250df">Pi</tspan> * r * r,</tspan>
+<tspan x="16" y="288">        <tspan fill="#8250df">Rectangle</tspan>(<tspan fill="#cf222e">var</tspan> w, <tspan fill="#cf222e">var</tspan> h) =&gt; w * h,</tspan>
+<tspan x="16" y="308">        <tspan fill="#8250df">Dot</tspan> =&gt; <tspan fill="#0550ae">0.0</tspan>);</tspan>
+<tspan x="16" y="328"></tspan>
+<tspan x="16" y="348">    <tspan fill="#cf222e">public</tspan> <tspan fill="#cf222e">static</tspan> <tspan fill="#cf222e">method</tspan> <tspan fill="#8250df">Main</tspan>()</tspan>
+<tspan x="16" y="368">        <tspan fill="#cf222e">var</tspan> shapes: <tspan fill="#8250df">Array</tspan>&lt;<tspan fill="#8250df">Shape</tspan>&gt; := [</tspan>
+<tspan x="16" y="388">            <tspan fill="#8250df">Shape</tspan>.<tspan fill="#8250df">Circle</tspan>(<tspan fill="#0550ae">1.0</tspan>),</tspan>
+<tspan x="16" y="408">            <tspan fill="#8250df">Shape</tspan>.<tspan fill="#8250df">Rectangle</tspan>(<tspan fill="#0550ae">2.0</tspan>, <tspan fill="#0550ae">3.0</tspan>),</tspan>
+<tspan x="16" y="428">            <tspan fill="#8250df">Shape</tspan>.<tspan fill="#8250df">Dot</tspan>,</tspan>
+<tspan x="16" y="448">            <tspan fill="#8250df">Shape</tspan>.<tspan fill="#8250df">Rectangle</tspan>(<tspan fill="#0550ae">4.0</tspan>, <tspan fill="#0550ae">4.0</tspan>)</tspan>
+<tspan x="16" y="468">        ];</tspan>
+<tspan x="16" y="488"></tspan>
+<tspan x="16" y="508">        <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> A function value. The lambda's parameter type comes from the declared type.</tspan></tspan>
+<tspan x="16" y="528">        <tspan fill="#cf222e">var</tspan> describe: (<tspan fill="#8250df">Shape</tspan>) -&gt; <tspan fill="#cf222e">string</tspan> := <tspan fill="#cf222e">lambda</tspan>(s) =&gt; (<tspan fill="#cf222e">case</tspan> s of</tspan>
+<tspan x="16" y="548">            <tspan fill="#8250df">Circle</tspan>(<tspan fill="#cf222e">var</tspan> r) =&gt; <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">circle of radius </tspan><tspan fill="#0a3069">{</tspan>r<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>,</tspan>
+<tspan x="16" y="568">            <tspan fill="#8250df">Rectangle</tspan>(<tspan fill="#cf222e">var</tspan> w, <tspan fill="#cf222e">var</tspan> h) =&gt;</tspan>
+<tspan x="16" y="588">                (<tspan fill="#cf222e">if</tspan> w = h <tspan fill="#cf222e">then</tspan> <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">square of side </tspan><tspan fill="#0a3069">{</tspan>w<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan> <tspan fill="#cf222e">else</tspan> <tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">rectangle </tspan><tspan fill="#0a3069">{</tspan>w<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069"> by </tspan><tspan fill="#0a3069">{</tspan>h<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>),</tspan>
+<tspan x="16" y="608">            <tspan fill="#8250df">Dot</tspan> =&gt; <tspan fill="#0a3069">"</tspan><tspan fill="#0a3069">dot</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
+<tspan x="16" y="628"></tspan>
+<tspan x="16" y="648">        <tspan fill="#cf222e">for</tspan> <tspan fill="#cf222e">var</tspan> s <tspan fill="#cf222e">in</tspan> shapes <tspan fill="#cf222e">do</tspan></tspan>
+<tspan x="16" y="668">            <tspan fill="#8250df">Console</tspan>.<tspan fill="#8250df">WriteLine</tspan>(<tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">{</tspan>describe(s)<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">: area </tspan><tspan fill="#0a3069">{</tspan><tspan fill="#8250df">Area</tspan>(s):<tspan fill="#8250df">F2</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
+<tspan x="16" y="688">        <tspan fill="#cf222e">end</tspan>;</tspan>
+<tspan x="16" y="708"></tspan>
+<tspan x="16" y="728">        <tspan fill="#59636e">//</tspan><tspan fill="#59636e"> The first lambda captures the local `threshold`.</tspan></tspan>
+<tspan x="16" y="748">        <tspan fill="#cf222e">var</tspan> threshold := <tspan fill="#0550ae">5.0</tspan>;</tspan>
+<tspan x="16" y="768">        <tspan fill="#cf222e">var</tspan> large := shapes.<tspan fill="#8250df">Where</tspan>(<tspan fill="#cf222e">lambda</tspan>(s) =&gt; <tspan fill="#8250df">Area</tspan>(s) &gt; threshold).<tspan fill="#8250df">Count</tspan>();</tspan>
+<tspan x="16" y="788">        <tspan fill="#cf222e">var</tspan> total := shapes.<tspan fill="#8250df">Select</tspan>(<tspan fill="#cf222e">lambda</tspan>(s) =&gt; <tspan fill="#8250df">Area</tspan>(s)).<tspan fill="#8250df">Sum</tspan>();</tspan>
+<tspan x="16" y="808">        <tspan fill="#8250df">Console</tspan>.<tspan fill="#8250df">WriteLine</tspan>(<tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">{</tspan>large<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069"> of </tspan><tspan fill="#0a3069">{</tspan>shapes.<tspan fill="#8250df">Count</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069"> shapes exceed </tspan><tspan fill="#0a3069">{</tspan>threshold<tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
+<tspan x="16" y="828">        <tspan fill="#8250df">Console</tspan>.<tspan fill="#8250df">WriteLine</tspan>(<tspan fill="#0a3069">$"</tspan><tspan fill="#0a3069">total area </tspan><tspan fill="#0a3069">{</tspan>total:<tspan fill="#8250df">F2</tspan><tspan fill="#0a3069">}</tspan><tspan fill="#0a3069">"</tspan>);</tspan>
+<tspan x="16" y="848">    <tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Main</tspan>;</tspan>
+<tspan x="16" y="868"><tspan fill="#cf222e">end</tspan> <tspan fill="#8250df">Program</tspan>;</tspan>
 </text>
 </svg>
