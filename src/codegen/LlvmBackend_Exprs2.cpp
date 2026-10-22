@@ -4878,7 +4878,10 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     llvm::Value* result = builder_.CreateLoad(st, base);
     // #1273: re-wrap the copied record into the tagged `{i8, P}` nullable struct,
     // carrying the source's tag so a null source stays null.
-    if (srcNullableRecord && nullableTag) {
+    // §9.5 + §7.4 (#7041): sema types a `with` over a §7.4-narrowed source as
+    // the NON-null record; that result is the bare record, not a box.
+    const sema::TypeRef* withTy = ctx_.exprType(we);
+    if (srcNullableRecord && nullableTag && !(withTy && !withTy->nullable)) {
         llvm::StructType* nst =
             llvm::StructType::get(llvm_, {nullablePrimHasValTy(), st});
         llvm::Value* wrapped = llvm::UndefValue::get(nst);

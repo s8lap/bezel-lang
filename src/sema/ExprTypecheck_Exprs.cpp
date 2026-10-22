@@ -15562,7 +15562,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // source (an object initializer / record copy preserves type).
         if (we->source) {
             if (auto* st = ctx_.exprType(*we->source))
-                ctx_.setExprType(&e, st);
+                // §9.5 + §7.4 (v0.340, #7041): a source §7.4 has narrowed
+                // non-null is a non-nullable record source, so the copy is
+                // the non-null record type; an un-narrowed `T?` stays `T?`.
+                ctx_.setExprType(&e,
+                                 scrutineeTypeAfterNarrowing(we->source.get(),
+                                                             st));
         }
     } else if (auto* cl =
                    dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
