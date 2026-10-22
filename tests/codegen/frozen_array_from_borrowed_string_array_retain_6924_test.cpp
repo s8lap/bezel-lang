@@ -157,17 +157,18 @@ BEZEL_TEST(frozen_array_from_borrowed_string_array_retain_6924,
         repeatLine("3 cz", 100));
 }
 
-// Row 9 — disposal that does not know the static type: `o.Dispose()` through
-// `Object` reads the element disposer from the array header. With the retain
-// of rows 1-4 the copy co-owns its strings, so the header must name the string
-// release (else one string per element leaks), for a borrowed source and an
-// owned one alike.
+// Row 9 — disposal that does not know the static type: the discard `_ := o`
+// through `Object` (an explicit disposal, §17.13; `o.Dispose()` is not a member
+// of `Object`, §8.7, #6990) reads the element disposer from the array header.
+// With the retain of rows 1-4 the copy co-owns its strings, so the header must
+// name the string release (else one string per element leaks), for a borrowed
+// source and an owned one alike.
 BEZEL_TEST(frozen_array_from_borrowed_string_array_retain_6924,
            object_typed_dispose_releases_copied_strings_spec_28_11) {
     expectClean(runAotChecked(program(
-        "var x := M.Mk(); var o: Object := move x; o.Dispose(); "
+        "var x := M.Mk(); var o: Object := move x; _ := o; "
         "var y := FrozenArray<string>.From(M.MkArr()); var p: Object := move y; "
-        "p.Dispose(); Console.WriteLine(\"d\");")),
+        "_ := p; Console.WriteLine(\"d\");")),
         repeatLine("d", 100));
 }
 

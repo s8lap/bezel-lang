@@ -206,17 +206,18 @@ BEZEL_TEST(unclassified_local_spec_28_3,
 // ── Rule 2, half 1, the control arm: PARSES, and discharges cleanly ───────
 //
 // The control that makes the arm above a measurement. Identical program, one
-// `.Dispose()` added: rc=0, zero diagnostics, runs. So the rejection above is
-// the §28.3 discharge requirement firing on an ADOPTED owned value, not a
-// syntax error, not a type error, and not an unrelated check that happens to
-// sit at the same line.
+// discard `_ := o;` added (§17.13, an explicit disposal of the named owned
+// binding; `o.Dispose()` is not a member of `Object`, §8.7, #6990): rc=0, zero
+// diagnostics, runs. So the rejection above is the §28.3 discharge requirement
+// firing on an ADOPTED owned value, not a syntax error, not a type error, and
+// not an unrelated check that happens to sit at the same line.
 BEZEL_TEST(unclassified_local_spec_28_3,
            unclassified_box_local_adopts_owned_discharged_28_3) {
     expectCleanRun(program(
         "public static method Run(): int "
         "  var o: Object := 7; "
         "  o := new Res(1); "
-        "  o.Dispose(); "
+        "  _ := o; "
         "  return 0; "
         "end Run; "));
 }
@@ -266,7 +267,7 @@ BEZEL_TEST(unclassified_local_spec_28_3,
         "public static method Run(): int "
         "  var o: Object := \"s\"; "
         "  o := new Res(1); "
-        "  o.Dispose(); "
+        "  _ := o; "
         "  return 0; "
         "end Run; "));
 }

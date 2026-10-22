@@ -294,18 +294,20 @@ BEZEL_TEST(codegen_object_param_vtableless_builtin_6776,
 
 // stdlib §6.2 (#706) — a Lock taken on a Mutex that is then disposed through
 // `Object` keeps the mutex core alive until the Lock is released: no
-// use-after-free, no double free. The mutex is MOVED into the `Object` local
-// and disposed explicitly through it while the Lock is still held (a
-// `using var o: Object := mx` alias would leave the disposal on `mx`'s own
-// scope end and never exercise the Object path). MEASURED on 279931c7 (the
+// use-after-free, no double free. The mutex is MOVED into an `Object` local
+// that is disposed at scope end while the Lock is still held: the Lock is
+// declared first, so the reverse-order scope end (§28.10) disposes the mutex
+// through `Object` before it releases the Lock. MEASURED on 279931c7 (the
 // base), ASan armed: SEGV (a read of address 0x1 in main) before `done` is
-// reached; on the fix: `done`, exit 0, no leak.
+// reached; on the fix: `done`, exit 0, no leak. #6990: `Dispose()` is not a
+// member of `Object` (§8.7), so the explicit `o.Dispose()` became `using var`
+// (§28.10). The discard `_ := o;` (§17.13) is not used: on this shape it leaks
+// the mutex core, on base as well (#7026).
 BEZEL_TEST(codegen_object_param_vtableless_builtin_6776,
            mutex_disposed_through_object_while_locked_outlives_lock_6_2) {
     BEZEL_EXPECT_EQ(
-        checkedOut(prog("", loop200("var mx := new Mutex(); var lk := mx.Acquire(); "
-                                    "var o: Object := move mx; o.Dispose(); "
-                                    "lk.Dispose();") +
+        checkedOut(prog("", loop200("var mx := new Mutex(); using var lk := mx.Acquire(); "
+                                    "using var o: Object := move mx; ") +
                             " Console.WriteLine(\"done\");")),
         std::string("done\n"));
 }
