@@ -2800,15 +2800,36 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
     // compiled against the exporter's placeholder layout, so dispatching it
     // importer-side needs the #783 monomorphization machinery. Not exported.
     if (!decl->genericConstraints.empty()) return false;
-    if (!decl->targetType->genericArgs.empty()) return false;
     const sema::TypeRef* target = ctx.resolvedType(*decl->targetType);
     if (target == nullptr) return false;
+    // fix #6898 (§26.4 / §2.8.2 clause 2, v0.340): a target with type arguments
+    // binds a block-level type parameter only when an argument is a FREE
+    // variable (a Named ref with no declaration and no arguments of its own,
+    // the shape TypeResolution leaves a bare identifier in). A GROUND head such
+    // as `extension IList<int>` binds nothing, so its member is the exact
+    // exported `bz$ext$IList$M` symbol and dispatches like any other extension;
+    // before this it was dropped from the metadata, so an importer's `il.Foo`
+    // found no extension and a bare reference degraded to a zero value.
+    if (!decl->targetType->genericArgs.empty()) {
+        std::function<bool(const sema::TypeRef*)> hasFreeVar =
+            [&](const sema::TypeRef* t) -> bool {
+            if (!t) return true;
+            if (t->kind == sema::TypeRef::Kind::Named && !t->declaration &&
+                t->genericArgs.empty())
+                return true;
+            for (const sema::TypeRef* ga : t->genericArgs)
+                if (hasFreeVar(ga)) return true;
+            return false;
+        };
+        for (const sema::TypeRef* ga : target->genericArgs)
+            if (hasFreeVar(ga)) return false;
+    }
     // §26.4: a bare single-segment identifier in the head introduces a fresh
     // block-level type parameter; TypeResolution leaves such a head as a
     // null-declaration Named ref. Only a resolved type (or a primitive, §26.2)
     // has a stable cross-module identity to dispatch against.
     if (target->kind == sema::TypeRef::Kind::Named &&
-        target->declaration == nullptr)
+        target->declaration == nullptr && target->genericArgs.empty())
         return false;
     out.target = convertType(target);
     out.visibility = toMetaVisibility(decl->visibility, /*inInterface=*/false);
@@ -2913,14 +2934,51 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
         }
     }
 
+    // fix #6898 (§26.5 rule 4 / §26.5.1 / §2.8.2 clause 2, v0.340): names of
+    // downstream-VISIBLE extension members this module does NOT export (a
+    // free-variable head such as `public extension Box<T>`, a `where` block,
+    // a generic member), and the exported GROUND generic blocks. An importer
+    // that saw `public extension Box<int>`'s `Foo` but not
+    // `public extension Box<T>`'s would bind the former where the same-module
+    // program reports §26.5.1's ambiguity (identical substituted heads), or
+    // where a more specific unexported head (`IList<T>` over `IEnumerable<int>`)
+    // wins. So a ground block's member sharing such a name is withheld: the
+    // importer then finds no such extension member, never a body the
+    // same-module program would not bind.
+    std::unordered_set<std::string> unexportedVisibleExtNames;
+    std::vector<std::size_t> groundGenericExtIdx;
+
     for (sema::Symbol* child : mod->children) {
         // §26 / §2.5 (#735): a `public extension T` block IS part of the
         // exported surface — §26.5 step 2 requires an importer to search "all
         // imported modules" for extension blocks on the receiver's type.
         if (auto* ext = dynamic_cast<const sema::ExtensionSymbol*>(child)) {
             MetaExtension me;
-            if (convertExtension(*ext, ctx, me, source, sourceFile))
+            bool converted = convertExtension(*ext, ctx, me, source, sourceFile);
+            const auto* edecl =
+                dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
+            if (edecl && edecl->visibility == ast::Visibility::Public) {
+                std::unordered_set<std::string> exportedNames;
+                if (converted)
+                    for (const MetaMember& mm : me.members)
+                        exportedNames.insert(mm.name);
+                for (sema::Symbol* m : ext->members) {
+                    bool visible = false;
+                    if (auto* p = dynamic_cast<const sema::PropertySymbol*>(m))
+                        visible = isExportedMember(p->visibility, false);
+                    else if (auto* mt = dynamic_cast<const sema::MethodSymbol*>(m))
+                        visible = isExportedMember(mt->visibility, false);
+                    std::string n(m->name);
+                    if (visible && !exportedNames.count(n))
+                        unexportedVisibleExtNames.insert(std::move(n));
+                }
+            }
+            if (converted) {
+                if (edecl && edecl->targetType &&
+                    !edecl->targetType->genericArgs.empty())
+                    groundGenericExtIdx.push_back(md.extensions.size());
                 md.extensions.push_back(std::move(me));
+            }
             continue;
         }
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(child);
@@ -2937,6 +2995,25 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
             if (td->isSynthesizedPrelude) continue;
         md.types.push_back(convertTypeDecl(*ts, ctx, source));
         md.exports.push_back(std::string(ts->name));  // §2.4 exported name
+    }
+
+    // fix #6898 (§26.5.1, v0.340): withhold a ground generic block's member
+    // that shares its name with a visible-but-unexported one (see above).
+    if (!unexportedVisibleExtNames.empty()) {
+        for (auto it = groundGenericExtIdx.rbegin();
+             it != groundGenericExtIdx.rend(); ++it) {
+            auto& members = md.extensions[*it].members;
+            members.erase(
+                std::remove_if(members.begin(), members.end(),
+                               [&](const MetaMember& mm) {
+                                   return unexportedVisibleExtNames.count(
+                                              mm.name) != 0;
+                               }),
+                members.end());
+            if (members.empty())
+                md.extensions.erase(md.extensions.begin() +
+                                    static_cast<std::ptrdiff_t>(*it));
+        }
     }
 
     // NOTE (decline-with-reasons, CLAUDE.md §4): the schema also carries

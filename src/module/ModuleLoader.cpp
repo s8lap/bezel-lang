@@ -6794,8 +6794,17 @@ static void loadMetadataPass2(
             // mangled `bz$ext$<T>$<M>` with (Emitter::functionName reads
             // targetType->name->parts.back()), so a class/record/enum head uses
             // the type's own name and a §26.2 primitive head its keyword.
-            targetTy->name->parts.push_back(
-                ctx.internString(metaTypeToSourceText(me.target)));
+            // fix #6898 (§26.4, v0.340): a ground generic head
+            // (`extension IList<int>`) is spelled by its bare head name, the
+            // exporter's `parts.back()`; its arguments enter the symbol from
+            // the resolved TypeRef registered below (fix #6946).
+            std::string extHead = metaTypeToSourceText(me.target);
+            if (!me.target.genericArgs.empty()) {
+                extHead = me.target.namedName;
+                if (auto dot = extHead.rfind('.'); dot != std::string::npos)
+                    extHead.erase(0, dot + 1);
+            }
+            targetTy->name->parts.push_back(ctx.internString(extHead));
             decl->targetType = std::move(targetTy);
             ctx.setResolvedType(decl->targetType.get(), loader.convert(me.target));
 

@@ -25243,7 +25243,13 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
             TypeRef::FuncParam fp;
             fp.modifier = par->modifier;
             fp.name = par->name;
+            // fix #6898 (§27.6 / §2.5, v0.340): an IMPORTED extension method's
+            // parameter carries no syntactic `declType`, only the loader's
+            // `resolvedDeclType`; reading the AST alone left the formed
+            // function type's parameter null (sema: "not implicitly
+            // convertible" or, for a builtin receiver, a zero-valued slot).
             if (par->declType) fp.type = ctx_.resolvedType(*par->declType);
+            if (!fp.type) fp.type = par->resolvedDeclType;
             ft->funcParams.push_back(fp);
         }
         // fix #4988 (§27 / §28.3, v0.307 — sister accessor to
