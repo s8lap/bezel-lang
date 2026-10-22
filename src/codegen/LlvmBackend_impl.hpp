@@ -16079,6 +16079,10 @@ private:
     void collectOutVarSuspendLocals(
         const ast::Expr* body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
+    // #7006 (§30.2, §19.3): case-pattern bindings -> frame-field reservations.
+    void reserveCaseBindingSlots(
+        const std::vector<const ast::BindingPattern*>& bps,
+        std::vector<std::pair<const ast::Node*, llvm::Type*>>& out);
     // fix #5253: every bare-identifier pre-declared `out` argument in `body`.
     void collectByRefArgIdents(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,

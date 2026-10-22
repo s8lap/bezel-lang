@@ -76,6 +76,46 @@ void Emitter::computeFrameCapturedLocals(
     }
 }
 
+// §29.3 / §19.3 (#6976, #7006): every BindingPattern (incl. nakedAnchor
+// sub-bindings, at any destructuring depth) introduced by `pat`.
+static void collectCasePatternBindings(
+        const ast::Pattern* pat,
+        std::vector<const ast::BindingPattern*>& bps) {
+    if (!pat) return;
+    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(pat)) {
+        bps.push_back(bp);
+    } else if (auto* alt = dynamic_cast<const ast::AltPattern*>(pat)) {
+        for (auto& m : alt->members) collectCasePatternBindings(m.get(), bps);
+    } else if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(pat)) {
+        for (auto& sp : dp->subPatterns) {
+            if (sp.nakedAnchor) bps.push_back(sp.nakedAnchor.get());
+            else collectCasePatternBindings(sp.pattern.get(), bps);
+        }
+    }
+}
+
+// §29.3 / §19.3 (#6976, #7006): reserve a frame field for each case-pattern
+// binding, keyed on its BindingPattern node and typed from the sema
+// LocalSymbol's declType (sema anchors `lsym->decl` on the BindingPattern).
+void Emitter::reserveCaseBindingSlots(
+        const std::vector<const ast::BindingPattern*>& bps,
+        std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
+    if (bps.empty()) return;
+    std::unordered_map<const ast::Node*, const sema::TypeRef*> tys;
+    for (const auto* bp : bps) tys[bp] = nullptr;
+    for (const auto& sym : ctx_.symbols())
+        if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(sym.get()))
+            if (loc->decl) {
+                auto it = tys.find(loc->decl);
+                if (it != tys.end()) it->second = loc->declType;
+            }
+    for (const auto* bp : bps) {
+        if (bp->name == "_") continue;
+        llvm::Type* ty = tys[bp] ? lowerTypeRef(tys[bp]) : ptrTy();
+        out.push_back({bp, ty});
+    }
+}
+
 void Emitter::collectSuspendLocals(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
@@ -262,37 +302,9 @@ void Emitter::collectSuspendLocals(
             // is the LocalSymbol's declType (sema anchors `lsym->decl` on the
             // BindingPattern).
             std::vector<const ast::BindingPattern*> bps;
-            std::function<void(const ast::Pattern*)> walkPat =
-                [&](const ast::Pattern* pat) {
-                    if (!pat) return;
-                    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(pat)) {
-                        bps.push_back(bp);
-                    } else if (auto* alt =
-                                   dynamic_cast<const ast::AltPattern*>(pat)) {
-                        for (auto& m : alt->members) walkPat(m.get());
-                    } else if (auto* dp = dynamic_cast<
-                                   const ast::DestructuringPattern*>(pat)) {
-                        for (auto& sp : dp->subPatterns) {
-                            if (sp.nakedAnchor) bps.push_back(sp.nakedAnchor.get());
-                            else walkPat(sp.pattern.get());
-                        }
-                    }
-                };
-            for (const auto& arm : cas->arms) walkPat(arm.pattern.get());
-            if (!bps.empty()) {
-                std::unordered_map<const ast::Node*, const sema::TypeRef*> tys;
-                for (const auto* bp : bps) tys[bp] = nullptr;
-                for (const auto& sym : ctx_.symbols())
-                    if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(sym.get()))
-                        if (loc->decl) {
-                            auto it = tys.find(loc->decl);
-                            if (it != tys.end()) it->second = loc->declType;
-                        }
-                for (const auto* bp : bps) {
-                    if (bp->name == "_") continue;
-                    out.push_back({bp, frameSlotTy(bp, nullptr, nullptr, tys[bp])});
-                }
-            }
+            for (const auto& arm : cas->arms)
+                collectCasePatternBindings(arm.pattern.get(), bps);
+            reserveCaseBindingSlots(bps, out);
         } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
             collectSuspendLocals(ifs->ifBranch.body, out);
             for (const auto& el : ifs->elifBranches)
@@ -477,6 +489,9 @@ struct OutVarSlotCollector {
     //     so the code comment is the citation for the refcount half.)
     // `lambdaDepth` is the in-lambda marker that separates a CAPTURE (an
     // escape) from an ordinary use.
+    // #7006 (§30.2, §19.3): case-EXPRESSION arm bindings, gathered for the
+    // frame-slot reservation (the statement walk covers case STATEMENTS).
+    std::vector<const ast::BindingPattern*>* caseExprBindings = nullptr;
     const sema::SemaContext* scanCtx = nullptr;
     const sema::Symbol* writeTarget = nullptr;
     bool targetAssigned = false;
@@ -617,6 +632,9 @@ struct OutVarSlotCollector {
         if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
             expr(ce->scrutinee.get());
             for (auto& arm : ce->arms) {
+                if (caseExprBindings)
+                    collectCasePatternBindings(arm.pattern.get(),
+                                                    *caseExprBindings);
                 expr(arm.guard.get());
                 expr(arm.exprBody.get());
                 for (auto& s : arm.stmts) stmt(s.get());
@@ -701,7 +719,10 @@ void Emitter::collectOutVarSuspendLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
     OutVarSlotCollector c{out, ptrTy()};
+    std::vector<const ast::BindingPattern*> caseBps;
+    c.caseExprBindings = &caseBps;
     for (auto& s : body) c.stmt(s.get());
+    reserveCaseBindingSlots(caseBps, out);  // #7006
 }
 
 
@@ -797,7 +818,10 @@ void Emitter::collectOutVarSuspendLocals(
         const ast::Expr* body,
         std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
     OutVarSlotCollector c{out, ptrTy()};
+    std::vector<const ast::BindingPattern*> caseBps;
+    c.caseExprBindings = &caseBps;
     c.expr(body);
+    reserveCaseBindingSlots(caseBps, out);  // #7006
 }
 
 
