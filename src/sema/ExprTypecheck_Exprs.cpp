@@ -3263,6 +3263,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         typeUnary(*ue);
     }
+    // fix #6869 (§17.14, §6.1, v0.340): a typed unary/binary node over
+    // constant operands is evaluated now, and its fault is a compile error.
+    if (dynamic_cast<const ast::UnaryExpr*>(&e) ||
+        dynamic_cast<const ast::BinaryExpr*>(&e))
+        checkConstEvalFault(e);
     // §17.12 / #2553: the postfix `!` (null-forgiving) operator yields
     // the non-nullable form of its operand's type. Recording it lets
     // member access through `x!` (and any other consumer) resolve —

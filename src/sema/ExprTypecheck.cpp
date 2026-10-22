@@ -15630,6 +15630,61 @@ std::optional<__int128> ExprTC::constIntValueTC(const ast::Expr& e,
     return std::nullopt;
 }
 
+
+namespace {
+const char* constEvalSpelling(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Byte:   return "byte";
+        case P::SByte:  return "sbyte";
+        case P::Short:  return "short";
+        case P::UShort: return "ushort";
+        case P::Int:    return "int";
+        case P::UInt:   return "uint";
+        case P::Long:   return "long";
+        default:        return "ulong";
+    }
+}
+}  // namespace
+
+void ExprTC::checkConstEvalFault(const ast::Expr& e) {
+    const TypeRef* t = ctx_.exprType(e);
+    if (!t || t->kind != TypeRef::Kind::Primitive || t->nullable ||
+        !constEvalIntPrim(t->primitive))
+        return;
+    const PrimitiveType p = t->primitive;
+    auto outOfRange = [&](__int128 v) {
+        return v < constEvalMin(p) || v > constEvalMax(p);
+    };
+    auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e);
+    if (ue && ue->op == "-" && ue->operand) {
+        // fix #6869 (§6.1, §17.14, v0.340): unary `-` over a constant operand
+        // that is not an integer literal (a literal operand is the §4.2
+        // boundary carve-out, or #6834's suffixed-literal arm in typeUnary).
+        if (dynamic_cast<const ast::IntLiteralExpr*>(ue->operand.get()))
+            return;
+        if (constFaulted_.count(ue->operand.get())) {
+            constFaulted_.insert(&e);  // reported at the operand
+            return;
+        }
+        auto v = constIntValueTC(*ue->operand);
+        if (!v || !outOfRange(-*v)) return;
+        // §17.14: an operand a constant short-circuits contributes no fault.
+        if (constDeadOperandDepth_ > 0) return;
+        constFaulted_.insert(&e);
+        ctx_.diagnostics().report(
+            Severity::Error, constFaultLoc(e),
+            "unary `-` on the constant expression of value " +
+                constEvalI128ToString(*v) + " has no representable result: " +
+                constEvalI128ToString(-*v) + " is outside `" +
+                constEvalSpelling(p) +
+                "`'s range, and a constant expression that faults is a "
+                "compile error, never a deferred run-time fault "
+                "(\xC2\xA7""6.1, \xC2\xA7""17.14, v0.340)");
+        return;
+    }
+}
+
 std::optional<bool> ExprTC::foldBoolConstTC(const ast::Expr& e, int depth) {
     if (depth > 64) return std::nullopt;
     if (auto* bl = dynamic_cast<const ast::BoolLiteralExpr*>(&e))
@@ -23270,7 +23325,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // LOCAL compile-time const. A runtime const's initializer faults
         // at runtime like any ordinary expression's — the rule does not
         // apply to it.
-        if (compileTimeClassified && lcTy && lc->value) {
+        // fix #6869 (§17.14, v0.340): an initializer whose evaluation already
+        // faulted was reported at the faulting constant expression; its
+        // unchecked fold is not reported a second time here.
+        if (compileTimeClassified && lcTy && lc->value &&
+            !constFaulted_.count(lc->value.get())) {
             using P = PrimitiveType;
             const P p = lcTy->primitive;
             const bool isIntConst =
