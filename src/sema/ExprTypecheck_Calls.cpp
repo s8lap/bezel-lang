@@ -6708,7 +6708,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 "`" + std::string(nts->type->name) +
                     "` is constructed with `new " +
                     std::string(nts->type->name) +
-                    "(...)`, not by calling the type name (§9.5)");
+                    "(...)`, not by calling the type name (§17.7)");
             return;
         }
     }
@@ -6799,7 +6799,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 Severity::Error, ce.span.begin,
                 "`" + std::string(ts->name) +
                     "` is constructed with `new " + std::string(ts->name) +
-                    "(...)`, not by calling the type name (§9.5)");
+                    "(...)`, not by calling the type name (§17.7)");
             return;
         }
     }
