@@ -10962,6 +10962,24 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         RecordSubstGuard eqSubst(this, recTyRef);
         llvm::Value* eq = emitStructEquality(
             l, r, llvm::cast<llvm::StructType>(l->getType()), recTy);
+        // fix #6940 (§28.3 "Unbound owned temporaries", §8.4, v0.340): `=`/`<>`
+        // only READS its operands, so a provably-fresh record construction
+        // (`new S(...)`, nested records included) used directly as an operand
+        // is an unbound owned temporary: release its string members at the end
+        // of the full expression. The freshness predicate is the one the
+        // scope-end recordStringFields disposal already trusts, so an operand
+        // aliasing a local / borrowed string is never released here.
+        if (recTy && recTyRef && isRecordWithStringFieldsTypeRef(recTyRef)) {
+            auto relTemp = [&](const ast::Expr* e, llvm::Value* v) {
+                if (!e || !v || !v->getType()->isStructTy()) return;
+                if (!isFreshRecordConstructionOfExactType(e, recTy)) return;
+                llvm::AllocaInst* slot = entryAlloca(v->getType());
+                builder_.CreateStore(v, slot);
+                emitRecordStringFieldReleases(slot, recTyRef);
+            };
+            relTemp(bin.left.get(), l);
+            relTemp(bin.right.get(), r);
+        }
         return op == "=" ? eq : builder_.CreateNot(eq);
     }
     // Guard against type mismatch when one operand is a null literal

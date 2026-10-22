@@ -4916,7 +4916,28 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // heap-use-after-free under ASan. A plain `var c := b;` copy leaves
         // `b` intact (copy semantics, §9.1), and `=` leaves both operands
         // intact, which is what fixes the comparison's contract.
-        return emitStructEquality(recv, other, st, ts);
+        llvm::Value* eqRes = emitStructEquality(recv, other, st, ts);
+        // fix #6940 (§28.3 "Unbound owned temporaries", §8.4, v0.340): same
+        // discharge as the `=` spelling (LlvmBackend_Exprs.cpp, lowerBinary):
+        // a provably-fresh record construction used directly as the receiver
+        // or the argument is an unbound owned temporary, released at the end
+        // of the full expression. A local / borrowed operand fails
+        // isFreshRecordConstructionOfExactType and is left alone, so the
+        // #4832 aliasing hazard described above cannot arise.
+        if (eqRes && isRecordWithStringFieldsTypeRef(recvTy)) {
+            auto relTemp = [&](const ast::Expr* e, llvm::Value* v) {
+                if (!e || !v || !v->getType()->isStructTy()) return;
+                if (!isFreshRecordConstructionOfExactType(e, ts)) return;
+                llvm::AllocaInst* slot = entryAlloca(v->getType());
+                builder_.CreateStore(v, slot);
+                emitRecordStringFieldReleases(slot, recvTy);
+            };
+            if (auto* cma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get()))
+                relTemp(cma->target.get(), recv);
+            relTemp(&argE, other);
+        }
+        return eqRes;
     }
     return nullptr;
 }
