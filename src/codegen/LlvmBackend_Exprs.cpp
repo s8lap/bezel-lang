@@ -10310,6 +10310,72 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                               bin.left.get())) ||
             (bin.right && dynamic_cast<const ast::NullLiteralExpr*>(
                                bin.right.get()));
+        // fix #6686 (§8.4, §25.2, §9.2, v0.340; owner ruling #6210): `=` /
+        // `<>` between a `string` (or `string?`) and a non-nullable record or
+        // choice value. No overload applies, so §25.2 hands it to §8.4's
+        // `a.Equals(b)`, and an operand of another type "compares unequal
+        // without the body running" (§9.2) -- a present value is never equal
+        // to an absent `string?` either. The string arms below key on the
+        // string side alone and handed the record struct to emitStringEq
+        // (malformed IR); the record-vs-other-type fold further down never ran.
+        // Both operands are already evaluated; a +1 string temporary is
+        // released, as the string-equality arm does.
+        if ((op == "=" || op == "<>") && !eitherNull) {
+            auto bareRecOrChoice = [&](const ast::Expr* e) {
+                auto* t = e ? ctx_.exprType(*e) : nullptr;
+                return t && !t->nullable &&
+                       t->kind == sema::TypeRef::Kind::Named &&
+                       t->declaration &&
+                       (t->declaration->kind == ast::TypeDeclKind::Record ||
+                        t->declaration->kind == ast::TypeDeclKind::Choice);
+            };
+            const bool lStr6686 =
+                isStr(bin.left.get()) || isGenericString(bin.left.get());
+            const bool rStr6686 =
+                isStr(bin.right.get()) || isGenericString(bin.right.get());
+            // A NULLABLE record/choice operand (its `{i8, T}` carrier) meets
+            // §8.4's null-safe wrapper first: both absent is equal, one absent
+            // is unequal, and two present values of different types are
+            // unequal (§9.2) -- so `=` is "the record is absent AND the string
+            // is null".
+            auto nullableRecOrChoice = [&](const ast::Expr* e,
+                                           llvm::Value* v) {
+                auto* t = e ? ctx_.exprType(*e) : nullptr;
+                return t && t->nullable &&
+                       t->kind == sema::TypeRef::Kind::Named &&
+                       t->declaration &&
+                       (t->declaration->kind == ast::TypeDeclKind::Record ||
+                        t->declaration->kind == ast::TypeDeclKind::Choice) &&
+                       isNullableValueTy(t) &&
+                       v->getType() == nullableValueStructTy(t);
+            };
+            const bool lBare = rStr6686 && bareRecOrChoice(bin.left.get());
+            const bool rBare = lStr6686 && bareRecOrChoice(bin.right.get());
+            const bool lNul = rStr6686 && r->getType()->isPointerTy() &&
+                              nullableRecOrChoice(bin.left.get(), l);
+            const bool rNul = lStr6686 && l->getType()->isPointerTy() &&
+                              nullableRecOrChoice(bin.right.get(), r);
+            if (lBare || rBare || lNul || rNul) {
+                llvm::Value* eq = builder_.getInt1(false);
+                if (lNul || rNul) {
+                    llvm::Value* rec = lNul ? l : r;
+                    llvm::Value* str = lNul ? r : l;
+                    eq = builder_.CreateAnd(
+                        builder_.CreateNot(nullablePrimHasValue(rec)),
+                        builder_.CreateICmpEQ(
+                            str, llvm::ConstantPointerNull::get(
+                                     llvm::cast<llvm::PointerType>(
+                                         str->getType())),
+                            "eq6686.strnull"),
+                        "eq6686");
+                }
+                if (lStr6686 && isPlusOneStringProducer(bin.left.get()))
+                    emitStringRelease(l);
+                if (rStr6686 && isPlusOneStringProducer(bin.right.get()))
+                    emitStringRelease(r);
+                return op == "=" ? eq : builder_.CreateNot(eq);
+            }
+        }
         // CG-nullable: `x = null` / `x <> null` for nullable value types
         // (primitives, and a nullable enum — issue #364). The tagged struct is
         // not ptr-typed, so the normal ptr-null check below wouldn't fire.
