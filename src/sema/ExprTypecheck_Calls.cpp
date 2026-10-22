@@ -17572,6 +17572,111 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                         mma->target.get())) {
                     if (tid->name == "Math") {
+                        // fix #6909 (stdlib §2.2 `Min/Max/Clamp<T>(a: T, b: T)`,
+                        // spec §14.5 "Agreement", v0.340): every binding T
+                        // receives must be the SAME type, and a constant
+                        // contributes its static type — "`Pick(b, 250)` for
+                        // `b: byte` is an error — `250` is an `int`; §5.1's
+                        // constant narrowing is a conversion-site rule and never
+                        // participates in a join". So with no explicit list,
+                        // primitive operands of different types (`Math.Max(b,
+                        // 7)`, `Math.Max(u, i)`, `Math.Max(l, 3)`, `Math.Max(d,
+                        // 3)`) are an inference failure; before this they
+                        // reached codegen and emitted malformed IR or compared
+                        // at the wrong signedness. With an explicit list —
+                        // `Math.Max<byte>(b, 7)` — T is `byte` and an int
+                        // literal argument constant-narrows at its conversion
+                        // site (§14.5, §5.1), so it is retyped to T here.
+                        if (mma->typeArgs.empty()) {
+                            const TypeRef* bound = nullptr;
+                            const TypeRef* clash = nullptr;
+                            for (const auto& arg : ce.args) {
+                                const TypeRef* at =
+                                    arg.value ? ctx_.exprType(*arg.value) : nullptr;
+                                if (!at || at->nullable ||
+                                    at->kind != TypeRef::Kind::Primitive ||
+                                    at->primitive == PrimitiveType::None) {
+                                    bound = nullptr;
+                                    clash = nullptr;
+                                    break;
+                                }
+                                if (!bound) bound = at;
+                                else if (!clash && at->primitive != bound->primitive)
+                                    clash = at;
+                            }
+                            if (bound && clash) {
+                                const std::string mname(mma->member);
+                                const std::string bn = rangeElementTypeName(bound);
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "inconsistent type-argument inference: type "
+                                    "parameter `T` of `Math." + mname +
+                                        "` cannot be bound to both `" + bn +
+                                        "` and `" + rangeElementTypeName(clash) +
+                                        "` — all arguments for a type parameter "
+                                        "must agree, and a constant contributes "
+                                        "its own type (§14.5, stdlib §2.2, "
+                                        "#6909); write explicit type arguments "
+                                        "(`Math." + mname + "<" + bn +
+                                        ">(…)`) or convert an operand");
+                                return;
+                            }
+                        } else if (mma->typeArgs.size() == 1 && mma->typeArgs[0]) {
+                            TypeRef* T = ctx_.resolvedType(*mma->typeArgs[0]);
+                            auto range = [](PrimitiveType pt, long long& lo,
+                                            long long& hi) -> bool {
+                                switch (pt) {
+                                case PrimitiveType::SByte: lo = -128; hi = 127; return true;
+                                case PrimitiveType::Byte: lo = 0; hi = 255; return true;
+                                case PrimitiveType::Short: lo = -32768; hi = 32767; return true;
+                                case PrimitiveType::UShort: lo = 0; hi = 65535; return true;
+                                case PrimitiveType::UInt: lo = 0; hi = 4294967295LL; return true;
+                                case PrimitiveType::Long:
+                                    lo = std::numeric_limits<long long>::min();
+                                    hi = std::numeric_limits<long long>::max();
+                                    return true;
+                                case PrimitiveType::ULong:
+                                    lo = 0; hi = std::numeric_limits<long long>::max();
+                                    return true;
+                                default: return false;
+                                }
+                            };
+                            long long lo = 0, hi = 0;
+                            if (T && !T->nullable &&
+                                T->kind == TypeRef::Kind::Primitive &&
+                                range(T->primitive, lo, hi)) {
+                                for (const auto& arg : ce.args) {
+                                    const ast::Expr* ae = arg.value.get();
+                                    if (!ae) continue;
+                                    const ast::Expr* lit = ae;
+                                    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(lit))
+                                        if (u->op == "-") lit = u->operand.get();
+                                    if (!dynamic_cast<const ast::IntLiteralExpr*>(lit))
+                                        continue;
+                                    const TypeRef* at = ctx_.exprType(*ae);
+                                    if (!at || at->kind != TypeRef::Kind::Primitive ||
+                                        at->primitive != PrimitiveType::Int)
+                                        continue;
+                                    auto cv = foldIntConstExprTC(*ae);
+                                    if (!cv) continue;
+                                    if (*cv < lo || *cv > hi) {
+                                        ctx_.diagnostics().report(
+                                            Severity::Error, ae->span.begin,
+                                            "constant " + std::to_string(*cv) +
+                                                " is out of range for the type "
+                                                "argument `" +
+                                                rangeElementTypeName(T) +
+                                                "` of `Math." +
+                                                std::string(mma->member) +
+                                                "` (§5.1 constant narrowing, "
+                                                "§14.5, #6909)");
+                                        return;
+                                    }
+                                    ctx_.setExprType(ae, T);
+                                    if (ae != lit) ctx_.setExprType(lit, T);
+                                }
+                            }
+                        }
                         const TypeRef* first = nullptr;
                         bool same = true;
                         for (const auto& arg : ce.args) {
