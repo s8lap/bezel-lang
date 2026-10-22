@@ -17536,6 +17536,50 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // fix #6955 (stdlib §2.2, §22.6, §5.1, v0.340): `Math.Abs` declares
+        // exactly four overloads (int, long, double, decimal). An operand whose
+        // type is none of those converts to several of them, and §22.6 ranks
+        // every implicit conversion co-equal, so the call is AMBIGUOUS - it is
+        // not an `Abs(int)` read at the operand's own width (byte 200 printed
+        // 56, uint 4000000000 printed 294967296). ulong converts to double and
+        // decimal only. float has one candidate (double) and is untouched.
+        if (auto* ama = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            auto* atid = dynamic_cast<const ast::IdentifierExpr*>(ama->target.get());
+            if (ama->member == "Abs" && ama->typeArgs.empty() && atid &&
+                atid->name == "Math" && ce.args.size() == 1 && ce.args[0].value &&
+                !ctx_.exprSymbol(*ama)) {
+                const TypeRef* at = ctx_.exprType(*ce.args[0].value);
+                if (at && !at->nullable && at->kind == TypeRef::Kind::Primitive) {
+                    std::vector<std::string> cands;
+                    switch (at->primitive) {
+                    case PrimitiveType::SByte: case PrimitiveType::Byte:
+                    case PrimitiveType::Short: case PrimitiveType::UShort:
+                    case PrimitiveType::Char:
+                        cands = {"Abs(int)", "Abs(long)", "Abs(double)",
+                                 "Abs(decimal)"};
+                        break;
+                    case PrimitiveType::UInt:
+                        cands = {"Abs(long)", "Abs(double)", "Abs(decimal)"};
+                        break;
+                    case PrimitiveType::ULong:
+                        cands = {"Abs(double)", "Abs(decimal)"};
+                        break;
+                    default: break;
+                    }
+                    if (!cands.empty()) {
+                        std::string msg =
+                            "ambiguous call to `Math.Abs`: no overload is "
+                            "unambiguously better (§22.6); candidates:";
+                        for (const auto& c : cands) msg += "\n  " + c;
+                        msg += "\nadd an explicit cast (§5.2) so exactly one "
+                               "candidate is an exact match";
+                        ctx_.diagnostics().report(Severity::Error,
+                                                  ce.span.begin, msg);
+                        return;
+                    }
+                }
+            }
+        }
         // stdlib §2.2: Math.Abs is polymorphic — its return type matches the
         // argument type (Abs(int):int, Abs(long):long, Abs(double):double).
         // Math.Min/Max/Clamp<T> are generic and also return T (same-as-arg).
