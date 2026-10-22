@@ -5356,7 +5356,53 @@ void Emitter::storePrimaryCtorPositionalArgs(
                       auto posSemaTy = genericSubstSemaTy_;
                       genericSubst_ = outerSubst;
                       genericSubstSemaTy_ = outerSemaTy;
-                      v = lowerExpr(*argExpr);
+                      // fix #7042 (§22.10 / §15.4, v0.340): a collection
+                      // literal passed directly as a primary-constructor
+                      // argument. `lowerExpr` returns null for a
+                      // `CollectionLiteralExpr` (it names no target type), so
+                      // the `if (!v) continue` below left the field
+                      // calloc-zero and the object saw an EMPTY collection.
+                      // Materialize it against the positional field's
+                      // declared type (the parameter's determined target,
+                      // §15.4), resolved under the NEW type's substitution
+                      // (`posSubst`). The field takes ownership of the fresh
+                      // collection, so no scope-end temp disposal is
+                      // registered (unlike a borrow-parameter literal temp).
+                      if (auto* argLit =
+                              dynamic_cast<const ast::CollectionLiteralExpr*>(
+                                  argExpr)) {
+                          auto outerSubstNow = genericSubst_;
+                          auto outerSemaNow = genericSubstSemaTy_;
+                          genericSubst_ = posSubst;
+                          genericSubstSemaTy_ = posSemaTy;
+                          const sema::TypeRef* fldTy =
+                              recordMemberTypeResolved(fs);
+                          genericSubst_ = std::move(outerSubstNow);
+                          genericSubstSemaTy_ = std::move(outerSemaNow);
+                          if (fldTy)
+                              v = materializeCollectionLiteralForArg(argLit,
+                                                                     fldTy);
+                          // An `owned` parameter's field takes the collection
+                          // (disposed with the object, §22.10). A plain
+                          // (borrowing) parameter does not own it: the
+                          // literal is an unbound owned temporary, disposed
+                          // once at scope exit (§28.3), mirroring the
+                          // borrow-parameter literal arm of buildOrderedArgs.
+                          if (v && fldTy &&
+                              !(fs->posParam &&
+                                fs->posParam->modifier == "owned") &&
+                              !disposeStack_.empty()) {
+                              llvm::AllocaInst* litSlot =
+                                  entryAlloca(v->getType());
+                              builder_.CreateStore(v, litSlot);
+                              if (smStateStruct_)
+                                  asyncHandlerSpillSlots_.push_back(litSlot);
+                              disposeStack_.back().push_back(
+                                  buildCollectionTempDisposal(litSlot, fldTy));
+                          }
+                      } else {
+                          v = lowerExpr(*argExpr);
+                      }
                       genericSubst_ = std::move(posSubst);
                       genericSubstSemaTy_ = std::move(posSemaTy);
                       currentThis_ = savedThisForArg;
