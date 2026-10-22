@@ -3078,6 +3078,11 @@ private:
     // `(if c …)` whose condition is the constant `false`, the `else` branch
     // when it is `true`. Every §17.14 evaluation-fault report consults it.
     int constDeadOperandDepth_ = 0;
+    // fix #6915 (§17.14, v0.340): const-initializer roots whose declaration's
+    // own range check reports their overflow (no second report), mapped to
+    // the written integer type (nullopt: inferred, i.e. the root's own type).
+    std::unordered_map<const ast::Expr*, std::optional<PrimitiveType>>
+        constInitRoots_;
     // The value of a `bool` constant expression (literal, `not`, `and`/`or`,
     // an integer or `bool` comparison, a `bool` const reference, an
     // `(if …)`), or nullopt. Decides the dead operands above.

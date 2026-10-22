@@ -15683,6 +15683,51 @@ void ExprTC::checkConstEvalFault(const ast::Expr& e) {
                 "(\xC2\xA7""6.1, \xC2\xA7""17.14, v0.340)");
         return;
     }
+    auto* be = dynamic_cast<const ast::BinaryExpr*>(&e);
+    if (!be || !be->left || !be->right) return;
+    const std::string_view op = be->op;
+    // fix #6915 (§6.1, §17.14, v0.340): the checked binary operators. A shift
+    // is §6.5's (checkShiftCountDomain); a division or `mod` by zero is not
+    // decided here.
+    if (!(op == "+" || op == "-" || op == "*" || op == "/" || op == "mod" ||
+          op == "%"))
+        return;
+    if (constFaulted_.count(be->left.get()) ||
+        constFaulted_.count(be->right.get())) {
+        constFaulted_.insert(&e);  // reported at the operand
+        return;
+    }
+    auto l = constIntValueTC(*be->left);
+    if (!l) return;
+    auto r = constIntValueTC(*be->right);
+    if (!r) return;
+    __int128 v = 0;
+    if (op == "+") v = *l + *r;
+    else if (op == "-") v = *l - *r;
+    else if (op == "*") v = *l * *r;
+    else {
+        if (*r == 0) return;
+        v = (op == "/") ? *l / *r : *l % *r;
+    }
+    if (!outOfRange(v)) return;
+    // The root of a const initializer whose own range check reports the same
+    // value (a local compile-time const, an explicitly typed class const)
+    // keeps that diagnostic; a nested overflow is reported here.
+    if (auto it = constInitRoots_.find(&e);
+        it != constInitRoots_.end() && (!it->second || *it->second == p))
+        return;
+    // §17.14: an operand a constant short-circuits contributes no fault.
+    if (constDeadOperandDepth_ > 0) return;
+    constFaulted_.insert(&e);
+    ctx_.diagnostics().report(
+        Severity::Error, constFaultLoc(e),
+        "constant evaluation overflows: `" + constEvalI128ToString(*l) + " " +
+            std::string(op) + " " + constEvalI128ToString(*r) + "` is " +
+            constEvalI128ToString(v) + ", outside `" + constEvalSpelling(p) +
+            "`'s range -- a constant expression is evaluated under the "
+            "checked arithmetic it has at run time, and its fault is a "
+            "compile error at the constant expression, never a deferred "
+            "run-time fault (\xC2\xA7""6.1, \xC2\xA7""17.14, v0.340)");
 }
 
 std::optional<bool> ExprTC::foldBoolConstTC(const ast::Expr& e, int depth) {
@@ -21836,6 +21881,12 @@ void ExprTC::visitMember(const ast::Member& m) {
             // isConstInitExpr below falsely rejects it. Mirrors #582/#1088.
             Scope* saveScope = currentScope_;
             if (!currentScope_) currentScope_ = moduleScope_.get();
+            // fix #6915 (§17.14, v0.340): checkTypeConsts already range-checked
+            // an explicitly typed const's root value.
+            if (cd->type)
+                if (auto* rt = ctx_.resolvedType(*cd->type);
+                    rt && rt->kind == TypeRef::Kind::Primitive)
+                    constInitRoots_[cd->value.get()] = rt->primitive;
             visitExpr(*cd->value);
             currentScope_ = saveScope;
             // §22.12 (#747 R42): a `const` member's initializer must be a
@@ -23219,6 +23270,17 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
     } else if (auto* lc =
                    dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        // fix #6915 (§17.14, v0.340): the local const's own range check below
+        // reports an overflow at the initializer's root.
+        if (lc->value) {
+            std::optional<PrimitiveType> written;
+            if (lc->type)
+                if (auto* rt = ctx_.resolvedType(*lc->type);
+                    rt && rt->kind == TypeRef::Kind::Primitive)
+                    written = rt->primitive;
+            if (!lc->type || written)
+                constInitRoots_[lc->value.get()] = written;
+        }
         if (lc->value) visitExpr(*lc->value);
         // fix #3700 (§21.1 / §6.3 / §28.3, v0.287): a runtime const of a
         // sub-int nullable width (e.g. `const cb: byte? := 3`) used to store
