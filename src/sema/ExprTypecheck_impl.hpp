@@ -3776,7 +3776,8 @@ private:
         const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
         const ast::Expr* exprBody,
         const std::vector<Symbol*>* paramSyms,
-        const std::vector<ast::ContractClause>* clauses = nullptr);
+        const std::vector<ast::ContractClause>* clauses = nullptr,
+        std::unique_ptr<ast::Expr>* exprBodySlot = nullptr);
 
     // §22.4 (v0.183, #1585) callee-side check: at a point where the body
     // returns the value `returnValue` (a `return E;` or the expression body of
@@ -3855,6 +3856,23 @@ private:
     // check of a payload-carrying case construction. See the definition in
     // ExprTypecheck_Exprs.cpp.
     void checkChoiceCaseConstruction(const ast::CallExpr& ce);
+
+    // §35.3 (v0.340, #2354) *Declared-result target-typing*: the case of the
+    // current body's declared result type (nullability stripped) named
+    // `name`, or null when that type is not a choice declaring such a case.
+    // `*choiceOut` receives the non-nullable choice instantiation.
+    const ChoiceCaseSymbol* declaredResultChoiceCase(std::string_view name,
+                                                     TypeRef** choiceOut);
+    // Rewrites a bare `N(args)` / `N` in the declared-result position `slot`
+    // into the qualified case construction `C<…>.N(args)` / `C<…>.N` of the
+    // declared result's choice, before the operand is typed. See the
+    // definition in ExprTypecheck_Exprs.cpp.
+    void applyDeclaredResultCaseReading(std::unique_ptr<ast::Expr>& slot);
+    // The qualifier heads those rewrites synthesize, with the choice
+    // instantiation each one names: resolved by symbol, never by name, so a
+    // same-named local or an unimported spelling cannot capture them.
+    std::unordered_map<const ast::IdentifierExpr*, TypeRef*>
+        declaredResultCaseHeads_;
 
     // fix #4325 (§5.1 / §11.2, v0.298): `explicitSubst` is the METHOD's own
     // type-parameter → concrete-TypeRef binding for the EXPLICITLY

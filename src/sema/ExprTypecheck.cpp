@@ -19968,7 +19968,8 @@ void ExprTC::runMethodBody(
     const std::vector<std::unique_ptr<ast::Stmt>>* stmts,
     const ast::Expr* exprBody,
     const std::vector<Symbol*>* paramSyms,
-    const std::vector<ast::ContractClause>* clauses) {
+    const std::vector<ast::ContractClause>* clauses,
+    std::unique_ptr<ast::Expr>* exprBodySlot) {
     Scope methodScope;
     methodScope.parent = declRootScope();   // §21.10: a local type's bodies
     if (paramSyms) {
@@ -20246,6 +20247,14 @@ void ExprTC::runMethodBody(
         if (auto* shNe = dynamic_cast<const ast::NewExpr*>(exprBody)) {
             if (!shNe->type)
                 rejectNewShorthandAtExpressionBody(*shNe, currentReturnType_);
+        }
+        // §35.3 (v0.340, #2354): a member's or accessor's expression body
+        // checked against a declared type is a declared-result position.
+        // Callers that own such a body pass its slot; the rewrite may replace
+        // the operand node, so `exprBody` is re-read from the slot.
+        if (exprBodySlot && exprBodySlot->get() == exprBody) {
+            applyDeclaredResultCaseReading(*exprBodySlot);
+            exprBody = exprBodySlot->get();
         }
         visitExpr(*exprBody);
         pendingLambdaTargetReturn_ = savedLamTargetRet;
@@ -21641,7 +21650,8 @@ void ExprTC::visitMember(const ast::Member& m) {
         // §22.16 (v0.203, #2053): pass the method's contract clauses so each
         // expression is type-checked (in the method scope) and bool-verified.
         runMethodBody(md->params, stmts, expr, paramSymbolsOf(m),
-                      &md->contractClauses);
+                      &md->contractClauses,
+                      const_cast<std::unique_ptr<ast::Expr>*>(&md->exprBody));
         inIteratorMethod_ = saveIter;
         // Slice DR1 (§21.7): a value-returning method with a block
         // body must return (or otherwise abruptly exit) on every
@@ -21675,7 +21685,8 @@ void ExprTC::visitMember(const ast::Member& m) {
             ? ReturnCtx::ValueMethod : ReturnCtx::VoidMethod;
         currentReturnType_ = od->returnType
             ? ctx_.resolvedType(*od->returnType) : nullptr;
-        runMethodBody(od->params, stmts, expr, paramSymbolsOf(m));
+        runMethodBody(od->params, stmts, expr, paramSymbolsOf(m), nullptr,
+                      const_cast<std::unique_ptr<ast::Expr>*>(&od->exprBody));
         currentReturnType_ = saveRetTy;
         returnCtx_ = saveRet;
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
@@ -21764,7 +21775,9 @@ void ExprTC::visitMember(const ast::Member& m) {
             returnCtx_ = ReturnCtx::ValueMethod;
             currentReturnType_ = propRetTy;
             runMethodBody(pdParams, nullptr, pd->exprBody.get(),
-                          idxSymsPtr);
+                          idxSymsPtr, nullptr,
+                          const_cast<std::unique_ptr<ast::Expr>*>(
+                              &pd->exprBody));
             returnCtx_ = savePropRet;
             currentReturnType_ = savePropRetTy;
         }
@@ -22004,7 +22017,9 @@ void ExprTC::visitMember(const ast::Member& m) {
             currentReturnType_ = propRetTy;
             if (a.exprBody)
                 runMethodBody(pdParams, nullptr, a.exprBody.get(),
-                              idxSymsPtr);
+                              idxSymsPtr, nullptr,
+                              const_cast<std::unique_ptr<ast::Expr>*>(
+                                  &a.exprBody));
             if (!a.stmts.empty())
                 runMethodBody(pdParams, &a.stmts, nullptr, idxSymsPtr);
             returnCtx_ = savePropRet;
@@ -23657,6 +23672,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     pendingLambdaParamTypes_.push_back(fp.type);
             }
         }
+        // §35.3 (v0.340, #2354): the top-level `return e;` operand under a
+        // declared return type (a method's, an accessor's, or a lambda's
+        // return-type ascription; for `async`, `Task<T>`'s T) is a
+        // declared-result position — a bare case name reads as the declared
+        // choice's case construction. The gate lives in
+        // declaredResultChoiceCase (returnCtx_/currentReturnType_).
+        if (rs->value)
+            applyDeclaredResultCaseReading(
+                const_cast<ast::ReturnStmt*>(rs)->value);
         if (rs->value) visitExpr(*rs->value);
         pendingLambdaTargetReturn_ = savedLamTargetRet;
         pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;

@@ -1983,6 +1983,19 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             ctx_.setExprSymbol(&e, builtinClassSym(id->name));
             return;
         }
+        // §35.3 (v0.340, #2354): the qualifier head a declared-result case
+        // rewrite synthesized (applyDeclaredResultCaseReading) names the
+        // declared result's choice by symbol. It is resolved as the written
+        // qualified head is — the choice's TypeSymbol, plus the instantiation
+        // as its type for a generic choice (the `Result<int, string>` head
+        // shape) — and never by name.
+        if (auto hit = declaredResultCaseHeads_.find(id);
+            hit != declaredResultCaseHeads_.end()) {
+            ctx_.setExprSymbol(&e, hit->second->declaration);
+            if (!hit->second->genericArgs.empty())
+                ctx_.setExprType(&e, hit->second);
+            return;
+        }
         // §2.7 rule 1 (#2097): in VALUE position — a bare name that is NOT the
         // head of a dotted access (`&e != maTargetHint_`, which is set only
         // while visiting a MemberAccessExpr's target) — an enclosing-type
@@ -2913,10 +2926,30 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     "` is an instance member of the enclosing type; a static "
                     "body has no `this` to reach it through \xC2\xA7""2.7");
             } else {
+                // §35.3 (v0.340, #2354): "Outside the family a bare case-named
+                // form keeps its ordinary resolution (or its ordinary-
+                // resolution error); when that error arises in a body whose
+                // declared result type is a choice with the written case
+                // name, the diagnostic carries a note naming the two
+                // remedies".
+                std::string note;
+                TypeRef* choiceTy = nullptr;
+                if (declaredResultChoiceCase(id->name, &choiceTy) && choiceTy)
+                    note = "; note: `" + std::string(id->name) +
+                        "` is a case of the declared result type `" +
+                        std::string(choiceTy->declaration->name) +
+                        (choiceTy->genericArgs.empty() ? "" : "<…>") +
+                        "`, but a bare case name constructs only at the top "
+                        "level of a `return` operand or expression body — "
+                        "move the construction to such a position, or "
+                        "qualify it (`" +
+                        std::string(choiceTy->declaration->name) +
+                        (choiceTy->genericArgs.empty() ? "" : "<…>") + "." +
+                        std::string(id->name) + "`) (§35.3)";
                 ctx_.diagnostics().report(
                     Severity::Error, id->span.begin,
                     std::string("unresolved identifier `") +
-                    std::string(id->name) + "`");
+                    std::string(id->name) + "`" + note);
             }
         }
         return;
@@ -6549,6 +6582,129 @@ void ExprTC::checkChoiceCaseConstruction(const ast::CallExpr& ce) {
                                std::string(ccs->name) + "`",
                            target, cts);
     rangeIEnumArgsAreFieldStores_ = savedFieldStores;
+}
+
+// §35.3 (v0.340, #2354) *Declared-result target-typing*: "where the declared
+// type — for an `async` body, the declared `Task<T>`'s result type —
+// nullability stripped, is a choice instantiation `C<…>` (or non-generic
+// choice `C`) that declares a case named `N`". `currentReturnType_` already
+// is that type: the async peel happens where the body context is set up
+// (asyncReturnCtxAndType), a lambda without a return-type ascription leaves
+// it null, and a bare type parameter has no declaration, so the rule "does
+// not fire on a bare type parameter".
+const ChoiceCaseSymbol* ExprTC::declaredResultChoiceCase(std::string_view name,
+                                                         TypeRef** choiceOut) {
+    if (returnCtx_ != ReturnCtx::ValueMethod || !currentReturnType_)
+        return nullptr;
+    TypeRef* t = currentReturnType_;
+    if (t->kind != TypeRef::Kind::Named || !t->declaration ||
+        t->declaration->kind != ast::TypeDeclKind::Choice)
+        return nullptr;
+    const ChoiceCaseSymbol* found = nullptr;
+    for (const ChoiceCaseSymbol* cc : choiceCasesOf(t->declaration))
+        if (cc && cc->name == name) { found = cc; break; }
+    if (!found) return nullptr;
+    if (choiceOut) {
+        TypeRef* c = t;
+        if (t->nullable) {
+            c = ctx_.makeTypeRef();
+            *c = *t;
+            c->nullable = false;
+        }
+        *choiceOut = c;
+    }
+    return found;
+}
+
+// §35.3 (v0.340, #2354): in a declared-result position — the top-level
+// operand of `return e;` under a declared return type, a member's or
+// accessor's expression body, and a `return` or expression body under a
+// lambda's return-type ascription — "the form `N(args)` is a case
+// construction of `C<…>.N(args)`, and the bare identifier `N` is the
+// payload-free case value `C<…>.N`". "The form is resolved to a case
+// construction before classification or any ownership rule runs", so the
+// rewrite produces exactly the qualified AST: every later consumer (typing,
+// the payload-argument check, ownership, codegen) sees `C<…>.N(args)`.
+// Source parentheses leave no AST node, so "a redundant parenthesized grouping
+// around the whole operand ... is transparent" holds by construction, while
+// an `(if …)` branch is a subexpression and is never a slot passed here.
+//
+// The original identifier node is kept and becomes the qualifier head (renamed
+// to the choice's name and resolved by symbol through
+// declaredResultCaseHeads_), so no node another pass may already point at is
+// destroyed.
+void ExprTC::applyDeclaredResultCaseReading(std::unique_ptr<ast::Expr>& slot) {
+    if (!slot) return;
+    // The slot whose IdentifierExpr is replaced: the operand itself (`N`) or
+    // the callee of the operand call (`N(args)`).
+    std::unique_ptr<ast::Expr>* idSlot = nullptr;
+    auto* call = dynamic_cast<ast::CallExpr*>(slot.get());
+    if (call) idSlot = &call->callee;
+    else idSlot = &slot;
+    auto* id = dynamic_cast<ast::IdentifierExpr*>(idSlot->get());
+    if (!id || !id->typeArgs.empty() || id->aliasQualifiedBuiltin ||
+        id->name == "this" || id->name == "base")
+        return;
+    if (declaredResultCaseHeads_.count(id)) return;
+    TypeRef* choiceTy = nullptr;
+    const ChoiceCaseSymbol* cc = declaredResultChoiceCase(id->name, &choiceTy);
+    if (!cc || !choiceTy) return;
+    auto* cts = choiceTy->declaration;
+    std::string choiceSpelled = std::string(cts->name) +
+                                (choiceTy->genericArgs.empty() ? "" : "<…>");
+    // "Within a declared-result position whose type *is* such a choice, the
+    // case reading is authoritative: it wins over any same-named local,
+    // parameter, member, or type in scope, and the compiler warns on such
+    // shadowing — naming the case and the shadowed declaration, with the
+    // remedy". Inside the choice's own body the name may resolve to the very
+    // same case, which shadows nothing.
+    if (Symbol* other = lookupName(id->name, /*memberBeforeModuleType=*/true)) {
+        auto* sameCase = dynamic_cast<ChoiceCaseSymbol*>(other);
+        if (!(sameCase && sameCase->parent == cts)) {
+            const char* what = "declaration";
+            if (dynamic_cast<LocalSymbol*>(other)) what = "local";
+            else if (dynamic_cast<ParameterSymbol*>(other)) what = "parameter";
+            else if (dynamic_cast<TypeSymbol*>(other) ||
+                     dynamic_cast<NestedTypeSymbol*>(other) ||
+                     dynamic_cast<TypeAliasSymbol*>(other) ||
+                     dynamic_cast<GenericParamSymbol*>(other))
+                what = "type";
+            else if (dynamic_cast<MemberSymbol*>(other)) what = "member";
+            ctx_.diagnostics().report(
+                Severity::Warning, id->span.begin,
+                "bare `" + std::string(id->name) +
+                "` in this declared-result position is the case `" +
+                choiceSpelled + "." + std::string(id->name) +
+                "` of the declared result type, which shadows the " + what +
+                " `" + std::string(id->name) + "`; to use the " + what +
+                ", qualify the intended member call, bind its result to a "
+                "differently-named local first, or rename the shadowed "
+                "binding (a local or parameter cannot be qualified) (§35.3)");
+        }
+    }
+    // "A payload case written bare, or a payload-free case written with an
+    // argument list, is the arity error §35.5 names". The bare payload case
+    // needs nothing here: after the rewrite it is the qualified `C.N` in value
+    // position, which rejectBarePayloadCaseValue (#6789) rejects naming the
+    // arity. The argument-list form of a payload-free case is rejected here.
+    if (call && cc->caseDecl && cc->caseDecl->payload.empty()) {
+        ctx_.diagnostics().report(
+            Severity::Error, id->span.begin,
+            "case `" + choiceSpelled + "." + std::string(id->name) +
+            "` has no payload, so it takes no argument list: a payload-free "
+            "case is the value `" + std::string(id->name) + "`, not a call "
+            "(§35.3, §35.5)");
+    }
+    std::string_view caseName = id->name;
+    auto ma = std::make_unique<ast::MemberAccessExpr>();
+    ma->span = id->span;
+    ma->member = caseName;
+    ma->parenthesized = id->parenthesized;
+    id->parenthesized = false;
+    id->name = cts->name;
+    declaredResultCaseHeads_[id] = choiceTy;
+    ma->target = std::move(*idSlot);
+    *idSlot = std::move(ma);
 }
 
 // §17.1 result-type table for binary operators. Slice 3c covers the
@@ -13436,6 +13592,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         currentReturnType_ ? currentReturnType_
                                            : lamTargetRet);
             }
+            // §35.3 (v0.340, #2354): an expression body checked against a
+            // lambda's return-type ascription is a declared-result position;
+            // one whose return type arrives only by target inference is not
+            // (currentReturnType_ is null there, so nothing fires).
+            if (hasAscription)
+                applyDeclaredResultCaseReading(
+                    const_cast<ast::LambdaExpr*>(lam)->exprBody);
             visitExpr(*lam->exprBody);
             // fix #4323 (§5.1/§11.2, v0.298): the SEVENTH site fix #4310
             // missed — an expression-bodied lambda's collection-literal body
