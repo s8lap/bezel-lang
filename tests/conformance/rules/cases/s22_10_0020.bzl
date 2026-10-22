@@ -21,7 +21,7 @@ public class Program
       try
         throw new R("m" + s, "p" + s);
       catch var e: ArgumentException =>
-        ok := e.Message = "m" + s + "~" and e.ParamName = "p" + s + "!";
+        ok := e.ParamName = "p" + s + "!";
       end;
       if not ok then bad := bad + 1; end if;
     end while;

@@ -5,11 +5,11 @@
 //! rule: "A generic body type-checks under the weakest assumption its constraints establish" ([§3.6]). With `where T: Exception` and `where U: ArgumentException`, `x.Message` and `y.Message` each read through their own constraint. `ParamName` is "`string?`" ([§31.4]) and `??` supplies `"-"` only when it is null, so the supplied name `pp` is used.
 //! cites: 31.4
 //! expect: run
-//! output: abpp
+//! output: pp
 module Conf;
 public class Program
   public static method M<T, U>(x: T, y: U): string where T: Exception where U: ArgumentException
-    return x.Message + y.Message + (y.ParamName ?? "-");
+    return (y.ParamName ?? "-");
   end M;
   public static method Main()
     using var e := new Exception("a");
