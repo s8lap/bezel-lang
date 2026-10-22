@@ -208,7 +208,7 @@ scripts/check_docs.sh                       # the documentation checks
 
 ## Acknowledgements
 
-Bezel was built with [Claude](https://www.anthropic.com/claude), Anthropic's AI model, working through Claude Code under the project owner's direction. Claude wrote most of the specification text, the compiler, its runtime and its tests, and reviewed its own work through independent review passes; the commits it wrote carry a `Co-Authored-By: Claude` trailer. The project owner directs the design and decides what lands.
+Bezel was built with [Claude](https://www.anthropic.com/claude), Anthropic's AI model, working through Claude Code: it wrote most of the specification, compiler and tests under the project owner's direction.
 
 ## License
 
