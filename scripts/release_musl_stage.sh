@@ -39,7 +39,7 @@ LLD_VERSION=17.0.6
 
 # ---- pinned packages (the versions the #6654 spike used, alpine 3.20) ------
 apk add --no-cache \
-  clang17=17.0.6-r1 compiler-rt=17.0.6-r1 musl-dev=1.2.5-r3 \
+  clang17=17.0.6-r1 compiler-rt=17.0.6-r1 musl-dev=1.2.5-r4 \
   libc++-dev=17.0.6-r1 libc++-static=17.0.6-r1 \
   llvm-libunwind-dev=17.0.6-r1 llvm-libunwind-static=17.0.6-r1 \
   llvm17-dev=17.0.6-r2 llvm17-static=17.0.6-r2 \
