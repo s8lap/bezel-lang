@@ -13783,6 +13783,27 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                             const sema::TypeRef* scrutTy) {
     if (dynamic_cast<const ast::DiscardPattern*>(pat))
         return builder_.getInt1(true);
+    // #7002 (§19.5, v0.340): "A typed binding pattern `var n: T` also matches
+    // only non-null values." A typed binding in a destructuring or case-payload
+    // SLOT (`Pair(var a: Object, var n)`) binds the slot unconditionally below,
+    // so it admitted null. This is the null half of the top-level typed-binding
+    // test: a reference slot tests non-null, a nullable value carrier
+    // ({hasValue, T}) tests its flag. A slot that cannot be null yields nullptr
+    // (no test). An untyped `var a` and a naked `a` are not typed and are not
+    // routed here (they bind null, §19.3).
+    auto typedSlotNonNull = [&](const ast::BindingPattern* vbp, llvm::Value* v,
+                                const sema::TypeRef* ty) -> llvm::Value* {
+        if (!vbp || !vbp->type) return nullptr;
+        if (v->getType()->isPointerTy())
+            return builder_.CreateICmpNE(
+                v, llvm::ConstantPointerNull::get(ptrTy()), "slot.nonnull");
+        const sema::TypeRef* resolved = resolveTypeParamRef(ty);
+        const bool nullable =
+            (ty && ty->nullable) || (resolved && resolved->nullable);
+        if (nullable && v->getType()->isStructTy())
+            return nullablePrimHasValue(v);
+        return nullptr;
+    };
     // fix #5232 (§19.3, v0.313): the scrutinee may be a TYPE PARAMETER (a bare
     // Named TypeRef with no declaration), which §19.3 says is decided PER
     // INSTANTIATION — the match verdict reads the SUBSTITUTED type argument,
@@ -13926,6 +13947,13 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                     recordDeclScopeDepth(vbp);  // fix #4523
                                 locals_[vbp] = slot;
                                 mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
+                                // #7002 (§19.5): a typed binding is a non-null test.
+                                if (llvm::Value* nn = typedSlotNonNull(
+                                        vbp, fv,
+                                        common::substitutedChoicePayloadType(
+                                            cc->caseDecl->payload[i], choiceTy,
+                                            scrutTy, ctx_)))
+                                    matched = builder_.CreateAnd(matched, nn);
                             } else if (sp.pattern) {
                                 // fix #3902 / §35.5: a REFUTABLE payload slot
                                 // (constant, range, relational, alternative
@@ -15955,6 +15983,10 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     builder_.CreateStore(fv, slot);
                     locals_[vbp] = slot;
                     mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
+                    // #7002 (§19.5): a typed binding is a non-null test.
+                    if (llvm::Value* nn = typedSlotNonNull(
+                            vbp, fv, recordMemberTypeResolved(fields[i])))
+                        innerMatched = builder_.CreateAnd(innerMatched, nn);
                 } else if (sp.pattern) {
                     // fix #3899 / §14.1 / §19.3: `recordMemberTypeResolved`
                     // (not the bare `recordMemberType`) so a generic-record
@@ -16075,6 +16107,10 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 builder_.CreateStore(fieldVal, slot);
                 locals_[vbp] = slot;
                 mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
+                // #7002 (§19.5): a typed binding is a non-null test.
+                if (llvm::Value* nn = typedSlotNonNull(
+                        vbp, fieldVal, recordMemberTypeResolved(fields[i])))
+                    matched = builder_.CreateAnd(matched, nn);
             } else if (sp.pattern) {
                 // Non-binding sub-pattern: check it against the field value.
                 // §19.3 / fix #615: resolve the field's declared type so that
