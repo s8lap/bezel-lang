@@ -78,7 +78,10 @@ BEZEL_TEST(codegen_5371, nested_inner_non_generic_outer) {
 }
 
 // §2.8.3 rule 3 (v0.314): a generic `Outer<T>` with nested `Inner` works.
-// The bare `Outer.Inner()` syntax resolves to the nested type within Outer<T>.
+// fix #6965 review (§11.6, v0.340; ruling #5386): respelled from
+// `new Outer.Inner()`, which at a generic-only `Outer` is Appendix C.1's arity
+// error ("A bare enclosing segment fixes arity 0"); §11.6's route outside
+// `Outer` is a static member reached through `Outer<int>`.
 BEZEL_TEST(codegen_5371, nested_inner_generic_outer) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -87,11 +90,12 @@ BEZEL_TEST(codegen_5371, nested_inner_generic_outer) {
         "    public value: int := 20; "
         "    destructor end destructor; "
         "  end Inner; "
+        "  public static method Make(): owned Inner return new Inner(); end Make; "
         "  destructor end destructor; "
         "end Outer; "
         "class Main "
         "  public static method Main(): int "
-        "    using var o := new Outer.Inner(); "
+        "    using var o := Outer<int>.Make(); "
         "    return o.value; "
         "  end Main; "
         "end Main;"), 20);

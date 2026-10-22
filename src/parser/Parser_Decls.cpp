@@ -1217,8 +1217,18 @@ std::unique_ptr<ast::Type> Parser::parseType() {
                 "type name (A.5 `TypeNoNullable ::= QualifiedName "
                 "GenericArgs?`), so it may not sit on an enclosing segment: `" +
                     outer + "<...>." + remedy.substr(outer.size() + 1) +
-                    "` is not a type \xe2\x80\x94 write `" + remedy +
-                    "` to name the nested type (\xc2\xa7""11.6, v0.286)");
+                    "` is not a type \xe2\x80\x94 a type nested in a generic "
+                    "type is named by its bare name `" +
+                    remedy.substr(outer.size() + 1) +
+                    "` inside that type's bodies, and reached elsewhere "
+                    "through a static member or a local declared without a "
+                    "type annotation (\xc2\xa7""11.6, v0.340)");
+            // fix #6965 review (§11.6, v0.340): the recovered `Outer.Tag` is
+            // no longer a remedy — "A bare enclosing segment fixes arity 0
+            // ... In a type position, therefore, no name passes through a
+            // generic enclosing type" — so the message names §11.6's routes
+            // instead, and sema's arity error on the recovered spelling is
+            // that same rule restated, not a contradiction of this one.
             type->genericArgs.clear();
         }
     }

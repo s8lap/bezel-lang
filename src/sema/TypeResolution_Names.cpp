@@ -3731,6 +3731,43 @@ void Resolver::recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
                                /*siteKey=*/&id, id.span.begin);
 }
 
+// fix #6965 review (§11.6, §2.2, Appendix C.1, v0.340): a dotted type name
+// passes THROUGH the segment that names `enclosing` to reach `part`. That
+// segment carries no type arguments (A.5's `TypeNoNullable ::= QualifiedName
+// GenericArgs?` admits them after the last segment only), and §11.6 says "A
+// bare enclosing segment fixes arity 0 (§2.2, §14.1), so `Tree.Node<int>` at
+// a generic-only `Tree` is Appendix C.1's arity error ... In a type position,
+// therefore, no name passes through a generic enclosing type". So when
+// `enclosing` is generic the reference is C.1's arity error, reported here
+// with C.1's arity text. The walks used to descend into the nested type
+// without looking at the enclosing segment's arity, which accepted
+// `new C.N()` / `var n: C.N` for a generic `C`. Returns true when it
+// reported. Only TYPE positions reach this (resolveNamed); a static-member
+// chain head (`C<int>.Make()`, §22.12) is an expression and never does.
+static bool reportGenericEnclosingSegment(DiagnosticEngine& diags,
+                                          const ast::Type& t,
+                                          const TypeSymbol* enclosing,
+                                          std::string_view part) {
+    if (!enclosing || enclosing->genericParams.empty()) return false;
+    const std::string enc(enclosing->name);
+    const std::size_t n = enclosing->genericParams.size();
+    diags.report(
+        Severity::Error, t.span.begin,
+        "generic-argument count does not match type's generic-parameter "
+        "count: `" + enc + "` declares " + std::to_string(n) +
+            (n == 1 ? " type parameter" : " type parameters") +
+            ", and the bare enclosing segment in `" + enc + "." +
+            std::string(part) +
+            "` supplies none, so no type name passes through it; a type "
+            "nested in a generic type is named by its bare name `" +
+            std::string(part) +
+            "` inside that type's bodies, and reached elsewhere through a "
+            "static member (`" + enc +
+            "<...>.Make()`) or a local declared without a type annotation "
+            "(\xc2\xa7""11.6, Appendix C.1, v0.340)");
+    return true;
+}
+
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (!t.name || t.name->parts.empty()) {
         ref.kind = TypeRef::Kind::Error;
@@ -5141,6 +5178,13 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // Walk remaining parts as nested types (§11.3).
                 for (std::size_t pi = 2; pi < t.name->parts.size(); ++pi) {
                     std::string_view part = t.name->parts[pi];
+                    // per §11.6 (v0.340): no type name passes through a
+                    // generic enclosing segment, alias-qualified included.
+                    if (reportGenericEnclosingSegment(ctx_.diagnostics(), t,
+                                                      tsymAlias, part)) {
+                        ref.kind = TypeRef::Kind::Error;
+                        return;
+                    }
                     TypeSymbol* inner = nullptr;
                     for (Symbol* m : tsymAlias->members) {
                         if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
@@ -5206,6 +5250,13 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 for (std::size_t pi = (std::size_t)prefixLen + 1;
                      pi < t.name->parts.size(); ++pi) {
                     std::string_view part = t.name->parts[pi];
+                    // per §11.6 (v0.340): no type name passes through a
+                    // generic enclosing segment, module-qualified included.
+                    if (reportGenericEnclosingSegment(ctx_.diagnostics(), t,
+                                                      tsymMod, part)) {
+                        ref.kind = TypeRef::Kind::Error;
+                        return;
+                    }
                     TypeSymbol* inner = nullptr;
                     for (Symbol* m : tsymMod->members) {
                         if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
@@ -5952,6 +6003,16 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // qualified name as a nested-type lookup within the current TypeSymbol.
         for (std::size_t pi = 1; pi < t.name->parts.size(); ++pi) {
             std::string_view part = t.name->parts[pi];
+            // per §11.6 (v0.340): no type name passes through a generic
+            // enclosing segment — Appendix C.1's arity error. (§2.2's arity
+            // selection of a same-named NON-generic head is not implemented
+            // here: a local `C<T>` keeps an imported `C` out of the scope
+            // entirely, so that program was already rejected — #7013.)
+            if (reportGenericEnclosingSegment(ctx_.diagnostics(), t, tsym,
+                                              part)) {
+                ref.kind = TypeRef::Kind::Error;
+                return;
+            }
             TypeSymbol* inner = nullptr;
             for (Symbol* m : tsym->members) {
                 if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {

@@ -230,12 +230,19 @@ BEZEL_TEST(variance_alias_head_6354, out_t_under_covariant_local_head_through_al
 // is sound; the top-level alias `Nested<T> := Array<T>` is invariant, so a
 // `Get()` returning THAT is not. If the guard were absent, the qualified
 // spelling would resolve through the alias and wrongly reject the first program.
+//
+// fix #6965 review (§11.6, Appendix C.1, v0.340): `Outer` is NON-generic in
+// both rows. They first declared `public class Outer<T>`, and at a generic-only
+// `Outer` the spelling `Outer.Nested<T>` is §11.6's own arity-error example:
+// "A bare enclosing segment fixes arity 0 (§2.2, §14.1), so `Tree.Node<int>`
+// at a generic-only `Tree` is Appendix C.1's arity error". The guard keys on
+// the spelling, which a non-generic `Outer` keeps intact.
 
 BEZEL_TEST(variance_alias_head_6354, qualified_nested_head_not_resolved_as_top_level_alias) {
     // The top-level alias `Nested` exists and is invariant; the spelling is
     // `Outer.Nested`, so it names the nested COVARIANT interface and is sound.
     expectAccepted("type Nested<T> := Array<T>; "
-                   "public class Outer<T> "
+                   "public class Outer "
                    "  public interface Nested<out T> method Get(): T; end Nested; "
                    "end Outer; "
                    "interface I<out T> method Get(): Outer.Nested<T>; end I; ");
@@ -247,7 +254,7 @@ BEZEL_TEST(variance_alias_head_6354, bare_head_of_same_name_still_resolves_throu
     // correctly composed through it (§27.8's synonym property). Together the two
     // rows pin that the guard keys on the SPELLING, not on the simple name.
     expectRejected("type Nested<T> := Array<T>; "
-                   "public class Outer<T> "
+                   "public class Outer "
                    "  public interface Nested<out T> method Get(): T; end Nested; "
                    "end Outer; "
                    "interface I<out T> method Get(): Nested<T>; end I; ",

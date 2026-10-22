@@ -148,7 +148,12 @@ BEZEL_TEST(nested_type_generic_enclosing_3582,
         rejects(p,
                 "a generic argument list attaches to the end of a qualified "
                 "type name"));
-    BEZEL_EXPECT_TRUE(rejects(p, "write `Outer.Tag` to name the nested type"));
+    // fix #6965 review (§11.6, v0.340; ruling #5386): the remedy no longer
+    // reads "write `Outer.Tag`", which is itself Appendix C.1's arity error
+    // at a generic-only `Outer` ("A bare enclosing segment fixes arity 0");
+    // it names §11.6's routes instead.
+    BEZEL_EXPECT_TRUE(rejects(p, "is named by its bare name `Tag` inside that type's bodies"));
+    BEZEL_EXPECT_FALSE(rejects(p, "write `Outer.Tag` to name the nested type"));
 }
 
 // The `new`-EXPRESSION form, which the issue recorded separately: pre-fix it
@@ -177,12 +182,36 @@ BEZEL_TEST(nested_type_generic_enclosing_3582,
 // works when the enclosing type is generic, which is what makes the PART 2
 // rejection a spelling rule with a remedy rather than an unimplemented
 // feature.
+// fix #6965 review (§11.6, v0.340; ruling #5386): respelled. `Outer.Tag` at
+// a generic-only `Outer` is now Appendix C.1's arity error — "In a type
+// position, therefore, no name passes through a generic enclosing type" — and
+// §11.6's route outside `Outer` is "a chain head reaches its static members,
+// and a local declared without a type annotation holds a value of it".
 BEZEL_TEST(nested_type_generic_enclosing_3582,
            nested_type_of_generic_outer_runs_spec_11_6) {
     BEZEL_EXPECT_EQ(
-        run(withOuter("using var t: Outer.Tag := new Outer.Tag(7); "
-                      "return t.N();")),
+        run("module M; public class Outer<T> "
+            "  public class Tag "
+            "    private _n: int; "
+            "    public constructor(n: int) _n := n; end constructor; "
+            "    public method N(): int => _n; "
+            "  end Tag; "
+            "  public static method Make(n: int): owned Tag return new Tag(n); end Make; "
+            "end Outer; "
+            "public class C public static method Main(): int "
+            "  using var t := Outer<int>.Make(7); return t.N(); "
+            "end Main; end C;"),
         7);
+}
+
+// ...and the old spelling is the arity error, not a silent accept.
+BEZEL_TEST(nested_type_generic_enclosing_3582,
+           bare_generic_enclosing_segment_is_arity_error_spec_11_6) {
+    const std::string p = withOuter(
+        "using var t: Outer.Tag := new Outer.Tag(7); return t.N();");
+    BEZEL_EXPECT_FALSE(compilerCrashed(p));
+    BEZEL_EXPECT_TRUE(rejects(
+        p, "generic-argument count does not match type's generic-parameter count"));
 }
 
 // §22.12 static member on a CONSTRUCTED generic: an expression chain, parsed

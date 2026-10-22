@@ -93,6 +93,7 @@ const char* kOuterWithTagNotUsingT =
     "    public constructor(n: int) _n := n; end constructor; "
     "    public method N(): int => _n; "
     "  end Tag; "
+    "  public static method Make(n: int): owned Tag return new Tag(n); end Make; "
     "end Outer; ";
 
 std::string withOuter(const std::string& outerDecl,
@@ -189,11 +190,18 @@ BEZEL_TEST(nested_type_generic_param_enclosing_3584,
 // §11.6 / #3582 PART 3 baseline: a nested type inside a generic enclosing
 // class that does NOT use the enclosing's parameters. The diagnostic must
 // NOT reach this shape.
+// fix #6965 review (§11.6, v0.340; ruling #5386): respelled. The row's old
+// `using var t: Outer.Tag := new Outer.Tag(7);` is Appendix C.1's arity error
+// at a generic-only `Outer` — "A bare enclosing segment fixes arity 0 ... In
+// a type position, therefore, no name passes through a generic enclosing
+// type" — and §11.6's route is kept: "Elsewhere a chain head reaches its
+// static members, and a local declared without a type annotation holds a
+// value of it".
 BEZEL_TEST(nested_type_generic_param_enclosing_3584,
            nested_type_without_enclosing_params_still_runs_spec_11_6) {
     BEZEL_EXPECT_EQ(
         run(withOuter(kOuterWithTagNotUsingT,
-                      "using var t: Outer.Tag := new Outer.Tag(7); "
+                      "using var t := Outer<int>.Make(7); "
                       "return t.N();")),
         7);
 }
