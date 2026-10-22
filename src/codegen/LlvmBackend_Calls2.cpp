@@ -67,6 +67,18 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         return ownedSrc;
     };
     auto releaseSrc = [&] { if (ownedSrc) emitStringRelease(ownedSrc); };
+    // Throwing guard that frees the materialized window on the throw edge too
+    // (fix #6979 review): a plain emitGuardThrow would leak it.
+    auto guardRel = [&](llvm::Value* cond, const char* name) {
+        if (!ownedSrc) { emitGuardThrow(cond, name); return; }
+        auto* errBB = llvm::BasicBlock::Create(llvm_, "enc.err", currentFn_);
+        auto* cont = llvm::BasicBlock::Create(llvm_, "enc.cont", currentFn_);
+        builder_.CreateCondBr(cond, errBB, cont);
+        builder_.SetInsertPoint(errBB);
+        releaseSrc();
+        emitThrowBuiltin(name);
+        builder_.SetInsertPoint(cont);
+    };
 
     // GetBytes(s): owned Array<byte>.  Returns null on failure for strict
     // encodings; codegen adds emitGuardThrow(null_check, "FormatException").
@@ -137,7 +149,7 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         if (sg == "ASCII") {
             llvm::Value* isFail =
                 builder_.CreateICmpSLT(needed, builder_.getInt64(0), "enc.sp.afail");
-            emitGuardThrow(isFail, "FormatException");
+            guardRel(isFail, "FormatException");
         }
         // Unpack span struct { ptr source, i32 start, i32 length }.
         auto* spanSt = arraySpanStructType();
@@ -151,7 +163,7 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
             builder_.CreateStructGEP(spanSt, spanSlot, 2), "enc.sp.len");
         // Bounds: span length (as i64) must be >= needed.
         llvm::Value* spanLen64 = builder_.CreateSExt(spanLen, i64(), "enc.sp.len64");
-        emitGuardThrow(
+        guardRel(
             builder_.CreateICmpSLT(spanLen64, needed), "IndexOutOfRangeException");
         // Get raw byte pointer into the backing array at spanStart.
         auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});

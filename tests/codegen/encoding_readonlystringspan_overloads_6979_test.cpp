@@ -66,3 +66,39 @@ BEZEL_TEST(encoding_readonlystringspan_overloads_6979, string_overloads_unchange
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("7\n7\n"));
 }
+
+// fix #6979 review: the materialized window string must be released on the
+// throw edges too (destination too short -> IndexOutOfRangeException;
+// non-ASCII window into ASCII -> FormatException). 100x loop, ASan+LSan.
+BEZEL_TEST(encoding_readonlystringspan_overloads_6979, span_dest_too_small_throw_releases_window_3_2) {
+    auto r = runAotChecked(
+        "module M; class C public static method Main(): int "
+        "  var caught := 0; "
+        "  for var i in 0..99 do "
+        "    var rs := new ReadOnlyStringSpan(\"a\\u00E9\\u20ACz\", 1, 2); "
+        "    using var dst := new Array<byte>(2, 0); "
+        "    try var n := Encoding.UTF8.GetBytes(rs, dst.AsSpan()); "
+        "    catch IndexOutOfRangeException => caught := caught + 1; "
+        "    end; "
+        "  end; "
+        "  Console.WriteLine(caught); return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
+BEZEL_TEST(encoding_readonlystringspan_overloads_6979, span_ascii_nonascii_throw_releases_window_3_2) {
+    auto r = runAotChecked(
+        "module M; class C public static method Main(): int "
+        "  var caught := 0; "
+        "  for var i in 0..99 do "
+        "    var rs := new ReadOnlyStringSpan(\"a\\u00E9\\u20ACz\", 1, 2); "
+        "    using var dst := new Array<byte>(8, 0); "
+        "    try var n := Encoding.ASCII.GetBytes(rs, dst.AsSpan()); "
+        "    catch FormatException => caught := caught + 1; "
+        "    end; "
+        "  end; "
+        "  Console.WriteLine(caught); return 0; end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
+}
