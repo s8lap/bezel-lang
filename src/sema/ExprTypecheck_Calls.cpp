@@ -26228,6 +26228,104 @@ TypeRef* ExprTC::applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,
     return out;
 }
 
+// fix #6997 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2, §4.12,
+// §4.13): a BARE (non-call) reference `e.Nope` / `e?.Nope` on a declaration-
+// less builtin collection interface, to a name that interface does not
+// declare. The per-family surfaces are typed by their own arms, and a bare §5
+// operator in the collection table is rejected by #6784's arm before this
+// one; a name none of them declares was left untyped, so
+// `var g: (int) -> int := il.Nope;` zero-initialized `g` (#2434) and `g(5)`
+// crashed. The CALL form is rejected by the #2457 backstop and is untouched
+// here: the callee slot decides which form this is.
+//
+// The surface is the stdlib's, per head, the UNION over the inherited
+// ancestors (stdlib §4.1: `IReadOnlyList<T>` inherits `Count` and
+// `GetEnumerator`; `IList<T>` inherits all of `ICollection<T>`; §4.2 the owning
+// pair, which also extends `IDisposable`; §4.12/§4.13 the enumeration pair).
+// The indexer is not a named member, so it never reaches a `.name` reference.
+static bool builtinCollectionInterfaceSurface(std::string_view head,
+                                              const char*& section,
+                                              const char*& surface) {
+    if (head == "IEnumerable") {
+        section = "§4.12";
+        surface = "GetEnumerator";
+    } else if (head == "IReadOnlyCollection") {
+        section = "§4.1";
+        surface = "Count/GetEnumerator";
+    } else if (head == "IReadOnlyList") {
+        section = "§4.1";
+        surface = "Count/GetEnumerator, and the indexer";
+    } else if (head == "ICollection") {
+        section = "§4.1";
+        surface = "Count/IsReadOnly/Add/Clear/Contains/Remove/GetEnumerator";
+    } else if (head == "IList") {
+        section = "§4.1";
+        surface = "Count/IsReadOnly/Add/Clear/Contains/Remove/Insert/"
+                  "GetEnumerator, and the indexer";
+    } else if (head == "IOwningCollection") {
+        section = "§4.2";
+        surface = "Count/IsReadOnly/Add/Clear/Contains/Remove/GetEnumerator/"
+                  "Dispose";
+    } else if (head == "IOwningList") {
+        section = "§4.2";
+        surface = "Count/IsReadOnly/Add/Clear/Contains/Remove/Insert/"
+                  "GetEnumerator/Dispose, and the indexer";
+    } else if (head == "IOwningEnumerable") {
+        section = "§4.13";
+        surface = "GetOwningEnumerator/Dispose";
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// True when `m` is a named member `head` declares, counting its ancestors.
+static bool isDocumentedBuiltinCollectionMember(std::string_view head,
+                                                std::string_view m) {
+    const bool owning = head == "IOwningCollection" || head == "IOwningList";
+    const bool collection = head == "ICollection" || head == "IList" || owning;
+    const bool counted =
+        collection || head == "IReadOnlyCollection" || head == "IReadOnlyList";
+    const bool enumerable = counted || head == "IEnumerable";
+    if (m == "GetEnumerator") return enumerable;
+    if (m == "Count") return counted;
+    if (m == "IsReadOnly" || m == "Add" || m == "Clear" || m == "Contains" ||
+        m == "Remove")
+        return collection;
+    if (m == "Insert") return head == "IList" || head == "IOwningList";
+    if (m == "Dispose") return owning || head == "IOwningEnumerable";
+    if (m == "GetOwningEnumerator") return head == "IOwningEnumerable";
+    return false;
+}
+
+// The "no member" diagnostic for the bare reference, or "" when no rejection
+// applies: `t` is not one of the heads above, or `name` is documented there,
+// is a universal Object member (§8.1), or is in the §5 collection table, whose
+// bare form #6784's bareStructuralOperatorReject rejects before this runs. A
+// §5 name outside that table gets this wording, which names §5 as one of its
+// possible reasons. The caller decides the
+// remaining exemption, a user extension that applies to the receiver (§26.5),
+// because it needs the extension table.
+static std::string bareBuiltinCollectionMemberReject(const TypeRef* t,
+                                                     std::string_view name) {
+    if (!t || t->kind != TypeRef::Kind::Named || t->declaration) return "";
+    const std::string_view head = t->headName();
+    const char* section = nullptr;
+    const char* surface = nullptr;
+    if (!builtinCollectionInterfaceSurface(head, section, surface)) return "";
+    if (name == "ToString" || name == "Equals" || name == "GetHashCode" ||
+        name == "GetType" || name == "ReferenceEquals")
+        return "";
+    if (common::isBuiltinCollectionLinqOperatorName(name)) return "";
+    if (isDocumentedBuiltinCollectionMember(head, name)) return "";
+    return "no member `" + std::string(name) + "` on `" + std::string(head) +
+           "` (stdlib " + std::string(section) + ") -- it is not part of this "
+           "interface's documented surface (" + std::string(surface) + "), a "
+           "universal `ToString`/`Equals`/`GetHashCode`/`GetType` member "
+           "(language spec §8.1), or a stdlib §5 LINQ "
+           "extension operator";
+}
+
 // fix #6814 / narrow #6784 / #6805 (language spec §27.6, §26.5, v0.340): see
 // the declaration. §26.5 rule 2 searches "extension blocks on `x`'s type,
 // base types, or implemented interfaces", and rule 3 prefers "extensions on
@@ -31122,6 +31220,27 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // fix #6997 (language spec §27.6, v0.340; stdlib §4.1, §4.2, §4.12,
+        // §4.13): the bare reference to a name the builtin collection
+        // interface does not declare -- see bareBuiltinCollectionMemberReject.
+        // The CALL form is exempt (calleeOfCallCtx_). A same-named user
+        // extension that applies to the receiver (§26.5) is what the reference
+        // resolves to, so it is not rejected.
+        if (ma.target && !ctx_.exprType(ma) && &ma != calleeOfCallCtx_) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target)
+                    loc = ma.target->span.begin;
+                std::string msg =
+                    bareBuiltinCollectionMemberReject(tt, ma.member);
+                if (!msg.empty() &&
+                    !lookupExtensionMember(tt, ma.member, nullptr, loc,
+                                           /*reportAmbiguity=*/false)) {
+                    ctx_.diagnostics().report(Severity::Error, loc, msg);
+                    return;
+                }
+            }
+        }
         // #2536 (stdlib §4.7/§4.8/§4.9/§4.10/§4.17/§4.18; language spec
         // §8.1/§27.6): bare-reference catch-all "no member" reject for the
         // collection families NOT covered by the #2457 per-family blocks
@@ -34612,6 +34731,20 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         std::string msg = bareStructuralOperatorReject(
             recvTyForDiag, nm.member, /*nullCond=*/true, loc);
         if (!msg.empty()) {
+            ctx_.diagnostics().report(Severity::Error, loc, msg);
+            return;
+        }
+    }
+    // fix #6997 (language spec §27.6, v0.340; stdlib §4.1, §4.2, §4.12,
+    // §4.13): the `?.` twin of the `.` arm in resolveMemberAccess.
+    if (!member && &nm != calleeOfCallCtx_ && recvTyForDiag) {
+        SourceLocation loc = nm.span.begin;
+        if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+        std::string msg =
+            bareBuiltinCollectionMemberReject(recvTyForDiag, nm.member);
+        if (!msg.empty() &&
+            !lookupExtensionMember(recvTyForDiag, nm.member, nullptr, loc,
+                                   /*reportAmbiguity=*/false)) {
             ctx_.diagnostics().report(Severity::Error, loc, msg);
             return;
         }
