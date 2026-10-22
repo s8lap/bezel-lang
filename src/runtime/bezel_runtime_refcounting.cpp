@@ -284,6 +284,17 @@ extern "C" void bz_array_set_type_desc(void* arr, void* desc) {
     if (word0 != (void*)bz_array_vtable) return;  // only a bz_array_t has the slot
     ((bz_array_t*)arr)->type_desc = desc;
 }
+// fix #6891 (§8.5, §12.7, v0.340): codegen's call-site stamp for an array a
+// RUNTIME producer allocated (String.Split, a lazy ToArray, readers, ...):
+// set the descriptor only when the array carries none, so an array that
+// already holds its instantiation tag is never overwritten.
+extern "C" void bz_array_stamp_if_unset(void* arr, void* desc) {
+    if (!arr) return;
+    void* word0;
+    memcpy(&word0, arr, sizeof(void*));
+    if (word0 != (void*)bz_array_vtable) return;
+    if (!((bz_array_t*)arr)->type_desc) ((bz_array_t*)arr)->type_desc = desc;
+}
 extern "C" void* bz_array_inst_desc(void* o) {
     if (!o) return nullptr;
     void* word0;

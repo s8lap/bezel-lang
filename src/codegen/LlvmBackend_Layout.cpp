@@ -4722,6 +4722,25 @@ void Emitter::stampBuiltinTypeDesc(llvm::Value* arr, const sema::TypeRef* rt) {
 }
 
 
+// fix #6891 (§8.5, §12.7, v0.340): an Array<T> a RUNTIME producer allocated
+// (String.Split, a lazy pipeline's ToArray, File.ReadAllLines, GroupBy,
+// Distinct, ...) carries no per-instantiation descriptor in word 1. The call
+// site knows the static result type, so stamp it after the call when the array
+// has none. Additive store only; bz_array_stamp_if_unset ignores null, a
+// non-bz_array_t and an already-stamped array, so an array a user method
+// stamped (or a copy that carried its source's tag) is never overwritten.
+void Emitter::stampRuntimeProducedArray(llvm::Value* arr,
+                                        const sema::TypeRef* rt) {
+    if (!arr || !rt || rt->kind != sema::TypeRef::Kind::Named) return;
+    if (builtinTypeName(rt) != "Array") return;
+    llvm::GlobalVariable* d = builtinInstanceDescriptorFor(rt);
+    if (!d) return;
+    builder_.CreateCall(
+        declareC("bz_array_stamp_if_unset", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy(), ptrTy()}),
+        {arr, d});
+}
+
 // §8.6: box an already-lowered value `value` (static type `srcTy`) into a heap
 // wrapper `{ boxVtable*, i64 rc, value-bytes }` and return the box pointer. The
 // leading vtable word lets `emitIsA` and virtual dispatch recognize the box

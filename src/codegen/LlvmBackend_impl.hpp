@@ -11897,6 +11897,7 @@ private:
     // runtime's kind-level tag).
     llvm::GlobalVariable* builtinInstanceDescriptorFor(const sema::TypeRef* rt);
     void stampBuiltinTypeDesc(llvm::Value* arr, const sema::TypeRef* rt);
+    void stampRuntimeProducedArray(llvm::Value* arr, const sema::TypeRef* rt);  // fix #6891
     // Whether `t` names a runtime-concrete type: no bare type parameter at any
     // depth (generic arguments, inline-array element, function parameters and
     // return). A type with a bare parameter has no single descriptor.

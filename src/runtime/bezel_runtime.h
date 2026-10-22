@@ -1476,6 +1476,7 @@ int32_t bz_obj_is_tagged_builtin(void* obj);
 // StringBuilder, a string or a class instance — and an unstamped array).
 void  bz_sb_tag(void* arr);
 void  bz_array_set_type_desc(void* arr, void* desc);
+void  bz_array_stamp_if_unset(void* arr, void* desc);  // fix #6891
 void* bz_array_inst_desc(void* obj);
 
 // §8.3 (v0.204, #2055): assigned identity hash. The class-default

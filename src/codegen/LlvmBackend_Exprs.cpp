@@ -109,6 +109,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     noteFnAtObjectChildren(e);   // #5978: see `fnAtObject_`
     if (checkedDisposal_) noteCdBenignChildren(e);   // #4602
     llvm::Value* v = lowerExprInner(e);
+    // fix #6891 (§8.5, §12.7, v0.340): see stampRuntimeProducedArray.
+    if (v && v->getType()->isPointerTy())
+        if (dynamic_cast<const ast::CallExpr*>(&e))
+            stampRuntimeProducedArray(v, ctx_.exprType(e));
     // fix #6674 (§7.4 / §22.6, v0.339): "a read of a binding §7.4 has
     // narrowed non-null is of its non-nullable type". Sema admitted this read
     // of a nullable value-type binding at a non-nullable target and recorded
