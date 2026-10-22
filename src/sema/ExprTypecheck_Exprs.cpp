@@ -6560,11 +6560,38 @@ void ExprTC::visitExpr(const ast::Expr& e) {
 // the shared `checkArgsAgainstParams` over the case's own payload list, with
 // the callee's target as the substitution receiver so a generic choice's
 // payload type `T` is checked at the written instantiation.
+// §35.3 (v0.340, #2354, #7048): a payload-free case is "a value expression,
+// not a call", so an argument list after it is the §35.5 arity error. One
+// message serves the bare declared-result spelling and the qualified one.
+void ExprTC::reportPayloadFreeCaseCall(SourceLocation at, const std::string& caseName,
+                                       const std::string& remedy) {
+    ctx_.diagnostics().report(
+        Severity::Error, at,
+        "case `" + caseName + "` has no payload, so it takes no argument "
+        "list: a payload-free case is the value `" + remedy + "`, not a call "
+        "(§35.3, §35.5)");
+}
+
 void ExprTC::checkChoiceCaseConstruction(const ast::CallExpr& ce) {
     auto* ccs = dynamic_cast<ChoiceCaseSymbol*>(ctx_.exprSymbol(*ce.callee));
     if (!ccs || !ccs->caseDecl) return;
     auto* cts = dynamic_cast<TypeSymbol*>(ccs->parent);
     if (!cts || cts->kind != ast::TypeDeclKind::Choice) return;
+    // §35.3 (v0.340, #7048): the qualified `C.N()` of a payload-free case.
+    // The bare declared-result spelling was rewritten to this shape and
+    // already reported by applyDeclaredResultCaseReading: skip its heads.
+    if (ccs->caseDecl->payload.empty()) {
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+        if (!ma) return;
+        auto* head = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (head && declaredResultCaseHeads_.count(head)) return;
+        reportPayloadFreeCaseCall(ma->span.begin,
+                                  std::string(cts->name) + "." +
+                                      std::string(ccs->name),
+                                  std::string(cts->name) + "." +
+                                      std::string(ccs->name));
+        return;
+    }
     // The substitution receiver is the written `Type<Args>` of the qualified
     // form. A bare declared-result case name (§35.3) has no written target,
     // and for a generic choice its payload types mention unbound parameters:
@@ -6688,12 +6715,9 @@ void ExprTC::applyDeclaredResultCaseReading(std::unique_ptr<ast::Expr>& slot) {
     // position, which rejectBarePayloadCaseValue (#6789) rejects naming the
     // arity. The argument-list form of a payload-free case is rejected here.
     if (call && cc->caseDecl && cc->caseDecl->payload.empty()) {
-        ctx_.diagnostics().report(
-            Severity::Error, id->span.begin,
-            "case `" + choiceSpelled + "." + std::string(id->name) +
-            "` has no payload, so it takes no argument list: a payload-free "
-            "case is the value `" + std::string(id->name) + "`, not a call "
-            "(§35.3, §35.5)");
+        reportPayloadFreeCaseCall(id->span.begin,
+                                  choiceSpelled + "." + std::string(id->name),
+                                  std::string(id->name));
     }
     std::string_view caseName = id->name;
     auto ma = std::make_unique<ast::MemberAccessExpr>();

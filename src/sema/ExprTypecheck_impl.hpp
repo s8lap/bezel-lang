@@ -3856,6 +3856,8 @@ private:
     // check of a payload-carrying case construction. See the definition in
     // ExprTypecheck_Exprs.cpp.
     void checkChoiceCaseConstruction(const ast::CallExpr& ce);
+    void reportPayloadFreeCaseCall(SourceLocation at, const std::string& caseName,
+                                   const std::string& remedy);
 
     // §35.3 (v0.340, #2354) *Declared-result target-typing*: the case of the
     // current body's declared result type (nullability stripped) named

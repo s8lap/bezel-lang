@@ -230,7 +230,7 @@ BEZEL_TEST(sema_choice_case_payload_args_6119, payload_free_case_with_argument_r
         "    var c := C.Two(1);"));
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "supplies 1 argument(s) but the parameter list has 0"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "case `C.Two` has no payload, so it takes no argument list"));
 }
 
 // R17 — the same check in an argument position (`Show(N1.One("s"))`).

@@ -228,7 +228,7 @@ BEZEL_TEST(sema_new_choice_construction_rejected_4163,
         "public choice ChoiceP Has(H: int), Empty(); end ChoiceP; "
         "class ProgramP "
         "  public static method Main(): int "
-        "    var x := ChoiceP.Empty(); "
+        "    var x := ChoiceP.Empty; "
         "    return (case x of Has(var h) => h, Empty() => 0); "
         "  end Main; "
         "end ProgramP;"),

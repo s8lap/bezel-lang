@@ -250,7 +250,7 @@ BEZEL_TEST(static_readonly_choice_case_call_init_4134,
         "public record SpanHolder4134F(V: ReadOnlyArraySpan<int>); "
         "public choice Choice4134F Has(H: SpanHolder4134F), Empty(); end Choice4134F; "
         "class Holder4134F "
-        "  public static readonly F: Choice4134F := Choice4134F.Empty(); "
+        "  public static readonly F: Choice4134F := Choice4134F.Empty; "
         "end Holder4134F; "
         "class Program4134F public static method Main(): int return 11; "
         "end Main; end Program4134F;";
@@ -332,7 +332,7 @@ BEZEL_TEST(static_readonly_choice_case_call_init_4134,
         "end Widget4134J; "
         "public choice Choice4134J Has(H: Widget4134J), Empty(); end Choice4134J; "
         "static class Factory4134J "
-        "  public static method Build(): Choice4134J return Choice4134J.Empty(); "
+        "  public static method Build(): Choice4134J return Choice4134J.Empty; "
         "  end Build; "
         "end Factory4134J; "
         "class Holder4134J "

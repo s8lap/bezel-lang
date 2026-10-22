@@ -225,7 +225,7 @@ BEZEL_TEST(choice_alt_list_tag_lowering_35_5,
         "  end Score; "
         "  public static method Main(): int "
         "    Console.WriteLine(Score(Opt.Some(42))); "
-        "    Console.WriteLine(Score(Opt.None())); "
+        "    Console.WriteLine(Score(Opt.None)); "
         "    return 0; "
         "end Main; end C;"),
         "42\n1\n");
@@ -353,7 +353,7 @@ BEZEL_TEST(choice_alt_list_tag_lowering_35_5,
         "  public static method Main(): int "
         "    Console.WriteLine(Opt.Some(7) = Opt.Some(7)); "
         "    Console.WriteLine(Opt.Some(7) = Opt.Some(8)); "
-        "    Console.WriteLine(Opt.Some(7) = Opt.None()); "
+        "    Console.WriteLine(Opt.Some(7) = Opt.None); "
         "    return 0; "
         "end Main; end C;"),
         "True\nFalse\nFalse\n");

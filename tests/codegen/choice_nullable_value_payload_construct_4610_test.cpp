@@ -156,7 +156,7 @@ BEZEL_TEST(codegen_choice_nullable_value_payload_construct_4610,
     // passed on both sides of the fix and is here to keep it that way.
     expectValue(
         run("choice Opt S(v: int?), N(); end Opt;",
-            "var o: Opt := Opt.N(); "
+            "var o: Opt := Opt.N; "
             "var r := 0; "
             "case o of "
             "  S(var v) => do r := -1; end, "
