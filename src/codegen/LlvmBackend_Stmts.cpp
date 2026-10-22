@@ -7975,12 +7975,22 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
     // identifier `i` in the body resolves through `locals_[fs]`.
     locals_[&fs] = slot;
 
-    // §29.3: in an iterator method, re-evaluate `hi` inside `condBB`
-    // rather than pre-computing it into an alloca. Pre-computed allocas
-    // are uninitialized in resumed states (state≥1), causing the upper
-    // bound to be garbage. Re-evaluating in condBB is correct because
-    // all params/locals it depends on ARE restored from the state struct.
+    // §29.2 / §16.3 / §16.5 (#6950): the range is evaluated ONCE; `hi` is
+    // the readonly `End`. In an iterator the pre-computed SSA value does not
+    // dominate the resume path into `for.cond`, so it is kept in a
+    // frame-backed i64 slot (spilled/restored across yields, like the #6904
+    // runtime step) and reloaded in the condition.
     if (smStateStruct_) {
+        llvm::AllocaInst* hiSlot = nullptr;
+        if (hi->getType()->isIntegerTy() &&
+            hi->getType()->getIntegerBitWidth() <= 64) {
+            hiSlot = entryAlloca(i64());
+            builder_.CreateStore(
+                eUns ? builder_.CreateZExtOrTrunc(hi, i64())
+                     : builder_.CreateSExtOrTrunc(hi, i64()),
+                hiSlot);
+            mapSuspendLocalSlot(range->hi.get(), hiSlot);
+        }
         auto* condBB = llvm::BasicBlock::Create(llvm_, "for.cond", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "for.body", currentFn_);
         auto* incBB  = llvm::BasicBlock::Create(llvm_, "for.inc",  currentFn_);
@@ -7988,12 +7998,10 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         builder_.CreateBr(condBB);
         builder_.SetInsertPoint(condBB);
         llvm::Value* cur = builder_.CreateLoad(slot->getAllocatedType(), slot);
-        // Re-evaluate hi here so it picks up any saved/restored values.
-        llvm::Value* hiVal = lowerExpr(*range->hi);
-        if (!hiVal) hiVal = hi;  // fallback to pre-computed value
-        else if (hiVal->getType() != eTy && hiVal->getType()->isIntegerTy())
-            hiVal = builder_.CreateIntCast(
-                hiVal, eTy, !isUnsignedTargetExpr(*range->hi));
+        llvm::Value* hiVal = hi;
+        if (hiSlot)
+            hiVal = builder_.CreateTrunc(
+                builder_.CreateLoad(i64(), hiSlot, "rf.hi"), hi->getType());
         llvm::Value* descV = builder_.getInt1(descending);
         if (rtStepSlot)  // §16.4: direction by the runtime step's sign
             descV = builder_.CreateICmpSLT(

@@ -236,7 +236,13 @@ void Emitter::collectSuspendLocals(
             // step turns out constant.
             if (auto* re = dynamic_cast<const ast::RangeExpr*>(
                     fs->iterable.get()))
-                if (re->step) out.push_back({re, i64()});
+                {
+                    if (re->step) out.push_back({re, i64()});
+                    // §29.2 / §16.3 / §16.5 (#6950): the evaluated upper bound
+                    // is held once in an i64 slot keyed on the `hi` node (the
+                    // lowering widens/narrows to the element width).
+                    if (re->hi) out.push_back({re->hi.get(), i64()});
+                }
             collectSuspendLocals(fs->body, out);
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
             collectSuspendLocals(ws->body, out);
