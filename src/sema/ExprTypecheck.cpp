@@ -9493,6 +9493,19 @@ bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
 // name resolution. The field-initializer window that §22.8 names is not
 // opened here, as on base; whether a readonly member may be bound inside its
 // own initializer is a spec question this change does not decide.
+// §22.8 / §23.1 (v0.340, #6894): the readonly member itself must be a direct
+// member of `this`: exactly `this.F` or the bare `F`. A deeper chain
+// (`this.Next.F`) is rooted at `this` but stores into ANOTHER value's
+// storage, which §22.8's "a constructor of the declaring type may not write
+// another value's `readonly` storage held in a ... field" rejects.
+static bool isDirectThisMemberTarget(const ast::Expr& target) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        return id && id->name == "this";
+    }
+    return dynamic_cast<const ast::IdentifierExpr*>(&target) != nullptr;
+}
+
 bool ExprTC::isReadonlyStoreWindowOpen(const ast::Expr& target,
                                        const TypeSymbol* declaring,
                                        bool isStatic) const {
@@ -9500,7 +9513,8 @@ bool ExprTC::isReadonlyStoreWindowOpen(const ast::Expr& target,
     if (isStatic)
         return inStaticMember_ && declaring != nullptr &&
                declaring == currentType_;
-    return !inStaticMember_ && isThisRootedLValueTarget(target);
+    return !inStaticMember_ && isDirectThisMemberTarget(target) &&
+           isThisRootedLValueTarget(target);
 }
 
 // §9.4 (v0.236, #2309; follow-up §9.4 "Value receivers are borrows", v0.307):
@@ -9808,6 +9822,7 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
         // now checks `fs->parent == currentType_` internally, so this
         // call site no longer carries the redundant conjunct.
         bool inDeclaringCtor = inConstructor_ &&
+                               isDirectThisMemberTarget(*as.target) &&
                                isThisRootedLValueTarget(*as.target);
         if (!inDeclaringCtor) {
             std::string nm = std::string(fs->name);
@@ -10630,6 +10645,7 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     if (fs.posParam && fs.parent &&
         fs.parent->kind == ast::TypeDeclKind::Record) {
         bool inDeclaringCtor = inConstructor_ &&
+                               isDirectThisMemberTarget(target) &&
                                isThisRootedLValueTarget(target);
         if (!inDeclaringCtor) {
             ctx_.diagnostics().report(
