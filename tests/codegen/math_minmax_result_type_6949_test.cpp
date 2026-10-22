@@ -138,3 +138,32 @@ BEZEL_TEST(math_minmax_result_type_6958, int_literals_under_double) {
         "Console.WriteLine(Math.Max<double>(2, 7).ToString());"),
         std::string("7\n7\n7\n"));
 }
+
+// fix #6958 follow-up 2 -- `decimal` is outside codegen's explicit-T
+// conversion (#6974), so typing `Math.Max<decimal>(a, b)` over same-typed
+// integer operands as decimal read the raw integer as a decimal: the byte row
+// printed `18446884787389528420`-style garbage or crashed. Sema leaves such a
+// call with its operand-derived type, and these rows pin the values (equal to
+// base 44d07226; stdlib §2.2, §14.5, §5.1, v0.340).
+BEZEL_TEST(math_minmax_result_type_6958, decimal_t_over_byte_operands) {
+    BEZEL_EXPECT_EQ(stdoutOf(
+        "var a: byte := 3; var b: byte := 100; "
+        "Console.WriteLine(Math.Max<decimal>(a, b)); "
+        "Console.WriteLine(Math.Min<decimal>(a, b)); "
+        "Console.WriteLine(Math.Clamp<decimal>(b, a, a)); "
+        "Console.WriteLine($\"{Math.Max<decimal>(a, b)}\"); "
+        "Console.WriteLine(Math.Max<decimal>(a, b).ToString());"),
+        std::string("100\n3\n3\n100\n100\n"));
+}
+BEZEL_TEST(math_minmax_result_type_6958, decimal_t_over_int_long_short_operands) {
+    BEZEL_EXPECT_EQ(stdoutOf(
+        "var i: int := 7; var j: int := -2; "
+        "Console.WriteLine(Math.Max<decimal>(i, j)); "
+        "Console.WriteLine(Math.Min<decimal>(i, j)); "
+        "var l: long := 5000000000L; var m: long := 4L; "
+        "Console.WriteLine(Math.Max<decimal>(l, m)); "
+        "Console.WriteLine(Math.Clamp<decimal>(l, m, m)); "
+        "var s: short := -300; var t: short := 12; "
+        "Console.WriteLine(Math.Min<decimal>(s, t));"),
+        std::string("7\n-2\n5000000000\n4\n-300\n"));
+}
