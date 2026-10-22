@@ -14886,7 +14886,8 @@ void ExprTC::checkCatchArmType(const ast::Type& armTy, SourceLocation fallback) 
         "arm, or name `Exception` or a class deriving from it");
 }
 
-void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
+void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms,
+                              const TypeRef* scrutTy) {
     for (std::size_t i = 0; i < arms.size(); ++i) {
         const ast::Pattern* p = arms[i].pattern.get();
         if (!p) continue;
@@ -14914,8 +14915,34 @@ void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
                 auto loV = foldIntConstExprTC(*re->lo);
                 auto hiV = foldIntConstExprTC(*re->hi);
                 if (loV && hiV) {
-                    bool neverMatches =
-                        re->inclusive ? (*loV > *hiV) : (*loV >= *hiV);
+                    // §16.6 (#6928): the bounds are values of the scrutinee's
+                    // type (§5.1), so they are ordered as values of that type.
+                    // A `ulong` constant above 2^63-1 folds to a wrapped
+                    // negative long long (#6916's readback), which reads back
+                    // as unsigned over a `ulong` scrutinee. The bound's own
+                    // static type is not recorded yet (the arms are typed
+                    // after this check), so the scrutinee's type decides. The
+                    // narrower unsigned types fold a valid bound non-negative,
+                    // where the signed comparison is already exact.
+                    const bool ulongScrut =
+                        scrutTy && scrutTy->kind == TypeRef::Kind::Primitive &&
+                        scrutTy->primitive == PrimitiveType::ULong;
+                    // §6.1: `-x` over a positive unsigned operand raises
+                    // OverflowException (`-1UL` has no ulong value), so a
+                    // negated bound is never a wrapped ulong, and it stays
+                    // signed.
+                    auto asScrutValue = [&](const ast::Expr& b,
+                                            long long v) -> __int128 {
+                        const auto* neg =
+                            dynamic_cast<const ast::UnaryExpr*>(&b);
+                        const bool negated = neg && neg->op == "-";
+                        return ulongScrut && v < 0 && !negated
+                            ? (__int128)(unsigned long long)v
+                            : (__int128)v;
+                    };
+                    const __int128 lo = asScrutValue(*re->lo, *loV);
+                    const __int128 hi = asScrutValue(*re->hi, *hiV);
+                    bool neverMatches = re->inclusive ? (lo > hi) : (lo >= hi);
                     if (neverMatches)
                         ctx_.diagnostics().report(
                             Severity::Warning, rp->span.begin,
@@ -28046,7 +28073,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             for (const ast::Node* a : wpAnchors)
                 caseBindingSource_[a] = cs->scrutinee.get();
         }
-        validateCaseArms(cs->arms);  // §16.4 / §19.6 (#738)
+        validateCaseArms(cs->arms,  // §16.4 / §19.6 (#738)
+                         cs->scrutinee ? ctx_.exprType(*cs->scrutinee)
+                                       : nullptr);
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(cs->scrutinee.get(), scrutTy);

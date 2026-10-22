@@ -13953,7 +13953,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             for (const ast::Node* a : wpAnchors)
                 caseBindingSource_[a] = ce->scrutinee.get();
         }
-        validateCaseArms(ce->arms);  // §16.4 / §19.6 (#738)
+        validateCaseArms(ce->arms,  // §16.4 / §19.6 (#738)
+                         ce->scrutinee ? ctx_.exprType(*ce->scrutinee)
+                                       : nullptr);
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(ce->scrutinee.get(), scrutTy);

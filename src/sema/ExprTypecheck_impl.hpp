@@ -2839,7 +2839,10 @@ private:
     // pattern (stride has no membership meaning, §16.4) and an unguarded `_`
     // catch-all in a non-last arm (§19.6). Both are clean diagnostics that
     // replace a downstream codegen IR failure / silently-unreachable arms.
-    void validateCaseArms(const std::vector<ast::CaseArm>& arms);
+    // §16.6 (#6928): `scrutTy` is the scrutinee's recorded type (null when
+    // unknown); the reversed-bounds verdict reads the bounds as values of it.
+    void validateCaseArms(const std::vector<ast::CaseArm>& arms,
+                          const TypeRef* scrutTy);
 
     // ── §19.3 (v0.334, #5870) *Move-only payload bindings across a write
     // point* ──────────────────────────────────────────────────────────────────
