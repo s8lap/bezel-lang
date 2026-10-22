@@ -28647,10 +28647,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (ma.target && currentCallArity_ <= 0 &&
             (ma.member == "Length" || ma.member == "Count")) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
+                // narrow #2374 (§2.5, v0.340): the imported shape too (no
+                // astNode, head in `importedName`), else an imported receiver is
+                // left untyped.
                 bool isBuiltin =
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                    tt->astNode && tt->astNode->name &&
-                    !tt->astNode->name->parts.empty();
+                    ((tt->astNode && tt->astNode->name &&
+                      !tt->astNode->name->parts.empty()) ||
+                     (!tt->astNode && !tt->importedName.empty()));
                 std::string_view cn = isBuiltin
                     ? std::string_view(tt->headName())
                     : std::string_view();
@@ -28768,10 +28772,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (ma.target && ma.member == "IsReadOnly" &&
                 &ma != calleeOfCallCtx_) {
             if (auto* tt = ctx_.exprType(*ma.target)) {
+                // narrow #2374 (§2.5, v0.340): the imported shape too (no
+                // astNode, head in `importedName`), else an imported receiver is
+                // left untyped.
                 bool isBuiltinColl =
                     tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                    tt->astNode && tt->astNode->name &&
-                    !tt->astNode->name->parts.empty();
+                    ((tt->astNode && tt->astNode->name &&
+                      !tt->astNode->name->parts.empty()) ||
+                     (!tt->astNode && !tt->importedName.empty()));
                 std::string_view cn = isBuiltinColl
                     ? tt->headName()
                     : std::string_view();
@@ -28885,9 +28893,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // ordinary member-lookup path never types them.
         if (ma.target) {
             auto* tt = ctx_.exprType(*ma.target);
+            // narrow #2374 (§2.5, v0.340): the imported shape too (no astNode,
+            // head in `importedName`), else an imported receiver is left
+            // untyped.
             bool isBuiltinLL = tt && tt->kind == TypeRef::Kind::Named &&
-                !tt->declaration && tt->astNode && tt->astNode->name &&
-                !tt->astNode->name->parts.empty();
+                !tt->declaration &&
+                ((tt->astNode && tt->astNode->name &&
+                  !tt->astNode->name->parts.empty()) ||
+                 (!tt->astNode && !tt->importedName.empty()));
             std::string_view llcn = isBuiltinLL
                 ? std::string_view(tt->headName()) : std::string_view{};
 
@@ -29004,9 +29017,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // borrow-bearing class ref, so a genuine escape stays rejected.
         if (ma.target) {
             auto* tt = ctx_.exprType(*ma.target);
+            // narrow #2374 (§2.5, v0.340): the imported shape too (no
+            // astNode, head in `importedName`), else an imported receiver is
+            // left untyped.
             bool isBuiltinColl = tt && tt->kind == TypeRef::Kind::Named &&
-                !tt->declaration && tt->astNode && tt->astNode->name &&
-                !tt->astNode->name->parts.empty();
+                !tt->declaration &&
+                ((tt->astNode && tt->astNode->name &&
+                  !tt->astNode->name->parts.empty()) ||
+                 (!tt->astNode && !tt->importedName.empty()));
             std::string_view scn = isBuiltinColl
                 ? std::string_view(tt->headName()) : std::string_view{};
             if (scn == "SortedSet" &&
