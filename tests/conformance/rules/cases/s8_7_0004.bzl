@@ -8,6 +8,9 @@
 //! stdout: ok
 module Conf;
 
+import System.IO;
+import System.Threading;
+
 public class Program
   public static method Main()
     var m := new Mutex();

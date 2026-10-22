@@ -14,15 +14,15 @@ public record P(Sku: string, Stock: int);
 public record G<T>(V: T, N: int);
 
 public class Holder
-  public readonly Item: P?;
+  public readonly Cur: P?;
 
   public constructor(i: P?)
-    Item := i;
+    Cur := i;
   end;
 
   public method Dec(): P
-    if Item = null then return new P("none", 0); end;
-    return Item with(Stock := Item.Stock - 1);
+    if Cur = null then return new P("none", 0); end;
+    return Cur with(Stock := Cur.Stock - 1);
   end Dec;
 end Holder;
 
@@ -30,8 +30,8 @@ public class Program
   public static method Main()
     var h := new Holder(new P("abc", 5));
     Console.WriteLine(h.Dec().Stock);
-    if h.Item <> null then
-      var r: P := h.Item with(Stock := 100);
+    if h.Cur <> null then
+      var r: P := h.Cur with(Stock := 100);
       Console.WriteLine(r.Stock);
     end;
     var h2 := new Holder(null);
