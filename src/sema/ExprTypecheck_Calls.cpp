@@ -11553,18 +11553,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                     if (srcArg) {
                         const TypeRef* st = ctx_.exprType(*srcArg->value);
+                        // fix #6978 (stdlib §3.2, v0.340): ALLOWLIST -- only a
+                        // `string` or a `ReadOnlyStringSpan` is a declared source.
+                        // An unresolved type (Error) stays quiet (no cascade).
                         bool bad = false;
                         if (st && st->kind == TypeRef::Kind::Primitive)
                             bad = st->primitive != PrimitiveType::None &&
                                   st->primitive != PrimitiveType::String;
-                        else if (st && st->kind == TypeRef::Kind::Named) {
-                            std::string_view h = st->headName();
-                            bad = h == "Array" || h == "OwningArray" ||
-                                  h == "List" || h == "Set" ||
-                                  h == "Dictionary" || h == "ReadOnlySpan" ||
-                                  h == "ReadOnlyArraySpan" || h == "Span" ||
-                                  h == "ArraySpan";
-                        }
+                        else if (st && st->kind == TypeRef::Kind::Named)
+                            bad = st->headName() != "ReadOnlyStringSpan";
+                        else if (st && st->kind != TypeRef::Kind::Error)
+                            bad = true;
                         if (bad) {
                             ctx_.diagnostics().report(
                                 Severity::Error, srcArg->value->span.begin,

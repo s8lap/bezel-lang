@@ -71,3 +71,59 @@ BEZEL_TEST(sema_builtin_byte_span_encode_arg_6957, legal_overloads_still_accepte
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("hi\nhi\nhi\n3\n3\n"));
 }
+
+// fix #6978 (stdlib §3.2, v0.340): the Encoding source is an ALLOWLIST
+// (string / ReadOnlyStringSpan). StringBuilder printed 0; OwningBuffer<char>
+// crashed rc 139.
+BEZEL_TEST(sema_builtin_byte_span_encode_arg_6957, encoding_getbytecount_stringbuilder_3_2) {
+    auto r = runAot(prog(
+        "var sb := new StringBuilder(); sb.Append(\"hey\"); "
+        "Console.WriteLine(Encoding.UTF8.GetByteCount(sb));"));
+    BEZEL_EXPECT_TRUE(rejectedWith(r, "`Encoding.GetByteCount` expects a `string`"));
+}
+BEZEL_TEST(sema_builtin_byte_span_encode_arg_6957, encoding_getbytes_stringbuilder_3_2) {
+    auto r = runAot(prog(
+        "var sb := new StringBuilder(); sb.Append(\"hey\"); "
+        "var b := Encoding.UTF8.GetBytes(sb);"));
+    BEZEL_EXPECT_TRUE(rejectedWith(r, "`Encoding.GetBytes` expects a `string`"));
+}
+BEZEL_TEST(sema_builtin_byte_span_encode_arg_6957, encoding_getbytecount_owningbuffer_char_3_2) {
+    auto r = runAot(prog(
+        "using var cb := new OwningBuffer<char>(2); "
+        "Console.WriteLine(Encoding.UTF8.GetByteCount(cb));"));
+    BEZEL_EXPECT_TRUE(rejectedWith(r, "`Encoding.GetByteCount` expects a `string`"));
+}
+// Over-rejection guards: nullable-narrowed string, string-returning call,
+// literal and interpolation stay accepted.
+BEZEL_TEST(sema_builtin_byte_span_encode_arg_6957, encoding_string_shaped_sources_accepted_3_2) {
+    auto r = runAot(
+        "module M; class C "
+        "  static method Make(): string return \"abc\"; end Make; "
+        "  public static method Main(): int "
+        "  var ns: string? := \"hey\"; "
+        "  if ns <> null then Console.WriteLine(Encoding.UTF8.GetByteCount(ns)); end; "
+        "  Console.WriteLine(Encoding.UTF8.GetByteCount(Make())); "
+        "  var n := 5; "
+        "  Console.WriteLine(Encoding.UTF8.GetByteCount($\"x{n}y\")); "
+        "  Console.WriteLine(Encoding.UTF8.GetBytes(Make()).Count); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n3\n3\n3\n"));
+}
+// #6957 reviewer's missing rows (GU02, RN02): span args to the other
+// byte-buffer builtins stay rejected.
+BEZEL_TEST(sema_builtin_byte_span_encode_arg_6957, guid_frombytearray_readonlyspan_2_6) {
+    auto r = runAot(prog(
+        "var a: Array<byte> := [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]; "
+        "var sp: ReadOnlySpan<byte> := a.AsReadOnlySpan(); "
+        "var g := Guid.FromByteArray(sp);"));
+    BEZEL_EXPECT_TRUE(rejectedWith(r, "`Guid.FromByteArray` expects `Array<byte>`"));
+}
+BEZEL_TEST(sema_builtin_byte_span_encode_arg_6957, random_nextbytes_readonlyspan_2_7) {
+    auto r = runAot(prog(
+        "var rng := new Random(7L); var buf: Array<byte> := [0,0,0,0]; "
+        "var sp: ReadOnlySpan<byte> := buf.AsReadOnlySpan(); rng.NextBytes(sp);"));
+    BEZEL_EXPECT_TRUE(rejectedWith(r, "`Random.NextBytes` expects `Array<byte>`"));
+}
