@@ -915,13 +915,19 @@ void ExprTC::checkDeferredRefTypeBindInGenericCaseInstantiations() {
     // ExprTypecheck_Exprs.cpp ~11744), applied to the SUBSTITUTED argument
     // here. A value substitution cannot form the implicit box the typed
     // binding requires (§8.6, §19.3, §19.5) — reject.
+    // fix #6969 (§19.3, v0.340): a NULLABLE value substitution (`int?`, the
+    // `?` of a record or enum) is a value substitution too. §12.7 names "the
+    // nullable form" of a value type a value-typed operand, and §8.6's
+    // nullable boxing forms the box for a non-null value, so `T = int?` is
+    // rejected as `T = int` is. `string?` and `Object?` stay reference
+    // substitutions: the primitive arm excludes both by name, nullable or not.
     auto isValueTypeAtInstantiation = [](const TypeRef* t) -> bool {
         if (!t) return false;
-        if (t->kind == TypeRef::Kind::Primitive && !t->nullable) {
+        if (t->kind == TypeRef::Kind::Primitive) {
             return t->primitive != PrimitiveType::String &&
                    t->primitive != PrimitiveType::Object;
         }
-        if (t->kind == TypeRef::Kind::Named && !t->nullable && t->declaration) {
+        if (t->kind == TypeRef::Kind::Named && t->declaration) {
             return t->declaration->kind == ast::TypeDeclKind::Record ||
                    t->declaration->kind == ast::TypeDeclKind::Enum;
         }
