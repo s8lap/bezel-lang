@@ -103,9 +103,12 @@ void Emitter::collectSuspendLocals(
     // (`LocalDecl::type` / `LocalConstDecl::type`) and the initializer
     // (`LocalDecl::initializer` / `LocalConstDecl::value`).
     auto frameSlotTy = [&](const ast::Node* node, const ast::Type* declType,
-                           const ast::Expr* init) -> llvm::Type* {
+                           const ast::Expr* init,
+                           const sema::TypeRef* knownRt = nullptr) -> llvm::Type* {
         llvm::Type* ty = ptrTy();
-        if (declType) {
+        if (knownRt) {
+            ty = lowerTypeRef(knownRt);
+        } else if (declType) {
             if (auto* rt = ctx_.resolvedType(*declType)) ty = lowerTypeRef(rt);
         } else if (init) {
             if (auto* rt = ctx_.exprType(*init)) ty = lowerTypeRef(rt);
@@ -252,6 +255,44 @@ void Emitter::collectSuspendLocals(
             // nested-body local and need their frame fields.
             for (const auto& arm : cas->arms)
                 collectSuspendLocals(arm.stmts, out);
+            // §29.3 / §19.3 (#6976): a case-pattern binding (`var n`, `n: T`,
+            // a destructured component, at any nesting depth) is a local of
+            // its arm and lives across a yield/await in the arm body, so it
+            // needs a frame field keyed on its BindingPattern node. Its type
+            // is the LocalSymbol's declType (sema anchors `lsym->decl` on the
+            // BindingPattern).
+            std::vector<const ast::BindingPattern*> bps;
+            std::function<void(const ast::Pattern*)> walkPat =
+                [&](const ast::Pattern* pat) {
+                    if (!pat) return;
+                    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(pat)) {
+                        bps.push_back(bp);
+                    } else if (auto* alt =
+                                   dynamic_cast<const ast::AltPattern*>(pat)) {
+                        for (auto& m : alt->members) walkPat(m.get());
+                    } else if (auto* dp = dynamic_cast<
+                                   const ast::DestructuringPattern*>(pat)) {
+                        for (auto& sp : dp->subPatterns) {
+                            if (sp.nakedAnchor) bps.push_back(sp.nakedAnchor.get());
+                            else walkPat(sp.pattern.get());
+                        }
+                    }
+                };
+            for (const auto& arm : cas->arms) walkPat(arm.pattern.get());
+            if (!bps.empty()) {
+                std::unordered_map<const ast::Node*, const sema::TypeRef*> tys;
+                for (const auto* bp : bps) tys[bp] = nullptr;
+                for (const auto& sym : ctx_.symbols())
+                    if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(sym.get()))
+                        if (loc->decl) {
+                            auto it = tys.find(loc->decl);
+                            if (it != tys.end()) it->second = loc->declType;
+                        }
+                for (const auto* bp : bps) {
+                    if (bp->name == "_") continue;
+                    out.push_back({bp, frameSlotTy(bp, nullptr, nullptr, tys[bp])});
+                }
+            }
         } else if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
             collectSuspendLocals(ifs->ifBranch.body, out);
             for (const auto& el : ifs->elifBranches)

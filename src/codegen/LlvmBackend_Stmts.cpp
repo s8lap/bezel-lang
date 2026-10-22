@@ -12687,6 +12687,7 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
             if (!disposeStack_.empty())
                 recordDeclScopeDepth(bp);  // fix #4523
             locals_[bp] = slot;
+            mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
         }
         if (arm.guard) {
             auto* guardBB = llvm::BasicBlock::Create(

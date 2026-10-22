@@ -13034,6 +13034,7 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 if (!disposeStack_.empty())
                     recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
+                mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
             // fix #2915: Kind::Unit is excluded EXPLICITLY rather than by
             // isBoxableValueType (which now admits it — §4.7/§8.6 — so a boxed
             // `()` has a runtime identity). This arm allocas and loads
@@ -13074,12 +13075,14 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 if (!disposeStack_.empty())
                     recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
+                mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
             } else {
                 llvm::AllocaInst* slot = entryAlloca(scrut->getType());
                 builder_.CreateStore(scrut, slot);
                 if (!disposeStack_.empty())
                     recordDeclScopeDepth(bp);  // fix #4523
                 locals_[bp] = slot;
+                mapSuspendLocalSlot(bp, slot);  // §29.3 (#6976)
             }
         }
         // fix #1254 / §19.3 / §14.1: for a destructuring arm over a concrete
@@ -13909,6 +13912,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                     recordDeclScopeDepth(  // fix #4523
                                         sp.nakedAnchor.get());
                                 locals_[sp.nakedAnchor.get()] = slot;
+                                mapSuspendLocalSlot(sp.nakedAnchor.get(), slot);  // §29.3 (#6976)
                             } else if (auto* vbp =
                                            dynamic_cast<const ast::BindingPattern*>(
                                                sp.pattern.get())) {
@@ -13921,6 +13925,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                                 if (!disposeStack_.empty())
                                     recordDeclScopeDepth(vbp);  // fix #4523
                                 locals_[vbp] = slot;
+                                mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
                             } else if (sp.pattern) {
                                 // fix #3902 / §35.5: a REFUTABLE payload slot
                                 // (constant, range, relational, alternative
@@ -15943,11 +15948,13 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                         recordDeclScopeDepth(  // fix #4523
                             sp.nakedAnchor.get());
                     locals_[sp.nakedAnchor.get()] = slot;  // #1271 real Node anchor
+                    mapSuspendLocalSlot(sp.nakedAnchor.get(), slot);  // §29.3 (#6976)
                 } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                                sp.pattern.get())) {
                     llvm::AllocaInst* slot = entryAlloca(fv->getType());
                     builder_.CreateStore(fv, slot);
                     locals_[vbp] = slot;
+                    mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
                 } else if (sp.pattern) {
                     // fix #3899 / §14.1 / §19.3: `recordMemberTypeResolved`
                     // (not the bare `recordMemberType`) so a generic-record
@@ -16058,6 +16065,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 builder_.CreateStore(fieldVal, slot);
                 const auto* key = sp.nakedAnchor.get();  // #1271 real Node anchor
                 locals_[key] = slot;
+                mapSuspendLocalSlot(key, slot);  // §29.3 (#6976)
             } else if (auto* vbp = dynamic_cast<const ast::BindingPattern*>(
                            sp.pattern.get())) {
                 // §19.3: `Pt(var x, var y)` — equivalent to bare form.
@@ -16066,6 +16074,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                 llvm::AllocaInst* slot = entryAlloca(fieldVal->getType());
                 builder_.CreateStore(fieldVal, slot);
                 locals_[vbp] = slot;
+                mapSuspendLocalSlot(vbp, slot);  // §29.3 (#6976)
             } else if (sp.pattern) {
                 // Non-binding sub-pattern: check it against the field value.
                 // §19.3 / fix #615: resolve the field's declared type so that
