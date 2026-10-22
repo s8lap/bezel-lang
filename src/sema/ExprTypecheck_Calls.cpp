@@ -29169,6 +29169,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     if (rt->astNode && rt->astNode->name &&
                         !rt->astNode->name->parts.empty())
                         return rt->headName();
+                    // fix #6906 (§2.5, v0.340): an IMPORTED builtin (a
+                    // `DateTime` returned by a dependency's method) has no
+                    // astNode; ModuleLoader puts its head in `importedName`.
+                    // Without this `p.Year` stayed UNTYPED in the importer.
+                    if (!rt->astNode && !rt->importedName.empty())
+                        return rt->importedName;
                     return {};
                 }
                 if (!rt->declaration->decl) return rt->declaration->name;
@@ -29325,6 +29331,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     if (rt->astNode && rt->astNode->name &&
                         !rt->astNode->name->parts.empty())
                         return rt->headName();
+                    // fix #6906 (§2.5, v0.340): the imported shape, as in the
+                    // DateTime/TimeSpan twin above (an imported `DateOnly`'s
+                    // `.Year` stayed untyped).
+                    if (!rt->astNode && !rt->importedName.empty())
+                        return rt->importedName;
                     return {};
                 }
                 if (!rt->declaration->decl) return rt->declaration->name;
