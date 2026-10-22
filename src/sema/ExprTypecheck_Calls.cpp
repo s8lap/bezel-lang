@@ -1176,9 +1176,13 @@ static bool byteBufferArgRejected(const TypeRef* t, bool allowSpan) {
             std::string_view h = t->headName();
             if (h.empty()) return false;
             bool arr = (h == "Array" || h == "OwningArray");
-            bool span = allowSpan &&
-                        (h == "ReadOnlySpan" || h == "Span" ||
-                         h == "ReadOnlyArraySpan" || h == "ArraySpan");
+            bool isSpanHead = (h == "ReadOnlySpan" || h == "Span" ||
+                               h == "ReadOnlyArraySpan" || h == "ArraySpan");
+            // fix #6920 follow-up (stdlib §10.3 `RawBytes.From`, §10.1
+            // `CString.FromBytes`, §2.6, §2.7): where no span twin is
+            // declared a span argument has no admissible overload.
+            if (isSpanHead && !allowSpan) return true;
+            bool span = allowSpan && isSpanHead;
             if (arr || span) {
                 if (!t->genericArgs.empty() && t->genericArgs[0] &&
                     t->genericArgs[0]->kind == TypeRef::Kind::Primitive &&
@@ -11494,6 +11498,43 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     recvTy->declaration &&
                     recvTy->declaration->name == "Encoding" &&
                     recvTy->declaration->moduleName.empty()) {
+                    // fix #6957 (stdlib §3.2, v0.340): GetBytes/GetByteCount
+                    // take a `string` (or ReadOnlyStringSpan) source; an int
+                    // or array argument has no overload and reached codegen.
+                    const ast::CallArgument* srcArg = nullptr;
+                    if (m == "GetBytes" || m == "GetByteCount")
+                        for (const auto& a : ce.args)
+                            if (a.value &&
+                                (a.name == "s" ||
+                                 (a.name.empty() && &a == &ce.args[0]))) {
+                                srcArg = &a;
+                                break;
+                            }
+                    if (srcArg) {
+                        const TypeRef* st = ctx_.exprType(*srcArg->value);
+                        bool bad = false;
+                        if (st && st->kind == TypeRef::Kind::Primitive)
+                            bad = st->primitive != PrimitiveType::None &&
+                                  st->primitive != PrimitiveType::String;
+                        else if (st && st->kind == TypeRef::Kind::Named) {
+                            std::string_view h = st->headName();
+                            bad = h == "Array" || h == "OwningArray" ||
+                                  h == "List" || h == "Set" ||
+                                  h == "Dictionary" || h == "ReadOnlySpan" ||
+                                  h == "ReadOnlyArraySpan" || h == "Span" ||
+                                  h == "ArraySpan";
+                        }
+                        if (bad) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, srcArg->value->span.begin,
+                                "`Encoding." + std::string(m) + "` expects a `string` or "
+                                "`ReadOnlyStringSpan` source (stdlib "
+                                "\xC2\xA7""3.2); got `" +
+                                    collectionLiteralTargetSpelling(st) +
+                                    "` (#6957)");
+                            return;
+                        }
+                    }
                     if (m == "GetBytes" && ce.args.size() <= 1) {
                         // fix #526 / stdlib §3.2: 1-arg GetBytes(s: string)
                         // returns owned Array<byte>. Use makeConcreteCollectionResult
