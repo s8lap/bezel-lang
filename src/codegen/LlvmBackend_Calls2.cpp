@@ -364,7 +364,19 @@ llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
             }
             return false;
         }
-        if (dynamic_cast<const ast::CallExpr*>(e)) return true;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+            // fix #6967 (§28.3, v0.340): a call to a resolved user/stdlib
+            // method whose declared return is NOT `owned` returns a borrow;
+            // the caller owns nothing, so From must retain-copy, not free.
+            // Unresolved callees (builtins, function values) keep the fresh
+            // rvalue reading.
+            if (ce->callee) {
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                        ctx_.exprSymbol(*ce->callee)))
+                    return sema::methodReturnsOwned(*ms, ctx_);
+            }
+            return true;
+        }
         if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
             return hasFreshStorage(c->thenValue.get()) &&
                    hasFreshStorage(c->elseValue.get());
