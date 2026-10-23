@@ -12,8 +12,12 @@ class C
   end Main;
 end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: floating-point literal is out of range for `float`
-// CHECK-SAME: (§4.3)
 // #6620: `internal:` is codegen-only and cannot occur on a row that
 // rejects in the front end; this needle is the front end's own ICE marker.
+// #7069: the front end's ICE marker is printed BEFORE any user-facing
+// diagnostic, and a negative directive scans only the region between the
+// surrounding matches — below the positive match this needle could never
+// fire, so it is written above it, where it can.
 // CHECK-NOT: internal compiler error
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: floating-point literal is out of range for `float`
+// CHECK-SAME: (§4.3)

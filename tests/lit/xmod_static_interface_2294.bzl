@@ -35,8 +35,12 @@ end C;
 
 // bezelc emits diagnostics as `file:line:col: message` with no "error:"
 // severity word, so anchor on the `:line:col:` shape and the rule text.
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: class `Bad` implements static interface member `Ping` of `IPing` with a different signature
-// CHECK-SAME: (§11.2 / §11.8)
 // #6620: `internal:` is codegen-only and cannot occur on a row that
 // rejects in the front end; this needle is the front end's own ICE marker.
+// #7069: the front end's ICE marker is printed BEFORE any user-facing
+// diagnostic, and a negative directive scans only the region between the
+// surrounding matches — below the positive match this needle could never
+// fire, so it is written above it, where it can.
 // CHECK-NOT: internal compiler error
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: class `Bad` implements static interface member `Ping` of `IPing` with a different signature
+// CHECK-SAME: (§11.2 / §11.8)
