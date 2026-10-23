@@ -13,6 +13,10 @@
 // compiles: a warning is not a rejection.
 
 // CHECK-NOT: owned value in `a`
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: error
 // CHECK: warning: owned value in `d` is implicitly disposed at the end of its scope
 // CHECK-NOT: owned value in `a`
 // CHECK-NOT: error

@@ -18,6 +18,10 @@
 
 module M; class Cell public static _n: int := 0; public constructor() Cell._n := Cell._n + 1; end constructor; destructor Cell._n := Cell._n - 1; end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push((new Cell())); s.TryPop(out var item); item?.Dispose(); end; return Cell._n; end Main; end C;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: auto-drop
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}:{{ ?warning: ?}} mutable static field `_n` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)
 // CHECK-NOT: auto-drop

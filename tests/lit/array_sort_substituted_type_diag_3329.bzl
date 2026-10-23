@@ -47,6 +47,11 @@ class C
   end Main;
 end C;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: §3 / #472
+// CHECK-NOT: Array<T>.Sort() requires
 // (1) The receiver is named with the substituted type argument — the
 //     defect this file's primary fix is to remove.
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: Array<Widget>.Sort() requires T: IComparable<T>

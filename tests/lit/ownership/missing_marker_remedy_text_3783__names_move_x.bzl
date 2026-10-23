@@ -35,5 +35,9 @@ class C public method M(s: Sink)
 end M;
 end C;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: write `M(owned x)`
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: this call consumes `x`; write `M(move x)` — passing the named owned binding `x` to an `owned` parameter transfers ownership and leaves it moved-from, which the call site must announce (§22.3
 // CHECK-NOT: write `M(owned x)`

@@ -50,8 +50,17 @@ class CC4343
   end Main;
 end CC4343;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: expected 'end'
 // CHECK: {{.*}}:{{[0-9]+}}:{{[0-9]+}}: an argument list is not permitted here
 // CHECK-SAME: permitted only on the base class
 // CHECK-SAME: not on an interface
 // CHECK-NOT: expected 'end'
 // CHECK: {{.*}}:{{[0-9]+}}:{{[0-9]+}}: expected ';' after return statement
+// #7065: and the same needle again, AFTER the last positive match, so the
+// prohibition covers the tail of the output too — a negative directive
+// scans only the region between the surrounding matches, and this one was
+// bounded by the next match.
+// CHECK-NOT: expected 'end'

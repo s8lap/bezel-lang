@@ -25,6 +25,10 @@
 // `owning_choice_case_ctor_only_is_a_fresh_producer_3575_test.cpp` pins the
 // matching disposal behaviour.
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: error
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: warning: owned value in `b` is implicitly disposed at the end of its scope
 // CHECK-SAME: (§28.3 must-use / auto-drop)
 // A must-use warning is not a rejection: nothing here may be an Error, or the

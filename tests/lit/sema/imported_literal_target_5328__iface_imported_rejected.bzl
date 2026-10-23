@@ -51,6 +51,10 @@ end Program;
 // surrounding matches — below the positive match this needle could never
 // fire, so it is written above it, where it can.
 // CHECK-NOT: internal compiler error
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: cannot target the imported parameter type here
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: a collection literal `[...]` cannot target the interface type `IEnumerable`
 // CHECK-SAME: §15.4 admits only a concrete collection target
 // CHECK-SAME: (§15.4)

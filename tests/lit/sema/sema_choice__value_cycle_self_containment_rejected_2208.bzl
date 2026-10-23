@@ -17,6 +17,15 @@
 
 module M; record Rec(K: Ch); choice Ch Wrap(r: Rec), Leaf; end Ch; class C public static method Main(): int return 0; end Main; end C;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: choice `Ch` cannot recursively contain itself
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: record `Rec` cannot recursively contain itself by value
 // CHECK-NOT: choice `Ch` cannot recursively contain itself
 // CHECK-SAME: (§9)
+// #7065: and the same needle again, AFTER the last positive match, so the
+// prohibition covers the tail of the output too — a negative directive
+// scans only the region between the surrounding matches, and this one was
+// bounded by the next match.
+// CHECK-NOT: choice `Ch` cannot recursively contain itself

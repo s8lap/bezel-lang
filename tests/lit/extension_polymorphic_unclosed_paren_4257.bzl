@@ -79,10 +79,19 @@ class CC4257
   end Main;
 end CC4257;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: expected 'end' to close extension block
 // CHECK: {{.*}}:{{[0-9]+}}:{{[0-9]+}}: an extension block may not declare a `polymorphic` member registry
 // CHECK-SAME: §26.3
 // CHECK-NOT: expected 'end' to close extension block
 // CHECK: {{.*}}:{{[0-9]+}}:14: `(` opened here has no matching `)`
 // CHECK: {{.*}}:{{[0-9]+}}:{{[0-9]+}}: expected ';' after return statement
+// #7065: and the same needle again, AFTER the last positive match, so the
+// prohibition covers the tail of the output too — a negative directive
+// scans only the region between the surrounding matches, and this one was
+// bounded by the next match.
+// CHECK-NOT: expected 'end' to close extension block
 
 // COUNT: {{^3$}}
