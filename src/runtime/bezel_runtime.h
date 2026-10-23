@@ -135,6 +135,14 @@ void bz_array_free_owning_wrap(void* arr, void (*fallback)(void*),
 // NOT free the header block — mirrors class-instance quarantine in the codegen.
 void bz_array_mark_disposed(void* arr, void (*dispose_elem)(void*));
 
+// fix #7045 (§28.2 / §28.3, v0.340): the checked-disposal twin of
+// bz_array_free_dynamic — the static collection head is erased, so the
+// backing's element ownership is taken from the header's recorded disposer,
+// and the block is QUARANTINED (header kept, disposed=1) instead of
+// reclaimed, so a borrow that survives the release can still have its
+// disposed flag read by the §28.2 backstop.
+void bz_array_mark_disposed_dynamic(void* arr);
+
 // §28.2 v0.135 / issue #621: return non-zero if the array has been disposed
 // via bz_array_mark_disposed (checked mode only).
 int8_t bz_array_is_disposed(void* arr);

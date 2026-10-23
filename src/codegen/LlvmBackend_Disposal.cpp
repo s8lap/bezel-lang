@@ -9489,7 +9489,29 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // collectionElemDisposer is set by registerUsingDisposal for
             // them and they never set collArrayDynamicFree.
             if (it->collArrayDynamicFree) {
-                auto* dynFn = declareC("bz_array_free_dynamic",
+                // fix #7045 (§28.2 / §28.3, v0.340): in CHECKED disposal mode
+                // the scope-end release of a collection must NOT reclaim the
+                // block. §28.3's store-rule residual admits a call that stores
+                // a borrow of a plain (non-`owned`) argument into a field, and
+                // the temporary is NOT lifetime-extended: it is disposed at
+                // its boundary while the stored borrow may still be read
+                // afterwards. The read must then raise
+                // DisposedAccessException (§28.2 K4.1) rather than read freed
+                // memory — and the backstop's flag test can only read the
+                // disposed byte if the header survives the release. So the
+                // checked-mode release QUARANTINES (the §28.2 latitude: "defer
+                // reclaiming a disposed instance's memory in checked mode
+                // (quarantine, delayed free) so that the flag remains readable
+                // after disposal"), exactly as the class-instance path already
+                // does in emitReclaimBlock and as the explicit `.Dispose()`
+                // call site does with bz_array_mark_disposed
+                // (LlvmBackend_Calls2.cpp). Unchecked mode keeps the immediate
+                // free: use-after-dispose is undefined there (§28.2's
+                // checked/unchecked split).
+                const char* dynName = checkedDisposal_
+                    ? "bz_array_mark_disposed_dynamic"
+                    : "bz_array_free_dynamic";
+                auto* dynFn = declareC(dynName,
                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(dynFn, {arr});
                 // fix #1878 (§28.4, v0.306): the backing is statically erased
@@ -9502,7 +9524,9 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 llvm::Value* disp = it->collectionElemDisposer
                     ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
                     : llvm::ConstantPointerNull::get(ptrTy());
-                auto* fn = declareC("bz_array_free",
+                auto* fn = declareC(checkedDisposal_
+                                        ? "bz_array_mark_disposed"
+                                        : "bz_array_free",
                                     llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), ptrTy()});
                 builder_.CreateCall(fn, {arr, disp});
@@ -9514,6 +9538,12 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 if (elementDisposerRunsUserCode(it->collectionElemDisposer))
                     ++userCodeDisposalCount_;
             }
+            // fix #7045 (§28.2 / §28.3, v0.340): the null-store stays
+            // unconditional — §28.3's "a sibling / outer disposal registered
+            // against the same slot reads null on its later pass and skips"
+            // still holds, and the checked-mode quarantine is idempotent
+            // (bz_array_mark_disposed returns early on an already-disposed
+            // header), so the repeat pass is a no-op either way.
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);

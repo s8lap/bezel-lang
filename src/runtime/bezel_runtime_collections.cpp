@@ -577,6 +577,26 @@ void bz_array_free_dynamic(void* arrp) {
     bz_array_free(arrp, ((bz_array_t*)arrp)->elem_disposer);
 }
 
+// fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL twin of
+// bz_array_free_dynamic — same "consult the header's recorded disposer" rule
+// (the static head is erased, so the backing may be a borrowing Array<T> or an
+// owning OwningArray<T>), but the block is QUARANTINED rather than reclaimed:
+// the data buffer is freed, the header survives with disposed=1, and the
+// header's disposed flag stays readable for the §28.2 backstop.
+//
+// WHY THE QUARANTINE. §28.3's store-rule residual admits a call that stores
+// a borrow of a plain (non-`owned`) argument into a field, and the temporary
+// is NOT lifetime-extended: it is disposed at its boundary while the stored
+// borrow may still be read afterwards. In checked mode the read must raise
+// DisposedAccessException (§28.2 K4.1), which requires the disposed flag to
+// still be readable — so the release must not reclaim the block. Unchecked
+// mode keeps the immediate free: use-after-dispose is undefined there
+// (§28.2's checked/unchecked split), so the release reclaims as before.
+void bz_array_mark_disposed_dynamic(void* arrp) {
+    if (!arrp) return;
+    bz_array_mark_disposed(arrp, ((bz_array_t*)arrp)->elem_disposer);
+}
+
 // #6439 (§28.6 / §28.11, v0.338): the OWNING enumerable WRAP's slot-1 free, for
 // the BORROWING `IEnumerable<T>` head only. Same header-consulting rule as
 // `bz_array_free_dynamic`, with `fallback` standing in for a header the

@@ -8432,6 +8432,37 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             bool isStackFamily = iterTy &&
                 (iterTy->headName() == "Stack" ||
                  iterTy->headName() == "OwningStack");
+            // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL
+            // backstop for the enumeration. §28.3's store-rule residual admits
+            // a call that stores a borrow of a plain (non-`owned`) argument
+            // into a field; the temporary is NOT lifetime-extended, so it is
+            // disposed at its boundary while the stored borrow may still be
+            // read afterwards. The read must then raise
+            // DisposedAccessException (§28.2 K4.1) — the owner's ruling for
+            // #7045 spells out that "`for var x in _xs` enumerates the array,
+            // so it is such an access".
+            //
+            // The guard reads the SAME disposed byte the indexer / Count /
+            // collection-method guards read (Exprs.cpp, Assign.cpp, Calls.cpp)
+            // — bz_array_is_disposed on the bz_array_t header — and throws
+            // through the same emitGuardThrow helper. It is emitted ONLY in
+            // checked mode: in unchecked mode use-after-dispose is undefined
+            // (§28.2's checked/unchecked split), and the release reclaims the
+            // block there, so the byte is not even readable.
+            //
+            // The guard must precede EVERY read of the array below — the mod
+            // epoch capture, the length, and the element readback — because
+            // the quarantined header's data buffer is already freed
+            // (bz_array_mark_disposed) and its count is zero.
+            if (checkedDisposal_) {
+                llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+                llvm::Value* flag =
+                    builder_.CreateCall(isFn, {arrObj}, "cd.arrdis");
+                llvm::Value* disposed = builder_.CreateICmpNE(
+                    flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                emitGuardThrow(disposed, "DisposedAccessException");
+            }
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             // §29.12 / #1232: capture mod epoch before the loop starts.
@@ -10364,6 +10395,22 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         else if (elemTy->isIntegerTy(16)) esz = 2;
         else if (elemTy->isStructTy())
             esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
+        // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL backstop for
+        // the enumeration — the sibling of the guard in lowerArrayFor, for the
+        // IEnumerable-protocol lowering of the same shape. A member access
+        // through a stored borrow of a logically disposed collection raises
+        // DisposedAccessException (§28.2 K4.1); the enumeration is such an
+        // access. Emitted only in checked mode, and it precedes every read of
+        // the array below (the length and the element readback).
+        if (checkedDisposal_) {
+            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+            llvm::Value* flag =
+                builder_.CreateCall(isFn, {enumObj}, "cd.arrdis");
+            llvm::Value* disposed = builder_.CreateICmpNE(
+                flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+            emitGuardThrow(disposed, "DisposedAccessException");
+        }
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
         auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
         llvm::Value* len = builder_.CreateCall(lenFn, {enumObj});
