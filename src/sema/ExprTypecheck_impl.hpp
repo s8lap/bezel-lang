@@ -1474,6 +1474,23 @@ private:
                                         std::string_view param, TypeRef* arg,
                                         std::string argName,
                                         SourceLocation loc);
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the owner key a
+    // CLASS-level generic parameter's site and use are keyed on.
+    //
+    // A LOCAL class keys both on its `ast::TypeDecl`. An IMPORTED class has
+    // no `ast::TypeDecl` at all (#3141: ModuleLoader never assigns
+    // `Symbol::decl` for a type across the boundary), so the `TypeSymbol` is
+    // the one key the site and the use can agree on across the boundary —
+    // and it is the key the loader publishes the imported class's §17.11
+    // obligation on.
+    const void* classParamOwner(const TypeSymbol* ts) const;
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): record the §17.11
+    // obligation an IMPORTED generic CLASS carries — its class-level type
+    // parameter's substitution must have a well-defined `default` value —
+    // so the end-of-pass join can judge an instantiation site of that class
+    // exactly as the same-module typechecker judges it.
+    void recordImportedClassDefaultObligation(const TypeSymbol* ts,
+                                               SourceLocation loc);
     // fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
     // instantiation sites — `var g: G<int>` and `class D : G<int>` — are not
     // recorded by recordDefaultObligationsForConstruction (only `new` calls

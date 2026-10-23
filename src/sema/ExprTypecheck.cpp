@@ -331,13 +331,32 @@ void ExprTC::run(const ast::SourceFile& src) {
     // fix #3044 (§17.11 / §3.6 rule 2, v0.242): every `default(T)` obligation
     // and every generic-method instantiation has now been seen, in whatever
     // source order they appeared. Join them.
+    checkDeferredDefaultInstantiations();
     // fix #6947 (§17.11, v0.340): publish the unconstrained `default(T)` uses
     // so ModuleLoader can carry them onto an imported method re-parsed from
     // shipped body text.
+    //
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the publication now runs
+    // AFTER the join, not before it. `checkDeferredDefaultInstantiations` calls
+    // `propagateDefaultTypeParamChains`, which DERIVES the chain uses — a
+    // generic whose own type parameter is passed on to a generic whose chain
+    // ends in a `default(T)` takes `default` of that parameter too (#5962).
+    // §17.11 reads such a chain as an obligation on the OWNER's parameter
+    // ("the rule below rejects at the instantiation site every substitution
+    // that is not defaultable ... read through any chain of user
+    // declarations"), so the derived uses are §17.11 obligations exactly like
+    // the direct ones and must be published: the exporter ships them in the
+    // metadata (`MetaGenericParam::requiresWellDefinedDefault`) and the
+    // importer replays them, which is what makes an external instantiation
+    // behave identically to a same-module one (§2.8.2 clause 2). Publishing
+    // BEFORE the join meant the derived uses — computed inside it — never
+    // reached the publication at all, so a class-level chain
+    // (`Box<T>.WrapC()` passing the class's own `T` to `Box<T>.DefB<T2>()`,
+    // whose body takes `default(T2)`) shipped no obligation and the importer
+    // accepted `Box<string>.WrapC()` where the same-module call is rejected.
     for (const auto& u : defaultTypeParamUses_)
         if (u.unconstrained)
             ctx_.noteUnconstrainedDefaultParam(u.owner, u.param);
-    checkDeferredDefaultInstantiations();
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): the same join for
     // `x as T`, over the same instantiation records.
     checkDeferredAsTargetInstantiations();
@@ -351,6 +370,52 @@ void ExprTC::run(const ast::SourceFile& src) {
     checkDeferredAsOperandInstantiations();
 }
 
+
+// fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the owner key a
+// CLASS-level generic parameter's site and use are keyed on.
+//
+// A LOCAL class keys both on its `ast::TypeDecl` — that is what every
+// class-level `default(T)` use in a class body is recorded against (see
+// ExprTypecheck_Exprs.cpp's `recordDefaultTypeParamUse(classDecl, ...)`) and
+// what every class-level instantiation site is recorded against.
+//
+// An IMPORTED class has no `ast::TypeDecl` (#3141: ModuleLoader never
+// assigns `Symbol::decl` for a type across the boundary), so the decl-keyed
+// site no-ops and the join has nothing to fire on. The `TypeSymbol` is the
+// one key the site and the use can agree on across the boundary — and it is
+// the key ModuleLoader publishes the imported class's §17.11 obligation on
+// (`SemaContext::setImportedUnconstrainedDefaultParams`).
+const void* ExprTC::classParamOwner(const TypeSymbol* ts) const {
+    if (!ts) return nullptr;
+    return ts->decl ? static_cast<const void*>(ts->decl)
+                    : static_cast<const void*>(ts);
+}
+
+// fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): record the §17.11
+// obligation an IMPORTED generic CLASS carries, so the end-of-pass join
+// (`checkDeferredDefaultInstantiations`) judges an instantiation site of that
+// class exactly as the same-module typechecker judges it.
+//
+// §17.11 makes the obligation a property of the class's BODY: a body that
+// takes `default(T)` (directly, or through a chain that ends in a
+// `default(T)`) is rejected at every non-defaultable substitution of the
+// class's type parameter T. The exporting module computed that obligation
+// and shipped it in the metadata; ModuleLoader published it on the imported
+// TypeSymbol; here the IMPORTING pass records the matching `default(T)` use
+// against the same owner key the site is recorded on, so the join can pair
+// them.
+//
+// A LOCAL class's obligation is recorded by its own body (the class-level
+// `recordDefaultTypeParamUse(classDecl, ...)`), so this is a no-op there.
+void ExprTC::recordImportedClassDefaultObligation(const TypeSymbol* ts,
+                                                   SourceLocation loc) {
+    if (!ts || ts->decl) return;  // a LOCAL class records its own
+    const std::vector<std::string>* req =
+        ctx_.importedUnconstrainedDefaultParams(ts);
+    if (!req) return;
+    for (const std::string& r : *req)
+        recordDefaultTypeParamUse(ts, r, loc, /*unconstrained=*/true);
+}
 
 // fix #3044 (§17.11 / §3.6 rule 2, v0.242): see the declarations in
 // ExprTypecheck_impl.hpp.
@@ -419,9 +484,16 @@ void ExprTC::recordAnnotationInstantiationSites(TypeRef* rt,
         if (arg->nullable) argName += "?";
         // Use the TypeDecl as the owner key — matches what recordAsOperandTypeParamUse
         // does for the type-level carrier (currentType_->decl, not currentType_).
-        recordGenericInstantiationSite(ts->decl, gp->name, arg,
+        // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): for an IMPORTED class
+        // there is no decl (#3141), so the owner is the imported TypeSymbol —
+        // the key its §17.11 obligation is published on.
+        recordGenericInstantiationSite(classParamOwner(ts), gp->name, arg,
                                      std::move(argName), loc);
     }
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the imported class's
+    // §17.11 obligation, recorded as the `default(T)` use the join pairs
+    // with the site above.
+    recordImportedClassDefaultObligation(ts, loc);
 }
 
 void ExprTC::recordGenericInstantiationSite(const void* owner,
@@ -673,14 +745,25 @@ void ExprTC::recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
     // boundary, #3141) — recordGenericInstantiationSite no-ops on a null
     // owner, and there is no LOCAL `defaultTypeParamUses_` entry keyed by an
     // imported decl pointer to join against regardless.
+    //
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): for an IMPORTED class the
+    // owner is the imported TypeSymbol — the key the loader publishes the
+    // class's §17.11 obligation on, and the key the importing pass records
+    // the matching `default(T)` use against. Without it the site no-ops and
+    // `new Box<string>()` (and the static-receiver `Box<string>.Get()`) is
+    // accepted where the same-module program is rejected.
     for (std::size_t i = 0; i < t->genericParams.size(); ++i) {
         Symbol* gp = t->genericParams[i];
         if (!gp) continue;
         TypeRef* arg = rt->genericArgs[i];
         if (!arg) continue;
-        recordGenericInstantiationSite(t->decl, gp->name, arg,
+        recordGenericInstantiationSite(classParamOwner(t), gp->name, arg,
                                        argNameOf(arg), ne.span.begin);
     }
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the imported class's
+    // §17.11 obligation, recorded as the `default(T)` use the join pairs
+    // with the site above.
+    recordImportedClassDefaultObligation(t, ne.span.begin);
     // fix #5641 (§15.1 / §3.6 rule 2, v0.327): a type parameter `T` used in
     // a nullable position (`T?`, a field/local/param typed `T?`) is a
     // compile error when `T` is substituted by an inline array at the

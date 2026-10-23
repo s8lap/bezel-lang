@@ -1178,10 +1178,20 @@ void fillParamDefaults(std::vector<MetaParam>& out,
 
 // Convert a method/type's generic parameters. Variance comes from the symbol;
 // constraints (§14.2) come from the declaring AST node's GenericConstraints.
+//
+// fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): `requiresDefault`
+// is the OWNING generic's set of type parameters whose substitution must have
+// a well-defined `default` value — the §17.11 obligation the owning body
+// creates (directly, by taking `default(T)`, or through a chain that ends in
+// a `default(T)`). The set comes from the owning module's own typecheck
+// (`SemaContext::unconstrainedDefaultParamsOfOwner`, keyed by the owning
+// declaration). It is shipped so the importer can reach the SAME verdict the
+// same-module typechecker reaches at the instantiation site.
 std::vector<MetaGenericParam> convertGenericParams(
     const std::vector<sema::Symbol*>& gps,
     const std::vector<ast::GenericConstraint>& constraints,
-    sema::SemaContext& ctx) {
+    sema::SemaContext& ctx,
+    const std::vector<std::string>* requiresDefault = nullptr) {
     std::vector<MetaGenericParam> out;
     out.reserve(gps.size());
     for (sema::Symbol* s : gps) {
@@ -1190,6 +1200,14 @@ std::vector<MetaGenericParam> convertGenericParams(
         MetaGenericParam mg;
         mg.name = std::string(gp->name);
         mg.variance = std::string(gp->variance);  // "", "in", "out"
+        // fix #7094 (§17.11, v0.343): the §17.11 obligation rides
+        // the parameter it constrains.
+        if (requiresDefault)
+            for (const std::string& r : *requiresDefault)
+                if (r == mg.name) {
+                    mg.requiresWellDefinedDefault = true;
+                    break;
+                }
         // §14.2: gather constraints whose `where T:` parameter matches.
         bool hasAstConstraint = false;
         for (const ast::GenericConstraint& gc : constraints) {
@@ -2202,7 +2220,12 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // §14 generic params + their §14.2 constraints (from the TypeDecl AST).
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl)) {
         out.genericParams =
-            convertGenericParams(t.genericParams, td->genericConstraints, ctx);
+            convertGenericParams(t.genericParams, td->genericConstraints, ctx,
+                                 // fix #7094 (§17.11, v0.343): the
+                                 // §17.11 obligation the class's OWN body
+                                 // creates for its class-level type
+                                 // parameters.
+                                 ctx.unconstrainedDefaultParamsOfOwner(td));
     }
 
     // §12 base class + interfaces (resolved TypeRefs, parallel to baseTypes).

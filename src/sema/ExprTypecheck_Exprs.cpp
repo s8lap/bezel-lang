@@ -2374,10 +2374,22 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         Symbol* gp = ts->genericParams[i];
                         TypeRef* arg = instTy->genericArgs[i];
                         if (!gp || !arg) continue;
+                        // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the
+                        // owner key is the class's `ast::TypeDecl` for a LOCAL
+                        // class and the imported `TypeSymbol` for an IMPORTED
+                        // one (which has no decl at all — #3141). The imported
+                        // class's §17.11 obligation is published on that
+                        // TypeSymbol, so recording the site against it is what
+                        // lets the end-of-pass join reject `Box<string>` the
+                        // way the same-module typechecker rejects it.
                         recordGenericInstantiationSite(
-                            ts->decl, gp->name, arg,
+                            classParamOwner(ts), gp->name, arg,
                             argNameOf(arg), e.span.begin);
                     }
+                    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the
+                    // imported class's §17.11 obligation, recorded as the
+                    // `default(T)` use the join pairs with the site above.
+                    recordImportedClassDefaultObligation(ts, e.span.begin);
                     // Return early — no further local/param/field type
                     // attachment is needed; the exprType is now set.
                     return;

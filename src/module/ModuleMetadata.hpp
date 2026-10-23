@@ -436,6 +436,31 @@ struct MetaGenericParam {
     std::vector<MetaType> constraintTypes;       // §14.2 type constraints
     std::vector<std::string> specialConstraints; // "class", "value", "new", ...
 
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): this type
+    // parameter's substitution MUST have a well-defined `default` value.
+    //
+    // §17.11 makes the obligation a property of the GENERIC BODY, not of the
+    // type argument list: a body that takes `default(T)` (directly, or through
+    // a chain that ends in a `default(T)`) is rejected at every non-defaultable
+    // substitution of T. The same-module typechecker discharges that obligation
+    // by joining the body's use of `default(T)` against the instantiation site
+    // (§17.11's closing rule). Across a module boundary the importer has no
+    // body to join against, so the exporter ships the obligation itself: this
+    // flag says "substituting this parameter requires a defaultable type".
+    //
+    // It is deliberately NOT a `where` constraint — it is not part of the
+    // declared signature, and it is not something the source says. It is the
+    // §17.11 obligation, carried, so §2.8.2 clause 2 ("an external
+    // instantiation behaves identically to a same-module instantiation of the
+    // same generic at the same arguments") can hold.
+    //
+    // WIRE: a 3rd scalar in GENERIC_BLOCK's REC_SCALARS, additive within the
+    // current schema version (the #2392 `outNullWhen` precedent): a reader
+    // predating this field never looks past index 1, and a current reader
+    // given a predating blob reads the missing 3rd scalar as false — the
+    // value every blob had before this field existed.
+    bool requiresWellDefinedDefault = false;
+
     bool operator==(const MetaGenericParam&) const;
 };
 

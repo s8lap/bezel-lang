@@ -4022,6 +4022,43 @@ static void carrySiblingSignatureTypes5160(const sema::SemaContext& mainCtx,
     }
 }
 
+// fix #7094 / #7095 (§17.11 / §2.8.2 clause 2, v0.343): publish an imported
+// symbol's §17.11 obligation WITHOUT dropping what is already published for
+// it.
+//
+// The obligation an imported symbol carries can arrive from TWO independent
+// sources, and neither is a subset of the other:
+//   - the EXPORTED requirement set (`MetaGenericParam::
+//     requiresWellDefinedDefault`), which carries both the direct
+//     `default(T)` uses and the DERIVED chain uses; and
+//   - the RE-PARSED body's own `default(T)` uses, published after the body
+//     re-parse (the #6947 publication below).
+// `SemaContext::setImportedUnconstrainedDefaultParams` REPLACES, so
+// publishing one source after the other would silently drop the first — e.g.
+// the exported DERIVED requirement of `U.Wrap<T>` (whose chain ends in
+// another type's `default(T)`) would be lost to the re-parsed body's (empty)
+// direct set. This helper unions instead.
+//
+// `SemaContext::setImportedUnconstrainedDefaultParams` is not touched: the
+// merge is a property of the LOADER's publication sites, not of the setter.
+static void publishImportedDefaultRequirement(sema::SemaContext& ctx,
+                                              const sema::Symbol* sym,
+                                              const std::vector<std::string>& names) {
+    if (!sym || names.empty()) return;
+    // Copy first: `setImportedUnconstrainedDefaultParams` may rehash the map
+    // and invalidate a pointer into it.
+    std::vector<std::string> merged;
+    if (const auto* cur = ctx.importedUnconstrainedDefaultParams(sym))
+        merged = *cur;
+    for (const std::string& n : names) {
+        bool seen = false;
+        for (const std::string& e : merged)
+            if (e == n) { seen = true; break; }
+        if (!seen) merged.push_back(n);
+    }
+    ctx.setImportedUnconstrainedDefaultParams(sym, merged);
+}
+
 static bool parseAndAttachMethodBody(
     const MetaTypeDecl& td,
     const MetaMember& target,
@@ -6463,6 +6500,22 @@ static void loadMetadataPass2(
         sema::TypeSymbol* t = created[i];
         t->genericParams =
             loader.convertGenericParams(td.genericParams, t->memberScope);
+        // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the CLASS-level
+        // §17.11 obligation — a class-level type parameter whose substitution
+        // must have a well-defined `default` value, because the class's body
+        // takes `default(T)` (directly, or through a chain that ends in a
+        // `default(T)`). The exporting module computed it and shipped it in
+        // the metadata; publish it on the imported TYPE symbol so the
+        // importing pass can judge a `Box<string>` instantiation site exactly
+        // as the same-module typechecker judges it.
+        {
+            std::vector<std::string> reqDefault;
+            for (const MetaGenericParam& mg : td.genericParams)
+                if (mg.requiresWellDefinedDefault)
+                    reqDefault.push_back(mg.name);
+            if (!reqDefault.empty())
+                publishImportedDefaultRequirement(ctx, t, reqDefault);
+        }
         // fix #3151 (§2.8.3 rule 4, v0.252): mirror the local rule from
         // reconstructTypeSymbol above — push to `baseTypeRefs` and
         // `baseTypes` under ONE guard (`kind == Named && declaration`) so

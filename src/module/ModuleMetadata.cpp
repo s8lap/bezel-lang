@@ -254,6 +254,10 @@ void hashGeneric(std::uint64_t& h, const MetaGenericParam& g) {
     for (const MetaType& c : g.constraintTypes) hashType(h, c);
     hashU64(h, g.specialConstraints.size());
     for (const std::string& s : g.specialConstraints) hashStr(h, s);
+    // fix #7094 (§17.11, v0.343): the §17.11 obligation is part of
+    // the parameter's identity — two blobs that differ only in it are
+    // semantically different interfaces, so the hash must separate them.
+    hashBool(h, g.requiresWellDefinedDefault);
 }
 
 void hashParam(std::uint64_t& h, const MetaParam& p) {
@@ -642,7 +646,11 @@ bool MetaType::operator==(const MetaType& o) const {
 bool MetaGenericParam::operator==(const MetaGenericParam& o) const {
     return name == o.name && variance == o.variance &&
            constraintTypes == o.constraintTypes &&
-           specialConstraints == o.specialConstraints;
+           specialConstraints == o.specialConstraints &&
+           // fix #7094 (§17.11, v0.343): the §17.11 obligation is
+           // part of the interface's identity — a blob that carries it and
+           // one that does not are different interfaces.
+           requiresWellDefinedDefault == o.requiresWellDefinedDefault;
 }
 
 bool MetaChoicePayloadField::operator==(const MetaChoicePayloadField& o) const {
@@ -950,8 +958,16 @@ void emitType(llvm::BitstreamWriter& w, const MetaType& t) {
 
 void emitGeneric(llvm::BitstreamWriter& w, const MetaGenericParam& g) {
     w.EnterSubblock(GENERIC_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 2> sc{g.constraintTypes.size(),
-                                           g.specialConstraints.size()};
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): a 3rd scalar
+    // carries the §17.11 obligation ("this parameter's substitution must be
+    // defaultable"). Additive within the current schema version, the #2392
+    // `outNullWhen` precedent: a reader predating this scalar never looks
+    // past index 1, and a current reader given a predating blob reads the
+    // missing 3rd scalar as false.
+    llvm::SmallVector<std::uint64_t, 3> sc{g.constraintTypes.size(),
+                                           g.specialConstraints.size(),
+                                           g.requiresWellDefinedDefault ? 1u
+                                                                         : 0u};
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, g.name);
     emitString(w, g.variance);
@@ -1903,9 +1919,13 @@ bool readType(Reader& r, MetaType& t) {
 }
 
 bool readGenericBody(Reader& r, MetaGenericParam& g) {
-    llvm::SmallVector<std::uint64_t, 2> sc;
+    llvm::SmallVector<std::uint64_t, 3> sc;
     if (!expectScalars(r, sc) || sc.size() < 2) return false;
     std::uint64_t nConstraints = sc[0];
+    // fix #7094 (§17.11, v0.343): the 3rd scalar is the §17.11
+    // obligation; absent (a predating blob) reads as false, the value every
+    // blob had before the field existed.
+    g.requiresWellDefinedDefault = sc.size() >= 3 ? (sc[2] != 0) : false;
     if (!expectString(r, g.name)) return false;
     if (!expectString(r, g.variance)) return false;
     if (!readStringList(r, g.specialConstraints)) return false;
