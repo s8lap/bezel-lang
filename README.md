@@ -4,17 +4,17 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-Bezel is built for **predictable performance and few surprises**. What a program costs should follow from what its source says, and what it does should not depend on rules the reader cannot see.
+Bezel is built for **predictable performance and few surprises**: a program should cost what its source says it costs, and do what its reader expects.
 
 Memory is where that matters most. In well-written code, a careful reader can already tell who owns every object and when it should be released. Bezel's premise is that the compiler should see it too. The part a reader infers from names and conventions — whether a function keeps what it is given, or hands back something new — becomes a word in the signature (`owned`, `scoped`), and a transfer out of a named variable is marked with `move`. The compiler works out the rest inside each function and inserts every release itself, on the normal path and when an exception passes through.
 
-The aim is to combine what garbage-collected languages and C++ each get right. Like a garbage-collected language, Bezel rules out memory corruption: no use-after-free and no double free, and where a stale reference does survive to run time, the default build raises an exception instead of reading freed memory. Like C++'s RAII, it releases everything at a known point, files, sockets and locks as well as memory, with no collector, no pause and no hidden reference count on the classes you write; unlike RAII, the compiler checks the rules instead of leaving them to discipline. The guarantees hold in multi-threaded programs too. No language can tell which reachable objects you still need, so a collection that only ever grows still grows, but nothing is ever simply forgotten.
+The result combines what garbage-collected languages and C++ each get right. As in a garbage-collected language, a memory error cannot silently corrupt the program: there is no use-after-free or double free, and if a stale reference does survive to run time, the default build raises an exception rather than reading freed memory. As with C++'s RAII, everything is released at a known point — files, sockets and locks as well as memory — with no collector, no pauses and no hidden reference counting on your classes. Unlike RAII, the compiler checks the rules instead of leaving them to discipline, and the guarantees hold across threads. What no language can do is tell which reachable objects you still need: a collection that only ever grows will still grow. But nothing is ever simply forgotten.
 
 The same aim runs through the rest of the language. Types are non-nullable unless written with `?`, integer arithmetic is checked for overflow, arithmetic on a possibly missing value is a compile error, and nothing converts implicitly between your own types.
 
 ## Status: experimental, expect things to break
 
-**The compiler is not reliable yet: expect arbitrary things to break at any moment while you write Bezel code.** The language design is close to settled and written down in full, and the compiler is still being brought up to it. Known bugs are tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The language may still change, and there are no stability guarantees. The compiler runs on Linux x86-64 only for now. If something breaks, please [report it](#reporting-a-bug).
+The design is close to settled and written down in full, but the compiler has not caught up with it yet. **Until it does, expect arbitrary things to break at any moment while you write Bezel code.** Known bugs are tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The language itself may still change, and there are no stability guarantees. The compiler runs on Linux x86-64 only for now. If something breaks, please [report it](#reporting-a-bug).
 
 ## A first look
 
