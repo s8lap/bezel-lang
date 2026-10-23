@@ -9702,19 +9702,29 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         bool nullableRecordTarget = false;
         if (sema::TypeRef* tt = ctx_.exprType(*ma.target))
             nullableRecordTarget = isNullableRecordTy(tt);
+        // The TAGGED nullable-record carrier layout for this record: {i8
+        // hasValue; <record payload>} (§7.2 / #416). It is a LITERAL struct,
+        // while a record's OWN layout is an IDENTIFIED one (`%record.P`) — so
+        // the carrier and a bare record can never be the same LLVM type, even
+        // when their element lists coincide (a record whose first field is a
+        // byte and whose second is another record has the same SHAPE as a
+        // carrier, but not the same type).
+        llvm::StructType* carrier =
+            llvm::StructType::get(llvm_, {nullablePrimHasValTy(), st});
         // CG29: prefer lvalue address so writes go to the original
         // memory (e.g. grid[2].Cells[x] := v must update grid[2],
         // not a stack copy). Fall back to lowerExpr for temporaries
         // (e.g. a freshly returned record value).
         llvm::Value* base = nullptr;
         llvm::Type* baseTy = nullptr;
+        // The STORAGE type at `base` — the type of the value that lives there,
+        // not of the pointer. It is what tells a TAGGED carrier slot from a
+        // bare-record slot (see the §12.7 arm below).
+        llvm::Type* storageTy = nullptr;
         // The struct the base pointer points at: the bare record struct, or the
         // tagged nullable-record struct when the target is a `record?`.
         llvm::StructType* baseStruct =
-            nullableRecordTarget
-                ? llvm::StructType::get(llvm_,
-                      {nullablePrimHasValTy(), st})
-                : st;
+            nullableRecordTarget ? carrier : st;
         // fix #3090 (§12.7 / §8.6, v0.252): `o.X` where `o: Object` is
         // §12.7-narrowed to this record reads the BOXED record, whose storage is
         // the box payload two words into the wrapper. Checked ahead of the
@@ -9726,12 +9736,15 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         llvm::Type* narrowedTy = nullptr;
         if (llvm::Value* np = narrowedBoxPayloadAddr(*ma.target, narrowedTy)) {
             base = np;
+            storageTy = narrowedTy;
         } else if (llvm::AllocaInst* slot = localSlot(*ma.target)) {
             // §27.5: a captured record local lives in its shared cell.
             llvm::Type* ety = nullptr;
             base = boxedStorage(slot, ety);
+            storageTy = ety;
         } else {
             base = lvalueAddr(*ma.target, baseTy);
+            storageTy = baseTy;
             if (!base) {
                 llvm::Value* obj = lowerThisAddrOr(*ma.target);
                 if (!obj) return nullptr;
@@ -9743,6 +9756,41 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                     base = tmp;
                 }
             }
+        }
+        if (!nullableRecordTarget && storageTy == carrier) {
+            // fix #7088 (§12.7 / §7.4, v0.340): a §12.7-TYPE-NARROWED carrier.
+            //
+            // §12.7 (v0.340) flow-narrows the carrier of a successful `is T`
+            // test to `T` inside the controlled block, and §7.4 (v0.340) places
+            // that narrowing there. The narrowing retypes the READ, not the
+            // STORAGE: `c`'s slot is still the tagged {i8, P} carrier, because
+            // the carrier's DECLARED type is `P?`. The sema type of the target
+            // is therefore the BARE record `P` — so `isNullableRecordTy` above
+            // answers NO and the payload GEP was skipped, leaving the member
+            // path to address the carrier's slot as if it held a bare record:
+            // the field GEP then lands on the carrier's OWN layout, so
+            // `c.Stock` read the `Sku` pointer's low half (measured: 2373392
+            // where 5 was expected) and `c.Sku` read the tag byte as a string
+            // pointer (malformed IR — "GEP base pointer is not a vector or a
+            // vector of pointers" — and a SIGSEGV in the generated program).
+            //
+            // §12.7 "a narrowing converts nothing": a narrowing retypes the
+            // carrier and converts no value, so the value still sitting in the
+            // slot is the TAGGED carrier and the member read must take its
+            // PAYLOAD. The same unwrap #7044 performs at the `with` site.
+            //
+            // The discriminator is the STORAGE, not the spelling: the address
+            // this access resolves to really holds a tagged carrier (its LLVM
+            // type is pointer-equal to `{i8, <this record>}`), so the payload
+            // is where the record's fields live. A plain non-nullable record
+            // source is NOT affected — its own layout is an IDENTIFIED struct
+            // (`%record.P`), and the carrier is a LITERAL one, so the pointer
+            // equality above can never hold for it (measured: a record whose
+            // layout coincidentally IS `{i8, T}` — `record Outer(Flag: byte,
+            // Value: Inner)` — keeps working unchanged). An UN-narrowed
+            // `record?` target keeps the §7.4 path above, untouched.
+            nullableRecordTarget = true;
+            baseStruct = carrier;
         }
         if (nullableRecordTarget) {
             // Step into the payload (tag-struct index 1) to reach the bare
