@@ -160,6 +160,13 @@ bezelc hello.bzl -o hello && ./hello
 | [Design rationale](https://s8lap.github.io/bezel-lang/rationale/) | why each decision was made, and what was declined |
 | [Design proposals](docs/proposals/README.md) | how the language was argued into shape: about 190 proposals, accepted, declined and pending, each with the alternatives it weighed |
 
+A few proposals are good reading on their own:
+
+- [0046, the ownership kernel](docs/proposals/0046-ownership-kernel-consolidation.md): the memory rules had grown rule by rule into case law; this restates them as nine kernel rules (K1–K9) and a register of axioms, with every rule traced back to them.
+- [0047, mechanized core semantics](docs/proposals/0047-mechanized-core-semantics.md): a pending plan to model that kernel in Lean and prove disposal exactly once and isolation between domains.
+- [0106, lessons from other languages](docs/proposals/0106-language-lessons-survey.md): 84 lessons from Ada/SPARK, the Wirth languages, Erlang, Rust, Go, Swift, C# and others, each judged against Bezel's design.
+- [0100, the body seam, examined and closed](docs/proposals/0100-the-body-seam-examined-and-closed.md): a whole exploration that ended in keeping things as they were, written up so the question need not be reopened from memory.
+
 Apart from the proposals, these are published together as a searchable site, one page per chapter, at **[s8lap.github.io/bezel-lang](https://s8lap.github.io/bezel-lang/)**. The site is rebuilt from `docs/` by `scripts/build_book.py` whenever the documents change on main.
 
 **Editor support:** [`editors/vscode/`](editors/vscode/) is a VS Code extension with syntax highlighting, editing rules and snippets. Its grammar is generated from the specification.
