@@ -102,6 +102,31 @@ std::string genericOver(const std::string& bound, const std::string& body,
            "return 0; end Main; end C;";
 }
 
+// The OWNING family: a generic method over a bare type parameter `T`
+// constrained to an owning head (`IOwningCollection` / `IOwningList`),
+// whose body is `body`, called with an `OwningArray<Item>` and an owned
+// `Item` binding named `it`.
+//
+// The `it` argument is a NAMED OWNED BINDING — the shape §22.3's call-site
+// transfer marker (`M(move it)`) governs. The non-generic spelling of the
+// same call (`a.Add(it)` on a concrete `OwningArray<Item>`) is rejected by
+// the compiler with "this call consumes `it`; write `M(move it)`".
+std::string genericOverOwning(const std::string& bound,
+                              const std::string& body,
+                              const std::string& decl = "") {
+    return "module M7086; "
+           "public class Item public method Get(): int return 4; end Get; "
+           "end Item; " +
+           decl +
+           "class C public static method G<T>(x: T, it: Item): int "
+           "where T: " + bound + " " + body + " end G; "
+           "public static method Main(): int "
+           "using var a: OwningArray<Item> := [new Item(), new Item()]; "
+           "var it: Item := new Item(); "
+           "Console.WriteLine(G(a, it)); "
+           "return 0; end Main; end C;";
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -280,12 +305,20 @@ BEZEL_TEST(constraint_collection_member_7086,
 // CONTROL 7 — the OWNING enumerator (stdlib §4.13) stays refused: admitting
 // it SEGFAULTs (MEASURED, exit 139), and a program that compiles and then
 // crashes is worse than a false rejection.
+//
+// The refusal TEXT changed with #7086's fix-forward: the constraint
+// `IOwningEnumerable` DOES establish the member (stdlib §4.13), so the old
+// "no member `GetOwningEnumerator` on bare type parameter `T`" was FALSE on
+// its face — the member IS there. The refusal now says so, and says why the
+// call is still refused. The row still asserts a compile-time reject with a
+// real location.
 BEZEL_TEST(constraint_collection_member_7086,
            owning_enumerable_getowning_enumerator_is_still_rejected_spec_4_13) {
     expectRejected(
         genericOver("IOwningEnumerable<int>",
                     "using var e := x.GetOwningEnumerator(); return 0;"),
-        "no member `GetOwningEnumerator` on bare type parameter `T`");
+        "`GetOwningEnumerator` through a type parameter constrained to "
+        "`IOwningEnumerable` is not supported");
 }
 
 // CONTROL 8 — the enumeration call through a type parameter whose
@@ -316,10 +349,21 @@ BEZEL_TEST(constraint_collection_member_7086,
 // builtin heads carry no member table to check the claim against, unlike
 // §12.5's check for a USER interface), and the call has no dispatch: sema
 // bound no member symbol (the head carries no declaration) and the collection
-// dispatch is structural. Without this refusal the call was DROPPED
-// SILENTLY — MEASURED, the user's own `Add` was never called and the program
-// printed the wrong answer with NO diagnostic. A loud refusal is the honest
-// answer for a shape the compiler cannot lower.
+// dispatch is structural. A loud refusal is the honest answer for a shape the
+// compiler cannot lower.
+//
+// WHAT WAS MEASURED (the comment here used to claim something else, and the
+// claim was FALSE). The "silently dropped, wrong answer, NO diagnostic" state
+// existed only in the producer's INTERMEDIATE tree and NEVER SHIPPED. At the
+// base (c1be4e19) this shape is a hard COMPILE-TIME REJECT — "no member
+// `Add` on bare type parameter `T`: a bare type parameter exposes only the
+// members its constraints establish (§3.6 rule 2 / §14.2)" — and the
+// coordinator measured the same rejection on the staging tip 3e3fc480. What
+// the parent commit actually changed is the TEXT of the refusal: the shape is
+// now refused with a LOCATED error of its own ("`Add` through a type
+// parameter has no dispatch for the substituted receiver type `MyL`")
+// instead of the base's "no member" wording. The row's needle below is
+// therefore unchanged, and this comment now says what was measured.
 BEZEL_TEST(constraint_collection_member_7086,
            user_class_substitution_is_rejected_spec_4_1) {
     expectRejected(
@@ -335,4 +379,150 @@ BEZEL_TEST(constraint_collection_member_7086,
         "Console.WriteLine(G(m)); "
         "return 0; end Main; end C;",
         "`Add` through a type parameter has no dispatch");
+}
+
+// ===========================================================================
+// THE FIX-FORWARD ROWS — the call is typed against the member's REAL
+// SIGNATURE (§22.5 arity, §5.1 argument type, §22.3's `owned` marker).
+//
+// The commit this fixes-forward admitted a documented collection member BY
+// NAME (the stdlib's surface table) and never typed the CALL against the
+// member's signature: the table's `arity` / element / index fields were read
+// NOWHERE in the tree. Three consequences, all MEASURED at that commit:
+//
+//   * the OWNING heads' `owned` parameter slot was not modelled at all, so
+//     `x.Add(it)` — `it` a named owned binding — was ACCEPTED where the base
+//     REJECTED it, and the program DISPOSED `it` TWICE (ASan:
+//     `heap-use-after-free` in `bz$elemDispose`);
+//   * a wrong ARGUMENT TYPE (`x.Add(7)` on `IList<string>`) produced
+//     MALFORMED IR and a compiler ICE;
+//   * a wrong ARITY (`x.Add(7, 8)`, `x.Insert(0)`) was admitted outright.
+//
+// Every row below asserts the compile-time REJECT with the diagnostic that
+// names the reason. Each one FAILS on the pre-fix commit (which accepted the
+// shape, or crashed the compiler) and PASSES here.
+// ===========================================================================
+
+// ROW 12 — stdlib §4.2: `IOwningCollection<T>` declares
+// `method Add(owned item: T)`, so §22.3's call-site transfer marker
+// (`M(move it)`) is REQUIRED on a named owned binding. The constraint head
+// carries no declaration and therefore no member symbol, so the compiler
+// cannot see that the parameter is `owned` — the call is REFUSED, loudly,
+// rather than admitted and double-disposed.
+BEZEL_TEST(constraint_collection_member_7086,
+           owning_collection_add_is_rejected_spec_4_2) {
+    expectRejected(
+        genericOverOwning("IOwningCollection<Item>", "x.Add(it); return x.Count;"),
+        "`Add` through a type parameter constrained to `IOwningCollection` "
+        "is not supported");
+}
+
+// ROW 13 — stdlib §4.2: `IOwningList<T>` declares
+// `method Insert(index: int, owned item: T)` — the same `owned` slot, on the
+// list head.
+BEZEL_TEST(constraint_collection_member_7086,
+           owning_list_insert_is_rejected_spec_4_2) {
+    expectRejected(
+        genericOverOwning("IOwningList<Item>", "x.Insert(0, it); return x.Count;"),
+        "`Insert` through a type parameter constrained to `IOwningList` "
+        "is not supported");
+}
+
+// ROW 14 — the CORRECT spelling of ROW 12 (`M(move it)`) is refused by the
+// same rule. The base rejected it too (with the "no member `Add` on bare
+// type parameter `T`" text), so this is a narrower refusal, not a new
+// rejection.
+BEZEL_TEST(constraint_collection_member_7086,
+           owning_collection_add_move_is_rejected_spec_4_2) {
+    expectRejected(
+        genericOverOwning("IOwningCollection<Item>",
+                          "x.Add(move it); return x.Count;"),
+        "`Add` through a type parameter constrained to `IOwningCollection` "
+        "is not supported");
+}
+
+// ROW 15 — stdlib §4.2: `IOwningCollection<T>: IReadOnlyCollection<T>,
+// IDisposable`, so the constraint DOES establish `Dispose`. The refusal now
+// says so; the earlier text ("no member `Dispose` on unconstrained type
+// parameter `T`") was FALSE on both counts — the parameter IS constrained,
+// and the head DOES declare the member.
+BEZEL_TEST(constraint_collection_member_7086,
+           owning_collection_dispose_is_rejected_spec_4_2) {
+    expectRejected(
+        genericOverOwning("IOwningCollection<Item>", "x.Dispose(); return 0;"),
+        "`Dispose` through a type parameter constrained to `IOwningCollection` "
+        "is not supported");
+}
+
+// ROW 16 — §22.5: `IList<T>` declares `method Add(item: T)` — ONE
+// parameter. The call supplies two.
+BEZEL_TEST(constraint_collection_member_7086,
+           ilist_add_wrong_arity_is_rejected_spec_22_5) {
+    expectRejected(genericOver("IList<int>", "x.Add(7, 8); return 0;"),
+                   "the call to `Add` supplies 2 argument(s) but `IList` "
+                   "declares 1");
+}
+
+// ROW 17 — §22.5: `IList<T>` declares `method Insert(index: int, item: T)`
+// — TWO parameters. The call supplies one.
+BEZEL_TEST(constraint_collection_member_7086,
+           ilist_insert_wrong_arity_is_rejected_spec_22_5) {
+    expectRejected(genericOver("IList<int>", "x.Insert(0); return 0;"),
+                   "the call to `Insert` supplies 1 argument(s) but `IList` "
+                   "declares 2");
+}
+
+// ROW 18 — §5.1: `IList<T>` declares `method Add(item: T)`, so the
+// argument must convert to the head's element type. A `string` does not
+// convert to `int`.
+BEZEL_TEST(constraint_collection_member_7086,
+           ilist_add_wrong_element_type_is_rejected_spec_5_1) {
+    expectRejected(genericOver("IList<int>", "x.Add(\"not an int\"); return 0;"),
+                   "the argument to `IList.Add` has a type that is not "
+                   "implicitly convertible to the target type");
+}
+
+// ROW 19 — §5.1: the INDEX parameter of `Insert(index: int, item: T)` is
+// an `int`. A `string` does not convert to `int`.
+//
+// This is the shape that reached the MALFORMED-IR lowering (a compiler ICE)
+// through the constraint path. The SAME shape reaches it through the direct
+// path too (`a.Insert("zero", 7)` on a concrete `Array<int>`) — that is a
+// PRE-EXISTING defect in the direct path's own lowering, reported
+// separately; this row pins the CONSTRAINT path, which must not reach it.
+BEZEL_TEST(constraint_collection_member_7086,
+           ilist_insert_wrong_index_type_is_rejected_spec_5_1) {
+    expectRejected(genericOver("IList<int>", "x.Insert(\"zero\", 7); return 0;"),
+                   "the `index` argument to `IList.Insert` has a type that "
+                   "is not implicitly convertible to the target type");
+}
+
+// ROW 20 — §5.1, the other direction: `IList<string>` declares
+// `method Add(item: T)` with `T = string`, so an `int` argument does not
+// convert. This is the shape that produced the compiler ICE
+// ("IR verification failed (malformed IR emitted)") through the constraint
+// path.
+BEZEL_TEST(constraint_collection_member_7086,
+           ilist_string_add_wrong_element_type_is_rejected_spec_5_1) {
+    expectRejected(genericOver("IList<string>", "x.Add(7); return 0;"),
+                   "the argument to `IList.Add` has a type that is not "
+                   "implicitly convertible to the target type");
+}
+
+// ROW 21 — stdlib §4.2: `IOwningCollection<T>` declares
+// `method Clear();  // disposes every element`. The owning family's element
+// DISPOSAL is an ownership effect the constraint path cannot reproduce: the
+// call leaves the collection undisposed and it LEAKS (MEASURED under ASan —
+// the elements are disposed, the collection's own storage is not freed),
+// while the same call on a concrete receiver, and on a concrete receiver
+// passed as a PARAMETER, is ASan-clean.
+//
+// The BORROWING family's `Clear` disposes nothing (stdlib §4.1) and stays
+// admitted — it measures identical to the direct path.
+BEZEL_TEST(constraint_collection_member_7086,
+           owning_collection_clear_is_rejected_spec_4_2) {
+    expectRejected(
+        genericOverOwning("IOwningCollection<Item>", "x.Clear(); return x.Count;"),
+        "`Clear` through a type parameter constrained to `IOwningCollection` "
+        "is not supported");
 }

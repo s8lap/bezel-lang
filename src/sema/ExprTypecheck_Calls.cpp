@@ -5776,9 +5776,8 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
 static TypeRef* builtinCollectionConstraintCallType(SemaContext& ctx,
                                                     const TypeRef* view,
                                                     std::string_view member);
-static bool builtinCollectionConstraintCallAdmitted(std::string_view member);
 static bool builtinCollectionConstraintPropertyAdmitted(
-    std::string_view member);
+    std::string_view head, std::string_view member);
 static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
                                                         const TypeRef* view,
                                                         std::string_view member);
@@ -10059,14 +10058,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // says the member IS there, so the call is admitted
                             // and typed from that surface.
                             //
+                            // The call is typed against the member's REAL
+                            // SIGNATURE — its arity (§22.5), its argument
+                            // types (§5.1) and, on the owning heads, its
+                            // `owned` parameter slot (§22.3) — or REFUSED
+                            // loudly with a diagnostic of its own. Admitting
+                            // a member BY NAME without typing the call
+                            // against its signature is what made the owning
+                            // heads' `Add` double-dispose its element and
+                            // made a wrong element type reach the
+                            // malformed-IR lowering.
+                            //
                             // The control side is unchanged: a name the head
                             // does NOT declare falls through to the reject
                             // below, exactly as it does for a head with no
                             // collection constraint at all.
                             if (TypeRef* view =
-                                        constraintCollectionView(paramName, mbr);
-                                view &&
-                                builtinCollectionConstraintCallAdmitted(mbr)) {
+                                    constraintCollectionView(paramName, mbr)) {
+                                if (!builtinCollectionConstraintCallChecked(
+                                        ce, view, mbr))
+                                    return;
                                 if (TypeRef* rt =
                                         builtinCollectionConstraintCallType(
                                             ctx_, view, mbr))
@@ -26408,31 +26419,55 @@ enum class BuiltinCollectionMemberShape {
 struct BuiltinCollectionMemberSig {
     BuiltinCollectionMemberShape shape = BuiltinCollectionMemberShape::None;
     int arity = 0;              // the declared parameter count of a METHOD
-    bool takesElement = false;  // a parameter is the element type
-    bool takesIndex = false;    // the FIRST parameter is the int index
+    int elementParam = -1;      // the ELEMENT-typed parameter's index (-1: none)
+    int indexParam = -1;        // the `index: int` parameter's index (-1: none)
+    bool elementOwned = false;  // the element parameter takes an `owned` value
 };
 
+// fix #7086 (stdlib §4.1 / §4.2, v0.340): the OWNING heads — the two whose
+// `Add`/`Insert` take an `owned` element (stdlib §4.2: "The mutating methods
+// take `owned` parameters where appropriate: `Add` and `Insert` take ownership
+// of the new element"). The owning-ness is a property of the HEAD, not of the
+// member name: `ICollection<T>.Add(item: T)` borrows and
+// `IOwningCollection<T>.Add(owned item: T)` transfers.
+static bool builtinCollectionHeadIsOwning(std::string_view head) {
+    return head == "IOwningCollection" || head == "IOwningList" ||
+           head == "IOwningEnumerable";
+}
+
+// fix #7086 (stdlib §4.1 / §4.2 / §4.12 / §4.13, v0.340): the SIGNATURE a
+// documented builtin-collection member carries, PER HEAD. The declared shapes,
+// verbatim from the stdlib:
+//
+//   §4.1  `method Add(item: T)` · `method Insert(index: int, item: T)`
+//   §4.2  `method Add(owned item: T)` · `method Insert(index: int, owned item: T)`
+//   §4.12 `method GetEnumerator(): owned IEnumerator<T>`
+//   §4.13 `method GetOwningEnumerator(): owned IOwningEnumerator<T>`
+//
+// The `elementOwned` flag is the head's: §4.1's `Add` borrows the element and
+// §4.2's transfers it.
 static BuiltinCollectionMemberSig builtinCollectionMemberSig(
-    std::string_view m) {
+    std::string_view head, std::string_view m) {
+    const bool owning = builtinCollectionHeadIsOwning(head);
     if (m == "Count")
-        return {BuiltinCollectionMemberShape::IntProperty, 0, false, false};
+        return {BuiltinCollectionMemberShape::IntProperty, 0, -1, -1, false};
     if (m == "IsReadOnly")
-        return {BuiltinCollectionMemberShape::BoolProperty, 0, false, false};
+        return {BuiltinCollectionMemberShape::BoolProperty, 0, -1, -1, false};
     if (m == "Add")
-        return {BuiltinCollectionMemberShape::UnitMethod, 1, true, false};
+        return {BuiltinCollectionMemberShape::UnitMethod, 1, 0, -1, owning};
     if (m == "Clear")
-        return {BuiltinCollectionMemberShape::UnitMethod, 0, false, false};
+        return {BuiltinCollectionMemberShape::UnitMethod, 0, -1, -1, false};
     if (m == "Contains" || m == "Remove")
-        return {BuiltinCollectionMemberShape::BoolMethod, 1, true, false};
+        return {BuiltinCollectionMemberShape::BoolMethod, 1, 0, -1, false};
     if (m == "Insert")
-        return {BuiltinCollectionMemberShape::UnitMethod, 2, true, true};
+        return {BuiltinCollectionMemberShape::UnitMethod, 2, 1, 0, owning};
     if (m == "GetEnumerator")
-        return {BuiltinCollectionMemberShape::BorrowingEnumerator, 0, false,
+        return {BuiltinCollectionMemberShape::BorrowingEnumerator, 0, -1, -1,
                 false};
     if (m == "GetOwningEnumerator")
-        return {BuiltinCollectionMemberShape::OwningEnumerator, 0, false, false};
+        return {BuiltinCollectionMemberShape::OwningEnumerator, 0, -1, -1, false};
     if (m == "Dispose")
-        return {BuiltinCollectionMemberShape::DisposeMethod, 0, false, false};
+        return {BuiltinCollectionMemberShape::DisposeMethod, 0, -1, -1, false};
     return {};
 }
 
@@ -26473,20 +26508,11 @@ static BuiltinCollectionMemberSig builtinCollectionMemberSig(
 //
 // Both are reported with their measurements; neither is silently admitted.
 static bool builtinCollectionConstraintPropertyAdmitted(
-    std::string_view member) {
+    std::string_view head, std::string_view member) {
     const BuiltinCollectionMemberShape shape =
-        builtinCollectionMemberSig(member).shape;
+        builtinCollectionMemberSig(head, member).shape;
     return shape == BuiltinCollectionMemberShape::IntProperty ||
            shape == BuiltinCollectionMemberShape::BoolProperty;
-}
-
-static bool builtinCollectionConstraintCallAdmitted(
-    std::string_view member) {
-    const BuiltinCollectionMemberShape shape =
-        builtinCollectionMemberSig(member).shape;
-    return shape == BuiltinCollectionMemberShape::UnitMethod ||
-           shape == BuiltinCollectionMemberShape::BoolMethod ||
-           shape == BuiltinCollectionMemberShape::BorrowingEnumerator;
 }
 
 // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the
@@ -26613,7 +26639,10 @@ static TypeRef* builtinCollectionEnumeratorType(SemaContext& ctx,
 static TypeRef* builtinCollectionConstraintCallType(SemaContext& ctx,
                                                     const TypeRef* view,
                                                     std::string_view member) {
-    const BuiltinCollectionMemberSig sig = builtinCollectionMemberSig(member);
+    const BuiltinCollectionMemberSig sig =
+        builtinCollectionMemberSig(view ? view->headName()
+                                        : std::string_view("IList"),
+                                    member);
     TypeRef* elem = builtinCollectionViewElement(view);
     switch (sig.shape) {
         case BuiltinCollectionMemberShape::UnitMethod:
@@ -26641,7 +26670,10 @@ static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
                                                         const TypeRef* view,
                                                         std::string_view member) {
     (void)view;  // the property shapes carry no element type
-    const BuiltinCollectionMemberSig sig = builtinCollectionMemberSig(member);
+    const BuiltinCollectionMemberSig sig =
+        builtinCollectionMemberSig(view ? view->headName()
+                                        : std::string_view("IList"),
+                                    member);
     switch (sig.shape) {
         case BuiltinCollectionMemberShape::IntProperty:
             return ctx.primitiveTypeRef(PrimitiveType::Int);
@@ -26650,6 +26682,210 @@ static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
         default:
             return nullptr;
     }
+}
+
+// fix #7086 (§14.2, §22.3, §22.5, §5.1, v0.340; stdlib §4.1, §4.2, §4.12,
+// §4.13): type a call to a documented builtin-collection member reached
+// through a type parameter's constraint AGAINST THE MEMBER'S REAL SIGNATURE.
+//
+// §14.2 (v0.340) puts the head's members — WITH their signatures — into T's
+// surface inside the generic body: "Inside the generic body, T's surface
+// includes IFoo's members". A call to one of them must therefore be typed
+// like a call to that member: the right ARITY (§22.5), the right ARGUMENT
+// TYPES (§5.1), and the right PARAMETER MODIFIERS (§22.3's `owned`
+// call-site transfer marker).
+//
+// The commit this fixes admitted these members BY NAME — the stdlib's
+// documented surface table — and never typed the CALL against the member's
+// signature, so the table's `arity` / element / index fields were read
+// NOWHERE. Three consequences, all MEASURED: the owning heads' `owned`
+// parameter slot was not modelled at all (a program the base REJECTED became
+// ACCEPTED and double-disposed its element — ASan heap-use-after-free); a
+// wrong element type produced MALFORMED IR and a compiler ICE; and a wrong
+// arity was admitted outright.
+//
+// The refusals below are the shapes this compiler cannot type yet. Each is a
+// LOUD refusal — a compile-time ERROR with a real location — because the
+// alternative (admitting the call) is either memory-unsafe or a wrong-answer
+// path. A refusal is a NARROWER behaviour than the base (which rejected these
+// shapes too, with a different message); an unsafe acceptance is not.
+//
+// Returns true when the call is admitted; false when a diagnostic has been
+// reported.
+bool ExprTC::builtinCollectionConstraintCallChecked(const ast::CallExpr& ce,
+                                                    TypeRef* view,
+                                                    std::string_view member) {
+    const std::string_view head = view->headName();
+    const BuiltinCollectionMemberSig sig =
+        builtinCollectionMemberSig(head, member);
+    const SourceLocation loc = ce.span.begin;
+
+    // (1) The OWNING heads' `Add`/`Insert` — stdlib §4.2 declares
+    //     `method Add(owned item: T)` on `IOwningCollection<T>` and
+    //     `method Insert(index: int, owned item: T)` on `IOwningList<T>`:
+    //     "The mutating methods take `owned` parameters where appropriate:
+    //     `Add` and `Insert` take ownership of the new element". §22.3
+    //     (v0.340), *Parameter modifiers*: "when the argument is a **named
+    //     owned binding** … the caller writes the transfer marker at the call
+    //     site: `M(move x)` … Omitting the marker on a named owned binding is
+    //     a compile error naming the fix."
+    //
+    //     The constraint head carries NO declaration and therefore no member
+    //     symbol, so nothing downstream of sema knows that this parameter is
+    //     `owned`: the ownership pass cannot see the sink, the transfer
+    //     marker is not required, and the element is disposed TWICE — once
+    //     by the collection that took it and once by the binding that still
+    //     owns it (MEASURED: ASan `heap-use-after-free` in `bz$elemDispose`).
+    //     The `owned` slot is modelled in the SIGNATURE TABLE above, but the
+    //     CALL-SITE marker cannot be enforced through a constraint, so the
+    //     shape is REFUSED until it can be. This is a sound interim, not a
+    //     completion. // per §22.3, v0.340
+    if (sig.elementOwned) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`" + std::string(member) + "` through a type parameter "
+            "constrained to `" + std::string(head) + "` is not supported: "
+            "the member takes an `owned` parameter (stdlib §4.2), and "
+            "§22.3's call-site transfer marker (`M(move x)`) is not checked "
+            "at a call through a type parameter — the constraint head "
+            "carries no declaration and therefore no member symbol, so the "
+            "compiler cannot see that the argument is consumed, and the "
+            "element would be disposed twice. Call the member on a concrete "
+            "receiver");
+        return false;
+    }
+
+    // (1b) The owning family's `Clear` — stdlib §4.2 declares
+    //      `method Clear();  // disposes every element` on
+    //      `IOwningCollection<T>`. The owning family's element DISPOSAL is
+    //      an ownership effect, and the constraint path cannot reproduce it
+    //      for a receiver reached through a type parameter: MEASURED under
+    //      ASan, `x.Clear()` on an `OwningArray<Item>` reached through
+    //      `where T: IOwningCollection<Item>` leaves the COLLECTION
+    //      undisposed and it LEAKS (the elements are disposed, the
+    //      collection's own storage is not freed), while the same call on a
+    //      concrete receiver — and on a concrete receiver passed as a
+    //      PARAMETER — is ASan-clean. The shape is REFUSED until the
+    //      owning semantics are reproduced. (The BORROWING family's `Clear`
+    //      disposes nothing — stdlib §4.1 — and is admitted: it measures
+    //      identical to the direct path.) // per §14.2, v0.340
+    if (builtinCollectionHeadIsOwning(head) && member == "Clear") {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`Clear` through a type parameter constrained to `" +
+                std::string(head) + "` is not supported: the owning family's "
+                "`Clear` disposes every element it holds (stdlib §4.2), and "
+                "the compiler cannot reproduce that ownership effect for a "
+                "receiver reached through a type parameter — MEASURED under "
+                "ASan, the collection is left undisposed and leaks. Call the "
+                "member on a concrete receiver");
+        return false;
+    }
+
+    // (2) `Dispose` on the owning heads — stdlib §4.2 declares
+    //     `IOwningCollection<T>: IReadOnlyCollection<T>, IDisposable`, so
+    //     the constraint DOES establish the member (§14.2). It is refused
+    //     here because the collection dispatch has no `Dispose` arm for a
+    //     receiver reached through a type parameter: the call would be
+    //     dropped and the elements would never be disposed. The refusal
+    //     NAMES the member and the head — the earlier "no member `Dispose`
+    //     on unconstrained type parameter `T`" was false on both counts
+    //     (the parameter IS constrained, and the head DOES declare the
+    //     member). // per §14.2, v0.340
+    if (sig.shape == BuiltinCollectionMemberShape::DisposeMethod) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`Dispose` through a type parameter constrained to `" +
+                std::string(head) + "` is not supported: the constraint "
+                "establishes the member (stdlib §4.2), but the compiler "
+                "cannot dispatch `Dispose` on a receiver reached through a "
+                "type parameter — the call would be dropped and the "
+                "collection's elements would never be disposed. Call it on "
+                "a concrete receiver");
+        return false;
+    }
+
+    // (3) The OWNING enumerator — stdlib §4.13 declares
+    //     `method GetOwningEnumerator(): owned IOwningEnumerator<T>` on
+    //     `IOwningEnumerable<T>`, so the constraint establishes the member
+    //     (§14.2). Admitting the CALL SEGFAULTs (MEASURED: exit 139 — the
+    //     owning enumeration path emits an enumerator over a value it
+    //     cannot enumerate), and a program that compiles and then crashes
+    //     is worse than a false rejection. // per §14.2, v0.340
+    if (sig.shape == BuiltinCollectionMemberShape::OwningEnumerator) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`GetOwningEnumerator` through a type parameter constrained to `" +
+                std::string(head) + "` is not supported: the constraint "
+                "establishes the member (stdlib §4.13), but a call to it "
+                "through a type parameter SEGFAULTs (MEASURED: exit 139). "
+                "Call it on a concrete receiver");
+        return false;
+    }
+
+    // (4) A PROPERTY called as a method (`x.Count()`) — the property shapes
+    //     carry no parameter list, so there is no call to type. // per §14.2
+    if (sig.shape == BuiltinCollectionMemberShape::IntProperty ||
+        sig.shape == BuiltinCollectionMemberShape::BoolProperty) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`" + std::string(member) + "` is a property of `" +
+                std::string(head) + "`, not a method — it cannot be "
+                "called (stdlib §4.1; §14.2, v0.340)");
+        return false;
+    }
+
+    // (5) The ARITY — §22.5's rule that a call supplies exactly the
+    //     parameters the callee declares. The non-generic spelling of the
+    //     same shape is rejected by the collection dispatch's own arity
+    //     check (§4.1's `Add(item: T)` / `Insert(index: int, item: T)`).
+    if (static_cast<int>(ce.args.size()) != sig.arity) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "the call to `" + std::string(member) + "` supplies " +
+                std::to_string(ce.args.size()) +
+                " argument(s) but `" + std::string(head) + "` declares " +
+                std::to_string(sig.arity) + " (§22.5, v0.340; stdlib "
+                "§4.1)");
+        return false;
+    }
+
+    // (6) The INDEX parameter — stdlib §4.1 declares
+    //     `method Insert(index: int, item: T)`, so the first parameter is
+    //     an `int`. The non-generic spelling of a wrong index type is NOT
+    //     rejected today (it reaches the malformed-IR lowering — a
+    //     PRE-EXISTING defect, reported separately), so this check is
+    //     what keeps the same shape from reaching that lowering through a
+    //     constraint. // per §5.1, v0.340
+    if (sig.indexParam >= 0 &&
+        static_cast<std::size_t>(sig.indexParam) < ce.args.size() &&
+        ce.args[sig.indexParam].value) {
+        TypeRef* argTy = ctx_.exprType(*ce.args[sig.indexParam].value);
+        checkAssignable(argTy, ctx_.primitiveTypeRef(PrimitiveType::Int),
+                        ce.args[sig.indexParam].value->span.begin,
+                        "`index` argument to `" + std::string(head) +
+                            "." + std::string(member) + "`",
+                        ce.args[sig.indexParam].value.get());
+    }
+
+    // (7) The ELEMENT parameter — stdlib §4.1 declares `method Add(item:
+    //     T)`, `method Contains(item: T): bool`, `method Remove(item: T):
+    //     bool` and `method Insert(index: int, item: T)`, so the argument
+    //     must convert to the head's element type (§5.1). The non-generic
+    //     spelling of a wrong element type is rejected with exactly this
+    //     diagnostic. // per §5.1, v0.340
+    if (sig.elementParam >= 0 &&
+        static_cast<std::size_t>(sig.elementParam) < ce.args.size() &&
+        ce.args[sig.elementParam].value) {
+        TypeRef* elemTy = builtinCollectionViewElement(view);
+        TypeRef* argTy = ctx_.exprType(*ce.args[sig.elementParam].value);
+        checkAssignable(argTy, elemTy,
+                        ce.args[sig.elementParam].value->span.begin,
+                        "argument to `" + std::string(head) + "." +
+                            std::string(member) + "`",
+                        ce.args[sig.elementParam].value.get());
+    }
+    return true;
 }
 
 
@@ -28691,14 +28927,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 constraintCollectionView(paramName, ma.member)) {
                             // A PROPERTY read (`x.Count`, `x.IsReadOnly`) is
                             // typed here. An INSTANCE CALL is typed by
-                            // typeCall, which owns the call's result type.
-                            // The shapes whose codegen path cannot resolve
-                            // the substitution are NOT admitted — they fall
-                            // through to the reject below (see
-                            // `builtinCollectionConstraintCallAdmitted`).
+                            // typeCall, which owns the call's result type
+                            // AND the call's own checks (its arity, its
+                            // argument types, and the `owned` marker on the
+                            // owning heads' members).
                             if (&ma != calleeOfCallCtx_) {
                                 if (builtinCollectionConstraintPropertyAdmitted(
-                                        ma.member)) {
+                                        view->headName(), ma.member)) {
                                     if (TypeRef* pt =
                                             builtinCollectionConstraintPropertyType(
                                                 ctx_, view, ma.member)) {
@@ -28706,10 +28941,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                         return;
                                     }
                                 }
-                            } else if (builtinCollectionConstraintCallAdmitted(
-                                           ma.member)) {
-                                // The callee position: typeCall admits the
-                                // call and sets its result type.
+                                // The METHOD-REFERENCE form (§27.6) of a
+                                // collection member stays refused: #7014
+                                // ruled that the reference form over a
+                                // collection head is not emitted, and its
+                                // call form is fenced, so the two must
+                                // agree. The refusal is unchanged by this
+                                // fix — it falls through to the reject below.
+                            } else {
+                                // The CALLEE position: typeCall owns the
+                                // call's typing and its refusals, so the
+                                // callee is left untyped here and ONE
+                                // diagnostic comes from typeCall. The
+                                // "no member ... on bare type parameter" text
+                                // below is FALSE for a member the head DOES
+                                // declare (§14.2), so it must not fire for
+                                // one.
                                 return;
                             }
                         }

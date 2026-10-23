@@ -665,6 +665,20 @@ private:
     TypeRef* constraintCollectionView(std::string_view paramName,
                                       std::string_view member);
 
+    // fix #7086 (§14.2, §22.3, §22.5, §5.1, v0.340; stdlib §4.1, §4.2,
+    // §4.12, §4.13): type a call to a documented builtin-collection member
+    // reached through a type parameter's constraint AGAINST THE MEMBER'S
+    // REAL SIGNATURE — its arity, its argument types, and (on the owning
+    // heads) its `owned` parameter slot — or REFUSE it loudly.
+    //
+    // `view` is the constraint-derived head (the declaration-less TypeRef of
+    // `IList<int>` for `where T: IList<int>`), and `member` the name the
+    // head declares. Returns true when the call is admitted; false when a
+    // diagnostic has been reported (the caller then reports nothing more).
+    bool builtinCollectionConstraintCallChecked(const ast::CallExpr& ce,
+                                                TypeRef* view,
+                                                std::string_view member);
+
     // Slice S6: in-progress method static-ness, so visitExpr's
     // IdentifierExpr handling can diagnose `this`/`base` in static
     // member bodies.
