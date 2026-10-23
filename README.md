@@ -195,7 +195,7 @@ Apart from the proposals, these are published together as a searchable site, one
 
 - **The design** is written down in full: the [specification](https://s8lap.github.io/bezel-lang/spec/), the [standard library](https://s8lap.github.io/bezel-lang/stdlib/) and the [rationale](https://s8lap.github.io/bezel-lang/rationale/), with one [changelog](https://s8lap.github.io/bezel-lang/changelog/) entry per revision.
 - **The compiler**, `bezelc`, is an ahead-of-time front end and LLVM back end. It compiles the language's core end to end — ownership and borrow checking, classes and generics, records, enums and choices, exceptions, collections and queries, `async`/`await`, multi-module builds — and much of the standard library.
-- **The gap** is measured. A rule corpus of one hand-written case per specification rule ([`tests/conformance/rules/`](tests/conformance/rules/)) records where the compiler still differs: of the 2,671 cases with a recorded result, 2,462 match the specification. Every difference has a tracking issue.
+- **The gap** is measured. A rule corpus of one hand-written case per specification rule ([`tests/conformance/rules/`](tests/conformance/rules/)) records where the compiler still differs: of the 3,085 cases with a recorded result, 2,873 match the specification. Every difference has a tracking issue.
 
 ## Repository layout
 
