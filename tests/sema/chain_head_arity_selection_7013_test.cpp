@@ -258,8 +258,14 @@ end C;
                                  ModuleSource{"App5", app}},
                                 "App5");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorWith(r, "is ambiguous: multiple imported modules "
-                                       "export a type with this name and arity"));
+    // fix #7083 (§2.2, v0.343): the collision diagnostic must cite BOTH
+    // ORIGINS — "a compile error citing both origins" — so the message names
+    // the two modules the colliding exports come from. The base's text
+    // ("multiple imported modules export a type with this name and arity")
+    // named the rule and not the origins.
+    BEZEL_EXPECT_TRUE(hasErrorWith(r, "is ambiguous: imported modules `LA` and "
+                                       "`LB` export a type with this name and "
+                                       "arity"));
     BEZEL_EXPECT_TRUE(hasErrorWith(r, "\xC2\xA7""2.2"));
     BEZEL_EXPECT_FALSE(r.ran);
 }

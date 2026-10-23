@@ -1,7 +1,10 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include <algorithm>  // fix #7083: std::sort / std::find — the ambiguity
+                       // diagnostic's module list must be deterministic
 #include <cstdio>   // send-back #4305: unhandledNullDeclClassConstraintSlot
 #include <cstdlib>  // send-back #4305: unhandledNullDeclClassConstraintSlot
+#include <vector>   // fix #7083: the colliding modules' names
 
 #include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
 #include "common/OwnershipFacts.hpp"   // isMoveOnlyValueType — §14.4 / §15.3 (#3794)
@@ -3961,15 +3964,27 @@ void Resolver::recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
 //     the same list that loop walks), restricted to the modules THIS FILE
 //     imported (`sourceImports_`).
 //
-// Returns the unique imported type of that (name, arity), or null. Sets
-// `*ambiguous` when two DISTINCT imported modules export that pair — §2.2's
-// collision, which the caller reports.
+// Returns the unique imported type of that (name, arity), or null. When two
+// or more DISTINCT imported modules export that pair — §2.2's collision, which
+// the caller reports — `*ambiguousModules` receives the ORIGIN modules' names.
+//
+// fix #7083 (§2.2, v0.343): §2.2 requires the collision diagnostic to cite
+// BOTH ORIGINS ("When two imported modules export the same public name, the
+// bare name is ambiguous: using it unqualified is a compile error citing both
+// origins"), so the module names are collected here rather than dropped.
+//
+// DETERMINISM. `sourceImports_` is an `unordered_set`, so the order in which
+// its members are visited is not the order they were imported in, and it is
+// not a property to rely on for a diagnostic's TEXT: the names are SORTED
+// before they are handed to the caller, so the message is byte-identical from
+// run to run however the set happens to be laid out.
 static TypeSymbol* selectImportedTypeByArity(
     SemaContext& ctx, const std::unordered_set<std::string>& sourceImports,
-    std::string_view name, std::size_t arity, bool* ambiguous) {
-    if (ambiguous) *ambiguous = false;
+    std::string_view name, std::size_t arity,
+    std::vector<std::string>* ambiguousModules) {
+    if (ambiguousModules) ambiguousModules->clear();
     TypeSymbol* found = nullptr;
-    std::string foundModule;
+    std::vector<std::string> modules;
     for (const std::string& mod : sourceImports) {
         const auto* exported = ctx.importedTypesOf(mod);
         if (!exported) continue;
@@ -3982,21 +3997,36 @@ static TypeSymbol* selectImportedTypeByArity(
             // an OPEN question there (#5140's HOLD). This lookup stays out of
             // that set rather than deciding it.
             if (isAlwaysAvailableBareName(t->name)) continue;
-            if (!found) {
-                found = t;
-                foundModule = mod;
-                continue;
-            }
-            if (foundModule != mod) {
-                // §2.2 collision: a second (different) import exports this
-                // (name, arity).
-                if (ambiguous) *ambiguous = true;
-                return nullptr;
-            }
-            // else: the same module listed twice (no-op).
+            if (!found) found = t;
+            // The same module may list the pair twice (a duplicate export);
+            // it is ONE origin, so it is recorded once.
+            if (std::find(modules.begin(), modules.end(), mod) == modules.end())
+                modules.push_back(mod);
         }
     }
+    // §2.2 collision: two (or more) DISTINCT imported modules export this
+    // (name, arity), so the bare name has no unique referent.
+    if (modules.size() >= 2) {
+        if (ambiguousModules) {
+            std::sort(modules.begin(), modules.end());
+            *ambiguousModules = modules;
+        }
+        return nullptr;
+    }
     return found;
+}
+
+// fix #7083 (§2.2, v0.343): the origin modules of a §2.2 collision, as the
+// diagnostic's list: "`LA` and `LB`", or "`LA`, `LB` and `LC`". The names are
+// already sorted by the caller, so the text does not depend on the order the
+// imports were visited in.
+static std::string citeOriginModules(const std::vector<std::string>& modules) {
+    std::string out;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        if (i) out += i + 1 == modules.size() ? " and " : ", ";
+        out += "`" + modules[i] + "`";
+    }
+    return out;
 }
 
 // fix #6965 review (§11.6, §2.2, Appendix C.1, v0.340): a dotted type name
@@ -4245,21 +4275,29 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     }
                     // Arity mismatch — skip this candidate, keep looking.
                 }
-                bool ambiguous = false;
+                std::vector<std::string> ambiguousModules;
                 if (!selected) {
                     // Rule 1's IMPORTED positions.
                     selected = selectImportedTypeByArity(
-                        ctx_, sourceImports_, first, 0, &ambiguous);
+                        ctx_, sourceImports_, first, 0, &ambiguousModules);
                 }
                 if (selected) {
                     sym = selected;
-                } else if (ambiguous) {
+                } else if (!ambiguousModules.empty()) {
+                    // fix #7083 (§2.2, v0.343): §2.2 requires the collision
+                    // diagnostic to cite BOTH ORIGINS — "When two imported
+                    // modules export the same public name, the bare name is
+                    // ambiguous: using it unqualified is a compile error citing
+                    // both origins; the fix is qualification (full module name
+                    // or an alias)". The origin modules are named here, in a
+                    // deterministic (sorted) order.
                     ctx_.diagnostics().report(
                         Severity::Error, t.span.begin,
                         std::string("bare name `") + std::string(first) +
-                        "` is ambiguous: multiple imported modules export a type "
-                        "with this name and arity; qualify it via a "
-                        "module-qualified name or an import alias "
+                        "` is ambiguous: imported modules " +
+                        citeOriginModules(ambiguousModules) +
+                        " export a type with this name and arity; qualify it "
+                        "via a module-qualified name or an import alias "
                         "(\xC2\xA7""2.2)");
                     ref.kind = TypeRef::Kind::Error;
                     return;
