@@ -6073,6 +6073,74 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     if (!ga) continue;
                     ref.genericArgs.push_back(resolveType(*ga, scope));
                 }
+                // fix #7010 (§2.2 arity selection, §2.3, §16.3, v0.340):
+                // §2.2 names this exact case — "a non-generic `Counter`
+                // and the always-available `Counter<K>` are two names,
+                // neither colliding with nor shadowing the other" — so
+                // `Range<T>` at a user `record Range` is the BUILTIN
+                // `Range<T>`, and the ref must carry the builtin's
+                // identity, not merely a null declaration.
+                //
+                // MEASURED before this arm, at `record Range(Lo, Hi)` +
+                // `var xs: Range<int> := r` (r the user record): the ref
+                // reached the typecheck pass as a Named with
+                // `declaration == nullptr`, so EVERY identity test keyed
+                // on `builtinClassSym("Range")` missed it —
+                //   * the §16.3 `T` restriction never ran (`Range<bool>`,
+                //     `Range<float>`, `Range<string>` all accepted; the
+                //     same spellings without a user `Range` are rejected
+                //     with §16.3's diagnostic), and
+                //   * `var xs: Range<int> := r` was accepted, because the
+                //     identity-conversion test compares declarations and
+                //     two null declarations compare equal, so the user
+                //     RECORD was taken as a `Range<int>`.
+                // The counter `Set` shows why the arm cannot be narrowed to
+                // `Range` alone: `record Set(V)` + `Set<bool>` is likewise
+                // accepted (MEASURED on the base, unchanged by this commit —
+                // `Set<T>`'s hashability rule is §3.6/§8.3, not an
+                // element-type restriction, so that one is a separate gap).
+                // `Set`'s own TypeRef shape is already CONSISTENT across both
+                // paths, because the always-available generic collections
+                // carry `declaration = nullptr` with or without a shadowing
+                // declaration. `Range` is the outlier precisely because §16.3
+                // requires its pointer-equality stamp, and `Ptr` and the
+                // synthesized interfaces need theirs for the same reason.
+                //
+                // The stamp is exactly what Slice S24 applies for the
+                // same names on the no-shadowing path (`first == "Range"`
+                // → `ctx_.builtinClassSym("Range")`, its `Ptr` and
+                // synthesized-interface siblings), so both spellings now
+                // produce ONE TypeRef shape. The §16.3 element check is
+                // duplicated here rather than shared because S24's copy
+                // sits in a different translation-unit-local helper and
+                // this arm runs after S24 in the same pass.
+                std::string_view headName = t.name->parts.front();
+                if (headName == "Range") {
+                    ref.declaration = ctx_.builtinClassSym("Range");
+                    // §16.3 (v0.340): T is restricted to the integer types
+                    // and `char`. `ref.genericArgs[0]` is post-resolution
+                    // (the loop above), so the predicate reads a resolved
+                    // TypeRef; an unresolved forward reference is null and
+                    // keeps the predicate's null-tolerant contract, the
+                    // downstream use re-erroring.
+                    if (!ref.genericArgs.empty() &&
+                        !isValidRangeElementType(ref.genericArgs[0])) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("`Range<T>` requires T to be one of "
+                                        "the integer types or `char` \xe2\x80\x94 "
+                                        "got `") +
+                                rangeElementTypeName(ref.genericArgs[0]) +
+                                "` (\xc2\xa7""16.3)");
+                    }
+                } else if (headName == "Ptr") {
+                    // §10.5 / stdlib §5: `Ptr<T>` is a compiler-intrinsic
+                    // record; the sibling of the `Range` arm in Slice S24.
+                    ref.declaration = ctx_.builtinClassSym("Ptr");
+                } else if (SemaContext::isSynthesizedBuiltinInterfaceName(
+                               headName)) {
+                    ref.declaration = ctx_.builtinInterfaceSym(headName);
+                }
             } else {
                 ctx_.diagnostics().report(
                     Severity::Error, t.span.begin,
