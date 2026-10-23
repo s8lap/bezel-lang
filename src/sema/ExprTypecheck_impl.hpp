@@ -636,8 +636,34 @@ private:
     // §11.8: enumerate the `type`-kind constraint bounds declared for
     // `paramName` (method constraints first, then the enclosing type's),
     // invoking `fn` with each resolved bound TypeRef until it returns true.
+    //
+    // fix #7086 (§14.2, v0.340): `includeDeclarationless` widens the walk to
+    // the bounds that carry NO declaration — the eight builtin COLLECTION
+    // interface heads (stdlib §4.1, §4.2, §4.12, §4.13), which have no
+    // TypeSymbol and therefore no member table. The DEFAULT walk skips them
+    // because every one of its callers reads `ctr->declaration`; the widened
+    // walk is for the caller that asks a NAME question over the stdlib's
+    // documented collection surface instead (see `constraintCollectionView`).
     bool forEachConstraintBound(std::string_view paramName,
-                                const std::function<bool(TypeRef*)>& fn);
+                                const std::function<bool(TypeRef*)>& fn,
+                                bool includeDeclarationless = false);
+    // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the
+    // constraint-derived BUILTIN COLLECTION view of the bare type parameter
+    // `paramName` — the declaration-less TypeRef of the builtin collection
+    // interface head the parameter is constrained to (`IList<int>` for
+    // `where T: IList<int>`), when that head's DOCUMENTED surface declares
+    // `member`. Null when there is no such bound, or when the bound's head
+    // does not declare that name.
+    //
+    // The eight builtin collection heads carry NO declaration, so the
+    // ordinary constraint walk cannot see them and §14.2's "inside the
+    // generic body, T's surface includes IFoo's members" reaches them
+    // nowhere. This asks the same question over the DECLARATION-LESS bounds
+    // and over a USER interface's declaration-less ancestors (stdlib §4.1's
+    // `interface MyI: IList<int>`), and answers it with the stdlib's own
+    // documented surface.
+    TypeRef* constraintCollectionView(std::string_view paramName,
+                                      std::string_view member);
 
     // Slice S6: in-progress method static-ness, so visitExpr's
     // IdentifierExpr handling can diagnose `this`/`base` in static

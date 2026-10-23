@@ -14036,7 +14036,8 @@ GenericParamSymbol* ExprTC::typeParamMarker(std::string_view name) {
 // T1/T2 repro pair fully round-trip. With BOTH arms added, `T.Zero()`
 // resolves and returns identically local vs. imported.
 bool ExprTC::forEachConstraintBound(
-    std::string_view paramName, const std::function<bool(TypeRef*)>& fn) {
+    std::string_view paramName, const std::function<bool(TypeRef*)>& fn,
+    bool includeDeclarationless) {
     // §14.2 type-parameter bounds: a constraint bound may itself be another type
     // parameter (`where T: U`). In that case `T` inherits `U`'s constraint-
     // derived member surface ("T conforms to every interface that U's own
@@ -14105,6 +14106,15 @@ bool ExprTC::forEachConstraintBound(
             TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
             if (!ctr || ctr->kind != TypeRef::Kind::Named) return false;
             if (ctr->declaration) return fn(ctr);  // concrete class/iface bound
+            // fix #7086 (§14.2, v0.340): a bound with NO declaration is one of
+            // the eight builtin COLLECTION interface heads (stdlib §4.1, §4.2,
+            // §4.12, §4.13) — they carry no TypeSymbol and therefore no member
+            // table, which is why the ordinary walk skips them. The widened
+            // walk hands them to the caller that asks the NAME question over
+            // the stdlib's documented collection surface
+            // (`constraintCollectionView`); every other caller reads
+            // `ctr->declaration` and must not see them.
+            if (includeDeclarationless && fn(ctr)) return true;
             // A bound with no declaration whose single-part name is another
             // in-scope type parameter is a `where nm: <param>` bound — enqueue
             // that parameter so its own constraint surface is searched too.

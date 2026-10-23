@@ -5769,6 +5769,20 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
 
 // Slice 3h: resolve a CallExpr's return type from the callee's
 // resolved MethodSymbol.
+// fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: forward
+// declarations of the builtin-collection constraint helpers. Their
+// definitions sit beside the stdlib surface tables they read (below), but
+// `typeCall` — which is earlier in this file — uses one of them.
+static TypeRef* builtinCollectionConstraintCallType(SemaContext& ctx,
+                                                    const TypeRef* view,
+                                                    std::string_view member);
+static bool builtinCollectionConstraintCallAdmitted(std::string_view member);
+static bool builtinCollectionConstraintPropertyAdmitted(
+    std::string_view member);
+static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
+                                                        const TypeRef* view,
+                                                        std::string_view member);
+
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
     // §22.16 (v0.250, #3038): `old(E)` — the callee is the contextual
@@ -10035,6 +10049,30 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                         if (isDeclaredParam) {
+                            // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2,
+                            // §4.12, §4.13: a `where T: IList<int>` bound DOES
+                            // provide this member — §14.2: "Inside the generic
+                            // body, T's surface includes IFoo's members". The
+                            // eight builtin collection heads carry no
+                            // declaration, which is why the constraint walk
+                            // cannot see them; the stdlib's documented surface
+                            // says the member IS there, so the call is admitted
+                            // and typed from that surface.
+                            //
+                            // The control side is unchanged: a name the head
+                            // does NOT declare falls through to the reject
+                            // below, exactly as it does for a head with no
+                            // collection constraint at all.
+                            if (TypeRef* view =
+                                        constraintCollectionView(paramName, mbr);
+                                view &&
+                                builtinCollectionConstraintCallAdmitted(mbr)) {
+                                if (TypeRef* rt =
+                                        builtinCollectionConstraintCallType(
+                                            ctx_, view, mbr))
+                                    ctx_.setExprType(&ce, rt);
+                                return;
+                            }
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 "no member `" + std::string(mbr) +
@@ -26336,6 +26374,285 @@ static bool isDocumentedBuiltinCollectionMember(std::string_view head,
     return false;
 }
 
+// fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the SHAPE of a
+// documented builtin-collection member.
+//
+// `isDocumentedBuiltinCollectionMember` is the single authority for WHICH
+// NAMES a head declares; this table adds the SIGNATURE each one carries,
+// which the §14.2 constraint walk needs to type a member reached through a
+// bare type parameter (`where T: IList<int>` → `x.Add(1)`, `x.Count`). The
+// declared shapes, verbatim from the stdlib:
+//
+//   §4.1  `pure readonly property Count: int`
+//         `readonly property IsReadOnly: bool`
+//         `method Add(item: T)` · `method Clear()`
+//         `method Contains(item: T): bool` · `method Remove(item: T): bool`
+//         `method Insert(index: int, item: T)`
+//   §4.2  the same surface, with `owned item: T` on the owning pair
+//   §4.12 `method GetEnumerator(): owned IEnumerator<T>`
+//   §4.13 `method GetOwningEnumerator(): owned IOwningEnumerator<T>`
+//
+// The head→name mapping is NOT repeated here — it stays in
+// `isDocumentedBuiltinCollectionMember`, so the two cannot drift apart.
+enum class BuiltinCollectionMemberShape {
+    None,
+    IntProperty,         // `Count`
+    BoolProperty,        // `IsReadOnly`
+    UnitMethod,          // `Add` / `Clear` / `Insert`
+    BoolMethod,          // `Contains` / `Remove`
+    BorrowingEnumerator,  // `GetEnumerator`
+    OwningEnumerator,     // `GetOwningEnumerator`
+    DisposeMethod,        // `Dispose`
+};
+
+struct BuiltinCollectionMemberSig {
+    BuiltinCollectionMemberShape shape = BuiltinCollectionMemberShape::None;
+    int arity = 0;              // the declared parameter count of a METHOD
+    bool takesElement = false;  // a parameter is the element type
+    bool takesIndex = false;    // the FIRST parameter is the int index
+};
+
+static BuiltinCollectionMemberSig builtinCollectionMemberSig(
+    std::string_view m) {
+    if (m == "Count")
+        return {BuiltinCollectionMemberShape::IntProperty, 0, false, false};
+    if (m == "IsReadOnly")
+        return {BuiltinCollectionMemberShape::BoolProperty, 0, false, false};
+    if (m == "Add")
+        return {BuiltinCollectionMemberShape::UnitMethod, 1, true, false};
+    if (m == "Clear")
+        return {BuiltinCollectionMemberShape::UnitMethod, 0, false, false};
+    if (m == "Contains" || m == "Remove")
+        return {BuiltinCollectionMemberShape::BoolMethod, 1, true, false};
+    if (m == "Insert")
+        return {BuiltinCollectionMemberShape::UnitMethod, 2, true, true};
+    if (m == "GetEnumerator")
+        return {BuiltinCollectionMemberShape::BorrowingEnumerator, 0, false,
+                false};
+    if (m == "GetOwningEnumerator")
+        return {BuiltinCollectionMemberShape::OwningEnumerator, 0, false, false};
+    if (m == "Dispose")
+        return {BuiltinCollectionMemberShape::DisposeMethod, 0, false, false};
+    return {};
+}
+
+// fix #7086 (§14.2, v0.340): the documented collection members this fix
+// ADMITS through a type parameter's constraint.
+//
+// The admission is limited to the members whose CODEGEN path resolves a bare
+// type parameter's substitution:
+//
+//   * the two PROPERTY reads (`Count` / `IsReadOnly`) — the property-read
+//     path resolves the receiver through the active substitution
+//     (LlvmBackend_Exprs.cpp's `resolveTypeParamRef`), so the read answers
+//     the member's real value;
+//   * the five INSTANCE CALLS (`Add` / `Clear` / `Contains` / `Remove` /
+//     `Insert`) — the collection-call path dispatches on the receiver's
+//     SEM type, so the concrete type is restated for the duration of the
+//     call's lowering (LlvmBackend_Exprs.cpp, #7086);
+//   * `GetEnumerator` (stdlib §4.12) — the enumeration path reads the
+//     receiver's type the same way, and the concrete type is restated the
+//     same way. The restatement is REFUSED for a receiver that is not a
+//     concrete array-backed collection (the collection-interface heads erase
+//     the concrete backing), and the refusal is a compile-time ERROR: the
+//     non-generic spelling of the same shape is rejected the same way
+//     (#2457), and admitting it SEGFAULTED (MEASURED: exit 139).
+//
+// The two shapes NOT admitted are measured SEGFAULTS, and a program that
+// compiles and then crashes is worse than a false rejection:
+//
+//   * `GetOwningEnumerator` (stdlib §4.13) — the owning enumeration path
+//     emits an enumerator over a value it cannot enumerate, and the program
+//     SEGFAULTs at the first `MoveNext()` (MEASURED: exit 139);
+//   * the METHOD-REFERENCE form (`var g: (int) -> bool := x.Contains;`,
+//     §27.6) — the method-reference lowering does not resolve the receiver
+//     either, so the bound function value degrades to a zero and calling it
+//     SEGFAULTs. (The ORDINARY receiver has the same gap — #7014 owns it,
+//     and #7014's ruling is that the reference form over a collection head
+//     is REJECTED, not emitted.)
+//
+// Both are reported with their measurements; neither is silently admitted.
+static bool builtinCollectionConstraintPropertyAdmitted(
+    std::string_view member) {
+    const BuiltinCollectionMemberShape shape =
+        builtinCollectionMemberSig(member).shape;
+    return shape == BuiltinCollectionMemberShape::IntProperty ||
+           shape == BuiltinCollectionMemberShape::BoolProperty;
+}
+
+static bool builtinCollectionConstraintCallAdmitted(
+    std::string_view member) {
+    const BuiltinCollectionMemberShape shape =
+        builtinCollectionMemberSig(member).shape;
+    return shape == BuiltinCollectionMemberShape::UnitMethod ||
+           shape == BuiltinCollectionMemberShape::BoolMethod ||
+           shape == BuiltinCollectionMemberShape::BorrowingEnumerator;
+}
+
+// fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the
+// constraint-derived BUILTIN COLLECTION view of a bare type parameter.
+//
+// §14.2 (v0.340) decides the case: "Inside the generic body, T's surface
+// includes IFoo's members, regardless of which conformance category T
+// belongs to." The compiler already does this for the seven builtin
+// interfaces that carry a REAL synthesized Interface TypeSymbol
+// (`SemaContext::isSynthesizedBuiltinInterfaceName` — IComparable,
+// IEquatable, …): `where T: IComparable<int>` + `x.CompareTo(o)` resolves.
+// The eight builtin COLLECTION interfaces carry NO declaration and therefore
+// no member table, so the ordinary constraint walk
+// (`ExprTC::forEachConstraintBound`) cannot see them at all and §14.2's
+// sentence reaches them nowhere.
+//
+// This asks the same question over the DECLARATION-LESS bounds and over a
+// USER interface's declaration-less ancestors (stdlib §4.1's
+// `interface MyI: IList<int>` — `Add` is inherited by MyI from IList<int>),
+// and answers it with the stdlib's own documented surface.
+//
+// The answer is the DECLARATION-LESS TypeRef of the head — the very shape an
+// ordinary `IList<int>` receiver carries — so every downstream consumer
+// (sema's collection typing, codegen's collection dispatch) sees the same
+// thing it sees for a non-generic receiver.
+TypeRef* ExprTC::constraintCollectionView(std::string_view paramName,
+                                          std::string_view member) {
+    TypeRef* found = nullptr;
+    forEachConstraintBound(
+        paramName,
+        [&](TypeRef* ctr) -> bool {
+            // (a) The bound IS one of the eight builtin collection heads.
+            if (!ctr->declaration) {
+                const char* section = nullptr;
+                const char* surface = nullptr;
+                if (!builtinCollectionInterfaceSurface(ctr->headName(), section,
+                                                       surface))
+                    return false;
+                if (!isDocumentedBuiltinCollectionMember(ctr->headName(),
+                                                         member))
+                    return false;
+                found = ctr;
+                return true;
+            }
+            // (b) The bound is a USER interface (or class): the member may be
+            // INHERITED from a declaration-less builtin collection head
+            // (`interface MyI: IList<int>` — stdlib §4.1). The declared bases
+            // that carry no user TypeSymbol live in `nonSymbolBaseRefs`
+            // (TypeResolution_Names.cpp), and the interface's own symbolic
+            // bases are walked in the same closure.
+            std::vector<TypeSymbol*> frontier{ctr->declaration};
+            std::unordered_set<TypeSymbol*> visited;
+            std::size_t i = 0;
+            while (i < frontier.size()) {
+                TypeSymbol* sym = frontier[i++];
+                if (!sym || !visited.insert(sym).second) continue;
+                for (const TypeRef* br : nonSymbolBaseRefsOf(sym)) {
+                    if (!br || br->kind != TypeRef::Kind::Named ||
+                        br->declaration)
+                        continue;
+                    const char* section = nullptr;
+                    const char* surface = nullptr;
+                    if (!builtinCollectionInterfaceSurface(br->headName(),
+                                                           section, surface))
+                        continue;
+                    if (!isDocumentedBuiltinCollectionMember(br->headName(),
+                                                             member))
+                        continue;
+                    found = const_cast<TypeRef*>(br);
+                    return true;
+                }
+                for (TypeSymbol* b : sym->baseTypes)
+                    if (b) frontier.push_back(b);
+            }
+            return false;
+        },
+        /*includeDeclarationless=*/true);
+    return found;
+}
+
+// fix #7086 (§14.2, v0.340): the ELEMENT type of a collection view — the
+// view's own type argument (stdlib §4.1: `IList<T>`'s `T`).
+static TypeRef* builtinCollectionViewElement(const TypeRef* view) {
+    if (!view || view->genericArgs.empty()) return nullptr;
+    return view->genericArgs[0];
+}
+
+// fix #7086 (§14.2, v0.340) + stdlib §4.12, §4.13: the `owned IEnumerator<T>`
+// / `owned IOwningEnumerator<T>` result of the two enumeration members. The
+// same declaration-less Named-ref shape the ordinary `Array<T>.GetEnumerator()`
+// uses (ExprTypecheck_Calls.cpp's #1002 arm), so codegen's manual-protocol
+// typing fires on it exactly as it does there.
+static TypeRef* builtinCollectionEnumeratorType(SemaContext& ctx,
+                                                TypeRef* elem,
+                                                bool owning) {
+    if (!elem) return nullptr;
+    static const ast::Type* kBorrowingNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("IEnumerator");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    static const ast::Type* kOwningNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("IOwningEnumerator");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    TypeRef* tr = ctx.makeTypeRef();
+    tr->kind = TypeRef::Kind::Named;
+    tr->declaration = nullptr;
+    tr->astNode = owning ? kOwningNode : kBorrowingNode;
+    tr->genericArgs.push_back(elem);
+    return tr;
+}
+
+// fix #7086 (§14.2, v0.340): the RESULT TYPE of a call to a documented
+// builtin-collection member reached through a type parameter's constraint.
+// The declared shapes are stdlib §4.1, §4.2, §4.12, §4.13.
+static TypeRef* builtinCollectionConstraintCallType(SemaContext& ctx,
+                                                    const TypeRef* view,
+                                                    std::string_view member) {
+    const BuiltinCollectionMemberSig sig = builtinCollectionMemberSig(member);
+    TypeRef* elem = builtinCollectionViewElement(view);
+    switch (sig.shape) {
+        case BuiltinCollectionMemberShape::UnitMethod:
+        case BuiltinCollectionMemberShape::DisposeMethod: {
+            TypeRef* u = ctx.makeTypeRef();
+            u->kind = TypeRef::Kind::Unit;
+            return u;
+        }
+        case BuiltinCollectionMemberShape::BoolMethod:
+            return ctx.primitiveTypeRef(PrimitiveType::Bool);
+        case BuiltinCollectionMemberShape::BorrowingEnumerator:
+            return builtinCollectionEnumeratorType(ctx, elem, /*owning=*/false);
+        case BuiltinCollectionMemberShape::OwningEnumerator:
+            return builtinCollectionEnumeratorType(ctx, elem, /*owning=*/true);
+        default:
+            return nullptr;
+    }
+}
+
+// fix #7086 (§14.2, v0.340): the type of a PROPERTY read of a documented
+// builtin-collection member reached through a type parameter's constraint
+// (`x.Count` → `int`, `x.IsReadOnly` → `bool`; stdlib §4.1, §4.2). Null
+// when the member is not a property.
+static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
+                                                        const TypeRef* view,
+                                                        std::string_view member) {
+    (void)view;  // the property shapes carry no element type
+    const BuiltinCollectionMemberSig sig = builtinCollectionMemberSig(member);
+    switch (sig.shape) {
+        case BuiltinCollectionMemberShape::IntProperty:
+            return ctx.primitiveTypeRef(PrimitiveType::Int);
+        case BuiltinCollectionMemberShape::BoolProperty:
+            return ctx.primitiveTypeRef(PrimitiveType::Bool);
+        default:
+            return nullptr;
+    }
+}
+
+
 // fix #7015 (stdlib §5, v0.340): EVERY operator name stdlib §5 documents.
 // `kStdlibLinqOverloads` (src/sema/LinqStdlibOverloads.hpp) is the §5 listing
 // the compiler already reads for the arity gate (#3726); the set of names it
@@ -28356,6 +28673,46 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "GetHashCode" || ma.member == "GetType" ||
                         ma.member == "ReferenceEquals" || ma.member == "Dispose";
                     if (!isUniversalObjMember) {
+                        // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12,
+                        // §4.13: a `where T: IList<int>` bound establishes
+                        // IList's DOCUMENTED member surface inside the generic
+                        // body. §14.2: "Inside the generic body, T's surface
+                        // includes IFoo's members, regardless of which
+                        // conformance category T belongs to." The eight
+                        // builtin collection heads carry NO declaration and
+                        // therefore no member table, which is why the
+                        // constraint walk above cannot see them at all.
+                        //
+                        // The control side is unchanged: a name the head does
+                        // NOT declare still falls through to the reject below,
+                        // and a name on a head with no collection bound at all
+                        // is unaffected.
+                        if (TypeRef* view =
+                                constraintCollectionView(paramName, ma.member)) {
+                            // A PROPERTY read (`x.Count`, `x.IsReadOnly`) is
+                            // typed here. An INSTANCE CALL is typed by
+                            // typeCall, which owns the call's result type.
+                            // The shapes whose codegen path cannot resolve
+                            // the substitution are NOT admitted — they fall
+                            // through to the reject below (see
+                            // `builtinCollectionConstraintCallAdmitted`).
+                            if (&ma != calleeOfCallCtx_) {
+                                if (builtinCollectionConstraintPropertyAdmitted(
+                                        ma.member)) {
+                                    if (TypeRef* pt =
+                                            builtinCollectionConstraintPropertyType(
+                                                ctx_, view, ma.member)) {
+                                        ctx_.setExprType(&ma, pt);
+                                        return;
+                                    }
+                                }
+                            } else if (builtinCollectionConstraintCallAdmitted(
+                                           ma.member)) {
+                                // The callee position: typeCall admits the
+                                // call and sets its result type.
+                                return;
+                            }
+                        }
                         // #6757 (§3.6 rule 2 / §14.2, the #5449 ruling): a class
                         // bound that derives from a built-in exception brings §31.4's
                         // surface with it (`Message` / `StackTrace` / `CauseChain` on

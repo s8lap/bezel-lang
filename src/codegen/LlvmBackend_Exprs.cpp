@@ -49,6 +49,23 @@ namespace bezel::codegen {
 // this exact placeholder body, treating a still-bare `T` as `int` is not a
 // guess: it is the one representation every possible caller has already been
 // forced into.
+// fix #7086 (§14.2, stdlib §4.1 / §4.2, v0.340): the member names a
+// builtin COLLECTION head's documented surface can establish — the ones this
+// fix admits through a type parameter's constraint. A CALL to one of them on
+// a receiver whose substituted type is NOT a collection has no dispatch at
+// all: sema bound no member (the head carries no declaration, so there is
+// nothing to bind) and the collection dispatch is structural (an array-backed
+// receiver only). The guard below refuses that shape loudly.
+//
+// The names are the ones `builtinCollectionMemberSig` (src/sema/
+// ExprTypecheck_Calls.cpp, the sema half of this fix) admits — the two
+// properties and the instance methods — MINUS the enumeration members, which
+// have their own refusal (the enumeration path, not the collection one).
+static bool isCollectionSurfaceMemberName(std::string_view m) {
+    return m == "Count" || m == "IsReadOnly" || m == "Add" || m == "Clear" ||
+           m == "Contains" || m == "Remove" || m == "Insert";
+}
+
 static sema::TypeRef* genericParamSoundAtI32ForPlaceholder(
         sema::SemaContext& ctx, sema::MethodSymbol* currentMethod,
         std::string_view paramName) {
@@ -1558,6 +1575,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         return lowerConditional(*cond);
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // fix #7086 (§14.2, v0.340): the CONCRETE type a bare-type-parameter
+        // receiver stands for, and the receiver node it belongs to. Filled in
+        // by the member-callee block below; consumed at the `lowerCall`
+        // dispatch, which is where the collection dispatch reads the
+        // receiver's SEM type.
+        const ast::Expr* callRecvExpr = nullptr;
+        const sema::TypeRef* callRecvConcreteTy = nullptr;
         // CG42: `x?.M(args)` — a call whose callee is a null-conditional
         // member access skips the call when the receiver is null.
         if (call->callee) {
@@ -1649,6 +1673,126 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         if (auto* p = genericParamSoundAtI32ForPlaceholder(
                                 ctx_, currentMethod_, tt->headName()))
                             tt = p;
+                    }
+                    // fix #7086 (§14.2, v0.340): a receiver typed as a BARE
+                    // TYPE PARAMETER (`x: T` under `where T: IList<int>`)
+                    // stands for the CONCRETE type the parameter is
+                    // substituted with — the same authority the #6757
+                    // exception-surface arm below reads ("A receiver typed as
+                    // a bare type parameter … resolves to its concrete type
+                    // through the active substitution, as every other
+                    // receiver does"). The collection dispatch
+                    // (`tryLowerCollectionInstanceCall`) reads the receiver's
+                    // SEM type, so the concrete type is carried to the
+                    // `lowerCall` dispatch, where it is restated for the
+                    // duration of that call's lowering.
+                    //
+                    // Only a CONCRETE COLLECTION substitution is carried: the
+                    // generic TEMPLATE body (the dead placeholder, `T` at its
+                    // i32 representation) has no substitution, so the bare `T`
+                    // stands there and the dispatch keeps its established
+                    // behaviour. The OWNING list interface is excluded for the
+                    // reason `tryLowerCollectionInstanceCall` excludes it:
+                    // mutation through it disposes owned elements.
+                    {
+                        auto* recvTy = ctx_.exprType(*ma->target);
+                        // The same `isBareTypeParamRef` gate: the concrete
+                        // type is the one the RECEIVER'S OWN type parameter
+                        // is substituted with, and `resolveTypeParamRef`
+                        // resolves BY HEAD NAME — an ungated call would
+                        // resolve a receiver whose type is spelled like a
+                        // generic parameter (the #5449 `G.Stack<int>` shape)
+                        // to that parameter's substitution.
+                        auto* concTy = isBareTypeParamRef(recvTy)
+                                           ? resolveTypeParamRef(recvTy)
+                                           : recvTy;
+                        bool concOwning = false;
+                        // The ENUMERATION members are carried only for a
+                        // CONCRETE array-backed collection: the enumeration
+                        // path has no dispatch for a LIST-INTERFACE receiver
+                        // (the same gap the non-generic form reports as
+                        // #2457 — "GetEnumerator on built-in type `IList`
+                        // produced no value"), and restating the receiver as
+                        // the interface would leave the enumerator with no
+                        // value at all.
+                        bool memberIsEnumerator =
+                            ma->member == "GetEnumerator" ||
+                            ma->member == "GetOwningEnumerator";
+                        if (concTy && concTy != recvTy) {
+                            if (memberIsEnumerator && !isCollectionTypeName(concTy)) {
+                                // fix #7086 (§14.2, stdlib §4.12, v0.340): the
+                                // enumeration call reached through a type
+                                // parameter has NO dispatch for a receiver
+                                // that is not a concrete array-backed
+                                // collection. Without this the compiler
+                                // emitted an enumerator over a value it
+                                // cannot enumerate, and the program SEGFAULTED
+                                // at the first `MoveNext()` (MEASURED: exit
+                                // 139) — a crash is worse than a rejection.
+                                // The non-generic spelling of the same shape
+                                // is REJECTED by the compiler
+                                // (#2457), so the type-parameter spelling is
+                                // rejected too.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, call->span.begin,
+                                    "`" + std::string(ma->member) +
+                                        "` through a type parameter has no "
+                                        "dispatch for the substituted "
+                                        "receiver type `" +
+                                        std::string(concTy->headName()) +
+                                        "`: the compiler can enumerate a "
+                                        "CONCRETE array-backed collection "
+                                        "through a constrained type parameter "
+                                        "(stdlib §4.12 / §4.1); the "
+                                        "collection-interface heads erase the "
+                                        "concrete backing");
+                                return nullptr;
+                            }
+                            if (isCollectionTypeName(concTy) ||
+                                (!memberIsEnumerator &&
+                                 isListInterfaceName(concTy, &concOwning) &&
+                                 !concOwning)) {
+                                callRecvExpr = ma->target.get();
+                                callRecvConcreteTy = concTy;
+                            } else if (isCollectionSurfaceMemberName(ma->member) &&
+                                       ctx_.exprSymbol(*ma) == nullptr) {
+                                // fix #7086 (§14.2, stdlib §4.1, v0.340): the
+                                // substituted type is NOT a collection, so the
+                                // structural collection dispatch has no arm for
+                                // it — and sema bound NO member symbol for the
+                                // call (the constraint head carries no
+                                // declaration, which is why the member was
+                                // admitted at all). There is therefore no
+                                // dispatch for this call, and the statement
+                                // would be DROPPED SILENTLY: MEASURED, the
+                                // user's own `Add` was never called and the
+                                // program printed the wrong answer with no
+                                // diagnostic. The #2445 substitution-site
+                                // diagnostic covers the READ path (the same
+                                // shape's `Count` read is rejected); the CALL
+                                // path has no equivalent, so this refusal
+                                // supplies it.
+                                //
+                                // A call that DID bind a member symbol (a
+                                // constraint that declares the member itself —
+                                // a user interface or a user class) is
+                                // dispatched the ordinary way and is not
+                                // refused here.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, call->span.begin,
+                                    "`" + std::string(ma->member) +
+                                        "` through a type parameter has no "
+                                        "dispatch for the substituted "
+                                        "receiver type `" +
+                                        std::string(concTy->headName()) +
+                                        "`: the compiler can call a "
+                                        "collection member through a "
+                                        "constrained type parameter only for "
+                                        "an array-backed collection (stdlib "
+                                        "§4.1 / §4.2)");
+                                return nullptr;
+                            }
+                        }
                     }
                     // fix #2661 (spec §8.5, v0.252): `Range<T>.ToString()` —
                     // §8.5's AUTO-EQUALITY BODY-RECORD default, which §8.5
@@ -2450,6 +2594,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                 }
             }
+        }
+        if (callRecvExpr && callRecvConcreteTy) {
+            // fix #7086 (§14.2, v0.340): restate the receiver's type as the
+            // CONCRETE type it stands for, for the duration of this call's
+            // lowering, so the collection dispatch sees the receiver it
+            // dispatches on. The statement is RESTORED afterwards: the AST
+            // and its sema types are shared by every specialization of a
+            // generic body (§2.8.3 rule 4 — one body, one substitution at a
+            // time), so a type left restated would be read by the NEXT
+            // specialization, whose concrete type is a different one.
+            auto* savedRecvTy = ctx_.exprType(*callRecvExpr);
+            ctx_.setExprType(callRecvExpr,
+                             const_cast<sema::TypeRef*>(callRecvConcreteTy));
+            llvm::Value* lowered = lowerCall(*call);
+            ctx_.setExprType(callRecvExpr, savedRecvTy);
+            return lowered;
         }
         return lowerCall(*call);
     }
@@ -5591,7 +5751,27 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // AST-structural, not symbol-based.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "IsReadOnly") {
-            auto* tt = ctx_.exprType(*ma->target);
+            // fix #7086 (§14.2, v0.340): a receiver typed as a BARE TYPE
+            // PARAMETER (`x: T` under `where T: ICollection<int>`) stands for
+            // the CONCRETE type the parameter is substituted with, so the
+            // read resolves to that concrete type's own `IsReadOnly` — the
+            // same authority the #6757 exception-surface arm below already
+            // reads ("A receiver typed as a bare type parameter … resolves to
+            // its concrete type through the active substitution, as every
+            // other receiver does"). Without it the read saw the bare `T`,
+            // matched no family, and degraded the slot to zero.
+            //
+            // `resolveTypeParamRef` resolves BY HEAD NAME, so it is gated on
+            // the receiver's type really being a bare type PARAMETER
+            // (`isBareTypeParamRef` — the #5024 helper's gate). Without the
+            // gate a receiver whose type is spelled like a generic parameter
+            // is resolved to that parameter's substitution: the #5449 shape
+            // (`import System.Collections.Generic as G;` + `class
+            // Holder<Stack>` + `new G.Stack<int>()`) resolved `G.Stack<int>`
+            // to `string`, and the count read degraded to zero.
+            auto* recvTy = ctx_.exprType(*ma->target);
+            auto* tt = isBareTypeParamRef(recvTy) ? resolveTypeParamRef(recvTy)
+                                                   : recvTy;
             // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
             // (astNode-less, head in `importedName`) must match the same arm.
             std::string_view cn =
@@ -5719,7 +5899,30 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // Dictionary<K,V>.Count — runtime bz_dict_count.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && (ma->member == "Length" || ma->member == "Count")) {
-            auto* tt = ctx_.exprType(*ma->target);
+            // fix #7086 (§14.2, v0.340): a receiver typed as a BARE TYPE
+            // PARAMETER (`x: T` under `where T: IList<int>`) stands for the
+            // CONCRETE type the parameter is substituted with, so the count
+            // read resolves to that concrete type's own count — the same
+            // authority the #6757 exception-surface arm below already reads
+            // ("A receiver typed as a bare type parameter … resolves to its
+            // concrete type through the active substitution, as every other
+            // receiver does"). Without it the read saw the bare `T`, matched
+            // no collection arm, and degraded the slot to zero.
+            //
+            // The generic TEMPLATE body (the dead placeholder, `T` at its i32
+            // representation) has no substitution, so `resolveTypeParamRef`
+            // returns the bare `T` unchanged there and the read falls through
+            // to the #2547 degrade — the dead body's own established
+            // behaviour, in a body no live call reaches.
+            //
+            // The same `isBareTypeParamRef` gate as the `IsReadOnly` arm
+            // above: `resolveTypeParamRef` resolves BY HEAD NAME, so an
+            // ungated call would resolve a receiver whose type is spelled
+            // like a generic parameter (the #5449 `G.Stack<int>` shape) to
+            // that parameter's substitution.
+            auto* recvTy = ctx_.exprType(*ma->target);
+            auto* tt = isBareTypeParamRef(recvTy) ? resolveTypeParamRef(recvTy)
+                                                   : recvTy;
             // StringBuilder.Length: sum of all part lengths.
             // fix-forward #6776 (§2.5, stdlib §3.1, v0.340): `headName()`
             // alone, so an IMPORTED `StringBuilder` (astNode-less, head in
