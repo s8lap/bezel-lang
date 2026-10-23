@@ -865,11 +865,10 @@ end D;
 // ambiguous. The inherited `N<U>` (arity 1) is not selected, so the fallback
 // must not fire and swallow the collision diagnostic.
 //
-// The collision's TEXT is the pre-existing sibling site's ("multiple imported
-// modules export a type with this name and arity") — the site that omits the
-// origins is a separate, already-filed gap, so this row pins the parts of the
-// message that are stable across that fix: the "bare name `N` is ambiguous"
-// prefix and the remedy.
+// The collision's TEXT is the sibling site's — the site that used to omit the
+// origins, which #7096 fixed (it now names them) — so this row pins the parts
+// of the message that are stable across that fix: the "bare name `N` is
+// ambiguous" prefix and the remedy.
 BEZEL_TEST(inherited_nested_type_bare_name_7012,
            ambiguous_import_collision_is_not_swallowed_by_the_arity_fallback_spec_2_2) {
     const std::string la = R"(

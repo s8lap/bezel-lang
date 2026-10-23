@@ -5512,9 +5512,20 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // reference's arity is `t.genericArgs.size()`; for a bare reference
         // (arity 0) we check (first, 0).
         std::size_t refArityForAmbiguity = t.genericArgs.size();
-        if (!ambiguousImportNames_.empty() &&
-            ambiguousImportNames_.count(
-                std::make_pair(std::string(first), refArityForAmbiguity))) {
+        auto ambiguousIt = ambiguousImportNames_.find(
+            std::make_pair(std::string(first), refArityForAmbiguity));
+        if (ambiguousIt != ambiguousImportNames_.end()) {
+            // fix #7096 (§2.2, v0.343): §2.2 requires the collision
+            // diagnostic to cite BOTH ORIGINS — "When two imported modules
+            // export the same public name, the bare name is ambiguous: using
+            // it unqualified is a compile error citing both origins; the fix
+            // is qualification (full module name or alias)". The origin
+            // modules are read from the collision table, which the import
+            // loop fills with them (TypeResolution.cpp); they are already
+            // sorted and deduplicated there, so the text does not depend on
+            // the order the imports were visited in. The wording and the
+            // origin list are the chain-head collision site's (#7083), so the
+            // two sites read as one rule.
             ctx_.diagnostics().report(
                 Severity::Error, t.span.begin,
                 std::string("bare name `") + std::string(first) +
@@ -5522,9 +5533,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                      ? std::string("")
                      : std::string("<") +
                            std::to_string(refArityForAmbiguity) + ">") +
-                "` is ambiguous: multiple imported modules export a type "
-                "with this name and arity; qualify it via a module-qualified "
-                "name or an import alias (\xC2\xA7""2.2)");
+                "` is ambiguous: imported modules " +
+                citeOriginModules(ambiguousIt->second) +
+                " export a type with this name and arity; qualify it via a "
+                "module-qualified name or an import alias (\xC2\xA7""2.2)");
             ref.kind = TypeRef::Kind::Error;
             return;
         }

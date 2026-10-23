@@ -223,7 +223,16 @@ private:
                    (std::hash<std::size_t>{}(p.second) * 0x9e3779b9);
         }
     };
-    std::unordered_set<std::pair<std::string, std::size_t>, PairHash>
+    // fix #7096 (§2.2, v0.343): the collision table is a MAP now, from the
+    // (name, arity) key to the ORIGIN MODULES that export it — §2.2 requires
+    // the diagnostic to cite both origins ("a compile error citing both
+    // origins"), and the origin modules are known only HERE, in the import
+    // loop that populates the table (TypeResolution.cpp). The value is
+    // SORTED and DEDUPED, so the diagnostic's text does not depend on the
+    // order the imports were visited in — the same guarantee the chain-head
+    // collision site gives (#7083).
+    std::unordered_map<std::pair<std::string, std::size_t>,
+                       std::vector<std::string>, PairHash>
         ambiguousImportNames_;
 
     // fix #5172 (§2.2, v0.310): every imported type is recorded here by

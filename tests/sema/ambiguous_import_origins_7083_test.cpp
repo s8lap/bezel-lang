@@ -29,13 +29,12 @@
 // are written, so the message is byte-identical from run to run.
 //
 // SCOPE — what is deliberately NOT claimed, and why:
-//   * The PRE-EXISTING sibling diagnostic (the §2.2 collision reported when
-//     nothing in scope binds the name, `src/sema/TypeResolution_Names.cpp`'s
-//     `ambiguousImportNames_` arm) still reads "multiple imported modules".
-//     §2.2's requirement reaches it too, but naming its origins means
-//     recording them where the import loop populates the collision set
-//     (`src/sema/TypeResolution.cpp`), which is outside this fix's file. The
-//     deferral is named in the commit body, not left silent.
+//   * The SIBLING diagnostic — the §2.2 collision reported when nothing in
+//     scope binds the name, `src/sema/TypeResolution_Names.cpp`'s
+//     `ambiguousImportNames_` arm — was the same defect, and #7096 fixed it:
+//     it cites both origins too, read from the same collision table (the
+//     import loop records the origin modules there). Its rows live in
+//     `tests/sema/ambiguous_import_origins_7096_test.cpp`.
 //   * The collision is at the (name, ARITY) pair, not the bare name
 //     (§2.2's own "a non-generic `Counter` and the always-available
 //     `Counter<K>` are two names, neither colliding with nor shadowing the

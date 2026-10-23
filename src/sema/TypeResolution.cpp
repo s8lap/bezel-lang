@@ -1,8 +1,10 @@
 #include "sema/TypeResolution.hpp"
 #include "sema/TypeResolution_impl.hpp"
 
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "ast/Node.hpp"
 #include "common/BuiltinRegistry.hpp"
@@ -305,6 +307,20 @@ void Resolver::run(const ast::SourceFile& src) {
         // ambiguous and lost the arity-selecting lookup the spec defines.
         std::unordered_map<std::pair<std::string, std::size_t>, std::string,
                            PairHash> importedNameOrigin;
+        // fix #7096 (§2.2, v0.343): the ORIGIN modules of each (name, arity)
+        // pair — every imported module that exports it, in the order the
+        // imports were visited. §2.2 requires the collision diagnostic to
+        // cite BOTH origins ("a compile error citing both origins"), and this
+        // loop is the only place that knows them: it applies the rules that
+        // decide which exports count at all (a local declaration shadows the
+        // import; an always-available name is excluded; a self-import is
+        // skipped). Recomputing the origins at the report site would
+        // duplicate those rules in a second place — a drift channel for a
+        // diagnostic that has to be exactly right — so they are recorded
+        // HERE and only formatted at the report site.
+        std::unordered_map<std::pair<std::string, std::size_t>,
+                           std::vector<std::string>, PairHash>
+            importOrigins;
         for (const auto& imp : src.imports) {
             if (!imp || !imp->name) continue;
             std::string dotted;
@@ -354,6 +370,14 @@ void Resolver::run(const ast::SourceFile& src) {
                 // directly on `genericParams`.
                 std::size_t arity = t->genericParams.size();
                 auto key = std::make_pair(std::string(t->name), arity);
+                // fix #7096 (§2.2, v0.343): record this module as an ORIGIN of
+                // the (name, arity) pair. The same module may list the pair
+                // twice (a duplicate export) — it is ONE origin, so it is
+                // recorded once.
+                std::vector<std::string>& origins = importOrigins[key];
+                if (std::find(origins.begin(), origins.end(), dotted) ==
+                    origins.end())
+                    origins.push_back(dotted);
                 auto [originIt, inserted] =
                     importedNameOrigin.emplace(key, dotted);
                 if (inserted) {
@@ -377,7 +401,22 @@ void Resolver::run(const ast::SourceFile& src) {
                     // (arity=0) reference may still resolve to an
                     // unambiguously-imported arity=0 from elsewhere; only
                     // the colliding (name, arity) pair is rejected.
-                    ambiguousImportNames_.insert(key);
+                    //
+                    // fix #7096 (§2.2, v0.343): the collision table carries the
+                    // ORIGIN modules as well as the key, because §2.2 requires
+                    // the diagnostic to cite both origins. The list is the
+                    // union of the modules that exported this pair (a third
+                    // colliding import adds its own), SORTED so the message's
+                    // text does not depend on the order the imports were
+                    // visited in — the guarantee the chain-head collision site
+                    // gives (#7083).
+                    std::vector<std::string>& cited = ambiguousImportNames_[key];
+                    for (const std::string& origin : origins) {
+                        if (std::find(cited.begin(), cited.end(), origin) ==
+                            cited.end())
+                            cited.push_back(origin);
+                    }
+                    std::sort(cited.begin(), cited.end());
                     moduleScope.names.erase(std::string_view(t->name));
                 }
                 // else: same module listed twice (no-op).
