@@ -1,5 +1,7 @@
 # Bezel
 
+[![Latest pre-release](https://img.shields.io/github/v/release/s8lap/bezel-lang?include_prereleases&label=pre-release)](https://github.com/s8lap/bezel-lang/releases) [![Documentation](https://img.shields.io/badge/docs-s8lap.github.io%2Fbezel--lang-blue)](https://s8lap.github.io/bezel-lang/) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
+
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
 Bezel is built for **predictable performance and few surprises**. What a program costs should follow from what its source says, and what it does should not depend on rules the reader cannot see.
@@ -10,7 +12,7 @@ The same aim runs through the rest of the language. Types are non-nullable unles
 
 ## Status: experimental, expect things to break
 
-**The compiler is not reliable yet: expect arbitrary things to break at any moment while you write Bezel code.** The language design is close to settled and written down in full, and the compiler is still being brought up to it. Known bugs are tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The language may still change, and there are no stability guarantees.
+**The compiler is not reliable yet: expect arbitrary things to break at any moment while you write Bezel code.** The language design is close to settled and written down in full, and the compiler is still being brought up to it. Known bugs are tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The language may still change, and there are no stability guarantees. The compiler runs on Linux x86-64 only for now. If something breaks, please [report it](#reporting-a-bug).
 
 ## A first look
 
@@ -91,6 +93,7 @@ It prints `10 x pen: charged 12.50`, `1 x ink: refused, no product 'ink'`, `7 x 
 - **Non-null by default.** A `Connection` always holds an object; only a `Connection?` may hold `null` ([§7](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-nullability-2)). The compiler checks the difference at every assignment, argument and return, and calling a member on a `Connection?` is a compile error until a check such as `if c <> null then` has ruled `null` out. A non-nullable field must be initialized where it is declared or by every constructor ([§7.9](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-definite-assignment-for-non-nullable-fields)). Missing values are handled in the open with `?.`, `??` and `??=`, and `!` asserts that a value is present, throwing `NullReferenceException` if it is not.
 - **Predictable costs and behaviour.** Objects are released at points you can find in the source, never by a background collector. Integer overflow throws `OverflowException` instead of wrapping ([§6.1](https://s8lap.github.io/bezel-lang/spec/07-6-arithmetic-and-overflow.html#sec-integer-arithmetic)). Arithmetic on a nullable number is a compile error, not a silent `null` ([§7.11](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-lifted-operators)). User types cannot declare conversion operators, so no hidden conversion runs on a call or an assignment ([§25.4](https://s8lap.github.io/bezel-lang/spec/26-25-operator-overloading.html#sec-no-user-defined-conversion-operators)).
 - **Ownership you can read.** A declaration says who owns a slot (`owned` on a parameter, a return type or a field), and the use site, or the `owned` slot a value is stored into, shows where ownership moves (`move`). An assignment never transfers anything silently.
+- **Compared with Rust.** The ownership model is close to Rust's: one owner per object, explicit transfers, and borrows checked against their owners. Bezel asks less of the programmer. There are no lifetime annotations, and no rule that a value has only one writer at a time: code inside one execution domain may share and mutate freely, because freedom from data races comes from the domains rather than from restricting aliases. The price is that a small class of mistakes Rust rejects at compile time shows up in Bezel at run time, as a deterministic `DisposedAccessException` in the default build ([rationale §1](https://s8lap.github.io/bezel-lang/rationale/02-1-the-big-picture.html#sec-the-big-picture)).
 - **Familiar everywhere else.** Classes, interfaces, generics, records, enums, sum types (`choice`) with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions and contracts (`requires`/`ensures`), in a syntax from the Pascal family with a type system close to C#'s.
 - **A specification first.** The language is defined by a normative specification, and every rule is pinned by a test that states the specification's verdict, not the compiler's.
 
@@ -207,14 +210,23 @@ editors/  editor support (VS Code)
 scripts/  build, test and documentation tooling
 ```
 
+## Reporting a bug
+
+Bug reports are very welcome, and the compiler has plenty of bugs to find. Please [open an issue](https://github.com/s8lap/bezel-lang/issues/new/choose) with:
+
+- the compiler version (`bezelc --version`, or the release you downloaded);
+- the smallest `.bzl` program that shows the problem;
+- what the compiler or the program did, and what you expected.
+
+When you are not sure whether the compiler or the specification is wrong, say so: questions about what the specification means are welcome too, and the specification decides. A crash, a leak or a memory error in a compiled program is always a bug.
+
 ## Contributing and testing
 
-The project works specification first: if the compiler and the specification disagree, the compiler is wrong, and every fix ships a regression test that cites the section it enforces. [`CLAUDE.md`](CLAUDE.md) is the project's working discipline, [`tests/README.md`](tests/README.md) explains how to write a test, and [`docs/proposals/spec-change-process.md`](docs/proposals/spec-change-process.md) describes how the language itself changes.
+The project works specification first: if the compiler and the specification disagree, the compiler is wrong, and every fix ships a regression test that cites the section it enforces. [`CONTRIBUTING.md`](CONTRIBUTING.md) explains how to build, test and send a change, [`tests/README.md`](tests/README.md) how to write a test, and [`docs/proposals/spec-change-process.md`](docs/proposals/spec-change-process.md) how the language itself changes. [`CLAUDE.md`](CLAUDE.md) holds the stricter working rules the project's AI agents follow.
 
 ```sh
-tests/run_parallel.sh 16                    # the behaviour suite, sharded (~2 min)
+tests/run_parallel.sh 16                    # the behaviour suite, sharded
 cmake --build build --target check-lit      # the diagnostic suite (needs lit and FileCheck)
-scripts/gate.sh                             # both, with a combined total
 scripts/check_docs.sh                       # the documentation checks
 ```
 

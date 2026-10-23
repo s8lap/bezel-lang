@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://s8lap.github.io/bezel-lang/
+    about: The Tour, the guides, the specification and the standard library.

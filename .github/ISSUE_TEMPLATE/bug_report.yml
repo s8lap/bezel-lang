@@ -1,0 +1,38 @@
+name: Bug report
+description: The compiler crashes, rejects a correct program, accepts a wrong one, or the compiled program misbehaves.
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Compiler version
+      description: The output of `bezelc --version`, or the release you downloaded.
+    validations:
+      required: true
+  - type: textarea
+    id: program
+    attributes:
+      label: Smallest program that shows the problem
+      description: A complete `.bzl` file, as small as you can make it.
+      render: bezel
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The compiler's messages, or what the program printed or how it failed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: If you can, name the section of the specification that says so.
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: Build options
+      description: Any flags you passed to `bezelc`, for example `--link=system` or `--sanitize=address`.

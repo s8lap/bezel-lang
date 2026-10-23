@@ -1,0 +1,29 @@
+name: Specification question
+description: The specification looks wrong, unclear, contradictory, or silent on a case.
+labels: ["spec-question"]
+body:
+  - type: input
+    id: section
+    attributes:
+      label: Section and revision
+      description: For example "§28.3, v0.340", or "stdlib §4.8".
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: The question
+      description: What the text says (quote it), and what it leaves open or gets wrong.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example program
+      description: A small program whose meaning depends on the answer, if there is one.
+      render: bezel
+  - type: textarea
+    id: readings
+    attributes:
+      label: Possible readings
+      description: The interpretations you see, and which one you would choose and why.
