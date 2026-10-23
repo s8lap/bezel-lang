@@ -8,9 +8,7 @@
 //!   **Owned**" (§28.3's producers table). The assignment `a := [1, 2, 3];` makes
 //!   `a` the owner of that literal, so `il` — an unmarked alias of `a` — is a
 //!   borrow of it, and `il.Dispose()` is disposal through a borrow: a compile
-//!   error. KNOWN DIVERGENCE (#7092): the ownership pass does not see the
-//!   producers row for a literal reached through an assignment, so it admits the
-//!   program and it double-frees at run time.
+//!   error.
 //! cites: 28.6, 28.3
 //! expect: reject
 //! diagnostic: cannot call `Dispose()` on `il`

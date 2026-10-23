@@ -11,11 +11,11 @@
 module Conf;
 
 public class C<T>
-  public class N
-    public class M2
-      public method V(): int => 7;
-    end M2;
+  public class M2
+    public method V(): int => 7;
+  end M2;
 
+  public class N
     public method Run(): int
       using var m := new M2();
       return m.V();

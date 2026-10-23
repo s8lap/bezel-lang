@@ -19,6 +19,7 @@ s31_2_0013	pass
 l4_1_0049	pass	
 l4_1_0050	pass	
 l4_1_0051	pass	
+l4_1_0052	pass	
 l4_2_0008	pass	
 l4_4_0046	pass	
 l5_0023	pass	
@@ -56,6 +57,9 @@ s2_2_0006	pass
 s2_2_0007	pass	
 s2_2_0038	pass	
 s2_2_0039	pass	
+s2_2_0040	pass	
+s2_2_0041	pass	
+s2_2_0042	pass	
 s2_3_0001	pass	
 s2_3_0002	fail	divergence
 s2_3_0003	pass	
@@ -1951,6 +1955,22 @@ s28_6_0040	pass
 s28_6_0041	pass	
 s28_6_0042	pass	
 s28_6_0043	pass	
+s28_6_0044	pass	
+s28_6_0045	pass	
+s28_6_0046	pass	
+s28_6_0047	pass	
+s28_6_0048	pass	
+s28_6_0049	pass	
+s28_6_0050	pass	
+s28_6_0051	pass	
+s28_6_0052	pass	
+s28_6_0053	fail	#7097
+s28_6_0054	fail	#7097
+s28_6_0055	fail	#7097
+s28_6_0056	pass	
+s28_6_0057	pass	
+s28_6_0058	pass	
+s28_6_0059	pass	
 s28_7_0001	pass	
 s28_7_0002	pass	
 s28_7_0003	pass	

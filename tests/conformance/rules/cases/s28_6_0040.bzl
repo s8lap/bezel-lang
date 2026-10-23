@@ -6,10 +6,11 @@
 //!   error. The borrow receivers: a borrowed local or parameter" (§28.6, v0.340).
 //!   `il` is an unmarked alias of the `using var` owner `a`, so it is a borrow of
 //!   `a`, and `il.Dispose()` is disposal through a borrow — a compile error.
-//!   KNOWN DIVERGENCE (#7092): the same program also draws the spurious "`using
-//!   var` `a` is vacuous" warning, because the ownership pass does not see that a
-//!   collection literal is an owned production (§28.3's producers table); that
-//!   warning is a separate row, `s28_10_0016`.
+//!   The program also draws the spurious "`using var` `a` is vacuous" warning,
+//!   because the ownership pass does not see that a collection literal is an
+//!   owned production (§28.3's producers table). That warning is a separate
+//!   defect, carried by the row `s28_10_0016` (issue #7092); this row asserts
+//!   the §28.6 rejection only.
 //! cites: 28.6, 28.3
 //! expect: reject
 //! diagnostic: cannot call `Dispose()` on `il`

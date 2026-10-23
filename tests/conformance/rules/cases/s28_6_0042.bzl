@@ -8,9 +8,7 @@
 //!   an unmarked alias of `b`, so it is a borrow of a borrow — still a borrow, and
 //!   `il.Dispose()` is disposal through a borrow, which is a compile error. The
 //!   rule is structural: it reads the receiver expression's ownership
-//!   classification, which §28.3 computes at every call site. KNOWN DIVERGENCE
-//!   (#7091): the compiler's alias check reads one hop only, so it admits the
-//!   two-hop chain and the program double-frees at run time.
+//!   classification, which §28.3 computes at every call site.
 //! cites: 28.6, 28.3
 //! expect: reject
 //! diagnostic: cannot call `Dispose()` on `il`
