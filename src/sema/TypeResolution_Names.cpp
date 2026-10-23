@@ -2786,14 +2786,28 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
 // member un-declarable. So the stop fires in a NESTED type's body and nowhere
 // else; a top-level type's own member of the name does not stop the search.
 //
-// One further axis is NOT covered, declared rather than assumed:
+// One further axis is NOT covered by the STOP, declared rather than assumed:
 //   * BASE types. §2.7's rule-1 ranking paragraph says "the enclosing type's
 //     accessible members (inherited included)", but §2.7's "Through nesting"
 //     paragraph — the one stating the stop rule quoted above — enumerates the
 //     chain as "the nested type and then each type enclosing it", with no base
 //     types in it, and inheritance is a separate axis with its own accessor
-//     (`baseTypes`). Widening to base types is a strictly larger change with a
-//     much larger blast radius, and is filed separately rather than smuggled in.
+//     (`baseTypes`). Widening the STOP to base types is a strictly larger
+//     change with a much larger blast radius, and is filed separately rather
+//     than smuggled in.
+//
+// fix #7012 (v0.340) covers the OTHER half of that axis, and the two are
+// different questions. The stop asks whether an enclosing type ends the search
+// WITHOUT a type to hand back; §2.7's normative table answers that a
+// same-named member of any other kind, "on the type's own body or on a type
+// enclosing it, DECLARED OR INHERITED", NEITHER BINDS NOR ENDS THE SEARCH at a
+// bare type name — so a base's same-named method, field or property is still
+// not a blocker here, and the deferral above stands unchanged. What #7012 adds
+// is the arm that finds a type to RETURN: a base's NESTED TYPE of the name,
+// which that same row admits as "the innermost answer". The qualified spelling
+// (`K.N` through the derived type) is a third question again — §11.6 gives a
+// nested type its DECLARING path (`Outer.Nested`) and §2.8.3 rule 3 identifies
+// a type by its declaring qualified name, so it is not claimed here either way.
 //
 // fix #6401 (§21.10 + §2.7 "Through nesting", v0.338): a §21.10 LOCAL type is
 // now a LINK of that chain. `resolveNamed`'s §21.10 arm pairs the local type's
@@ -2821,10 +2835,176 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
 // The stop is placed so it can only ADD a rejection, never remove one: the
 // symbol `lookupName` would have returned is returned unchanged, and
 // `*stoppedAt` is a separate answer the caller decides about.
+//
+// fix #7012 (§2.7, v0.340) adds the ONE thing this walk was still missing and
+// that its own scope note below declined to guess at: a BASE type's nested
+// type. The note is right that widening the STOP to base types is a different
+// and larger change — this is not that. The stop answers "does an enclosing
+// type end the search without a type to hand back"; the arm added here answers
+// "is there a type to hand back", and it only ever admits a NESTED TYPE of the
+// name, which is precisely what §2.7's normative table says a bare type name
+// may bind to. A base's same-named member of any OTHER kind is untouched: it
+// still neither binds nor ends the search, per that row.
+//
+// §2.7, "Enclosing-type members": "Inside a type's bodies, the enclosing
+// type's accessible members (INHERITED INCLUDED; instance and static, ...)
+// participate in rule 1's bare-name lookup at a position fixed by the name's
+// syntactic shape, decided before any lookup." The table's Bare type name row
+// is that position, and states the answer in both halves: the enclosing type's
+// members rank "between local scope and module declarations, NESTED TYPES ONLY"
+// and "a nested type of the name, DECLARED OR INHERITED, is the innermost
+// answer (§2.2 selecting by arity)".
+//
+// §11.6 names the generic case outright, and it is the one this arm could not
+// have reached by extending a lexical chain: a type nested in a generic type "is
+// named only where §2.7's enclosing-type lookup reaches it, or reaches a
+// non-generic type enclosing it below the generic one (`Node<int>` in `Tree`'s
+// own declaration OR IN THE BODY OF A TYPE DERIVING FROM `Tree`; `Inner.Leaf`
+// there for a `Leaf` nested in a non-generic `Inner`)".
+//
+// WHY THE SCOPE CHAIN CANNOT EXPRESS IT. A body scope registers only the type's
+// GENERIC PARAMETERS and NESTED TYPES (`resolveTypeDecl`'s §11.3/#482 loop),
+// and `resolveMember` gives a nested type's body scope the OUTER type's body
+// scope as its parent — so LEXICAL nesting has always resolved through the
+// chain. Inheritance is a separate axis with its own accessor (`baseTypes`), and
+// no Scope carries it. MEASURED on the base (5c3e10f7), `class B { public class
+// N }` with `class K: B` reporting a bare `N` in `K`'s body: "unresolved type
+// name `N`", twice, with a generic base (`B<T>` / `K: B<int>`) and with a
+// generic nested type (`B<T>`'s `N<U>` spelled `N<string>`) failing identically.
+// The qualified spelling was unaffected — `B.N` from outside resolves (#7012).
+
+// fix #7012 (§13.1 / §11.6, v0.340): is `inner` nested (directly or
+// transitively) inside `outer`? The file-local twin of `isNestedWithin` in
+// TypeResolution_Checks.cpp, which backs the same §11.6 mutual-access rule for
+// ordinary member access and §12.2's `private` hiding carve-out; duplicated
+// internal-linkage for the reason that copy gives — the two checkers live in
+// different translation units with no shared utility header for a helper this
+// narrow. Keep the two in step.
+static bool typeNestedWithin(const TypeSymbol* inner, const TypeSymbol* outer) {
+    if (!inner || !outer) return false;
+    for (const Symbol* m : outer->members) {
+        if (const auto* nts = dynamic_cast<const NestedTypeSymbol*>(m)) {
+            if (nts->type == inner) return true;
+            if (nts->type && typeNestedWithin(inner, nts->type)) return true;
+        }
+    }
+    return false;
+}
+
+// fix #7012 (§13.1, §13.4, §11.6, §12.2, v0.340): is the inherited nested type
+// `nts` — declared in `declaring`, reached by walking `link`'s base chain —
+// accessible at the site being resolved?
+static bool inheritedNestedTypeAccessible(SemaContext& ctx, TypeSymbol* link,
+                                          TypeSymbol* declaring,
+                                          const NestedTypeSymbol* nts) {
+    switch (nts->visibility) {
+        case ast::Visibility::Public:
+        case ast::Visibility::None:
+            // §13.1: "`public` — Anyone who can see the enclosing context".
+            // `None` is not reachable for a nested type: §11.6 requires the
+            // visibility keyword ("omitting the keyword is a compile error, not
+            // a default"), and §13.3 gives no member kind a default.
+            //
+            // §11.6's EFFECTIVE-VISIBILITY clamp ("a nested type's effective
+            // visibility is the more restrictive of its declared visibility and
+            // its enclosing class's visibility") needs no arm here, and the
+            // reason is structural rather than assumed: a non-public enclosing
+            // type that would clamp a `public` nested type below `public` is
+            // itself unreachable from another module, because an `internal`
+            // top-level type is not exported at all. MEASURED cross-module, an
+            // `internal class Outer` wrapping the declaring class: naming it
+            // from the importing module fails with "module `Lib` has no public
+            // type `Outer` (§2.7)" before any member of it is considered. The
+            // one place the clamp could still bite — same module — is the case
+            // where every type involved is visible by §13.1 anyway.
+            return true;
+        case ast::Visibility::Internal:
+            // §13.1: "`internal` — Code in the same module"; §13.4 closes
+            // `internal` by compilation, so an imported declaring type or an
+            // imported member of it is out of reach in either role.
+            return !ctx.isImported(nts) && !ctx.isImported(declaring);
+        case ast::Visibility::Protected:
+            // §13.1: "`protected` — The declaring class and all classes derived
+            // from it". `declaring` is reached ONLY by walking `link`'s own
+            // base chain, so `link` is by construction a class derived from
+            // `declaring` — the second half of the level, which is why this arm
+            // cannot fail. The test is on `link`, the type whose members this
+            // rank of the lookup consults (§2.7 "Through nesting" ranks "each
+            // type enclosing it ... at the rank the table gives ITS members"),
+            // and not on the innermost body being resolved: §2.7's
+            // accessibility sentence adds that in a nested type's body "the
+            // `private` and `protected` members of every type enclosing the
+            // body ... count as accessible", so a `protected` nested type of a
+            // base reaches a nested type's body as well as the derived type's
+            // own. (MEASURED, the value-position twin does NOT: a `protected
+            // static` member of a base is NOT reachable by bare name from a
+            // nested type's body — `unresolved identifier `S``. The two
+            // positions are separate rules and only this one is claimed.)
+            return true;
+        case ast::Visibility::Private:
+            // §13.1: "`private` — The declaring class only", extended by §11.6
+            // "in both directions" between a class and the types nested in it
+            // "at any depth", and by §12.2's carve-out — "a derived class
+            // nested inside the base class (§11.6) sees the base's `private`
+            // members and is blocked by them". `link` is strictly a DERIVED
+            // class here, never `declaring` itself, so the two nesting tests
+            // are the whole of what is left.
+            return typeNestedWithin(link, declaring) ||
+                   typeNestedWithin(declaring, link);
+    }
+    return true;
+}
+
+// fix #7012 (§2.7 "Through nesting" + §2.2 arity, v0.340): the nearest type,
+// breadth-first through `link`'s base chain, that carries a nested type of
+// `name` whose arity the reference fixes and that is accessible at the site.
+static NestedTypeSymbol* findInheritedNestedType(SemaContext& ctx,
+                                                 TypeSymbol* link,
+                                                 std::string_view name,
+                                                 std::size_t refArity) {
+    if (!link) return nullptr;
+    // Nearest base first: the order `ExprTC::lookupMember` and this file's
+    // `findFieldInTypeChain` both use for an inherited member. Two bases
+    // declaring the same nested-type name would be a sibling-base ambiguity,
+    // which those two carry as a separate slice too — §12.2 forbids the
+    // ordinary shape (a derived type may not reuse the name of an inherited
+    // member visible at its declaration site), so the two never meet at a
+    // declaration that this arm can reach.
+    std::vector<TypeSymbol*> frontier(link->baseTypes.begin(),
+                                      link->baseTypes.end());
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        TypeSymbol* base = frontier[i];
+        if (!base || base == link) continue;
+        for (Symbol* m : base->members) {
+            auto* nts = dynamic_cast<NestedTypeSymbol*>(m);
+            if (!nts || !nts->type || nts->name != name) continue;
+            // §2.7 "Through nesting": the enclosing-type lookup ends at "the
+            // first type that has a NESTED TYPE of the name, declared or
+            // inherited, WHOSE ARITY THE REFERENCE FIXES (§2.2)". §2.2: "a
+            // reference resolves to the first, in that rule's order, whose
+            // arity its type-argument list fixes". So an arity-mismatched
+            // candidate is not a candidate: the walk continues to the next base
+            // rather than binding it and letting a later arity check reject.
+            if (nts->type->genericParams.size() != refArity) continue;
+            if (!inheritedNestedTypeAccessible(ctx, link, base, nts)) continue;
+            return nts;
+        }
+        for (TypeSymbol* b : base->baseTypes) frontier.push_back(b);
+    }
+    return nullptr;
+}
+
 Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
                                      TypeSymbol** stoppedAt,
                                      const ast::Type* resolving) {
     if (stoppedAt) *stoppedAt = nullptr;
+    // fix #7012 (§2.7 "Through nesting" + §2.2, v0.340): the arity this
+    // reference fixes. `resolving` IS the node being resolved — the one call
+    // site passes `&t`, the `ast::Type` `resolveNamed` is resolving (the same
+    // node §2.7's `property Color: Color` carve-out reads above) — so this
+    // reads it off rather than adding a parameter and a header declaration.
+    const std::size_t refArity =
+        resolving ? resolving->genericArgs.size() : 0;
     for (Scope* s = scope; s; s = s->parent) {
         // §2.7 rule 1 ranks local scope ABOVE the enclosing type's members, so
         // a name carried by this scope (a local, a parameter, a generic-
@@ -2833,17 +3013,32 @@ Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
         // carries nothing can end the search below.
         auto it = s->names.find(name);
         if (it != s->names.end()) return it->second;
-        if (stoppedAt) {
-            for (const auto& entry : typeBodyScopes_) {
-                if (entry.first != s) continue;
-                if (enclosingTypeMemberBlocksBareName(entry.second, name,
-                                                     resolving)) {
-                    *stoppedAt = entry.second;
-                    break;
-                }
+        // The type whose body this scope IS, if it is a type body scope: §2.7's
+        // enclosing-type link, paired with its owner by `typeBodyScopes_` (see
+        // that field's declaration for why a scope alone cannot say it).
+        TypeSymbol* link = nullptr;
+        for (const auto& entry : typeBodyScopes_) {
+            if (entry.first == s) {
+                link = entry.second;
+                break;
             }
-            if (*stoppedAt) return nullptr;
         }
+        if (!link) continue;
+        // The §2.7 stop, unchanged and still ahead of anything added below: it
+        // only ever takes a member of a kind a TYPE position cannot use, and it
+        // is load-bearing for four pinned rows (named above).
+        if (stoppedAt &&
+            enclosingTypeMemberBlocksBareName(link, name, resolving)) {
+            *stoppedAt = link;
+            return nullptr;
+        }
+        // fix #7012: a base type's nested type, which the chain cannot reach.
+        // Placed after the stop so the stop keeps its exact precedence, and
+        // after `s->names` so a DECLARED nested type of the link still wins —
+        // which is §2.7's own order, "declared or inherited", declared first.
+        if (NestedTypeSymbol* inherited =
+                findInheritedNestedType(ctx_, link, name, refArity))
+            return inherited;
     }
     return nullptr;
 }
