@@ -64,7 +64,18 @@ struct LocalOwnership {
     // every one of them. `joinInto` (Ownership_Checks.cpp, fix #4236
     // send-back) additionally OR-merges it across a branch join that
     // converges to the same state, so which arm is listed first cannot
-    // change whether a post-join alias is recognized. Deliberately NOT
+    // change whether a post-join alias is recognized.
+    //
+    // fix #7091 (§28.3 "Ownership state of locals" / §28.6 "Who may call
+    // Dispose()", v0.340): the field records the ROOT of the alias chain,
+    // not the direct source, when the source is itself an alias. A ONE-hop
+    // alias (`var b := a;`) records `a` — unchanged. A TWO-hop chain
+    // (`var b := a; var il := b;`) records `a` as well, because `b` is a
+    // borrow and does not own the value: the §28.6 diagnostic the field
+    // feeds says "it is a borrow (an alias) of `X`, which still owns it",
+    // and only the root satisfies "which still owns it". The chain is
+    // followed by `disposeAliasChainRoot` (Ownership.cpp), a file-local
+    // static over the same `states_` map. Deliberately NOT
     // reused from `source`
     // (borrowSourceForExpr's Shape 1): that field's populate gate
     // (returnedExprMayBorrow -> isBorrowableType) answers FALSE for every

@@ -3737,6 +3737,76 @@ static bool isOwnedCollectionLiteralLocal(sema::Symbol* sym) {
     return common::isPatternAResultCollectionHead(t->headName());
 }
 
+// fix #7091 (§28.3 "Ownership state of locals" / §28.6 "Who may call
+// Dispose()", v0.340): the ROOT owner of an ALIAS CHAIN.
+//
+// `disposeAliasSource` (OwnershipState.hpp) records, for a local bound to a
+// bare identifier read of an owner, the source of that read. The §28.6
+// receiver check consults that field ONCE, so it recognizes a ONE-HOP alias
+// (`var b := a;` — `b`'s recorded source is the owned local `a`) and misses a
+// TWO-HOP chain: `b` is itself a BORROW, so a local bound to `b` records `b`
+// — not an owner — and nothing is recorded for it.
+//
+// §28.3, *Consuming positions for an owned-local read* (v0.340): "an
+// **unmarked** local binding or assignment RHS over a **class- or
+// interface-typed** binding — `var y := x;`, `y := x;`: a plain alias binding
+// is a borrow of `x`, source `x` itself". So in
+//
+//   var a: Array<int> := new Array<int>(2);
+//   var b: Array<int> := a;
+//   var il: IList<int> := b;
+//   il.Dispose();
+//
+// `b` is a borrow of `a` and `il` is a borrow of that borrow; `a` is the
+// owner. §28.6 (v0.340): "`Dispose()` or a direct `DisposeAsync()` call
+// through a **borrow** is a compile error. The borrow receivers: a borrowed
+// local or parameter ...". So the call is a compile error and the program must
+// not run.
+//
+// MEASURED (issue #7091, on this branch's base 9f1d7603, generated-code
+// AddressSanitizer): the two-hop chain compiled with NO diagnostic and
+// double-freed — "ERROR: AddressSanitizer: attempting double-free on
+// 0x7b70373e0010 in thread T0: #1 bz_array_free
+// src/runtime/bezel_runtime_collections.cpp:741:5 #2 main" — the explicit
+// `il.Dispose()` (the interface arm of the explicit-dispose chain) and `a`'s
+// scope-end pass, on the same 8-byte region. The one-hop twin
+// (`var il: IList<int> := a; il.Dispose();`) IS rejected today, so the number
+// of hops was the whole difference between "compile error" and "double free
+// at run time".
+//
+// WHY THE ROOT, AND WHY THE DIAGNOSTIC NAMES IT. The chain is followed to its
+// TERMINAL element — the last symbol that still carries a recorded source.
+// Every link is created by a populate site whose source is an owner (an owned
+// tracked local, a collection-literal owner per #7073, or an `owned` field
+// per #4283), so the terminal IS the owner the chain roots at. Naming it
+// keeps the existing §28.6 wording TRUE: "it is a borrow (an alias) of `X`,
+// which still owns it" is true of the root owner and FALSE of an intermediate
+// alias (`b` does not own the array `il` borrows — `a` does), so the field
+// records the ROOT rather than the direct source. The diagnostic text is
+// therefore UNCHANGED by this fix — the one-hop case's message is
+// byte-identical, and the multi-hop case reuses it verbatim with the root's
+// name in the slot the direct source used to occupy.
+//
+// The helper is a file-local STATIC (no header edit): it reads only the
+// `states_` map, which every caller has. The chain is a DAG over declaration
+// order (a link always points at an EARLIER declaration), so the walk
+// terminates; the depth bound is a belt-and-braces guard against a malformed
+// cycle.
+static sema::Symbol* disposeAliasChainRoot(
+        sema::Symbol* sym,
+        const std::unordered_map<sema::Symbol*, LocalOwnership>& states) {
+    if (!sym) return nullptr;
+    auto it = states.find(sym);
+    if (it == states.end() || !it->second.disposeAliasSource) return nullptr;
+    sema::Symbol* cur = it->second.disposeAliasSource;
+    for (int depth = 0; depth < 64; ++depth) {
+        auto it2 = states.find(cur);
+        if (it2 == states.end() || !it2->second.disposeAliasSource) break;
+        cur = it2->second.disposeAliasSource;
+    }
+    return cur;
+}
+
 // §29.2 (#834): find the LocalSymbol ExprTypecheck created for `fs`'s
 // iteration variable. Sema anchors that symbol on the ForStmt
 // (`lsym->decl = fs`), so it is the LocalSymbol whose `decl` is `&fs`.
@@ -4150,6 +4220,14 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 if (isOwnedTrackedLocal(rsym) ||
                     isOwnedCollectionLiteralLocal(rsym))
                     aliasSrc = rsym;
+                // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain
+                // — the source is itself a borrow of an owner, so record the
+                // chain's ROOT owner instead of the intermediate alias (the
+                // §28.6 wording names the root, which is the one that still
+                // owns the value). See `disposeAliasChainRoot`'s comment.
+                else if (sema::Symbol* root =
+                             disposeAliasChainRoot(rsym, states_))
+                    aliasSrc = root;
             }
             // fix #4283 (§28.3/§28.6, v0.298): mirrors `handleLocalDecl`'s own
             // #4283 widening one arm above — see that site's comment for the
@@ -7896,6 +7974,17 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                     // tracking comment for the follow-up.
                     states_[lsym].disposeAliasSource = rsym;
                 }
+                // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain
+                // — the source is itself a borrow of an owner, so record the
+                // chain's ROOT owner instead of the intermediate alias. The
+                // §28.6 wording the receiver check emits names the root
+                // ("... of `X`, which still owns it"), and only the root
+                // still owns the value: an intermediate alias does not. See
+                // `disposeAliasChainRoot`'s own comment for the measurement
+                // and the full rationale.
+                else if (sema::Symbol* root =
+                             disposeAliasChainRoot(rsym, states_))
+                    states_[lsym].disposeAliasSource = root;
             }
             // fix #4283 (§28.3 "Ownership state of locals" / §28.6 "Who may
             // call Dispose()", v0.298): the IdentifierExpr check above can
@@ -9012,6 +9101,15 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             if (isOwnedTrackedLocal(rsym) ||
                 isOwnedCollectionLiteralLocal(rsym))
                 aliasSrc = rsym;
+            // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain — the
+            // RHS names a borrow of an owner (`b := a;` where `a` is owned and
+            // `b` is its borrow), so record the chain's ROOT owner. The §28.6
+            // wording the receiver check emits names the root ("... of `X`,
+            // which still owns it"), and only the root still owns the value.
+            // See `disposeAliasChainRoot`'s own comment.
+            else if (sema::Symbol* root =
+                         disposeAliasChainRoot(rsym, states_))
+                aliasSrc = root;
         }
         for (auto& [sym, st] : states_) {
             if (!refersTo(sym, *id)) continue;
@@ -12337,6 +12435,13 @@ void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
             } else if (isOwnedParameterInEnclosingFrame(rsym)) {
                 aliasSrc = rsym;
             }
+            // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain — the
+            // source is itself a borrow of an owner, so record the chain's
+            // ROOT owner instead of the intermediate alias. See
+            // `disposeAliasChainRoot`'s own comment.
+            else if (sema::Symbol* root =
+                         disposeAliasChainRoot(rsym, states_))
+                aliasSrc = root;
         }
         if (!aliasSrc && exprIsOwnedFieldRead(*ld->initializer))
             aliasSrc = ctx_.exprSymbol(*ld->initializer);
@@ -12506,6 +12611,13 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     // (Ownership_impl.hpp) for the full rationale.
                     aliasSrc = rsym;
                 }
+                // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain —
+                // the source is itself a borrow of an owner, so record the
+                // chain's ROOT owner instead of the intermediate alias. See
+                // `disposeAliasChainRoot`'s own comment.
+                else if (sema::Symbol* root =
+                             disposeAliasChainRoot(rsym, states_))
+                    aliasSrc = root;
             }
             if (!aliasSrc && exprIsOwnedFieldRead(*lc->value))
                 aliasSrc = ctx_.exprSymbol(*lc->value);
@@ -12715,6 +12827,13 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     if (isOwnedTrackedLocal(rsym) ||
                         isOwnedCollectionLiteralLocal(rsym))
                         aliasSrc = rsym;
+                    // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias
+                    // chain — the RHS names a borrow of an owner, so record
+                    // the chain's ROOT owner. See
+                    // `disposeAliasChainRoot`'s own comment.
+                    else if (sema::Symbol* root =
+                                 disposeAliasChainRoot(rsym, states_))
+                        aliasSrc = root;
                 }
                 for (auto& [sym, st] : states_) {
                     if (!refersTo(sym, *tid)) continue;
