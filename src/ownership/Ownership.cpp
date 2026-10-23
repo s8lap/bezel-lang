@@ -3621,6 +3621,77 @@ bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
            common::isOwningIterableInterfaceHead(head);
 }
 
+// fix #7073 (§28.3 "Ownership state of locals" / §15.4 "Collection literals",
+// §28.6 "Who may call Dispose()", v0.340): is `sym` a local bound to a
+// COLLECTION LITERAL — a FRESH OWNED production per language spec §28.3's
+// *Producers* table, which names the row by name:
+//
+//   | Collection literal (`[1, 2, 3]`) targeting a reference type
+//     (`Array<T>`, `OwningArray<T>`, `Set<T>`, `Dictionary<K, V>`, etc.)
+//     | Owned |
+//
+// The ownership pass CANNOT see that row, and the reason is §15.4's
+// context-typing: "A collection literal has no standalone type. It is
+// well-typed only in a context that provides the target type" — so sema
+// records NO `exprType` for the literal node. MEASURED on this lane (a
+// temporary `BEZEL_DEBUG_OWN` instrumentation of `producerState` and of the
+// `disposeAliasSource` populate): `ctx_.exprType(*ld.initializer)` is NULL
+// for a `CollectionLiteralExpr`, so `producerState`'s collection-literal arm
+// (fix #4338's) never fires and the local is classified **Borrowed**.
+//
+// The consequence is a §28.6 HOLE, not a cosmetic mislabel.
+// `disposeAliasSource` (OwnershipState.hpp) — the dedicated field
+// `checkDisposeReceiverOwnership` reads — is populated only from
+// `isOwnedTrackedLocal`, i.e. from a source the pass classifies as OWNED. An
+// alias of a literal-initialized collection local is therefore invisible to
+// the §28.6 borrow-receiver check.
+//
+// MEASURED (issue #7073, the AOT path):
+//
+//   var a: Array<int> := [1,2,3];
+//   var il: IList<int> := a;
+//   il.Dispose();
+//
+// compiled with NO diagnostic, printed "survived", and then aborted with
+// "free(): double free detected in tcache 2" (rc 134). The IR (BEZEL_DUMP_IR)
+// shows why: `il.Dispose()` takes the interface arm of the explicit-Dispose
+// chain and calls `bz_array_free` on the array — RECLAIMING it — while `a`'s
+// own scope-end pass reclaims the SAME array through `a`'s slot (the two
+// slots hold the same pointer, so nulling `il`'s slot does not stop `a`'s
+// pass). The `new`-source twin of the same program
+// (`var a: Array<int> := new Array<int>(2);`) is REJECTED today by fix
+// #4236's `disposeAliasSource` arm — the ONLY difference is the source's
+// initializer form, i.e. exactly this blind spot.
+//
+// This helper is the missing half of §28.3's producers row: it recognizes the
+// literal-initialized local as the OWNER the spec says it is, so that an
+// alias of it is the BORROW §28.6 names ("`Dispose()` or a direct
+// `DisposeAsync()` call through a **borrow** is a compile error. The borrow
+// receivers: a borrowed local or parameter ...") and the §28.6 check rejects
+// the dispose-through-alias.
+//
+// The TARGET type decides the row, exactly as §28.3's table does: a literal
+// targeting an INLINE-ARRAY type produces a VALUE ("Collection literal ...
+// targeting an inline-array type (`[N]T`, including `[N owned]T?`) | Not
+// applicable — produces a value"), so only a reference-type target is the
+// Owned row. The local's DECLARED type is the context §15.4 says types the
+// literal, and it is also the type `producerState`'s collection-literal arm
+// WOULD have read had the literal carried one — so the two agree by
+// construction (the same `common::isPatternAResultCollectionHead` authority).
+// // per §28.3, §15.4, §28.6, v0.340, #7073
+static bool isOwnedCollectionLiteralLocal(sema::Symbol* sym) {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls) return false;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld || !ld->initializer) return false;
+    if (!dynamic_cast<const ast::CollectionLiteralExpr*>(
+            ld->initializer.get()))
+        return false;
+    const sema::TypeRef* t = ls->declType;
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    return common::isPatternAResultCollectionHead(t->headName());
+}
+
 // §29.2 (#834): find the LocalSymbol ExprTypecheck created for `fs`'s
 // iteration variable. Sema anchors that symbol on the ForStmt
 // (`lsym->decl = fs`), so it is the LocalSymbol whose `decl` is `&fs`.
@@ -4025,7 +4096,15 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             if (auto* rid =
                     dynamic_cast<const ast::IdentifierExpr*>(lc->value.get())) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+                // fix #7073 (§28.3, §28.6, v0.340): the source is also an
+                // owner when it is a collection-LITERAL local (§28.3's
+                // producers table: a collection literal targeting a reference
+                // type is Owned) — the ownership pass cannot see that row
+                // because the literal is CONTEXT-TYPED (§15.4) and carries no
+                // exprType, so `isOwnedTrackedLocal` answers false for it.
+                if (isOwnedTrackedLocal(rsym) ||
+                    isOwnedCollectionLiteralLocal(rsym))
+                    aliasSrc = rsym;
             }
             // fix #4283 (§28.3/§28.6, v0.298): mirrors `handleLocalDecl`'s own
             // #4283 widening one arm above — see that site's comment for the
@@ -7705,7 +7784,13 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                     dynamic_cast<const ast::IdentifierExpr*>(
                         ld.initializer.get())) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                if (isOwnedTrackedLocal(rsym)) {
+                // fix #7073 (§28.3, §28.6, v0.340): a collection-LITERAL
+                // local is an OWNER per §28.3's producers table even though
+                // the ownership pass cannot classify it (the literal is
+                // CONTEXT-TYPED — §15.4 — and carries no exprType), so the
+                // alias of one is the BORROW §28.6 rejects a dispose through.
+                if (isOwnedTrackedLocal(rsym) ||
+                    isOwnedCollectionLiteralLocal(rsym)) {
                     states_[lsym].disposeAliasSource = rsym;
                 } else if (fromLambdaBody &&
                            (isOwnedTrackedLocalInEnclosingFrame(rsym) ||
@@ -8876,7 +8961,12 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         sema::Symbol* aliasSrc = nullptr;
         if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
             sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-            if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+            // fix #7073 (§28.3, §28.6, v0.340): the collection-LITERAL local
+            // is an owner too (§28.3's producers table) — see the helper's
+            // own comment for why the ownership pass cannot classify it.
+            if (isOwnedTrackedLocal(rsym) ||
+                isOwnedCollectionLiteralLocal(rsym))
+                aliasSrc = rsym;
         }
         for (auto& [sym, st] : states_) {
             if (!refersTo(sym, *id)) continue;
@@ -12189,7 +12279,11 @@ void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
         if (auto* rid =
                 dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
             sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-            if (isOwnedTrackedLocal(rsym)) {
+            // fix #7073 (§28.3, §28.6, v0.340): the collection-LITERAL local
+            // is an owner too (§28.3's producers table) — see the helper's
+            // own comment for why the ownership pass cannot classify it.
+            if (isOwnedTrackedLocal(rsym) ||
+                isOwnedCollectionLiteralLocal(rsym)) {
                 aliasSrc = rsym;
             } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
                 aliasSrc = rsym;
@@ -12341,7 +12435,11 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
                     lc->value.get())) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                if (isOwnedTrackedLocal(rsym)) {
+                // fix #7073 (§28.3, §28.6, v0.340): the collection-LITERAL
+                // local is an owner too (§28.3's producers table) — see the
+                // helper's own comment.
+                if (isOwnedTrackedLocal(rsym) ||
+                    isOwnedCollectionLiteralLocal(rsym)) {
                     aliasSrc = rsym;
                 } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
                     // fix #4286: `isOwnedTrackedLocalInEnclosingFrame`, NOT
@@ -12566,7 +12664,12 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
                         as->value.get())) {
                     sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                    if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+                    // fix #7073 (§28.3, §28.6, v0.340): the collection-LITERAL
+                    // local is an owner too (§28.3's producers table) — see
+                    // the helper's own comment.
+                    if (isOwnedTrackedLocal(rsym) ||
+                        isOwnedCollectionLiteralLocal(rsym))
+                        aliasSrc = rsym;
                 }
                 for (auto& [sym, st] : states_) {
                     if (!refersTo(sym, *tid)) continue;
