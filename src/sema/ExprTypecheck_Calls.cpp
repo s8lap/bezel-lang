@@ -26336,25 +26336,105 @@ static bool isDocumentedBuiltinCollectionMember(std::string_view head,
     return false;
 }
 
-// The "no member" diagnostic for the bare reference, or "" when no rejection
-// applies: `t` is not one of the heads above, or `name` is documented there,
-// is a universal Object member (§8.1), or is in the §5 collection table, whose
-// bare form #6784's bareStructuralOperatorReject rejects before this runs. A
-// §5 name outside that table gets this wording, which names §5 as one of its
-// possible reasons. The caller decides the
-// remaining exemption, a user extension that applies to the receiver (§26.5),
-// because it needs the extension table.
-static std::string bareBuiltinCollectionMemberReject(const TypeRef* t,
-                                                     std::string_view name) {
+// fix #7015 (stdlib §5, v0.340): EVERY operator name stdlib §5 documents.
+// `kStdlibLinqOverloads` (src/sema/LinqStdlibOverloads.hpp) is the §5 listing
+// the compiler already reads for the arity gate (#3726); the set of names it
+// holds is the documented stdlib §5 name set. The shared 38-name table
+// (`kBuiltinCollectionLinqOperatorNames`, src/common/BuiltinRegistry.cpp) is a
+// SUBSET of it: it misses `ElementAtOrNull` and `Reverse` (and it answers a
+// narrower question — "is this name a builtin-collection LINQ operator the
+// compiler dispatches structurally" — not "is this name documented in §5").
+static bool isDocumentedStdlibLinqOperatorName(std::string_view n) {
+    return bezel::sema::stdlibLinqLookup(n, /*arity=*/-1) != nullptr;
+}
+
+// fix #7015 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2, §4.12,
+// §4.13): the builtin collection interface heads whose CALL form this
+// reject covers.
+//
+// The eight builtin collection interface heads split in two by what the
+// #853 codegen backstop does with an undeclared name on them:
+//   * the four it REJECTS with its own "not yet supported in codegen"
+//     message — IReadOnlyCollection<T> / ICollection<T> /
+//     IOwningCollection<T> / IOwningList<T> (the polymorphic collection
+//     interfaces plus the owning list). On those heads the call is already
+//     refused, but #853's wording says the member EXISTS and is missing only
+//     from codegen, which is false for a name the head does not declare
+//     (#7027). That half of the family is #7027's own fix.
+//   * the four it does NOT reach — IReadOnlyList<T> / IList<T> (§4.1),
+//     IEnumerable<T> (§4.12), IOwningEnumerable<T> (§4.13). These are the
+//     array-backed / borrowed heads, where codegen's structural dispatch
+//     accepted the undeclared name and the call compiled with NO diagnostic
+//     at all: `ro.Add(1)` (a READ-ONLY list) and `il.IndexOf(2)` both ran.
+//     This is the half #7015 reports.
+static bool isBuiltinCollectionCallRejectHead(std::string_view head) {
+    return head == "IReadOnlyList" || head == "IList" ||
+           head == "IEnumerable" || head == "IOwningEnumerable";
+}
+
+// The "no member" diagnostic for a member a builtin collection interface does
+// not declare, or "" when no rejection applies: `t` is not one of the heads
+// above, or `name` is documented there, is a universal Object member (§8.1),
+// or is a stdlib §5 operator name.
+//
+// The two spellings differ in ONE respect, and it is deliberate:
+//   * the BARE reference exempts the shared 38-name table's names only. A §5
+//     name outside that table (fix #7019: `ElementAtOrNull`, `Reverse`) is
+//     NOT exempted here, because #6784's arm
+//     (bareStructuralOperatorReject) rejects it with its own "not yet
+//     supported" wording; exempting it without that reject would leave the
+//     reference untyped and codegen would degrade it to a zero function
+//     value (#2434) — the crash #6997 was filed for.
+//   * the CALL form exempts the WHOLE documented §5 name set, because the
+//     call is typed by the LINQ typing for every §5 name (not only the 38
+//     the table lists), so `il.ElementAtOrNull(1)` and `ro.Contains(3)` are
+//     legitimate calls (§5) and must not be taken for undeclared members.
+//
+// `callForm` also restricts the reject to the heads
+// isBuiltinCollectionCallRejectHead names.
+//
+// The caller decides the remaining exemption, a user extension that applies
+// to the receiver (§26.5), because it needs the extension table.
+static std::string builtinCollectionMemberReject(const TypeRef* t,
+                                                 std::string_view name,
+                                                 bool callForm) {
     if (!t || t->kind != TypeRef::Kind::Named || t->declaration) return "";
     const std::string_view head = t->headName();
     const char* section = nullptr;
     const char* surface = nullptr;
     if (!builtinCollectionInterfaceSurface(head, section, surface)) return "";
+    if (callForm && !isBuiltinCollectionCallRejectHead(head)) return "";
     if (name == "ToString" || name == "Equals" || name == "GetHashCode" ||
         name == "GetType" || name == "ReferenceEquals")
         return "";
-    if (common::isBuiltinCollectionLinqOperatorName(name)) return "";
+    // fix #7015 (language spec §8.7, §28.6, v0.340; stdlib §4.1, §4.2, §4.12,
+    // §4.13): `Dispose` is EXEMPTED in the CALL form, and only there.
+    //
+    // The compiler has always routed `il.Dispose()` on a borrowing collection
+    // interface head to the concrete collection's disposal, and ten shipped
+    // rows pin that: `codegen_iface_head_dispose_2970` (4), `codegen_iface_head_
+    // dispose_3026`, `codegen_iface_head_raw_user_class_2975`,
+    // `codegen_nullcond_dispose_collections_4221`,
+    // `iowningenumerable_explicit_dispose_6553` and
+    // `named_local_property_read_source_abandonment_3605` (2) each ship a
+    // deliberate fix on it (#2970's wild jump, #3026, #4221's `?.` path, #6553,
+    // #3605) and assert the program COMPILES and runs. Rejecting the call
+    // would delete the premise of six test files.
+    //
+    // The SPEC does not settle the question, so this hunk is held, not decided:
+    // stdlib §4.1 declares no `Dispose` on the borrowing heads (they do not
+    // extend `IDisposable`), while language spec §8.7 makes `Dispose()` a
+    // member of every non-static class and §28.6's receiver rule reads the
+    // receiver's OWNERSHIP classification, not the interface's member set. The
+    // two readings disagree, and the compiler's shipped behavior follows the
+    // second. Filed as a spec-question; the BARE form's #6997 rejection
+    // ("no member `Dispose` on `IList`", the #6997 ROW 4) is left exactly as
+    // it shipped, so the two spellings of `Dispose` still disagree -- the
+    // pre-existing disagreement this fix does not widen.
+    if (callForm && name == "Dispose") return "";
+    if (callForm ? isDocumentedStdlibLinqOperatorName(name)
+                 : common::isBuiltinCollectionLinqOperatorName(name))
+        return "";
     if (isDocumentedBuiltinCollectionMember(head, name)) return "";
     return "no member `" + std::string(name) + "` on `" + std::string(head) +
            "` (stdlib " + std::string(section) + ") -- it is not part of this "
@@ -31260,7 +31340,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
         // fix #6997 (language spec §27.6, v0.340; stdlib §4.1, §4.2, §4.12,
         // §4.13): the bare reference to a name the builtin collection
-        // interface does not declare -- see bareBuiltinCollectionMemberReject.
+        // interface does not declare -- see builtinCollectionMemberReject.
         // The CALL form is exempt (calleeOfCallCtx_). A same-named user
         // extension that applies to the receiver (§26.5) is what the reference
         // resolves to, so it is not rejected.
@@ -31270,7 +31350,44 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (loc.line == 0 && ma.target)
                     loc = ma.target->span.begin;
                 std::string msg =
-                    bareBuiltinCollectionMemberReject(tt, ma.member);
+                    builtinCollectionMemberReject(tt, ma.member,
+                                                  /*callForm=*/false);
+                if (!msg.empty() &&
+                    !lookupExtensionMember(tt, ma.member, nullptr, loc,
+                                           /*reportAmbiguity=*/false)) {
+                    ctx_.diagnostics().report(Severity::Error, loc, msg);
+                    return;
+                }
+            }
+        }
+        // fix #7015 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2,
+        // §4.12, §4.13): the CALL form of a name the builtin collection
+        // interface does not declare. §27.6 resolves a receiver-qualified
+        // reference "on the value exactly as the call `v.Scaled()` is", so
+        // the two spellings of one undeclared name must agree — and after
+        // #6997 they did NOT: the bare form was rejected and the call form
+        // was not. On the heads codegen's structural dispatch reaches (the
+        // array-backed list interfaces) the call compiled with NO diagnostic
+        // at all: `ro.Add(1)` (a READ-ONLY list) mutated the array behind
+        // it and `il.IndexOf(2)` printed a value, for names no head declares
+        // (stdlib §4.1 declares `IReadOnlyList<T>` as the indexer plus
+        // `Count` and `GetEnumerator`, and `IList<T>` as the indexer plus
+        // `Insert` inheriting the `ICollection<T>` members).
+        //
+        // The callee slot decides which form this is; the heads the #853
+        // codegen backstop already rejects are #7027's own fix, and the
+        // §5 operator names are exempted above (a §5 call is typed by the
+        // LINQ typing). A same-named user extension that applies to the
+        // receiver (§26.5) is what the call resolves to, so it is not
+        // rejected.
+        if (ma.target && &ma == calleeOfCallCtx_ && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target)
+                    loc = ma.target->span.begin;
+                std::string msg =
+                    builtinCollectionMemberReject(tt, ma.member,
+                                                  /*callForm=*/true);
                 if (!msg.empty() &&
                     !lookupExtensionMember(tt, ma.member, nullptr, loc,
                                            /*reportAmbiguity=*/false)) {
@@ -34779,7 +34896,30 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         SourceLocation loc = nm.span.begin;
         if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
         std::string msg =
-            bareBuiltinCollectionMemberReject(recvTyForDiag, nm.member);
+            builtinCollectionMemberReject(recvTyForDiag, nm.member,
+                                          /*callForm=*/false);
+        if (!msg.empty() &&
+            !lookupExtensionMember(recvTyForDiag, nm.member, nullptr, loc,
+                                   /*reportAmbiguity=*/false)) {
+            ctx_.diagnostics().report(Severity::Error, loc, msg);
+            return;
+        }
+    }
+    // fix #7015 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2, §4.12,
+    // §4.13): the `?.` CALL form of a name the builtin collection interface
+    // does not declare — the `?.` twin of the `.` call-form arm in
+    // resolveMemberAccess. The `?.` call's typing goes through the SPECULATIVE
+    // twin in typeCall (the member-access typing is keyed on the `.` callee),
+    // and that twin DISCARDS anything it reports — so a reject raised only
+    // there would be rolled back and the call would still compile. This arm
+    // reports it here, where it survives: the twin's own copy of the same
+    // reject is inside the rolled-back region.
+    if (!member && &nm == calleeOfCallCtx_ && recvTyForDiag) {
+        SourceLocation loc = nm.span.begin;
+        if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+        std::string msg =
+            builtinCollectionMemberReject(recvTyForDiag, nm.member,
+                                          /*callForm=*/true);
         if (!msg.empty() &&
             !lookupExtensionMember(recvTyForDiag, nm.member, nullptr, loc,
                                    /*reportAmbiguity=*/false)) {

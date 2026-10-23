@@ -135,18 +135,29 @@ BEZEL_TEST(collection_interface_853, ilist_contains_4_1) {
         "  end Main; end C;"), 1);
 }
 
-// §4.1 / §25.2 (#853): `IList<int>.IndexOf` / `.Remove` / `.Insert` through the
-// interface all reach the array runtime. Insert(0,100) → [100,1,2]; IndexOf(100)
-// → 0; Remove(100) → true and Count drops back to 2. Encoded: index(0) + 1000
-// (removed) + final Count(2) = 1002.
-BEZEL_TEST(collection_interface_853, ilist_indexof_remove_insert_4_1) {
+// §4.1 (#853): `IList<int>.Remove` / `.Insert` through the interface reach the
+// array runtime. Insert(0,100) → [100,1,2]; Remove(100) → true and Count drops
+// back to 2. Encoded: 1000 (removed) + final Count(2) = 1002.
+//
+// fix #7015 (language spec §27.6, v0.340; stdlib §4.1) FLIPPED this row's
+// `IndexOf` call out: `IList<T>` declares the settable indexer and `Insert`
+// and inherits `ICollection<T>`'s members (`Count`, `IsReadOnly`, `Add`,
+// `Clear`, `Contains`, `Remove`) plus `GetEnumerator` — it declares NO
+// `IndexOf` (stdlib §4.1). §27.6 resolves a member "on the value exactly as
+// the call `v.Scaled()` is", and the BARE form `il.IndexOf` was already
+// rejected as a name the head does not declare (fix #6997), so the call form
+// had to agree. The rejection is pinned by
+// `builtin_interface_undeclared_member_call_7015.ilist_call_indexof_is_
+// rejected_spec_4_1`; the concrete `Array<T>.IndexOf` (stdlib §4.4) is
+// unaffected. The row's bridge coverage (Insert and Remove through the
+// interface reach the array runtime) is unchanged.
+BEZEL_TEST(collection_interface_853, ilist_remove_insert_4_1) {
     BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C "
         "  public static method Mutate(c: IList<int>): int "
         "    c.Insert(0, 100); "
-        "    var idx := c.IndexOf(100); "
         "    var removed := c.Remove(100); "
-        "    var r := idx; "
+        "    var r := 0; "
         "    if removed then r := r + 1000; end; "
         "    return r; "
         "  end Mutate; "
