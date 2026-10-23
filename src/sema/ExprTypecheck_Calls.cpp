@@ -26382,13 +26382,14 @@ static bool isDocumentedStdlibLinqOperatorName(std::string_view n) {
 // or is a stdlib §5 operator name.
 //
 // The two spellings differ in ONE respect, and it is deliberate:
-//   * the BARE reference exempts the shared 38-name table's names only. A §5
-//     name outside that table (fix #7019: `ElementAtOrNull`, `Reverse`) is
-//     NOT exempted here, because #6784's arm
-//     (bareStructuralOperatorReject) rejects it with its own "not yet
-//     supported" wording; exempting it without that reject would leave the
-//     reference untyped and codegen would degrade it to a zero function
-//     value (#2434) — the crash #6997 was filed for.
+//   * the BARE reference exempts every name the #6784 arm
+//     (bareStructuralOperatorReject) rejects with its own "not yet
+//     supported" wording -- the shared 38-name table AND the whole documented
+//     §5 name set (fix #7019 added `ElementAtOrNull` and the lazy `Reverse`)
+//     -- so the two arms cannot both fire on one name, and the DESIGNED
+//     wording is the one the user sees. A §5 name outside both sets is not
+//     exempted here: it is not a §5 member, so the "no member" wording is the
+//     right one.
 //   * the CALL form exempts the WHOLE documented §5 name set, because the
 //     call is typed by the LINQ typing for every §5 name (not only the 38
 //     the table lists), so `il.ElementAtOrNull(1)` and `ro.Contains(3)` are
@@ -26436,8 +26437,14 @@ static std::string builtinCollectionMemberReject(const TypeRef* t,
     // it shipped, so the two spellings of `Dispose` still disagree -- the
     // pre-existing disagreement this fix does not widen.
     if (callForm && name == "Dispose") return "";
+    // fix #7019 (language spec §27.6, v0.340; stdlib §5): the BARE form
+    // exempts the 38-name table AND the whole documented §5 set -- the same
+    // names the #6784 arm rejects with its own "not yet supported" wording.
+    // Exempting only the table's names would let this arm answer a §5 name
+    // the #6784 arm was designed for, with the generic wording.
     if (callForm ? isDocumentedStdlibLinqOperatorName(name)
-                 : common::isBuiltinCollectionLinqOperatorName(name))
+                 : (common::isBuiltinCollectionLinqOperatorName(name) ||
+                    isDocumentedStdlibLinqOperatorName(name)))
         return "";
     if (isDocumentedBuiltinCollectionMember(head, name)) return "";
     return "no member `" + std::string(name) + "` on `" + std::string(head) +
@@ -26464,9 +26471,50 @@ std::string ExprTC::bareStructuralOperatorReject(const TypeRef* receiver,
                                                  bool nullCond,
                                                  SourceLocation loc) {
     if (!receiver) return "";
-    bool isOp = receiver->kind == TypeRef::Kind::Primitive
-                    ? common::isStringLinqOperatorMemberName(name)
-                    : common::isBuiltinCollectionLinqOperatorName(name);
+    // fix #7019 (language spec §27.6, v0.340; stdlib §5): the name test is
+    // stdlib §5's OWN list, not the shared 38-name table. The table
+    // (`kBuiltinCollectionLinqOperatorNames`, src/common/BuiltinRegistry.cpp)
+    // answers a narrower question -- "is this name a builtin-collection LINQ
+    // operator the compiler dispatches structurally" -- and it MISSES two
+    // names stdlib §5 documents: `ElementAtOrNull` and the lazy `Reverse`.
+    // A bare reference to those two was left untyped, codegen degraded the
+    // local to a zero function value (#2434), and calling it SEGV'd -- the
+    // crash #6784 was filed for. They must get the #6784 wording, like every
+    // other documented §5 name.
+    //
+    // The §5 list is read from `kStdlibLinqOverloads`
+    // (src/sema/LinqStdlibOverloads.hpp) -- the same table the arity gate
+    // (#3726) reads -- so the name set cannot drift from the stdlib again.
+    //
+    // The extension applies to the EIGHT builtin collection INTERFACE heads,
+    // the ones whose declared surface sema knows
+    // (isDocumentedBuiltinCollectionMember). A name the head DECLARES keeps
+    // its own resolution (language spec §26.5 rule 1: instance resolution is
+    // committed): `il.Count` is the `Count` property of stdlib §4.1 and
+    // `il.Contains` is `ICollection<T>.Contains` -- neither is a §5-only
+    // name, so neither takes the §5 wording. The concrete and span families
+    // keep the table's set: their declared surface is not sema's to read, and
+    // their own per-family arms (fix #2470/#2492/#2537) answer the bare
+    // reference there.
+    bool isOp;
+    if (receiver->kind == TypeRef::Kind::Primitive) {
+        isOp = common::isStringLinqOperatorMemberName(name);
+    } else {
+        isOp = common::isBuiltinCollectionLinqOperatorName(name);
+        if (!isOp) {
+            const std::string_view h = receiver->headName();
+            const char* section = nullptr;
+            const char* surface = nullptr;
+            // builtinCollectionInterfaceSurface IS the list of the eight
+            // builtin collection INTERFACE heads, so there is one list here,
+            // not two.
+            const bool isCollectionInterfaceHead =
+                builtinCollectionInterfaceSurface(h, section, surface);
+            isOp = isCollectionInterfaceHead &&
+                   isDocumentedStdlibLinqOperatorName(name) &&
+                   !isDocumentedBuiltinCollectionMember(h, name);
+        }
+    }
     if (!isOp) return "";
     std::string recv = structuralLinqReceiverName(receiver, nullCond, name);
     if (recv.empty()) return "";
