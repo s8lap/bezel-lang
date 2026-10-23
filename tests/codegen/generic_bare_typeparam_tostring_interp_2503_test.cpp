@@ -63,13 +63,6 @@ int run(const std::string& program) {
     return r.ran ? r.exitCode : -999;
 }
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // Per tests/README.md: runAot's WIFSIGNALED path also synthesizes an Error
 // diagnostic for a runtime crash, so a genuine compile-time rejection must
 // be distinguished by asserting on the diagnostic TEXT, never by exit code
@@ -247,7 +240,18 @@ BEZEL_TEST(generic_bare_typeparam_tostring_interp_2503,
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(program);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard that used to stand here
+    // (`if (wasSkipped(r)) return;`) is GONE, and this is a STRENGTHENING,
+    // not a weakening. The guard swallowed the "C toolchain (clang)
+    // unavailable for the ASan link" SKIP and returned early, so on a box
+    // without clang this row reported a clean PASS having run no sanitizer
+    // at all — a vacuous oracle. The very next assertion already pins the
+    // same condition from the other side: `r.ran` is TRUE only when the
+    // program compiled, linked AND ran, so a SKIP (ran=false) now FAILS this
+    // row loudly instead of passing silently. In every configuration where
+    // the toolchain is present the row behaves exactly as before; the only
+    // behaviour that changes is the broken-environment one, which stops
+    // hiding.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
