@@ -2961,10 +2961,19 @@ static bool inheritedNestedTypeAccessible(SemaContext& ctx, TypeSymbol* link,
 // fix #7012 (§2.7 "Through nesting" + §2.2 arity, v0.340): the nearest type,
 // breadth-first through `link`'s base chain, that carries a nested type of
 // `name` whose arity the reference fixes and that is accessible at the site.
+//
+// fix #7084 (§2.2, v0.343): `arityMismatch` is the out-parameter that keeps
+// the FIRST accessible candidate whose arity the reference does NOT fix. Such
+// a candidate is not the one §2.2's arity rule SELECTS, but it IS one of the
+// candidates — "where none has that arity, it resolves to the first of them
+// and is Appendix C.1's arity error" — so the caller can resolve to it and
+// report the arity error instead of an unresolved name. The parameter is
+// in/out: a candidate found at an earlier link is kept.
 static NestedTypeSymbol* findInheritedNestedType(SemaContext& ctx,
                                                  TypeSymbol* link,
                                                  std::string_view name,
-                                                 std::size_t refArity) {
+                                                 std::size_t refArity,
+                                                 NestedTypeSymbol** arityMismatch) {
     if (!link) return nullptr;
     // Nearest base first: the order `ExprTC::lookupMember` and this file's
     // `findFieldInTypeChain` both use for an inherited member. Two bases
@@ -2981,15 +2990,23 @@ static NestedTypeSymbol* findInheritedNestedType(SemaContext& ctx,
         for (Symbol* m : base->members) {
             auto* nts = dynamic_cast<NestedTypeSymbol*>(m);
             if (!nts || !nts->type || nts->name != name) continue;
+            // §13.1 / §13.4: a member that is not accessible at the site is
+            // not a candidate at all, so it is not "one of them" either.
+            if (!inheritedNestedTypeAccessible(ctx, link, base, nts)) continue;
             // §2.7 "Through nesting": the enclosing-type lookup ends at "the
             // first type that has a NESTED TYPE of the name, declared or
             // inherited, WHOSE ARITY THE REFERENCE FIXES (§2.2)". §2.2: "a
             // reference resolves to the first, in that rule's order, whose
             // arity its type-argument list fixes". So an arity-mismatched
-            // candidate is not a candidate: the walk continues to the next base
-            // rather than binding it and letting a later arity check reject.
-            if (nts->type->genericParams.size() != refArity) continue;
-            if (!inheritedNestedTypeAccessible(ctx, link, base, nts)) continue;
+            // candidate is not the one SELECTED: the walk continues to the
+            // next base rather than binding it. fix #7084: it is still
+            // remembered, because §2.2's fallback — "where none has that
+            // arity, it resolves to the first of them and is Appendix C.1's
+            // arity error" — resolves to it when NOTHING matches.
+            if (nts->type->genericParams.size() != refArity) {
+                if (arityMismatch && !*arityMismatch) *arityMismatch = nts;
+                continue;
+            }
             return nts;
         }
         for (TypeSymbol* b : base->baseTypes) frontier.push_back(b);
@@ -3008,6 +3025,11 @@ Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
     // reads it off rather than adding a parameter and a header declaration.
     const std::size_t refArity =
         resolving ? resolving->genericArgs.size() : 0;
+    // fix #7084 (§2.2, v0.343): the FIRST inherited nested type of the name
+    // whose arity the reference does NOT fix. Kept across the walk, because
+    // §2.2's fallback resolves to the first of the candidates when NONE of
+    // them has the reference's arity.
+    NestedTypeSymbol* arityMismatch = nullptr;
     for (Scope* s = scope; s; s = s->parent) {
         // §2.7 rule 1 ranks local scope ABOVE the enclosing type's members, so
         // a name carried by this scope (a local, a parameter, a generic-
@@ -3040,8 +3062,75 @@ Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
         // after `s->names` so a DECLARED nested type of the link still wins —
         // which is §2.7's own order, "declared or inherited", declared first.
         if (NestedTypeSymbol* inherited =
-                findInheritedNestedType(ctx_, link, name, refArity))
+                findInheritedNestedType(ctx_, link, name, refArity,
+                                        &arityMismatch))
             return inherited;
+    }
+    // fix #7084 (§2.2, §2.3, Appendix C.1, v0.343): §2.2's arity rule reads
+    //
+    //   "Arity selects among the types rule 1 of §2.7 finds for an
+    //    identifier: a reference resolves to the first, in that rule's order,
+    //    whose arity its type-argument list fixes; where none has that arity,
+    //    it resolves to the first of them and is Appendix C.1's arity error,
+    //    never an alias, a member or a module prefix."
+    //
+    // The walk above ended with NOTHING bound, and the candidate it found is an
+    // inherited nested type whose arity the reference does NOT fix. §2.2's
+    // fallback — "where NONE has that arity" — is the CONDITION for resolving
+    // to it, so it may be bound only after the other rule-1 candidate sources
+    // have been consulted. Two of them are not visible to this walk:
+    //
+    //   * the §2.3 ALWAYS-AVAILABLE names, which the CALLER resolves (Slice
+    //     S24) whenever this returns null; and
+    //   * the §2.2 AMBIGUOUS-IMPORT set, which the CALLER reports (its
+    //     `ambiguousImportNames_` arm) whenever this returns null.
+    //
+    // Both are consulted below, so a name one of them owns is never stolen by
+    // the fallback:
+    //
+    //   * The always-available name's arity is compared with the reference's
+    //     EXACTLY as Slice S24 compares them — including the §2.3 Row 5
+    //     sentinel `kBuiltinTaskLike`, which means the `Task` family is
+    //     available at arity 0 AND 1 ("Importing `System.Threading` is not
+    //     required to use the `Task` family", §2.3). When the always-
+    //     available name HAS the reference's arity it is a candidate of that
+    //     arity, so §2.2's fallback does not apply ("where none has that
+    //     arity"), and the caller resolves the always-available name instead —
+    //     §2.7 rule 1's own worked example: "`Array<int>` passes over it to
+    //     the always-available `Array<T>`" (an arity-mismatched candidate is
+    //     PASSED OVER, not fatal).
+    //   * The ambiguous-import set is consulted at the reference's arity:
+    //     two imported modules exporting the same (name, arity) make the bare
+    //     name ambiguous (§2.2), and that diagnostic must not be swallowed by
+    //     the fallback.
+    //
+    // Only when NEITHER has the name does §2.2's fallback apply: the
+    // reference "resolves to the first of them" — that inherited nested type —
+    // and is Appendix C.1's arity error. Returning it binds the name, and the
+    // ordinary generic-arity check (the one the LEXICAL twin of this shape —
+    // a nested type in a type's OWN body — already reaches) reports it.
+    //
+    // Before this, the arity-mismatched candidate was skipped and the name
+    // was left unresolved, so the diagnostic was "unresolved type name `N`" —
+    // LESS specific than the lexical twin's "generic-argument count does not
+    // match type's generic-parameter count", and not the diagnostic §2.2
+    // names for this shape.
+    if (arityMismatch) {
+        int builtinAr = builtinTypeArity(name);
+        if (builtinAr != kNotBuiltin) {
+            // The same comparison Slice S24 makes (the sentinel means arity 0
+            // AND 1), so the two sites cannot disagree about whether the
+            // always-available name is a candidate of the reference's arity.
+            bool ok = (builtinAr == kBuiltinTaskLike)
+                          ? (refArity == 0 || refArity == 1)
+                          : (refArity == static_cast<std::size_t>(builtinAr));
+            if (ok) return nullptr;  // the always-available name owns it
+        }
+        if (!ambiguousImportNames_.empty() &&
+            ambiguousImportNames_.count(
+                std::make_pair(std::string(name), refArity)))
+            return nullptr;  // §2.2's collision diagnostic stands
+        return arityMismatch;
     }
     return nullptr;
 }
@@ -4517,8 +4606,29 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         // generic-parameter count" against the local
                         // declaration.
                         int builtinAr = builtinTypeArity(first);
-                        if (builtinAr != kNotBuiltin &&
-                            builtinAr == static_cast<int>(refArity)) {
+                        // fix #7084 (§2.2, §2.3, v0.343): the SENTINEL
+                        // `kBuiltinTaskLike` means the `Task` family is
+                        // available at arity 0 AND 1 (§2.3 Row 5), so the
+                        // comparison is the one Slice S24 makes below, not a
+                        // plain equality against the table's (negative) value
+                        // — with the plain equality the two sentinel names can
+                        // never match a reference's arity here. NOTE (MEASURED
+                        // by reading this block): at its present site the
+                        // branch assigns `sym = nullptr` INSIDE `if (!sym)`,
+                        // so it is a no-op today — the always-available names
+                        // are resolved by Slice S24, which is where the
+                        // sentinel decides. The comparison is made
+                        // consistent with Slice S24 so the two sites cannot
+                        // disagree.
+                        bool builtinArityMatches = false;
+                        if (builtinAr != kNotBuiltin) {
+                            builtinArityMatches =
+                                (builtinAr == kBuiltinTaskLike)
+                                    ? (refArity == 0 || refArity == 1)
+                                    : (refArity ==
+                                       static_cast<std::size_t>(builtinAr));
+                        }
+                        if (builtinArityMatches) {
                             sym = nullptr;
                         }
                     }

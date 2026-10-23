@@ -39,6 +39,27 @@
 // stop, walk the link's base chain breadth-first for a nested type of the name
 // whose arity the reference fixes and that §13.1 makes accessible there.
 //
+// fix #7084 (§2.2, Appendix C.1, v0.343) adds §2.2's arity FALLBACK to that
+// arm: a candidate whose arity the reference does not fix is not the one the
+// arity rule selects, but it IS one of the candidates, and "where none has
+// that arity, it resolves to the first of them and is Appendix C.1's arity
+// error" — so the reference resolves to it and the diagnostic is the arity
+// error, the same one the LEXICAL twin of that shape gives. The rows
+// `arity_mismatched_inherited_nested_type_is_the_arity_error_spec_2_2` and
+// `arity_mismatched_inherited_nested_type_with_arguments_is_the_arity_error_spec_2_2`
+// pin it; the row
+// `arity_mismatched_inherited_nested_type_is_not_a_candidate_spec_2_2` pinned
+// the divergent "unresolved type name `N`" and is FLIPPED by that fix.
+//
+// fix-forward of #7084 (§2.2 / §2.3, v0.343) corrects the fallback's
+// PRECONDITION. §2.2's fallback applies "where none has that arity", and two
+// of the rule-1 candidate sources are not visible to the enclosing-type walk
+// that finds the inherited nested type: the §2.3 always-available names and
+// the §2.2 ambiguous-import set. Binding the inherited candidate before they
+// are consulted made an inherited `Task<T>` steal the always-available
+// `Task` (a §2.3 guarantee lost) and swallowed §2.2's collision diagnostic.
+// Part 6 pins the three shapes that decide it.
+//
 // SCOPE — what is deliberately NOT claimed, and why:
 //   * The §2.7 STOP is not widened to base types. That is the other half of the
 //     same axis and a strictly larger change (the in-tree note above
@@ -559,14 +580,26 @@ end D;
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
-// §2.7 "Through nesting" + §2.2: the candidate is "the first type that has a
-// nested type of the name, declared or inherited, WHOSE ARITY THE REFERENCE
-// FIXES". A bare `N` supplies no type argument, so it does not fix `N<U>`'s
-// arity 1 — the candidate is skipped rather than bound, and the search ends
-// with the name unresolved. This pins that the arm filters on arity instead of
-// handing a mismatched nested type to a later arity check.
+// §2.7 "Through nesting" + §2.2 (the arity rule). A bare `N` supplies no type
+// argument, so it does not fix `N<U>`'s arity 1 — `N<U>` is not the candidate
+// the arity rule SELECTS. But it IS one of the candidates, and §2.2's
+// fallback is explicit about what happens when none of them has the
+// reference's arity:
+//
+//   "where none has that arity, it resolves to the first of them and is
+//    Appendix C.1's arity error, never an alias, a member or a module prefix"
+//
+// So the reference resolves to `N<U>` and is Appendix C.1's arity error — the
+// SAME diagnostic the LEXICAL twin of this shape gives (a generic nested type
+// in a type's OWN body, referenced without type arguments). Before fix #7084
+// the inherited shape reported "unresolved type name `N`" — LESS specific
+// than its lexical twin, and not the diagnostic §2.2 names for it.
+//
+// This row is the FLIP of the #7012 control row
+// `arity_mismatched_inherited_nested_type_is_not_a_candidate_spec_2_2`, which
+// pinned the divergent "unresolved type name `N`".
 BEZEL_TEST(inherited_nested_type_bare_name_7012,
-           arity_mismatched_inherited_nested_type_is_not_a_candidate_spec_2_2) {
+           arity_mismatched_inherited_nested_type_is_the_arity_error_spec_2_2) {
     auto r = runAot(R"(
 module M;
 class B
@@ -586,7 +619,78 @@ class D
 end D;
 )");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        hasErrorWith(r, "generic-argument count does not match type's "
+                        "generic-parameter count"));
+    // The name is RESOLVED (to the inherited `N<U>`), so it is not reported
+    // as an unresolved name any more.
+    BEZEL_EXPECT_FALSE(hasErrorWith(r, "unresolved type name `N`"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// §2.2 + Appendix C.1 (v0.343): the OTHER direction of the same arity
+// mismatch — an inherited NON-generic nested type referenced WITH type
+// arguments. The reference fixes arity 1, the candidate declares arity 0, so
+// the candidate is not the one §2.2 selects; nothing else has the name, so
+// the reference resolves to it and is Appendix C.1's arity error. The LEXICAL
+// twin (a non-generic nested type in a type's OWN body, referenced as
+// `N<string>`) gives the same diagnostic.
+BEZEL_TEST(inherited_nested_type_bare_name_7012,
+           arity_mismatched_inherited_nested_type_with_arguments_is_the_arity_error_spec_2_2) {
+    auto r = runAot(R"(
+module M;
+class B
+  public class N
+    public method Get(): int return 7; end Get;
+  end N;
+end B;
+class K: B
+  public static method Run(): int
+    using var n: N<string> := new N<string>();
+    Console.WriteLine("reached");
+    return 0;
+  end Run;
+end K;
+class D
+  public static method Main(): int return K.Run(); end Main;
+end D;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        hasErrorWith(r, "generic-argument count does not match type's "
+                        "generic-parameter count"));
+    BEZEL_EXPECT_FALSE(hasErrorWith(r, "unresolved type name `N`"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// §2.7 "Through nesting" + §2.2 (v0.343): a base that has a member of the
+// name which is NOT a nested type is not a candidate at all — §2.7's rule is
+// about "a NESTED TYPE of the name". So there is no candidate of any arity,
+// §2.2's fallback has nothing to resolve to, and the name is unresolved — the
+// diagnostic is unchanged by fix #7084.
+BEZEL_TEST(inherited_nested_type_bare_name_7012,
+           base_member_of_another_kind_is_not_an_arity_candidate_spec_2_7) {
+    auto r = runAot(R"(
+module M;
+class B
+  public method N(): int return 2; end N;
+end B;
+class K: B
+  public static method Run(): int
+    using var n: N := new N();
+    Console.WriteLine("reached");
+    return 0;
+  end Run;
+end K;
+class D
+  public static method Main(): int return K.Run(); end Main;
+end D;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorWith(r, "unresolved type name `N`"));
+    BEZEL_EXPECT_FALSE(
+        hasErrorWith(r, "generic-argument count does not match type's "
+                        "generic-parameter count"));
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
@@ -662,5 +766,192 @@ end D;
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(
         hasErrorWith(r, "type `K` has no nested type named `N`"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+// ============================================================================
+// Part 6 — the arity FALLBACK's two other rule-1 candidate sources
+// (fix-forward of #7084, §2.2 / §2.3, v0.343).
+//
+// §2.2's fallback — "where none has that arity, it resolves to the first of
+// them and is Appendix C.1's arity error" — has a PRECONDITION: that no
+// candidate has the reference's arity. Two of the candidate sources are not
+// visible to the enclosing-type walk that finds the inherited nested type:
+//
+//   * the §2.3 ALWAYS-AVAILABLE names, which the name resolver resolves after
+//     the walk finds nothing; and
+//   * the §2.2 AMBIGUOUS-IMPORT set, whose collision diagnostic the name
+//     resolver reports after the walk finds nothing.
+//
+// So the fallback may bind the inherited candidate only after both have been
+// consulted. The rows below pin the three shapes that decide it.
+// ============================================================================
+
+// §2.2 (the arity rule) + §2.3 (the always-available names), v0.343: the
+// `Task` family is ALWAYS AVAILABLE — "Importing `System.Threading` is not
+// required to use the `Task` family" (§2.3) — and `Task` is available at
+// arity 0 (`Task`) AND at arity 1 (`Task<T>`) (§2.3 Row 5), which the
+// compiler records as the `kBuiltinTaskLike` sentinel.
+//
+// A base that declares a nested `Task<T>` must NOT take the name away. §2.2
+// selects "the first, in that rule's order, whose arity its type-argument list
+// fixes", and the always-available `Task` HAS the reference's arity (0), so
+// the fallback's precondition ("where none has that arity") is FALSE and the
+// fallback must not fire. §2.7 rule 1's own worked example is the same shape:
+// "`Array<int>` passes over it to the always-available `Array<T>`" — an
+// arity-mismatched candidate is PASSED OVER, not fatal.
+//
+// The row pins the IDENTITY, not merely the absence of a diagnostic: a bare
+// `Task` reference can only type-check if it denotes a type of arity 0, and
+// the inherited `Task<T>` is arity 1 — so a program that names the type bare
+// and compiles at all has denoted the ALWAYS-AVAILABLE `Task`.
+BEZEL_TEST(inherited_nested_type_bare_name_7012,
+           always_available_task_wins_over_an_inherited_nested_type_spec_2_3) {
+    auto r = runAot(R"(
+module M;
+class B
+  public class Task<T>
+    public method Get(): int return 1; end Get;
+  end Task;
+end B;
+class K: B
+  public method Take(t: Task): int return 0; end Take;
+  public static method Run(): int
+    Console.WriteLine("reached");
+    return 0;
+  end Run;
+end K;
+class D
+  public static method Main(): int return K.Run(); end Main;
+end D;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(
+        hasErrorWith(r, "generic-argument count does not match type's "
+                        "generic-parameter count"));
+    BEZEL_EXPECT_FALSE(hasErrorWith(r, "unresolved type name `Task`"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "reached\n");
+}
+
+// §2.3 Row 5 + §2.6: `TaskCompletionSource` is the SECOND always-available
+// name whose arity is the sentinel (available at arity 0 and at arity 1), so
+// it is the second half of the pair the row above pins. Without the sentinel
+// being read as "arity 0 AND 1", the always-available name is not a candidate
+// of the reference's arity and the fallback steals the name.
+BEZEL_TEST(inherited_nested_type_bare_name_7012,
+           always_available_task_completion_source_wins_over_an_inherited_nested_type_spec_2_3) {
+    auto r = runAot(R"(
+module M;
+class B
+  public class TaskCompletionSource<T>
+    public method Get(): int return 1; end Get;
+  end TaskCompletionSource;
+end B;
+class K: B
+  public method Take(t: TaskCompletionSource): int return 0; end Take;
+end K;
+class D
+  public static method Main(): int return 0; end Main;
+end D;
+)");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+}
+
+// §2.2 (the collision rule), v0.343: "When two imported modules export the
+// same public name, the bare name is ambiguous: using it unqualified is a
+// compile error citing both origins." The two imported `N`s are arity 0 and the
+// reference fixes arity 0, so §2.2's arity rule selects them — and they are
+// ambiguous. The inherited `N<U>` (arity 1) is not selected, so the fallback
+// must not fire and swallow the collision diagnostic.
+//
+// The collision's TEXT is the pre-existing sibling site's ("multiple imported
+// modules export a type with this name and arity") — the site that omits the
+// origins is a separate, already-filed gap, so this row pins the parts of the
+// message that are stable across that fix: the "bare name `N` is ambiguous"
+// prefix and the remedy.
+BEZEL_TEST(inherited_nested_type_bare_name_7012,
+           ambiguous_import_collision_is_not_swallowed_by_the_arity_fallback_spec_2_2) {
+    const std::string la = R"(
+module LA;
+public class N
+  public method Get(): int return 77; end Get;
+end N;
+)";
+    const std::string lb = R"(
+module LB;
+public class N
+  public method Get(): int return 88; end Get;
+end N;
+)";
+    const std::string app = R"(
+module App;
+import LA;
+import LB;
+class B
+  public class N<U>
+    public method Get(): int return 8; end Get;
+  end N;
+end B;
+class K: B
+  public static method Run(): int
+    using var n: N := new N();
+    Console.WriteLine(n.Get());
+    return 0;
+  end Run;
+end K;
+class D
+  public static method Main(): int return K.Run(); end Main;
+end D;
+)";
+    JitResult r = runAotModules({ModuleSource{"LA", la},
+                                 ModuleSource{"LB", lb},
+                                 ModuleSource{"App", app}},
+                                "App");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorWith(r, "bare name `N` is ambiguous"));
+    BEZEL_EXPECT_TRUE(
+        hasErrorWith(r, "qualify it via a module-qualified name or an "
+                        "import alias"));
+    BEZEL_EXPECT_FALSE(
+        hasErrorWith(r, "generic-argument count does not match type's "
+                        "generic-parameter count"));
+    BEZEL_EXPECT_FALSE(hasErrorWith(r, "unresolved type name `N`"));
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// §2.2 / §2.3, v0.343: the always-available names are BROADER than the
+// compiler's built-in table — `Console`, `Math`, `Convert`, `Environment` and
+// `BitReader` are always-available names of the auto-imported `System` (§2.3
+// Row 10 / stdlib §4) that the built-in table does not carry, so the name
+// resolver does not resolve them at all (a PRE-EXISTING gap, not this fix's).
+//
+// The consequence is NAMED here, because it is a diagnostic this fix moves:
+// for such a name the fallback has nothing to defer to, so the reference
+// resolves to the inherited nested type and the diagnostic is Appendix C.1's
+// arity error — where the base reported "unresolved type name `Console`".
+// The verdict is unchanged (a rejection either way); the MESSAGE moves, and
+// this row pins it so the move is not silent.
+BEZEL_TEST(inherited_nested_type_bare_name_7012,
+           always_available_module_member_name_keeps_the_arity_fallback_message_spec_2_2) {
+    auto r = runAot(R"(
+module M;
+class B
+  public class Console<T>
+    public method Get(): int return 1; end Get;
+  end Console;
+end B;
+class K: B
+  public method Take(c: Console): int return 0; end Take;
+end K;
+class D
+  public static method Main(): int return 0; end Main;
+end D;
+)");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(
+        hasErrorWith(r, "generic-argument count does not match type's "
+                        "generic-parameter count"));
+    BEZEL_EXPECT_FALSE(hasErrorWith(r, "unresolved type name `Console`"));
     BEZEL_EXPECT_FALSE(r.ran);
 }
