@@ -3926,6 +3926,79 @@ void Resolver::recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
                                /*siteKey=*/&id, id.span.begin);
 }
 
+// fix #7013 (§2.2, §11.6, v0.340): §2.2's arity selection, for a reference
+// that fixes arity 0 — a chain HEAD, which §11.6 calls "a bare enclosing
+// segment" ("A bare enclosing segment fixes arity 0").
+//
+// §2.2's collision AND shadowing rules compare names "together with their
+// generic arity", and its arity rule is "Arity selects among the types rule 1
+// of §2.7 finds for an identifier: a reference resolves to the first, in that
+// rule's order, whose arity its type-argument list fixes". So a current
+// module's `C<T>` (arity 1) does NOT shadow an imported `C` (arity 0): the two
+// are "two names, neither colliding with nor shadowing the other" (§2.2's own
+// `Counter` / `Counter<K>` example, whose usable spellings are `Counter.Bump()`
+// — a chain head — and `Counter<string>`). A head that fixes arity 0 therefore
+// selects the imported arity-0 `C`, and §11.6's "In a type position, therefore,
+// no name passes through a generic enclosing type" is satisfied because the
+// selected `C` is NOT generic.
+//
+// The candidate set is rule 1's, in rule 1's order, with the arity filter
+// applied to each candidate in turn:
+//
+//   * the SCOPE chain first (local scope, then the enclosing type's
+//     accessible members, then the current module's declarations) — a
+//     candidate whose arity does not match is SKIPPED, not fatal, because
+//     §2.2's rule is "the first, in that rule's order, whose arity its
+//     type-argument list fixes". That walk needs `Scope`, which is private
+//     to `Resolver`, so it lives at the call site;
+//   * then the IMPORTED names, which this helper looks up. The import loop
+//     in TypeResolution.cpp keys its current-module shadowing test on the
+//     BARE name (`if (localNames.count(std::string_view(t->name))) continue;`),
+//     so it skips the imported arity-0 `C` before recording it in
+//     `importedByArity_` — the table the #5172 arity redirect consults — and
+//     the scope chain therefore never holds it. This lookup reaches the
+//     module's exported-type list directly (`ctx_.importedTypesOf(dotted)`,
+//     the same list that loop walks), restricted to the modules THIS FILE
+//     imported (`sourceImports_`).
+//
+// Returns the unique imported type of that (name, arity), or null. Sets
+// `*ambiguous` when two DISTINCT imported modules export that pair — §2.2's
+// collision, which the caller reports.
+static TypeSymbol* selectImportedTypeByArity(
+    SemaContext& ctx, const std::unordered_set<std::string>& sourceImports,
+    std::string_view name, std::size_t arity, bool* ambiguous) {
+    if (ambiguous) *ambiguous = false;
+    TypeSymbol* found = nullptr;
+    std::string foundModule;
+    for (const std::string& mod : sourceImports) {
+        const auto* exported = ctx.importedTypesOf(mod);
+        if (!exported) continue;
+        for (TypeSymbol* t : *exported) {
+            if (!t || t->name != name) continue;
+            if (t->genericParams.size() != arity) continue;
+            // §2.3 Row 10 / #5140: an always-available name and an imported
+            // public of the same identifier are ambiguous in bare use, and
+            // the (identifier, arity) keying for the always-available set is
+            // an OPEN question there (#5140's HOLD). This lookup stays out of
+            // that set rather than deciding it.
+            if (isAlwaysAvailableBareName(t->name)) continue;
+            if (!found) {
+                found = t;
+                foundModule = mod;
+                continue;
+            }
+            if (foundModule != mod) {
+                // §2.2 collision: a second (different) import exports this
+                // (name, arity).
+                if (ambiguous) *ambiguous = true;
+                return nullptr;
+            }
+            // else: the same module listed twice (no-op).
+        }
+    }
+    return found;
+}
+
 // fix #6965 review (§11.6, §2.2, Appendix C.1, v0.340): a dotted type name
 // passes THROUGH the segment that names `enclosing` to reach `part`. That
 // segment carries no type arguments (A.5's `TypeNoNullable ::= QualifiedName
@@ -4130,6 +4203,69 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         }
     } else {
         sym = lookupName(first, scope);
+        // fix #7013 (§2.2, §11.6, v0.340): the CHAIN HEAD is a bare
+        // enclosing segment, and §11.6 says "A bare enclosing segment fixes
+        // arity 0" — A.5 admits a type-argument list after the LAST segment
+        // only, so the head of a dotted type name is always arity 0. §2.2's
+        // arity rule then selects among rule 1's candidates: "a reference
+        // resolves to the first, in that rule's order, whose arity its
+        // type-argument list fixes". A generic head is therefore NOT a
+        // candidate for a chain head — and §11.6 agrees ("In a type position,
+        // therefore, no name passes through a generic enclosing type").
+        //
+        // So when the scope lookup found a GENERIC type for the head, the
+        // arity-0 candidate is the imported non-generic type of the same
+        // name, and §2.2's shadowing rule (which compares names "together
+        // with their generic arity") says the current module's `C<T>` does
+        // not shadow it. Select it here so `C.N` reaches the imported `C`'s
+        // nested type instead of the §11.6 arity error.
+        //
+        // When there is no such candidate, `sym` stays the generic head and
+        // the existing §11.6 arity error stands (nothing else changes).
+        if (TypeSymbol* head = dynamic_cast<TypeSymbol*>(sym)) {
+            if (!head->genericParams.empty()) {
+                // Rule 1's SCOPE positions, in order: local scope, then the
+                // enclosing type's accessible members, then the current
+                // module's declarations. A candidate whose arity does not
+                // match is SKIPPED, not fatal (§2.2's rule is "the first, in
+                // that rule's order, whose arity its type-argument list
+                // fixes"). A scope entry that is not a TYPE is not an arity
+                // candidate at all — §2.2's rule selects among "the types
+                // rule 1 of §2.7 finds" — so the walk stops there and the
+                // name stays bound to that non-type, as before.
+                TypeSymbol* selected = nullptr;
+                for (Scope* s = scope; s; s = s->parent) {
+                    auto it = s->names.find(first);
+                    if (it == s->names.end()) continue;
+                    auto* ts = dynamic_cast<TypeSymbol*>(it->second);
+                    if (!ts) break;  // a non-type binds the name here
+                    if (ts->genericParams.empty()) {
+                        selected = ts;
+                        break;
+                    }
+                    // Arity mismatch — skip this candidate, keep looking.
+                }
+                bool ambiguous = false;
+                if (!selected) {
+                    // Rule 1's IMPORTED positions.
+                    selected = selectImportedTypeByArity(
+                        ctx_, sourceImports_, first, 0, &ambiguous);
+                }
+                if (selected) {
+                    sym = selected;
+                } else if (ambiguous) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("bare name `") + std::string(first) +
+                        "` is ambiguous: multiple imported modules export a type "
+                        "with this name and arity; qualify it via a "
+                        "module-qualified name or an import alias "
+                        "(\xC2\xA7""2.2)");
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
+            }
+        }
     }
     if (!sym) {
         // Unknown — but a null lookup may also mean "name is in scope as
@@ -6200,9 +6336,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             std::string_view part = t.name->parts[pi];
             // per §11.6 (v0.340): no type name passes through a generic
             // enclosing segment — Appendix C.1's arity error. (§2.2's arity
-            // selection of a same-named NON-generic head is not implemented
-            // here: a local `C<T>` keeps an imported `C` out of the scope
-            // entirely, so that program was already rejected — #7013.)
+            // selection of a same-named NON-generic head is applied at the
+            // HEAD lookup above — fix #7013: a chain head fixes arity 0, so
+            // a generic head loses to an imported non-generic type of the
+            // same name, and this error is what stands when there is none.)
             if (reportGenericEnclosingSegment(ctx_.diagnostics(), t, tsym,
                                               part)) {
                 ref.kind = TypeRef::Kind::Error;
