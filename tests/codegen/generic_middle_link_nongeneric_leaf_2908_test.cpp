@@ -46,14 +46,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // A `Cell` whose live count is the exactly-once (§28.4/§28.5) disposal oracle.
 const char* kCountedCell =
     "class Cell "
@@ -94,7 +86,8 @@ BEZEL_TEST(generic_middle_link_2908, generic_middle_nongeneric_leaf_spec_22_8) {
         "  c.mv := 9; "
         "  return c.ba + c.cell.tag + c.ma + c.bv.Length + c.mv + c.la; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 + 6 + 4 + 9 + 2
     BEZEL_EXPECT_EQ(r.exitCode, 65);
@@ -129,7 +122,8 @@ BEZEL_TEST(generic_middle_link_2908, generic_base_with_ctor_under_nongeneric_lea
         "  c.mv := 9; "
         "  return c.ba + c.cell.tag + c.ma + c.bv.Length + c.mv + c.la; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 + 6 + 4 + 9 + 2
     BEZEL_EXPECT_EQ(r.exitCode, 65);
@@ -174,7 +168,8 @@ BEZEL_TEST(generic_middle_link_2908, two_generic_middle_links_renamed_spec_14_1)
         "  return x.n0 + x.n1 + x.n2 + x.n3 + x.c1.tag + x.c2.tag + x.c3.tag "
         "         + x.bv.Length + x.dv + wide; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 2 + 13 + 11 + 7 + 3 + 3 + 3 + 4 + 9 + 1
     BEZEL_EXPECT_EQ(r.exitCode, 56);
@@ -211,7 +206,8 @@ BEZEL_TEST(generic_middle_link_2908, exactly_once_disposal_loop_spec_28_4) {
         "  end; "
         "  return (acc - 780) + Cell.live * 100 + (Cell.made - 12); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 12 * 65 = 780; 12 cells made, 0 live at the end.
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -248,7 +244,8 @@ BEZEL_TEST(generic_middle_link_2908, control_generic_leaf_over_generic_middle_sp
         "  return c.ba + c.cell.tag + c.ma + c.bv.Length + c.mv + c.la "
         "         + c.lv.Length; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 + 6 + 4 + 9 + 2 + 3
     BEZEL_EXPECT_EQ(r.exitCode, 68);

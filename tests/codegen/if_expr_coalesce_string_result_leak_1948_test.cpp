@@ -53,13 +53,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // (A) #1948 repro — an `if` EXPRESSION whose then-branch mints `"a" + "b"` and
 // the result is RETURNED. Pre-fix the minted "ab" leaked inside Pick.
 const char* kIfExprProducerBranch =
@@ -143,7 +136,8 @@ const char* kIfExprBindThenReturn =
 BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
            return_if_expr_producer_branch_lsan_clean_spec_20) {
     JitResult r = runAotChecked(kIfExprProducerBranch);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);        // compiled + LSan-clean (arm string freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // "ab".Length
 }
@@ -154,7 +148,8 @@ BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
 BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
            if_expr_mixed_branches_no_uaf_spec_28_3) {
     JitResult r = runAotChecked(kIfExprMixedBranches);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);  // "ab"(2) + "borrowed"(8)
 }
@@ -165,7 +160,8 @@ BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
 BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
            return_coalesce_rhs_producer_lsan_clean_spec_7_7) {
     JitResult r = runAotChecked(kCoalesceRhsProducer);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // "ab".Length
 }
@@ -177,7 +173,8 @@ BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
 BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
            coalesce_lhs_borrow_no_uaf_spec_7_7) {
     JitResult r = runAotChecked(kCoalesceLhsBorrow);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);  // "hi".Length
 }
@@ -189,7 +186,8 @@ BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
 BEZEL_TEST(if_expr_coalesce_string_result_leak_1948,
            bind_then_return_if_expr_result_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kIfExprBindThenReturn);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 2);
 }

@@ -77,14 +77,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// ASan toolchain skip-guard (matches the #2587 / #2576 / #2567 test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // ----------------------------------------------------------------------
 // Probe A — CARDINAL: Dictionary<int,string> compound += producer-RHS string
 // concat. emitStringConcat mints newVal (+1, transferred to slot via the
@@ -222,7 +214,8 @@ const char* kUserIndexerCompound =
 BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
            dict_string_compound_producer_rhs_does_not_leak_spec_23_4_28_9) {
     JitResult r = runAotChecked(kDictCompoundProducer);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);           // LSan-clean (the #2596 leak flips this)
     BEZEL_EXPECT_EQ(r.exitCode, 75);    // sink mod 256 — independent value check
 }
@@ -238,7 +231,8 @@ BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
 BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
            dict_string_compound_borrow_no_uaf_spec_23_4_28_9) {
     JitResult r = runAotChecked(kDictCompoundBorrow);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -251,7 +245,8 @@ BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
 BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
            dict_int_compound_unaffected_spec_23_4_28_9) {
     JitResult r = runAotChecked(kDictCompoundInt);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 86);    // 4950 mod 256
 }
@@ -265,7 +260,8 @@ BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
 BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
            array_string_compound_remains_clean_2587_spec_23_4_28_9) {
     JitResult r = runAotChecked(kArrayCompoundProducer);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -278,6 +274,7 @@ BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
 BEZEL_TEST(dict_indexer_compound_rhs_leak_2596,
            user_indexer_compound_remains_clean_2567_spec_23_4_28_9) {
     JitResult r = runAotChecked(kUserIndexerCompound);
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
 }

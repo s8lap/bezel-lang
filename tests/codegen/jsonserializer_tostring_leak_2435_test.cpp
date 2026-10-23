@@ -65,17 +65,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required
-// to build this repo, so a skip is not expected — guard anyway (mirrors
-// guid_tostring_leak_1982_stdlib_2_6_test.cpp / #1934).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 const char* kImport = "import System.Serialization; ";
 
 // A minimal ISerializable/IDeserializable class (§2.14) — synthesized
@@ -106,7 +95,8 @@ BEZEL_TEST(json_serializer_tostring_leak_2435,
         "  if json.Contains(\"hello\") then return 42; end; "
         "  return 0; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);        // compiled + LSan-clean (result freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 42); // round-tripped JSON content, value intact
 }
@@ -143,7 +133,8 @@ BEZEL_TEST(json_serializer_tostring_leak_2435,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);        // neither leaked nor double-freed
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -167,7 +158,8 @@ BEZEL_TEST(json_serializer_tostring_leak_2435,
         "  p.Serialize(s); "
         "  return s.ToString().Length; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // '{"Name":"hello"}' — pin the exact synthesized JSON length so a
     // premature free (which would corrupt or truncate the buffer) is caught
@@ -196,7 +188,8 @@ BEZEL_TEST(json_serializer_tostring_leak_2435,
         "  if a.Contains(\"hello\") and b.Contains(\"hello\") then return 42; end; "
         "  return 0; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -218,7 +211,8 @@ BEZEL_TEST(json_serializer_tostring_leak_2435,
         "  using var buf := s.ToBytes(); "
         "  return buf.Length; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, static_cast<int>(
         std::string("{\"Name\":\"hello\"}").size()));
