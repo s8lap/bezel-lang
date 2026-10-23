@@ -26349,28 +26349,32 @@ static bool isDocumentedStdlibLinqOperatorName(std::string_view n) {
 }
 
 // fix #7015 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2, §4.12,
-// §4.13): the builtin collection interface heads whose CALL form this
-// reject covers.
+// §4.13) + fix #7027 (language spec §27.6, v0.340; stdlib §4.1, §4.2): the
+// builtin collection interface heads whose CALL form this reject covers —
+// ALL EIGHT of them, the same set builtinCollectionInterfaceSurface names.
 //
-// The eight builtin collection interface heads split in two by what the
-// #853 codegen backstop does with an undeclared name on them:
-//   * the four it REJECTS with its own "not yet supported in codegen"
-//     message — IReadOnlyCollection<T> / ICollection<T> /
-//     IOwningCollection<T> / IOwningList<T> (the polymorphic collection
-//     interfaces plus the owning list). On those heads the call is already
-//     refused, but #853's wording says the member EXISTS and is missing only
-//     from codegen, which is false for a name the head does not declare
-//     (#7027). That half of the family is #7027's own fix.
+// The eight heads split in two by what the #853 codegen backstop does with an
+// undeclared name on them:
 //   * the four it does NOT reach — IReadOnlyList<T> / IList<T> (§4.1),
 //     IEnumerable<T> (§4.12), IOwningEnumerable<T> (§4.13). These are the
 //     array-backed / borrowed heads, where codegen's structural dispatch
 //     accepted the undeclared name and the call compiled with NO diagnostic
 //     at all: `ro.Add(1)` (a READ-ONLY list) and `il.IndexOf(2)` both ran.
-//     This is the half #7015 reports.
-static bool isBuiltinCollectionCallRejectHead(std::string_view head) {
-    return head == "IReadOnlyList" || head == "IList" ||
-           head == "IEnumerable" || head == "IOwningEnumerable";
-}
+//     This is the half fix #7015 reports.
+//   * the four it REJECTS with its own "not yet supported in codegen"
+//     message — IReadOnlyCollection<T> / ICollection<T> /
+//     IOwningCollection<T> / IOwningList<T> (the polymorphic collection
+//     interfaces plus the owning list). On those heads the call was already
+//     refused, but #853's wording says the member EXISTS and is missing only
+//     from codegen — false for a name the head does not declare: `co.Insert(0,
+//     1)` on an `ICollection<T>` (stdlib §4.1: `Insert` is declared on
+//     `IList<T>` only) got the #853 message. This is fix #7027's half.
+//
+// So the type-level reject now covers every head, and the two spellings of one
+// undeclared name agree on all of them (language spec §27.6: the member is
+// resolved "on the value exactly as the call `v.Scaled()` is"). A DECLARED
+// member on a polymorphic head keeps #853's message — that one is true: the
+// member exists and only codegen's lowering is missing.
 
 // The "no member" diagnostic for a member a builtin collection interface does
 // not declare, or "" when no rejection applies: `t` is not one of the heads
@@ -26390,8 +26394,9 @@ static bool isBuiltinCollectionCallRejectHead(std::string_view head) {
 //     the table lists), so `il.ElementAtOrNull(1)` and `ro.Contains(3)` are
 //     legitimate calls (§5) and must not be taken for undeclared members.
 //
-// `callForm` also restricts the reject to the heads
-// isBuiltinCollectionCallRejectHead names.
+// `callForm` selects the CALL form's exemptions (the whole documented §5 name
+// set, and `Dispose`); the head set is the same for both spellings, so the
+// two agree on every head (fix #7015, fix #7027).
 //
 // The caller decides the remaining exemption, a user extension that applies
 // to the receiver (§26.5), because it needs the extension table.
@@ -26403,7 +26408,6 @@ static std::string builtinCollectionMemberReject(const TypeRef* t,
     const char* section = nullptr;
     const char* surface = nullptr;
     if (!builtinCollectionInterfaceSurface(head, section, surface)) return "";
-    if (callForm && !isBuiltinCollectionCallRejectHead(head)) return "";
     if (name == "ToString" || name == "Equals" || name == "GetHashCode" ||
         name == "GetType" || name == "ReferenceEquals")
         return "";
