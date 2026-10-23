@@ -42,11 +42,27 @@ public class Program
   end Main;
 end Program;
 
+// #7071: this row's expected diagnostic is emitted by CODEGEN — the
+// imported-argument lowering of `lowerCallDispatch`
+// (src/codegen/LlvmBackend_Calls2.cpp:14276) — so CODEGEN RUNS on this row.
+// The ICE-escape guard must therefore name a marker that layer can produce:
+// `internal:` is the codegen-only marker (every `internal:` string literal in
+// src/ lives under src/codegen/), so it is the one that can fire here.
+//
+// #6620's replacement — the front end's own `internal compiler error` —
+// cannot land on this row: all four front-end ICE sites are `[[noreturn]]`
+// aborts that kill the process before the positive diagnostic exists, so the
+// needle was never even evaluated. #6620's premise ("all 17 rows reject in
+// the front end") is false for this row.
+//
+// The guard is written on BOTH sides of the positive match: a codegen
+// `internal:` diagnostic is collected and rendered at the end of the compile
+// (src/driver/Driver.cpp:809), in report order, so it can land either before
+// or after the §15.4 diagnostic this row pins.
+// CHECK-NOT: internal:
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: a collection literal `[...]` cannot target the imported parameter type here
 // The load-bearing assertions: the gate must NOT have called this class an
 // interface, and must NOT have reached the generic out-of-list diagnostic.
 // CHECK-NOT: cannot target the interface type
 // CHECK-NOT: cannot target the type
-// #6620: `internal:` is codegen-only and cannot occur on a row that
-// rejects in the front end; this needle is the front end's own ICE marker.
-// CHECK-NOT: internal compiler error
+// CHECK-NOT: internal:
