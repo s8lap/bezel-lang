@@ -59,11 +59,38 @@
 // "on the value exactly as the call `v.Scaled()` is"; rejecting it would turn
 // an accepted program into a rejection.
 //
-// Also excluded, for the same reason: a bare type parameter constrained by
-// `where T: ICollection<int>` exposes no `IsReadOnly` member at all ("no
-// member `IsReadOnly` on bare type parameter `T`: a bare type parameter
-// exposes only the members its constraints establish", §3.6 rule 2 / §14.2),
-// so it never reaches this arm.
+// Also NOT this arm's case, but for a DIFFERENT reason than the paragraph
+// above: a bare type parameter constrained by `where T: ICollection<int>`
+// DOES expose `IsReadOnly`. §3.6 rule 2 / §14.2 puts the head's members in
+// T's surface inside the generic body, and stdlib §4.1 DECLARES
+// `readonly property IsReadOnly: bool;` on `ICollection<T>` (§4.2 declares
+// the same on `IOwningCollection<T>`), so the read is ADMITTED and TYPED
+// `bool` through the CONSTRAINT path — the #7086 fix, which established
+// these heads' documented surface for a constrained type parameter. The
+// statement that a constrained bare type parameter "exposes no `IsReadOnly`
+// member at all" was true of the PRE-#7086 compiler and is FALSE now.
+//
+// The two paths stay distinct, so the read does NOT reach this arm. This
+// arm is the INTERFACE-TYPED RECEIVER — a value whose STATIC type is the
+// head (`var co: ICollection<int> := a; co.IsReadOnly`), where the head
+// erases the concrete collection and this arm supplies the constant. The
+// constraint path's receiver is a bare type PARAMETER, and codegen resolves
+// it to the type it is SUBSTITUTED with before the arm dispatch
+// (`resolveTypeParamRef`, LlvmBackend_Exprs.cpp's #7086 change), so the
+// read is answered by the arm for that substituted type — the
+// CONCRETE-collection arm for an `Array<int>` argument, this arm for an
+// interface-typed one. Both answer the same §4.1 constant. The read is also
+// TYPED by sema on the constraint path (§14.2's surface), so this arm's
+// codegen type-patch is not needed for it.
+//
+// MEASURED on this lane's tip: `where T: ICollection<int>` and `where T:
+// IList<int>`, each reading `x.IsReadOnly` over an `Array<int>` argument,
+// both print "rw" (the §4.1 value `false`) and compile clean. The two
+// `internal:` diagnostics are the generic TEMPLATE body's placeholder
+// lowering — the dead body has no substitution, so its bare `T` matches no
+// arm. The SPECIALIZATION answers the read from the concrete type: the same
+// program's `x.Count` prints 3, not 0 (a degraded read would print 0 and
+// would not print the line at all — the #3079 no-op).
 //
 // ORACLE. `runAot` / `runAotOut`. Every positive row asserts the program's
 // EXACT stdout, so a statement the #3079 no-op deleted is a failure (an empty
