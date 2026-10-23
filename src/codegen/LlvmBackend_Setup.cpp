@@ -2733,6 +2733,79 @@ void Emitter::declareFunctions() {
     }
 }
 
+// fix #7055 (§14.1 / §2.8.2, v0.340): the generic parameters whose NAMES are
+// in scope for an IMPORTED declaration — the member's own §14.1 parameters and
+// the ones its declaring type contributes. An imported type-parameter
+// reference has no `ast::Type` node (there is no AST in the importer), so the
+// name is carried in `TypeRef::importedName` (ModuleLoader's `convert`).
+static void collectImportedTemplateParamNames(
+    const sema::MethodSymbol* ms,
+    std::vector<std::string_view>& out) {
+    auto add = [&out](const std::vector<sema::Symbol*>& ps) {
+        for (sema::Symbol* p : ps) {
+            auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(p);
+            if (gp) out.push_back(gp->name);
+        }
+    };
+    if (ms) {
+        add(ms->genericParams);
+        if (ms->parent) add(ms->parent->genericParams);
+    }
+}
+
+// fix #7055 (§14.1 / §2.8.2, v0.340): true when `rt` is a reference to one of
+// the generic type parameters in `params` — the erased-placeholder shape an
+// imported generic declaration's signature carries. `headOut` receives the
+// matched name.
+//
+// An imported generic method is called through the DEFINING module's
+// erased-placeholder template (§2.8.2 clause 2: "An external instantiation
+// behaves identically to a same-module instantiation"), so the importer's
+// declaration of it must be the TEMPLATE's signature. The template lowers a
+// type-parameter reference to the i32 placeholder, and its NULLABLE form to
+// the placeholder nullable struct {i8 hasValue; i32 value} — the rule
+// `lowerTypeRef` states for an unspecialized template body. `lowerTypeRef`
+// applies that rule to a LOCAL type-parameter reference (which carries an
+// `ast::Type` node); an IMPORTED one carries no AST, so the nullable branch
+// cannot fire and the nullability was DROPPED: the importer declared `T?` as
+// a bare i32 against the exporter's {i8, i32}.
+//
+// ⚠ THE NAME ALONE IS NOT THE TEST, and the caller must check it. A type
+// parameter may be spelled like a reserved built-in — §14.1 "Type-parameter
+// names" admits a type parameter named like an ordinary type, and §2.7 rule 1
+// finds the type parameter first — so `M<IntPtr>(x: IntPtr): IntPtr?` declares
+// a type parameter named `IntPtr`. The defining module's template lowers that
+// reference to the BUILT-IN's own layout (lowerTypeRef's built-in arms answer
+// before the type-parameter fallback reaches the i32 placeholder), and the
+// importer's declaration must lower it the SAME way, or the two modules
+// disagree on the ABI of one symbol: the importer declared {i8, i32} against
+// the exporter's {i8, i64}, and the call read the exporter's result as a
+// different struct — a SILENT wrong value (0 instead of 14), which §2.8.2
+// clause 2 forbids ("An external instantiation behaves identically to a
+// same-module instantiation of the same generic at the same arguments").
+// The caller therefore applies `isBuiltinTypeRefName` to `headOut` and leaves
+// such a reference to `lowerTypeRef`, which is the path that produced the
+// exporter's own layout.
+static bool importedTypeNamesGenericParam(
+    const sema::TypeRef* rt,
+    const std::vector<std::string_view>& params,
+    std::string_view& headOut) {
+    headOut = {};
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->declaration) return false;
+    std::string_view head = rt->importedName;
+    if (head.empty() && rt->astNode && rt->astNode->name &&
+        !rt->astNode->name->parts.empty())
+        head = rt->astNode->name->parts[0];
+    if (head.empty()) return false;
+    for (std::string_view n : params)
+        if (n == head) {
+            headOut = head;
+            return true;
+        }
+    return false;
+}
+
 // §2.5 (issue #328 inc 3): see the call site in declareFunctions(). One external
 // `llvm::Function` per imported method, registered in methodFns_ so the call
 // path (directCall) finds it. The body-emit loop iterates methodFns_ but
@@ -2748,6 +2821,29 @@ void Emitter::declareImportedFunctions() {
         sema::TypeRef* retRef = ctx_.importedReturnType(ms);
         llvm::Type* retTy = retRef ? lowerTypeRef(retRef)
                                    : llvm::Type::getVoidTy(llvm_);
+        // fix #7055 (§14.1 / §2.8.2, v0.340): the imported method's ABI is
+        // the defining module's erased-placeholder template, whose NULLABLE
+        // type-parameter form is the placeholder nullable struct
+        // {i8 hasValue; i32 value} — the same struct `lowerTypeRef` builds for
+        // a local template body. Declaring it as a bare i32 (what the
+        // nullability-dropping imported path answered) made the importer's
+        // call read the exporter's {i8, i32} result as an int: the first word
+        // of the struct, i.e. the hasValue tag plus padding — a garbage
+        // value — while the SEMANTIC type of the expression stayed `int?`, so
+        // the `??` path extracted field 0 of an i32 and crashed bezelc
+        // (SIGSEGV in llvm::Value::setName, from an extractvalue with a null
+        // result type).
+        std::vector<std::string_view> tmplParams;
+        collectImportedTemplateParamNames(ms, tmplParams);
+        // fix #7055 (§14.1 / §2.8.2, v0.340): the placeholder applies to a
+        // type parameter whose name is NOT a reserved built-in — a parameter
+        // named like a built-in (`M<IntPtr>`) is lowered by the DEFINING
+        // module's template to the built-in's own layout, so the importer
+        // declares it the same way (see the recognizer's comment).
+        std::string_view retHead;
+        if (importedTypeNamesGenericParam(retRef, tmplParams, retHead) &&
+            retRef->nullable && !isBuiltinTypeRefName(retHead))
+            retTy = nullablePrimStructTy(sema::PrimitiveType::Int);
         std::vector<llvm::Type*> paramTys;
         // #735: an imported ENUM instance method's `this` is the enum's
         // underlying integer (i32), passed BY VALUE — matching the exporter's
@@ -2777,9 +2873,19 @@ void Emitter::declareImportedFunctions() {
             sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
             // fix #3095 / §4.7: lowerParamTypeRef — the imported face of the
             // same `()`-parameter substitution declareFunctions makes.
+            llvm::Type* pTy = pt ? lowerParamTypeRef(pt) : i32();
+            // fix #7055 (§14.1 / §2.8.2, v0.340): the parameter side of the
+            // erased-placeholder ABI — see the return type above. The
+            // exporter's template takes a nullable type parameter as
+            // {i8 hasValue; i32 value}; declaring it as a bare i32 made the
+            // importer pass a raw int where the callee read a tagged struct.
+            std::string_view paramHead;
+            if (importedTypeNamesGenericParam(pt, tmplParams, paramHead) &&
+                pt->nullable && !isBuiltinTypeRefName(paramHead))
+                pTy = nullablePrimStructTy(sema::PrimitiveType::Int);
             paramTys.push_back(isByRefMod(ps ? ps->modifier : std::string_view())
                                    ? ptrTy()
-                                   : (pt ? lowerParamTypeRef(pt) : i32()));
+                                   : pTy);
         }
         auto* fnType = llvm::FunctionType::get(retTy, paramTys,
                                                /*isVarArg=*/false);
@@ -47861,6 +47967,26 @@ static const char* valueBuiltinBoxNameStr(std::string_view n) {
     return nullptr;
 }
 
+// fix #7055 (§32.7 / stdlib §10.0, v0.340): the FFI pointer-sized INTEGER
+// value types. `IntPtr`/`UIntPtr` are VALUE types — a machine-word integer,
+// i64 on the host — so their NULLABLE form is a nullable value type (§7.2):
+// the tagged {i8 hasValue; i64 value} struct, exactly like `DateTime?`.
+// They were absent from the nullable-value-builtin family, so `IntPtr?` fell
+// through to the BARE i64 lowering and its NULLABILITY WAS DROPPED — `null`
+// had no representation, and a cross-module generic method whose type
+// parameter is named `IntPtr` published an `i64` return that the importer
+// read as a nullable struct: the two modules disagreed on the ABI of one
+// symbol, and the call returned a SILENT wrong value.
+//
+// They are NOT among the boxable value builtins (§8.6: the boxed value
+// builtins are the DateTime/TimeSpan/DateOnly/TimeOnly/Guid shapes), so the
+// box-key set is left exactly as it was.
+static const char* ffiIntegerValueBuiltinName(std::string_view n) {
+    if (n == "IntPtr")  return "IntPtr";
+    if (n == "UIntPtr") return "UIntPtr";
+    return nullptr;
+}
+
 
 // §2.5–§2.6 (#1945/#1954): the value-builtin name (DateTime/TimeSpan/DateOnly/
 // TimeOnly/Guid) a TypeRef denotes, resolved across the three shapes value-builtins
@@ -47873,15 +47999,24 @@ const char* Emitter::valueBuiltinName(const sema::TypeRef* rt) {
     using K = sema::TypeRef::Kind;
     if (!rt || rt->kind != K::Named) return nullptr;
     // (a) builtinClassSym form: a compiler-intrinsic TypeSymbol (decl==nullptr).
-    if (rt->declaration)
-        return rt->declaration->decl ? nullptr
-                                     : valueBuiltinBoxNameStr(rt->declaration->name);
+    if (rt->declaration) {
+        if (rt->declaration->decl) return nullptr;
+        if (const char* ffi = ffiIntegerValueBuiltinName(rt->declaration->name))
+            return ffi;
+        return valueBuiltinBoxNameStr(rt->declaration->name);
+    }
     // (b) annotation form: declaration null, name via astNode headName.
-    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty()) {
+        if (const char* ffi = ffiIntegerValueBuiltinName(rt->headName()))
+            return ffi;
         return valueBuiltinBoxNameStr(rt->headName());
+    }
     // (c) imported form: declaration null, no astNode, importedName set.
-    if (!rt->importedName.empty())
+    if (!rt->importedName.empty()) {
+        if (const char* ffi = ffiIntegerValueBuiltinName(rt->importedName))
+            return ffi;
         return valueBuiltinBoxNameStr(rt->importedName);
+    }
     return nullptr;
 }
 
@@ -47891,7 +48026,9 @@ const char* Emitter::valueBuiltinName(const sema::TypeRef* rt) {
 // value-builtin's tagged-struct layout is keyed by isNullableValueBuiltinTy instead.
 const char* Emitter::valueBuiltinBoxName(const sema::TypeRef* rt) {
     if (!rt || rt->nullable) return nullptr;
-    return valueBuiltinName(rt);
+    const char* n = valueBuiltinName(rt);
+    if (n && ffiIntegerValueBuiltinName(n)) return nullptr;
+    return n;
 }
 
 
