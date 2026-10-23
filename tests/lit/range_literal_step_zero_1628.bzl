@@ -13,12 +13,12 @@
 // step-0 and must be rejected where written.
 //
 // FileCheck matches the diagnostic's CONTENT — the rule wording and the §16.4
-// citation — not merely "compilation failed".  The `CHECK-NOT: internal
-// compiler error` guards that the reject is a clean, user-facing §16.4
-// diagnostic and not an internal-compiler-error escape. (#6620: that needle
-// used to be `internal:`, which is a CODEGEN-only marker — codegen is gated
-// on a clean front end, so on a row that rejects in the front end it named a
-// needle that could never fire.)
+// citation — not merely "compilation failed".  The escape guard below keeps
+// the reject a clean, user-facing §16.4 diagnostic and not an
+// internal-compiler-error escape. (#6620: that guard used to name the
+// codegen-only `internal:` marker — codegen is gated on a clean front end, so
+// on a row that rejects in the front end it named a needle that could never
+// fire; it now names the front end's own ICE marker.)
 module M;
 class C
   public static method Main(): int

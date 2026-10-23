@@ -17,10 +17,11 @@
 // sections — not merely that compilation failed: the gtest harness maps a
 // compiler CRASH to the same signal as a clean reject (issue #2254), so a
 // content match is what distinguishes a real §11.2/§11.8 diagnostic from an
-// internal-compiler-error escape. `CHECK-NOT: internal compiler error` pins
-// that too. (#6620: that needle used to be `internal:`, a CODEGEN-only
-// marker — codegen is gated on a clean front end, so on a row that rejects in
-// the front end it named a needle that could never fire.)
+// internal-compiler-error escape. The escape guard below pins that too.
+// (#6620: that guard used to name the codegen-only `internal:` marker —
+// codegen is gated on a clean front end, so on a row that rejects in the front
+// end it named a needle that could never fire; it now names the front end's
+// own ICE marker.)
 module SiApp;
 import SiLib2294;
 

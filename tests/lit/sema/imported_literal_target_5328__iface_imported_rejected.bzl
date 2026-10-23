@@ -25,12 +25,12 @@
 // indistinguishable from the local one at the same location (§2.6; the
 // property #3141 pins and #3173 keeps).
 //
-// `CHECK-NOT: internal compiler error` — a gtest-style harness maps a compiler
-// CRASH to the same signal as a clean reject, so pinning the diagnostic's
-// CONTENT is what distinguishes a real §15.4 rejection from an ICE escape.
-// (#6620: that needle used to be `internal:`, a CODEGEN-only marker — codegen
-// is gated on a clean front end, so on a row that rejects in the front end it
-// named a needle that could never fire.)
+// The escape guard below — a gtest-style harness maps a compiler CRASH to the
+// same signal as a clean reject, so pinning the diagnostic's CONTENT is what
+// distinguishes a real §15.4 rejection from an ICE escape. (#6620: that guard
+// used to name the codegen-only `internal:` marker — codegen is gated on a
+// clean front end, so on a row that rejects in the front end it named a
+// needle that could never fire; it now names the front end's own ICE marker.)
 module App5328Iface;
 
 import Lib5328;
