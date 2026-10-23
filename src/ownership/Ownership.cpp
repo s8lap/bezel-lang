@@ -3737,6 +3737,54 @@ static bool isOwnedCollectionLiteralLocal(sema::Symbol* sym) {
     return common::isPatternAResultCollectionHead(t->headName());
 }
 
+// fix #7092 (§28.3 "Ownership state of locals" / §15.4 / §28.6, v0.340): does
+// this assignment install an OWNED collection LITERAL into `sym`?
+//
+// The DECLARATION spelling of the same producers row is
+// `isOwnedCollectionLiteralLocal` above (fix #7073's): the local's DECLARED
+// type is the context §15.4 says types the literal. The ASSIGNMENT spelling
+// has the same context — the LHS's declared type — and no helper, because
+// the fact is about the local's CURRENT VALUE, not about its declaration:
+// `a := [1,2,3];` installs the literal into `a` whatever `a`'s initializer
+// was.
+//
+// The predicate is the SAME authority the declaration helper uses
+// (`common::isPatternAResultCollectionHead` over the DECLARED type), so the
+// two spellings of §28.3's producers row cannot skew: a literal targeting a
+// heap-collection type is Owned in both, and a literal targeting anything
+// else (an inline-array type, which produces a VALUE — §28.3's producers
+// row's second literal row) is Owned in neither.
+//
+// per §28.3, §15.4, §28.6, v0.340, #7092
+static bool assignmentInstallsOwnedCollectionLiteral(sema::Symbol* sym,
+                                                      const ast::Expr* value) {
+    if (!value) return false;
+    if (!dynamic_cast<const ast::CollectionLiteralExpr*>(value)) return false;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || !ls->declType) return false;
+    if (ls->declType->kind != sema::TypeRef::Kind::Named) return false;
+    return common::isPatternAResultCollectionHead(ls->declType->headName());
+}
+
+// fix #7092 (§28.3, §28.6, v0.340): does this local currently hold an OWNED
+// collection literal? The mirror of `disposeAliasChainRoot`'s shape — a
+// file-local static over the same `states_` map every caller has.
+//
+// The local's ownership STATE is deliberately NOT consulted: the §28.3
+// producers row is about the VALUE (a collection literal targeting a
+// reference type is Owned), and the state of a literal-carrying local is
+// mis-classified as Borrowed precisely because the literal is
+// context-typed (§15.4) and carries no `exprType` — that mis-classification
+// is the blind spot this fact compensates for, without changing any state.
+// per §28.3, §15.4, §28.6, v0.340, #7092
+static bool holdsOwnedCollectionLiteral(
+    sema::Symbol* sym,
+    const std::unordered_map<sema::Symbol*, LocalOwnership>& states) {
+    if (!sym) return false;
+    auto it = states.find(sym);
+    return it != states.end() && it->second.ownsCollectionLiteral;
+}
+
 // fix #7091 (§28.3 "Ownership state of locals" / §28.6 "Who may call
 // Dispose()", v0.340): the ROOT owner of an ALIAS CHAIN.
 //
@@ -4218,7 +4266,13 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 // because the literal is CONTEXT-TYPED (§15.4) and carries no
                 // exprType, so `isOwnedTrackedLocal` answers false for it.
                 if (isOwnedTrackedLocal(rsym) ||
-                    isOwnedCollectionLiteralLocal(rsym))
+                    isOwnedCollectionLiteralLocal(rsym) ||
+                    // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source
+                    // holds an OWNED collection LITERAL — §28.3's producers
+                    // row — whose ownership state the pass cannot see (the
+                    // literal is CONTEXT-TYPED, §15.4). See
+                    // `holdsOwnedCollectionLiteral`'s own comment.
+                    holdsOwnedCollectionLiteral(rsym, states_))
                     aliasSrc = rsym;
                 // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain
                 // — the source is itself a borrow of an owner, so record the
@@ -7913,7 +7967,13 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                 // CONTEXT-TYPED — §15.4 — and carries no exprType), so the
                 // alias of one is the BORROW §28.6 rejects a dispose through.
                 if (isOwnedTrackedLocal(rsym) ||
-                    isOwnedCollectionLiteralLocal(rsym)) {
+                    isOwnedCollectionLiteralLocal(rsym) ||
+                    // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source
+                    // holds an OWNED collection LITERAL — §28.3's producers
+                    // row — whose ownership state the pass cannot see (the
+                    // literal is CONTEXT-TYPED, §15.4). See
+                    // `holdsOwnedCollectionLiteral`'s own comment.
+                    holdsOwnedCollectionLiteral(rsym, states_)) {
                     states_[lsym].disposeAliasSource = rsym;
                 } else if (fromLambdaBody &&
                            (isOwnedTrackedLocalInEnclosingFrame(rsym) ||
@@ -9099,7 +9159,13 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // is an owner too (§28.3's producers table) — see the helper's
             // own comment for why the ownership pass cannot classify it.
             if (isOwnedTrackedLocal(rsym) ||
-                isOwnedCollectionLiteralLocal(rsym))
+                isOwnedCollectionLiteralLocal(rsym) ||
+                // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source holds
+                // an OWNED collection LITERAL — §28.3's producers row — whose
+                // ownership state the pass cannot see (the literal is
+                // CONTEXT-TYPED, §15.4). See `holdsOwnedCollectionLiteral`'s
+                // own comment.
+                holdsOwnedCollectionLiteral(rsym, states_))
                 aliasSrc = rsym;
             // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain — the
             // RHS names a borrow of an owner (`b := a;` where `a` is owned and
@@ -9420,6 +9486,19 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // fix #4236: mirror the reset/set above for disposeAliasSource.
             st.disposeAliasSource =
                 (aliasSrc && aliasSrc != sym) ? aliasSrc : nullptr;
+            // fix #7092 (§28.3, §15.4, §28.6, v0.340): re-derive the
+            // "this local's current value is an OWNED collection LITERAL"
+            // fact on every reassignment — SET when the RHS is a collection
+            // literal targeting a reference type (§28.3's producers row), and
+            // CLEARED otherwise, so a rebind away from the literal
+            // (`a := new Array<int>(3);`) does not leave a stale owner fact
+            // behind. The local's ownership STATE is untouched by this (the
+            // literal's producers row is a fact about the VALUE, and the
+            // state-match rule and the must-use lint must not see a change
+            // from this fix). See `assignmentInstallsOwnedCollectionLiteral`'s
+            // own comment.
+            st.ownsCollectionLiteral =
+                assignmentInstallsOwnedCollectionLiteral(sym, as.value.get());
             return;
         }
         // §28.8.1 / #825: name not found in local states — this bare identifier
@@ -12426,7 +12505,13 @@ void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
             // is an owner too (§28.3's producers table) — see the helper's
             // own comment for why the ownership pass cannot classify it.
             if (isOwnedTrackedLocal(rsym) ||
-                isOwnedCollectionLiteralLocal(rsym)) {
+                isOwnedCollectionLiteralLocal(rsym) ||
+                // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source holds
+                // an OWNED collection LITERAL — §28.3's producers row — whose
+                // ownership state the pass cannot see (the literal is
+                // CONTEXT-TYPED, §15.4). See `holdsOwnedCollectionLiteral`'s
+                // own comment.
+                holdsOwnedCollectionLiteral(rsym, states_)) {
                 aliasSrc = rsym;
             } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
                 aliasSrc = rsym;
@@ -12589,7 +12674,13 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 // local is an owner too (§28.3's producers table) — see the
                 // helper's own comment.
                 if (isOwnedTrackedLocal(rsym) ||
-                    isOwnedCollectionLiteralLocal(rsym)) {
+                    isOwnedCollectionLiteralLocal(rsym) ||
+                    // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source
+                    // holds an OWNED collection LITERAL — §28.3's producers
+                    // row — whose ownership state the pass cannot see (the
+                    // literal is CONTEXT-TYPED, §15.4). See
+                    // `holdsOwnedCollectionLiteral`'s own comment.
+                    holdsOwnedCollectionLiteral(rsym, states_)) {
                     aliasSrc = rsym;
                 } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
                     // fix #4286: `isOwnedTrackedLocalInEnclosingFrame`, NOT
@@ -12825,7 +12916,13 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     // local is an owner too (§28.3's producers table) — see
                     // the helper's own comment.
                     if (isOwnedTrackedLocal(rsym) ||
-                        isOwnedCollectionLiteralLocal(rsym))
+                        isOwnedCollectionLiteralLocal(rsym) ||
+                        // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source
+                        // holds an OWNED collection LITERAL — §28.3's
+                        // producers row — whose ownership state the pass
+                        // cannot see (the literal is CONTEXT-TYPED, §15.4).
+                        // See `holdsOwnedCollectionLiteral`'s own comment.
+                        holdsOwnedCollectionLiteral(rsym, states_))
                         aliasSrc = rsym;
                     // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias
                     // chain — the RHS names a borrow of an owner, so record
@@ -12942,6 +13039,16 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     // above (~line 9364) for why this line was missing.
                     st.disposeAliasSource =
                         (aliasSrc && aliasSrc != sym) ? aliasSrc : nullptr;
+                    // fix #7092 (§28.3, §15.4, §28.6, v0.340): the same
+                    // re-derivation for the "this local's current value is an
+                    // OWNED collection LITERAL" fact — SET when the RHS is a
+                    // collection literal targeting a reference type (§28.3's
+                    // producers row), CLEARED otherwise. The lambda-body arm
+                    // mirrors the method-scope arm exactly (as #4269's
+                    // comment above demands of this arm).
+                    st.ownsCollectionLiteral =
+                        assignmentInstallsOwnedCollectionLiteral(
+                            sym, as->value.get());
                     break;
                 }
             }
