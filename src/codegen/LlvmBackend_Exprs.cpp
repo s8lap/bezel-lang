@@ -5817,6 +5817,25 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (isOB) {
                     llvm::Value* obj = lowerExpr(*ma->target);
                     if (obj) {
+                        // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL
+                        // backstop for this arm. OwningBuffer<T> is bz_array_t-backed
+                        // (the same header `bz_array_is_disposed` reads), so this is
+                        // the same guard the isCollectionTypeName arm below emits —
+                        // this arm was simply missed. Without it the read reports the
+                        // QUARANTINED header's count, which `bz_array_mark_disposed`
+                        // zeroed: a silently empty 0 instead of §28.2 K4.1's
+                        // DisposedAccessException.
+                        if (checkedDisposal_) {
+                            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                            auto* isFn = declareC("bz_array_is_disposed", i8Ty,
+                                                  {ptrTy()});
+                            llvm::Value* flag =
+                                builder_.CreateCall(isFn, {obj}, "cd.arrdis");
+                            llvm::Value* disposed = builder_.CreateICmpNE(
+                                flag, llvm::ConstantInt::get(i8Ty, 0),
+                                "cd.disposed");
+                            emitGuardThrow(disposed, "DisposedAccessException");
+                        }
                         auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
                         llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
                         return builder_.CreateTrunc(cnt64, i32(), "ob.cnt");
@@ -5880,6 +5899,25 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (isListInterfaceName(tt)) {
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {
+                    // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL
+                    // backstop for this arm. The arm's own #853 note establishes
+                    // that these interfaces are implemented ONLY by Array<T> /
+                    // OwningArray<T>, both bz_array_t*-backed, so the erased
+                    // receiver carries the same header `bz_array_is_disposed`
+                    // reads — the same guard the isCollectionTypeName arm emits.
+                    // Without it the read reports the QUARANTINED header's count,
+                    // which `bz_array_mark_disposed` zeroed: a silently empty 0
+                    // instead of §28.2 K4.1's DisposedAccessException.
+                    if (checkedDisposal_) {
+                        llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                        auto* isFn = declareC("bz_array_is_disposed", i8Ty,
+                                              {ptrTy()});
+                        llvm::Value* flag =
+                            builder_.CreateCall(isFn, {obj}, "cd.arrdis");
+                        llvm::Value* disposed = builder_.CreateICmpNE(
+                            flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                        emitGuardThrow(disposed, "DisposedAccessException");
+                    }
                     auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
                     llvm::Value* len64 = builder_.CreateCall(fn, {obj});
                     return builder_.CreateTrunc(len64, i32(), "ilist.len");

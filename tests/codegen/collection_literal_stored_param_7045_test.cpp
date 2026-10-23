@@ -68,8 +68,10 @@
 // The default-build rows (4-6) run with leak detection ON.
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
 using bezel::test::runAot;
 using bezel::test::runAotCheckedDisposal;
 
@@ -156,6 +158,61 @@ const char* kNamedLocalTwin =
     "    end;\n"
     "    try\n"
     "      Console.WriteLine(h!.Sum());\n"
+    "    catch\n"
+    "      DisposedAccessException => Console.WriteLine(\"faulted\"),\n"
+    "    end try;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+// The two sibling receivers whose `.Count` / `.Length` read had NO
+// disposed-flag guard: an interface-typed head (IList<T> — the list
+// interfaces are implemented ONLY by the array-backed families, so the erased
+// receiver carries the same bz_array_t header) and `OwningBuffer<T>` (also
+// bz_array_t-backed). Both read the header's count, so a QUARANTINED header
+// (whose count `bz_array_mark_disposed` zeroed) made them report a silent 0
+// where §28.2 K4.1 requires DisposedAccessException.
+const char* kListInterfaceCount =
+    "module Conf;\n"
+    "public class B\n"
+    "  private _xs: IList<int>;\n"
+    "  public constructor(xs: IList<int>)\n"
+    "    _xs := xs;\n"
+    "  end;\n"
+    "  public method Count(): int => _xs.Count;\n"
+    "end B;\n"
+    "public class Program\n"
+    "  public static method Main()\n"
+    "    var h: B? := null;\n"
+    "    do\n"
+    "      var a: Array<int> := [1, 2, 3];\n"
+    "      h := new B(a);\n"
+    "    end;\n"
+    "    try\n"
+    "      Console.WriteLine(h!.Count());\n"
+    "    catch\n"
+    "      DisposedAccessException => Console.WriteLine(\"faulted\"),\n"
+    "    end try;\n"
+    "  end Main;\n"
+    "end Program;\n";
+
+const char* kOwningBufferLength =
+    "module Conf;\n"
+    "public class B\n"
+    "  private _xs: OwningBuffer<int>;\n"
+    "  public constructor(xs: OwningBuffer<int>)\n"
+    "    _xs := xs;\n"
+    "  end;\n"
+    "  public method Len(): int => _xs.Length;\n"
+    "end B;\n"
+    "public class Program\n"
+    "  public static method Main()\n"
+    "    var h: B? := null;\n"
+    "    do\n"
+    "      var buf: OwningBuffer<int> := new OwningBuffer<int>(3);\n"
+    "      h := new B(buf);\n"
+    "    end;\n"
+    "    try\n"
+    "      Console.WriteLine(h!.Len());\n"
     "    catch\n"
     "      DisposedAccessException => Console.WriteLine(\"faulted\"),\n"
     "    end try;\n"
@@ -276,6 +333,26 @@ BEZEL_TEST(codegen_collection_literal_stored_param_7045,
     BEZEL_EXPECT_EQ(checkedOut(kNamedLocalTwin), "faulted\n");
 }
 
+// ── the sibling receivers: a quarantined header must not read as an empty ──
+
+BEZEL_TEST(codegen_collection_literal_stored_param_7045,
+           spec_28_2_list_interface_count_faults_after_boundary) {
+    // §28.2 (v0.340) K4.1: the `.Count` read through the stored borrow is a
+    // member access on a logically disposed instance, so it must raise
+    // DisposedAccessException — NOT report the quarantined header's zeroed
+    // count. The receiver here is an interface-typed head; the list
+    // interfaces are implemented only by the array-backed families, so the
+    // erased receiver carries the same bz_array_t header the guard reads.
+    BEZEL_EXPECT_EQ(checkedOut(kListInterfaceCount), "faulted\n");
+}
+
+BEZEL_TEST(codegen_collection_literal_stored_param_7045,
+           spec_28_2_owning_buffer_length_faults_after_boundary) {
+    // The same for the OwningBuffer<T> receiver, whose `.Length` reads the
+    // same bz_array_t header.
+    BEZEL_EXPECT_EQ(checkedOut(kOwningBufferLength), "faulted\n");
+}
+
 // ── the remedies the rule names must PRINT the values ──────────────────────
 
 BEZEL_TEST(codegen_collection_literal_stored_param_7045,
@@ -304,12 +381,18 @@ BEZEL_TEST(codegen_collection_literal_stored_param_7045,
     // class-typed, or interface-typed parameter. A collection-typed parameter
     // cannot take it, so the declaration is rejected — the compiler must not
     // admit a shape the modifier does not cover.
+    //
+    // The needle check goes through the shared `diagnosticMessageContains`
+    // helper (tests/support/aot_result_asserts.hpp), the idiom the codebase's
+    // ratchet for ambiguous "did-not-run" rows recognises: a bare `!r.ran`
+    // would not distinguish a correct rejection from a parse error or a
+    // toolchain failure, and an inline `.message` alias is not one of the
+    // shapes that checker resolves.
     auto r = runAot(kScopedParam);
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(!r.diagnostics.diagnostics().empty());
-    std::string msg = r.diagnostics.diagnostics()[0].message;
-    BEZEL_EXPECT_TRUE(msg.find("scoped") != std::string::npos);
-    BEZEL_EXPECT_TRUE(msg.find("28.14") != std::string::npos);
-    std::cout << "    (diagnostic: " << msg << ")\n";
-
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "scoped"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "28.14"));
+    std::cout << "    (diagnostic: " << r.diagnostics.diagnostics()[0].message
+              << ")\n";
 }
