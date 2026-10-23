@@ -18,9 +18,9 @@
 // not Interface) rather than on the spelling.
 //
 // The shipped fix gets this right, and this row is what makes that claim
-// evidence rather than reasoning: the `CHECK-NOT: cannot target the interface
-// type` line below FAILS if the name-match branch ever starts firing on a
-// user class.
+// evidence rather than reasoning: the guard below that forbids the "cannot
+// target the interface type" wording FAILS if the name-match branch ever
+// starts firing on a user class.
 //
 // The program IS still rejected, and the rejection is NOT this lane's. It
 // comes from codegen's `lowerCallDispatch` imported-argument arm with
@@ -60,6 +60,14 @@ end Program;
 // (src/driver/Driver.cpp:809), in report order, so it can land either before
 // or after the §15.4 diagnostic this row pins.
 // CHECK-NOT: internal:
+// #7070: the two wording guards below say "the §15.4 SEMA wording must not
+// appear in this output" — and that is a claim about the WHOLE output, not
+// only about the text that follows the expected diagnostic. A `CHECK-NOT`
+// scans the region between the surrounding matches, so the post-positive
+// copy alone lets a wrong diagnostic emitted FIRST through. These are the
+// pre-positive copies: same needle, region before the positive match.
+// CHECK-NOT: cannot target the interface type
+// CHECK-NOT: cannot target the type
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: a collection literal `[...]` cannot target the imported parameter type here
 // The load-bearing assertions: the gate must NOT have called this class an
 // interface, and must NOT have reached the generic out-of-list diagnostic.
