@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.341 — October 2026**
+**Companion to the Bezel Language Specification, v0.342 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -14943,5 +14943,27 @@ The composition step resolved these seams:
 **Migration.** None: doc-only.
 
 **Checks.** `scripts/check_docs.sh` and `scripts/build_book.py --check` are clean.
+
+---
+
+### v0.342 changelog (v0.341 → v0.342)
+
+**Editorial: rationale §2.1 corrected, and its name-resolution paragraph moved to a section of its own.** On 2026-10-23 the owner asked whether rationale §2.1 made sense and whether it was right about C# namespaces, and then asked for the fixes. Class: **editorial** (spec-change process §2). No rule, verdict or decline moves.
+
+- **Rationale §2.1, *Dotted module names are one name*.** Its C# facts were right, but its summary sentence was wrong. It said "the hierarchy the dots suggest is not one any visibility or import rule actually follows", yet C# name lookup does follow it: code in `Foo.Bar.Baz` names `Foo.Bar`'s types unqualified because lookup searches the enclosing namespaces, and that was the paragraph's own first example. The paragraph now makes the narrower, accurate argument:
+  - In C# only name lookup follows the hierarchy.
+  - Access does not: `internal` is assembly-wide.
+  - Imports do not: `using Foo;` does not import `Foo.Bar`.
+  - So the dots promise a containment the access and import rules contradict.
+
+  The unsupported claim about what programmers assume is gone.
+- **New rationale §2.4, *Name resolution: position, not meaning*.** The *Member vs type at a chain head* paragraph (#2097/#2125, spec §2.7) is about how a bare name resolves inside a type body, not about module names. It had been appended to §2.1 and now has its own section, unchanged in content. §2.2 and §2.3 keep their numbers.
+- **Pointers updated:**
+  - `DECLINED.md`'s Color-Color row now names rationale §2.4.
+  - Rationale §1's "lookup never backtracks" link now points at §2.4.
+
+**Migration.** None: doc-only.
+
+**Checks.** `scripts/check_docs.sh` and `scripts/check_proposals.sh` are clean.
 
 ---
