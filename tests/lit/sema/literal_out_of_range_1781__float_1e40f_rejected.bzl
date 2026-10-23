@@ -14,4 +14,6 @@ end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: floating-point literal is out of range for `float`
 // CHECK-SAME: (§4.3)
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error

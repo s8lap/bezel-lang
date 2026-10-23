@@ -47,4 +47,6 @@ end Program;
 // interface, and must NOT have reached the generic out-of-list diagnostic.
 // CHECK-NOT: cannot target the interface type
 // CHECK-NOT: cannot target the type
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error

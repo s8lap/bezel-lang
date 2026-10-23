@@ -32,4 +32,6 @@ end Program;
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: a collection literal `[...]` cannot target the interface type `IEnumerable`
 // CHECK-SAME: §15.4 admits only a concrete collection target
 // CHECK-SAME: (§15.4)
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error

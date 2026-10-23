@@ -9,7 +9,9 @@
 // with exit 0 and the executable exited 4 — the impure getter's write ran
 // inside the pure body.
 //
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error
 
 module App;
 public class Bag

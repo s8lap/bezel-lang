@@ -13,9 +13,12 @@
 // step-0 and must be rejected where written.
 //
 // FileCheck matches the diagnostic's CONTENT — the rule wording and the §16.4
-// citation — not merely "compilation failed".  The `CHECK-NOT: internal:`
-// guards that the reject is a clean, user-facing §16.4 diagnostic and not an
-// internal-compiler-error escape.
+// citation — not merely "compilation failed".  The `CHECK-NOT: internal
+// compiler error` guards that the reject is a clean, user-facing §16.4
+// diagnostic and not an internal-compiler-error escape. (#6620: that needle
+// used to be `internal:`, which is a CODEGEN-only marker — codegen is gated
+// on a clean front end, so on a row that rejects in the front end it named a
+// needle that could never fire.)
 module M;
 class C
   public static method Main(): int
@@ -27,4 +30,6 @@ end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: a range step of zero is a compile error (§16.4)
 // CHECK-SAME: compile-time constant
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error

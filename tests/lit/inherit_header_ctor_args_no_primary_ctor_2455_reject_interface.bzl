@@ -21,4 +21,6 @@ end Derived;
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: an argument list is not permitted here
 // CHECK-SAME: permitted only on the base class
 // CHECK-SAME: not on an interface
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error
