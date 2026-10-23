@@ -26387,13 +26387,15 @@ static bool isDocumentedStdlibLinqOperatorName(std::string_view n) {
 //     supported" wording -- the shared 38-name table AND the whole documented
 //     §5 name set (fix #7019 added `ElementAtOrNull` and the lazy `Reverse`)
 //     -- so the two arms cannot both fire on one name, and the DESIGNED
-//     wording is the one the user sees. A §5 name outside both sets is not
+//     wording is the one the user sees. A name outside both sets is not
 //     exempted here: it is not a §5 member, so the "no member" wording is the
 //     right one.
 //   * the CALL form exempts the WHOLE documented §5 name set, because the
 //     call is typed by the LINQ typing for every §5 name (not only the 38
 //     the table lists), so `il.ElementAtOrNull(1)` and `ro.Contains(3)` are
-//     legitimate calls (§5) and must not be taken for undeclared members.
+//     legitimate calls (§5) and must not be taken for undeclared members (the
+//     exemption is about the member surface: `il.ElementAtOrNull(1)` is
+//     typed, and codegen's #2457 backstop is what refuses it).
 //
 // `callForm` selects the CALL form's exemptions (the whole documented §5 name
 // set, and `Dispose`); the head set is the same for both spellings, so the
@@ -26440,8 +26442,12 @@ static std::string builtinCollectionMemberReject(const TypeRef* t,
     // fix #7019 (language spec §27.6, v0.340; stdlib §5): the BARE form
     // exempts the 38-name table AND the whole documented §5 set -- the same
     // names the #6784 arm rejects with its own "not yet supported" wording.
-    // Exempting only the table's names would let this arm answer a §5 name
-    // the #6784 arm was designed for, with the generic wording.
+    // The #6784 arm is reached FIRST on both the `.` and the `?.` spelling,
+    // under the same guard as this one, and it reports and returns as soon as
+    // it has a message -- so this arm is not reached for those names at all.
+    // The widened exemption is therefore an INVARIANT, not a behavioural fix:
+    // it keeps the two arms provably unable to both fire on one name, and it
+    // is NOT a claim about which arm runs first.
     if (callForm ? isDocumentedStdlibLinqOperatorName(name)
                  : (common::isBuiltinCollectionLinqOperatorName(name) ||
                     isDocumentedStdlibLinqOperatorName(name)))
