@@ -6,6 +6,7 @@
 //! cites: 22.10, 28.2
 //! expect: run
 //! stdout: faulted
+//! flags: --checked-disposal
 //! issue: 7045
 module Conf;
 
