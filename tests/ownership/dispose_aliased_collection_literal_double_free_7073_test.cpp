@@ -192,10 +192,217 @@ BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
     BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
 }
 
+// The CONST SOURCE — the §21.1 runtime-`const` spelling of the OWNER. The
+// const ALIAS above (`const b := a;`) is the other kind of `const` in this
+// family; this row is the `const` on the SOURCE side, and it was the hole
+// the fix-forward closes.
+//
+// MEASURED on the pre-fix code (the reviewer's repro, on this lane's HEAD
+// before the widening): it compiled with NO diagnostic and then double-freed
+// — "AddressSanitizer: attempting double-free … #1 bz_array_free
+// src/runtime/bezel_runtime_collections.cpp:741 … 64-byte region" — the same
+// defect as the `var`-source row above, the binding KEYWORD alone making the
+// difference.
+//
+// Why the source's binding kind must not matter: §28.3's producers table
+// names the collection literal as an Owned production ("Collection literal
+// (`[1, 2, 3]`) targeting a reference type (`Array<T>`, `OwningArray<T>`,
+// `Set<T>`, `Dictionary<K, V>`, etc.) | Owned"), and §28.3's *Consuming
+// positions* makes the unmarked alias binding a borrow of it. §28.6: "`Dispose()`
+// or a direct `DisposeAsync()` call through a **borrow** is a compile error."
+// §21.1 does not make the `const` spelling a way out: a runtime `const`'s
+// initializer must not be an owned production (§28.3), and a collection
+// literal targeting a reference type IS one — so this declaration is itself
+// a §21.1 error the compiler does not enforce today (#7092's territory). The
+// verdict the §28.6 check must return is unchanged by the keyword: `a` owns,
+// `il` borrows, `il.Dispose()` is the error.
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           const_source_alias_dot_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "const a: Array<int> := [1,2,3]; "
+        "var il: IList<int> := a; "
+        "il.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§28.6"));
+}
+
+// The CONCRETE-typed alias of a `const` literal source — the same §28.6 rule
+// (the receiver's OWNERSHIP decides, not its static type).
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           const_source_concrete_alias_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "const a: Array<int> := [1,2,3]; "
+        "var b: Array<int> := a; "
+        "b.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§28.6"));
+}
+
+// The `?.` spelling of the const-source alias — §28.6 names it explicitly
+// ("the `x?.Dispose()` / `x!.Dispose()` spellings").
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           const_source_alias_nullcond_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "const a: Array<int> := [1,2,3]; "
+        "var il: IList<int> := a; "
+        "il?.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// The `!.` spelling of the const-source alias.
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           const_source_alias_bang_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "const a: Array<int> := [1,2,3]; "
+        "var il: IList<int> := a; "
+        "il!.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// The alias inside a LAMBDA of a `const` literal source — the closure frame
+// does not change the receiver's ownership (§28.3: a captured binding is read
+// as a borrow), so the §28.6 verdict stands.
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           const_source_alias_in_lambda_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "const a: Array<int> := [1,2,3]; "
+        "var f := lambda() => do "
+        "  var il: IList<int> := a; "
+        "  il.Dispose(); "
+        "end; "
+        "f(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§28.6"));
+}
+
+// The `!.Dispose()` spelling of the plain `var`-source alias — §28.6 names
+// it explicitly ("the `x?.Dispose()` / `x!.Dispose()` spellings"). Pinned
+// here so the `!.` arm of the §28.6 check cannot silently stop matching the
+// literal-source family.
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           bang_alias_of_literal_owner_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "var a: Array<int> := [1,2,3]; "
+        "var il: IList<int> := a; "
+        "il!.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+}
+
+// The other §28.3 producers-table heads: `Dictionary<K, V>` (stdlib §4.8).
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           dictionary_alias_of_literal_owner_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "var d: Dictionary<string, int> := [\"a\": 1]; "
+        "var il: ICollection<DictionaryEntry<string, int>> := d; "
+        "il.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `d`"));
+}
+
+// `Set<T>` (stdlib §4.10).
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           set_alias_of_literal_owner_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "var s: Set<int> := [1,2,3]; "
+        "var il: ICollection<int> := s; "
+        "il.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `s`"));
+}
+
+// `Stack<T>` (stdlib §4.11) — conforms only to `IReadOnlyCollection<T>`.
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           stack_alias_of_literal_owner_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "var st: Stack<int> := [1,2,3]; "
+        "var il: IReadOnlyCollection<int> := st; "
+        "il.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `st`"));
+}
+
+// `LinkedList<T>` (stdlib §4.6).
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           linkedlist_alias_of_literal_owner_dispose_rejected_28_6) {
+    auto r = runAotChecked(prog(
+        "var ll: LinkedList<int> := [1,2,3]; "
+        "var il: ICollection<int> := ll; "
+        "il.Dispose(); return 0;"));
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `ll`"));
+}
+
 // =====================================================================
 // ACCEPT-side controls (LANE_RULES §15) — programs that MUST keep compiling
 // and running. A false-reject here would be worse than the defect.
 //
+// (z1) A LEGAL runtime `const` whose initializer IS a collection literal, but
+//      whose target is an INLINE-ARRAY type. §28.3's producers table says
+//      that row is "Not applicable — produces a value", so it is NOT an owned
+//      production and §21.1 ADMITS it: "the initializer of a runtime `const`
+//      must not be an **owned production**". This row is the guard that the
+//      widening did not turn a legal runtime `const` into a compile error:
+//      the same collection-literal initializer, a different (value) target.
+// =====================================================================
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           const_inline_array_literal_still_compiles_28_3) {
+    auto r = runAotChecked(prog(
+        "var i := 0; "
+        "while i < 200 do "
+        "  const xs: [3]int := [1,2,3]; "
+        "  i := i + xs[0] - 1; "
+        "  i := i + 1; "
+        "end; "
+        "return 0;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// (z2) The `const` literal SOURCE used on its own — no alias, no dispose.
+//      This is the over-rejection guard for the widening: the widening only
+//      feeds the §28.6 borrow-receiver check, so a `const` literal owner
+//      that is never aliased must still compile and must still free its
+//      array exactly once (at its scope end). It is loop-amplified, so a
+//      second free or a leak is a sanitizer report on the same line.
+//
+//      NOTE (deferred, #7092): §21.1 itself says a runtime `const`'s
+//      initializer must not be an owned production, and a collection literal
+//      targeting a reference type IS one — so this declaration is, per the
+//      spec, a compile error the compiler does not enforce today. This row
+//      pins the CURRENT verdict (accepted) so that this lane's widening is
+//      visibly not the thing that changes it; a future §21.1 enforcement
+//      must update this row.
+BEZEL_TEST(ownership_dispose_aliased_collection_literal_7073,
+           const_literal_owner_never_aliased_still_runs_28_3) {
+    auto r = runAotChecked(prog(
+        "var i := 0; "
+        "while i < 200 do "
+        "  const a: Array<int> := [1,2,3]; "
+        "  var n := a.Count; "
+        "  i := i + n - 3; "
+        "  i := i + 1; "
+        "end; "
+        "return 0;"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
 // (a) The OWNER's own dispose: `a` holds the literal, so `a.Dispose()` is
 //     §28.6's "an owned local" receiver — legal, and it must free exactly
 //     once (loop-amplified, so a second free or a leak is a sanitizer

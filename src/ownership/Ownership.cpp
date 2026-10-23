@@ -3678,14 +3678,59 @@ bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
 // literal, and it is also the type `producerState`'s collection-literal arm
 // WOULD have read had the literal carried one — so the two agree by
 // construction (the same `common::isPatternAResultCollectionHead` authority).
-// // per §28.3, §15.4, §28.6, v0.340, #7073
+// fix #7073 follow-up (§21.1, §28.3, §28.6, v0.340): the candidate is
+// widened from `const ast::LocalDecl*` to `const ast::Node*` so that a §21.1
+// RUNTIME `const` local — a DIFFERENT AST node (`ast::LocalConstDecl`, with
+// its own `value` field) — is admitted beside the `var` form
+// (`ast::LocalDecl`, with its `initializer`). This is the canonical
+// LocalDecl/LocalConstDecl split (#3591's ratchet, whose recorded fix shape
+// is `LlvmBackend_Setup.cpp:24776` — "widen the candidate ... to
+// `const ast::Node*`"; the same split is read the same way at
+// `Ownership.cpp`'s own `checkReturnGetEnumeratorFromScopeBoundReceiver`,
+// which reads `ld->type.get()` / `lc->type.get()` off whichever node kind
+// `ls->decl` actually is).
+//
+// MEASURED, and the reason this is not optional: the previous, `LocalDecl`-
+// only spelling made a `const` SOURCE invisible to this predicate, so
+//
+//   const a: Array<int> := [1,2,3];
+//   var il: IList<int> := a;
+//   il.Dispose();
+//
+// compiled with NO diagnostic and DOUBLE-FREED (ASan: two `bz_array_free`
+// calls on the same 64-byte region — one from the explicit dispose through
+// the alias, one from the compiler-inserted scope-end free of the `const`
+// literal owner). The `var`-source twin of the very same program IS rejected
+// (the `const_alias_of_literal_owner_dot_dispose_rejected_28_6` row), so the
+// difference between the two verdicts was the binding KEYWORD alone — the
+// §28.3 producers row does not care whether the owner is spelled `var` or
+// `const`.
+//
+// §21.1 does not make the `const` spelling a way OUT: a runtime `const`'s
+// initializer must not be an owned production (§28.3), and a collection
+// literal targeting a reference type IS one — so `const a: Array<int> :=
+// [1,2,3];` is itself a §21.1 compile error the compiler does not enforce
+// today (fix #7092's territory, deferred). The §28.6 verdict on the dispose
+// is what this predicate decides, and it is unchanged by the binding kind:
+// `a` owns the array (§28.3's producers table), `il` is a borrow of it
+// (§28.3's *Consuming positions*), and "`Dispose()` or a direct
+// `DisposeAsync()` call through a **borrow** is a compile error" (§28.6).
+//
+// The widening is safe by construction: the candidate is READ here (the
+// initializer/collection-literal test and the declared type), never
+// compared by pointer identity, so admitting a second node kind changes
+// nothing downstream.
+// // per §21.1, §28.3, §15.4, §28.6, v0.340, #7073
 static bool isOwnedCollectionLiteralLocal(sema::Symbol* sym) {
     auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
-    if (!ls) return false;
-    auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-    if (!ld || !ld->initializer) return false;
-    if (!dynamic_cast<const ast::CollectionLiteralExpr*>(
-            ld->initializer.get()))
+    if (!ls || !ls->decl) return false;
+    const ast::Expr* init = nullptr;
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+        init = ld->initializer.get();
+    else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+        init = lc->value.get();
+    if (!init) return false;
+    if (!dynamic_cast<const ast::CollectionLiteralExpr*>(init))
         return false;
     const sema::TypeRef* t = ls->declType;
     if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
