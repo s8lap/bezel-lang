@@ -1,4 +1,21 @@
 # Observed verdicts, banked by runner.py. A `fail` row is a recorded divergence between the spec and the implementation, not a case to edit. See README.md.
+s7_4_0108	pass	
+s7_4_0109	pass	
+s9_5_0008	pass	
+s9_5_0009	pass	
+s12_7_0042	pass	
+s12_7_0043	pass	
+s17_8_0004	pass	
+s21_5_0006	pass	
+s21_5_0007	pass	
+s21_5_0008	pass	
+s21_5_0009	pass	
+s21_5_0010	pass	
+s21_5_0011	pass	
+s27_8_0013	pass	
+s27_8_0014	pass	
+s28_10_0017	pass	
+s31_2_0013	pass	
 case-id	verdict	note
 s1_3_0001	pass	
 s1_3_0002	pass	
