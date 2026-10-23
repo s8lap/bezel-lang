@@ -1444,6 +1444,38 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         return unwrapNarrowedNullableOperand(lowerExpr(*call.args[idx].value),
                                              call.args[idx].value.get());
     };
+    // fix #6639 (§5.1, v0.343): widen an `int`-typed PARAMETER to i64 the way
+    // its SOURCE type's signedness requires, instead of always sign-extending.
+    //
+    // §5.1 (v0.343): "a value converts implicitly … when no programmer-visible
+    // information is lost", and "widening from unsigned to a strictly larger
+    // signed type (e.g. `byte → short`, `ushort → int`) is permitted because
+    // no value is lost". So a `byte` 200 is the `int` 200 — the widening is
+    // LOSSLESS and must preserve the value. A bare `CreateSExt` read the
+    // unsigned source's high bit as a sign bit, so a `byte` startIndex of 200
+    // arrived as -56: the char-needle arm then raised IndexOutOfRangeException
+    // and the string-needle arm silently searched from 0.
+    //
+    // The signedness is the SOURCE's, read from the sema type of the argument
+    // expression (`typeRefIsUnsigned` → `isUnsignedPrim`, the same predicate
+    // the §18.5 format path uses for a `byte` operand). An UNSIGNED source
+    // zero-extends; a SIGNED one sign-extends. A nullable source (`int?`,
+    // narrowed per §7.4) keeps the payload's signedness — the payload of an
+    // `int?` is an `int`.
+    //
+    // ⚠ The value must be widened BY ITS OWN SIGNEDNESS, not by the width of
+    // the parameter. Widening to the parameter's declared `int` width first
+    // would sign-extend a `byte` 200 to the int -56 before the zero-extension
+    // could see it.
+    auto widenIntParam = [&](const ast::Expr* arg, llvm::Value* v,
+                             const char* signedName, const char* unsignedName)
+            -> llvm::Value* {
+        if (!v) return v;
+        if (v->getType()->isIntegerTy(64)) return v;
+        return typeRefIsUnsigned(ctx_.exprType(*arg))
+            ? builder_.CreateZExt(v, i64(), unsignedName)
+            : builder_.CreateSExt(v, i64(), signedName);
+    };
 
     // §9.6 / §3.3 (#883): string.AsSpan() and its overloads → a ReadOnlyStringSpan
     // { Source = self (string ptr), Start, Length } over a contiguous code-point
@@ -1842,9 +1874,11 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 llvm::Value* startV = getIntArg(1);
                 if (!startV) return nullptr;
                 // Normalize startV to i64 for the loop counter / bounds check.
-                llvm::Value* start64 = startV->getType()->isIntegerTy(64)
-                    ? startV
-                    : builder_.CreateSExt(startV, i64(), "ioc2.s64");
+                // fix #6639 (§5.1): widen by the SOURCE's signedness — an
+                // unsigned `byte` startIndex zero-extends, so `byte` 200 stays
+                // 200 instead of becoming -56 and failing the bounds check.
+                llvm::Value* start64 = widenIntParam(call.args[1].value.get(),
+                                                     startV, "ioc2.s64", "ioc2.z64");
                 llvm::Value* len = loadStringLen(self);
                 // Bounds check: 0 <= startIndex <= Length.
                 llvm::Value* oor = builder_.CreateOr(
@@ -1893,8 +1927,12 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             llvm::Value* startVal = getIntArg(1);
             if (!startVal) return nullptr;
             // Normalize start to i64 for the runtime.
-            if (!startVal->getType()->isIntegerTy(64))
-                startVal = builder_.CreateSExt(startVal, i64(), "iof2.s64");
+            // fix #6639 (§5.1): widen by the SOURCE's signedness — an unsigned
+            // `byte` startIndex zero-extends, so `byte` 200 stays 200 instead
+            // of becoming -56 (which the runtime's negative-start clamp then
+            // silently turned into a search from 0).
+            startVal = widenIntParam(call.args[1].value.get(), startVal,
+                                     "iof2.s64", "iof2.z64");
             auto* fn = declareC("bz_str_indexof_from", i32(),
                                 {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {self, sub, startVal}, "iof2.result");
