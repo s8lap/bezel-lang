@@ -88,57 +88,27 @@ It prints `10 x pen: charged 12.50`, `1 x ink: refused, no product 'ink'`, `7 x 
 
 ## Why Bezel
 
-- **Memory safety without a collector.** Every object has exactly one owner and is disposed exactly once. Using a moved-out value or keeping a borrow longer than its owner lives is a compile-time error, and no resource is dropped without being disposed. Where a stale reference can still arise at run time, the default build stops with an exception instead of corrupting memory.
-- **Safe across threads.** Code runs in *execution domains* that share no mutable state, so the memory guarantees hold in multi-threaded programs and data races are ruled out by construction ([details below](#how-memory-management-works)).
-- **Non-null by default.** A `Connection` always holds an object; only a `Connection?` may hold `null` ([§7](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-nullability-2)). The compiler checks the difference at every assignment, argument and return, and calling a member on a `Connection?` is a compile error until a check such as `if c <> null then` has ruled `null` out. A non-nullable field must be initialized where it is declared or by every constructor ([§7.9](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-definite-assignment-for-non-nullable-fields)). Missing values are handled in the open with `?.`, `??` and `??=`, and `!` asserts that a value is present, throwing `NullReferenceException` if it is not.
-- **Predictable costs and behaviour.** Objects are released at points you can find in the source, never by a background collector. Integer overflow throws `OverflowException` instead of wrapping ([§6.1](https://s8lap.github.io/bezel-lang/spec/07-6-arithmetic-and-overflow.html#sec-integer-arithmetic)). Arithmetic on a nullable number is a compile error, not a silent `null` ([§7.11](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-lifted-operators)). User types cannot declare conversion operators, so no hidden conversion runs on a call or an assignment ([§25.4](https://s8lap.github.io/bezel-lang/spec/26-25-operator-overloading.html#sec-no-user-defined-conversion-operators)).
-- **Ownership you can read.** A declaration says who owns a slot (`owned` on a parameter, a return type or a field), and the use site, or the `owned` slot a value is stored into, shows where ownership moves (`move`). An assignment never transfers anything silently.
-- **Compared with Rust.** The ownership model is close to Rust's: one owner per object, explicit transfers, and borrows checked against their owners. Bezel asks less of the programmer. There are no lifetime annotations, and no rule that a value has only one writer at a time: code inside one execution domain may share and mutate freely, because freedom from data races comes from the domains rather than from restricting aliases. The price is that a small class of mistakes Rust rejects at compile time shows up in Bezel at run time, as a deterministic `DisposedAccessException` in the default build ([rationale §1](https://s8lap.github.io/bezel-lang/rationale/02-1-the-big-picture.html#sec-the-big-picture)).
-- **Familiar everywhere else.** Classes, interfaces, generics, records, enums, sum types (`choice`) with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions and contracts (`requires`/`ensures`), in a syntax from the Pascal family with a type system close to C#'s.
-- **A specification first.** The language is defined by a normative specification, and every rule is pinned by a test that states the specification's verdict, not the compiler's.
+- **Memory safety without a collector.** Every object has one owner and is disposed exactly once. Using a moved-out value or keeping a borrow past its owner is a compile-time error; where a stale reference can still arise at run time, the default build throws instead of corrupting memory.
+- **Safe across threads.** Execution domains share no mutable state, so the guarantees hold in multi-threaded code and data races are ruled out by construction.
+- **Non-null by default.** A `Connection` always holds an object; only a `Connection?` may be `null`, and calling a member on it is a compile error until a check rules `null` out ([§7](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-nullability-2)). Missing values are handled in the open with `?.`, `??` and `!`.
+- **Predictable costs and behaviour.** Objects are released at points you can find in the source. Integer overflow throws instead of wrapping ([§6.1](https://s8lap.github.io/bezel-lang/spec/07-6-arithmetic-and-overflow.html#sec-integer-arithmetic)), arithmetic on a nullable value is a compile error ([§7.11](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-lifted-operators)), and user types cannot declare conversion operators ([§25.4](https://s8lap.github.io/bezel-lang/spec/26-25-operator-overloading.html#sec-no-user-defined-conversion-operators)).
+- **Compared with Rust.** The ownership model is close to Rust's, but there are no lifetime annotations and no single-writer rule: freedom from data races comes from domains, not from restricting aliases. The price is that a small class of mistakes Rust rejects at compile time shows up here as a deterministic run-time exception ([rationale §1](https://s8lap.github.io/bezel-lang/rationale/02-1-the-big-picture.html#sec-the-big-picture)).
+- **Familiar everywhere else.** Classes, interfaces, generics, records, enums, sum types with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions and contracts.
+- **A specification first.** Every rule is pinned by a test that states the specification's verdict, not the compiler's.
 
 ## How memory management works
 
-The rules are in [chapter 28 of the specification](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-resource-management). They are long because they are precise, but most of their weight falls on the compiler, which tracks ownership through every statement. The programmer meets three ownership keywords, plus `using var` for a local disposed at the end of its block:
+The rules are in [chapter 28 of the specification](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-resource-management). Most of their weight falls on the compiler; the programmer meets three keywords, plus `using var` for a local disposed at the end of its block:
 
-- **`owned`** marks a slot that holds ownership: a parameter that takes it, a return type that hands it to the caller, or a field that holds it until it is replaced or its object is disposed.
-- **`move`** transfers ownership out of a named variable at a use site, for example into an `owned` parameter. Where the destination itself announces the transfer, such as a `return` or a store into an `owned` field, no marker is written. Either way, every transfer is visible in the source.
-- **`scoped`** lets a method keep something it was given, typically a callback, beyond the call. See below.
+- **`owned`** marks a slot that holds ownership: a parameter that takes it, a return type that hands it to the caller, or a field.
+- **`move`** transfers ownership out of a named variable. Where the destination itself announces the transfer, such as a `return` or a store into an `owned` field, no marker is needed, so every transfer is visible in the source.
+- **`scoped`** lets a method keep a callback (or a borrowed object) beyond the call, for as long as the object that stores it lives. A plain parameter may only be used during the call; with `scoped`, the compiler checks at the call site that everything the callback captures outlives the object keeping it ([§28.14](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-scoped-callback-parameters); [Guide 1](https://s8lap.github.io/bezel-lang/guide-01/) has a worked example).
 
-A local initialized with a new object (`new`, or a call whose return type is `owned`) owns it. Every other reference is a **borrow**: a reference passed around without transferring ownership. The compiler checks that no borrow outlives what it borrows, so a dangling reference is a compile-time error.
+A local initialized with a new object owns it. Every other reference is a **borrow**, and the compiler checks that no borrow outlives what it borrows. Only the owner may dispose an object ([§28.6](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-who-may-dispose)): `Dispose()` runs its cleanup and marks it disposed, and the memory is released by code the compiler inserts at the owner's release point, such as the end of a scope. Using an object after it has been disposed throws `DisposedAccessException` in the default build instead of reading freed memory.
 
-**What `scoped` is for.** A lambda is only safe while everything it captured is still alive. By default, a method that receives a lambda may call it but may not keep it: storing it in a field, in a collection or in a returned closure is a compile error, because the method's signature says nothing about how long the captured values live. Declaring the parameter `scoped` says *"I will keep this for as long as the object that stores it lives"*, and the compiler then checks the caller's side:
+**Threads.** Code runs in **execution domains** ([§30.13](https://s8lap.github.io/bezel-lang/spec/31-30-asynchronous-programming.html#sec-runtime-model)). A domain runs one piece of code at a time; domains run in parallel but share no mutable state, and a value passes between them only by being moved or as an immutable copy ([§30.14](https://s8lap.github.io/bezel-lang/spec/31-30-asynchronous-programming.html#sec-multiple-domains)). That keeps the memory guarantees in multi-threaded programs and rules out data races, with one documented limit: an alias the compiler cannot see, made before the move, is the programmer's responsibility.
 
-```bezel
-class Timer
-  private scoped _onTick: (() -> ())?;              // a scoped field: it can be invoked, replaced or cleared, never read out
-  public method OnTick(scoped handler: () -> ())
-    _onTick := handler;                              // allowed: stored in the object that received it
-  end OnTick;
-  public method Tick()
-    _onTick?();                                      // call the handler if one is set
-  end Tick;
-end Timer;
-
-using var conn := new Connection("db");              // declared before the timer
-using var timer := new Timer();
-timer.OnTick(lambda() => conn.Send("ping"));         // the lambda borrows conn; timer stores the lambda
-timer.Tick();
-// while timer lives, conn cannot be moved, reassigned or disposed
-```
-
-The call is accepted because `conn` is declared before `timer`, so it is disposed after `timer` at the end of the block. If the two `using var` lines are swapped, the call is rejected and the message names `conn`. If `timer` is a plain `var` with no fixed end, only lambdas that capture nothing are accepted. The same mechanism lets an object keep a borrowed object rather than a lambda (`new Statement(scoped account)`), and the standard library uses it for event subscriptions and for `TaskScope.Spawn` ([§28.14](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-scoped-callback-parameters); [Guide 1](https://s8lap.github.io/bezel-lang/guide-01/) has more).
-
-Only an object's owner may dispose it ([§28.6](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-who-may-dispose)). Calling `Dispose()` runs the object's cleanup, its destructor, and marks it disposed. It does not free the memory. The memory is always released by code the compiler inserts at the owner's release point: the end of a scope, the overwrite of a field, the disposal of the object that holds it. Using an object after it has been disposed raises `DisposedAccessException` in the default build instead of reading freed memory.
-
-**Threads.** The guarantees hold in multi-threaded programs, through **execution domains** ([§30.13](https://s8lap.github.io/bezel-lang/spec/31-30-asynchronous-programming.html#sec-runtime-model), [§30.14](https://s8lap.github.io/bezel-lang/spec/31-30-asynchronous-programming.html#sec-multiple-domains)). Code inside a domain runs one piece at a time, so it never races with itself, and domains run in parallel on separate threads but share no mutable state. A value crosses from one domain to another only by being moved, so the sender statically loses access to it, or as an immutable value such as a string or a copy. Only *sendable* types may cross at all, and the compiler checks every crossing. That rules out data races by construction, with one documented limit: an alias made before the move and kept out of the compiler's sight, such as a borrow stored in another object's field or held by a pending task, is the programmer's responsibility.
-
-**Where reference counting is used.** No class you write is ever reference-counted. The specification lets the runtime manage four kinds of value by whatever mechanism it chooses: strings, `Type` tokens, boxed values and function values ([§28.9](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-runtime-managed-types)). It asks for counting only where a program opts in, with `Shared<T>` and `Weak<T>` ([§28.13](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-shared-ownership)). The current compiler and runtime count references in these places:
-
-- strings, boxed values and closures (`Type` tokens are interned and never freed);
-- the cell holding a variable that a lambda captures, but only when the compiler cannot prove where the lambda's environment dies, for example when a capturing lambda is passed to another method. The last holder frees the cell;
-- `Shared<T>` and `Weak<T>` handles;
-- runtime internals that never appear as user objects: tasks, cancellation token sources, and the shared cores of `Semaphore` and the atomics.
+**Reference counting.** No class you write is ever reference-counted. The runtime manages strings, boxed values and closures itself, and the current one counts their references; it also counts the cells of variables captured by a lambda whose lifetime the compiler cannot bound statically. Shared ownership is opt-in, with `Shared<T>` and `Weak<T>` ([§28.9](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-runtime-managed-types), [§28.13](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-shared-ownership)).
 
 ## Getting started
 
@@ -196,7 +166,6 @@ Apart from the proposals, these are published together as a searchable site, one
 
 ## How far along is it
 
-- **The design** is written down in full: the [specification](https://s8lap.github.io/bezel-lang/spec/), the [standard library](https://s8lap.github.io/bezel-lang/stdlib/) and the [rationale](https://s8lap.github.io/bezel-lang/rationale/), with one [changelog](https://s8lap.github.io/bezel-lang/changelog/) entry per revision.
 - **The compiler**, `bezelc`, is an ahead-of-time front end and LLVM back end. It compiles the language's core end to end — ownership and borrow checking, classes and generics, records, enums and choices, exceptions, collections and queries, `async`/`await`, multi-module builds — and much of the standard library.
 - **The gap** is measured. A rule corpus of one hand-written case per specification rule ([`tests/conformance/rules/`](tests/conformance/rules/)) records where the compiler still differs: of the 3,085 cases with a recorded result, 2,873 match the specification. Every difference has a tracking issue.
 
@@ -212,13 +181,13 @@ scripts/  build, test and documentation tooling
 
 ## Reporting a bug
 
-Bug reports are very welcome, and the compiler has plenty of bugs to find. Please [open an issue](https://github.com/s8lap/bezel-lang/issues/new/choose) with:
+Bug reports are very welcome. Please [open an issue](https://github.com/s8lap/bezel-lang/issues/new/choose) with:
 
 - the compiler version (`bezelc --version`, or the release you downloaded);
 - the smallest `.bzl` program that shows the problem;
 - what the compiler or the program did, and what you expected.
 
-When you are not sure whether the compiler or the specification is wrong, say so: questions about what the specification means are welcome too, and the specification decides. A crash, a leak or a memory error in a compiled program is always a bug.
+Questions about what the specification means are welcome too. A crash, a leak or a memory error in a compiled program is always a bug.
 
 ## Contributing and testing
 
