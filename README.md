@@ -2,7 +2,11 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-Manual memory management is easy to get wrong, and garbage collection and automatic reference counting cost time and memory at run time. Bezel takes a third route. The compiler knows, for every object, where it is created, who owns it, and the exact point at which it is released, and it inserts the release itself, on the normal path and when an exception passes through. The effect is close to C++'s RAII, except that the compiler checks the rules instead of leaving them to discipline. There is no collector and no hidden reference count on any class you write (only the opt-in `Shared<T>` counts), and the guarantees hold in multi-threaded programs too.
+Bezel is built for **predictable performance and few surprises**. What a program costs should follow from what its source says, and what it does should not depend on rules the reader cannot see.
+
+Memory is where that matters most. Manual memory management is easy to get wrong, and garbage collection and automatic reference counting cost time and memory at run time. Bezel takes a third route: the compiler knows, for every object, who owns it and the exact point at which it is released, and inserts the release itself, on the normal path and when an exception passes through. The effect is close to C++'s RAII, except that the compiler checks the rules instead of leaving them to discipline. There is no collector, no pause and no hidden reference count on the classes you write, and the guarantees hold in multi-threaded programs too.
+
+The same aim runs through the rest of the language. Types are non-nullable unless written with `?`, integer arithmetic is checked for overflow, arithmetic on a possibly missing value is a compile error, and nothing converts implicitly between your own types.
 
 ## Status: experimental, expect things to break
 
@@ -80,6 +84,16 @@ It prints `10 x pen: charged 12.50`, `1 x ink: refused, no product 'ink'`, `7 x 
 
 **Try it:** a prebuilt compiler for Linux x86-64 is on the [releases page](https://github.com/s8lap/bezel-lang/releases). It is a single static download with its own linker, so nothing else needs to be installed ([Getting started](#getting-started)).
 
+## Why Bezel
+
+- **Memory safety without a collector.** Every object has exactly one owner and is disposed exactly once. Using a moved-out value or keeping a borrow longer than its owner lives is a compile-time error, and no resource is dropped without being disposed. Where a stale reference can still arise at run time, the default build stops with an exception instead of corrupting memory.
+- **Safe across threads.** Code runs in *execution domains* that share no mutable state, so the memory guarantees hold in multi-threaded programs and data races are ruled out by construction ([details below](#how-memory-management-works)).
+- **Non-null by default.** A `Connection` always holds an object; only a `Connection?` may hold `null` ([§7](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-nullability-2)). The compiler checks the difference at every assignment, argument and return, and calling a member on a `Connection?` is a compile error until a check such as `if c <> null then` has ruled `null` out. A non-nullable field must be initialized where it is declared or by every constructor ([§7.9](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-definite-assignment-for-non-nullable-fields)). Missing values are handled in the open with `?.`, `??` and `??=`, and `!` asserts that a value is present, throwing `NullReferenceException` if it is not.
+- **Predictable costs and behaviour.** Objects are released at points you can find in the source, never by a background collector. Integer overflow throws `OverflowException` instead of wrapping ([§6.1](https://s8lap.github.io/bezel-lang/spec/07-6-arithmetic-and-overflow.html#sec-integer-arithmetic)). Arithmetic on a nullable number is a compile error, not a silent `null` ([§7.11](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-lifted-operators)). User types cannot declare conversion operators, so no hidden conversion runs on a call or an assignment ([§25.4](https://s8lap.github.io/bezel-lang/spec/26-25-operator-overloading.html#sec-no-user-defined-conversion-operators)).
+- **Ownership you can read.** A declaration says who owns a slot (`owned` on a parameter, a return type or a field), and the use site, or the `owned` slot a value is stored into, shows where ownership moves (`move`). An assignment never transfers anything silently.
+- **Familiar everywhere else.** Classes, interfaces, generics, records, enums, sum types (`choice`) with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions and contracts (`requires`/`ensures`), in a syntax from the Pascal family with a type system close to C#'s.
+- **A specification first.** The language is defined by a normative specification, and every rule is pinned by a test that states the specification's verdict, not the compiler's.
+
 ## How memory management works
 
 The rules are in [chapter 28 of the specification](https://s8lap.github.io/bezel-lang/spec/29-28-resource-management.html#sec-resource-management). They are long because they are precise, but most of their weight falls on the compiler, which tracks ownership through every statement. The programmer meets three ownership keywords, plus `using var` for a local disposed at the end of its block:
@@ -122,14 +136,6 @@ Only an object's owner may dispose it ([§28.6](https://s8lap.github.io/bezel-la
 - the cell holding a variable that a lambda captures, but only when the compiler cannot prove where the lambda's environment dies, for example when a capturing lambda is passed to another method. The last holder frees the cell;
 - `Shared<T>` and `Weak<T>` handles;
 - runtime internals that never appear as user objects: tasks, cancellation token sources, and the shared cores of `Semaphore` and the atomics.
-
-## Why Bezel
-
-- **Memory safety without a collector, across threads too.** Every object has exactly one owner and is disposed exactly once, and execution domains keep those guarantees in multi-threaded code. Using a moved-out value and keeping a borrow past its owner are compile-time errors; a resource is never dropped without being disposed; where a stale reference can still arise at run time, the default build fails with an exception instead of corrupting memory.
-- **No null surprises.** A class type is non-nullable unless it is written with `?`: a `Connection` always holds an object, a `Connection?` may hold `null` ([§7](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-nullability-2)). The compiler enforces the difference at every assignment, argument and return, and calling a member on a `Connection?` is a compile error until a check such as `if c <> null then` has narrowed it. A non-nullable field must be initialized where it is declared or by every constructor ([§7.9](https://s8lap.github.io/bezel-lang/spec/08-7-nullability.html#sec-definite-assignment-for-non-nullable-fields)). Absence is handled explicitly with `?.`, `??` and `??=`, and `!` asserts presence, raising `NullReferenceException` if the value is null.
-- **Ownership you can read.** The declaration says who owns a slot (`owned` on a parameter, a return type or a field); the use site, or the `owned` slot it stores into, says when ownership moves (`move`). An assignment never transfers anything silently.
-- **Familiar everywhere else.** Classes, interfaces, generics, records, enums, sum types (`choice`) with exhaustive matching, `async`/`await` with structured concurrency, LINQ-style queries, exceptions, and contracts (`requires`/`ensures`) — in a syntax that reads like the Pascal family with the type system of C#.
-- **A specification first.** The language is defined by a normative specification, and every rule is pinned by a test that states the specification's verdict, not the compiler's.
 
 ## Getting started
 
