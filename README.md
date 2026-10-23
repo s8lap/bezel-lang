@@ -167,6 +167,7 @@ Apart from the proposals, these are published together as a searchable site, one
 ## How far along is it
 
 - **The compiler**, `bezelc`, is an ahead-of-time front end and LLVM back end. It compiles the language's core end to end — ownership and borrow checking, classes and generics, records, enums and choices, exceptions, collections and queries, `async`/`await`, multi-module builds — and much of the standard library.
+- **The tests.** About 35,000 behaviour tests compile and run real programs, with an AddressSanitizer pass before anything lands on main, and 2,500 diagnostic tests pin the compiler's error messages.
 - **The gap** is measured. A rule corpus of one hand-written case per specification rule ([`tests/conformance/rules/`](tests/conformance/rules/)) records where the compiler still differs: of the 3,085 cases with a recorded result, 2,873 match the specification. Every difference has a tracking issue.
 
 ## Reporting a bug
