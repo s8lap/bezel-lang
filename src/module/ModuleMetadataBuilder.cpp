@@ -1518,7 +1518,14 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             out.type = convertAstType(md->returnType.get(), ctx);
             out.returnOwned = md->returnOwned;
             out.genericParams = convertGenericParams(
-                meth->genericParams, md->genericConstraints, ctx);
+                meth->genericParams, md->genericConstraints, ctx,
+                // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): the §17.11
+                // obligation this method's OWN body creates for its own type
+                // parameters — the direct `default(T)` uses and the DERIVED
+                // chain uses alike. The owner key is the method's
+                // `ast::MethodDecl`, the key the exporting module's
+                // typecheck records both against.
+                ctx.unconstrainedDefaultParamsOfOwner(md));
             out.params = convertParams(meth->params, ctx);
             fillParamDefaults(out.params, md->params, &ctx);
             std::vector<sema::Symbol*> contractGenerics;

@@ -417,6 +417,152 @@ void ExprTC::recordImportedClassDefaultObligation(const TypeSymbol* ts,
         recordDefaultTypeParamUse(ts, r, loc, /*unconstrained=*/true);
 }
 
+// fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): record the §17.11
+// obligation an IMPORTED generic METHOD carries, at the call site, for the
+// case the importer's own replay does not reach.
+//
+// The #6947 replay (ExprTypecheck_Calls.cpp's `checkMethodGenericConstraints`)
+// records the imported method's `default(T)` uses against the method's
+// `ast::MethodDecl` and the call site's instantiation site against that same
+// key. Both need the decl. An imported method whose body could NOT be
+// reconstructed has NO `ast::MethodDecl` at all: the loader's re-parse of a
+// body that calls a generic in ANOTHER type of the exporting module fails
+// (that type is not in the re-parsed synthetic class), so the body is not
+// attached — and then the replay records nothing, the site no-ops, and the
+// join has nothing to fire on. That is the shape of #7095: the importer
+// accepts `U.Wrap<string>()`, where the same-module typechecker rejects it.
+//
+// The obligation is still known: the exporting module computed it (it can
+// see the whole chain, including across a type boundary) and shipped it in
+// the metadata, and the loader published it on the imported MethodSymbol.
+// Here the importing pass records the matching `default(T)` use against that
+// MethodSymbol — the key the obligation was published on — and the matching
+// instantiation site against the same key, so the join reaches the same
+// verdict the same-module typechecker reaches.
+//
+// The substitution is the call's own: an explicit type-argument list binds
+// the method's declared type parameters in declaration order (§14.5);
+// otherwise §14.5's argument-driven inference applies.
+void ExprTC::recordImportedMethodDefaultObligation(const ast::CallExpr& ce) {
+    auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce.callee));
+    if (!ms) return;
+    // The importer's own replay covers the method whose body WAS attached.
+    if (ms->decl) return;
+    const std::vector<std::string>* req =
+        ctx_.importedUnconstrainedDefaultParams(ms);
+    if (!req || req->empty()) return;
+
+    std::unordered_map<std::string_view, TypeRef*> subst;
+    const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs = nullptr;
+    if (auto* cma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        callTypeArgs = &cma->typeArgs;
+    else if (auto* cncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                             ce.callee.get()))
+        callTypeArgs = &cncm->typeArgs;
+    else if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                             ce.callee.get()))
+        callTypeArgs = &cid->typeArgs;
+    if (callTypeArgs && !callTypeArgs->empty()) {
+        // §14.5: "an explicit type-argument list binds the method's declared
+        // type parameters in declaration order".
+        for (std::size_t gi = 0;
+             gi < ms->genericParams.size() && gi < callTypeArgs->size(); ++gi) {
+            const Symbol* gp = ms->genericParams[gi];
+            if (!gp) continue;
+            const ast::Type* ta = (*callTypeArgs)[gi].get();
+            if (!ta) continue;
+            TypeRef* resolved = ctx_.resolvedType(*ta);
+            if (resolved) subst[gp->name] = resolved;
+        }
+    } else {
+        // §14.5's argument-driven inference: unify each argument's type
+        // against the formal parameter's, binding the method's type
+        // parameters. A conflicting binding clears the whole substitution
+        // (nothing is then judged — the safe direction: the call is left to
+        // the overload resolution that already ran).
+        std::unordered_set<std::string_view> paramNames;
+        for (const Symbol* gp : ms->genericParams)
+            if (gp && !gp->name.empty()) paramNames.insert(gp->name);
+        bool consistent = true;
+        for (std::size_t pi = 0; pi < ce.args.size() && consistent; ++pi) {
+            if (!ce.args[pi].value) continue;
+            std::string_view amod = ce.args[pi].modifier;
+            if (amod == "out var" || amod == "out using var" ||
+                amod == "out owned var")
+                continue;  // §22.4: an inline out-var binds the parameter
+            const TypeRef* pt = sema::formalParamResolvedType(*ms, pi);
+            if (!pt) continue;
+            TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+            if (!argTy) continue;
+            if (argTy->kind == TypeRef::Kind::Primitive &&
+                argTy->primitive == PrimitiveType::Object && argTy->nullable)
+                continue;  // §14.5: a bare `null` contributes no binding
+            if (!unifyReturnAgainstTarget(pt, argTy, paramNames, subst))
+                consistent = false;
+        }
+        if (!consistent) subst.clear();
+    }
+    if (subst.empty()) return;
+
+    // Name the offending type argument the way the §14.2 diagnostics do
+    // (mirroring ExprTypecheck_Calls.cpp's §14.2 `argNameOf` lambda).
+    //
+    // fix #5282's shape matters here: an ARGUMENT-INFERRED substitution is
+    // built from the argument's sema TypeRef, which for a PRIMITIVE carries
+    // neither `declaration` nor a name-bearing `astNode` — so a lambda that
+    // stops at "the type argument" would name nothing in the diagnostic
+    // ("type argument `the type argument` is not defaultable"). The
+    // explicitly-spelled `Wrap<string>()` path never hit this, because its
+    // TypeRef is resolved from a written ast::Type and keeps its name head.
+    auto argNameOf = [](const TypeRef* a) -> std::string {
+        std::string base;
+        if (a && a->declaration) base = std::string(a->declaration->name);
+        else if (a && a->astNode && a->astNode->name &&
+                 !a->astNode->name->parts.empty())
+            base = std::string(a->astNode->name->parts.back());
+        else if (a && a->kind == TypeRef::Kind::Primitive) {
+            using P = PrimitiveType;
+            switch (a->primitive) {
+                case P::Bool:    base = "bool";    break;
+                case P::Char:    base = "char";    break;
+                case P::String:  base = "string";  break;
+                case P::Byte:    base = "byte";    break;
+                case P::SByte:   base = "sbyte";   break;
+                case P::Short:   base = "short";   break;
+                case P::UShort:  base = "ushort";  break;
+                case P::Int:     base = "int";     break;
+                case P::UInt:    base = "uint";    break;
+                case P::Long:    base = "long";    break;
+                case P::ULong:   base = "ulong";   break;
+                case P::Float:   base = "float";   break;
+                case P::Double:  base = "double";  break;
+                case P::Decimal: base = "decimal"; break;
+                case P::Object:  base = "Object";  break;
+                default:         return "the type argument";
+            }
+        }
+        else return "the type argument";
+        // §7.1 (#741/f13): a nullable type argument displays with its `?`.
+        if (a->nullable) base += "?";
+        return base;
+    };
+
+    for (const auto& sb : subst) {
+        if (!sb.second) continue;
+        bool required = false;
+        for (const std::string& r : *req)
+            if (r == sb.first) { required = true; break; }
+        if (!required) continue;
+        // The owner is the imported MethodSymbol — the key the obligation was
+        // published on, and the key no other join's use is recorded against.
+        recordDefaultTypeParamUse(ms, sb.first, ce.span.begin,
+                                  /*unconstrained=*/true);
+        recordGenericInstantiationSite(ms, sb.first, sb.second,
+                                       argNameOf(sb.second), ce.span.begin);
+    }
+}
+
 // fix #3044 (§17.11 / §3.6 rule 2, v0.242): see the declarations in
 // ExprTypecheck_impl.hpp.
 void ExprTC::recordDefaultTypeParamUse(const void* owner,

@@ -1491,6 +1491,14 @@ private:
     // exactly as the same-module typechecker judges it.
     void recordImportedClassDefaultObligation(const TypeSymbol* ts,
                                                SourceLocation loc);
+    // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): record the §17.11
+    // obligation an IMPORTED generic METHOD carries, at the call site, for
+    // the case the importer's own replay does not reach — an imported method
+    // whose body could not be reconstructed has no `ast::MethodDecl`, so the
+    // replay (keyed on that decl) records neither the use nor the site.
+    // The owner is the imported MethodSymbol, the key the loader published
+    // the obligation on.
+    void recordImportedMethodDefaultObligation(const ast::CallExpr& ce);
     // fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
     // instantiation sites — `var g: G<int>` and `class D : G<int>` — are not
     // recorded by recordDefaultObligationsForConstruction (only `new` calls

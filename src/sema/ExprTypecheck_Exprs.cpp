@@ -6559,6 +6559,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         typeCall(*ce);
         checkChoiceCaseConstruction(*ce);
+        // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): the §17.11
+        // obligation of an IMPORTED generic method whose body could not be
+        // reconstructed — the importer's own replay is keyed on the method's
+        // `ast::MethodDecl`, which such a method does not have. Recorded
+        // after the call is typed, so the callee's symbol is resolved.
+        recordImportedMethodDefaultObligation(*ce);
     }
 }
 

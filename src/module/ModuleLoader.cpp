@@ -83,6 +83,43 @@ std::optional<std::vector<std::uint8_t>> readMetadataSection(
 
 namespace {
 
+// fix #7094 / #7095 (§17.11 / §2.8.2 clause 2, v0.343): publish an imported
+// symbol's §17.11 obligation WITHOUT dropping what is already published for
+// it.
+//
+// The obligation an imported symbol carries can arrive from TWO independent
+// sources, and neither is a subset of the other:
+//   - the EXPORTED requirement set (`MetaGenericParam::
+//     requiresWellDefinedDefault`), which carries both the direct
+//     `default(T)` uses and the DERIVED chain uses; and
+//   - the RE-PARSED body's own `default(T)` uses, published after the body
+//     re-parse (the #6947 publication below).
+// `SemaContext::setImportedUnconstrainedDefaultParams` REPLACES, so
+// publishing one source after the other would silently drop the first — e.g.
+// the exported DERIVED requirement of `U.Wrap<T>` (whose chain ends in
+// another type's `default(T)`) would be lost to the re-parsed body's (empty)
+// direct set. This helper unions instead.
+//
+// `SemaContext::setImportedUnconstrainedDefaultParams` is not touched: the
+// merge is a property of the LOADER's publication sites, not of the setter.
+static void publishImportedDefaultRequirement(sema::SemaContext& ctx,
+                                              const sema::Symbol* sym,
+                                              const std::vector<std::string>& names) {
+    if (!sym || names.empty()) return;
+    // Copy first: `setImportedUnconstrainedDefaultParams` may rehash the map
+    // and invalidate a pointer into it.
+    std::vector<std::string> merged;
+    if (const auto* cur = ctx.importedUnconstrainedDefaultParams(sym))
+        merged = *cur;
+    for (const std::string& n : names) {
+        bool seen = false;
+        for (const std::string& e : merged)
+            if (e == n) { seen = true; break; }
+        if (!seen) merged.push_back(n);
+    }
+    ctx.setImportedUnconstrainedDefaultParams(sym, merged);
+}
+
 // --- MetaType → TypeRef reconstruction --------------------------------------
 
 sema::PrimitiveType fromPrimitiveKind(PrimitiveKind p) {
@@ -951,6 +988,26 @@ struct Loader {
                 m->isOperator = mm.isOperator;
                 if (mm.isOperator) m->operatorToken = ctx.internString(mm.name);
                 m->genericParams = convertGenericParams(mm.genericParams, scope);
+                // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): the
+                // METHOD-level §17.11 obligation — a method-level type
+                // parameter whose substitution must have a well-defined
+                // `default` value, because the method's body takes
+                // `default(T)` (directly, or through a chain that ends in a
+                // `default(T)` — possibly in ANOTHER type of the exporting
+                // module, which the importer's re-parse of this body cannot
+                // see). The exporting module computed the obligation and
+                // shipped it in the metadata; publish it on the imported
+                // METHOD symbol so the importing pass can judge
+                // `U.Wrap<string>()` exactly as the same-module typechecker
+                // judges it.
+                {
+                    std::vector<std::string> reqDefault;
+                    for (const MetaGenericParam& mg : mm.genericParams)
+                        if (mg.requiresWellDefinedDefault)
+                            reqDefault.push_back(mg.name);
+                    if (!reqDefault.empty())
+                        publishImportedDefaultRequirement(ctx, m, reqDefault);
+                }
                 m->params = convertParams(mm.params, scope);
                 // The method's resolved return type rides on a side table keyed
                 // by ast::Type — but an imported method has no ast::Type node.
@@ -4022,43 +4079,6 @@ static void carrySiblingSignatureTypes5160(const sema::SemaContext& mainCtx,
     }
 }
 
-// fix #7094 / #7095 (§17.11 / §2.8.2 clause 2, v0.343): publish an imported
-// symbol's §17.11 obligation WITHOUT dropping what is already published for
-// it.
-//
-// The obligation an imported symbol carries can arrive from TWO independent
-// sources, and neither is a subset of the other:
-//   - the EXPORTED requirement set (`MetaGenericParam::
-//     requiresWellDefinedDefault`), which carries both the direct
-//     `default(T)` uses and the DERIVED chain uses; and
-//   - the RE-PARSED body's own `default(T)` uses, published after the body
-//     re-parse (the #6947 publication below).
-// `SemaContext::setImportedUnconstrainedDefaultParams` REPLACES, so
-// publishing one source after the other would silently drop the first — e.g.
-// the exported DERIVED requirement of `U.Wrap<T>` (whose chain ends in
-// another type's `default(T)`) would be lost to the re-parsed body's (empty)
-// direct set. This helper unions instead.
-//
-// `SemaContext::setImportedUnconstrainedDefaultParams` is not touched: the
-// merge is a property of the LOADER's publication sites, not of the setter.
-static void publishImportedDefaultRequirement(sema::SemaContext& ctx,
-                                              const sema::Symbol* sym,
-                                              const std::vector<std::string>& names) {
-    if (!sym || names.empty()) return;
-    // Copy first: `setImportedUnconstrainedDefaultParams` may rehash the map
-    // and invalidate a pointer into it.
-    std::vector<std::string> merged;
-    if (const auto* cur = ctx.importedUnconstrainedDefaultParams(sym))
-        merged = *cur;
-    for (const std::string& n : names) {
-        bool seen = false;
-        for (const std::string& e : merged)
-            if (e == n) { seen = true; break; }
-        if (!seen) merged.push_back(n);
-    }
-    ctx.setImportedUnconstrainedDefaultParams(sym, merged);
-}
-
 static bool parseAndAttachMethodBody(
     const MetaTypeDecl& td,
     const MetaMember& target,
@@ -4712,8 +4732,18 @@ static bool parseAndAttachMethodBody(
     importedMs->decl = parsedMdBase;
     // fix #6947 (§17.11 / §2.8.2 clause 1, v0.340): carry the body's
     // unconstrained `default(T)` uses to the importer (see SemaContext).
+    //
+    // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): this publishes by UNION,
+    // not by replacement. `Loader::convertMember` has already published the
+    // EXPORTED requirement set for this method — the direct `default(T)`
+    // uses and the DERIVED chain uses alike — and that set is NOT a subset
+    // of the re-parsed body's own (direct) uses: the chain's obligation lives
+    // in the CALLEE's body, in another type of the exporting module, which
+    // this re-parse cannot see. Replacing would silently drop it, and the
+    // importer would judge `U.Wrap<string>()` against an empty obligation
+    // set — accepting a program the same-module typechecker rejects.
     if (const auto* names = freshCtx.unconstrainedDefaultParamsOfOwner(parsedMdBase))
-        mainCtx.setImportedUnconstrainedDefaultParams(importedMs, *names);
+        publishImportedDefaultRequirement(mainCtx, importedMs, *names);
     // fix #7008 (§17.11 / §2.8.2 clause 2, v0.340): collect the CHAIN edges of
     // this body — the calls it makes to a sibling method with one of the type
     // parameters in scope as the type argument. The sibling's own body is
