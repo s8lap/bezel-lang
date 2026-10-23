@@ -5199,6 +5199,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 : builder_.CreateSExt(v, iterElemTy_);
                         }
                     }
+                    // fix #7054 (§29.3 / §14.1 / §2.8.2, v0.340): the yielded
+                    // value's LLVM type can differ NOMINALLY from the iterator's
+                    // element type while being LAYOUT-IDENTICAL — the erased-
+                    // template type-name mismatch fix #7049 fixed at the `return`
+                    // site. In a generic template body, `Opt<T>.Some(x)` builds
+                    // the SPECIALIZED `choice.Opt$spec0` (the payload-carrying
+                    // case construction installs the instantiation substitution,
+                    // LlvmBackend_Calls2.cpp's `choiceCtorSubst`) while the
+                    // element type is the UNSPECIALIZED `choice.Opt`. The store
+                    // below is conditional on an exact type match, so the value
+                    // was DROPPED on the floor: the consumer read the
+                    // calloc-zeroed current_val slot and every payload read 0
+                    // (MEASURED on the base: an imported generic iterator
+                    // yielding `Opt<T>.Some(x)` at T = int printed 0 for 15; the
+                    // same-module instantiation printed 15).
+                    //
+                    // §14.1 / §2.8.2 clause 2: the external instantiation must
+                    // behave identically to the same-module one, so the value
+                    // must cross. Reinterpret it through the SAME alloca
+                    // round-trip `emitReturn` uses for the return site (fix
+                    // #7049) — the two structs are layout-identical, so this is
+                    // the same bits under another struct name. A genuinely
+                    // irreconcilable layout is left alone, and the store stays
+                    // skipped (the pre-existing conservative behaviour).
+                    if (v->getType() != iterElemTy_)
+                        v = reinterpretToType(v, iterElemTy_);
                     if (v->getType() == iterElemTy_) {
                         llvm::Value* cvField = builder_.CreateStructGEP(
                             smStateStruct_, smSelf_, iterCurrentValField_);
