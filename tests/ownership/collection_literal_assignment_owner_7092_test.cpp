@@ -77,8 +77,15 @@
 //   * the CONCRETE-typed alias's leak (`var a: Array<int> := [1,2,3]; var b:
 //     Array<int> := a;`) — decided by codegen's borrow-escape scan;
 //   * the `using var` alias's "vacuous" warning and §28.10's missing
-//     compile error for an unmarked `using var` over a named owned binding —
-//     unimplemented for ALL sources, not a literal blind spot.
+//     compile error for an unmarked `using var` over a named owned binding.
+//     MEASURED (a non-author review, on the current compiler): §28.10's
+//     compile error is missing for BOTH spellings, but the "vacuous" warning
+//     fires only for the COLLECTION-shaped sources (the literal twin and the
+//     `new`-source Array twin) and does NOT fire for a user-class RHS. So the
+//     warning is keyed on the source being collection-shaped, not on the
+//     "value-typed/runtime-managed" its text claims — it is not a claim about
+//     every class-typed RHS. The user-class spelling is admitted with no
+//     diagnostic at all.
 
 #include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
@@ -87,15 +94,10 @@
 
 using bezel::test::diagnosticMessageContains;
 using bezel::test::failedAtCompileTimeWithRealLocation;
-using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
-
-bool diagContains(const JitResult& r, const char* sub) {
-    return diagnosticMessageContains(r, sub);
-}
 
 }  // namespace
 
@@ -117,9 +119,9 @@ BEZEL_TEST(ownership_collection_literal_assignment_7092,
         "  il.Dispose(); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "§28.6"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "borrow (an alias) of `a`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§28.6"));
 }
 
 // The CONCRETE-typed spelling: §28.6's rule is about the RECEIVER's
@@ -134,9 +136,9 @@ BEZEL_TEST(ownership_collection_literal_assignment_7092,
         "  b.Dispose(); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `b`"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "§28.6"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "cannot call `Dispose()` on `b`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "borrow (an alias) of `a`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§28.6"));
 }
 
 // The LAMBDA spelling: the assignment happens inside a lambda body, on a
@@ -159,9 +161,9 @@ BEZEL_TEST(ownership_collection_literal_assignment_7092,
         "  return f(); "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "§28.6"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "borrow (an alias) of `a`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§28.6"));
 }
 
 // =====================================================================
@@ -186,8 +188,8 @@ BEZEL_TEST(ownership_collection_literal_assignment_7092,
         "  il.Dispose(); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagContains(r, "cannot call `Dispose()` on `il`"));
-    BEZEL_EXPECT_TRUE(diagContains(r, "borrow (an alias) of `a`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "cannot call `Dispose()` on `il`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "borrow (an alias) of `a`"));
 }
 
 // (b) The OWNER's own dispose — `a` owns the assigned literal, so
