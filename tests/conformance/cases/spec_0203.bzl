@@ -3,7 +3,7 @@
 var x: Stream;                       // x will be a borrow at the merge
 if condition then
   using var scratch := new FileStream(path, FileMode.Create);  // owned: used and discharged in-branch
-  primary.Reset(scratch);            // scratch's work is done here
+  primary.WriteSnapshotTo(scratch);  // uses scratch only during the call
   x := primary.Stream;               // x borrows primary (outlives the if)
 else
   x := otherSource.Stream;           // x borrows otherSource (outlives the if)

@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.342 — October 2026**
+**Companion to the Bezel Language Specification, v0.343 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -14965,5 +14965,26 @@ The composition step resolved these seams:
 **Migration.** None: doc-only.
 
 **Checks.** `scripts/check_docs.sh` and `scripts/check_proposals.sh` are clean.
+
+---
+
+### v0.343 changelog (v0.342 → v0.343)
+
+**Editorial: §28.3's Pattern 1 example no longer depends on an unstated callee.** On 2026-10-23 the owner asked whether Pattern 1 of the branch-equalization example in §28.3 (*Ownership state of locals*) was correct, and then asked for the fix. Class: **editorial** (spec-change process §2). No rule or verdict moves.
+
+**The problem.** The example disposed a `using var scratch` inside the branch after calling `primary.Reset(scratch)`, then bound `x := primary.Stream`. It is correct only if `Reset` uses `scratch` during the call and does not keep it, and the name suggests the opposite reading.
+- **If `Reset` stored its plain parameter as `primary`'s stream:** the program is still admitted, because that store is §28.3's field-store trust clause. But `x` would then read a disposed `scratch` after the merge. That is the trap the paragraph after the example warns about.
+- **If `Reset` took ownership:** the call would have had to read `primary.Reset(move scratch)`, with no `using var`.
+
+**The fix.**
+- **The example.** The call is now `primary.WriteSnapshotTo(scratch)`, commented "uses scratch only during the call". The paragraph after the example gains a sentence:
+  - the in-branch call must be one that does not keep its argument;
+  - a method that stores its argument declares the parameter `owned` (called with `move scratch`) or `scoped` (§28.14);
+  - a stored plain parameter is admitted only as the trust clause, and here would leave `x` reading a disposed stream.
+- **The corpus.** The doc-example case extracted from this block, `tests/conformance/cases/spec_0203.bzl`, is updated to match. It stays `skip`, still blocked on #1394.
+
+**Migration.** None: doc-only.
+
+**Checks.** `scripts/check_docs.sh` is clean.
 
 ---

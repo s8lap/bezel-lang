@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.342 — October 2026**
+**Version 0.343 — October 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -6430,7 +6430,7 @@ To compile a mixed merge, **the program** must equalize the branches before the 
 var x: Stream;                       // x will be a borrow at the merge
 if condition then
   using var scratch := new FileStream(path, FileMode.Create);  // owned: used and discharged in-branch
-  primary.Reset(scratch);            // scratch's work is done here
+  primary.WriteSnapshotTo(scratch);  // uses scratch only during the call
   x := primary.Stream;               // x borrows primary (outlives the if)
 else
   x := otherSource.Stream;           // x borrows otherSource (outlives the if)
@@ -6452,7 +6452,7 @@ end;
 
 Where one branch is a **named owned binding**, the marked arm transfer ([K3.4](#sec-kernel-k3)) writes the same equalization as one expression: `var x := (if useFresh then new FileStream(path, FileMode.Create) else move cached);` — both arms owned, `cached` consumed only on the selected path and per-path consumed after the construct ([K7.4](#sec-kernel-k7)).
 
-Equalizing to borrowed (Pattern 1) does not merely require both branches to *be* borrows — it requires each branch's borrow source to outlive the merge point ([K2.1](#sec-kernel-k2)). Binding `x` in one branch to a borrow of a `using var` discharged at that branch's end does **not** equalize the merge: the borrow's source is already gone by the time `x` is read after the `if`, and the borrow-lifetime rule rejects it. The `using var` completes its work *within* the branch; `x` takes its post-merge value from a source that lives past the `if` (as `primary` and `otherSource` do above).
+Equalizing to borrowed (Pattern 1) does not merely require both branches to *be* borrows — it requires each branch's borrow source to outlive the merge point ([K2.1](#sec-kernel-k2)). Binding `x` in one branch to a borrow of a `using var` discharged at that branch's end does **not** equalize the merge: the borrow's source is already gone by the time `x` is read after the `if`, and the borrow-lifetime rule rejects it. The `using var` completes its work *within* the branch; `x` takes its post-merge value from a source that lives past the `if` (as `primary` and `otherSource` do above). The call that uses `scratch` must also be one that does not keep it: `WriteSnapshotTo` takes a plain parameter and uses it only during the call. A method that stores its argument would declare the parameter `owned`, called with `move scratch` and no `using var`, or `scoped` ([§28.14](#sec-scoped-callback-parameters)); a plain parameter that the callee stores in a field is admitted only as a trust clause ([*Borrow lifetime rules*](#sec-borrow-lifetime-rules)), and had the call stored `scratch` as `primary`'s stream, `x` would read it after the branch disposed it.
 
 <a id="sec-producers"></a>
 #### Producers
