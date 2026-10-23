@@ -3159,3 +3159,26 @@ s11_6_0006	pass
 s11_6_0007	pass	
 s11_6_0008	pass	
 s14_1_0004	pass	
+s14_2_0088	pass	
+s14_2_0089	fail	#7086
+s17_11_0064	pass	
+s17_11_0065	pass	
+s17_11_0066	pass	
+s17_11_0067	pass	
+s17_11_0068	pass	
+s17_11_0069	pass	
+s17_11_0070	pass	
+s17_11_0071	pass	
+s17_11_0072	pass	
+s17_11_0073	pass	
+s17_11_0074	pass	
+s17_11_0075	fail	#7008
+s22_3_0055	fail	#7086
+s22_5_0013	pass	
+s22_5_0014	pass	
+s22_5_0015	pass	
+s28_11_0040	pass	
+s28_11_0041	pass	
+s5_1_0134	pass	
+s5_1_0135	pass	
+s5_1_0136	pass	
