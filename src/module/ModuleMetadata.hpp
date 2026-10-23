@@ -330,7 +330,16 @@ inline constexpr std::uint32_t kSchemaVersion = 7;
 // the importer-visible codegen ABI. An artifact stamped with another revision
 // is refused at import with the existing diagnostic (rc 1, "built by a
 // compiler with a different metadata content revision"), and must be rebuilt.
-inline constexpr std::uint32_t kProducerContentRevision = 3;
+// fix #7094 / #7095 (§17.11 / §2.8.2, v0.343) bumped 3 -> 4: the exporting
+// module now ships the §17.11 `default(T)` obligation of a generic's BODY
+// (`MetaGenericParam::requiresWellDefinedDefault`, a 3rd scalar of
+// GENERIC_BLOCK's REC_SCALARS) and folds it into the semantic hash — a NEW
+// METADATA FIELD and a NEW FOLD, the two changes this stamp exists to police.
+// Without the bump a compiler reading an artifact written before #7094 sees
+// the SAME stamp and LOADS IT SILENTLY: the obligation's fold is missing, the
+// importer judges the instantiation against an empty obligation set, ACCEPTS
+// it, and the program SEGFAULTS (exit 139) instead of being rejected.
+inline constexpr std::uint32_t kProducerContentRevision = 4;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
