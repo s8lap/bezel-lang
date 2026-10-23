@@ -1933,6 +1933,24 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // silently turned into a search from 0).
             startVal = widenIntParam(call.args[1].value.get(), startVal,
                                      "iof2.s64", "iof2.z64");
+            // fix #6641 (§9.6, v0.343): `IndexOf(value: string, startIndex: int
+            // := 0)` requires "0 <= startIndex <= Length (IndexOutOfRange-
+            // Exception otherwise)" — the SAME bound the char-needle arm
+            // checks. This arm had NO check, so an out-of-range start reached
+            // the runtime: `bz_str_indexof_from` clamps a negative start to 0
+            // (a silent search from the front) and returns -1 for a start past
+            // the end, instead of raising.
+            //
+            // ⚠ The check runs against the NORMALISED start — the value the
+            // search actually starts from (fix #6639), not a pre-widening one.
+            // A `byte` 200 widens to the int 200, which is a legal start on a
+            // long enough string; had the check seen a sign-extended -56 it
+            // would have rejected a program §5.1 and §9.6 both admit.
+            llvm::Value* len = loadStringLen(self);
+            llvm::Value* oor = builder_.CreateOr(
+                builder_.CreateICmpSLT(startVal, builder_.getInt64(0), "iof2.sneg"),
+                builder_.CreateICmpSGT(startVal, len, "iof2.sbig"), "iof2.oor");
+            emitGuardThrow(oor, "IndexOutOfRangeException");
             auto* fn = declareC("bz_str_indexof_from", i32(),
                                 {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {self, sub, startVal}, "iof2.result");
