@@ -8,10 +8,20 @@
 //!   under a parameter or local `owner` — is admitted on its source's standing, and a later overwrite, `move` or disposal of that slot
 //!   (`_s := new Stream();`, `owner.Reset()`) is K5.6's posture ... a member access
 //!   through the stored borrow afterwards is K4.1's deterministic
-//!   `DisposedAccessException` in checked disposal mode
+//!   `DisposedAccessException` in checked disposal mode. KNOWN DIVERGENCE (#4602,
+//!   default build only): in checked disposal mode the backstop raises
+//!   `DisposedAccessException`, which is what §28.2 requires, so this row runs with
+//!   `--checked-disposal` — the compiler's default is still unchecked
+//!   (`CodegenOptions::checkedDisposal = false`, src/codegen/LlvmBackend.hpp:37) and
+//!   #4602's default flip is still open. In the default build the compiler reads the
+//!   overwritten slot instead of raising (measured here as the value 7 rather than
+//!   "faulted"): §28.2 says the default *is* checked, the implementation is not, and
+//!   the `flags` column is currently carrying the spec's default. When the default
+//!   flips, the flags come off.
 //! cites: 28.14, 28.2, 28.7
 //! expect: run
 //! stdout: faulted
+//! flags: --checked-disposal
 module Conf;
 
 public class Source

@@ -1722,12 +1722,17 @@ s27_6_0029	fail	#4704
 s27_6_0030	fail	#4704
 s27_6_0031	pass	
 s27_6_0032	pass	
+s27_6_0033	pass	
+s27_6_0034	fail	#7093
+s27_6_0035	pass	
 s27_7_0001	pass	
 s27_7_0002	pass	
 s27_7_0003	pass	
 s27_7_1_0001	pass	
 s27_7_1_0002	pass	
 s27_7_1_0003	pass	
+s27_7_1_0008	pass	
+s27_7_1_0009	pass	
 s27_8_0001	pass	
 s27_8_0002	pass	
 s27_8_0003	pass	
@@ -1759,6 +1764,7 @@ s28_2_0009	pass
 s28_2_0010	pass	
 s28_2_0011	fail	#4602
 s28_2_0012	pass	
+s28_2_0013	pass	
 s28_3_0001	pass	
 s28_3_0002	pass	
 s28_3_0003	pass	
@@ -1856,6 +1862,9 @@ s28_3_0205	pass	#7045 default-build divergence (checked-mode row)
 s28_3_0206	pass	#7045 default-build divergence (checked-mode row)
 s28_3_0207	pass	
 s28_3_0208	pass	
+s28_3_0209	pass	
+s28_3_0210	pass	
+s28_3_0211	pass	
 s28_4_0001	pass	
 s28_4_0002	pass	
 s28_4_0003	pass	
@@ -1914,6 +1923,10 @@ s28_6_0030	pass
 s28_6_0031	pass	
 s28_6_0032	pass	
 s28_6_0033	pass	#5660
+s28_6_0040	pass	
+s28_6_0041	pass	
+s28_6_0042	fail	#7091
+s28_6_0043	fail	#7092
 s28_7_0001	pass	
 s28_7_0002	pass	
 s28_7_0003	pass	
@@ -1974,6 +1987,8 @@ s28_10_0011	pass
 s28_10_0012	pass	
 s28_10_0013	fail	#5644
 s28_10_0014	pass	
+s28_10_0015	fail	#5582
+s28_10_0016	fail	#7092
 s28_11_0001	pass	
 s28_11_0002	pass	
 s28_11_0003	pass	
@@ -2033,6 +2048,7 @@ s28_14_0022	pass
 s28_14_0023	fail	divergence
 s28_14_0024	pass	
 s28_14_0025	pass	
+s28_14_0031	pass	#4602 default-build divergence (checked-mode row)
 s29_1_0001	pass	
 s29_1_0002	fail	divergence
 s29_1_0003	pass	
