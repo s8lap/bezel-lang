@@ -169,16 +169,6 @@ Apart from the proposals, these are published together as a searchable site, one
 - **The compiler**, `bezelc`, is an ahead-of-time front end and LLVM back end. It compiles the language's core end to end — ownership and borrow checking, classes and generics, records, enums and choices, exceptions, collections and queries, `async`/`await`, multi-module builds — and much of the standard library.
 - **The gap** is measured. A rule corpus of one hand-written case per specification rule ([`tests/conformance/rules/`](tests/conformance/rules/)) records where the compiler still differs: of the 3,085 cases with a recorded result, 2,873 match the specification. Every difference has a tracking issue.
 
-## Repository layout
-
-```text
-src/      the compiler: lexer, parser, semantic analysis, ownership, codegen, runtime, modules, driver
-tests/    behaviour tests (gtest), diagnostic tests (lit + FileCheck), the conformance corpora
-docs/     specification, standard library, rationale, changelog, tour and guides
-editors/  editor support (VS Code)
-scripts/  build, test and documentation tooling
-```
-
 ## Reporting a bug
 
 Bug reports are very welcome. Please [open an issue](https://github.com/s8lap/bezel-lang/issues/new/choose) with:
