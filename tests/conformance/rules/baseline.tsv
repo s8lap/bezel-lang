@@ -1848,8 +1848,8 @@ s28_3_0120	pass
 s28_3_0147	pass	
 s28_3_0203	pass	
 s28_3_0204	pass	
-s28_3_0205	fail	divergence
-s28_3_0206	fail	divergence
+s28_3_0205	pass	#7045 default-build divergence (checked-mode row)
+s28_3_0206	pass	#7045 default-build divergence (checked-mode row)
 s28_3_0207	pass	
 s28_3_0208	pass	
 s28_4_0001	pass	
