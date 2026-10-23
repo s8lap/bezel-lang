@@ -4700,6 +4700,51 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
         nullableTag = builder_.CreateExtractValue(src, {0u}, "with.nul.tag");
         src = builder_.CreateExtractValue(src, {1u}, "with.nul.payload");
     }
+    // fix #7044 (§12.7 / §9.5 / §7.4, v0.340): a §12.7 TYPE-NARROWED
+    // source — `if c is P then … c with(…) end;` over `c: P?` — reads as the
+    // BARE record `P`, but its STORAGE is still the tagged `{i8, P}` nullable
+    // carrier: §12.7 retypes the READ, not the storage, and the carrier's
+    // DECLARED type (`P?`) is what codegen lays out. `rt` above is the
+    // NARROWED type, so it is non-nullable and the #1273 test ("a nullable
+    // record source") answers NO: the unwrap was skipped and the TAGGED
+    // value was stored into the BARE record copy alloca — a 24-byte store
+    // into a 16-byte slot (ASan: stack-buffer-overflow, WRITE of size 24)
+    // and a copy whose first field is the tag byte.
+    //
+    // The unwrap is keyed on the SOURCE's DECLARED type (the carrier's
+    // storage type, which the narrowing left alone) and on the lowered value
+    // carrying EXACTLY that carrier's layout — so a plain non-nullable
+    // record source (whose own layout can coincidentally be `{i8, T}`) is
+    // untouched. §12.7 narrows only a simple variable, so the source of a
+    // narrowed `with` is an identifier or a parameter; anything else keeps
+    // the pre-fix behaviour.
+    if (!srcNullableRecord && !nullableTag) {
+        const sema::TypeRef* srcDeclTy = nullptr;
+        if (auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(we.source.get())) {
+            if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+                    srcDeclTy = ls->declType;
+                else if (auto* ps =
+                             dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                    srcDeclTy = ps->resolvedDeclType;
+                    if (!srcDeclTy && ps->declType)
+                        srcDeclTy = ctx_.resolvedType(*ps->declType);
+                }
+            }
+        }
+        if (srcDeclTy && srcDeclTy->nullable &&
+            srcDeclTy->kind == sema::TypeRef::Kind::Named &&
+            srcDeclTy->declaration &&
+            srcDeclTy->declaration->kind == ast::TypeDeclKind::Record &&
+            !src->getType()->isPointerTy()) {
+            llvm::StructType* carrier =
+                llvm::StructType::get(llvm_, {nullablePrimHasValTy(), st});
+            if (src->getType() == carrier)
+                src = builder_.CreateExtractValue(src, {1u},
+                                                  "with.nul.payload");
+        }
+    }
     // The GEP base: a spilled copy of the source record.
     llvm::Value* base = entryAlloca(st);
     // #575 / §9.5 / §22.3: when `this with { … }` is used inside a record
