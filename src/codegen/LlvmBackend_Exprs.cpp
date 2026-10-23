@@ -5608,6 +5608,110 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 lowerExpr(*ma->target);
                 return llvm::ConstantInt::get(i1(), 0);
             }
+            // fix #7017 (stdlib §4.1 / §4.2, v0.340): the same read through
+            // a BUILTIN COLLECTION INTERFACE receiver — `ICollection<T>`
+            // (stdlib §4.1), `IList<T>` (§4.1, which inherits it),
+            // `IOwningCollection<T>` (§4.2) and `IOwningList<T>` (§4.2, which
+            // inherits it). The member is DECLARED on those heads (§4.1:
+            // "readonly property IsReadOnly: bool;" on `ICollection<T>`; §4.2:
+            // the same on `IOwningCollection<T>`), and the #6997 sema arm
+            // admits it (it is in the head's documented surface), so the read
+            // reached codegen — and NOTHING lowered it: the local degraded to
+            // a zero-initialised value with the #2434 warning and the program
+            // answered `False` by accident, not by reading the member.
+            //
+            // The VALUE is the same constant the seven concrete families get
+            // above, and for the same reason: §4.1 fixes it — "`IsReadOnly`
+            // is `false` for every standard collection implementing
+            // `ICollection<T>` … The standard library currently ships no
+            // read-only `ICollection<T>` implementation" — and §4.2's owning
+            // pair is implemented by the owning standard collections
+            // (OwningArray §4.5, OwningLinkedList §4.7, OwningSet §4.10),
+            // whose `IsReadOnly` the #4746 arm above already answers `false`.
+            //
+            // THE ONE CASE THE CONSTANT DOES NOT COVER, measured and filed.
+            // §4.1 contemplates a "user-defined read-only implementation",
+            // and a user class CAN hold such a slot — `public class
+            // MyList: IList<int> … end MyList;` followed by `var il:
+            // IList<int> := new MyList();` is accepted (§5.1). Through that
+            // receiver the constant is wrong: the head erases the concrete
+            // layout with no itable, so the read has nothing to dispatch
+            // through. MEASURED on this lane's base, over a `MyList` whose
+            // `_a` is `[1,2,3]` and whose `IsReadOnly` returns `true`:
+            // `il.Count` → `0`, `il.Contains(2)` → `False`,
+            // `il.IsReadOnly` → `False` — all three wrong, all three with no
+            // diagnostic. That is #7063, whose scope is the whole
+            // user-implementation family; this arm answers only the standard
+            // collections, which §4.1 and §4.2 pin to `false`. The pre-fix
+            // #2434 fallback printed `False` for that receiver too, so this
+            // is not a regression — it is the same wrong answer reached
+            // deliberately instead of accidentally, and only for a case
+            // #7063 already owns. The other available answer, an Error, is
+            // excluded: §27.6 resolves a bare reference "on the value exactly
+            // as the call `v.Scaled()` is", and §4.1 DECLARES this member on
+            // these heads, so the read resolves; rejecting it would turn an
+            // accepted program into a rejection — the silent-acceptance
+            // inversion this repo treats as its worst defect class.
+            //
+            // The read is TYPED here (as `bool`) because sema does not type
+            // it on an interface receiver (the #4746 sema arm admits the seven
+            // CONCRETE families only), so without this the expression would
+            // stay untyped and every consumer that keys on the semantic type
+            // — the `Console.WriteLine` renderer (a nullable/primitive
+            // dispatch keyed on `ctx_.exprType`), and an INFERRED local's
+            // declared type — would see "no type" instead of `bool`. The
+            // #2781 arm above already mints the same type from codegen for
+            // the same reason (an `Object` universal member has no
+            // MethodSymbol and no sema type), and patches the bound local's
+            // declared type with it; this arm does the same for the same
+            // reason.
+            if (cn == "ICollection" || cn == "IList" ||
+                cn == "IOwningCollection" || cn == "IOwningList") {
+                sema::TypeRef* boolTy =
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Bool);
+                ctx_.setExprType(&e, boolTy);
+                // The inferred-local twin of the #2781 patch: when this read
+                // IS the initializer of a local, sema left that local's
+                // DECLARED type null — sema types the member only on the
+                // seven CONCRETE families, never on an interface receiver —
+                // so the binding carries no type even though the read's own
+                // type is `bool`. Restoring it here is the #2781 precedent's
+                // exact mechanism ("sema left the binding local's declType
+                // null … Restore it here from the exprType we just set"). A
+                // post-sema codegen-only patch is safe — sema does not read a
+                // local's declared type again after the initializer is
+                // typechecked.
+                //
+                // fix #7017 + the #3614 shape (§21.1, v0.340): the
+                // initializer is read through the SHARED `localDeclInitView`
+                // authority (#2802/#3402), NOT through a `const
+                // ast::LocalDecl*` dynamic_cast. A §21.1 `const` local is a
+                // DIFFERENT AST node (`ast::LocalConstDecl`, whose
+                // initializer field is `value`, not `initializer`), so that
+                // cast is null for it and the `const` form was SILENTLY
+                // SKIPPED — the exact defect shape the #3591 ratchet family
+                // exists to catch (this file's grandfathered ceiling is ONE
+                // bare site, so a second one is a gate-blocking violation;
+                // #3614 is the in-repo precedent for this very repair:
+                // "read the … triple through the shared `localDeclInitView`
+                // instead of re-deriving it via a LocalDecl-only
+                // dynamic_cast"). `localDeclInitView` is the ONE place the
+                // LocalDecl/LocalConstDecl split is decoded, so both kinds are
+                // recognized identically — and the site is no longer a bare
+                // cast at all.
+                for (const auto& sym : ctx_.symbols()) {
+                    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
+                    if (!ls || !ls->decl) continue;
+                    LocalDeclInitView view = localDeclInitView(ls->decl);
+                    if (!view.init || view.init != &e) continue;
+                    ls->declType = boolTy;
+                    break;
+                }
+                // Lower the receiver for its side effects and discard the
+                // value: the property does not depend on the object's state.
+                lowerExpr(*ma->target);
+                return llvm::ConstantInt::get(i1(), 0);
+            }
         }
     }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
