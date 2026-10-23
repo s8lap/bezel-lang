@@ -163,9 +163,9 @@ bezelc hello.bzl -o hello && ./hello
 A few proposals are good reading on their own:
 
 - [0046, the ownership kernel](docs/proposals/0046-ownership-kernel-consolidation.md): the memory rules had grown rule by rule into case law; this restates them as nine kernel rules (K1–K9) and a register of axioms, with every rule traced back to them.
-- [0047, mechanized core semantics](docs/proposals/0047-mechanized-core-semantics.md): a pending plan to model that kernel in Lean and prove disposal exactly once and isolation between domains.
-- [0106, lessons from other languages](docs/proposals/0106-language-lessons-survey.md): 84 lessons from Ada/SPARK, the Wirth languages, Erlang, Rust, Go, Swift, C# and others, each judged against Bezel's design.
-- [0100, the body seam, examined and closed](docs/proposals/0100-the-body-seam-examined-and-closed.md): a whole exploration that ended in keeping things as they were, written up so the question need not be reopened from memory.
+- [0174, the replacing `move`](docs/proposals/0174-replacing-move.md): `move loc with e` takes the value out of an owned field or slot and puts a new one in, in one step, so no owned location is ever left empty.
+- [0077, silent tracking](docs/proposals/0077-silent-tracking.md): classes that hold no resources need no `using var` and draw no warnings, yet each instance still has a known owner and is freed at a known point, with no runtime lifetime mechanism on any class you write.
+- [0131, the trust-admission report](docs/proposals/0131-report-trust-admissions.md): where the guarantees stop. A build mode warns at every place the compiler accepts a borrow on trust rather than proof, naming the source and the static spelling that would replace the trust.
 
 Apart from the proposals, these are published together as a searchable site, one page per chapter, at **[s8lap.github.io/bezel-lang](https://s8lap.github.io/bezel-lang/)**. The site is rebuilt from `docs/` by `scripts/build_book.py` whenever the documents change on main.
 
