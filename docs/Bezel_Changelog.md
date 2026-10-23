@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.340 — October 2026**
+**Companion to the Bezel Language Specification, v0.341 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -14924,5 +14924,24 @@ The composition step resolved these seams:
   *Matrix status after this train* (the v0.336 run files are pinned and not edited; the next re-runs re-quote):
   - **Found at composition:** borrow-flow R3/C13–R6/C13 quote §28.14's "locals and parameters of a value type that holds borrows (each tested, and frozen, …", which 0194 splits to name the copied `this`. Generics R3/C7 and R4/C7 quote §27.1.1's "may bridge any §5.1 implicit conversion, because", which the formation fold scopes to a by-value slot. Re-quote them. The verdicts are unchanged: the borrow-flow cells concern locals and parameters, and the generics cells by-value conversions at a value-type instantiation.
   - No other cell loses a fragment. The lanes re-walked their cells' row and column neighbours and found none opened.
+
+---
+
+### v0.341 changelog (v0.340 → v0.341)
+
+**Editorial: the rationale's opening rewritten for coherence.** On 2026-10-23 the owner asked whether the rationale's opening could be more coherent, and then asked for the improvements as their own change. Class: **editorial** (spec-change process §2). No rule, verdict, decline record or cross-reference target moves; no other document changes beyond the version headers and the code-generation reference's pins.
+
+- **Rationale preamble.** Its first two paragraphs said the same thing twice: the specification says what, this document says why, and each decision names the alternative and what it would have cost. They are now one paragraph. The note that settled conventions are not discussed is unchanged.
+- **Rationale §1, *The big picture*.** It now opens with three commitments instead of two:
+  - **predictable performance**, the old first commitment;
+  - **memory safety the compiler checks**, the old second commitment, now also naming the reach into concurrent code through execution domains;
+  - **few surprises**, newly named. It points at the chapters that already carry it: non-null by default (§6), operators that do not lift (§6.4), no implicit user conversions (§14.5) and lookup without backtracking (§2). It also names checked integer overflow (spec §6.1).
+
+  The Rust comparison keeps its content and drops its repeated closing clause ("simple enough to keep entirely in your head"). The bridge paragraph now also maps the chapters that follow.
+- **Moved out of §1:** the sentence on the tier that needs no ceremony (runtime-managed values, and resource-free classes freed with no `using var` and no warning). §4, §5.9 and §5.28 already state it. One spec link that the same paragraph repeated is dropped as well.
+
+**Migration.** None: doc-only.
+
+**Checks.** `scripts/check_docs.sh` and `scripts/build_book.py --check` are clean.
 
 ---
