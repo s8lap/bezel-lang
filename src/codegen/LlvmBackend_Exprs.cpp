@@ -8358,6 +8358,27 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // it). isPrimIntrinsicMethodRef keys the disposal sites to this same set.
         if (isPrimIntrinsicMethodRef(&e))
             return makePrimIntrinsicThunk(*ma, ctx_.exprType(e));
+        // fix #7014 (stdlib §4.1 / §4.2, spec §27.6, v0.340): a bare
+        // method-group reference to a member a BUILTIN COLLECTION INTERFACE
+        // head declares (`co.Contains`, `ol.Insert`, …) has no MethodSymbol
+        // (an interface head has no method declaration to bind), so the CG60
+        // path fell through to `ret nullptr` and the local degraded to a zero
+        // value — calling the method group was a SIGSEGV (measured: rc 139).
+        //
+        // §27.6: "the member resolved on the value exactly as the call
+        // `v.Scaled()` is" — and the CALL form of these members is rejected by
+        // the #853 fence (the interface erases the concrete backing, so no
+        // single bz_* call is sound). The reference form must be rejected
+        // identically; the arm below lowers a synthetic call through that same
+        // path so the fence fires with the same diagnostic and location. The
+        // PROPERTY form on the same heads is already rejected by the matching
+        // fence in the property arm above, so this makes all three agree.
+        //
+        // Placed AFTER the MethodSymbol arm: a real MethodSymbol (a user
+        // class's method reached through a user interface) is the ordinary
+        // §27.6 reference and must keep its own thunk.
+        if (isBuiltinCollMemberMethodRef(&e))
+            return lowerBuiltinCollMemberRef(*ma);
     }
     return nullptr;
 }

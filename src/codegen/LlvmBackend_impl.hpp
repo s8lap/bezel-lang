@@ -24212,6 +24212,39 @@ private:
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
 
+    // fix #7014 (stdlib §4.1 / §4.2, spec §27.6, v0.340): the bare
+    // method-group REFERENCE to a member a BUILTIN COLLECTION INTERFACE head
+    // declares (`co.Contains`, `ol.Insert`, …) must resolve exactly as the
+    // CALL form does (§27.6: "the member resolved on the value exactly as the
+    // call `v.Scaled()` is"). The call form of these members is rejected by the
+    // #853 fence in tryLowerCollectionInstanceCall (the interface erases the
+    // concrete backing, so no single bz_* call is sound); the reference form
+    // was ACCEPTED, degraded to a zero value (the #2434 warning) and SEGVed
+    // when the method group was called.
+    //
+    // `lowerBuiltinCollMemberRef` lowers a synthetic call through that SAME
+    // path, so the fence fires with the identical diagnostic and location —
+    // the reference form agrees with the call form and with the property form
+    // (which the matching fence in the MemberAccessExpr property arm already
+    // rejects). The array-backed BORROWING LIST interfaces (IReadOnlyList<T> /
+    // IList<T>) are NOT fenced — their call form lowers through the
+    // bz_array_* bridge — so their method-reference form must be EMITTED, not
+    // rejected; that needs a closure cell whose scope-end release is armed by
+    // the +1-producer scan in LlvmBackend_Setup.cpp, which is outside this
+    // lane's files (deferred, #7014).
+    //
+    // `isBuiltinCollMemberMethodRef` recognizes the shape the arm handles: a
+    // MemberAccessExpr over a collection-interface receiver with NO
+    // MethodSymbol (an interface head has no method declaration to bind).
+    bool isBuiltinCollMemberMethodRef(const ast::Expr* e) const;
+    llvm::Value* lowerBuiltinCollMemberRef(const ast::MemberAccessExpr& ma);
+
+    // fix #7014: owns the synthetic call trees built for the fenced
+    // method-reference forms, so the exprType entry set on their receiver
+    // placeholder never outlives its key (the same discipline
+    // primIntrinsicSynthCalls_ / nullCondCountSynth_ follow).
+    std::vector<std::unique_ptr<ast::CallExpr>> builtinCollMemberSynthCalls_;
+
     // fix #2513 / spec §35.2 (v0.236): the stdlib §2.20 `Result<T, E>` carries
     // four compiler-provided per-instantiation combinators (Map / MapError /
     // AndThen / UnwrapOr) — only admissible where the receiver AND result

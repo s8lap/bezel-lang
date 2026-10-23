@@ -2439,6 +2439,95 @@ bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
 }
 
 
+// fix #7014 (stdlib §4.1 / §4.2, spec §27.6, v0.340): recognize the bare
+// method-group REFERENCE shape over a builtin collection interface head.
+//
+// The shape: a MemberAccessExpr `recv.Member` whose receiver's type is one of
+// the builtin COLLECTION INTERFACE heads (stdlib §4.1 / §4.2) and which has
+// NO MethodSymbol — an interface head has no method DECLARATION to bind, so
+// sema resolves the name against the head's documented surface (the same
+// table the #6997 arm rejects against) and leaves the reference symbol-less.
+//
+// The member must be one the collection call path recognizes: the #853 fence
+// in tryLowerCollectionInstanceCall names exactly Add / Clear / Contains /
+// Remove / Insert / IndexOf. A member the head does NOT declare is rejected
+// by sema (the #6997 arm), so it never reaches codegen.
+bool Emitter::isBuiltinCollMemberMethodRef(const ast::Expr* e) const {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || !ma->target) return false;
+    if (ctx_.exprSymbol(*e)) return false;   // a real MethodSymbol reference
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy) return false;
+    bool owning = false;
+    // The POLYMORPHIC collection interfaces + the OWNING list interface: the
+    // #853 fence's set (the interface erases the concrete backing). The
+    // array-backed borrowing LIST interfaces (IReadOnlyList<T> / IList<T>) are
+    // NOT in it — their call form lowers through the bz_array_* bridge.
+    const bool polyColl = isCollectionInterfaceName(recvTy) ||
+                          (isListInterfaceName(recvTy, &owning) && owning);
+    if (!polyColl) return false;
+    const std::string_view m = ma->member;
+    return m == "Add" || m == "Clear" || m == "Contains" || m == "Remove" ||
+           m == "Insert" || m == "IndexOf";
+}
+
+// fix #7014 (stdlib §4.1 / §4.2, spec §27.6, v0.340): lower the bare
+// method-group reference to a member a POLYMORPHIC collection interface head
+// declares.
+//
+// §27.6: "the member resolved on the value exactly as the call `v.Scaled()`
+// is". The CALL form of these members is rejected by the #853 fence in
+// tryLowerCollectionInstanceCall — "these interfaces are implemented by
+// collections with incompatible runtime representations (array / linked-list
+// / hash-table) and the concrete backing is erased at the interface, so no
+// single runtime dispatch is sound" (stdlib §4.1–§4.3). The REFERENCE form
+// was ACCEPTED, degraded to a zero value (the #2434 warning) and SEGVed when
+// the method group was called.
+//
+// So: lower a synthetic call through that SAME path. The fence fires with the
+// identical diagnostic and the same source location, and the compile fails —
+// the reference form now agrees with the call form and with the property form
+// (the matching fence in the MemberAccessExpr property arm already rejects
+// `.Count` on these heads).
+//
+// The synthetic call carries NO arguments: the fence reads only the member
+// name and the RECEIVER'S TYPE, and it returns before the receiver is
+// lowered — so nothing is emitted into the caller. The receiver is a
+// placeholder whose type is the receiver's own type (the pattern the #6024
+// null-conditional arm uses), because the fence classifies the receiver by
+// its type.
+//
+// The array-backed borrowing LIST interfaces (IReadOnlyList<T> / IList<T>) are
+// NOT reached here (isBuiltinCollMemberMethodRef declines them): their call
+// form lowers, so their method-reference form must be EMITTED, which needs a
+// closure cell whose scope-end release is armed by the +1-producer scan in
+// LlvmBackend_Setup.cpp — a file outside this lane's; deferred (#7014).
+llvm::Value* Emitter::lowerBuiltinCollMemberRef(const ast::MemberAccessExpr& ma) {
+    if (!ma.target) return nullptr;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma.target);
+    if (!recvTy) return nullptr;
+    auto synthCall = std::make_unique<ast::CallExpr>();
+    auto synthCallee = std::make_unique<ast::MemberAccessExpr>();
+    auto placeholder = std::make_unique<ast::IdentifierExpr>();
+    placeholder->name = ma.member;  // unused: the value comes from the type
+    ctx_.setExprType(placeholder.get(), const_cast<sema::TypeRef*>(recvTy));
+    synthCallee->target = std::move(placeholder);
+    synthCallee->member = std::string_view(ma.member);
+    synthCallee->span = ma.span;
+    synthCall->callee = std::move(synthCallee);
+    synthCall->span = ma.span;
+    // The tree must outlive the exprType entry set on its receiver
+    // placeholder — park it for the whole compilation (the discipline
+    // primIntrinsicSynthCalls_ / nullCondCountSynth_ follow).
+    const ast::CallExpr* call = synthCall.get();
+    builtinCollMemberSynthCalls_.push_back(std::move(synthCall));
+    // The fence reports the diagnostic and returns a poison; the value is
+    // never used (the compile failed). Nothing is emitted into the caller.
+    tryLowerCollectionInstanceCall(*call);
+    return nullptr;
+}
+
+
 llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
