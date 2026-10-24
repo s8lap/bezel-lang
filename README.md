@@ -206,3 +206,6 @@ Bezel is built with [Claude](https://www.anthropic.com/claude), Anthropic's AI m
 ## License
 
 Apache 2.0. See [`LICENSE`](LICENSE).
+
+
+<!-- Automated fix for issue #7147: [ownership] §28.6's 'other non-owned call result' is unenforced: a call whose declared return is a plain class type is a BORROW (§28.3's producers table), yet Dispose() on it is accepted -->
