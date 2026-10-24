@@ -1516,6 +1516,46 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // #7117 filed the static arm's, #7120 had to repair the static widening
     // AGAIN to make its own new guard correct). One definition, one rule.
 
+    // fix #7180 (§22.5, v0.343): a NAMED argument binds to the PARAMETER it
+    // NAMES, never to the position it occupies. §22.5 (v0.343): "named
+    // arguments may appear in any order after positional arguments. Each
+    // supplied argument binds exactly one parameter". Sema binds a built-in
+    // member's named arguments correctly and PUBLISHES that binding — the
+    // `paramToArg` vector, PARAMETER index -> SOURCE argument index — through
+    // `ExprTC::checkBuiltinNamedArgs` -> `SemaContext::setBuiltinCallBinding`
+    // (src/sema/ExprTypecheck_Calls.cpp, src/sema/SemaContext.hpp). An arm
+    // that reads `call.args[p]` POSITIONALLY ignores that binding: the
+    // reordered call then hands a parameter the value of a DIFFERENT
+    // parameter — and, when the two parameters have different types, an `i1`
+    // to a `ptr` slot, which is malformed IR and aborted the compiler with
+    // "IR verification failed" (#7180, `s.Equals(ignoreCase := true, other :=
+    // "ABC")`).
+    //
+    // The registry's parameter order for a member (`kStringParamNames`,
+    // src/common/BuiltinRegistry.cpp) is the order these arms already assumed
+    // positionally — `Equals/2` is {other, ignoreCase}, `CompareTo/2` is
+    // {other, ignoreCase}, `IndexOf/2` is {value, startIndex}, `Substring/2`
+    // is {startIndex, length}, `AsSpan/2` is {start, length}, `Pad*/2` is
+    // {totalWidth, paddingChar}, `Insert/2` is {startIndex, value}, and
+    // `Replace/2` is {oldChar, newChar} / {oldValue, newValue} (both with the
+    // OLD operand first) — so PARAMETER p's source argument is `(*bnd)[p]`.
+    //
+    // A POSITIONAL call, and a named call already in DECLARATION order (the
+    // identity permutation), publish NOTHING — for those the positional read
+    // is the correct one, and the fallback below keeps it byte for byte.
+    const auto* bnd = ctx_.builtinCallBinding(call);
+    // The SOURCE argument index bound to PARAMETER `p` (0-based, in the
+    // registry's parameter order). `p` itself when there is no published
+    // binding.
+    auto srcArgIdx = [&](std::size_t p) -> std::size_t {
+        if (bnd && p < bnd->size()) {
+            const int ai = (*bnd)[p];
+            if (ai >= 0 && static_cast<std::size_t>(ai) < call.args.size())
+                return static_cast<std::size_t>(ai);
+        }
+        return p;
+    };
+
     // §9.6 / §3.3 (#883): string.AsSpan() and its overloads → a ReadOnlyStringSpan
     // { Source = self (string ptr), Start, Length } over a contiguous code-point
     // range. Reuses the {ptr,i32,i32} span struct (buildArraySpan); the span's
@@ -1572,15 +1612,32 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         }
         // (start, length)
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-            llvm::Value* start = getIntArg(0);
-            llvm::Value* len   = getIntArg(1);
+            // fix #7180 (§22.5, v0.343): `start` and `length` are PARAMETERS;
+            // a named argument binds the parameter it NAMES, so the source
+            // argument of each parameter comes from the published binding.
+            const std::size_t startSrc = srcArgIdx(0);
+            const std::size_t lenSrc   = srcArgIdx(1);
+            llvm::Value* start = nullptr;
+            llvm::Value* len   = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (startSrc <= lenSrc) {
+                start = getIntArg(startSrc);
+                if (!start) return nullptr;
+                len = getIntArg(lenSrc);
+            } else {
+                len = getIntArg(lenSrc);
+                if (!len) return nullptr;
+                start = getIntArg(startSrc);
+            }
             if (!start || !len) return nullptr;
             // fix #7106 (§5.1, v0.343): same widen-by-signedness fit as the
             // (start) arm above — the span's Start/Length are i32 slots, and a
             // `trunc` to a WIDER type is malformed IR (the compiler-crash arm
             // this replaces).
-            start = fitToI32(call.args[0].value.get(), start);
-            len   = fitToI32(call.args[1].value.get(), len);
+            start = fitToI32(call.args[startSrc].value.get(), start);
+            len   = fitToI32(call.args[lenSrc].value.get(), len);
             guardThrowReleasingSelf(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(start, builder_.getInt32(0)),
@@ -1667,15 +1724,38 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // §9.6: Equals(other: string): bool — content equality (same as `=`).
     // Equals(other, ignoreCase: bool): bool — optional case-insensitive.
     if (method == "Equals" && !call.args.empty() && call.args[0].value) {
-        llvm::Value* other = getStrArg(0);
-        if (!other) return nullptr;
+        // fix #7180 (§22.5, v0.343): `other` and `ignoreCase` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally, the
+        // reordered call `s.Equals(ignoreCase := true, other := "ABC")` took
+        // `call.args[0]` — the `i1` — as the `other` STRING operand and handed
+        // it to a `ptr` parameter: malformed IR, and the compiler aborted with
+        // "IR verification failed" (#7180).
+        const std::size_t otherSrc = srcArgIdx(0);
         if (call.args.size() == 1) {
-            return emitStringEq(self, other);
+            llvm::Value* other1 = getStrArg(otherSrc);
+            if (!other1) return nullptr;
+            return emitStringEq(self, other1);
+        }
+        const std::size_t icSrc = srcArgIdx(1);
+        llvm::Value* other = nullptr;
+        llvm::Value* ignoreCase = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (otherSrc <= icSrc) {
+            other = getStrArg(otherSrc);
+            if (!other) return nullptr;
+            if (!call.args[icSrc].value) return nullptr;
+            ignoreCase = lowerExpr(*call.args[icSrc].value);
+        } else {
+            if (!call.args[icSrc].value) return nullptr;
+            ignoreCase = lowerExpr(*call.args[icSrc].value);
+            other = getStrArg(otherSrc);
+            if (!other) return nullptr;
         }
         // 2-arg form: Equals(other, ignoreCase).
         // ignoreCase=true → the code-point-wise case-folded compare
         // (bz_str_equals_ignorecase, fix #4483); false → plain equality.
-        llvm::Value* ignoreCase = lowerExpr(*call.args[1].value);
         if (!ignoreCase) return emitStringEq(self, other);
         // Fast path: ignoreCase=false → plain equality.
         auto* icBB = llvm::BasicBlock::Create(llvm_, "eq.ic", currentFn_);
@@ -1773,9 +1853,29 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // same runtime relation, which is what those two documents require.
     if (method == "CompareTo" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* other = getStrArg(0);
-        if (!other) return nullptr;
-        llvm::Value* ic = lowerExpr(*call.args[1].value);
+        // fix #7180 (§22.5, v0.343): `other` and `ignoreCase` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally,
+        // the reordered call `s.CompareTo(ignoreCase := true, other := "ABC")`
+        // handed the `i1` to the `ptr` `other` slot — malformed IR (the same
+        // crash #7180 reports for `Equals`).
+        const std::size_t otherSrc = srcArgIdx(0);
+        const std::size_t icSrc    = srcArgIdx(1);
+        llvm::Value* other = nullptr;
+        llvm::Value* ic = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (otherSrc <= icSrc) {
+            other = getStrArg(otherSrc);
+            if (!other) return nullptr;
+            if (!call.args[icSrc].value) return nullptr;
+            ic = lowerExpr(*call.args[icSrc].value);
+        } else {
+            if (!call.args[icSrc].value) return nullptr;
+            ic = lowerExpr(*call.args[icSrc].value);
+            other = getStrArg(otherSrc);
+            if (!other) return nullptr;
+        }
         if (!ic) return nullptr;
         llvm::Value* ic32 = ic->getType()->isIntegerTy(32)
             ? ic : builder_.CreateZExt(ic, i32());
@@ -1905,7 +2005,13 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // Linear scan starting at the code-point index startIndex; startIndex is
         // required to lie in [0, Length] (IndexOutOfRangeException otherwise).
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-            auto* argTy = ctx_.exprType(*call.args[0].value);
+            // fix #7180 (§22.5, v0.343): `value` and `startIndex` are
+            // PARAMETERS; a named argument binds the parameter it NAMES. The
+            // OVERLOAD is chosen by the type of the `value` operand, so that
+            // type is read from the parameter's source argument too.
+            const std::size_t valSrc   = srcArgIdx(0);
+            const std::size_t startSrc = srcArgIdx(1);
+            auto* argTy = ctx_.exprType(*call.args[valSrc].value);
             if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
                 argTy->primitive == sema::PrimitiveType::Char) {
                 // fix #6547: same narrowed-`char?` unwrap as Contains above.
@@ -1913,16 +2019,30 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 // flow-narrowed `int?` to its payload (§7.4). Sema gates this
                 // position (checkBuiltinStringCallArgs' intPos), so an
                 // un-narrowed `int?` is rejected before codegen.
-                llvm::Value* needle = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[0].value), call.args[0].value.get());
-                if (!needle) return nullptr;
-                llvm::Value* startV = getIntArg(1);
-                if (!startV) return nullptr;
+                llvm::Value* needle = nullptr;
+                llvm::Value* startV = nullptr;
+                // §22.5 (v0.343): the supplied argument expressions are
+                // evaluated in CALL-SITE TEXTUAL order — the expression
+                // written FIRST runs first, whatever parameter it binds to.
+                if (valSrc <= startSrc) {
+                    needle = unwrapNarrowedNullableOperand(
+                        lowerExpr(*call.args[valSrc].value),
+                        call.args[valSrc].value.get());
+                    if (!needle) return nullptr;
+                    startV = getIntArg(startSrc);
+                } else {
+                    startV = getIntArg(startSrc);
+                    if (!startV) return nullptr;
+                    needle = unwrapNarrowedNullableOperand(
+                        lowerExpr(*call.args[valSrc].value),
+                        call.args[valSrc].value.get());
+                }
+                if (!needle || !startV) return nullptr;
                 // Normalize startV to i64 for the loop counter / bounds check.
                 // fix #6639 (§5.1): widen by the SOURCE's signedness — an
                 // unsigned `byte` startIndex zero-extends, so `byte` 200 stays
                 // 200 instead of becoming -56 and failing the bounds check.
-                llvm::Value* start64 = widenIntParam(call.args[1].value.get(),
+                llvm::Value* start64 = widenIntParam(call.args[startSrc].value.get(),
                                                      startV, "ioc2.s64", "ioc2.z64");
                 llvm::Value* len = loadStringLen(self);
                 // Bounds check: 0 <= startIndex <= Length.
@@ -1966,17 +2086,32 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // `start` is a code-point index (§4.6 adaptive-width strings); the
         // runtime bz_str_indexof_from honours the width-aware code-point model.
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-            llvm::Value* sub = lowerExpr(*call.args[0].value);
-            if (!sub) return nullptr;
+            // fix #7180 (§22.5, v0.343): `value` and `startIndex` are
+            // PARAMETERS; a named argument binds the parameter it NAMES.
+            const std::size_t valSrc   = srcArgIdx(0);
+            const std::size_t startSrc = srcArgIdx(1);
+            llvm::Value* sub = nullptr;
             // fix #6562: startIndex via getIntArg (narrowed `int?` unwrap, §7.4).
-            llvm::Value* startVal = getIntArg(1);
-            if (!startVal) return nullptr;
+            llvm::Value* startVal = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (valSrc <= startSrc) {
+                sub = lowerExpr(*call.args[valSrc].value);
+                if (!sub) return nullptr;
+                startVal = getIntArg(startSrc);
+            } else {
+                startVal = getIntArg(startSrc);
+                if (!startVal) return nullptr;
+                sub = lowerExpr(*call.args[valSrc].value);
+            }
+            if (!sub || !startVal) return nullptr;
             // Normalize start to i64 for the runtime.
             // fix #6639 (§5.1): widen by the SOURCE's signedness — an unsigned
             // `byte` startIndex zero-extends, so `byte` 200 stays 200 instead
             // of becoming -56 (which the runtime's negative-start clamp then
             // silently turned into a search from 0).
-            startVal = widenIntParam(call.args[1].value.get(), startVal,
+            startVal = widenIntParam(call.args[startSrc].value.get(), startVal,
                                      "iof2.s64", "iof2.z64");
             // fix #6641 (§9.6, v0.343): `IndexOf(value: string, startIndex: int
             // := 0)` requires "0 <= startIndex <= Length (IndexOutOfRange-
@@ -2061,23 +2196,42 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // Delegates to bz_str_substring which uses the source string's width field
     // to copy the correct bytes (width * count) and preserves the source width.
     if (method == "Substring") {
-        llvm::Value* startV = getIntArg(0);
-        if (!startV) return nullptr;
+        // fix #7180 (§22.5, v0.343): `startIndex` and `length` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally,
+        // the reordered call `s.Substring(length := 2, startIndex := 1)` took
+        // `length` as the START and `startIndex` as the LENGTH — a silently
+        // wrong value ("c" instead of "bc").
+        const std::size_t startSrc = srcArgIdx(0);
+        const std::size_t lenSrc   = srcArgIdx(1);
+        bool hasLen = call.args.size() >= 2 && call.args[lenSrc].value;
+        llvm::Value* startV = nullptr;
+        llvm::Value* countArg = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (!hasLen || startSrc <= lenSrc) {
+            startV = getIntArg(startSrc);
+            if (!startV) return nullptr;
+            if (hasLen) countArg = lowerExpr(*call.args[lenSrc].value);
+        } else {
+            countArg = lowerExpr(*call.args[lenSrc].value);
+            startV = getIntArg(startSrc);
+            if (!startV) return nullptr;
+        }
         // fix #7102 (§5.1, §9.6, v0.343): BOTH `int` parameters of Substring
         // are widened by the SOURCE's signedness (widenIntParam above), not by
         // a bare sign-extension. A `byte` 200 is the `int` 200 — the §5.1
         // widening is lossless, so it must preserve the value; the bare
         // CreateSExt read the unsigned source's high bit as a sign bit and
         // delivered -56, which the arm's own bounds check then rejected.
-        llvm::Value* start64 = widenIntParam(call.args[0].value.get(), startV,
+        llvm::Value* start64 = widenIntParam(call.args[startSrc].value.get(), startV,
                                              "sub.start", "sub.zstart");
-        bool hasLen = call.args.size() >= 2 && call.args[1].value;
         // If length arg absent, pass -1 to signal "rest of string" to runtime.
         llvm::Value* count64 = hasLen
-            ? widenIntParam(call.args[1].value.get(),
-                            lowerExpr(*call.args[1].value),
+            ? widenIntParam(call.args[lenSrc].value.get(), countArg,
                             "sub.count", "sub.zcount")
             : builder_.getInt64(-1);
+        if (hasLen && !count64) return nullptr;
         // fix #747 R43 / §9.6 / language spec §4.6: an out-of-range start or
         // length raises IndexOutOfRangeException — the same convention every
         // string/span/array bounds operation follows (the runtime previously
@@ -2109,17 +2263,40 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // Detected by arg type being char (Char primitive).
     if (method == "Replace" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        auto* at0 = ctx_.exprType(*call.args[0].value);
+        // fix #7180 (§22.5, v0.343): `oldChar` and `newChar` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. The registry's two
+        // `Replace/2` rows ({oldChar, newChar} and {oldValue, newValue}) both
+        // carry the OLD operand first, so PARAMETER 0 is the old one in
+        // either overload.
+        const std::size_t oldSrc = srcArgIdx(0);
+        const std::size_t newSrc = srcArgIdx(1);
+        auto* at0 = ctx_.exprType(*call.args[oldSrc].value);
         if (at0 && at0->kind == sema::TypeRef::Kind::Primitive &&
             at0->primitive == sema::PrimitiveType::Char) {
             // fix #6547: same narrowed-`char?` unwrap as Contains above, on
             // BOTH operands — sema gates each (`oldChar` and `newChar` are
             // `char` parameters, stdlib §9.6), and the body both compares
             // `oldCh` against a code point and truncates `newCh` to `i8`.
-            llvm::Value* oldCh = unwrapNarrowedNullableOperand(
-                lowerExpr(*call.args[0].value), call.args[0].value.get());
-            llvm::Value* newCh = unwrapNarrowedNullableOperand(
-                lowerExpr(*call.args[1].value), call.args[1].value.get());
+            llvm::Value* oldCh = nullptr;
+            llvm::Value* newCh = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (oldSrc <= newSrc) {
+                oldCh = unwrapNarrowedNullableOperand(
+                    lowerExpr(*call.args[oldSrc].value),
+                    call.args[oldSrc].value.get());
+                newCh = unwrapNarrowedNullableOperand(
+                    lowerExpr(*call.args[newSrc].value),
+                    call.args[newSrc].value.get());
+            } else {
+                newCh = unwrapNarrowedNullableOperand(
+                    lowerExpr(*call.args[newSrc].value),
+                    call.args[newSrc].value.get());
+                oldCh = unwrapNarrowedNullableOperand(
+                    lowerExpr(*call.args[oldSrc].value),
+                    call.args[oldSrc].value.get());
+            }
             if (!oldCh || !newCh) return nullptr;
             auto* i8Ty  = llvm::Type::getInt8Ty(llvm_);
             auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
@@ -2188,8 +2365,24 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // output width for the result (§4.6 adaptive storage).
     if (method == "Replace" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* oldStr = lowerExpr(*call.args[0].value);
-        llvm::Value* newStr = lowerExpr(*call.args[1].value);
+        // fix #7180 (§22.5, v0.343): `oldValue` and `newValue` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally, the
+        // reordered call `s.Replace(newValue := "X", oldValue := "b")` took
+        // the NEW value as the OLD one — a silently wrong value.
+        const std::size_t oldSrc = srcArgIdx(0);
+        const std::size_t newSrc = srcArgIdx(1);
+        llvm::Value* oldStr = nullptr;
+        llvm::Value* newStr = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (oldSrc <= newSrc) {
+            oldStr = lowerExpr(*call.args[oldSrc].value);
+            newStr = lowerExpr(*call.args[newSrc].value);
+        } else {
+            newStr = lowerExpr(*call.args[newSrc].value);
+            oldStr = lowerExpr(*call.args[oldSrc].value);
+        }
         if (!oldStr || !newStr) return nullptr;
         auto* fn = declareC("bz_str_replace", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
         return builder_.CreateCall(fn, {self, oldStr, newStr}, "repl.result");
@@ -2377,8 +2570,15 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // mechanism.
     if ((method == "PadLeft" || method == "PadRight" || method == "PadCenter") &&
         !call.args.empty() && call.args[0].value) {
-        llvm::Value* widthArg = lowerExpr(*call.args[0].value);
-        if (!widthArg) return nullptr;
+        // fix #7180 (§22.5, v0.343): `totalWidth` and `paddingChar` are
+        // PARAMETERS; a named argument binds the parameter it NAMES. Read
+        // positionally, the reordered call `s.PadLeft(paddingChar := 'x',
+        // totalWidth := 4)` took the PADDING CHARACTER as the WIDTH.
+        const std::size_t widthSrc = srcArgIdx(0);
+        const std::size_t padSrc   = srcArgIdx(1);
+        bool hasPad = call.args.size() >= 2 && call.args[padSrc].value;
+        llvm::Value* width64 = nullptr;
+        llvm::Value* padCharArg = nullptr;
         // fix #7105 (§5.1, v0.343): widen the width to i64 BY THE SOURCE'S
         // SIGNEDNESS. A bare `CreateSExt` read an unsigned `byte` totalWidth's
         // high bit as a sign bit, so `byte` 200 arrived as -56 and the pad
@@ -2405,15 +2605,32 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // header, reachable from the static `Repeat` arm's file too. The
         // widening, the comparison and the raise are ONE function, so the
         // `Pad*` width and the `Repeat` count cannot drift apart either.
-        llvm::Value* width64 = emitSection96CountContract(
-                call.args[0].value.get(), widthArg, ownedSelf,
-                "pad.s64", "pad.z64", "pad.neg");
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to. The width's guard is emitted right
+        // after the width's own lowering, exactly as the positional form does
+        // (the padding character's expression is evaluated between the two
+        // only when the width is written first).
+        if (!hasPad || widthSrc <= padSrc) {
+            llvm::Value* widthArg = lowerExpr(*call.args[widthSrc].value);
+            if (!widthArg) return nullptr;
+            width64 = emitSection96CountContract(
+                    call.args[widthSrc].value.get(), widthArg, ownedSelf,
+                    "pad.s64", "pad.z64", "pad.neg");
+            if (hasPad) padCharArg = lowerExpr(*call.args[padSrc].value);
+        } else {
+            padCharArg = lowerExpr(*call.args[padSrc].value);
+            llvm::Value* widthArg = lowerExpr(*call.args[widthSrc].value);
+            if (!widthArg) return nullptr;
+            width64 = emitSection96CountContract(
+                    call.args[widthSrc].value.get(), widthArg, ownedSelf,
+                    "pad.s64", "pad.z64", "pad.neg");
+        }
         // Pad character: default space, or the 2nd arg (a code point, i32).
         llvm::Value* padCharI32 = builder_.getInt32(' ');
-        if (call.args.size() >= 2 && call.args[1].value) {
-            llvm::Value* pc = lowerExpr(*call.args[1].value);
-            if (pc && pc->getType()->isIntegerTy(32)) padCharI32 = pc;
-            else if (pc) padCharI32 = builder_.CreateZExtOrTrunc(pc, i32());
+        if (padCharArg) {
+            if (padCharArg->getType()->isIntegerTy(32)) padCharI32 = padCharArg;
+            else padCharI32 = builder_.CreateZExtOrTrunc(padCharArg, i32());
         }
         // align: 1 for PadRight (self first, pad after); 0 for PadLeft;
         // 2 for PadCenter (padding split evenly, the odd extra on the RIGHT).
@@ -2665,8 +2882,25 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // §9.6: Insert(index, value): string — insert value at code-point position index.
     if (method == "Insert" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* idxV = getIntArg(0);
-        llvm::Value* ins  = getStrArg(1);
+        // fix #7180 (§22.5, v0.343): `startIndex` and `value` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally, the
+        // reordered call `s.Insert(value := "X", startIndex := 1)` took the
+        // STRING as the index (and the index as the string).
+        const std::size_t idxSrc = srcArgIdx(0);
+        const std::size_t valSrc = srcArgIdx(1);
+        llvm::Value* idxV = nullptr;
+        llvm::Value* ins  = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (idxSrc <= valSrc) {
+            idxV = getIntArg(idxSrc);
+            if (!idxV) return nullptr;
+            ins = getStrArg(valSrc);
+        } else {
+            ins = getStrArg(valSrc);
+            idxV = getIntArg(idxSrc);
+        }
         if (!idxV || !ins) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
@@ -2675,7 +2909,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // the SOURCE's signedness (widenIntParam above). A `byte` 200 is the
         // `int` 200; the bare CreateSExt read it as -56, and the arm's clamp
         // below then pinned the insertion to the front of the string.
-        llvm::Value* idx64 = widenIntParam(call.args[0].value.get(), idxV,
+        llvm::Value* idx64 = widenIntParam(call.args[idxSrc].value.get(), idxV,
                                            "ins.idx", "ins.zidx");
         // Clamp index to [0, selfLen]
         llvm::Value* tooHigh = builder_.CreateICmpSGT(idx64, selfLen);
