@@ -327,6 +327,36 @@ bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs);
 // deliberately DECLINED and is the subject of the open spec-question #7067).
 bool isGeneratedDisposeMethodRef(const ast::Expr* e, sema::SemaContext& ctx);
 
+// fix #7025 (follow-up, §27.6 / §28.2 / §28.6, v0.343): the STORAGE a
+// method-group RECEIVER denotes — the symbol the §28.2 borrow fact ("the
+// receiver's block stays live until the holder's release point") is recorded
+// on.
+//
+// A method-group receiver is spelled either as a BINDING (`d`) or as a FIELD
+// ACCESS (`this.d`), and the two spellings denote the SAME storage: §27.6's
+// capture ("the instance is captured at formation — by reference for class- or
+// interface-typed receivers") and §28.2's borrow read the STORAGE, never the
+// spelling. The borrow fact must therefore not depend on the spelling
+// either.
+//
+//   * a binding (`d`) — the symbol sema bound to the identifier: a
+//     LocalSymbol, a ParameterSymbol, or the FieldSymbol of an implicit
+//     `this.f` (a bare field read inside the declaring class);
+//   * a field access (`this.d`) — the FieldSymbol sema attached to the
+//     MemberAccessExpr (the same symbol the bare spelling resolves to —
+//     §28.3's `exprIsOwnedFieldRead` reads it there).
+//
+// `this` itself and a temporary carry no symbol: there is no storage to
+// borrow, and §28.6 admits neither as a disposal receiver anyway.
+//
+// This is the ONE authority for the receiver→storage mapping, so the codegen's
+// stamp (`Emitter::noteMethodGroupBorrow`), the codegen's query
+// (`Emitter::receiverIsGroupBorrowed`) and the ownership pass's pre-scan
+// stamp (`MethodOwnership::noteMethodGroupBorrow`) cannot disagree about it —
+// the #2963/#4080 pattern, applied to the receiver's storage.
+sema::Symbol* methodGroupReceiverStorage(sema::SemaContext& ctx,
+                                         const ast::Expr* recv);
+
 // Shared shape-recognition: if the callee of `call` resolves to a user
 // `ast::MethodDecl` (a MethodSymbol whose `decl` is a MethodDecl), return it;
 // null otherwise (unresolved overload, a builtin with no MethodSymbol, or a

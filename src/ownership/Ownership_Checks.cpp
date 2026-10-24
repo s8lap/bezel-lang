@@ -4589,6 +4589,17 @@ void MethodOwnership::checkTransitiveCapturesDisposed(
 // `dynamic_cast<sema::LocalSymbol*>` therefore never saw a parameter
 // receiver — the owned-parameter shape kept reclaiming eagerly and the
 // group's invocation was a measured heap-use-after-free.
+//
+// fix #7025 (follow-up, §27.6 / §28.2 / §28.6, v0.343): the receiver's
+// STORAGE is resolved through the shared `common::methodGroupReceiverStorage`,
+// so the EXPLICIT field spelling (`this.d`) — a `MemberAccessExpr`, not an
+// `IdentifierExpr` — lands on the same FieldSymbol the bare spelling (`d`)
+// does. Before this, the explicit spelling was never stamped, so the explicit
+// `Dispose()` of an owned field reclaimed the field's block eagerly while the
+// group still captured it — the measured heap-use-after-free (the free was
+// inside `bz$M.Holder$Go`, not at the containing object's teardown, which is
+// §28.6's "the compiler's single free stays at the holder's release point,
+// the containing object's teardown").
 void MethodOwnership::noteMethodGroupBorrow(const ast::Expr& e) {
     const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
     if (!ma) return;
@@ -4598,10 +4609,8 @@ void MethodOwnership::noteMethodGroupBorrow(const ast::Expr& e) {
         dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e)) != nullptr;
     if (!generatedDispose && !ordinaryReference) return;
     if (!ma->target) return;
-    const auto* id =
-        dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    if (!id) return;
-    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    sema::Symbol* sym =
+        common::methodGroupReceiverStorage(ctx_, ma->target.get());
     if (!sym) return;
     sym->borrowedByMethodGroup = true;
 }

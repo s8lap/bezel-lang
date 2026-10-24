@@ -2656,11 +2656,19 @@ sema::TypeRef* Emitter::builtinListMemberFnType(const ast::MemberAccessExpr& ma)
 // the body. This codegen-side stamp covers the shapes the pre-scan cannot
 // see (a method reference that is not bound to a local — an argument, a
 // field store).
+//
+// fix #7025 (follow-up, §27.6 / §28.2 / §28.6, v0.343): the receiver's
+// STORAGE, not its spelling — the receiver is resolved through the shared
+// `common::methodGroupReceiverStorage`, so the explicit field spelling
+// (`this.d`) and the bare one (`d`) land on the SAME FieldSymbol. Before
+// this, the explicit spelling was never stamped (it is not an
+// `IdentifierExpr`), so the explicit `Dispose()` reclaimed the field's block
+// eagerly while the group still captured it — the measured heap-use-after-free
+// (the free was inside `bz$M.Holder$Go`, not at the holder's release point).
 void Emitter::noteMethodGroupBorrow(const ast::Expr* recvExpr) {
     if (!recvExpr) return;
-    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(recvExpr);
-    if (!id) return;
-    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    sema::Symbol* sym =
+        common::methodGroupReceiverStorage(ctx_, recvExpr);
     if (!sym) return;
     sym->borrowedByMethodGroup = true;
 }
@@ -2676,10 +2684,14 @@ void Emitter::noteMethodGroupBorrow(const ast::Expr* recvExpr) {
 // holder's release point — the obligation is discharged exactly once either
 // way — and it is NECESSARY, because the stamp has to be in place at the
 // explicit-`Dispose()` call site for a group formed LATER in the body.
+//
+// fix #7025 (follow-up, §28.6, v0.343): the receiver's STORAGE is read
+// through the shared `common::methodGroupReceiverStorage`, so the explicit
+// field spelling (`this.d`) resolves to the same FieldSymbol the bare
+// spelling (`d`) does — the fact does not depend on the spelling.
 bool Emitter::receiverIsGroupBorrowed(const ast::Expr& recvExpr) const {
-    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&recvExpr);
-    if (!id) return false;
-    const sema::Symbol* sym = ctx_.exprSymbol(*id);
+    const sema::Symbol* sym =
+        common::methodGroupReceiverStorage(ctx_, &recvExpr);
     return sym && sym->borrowedByMethodGroup;
 }
 

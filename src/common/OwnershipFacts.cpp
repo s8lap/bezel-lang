@@ -67,6 +67,33 @@ bool isGeneratedDisposeMethodRef(const ast::Expr* e, sema::SemaContext& ctx) {
     return true;
 }
 
+// fix #7025 (follow-up, §27.6 / §28.2 / §28.6, v0.343): the STORAGE a
+// method-group receiver denotes. See the header declaration for the contract.
+//
+// The FIXTURE: the explicit spelling `this.d` and the bare spelling `d` are
+// the SAME storage — sema binds the SAME FieldSymbol to both — so the §28.2
+// borrow fact must land on it for both. Before this, only the bare spelling
+// was recorded (the receiver had to be an `IdentifierExpr`), and the explicit
+// spelling took the eager-reclaim path at the explicit `Dispose()` — the
+// measured heap-use-after-free: the group's capture (§27.6) pointed at a
+// block the explicit dispose had already freed, and §28.2's "the receiver's
+// block stays live until the holder's release point" did not hold.
+sema::Symbol* methodGroupReceiverStorage(sema::SemaContext& ctx,
+                                         const ast::Expr* recv) {
+    if (!recv) return nullptr;
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv))
+        return ctx.exprSymbol(*id);
+    if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(recv)) {
+        // `this.d` — the EXPLICIT spelling of the bare field read `d`. Sema
+        // attaches the member's FieldSymbol to the MemberAccessExpr
+        // (ExprTypecheck), which is the SAME symbol the bare spelling
+        // resolves to — so the two spellings share one storage, and one fact.
+        if (auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*ma)))
+            return fs;
+    }
+    return nullptr;
+}
+
 // §28.9 "Trivial-dispose classes" (v0.286) — see the header. This is the
 // pre-#3632 (TypeSymbol-only) entry point. It cannot read a field's RESOLVED
 // TypeRef without a `SemaContext`, so its `owned`-field arm is the
