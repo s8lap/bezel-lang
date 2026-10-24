@@ -2018,11 +2018,20 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     if (method == "Substring") {
         llvm::Value* startV = getIntArg(0);
         if (!startV) return nullptr;
-        llvm::Value* start64 = builder_.CreateSExt(startV, i64(), "sub.start");
+        // fix #7102 (§5.1, §9.6, v0.343): BOTH `int` parameters of Substring
+        // are widened by the SOURCE's signedness (widenIntParam above), not by
+        // a bare sign-extension. A `byte` 200 is the `int` 200 — the §5.1
+        // widening is lossless, so it must preserve the value; the bare
+        // CreateSExt read the unsigned source's high bit as a sign bit and
+        // delivered -56, which the arm's own bounds check then rejected.
+        llvm::Value* start64 = widenIntParam(call.args[0].value.get(), startV,
+                                             "sub.start", "sub.zstart");
         bool hasLen = call.args.size() >= 2 && call.args[1].value;
         // If length arg absent, pass -1 to signal "rest of string" to runtime.
         llvm::Value* count64 = hasLen
-            ? builder_.CreateSExt(lowerExpr(*call.args[1].value), i64(), "sub.count")
+            ? widenIntParam(call.args[1].value.get(),
+                            lowerExpr(*call.args[1].value),
+                            "sub.count", "sub.zcount")
             : builder_.getInt64(-1);
         // fix #747 R43 / §9.6 / language spec §4.6: an out-of-range start or
         // length raises IndexOutOfRangeException — the same convention every
@@ -2549,7 +2558,12 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
         llvm::Value* insLen  = loadStringLen(ins);
-        llvm::Value* idx64 = builder_.CreateSExt(idxV, i64(), "ins.idx");
+        // fix #7102 (§5.1, §9.6, v0.343): the `int` startIndex is widened by
+        // the SOURCE's signedness (widenIntParam above). A `byte` 200 is the
+        // `int` 200; the bare CreateSExt read it as -56, and the arm's clamp
+        // below then pinned the insertion to the front of the string.
+        llvm::Value* idx64 = widenIntParam(call.args[0].value.get(), idxV,
+                                           "ins.idx", "ins.zidx");
         // Clamp index to [0, selfLen]
         llvm::Value* tooHigh = builder_.CreateICmpSGT(idx64, selfLen);
         idx64 = builder_.CreateSelect(tooHigh, selfLen, idx64);
@@ -2619,13 +2633,21 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen  = loadStringLen(self);
         llvm::Value* selfData = loadStringData(self);
-        llvm::Value* start64 = builder_.CreateSExt(startV, i64(), "rm.start");
+        // fix #7102 (§5.1, §9.6, v0.343): BOTH `int` parameters of Remove are
+        // widened by the SOURCE's signedness (widenIntParam above). A `byte`
+        // 200 is the `int` 200; the bare CreateSExt read it as -56, so the
+        // negative start reached `malloc` as a negative allocation size and
+        // then `memcpy` as a negative copy size — a memory-safety defect, not
+        // merely a wrong answer.
+        llvm::Value* start64 = widenIntParam(call.args[startArgIdx].value.get(),
+                                             startV, "rm.start", "rm.zstart");
         // end = start + count (if given), else = selfLen
         llvm::Value* end64;
         if (call.args.size() >= 2 && call.args[1].value) {
             llvm::Value* cntV = lowerExpr(*call.args[countArgIdx].value);
             if (!cntV) return nullptr;
-            llvm::Value* cnt64 = builder_.CreateSExt(cntV, i64(), "rm.cnt");
+            llvm::Value* cnt64 = widenIntParam(call.args[countArgIdx].value.get(),
+                                                cntV, "rm.cnt", "rm.zcnt");
             end64 = builder_.CreateAdd(start64, cnt64, "rm.end");
             // Clamp to selfLen
             llvm::Value* pastEnd = builder_.CreateICmpSGT(end64, selfLen);
