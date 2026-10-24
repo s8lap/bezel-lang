@@ -8746,6 +8746,61 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // it). isPrimIntrinsicMethodRef keys the disposal sites to this same set.
         if (isPrimIntrinsicMethodRef(&e))
             return makePrimIntrinsicThunk(*ma, ctx_.exprType(e));
+        // fix #7014 (stdlib §4.1, spec §27.6, v0.340): a bare method-group
+        // reference to a member of the array-backed BORROWING LIST interface
+        // `IList<T>` (`il.Contains`, `il.Add`, `il.Insert`, …).
+        //
+        // §27.6: "the member resolved on the value exactly as the call
+        // `v.Scaled()` is" — and the CALL form of these members LOWERS
+        // (through the identical bz_array_* bridge the concrete `Array<T>`
+        // uses: `IList<T>` is implemented only by the array-backed
+        // `Array<T>`, stdlib §4.1 / §4.4). So the reference form must be
+        // EMITTED, not rejected. It has NO MethodSymbol (an interface head has
+        // no method DECLARATION to bind), so the CG60 path fell through to
+        // `ret nullptr` and the local degraded to a zero value — calling the
+        // method group was a SIGSEGV (measured: rc 139).
+        //
+        // The POLYMORPHIC collection interfaces (ICollection<T> /
+        // IOwningCollection<T> / IOwningList<T>) are NOT reached here: their
+        // call form is fenced (#853) and their reference form is rejected to
+        // match (the arm below).
+        if (isBuiltinListMemberMethodRef(&e)) {
+            sema::TypeRef* fnTy = builtinListMemberFnType(*ma);
+            if (!fnTy) return nullptr;
+            // The BINDING LOCAL's declared type. Sema could not type it (the
+            // member has no symbol), so codegen restores it — the #2781
+            // Object-member arm's discipline: without a function-typed local,
+            // `f(x)` never dispatches through the closure-call path.
+            sema::LocalSymbol* ls = bindingLocalSymbol(&e);
+            auto sameTy = [this](const sema::TypeRef* a,
+                                 const sema::TypeRef* b) {
+                if (!a || !b) return a == b;
+                return typeRefIdentityKey(a) == typeRefIdentityKey(b);
+            };
+            if (ls && ls->declType) {
+                // An ANNOTATED local (`var f: (int) -> bool := il.Contains;`).
+                // §27.6: "The reference's signature must be compatible with
+                // the target function type", and "formation may bridge
+                // representation-changing conversions by synthesizing an
+                // adapter" — the adapter is NOT implemented here, so a target
+                // that does not match the member's own signature keeps the
+                // status quo (the reference does not lower) rather than
+                // minting a thunk whose ABI the call site would violate.
+                if (ls->declType->kind != sema::TypeRef::Kind::Function ||
+                    ls->declType->funcParams.size() !=
+                        fnTy->funcParams.size() ||
+                    !sameTy(ls->declType->funcReturn, fnTy->funcReturn))
+                    return nullptr;
+                for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i)
+                    if (!sameTy(ls->declType->funcParams[i].type,
+                                fnTy->funcParams[i].type))
+                        return nullptr;
+            } else if (ls) {
+                ls->declType = fnTy;
+            }
+            ctx_.setExprType(&e, fnTy);
+            return makeBuiltinListMemberThunk(*ma, fnTy);
+        }
         // fix #7014 (stdlib §4.1 / §4.2, spec §27.6, v0.340): a bare
         // method-group reference to a member a BUILTIN COLLECTION INTERFACE
         // head declares (`co.Contains`, `ol.Insert`, …) has no MethodSymbol

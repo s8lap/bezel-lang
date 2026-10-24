@@ -2528,6 +2528,316 @@ llvm::Value* Emitter::lowerBuiltinCollMemberRef(const ast::MemberAccessExpr& ma)
 }
 
 
+// fix #7014 (stdlib §4.1, spec §27.6, v0.340): recognize the bare
+// method-group REFERENCE shape over the array-backed BORROWING LIST
+// interface `IList<T>` (`il.Contains`, `il.Add`, `il.Insert`, …).
+//
+// WHY THIS INTERFACE AND NOT THE OTHERS. `IList<T>` is the one builtin
+// collection interface whose members' CALL form LOWERS: the interface erases
+// nothing that matters, because the only builtin implementing it is the
+// array-backed `Array<T>` (stdlib §4.1 / §4.4), so `il.Contains(x)` lowers
+// through the identical bz_array_* bridge the concrete `Array<T>` uses (the
+// #853 bridge in tryLowerCollectionInstanceCall — "a BORROWING list-interface
+// receiver (IReadOnlyList<T> / IList<T>) is implemented only by the
+// array-backed Array<T>, so its runtime value is the same bz_array_t* as the
+// concrete collection"). The POLYMORPHIC interfaces (ICollection<T> /
+// IOwningCollection<T> / IOwningList<T>) have no such bridge — the interface
+// erases the concrete backing — so their call form is fenced (#853) and their
+// reference form is REJECTED to match (isBuiltinCollMemberMethodRef).
+//
+// §27.6 (v0.340): "the member resolved on the value exactly as the call
+// `v.Scaled()` is". The call form works here, so the reference form must work
+// too — it must be EMITTED.
+//
+// The shape: a MemberAccessExpr `recv.Member` whose receiver's type is
+// `IList<T>` and which has NO MethodSymbol (an interface head has no method
+// DECLARATION to bind, so sema resolves the name against the head's
+// documented surface and leaves the reference symbol-less).
+bool Emitter::isBuiltinListMemberMethodRef(const ast::Expr* e) const {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || !ma->target) return false;
+    if (ctx_.exprSymbol(*e)) return false;   // a real MethodSymbol reference
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy) return false;
+    bool owning = false;
+    if (!isListInterfaceName(recvTy, &owning) || owning) return false;
+    // `IReadOnlyList<T>` declares no METHOD (stdlib §4.1: only the `Count`
+    // property and the indexer), so a member reference over it is rejected by
+    // sema (the #6997 "no member" arm) and never reaches codegen.
+    if (recvTy->headName() != "IList") return false;
+    // The METHOD members `IList<T>` declares (stdlib §4.1: it extends
+    // `ICollection<T>` — `Add` / `Clear` / `Contains` / `Remove` — and adds
+    // `Insert`; the `Count` / `IsReadOnly` properties and the indexer are
+    // PROPERTY references, a different §27.6 shape).
+    const std::string_view m = ma->member;
+    return m == "Add" || m == "Clear" || m == "Contains" || m == "Remove" ||
+           m == "Insert";
+}
+
+// fix #7014 (stdlib §4.1, spec §27.6, v0.340): the member's own signature,
+// read as a function type.
+//
+// §27.6: "A reference's **formed type** … is the callee's own signature read
+// as a function type — the receiver slot removed for a bound reference".
+// The signature is the one stdlib §4.1 declares for `IList<T>`:
+//
+//   Add(item: T)                -> ()
+//   Clear()                     -> ()
+//   Contains(item: T)           -> bool
+//   Remove(item: T)             -> bool
+//   Insert(index: int, item: T) -> ()
+//
+// The element type `T` is the receiver's own type argument.
+sema::TypeRef* Emitter::builtinListMemberFnType(const ast::MemberAccessExpr& ma) {
+    if (!ma.target) return nullptr;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma.target);
+    if (!recvTy) return nullptr;
+    bool owning = false;
+    if (!isListInterfaceName(recvTy, &owning) || owning) return nullptr;
+    const sema::TypeRef* elemTy =
+        (recvTy->kind == sema::TypeRef::Kind::Named &&
+         !recvTy->genericArgs.empty())
+            ? recvTy->genericArgs[0] : nullptr;
+    if (!elemTy) return nullptr;
+    const std::string_view m = ma.member;
+
+    sema::TypeRef* fnTy = ctx_.makeTypeRef();
+    fnTy->kind = sema::TypeRef::Kind::Function;
+    auto addParam = [&](const sema::TypeRef* t) {
+        sema::TypeRef::FuncParam fp;
+        fp.type = const_cast<sema::TypeRef*>(t);
+        fnTy->funcParams.push_back(std::move(fp));
+    };
+    bool retBool = false;
+    if (m == "Add") {
+        addParam(elemTy);
+    } else if (m == "Clear") {
+        // no parameters
+    } else if (m == "Contains") {
+        addParam(elemTy);
+        retBool = true;
+    } else if (m == "Remove") {
+        addParam(elemTy);
+        retBool = true;
+    } else if (m == "Insert") {
+        sema::TypeRef* intTy = ctx_.makeTypeRef();
+        intTy->kind = sema::TypeRef::Kind::Primitive;
+        intTy->primitive = sema::PrimitiveType::Int;
+        addParam(intTy);
+        addParam(elemTy);
+    } else {
+        return nullptr;
+    }
+    if (retBool) {
+        sema::TypeRef* boolTy = ctx_.makeTypeRef();
+        boolTy->kind = sema::TypeRef::Kind::Primitive;
+        boolTy->primitive = sema::PrimitiveType::Bool;
+        fnTy->funcReturn = boolTy;
+    } else {
+        sema::TypeRef* unitTy = ctx_.makeTypeRef();
+        unitTy->kind = sema::TypeRef::Kind::Unit;
+        fnTy->funcReturn = unitTy;
+    }
+    return fnTy;
+}
+
+// fix #7014: the LOCAL a method-reference initializer binds to.
+sema::LocalSymbol* Emitter::bindingLocalSymbol(const ast::Expr* init) const {
+    if (!init) return nullptr;
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
+        if (!ls || !ls->decl) continue;
+        auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+        if (!ld || ld->initializer.get() != init) continue;
+        return ls;
+    }
+    return nullptr;
+}
+
+// fix #7014 (stdlib §4.1, spec §27.6, v0.340): back the bare reference to an
+// `IList<T>` member with a thunk closure.
+//
+// THE THUNK. `ret (ptr env, params…)` — the closure ABI the function-value
+// call site expects (fn(env, args…)). The env holds the captured receiver (a
+// BORROW of the array: §27.6 "the instance is captured at formation — by
+// reference for class- or interface-typed receivers"; §28.3 the cell does not
+// own it). The body lowers a SYNTHETIC call through the SAME path the direct
+// call uses (tryLowerCollectionInstanceCall), with the receiver read from the
+// env and the arguments taken from the thunk's parameters — so the reference
+// form and the call form cannot drift: whatever the call form computes, the
+// reference form computes.
+//
+// THE FORMED TYPE. §27.6: "the callee's own signature read as a function
+// type — the receiver slot removed for a bound reference". The signature is
+// the member's own, per stdlib §4.1's `IList<T>`:
+//
+//   Add(item: T)                -> ()
+//   Clear()                     -> ()
+//   Contains(item: T)           -> bool
+//   Remove(item: T)             -> bool
+//   Insert(index: int, item: T) -> ()
+llvm::Value* Emitter::makeBuiltinListMemberThunk(const ast::MemberAccessExpr& ma,
+                                                 sema::TypeRef* fnTy) {
+    if (!ma.target || !fnTy) return nullptr;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma.target);
+    if (!recvTy) return nullptr;
+
+    // The receiver's value at the use site — a BORROW of the collection.
+    llvm::Value* recvVal = lowerExpr(*ma.target);
+    if (!recvVal || !recvVal->getType()->isPointerTy()) return nullptr;
+
+    // The thunk is SHARED across evaluations of the same member over the same
+    // element type (§27.7.1: "Repeated evaluations of `obj.Method` on the same
+    // class-typed `obj` are therefore guaranteed equal" — the runtime's
+    // FVK_FN_PLUS_RECV rule compares the thunk pointers and then the receiver
+    // words, so a fresh thunk per evaluation would make two references over
+    // the same array UNEQUAL). The cell + env are still fresh per evaluation.
+    std::string key = std::string(ma.member) + "|" +
+                      typeRefIdentityKey(fnTy->funcReturn);
+    for (const auto& fp : fnTy->funcParams)
+        key += "|" + typeRefIdentityKey(fp.type);
+    auto cit = builtinListMemberThunks_.find(key);
+    if (cit != builtinListMemberThunks_.end())
+        return buildMethodClosureCell(cit->second, /*instMethod=*/true,
+                                      /*receiverVal=*/recvVal,
+                                      FVK_FN_PLUS_RECV);
+
+    // Thunk signature: ret (ptr env, params…).
+    llvm::Type* retTy = fnTy->funcReturn ? lowerTypeRef(fnTy->funcReturn)
+                                         : llvm::Type::getVoidTy(llvm_);
+    std::vector<llvm::Type*> thunkParamTys;
+    thunkParamTys.push_back(ptrTy());  // env
+    for (const auto& fp : fnTy->funcParams)
+        thunkParamTys.push_back(fp.type ? lowerTypeRef(fp.type) : ptrTy());
+    auto* thunkFnTy = llvm::FunctionType::get(retTy, thunkParamTys, false);
+    auto* thunk = llvm::Function::Create(
+        thunkFnTy, llvm::Function::InternalLinkage,
+        "listthunk$" + std::string(ma.member) + "$" +
+        std::to_string(synthSeq_.listThunk++),
+        module_.get());
+
+    // Save emitter state (mirrors makePrimIntrinsicThunk's preamble).
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;
+    auto savedDisposeStack = disposeStack_;
+    auto savedLoopStack = loopStack_;
+    auto savedFinallyStack = finallyStack_;
+    auto savedFinallyBodies = finallyBodyStack_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+
+    currentFn_ = thunk;
+    currentThis_ = nullptr;
+    locals_.clear(); paramSlots_.clear(); refParams_.clear();
+    disposeStack_.clear(); loopStack_.clear();
+    finallyStack_.clear(); finallyBodyStack_.clear();
+    unwindTarget_ = nullptr; propagateBB_ = nullptr;
+    currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
+
+    // Arg 0 is the env — the heap block holding the captured receiver. Load
+    // it inside the thunk (SSA values from the outer function are not in
+    // scope here).
+    auto argIt = thunk->args().begin();
+    llvm::Value* envPtr = &*argIt++;
+    llvm::Value* recvInThunk =
+        builder_.CreateLoad(ptrTy(), envPtr, "listthunk.recv");
+
+    // The synthetic call: `recv.Member(args…)`, with the receiver's value
+    // pinned to the loaded env and each argument pinned to the thunk's
+    // parameter — the same override discipline makePrimIntrinsicThunk uses.
+    auto synthCall = std::make_unique<ast::CallExpr>();
+    auto synthTarget = std::make_unique<ast::IdentifierExpr>();
+    synthTarget->name = ma.member;  // unused: the value comes from the override
+    ctx_.setExprType(synthTarget.get(), const_cast<sema::TypeRef*>(recvTy));
+    const ast::Expr* targetKey = synthTarget.get();
+    exprValueOverride_[targetKey] = recvInThunk;
+    {
+        auto synthCallee = std::make_unique<ast::MemberAccessExpr>();
+        synthCallee->target = std::move(synthTarget);
+        synthCallee->member = ma.member;
+        synthCallee->span = ma.span;
+        synthCall->callee = std::move(synthCallee);
+    }
+    std::vector<const ast::Expr*> synthArgs;
+    for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i) {
+        ast::CallArgument arg;
+        auto argExpr = std::make_unique<ast::IdentifierExpr>();
+        argExpr->name = ma.member;  // unused: the value comes from the override
+        exprValueOverride_[argExpr.get()] =
+            thunk->getArg(static_cast<unsigned>(i) + 1);
+        // The collection lowering reads the argument's type (the element
+        // comparison, the boxing decision) — give it the member's own
+        // parameter type.
+        if (fnTy->funcParams[i].type)
+            ctx_.setExprType(argExpr.get(),
+                             const_cast<sema::TypeRef*>(fnTy->funcParams[i].type));
+        synthArgs.push_back(argExpr.get());
+        arg.value = std::move(argExpr);
+        synthCall->args.push_back(std::move(arg));
+    }
+    synthCall->span = ma.span;
+
+    // The SAME lowering the direct call form uses.
+    llvm::Value* result = tryLowerCollectionInstanceCall(*synthCall);
+
+    // Drop the per-node value overrides now that the body is emitted; keep
+    // the tree (and its exprType keys) alive by parking it in the owner
+    // vector.
+    for (const ast::Expr* a : synthArgs) exprValueOverride_.erase(a);
+    exprValueOverride_.erase(targetKey);
+    builtinListMemberSynthCalls_.push_back(std::move(synthCall));
+
+    if (!result && !retTy->isVoidTy()) {
+        // The member's lowering did not produce a value — the compile is
+        // already broken (the collection path reports its own diagnostic);
+        // trap rather than return a garbage value.
+        builder_.CreateUnreachable();
+    } else if (retTy->isVoidTy()) {
+        builder_.CreateRetVoid();
+    } else if (result && result->getType() == retTy) {
+        builder_.CreateRet(result);
+    } else if (result && retTy->isIntegerTy() && result->getType()->isIntegerTy()) {
+        // A bool member's result may arrive as i32 (the runtime's poison
+        // shape) — narrow it to the declared return type.
+        llvm::Value* narrowed =
+            retTy->getIntegerBitWidth() < result->getType()->getIntegerBitWidth()
+                ? builder_.CreateTrunc(result, retTy, "listthunk.ret")
+                : builder_.CreateZExt(result, retTy, "listthunk.ret");
+        builder_.CreateRet(narrowed);
+    } else {
+        builder_.CreateUnreachable();
+    }
+
+    // Restore emitter state (mirrors makePrimIntrinsicThunk's tail).
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);
+    finallyBodyStack_ = std::move(savedFinallyBodies);
+    unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
+    currentCaughtExc_ = savedCaught;
+    unwindScopeDepth_ = savedUnwindDepth; diverged_ = savedDiverged;
+    if (savedBB) builder_.SetInsertPoint(savedBB);
+
+    builtinListMemberThunks_[key] = thunk;
+    // §27.7.1: an interface-receiver method reference is FVK_FN_PLUS_RECV
+    // (same fn + same receiver ⇒ equal; the same rule the #2781 Object-member
+    // thunk and makeMethodThunk use).
+    return buildMethodClosureCell(thunk, /*instMethod=*/true,
+                                  /*receiverVal=*/recvVal, FVK_FN_PLUS_RECV);
+}
+
 // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): recognize the bare method-group
 // REFERENCE shape over a CLASS's own compiler-generated `Dispose`.
 //

@@ -32560,6 +32560,19 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // one the producer gate uses, so the producer and this consumer can never
     // disagree about the set.
     if (isClassDisposeMethodRef(init)) return true;
+    // fix #7014 (stdlib §4.1, spec §27.6 / §28.9, v0.340): a bare reference
+    // to a member of the array-backed BORROWING LIST interface `IList<T>`
+    // (`var f := il.Contains;`) lowers to a fresh +1 closure cell via
+    // makeBuiltinListMemberThunk (the CG60 path, LlvmBackend_Exprs.cpp). The
+    // member has no MethodSymbol (an interface head has no method DECLARATION
+    // to bind), so the MethodSymbol branch above misses it and the 40-byte
+    // cell + its 8-byte env leaked on every reference. Match the CG60 gate
+    // that produced the cell — an `IList<T>`-typed receiver naming one of the
+    // head's METHOD members, with no bound symbol — so the local's scope-end
+    // release picks it up (§28.9). The predicate is the same one the producer
+    // gate uses, so the producer and this consumer can never disagree about
+    // the set.
+    if (isBuiltinListMemberMethodRef(init)) return true;
     return false;
 }
 

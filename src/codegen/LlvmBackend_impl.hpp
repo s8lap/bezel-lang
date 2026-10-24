@@ -1230,6 +1230,7 @@ private:
         unsigned methodThunk = 0;    // thunk$N
         unsigned objThunk = 0;       // objthunk$<member>$N
         unsigned primThunk = 0;      // primthunk$<recv>$<member>$N
+        unsigned listThunk = 0;      // listthunk$<member>$N (#7014)
         unsigned propThunk = 0;      // pthunk$N
         unsigned raiseAsyncShim = 0; // __bz_raiseasync_shim_N
         unsigned spawnLambda = 0;    // spawn.lam$N
@@ -24287,6 +24288,61 @@ private:
     // placeholder never outlives its key (the same discipline
     // primIntrinsicSynthCalls_ / nullCondCountSynth_ follow).
     std::vector<std::unique_ptr<ast::CallExpr>> builtinCollMemberSynthCalls_;
+
+    // fix #7014 (stdlib §4.1, spec §27.6, v0.340): the method-group
+    // REFERENCE to a member of the array-backed BORROWING LIST interface
+    // `IList<T>` (`il.Contains`, `il.Add`, `il.Insert`, …).
+    //
+    // `IList<T>` is the ONE builtin collection interface whose members' CALL
+    // form LOWERS: the interface erases nothing that matters, because the only
+    // builtin implementing it is the array-backed `Array<T>` (stdlib §4.1 /
+    // §4.4), so `il.Contains(x)` lowers through the identical bz_array_*
+    // bridge the concrete `Array<T>` uses (the #853 bridge in
+    // tryLowerCollectionInstanceCall). The POLYMORPHIC interfaces
+    // (ICollection<T> / IOwningCollection<T> / IOwningList<T>) have no such
+    // bridge — their call form is fenced (#853) — and the reference form over
+    // them is rejected to match (isBuiltinCollMemberMethodRef).
+    //
+    // So §27.6 ("the member resolved on the value exactly as the call
+    // `v.Scaled()` is") requires the reference form here to behave EXACTLY as
+    // the call form does — which means EMITTING it, not rejecting it. It has
+    // NO MethodSymbol (an interface head has no method DECLARATION to bind),
+    // so the CG60 path fell through to `ret nullptr` and the local degraded to
+    // a zero value — the call was a SIGSEGV (measured: rc 139).
+    //
+    // `makeBuiltinListMemberThunk` mints the closure cell: a `ret (ptr env,
+    // params…)` thunk over the captured receiver whose body lowers a synthetic
+    // call through the SAME path the direct call uses.
+    bool isBuiltinListMemberMethodRef(const ast::Expr* e) const;
+    // The member's own signature read as a function type (§27.6: "the
+    // callee's own signature read as a function type — the receiver slot
+    // removed for a bound reference"), per stdlib §4.1's `IList<T>`.
+    sema::TypeRef* builtinListMemberFnType(const ast::MemberAccessExpr& ma);
+    llvm::Value* makeBuiltinListMemberThunk(const ast::MemberAccessExpr& ma,
+                                            sema::TypeRef* fnTy);
+
+    // The LOCAL a method-reference initializer binds to (the local whose
+    // initializer IS this expression), or null. §27.6's reference over a
+    // member with no MethodSymbol leaves sema unable to type the binding, so
+    // codegen restores the local's function type itself (the #2781
+    // Object-member arm's discipline).
+    sema::LocalSymbol* bindingLocalSymbol(const ast::Expr* init) const;
+
+    // fix #7014: owns the synthetic call trees built for the emitted
+    // borrowing-list method-reference forms, so the exprType entries set on
+    // their receiver placeholder and their arguments never outlive their keys
+    // (the same discipline primIntrinsicSynthCalls_ / builtinCollMemberSynthCalls_
+    // follow).
+    std::vector<std::unique_ptr<ast::CallExpr>> builtinListMemberSynthCalls_;
+
+    // fix #7014: the emitted thunks for the borrowing-list member references,
+    // keyed by (member, element type). §27.7.1 requires repeated evaluations
+    // of `il.Contains` over the SAME receiver to compare EQUAL, and the
+    // runtime's FVK_FN_PLUS_RECV rule compares the THUNK POINTERS (and then
+    // the receiver words) — so the thunk must be SHARED across evaluations
+    // (the cell + env are still fresh per evaluation, exactly as
+    // makeMethodThunk's cached thunks are).
+    std::map<std::string, llvm::Function*> builtinListMemberThunks_;
 
     // fix #2513 / spec §35.2 (v0.236): the stdlib §2.20 `Result<T, E>` carries
     // four compiler-provided per-instantiation combinators (Map / MapError /
