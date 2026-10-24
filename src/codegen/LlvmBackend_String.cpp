@@ -2796,6 +2796,42 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // merely a wrong answer.
         llvm::Value* start64 = widenIntParam(call.args[startArgIdx].value.get(),
                                              startV, "rm.start", "rm.zstart");
+        // fix #7168 (§9.6, §3.1, §4.6, v0.343): the POSITION contract.
+        //
+        // `startIndex` is the string family's established spelling of a start
+        // POSITION (stdlib §1's "Window parameters" convention), and the
+        // family's position convention is uniform: an out-of-range position
+        // raises IndexOutOfRangeException — §4.6 ("`s[i]` … Out-of-range
+        // raises IndexOutOfRangeException"), §31.4 ("IndexOutOfRangeException
+        // — array or string index out of bounds"), §9.6's own `IndexOf`
+        // contract ("0 <= startIndex <= Length (IndexOutOfRangeException
+        // otherwise)"), the sibling `Substring` (which already raises it), and
+        // §3.1's StringBuilder twin ("`Insert` and `Remove` raise
+        // IndexOutOfRangeException when the index or the `(startIndex, length)`
+        // window falls outside `0..Length`").
+        //
+        // ⚠ §9.6 (v0.343) declares `Remove(startIndex)` and
+        // `Remove(startIndex, length)` with NO range contract of its own — the
+        // silence #7108 records. That silence cannot license an out-of-bounds
+        // READ: before this guard, `s.Remove(999)` computed a 999-byte
+        // `memcpy` from a 3-byte allocation (ASan: "heap-buffer-overflow …
+        // READ of size 999 … 0 bytes after 3-byte region"), and the 2-arg form
+        // did the same for a NEGATIVE count (a negative byte offset ⇒ a read
+        // BEFORE the buffer). The guard makes the out-of-range case a defined
+        // raise instead of a memory-safety defect; the exception type follows
+        // the family's position convention, not the count/width convention
+        // (§9.6's `Repeat` count and `Pad*` width raise
+        // ArgumentOutOfRangeException — those are NEGATIVE counts, not
+        // positions).
+        //
+        // The bound is in CODE POINTS (§4.6: a string's length is a count of
+        // code points), matching `Substring`'s guard beside it.
+        llvm::Value* startNeg = builder_.CreateICmpSLT(start64,
+                                                       builder_.getInt64(0),
+                                                       "rm.sneg");
+        llvm::Value* startBig = builder_.CreateICmpSGT(start64, selfLen,
+                                                       "rm.sbig");
+        llvm::Value* oor = builder_.CreateOr(startNeg, startBig, "rm.soor");
         // end = start + count (if given), else = selfLen
         llvm::Value* end64;
         if (call.args.size() >= 2 && call.args[1].value) {
@@ -2803,13 +2839,24 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             if (!cntV) return nullptr;
             llvm::Value* cnt64 = widenIntParam(call.args[countArgIdx].value.get(),
                                                 cntV, "rm.cnt", "rm.zcnt");
+            // The WINDOW: `length` must be >= 0 and the window must lie
+            // inside the receiver (§3.1's StringBuilder `Remove` contract; the
+            // `Substring(startIndex, length)` window beside it).
+            llvm::Value* cntNeg = builder_.CreateICmpSLT(cnt64,
+                                                          builder_.getInt64(0),
+                                                          "rm.cneg");
             end64 = builder_.CreateAdd(start64, cnt64, "rm.end");
-            // Clamp to selfLen
-            llvm::Value* pastEnd = builder_.CreateICmpSGT(end64, selfLen);
-            end64 = builder_.CreateSelect(pastEnd, selfLen, end64);
+            llvm::Value* endBig = builder_.CreateICmpSGT(end64, selfLen,
+                                                         "rm.ebig");
+            oor = builder_.CreateOr(oor,
+                    builder_.CreateOr(cntNeg, endBig, "rm.coor"), "rm.oor");
         } else {
             end64 = selfLen;  // remove from start to end of string
         }
+        // The guard RAISES, so it releases the caller-owned producer receiver
+        // on the throw edge (§28.9 — the #6979 idiom; see
+        // `emitGuardThrowReleasingString`).
+        guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
         // Result length = start + (selfLen - end)
         llvm::Value* tailLen = builder_.CreateSub(selfLen, end64, "rm.tail");
         llvm::Value* resultLen = builder_.CreateAdd(start64, tailLen, "rm.reslen");
