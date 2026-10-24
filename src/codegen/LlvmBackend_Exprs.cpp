@@ -2673,6 +2673,127 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (!ix->target || ix->indices.empty() || !ix->indices[0].value)
             return nullptr;
+        // fix #7171 (§28.3 / §4.6, v0.343): the UNBOUND OWNED TEMPORARY
+        // receiver discharge for the string index / slice path.
+        //
+        // §28.3 (v0.343) requires an unbound owned temporary to be "disposed
+        // at the END of the FULL EXPRESSION in which it is produced, after
+        // every use of it within that expression has completed", and an index
+        // / slice access is one of the BORROWING uses of such a temporary.
+        // This arm lowered the receiver with `lowerExpr(*ix->target)` and
+        // returned the index / slice result with NO discharge registered, so a
+        // producer receiver (`("a" + "b")[0..0]`) leaked for the whole
+        // program — the RECEIVER, not the result (the leaked byte count
+        // tracks the receiver's length: 32 B header + the receiver's code
+        // points + NUL).
+        //
+        // MEASURED on this lane's base (e0a44e9c), `bezelc --sanitize=address`
+        // with `ASAN_OPTIONS=detect_leaks=1` (one call each):
+        //
+        //   var k := "a";  var c: char := (k + "cd")[0];
+        //       -> 36 byte(s) leaked in 2 allocation(s)   (receiver "acd")
+        //   var k := "ab"; var t: string := (k + "cd")[0..3];
+        //       -> 37 byte(s) leaked in 2 allocation(s)   (receiver "abcd")
+        //   var k := "ab"; var r := 0..3; (k + "cd")[r];
+        //       -> 37 byte(s) leaked in 2 allocation(s)
+        //   var k := "ab"; (k + "cd")[0..999]   (the raise CAUGHT)
+        //       -> 37 byte(s) leaked in 2 allocation(s)
+        //
+        // and the CONTROL shapes were already clean:
+        //
+        //   Console.WriteLine((k + "cd").Length);   -> clean
+        //   var s := k + "cd"; var c := s[0];        -> clean
+        //
+        // ⇒ the member-access form releases the temporary and the index forms
+        // do not; the bound-receiver form is clean because the local's own
+        // scope-end disposal covers it. The defect is the UNBOUND TEMPORARY
+        // receiver in index / slice position.
+        //
+        // THE COUNTERPART IS THE COLLECTION INDEXER PATH
+        // (`LlvmBackend_Assign.cpp`'s `lowerCollectionIndexerGet`, ~line 706),
+        // which DOES register a §28.3 receiver discharge
+        // (`disposeStack_.back().push_back(d)`). This is that path's missing
+        // string twin — the same shape, the same scope-end registration, the
+        // same `unwindOnly = false` (fires on BOTH the normal and the unwind
+        // exit; a given exit goes one way only, so it runs exactly once).
+        //
+        // ⚠ THE DISCHARGE IS A SCOPE-END REGISTRATION, NOT AN INLINE FREE.
+        // The index result is read OUT of the receiver: the char path loads
+        // the code point from the receiver's bytes (`loadCodePoint`) and the
+        // slice path COPIES them (`emitStringSliceBytes`'s memcpy). An inline
+        // free at the lowering path's return would free the very header the
+        // next instruction loads — a use-after-free. §28.3's own wording is
+        // the reason: the temporary is disposed "after every use of it within
+        // that expression has completed". So the receiver's reference must
+        // outlive the index read, and the scope-end pass is where it dies.
+        //
+        // ⚠ REGISTRATION IS AT THE PRODUCTION, NOT AT THE RETURN — the same
+        // discipline the collection path records. The receiver is registered
+        // immediately after it is produced, so the `IndexOutOfRangeException`
+        // the bounds check raises (§4.6 / §31.2) is covered too: §28.3's
+        // exception-path paragraph discharges an already-produced,
+        // not-yet-consumed unbound owned temporary during unwinding, and an
+        // `emitGuardThrow` edge reaches the scope's unwind pass with the
+        // receiver already produced. Registering after the read would leave
+        // that path leaking.
+        //
+        // THE GATE IS THE ONE THE SANCTIONED STRING RELEASES USE.
+        // `isPlusOneStringProducer` is the SAME predicate every other §28.9
+        // string-producer release keys on — the `.Length` / `.IsAscii`
+        // member-access arms above, `releaseConcatIntermediate`, and the
+        // borrowed-string-argument pin skip (`emitBorrowedStringArgPins`) —
+        // so this registration and those releases cover the SAME population
+        // and can never disagree about it: a bound / `move`d / returned /
+        // literal receiver is not one of those shapes, is not registered here,
+        // and is freed by its own owner (no double-free). A string-returning
+        // CALL is deliberately excluded by that predicate (the callee may
+        // return a borrow), so a call receiver keeps the pre-existing leak —
+        // the safe direction, and the same posture the collection path takes
+        // for a shape it does not recognise.
+        //
+        // ⚠ THE SCOPE END IS LATER THAN THE FULL-EXPRESSION END. §28.3 names
+        // the full-expression boundary; the scope end is the nearest
+        // registration point the disposal machinery offers, and it is LATER,
+        // so the receiver merely outlives its boundary — the safe direction,
+        // exactly as the collection path's own registration records ("the
+        // table merely outlives its boundary, which is the safe direction").
+        // The receiver is unreachable by any other name (it is an unbound
+        // temporary), so nothing can observe the delay.
+        auto registerIndexReceiverDischarge = [&](llvm::Value* recv) {
+            if (!recv) return;
+            // No enclosing scope to discharge through, or a disposer body —
+            // the pre-existing leak, the safe direction (§28.3's "else it
+            // leaks"). A disposer body has no scope of its own to register
+            // into (the same gate the collection path applies).
+            if (disposeStack_.empty() || emittingDisposerBody_) return;
+            if (!isPlusOneStringProducer(ix->target.get())) return;
+            // Belt-and-braces: only a heap pointer is a disposable string.
+            if (!recv->getType()->isPointerTy()) return;
+            // `entryAllocaNullPtr` (#2733), NOT a bare `entryAlloca`: a
+            // disposal pass can be reached on a path that never ran this
+            // store (an unwind out of the index operand evaluated after the
+            // production, a sibling branch), and the slot must read null there.
+            llvm::AllocaInst* slot = entryAllocaNullPtr();
+            builder_.CreateStore(recv, slot);
+            Disposal d{slot, nullptr};
+            // Fires on BOTH exits: the reference dies on the normal edge (the
+            // scope-end boundary §28.3 names) and on the unwind edge (its
+            // exception-path paragraph), and a given exit goes one way only,
+            // so this runs exactly once per scope exit.
+            d.unwindOnly = false;
+            // §28.9: the string's own reference is dropped with
+            // `bz_string_release` (refcounted; null- and sentinel-safe). The
+            // receiver is a heap +1 producer, so this is its ONLY reference.
+            d.stringRelease = true;
+            // Null the slot after the release so the discharge is IDEMPOTENT.
+            // A scope can be traversed twice on distinct paths (the
+            // `emitDisposalsInRange` + `emitAllDisposals` shape the
+            // `awaitedTaskTemp` arm documents), and a second release of an
+            // already-freed string is a refcount over-release (a runtime
+            // abort), not a no-op.
+            d.nullSlotAfterRelease = true;
+            disposeStack_.back().push_back(d);
+        };
         // CG27e (§4.6): string indexer `s[i]` → char (i32 code point).
         {
             // Pre-warm: if the target has no sema type yet (lambda param with
@@ -2702,6 +2823,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         ix->indices[0].value.get())) {
                     llvm::Value* strPtr = lowerExpr(*ix->target);
                     if (!strPtr) return nullptr;
+                    // fix #7171: register the receiver's §28.3 discharge AT
+                    // THE PRODUCTION — before the slice's own bounds check can
+                    // raise (§3.4), so the throw edge is covered too.
+                    registerIndexReceiverDischarge(strPtr);
                     return emitStringRangeSlice(strPtr, *range);
                 }
                 // R33: the index may be a Range *value* (a variable / call
@@ -2713,6 +2838,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (auto* idxTy = ctx_.exprType(*ix->indices[0].value)) {
                     if (isRangeType(idxTy)) {
                         llvm::Value* strPtr = lowerExpr(*ix->target);
+                        // fix #7171: register the receiver's §28.3 discharge as
+                        // soon as the receiver exists — BEFORE the index
+                        // operand is lowered, so an exception raised while
+                        // evaluating the index operand still discharges the
+                        // already-produced receiver (§28.3's exception-path
+                        // paragraph).
+                        if (strPtr) registerIndexReceiverDischarge(strPtr);
                         llvm::Value* rv = lowerExpr(*ix->indices[0].value);
                         if (!strPtr || !rv) return nullptr;
                         return emitStringRangeSliceValue(strPtr, rv);
@@ -2720,6 +2852,11 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 }
                 // §4.6: a single int index `s[i]` returns the i-th char.
                 llvm::Value* strPtr = lowerExpr(*ix->target);
+                // fix #7171: same discipline as the range-value arm above —
+                // register the receiver's §28.3 discharge at the production,
+                // before the index operand is lowered and long before the
+                // bounds check can raise (§4.6 / §31.2).
+                if (strPtr) registerIndexReceiverDischarge(strPtr);
                 llvm::Value* idx = lowerExpr(*ix->indices[0].value);
                 if (!strPtr || !idx) return nullptr;
                 // fix #2799 / §7.4: a §7.4-flow-narrowed `int?` arrives here
