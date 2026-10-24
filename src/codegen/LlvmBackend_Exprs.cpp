@@ -238,6 +238,146 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     return v;
 }
 
+// fix #7098 (§5.1, v0.343): does `from` derive from `to`? The class /
+// interface hierarchy walk §5.1's reference conversions need ("a type to an
+// interface it implements or conforms to", "class to base class").
+static bool listMemberDerivesFrom(sema::TypeSymbol* from, sema::TypeSymbol* to,
+                                   int depth) {
+    if (!from || !to || depth > 16) return false;
+    if (from == to) return true;
+    for (sema::TypeSymbol* b : from->baseTypes)
+        if (listMemberDerivesFrom(b, to, depth + 1)) return true;
+    return false;
+}
+
+// fix #7098 (spec §27.6 / §5.1, v0.343): the §27.6 FORMATION VERDICT for a
+// bare `IList<T>` member reference (`il.Contains`, `il.Add`, …) — is the
+// ANNOTATED target function type compatible with the member's OWN signature?
+//
+// THE DIRECTION MATTERS. §27.6 (v0.343): "The reference's signature must be
+// compatible with the target function type: its parameter and return types
+// unify with the target's under the standard implicit-conversion rules
+// (§5.1)." For a PARAMETER slot the value ARRIVES as the TARGET's type and is
+// handed to the CALLEE, so the TARGET's slot type must convert to the
+// CALLEE's; for the RETURN slot it is the other way round (the CALLEE's type
+// converts to the TARGET's).
+//
+// THE ORDINARY §27.6 REFERENCE IS CHECKED THE SAME WAY, and MEASURED on the
+// staging tip: over `N(x: int): bool`, the target `(long) -> bool` is
+// REJECTED ("the initializer for `f` has a type that is not implicitly
+// convertible to the target type (§5.1)") — `long` does not convert to `int`
+// — while the target `(byte) -> bool` is ADMITTED (the §27.6 formation-site
+// adapter widens the argument). The `IList<T>` arm has no MethodSymbol, so
+// sema never checked it, and its codegen arm did not check it either: it
+// `return nullptr`'d SILENTLY on a mismatch (a #7098 defect — the program
+// compiled and then SEGFAULTED).
+//
+// CONSERVATIVE: a pair this predicate cannot judge is NOT convertible, so a
+// formation is refused rather than minted at an ABI the call site would
+// violate. (sema's own `ExprTC::implicitlyConvertible` takes the same
+// stance, and it is not reachable from codegen.)
+static bool listMemberSlotConverts(const sema::TypeRef* from,
+                                   const sema::TypeRef* to) {
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    if (!from || !to) return false;
+    if (from->kind == K::Function || to->kind == K::Function) return false;
+    // Identity (§5.1's first row).
+    if (sema::typeRefEqual(from, to)) return true;
+    // §5.1's nullable lift: `T` converts to `T?`.
+    if (!from->nullable && to->nullable) {
+        sema::TypeRef bare = *to;
+        bare.nullable = false;
+        return listMemberSlotConverts(from, &bare);
+    }
+    // §7.1: dropping the null case is never implicit.
+    if (from->nullable && !to->nullable) return false;
+    // §5.1's numeric / char widening table — sema's ONE copy
+    // (`sema::primitiveImplicitlyWidens`), not a second, drifting one.
+    if (from->kind == K::Primitive && to->kind == K::Primitive)
+        return sema::primitiveImplicitlyWidens(from->primitive, to->primitive);
+    // §5.1's reference conversions: any type to `Object`.
+    if (to->kind == K::Primitive && to->primitive == P::Object) return true;
+    // §5.1's reference conversions: a class / interface to a base of it.
+    if (from->kind == K::Named && to->kind == K::Named &&
+        from->declaration && to->declaration)
+        return listMemberDerivesFrom(from->declaration, to->declaration, 0);
+    return false;
+}
+
+// fix #7098 (§27.6 / §5.1, v0.343): the whole formation verdict — is the
+// TARGET function type compatible with the CALLEE's own signature?
+static bool listMemberTargetConverts(const sema::TypeRef* target,
+                                     const sema::TypeRef* callee) {
+    using K = sema::TypeRef::Kind;
+    if (!target || !callee) return false;
+    if (target->kind != K::Function || callee->kind != K::Function) return false;
+    // §27.1.1: the rule is "slot-wise over equal parameter counts".
+    if (target->funcParams.size() != callee->funcParams.size()) return false;
+    for (std::size_t i = 0; i < callee->funcParams.size(); ++i)
+        if (!listMemberSlotConverts(target->funcParams[i].type,
+                                    callee->funcParams[i].type))
+            return false;
+    // The return slot runs the other way (the CALLEE's type reaches the
+    // TARGET's).
+    return listMemberSlotConverts(callee->funcReturn, target->funcReturn);
+}
+
+// fix #7098 (§27.6, v0.343): spell a type for the formation diagnostic.
+static std::string listMemberTypeSpelling(const sema::TypeRef* t) {
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    if (!t) return "?";
+    if (t->kind == K::Unit) return "()";
+    if (t->kind == K::Primitive) {
+        switch (t->primitive) {
+            case P::Bool:    return "bool";
+            case P::Char:    return "char";
+            case P::String:  return "string";
+            case P::Byte:    return "byte";
+            case P::SByte:   return "sbyte";
+            case P::Short:   return "short";
+            case P::UShort:  return "ushort";
+            case P::Int:     return "int";
+            case P::UInt:    return "uint";
+            case P::Long:    return "long";
+            case P::ULong:   return "ulong";
+            case P::Float:   return "float";
+            case P::Double:  return "double";
+            case P::Decimal: return "decimal";
+            case P::Object:  return "Object";
+            default:         return "?";
+        }
+    }
+    if (t->kind == K::Named) {
+        std::string s(t->headName());
+        if (!t->genericArgs.empty()) {
+            s += "<";
+            for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                if (i) s += ", ";
+                s += listMemberTypeSpelling(t->genericArgs[i]);
+            }
+            s += ">";
+        }
+        return s;
+    }
+    return "?";
+}
+
+// fix #7098 (§27.6, v0.343): the member's OWN signature, spelled the way
+// §27.1 writes a function type — `(int) -> bool`.
+static std::string listMemberSignatureSpelling(const sema::TypeRef* fnTy) {
+    if (!fnTy) return "?";
+    std::string s = "(";
+    for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i) {
+        if (i) s += ", ";
+        s += listMemberTypeSpelling(fnTy->funcParams[i].type);
+    }
+    s += ") -> ";
+    s += listMemberTypeSpelling(fnTy->funcReturn);
+    return s;
+}
+
 llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic
@@ -8900,17 +9040,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // refuses with that same verdict, LOCATED, rather than
                 // letting the program degrade into a runtime failure.
                 //
-                // ⚠ THE #7014 ARM IS NOT AN EXAMPLE OF THAT. It does NOT
-                // refuse on a mismatch: on a signature mismatch it `return
-                // nullptr` — the reference does NOT lower, and the program
-                // keeps the pre-fix behaviour (the local stays as the
-                // annotation left it, and the call site's own verdict is
-                // whatever it was before this lane). It is a SILENT
-                // non-lowering, not a diagnostic. (An earlier revision of
-                // this comment claimed the #7014 arm "already refuses on a
+                // ⚠ THE #7014 ARM NOW REFUSES THE SAME WAY (fix #7098,
+                // §27.6 / §5.1, v0.343). It used NOT to: on a signature
+                // mismatch it `return nullptr` — a SILENT non-lowering, not a
+                // diagnostic — so the program kept the pre-fix behaviour (the
+                // local stayed as the annotation left it) and the CALL
+                // SEGFAULTED (measured: rc 139, ASan "SEGV on unknown address
+                // 0x000000000008"). It now refuses with a located §27.6
+                // diagnostic, exactly as this arm does. (An earlier revision
+                // of this comment claimed the #7014 arm "already refuses on a
                 // mismatch instead of overwriting", and that was false —
-                // the review measured it: `Exprs.cpp`'s #7014 arm returns
-                // nullptr and keeps the pre-fix behaviour.)
+                // the review measured it: `Exprs.cpp`'s #7014 arm returned
+                // nullptr and kept the pre-fix behaviour.)
                 const sema::TypeRef* declTy = ls->declType;
                 const bool compatible =
                     declTy->kind == sema::TypeRef::Kind::Function &&
@@ -8975,22 +9116,78 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             };
             if (ls && ls->declType) {
                 // An ANNOTATED local (`var f: (int) -> bool := il.Contains;`).
-                // §27.6: "The reference's signature must be compatible with
-                // the target function type", and "formation may bridge
-                // representation-changing conversions by synthesizing an
-                // adapter" — the adapter is NOT implemented here, so a target
-                // that does not match the member's own signature keeps the
-                // status quo (the reference does not lower) rather than
-                // minting a thunk whose ABI the call site would violate.
-                if (ls->declType->kind != sema::TypeRef::Kind::Function ||
-                    ls->declType->funcParams.size() !=
-                        fnTy->funcParams.size() ||
-                    !sameTy(ls->declType->funcReturn, fnTy->funcReturn))
-                    return nullptr;
-                for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i)
-                    if (!sameTy(ls->declType->funcParams[i].type,
+                //
+                // fix #7098 (spec §27.6 / §5.1, v0.343): the ANNOTATION must
+                // be COMPATIBLE with the member's own signature, and a
+                // mismatch is REFUSED with a located diagnostic — the #7025
+                // arm's discipline, verbatim (it refuses a `Dispose` group
+                // whose annotation does not match, for the same reason).
+                //
+                // §27.6 (v0.343): "The reference's signature must be
+                // compatible with the target function type: its parameter and
+                // return types unify with the target's under the standard
+                // implicit-conversion rules (§5.1)."
+                //
+                // BEFORE THIS, THE MISMATCH WAS SILENT: the arm `return
+                // nullptr`'d, the reference did NOT lower, the local degraded
+                // to a zero-initialized value (the #2434 warning) and the CALL
+                // SEGFAULTED — MEASURED on the staging tip: compile rc 0 with
+                // only the internal #2434 warning, run rc 139, and under
+                // ASan "SEGV on unknown address 0x000000000008 … rax =
+                // 0x0000000000000008". A program that COMPILES and then
+                // SEGFAULTS is strictly worse than a rejection.
+                //
+                // TWO VERDICTS, because §27.6 admits a bridge that this arm
+                // does not build:
+                //  - INCOMPATIBLE: §5.1 admits no conversion in the needed
+                //    direction (e.g. the target `(long) -> bool` over
+                //    `Contains(item: int)` — `long` does not convert to
+                //    `int`). The formation is a compile error, and the
+                //    diagnostic says so.
+                //  - BRIDGED: §5.1 DOES admit a conversion (e.g. the target
+                //    `(byte) -> bool` over `Contains(item: int)` — `byte`
+                //    converts to `int`), so §27.6's "formation may bridge
+                //    representation-changing conversions by synthesizing an
+                //    adapter" would admit it. This arm does NOT synthesize
+                //    that adapter (the #5208 formation-site adapter is wired
+                //    to a MethodSymbol's thunk, and an interface head has no
+                //    MethodSymbol), so the formation is refused — LOUDLY,
+                //    with the remedy, rather than minted at an ABI the call
+                //    site would violate.
+                const sema::TypeRef* declTy = ls->declType;
+                bool identical =
+                    declTy->kind == sema::TypeRef::Kind::Function &&
+                    declTy->funcParams.size() == fnTy->funcParams.size() &&
+                    sameTy(declTy->funcReturn, fnTy->funcReturn);
+                for (std::size_t i = 0; identical && i < fnTy->funcParams.size();
+                     ++i)
+                    if (!sameTy(declTy->funcParams[i].type,
                                 fnTy->funcParams[i].type))
-                        return nullptr;
+                        identical = false;
+                if (!identical) {
+                    const bool bridged =
+                        listMemberTargetConverts(declTy, fnTy);
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        std::string("the method group over `") +
+                            std::string(ma->member) + "` has the signature `" +
+                            listMemberSignatureSpelling(fnTy) + "`, which is " +
+                            (bridged ? "not the declared type of `"
+                                     : "not compatible with the declared type of `") +
+                            std::string(ls->name) +
+                            "` — §27.6: \"The reference's signature must be "
+                            "compatible with the target function type: its "
+                            "parameter and return types unify with the target's "
+                            "under the standard implicit-conversion rules "
+                            "(§5.1)\"" +
+                            (bridged
+                                 ? ": this compiler cannot yet bridge the "
+                                   "difference with a formation-site adapter, "
+                                   "so the formation is refused here — write a "
+                                   "lambda that converts explicitly"
+                                 : ""));
+                    return nullptr;
+                }
             } else if (ls) {
                 ls->declType = fnTy;
             }
