@@ -29416,6 +29416,160 @@ bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i) {
     return false;
 }
 
+// fix #7127 / #6889 (§22.3 / §28.3 / §28.9, v0.343): is argument `i` of a call
+// whose callee is `callee` a COLLECTION-typed argument of a BUILT-IN member
+// whose lowering READS the argument and never STORES it?
+//
+// THE DEFECT THIS CLOSES. A named `Array<T>` local that is passed to a
+// BUILT-IN member (stdlib §9.6's `string.Join` / `string.From` /
+// `string.Trim`, stdlib §2.1's `Console.Write` / `Console.WriteLine`) is
+// NEVER DISPOSED: the compiler-inserted scope-end free of the array does not
+// run, and the callee does not dispose it either.
+//
+// WHY THE SCOPE-END FREE WAS SUPPRESSED. The array local's scope-end free is
+// armed only for a local the escape walk proves never ESCAPES
+// (`collectBorrowingArrayFreeEligible` → `borrowingArrayFreeEligible_`).
+// The walk's #1430 relaxation admits a bare-identifier argument in a PLAIN
+// (no-modifier) formal position of a RESOLVED user/imported method as a
+// CALL-BOUNDED borrow — but a BUILT-IN callee has no resolved MethodSymbol
+// (`ctx.exprSymbol` on `string.Join` / `Console.WriteLine` is null — the
+// members are matched structurally by the lowerings), so the `ms` path never
+// fires and every builtin argument fell through to the walk's conservative
+// ESCAPE ⇒ the local was excluded from the free-eligible set ⇒ §28.9's
+// "the backing storage is released with it by the compiler-inserted free at
+// the array's owner's release point" (stdlib §4.4) never ran.
+//
+// MEASURED on the base tree (`bezelc --sanitize=address`, LSan):
+//   `var a: Array<string> := ["x","y"]; string.Join(",", a);`
+//       → 208 B / 2 allocations leaked (the `bz_array_alloc` header at
+//         collections.cpp:252 and its backing store at :257);
+//   `var a: Array<string> := ["x","y"]; Console.WriteLine(a);`
+//       → the SAME 208 B / 2 allocations — the two are ONE site (#6889);
+//   `var b: Array<char> := ['a','b','c']; string.From(b, 0, 3);`
+//       → 144 B / 2 allocations;
+//   `var cs: Array<char> := [' ']; "abc".Trim(cs);`
+//       → 144 B / 2 allocations.
+// The CONTROLS are clean on the base tree: the same array never passed is
+// disposed, and the same array passed to a USER method (a concrete
+// `Array<char>` formal, or an `IEnumerable<char>` one) is disposed — the
+// user-method path is the `ms` relaxation, and it works.
+//
+// ⇒ ⇒ ⇒ THIS IS A LEAK, NOT A TRANSFER. The local is NOT consumed: after
+// `string.Join(",", a)` the program still reads `a.Count` and gets the right
+// value (MEASURED: prints `2`), so no ownership moved and no use-after-move
+// is diagnosed. The scope-end release was suppressed WITHOUT any ownership
+// transfer ⇒ the array's owner released nothing ⇒ §28.9's "released exactly
+// once" is violated. The fix restores the scope-end release; it must NOT
+// introduce a double free (see the exclusions below).
+//
+// WHY THE CALL-BOUNDED-BORROW READING IS THE SPEC'S (§22.3, v0.343). A PLAIN
+// (non-`owned`) formal is a BORROW: "the `owned` modifier is what transfers
+// ownership". stdlib §9.6 declares `Join(separator: string, items:
+// IEnumerable<string>)`, `From(buffer: Array<char>, start: length)` and
+// `Trim(chars: IEnumerable<char>)` with NO `owned` marker, and stdlib §2.1
+// declares `Console.Write(value: …)` / `Console.WriteLine(value: …)` the same
+// way ⇒ every one of those positions is a BORROW, and the CALLER keeps the
+// obligation ⇒ the scope-end free must run. (stdlib §3.1 states the same
+// fact for the `StringBuilder` family's own `args: Array<Object>` parameter:
+// "`AppendFormat`'s `args` is a call-bounded borrow".)
+//
+// THE EXCLUSIONS — WHY THIS IS NOT "EVERY BUILTIN CALLEE". The relaxation is
+// NOT the blanket rule "a builtin callee borrows its argument", because a
+// builtin CAN store its argument:
+//
+//   * a COLLECTION member stores its argument into an element slot
+//     (`Array<T>.Add(item: T)` — stdlib §4.4 — and its siblings). MEASURED on
+//     the base tree: `var l: Array<Array<int>> := []; do var a: Array<int> :=
+//     [1,2]; l.Add(a); end do; Console.WriteLine(l[0][0]);` COMPILES and
+//     LEAKS 144 B — the borrow escapes the inner scope into the outer
+//     container, and the compiler does not reject it. Freeing `a` at its
+//     scope end there would turn that leak into a heap-use-after-free. (The
+//     `using var` spelling of the same program is ALREADY a heap-use-after-free
+//     on the base tree — MEASURED — so this is a pre-existing borrow-escape
+//     hole in the ownership layer, not one this relaxation creates; it is
+//     REPORTED to the coordinator, not fixed here.)
+//   * an OWNING collection's element slot requires `owned` (stdlib §4.5's
+//     `OwningArray<T>.Add(owned item: T)`), so the compiler REJECTS a plain
+//     argument there ("a borrow cannot be passed where an `owned` value is
+//     required") — MEASURED — and the call-site `owned`/`move` spelling is
+//     excluded by the `a.modifier.empty()` gate at the call site.
+//
+// ⇒ ⇒ the relaxation is therefore admitted ONLY for the builtins whose
+// lowering READS the argument and provably never stores it — and it is keyed
+// on the SAME structural shapes the lowerings key on, so the escape decision
+// and the lowering stay in lockstep (the `isConsoleNonRetainingArg`
+// discipline). Every other builtin argument keeps the conservative ESCAPE —
+// leak-over-UAF, the safe direction.
+//
+// RECOGNIZED SHAPES (the stdlib's own parameter positions):
+//   * stdlib §9.6 `string.Join(separator, items)`  — `items` is parameter 1;
+//   * stdlib §9.6 `string.From(buffer, start, length)` — `buffer` is parameter 0;
+//   * stdlib §9.6 `string.Trim(chars)` / `TrimStart(chars)` / `TrimEnd(chars)`
+//     — `chars` is parameter 0;
+//   * stdlib §2.1 `Console.Write(value)` / `Console.WriteLine(value)` — the
+//     value is parameter 0.
+//
+// The argument must ALSO be a COLLECTION-typed value: that is the case this
+// relaxation exists for, and it keeps the other `string.From` overloads
+// (stdlib §9.6's `From(value: char)` and `From(value: CString)`) and the
+// `Console.Write` string overload out of the relaxation.
+static bool isBuiltinReaderCollectionArg(const ast::Expr* callee, size_t i,
+                                         const ast::Expr* arg,
+                                         const sema::SemaContext& ctx) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target || !arg) return false;
+
+    // ---- the OWNER: the static type the builtin member is accessed on ----
+    std::string_view owner;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+        // The static-qualifier spelling (`string.Join`, `Console.WriteLine`):
+        // the qualifier is a TYPE name, and the sema layer resolves NO type
+        // for it (MEASURED: `ctx.exprType` on the `string` / `Console`
+        // identifier is null), so the owner is read off the NAME — the same
+        // spelling the lowerings key on (`cls == "string" || cls == "String"`
+        // for `Join` in LlvmBackend_Calls.cpp; the identifier "Console" for
+        // the console lowering).
+        if (id->name == "string" || id->name == "String") owner = "string";
+        else if (id->name == "Console") owner = "Console";
+        else return false;
+    } else {
+        // The instance spelling (`"abc".Trim(cs)`): the receiver is a VALUE.
+        const sema::TypeRef* rt = ctx.exprType(*ma->target);
+        if (!rt) return false;
+        if (rt->kind == sema::TypeRef::Kind::Primitive &&
+            rt->primitive == sema::PrimitiveType::String) {
+            owner = "string";
+        } else {
+            return false;
+        }
+    }
+
+    // ---- the READER POSITION (the stdlib's own parameter positions) ----
+    bool readerPos = false;
+    if (owner == "string") {
+        readerPos = (ma->member == "Join" && i == 1) ||
+                    (ma->member == "From" && i == 0) ||
+                    ((ma->member == "Trim" || ma->member == "TrimStart" ||
+                      ma->member == "TrimEnd") && i == 0);
+    } else if (owner == "Console") {
+        readerPos = (ma->member == "Write" || ma->member == "WriteLine") &&
+                    i == 0;
+    }
+    if (!readerPos) return false;
+
+    // ---- the ARGUMENT must be a BORROWING COLLECTION value ----
+    const sema::TypeRef* at = ctx.exprType(*arg);
+    if (!at || at->kind != sema::TypeRef::Kind::Named) return false;
+    std::string_view head = at->headName();
+    if (head.empty() && at->declaration) head = at->declaration->name;
+    // §4.4–§4.11's borrowing collection family; the OWNING family is
+    // excluded (its element slots consume, and its `owned` parameters make a
+    // plain argument a compile error anyway).
+    if (!common::isBareCollectionTypeName(head)) return false;
+    if (common::isOwningPrefixedName(head)) return false;
+    return true;
+}
+
 // fix #3874 (§4.14/§4.15/§4.16/§8.6/§28.9, v0.294): is argument `i` of a call
 // whose callee is `callee` the `other` argument of `SequenceEqual` on a
 // T-element span receiver — ArraySpan<T>/ReadOnlyArraySpan<T> (§4.15,
@@ -30555,6 +30709,32 @@ struct StringEscapeWalker {
                         }
                     }
                 }
+            }
+            // fix #7127 / #6889 (§22.3 / §28.3 / §28.9, v0.343): a
+            // COLLECTION-typed argument of a BUILT-IN member that READS it
+            // (`string.Join` / `string.From` / `string.Trim` — stdlib §9.6;
+            // `Console.Write` / `Console.WriteLine` — stdlib §2.1) is a
+            // CALL-BOUNDED BORROW: the callee never stores it, so the
+            // caller's scope-end release of the array stays armed and
+            // §28.9's "the backing storage is released with it by the
+            // compiler-inserted free at the array's owner's release point"
+            // (stdlib §4.4) runs. WITHOUT this arm the builtin argument fell
+            // through to the walk's conservative ESCAPE (a builtin callee has
+            // no resolved MethodSymbol, so the #1430 `ms` path never fired),
+            // the local was excluded from `borrowingArrayFreeEligible_`, and
+            // the array's backing storage LEAKED (MEASURED: 208 B / 2
+            // allocations for `Array<string>`; 144 B / 2 for `Array<char>`).
+            // Gated on `borrowingArrayMode` for the same reason as the #2824
+            // FFI-buffer arm above: the dict-materializer / grouping /
+//            record-call-result walks have no release-old-on-reassign
+            // counterpart and keep their conservative ESCAPE. The
+            // non-retaining builtins are recognized structurally, keyed on
+            // the same callee shapes their lowerings key on, so the escape
+            // decision and the lowering stay in lockstep.
+            if (!safeArg && borrowingArrayMode && a.modifier.empty() &&
+                a.name.empty() && isTargetIdent(a.value.get()) &&
+                isBuiltinReaderCollectionArg(callee, i, a.value.get(), ctx)) {
+                safeArg = true;
             }
             // fix #2222 residue: a string local passed in a plain
             // (no-modifier, no-name) parameter position of an EXTERN
