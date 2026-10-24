@@ -10,7 +10,11 @@
 # target sitting un-gated. This prints every one of them as a row, and an
 # ACTION line only for the rows that need one. It never acts itself.
 #
-# Usage:  scripts/run_status.sh [--staging <worktree-path>] [--target N (default 60)]
+# Usage:  scripts/run_status.sh [--staging <worktree-path>] [--target N (default 100)]
+# --target is the OWNER's "gate 100 fixes at a time" directive (R35), not a
+# coordinator-chosen number: the staging row FLAGS and prints an ACTION line
+# once that many fix issues are banked. Raise it with --target for a run whose
+# directive says otherwise.
 # Exit 0 always, unless the script itself errors. Every probe is tolerant: a
 # missing tool or file reads `n/a`, never a crash.
 #
@@ -47,7 +51,7 @@ DONEFILE="${BEZEL_GATE_DONEFILE:-$SCRATCH/gate.done}"
 FAST="${BEZEL_AOT_FAST_ROOT-/mnt/fast}"
 MEMINFO="${BEZEL_MEMINFO:-/proc/meminfo}"
 SKIP=" ${BEZEL_STATUS_SKIP:-} "
-STAGING="" TARGET=60
+STAGING="" TARGET=100
 while [ $# -gt 0 ]; do
   case "$1" in
     --staging|--target)
