@@ -2323,7 +2323,14 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         !call.args.empty() && call.args[0].value) {
         llvm::Value* widthArg = lowerExpr(*call.args[0].value);
         if (!widthArg) return nullptr;
-        llvm::Value* width64 = builder_.CreateSExt(widthArg, i64(), "pad.width");
+        // fix #7105 (§5.1, v0.343): widen the width to i64 BY THE SOURCE'S
+        // SIGNEDNESS. A bare `CreateSExt` read an unsigned `byte` totalWidth's
+        // high bit as a sign bit, so `byte` 200 arrived as -56 and the pad
+        // silently produced the ORIGINAL string (width 3) instead of a
+        // 200-code-point one — §5.1 admits `byte → int` as a LOSSLESS
+        // conversion, so the two spellings must agree.
+        llvm::Value* width64 = widenIntParam(call.args[0].value.get(), widthArg,
+                                             "pad.s64", "pad.z64");
         // Pad character: default space, or the 2nd arg (a code point, i32).
         llvm::Value* padCharI32 = builder_.getInt32(' ');
         if (call.args.size() >= 2 && call.args[1].value) {
@@ -2347,7 +2354,14 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
         llvm::Value* selfData = loadStringData(self);
-        llvm::Value* n64 = builder_.CreateSExt(nArg, i64(), "rep.n");
+        // fix #7104 (§5.1, v0.343): widen the count to i64 BY THE SOURCE'S
+        // SIGNEDNESS. A bare `CreateSExt` read an unsigned `byte` count's high
+        // bit as a sign bit, so `byte` 200 arrived as -56: the negative count
+        // reached the `malloc` below and the process died (SIGSEGV) instead of
+        // repeating the string 200 times. §5.1 admits `byte → int` as a
+        // LOSSLESS conversion, so the two spellings must agree.
+        llvm::Value* n64 = widenIntParam(call.args[0].value.get(), nArg,
+                                         "rep.s64", "rep.z64");
         llvm::Value* totalLen = builder_.CreateMul(selfLen, n64, "rep.total");
         auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
         auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
