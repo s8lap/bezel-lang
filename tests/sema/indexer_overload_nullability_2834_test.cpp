@@ -37,6 +37,7 @@
 #include "driver/Driver.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains
 #include "support/aot_support.hpp"
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
@@ -74,6 +75,11 @@ bool hasError(const bezel::test::SemaResult& r, const char* sub) {
 // with #2619 / #2795's own gates.
 constexpr const char* kNullableDiag =
     "is nullable but the target type is non-nullable";
+
+// The §5.1 "not implicitly convertible" fragment — the SHARED needle every
+// §5.1 site reports (`checkAssignable`'s one message).
+constexpr const char* kNotConvertible =
+    "has a type that is not implicitly convertible to the target type (§5.1)";
 
 }  // namespace
 
@@ -198,13 +204,25 @@ BEZEL_TEST(sema_indexer_overload_nullability_2834,
 }
 
 // ===========================================================================
-// T5 — ACCEPT-CONTROL: #2619's accept controls (`non_nullable_index_spellings_are_untouched`)
-// must keep passing — the fix's nullable comparison does not narrow the
-// existing single-indexer / arity-only fallback. `a[someLong]` on a class
-// whose only indexer is `[i: int]` is a §5.1 implicit widening and stays
-// accepted. The new bug-repro class with BOTH overloads declared still
-// allows the widening path for an `int` argument (no nullable candidate
-// matches; the [i: int] overload is selected by arity).
+// T5 — ARITY-ONLY FALLBACK: #2619's accept controls
+// (`non_nullable_index_spellings_are_untouched`) must keep passing — the
+// fix's nullable comparison does not narrow the existing single-indexer /
+// arity-only fallback. With BOTH overloads declared, no nullable candidate
+// matches a non-nullable `int` argument, so the `[i: int]` overload is
+// selected BY ARITY and the access is admitted.
+//
+// BEHAVIOUR FLIP (#7064, §5.1 / §23.4, v0.343). This row USED to carry a
+// `long` argument (`var l: long := 3; b[l]`) and asserted that it COMPILED
+// AND RAN (exit 30), on the stated premise that "`a[someLong]` on a class
+// whose only indexer is `[i: int]` is a §5.1 implicit widening". That
+// premise is FALSE: §5.1's table row is `int` -> `long`, never the reverse,
+// and §5.1's constant-narrowing clause — the only way a wider integer
+// reaches a narrower declared type — applies to COMPILE-TIME CONSTANTS only.
+// #7064 closes that gate (the index argument's type is checked at the index
+// position, §23.4's parameter pass), so a `long` argument at an `int`
+// parameter is now REJECTED — see the row below. The row's ACTUAL subject,
+// the arity-only fallback, is kept below with the `int` argument it was
+// always about.
 // ===========================================================================
 BEZEL_TEST(sema_indexer_overload_nullability_2834,
            arity_only_implicit_conversion_fallback_is_preserved) {
@@ -217,12 +235,39 @@ BEZEL_TEST(sema_indexer_overload_nullability_2834,
         "class C "
         "  public static method Main(): int "
         "    using var b := new Box(); "
-        "    var l: long := 3; "
-        "    return b[l]; "                   // widens long->int; [i: int]
+        "    var i := 3; "
+        "    return b[i]; "                   // arity-only fallback; [i: int]
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 30);
+}
+
+// The `long` half of the row above, now REJECTED (#7064, §5.1 / §23.4,
+// v0.343). Pre-#7064 this program compiled and ran (exit 30); the `long` was
+// passed to the `int` parameter unconverted. §5.1's table has no `long` ->
+// `int` row, so it is a compile error at the conversion site — the index
+// position, which §23.4 makes a parameter pass.
+BEZEL_TEST(sema_indexer_overload_nullability_2834,
+           long_index_at_an_int_parameter_is_rejected_spec_5_1) {
+    auto r = runAot(
+        "module M; "
+        "class Box "
+        "  public property [i: int]: int => i * 10; "
+        "  public property [n: int?]: int => -1; "
+        "end Box; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box(); "
+        "    var l: long := 3; "
+        "    return b[l]; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "the index argument to `Box[i]` has a type that is not "
+           "implicitly convertible to the target type (§5.1)"));
 }
 
 // ===========================================================================

@@ -69,6 +69,13 @@ bool hasError(const bezel::test::SemaResult& r, const char* sub) {
 constexpr const char* kNullableDiag =
     "is nullable but the target type is non-nullable";
 
+// The §5.1 "not implicitly convertible" fragment — the SHARED needle every
+// §5.1 site reports (`checkAssignable`'s one message). #7064 (v0.343) reports
+// it at the INDEX position, where the index argument's type is checked
+// against the indexer's declared parameter type.
+constexpr const char* kNotConvertible =
+    "has a type that is not implicitly convertible to the target type (§5.1)";
+
 // The type declarations the cases below index into. Kept in one place so a
 // negative case and its positive control index the SAME declaration.
 constexpr const char* kDecls =
@@ -326,7 +333,18 @@ BEZEL_TEST(sema_indexer_nullable_index_arg_2619,
 // #2619 — every NON-nullable index spelling. The fix gates on the argument's
 // own type being nullable, so none of these reaches the check at all; this case
 // is the mechanical proof of that claim across the axes the receiver families
-// differ on (literal, local, `const`, enum, bare generic `T`, widening `long`).
+// differ on (literal, local, `const`, enum, bare generic `T`).
+//
+// BEHAVIOUR FLIP (#7064, §5.1 / §23.4, v0.343). The `long` axis (`T5`, below)
+// USED to sit in this accept control — the comment called it a "widening
+// `long`", on the premise that `long` -> `int` is a §5.1 conversion. It is
+// NOT: §5.1's table row is `int` -> `long`, never the reverse, and §5.1's
+// constant-narrowing clause — the only way a wider integer reaches a
+// narrower declared type — applies to COMPILE-TIME CONSTANTS only. #7064
+// closes the index position (§23.4's parameter pass), so `a[l]` at a `long l`
+// is now a §5.1 error. The axis moved to the row below, which still pins
+// #2619's own claim — the §7 gate does NOT fire on a `long` — while pinning
+// the §5.1 verdict that replaced it.
 BEZEL_TEST(sema_indexer_nullable_index_arg_2619,
            non_nullable_index_spellings_are_untouched) {
     auto r = parseSemaAll(prog(
@@ -335,11 +353,22 @@ BEZEL_TEST(sema_indexer_nullable_index_arg_2619,
         "public static method T2(e: EnumIdx): int return e[E.A]; end T2; "
         "public static method T3(b: Box<int>): int return b[7]; end T3; "
         "public static method T4<T>(b: Box<T>, k: T): int return b[k]; end T4; "
-        "public static method T5(a: Array<int>, l: long): int "
-        "  return a[l]; end T5; "
         "public static method T6(g: Grid): int return g[1, 2]; end T6;"));
     BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
     BEZEL_EXPECT_TRUE(!r.diagnostics.hasErrors());
+}
+
+// The `long` axis moved here (#7064, §5.1 / §23.4, v0.343): a `long` index
+// at an `int` index parameter is a §5.1 ERROR (the table has no `long` ->
+// `int` row), and it is NOT §7's nullable diagnostic — #2619's own claim,
+// that the §7 gate fires only on a NULLABLE argument, still holds.
+BEZEL_TEST(sema_indexer_nullable_index_arg_2619,
+           long_index_is_rejected_by_the_5_1_rule_not_the_7_rule) {
+    auto r = parseSemaAll(prog(
+        "public static method T5(a: Array<int>, l: long): int "
+        "  return a[l]; end T5; "));
+    BEZEL_EXPECT_TRUE(!hasError(r, kNullableDiag));
+    BEZEL_EXPECT_TRUE(hasError(r, kNotConvertible));
 }
 
 // #2619 / §15.6 + §4.6 — the RANGE index forms (`s[a..b]` slicing and a

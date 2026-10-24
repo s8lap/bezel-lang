@@ -4795,6 +4795,42 @@ private:
     void checkIndexArgNullability(const ast::IndexExpr& ix, const ast::Expr& e,
                                   TypeRef* recvTy);
 
+    // fix #7064 (§23.4 / §5.1 / stdlib §4.4, v0.343): the INDEX-ARGUMENT TYPE
+    // twin of the §7 nullability check above — the question
+    // `checkIndexArgNullability`'s own header declines to open ("a type
+    // MISMATCH between an index argument and a declared parameter is a
+    // different question this fix does not open").
+    //
+    // §23.4: "An indexer is a property whose name is replaced by
+    // `[parameters]`" — an index argument is therefore a PARAMETER PASS, and
+    // §5.1 governs the conversion at that pass exactly as it governs
+    // `Add(key: K, …)`. stdlib §4.4 declares `Array<T>`'s indexer as
+    // `public property [i: int]: T`, and every other int-indexed builtin
+    // (the list interfaces §4.1/§4.2, `OwningArray<T>` §4.5, the buffer and
+    // span families §4.14, the array-backed spans §4.15, `FrozenArray<T>`
+    // §4.19, `ReadOnlyStringSpan` §3.3) declares the same `int` parameter.
+    //
+    // Before this check the index argument's type was never consulted at the
+    // index position: a `double`, `string`, record or class index compiled and
+    // reached codegen, where it produced malformed IR ("SExt only operates on
+    // integer"), and a `long` or `bool` index compiled and ran. Called once
+    // per IndexExpr, right after `checkIndexArgNullability`, so both checks
+    // see the same receiver typing and the same resolved indexer symbol.
+    void checkIndexArgTypes(const ast::IndexExpr& ix, const ast::Expr& e,
+                             TypeRef* recvTy);
+
+    // fix #7064 (§23.4, v0.343): the DECLARED index-parameter type of a
+    // resolved indexer PropertySymbol — the k-th parameter's declared type,
+    // substituted against the receiver's concrete generic arguments (§14.1 /
+    // §14.2). Reads a LOCAL indexer through its `ast::PropertyDecl` and an
+    // IMPORTED one through the reconstructed `ParameterSymbol`s (#2414's dual
+    // read), exactly as `checkIndexArgNullability` did; factored out so the
+    // §7 nullability check and the §5.1 type check cannot disagree about
+    // what an indexer declares. Returns null when the parameter type is not
+    // knowable (no indexer, no such parameter, an unresolved declaration).
+    TypeRef* declaredIndexerParamType(PropertySymbol* ps, std::size_t k,
+                                      const ast::Expr* target);
+
     // fix #2758 (§23.5, v0.241): "Index arguments are **positional-only**. The
     // named-argument form (`Identifier :=`, §22.5) is not admitted at an index
     // position — a compile error naming this rule." An IndexExpr's indices
