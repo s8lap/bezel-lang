@@ -383,3 +383,68 @@ BEZEL_TEST(string_repeat_pad_range_7120,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.stdoutText, "200\n200\n200\n");
 }
+
+// ===========================================================================
+// (I) The `ushort` SIBLING of row (H) — the static spelling's value.
+//
+// Row (H) pins the `byte` count. The `ushort` sibling is the SAME rule with
+// a wider source type, and it was the case the #7120 REVIEWER measured and
+// the #7120 commit body did NOT name: the static spelling's count was
+// widened with a bare `CreateSExt` and CLAMPED, so a `ushort` 65535 arrived
+// as -1 and the count was reported as the EMPTY string (printed `0`).
+//
+// ⚠ This row pins a BEHAVIOUR CHANGE of the STATIC spelling: `ushort` 65535
+// used to print `0`, and now prints `65535` — the same source-signedness
+// widening as row (H), one type wider.
+//
+// §5.1 (v0.343): `ushort → int` is a LOSSLESS widening ("Widening from
+// unsigned to a strictly larger signed type (e.g. `byte → short`,
+// `ushort → int`) is permitted because no value is lost"), so the count
+// reaches the `int` parameter as 65535.
+//
+// FAIL-WITHOUT (MEASURED, on the pre-#7120 compiler `bezelc.base`, the
+// #7120 reviewer's own base build, verified by re-running row (H)'s `byte`
+// case on it and getting `0` where the fix gives `200`):
+//
+//   pre-#7120:  `string.Repeat('x', u)` printed 0   ("x".Repeat(u) printed
+//               65535 — the INSTANCE arm was already right)
+//   after:      `string.Repeat('x', u)` printed 65535
+//
+// ⇒ this row FAILS on the base (the base prints `0`, the row expects
+// `65535`) and PASSES with the fix.
+//
+// The row NAME states the VALUE (65535) rather than the spelling's
+// signedness, so it cannot be misread as a claim about the parameter's
+// signedness — the parameter is a SIGNED `int` (§9.6's
+// `Repeat(c: char, count: int)`); it is the SOURCE's value that is
+// unsigned.
+// ===========================================================================
+BEZEL_TEST(string_repeat_pad_range_7120,
+           ushort_count_reaches_the_int_parameter_as_65535_static_spelling_stdlib_5_1) {
+    JitResult r = runAot(prog(
+        "    var u: ushort := 65535;\n"
+        "    Console.WriteLine(string.Repeat('x', u).Length);\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(r.stdoutText, "65535\n");
+}
+
+// ===========================================================================
+// (J) The CONTROL for row (I) — the INSTANCE spelling, which was already
+// right on the base and must stay right.
+//
+// The pre-#7120 compiler printed `65535` here (the instance arm used the
+// count directly), so this row PASSES on BOTH arms. It is the control that
+// shows row (I)'s flip is the STATIC spelling's and not the rule's: if this
+// row ever fails, the source-signedness widening has reached the instance
+// arm too, and the two spellings have stopped agreeing.
+// ===========================================================================
+BEZEL_TEST(string_repeat_pad_range_7120,
+           ushort_count_reaches_the_int_parameter_as_65535_instance_spelling_stdlib_5_1) {
+    JitResult r = runAot(prog(
+        "    var u: ushort := 65535;\n"
+        "    Console.WriteLine(\"x\".Repeat(u).Length);\n"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_EQ(r.stdoutText, "65535\n");
+}
