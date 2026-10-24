@@ -6136,6 +6136,21 @@ private:
     void scopedPreScanStmt(const ast::Stmt& s);
     void scopedPreScanExpr(const ast::Expr& e);
 
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): TRUE while the pre-scan
+    // is visiting a CALL's CALLEE.
+    //
+    // A callee member access (`d.Dispose()`, `d.Ping()`) is a CALL to the
+    // member, NOT a method-group FORMATION (§27.6 forms the group only when
+    // the member access is used as a VALUE). So the callee must NOT stamp the
+    // receiver's §27.6 borrow fact: stamping it would make EVERY explicit
+    // `Dispose()` defer its reclaim — a wholesale change of the disposal
+    // lowering, far beyond the shape this fix is about.
+    //
+    // Everything else that reaches a member access — a call ARGUMENT, a
+    // `return` value, a discarded expression statement, a lambda body, a
+    // collection literal element — IS a formation site and does stamp.
+    bool preScanInCallCallee_ = false;
+
     // True when the call's formal at `argPos` is `scoped`. Resolves user
     // methods/ctors via sema symbols, builtin TaskScope.Spawn by receiver
     // type name, and function-VALUE callees via their Function TypeRef.

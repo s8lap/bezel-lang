@@ -23521,6 +23521,9 @@ bool MethodOwnership::builtinScopedCallbackFormal(const ast::Expr* callee,
 
 void MethodOwnership::scopedPreScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): the callee-suppression
+    // flag starts CLEAR — a statement is never a call's callee.
+    preScanInCallCallee_ = false;
     // §28.14 v0.273: seed the block-end stack with the method body's
     // effective end — the last statement's `span.end` (if any). A
     // `using var` declared at the top of the method body takes this as its
@@ -23818,6 +23821,12 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e))
         callee = nc->callee.get();
     if (const auto* args = scopedArgsOf(e)) {
+        // fix #7025 (follow-up, §27.6 / §28.2, v0.343): an ARGUMENT is a
+        // formation site — `Take(d.Dispose)` forms a §27.6 method group over
+        // `d` — so the callee-suppression flag is CLEARED for the argument
+        // walk (it is re-set for the callee walk below).
+        const bool savedInArgs = preScanInCallCallee_;
+        preScanInCallCallee_ = false;
         // §28.3 closure bullet *Set-erasing positions* (v0.330): reject a
         // function value with a non-empty source set at a parameter declared
         // Object, or a bare type parameter substituted with a function type.
@@ -23911,11 +23920,46 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
                     {&e, callee, ne, a.value.get()});
             scopedPreScanExpr(*a.value);
         }
-        if (callee) scopedPreScanExpr(*callee);
+        preScanInCallCallee_ = savedInArgs;
+        if (callee) {
+            // fix #7025 (follow-up, §27.6 / §28.2, v0.343): a CALLEE is a
+            // CALL to the member, not a method-group FORMATION — see
+            // `preScanInCallCallee_`.
+            const bool savedInCallee = preScanInCallCallee_;
+            preScanInCallCallee_ = true;
+            scopedPreScanExpr(*callee);
+            preScanInCallCallee_ = savedInCallee;
+        }
         return;
     }
     // Structural recursion over the remaining expression forms.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // fix #7025 (follow-up, §27.6 / §28.2, v0.343): a member access that
+        // denotes a METHOD GROUP and is used as a VALUE is a §27.6 FORMATION,
+        // and the formation CAPTURES the receiver ("the instance is captured
+        // at formation — by reference for class- or interface-typed
+        // receivers"). The capture borrows the receiver's block (§28.3), so
+        // the block must stay LIVE across the receiver's logical disposal
+        // (§28.2: "an explicit `Dispose()` … performs logical disposal only
+        // … and does not reclaim its receiver: the receiver's block stays
+        // live until the holder's release point").
+        //
+        // The stamp is a WHOLE-BODY fact (the receiver's symbol carries it),
+        // so it must be set for a group formed ANYWHERE in the body — a call
+        // ARGUMENT, a `return` value, a discarded expression statement, a
+        // lambda body, a collection-literal element — and not only for the
+        // local-initializer spelling the pre-scan used to record. Before this,
+        // a group formed at a CALL ARGUMENT was never stamped, so the
+        // explicit `Dispose()` that PRECEDED the formation reclaimed the
+        // receiver's block eagerly and nulled its slot; the group then
+        // captured the null and its invocation SEGV'd (measured: ASan
+        // "SEGV on unknown address 0x000000000000" in `disposethunk$Dispose`
+        // for `d.Dispose(); Take(d.Dispose);`).
+        //
+        // The stamp is set HERE, in the pre-scan, so it is in place at the
+        // explicit-`Dispose()` call site even for a group formed LATER in
+        // the body — the whole-body fact the disposal lowering needs.
+        if (!preScanInCallCallee_) noteMethodGroupBorrow(e);
         if (ma->target) scopedPreScanExpr(*ma->target);
         return;
     }
