@@ -22427,6 +22427,49 @@ private:
     // also catches sites that bypassed CG60 by accident).
     bool isObjectMemberMethodRef(const ast::Expr* e) const;
 
+    // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): recognize the bare
+    // method-group REFERENCE shape over a CLASS's own compiler-generated
+    // `Dispose` — `var f := d.Dispose;` where `d: D` and `D` is a class.
+    //
+    // §8.7: "The compiler generates `IDisposable` on every non-static class."
+    // The generated `Dispose` has NO MethodDecl and NO MethodSymbol (§28.2:
+    // the name is the compiler's — "Declaring a member named `Dispose` on a
+    // class or a record is a compile error"), so sema leaves the member
+    // access expression symbol-less and codegen's §27.6 method-reference
+    // path (CG60, LlvmBackend_Exprs.cpp) fell through to `ret nullptr`: the
+    // local degraded to a zero-initialized value (the #2434 warning) and the
+    // CALL was a silent no-op — or, with a `() -> ()` annotation, a SIGSEGV.
+    //
+    // The producer guards are: a MemberAccessExpr naming `Dispose` whose
+    // `exprSymbol` is null (the generated member binds no symbol) and whose
+    // RECEIVER's type is a user CLASS (§8.7 gives `IDisposable` to every
+    // non-static class; a record / enum / choice / primitive does not
+    // implement it, and an INTERFACE receiver is a different shape — its
+    // runtime value may be a builtin collection with no vtable at all).
+    // Shared by the CG60 value-lowering gate and isPlusOneClosureProducer
+    // (so a bound local releases the cell at scope end) — one predicate keeps
+    // the producer and the consumer recognizing exactly the same set.
+    bool isClassDisposeMethodRef(const ast::Expr* e) const;
+
+    // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): back the bare reference to a
+    // class's own compiler-generated `Dispose` with a thunk closure — the
+    // shape `isClassDisposeMethodRef` recognizes.
+    //
+    // The thunk is `void (ptr env)`: it loads the captured receiver from the
+    // env and performs the receiver's LOGICAL DISPOSAL — §28.2: "An explicit
+    // `Dispose()` or direct `DisposeAsync()` performs logical disposal only
+    // — it sets the flag and runs the class's cleanup — and does not reclaim
+    // its receiver: the receiver's block stays live until the holder's
+    // release point." The vtable dispatch (slot 2) is exactly that operation
+    // (`emitDynamicDispose`); the holder's own release point performs the
+    // free, so the two agree on ONE disposal (§28.2's idempotent flag makes
+    // a second invocation a no-op).
+    //
+    // `ma` is the MemberAccessExpr node. Returns a fresh +1 closure cell —
+    // the cell holds a BORROW of the receiver (§27.6: the instance is
+    // captured at formation; §28.3: the cell does not own it).
+    llvm::Value* makeClassDisposeThunk(const ast::MemberAccessExpr& ma);
+
     // #1170: build a fresh closure cell { thunk, env, rc, envdtor, kind }
     // wrapping a (possibly cached) method thunk and the current receiver. Shared
     // by the cache-hit and cache-miss paths of makeMethodThunk. `kind` tags the

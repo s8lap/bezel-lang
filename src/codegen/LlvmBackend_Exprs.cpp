@@ -8695,6 +8695,49 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
             return cell;
         }
+        // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): a bare method-group
+        // reference to a CLASS's own compiler-generated `Dispose`
+        // (`var f := d.Dispose;`).
+        //
+        // The generated `Dispose` has no MethodDecl and no MethodSymbol
+        // (§28.2: the name is the compiler's), so the CG60 path fell
+        // through to `ret nullptr` and the local degraded to a zero value
+        // (the #2434 warning) — the call was a SILENT NO-OP, or (with a
+        // `() -> ()` annotation) a SIGSEGV.
+        //
+        // §27.6: the member is resolved on the value "exactly as the call
+        // `v.Scaled()` is", and `d.Dispose()` is accepted and works — so the
+        // reference form is accepted and produces a real callable.
+        //
+        // Placed AFTER the MethodSymbol arm: a real MethodSymbol (a user
+        // interface's declared `Dispose`, reached through a user interface)
+        // is the ordinary §27.6 reference and keeps its own thunk.
+        if (isClassDisposeMethodRef(&e)) {
+            // The reference's function type: `() -> ()` — §28.2's `Dispose()`
+            // takes no parameter and returns nothing.
+            sema::TypeRef* fnTy = ctx_.makeTypeRef();
+            fnTy->kind = sema::TypeRef::Kind::Function;
+            sema::TypeRef* unitTy = ctx_.makeTypeRef();
+            unitTy->kind = sema::TypeRef::Kind::Unit;
+            fnTy->funcReturn = unitTy;
+            ctx_.setExprType(&e, fnTy);
+            // … and the BINDING LOCAL's declType, so `f()` dispatches
+            // through the closure-call path. Sema left the local untyped
+            // because the member has no symbol (the #2781 Object-member
+            // arm's patch, verbatim): without it, `f()`'s lowerCall arm
+            // sees a null declType on the LocalSymbol and silently
+            // degrades to the #2434 zero-init — the closure cell is BUILT
+            // but never called.
+            for (const auto& sym : ctx_.symbols()) {
+                auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
+                if (!ls || !ls->decl) continue;
+                auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+                if (!ld || ld->initializer.get() != &e) continue;
+                ls->declType = fnTy;
+                break;
+            }
+            return makeClassDisposeThunk(*ma);
+        }
         // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
         // method (`int.Parse`, `char.IsDigit`, …) — no MethodSymbol (intrinsics
         // are name-recognized) — that sema typed as a function value. Back it with

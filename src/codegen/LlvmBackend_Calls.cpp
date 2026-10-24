@@ -2528,6 +2528,157 @@ llvm::Value* Emitter::lowerBuiltinCollMemberRef(const ast::MemberAccessExpr& ma)
 }
 
 
+// fix #7025 (§8.7 / §27.6 / §28.2, v0.340): recognize the bare method-group
+// REFERENCE shape over a CLASS's own compiler-generated `Dispose`.
+//
+// THE DEFECT. §8.7: "The compiler generates `IDisposable` on every non-static
+// class." The generated `Dispose` has NO MethodDecl and NO MethodSymbol —
+// §28.2: "the name is the compiler's: the generated `Dispose()` … cannot be
+// overridden", and "Declaring a member named `Dispose` on a class or a record
+// is a compile error at that declaration". There is therefore no declaration
+// to bind, and sema leaves the member-access expression symbol-less. Codegen's
+// §27.6 method-reference path (CG60, LlvmBackend_Exprs.cpp) therefore fell
+// through to `ret nullptr`, and the local degraded to a zero-initialized
+// value (the #2434 warning). Calling the method group was then a SILENT NO-OP
+// (the local's type was never a function type, so the call degraded too) —
+// or, with a `() -> ()` annotation, a SIGSEGV on the null cell.
+//
+// THE RULE, and why a real callable is the answer. §27.6 (v0.340): "the
+// member resolved on the value exactly as the call `v.Scaled()` is". The CALL
+// form `d.Dispose()` is ACCEPTED and works (§28.2: the generated `Dispose()`
+// is what `using var`, the owned-field cascade, the discard and an explicit
+// call all reach). So the reference form must be accepted too, and it must
+// produce a callable — a zero-initialized slot is neither.
+//
+// THE RECEIVER must be a CLASS. §8.7 gives `IDisposable` to every non-static
+// class, and a class instance carries the vtable the disposal dispatch needs.
+// A record / enum / choice / primitive does not implement `IDisposable`
+// (§8.7), and an INTERFACE receiver is a different shape entirely — its
+// runtime value may be a builtin collection with no vtable at all (the
+// `IOwningCollection<T>` / `IOwningList<T>` case, whose `Dispose` frees the
+// collection rather than performing the §28.2 logical disposal; that case is
+// deliberately DECLINED here and is the subject of the open spec-question
+// #7067).
+bool Emitter::isClassDisposeMethodRef(const ast::Expr* e) const {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || !ma->target) return false;
+    if (ma->member != "Dispose") return false;
+    if (ctx_.exprSymbol(*e)) return false;   // a real MethodSymbol reference
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named) return false;
+    const sema::TypeSymbol* ts = recvTy->declaration;
+    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
+    // §8.7: "Static classes, records, enums, choices, primitives, and inline
+    // arrays do not implement `IDisposable`." A static class has no instance,
+    // so no value of that type can reach here — but the check keeps the
+    // predicate honest for the imported case, where the modifier list is not
+    // carried over the module boundary.
+    for (std::string_view mod : ts->modifiers)
+        if (mod == "static") return false;
+    return true;
+}
+
+
+// fix #7025 (§8.7 / §27.6 / §28.2, v0.340): back the bare reference to a
+// class's own compiler-generated `Dispose` with a thunk closure.
+//
+// WHAT THE FORMED VALUE DOES. §28.2 (v0.340): "An explicit `Dispose()` or
+// direct `DisposeAsync()` performs **logical disposal only** — it sets the
+// flag and runs the class's cleanup — and does not reclaim its receiver: the
+// receiver's block stays live until the holder's release point, so the
+// `Dispose()` the language itself issues there … reads a live flag in both
+// modes, and a repeated call is the no-op stated above in both modes." The
+// vtable dispatch (slot 2) is exactly that operation — `emitDynamicDispose`
+// "does NOT free the object's heap block"; the FREE belongs to the holder's
+// release point (§28.2's "The compiler-inserted free … the free there is
+// logical disposal followed by reclamation").
+//
+// So the formed value and the receiver's own scope-end drop agree on ONE
+// disposal: the method group's invocation performs the LOGICAL half (the
+// destructor body, the owned-field cascade, the idempotent flag), the
+// holder's release point performs the RECLAIM, and §28.2's idempotence
+// ("the first call performs the disposal; subsequent calls are no-ops") makes
+// a second invocation of the group a no-op. That is why the value-capturing
+// §27.6 shape is sound here: the group holds a BORROW of the receiver, and
+// the borrow stays valid because nothing the group does frees the block.
+//
+// §27.6: "the instance is captured at formation — by reference for class- or
+// interface-typed receivers". The env block holds the receiver's POINTER; the
+// closure cell does not own it (§28.3) and never disposes it.
+llvm::Value* Emitter::makeClassDisposeThunk(const ast::MemberAccessExpr& ma) {
+    if (!ma.target) return nullptr;
+    // The receiver's value at the use site — a BORROW of the receiver (§28.3:
+    // the closure cell does not own it).
+    llvm::Value* recvVal = lowerExpr(*ma.target);
+    if (!recvVal || !recvVal->getType()->isPointerTy()) return nullptr;
+
+    // Thunk signature: void (ptr env) — the closure ABI the function-value
+    // call site expects (fn(env, args…)); `Dispose` takes no user parameter.
+    auto* thunkFnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {ptrTy()}, /*isVarArg=*/false);
+    auto* thunk = llvm::Function::Create(
+        thunkFnTy, llvm::Function::InternalLinkage, "disposethunk$Dispose",
+        module_.get());
+
+    // Save emitter state (mirrors makeObjectMemberThunk's preamble).
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;
+    auto savedDisposeStack = disposeStack_;
+    auto savedLoopStack = loopStack_;
+    auto savedFinallyStack = finallyStack_;
+    auto savedFinallyBodies = finallyBodyStack_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+
+    currentFn_ = thunk;
+    currentThis_ = nullptr;
+    locals_.clear(); paramSlots_.clear(); refParams_.clear();
+    disposeStack_.clear(); loopStack_.clear();
+    finallyStack_.clear(); finallyBodyStack_.clear();
+    unwindTarget_ = nullptr; propagateBB_ = nullptr;
+    currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
+
+    // Arg 0 is the env — the heap block holding the captured receiver. Load
+    // it inside the thunk (SSA values from the outer function are not in
+    // scope here).
+    llvm::Value* envPtr = &*thunk->args().begin();
+    llvm::Value* recvInThunk =
+        builder_.CreateLoad(ptrTy(), envPtr, "dispose.recv");
+    // §28.2: the LOGICAL disposal — the vtable's idempotent Dispose (slot
+    // 2). It runs the destructor and the owned-field cascade and does NOT
+    // reclaim the receiver; the holder's release point does the free.
+    emitDynamicDispose(recvInThunk);
+    builder_.CreateRetVoid();
+
+    // Restore emitter state (mirrors makeObjectMemberThunk's tail).
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);
+    finallyBodyStack_ = std::move(savedFinallyBodies);
+    unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
+    currentCaughtExc_ = savedCaught;
+    unwindScopeDepth_ = savedUnwindDepth; diverged_ = savedDiverged;
+    if (savedBB) builder_.SetInsertPoint(savedBB);
+
+    // §27.7.1: a class-receiver method reference is FVK_FN_PLUS_RECV (same
+    // fn + same receiver ⇒ guaranteed equal).
+    return buildMethodClosureCell(thunk, /*instMethod=*/true,
+                                  /*receiverVal=*/recvVal, FVK_FN_PLUS_RECV);
+}
+
+
 llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());

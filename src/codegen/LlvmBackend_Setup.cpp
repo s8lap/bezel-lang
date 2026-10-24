@@ -32546,6 +32546,20 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // Function with no MethodSymbol and an Object-typed receiver — so the
     // local's scope-end release picks it up.
     if (isObjectMemberMethodRef(init)) return true;
+    // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): a bare reference to a CLASS's
+    // own compiler-generated `Dispose` (`var f := d.Dispose;` where `d: D` and
+    // `D` is a class) lowers to a fresh +1 closure cell via
+    // makeClassDisposeThunk (the CG60 path, LlvmBackend_Exprs.cpp). The
+    // generated `Dispose` has no MethodDecl and no MethodSymbol (§28.2: the
+    // name is the compiler's — "Declaring a member named `Dispose` on a class
+    // or a record is a compile error at that declaration"), so the
+    // MethodSymbol branch above misses it and the 40-byte cell + its 8-byte
+    // env leaked on every reference. Match the CG60 gate that produced the
+    // cell — a class-typed receiver naming `Dispose`, with no bound symbol —
+    // so the local's scope-end release picks it up. The predicate is the same
+    // one the producer gate uses, so the producer and this consumer can never
+    // disagree about the set.
+    if (isClassDisposeMethodRef(init)) return true;
     return false;
 }
 
