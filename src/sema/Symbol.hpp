@@ -82,6 +82,35 @@ struct Symbol {
     const ast::Node* decl = nullptr;
     SourceLocation declLoc;
 
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): TRUE when a method-group
+    // REFERENCE over this binding's value is formed in the method body that
+    // owns the binding — §27.6: "the instance is captured at formation — by
+    // reference for class- or interface-typed receivers". That capture is a
+    // BORROW of the binding's block (§28.3: the closure cell does not own it),
+    // so the block must stay LIVE across the binding's LOGICAL disposal —
+    // §28.2: "An explicit `Dispose()` or direct `DisposeAsync()` performs
+    // **logical disposal only** — it sets the flag and runs the class's
+    // cleanup — and does not reclaim its receiver: the receiver's block stays
+    // live until the holder's release point".
+    //
+    // The fact lives on the BASE symbol, not on `LocalSymbol`, because the
+    // receiver of a method group may be an `owned` PARAMETER — and
+    // `ParameterSymbol` is a SIBLING of `LocalSymbol`, not a subclass, so a
+    // `dynamic_cast<sema::LocalSymbol*>` cannot see it. The rejected
+    // fix-forward stamped the fact on `LocalSymbol` only, so the owned-
+    // parameter receiver shape never got it and the explicit `Dispose()`
+    // reclaimed a block the group still pointed at (measured: ASan
+    // "heap-use-after-free … READ of size 8" in `disposethunk$Dispose`).
+    //
+    // WHAT IT TRACKS, precisely: "a method group over this binding was formed
+    // somewhere in this method body" — NOT "a live borrow exists at this
+    // point". The stamp is never cleared (a group's death is not tracked),
+    // so it is a WHOLE-BODY fact. The ownership pass's pre-scan sets it before
+    // ANY statement is lowered, so the explicit-`Dispose()` call site sees a
+    // group that is formed LATER in the body as well as one formed earlier;
+    // the deferral it triggers is therefore never "too late".
+    bool borrowedByMethodGroup = false;
+
     Symbol() = default;
     virtual ~Symbol() = default;
 

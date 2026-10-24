@@ -6683,6 +6683,18 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // #4602 (§28.2, v0.338): a bound method reference retains its receiver
     // in the closure env past this frame.
     if (receiverVal) emitCdMarkEscaped(receiverVal);
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.340): an ordinary §27.6 method
+    // reference CAPTURES its receiver ("the instance is captured at formation
+    // — by reference for class- or interface-typed receivers"), so the
+    // receiver's block must stay live across the receiver's logical disposal
+    // — §28.2: an explicit `Dispose()` "does not reclaim its receiver: the
+    // receiver's block stays live until the holder's release point". The
+    // stamp is the same one the compiler-generated `Dispose` group records,
+    // so the explicit-`Dispose()` call site treats every method group alike.
+    if (refExpr)
+        if (const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(refExpr))
+            noteMethodGroupBorrow(ma->target.get());
     // per §27.6 (v0.338; #5814): a reference over a generic method forms the
     // method at the type arguments it names, never the erased template.
     if (!ms->genericParams.empty() && refExpr)

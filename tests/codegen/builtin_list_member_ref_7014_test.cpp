@@ -270,3 +270,27 @@ BEZEL_TEST(builtin_list_member_ref_7014,
         "end Main; end C;",
         kNotYetSupported));
 }
+
+// fix #7025 (follow-up, §21.1 / §27.6, v0.340): the §21.1 `const` spelling
+// of the member-group reference. A §21.1 runtime `const` local's declaration
+// is an `ast::LocalConstDecl` (initializer field `value`), NOT an
+// `ast::LocalDecl` (field `initializer`), so the binding-local scan missed
+// it: the local's declared type was never restored, the call degraded (the
+// #2434 warning plus "the argument of this `Console.WriteLine` failed to
+// lower to a value, so the whole statement emits nothing — #3079"), and the
+// group was a SILENT NO-OP. The row pins the group's real answer.
+BEZEL_TEST(builtin_list_member_ref_7014,
+           spec_21_1_const_ilist_contains_group_answers_the_call) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(
+            "module M; "
+            "import System; "
+            "class C public static method Main(): int "
+            "  var a: Array<int> := [1,2,3]; "
+            "  var il: IList<int> := a; "
+            "  const f := il.Contains; "
+            "  Console.WriteLine(f(2)); "
+            "  return 0; "
+            "end Main; end C;"),
+        "True");
+}

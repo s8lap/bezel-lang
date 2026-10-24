@@ -8728,13 +8728,72 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // sees a null declType on the LocalSymbol and silently
             // degrades to the #2434 zero-init — the closure cell is BUILT
             // but never called.
-            for (const auto& sym : ctx_.symbols()) {
-                auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
-                if (!ls || !ls->decl) continue;
-                auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-                if (!ld || ld->initializer.get() != &e) continue;
+            //
+            // fix #7025 (follow-up, §21.1 / §27.6, v0.340): the binding
+            // local is found through the SHARED `bindingLocalSymbol`
+            // authority, which reads BOTH local-declaration forms — a §21.1
+            // runtime `const` local is an `ast::LocalConstDecl` (initializer
+            // field `value`), NOT an `ast::LocalDecl` (field `initializer`),
+            // so the previous `dynamic_cast<const ast::LocalDecl*>` scan
+            // MISSED every `const` spelling: `const f := d.Dispose;` kept a
+            // null declType, the call degraded to the #2434 zero-init, and
+            // the group was a silent no-op.
+            sema::LocalSymbol* ls = bindingLocalSymbol(&e);
+            if (ls && ls->declType) {
+                // fix #7025 (follow-up, §27.6 / §5.1, v0.340): an ANNOTATED
+                // local (`var f: (int) -> int := d.Dispose;`). §27.6: "The
+                // reference's signature must be compatible with the target
+                // function type: its parameter and return types unify with
+                // the target's under the standard implicit-conversion rules
+                // (§5.1)." The formed type is `() -> ()` (§28.2's `Dispose()`
+                // takes no parameter and returns nothing), so an annotation
+                // with a different arity or return type is INCOMPATIBLE.
+                //
+                // The previous revision OVERWROTE the user's annotation
+                // unconditionally (`ls->declType = fnTy`), which turned a
+                // loud base failure (the annotation's type drove the call
+                // into the null cell → SIGSEGV) into a SILENT wrong answer
+                // (the call ran the group with the wrong shape and the
+                // statement emitted nothing) — the repo's top defect class.
+                // This arm does not overwrite: on a mismatch it REFUSES with
+                // a located diagnostic, and — because the ordinary §27.6
+                // reference form is REJECTED by sema for the same mismatch
+                // ("the initializer for `f` has a type that is not implicitly
+                // convertible to the target type (§5.1)", measured) — it
+                // refuses with that same verdict, LOCATED, rather than
+                // letting the program degrade into a runtime failure.
+                //
+                // ⚠ THE #7014 ARM IS NOT AN EXAMPLE OF THAT. It does NOT
+                // refuse on a mismatch: on a signature mismatch it `return
+                // nullptr` — the reference does NOT lower, and the program
+                // keeps the pre-fix behaviour (the local stays as the
+                // annotation left it, and the call site's own verdict is
+                // whatever it was before this lane). It is a SILENT
+                // non-lowering, not a diagnostic. (An earlier revision of
+                // this comment claimed the #7014 arm "already refuses on a
+                // mismatch instead of overwriting", and that was false —
+                // the review measured it: `Exprs.cpp`'s #7014 arm returns
+                // nullptr and keeps the pre-fix behaviour.)
+                const sema::TypeRef* declTy = ls->declType;
+                const bool compatible =
+                    declTy->kind == sema::TypeRef::Kind::Function &&
+                    declTy->funcParams.empty() && declTy->funcReturn &&
+                    declTy->funcReturn->kind == sema::TypeRef::Kind::Unit;
+                if (!compatible) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        std::string("the method group over `") +
+                            std::string(ma->member) +
+                            "` has the signature `() -> ()`, which is not "
+                            "compatible with the declared type of `" +
+                            std::string(ls->name) +
+                            "` — §27.6: \"The reference's signature must be "
+                            "compatible with the target function type\" "
+                            "(§5.1)");
+                    return nullptr;
+                }
+            } else if (ls) {
                 ls->declType = fnTy;
-                break;
             }
             return makeClassDisposeThunk(*ma);
         }

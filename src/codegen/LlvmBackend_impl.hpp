@@ -22452,6 +22452,80 @@ private:
     // the producer and the consumer recognizing exactly the same set.
     bool isClassDisposeMethodRef(const ast::Expr* e) const;
 
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): record that a method-group
+    // REFERENCE over `recvExpr`'s value has been formed — §27.6: "the instance
+    // is captured at formation — by reference for class- or interface-typed
+    // receivers". The capture is a BORROW of the receiver's block (§28.3: the
+    // closure cell does not own it), so the block must stay LIVE across the
+    // receiver's LOGICAL disposal — §28.2: "An explicit `Dispose()` or direct
+    // `DisposeAsync()` performs **logical disposal only** … and does not
+    // reclaim its receiver: the receiver's block stays live until the holder's
+    // release point".
+    //
+    // The fact is stamped on the receiver's symbol
+    // (`borrowedByMethodGroup`, on the BASE `sema::Symbol`) because it must
+    // survive from the group's FORMATION to the explicit-`Dispose()` CALL
+    // SITE, which is a different statement (the #2781 arm's `declType` patch
+    // is the same pattern: codegen writing a fact sema could not). The BASE
+    // symbol, not `LocalSymbol`: an `owned` PARAMETER receiver is a SIBLING
+    // of `LocalSymbol`, not a subclass, so a `dynamic_cast<sema::LocalSymbol*>`
+    // never saw it. A receiver that is not a binding at all (`this`, a field,
+    // a temporary) carries no symbol and is not recorded.
+    void noteMethodGroupBorrow(const ast::Expr* recvExpr);
+
+    // fix #7025 (follow-up, §28.2, v0.343): true when a method group borrows
+    // the block `recvExpr` denotes — the explicit `Dispose()` call path must
+    // then perform the LOGICAL disposal only and leave the reclaim to the
+    // holder's release point (§28.2). It tracks "a group over this binding
+    // was formed in this method body", NOT "a live borrow exists here" — see
+    // the definition's own comment.
+    bool receiverIsGroupBorrowed(const ast::Expr& recvExpr) const;
+
+    // fix #7025 (follow-up, §28.2, v0.343): the `disposeStack_` INDEX of the
+    // scope that OWNS the receiver's BINDING — the scope whose end is the
+    // receiver's holder's release point (§28.2: "the receiver's block stays
+    // live until the holder's release point").
+    //
+    // ⚠ IT IS NOT THE CALL SITE'S SCOPE. The rejected fix-forward registered
+    // the deferred reclaim on `disposeStack_.back()` — the innermost scope
+    // open at the DISPOSAL CALL SITE — and claimed that scope "is the
+    // receiver's holder scope whenever the disposal happens in the receiver's
+    // own scope (the ordinary shape)". That claim is FALSE for every shape
+    // where the explicit `Dispose()` sits in a NESTED scope of the receiver's
+    // binding (`do … end` block, `if` branch, …): the nested scope ends
+    // first, so the receiver's block was FREED while the holder was still
+    // live and the method group still pointed at it — measured on the
+    // rejected tip: ASan "heap-use-after-free … READ of size 8" in
+    // `disposethunk$Dispose` for `do d.Dispose(); end; f();`.
+    //
+    // A LOCAL's binding scope is the scope its declaration was lowered in, and
+    // that scope's depth is what `declScopeDisposeIndex` turns into an index
+    // (#4526's ONE sanctioned way to index `disposeStack_` with a recorded
+    // declaration depth). A PARAMETER is bound in the body's OUTERMEST scope
+    // by construction (#3403 — the scope the `owned` parameter's own
+    // auto-drop is registered in).
+    //
+    // THE CONTRACT OF THE FALSE BRANCH IS THE CONSERVATIVE ONE: REGISTER
+    // NOTHING (a bounded leak). `declScopeDisposeIndex`'s own documentation
+    // says so ("Every caller's false branch must be the conservative one
+    // (register nothing), which costs a bounded leak; the alternative reading
+    // is a use-after-free"). A receiver whose binding scope cannot be
+    // established is therefore NEVER registered on the call site's scope.
+    bool receiverBindingScopeIndex(const ast::Expr& recvExpr,
+                                   std::size_t& idxOut) const;
+
+    // fix #7025 (follow-up, §28.2, v0.343): register the holder's release
+    // point for a receiver whose explicit `Dispose()` performed the logical
+    // disposal only. The block is freed by a scope-end disposal registered on
+    // the RECEIVER'S OWN SLOT and on the scope that owns the receiver's
+    // BINDING (`scopeIdx`, from `receiverBindingScopeIndex` — NOT the call
+    // site's scope). Registering it on the receiver's own slot is what makes
+    // the OTHER reclaim paths for that block (`using var` scope end, the
+    // unwind-only path) mutually exclusive: they reload the same slot, and
+    // the scope-end null-guard lets exactly one of them reclaim the block.
+    void registerDeferredReclaim(llvm::AllocaInst* recvSlot,
+                                 std::size_t scopeIdx);
+
     // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): back the bare reference to a
     // class's own compiler-generated `Dispose` with a thunk closure — the
     // shape `isClassDisposeMethodRef` recognizes.

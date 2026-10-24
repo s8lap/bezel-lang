@@ -297,6 +297,36 @@ bool isNonTrivialDisposeClass(
 // pattern — for the codegen consumer and #3205's leak history.
 bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs);
 
+// fix #7025 (follow-up, §8.7 / §27.6 / §28.2, v0.340): is `e` a method-group
+// REFERENCE to a CLASS's own compiler-generated `Dispose` — the shape
+// `var f := d.Dispose;`?
+//
+// §8.7: "The compiler generates `IDisposable` on every non-static class." The
+// generated `Dispose` has NO MethodDecl and NO MethodSymbol — §28.2: "the
+// name is the compiler's: the generated `Dispose()` … cannot be overridden",
+// and "Declaring a member named `Dispose` on a class or a record is a compile
+// error at that declaration". There is therefore no declaration for sema to
+// bind, and the member-access expression is left SYMBOL-less — which is why
+// this shape needs its own recognizer on BOTH sides of the compiler (the
+// ownership pass, which must see the group's CAPTURE of the receiver — §27.6:
+// "the instance is captured at formation — by reference for class- or
+// interface-typed receivers" — and the codegen, which lowers the group).
+//
+// This is the ONE authority for the shape: the codegen's
+// `Emitter::isClassDisposeMethodRef` and the ownership pass's pre-scan both
+// delegate here, so the producer and the consumer can never disagree about
+// the set (the #2963/#4080 pattern).
+//
+// The receiver must be a CLASS: §8.7 gives `IDisposable` to every non-static
+// class, and a class instance carries the vtable the disposal dispatch needs.
+// A record / enum / choice / primitive does not implement `IDisposable`
+// (§8.7), and an INTERFACE receiver is a different shape entirely (its
+// runtime value may be a builtin collection with no vtable at all — the
+// `IOwningCollection<T>` / `IOwningList<T>` case, whose `Dispose` frees the
+// collection rather than performing the §28.2 logical disposal; that case is
+// deliberately DECLINED and is the subject of the open spec-question #7067).
+bool isGeneratedDisposeMethodRef(const ast::Expr* e, sema::SemaContext& ctx);
+
 // Shared shape-recognition: if the callee of `call` resolves to a user
 // `ast::MethodDecl` (a MethodSymbol whose `decl` is a MethodDecl), return it;
 // null otherwise (unresolved overload, a builtin with no MethodSymbol, or a

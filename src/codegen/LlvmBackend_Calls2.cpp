@@ -7213,17 +7213,89 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             builder_.CreateBr(cont);
 
             builder_.SetInsertPoint(clsBB);
-            emitDisposeAndReclaim(recv);
-            // §28.2 v0.134 / issue #601: in checked-disposal
-            // mode the object is quarantined (not freed), so
-            // the slot must remain valid — the disposed-flag
-            // guard at the next member-entry reads through it.
-            // In unchecked mode, null the slot as usual to
-            // prevent a second reclaim.
-            if (!checkedDisposal_)
-                builder_.CreateStore(
-                    llvm::ConstantPointerNull::get(ptrTy()),
-                    slot);
+            // fix #7025 (follow-up, §28.2, v0.343): §28.2 — "An explicit
+            // `Dispose()` or direct `DisposeAsync()` performs **logical
+            // disposal only** — it sets the flag and runs the class's cleanup
+            // — and does not reclaim its receiver: the receiver's block stays
+            // live until the holder's release point, so the `Dispose()` the
+            // language itself issues there … reads a live flag in both modes,
+            // and a repeated call is the no-op stated above in both modes."
+            //
+            // The reclaim below (`emitDisposeAndReclaim` — the eager free) is
+            // sound ONLY while no BORROW points at the block. A method group
+            // over the receiver IS such a borrow (§27.6: "the instance is
+            // captured at formation — by reference for class- or
+            // interface-typed receivers"; §28.3: the cell does not own it), so
+            // the free would leave the group's capture dangling — measured: ASan
+            // "heap-use-after-free … READ of size 8" in `disposethunk$Dispose`
+            // for `var f := d.Dispose; d.Dispose(); f();`.
+            //
+            // Under such a borrow the call performs the LOGICAL half only and
+            // the RECLAIM moves to the holder's release point — the scope end
+            // — which is §28.2's own sentence ("the receiver's block stays
+            // live until the holder's release point").
+            //
+            // THE SLOT IS NOT NULLED on this path, and that is load-bearing:
+            // a group formed AFTER this call (`d.Dispose(); var f :=
+            // d.Dispose;`) reads the receiver's slot when it captures the
+            // instance, and a nulled slot is what made that shape SEGV
+            // (measured on the rejected fix-forward). The other reclaim paths
+            // for this block — the `using var` scope-end disposal, the
+            // unwind-only disposal — all reload THIS slot and are arbitrated
+            // by the scope-end null-guard, so the block is still reclaimed
+            // exactly once.
+            const bool groupBorrowed = receiverIsGroupBorrowed(target);
+            if (groupBorrowed) {
+                emitDynamicDispose(recv);
+                // The RECLAIM moves to the holder's release point. The
+                // holder's release point is registered as a scope-end
+                // disposal on the receiver's OWN slot, so the other reclaim
+                // paths for that block (`using var` scope end, the
+                // unwind-only path) find the same slot and the scope-end
+                // null-guard lets exactly one of them reclaim it.
+                //
+                // THE SCOPE IS THE RECEIVER'S BINDING'S SCOPE, not the scope
+                // this call sits in. §28.2: "the receiver's block stays live
+                // until the holder's release point" — the HOLDER is the
+                // binding that owns the block, so its release point is the
+                // end of the BINDING's own scope. Registering on the CALL
+                // SITE's scope frees the block when that scope ends, which
+                // for a `do … end` block or an `if` branch is BEFORE the
+                // holder's release point — the rejected fix-forward's
+                // measured "heap-use-after-free … READ of size 8" in
+                // `disposethunk$Dispose`.
+                //
+                // A receiver whose slot is NOT an alloca is an owned FIELD
+                // (§28.5) — its holder is the CONTAINING object, and §28.5's
+                // owned-field auto-dispose (the cascade the containing
+                // object's disposal runs) is that holder's release point: it
+                // reclaims the field's block when the containing object is
+                // disposed. Nothing is registered here for that shape.
+                if (auto* slotAlloca =
+                        llvm::dyn_cast<llvm::AllocaInst>(slot)) {
+                    std::size_t scopeIdx = 0;
+                    // The CONSERVATIVE fallback is REGISTER NOTHING (a
+                    // bounded leak) — `declScopeDisposeIndex`'s own contract
+                    // ("Every caller's false branch must be the conservative
+                    // one (register nothing) … the alternative reading is a
+                    // use-after-free"). It is NEVER "register on the call
+                    // site's scope".
+                    if (receiverBindingScopeIndex(target, scopeIdx))
+                        registerDeferredReclaim(slotAlloca, scopeIdx);
+                }
+            } else {
+                emitDisposeAndReclaim(recv);
+                // §28.2 v0.134 / issue #601: in checked-disposal
+                // mode the object is quarantined (not freed), so
+                // the slot must remain valid — the disposed-flag
+                // guard at the next member-entry reads through it.
+                // In unchecked mode, null the slot as usual to
+                // prevent a second reclaim.
+                if (!checkedDisposal_)
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()),
+                        slot);
+            }
             builder_.CreateBr(cont);
             builder_.SetInsertPoint(cont);
             // #2310 / §29.8 / §30.1 (#973a residual): also null

@@ -40,6 +40,33 @@ bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs) {
            fs->posParam->modifier == "owned" && !fs->posParamInitRef;
 }
 
+// fix #7025 (follow-up, §8.7 / §27.6 / §28.2, v0.340): the ONE authority for
+// "this expression is a method-group reference to a class's own
+// compiler-generated `Dispose`". See the header declaration for the spec
+// citations and the reason the shape needs its own recognizer (the generated
+// member has no MethodDecl and no MethodSymbol, so sema binds nothing).
+bool isGeneratedDisposeMethodRef(const ast::Expr* e, sema::SemaContext& ctx) {
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || !ma->target) return false;
+    if (ma->member != "Dispose") return false;
+    // A real MethodSymbol (a user interface's declared `Dispose`, reached
+    // through a user interface) is the ORDINARY §27.6 reference and keeps its
+    // own thunk and its own capture bookkeeping.
+    if (ctx.exprSymbol(*e)) return false;
+    const sema::TypeRef* recvTy = ctx.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named) return false;
+    const sema::TypeSymbol* ts = recvTy->declaration;
+    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
+    // §8.7: "Static classes, records, enums, choices, primitives, and inline
+    // arrays do not implement `IDisposable`." A static class has no instance,
+    // so no value of that type can reach here — but the check keeps the
+    // predicate honest for the imported case, where the modifier list is not
+    // carried over the module boundary.
+    for (std::string_view mod : ts->modifiers)
+        if (mod == "static") return false;
+    return true;
+}
+
 // §28.9 "Trivial-dispose classes" (v0.286) — see the header. This is the
 // pre-#3632 (TypeSymbol-only) entry point. It cannot read a field's RESOLVED
 // TypeRef without a `SemaContext`, so its `owned`-field arm is the

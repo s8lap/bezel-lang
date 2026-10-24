@@ -4548,6 +4548,87 @@ void MethodOwnership::checkTransitiveCapturesDisposed(
     }
 }
 
+// fix #7025 (follow-up, §28.2, v0.340): the METHOD-GROUP twin of
+// checkTransitiveCapturesDisposed.
+//
+// A method-group reference over a class's own compiler-generated `Dispose`
+// CAPTURES its receiver — §27.6: "the instance is captured at formation — by
+// reference for class- or interface-typed receivers" — and the group's
+// INVOCATION reads that captured borrow (the thunk dispatches the receiver's
+// `Dispose`). So a receiver disposed before the invocation is exactly §28.2's
+// use-after-dispose case: "the compiler must emit a compile-time warning when
+// a local variable is used (read, borrowed from, or consumed) after an
+// explicit `Dispose()` or direct `DisposeAsync()` call … on the same variable
+// that dominates the use site on every path".
+//
+// The lambda twin's wording is followed ("a closure's captured borrow is read
+// at invoke time, and this call reads a disposed value"), with the group in
+// place of the closure — the two shapes have the same obligation.
+// fix #7025 (follow-up, §27.6 / §28.2, v0.343): the BORROW fact behind the
+// §28.2 use-after-dispose warning — a method-group reference CAPTURES its
+// receiver, so the receiver's block is BORROWED from the group's formation
+// until the group dies.
+//
+// §27.6: "the instance is captured at formation — by reference for class- or
+// interface-typed receivers". §28.3: the capture is a borrow — the cell that
+// holds it does not own the block. §28.2: the block of an explicitly
+// disposed receiver "stays live until the holder's release point".
+//
+// Two shapes borrow, and BOTH are stamped:
+//   * a reference to a class's own compiler-generated `Dispose` — it has no
+//     MethodDecl and no MethodSymbol (§28.2: "the name is the compiler's"),
+//     so the MethodSymbol test misses it;
+//   * an ordinary §27.6 method reference (`d.Hi`) — the symbol is the
+//     MethodSymbol.
+//
+// A plain member READ (`d.X`) captures nothing and is not stamped.
+//
+// The stamp goes on the BASE `sema::Symbol`, so an `owned` PARAMETER
+// receiver carries it as well as a local: `ParameterSymbol` is a SIBLING of
+// `LocalSymbol`, not a subclass, and the rejected fix-forward's
+// `dynamic_cast<sema::LocalSymbol*>` therefore never saw a parameter
+// receiver — the owned-parameter shape kept reclaiming eagerly and the
+// group's invocation was a measured heap-use-after-free.
+void MethodOwnership::noteMethodGroupBorrow(const ast::Expr& e) {
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e);
+    if (!ma) return;
+    const bool generatedDispose =
+        common::isGeneratedDisposeMethodRef(&e, ctx_);
+    const bool ordinaryReference =
+        dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e)) != nullptr;
+    if (!generatedDispose && !ordinaryReference) return;
+    if (!ma->target) return;
+    const auto* id =
+        dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id) return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    sym->borrowedByMethodGroup = true;
+}
+
+void MethodOwnership::checkGeneratedDisposeReceiverDisposed(
+        const ast::MemberAccessExpr& ma) {
+    if (!ma.target) return;
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
+    if (!id) return;
+    if (!ctx_.exprSymbol(*id)) return;
+    LocalOwnership* st = lookupStateFor(*id);
+    if (!st) return;
+    if (st->state != OwnershipState::Disposed) return;
+    report(
+        Severity::Warning, id->span.begin,
+        std::string("the method group over `") + std::string(id->name) +
+            "` was disposed before this invocation — a method group's captured "
+            "borrow is read at invoke time, and this call reads a disposed "
+            "value (§28.2 use-after-dispose)");
+    if (st->explicitlyDisposed && st->explicitDisposeLoc.line != 0) {
+        report(
+            Severity::Note, st->explicitDisposeLoc,
+            std::string("explicit Dispose() of `") + std::string(id->name) +
+                "` was here");
+    }
+}
+
 // -------------------------------------------------------------------------
 // §28.3 (v0.184, #1958) captured-owned-binding consume inside a closure.
 //
@@ -4967,6 +5048,18 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
                         if (lit != scopedLambdaLocalInit_.end()) {
                             std::set<const ast::LambdaExpr*> visited;
                             checkTransitiveCapturesDisposed(*lit->second, visited);
+                        } else {
+                            // fix #7025 (follow-up, §28.2, v0.340): the
+                            // METHOD-GROUP twin of the lambda arm above — a
+                            // group over a class's own compiler-generated
+                            // `Dispose` captures its receiver (§27.6), and
+                            // the invocation READS that captured borrow, so a
+                            // receiver disposed before the invocation is the
+                            // §28.2 use-after-dispose case.
+                            auto git =
+                                deferredGeneratedDisposeRefDecl_.find(ls->decl);
+                            if (git != deferredGeneratedDisposeRefDecl_.end())
+                                checkGeneratedDisposeReceiverDisposed(*git->second);
                         }
                     }
                 }
@@ -23497,6 +23590,19 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         if (ld->initializer) {
             if (ld->isUsing)
                 scopedInitOfUsingLocal_[ld->initializer.get()] = ld;
+            // fix #7025 (follow-up, §27.6 / §28.2, v0.343): stamp the BORROW
+            // fact on the group's RECEIVER — §27.6: "the instance is captured
+            // at formation — by reference for class- or interface-typed
+            // receivers". The capture borrows the receiver's block (§28.3),
+            // so the block must stay LIVE across the receiver's LOGICAL
+            // disposal (§28.2). The stamp is set HERE, in the pre-scan, so it
+            // is a WHOLE-BODY fact: the explicit-`Dispose()` call site sees a
+            // group formed LATER in the body as well as one formed earlier.
+            // The rejected fix-forward stamped the fact in CODEGEN, at the
+            // moment the group was formed, which made the stamp too LATE for
+            // a group formed after the dispose (the `p12b` shape) — the group
+            // then captured the nulled slot and the invocation SEGV'd.
+            noteMethodGroupBorrow(*ld->initializer);
             // A lambda-literal initializer makes this local a verifiable
             // function value at a scoped call site (unless reassigned —
             // scopedAssignedSyms_). // per §28.14
@@ -23515,13 +23621,46 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
                 // // per §28.3 v0.196
                 if (sema::LocalSymbol* ls = findLocalSymbol(*ld))
                     deferredMethodRefLocalInit_[ls] = ld->initializer.get();
+            } else if (const auto* ma =
+                           dynamic_cast<const ast::MemberAccessExpr*>(
+                               ld->initializer.get());
+                       ma && common::isGeneratedDisposeMethodRef(
+                                ld->initializer.get(), ctx_)) {
+                // fix #7025 (follow-up, §21.1 / §27.6 / §28.2, v0.340): the
+                // generated `Dispose` has NO MethodDecl and NO MethodSymbol
+                // (§28.2: "the name is the compiler's"), so the MethodSymbol
+                // test above misses this shape and the §28.2 use-after-
+                // dispose machinery never saw the group's CAPTURE of the
+                // receiver (§27.6: "the instance is captured at formation — by
+                // reference for class- or interface-typed receivers"). Record
+                // it, keyed on the DECLARATION NODE so the §21.1 `const`
+                // spelling (an `ast::LocalConstDecl`, a different node) is
+                // found by the same lookup.
+                deferredGeneratedDisposeRefDecl_[ld] = ma;
             }
             scopedPreScanExpr(*ld->initializer);
         }
         return;
     }
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
-        if (lc->value) scopedPreScanExpr(*lc->value);
+        // fix #7025 (follow-up, §21.1 / §27.6 / §28.2, v0.340): the §21.1
+        // runtime `const` spelling of the method-group reference
+        // (`const f := d.Dispose;`) — the same shape as the `var` spelling
+        // above, recorded under the CONST declaration node so the invocation
+        // site's lookup finds it.
+        if (lc->value) {
+            if (const auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(lc->value.get());
+                ma && common::isGeneratedDisposeMethodRef(lc->value.get(),
+                                                          ctx_))
+                deferredGeneratedDisposeRefDecl_[lc] = ma;
+            // fix #7025 (follow-up, §21.1 / §27.6 / §28.2, v0.343): the §21.1
+            // `const` spelling stamps the SAME borrow fact as the `var`
+            // spelling above — the borrow is a property of the CAPTURE, not
+            // of the declaration's mutability.
+            noteMethodGroupBorrow(*lc->value);
+            scopedPreScanExpr(*lc->value);
+        }
         return;
     }
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {

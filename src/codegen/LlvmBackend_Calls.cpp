@@ -2641,14 +2641,175 @@ sema::TypeRef* Emitter::builtinListMemberFnType(const ast::MemberAccessExpr& ma)
     return fnTy;
 }
 
+// fix #7025 (follow-up, §27.6 / §28.2, v0.343): record the BORROW a formed
+// method group takes on its receiver — §27.6: "the instance is captured at
+// formation — by reference for class- or interface-typed receivers".
+//
+// The fact lives on the receiver's symbol (`borrowedByMethodGroup`, on the
+// BASE `sema::Symbol`): it must survive from the group's FORMATION to the
+// explicit-`Dispose()` CALL SITE, which is a different statement, and the
+// symbol is the one thing both statements can name. (The #2781 arm's
+// `declType` patch is the same pattern — codegen writing a fact sema could
+// not.) The OWNERSHIP pass's pre-scan sets the same fact for the shapes that
+// are bound to a local or a `const` local, and it sets it BEFORE any
+// statement is lowered — so the call site also sees a group formed LATER in
+// the body. This codegen-side stamp covers the shapes the pre-scan cannot
+// see (a method reference that is not bound to a local — an argument, a
+// field store).
+void Emitter::noteMethodGroupBorrow(const ast::Expr* recvExpr) {
+    if (!recvExpr) return;
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(recvExpr);
+    if (!id) return;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return;
+    sym->borrowedByMethodGroup = true;
+}
+
+// fix #7025 (follow-up, §28.2, v0.343): true when a method group borrows the
+// block `recvExpr` denotes.
+//
+// WHAT IT TRACKS, precisely: "a method group over this binding was formed
+// somewhere in this method body" — a WHOLE-BODY fact, not "a live borrow
+// exists at this point". The stamp is never cleared (a group's death is not
+// tracked), so a group that is formed and never invoked still defers the
+// reclaim. That is SOUND, because the deferral only moves the free to the
+// holder's release point — the obligation is discharged exactly once either
+// way — and it is NECESSARY, because the stamp has to be in place at the
+// explicit-`Dispose()` call site for a group formed LATER in the body.
+bool Emitter::receiverIsGroupBorrowed(const ast::Expr& recvExpr) const {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&recvExpr);
+    if (!id) return false;
+    const sema::Symbol* sym = ctx_.exprSymbol(*id);
+    return sym && sym->borrowedByMethodGroup;
+}
+
+// fix #7025 (follow-up, §28.2, v0.343): the `disposeStack_` INDEX of the scope
+// that OWNS the receiver's BINDING.
+//
+// §28.2: "An explicit `Dispose()` or direct `DisposeAsync()` performs **logical
+// disposal only** — it sets the flag and runs the class's cleanup — and does
+// not reclaim its receiver: the receiver's block stays live until the holder's
+// release point". The HOLDER is the binding that owns the receiver's block, so
+// the holder's release point is the END OF THE BINDING'S OWN SCOPE — not the
+// end of whatever scope the explicit call happens to sit in.
+//
+// ⚠ THE CALL SITE'S SCOPE IS NOT THE HOLDER'S SCOPE. The rejected
+// fix-forward registered the deferred reclaim on `disposeStack_.back()` — the
+// innermost scope open at the DISPOSAL CALL SITE — and claimed that scope "is
+// the receiver's holder scope whenever the disposal happens in the receiver's
+// own scope (the ordinary shape)". That is FALSE for every shape where the
+// explicit `Dispose()` sits in a NESTED scope of the receiver's binding (a
+// `do … end` block, an `if` branch — ordinary language surface): the nested
+// scope ends FIRST, so the receiver's block was freed while the holder was
+// still live and the method group still pointed at it. MEASURED on the
+// rejected tip: ASan "heap-use-after-free … READ of size 8" in
+// `disposethunk$Dispose` for `do d.Dispose(); end; f();`.
+//
+// A LOCAL's binding scope is the scope its DECLARATION was lowered in.
+// `declScopeDisposeIndex` (#4526) is the ONE sanctioned way to turn that
+// recorded declaration depth into a `disposeStack_` INDEX, and its documented
+// contract is the conservative one — "Every caller's false branch must be the
+// conservative one (register nothing), which costs a bounded leak; the
+// alternative reading is a use-after-free" — which is exactly the shape of
+// the defect this function exists to close.
+//
+// A PARAMETER is bound in the body's OUTERMEST scope by construction (#3403:
+// "Params are absent from `declScopeDepth_` by construction (#3403), so a
+// parameter is bound in the body's outermost scope"), which is the scope the
+// `owned` parameter's own auto-drop is registered in
+// (`registerUnwindOwnedParam` uses `disposeStack_.front()`).
+//
+// The LOOP shape keeps its per-iteration reclaim: the binding is declared in
+// the loop BODY, so the binding's scope is the loop body's scope, whose end
+// code runs INSIDE the loop.
+bool Emitter::receiverBindingScopeIndex(const ast::Expr& recvExpr,
+                                        std::size_t& idxOut) const {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&recvExpr);
+    if (!id) return false;
+    const sema::Symbol* sym = ctx_.exprSymbol(*id);
+    if (!sym) return false;
+    if (const auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym)) {
+        // The local's DECLARATION node is the key `recordDeclScopeDepth`
+        // recorded the declaration's scope depth under (`lsym->decl` is the
+        // `ast::LocalDecl`, the very node `lowerLocalDecl` was handed).
+        if (!ls->decl) return false;
+        return declScopeDisposeIndex(ls->decl, idxOut);
+    }
+    if (dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+        if (disposeStack_.empty()) return false;
+        idxOut = 0;
+        return true;
+    }
+    // A receiver that is not a binding (a field, a temporary, `this`) has no
+    // binding scope of its own: CONSERVATIVE — register nothing.
+    return false;
+}
+
+// fix #7025 (follow-up, §28.2, v0.343): the holder's release point for a
+// receiver whose explicit `Dispose()` performed the LOGICAL disposal only.
+//
+// §28.2: "An explicit `Dispose()` or direct `DisposeAsync()` performs **logical
+// disposal only** — it sets the flag and runs the class's cleanup — and does
+// not reclaim its receiver: the receiver's block stays live until the holder's
+// release point, so the `Dispose()` the language itself issues there … reads a
+// live flag in both modes, and a repeated call is the no-op stated above in
+// both modes." So the free happens at the HOLDER'S RELEASE POINT and not at
+// the explicit call, which would leave a method group's capture (§27.6)
+// pointing at a freed block (ASan: "heap-use-after-free … READ of size 8").
+//
+// THE SCOPE. The disposal is registered on `scopeIdx` — the scope that owns
+// the receiver's BINDING (`receiverBindingScopeIndex`), which is the holder's
+// release point (§28.2). It is NOT the scope the disposal call sits in: the
+// rejected fix-forward used `disposeStack_.back()` and that is a
+// use-after-free whenever the call sits in a nested scope (see
+// `receiverBindingScopeIndex`'s own comment for the measurement). The
+// rejected fix-forward before it used `disposeStack_.front()` — the FUNCTION
+// scope — so in a LOOP the single static slot it wrote was overwritten by the
+// next iteration and every iteration but the last leaked its block (measured:
+// ASan "144 byte(s) leaked in 9 allocation(s)" on a legal ten-iteration loop).
+//
+// THE SLOT. The disposal is registered on the RECEIVER'S OWN SLOT, so every
+// other reclaim path for that block — the `using var` scope-end disposal,
+// the unwind-only disposal of an owned local or parameter — finds the SAME
+// slot, and the scope-end null-guard arbitrates: the first one to fire
+// reclaims the block and nulls the slot, the rest reload null and skip. The
+// rejected fix-forward registered the free on a SEPARATE slot holding a
+// snapshot of the value, which left those other paths free to reclaim the
+// same block a second time.
+//
+// The `dynamicDispose` disposal is the existing scope-end shape for a class
+// instance whose concrete class is not statically known here: it loads the
+// slot, skips a null, dispatches the object's idempotent `Dispose()` (a NO-OP
+// here — the flag is already set, §28.2) and reclaims the block, then nulls
+// the slot.
+void Emitter::registerDeferredReclaim(llvm::AllocaInst* recvSlot,
+                                      std::size_t scopeIdx) {
+    if (!recvSlot) return;
+    if (scopeIdx >= disposeStack_.size()) return;
+    Disposal d{recvSlot, nullptr};
+    d.dynamicDispose = true;
+    disposeStack_[scopeIdx].push_back(d);
+}
+
 // fix #7014: the LOCAL a method-reference initializer binds to.
+//
+// fix #7025 (follow-up, §21.1, v0.340): the scan reads the local's
+// initializer through the SHARED `localDeclInitView` authority, which covers
+// BOTH local-declaration forms. A §21.1 runtime `const` local is an
+// `ast::LocalConstDecl` (initializer field `value`), NOT an
+// `ast::LocalDecl` (field `initializer`) — so the previous
+// `dynamic_cast<const ast::LocalDecl*>` scan MISSED every `const` spelling,
+// and the local's `declType` was never restored: `const f := d.Dispose;`
+// kept a null declType, the CALL degraded to the #2434 zero-init, and the
+// group was a SILENT NO-OP. This is the `check_localdecl_only_walkers`
+// family's source-level counterpart (the canonical widening at
+// LlvmBackend_Setup.cpp's `localDeclInitView`).
 sema::LocalSymbol* Emitter::bindingLocalSymbol(const ast::Expr* init) const {
     if (!init) return nullptr;
     for (const auto& sym : ctx_.symbols()) {
         auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
         if (!ls || !ls->decl) continue;
-        auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
-        if (!ld || ld->initializer.get() != init) continue;
+        if (localDeclInitView(ls->decl).init != init) continue;
         return ls;
     }
     return nullptr;
@@ -2685,6 +2846,12 @@ llvm::Value* Emitter::makeBuiltinListMemberThunk(const ast::MemberAccessExpr& ma
     // The receiver's value at the use site — a BORROW of the collection.
     llvm::Value* recvVal = lowerExpr(*ma.target);
     if (!recvVal || !recvVal->getType()->isPointerTy()) return nullptr;
+
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.340): the group CAPTURES the
+    // receiver (§27.6: "the instance is captured at formation — by reference
+    // for class- or interface-typed receivers"), so the receiver's block must
+    // stay live across the receiver's logical disposal (§28.2).
+    noteMethodGroupBorrow(ma.target.get());
 
     // The thunk is SHARED across evaluations of the same member over the same
     // element type (§27.7.1: "Repeated evaluations of `obj.Method` on the same
@@ -2870,22 +3037,12 @@ llvm::Value* Emitter::makeBuiltinListMemberThunk(const ast::MemberAccessExpr& ma
 // deliberately DECLINED here and is the subject of the open spec-question
 // #7067).
 bool Emitter::isClassDisposeMethodRef(const ast::Expr* e) const {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
-    if (!ma || !ma->target) return false;
-    if (ma->member != "Dispose") return false;
-    if (ctx_.exprSymbol(*e)) return false;   // a real MethodSymbol reference
-    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
-    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named) return false;
-    const sema::TypeSymbol* ts = recvTy->declaration;
-    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
-    // §8.7: "Static classes, records, enums, choices, primitives, and inline
-    // arrays do not implement `IDisposable`." A static class has no instance,
-    // so no value of that type can reach here — but the check keeps the
-    // predicate honest for the imported case, where the modifier list is not
-    // carried over the module boundary.
-    for (std::string_view mod : ts->modifiers)
-        if (mod == "static") return false;
-    return true;
+    // fix #7025 (follow-up, §8.7 / §27.6 / §28.2, v0.340): the ONE authority
+    // for this shape is `common::isGeneratedDisposeMethodRef` — the ownership
+    // pass's pre-scan (which must see the group's CAPTURE of the receiver)
+    // and this producer gate delegate to it, so the two can never disagree
+    // about the set.
+    return common::isGeneratedDisposeMethodRef(e, ctx_);
 }
 
 
@@ -2921,6 +3078,14 @@ llvm::Value* Emitter::makeClassDisposeThunk(const ast::MemberAccessExpr& ma) {
     // the closure cell does not own it).
     llvm::Value* recvVal = lowerExpr(*ma.target);
     if (!recvVal || !recvVal->getType()->isPointerTy()) return nullptr;
+
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.340): the group CAPTURES the
+    // receiver (§27.6: "the instance is captured at formation — by reference
+    // for class- or interface-typed receivers"), so the receiver's block must
+    // stay live across the receiver's logical disposal — the explicit
+    // `Dispose()` call site reads the stamp and leaves the reclaim to the
+    // holder's release point (§28.2).
+    noteMethodGroupBorrow(ma.target.get());
 
     // Thunk signature: void (ptr env) — the closure ABI the function-value
     // call site expects (fn(env, args…)); `Dispose` takes no user parameter.

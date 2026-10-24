@@ -2677,6 +2677,27 @@ private:
     void checkTransitiveCapturesDisposed(
         const ast::LambdaExpr& lam,
         std::set<const ast::LambdaExpr*>& visited);
+    // fix #7025 (follow-up, §28.2, v0.340): the METHOD-GROUP twin of
+    // checkTransitiveCapturesDisposed. A method-group reference over a class's
+    // own compiler-generated `Dispose` CAPTURES its receiver (§27.6: "the
+    // instance is captured at formation — by reference for class- or
+    // interface-typed receivers"), and the group's INVOCATION reads that
+    // captured borrow — so a receiver disposed before the invocation is the
+    // §28.2 use-after-dispose case the warning regime covers ("the compiler
+    // must emit a compile-time warning when a local variable is used (read,
+    // borrowed from, or consumed) after an explicit `Dispose()` … on the same
+    // variable that dominates the use site on every path").
+    void checkGeneratedDisposeReceiverDisposed(
+        const ast::MemberAccessExpr& ma);
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): stamp the BORROW fact
+    // on the RECEIVER of a method-group reference — §27.6: "the instance is
+    // captured at formation — by reference for class- or interface-typed
+    // receivers". Called from the pre-scan, so the fact is a WHOLE-BODY fact
+    // (a group formed later in the body is seen by an earlier explicit
+    // `Dispose()`), and stamped on the BASE symbol so an `owned` PARAMETER
+    // receiver — whose symbol is a SIBLING of `LocalSymbol`, not a subclass —
+    // carries it too.
+    void noteMethodGroupBorrow(const ast::Expr& e);
     void collectIdentifiersIn(
         const ast::Expr& e,
         std::vector<const ast::IdentifierExpr*>& out) const;
@@ -6048,6 +6069,22 @@ private:
     // in the same LocalDecl pass as scopedLambdaLocalInit_. // per §28.3 v0.196
     std::unordered_map<sema::Symbol*, const ast::Expr*>
         deferredMethodRefLocalInit_;
+    // fix #7025 (follow-up, §21.1 / §27.6 / §28.2, v0.340): a local bound to
+    // a method-group REFERENCE over a CLASS's own compiler-generated `Dispose`
+    // (`var f := d.Dispose;` / `const f := d.Dispose;`) — the shape the
+    // generated member leaves SYMBOL-less (§28.2: "the name is the
+    // compiler's"), so `deferredMethodRefLocalInit_`'s MethodSymbol test
+    // misses it and the §28.2 use-after-dispose machinery never saw the
+    // group's CAPTURE of the receiver (§27.6: "the instance is captured at
+    // formation — by reference for class- or interface-typed receivers").
+    //
+    // Keyed on the local's DECLARATION NODE (not its LocalSymbol) so the §21.1
+    // `const` spelling — whose declaration is an `ast::LocalConstDecl`, a
+    // different node — is found by the same lookup. Recorded by
+    // scopedPreScanStmt; consulted at the group's INVOCATION site, where the
+    // captured borrow is read (§28.2's use-after-dispose warning regime).
+    std::unordered_map<const void*, const ast::MemberAccessExpr*>
+        deferredGeneratedDisposeRefDecl_;
     // Every symbol that is an assignment target anywhere in the body
     // (including through an `out`/`ref` call argument). A lambda-literal
     // local among them is NOT verifiable (the binding may have been swapped
