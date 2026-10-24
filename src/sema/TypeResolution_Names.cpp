@@ -4018,6 +4018,110 @@ void Resolver::recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
                                /*siteKey=*/&id, id.span.begin);
 }
 
+// fix #7164 (§14.1 / §2.2 / §2.3 / Appendix C.1, v0.343): the §14.1 arity
+// rule at an EXPRESSION-position type reference.
+//
+// THE TYPE POSITION ENFORCES IT, THE EXPRESSION POSITION DID NOT.  The type
+// position's check is `resolveNamed`'s "Generic-arity check" (this file):
+// it compares the reference's type-argument count with the resolved type's
+// declared parameter count and reports "generic-argument count does not
+// match type's generic-parameter count".  An EXPRESSION-position type
+// reference — `Box<int>.Make(…)`, `var v := Box<int>;` — is an
+// `ast::IdentifierExpr` carrying `typeArgs`, NOT an `ast::Type` node, so
+// `resolveNamed` was never called for it: the expression pass hand-built the
+// instantiated TypeRef (ExprTypecheck_Exprs.cpp's IdentifierExpr arm) and
+// never compared the two counts.  A wrong count was therefore accepted
+// silently and the program ran — the type position and the expression
+// position disagreed about the SAME reference, which is the shape this fixes.
+//
+// §2.2's arity SELECTION comes FIRST, exactly as `resolveNamed` applies it:
+// the reference's type-argument list selects among §2.7 rule 1's candidate
+// types ("a reference resolves to the first, in that rule's order, whose
+// arity its type-argument list fixes").  So a reference whose arity matches a
+// DIFFERENT candidate — an imported type of the same name at that arity, or a
+// §2.3 always-available built-in at that arity — denotes THAT candidate, and
+// the §14.1 arity rule is checked against it, not against the bare-name scope
+// entry this lookup found.  A reference whose arity matches no candidate is
+// the arity error.  The two tables consulted here (`importedByArity_` and
+// `builtinTypeArity`) are the SAME two `resolveNamed` applies the selection
+// with, so the two positions cannot drift apart.
+//
+// The diagnostic TEXT is the type position's text, verbatim: one rule, one
+// message.  A second wording for the same rule would make the same defect
+// read two ways depending on which position it was written in.
+void Resolver::checkExprTypeRefArity(const ast::IdentifierExpr& id,
+                                     Scope* scope) {
+    if (id.typeArgs.empty()) return;
+    const std::size_t refArity = id.typeArgs.size();
+    // §2.7 rule 1: the head name must denote a TYPE.  A name that resolves
+    // to something else (a local, a parameter, a method) is §22.12's rule —
+    // "a name that resolves to a non-generic entity after a
+    // syntactically-successful generic reading is an ordinary error at that
+    // name" — which is a DIFFERENT rule and is not this one.
+    Symbol* sym = lookupName(id.name, scope);
+    if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(sym)) {
+        // §14.1 (v0.343): "… and the same holds for a generic type alias".
+        // The TYPE position enforces the alias's arity — `resolveNamed`'s
+        // alias arm reports "generic-argument count does not match type
+        // alias `X`'s generic-parameter count (§27.8)" — so the expression
+        // position must enforce the SAME count with the SAME wording.  The
+        // alias's declared count is its OWN parameter count (an alias's
+        // arity is its own; §27.8's alias-transparency does not change it).
+        // An alias whose AST declaration is not here (an IMPORTED alias)
+        // has no declared count to compare against, exactly as in the type
+        // position, whose alias arm is likewise gated on the declaration.
+        const auto* aliasDecl =
+            dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
+        if (!aliasDecl) return;
+        if (refArity != aliasDecl->genericParams.size()) {
+            ctx_.diagnostics().report(
+                Severity::Error, id.span.begin,
+                "generic-argument count does not match type alias `" +
+                    std::string(aliasDecl->name) +
+                    "`'s generic-parameter count (\xC2\xA7""27.8)");
+        }
+        return;
+    }
+    auto* tsym = dynamic_cast<TypeSymbol*>(sym);
+    if (!tsym) {
+        // No type of that name in scope.  The name is then either a §2.3
+        // always-available built-in (whose arity Slice S24 owns, and which the
+        // expression position has no type reference of its own to
+        // instantiate) or not a type at all.  Neither is §14.1's arity rule
+        // applied to a user type, so there is nothing to check here.
+        return;
+    }
+    if (tsym->genericParams.size() == refArity) return;  // the rule holds
+    // §2.2 arity selection — the same two candidates `resolveNamed` consults
+    // (see the comment above).  A candidate of the reference's arity means
+    // the reference denotes THAT type, not the one the bare-name lookup
+    // found, so the arity rule is not violated here: this reference belongs
+    // to the type position's selection, not to this check.
+    {
+        auto it = importedByArity_.find(
+            std::make_pair(std::string(id.name), refArity));
+        if (it != importedByArity_.end() && it->second) return;
+        const int builtinAr = builtinTypeArity(id.name);
+        if (builtinAr != kNotBuiltin) {
+            // fix #7084's sentinel: the `Task` family is available at arity 0
+            // AND 1 (§2.3 Row 5), so the comparison is the one Slice S24
+            // makes, not a plain equality against the table's negative value.
+            const bool ok = (builtinAr == kBuiltinTaskLike)
+                                ? (refArity == 0 || refArity == 1)
+                                : (refArity == static_cast<std::size_t>(builtinAr));
+            if (ok) return;
+        }
+    }
+    // §14.1 / Appendix C.1: every type reference supplies exactly the
+    // declared number of type arguments.  "Bezel has no raw and no open
+    // generic type reference" — a reference that supplies a different number
+    // than the type declares is an error, and the type position already
+    // says so with this text.
+    ctx_.diagnostics().report(Severity::Error, id.span.begin,
+                               "generic-argument count does not match type's "
+                               "generic-parameter count");
+}
+
 // fix #7013 (§2.2, §11.6, v0.340): §2.2's arity selection, for a reference
 // that fixes arity 0 — a chain HEAD, which §11.6 calls "a bare enclosing
 // segment" ("A bare enclosing segment fixes arity 0").
@@ -8286,6 +8390,13 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         // spelling. Runs after the loop above so every argument already has a
         // resolved TypeRef to record.
         recordStaticReceiverInstantiation(*id, scope);
+        // fix #7164 (§14.1 / §2.2 / Appendix C.1, v0.343): the §14.1 arity
+        // rule at this EXPRESSION position.  The type position enforces it
+        // (`resolveNamed`'s "Generic-arity check"); this spelling is not an
+        // `ast::Type` node, so it never reached that check and a wrong count
+        // was accepted silently.  Runs after the recording above so the two
+        // halves see the same site.
+        checkExprTypeRefArity(*id, scope);
         return;
     }
     // Literals + ThisBaseTypeOf — no nested Types/Exprs.

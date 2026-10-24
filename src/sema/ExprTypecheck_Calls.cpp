@@ -35613,11 +35613,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // `substituteMemberType(rt, ma->target.get(), ms->parent)`, which
         // reads the receiver's TypeRef — the one this branch publishes.
         //
-        // The BARE form (`Tree<int>.Node`, no type arguments) is NOT typed
-        // here: it is a different spelling with its own arity rule (§11.6's
-        // "a bare enclosing segment fixes arity 0"), and typing it here would
-        // change the verdict of programs that compile today.
-        if (!ma.typeArgs.empty() && nts->type) {
+        // The BARE form (`Tree<int>.Node`, no type arguments) is NOT TYPED
+        // here: it is a different spelling, and typing it here would change
+        // the verdict of programs that compile today.  Its ARITY, though, is
+        // checked below.
+        //
+        // fix #7164 (§14.1 / §2.2 / Appendix C.1, v0.343): the BARE form's
+        // arity rule is §14.1's own — "every such reference supplies exactly
+        // the declared number of type arguments … there, too, the bare `Box`
+        // fixes arity 0".  The nested type's OWN parameter count is the
+        // declared count, so a bare reference to a nested type that declares
+        // parameters supplies ZERO and is a wrong-arity reference: it left
+        // the nested type's parameter unbound and the program ran.  The type
+        // position already says so for the same shape (`var v: Outer.Inner;`
+        // at a `class Inner<V>` is rejected with this same text), so the
+        // two positions now agree.  §11.6's
+        // "a bare enclosing segment fixes arity 0"
+        // is the ENCLOSING segment's rule (the chain head
+        // `Tree<int>`), not a licence for the nested segment to be bare.
+        if (nts->type) {
             if (ma.typeArgs.size() != nts->type->genericParams.size()) {
                 // §14.1 / Appendix C.1: every type reference supplies exactly
                 // the declared number of type arguments. The wording is the
@@ -35629,23 +35643,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     "generic-parameter count");
                 return;
             }
-            auto* instTy = ctx_.makeTypeRef();
-            instTy->kind = TypeRef::Kind::Named;
-            instTy->declaration = nts->type;
-            std::vector<const ast::Type*> argAsts;
-            argAsts.reserve(ma.typeArgs.size());
-            for (const auto& ta : ma.typeArgs) {
-                instTy->genericArgs.push_back(ta ? ctx_.resolvedType(*ta)
-                                                : nullptr);
-                argAsts.push_back(ta.get());
+            if (!ma.typeArgs.empty()) {
+                auto* instTy = ctx_.makeTypeRef();
+                instTy->kind = TypeRef::Kind::Named;
+                instTy->declaration = nts->type;
+                std::vector<const ast::Type*> argAsts;
+                argAsts.reserve(ma.typeArgs.size());
+                for (const auto& ta : ma.typeArgs) {
+                    instTy->genericArgs.push_back(ta ? ctx_.resolvedType(*ta)
+                                                    : nullptr);
+                    argAsts.push_back(ta.get());
+                }
+                ctx_.setExprType(&ma, instTy);
+                // §14.2 constraint check at this instantiation site — the same
+                // dispatch the chain-head receiver (`Registry<int>.Make()`) runs
+                // through `checkGenericConstraintsAtExpr` (fix #3160), so a
+                // nested type's own `where` clause is enforced here too.
+                checkGenericConstraintsAtExpr(ctx_, ma.span.begin, argAsts,
+                                               instTy->genericArgs, nts->type);
             }
-            ctx_.setExprType(&ma, instTy);
-            // §14.2 constraint check at this instantiation site — the same
-            // dispatch the chain-head receiver (`Registry<int>.Make()`) runs
-            // through `checkGenericConstraintsAtExpr` (fix #3160), so a
-            // nested type's own `where` clause is enforced here too.
-            checkGenericConstraintsAtExpr(ctx_, ma.span.begin, argAsts,
-                                           instTy->genericArgs, nts->type);
         }
     } else if (auto* ms = dynamic_cast<MethodSymbol*>(member)) {
         // §27.6 (issue #436): a bare `obj.Method` in value position (not the

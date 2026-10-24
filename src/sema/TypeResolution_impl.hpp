@@ -842,6 +842,19 @@ private:
     void recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
                                            Scope* scope);
 
+    // fix #7164 (§14.1 / §2.2 / §2.3 / Appendix C.1, v0.343): the §14.1
+    // arity rule at an EXPRESSION-position type reference. The TYPE
+    // position enforces it (resolveNamed's "Generic-arity check"); the
+    // expression position never reached that check, because an
+    // IdentifierExpr carrying type arguments (`Box<int>.Make(…)`,
+    // `var v := Box<int>;`) is not an `ast::Type` node — so `resolveNamed`
+    // was never called for it. Method, not free function, because the
+    // §2.2 arity SELECTION it consults reads this Resolver's
+    // `importedByArity_` table and its `builtinTypeArity` table — the same
+    // two tables `resolveNamed` applies the selection with, so the two
+    // positions cannot disagree about the same reference.
+    void checkExprTypeRefArity(const ast::IdentifierExpr& id, Scope* scope);
+
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): Pass 2 for the
     // degenerate-`as`-target rule at a TYPE-level generic parameter. The
     // declaration-site check in ExprTypecheck admits `o as T` inside the
