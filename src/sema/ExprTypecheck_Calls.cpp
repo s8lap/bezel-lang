@@ -33911,6 +33911,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ma.member));
         return;
     }
+    // fix #7135 (§22.12 / §14.1 / §11.6 / A.7, v0.343): explicit type
+    // arguments are meaningful on exactly two kinds of member — a generic
+    // METHOD (the §14.1 / §27.6 spelling `obj.Method<int>(args)`, whose list
+    // the method-reference and call paths validate) and a generic NESTED TYPE
+    // (the §11.6 spelling `Tree<int>.Node<int>`, whose list the nested-type
+    // branch below applies). §22.12 states the rule for every other name:
+    // "a name that resolves to a non-generic entity after a
+    // syntactically-successful generic reading is an ordinary error at that
+    // name". A field, a property, a const, an enum constant or a choice case
+    // reached with a type-argument list is such a name — the list spells
+    // nothing there, and silently ignoring it is how `o.F<int>.Length` would
+    // come to compile as if it were `o.F.Length`.
+    if (!ma.typeArgs.empty() && member &&
+        !dynamic_cast<MethodSymbol*>(member) &&
+        !dynamic_cast<NestedTypeSymbol*>(member)) {
+        ctx_.diagnostics().report(
+            Severity::Error, ma.span.begin,
+            "`" + std::string(ma.member) +
+                "` names no type parameters: a type-argument list is spelled "
+                "on a generic method (`obj.Method<int>(…)`, §14.1 / §27.6) or "
+                "on a nested type (`Tree<int>.Node<int>`, §11.6), and this "
+                "member is neither — a name that resolves to a non-generic "
+                "entity after a syntactically-successful generic reading is "
+                "an ordinary error at that name (§22.12)");
+        return;
+    }
     if (!member) {
         // fix #3907 (stdlib §4.19, mirroring #3896's kResidualAuditedNames
         // carve-out — ExprTypecheck_Calls.cpp's isAuditedElsewhere block,
@@ -35437,6 +35463,52 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             tgt && tgt->declaration == targetType && !tgt->genericArgs.empty())
             ct->genericArgs = tgt->genericArgs;
         ctx_.setExprType(&ma, ct);
+    } else if (auto* nts = dynamic_cast<NestedTypeSymbol*>(member)) {
+        // fix #7135 (§11.6 / §14.1 / Appendix C.1, v0.343): a nested type
+        // reached through a chain head that supplies the enclosing type's
+        // arguments, carrying EXPLICIT type arguments of its own — §11.6's
+        // worked example `Tree<int>.Node<int>.Create()` — is an
+        // INSTANTIATION of that nested type.  Build the instantiated TypeRef
+        // and attach it, so the members reached THROUGH it substitute the
+        // nested type's own type parameters (`U := int` in the example):
+        // the call's return type is substituted by
+        // `substituteMemberType(rt, ma->target.get(), ms->parent)`, which
+        // reads the receiver's TypeRef — the one this branch publishes.
+        //
+        // The BARE form (`Tree<int>.Node`, no type arguments) is NOT typed
+        // here: it is a different spelling with its own arity rule (§11.6's
+        // "a bare enclosing segment fixes arity 0"), and typing it here would
+        // change the verdict of programs that compile today.
+        if (!ma.typeArgs.empty() && nts->type) {
+            if (ma.typeArgs.size() != nts->type->genericParams.size()) {
+                // §14.1 / Appendix C.1: every type reference supplies exactly
+                // the declared number of type arguments. The wording is the
+                // type resolver's (§14.1's arity rule), so one rule has one
+                // message.
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    "generic-argument count does not match type's "
+                    "generic-parameter count");
+                return;
+            }
+            auto* instTy = ctx_.makeTypeRef();
+            instTy->kind = TypeRef::Kind::Named;
+            instTy->declaration = nts->type;
+            std::vector<const ast::Type*> argAsts;
+            argAsts.reserve(ma.typeArgs.size());
+            for (const auto& ta : ma.typeArgs) {
+                instTy->genericArgs.push_back(ta ? ctx_.resolvedType(*ta)
+                                                : nullptr);
+                argAsts.push_back(ta.get());
+            }
+            ctx_.setExprType(&ma, instTy);
+            // §14.2 constraint check at this instantiation site — the same
+            // dispatch the chain-head receiver (`Registry<int>.Make()`) runs
+            // through `checkGenericConstraintsAtExpr` (fix #3160), so a
+            // nested type's own `where` clause is enforced here too.
+            checkGenericConstraintsAtExpr(ctx_, ma.span.begin, argAsts,
+                                           instTy->genericArgs, nts->type);
+        }
     } else if (auto* ms = dynamic_cast<MethodSymbol*>(member)) {
         // §27.6 (issue #436): a bare `obj.Method` in value position (not the
         // callee of a CallExpr) is a method reference — a function value of

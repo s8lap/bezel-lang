@@ -1102,6 +1102,11 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
 //   `a < b > 0`               → relational chain (> followed by numeric/ident)
 //   `Wrapper.Identity<int>(v)` → method type-arg list (handled by #509)
 // both parsed correctly.
+//
+// fix #7135 (§11.6 / §22.12, v0.343): the same scan is now also consulted
+// after a DOTTED segment, where a closing `>` followed by `.` denotes the
+// NESTED TYPE's own type arguments — §11.6's `Tree<int>.Node<int>.Create()`.
+// The successor rule is the same one (§22.12's), so the scan is unchanged.
 bool Parser::tokensLookLikeReceiverTypeArgs() {
     std::size_t k = 1;                // start scanning after the opening `<`
     std::size_t depth = 1;
@@ -2172,7 +2177,38 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             // parsed when the disambiguating scan confirms the `<` is a
             // generic-arg list (closes with `>` followed by `(`), not a
             // relational `<` operator.
-            if (isPunctuator("<") && tokensLookLikeMethodTypeArgs()) {
+            //
+            // fix #7135 (§11.6 / §22.12 / A.7, v0.343): the same scan also
+            // admits a closing `>` followed by a `.`, which at a DOTTED
+            // segment denotes the NESTED TYPE's own type arguments — §11.6's
+            // worked example `Tree<int>.Node<int>.Create()`, whose `Node<int>`
+            // is a nested type reached through the chain head that supplies
+            // the enclosing type's arguments.  A.7's grammar gives the dotted
+            // segment a `GenericArgs?` slot (`PrimarySuffix ::= "." Identifier
+            // GenericArgs?`) and points it at §22.12's resolution, whose
+            // successor set is exactly the union of the two scans used here: a
+            // token that can continue a primary expression (`.`, `(`) or one
+            // that cannot begin an operand (`)`, `]`, `,`, `;`).
+            //
+            // The relational reading is untouched: a `<` whose closing `>` is
+            // followed by anything else stays the relational operator, and a
+            // relational `>` always has a right operand (`.` cannot begin
+            // one), so `a.b < c`, `a.b < c > d` and `a.b < c > .d` keep
+            // their relational parse.
+            bool haveTypeArgs = false;
+            bool nestedTypeArgs = false;
+            if (isPunctuator("<")) {
+                if (tokensLookLikeMethodTypeArgs()) {
+                    haveTypeArgs = true;
+                } else if (tokensLookLikeReceiverTypeArgs()) {
+                    // The nested-type form: the closing `>` is followed by a
+                    // `.`, so the type arguments belong to the nested type
+                    // this segment names (§11.6's `Tree<int>.Node<int>`).
+                    haveTypeArgs = true;
+                    nestedTypeArgs = true;
+                }
+            }
+            if (haveTypeArgs) {
                 advance(); // past `<`
                 access->typeArgs.push_back(parseType());
                 while (isPunctuator(",")) {
@@ -2188,7 +2224,11 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                 }
                 if (!consumeClosingAngle()) {
                     diagnostics_.report(Severity::Error, current_.location,
-                        "expected '>' to close method type-argument list");
+                        nestedTypeArgs
+                            ? "expected '>' to close nested type-argument "
+                              "list"
+                            : "expected '>' to close method type-argument "
+                              "list");
                 }
             }
             access->span.begin = suffixBegin;

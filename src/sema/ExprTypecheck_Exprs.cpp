@@ -5643,7 +5643,20 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // non-null `ctx_.exprType(*ma->target)` made the
                     // instance-receiver rejection fire on a perfectly legal
                     // type-name access.
-                    dynamic_cast<sema::TypeAliasSymbol*>(recv) != nullptr;
+                    dynamic_cast<sema::TypeAliasSymbol*>(recv) != nullptr ||
+                    // fix #7135 (§11.6 / §22.12, v0.343): a NESTED TYPE
+                    // reached through a chain head that supplies the
+                    // enclosing type's arguments —
+                    // `Tree<int>.Node<int>.Create()` — is a type-name
+                    // receiver too: the static member is reached through the
+                    // nested TYPE, not through an instance. The nested type's
+                    // own explicit type arguments make the receiver's
+                    // exprType non-null (resolveMemberAccess's nested-type
+                    // branch publishes the instantiated TypeRef), which is
+                    // exactly the condition this check reads, so without this
+                    // arm the legal spelling would be rejected as an instance
+                    // access.
+                    dynamic_cast<sema::NestedTypeSymbol*>(recv) != nullptr;
                 bool recvIsPrim = false;
                 if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
                         ma->target.get()))
