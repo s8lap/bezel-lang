@@ -2698,6 +2698,11 @@ private:
     // receiver — whose symbol is a SIBLING of `LocalSymbol`, not a subclass —
     // carries it too.
     void noteMethodGroupBorrow(const ast::Expr& e);
+    // fix #7025 (follow-up, §27.6 / §28.6, v0.343): §28.6's receiver-
+    // ownership rule, read at a §27.6 FORMATION of `Dispose` /
+    // `DisposeAsync` (the call spelling's own check lives in
+    // `handleDischarge`). See the definition's comment.
+    void checkDisposeReceiverOwnershipAtFormation(const ast::MemberAccessExpr& ma);
     void collectIdentifiersIn(
         const ast::Expr& e,
         std::vector<const ast::IdentifierExpr*>& out) const;

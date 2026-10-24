@@ -4615,6 +4615,49 @@ void MethodOwnership::noteMethodGroupBorrow(const ast::Expr& e) {
     sym->borrowedByMethodGroup = true;
 }
 
+// fix #7025 (follow-up, §27.6 / §28.6, v0.343): §28.6's receiver-ownership
+// rule, read AT A §27.6 FORMATION.
+//
+// THE RULE. §27.6: "every receiver-side rule of the call the formation
+// resolves as is read at the formation". §28.6 "Who may call `Dispose()`":
+// "`Dispose()` or a direct `DisposeAsync()` call through a **borrow** is a
+// compile error. The borrow receivers: a borrowed local or parameter —
+// including `this` … — a non-`owned` field read, an owned-field read outside
+// the declaring class, …" and "The owned-receiver rule is exception-free:
+// **only owners dispose**".
+//
+// The CALL spelling already carries that rule (the `handleDischarge` arm that
+// calls `checkDisposeReceiverOwnership` for a `Dispose` / `DisposeAsync`
+// callee). The FORMATION spelling did not: `var f := d.Dispose;` over a
+// borrowed parameter, over `this`, over a non-`owned` field read, or over an
+// `owned` field read outside the declaring class was ACCEPTED — and
+// INVOKING such a group disposed a value the disposing code does not own
+// (MEASURED by the reviewer: `method Take(d: D): int  var f := d.Dispose;
+// f();` ⇒ the destructor ran inside `Take`, i.e. the callee disposed the
+// caller's object).
+//
+// The check below is the SAME authority the call spelling uses
+// (`checkDisposeReceiverOwnership`), so the two spellings of the same member
+// cannot disagree about the same receiver.
+//
+// The pre-scan's `preScanInCallCallee_` flag is the hook: a member access
+// reached as a CALL's CALLEE is a call to the member, not a reference to it,
+// and the call spelling's own check covers it — so the flag keeps this check
+// to the FORMATION sites only, and no program is diagnosed twice.
+void MethodOwnership::checkDisposeReceiverOwnershipAtFormation(
+        const ast::MemberAccessExpr& ma) {
+    if (ma.member != "Dispose" && ma.member != "DisposeAsync") return;
+    if (!ma.target) return;
+    // The same receiver unwrapping the call spelling does (§28.2's
+    // `x!.Dispose()` and `await x.DisposeAsync()` spellings).
+    const ast::Expr* recv = lookThroughForceUnwrap(ma.target.get());
+    if (auto* awaitExpr = dynamic_cast<const ast::UnaryExpr*>(recv))
+        if (awaitExpr->op == "await" && awaitExpr->operand)
+            recv = awaitExpr->operand.get();
+    if (!recv) return;
+    checkDisposeReceiverOwnership(*recv, recv->span.begin);
+}
+
 void MethodOwnership::checkGeneratedDisposeReceiverDisposed(
         const ast::MemberAccessExpr& ma) {
     if (!ma.target) return;
@@ -23959,7 +24002,16 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
         // The stamp is set HERE, in the pre-scan, so it is in place at the
         // explicit-`Dispose()` call site even for a group formed LATER in
         // the body — the whole-body fact the disposal lowering needs.
-        if (!preScanInCallCallee_) noteMethodGroupBorrow(e);
+        if (!preScanInCallCallee_) {
+            noteMethodGroupBorrow(e);
+            // fix #7025 (follow-up, §27.6 / §28.6, v0.343): §28.6's receiver-
+            // ownership rule, read AT THE FORMATION (§27.6: "every
+            // receiver-side rule of the call the formation resolves as is read
+            // at the formation"). The `preScanInCallCallee_` guard above keeps
+            // the CALL spelling to the call spelling's own check, so the two
+            // spellings cannot disagree and no program is diagnosed twice.
+            checkDisposeReceiverOwnershipAtFormation(*ma);
+        }
         if (ma->target) scopedPreScanExpr(*ma->target);
         return;
     }
