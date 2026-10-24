@@ -4155,6 +4155,76 @@ static bool reportGenericEnclosingSegment(DiagnosticEngine& diags,
     return true;
 }
 
+// fix #7085 (§2.7 warning row, v0.343): the chain-head warning row's FIRST
+// half — "chain head resolves to a type while a same-named accessible member
+// exists — warn, *unless* the member's declared type is the resolved type (or
+// an instantiation of the resolved generic)".
+//
+// Extracted from `warnChainHeadTypeShadows` (the VALUE path's site, called
+// from ExprTypecheck_Exprs.cpp) so the TYPE path (this file's `resolveNamed`)
+// and the VALUE path emit ONE rule's text: §2.7's warning row is one rule
+// with two positions, and two texts would let the two sites drift apart.
+//
+// The CARVE-OUT is the rule's own: the member's declared type must not BE
+// the resolved type. For a NESTED TYPE the member's declared type is the
+// type itself, so the carve-out holds exactly when the nested type IS the
+// resolved type — the case where nothing is shadowed and no warning is
+// wanted. `storageComponentType` answers the question for the member kinds
+// it covers (a field, a property); a nested type has no storage component,
+// so its own type is read here.
+static void warnChainHeadMemberShadowedByType(
+    SemaContext& ctx, std::string_view headName,
+    const TypeSymbol* resolvedType, const Symbol* shadowedEnclosingMember,
+    SourceLocation loc) {
+    if (!shadowedEnclosingMember || !resolvedType) return;
+    const TypeRef* memberType =
+        storageComponentType(shadowedEnclosingMember, ctx);
+    bool carveOut = false;
+    if (memberType && memberType->kind == TypeRef::Kind::Named &&
+        memberType->declaration == resolvedType) {
+        carveOut = true;
+    }
+    // §2.7 generic carve-out: the member's declared type is an
+    // instantiation of the resolved generic (e.g. `property Buffer:
+    // Buffer<int>` with resolved type `Buffer`).
+    if (!carveOut && memberType && memberType->kind == TypeRef::Kind::Named &&
+        memberType->declaration == resolvedType &&
+        !resolvedType->genericParams.empty()) {
+        carveOut = true;
+    }
+    // fix #7085: a NESTED TYPE member declares no storage component, so the
+    // carve-out above cannot see it; its declared type is the type itself.
+    const TypeSymbol* memberTypeSym = nullptr;
+    if (const auto* nts =
+            dynamic_cast<const NestedTypeSymbol*>(shadowedEnclosingMember))
+        memberTypeSym = nts->type;
+    else if (const auto* ts =
+                 dynamic_cast<const TypeSymbol*>(shadowedEnclosingMember))
+        memberTypeSym = ts;
+    if (!carveOut && memberTypeSym && memberTypeSym == resolvedType)
+        carveOut = true;
+    if (carveOut) return;
+    std::string memberKind = "member";
+    if (dynamic_cast<const FieldSymbol*>(shadowedEnclosingMember))
+        memberKind = "field";
+    else if (dynamic_cast<const PropertySymbol*>(shadowedEnclosingMember))
+        memberKind = "property";
+    else if (dynamic_cast<const MethodSymbol*>(shadowedEnclosingMember))
+        memberKind = "method";
+    else if (dynamic_cast<const ConstMemberSymbol*>(shadowedEnclosingMember))
+        memberKind = "const";
+    else if (dynamic_cast<const EventSymbol*>(shadowedEnclosingMember))
+        memberKind = "event";
+    ctx.diagnostics().report(
+        Severity::Warning, loc,
+        std::string("warning: chain head `") + std::string(headName) +
+            "` resolves to type `" + std::string(resolvedType->name) +
+            "` while the enclosing type declares a same-named " + memberKind +
+            " — the type wins for chain purposes; qualify with `this." +
+            std::string(headName) + "` to reach the " + memberKind +
+            " (\xC2\xA7""2.7)");
+}
+
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     if (!t.name || t.name->parts.empty()) {
         ref.kind = TypeRef::Kind::Error;
@@ -4289,6 +4359,24 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     }
     // Look up the first part.
     Symbol* sym = nullptr;
+    // fix #7085 (§2.7 chain-head row, v0.343): the ENCLOSING TYPE's member
+    // of the chain head's name, DEFERRED — see the chain-head branch below
+    // and the warning-row site after the `if (!sym)` block. Null unless the
+    // chain head found one.
+    Symbol* chainHeadEnclosingMember = nullptr;
+    bool chainHeadHasEnclosingMember = false;
+    // fix #7085: is `s` the scope of a TYPE BODY — §2.7's "Through nesting"
+    // link? A type's body scope registers ONLY the type's generic parameters
+    // and its NESTED TYPES (§11.3 / #482): never its fields, methods,
+    // properties or events. So "the name is carried by a type-body scope" IS
+    // "the enclosing type declares a member of that name", which is the
+    // distinction §2.7's table turns on. The pairing is the one
+    // `typeBodyScopes_` keeps (each body scope with the type that owns it).
+    auto isTypeBodyScope = [this](const Scope* s) {
+        for (const auto& entry : typeBodyScopes_)
+            if (entry.first == s) return true;
+        return false;
+    };
     // fix #6383 follow-up (§2.7 "Through nesting", v0.338): §2.7's stop rule,
     // applied to the one shape it is stated for — a BARE name. A chain head
     // (`Box.Red`) is a different row of §2.7's normative table, where the
@@ -4321,7 +4409,41 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             return;
         }
     } else {
-        sym = lookupName(first, scope);
+        // fix #7085 (§2.7 chain-head row, v0.343): §2.7's NORMATIVE TABLE
+        // ranks the enclosing type's accessible members LAST at a chain head
+        // — "Chain head — name followed by `.`: Enclosing-type members rank:
+        // last, after aliases" — and its prose says "Because the chain-head
+        // member fallback ranks below imports, it is the one rule-1 source a
+        // later-added import or type declaration can preempt — loudly in
+        // practice, since the preempting type must itself host the accessed
+        // member".
+        //
+        // The scope chain is walked innermost-first, and a type's OWN body
+        // scope sits INSIDE the module scope: so the walk below DEFERS a hit
+        // in a type-body scope (§2.7's "Through nesting" link — the
+        // enclosing type's own scope) and keeps looking outward, through the
+        // current module's declarations and the imported bare names. The
+        // deferred member is used only when no earlier rule-1 position
+        // answers the name (the site after the `if (!sym)` block below).
+        //
+        // A LOCAL scope (a block, a method's parameters) sits INSIDE the type
+        // body scope and is NOT deferred: §2.7 rule 1 puts local scope
+        // first, at every head shape.
+        chainHeadEnclosingMember = nullptr;
+        chainHeadHasEnclosingMember = false;
+        for (Scope* s = scope; s; s = s->parent) {
+            auto it = s->names.find(first);
+            if (it == s->names.end()) continue;
+            if (isTypeBodyScope(s)) {
+                if (!chainHeadHasEnclosingMember) {
+                    chainHeadEnclosingMember = it->second;
+                    chainHeadHasEnclosingMember = true;
+                }
+                continue;  // §2.7 chain-head row: ranks LAST
+            }
+            sym = it->second;
+            break;
+        }
         // fix #7013 (§2.2, §11.6, v0.340): the CHAIN HEAD is a bare
         // enclosing segment, and §11.6 says "A bare enclosing segment fixes
         // arity 0" — A.5 admits a type-argument list after the LAST segment
@@ -4344,10 +4466,11 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         if (TypeSymbol* head = dynamic_cast<TypeSymbol*>(sym)) {
             if (!head->genericParams.empty()) {
                 // Rule 1's SCOPE positions, in order: local scope, then the
-                // enclosing type's accessible members, then the current
-                // module's declarations. A candidate whose arity does not
-                // match is SKIPPED, not fatal (§2.2's rule is "the first, in
-                // that rule's order, whose arity its type-argument list
+                // current module's declarations (the enclosing type's
+                // accessible members rank LAST at a chain head — see the
+                // walk above). A candidate whose arity does not match is
+                // SKIPPED, not fatal (§2.2's rule is "the first, in that
+                // rule's order, whose arity its type-argument list
                 // fixes"). A scope entry that is not a TYPE is not an arity
                 // candidate at all — §2.2's rule selects among "the types
                 // rule 1 of §2.7 finds" — so the walk stops there and the
@@ -4356,6 +4479,11 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 for (Scope* s = scope; s; s = s->parent) {
                     auto it = s->names.find(first);
                     if (it == s->names.end()) continue;
+                    // fix #7085: the enclosing type's members rank LAST at a
+                    // chain head, so they are not consulted here — the
+                    // IMPORTED position comes first, and the deferred member
+                    // is the last candidate (below).
+                    if (isTypeBodyScope(s)) continue;
                     auto* ts = dynamic_cast<TypeSymbol*>(it->second);
                     if (!ts) break;  // a non-type binds the name here
                     if (ts->genericParams.empty()) {
@@ -4369,6 +4497,22 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                     // Rule 1's IMPORTED positions.
                     selected = selectImportedTypeByArity(
                         ctx_, sourceImports_, first, 0, &ambiguousModules);
+                }
+                if (!selected && chainHeadHasEnclosingMember) {
+                    // fix #7085: the enclosing type's member is the LAST
+                    // rule-1 candidate at a chain head, so it is consulted
+                    // only when neither the scope positions nor the imports
+                    // hold an arity-0 type of the name. A nested type of the
+                    // enclosing type is carried as a `NestedTypeSymbol`
+                    // (§11.3 / #482), whose TYPE is the candidate.
+                    if (auto* nts = dynamic_cast<NestedTypeSymbol*>(
+                            chainHeadEnclosingMember)) {
+                        if (nts->type && nts->type->genericParams.empty())
+                            selected = nts->type;
+                    } else if (auto* ts = dynamic_cast<TypeSymbol*>(
+                                   chainHeadEnclosingMember)) {
+                        if (ts->genericParams.empty()) selected = ts;
+                    }
                 }
                 if (selected) {
                     sym = selected;
@@ -5904,16 +6048,54 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 return;
             }
         }
-        {
-            std::string msg = std::string("unresolved type name `") +
-                              std::string(first) + "`";
-            std::string hint = owningRenameHint(first);  // v0.168 (#1372)
-            if (!hint.empty()) msg += "; " + hint;
-            ctx_.diagnostics().report(Severity::Error, t.span.begin, msg);
+        // fix #7085 (§2.7 chain-head row, v0.343): the enclosing type's
+        // member is the LAST rule-1 candidate at a chain head, so it is the
+        // answer only when no EARLIER position answered the name. Every
+        // earlier position is consulted above — the module's declarations
+        // (#6425's local-type head and the module-children fallback), the
+        // import ALIASES (§2.2), the imported bare names (the §2.2
+        // collision arm), and the always-available names (Slice S24) — and
+        // each of them returned or set `sym` when it applied. Nothing did,
+        // so the deferred member is bound here rather than the name being
+        // reported unresolved.
+        if (chainHeadHasEnclosingMember && chainHeadEnclosingMember) {
+            sym = chainHeadEnclosingMember;
+        } else {
+            {
+                std::string msg = std::string("unresolved type name `") +
+                                  std::string(first) + "`";
+                std::string hint = owningRenameHint(first);  // v0.168 (#1372)
+                if (!hint.empty()) msg += "; " + hint;
+                ctx_.diagnostics().report(Severity::Error, t.span.begin, msg);
+            }
+            ref.kind = TypeRef::Kind::Error;
+            return;
         }
-        ref.kind = TypeRef::Kind::Error;
-        return;
         }  // end of the `if (!sym)` that the #6425 local-type head can leave
+    }
+    // fix #7085 (§2.7 warning row, v0.343): "chain head resolves to a type
+    // while a same-named accessible member exists — warn, *unless* the
+    // member's declared type is the resolved type (or an instantiation of the
+    // resolved generic)".
+    //
+    // The chain head resolved to a type that is NOT the enclosing type's
+    // same-named member (the member is the deferred one, above), so that
+    // member is shadowed at this chain head and the spec asks for the
+    // warning. The carve-out — the member's declared type IS the resolved
+    // type — is decided inside the helper, and it holds exactly for the
+    // nested-type member whose type IS the resolved type (nothing is
+    // shadowed then).
+    if (chainHeadHasEnclosingMember && chainHeadEnclosingMember &&
+        chainHeadEnclosingMember != sym) {
+        const TypeSymbol* resolvedType = nullptr;
+        if (const auto* ts = dynamic_cast<const TypeSymbol*>(sym))
+            resolvedType = ts;
+        else if (const auto* nts = dynamic_cast<const NestedTypeSymbol*>(sym))
+            resolvedType = nts->type;
+        if (resolvedType)
+            warnChainHeadMemberShadowedByType(
+                ctx_, first, resolvedType, chainHeadEnclosingMember,
+                t.span.begin);
     }
     // For multi-part QualifiedNames, descend through the looked-up symbol's
     // nested types for each subsequent part. Per Grammar A.8 / §11.3:
@@ -7908,58 +8090,12 @@ void warnChainHeadTypeShadows(
     // Color: Color` idiom is exactly the case where it IS, and the
     // warning would falsely advise `this.` qualification for what is
     // already the same store.
-    if (shadowedEnclosingMember && resolvedType) {
-        const TypeRef* memberType =
-            storageComponentType(shadowedEnclosingMember, ctx);
-        bool carveOut = false;
-        if (memberType && memberType->kind == TypeRef::Kind::Named &&
-            memberType->declaration == resolvedType) {
-            carveOut = true;
-        }
-        // §2.7 generic carve-out: the member's declared type is an
-        // instantiation of the resolved generic (e.g.
-        // `property Buffer: Buffer<int>` with resolved type `Buffer`).
-        // Detected when the member's declared TypeRef is Named, the
-        // resolved type is a generic, and the member's declaration is
-        // the same generic type symbol. (An exact-arity check isn't
-        // necessary: a member declared with the wrong number of type
-        // args would already have been rejected at the declaration
-        // site, so a Named TypeRef whose declaration matches the
-        // resolved generic is by construction an instantiation of it.)
-        if (!carveOut && memberType &&
-            memberType->kind == TypeRef::Kind::Named &&
-            memberType->declaration == resolvedType &&
-            !resolvedType->genericParams.empty()) {
-            carveOut = true;
-        }
-        if (!carveOut) {
-            std::string memberKind = "member";
-            if (dynamic_cast<const FieldSymbol*>(shadowedEnclosingMember))
-                memberKind = "field";
-            else if (dynamic_cast<const PropertySymbol*>(
-                         shadowedEnclosingMember))
-                memberKind = "property";
-            else if (dynamic_cast<const MethodSymbol*>(
-                         shadowedEnclosingMember))
-                memberKind = "method";
-            else if (dynamic_cast<const ConstMemberSymbol*>(
-                         shadowedEnclosingMember))
-                memberKind = "const";
-            else if (dynamic_cast<const EventSymbol*>(
-                         shadowedEnclosingMember))
-                memberKind = "event";
-            ctx.diagnostics().report(
-                Severity::Warning, loc,
-                std::string("warning: chain head `") + std::string(headName) +
-                    "` resolves to type `" +
-                    std::string(resolvedType->name) +
-                    "` while the enclosing type declares a same-named " +
-                    memberKind + " — the type wins for chain purposes; "
-                    "qualify with `this." + std::string(headName) +
-                    "` to reach the " + memberKind +
-                    " (\xC2\xA7""2.7)");
-        }
-    }
+    //
+    // fix #7085: the half is now `warnChainHeadMemberShadowedByType`, the
+    // ONE text for the rule — the TYPE path (`resolveNamed`, this file)
+    // calls the same helper, so the two positions cannot drift apart.
+    warnChainHeadMemberShadowedByType(ctx, headName, resolvedType,
+                                       shadowedEnclosingMember, loc);
 
     // (B) §2.7 consequence: a type named `A` in scope shadows an imported
     // module-name prefix `A.…` — warn when both readings exist. The local

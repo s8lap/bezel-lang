@@ -354,13 +354,25 @@ end C;
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
-// §2.7 (v0.340): an ENCLOSING-TYPE MEMBER of the head's name is rule 1's
-// earlier position than the current module's declarations, so it wins over
-// both the local generic `C<T>` and the imported non-generic `C`. This is
-// the control that the arity-0 selection does not overtake an enclosing
-// member that already answers the name.
+// §2.7 (v0.343): an ENCLOSING-TYPE MEMBER of the head's name ranks LAST at
+// a CHAIN HEAD — §2.7's normative table's chain-head row ("Enclosing-type
+// members rank: last, after aliases"), which the prose states as "Because
+// the chain-head member fallback ranks below imports, it is the one rule-1
+// source a later-added import or type declaration can preempt".
+//
+// ⚠ THIS ROW FLIPPED with fix #7085 (§2.7, v0.343). It was named
+// `enclosing_member_head_outranks_the_import_spec_2_7` and pinned the
+// enclosing member's WIN (stdout "6\n"), which is the behaviour §2.7's
+// chain-head row forbids: the shape under test is a CHAIN HEAD (`C.N` — the
+// head `C` is followed by `.`), not a bare type name, and the row's comment
+// cited the "Bare type name" row's rank, which is a DIFFERENT row of the
+// table. The imported non-generic `C` now wins (stdout "7\n"), and §2.7's
+// warning row polices the shadowed enclosing member.
+//
+// The name is changed with the behaviour: the old name asserted the
+// non-conformant ordering.
 BEZEL_TEST(chain_head_arity_selection_7013,
-           enclosing_member_head_outranks_the_import_spec_2_7) {
+           imported_type_outranks_the_enclosing_member_spec_2_7) {
     const std::string app = R"(
 module App9;
 import LC;
@@ -387,7 +399,9 @@ end Outer;
                                 "App9");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.stdoutText, "6\n");
+    // fix #7085 (§2.7, v0.343): the imported `C` wins the chain head, so
+    // the program prints 7 — the base printed 6 (the enclosing member).
+    BEZEL_EXPECT_EQ(r.stdoutText, "7\n");
 }
 
 // §2.2 (v0.340): the import stays reachable by QUALIFIER — "A declaration
