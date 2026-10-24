@@ -27130,9 +27130,58 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
                 if (ma->target) {
                     auto* tt = ctx_.exprType(*ma->target);
+                    // fix #7139 / §7.4 / §7.11 / §9.6 / §28.9 (v0.343): the
+                    // receiver's DECLARED nullability is NOT part of the
+                    // producer contract, and reading it here is what made
+                    // EVERY string-producing §9.6 instance method leak its
+                    // producer's reference on a §7.4-narrowed `string?`
+                    // receiver.
+                    //
+                    // §7.4 (v0.343): "Member access, method calls, and
+                    // indexing on a nullable value are compile errors unless
+                    // the compiler has narrowed it to non-null". Sema
+                    // enforces that in ONE gate (ExprTC::resolveMemberAccess),
+                    // and the gate rejects EVERY nullable receiver that is not
+                    // narrowed: a simple local / parameter whose §7.4 flow
+                    // fact does not hold, a field or property that is not a
+                    // narrowed `readonly` path, an index result, and every
+                    // other expression shape (a call result, a conditional, a
+                    // `??` result, …). ⇒ a member access whose receiver's
+                    // static type is still `string?` at THIS point is a
+                    // receiver §7.4 has narrowed non-null — the program would
+                    // not have compiled otherwise. The narrowing is a FLOW
+                    // fact, so the receiver's DECLARED type stays `string?`
+                    // and `ctx_.exprType` still reports it as nullable.
+                    //
+                    // §7.11 (v0.343): "The rule reads the operand's static
+                    // type, so an operand that §7.4 has narrowed non-null is a
+                    // non-nullable operand and the ordinary operator applies
+                    // to it unchanged." ⇒ after the narrowing the receiver IS a
+                    // non-nullable operand, and the ordinary (non-nullable)
+                    // path is the one that runs.
+                    //
+                    // The LOWERING agrees, so the two stay in lockstep:
+                    // tryLowerStringMethod does not branch on the receiver's
+                    // nullability — `string?` is a BARE nullable pointer
+                    // (isNullableRefTy: "Covers `string?`, `Object?`, and
+                    // nullable class/interface fields"), so `self` is the
+                    // same `bz_string*` in both cases — and it mints the fresh
+                    // string at rc := 1 either way. Reading the DECLARED
+                    // nullability here made the recognizer and the lowering
+                    // DISAGREE about the receiver: the consumer then retained
+                    // on top of the producer's +1 and the producer's original
+                    // +1 never died. MEASURED before this fix: 3269 byte(s)
+                    // in 79 allocation(s) for a 40-iteration loop of
+                    // `var s: string? := "x"; var t: string := s.Repeat(50);`
+                    // (83 B per iteration: the 32-byte `bz_string` header plus
+                    // the 51-byte data buffer).
+                    //
+                    // The `?.` spelling is a DIFFERENT AST node
+                    // (ast::NullCondMemberExpr) and never reaches this arm —
+                    // it keeps its own classification, and its own codegen gap
+                    // is tracked separately (#7130).
                     if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
-                        tt->primitive == sema::PrimitiveType::String &&
-                        !tt->nullable) {
+                        tt->primitive == sema::PrimitiveType::String) {
                         std::string_view m = ma->member;
                         std::size_t argc = call->args.size();
                         // §9.6 ToUpper/ToLower: no args. Inline malloc + initStringRc.
