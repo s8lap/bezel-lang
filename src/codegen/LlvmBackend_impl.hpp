@@ -11837,8 +11837,146 @@ private:
     // `tryLowerStringMethod` must go through it, so a §9.6 member added later
     // cannot forget the release (the #7120 lane's per-arm fix was the shape
     // that let the other arms leak; this is the shape that cannot).
+    //
+    // fix #7169 (§9.6, v0.343): `ownedProducers` is the LIST of the
+    // caller-owned +1 string producers the CALL holds: the receiver's
+    // producer for a member call, a `string` argument's producer for a static
+    // call, and one entry for each when a call holds both. Every non-null
+    // entry is released on the throw edge; an empty list is exactly
+    // `emitGuardThrow`. The list is what lets ONE guard shape serve the
+    // member arms (receiver) and the static arms (argument) alike.
     void emitGuardThrowReleasingString(llvm::Value* cond, const char* name,
-                                       llvm::Value* ownedReceiver);
+                                       llvm::ArrayRef<llvm::Value*> ownedProducers);
+
+    // fix #6639 (§5.1, v0.343): widen an `int`-typed PARAMETER to i64 the way
+    // its SOURCE type's signedness requires, instead of always sign-extending.
+    //
+    // §5.1 (v0.343): "a value converts implicitly … when no programmer-visible
+    // information is lost", and "widening from unsigned to a strictly larger
+    // signed type (e.g. `byte → short`, `ushort → int`) is permitted because
+    // no value is lost". So a `byte` 200 is the `int` 200 — the widening is
+    // LOSSLESS and must preserve the value. A bare `CreateSExt` read the
+    // unsigned source's high bit as a sign bit, so a `byte` startIndex of 200
+    // arrived as -56: the char-needle arm then raised IndexOutOfRangeException
+    // and the string-needle arm silently searched from 0.
+    //
+    // The signedness is the SOURCE's, read from the sema type of the argument
+    // expression (`typeRefIsUnsigned` → `isUnsignedPrim`, the same predicate
+    // the §18.5 format path uses for a `byte` operand). An UNSIGNED source
+    // zero-extends; a SIGNED one sign-extends. A nullable source (`int?`,
+    // narrowed per §7.4) keeps the payload's signedness — the payload of an
+    // `int?` is an `int`.
+    //
+    // ⚠ The value must be widened BY ITS OWN SIGNEDNESS, not by the width of
+    // the parameter. Widening to the parameter's declared `int` width first
+    // would sign-extend a `byte` 200 to the int -56 before the zero-extension
+    // could see it.
+    //
+    // fix #7169 (§9.6, v0.343): this helper is EMITTER-SCOPE (it used to be a
+    // local lambda inside `tryLowerStringMethod`), because stdlib §9.6's
+    // range contracts are enforced in TWO files — the instance arms lower in
+    // `LlvmBackend_String.cpp`, the static `Repeat(c: char, count: int)` arm
+    // lowers in `LlvmBackend_Calls2.cpp` — and a file-local helper is not
+    // reachable from the second file. The static arm used to re-implement the
+    // rule inline, and the pair drifted (#7104 fixed the instance arm, #7117
+    // filed the static arm's, #7120 had to repair the static widening AGAIN
+    // to make its own new guard correct). One definition, one rule.
+    llvm::Value* widenIntParam(const ast::Expr* arg, llvm::Value* v,
+                                const char* signedName, const char* unsignedName) {
+        if (!v) return v;
+        if (v->getType()->isIntegerTy(64)) return v;
+        return typeRefIsUnsigned(ctx_.exprType(*arg))
+            ? builder_.CreateZExt(v, i64(), unsignedName)
+            : builder_.CreateSExt(v, i64(), signedName);
+    }
+
+    // fix #7106 (§5.1, v0.343): fit an `int`-typed PARAMETER that must land in
+    // an i32 SLOT (the span struct's Start/Length are i32 fields) to that slot
+    // BY THE SOURCE'S SIGNEDNESS.
+    //
+    // ⚠ This is NOT `widenIntParam`: that helper widens to i64 — the width the
+    // runtime helpers take — while the span's Start/Length are i32. Copying the
+    // #7102 fix here would emit an i64 into an i32 struct field.
+    //
+    // The pre-existing code did `CreateTrunc(v, i32())` for every value that
+    // was not already i32. A `trunc` to a WIDER type is malformed IR, so a
+    // `byte` start (i8) aborted the compiler:
+    //
+    //     DestTy too big for Trunc
+    //       %4 = trunc i8 %3 to i32
+    //     bezelc: codegen error: IR verification failed (malformed IR emitted)
+    //
+    // ⇒ an ICE on a program §5.1 admits.
+    //
+    // §5.1 (v0.343): a `byte` above the signed midpoint is the `int` 200, not
+    // -56 ("A value of one type implicitly converts to another when no
+    // programmer-visible information is lost"; the table row
+    // `| byte | short, ushort, int, uint, long, ulong, float, double, decimal |`).
+    // ⇒ an UNSIGNED source (`byte`, `ushort`, `uint`, `ulong`, `char`) ZERO-
+    // extends; a SIGNED one (`sbyte`, `short`, `int`) SIGN-extends. A value
+    // already i32 is used as is. A WIDER one (i64) keeps the pre-existing
+    // trunc — `long → int` is never implicit (§5.1's never-implicit list), so
+    // that arm is unreachable for a well-typed program and is kept only so the
+    // helper never hands a non-i32 value to an i32 slot.
+    //
+    // fix #7169 (§9.6, v0.343): emitter-scope, for the same reason as
+    // `widenIntParam` above — the §5.1 widening rules are ONE set.
+    llvm::Value* fitToI32(const ast::Expr* arg, llvm::Value* v) {
+        if (!v || !v->getType()->isIntegerTy()) return v;
+        unsigned w = v->getType()->getIntegerBitWidth();
+        if (w == 32) return v;
+        if (w < 32) {
+            return typeRefIsUnsigned(ctx_.exprType(*arg))
+                ? builder_.CreateZExt(v, i32(), "fit32.z")
+                : builder_.CreateSExt(v, i32(), "fit32.s");
+        }
+        return builder_.CreateTrunc(v, i32(), "fit32.t");
+    }
+
+    // fix #7169 (§9.6, §5.1, §28.9, §31.4, v0.343): the ONE place stdlib
+    // §9.6's "a negative count/width raises ArgumentOutOfRangeException"
+    // contract is enforced — the `Pad*` width and the `Repeat` count.
+    //
+    // stdlib §9.6 (v0.343) declares the count contract on the static
+    // `Repeat(c: char, count: int)` — "count < 0 raises
+    // ArgumentOutOfRangeException; count = 0 is \"\"" — and, by "same count
+    // contract", on `Repeat(unit: string, count: int)`; and the Pad contract
+    // on all three Pad members — "totalWidth <= Length returns the original
+    // string unchanged; totalWidth < 0 raises ArgumentOutOfRangeException".
+    //
+    // ⚠ The WIDENING is a PREREQUISITE of the guard, not an extra: the guard
+    // must test the count's §5.1 value, and §5.1 admits `byte → int` as a
+    // LOSSLESS conversion — an unsigned source must therefore ZERO-extend (a
+    // `byte` 200 is the int 200, never -56). The count is widened ONCE, and
+    // the SAME value is tested by the guard and used as the length/width.
+    //
+    // `ownedOnThrow` is the LIST of the caller-owned +1 string producers the
+    // call holds — the receiver's producer for a member call, the `string`
+    // argument's producer for a static call — and they are RELEASED on the
+    // throw edge (§28.9: the exception unwinds past the caller's post-call
+    // release; §31.4: the built-in exceptions are trivial-dispose, so nothing
+    // else releases it). This is the #7159 shape, and it is a PARAMETER of
+    // the contract function rather than a step each arm remembers: the
+    // future `Repeat(unit: string, count: int)` overload (#7129/#7131) passes
+    // the `unit` argument's producer here, so its guard releases it by
+    // construction instead of by remembering.
+    //
+    // Returns the widened count, so the caller uses the SAME value the guard
+    // tested.
+    llvm::Value* emitSection96CountContract(
+            const ast::Expr* countArg, llvm::Value* countRaw,
+            llvm::ArrayRef<llvm::Value*> ownedOnThrow,
+            const char* signedName, const char* unsignedName,
+            const char* compareName) {
+        llvm::Value* count64 = widenIntParam(countArg, countRaw, signedName,
+                                             unsignedName);
+        llvm::Value* neg = builder_.CreateICmpSLT(count64,
+                                                  builder_.getInt64(0),
+                                                  compareName);
+        emitGuardThrowReleasingString(neg, "ArgumentOutOfRangeException",
+                                      ownedOnThrow);
+        return count64;
+    }
 
     // §6.5 / §31.4 (v0.242, #3045): guard a shift's COUNT against its domain
     // `0 .. bitwidth(l)−1` — the width of the LEFT (shifted) operand, since

@@ -1267,19 +1267,34 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // clamp then hid it as 0 (that is the symptom #7117 reports; this
         // widening repairs it). The count is now widened ONCE, and the SAME
         // value is tested by the guard and used as the length.
-        const sema::TypeRef* cntTy = ctx_.exprType(*call.args[cntArgIdx].value);
-        llvm::Value* count64 = cnt->getType()->isIntegerTy(64)
-            ? cnt
-            : (typeRefIsUnsigned(cntTy)
-                   ? builder_.CreateZExt(cnt, i64(), "rep.z64")
-                   : builder_.CreateSExt(cnt, i64(), "rep.s64"));
-        // §9.6 (v0.343): "count < 0 raises ArgumentOutOfRangeException".
-        // The guard is emitted BEFORE the `malloc` below, so a negative count
+        //
+        // fix #7169 (§9.6, v0.343): the widening, the comparison and the
+        // raise are now the SHARED §9.6 count contract
+        // (`emitSection96CountContract`, in the emitter header) — the SAME
+        // function the instance `Repeat` arm and the `Pad*` arm call. This
+        // arm used to RE-IMPLEMENT the §5.1 widening inline (the shared
+        // helper was a local lambda in `LlvmBackend_String.cpp`, unreachable
+        // from here), and the pair drifted: #7104 fixed the instance arm's
+        // widening, #7117 filed this arm's, and #7120 had to repair this
+        // arm's widening AGAIN to make its own new guard correct. One
+        // definition, one rule.
+        //
+        // §9.6 (v0.343): "count < 0 raises ArgumentOutOfRangeException". The
+        // guard is emitted BEFORE the `malloc` below, so a negative count
         // allocates nothing. `count = 0` is NOT an error (§9.6): the result
         // is the empty string.
-        llvm::Value* neg = builder_.CreateICmpSLT(count64, builder_.getInt64(0),
-                                                  "rep.neg");
-        emitGuardThrow(neg, "ArgumentOutOfRangeException");
+        //
+        // The release set is EMPTY here: `Repeat(c: char, count: int)` holds
+        // no +1 string producer (a `char` and an `int` are not producers), so
+        // its throw edge has nothing to release — which is exactly why this
+        // arm's guard was a plain `emitGuardThrow`. The future
+        // `Repeat(unit: string, count: int)` overload (#7129/#7131) takes a
+        // `string` argument, and passes the `unit` argument's producer here
+        // so its throw edge releases it (§28.9/§31.4 — the #7159 shape) by
+        // construction, not by remembering.
+        llvm::Value* count64 = emitSection96CountContract(
+                call.args[cntArgIdx].value.get(), cnt, {},
+                "rep.s64", "rep.z64", "rep.neg");
         llvm::Value* chI8 = builder_.CreateTrunc(
             ch->getType()->isIntegerTy(32) ? ch
                 : builder_.CreateSExt(ch, i32()), i32());  // keep i32 for memset
