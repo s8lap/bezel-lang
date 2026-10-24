@@ -3,6 +3,7 @@
 #include "common/BuiltinRegistry.hpp"
 #include "common/OwnershipFacts.hpp"  // §35.7 (#2045): classifyChoiceType
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
+#include "sema/GenericParams.hpp"  // genericParamCount / genericParamNameAt — #3143
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
@@ -4365,6 +4366,90 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     if (cn == "OwningStack" || cn == "OwningQueue" ||
                         cn == "OwningLinkedList" || cn == "OwningSet" ||
                         cn == "OwningSlotMap") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, e.span.begin,
+                            std::string("type `") +
+                                std::string(cn) +
+                                "<T>` does not declare an indexer — "
+                                "`a[i]` requires an indexer (§23.4)");
+                    }
+                    // fix #7114 (§23.4 / §4.6 / §4.10 / §4.11 / §4.18,
+                    // v0.343): the BORROWING half of the very same family —
+                    // `LinkedList<T>` (stdlib §4.6), `Set<T>` (§4.10),
+                    // `Stack<T>` and `Queue<T>` (§4.11), and `SortedSet<T>`
+                    // (§4.18) — declares NO indexer either, and #5588's arm
+                    // named only the `Owning…` half of each pair. The
+                    // omission is the defect this issue reports: an index
+                    // expression on such a receiver is an indexer access on a
+                    // type that declares no indexer, so there is no member to
+                    // read and §2.7's name-resolution rule (a reference that
+                    // names nothing does not resolve) applies. The IndexExpr
+                    // was left untyped, and codegen's lowerCollectionIndexerGet
+                    // picked the receiver up through the SAME
+                    // kArrayBackedCollections registration #5588's comment
+                    // names (that table exists for NON-indexer operations like
+                    // `.Count`, not for a positional read), so the program
+                    // compiled, ran and exited 0 with a wrong answer.
+                    //
+                    // MEASURED on the pre-fix base (r30-c1 tip 9c966ddf), for
+                    // `var v: int := x[0];` after one element was stored:
+                    //   * `LinkedList<int>` — the #2434 backstop degraded the
+                    //     read to a zero-initialised value: the program
+                    //     COMPILED, RAN, exited 0 and printed `0` where the
+                    //     list held `1` (the issue's own repro).
+                    //   * `Stack<int>` / `Queue<int>` — NO diagnostic at all;
+                    //     codegen read the collection's array backing store
+                    //     directly and printed `1`, a plausible-but-wrong
+                    //     answer (a Stack iterates top-to-bottom and a Queue
+                    //     front-to-back, and NEITHER declares a positional
+                    //     read at all).
+                    //   * `Set<int>` / `SortedSet<int>` — NO diagnostic; the
+                    //     hash-table backing store was read as if it were an
+                    //     array and the program printed a garbage value.
+                    // All five are one defect in one arm, so all five are
+                    // rejected here.
+                    //
+                    // A declared generic PARAMETER may carry one of these
+                    // head names (`method F<Set>(x: Set)`), and such a
+                    // receiver is the DECLARATION's own type parameter
+                    // (§14.2), not the builtin — MEASURED on the pre-fix
+                    // base, a parameter named `Set` reaches this very branch
+                    // (head "Set", no generic arguments), so the guard is
+                    // not hypothetical. The three lookups mirror the ones the
+                    // tryIndexerConstraint arm below uses for the same
+                    // question, except that the class's parameters are read
+                    // through `sema::genericParamNameAt` — the ONE accessor
+                    // for a type's declared parameter names (#3143) — because
+                    // `TypeSymbol::decl` is null for an IMPORTED class and
+                    // the AST-gated read is exactly the seam
+                    // scripts/check_imported_symbol_reads.py ratchets (#3152).
+                    bool cnIsDeclaredTypeParam = false;
+                    if (currentMethodDecl_)
+                        for (const auto& gp : currentMethodDecl_->genericParams)
+                            if (gp.name == cn) {
+                                cnIsDeclaredTypeParam = true;
+                                break;
+                            }
+                    if (!cnIsDeclaredTypeParam && currentType_) {
+                        const std::size_t n = genericParamCount(currentType_);
+                        for (std::size_t i = 0; i < n; ++i)
+                            if (genericParamNameAt(currentType_, i) == cn) {
+                                cnIsDeclaredTypeParam = true;
+                                break;
+                            }
+                    }
+                    if (!cnIsDeclaredTypeParam && currentExtension_ &&
+                        currentExtension_->decl)
+                        if (auto* ed =
+                                dynamic_cast<const ast::ExtensionDecl*>(
+                                    currentExtension_->decl))
+                            if (ed->targetType &&
+                                isExtensionTargetTypeParam(*ed->targetType, cn))
+                                cnIsDeclaredTypeParam = true;
+                    if (!cnIsDeclaredTypeParam &&
+                        (cn == "LinkedList" || cn == "Stack" ||
+                         cn == "Queue" || cn == "Set" ||
+                         cn == "SortedSet")) {
                         ctx_.diagnostics().report(
                             Severity::Error, e.span.begin,
                             std::string("type `") +
