@@ -6190,9 +6190,56 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // `string.Join` as an `rc := 1` heap-string producer — stays
             // CONSISTENT with the rejection by construction: a rejected call
             // is never classified.
+            //
+            // fix #7191 (§22.5, stdlib §9.6, v0.343): the SEPARATOR is the
+            // PARAMETER named `separator`, and §22.5 binds a named argument to
+            // the parameter it NAMES, never to the position it occupies:
+            // "named arguments may appear in any order after positional
+            // arguments. Each supplied argument binds exactly one parameter".
+            // This gate read `ce.args[0]` POSITIONALLY, so
+            // `string.Join(items := parts, separator := ",")` was checked
+            // against the ITEMS argument and REJECTED — naming the WRONG
+            // parameter — while the very same call spelled in declaration
+            // order was accepted. The two spellings name the same parameters
+            // and supply the same arguments; they are the same call.
+            //
+            // WHERE THE BINDING COMES FROM. The published §22.5 binding
+            // (`ctx_.builtinCallBinding`) is NOT available here: this gate runs
+            // early in `typeCall`, and the publication (`checkBuiltinNamedArgs`
+            // -> `ctx_.setBuiltinCallBinding`) happens at the END of it. So the
+            // binding is established LOCALLY, with the SHARED §22.5 binder
+            // (`bindArgsToParams` — the same one `checkBuiltinNamedArgs`
+            // runs) over the REGISTRY's declared names
+            // (`common::builtinParamNameCandidates`, whose `string.Join`/2 row
+            // carries {"separator", "items"}), so NO second name table is
+            // introduced here.
+            //
+            // A call that does not bind at all (an unknown name, a double
+            // bind, a positional argument after a named one) keeps the
+            // POSITIONAL read: `checkBuiltinNamedArgs` reports the §22.5
+            // violation later, and the separator must still be type-checked
+            // here, so that a non-`string` separator is rejected rather than
+            // lowered.
             if (recvPt == PrimitiveType::String && mm == "Join" &&
                 ce.args.size() == 2) {
-                const auto& sepArg = ce.args[0];
+                std::size_t sepArgIdx = 0;  // parameter 0 is `separator`
+                for (const auto& f : common::builtinParamNameCandidates(
+                         tid->name, "Join", ce.args.size())) {
+                    BindResult br = bindArgsToParams(
+                        sema::FormalsView::ofNames(f.names, f.required), ce.args,
+                        ce.span.begin, "call to built-in `string.Join`",
+                        /*emit=*/false);
+                    if (!br.ok) continue;  // not this overload's binding
+                    for (std::size_t p = 0; p < f.names.size(); ++p) {
+                        if (f.names[p] != "separator") continue;
+                        const int src = br.paramToArg[p];
+                        if (src >= 0 &&
+                            static_cast<std::size_t>(src) < ce.args.size())
+                            sepArgIdx = static_cast<std::size_t>(src);
+                    }
+                    break;
+                }
+                const auto& sepArg = ce.args[sepArgIdx];
                 if (sepArg.value && !sepArg.isDiscard) {
                     TypeRef* sepTy = ctx_.exprType(*sepArg.value);
                     if (sepTy) {
