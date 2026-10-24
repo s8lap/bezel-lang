@@ -869,6 +869,8 @@ s14_1_0001	pass
 s14_1_0005	pass	
 s14_1_0006	pass	
 s14_1_0007	pass	
+s14_1_0008	pass	
+s14_1_0009	pass	
 s14_2_0001	pass	
 s14_2_0002	pass	
 s14_2_0003	pass	
@@ -1924,6 +1926,8 @@ s28_3_0223	pass
 s28_3_0224	fail	#7125: the direct-call path discharges the unbound owned temporary at the enclosing scope's end, not at the K8 full-expression boundary
 s28_3_0225	fail	#7125: the function-value path's discharge gate requires a class-typed formal; an interface-typed formal leaves the temporary undischarged
 s28_3_0226	pass	
+s28_3_0227	fail	#7187: a while condition's unbound owned temporary accumulates across evaluations (K8.2) instead of being disposed at each evaluation's full-expression boundary
+s28_3_0228	pass	
 s28_4_0001	pass	
 s28_4_0002	pass	
 s28_4_0003	pass	
@@ -3055,6 +3059,13 @@ l9_6_0019	pass
 l9_6_0020	pass	
 l9_6_0021	pass	
 l9_6_0022	pass	
+l9_6_0023	pass	
+l9_6_0024	pass	
+l9_6_0025	pass	
+l9_6_0026	pass	
+l9_6_0027	fail	#7198 residual: the compiler admits a string in string.Join's items slot (§9.6 declares items: IEnumerable<string>)
+l9_6_0028	pass	
+l9_6_0029	fail	#7198 residual: the compiler admits the reordered named-argument string.Join whose slots carry the wrong types
 l9_7_0001	pass	
 l9_7_0002	pass	
 l9_8_0001	fail	divergence
@@ -3254,6 +3265,7 @@ s22_5_0013	pass
 s22_5_0014	pass	
 s22_5_0015	pass	
 s22_5_0016	pass	
+s22_5_0017	pass	
 s28_11_0040	pass	
 s28_11_0041	pass	
 s5_1_0134	pass	
@@ -3283,3 +3295,4 @@ s5_1_0143	pass
 s5_1_0144	pass	
 s5_1_0145	pass	
 s5_1_0146	pass	
+s5_1_0147	pass	
