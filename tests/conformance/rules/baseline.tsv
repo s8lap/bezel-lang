@@ -135,6 +135,7 @@ s3_4_0002	pass
 s3_4_0003	pass	
 s3_4_0004	pass	
 s3_4_0005	pass	
+s3_4_0006	pass	
 s3_5_0001	pass	
 s3_5_0002	pass	
 s3_5_0003	pass	
@@ -338,6 +339,13 @@ s7_4_0104	pass
 s7_4_0105	pass	
 s7_4_0106	pass	
 s7_4_0107	pass	
+s7_4_0110	pass	
+s7_4_0111	pass	
+s7_4_0112	pass	
+s7_4_0113	pass	
+s7_4_0114	pass	
+s7_4_0115	pass	
+s7_4_0116	pass	
 s7_5_0001	pass	
 s7_5_0002	pass	
 s7_5_0003	pass	
@@ -351,6 +359,7 @@ s7_5_0010	pass
 s7_5_0011	pass	
 s7_5_0012	pass	
 s7_5_0013	pass	
+s7_5_0018	fail	#7130: the `?.` spelling of a string instance method is rejected in codegen, though §7.5 defines it
 s7_6_0001	pass	
 s7_6_0002	pass	
 s7_7_0001	pass	
@@ -1914,6 +1923,7 @@ s28_3_0222	pass
 s28_3_0223	pass	
 s28_3_0224	fail	#7125: the direct-call path discharges the unbound owned temporary at the enclosing scope's end, not at the K8 full-expression boundary
 s28_3_0225	fail	#7125: the function-value path's discharge gate requires a class-typed formal; an interface-typed formal leaves the temporary undischarged
+s28_3_0226	pass	
 s28_4_0001	pass	
 s28_4_0002	pass	
 s28_4_0003	pass	
@@ -3022,6 +3032,7 @@ l9_4_0001	pass
 l9_4_0002	pass	
 l9_5_0001	pass	
 l9_5_0002	pass	
+l9_5_0003	pass	
 l9_6_0001	pass	
 l9_6_0002	pass	
 l9_6_0003	pass	
@@ -3033,6 +3044,17 @@ l9_6_0008	pass
 l9_6_0009	pass	
 l9_6_0010	pass	
 l9_6_0011	pass	
+l9_6_0012	pass	
+l9_6_0013	pass	
+l9_6_0014	pass	
+l9_6_0015	pass	
+l9_6_0016	pass	
+l9_6_0017	pass	
+l9_6_0018	pass	
+l9_6_0019	pass	
+l9_6_0020	pass	
+l9_6_0021	pass	
+l9_7_0001	pass	
 l9_8_0001	fail	divergence
 l9_8_0003	pass	
 l9_8_0004	pass	
