@@ -7104,21 +7104,56 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         else if (auto* cid =
                      dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
             callTypeArgs = &cid->typeArgs;
-        if (declaredArity > 0) {
-            if (callTypeArgs && !callTypeArgs->empty() &&
-                callTypeArgs->size() != declaredArity) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ce.span.begin,
-                    "call to `" + std::string(ms->name) +
-                    "` supplies " + std::to_string(callTypeArgs->size()) +
-                    " explicit type argument(s), but `" +
-                    std::string(ms->name) + "` declares " +
-                    std::to_string(declaredArity) +
-                    " type parameter(s) — an explicit type-argument list "
-                    "must supply exactly as many arguments as the method "
-                    "declares type parameters; there are no partial lists "
-                    "(§14.5)");
-            }
+        // fix #7162 (§22.12 / §14.1 / §14.5, v0.343): §14.5's all-or-nothing
+        // rule fixes an explicit type-argument list against the method's
+        // DECLARED count, and the declared count may be ZERO. The old
+        // `declaredArity > 0` gate therefore exempted exactly the case
+        // §22.12 names — "a name that resolves to a non-generic entity after
+        // a syntactically-successful generic reading is an ordinary error at
+        // that name" — and the compiler SILENTLY DROPPED the list: a call
+        // `o.Plain<int>()` on a method that declares no type parameters ran
+        // as `o.Plain()`, and the bare callee `Make<int>(7)` as `Make(7)`.
+        //
+        // The gate is REMOVED, not narrowed: the inner condition already
+        // requires a NON-EMPTY list, so the check fires exactly where a list
+        // is present and its length differs from the declared count (zero
+        // included) — never on a call without a list, and never on a list
+        // that matches the declared count.
+        //
+        // §22.6's overload selection, read with §14.5's participation rule
+        // ("with a list, only candidates declaring that many type parameters
+        // of their own take part"), makes this safe for an OVERLOADED name:
+        // `resolveMethodOverload` narrows the candidate set to the
+        // candidates declaring the list's length, so the selected overload
+        // declares that length whenever ANY candidate does. The check
+        // therefore fires only where NO candidate admits the list: a list
+        // that spells nothing at that name (§22.12), and a wrong arity
+        // (§14.1: "Every such reference supplies exactly the declared number
+        // of type arguments"). The one place the selection does NOT narrow
+        // is where the call's ARGUMENTS bind no candidate at all — the
+        // selection then falls back to a candidate of its own choosing, in a
+        // program that is already erroneous for its arguments; there the
+        // message names the candidate the fallback chose, as it always has.
+        //
+        // The message is UNCHANGED, so the diagnostics the lit track and the
+        // #4589/#6312 gtests pin for the declaredArity > 0 shapes are
+        // byte-identical; the zero case reuses the same sentence, which
+        // already reads correctly for a declared count of zero ("supplies 1
+        // explicit type argument(s), but `Plain` declares 0 type
+        // parameter(s)").
+        if (callTypeArgs && !callTypeArgs->empty() &&
+            callTypeArgs->size() != declaredArity) {
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "call to `" + std::string(ms->name) +
+                "` supplies " + std::to_string(callTypeArgs->size()) +
+                " explicit type argument(s), but `" +
+                std::string(ms->name) + "` declares " +
+                std::to_string(declaredArity) +
+                " type parameter(s) — an explicit type-argument list "
+                "must supply exactly as many arguments as the method "
+                "declares type parameters; there are no partial lists "
+                "(§14.5)");
         }
         // §14.2 (v0.327, #5640): a dispatched generic method's call rejects a
         // move-only value type (§15.3) and an inline array of any form (§15.1)
