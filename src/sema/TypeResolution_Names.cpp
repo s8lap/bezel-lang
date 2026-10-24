@@ -4229,19 +4229,58 @@ static void warnChainHeadMemberShadowedByType(
         // NESTED TYPE, and `this.<X>` does not parse in a type position —
         // §2.7's remedy is "the enclosing type's name for statics", which
         // for a nested type is `<EnclosingType>.<X>`.
+        //
+        // fix #7085 (round 3): that qualified spelling EXISTS only when the
+        // DECLARING type is not generic. §11.6 — "In a type position,
+        // therefore, no name passes through a generic enclosing type" — and
+        // A.5 (a type-argument list attaches to the END of a qualified type
+        // name) forbid every qualified form of a nested type under a
+        // generic enclosing type: MEASURED, `Outer.C` is the §11.6 /
+        // Appendix C.1 arity error ("the bare enclosing segment in
+        // `Outer.C` supplies none") and `Outer<int>.C` is A.5's parse error.
+        // ⇒ The warning must not offer a spelling that does not compile;
+        // in that case it says what §11.6 says the reachability IS (the
+        // coordinator's interim ruling on #7121 — the warning still fires,
+        // because §2.7's warning row says warn and "the type wins for chain
+        // purposes" is useful information).
+        //
+        // MEASURED, the qualified spelling compiles for every NON-GENERIC
+        // declaring type: a module-level one, one nested in another type,
+        // one nested inside a generic type, a LOCAL type (§21.10), and one
+        // whose nested type is private or protected; and for a non-generic
+        // type BELOW a generic one (§11.6's "reaches a non-generic type
+        // enclosing it below the generic one").
         const auto* nts =
             dynamic_cast<const NestedTypeSymbol*>(shadowedEnclosingMember);
-        std::string remedy = std::string(headName);
-        if (nts && nts->parent && !nts->parent->name.empty())
-            remedy = std::string(nts->parent->name) + "." +
-                     std::string(headName);
-        ctx.diagnostics().report(
-            Severity::Warning, loc,
-            std::string("warning: chain head `") + std::string(headName) +
-                "` resolves to type `" + std::string(resolvedType->name) +
-                "` while the enclosing type declares a same-named nested "
-                "type — the type wins for chain purposes; qualify with `" +
-                remedy + "` to reach the nested type (\xC2\xA7""2.7)");
+        const TypeSymbol* owner = nts ? nts->parent : nullptr;
+        const std::string head(headName);
+        const std::string prefix =
+            std::string("warning: chain head `") + head +
+            "` resolves to type `" + std::string(resolvedType->name) +
+            "` while the enclosing type declares a same-named nested "
+            "type — the type wins for chain purposes; ";
+        if (!owner || owner->genericParams.empty()) {
+            // The qualified spelling EXISTS (the declaring type is not
+            // generic) — MEASURED: it compiles in every such case.
+            std::string remedy = head;
+            if (owner && !owner->name.empty())
+                remedy = std::string(owner->name) + "." + head;
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                prefix + "qualify with `" + remedy +
+                    "` to reach the nested type (\xC2\xA7""2.7)");
+        } else {
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                prefix + "the enclosing type `" +
+                    std::string(owner->name) +
+                    "` is generic, so its nested type has no qualified "
+                    "spelling: \xC2\xA7""11.6 names it by its bare name "
+                    "inside that type's bodies — the spelling this chain "
+                    "head now takes — and reaches it elsewhere through a "
+                    "static member or a local declared without a type "
+                    "annotation (\xC2\xA7""2.7, \xC2\xA7""11.6)");
+        }
         return;
     }
     std::string memberKind = "member";

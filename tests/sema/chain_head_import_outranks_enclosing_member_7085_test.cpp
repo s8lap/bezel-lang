@@ -365,6 +365,96 @@ end Outer;
         hasDiagnosticWith(r.diagnostics, "qualify with `this.C`"));
 }
 
+// fix #7085 (round 3): the warning's remedy must be a spelling that COMPILES.
+// A nested type under a GENERIC enclosing type has NO qualified spelling:
+// §11.6 ("In a type position, therefore, no name passes through a generic
+// enclosing type") and A.5 (a type-argument list attaches to the END of a
+// qualified type name) forbid every qualified form — MEASURED, `Outer.C` is
+// the §11.6 / Appendix C.1 arity error and `Outer<int>.C` is A.5's parse
+// error. ⇒ The warning must not offer one; it says what §11.6 says the
+// reachability IS (the coordinator's interim ruling on #7121: the warning
+// still fires — §2.7's warning row says warn).
+BEZEL_TEST(chain_head_import_outranks_enclosing_member_7085,
+           chain_head_warning_for_a_generic_enclosing_type_offers_no_qualified_remedy_spec_2_7) {
+    const std::string src = R"(
+module Warn5;
+public class C
+  public class N
+    public method Get(): int return 4; end Get;
+  end N;
+end C;
+class Outer<T>
+  public class C
+    public class N
+      public method Get(): int return 6; end Get;
+    end N;
+  end C;
+  public class Inner
+    public static method Main(): int
+      using var n: C.N := new C.N();
+      Console.WriteLine(n.Get());
+      return 0;
+    end Main;
+  end Inner;
+end Outer;
+)";
+    auto r = bezel::test::parseAndResolveGated(src);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasChainHeadShadowWarning(r.diagnostics));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "the enclosing type `Outer` is generic, so its nested type has no "
+        "qualified spelling"));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "\xC2\xA7" "11.6 names it by its bare name inside that type's "
+                    "bodies"));
+    // The qualified remedy must NOT be offered here: `Outer.C` does not
+    // compile (§11.6 / Appendix C.1's arity error).
+    BEZEL_EXPECT_FALSE(
+        hasDiagnosticWith(r.diagnostics, "qualify with `Outer.C`"));
+}
+
+// fix #7085 (round 3): a LOCAL enclosing type (§21.10) is not generic, so
+// the qualified spelling EXISTS — MEASURED, `Local.C` compiles and reaches
+// the nested type. The row pins that the remedy names the LOCAL type (the
+// declaring type), not some other spelling.
+BEZEL_TEST(chain_head_import_outranks_enclosing_member_7085,
+           chain_head_warning_for_a_local_enclosing_type_names_it_spec_2_7) {
+    const std::string src = R"(
+module Warn6;
+public class C
+  public class N
+    public method Get(): int return 4; end Get;
+  end N;
+end C;
+class Holder
+  public static method Main(): int
+    record Local
+      public class C
+        public class N
+          public method Get(): int return 6; end Get;
+        end N;
+      end C;
+      public class Inner
+        public static method Go(): int
+          using var n: C.N := new C.N();
+          Console.WriteLine(n.Get());
+          return 0;
+        end Go;
+      end Inner;
+    end Local;
+    return Local.Inner.Go();
+  end Main;
+end Holder;
+)";
+    auto r = bezel::test::parseAndResolveGated(src);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasChainHeadShadowWarning(r.diagnostics));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics, "qualify with `Local.C` to reach the nested type"));
+}
+
 // ============================================================================
 // Part 4 — §11.6: the enclosing type's TYPE PARAMETER is not a member.
 //
