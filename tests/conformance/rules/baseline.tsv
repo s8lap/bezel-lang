@@ -88,6 +88,7 @@ s2_7_0035	pass
 s2_7_0036	pass	
 s2_7_0037	pass	
 s2_7_0038	pass	
+s2_7_0039	fail	#7085
 s2_8_1_0001	pass	
 s2_8_1_0002	pass	
 s2_8_1_0003	pass	
@@ -1893,6 +1894,17 @@ s28_3_0208	pass
 s28_3_0209	pass	
 s28_3_0210	pass	
 s28_3_0211	pass	
+s28_3_0212	pass	
+s28_3_0213	pass	
+s28_3_0214	pass	
+s28_3_0215	pass	
+s28_3_0216	pass	
+s28_3_0217	pass	
+s28_3_0218	pass	
+s28_3_0219	pass	
+s28_3_0220	pass	
+s28_3_0221	pass	
+s28_3_0222	pass	
 s28_4_0001	pass	
 s28_4_0002	pass	
 s28_4_0003	pass	
