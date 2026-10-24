@@ -1340,6 +1340,37 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
     }
 
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): an expression body that is
+    // a method-group REFERENCE to a class's own compiler-generated `Dispose`
+    // has NO sema type — the generated member has no MethodDecl and no
+    // MethodSymbol (§28.2: "the name is the compiler's"), so sema binds
+    // nothing to the reference and the lambda's body type is null. The
+    // expr-body return type would then be the `i32` fallback while the body
+    // lowers to a FUNCTION VALUE (a closure cell), and the emitted `ret` does
+    // not match the function's return type:
+    //
+    //   Function return type does not match operand type of return inst!
+    //   ret ptr %5
+    //
+    // — the IR verifier rejects the module and the compile fails with "IR
+    // verification failed (malformed IR emitted)". The ordinary §27.6
+    // reference (`lambda() => d.Ping`) has a sema-typed body and gets the
+    // function value's representation (`ptr`); give the class-`Dispose`
+    // reference the same type, HERE, before the return type is derived.
+    //
+    // The type is the member's OWN signature read as a function type (§27.6):
+    // `Dispose()` takes no parameter and returns nothing (§28.2), so
+    // `() -> ()`.
+    if (lam.exprBody && !ctx_.exprType(*lam.exprBody) &&
+        isClassDisposeMethodRef(lam.exprBody.get())) {
+        sema::TypeRef* fnTy = ctx_.makeTypeRef();
+        fnTy->kind = sema::TypeRef::Kind::Function;
+        sema::TypeRef* unitTy = ctx_.makeTypeRef();
+        unitTy->kind = sema::TypeRef::Kind::Unit;
+        fnTy->funcReturn = unitTy;
+        ctx_.setExprType(lam.exprBody.get(), fnTy);
+    }
+
     // Pre-determine return type from sema's exprType of the body.
     // retSemaTy tracks the sema TypeRef that SET retTy (used below for
     // nullable-value promotion in the expr-body emit path — fix #541 / §7).
