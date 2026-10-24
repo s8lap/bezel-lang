@@ -20816,12 +20816,30 @@ static const std::vector<BuiltinStringArityRow>& builtinStringInstanceArities() 
          "`PadLeft(totalWidth: int, paddingChar: char := ' '): string`"},
         {"PadRight", {1, 2},
          "`PadRight(totalWidth: int, paddingChar: char := ' '): string`"},
+        // fix #7153 (stdlib §9.6, v0.343): `PadCenter` was MISSING here — the
+        // table was built from the §9.6 listing and the member was omitted, so
+        // a call at an arity §9.6 does not declare was ACCEPTED (the surplus
+        // argument silently DROPPED, and the zero-argument form degraded to a
+        // zero-initialised slot that faulted at 0x8 on the first read). §9.6
+        // declares it exactly like its two siblings — one required parameter
+        // and one DEFAULTED one ⇒ arities {1, 2}, not {2}.
+        {"PadCenter", {1, 2},
+         "`PadCenter(totalWidth: int, paddingChar: char := ' '): string`"},
         {"Insert", {2}, "`Insert(startIndex: int, value: string): string`"},
         {"Remove", {1, 2},
          "`Remove(startIndex: int): string` / "
          "`Remove(startIndex: int, length: int): string`"},
         // §9.6's Object overrides.
         {"GetHashCode", {0}, "`GetHashCode(): int`"},
+        // fix #7153 (stdlib §9.6, v0.343): `ToString` was MISSING here too —
+        // it is declared in §9.6's *Object overrides* group, which the widening
+        // pass over the member list did not reach, so a call at the wrong
+        // arity was ACCEPTED and the surplus argument silently DROPPED. §9.6
+        // declares `public pure override method ToString(): string;` — the
+        // `Object`-override spelling, at arity {0}. The gate is on the ARITY:
+        // the member itself keeps working (`"ab".ToString()` is the §9.6
+        // contract, "returns this").
+        {"ToString", {0}, "`ToString(): string`"},
         // §9.6's Splitting and Conversion groups.
         {"Split", {1},
          "`Split(separator: char): owned Array<string>` / "
