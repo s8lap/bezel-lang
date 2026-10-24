@@ -1168,6 +1168,34 @@ run_string_ratchet() {
 run_string_ratchet check_string_mint_methods scripts/check_string_mint_methods.py
 run_string_ratchet check_string_arity_table scripts/check_string_arity_table.py
 
+# ── §7.4 NULLABLE-RECEIVER / STRING-PRODUCER GUARD PHASE (#7139) ───────────
+# `Emitter::isPlusOneStringProducer` classifies a §9.6 string-producing
+# instance method's receiver as a +1 PRODUCER without asking whether the
+# receiver's DECLARED type is `string?`. That is sound ONLY because sema
+# rejects every member access on an un-narrowed nullable receiver (§7.4,
+# v0.343) — a `string?` receiver that reaches codegen has been narrowed
+# non-null, and §7.11 (v0.343) says a narrowed operand IS a non-nullable
+# operand.
+#
+# The premise is a CROSS-COMPONENT invariant, and it had no mechanical
+# guard: before #7139 the recognizer consulted `tt->nullable` and every
+# string-producing §9.6 instance method leaked its producer's reference on
+# a narrowed `string?` receiver. The hazard that remains is the other
+# direction — a future sema change admitting an un-narrowed `string?`
+# receiver would make codegen classify a BORROW as a +1 producer, i.e. an
+# over-release, with no diagnostic and no test failure.
+#
+# The ratchet pairs the two sides: the codegen arm must not consult
+# nullability, the `?.` call arm must keep excluding String, every sema
+# rejection of an un-narrowed nullable receiver must name §7.4, and the
+# #7139 regression test must still pin that rejection.
+#
+# The script path is spelled out LITERALLY — see the note on the phase
+# above: scripts/ratchet_sweep.sh discovers build-free source ratchets by
+# grepping this gate for `scripts/check_<name>.py`.
+run_string_ratchet check_nullable_string_producer_guard \
+  scripts/check_nullable_string_producer_guard.py
+
 # ── STRING-VIEW OWNERSHIP PHASE (#6469) ────────────────────────────────────
 # `ast::QualifiedName::parts` is a `std::vector<std::string_view>`
 # (src/ast/Node.hpp:42), and 139 `vector<string_view>` declarations exist
