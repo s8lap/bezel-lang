@@ -11816,6 +11816,30 @@ private:
     // continue. Splits the current block.
     void emitGuardThrow(llvm::Value* cond, const char* name);
 
+    // fix #7159 / #6979 idiom (§28.9 / §31.4, v0.343): a guard that RAISES
+    // must release the CALLER-OWNED +1 reference to the string producer it
+    // holds, ON THE THROW EDGE.
+    //
+    // §28.9 (v0.343): a fresh runtime-managed string hands its consumer a +1
+    // reference that the consumer must release EXACTLY ONCE. The consumer of a
+    // +1 producer RECEIVER in a member call is the CALLER, which releases it
+    // AFTER the call returns (src/codegen/LlvmBackend_Exprs.cpp's
+    // `tryLowerStringMethod` call site). A raise branches to the unwind block,
+    // so that post-call release is UNREACHABLE, and the producer's reference
+    // leaks; §31.4's built-in exceptions are trivial-dispose, so nothing else
+    // releases it either.
+    //
+    // `ownedReceiver` is the caller's +1 reference — null when the receiver is
+    // NOT a caller-owned producer (a named local, a literal, a sentinel), in
+    // which case this is exactly `emitGuardThrow`.
+    //
+    // ⚠ This is the SINGLE funnel for the throw edge: every raise inside
+    // `tryLowerStringMethod` must go through it, so a §9.6 member added later
+    // cannot forget the release (the #7120 lane's per-arm fix was the shape
+    // that let the other arms leak; this is the shape that cannot).
+    void emitGuardThrowReleasingString(llvm::Value* cond, const char* name,
+                                       llvm::Value* ownedReceiver);
+
     // §6.5 / §31.4 (v0.242, #3045): guard a shift's COUNT against its domain
     // `0 .. bitwidth(l)−1` — the width of the LEFT (shifted) operand, since
     // §6.5 keeps the count out of §6.2's promotion — and return the count

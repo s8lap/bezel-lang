@@ -1403,6 +1403,33 @@ llvm::Value* Emitter::emitStringOrdCmp(llvm::Value* l, llvm::Value* r) {
 }
 
 
+// fix #7159 / #6979 idiom (§28.9 / §31.4, v0.343): a guard that RAISES must
+// release the CALLER-OWNED +1 reference to the string producer it holds, ON
+// THE THROW EDGE.
+//
+// §28.9 (v0.343): a fresh runtime-managed string hands its consumer a +1
+// reference that the consumer must release EXACTLY ONCE. For a member call on
+// a +1 producer RECEIVER, that consumer is the CALLER, which releases it AFTER
+// the call returns (src/codegen/LlvmBackend_Exprs.cpp). A raise branches to
+// the unwind block, so the post-call release is UNREACHABLE and the reference
+// leaks; §31.4's built-in exceptions are trivial-dispose, so nothing else
+// releases it.
+//
+// With no caller-owned receiver (a named local, a literal, a sentinel) this is
+// exactly `emitGuardThrow`.
+void Emitter::emitGuardThrowReleasingString(llvm::Value* cond, const char* name,
+                                             llvm::Value* ownedReceiver) {
+    if (!ownedReceiver) { emitGuardThrow(cond, name); return; }
+    auto* errBB = llvm::BasicBlock::Create(llvm_, "chk.err", currentFn_);
+    auto* cont = llvm::BasicBlock::Create(llvm_, "chk.cont", currentFn_);
+    builder_.CreateCondBr(cond, errBB, cont);
+    builder_.SetInsertPoint(errBB);
+    emitStringRelease(ownedReceiver);
+    emitThrowBuiltin(name);
+    builder_.SetInsertPoint(cont);
+}
+
+
 llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                                    const ast::MemberAccessExpr& ma,
                                    llvm::Value* self) {
@@ -1422,15 +1449,16 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // caller's post-call release, and §31.4's built-in exceptions are
     // trivial-dispose, so nothing else releases the receiver). With no
     // caller-owned receiver this is exactly `emitGuardThrow`.
+    //
+    // fix #7159 (§28.9 / §31.4, v0.343): EVERY raise inside this function goes
+    // through this one funnel — `emitGuardThrowReleasingString` — not through
+    // a plain `emitGuardThrow`. The #7120 lane fixed three arms (the instance
+    // `Repeat`, `PadLeft`/`PadRight`/`PadCenter`) and left the others raising
+    // through the plain helper, so their producer receivers leaked (35 B in 2
+    // allocations each). The leak is the CLASS, not the arm: a §9.6 member
+    // added here later must not be able to forget the release.
     auto guardThrowReleasingSelf = [&](llvm::Value* cond, const char* name) {
-        if (!callerOwnedSelf) { emitGuardThrow(cond, name); return; }
-        auto* errBB = llvm::BasicBlock::Create(llvm_, "chk.err", currentFn_);
-        auto* cont = llvm::BasicBlock::Create(llvm_, "chk.cont", currentFn_);
-        builder_.CreateCondBr(cond, errBB, cont);
-        builder_.SetInsertPoint(errBB);
-        emitStringRelease(callerOwnedSelf);
-        emitThrowBuiltin(name);
-        builder_.SetInsertPoint(cont);
+        emitGuardThrowReleasingString(cond, name, callerOwnedSelf);
     };
 
     // Helpers for extracting the first string argument.
@@ -1570,7 +1598,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             llvm::Value* lenNeg = builder_.CreateICmpSLT(len, builder_.getInt32(0));
             llvm::Value* endOOB =
                 builder_.CreateICmpSGT(builder_.CreateAdd(lo, len), count);
-            emitGuardThrow(
+            guardThrowReleasingSelf(
                 builder_.CreateOr(builder_.CreateOr(startNeg, lenNeg), endOOB),
                 "IndexOutOfRangeException");
             return buildArraySpan(self, lo, len);
@@ -1585,7 +1613,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // too big for Trunc"; and a `byte` 200 must reach the i32 slot as
             // 200 (§5.1), not -56.
             start = fitToI32(call.args[0].value.get(), start);
-            emitGuardThrow(
+            guardThrowReleasingSelf(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(start, builder_.getInt32(0)),
                     builder_.CreateICmpSGT(start, count)),
@@ -1604,13 +1632,13 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // this replaces).
             start = fitToI32(call.args[0].value.get(), start);
             len   = fitToI32(call.args[1].value.get(), len);
-            emitGuardThrow(
+            guardThrowReleasingSelf(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(start, builder_.getInt32(0)),
                     builder_.CreateICmpSGT(start, count)),
                 "IndexOutOfRangeException");
             llvm::Value* avail = builder_.CreateSub(count, start);
-            emitGuardThrow(
+            guardThrowReleasingSelf(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(len, builder_.getInt32(0)),
                     builder_.CreateICmpSGT(len, avail)),
@@ -1671,7 +1699,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // Neither "true" nor "false" → raise FormatException.
             llvm::Value* notTrueOrFalse = builder_.CreateNot(
                 builder_.CreateOr(cmpTrue, cmpFalse), "tobool.invalid");
-            emitGuardThrow(notTrueOrFalse, "FormatException");
+            guardThrowReleasingSelf(notTrueOrFalse, "FormatException");
             return cmpTrue;
         }
         // stdlib §9.6, #882: GetHashCode(): int — content-based hash consistent
@@ -1952,7 +1980,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 llvm::Value* oor = builder_.CreateOr(
                     builder_.CreateICmpSLT(start64, builder_.getInt64(0), "ioc2.sneg"),
                     builder_.CreateICmpSGT(start64, len, "ioc2.sbig"), "ioc2.oor");
-                emitGuardThrow(oor, "IndexOutOfRangeException");
+                guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
                 // Inline forward scan from startIndex, mirroring the 1-arg form.
                 auto* idxS = entryAlloca(i64());
                 builder_.CreateStore(start64, idxS);
@@ -2018,7 +2046,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             llvm::Value* oor = builder_.CreateOr(
                 builder_.CreateICmpSLT(startVal, builder_.getInt64(0), "iof2.sneg"),
                 builder_.CreateICmpSGT(startVal, len, "iof2.sbig"), "iof2.oor");
-            emitGuardThrow(oor, "IndexOutOfRangeException");
+            guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
             auto* fn = declareC("bz_str_indexof_from", i32(),
                                 {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {self, sub, startVal}, "iof2.result");
@@ -2123,7 +2151,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             oor = builder_.CreateOr(
                 oor, builder_.CreateOr(lenNeg, endBig, "sub.loor"), "sub.oor");
         }
-        emitGuardThrow(oor, "IndexOutOfRangeException");
+        guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
         auto* fn = declareC("bz_str_substring", ptrTy(), {ptrTy(), i64(), i64()});
         return builder_.CreateCall(fn, {self, start64, count64}, "sub.result");
     }
