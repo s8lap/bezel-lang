@@ -6097,10 +6097,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     "' requires a `char` " + what + " (stdlib §9.5/§9.6)");
             };
             // §9.6: string.Repeat(c: char, count: int).
+            //
+            // fix #7132 (§5.1, §9.6, v0.343): `requireIntLike` only asks
+            // "is this argument integer-LIKE?" — a `uint` / `long` / `ulong`
+            // count passes it, so the STATIC spelling's `count: int` was
+            // admitted with a type §5.1's "never implicit" bullet forbids
+            // (`uint` → `int` is the bullet's own example). The count is
+            // therefore put on the SAME implicitly-convertible check the
+            // PAD/SPAN parameters use — `checkAssignable` against `int` — so
+            // the static and the instance spelling report the SAME §5.1
+            // diagnostic, and §5.1's constant-narrowing clause still admits a
+            // `long` CONSTANT whose value fits `int`'s range
+            // (`const N: long := 3L`), because `checkAssignable` runs
+            // `narrowIntConstantToTarget` first.
+            //
+            // The gate is applied only to an INTEGER-LIKE count: a
+            // non-integer-like one is already rejected by `requireIntLike`
+            // above with the "requires a `char` (int) count" wording, and
+            // running both on the same argument would report one program
+            // twice for one mistake.
             if (recvPt == PrimitiveType::String && mm == "Repeat" &&
                 ce.args.size() == 2) {
                 requireIntLike(0, "first argument");
                 requireIntLike(1, "(int) count");
+                const auto& cntArg = ce.args[1];
+                if (cntArg.value && !cntArg.isDiscard) {
+                    TypeRef* cntTy = ctx_.exprType(*cntArg.value);
+                    if (cntTy && cntTy->kind == TypeRef::Kind::Primitive &&
+                        isIntegerLike(cntTy->primitive)) {
+                        checkAssignable(
+                            cntTy,
+                            ctx_.primitiveTypeRef(PrimitiveType::Int),
+                            cntArg.value->span.begin,
+                            "argument to `string.Repeat`",
+                            cntArg.value.get());  // §5.1 / §7.4
+                    }
+                }
             }
             // fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): the static
             // `string.Compare(a, b[, ignoreCase])` this #2581 protection used
@@ -20534,10 +20566,39 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         // `AsSpan(r: Range<int>)` passes a Named (non-primitive) argument and
         // is skipped by the Primitive guard in the loop below, so admitting
         // AsSpan here cannot false-reject the Range form.
+        //
+        // fix #7132 (§5.1, §9.6, v0.343): the INSTANCE `Repeat(count)`
+        // takes its count as an `int` — the same declared type stdlib §9.6
+        // gives the STATIC `Repeat(c: char, count: int)` — and its count was
+        // NOT in this set, so the count argument was never type-checked at
+        // all. A `uint` count (which §5.1's "never implicit" bullet forbids:
+        // "between signed and unsigned types of the same or narrower width")
+        // was admitted, and after the #7104 byte-widening fix it produced a
+        // SILENT WRONG VALUE where it used to crash loudly: `"x".Repeat(b)`
+        // with `b: uint := 4000000000` compiled and printed `-294967296`.
+        // Adding `Repeat` here puts its count on the SAME
+        // implicitly-convertible check the PAD/SPAN parameters already use
+        // (the `checkAssignable` call in the loop below), so the `uint` count
+        // is rejected at the sibling site with the same §5.1 diagnostic —
+        // and §5.1's constant-narrowing clause still admits a `long`
+        // CONSTANT whose value fits `int`'s range (`const N: long := 3L`),
+        // because `checkAssignable` runs `narrowIntConstantToTarget` first.
+        // (Whether the INSTANCE spelling belongs on stdlib §9.6's `String`
+        // listing at all is a SEPARATE, open question — issue #7131 records
+        // that §9.6 declares only the two STATIC `Repeat` forms; this fix
+        // gates the count of the spelling the compiler implements, and does
+        // not rule on the member's existence.)
+        // NOTE the position: the instance spelling puts the count at
+        // position 0; the STATIC `string.Repeat(c, count)` puts it at
+        // position 1 and is gated at its own site (the static-primitive
+        // argument check in `typeCall`), because the static callee's target
+        // is the TYPE NAME `string` — which carries no value exprType — and
+        // the receiver guard above therefore excludes it by construction.
         bool intPos =
             (pos == 0 && (m == "Substring" || m == "Remove" || m == "Insert" ||
                           m == "PadLeft" || m == "PadRight" ||
-                          m == "PadCenter" || m == "AsSpan")) ||
+                          m == "PadCenter" || m == "AsSpan" ||
+                          m == "Repeat")) ||
             (pos == 1 && (m == "Substring" || m == "Remove" ||
                           m == "IndexOf" || m == "AsSpan"));
         if (intPos) return PT::Int;
