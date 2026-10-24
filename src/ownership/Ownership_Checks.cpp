@@ -21326,12 +21326,13 @@ bool MethodOwnership::lazySelectSelectorReturnMints(const ast::Expr& retExpr) {
             return true;
         // §28.3 / stdlib §5 (#1931): a call to a STDLIB string-minting method
         // (`s.ToUpper()`, `s.Substring(...)`, `s.Trim()`, `s.Replace(...)`,
-        // `s.PadLeft(...)`, `s.Insert(...)`, `s.Remove(...)`, ...) mints a
-        // fresh string per element. The documented mint set is stdlib §9.6
-        // `String` (v0.197) — every method whose contract is "returns a new
-        // `string` value; original unchanged". A user-defined override is left
-        // alone (over-rejection guard, same as #1917's `Select` gate); a
-        // non-string receiver and a non-string result are likewise excluded.
+        // `s.PadLeft(...)`, `s.PadCenter(...)`, `s.Insert(...)`, `s.Remove(...)`,
+        // ...) mints a fresh string per element. The documented mint set is
+        // stdlib §9.6 `String` (v0.343) — every method whose contract is
+        // "returns a new `string` value; original unchanged". A user-defined
+        // override is left alone (over-rejection guard, same as #1917's
+        // `Select` gate); a non-string receiver and a non-string result are
+        // likewise excluded.
         // // per §28.3 / stdlib §9.6 (#1931)
         if (auto* ce = dynamic_cast<const ast::CallExpr*>(&retExpr))
             if (isStdlibStringMintingCall(*ce)) return true;
@@ -21348,7 +21349,7 @@ bool MethodOwnership::lazySelectSelectorReturnMints(const ast::Expr& retExpr) {
 
 // §28.3 / stdlib §9.6 (#1931): true when `ce` is a CALL to a STDLIB string-
 // minting method on a string receiver — a documented-mint set whose contract
-// (stdlib §9.6 `String`, v0.197) is "returns a new `string` value; original
+// (stdlib §9.6 `String`, v0.343) is "returns a new `string` value; original
 // unchanged" and which therefore mints a fresh heap allocation per call. Used
 // by lazySelectSelectorReturnMints to extend the §28.3 minting-selector reject
 // to method-call selectors — the interprocedural gap left by #1917. The
@@ -21365,17 +21366,48 @@ bool MethodOwnership::isStdlibStringMintingCall(const ast::CallExpr& ce) {
     if (common::calleeMethodDecl(ce, ctx_)) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
     if (!ma) return false;
-    // Documented stdlib §9.6 string-mint set (v0.197). Every method whose
-    // contract is "returns a new `string` value; original unchanged". ToUpper /
+    // Documented stdlib §9.6 string-mint set (v0.343). The set is DERIVED from
+    // §9.6's own member list: every §9.6 INSTANCE member whose declared result
+    // is `string` and whose contract is "returns a new `string` value; original
+    // unchanged" — i.e. every §9.6 instance member that returns a `string` EXCEPT
+    // the two that do not mint a fresh value:
+    //   * `ToString()` — §9.6 says it "returns this" (a BORROW of the receiver);
+    //   * `AsSpan()` / `AsSpan(start)` / `AsSpan(start, length)` / `AsSpan(r)` —
+    //     their declared result is `ReadOnlyStringSpan`, not `string` (a view).
+    // The members that DO mint, and are therefore the set below: ToUpper /
     // ToLower (case mapping), Substring (two overloads — covered by name only;
     // overload resolution is independent), Trim / TrimStart / TrimEnd (whitespace
-    // / char-set trim), Replace (two overloads — same), PadLeft / PadRight
-    // (two overloads each), Insert, Remove (two overloads).
-    // // per stdlib §9.6 (v0.197)
+    // / char-set trim), Replace (two overloads — same), PadLeft / PadRight /
+    // PadCenter (two overloads each), Insert, Remove (two overloads).
+    // The STATIC §9.6 members (`From`, `Repeat`, `Join`) are outside this set:
+    // the gate classifies a CALL ON A STRING RECEIVER, and a static call's
+    // "receiver" is the TYPE NAME `string`, not a string value. None of their
+    // names is in the set below either.
+    // §9.6's `[r: Range<int>]` indexer (the slice form) is also outside this
+    // set, and by a different route: it is a PROPERTY, not a member CALL, so
+    // this predicate's shape never sees it. RECORDED GAP (NOT this fix): a
+    // slice selector (`Select(s => s[0..2])`) mints a fresh string — §4.6 "the
+    // result is a fresh `string`" — and is still ACCEPTED here (MEASURED: 72 B
+    // in 4 allocations for two elements). The Range-slice form is a separate
+    // gate from the §28.3 minting-SELECTOR gate.
+    // // per stdlib §9.6 (v0.343)
+    //
+    // fix #7144 (§28.3, §9.6, v0.343): the list had been frozen at stdlib §9.6
+    // v0.197 and never gained `PadCenter` — §9.6 declares
+    // `public pure method PadCenter(totalWidth: int, paddingChar: char := ' '):
+    // string;` ("PadCenter splits the padding evenly; when it is odd, the extra
+    // character goes to the RIGHT: \"ab\".PadCenter(5) = \" ab  \"") — a member
+    // whose contract is "returns a new `string` value; original unchanged", so
+    // it IS a mint. The #7133 fix gave `PadCenter` its codegen arm (a fresh
+    // `bz_str_pad` allocation per call) without adding it here, so
+    // `Select(x => x.PadCenter(5))` was ACCEPTED by this gate and LEAKED
+    // (MEASURED: 114 B in 6 allocations for three elements — the same shape as
+    // its `PadLeft` / `PadRight` siblings, which this gate rejected).
+    // // per §28.3 / stdlib §9.6 (v0.343)
     static constexpr std::string_view kMintMethods[] = {
         "ToUpper",   "ToLower",   "Substring",  "Trim",
         "TrimStart", "TrimEnd",   "Replace",    "PadLeft",
-        "PadRight",  "Insert",    "Remove",
+        "PadRight",  "PadCenter", "Insert",    "Remove",
     };
     bool isMintName = false;
     for (auto m : kMintMethods)
