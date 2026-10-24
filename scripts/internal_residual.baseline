@@ -26,4 +26,4 @@
 # REJECT-only; see scripts/check_vacuous_tests.py for the same
 # coverage caveat, and feedback-run-aot-discards-stderr-on-
 # success for the gtest blind spot).
-total_internal_lines = 87
+total_internal_lines = 86

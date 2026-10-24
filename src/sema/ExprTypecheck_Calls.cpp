@@ -28097,7 +28097,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                     // #1034: `string.Format` and `string.Concat` are NOT provided
-                    // by the stdlib (§9.6 lists Join/From/Empty/Repeat; composite
+                    // by the stdlib (§9.6 lists Join/From/Repeat; composite
                     // formatting is done with string interpolation `$"{...}"`).
                     // They were typed `string` here but have no codegen lowering,
                     // so `string.Format(...)` compiled and CRASHED (SIGSEGV) and
@@ -28114,7 +28114,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // `getenv` example) was rejected outright as an unknown
                     // static. Both return `string`; codegen lowers them in
                     // tryLowerPrimitiveStaticCall.
-                    if (mbr == "Join" || mbr == "Empty" ||
+                    //
+                    // fix #7128 (stdlib §9.6, v0.343): `string.Empty` is NOT a
+                    // stdlib §9.6 member — the `String` listing declares
+                    // `Length` / `IsEmpty` / `IsAscii` and the construction
+                    // methods (`From` / `FromCStringPointer` /
+                    // `FromWStringPointer` / `Repeat` / `Join`) and NO `Empty`,
+                    // as a property or as a method;
+                    // `Bezel_For_Code_Generation.md` §5 lists `String.Empty`
+                    // among the APIs that do NOT exist, with the replacement
+                    // "use `""`". It was nonetheless in this accept set, so
+                    // sema typed BOTH spellings — the member READ
+                    // `string.Empty` and the CALL `string.Empty()` — as a
+                    // `string`. The READ spelling has no codegen lowering, so
+                    // the local it initialised was left zero-initialized (a
+                    // NULL bz.string) and the program's first read of it
+                    // (`.Length`) dereferenced NULL at offset 0x8 — the
+                    // string header's length field — and the generated program
+                    // died with SIGSEGV. The remedy is the REJECTION, not an
+                    // addition: dropping `Empty` from this set makes both
+                    // spellings fall through to the clean §3.4 "type 'string'
+                    // has no static method or property 'Empty'" reject, exactly
+                    // as any other unknown static (`string.Bogus()`) and
+                    // exactly as the `Format`/`Concat` removal above does.
+                    if (mbr == "Join" ||
                         mbr == "From" || mbr == "Repeat" ||
                         mbr == "FromCStringPointer" ||
                         mbr == "FromWStringPointer") {
