@@ -10,6 +10,8 @@
 
 #include <string_view>
 
+#include "lexer/Token.hpp"
+
 namespace bezel {
 
 // §3.4: the lowercase primitive-type aliases. These are unconditionally
@@ -28,6 +30,34 @@ inline bool isPrimitiveTypeKeyword(std::string_view text) {
            text == "uint"   || text == "long"  || text == "ulong" ||
            text == "float"  || text == "double" || text == "decimal" ||
            text == "char"   || text == "string";
+}
+
+// fix #7163 (§22.12, v0.343): the generics-vs-less-than resolution's
+// SUCCESSOR SET, spelled out once.
+//
+// "After an identifier in expression position, a `<` opens generic arguments
+// **iff** scanning forward finds a balanced `<…>` group (respecting nesting)
+// whose closing `>` is immediately followed by a token that can continue a
+// primary expression — `.`, `?.`, `(`, or `[` — or by a token that cannot
+// begin an operand — `)`, `]`, `,`, or `;` (a relational `>` always has a
+// right operand, so no relational reading is lost; this is how a method
+// reference at explicit type arguments, `xs.Select(Util.Id<int>)` or
+// `var k := Util.Keep<Pair>;`, parses as one, §27.6).  Otherwise the `<` is
+// the relational operator."
+//
+// EIGHT successors.  This predicate used to be spelled out — as two
+// DIFFERENT subsets, five tokens and one — in two scan helpers of
+// Parser_Exprs.cpp, so `?.` and `[` were honoured nowhere and the set could
+// drift per site again.  Hoisted here for the same reason
+// `isPrimitiveTypeKeyword` was: one spelling, one decision.
+inline bool genericArgsCloserFollows(const Token& after) {
+    if (after.kind != TokenKind::Punctuator) return false;
+    // A token that can continue a primary expression (`.`, `?.`, `(`, `[`) or
+    // one that cannot begin an operand (`)`, `]`, `,`, `;`).
+    return after.text == "."  || after.text == "?." ||
+           after.text == "("  || after.text == "["  ||
+           after.text == ")"  || after.text == "]"  ||
+           after.text == ","  || after.text == ";";
 }
 
 } // namespace bezel

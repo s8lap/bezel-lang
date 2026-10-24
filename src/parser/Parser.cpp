@@ -16,11 +16,12 @@ namespace {
 // an unparenthesized generic-argument list at the top level of a hole —
 // `Identifier<T1, T2>.Member` / `Identifier<T1, T2>(args)`, the Appendix A.7
 // `Identifier GenericArgs` atom, disambiguated the same way §14.1/§22.12
-// disambiguate it everywhere else it appears (`Parser::tokensLookLikeReceiverTypeArgs`
-// / `Parser::tokensLookLikeMethodTypeArgs`: a bare `<` right after a name,
+// disambiguate it everywhere else it appears (`Parser::tokensLookLikeGenericArgs`:
+// a bare `<` right after a name,
 // followed only by TypeArgToken-shaped tokens, closing on a bare `>`/`>>`
-// immediately followed by `.` or `(`) — has its top-level comma or colon cut
-// by the normative hole-delimitation rule (§18.5, v0.172, #1339). That rule's
+// immediately followed by one of §22.12's eight successors
+// (`genericArgsCloserFollows` in Parser_impl.hpp) — has its top-level comma or
+// colon cut by the normative hole-delimitation rule (§18.5, v0.172, #1339). That rule's
 // tracked nesting set is `()[]{}` only and does not extend to `<...>`: this is
 // the CURRENT spec text, read literally, and is not changed here (`<` doubles
 // as the relational/`<>`/`<<` operator family, and generic-vs-relational is
@@ -77,7 +78,7 @@ bool holeCutInsideGenericArgList(std::string_view exprText,
                 continue;
             }
             if (u.kind == TokenKind::Punctuator && u.text == ">>") {
-                // Mirrors tokensLookLikeMethodTypeArgs: `>>` closes two
+                // Mirrors tokensLookLikeGenericArgs: `>>` closes two
                 // levels at once; closing exactly the outstanding two is a
                 // match, closing just one (depth==1) is malformed (bail).
                 if (depth <= 2) {
@@ -114,9 +115,11 @@ bool holeCutInsideGenericArgList(std::string_view exprText,
             continue;
         }
         const Token& after = toks[afterIdx];
-        bool followedByAccess = after.kind == TokenKind::Punctuator &&
-            (after.text == "." || after.text == "(");
-        if (!followedByAccess) continue;
+        // The same test the parser's commit points make (§22.12, v0.343): the
+        // closing `>` of a generic-argument list is followed by one of the
+        // eight successors.  fix #7163: this used to accept only `.` and `(`,
+        // a third partial copy of the set.
+        if (!genericArgsCloserFollows(after)) continue;
 
         std::size_t spanStart = open.location.offset;
         std::size_t spanEnd = toks[j].location.offset + toks[j].text.size();
