@@ -6139,6 +6139,73 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                 }
             }
+            // fix #7150 (stdlib §9.6, §5.1, §4.6, v0.343): `string.Join`'s
+            // SEPARATOR.
+            //
+            // stdlib §9.6 declares
+            //   public static method Join(separator: string, items: IEnumerable<string>): string;
+            // — the separator is a `string`, and there is NO `char` separator
+            // overload. §5.1's implicit-conversion table has no row into
+            // `string` at all: its `char` row widens to `int`/`uint`/`long`/
+            // `ulong`/`float`/`double`/`decimal` and never to `string`, and
+            // §4.6 says it outright — "The compiler does not implicitly
+            // convert other types to `string`". So the only admissible
+            // separator is a `string` — a `string?` that §7.4 has narrowed
+            // non-null included, since the narrowed read HAS type `string`.
+            //
+            // THE DEFECT. A built-in `string` member is a compiler intrinsic:
+            // it has no MethodSymbol, so §22.5's per-argument assignability
+            // check never ran for this call, and the codegen lowering
+            // (`LlvmBackend_Calls.cpp`'s static `Join` arm) lowered
+            // `call.args[0]` — the separator — as a `bz_string*` whatever its
+            // type. MEASURED pre-fix on this tree:
+            //
+            //   `string.Join(',', parts)`   → the compiler emits MALFORMED IR:
+            //     "Load operand must be a pointer." x3, then "codegen error:
+            //     IR verification failed (malformed IR emitted)" — the
+            //     COMPILER'S OWN IR verifier rejects the module, because the
+            //     `char` arrives as an `i32` where a pointer is expected;
+            //   `string.Join(5, parts)` and `string.Join(sep, parts)` over a
+            //     `char`/`double` variable → the same malformed IR
+            //     ("GEP base pointer is not a vector or a vector of
+            //     pointers" + "Load operand must be a pointer.");
+            //   `String.Join(',', parts)` → the same malformed IR (the
+            //     PascalCase alias of the same type keyword);
+            //   `string.Join(null, parts)` → compiled CLEANLY and then
+            //     SEGFAULTED at run time (the lowering reads the length and
+            //     the data pointer out of a null string header).
+            //
+            // ⇒ Every one of those is a program the document does not define,
+            // and each was a COMPILER defect rather than a diagnostic. The
+            // gate below rejects them at the front end, so the lowering never
+            // sees an argument it has no lowering for.
+            //
+            // WHERE THE REJECTION BELONGS. In SEMA, not in codegen: the
+            // document says the call is not well-formed (§9.6 declares a
+            // `string` separator; §4.6/§5.1 convert nothing else into one),
+            // so the rejection belongs where the call is CHECKED. Codegen is
+            // unreachable for a rejected program (`Driver::compileFile` runs
+            // it only when `!diagnostics.hasErrors()`), so the +1 producer
+            // recognizer in `LlvmBackend_Setup.cpp` — which claims
+            // `string.Join` as an `rc := 1` heap-string producer — stays
+            // CONSISTENT with the rejection by construction: a rejected call
+            // is never classified.
+            if (recvPt == PrimitiveType::String && mm == "Join" &&
+                ce.args.size() == 2) {
+                const auto& sepArg = ce.args[0];
+                if (sepArg.value && !sepArg.isDiscard) {
+                    TypeRef* sepTy = ctx_.exprType(*sepArg.value);
+                    if (sepTy) {
+                        checkAssignable(
+                            sepTy,
+                            ctx_.primitiveTypeRef(PrimitiveType::String,
+                                                  /*nullable=*/false),
+                            sepArg.value->span.begin,
+                            "separator argument to `string.Join`",
+                            sepArg.value.get());  // §5.1 / §7.4
+                    }
+                }
+            }
             // fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): the static
             // `string.Compare(a, b[, ignoreCase])` this #2581 protection used
             // to cover was RETIRED — `mbr == "Compare"` is rejected outright
