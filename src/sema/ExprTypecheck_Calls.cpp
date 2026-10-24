@@ -5781,6 +5781,11 @@ static bool builtinCollectionConstraintPropertyAdmitted(
 static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
                                                         const TypeRef* view,
                                                         std::string_view member);
+// fix #7140 (stdlib §9.6, v0.343): the built-in `string` members' ARITY
+// gate. Its definition sits beside the other stdlib §9.6 string-member
+// helper (below), but `typeCall` — which is earlier in this file — uses it.
+static void checkBuiltinStringCallArity(SemaContext& ctx,
+                                         const ast::CallExpr& ce);
 
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
@@ -6157,6 +6162,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // fix #7140 (stdlib §9.6, v0.343): the ARITY gate for the built-in
+    // `string` members. A built-in `string` member has no MethodSymbol, so
+    // §22.5's argument-count check (`checkCallArity`) never ran for it, and
+    // `resolveMemberAccess` typed the member by NAME alone — the argument
+    // count was never inspected. The lowerings (`Emitter::tryLowerStringMethod`
+    // and the static-factory arms) key on name AND arity, so a call at an
+    // arity no stdlib §9.6 overload declares matched NO lowering: the #2477
+    // permissive-acceptance path degraded the slot to a zero-initialized value
+    // and the program's first read of it faulted (SIGSEGV at 0x8), or — where
+    // the lowering ignores the surplus arguments — the call silently DROPPED
+    // them and printed a plausible wrong value. Both are closed here, by
+    // REJECTING the call: the diagnostic names the arity stdlib §9.6
+    // declares.
+    checkBuiltinStringCallArity(ctx_, ce);
     // per §15.4 (#1174): the builtin string methods whose parameter is an
     // `IEnumerable<T>` — `string.Trim(chars: IEnumerable<char>)` (stdlib §9.6)
     // and `string.Join(sep: string, items: IEnumerable<string>)` (stdlib §3.4)
@@ -20658,6 +20677,307 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
             std::string("argument to `string.") + std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
     }
+}
+
+// fix #7140 (stdlib §9.6, v0.343): the ARITY of a built-in `string` member
+// call.
+//
+// THE DEFECT. A built-in `string` member is a compiler intrinsic: it has no
+// MethodSymbol, so §22.5's argument-count check (`checkCallArity`) never ran
+// for it, and `resolveMemberAccess` typed the member by NAME alone — the
+// argument count was never inspected (the CG27f arms key on `ma.member` and
+// nothing else). The lowerings are the arity-discriminating half:
+// `Emitter::tryLowerStringMethod` (LlvmBackend_String.cpp) keys on the member
+// name AND the argument count, and the static-factory arms
+// (LlvmBackend_Setup.cpp) key on the argument count alone. A call at an arity
+// no stdlib §9.6 overload declares therefore matched NO lowering: codegen
+// found no dispatch, the #2477 permissive-acceptance path degraded the slot
+// to a zero-initialized value, and the program's first read of it faulted —
+// MEASURED pre-fix: SIGSEGV (rc 139) at fault address 0x8, the string
+// header's length field read off a null pointer.
+//
+// MEASURED pre-fix, the whole §9.6-declared instance surface at a wrong
+// arity (each row = the member, its declared arities, the observed
+// behaviour):
+//
+//   member        declared   wrong arity observed
+//   Substring     1 or 2     0 -> SIGSEGV;  3, 4 -> the surplus arguments
+//                               are DROPPED and "bc" is printed (a silent
+//                               wrong value)
+//   Trim          0 or 1     2, 3 -> SIGSEGV
+//   TrimStart     0          1 -> SIGSEGV
+//   TrimEnd       0          1 -> SIGSEGV
+//   ToUpper       0          1, 2 -> SIGSEGV
+//   ToLower       0          1 -> SIGSEGV
+//   Replace       2          0, 1, 3 -> SIGSEGV
+//   PadLeft       1 or 2     0 -> SIGSEGV;  3 -> the surplus argument is
+//                               DROPPED ("--ab" is printed)
+//   PadRight      1 or 2     0 -> SIGSEGV;  3 -> DROPPED ("ab--")
+//   Insert        2          0, 1, 3 -> SIGSEGV
+//   Remove        1 or 2     0 -> SIGSEGV;  3 -> DROPPED ("adef")
+//   Contains      1          0 -> the slot degrades to `false`;  2, 3 -> the
+//                               surplus arguments are DROPPED
+//   StartsWith    1          2 -> DROPPED
+//   EndsWith      1          2 -> DROPPED
+//   Equals        1 or 2     0 -> the slot degrades to `false`;  3 -> DROPPED
+//   IndexOf       1 or 2     0 -> the slot degrades to 0;  3 -> DROPPED
+//   LastIndexOf   1          0 -> the slot degrades to 0;  2 -> DROPPED
+//   CompareTo     1 or 2     0 -> the slot degrades to 0;  3 -> DROPPED
+//   GetHashCode   0          1 -> the slot degrades to 0
+//
+// and the STATIC surface:
+//
+//   string.Repeat             2   0, 1, 3 -> SIGSEGV
+//   string.From               1/3 2, 4 -> SIGSEGV
+//   string.Join               2   1, 3 -> SIGSEGV
+//   string.IsNullOrWhiteSpace 1   0, 2 -> the slot degrades to `false`
+//
+// ⇒ ⇒ Both halves of the failure are ACCEPTANCE INVERSIONS, and the fix must
+// REJECT: dropping the surplus argument, or coercing it, would compile a
+// call the document does not define and print a plausible value for it.
+//
+// THE GATE. Keyed on the ARITIES stdlib §9.6 declares — the rows below are
+// transcribed from `docs/Bezel_Standard_Library.md` §9.6's `String` listing,
+// which is the same set of declarations `common::builtinParamNameCandidates`'
+// `kStringParamNames` rows carry (that table omits the nullary members,
+// because a member that takes no parameter can take no named argument).
+//
+// THE THREE MEMBERS §9.6 DOES NOT DECLARE. The INSTANCE `Repeat(count)`,
+// `GetField(delim, n)` and `CountOf(sub)` are implemented by the compiler but
+// are NOT declared in stdlib §9.6 — issue #7131 records that gap and asks
+// whether they belong in the document and at which arity, and a document
+// amendment is a coordinator decision, not this lane's. They are therefore
+// NOT deleted here (deleting a member the compiler has shipped is a
+// behaviour flip this lane does not own), but they are not left crashing
+// either: their arity is pinned to the arity the compiler LOWERS them at, so
+// a call the lowering cannot dispatch is rejected with a diagnostic that says
+// so and points at #7131.
+//
+// THE SCOPE. The rows cover the members the four built-in `string` arms in
+// `resolveMemberAccess` accept (the `string`-returning, `bool`-returning,
+// `int`-returning and `double`/`long`/`float`-returning arms). The numeric
+// conversion members (`ToInt32` / `ToUInt32` / `ToInt64` / `ToDouble` /
+// `ToFloat` / `ToBoolean`) are NOT in the table: stdlib §9.6 declares no such
+// member either, so pinning their arity is #7131's question too (they are
+// reported, not changed).
+struct BuiltinStringArityRow {
+    std::string_view member;
+    // The declared arities. A LIST, not a range: `string.From` declares a
+    // one-argument form AND a three-argument form, and the two-argument
+    // shape is not one of them.
+    std::vector<unsigned> arities;
+    // The stdlib §9.6 declaration(s), quoted so the diagnostic names the
+    // surface the programmer must match.
+    std::string_view decl;
+};
+
+// The INSTANCE members stdlib §9.6 declares, with their declared arities.
+static const std::vector<BuiltinStringArityRow>& builtinStringInstanceArities() {
+    static const std::vector<BuiltinStringArityRow> kRows = {
+        // §9.6's Inspection group.
+        {"Contains", {1},
+         "`Contains(value: string): bool` / `Contains(value: char): bool`"},
+        {"StartsWith", {1}, "`StartsWith(value: string): bool`"},
+        {"EndsWith", {1}, "`EndsWith(value: string): bool`"},
+        {"IndexOf", {1, 2},
+         "`IndexOf(value: char, startIndex: int := 0): int` / "
+         "`IndexOf(value: string, startIndex: int := 0): int`"},
+        {"LastIndexOf", {1},
+         "`LastIndexOf(value: char): int` / `LastIndexOf(value: string): int`"},
+        // §9.6's Comparison and equality group.
+        {"CompareTo", {1, 2},
+         "`CompareTo(other: string): int` / "
+         "`CompareTo(other: string, ignoreCase: bool): int`"},
+        {"Equals", {1, 2},
+         "`Equals(other: string): bool` / "
+         "`Equals(other: string?, ignoreCase: bool): bool`"},
+        // §9.6's Substring group.
+        {"Substring", {1, 2},
+         "`Substring(startIndex: int): string` / "
+         "`Substring(startIndex: int, length: int): string`"},
+        // §9.6's Span views group. `AsSpan(r: Range<int>)` is the one-argument
+        // form beside `AsSpan(start: int)`, so the range is admitted at the
+        // one-argument arity.
+        {"AsSpan", {0, 1, 2},
+         "`AsSpan(): ReadOnlyStringSpan` / `AsSpan(start: int): ReadOnlyStringSpan`"
+         " / `AsSpan(start: int, length: int): ReadOnlyStringSpan` / "
+         "`AsSpan(r: Range<int>): ReadOnlyStringSpan`"},
+        // §9.6's Modification group.
+        {"Trim", {0, 1},
+         "`Trim(): string` / `Trim(chars: IEnumerable<char>): string`"},
+        {"TrimStart", {0}, "`TrimStart(): string`"},
+        {"TrimEnd", {0}, "`TrimEnd(): string`"},
+        {"ToUpper", {0}, "`ToUpper(): string`"},
+        {"ToLower", {0}, "`ToLower(): string`"},
+        {"Replace", {2},
+         "`Replace(oldChar: char, newChar: char): string` / "
+         "`Replace(oldValue: string, newValue: string): string`"},
+        {"PadLeft", {1, 2},
+         "`PadLeft(totalWidth: int, paddingChar: char := ' '): string`"},
+        {"PadRight", {1, 2},
+         "`PadRight(totalWidth: int, paddingChar: char := ' '): string`"},
+        {"Insert", {2}, "`Insert(startIndex: int, value: string): string`"},
+        {"Remove", {1, 2},
+         "`Remove(startIndex: int): string` / "
+         "`Remove(startIndex: int, length: int): string`"},
+        // §9.6's Object overrides.
+        {"GetHashCode", {0}, "`GetHashCode(): int`"},
+        // §9.6's Splitting and Conversion groups.
+        {"Split", {1},
+         "`Split(separator: char): owned Array<string>` / "
+         "`Split(separator: string): owned Array<string>` / "
+         "`Split(separators: Array<char>): owned Array<string>`"},
+        {"ToCharArray", {0}, "`ToCharArray(): owned Array<char>`"},
+    };
+    return kRows;
+}
+
+// The STATIC members stdlib §9.6 declares, with their declared arities.
+// The head is the TYPE NAME `string` (no value exprType), which is how the
+// static spelling is told from the instance one.
+static const std::vector<BuiltinStringArityRow>& builtinStringStaticArities() {
+    static const std::vector<BuiltinStringArityRow> kRows = {
+        // §9.6 declares `From` at ONE argument (the `char` / `CString` /
+        // `WString` forms) and at THREE (the char-array window form) — the
+        // two-argument shape is not one of them.
+        {"From", {1, 3},
+         "`From(value: char): string` / "
+         "`From(buffer: Array<char>, start: int, length: int): string` / "
+         "the `CString` and `WString` forms (one argument each)"},
+        // `FromCStringPointer` / `FromWStringPointer` are NOT listed here:
+        // the static-primitive path already rejects their wrong arity with
+        // "no matching overload of `String.FromCStringPointer` — it takes
+        // exactly one `IntPtr`", and a second diagnostic would report one
+        // mistake twice.
+        {"Join", {2},
+         "`Join(separator: string, items: IEnumerable<string>): string`"},
+        {"Repeat", {2},
+         "`Repeat(c: char, count: int): string` / "
+         "`Repeat(unit: string, count: int): string`"},
+        {"IsNullOrWhiteSpace", {1},
+         "`IsNullOrWhiteSpace(value: string?): bool`"},
+    };
+    return kRows;
+}
+
+// The three built-in `string` members stdlib §9.6 does NOT declare (issue
+// #7131): the INSTANCE `Repeat(count)`, `GetField(delim, n)` and
+// `CountOf(sub)`. The arity below is the one the compiler LOWERS them at, not
+// a declared one — the diagnostic says so, so the reader is never told a
+// declaration that does not exist.
+static const std::vector<BuiltinStringArityRow>&
+builtinStringUndeclaredArities() {
+    static const std::vector<BuiltinStringArityRow> kRows = {
+        {"Repeat", {1}, "`Repeat(count: int): string` (the INSTANCE spelling)"},
+        {"GetField", {2}, "`GetField(delimiter: char, n: int): string`"},
+        {"CountOf", {1}, "`CountOf(substring: string): int`"},
+    };
+    return kRows;
+}
+
+static const BuiltinStringArityRow* findBuiltinStringArity(
+    const std::vector<BuiltinStringArityRow>& rows, std::string_view member) {
+    for (const auto& r : rows)
+        if (r.member == member) return &r;
+    return nullptr;
+}
+
+// "exactly 2 argument(s)" / "0 or 1 argument(s)" / "1 or 3 argument(s)" — how
+// the declared arity is spelled in the diagnostic.
+static std::string builtinStringArityExpectation(const BuiltinStringArityRow& r) {
+    if (r.arities.size() == 1)
+        return "exactly " + std::to_string(r.arities.front()) + " argument(s)";
+    std::string out;
+    for (std::size_t i = 0; i < r.arities.size(); ++i) {
+        if (i) out += (i + 1 == r.arities.size()) ? " or " : ", ";
+        out += std::to_string(r.arities[i]);
+    }
+    return out + " argument(s)";
+}
+
+static void checkBuiltinStringCallArity(SemaContext& ctx,
+                                         const ast::CallExpr& ce) {
+    const ast::Expr* target = nullptr;
+    std::string_view member;
+    bool nullCond = false;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        target = ma->target.get();
+        member = ma->member;
+    } else if (auto* ncm =
+                   dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
+        target = ncm->target.get();
+        member = ncm->member;
+        nullCond = true;
+    } else {
+        return;
+    }
+    if (!target) return;
+    const BuiltinStringArityRow* spec = nullptr;
+    bool declared = true;   // does stdlib §9.6 declare this member at all?
+    bool isStatic = false;
+    // The STATIC spelling: the callee's target is the TYPE NAME `string`,
+    // which carries no value exprType. This is the same shape
+    // `resolveMemberAccess`'s primitive-qualifier branch recognises (the
+    // bare-keyword head), so a local that happens to be named `string` is
+    // read the same way the rest of the compiler reads it.
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+        if (tid->name == "string" || tid->name == "String") {
+            isStatic = true;
+            spec = findBuiltinStringArity(builtinStringStaticArities(), member);
+            if (!spec) return;   // not a stdlib §9.6 static member at all
+        }
+    }
+    if (!spec) {
+        // The INSTANCE spelling: the receiver is a VALUE of type `string`.
+        const TypeRef* recv = ctx.exprType(*target);
+        if (!recv || recv->kind != TypeRef::Kind::Primitive ||
+            recv->primitive != PrimitiveType::String)
+            return;
+        spec = findBuiltinStringArity(builtinStringInstanceArities(), member);
+        if (!spec) {
+            spec = findBuiltinStringArity(builtinStringUndeclaredArities(),
+                                          member);
+            declared = false;
+        }
+        if (!spec) return;
+        // The null-conditional spelling `s?.M(..)`: the `?.` mirror of the
+        // string-member gate REJECTS every built-in `string` member it cannot
+        // lower ("string member `?.M` is not yet supported in codegen"), so
+        // gating one of those here would report the SAME mistake twice. Only
+        // the two §9.6 members the `?.` path DOES admit are gated.
+        if (nullCond && member != "Split" && member != "ToCharArray")
+            return;
+    }
+    const unsigned argc = static_cast<unsigned>(ce.args.size());
+    bool admitted = false;
+    for (unsigned a : spec->arities)
+        if (a == argc) { admitted = true; break; }
+    if (admitted) return;
+    // How the callee is named in the diagnostic: the static spelling is
+    // `string.M`, the instance spelling `M` on `string`.
+    const std::string callee =
+        isStatic ? ("`string." + std::string(member) + "`")
+                 : ("`" + std::string(member) + "` on `string`");
+    const std::string expectation = builtinStringArityExpectation(*spec);
+    if (declared) {
+        ctx.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "the call to " + callee + " supplies " + std::to_string(argc) +
+                " argument(s) but stdlib §9.6 declares " +
+                std::string(spec->decl) + " — " + expectation +
+                " (§22.5; §9.6)");
+        return;
+    }
+    // A member stdlib §9.6 does not declare: the arity below is the one the
+    // compiler LOWERS it at, so name that, and point at the issue that
+    // records the gap in the document.
+    ctx.diagnostics().report(
+        Severity::Error, ce.span.begin,
+        "the call to " + callee + " supplies " + std::to_string(argc) +
+            " argument(s) but the compiler lowers `" + std::string(member) +
+            "` only at " + expectation +
+            "; stdlib §9.6 declares no such member at all (issue #7131 asks "
+            "whether the member belongs in §9.6 and at which arity)");
 }
 
 // fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
