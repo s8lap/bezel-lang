@@ -8692,6 +8692,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // `releaseBorrowedStringArgPins` releases them.  The post-call release is
         // installed below after the `CreateCall`.
         std::vector<llvm::Value*> closureStringPins;
+        // fix #7025 (follow-up, §28.3 / §27.6, v0.343): the fresh owned
+        // class arguments that are §28.3 unbound owned temporaries are queued
+        // on the K8 full-expression boundary in the argument loop below (the
+        // queue itself lives in `k8RecvTemps_`).
         for (std::size_t pi = 0; pi < call.args.size(); ++pi) {
             const auto& a = call.args[pi];
             if (!a.value) return nullptr;
@@ -8844,6 +8848,98 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (!v) return nullptr;
             }
             args.push_back(v);
+            // fix #7025 (follow-up, §28.3 / §27.6, v0.343): a FRESH owned
+            // class producer passed as a PLAIN (non-`owned`) argument of a
+            // function value is §28.3's UNBOUND OWNED TEMPORARY — "not bound
+            // to any name, not `move`d, and not returned, but used only by
+            // *borrowing* operations within the expression — as the receiver
+            // of a further call, as a non-`owned` argument, … Such a temporary
+            // is disposed at the **end of the full expression** in which it is
+            // produced, after every use of it within that expression has
+            // completed".
+            //
+            // The function-VALUE invoke path builds its own argument list (it
+            // does NOT route through `buildOrderedArgs`), so it never
+            // discharged the temporary — and the value stayed owned by nobody:
+            // MEASURED (ASan/LSan) on the reviewer's probe
+            // `var f: (Item) -> () := il.Add; f(new Item());` → "Direct leak of
+            // 16 byte(s) in 1 object(s)", while the byte-identical DIRECT call
+            // `il.Add(new Item());` is clean (the borrowing-collection `Add`
+            // arm discharges it — §28.11's "a retained fresh `Add` argument").
+            //
+            // THE GATE, and why each clause fails closed:
+            //   * the argument must be a FRESH owned CLASS producer — a
+            //     borrowed value is the callee's borrow, not the caller's
+            //     temporary, and disposing it would free a value the caller
+            //     does not own (a use-after-free);
+            //   * the FORMAL must be a plain CLASS-typed slot — an `owned`
+            //     slot consumes the argument (the callee owns it and
+            //     disposes it), a `scoped` slot may retain it, and a
+            //     non-class formal has no class block to dispose;
+            //   * the value must be a pointer — a value-typed producer has no
+            //     heap block.
+            // A formal typed at `Object`/an interface is NOT queued here: the
+            // callee's static type is then not the producer's class, so the
+            // dynamic type the callee sees is unknown here and the discharge
+            // would run against a type this site cannot prove. Leaking is the
+            // safe direction for that shape. (A `move` argument is excluded
+            // for the same reason: the shared producer classifier
+            // `common::isFreshOwnedClassProducer` recognises `new` and an
+            // `owned`-returning call, not a moved binding, whose source slot
+            // the transfer nulls — the leak is the safe direction there too.)
+            //
+            // WHERE the discharge runs. §28.3's rule 1: the temporary "is
+            // disposed at the end of the full expression in which it is
+            // produced, after every use of it within that expression has
+            // completed", and K8.4: "A plain parameter announces none: a callee
+            // that stores it holds the borrow under the borrowed-field rule's
+            // or the borrowing-collection store rule's recorded residual …
+            // and the temporary is still disposed at its boundary (K8.1)".
+            // ⇒ the discharge belongs on the K8 FULL-EXPRESSION BOUNDARY,
+            // not immediately after the call: the argument may be one of
+            // several operands of a larger full expression, and the callee's
+            // own copy of the borrow must be the last use. The
+            // `deferUnboundOwnedTempToK8` queue is the established mechanism
+            // for exactly this obligation (the same one #5297 installed for
+            // the discarded-`out owned` value: "dispose at the full
+            // statement's end, after every later operand — queue on the K8
+            // boundary instead of disposing right after the call"), and it
+            // also covers the EXCEPTION edge: the queue registers an
+            // unwind-only disposal, so a callee that raises discharges the
+            // temporary during unwinding (§28.3's *Exception-path discharge*).
+            if (v && v->getType()->isPointerTy() &&
+                isFreshOwnedClassProducer(a.value.get()) &&
+                pi < rt->funcParams.size() &&
+                rt->funcParams[pi].modifier.empty() &&
+                rt->funcParams[pi].type) {
+                const sema::TypeRef* formalTy =
+                    resolveTypeParamRef(rt->funcParams[pi].type);
+                if (formalTy && formalTy->kind == sema::TypeRef::Kind::Named &&
+                    formalTy->declaration &&
+                    formalTy->declaration->kind ==
+                        ast::TypeDeclKind::Class) {
+                    llvm::AllocaInst* slot = entryAllocaNullPtr();
+                    builder_.CreateStore(v, slot);
+                    if (!deferUnboundOwnedTempToK8(slot)) {
+                        // No K8 boundary to queue on (a disposer body): fall
+                        // back to an immediate, null-guarded discharge so the
+                        // value is not leaked outright.
+                        llvm::Value* obj =
+                            builder_.CreateLoad(ptrTy(), slot, "closown.arg");
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            obj, llvm::ConstantPointerNull::get(ptrTy()));
+                        auto* dispBB = llvm::BasicBlock::Create(
+                            llvm_, "closown.dispose", currentFn_);
+                        auto* contBB = llvm::BasicBlock::Create(
+                            llvm_, "closown.cont", currentFn_);
+                        builder_.CreateCondBr(isNull, contBB, dispBB);
+                        builder_.SetInsertPoint(dispBB);
+                        emitDisposeAndReclaim(obj);
+                        builder_.CreateBr(contBB);
+                        builder_.SetInsertPoint(contBB);
+                    }
+                }
+            }
             // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): collect the lowered
             // closure-cell value for the post-call release when the AST was a
             // +1 producer AND the formal parameter is call-bounded (computed
@@ -9176,6 +9272,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // double-free).
         if (!diverged_) {
             for (llvm::Value* cl : callBoundedClosures) emitClosureRelease(cl);
+            // fix #7025 (follow-up, §28.3 / §27.6, v0.343): §28.3's unbound
+            // owned temporaries — the fresh owned class arguments the callee
+            // only BORROWED (a plain formal) — are NOT discharged here: they
+            // are queued on the K8 FULL-EXPRESSION boundary above
+            // (`deferUnboundOwnedTempToK8`), which is the boundary §28.3's
+            // rule 1 and K8.4 name ("the temporary is still disposed at its
+            // boundary"). The same queue covers the exception edge (an
+            // unwind-only disposal), so a callee that raises discharges the
+            // temporary during unwinding (§28.3's *Exception-path
+            // discharge*).
             // fix #5438: discharge the borrowed-string pin vector on the
             // normal-return edge. fix #5441: allStringPins is closureStringPins
             // only now (the helper call was removed); direct +1 producers get
