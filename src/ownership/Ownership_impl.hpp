@@ -5081,6 +5081,28 @@ private:
     // scannable body and are not recognized (adoption, as before). // per
     // §28.10, §28.3, §28.6, #2137
     bool propertyGetterIsRecognizedBorrow(const ast::PropertyDecl& pd) const;
+    // §28.6 / §28.3 / §28.10 (v0.343): true when `read` is a PROPERTY (getter)
+    // read whose RESULT is a BORROW — §28.3's producers table ("Property
+    // access `obj.P` (instance getter) | Borrowed (source: `obj`)", "Static
+    // property access `T.P` (class-typed result) | Borrowed (source: the
+    // declaring type's static storage)") and §28.6's borrow-receiver list
+    // ("a getter or other non-`owned` call result"). The borrow-ness is read
+    // by the SAME predicate §28.10's borrow-pin uses
+    // (`propertyGetterIsRecognizedBorrow`), so the two rules cannot disagree
+    // about what a getter hands back:
+    //   - a resolved USER getter whose own declared type is not
+    //     mint-announcing ALWAYS lends (§28.6's A4 bullet: "properties and
+    //     indexers do not carry `owned` ... so its return is always a
+    //     borrow");
+    //   - a getter declared at a mint-announcing type (Task-family /
+    //     iterable-family) is body-scanned (#6404): a mint-source body hands
+    //     the caller an owned frame, a borrow-source body lends;
+    //   - a read with no resolved body lends when it is interface- or
+    //     virtual-dispatched (#2174's signature-level guarantee) and does NOT
+    //     for a BUILTIN property (not a user-declared getter, so §28.6's A4
+    //     guarantee does not bind it) — the pre-#2174 adoption for that
+    //     face, unchanged.
+    bool propertyReadIsRecognizedBorrow(const ast::Expr& read) const;
     // §28.10 / §28.3 / §28.6 / #2137-residual: body-level predicate called
     // from propertyGetterIsRecognizedBorrow ONLY for the Task-family return
     // carve. A Task-family getter's body determines whether it MINTS a fresh

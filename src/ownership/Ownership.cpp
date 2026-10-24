@@ -7207,6 +7207,100 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     return true;
 }
 
+// §28.6 / §28.3 / §28.10 (v0.343): true when `read` is a PROPERTY (getter)
+// read whose RESULT is a BORROW.
+//
+// §28.3's producers table: "Property access `obj.P` (instance getter) |
+// Borrowed (source: `obj`)" and "Static property access `T.P` (class-typed
+// result) | Borrowed (source: the declaring type's static storage)". §28.6's
+// borrow-receiver list names "a getter or other non-`owned` call result" — so
+// a getter result is a receiver on which `Dispose()` is a compile error.
+//
+// The borrow-ness is decided by the SAME predicate §28.10's borrow-pin uses
+// (`propertyGetterIsRecognizedBorrow`), so §28.10's borrow-pin and §28.6's
+// dispose-receiver rule cannot disagree about what a getter hands back:
+//
+//   * a resolved USER getter whose own declared type is NOT mint-announcing
+//     ALWAYS lends — §28.6's A4 bullet: "properties and indexers do not carry
+//     `owned` ... so its return is always a borrow";
+//   * a getter declared at a mint-announcing type (Task-family /
+//     iterable-family) is body-scanned (#6404): a mint-source body hands the
+//     caller an owned frame, a borrow-source body lends;
+//   * a read with no resolved body lends when it is interface- or
+//     virtual-dispatched (#2174's signature-level guarantee for any
+//     user-declared getter) and does NOT for a BUILTIN property (not a
+//     user-declared getter, so §28.6's A4 guarantee does not bind it) — the
+//     pre-#2174 adoption for that face, unchanged.
+//
+// Extracted from `usingVarInitIsRecognizedBorrow`'s PropertySymbol branch
+// (whose logic is carried over verbatim) so the two rules read ONE fact. //
+// per §28.6, §28.3, §28.10, #2137, #2174
+bool MethodOwnership::propertyReadIsRecognizedBorrow(
+        const ast::Expr& read) const {
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(read));
+    if (!ps) return false;
+    // An indexer read is an IndexExpr, never a MemberAccessExpr — the
+    // PropertySymbol arm never sees one. // per §28.11
+    if (ps->isIndexer) return false;
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+        return propertyGetterIsRecognizedBorrow(*pd);
+    // No resolved body (an interface-dispatched or virtual read, or a builtin
+    // property). The condition is narrow:
+    //   1. the read is a `MemberAccessExpr` (the dispatch form);
+    //   2. the PropertySymbol's `parent` is an INTERFACE (interface-dispatched)
+    //      or a CLASS that contributes a virtual/override (the inherited
+    //      member case — same dispatch path);
+    //   3. the receiver's static type is the interface or the base class (so
+    //      the read is NOT a direct dispatch on a concrete class — the
+    //      concrete class's getter would have resolved to its own
+    //      PropertyDecl and taken the resolved branch above).
+    // Anything else with null decl (a builtin property like `tcs.Task`
+    // registered through some other pathway) keeps adoption, matching the
+    // pre-#2174 behavior for those shapes. // per §28.10, §28.3, §28.6,
+    // #2137, #2174
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&read);
+    if (!ma || !ma->target || !ps->parent) return false;
+    // Match either: (a) parent is an interface (declaration site) or (b) the
+    // read goes through an interface-typed receiver. The "parent is a class
+    // with a virtual/override member" branch is already covered by the
+    // resolved case (the inheriting class's PropertySymbol carries the
+    // concrete PropertyDecl, ps->decl is set).
+    const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+    bool interfaceDispatched = false;
+    if (rt) {
+        // Receiver's static type is an interface head.
+        if (rt->declaration &&
+            rt->declaration->kind == ast::TypeDeclKind::Interface) {
+            interfaceDispatched = true;
+        } else if (!rt->declaration && rt->astNode && rt->astNode->name) {
+            // A null-declaration Named with a head name (e.g. IHas for an
+            // interface alias) — also interface-dispatched.
+            std::string_view head = rt->headName();
+            if (head.size() > 0 && head.front() == 'I' &&
+                head[1] >= 'A' && head[1] <= 'Z') {
+                // Conservative: only call it an interface if the head starts
+                // with an uppercase letter after `I`. (Real interface names
+                // start with `I` followed by uppercase.)
+                interfaceDispatched = true;
+            }
+        }
+    }
+    // Also: an inherited (virtual/override) member resolved to a parent-class
+    // PropertySymbol with no decl — the inherited shape. We need the parent
+    // to be a CLASS (not interface) with a virtual/override member. This is
+    // rare (the inheriting class usually carries its own PropertyDecl) and
+    // conservative: only fire when the member carries a virtual/override
+    // modifier on the symbol.
+    bool inheritedVirtual = false;
+    if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Class) {
+        for (auto m : ps->modifiers)
+            if (m == "virtual" || m == "override") {
+                inheritedVirtual = true; break;
+            }
+    }
+    return interfaceDispatched || inheritedVirtual;
+}
+
 // §28.10 "using var initialized from a borrow" (v0.180+, #2128). See the header
 // for the full contract: the borrow shapes a `using var` initializer can take —
 // beyond the bare-id / arm-meet / bind-atom / bare-T-call shapes handled inline
@@ -7240,97 +7334,11 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
         // surfaces with no PropertyDecl) keep adoption. Indexer
         // PropertySymbols never arrive here (an indexer read is an IndexExpr,
         // recognized below). // per §28.10, §28.3, §28.6, #2137
-        if (auto* ps =
-                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(init))) {
-            if (!ps->isIndexer) {
-                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-                    if (propertyGetterIsRecognizedBorrow(*pd)) return true;
-                } else if (auto* ma =
-                               dynamic_cast<const ast::MemberAccessExpr*>(&init)) {
-                    // #2174: an INTERFACE- or virtual-DISPATCHED read — the
-                    // PropertySymbol has no resolved PropertyDecl (the
-                    // PropertySymbol is the interface's auto-property or
-                    // a virtual override, with no body to body-scan). §28.6's
-                    // "a property or indexer getter may not return a
-                    // freshly-produced owned value" is a SIGNATURE-LEVEL
-                    // guarantee for any user-declared getter — the same
-                    // guarantee #2137(b) relied on for the resolved case.
-                    // Pin it: the typed `using var` over `i.P` would
-                    // otherwise reach codegen's classOfLocal dispose path
-                    // and double-free the borrow (heap-use-after-free under
-                    // ASan, the #2137 family). The condition is narrow:
-                    //   1. init is a `MemberAccessExpr` (the dispatch form);
-                    //   2. the PropertySymbol's `parent` is an INTERFACE
-                    //      (interface-dispatched) or a CLASS that
-                    //      contributes a virtual/override (the inherited
-                    //      member case — same dispatch path);
-                    //   3. the receiver's static type is the interface
-                    //      or the base class (so the read is NOT a
-                    //      direct dispatch on a concrete class — the
-                    //      concrete class's getter would have resolved to
-                    //      its own PropertyDecl and taken the resolved
-                    //      branch above).
-                    // Anything else with null decl (a builtin property
-                    // like `tcs.Task` registered through some other
-                    // pathway) keeps adoption, matching the pre-#2174
-                    // behavior for those shapes.
-                    // // per §28.10, §28.3, §28.6, #2137, #2174
-                    if (ma->target && ps->parent) {
-                        // Match either: (a) parent is an interface
-                        // (declaration site) or (b) the read goes through
-                        // an interface-typed receiver. The "parent is a
-                        // class with a virtual/override member" branch is
-                        // already covered by the resolved case (the
-                        // inheriting class's PropertySymbol carries the
-                        // concrete PropertyDecl, ps->decl is set).
-                        const sema::TypeRef* rt =
-                            ctx_.exprType(*ma->target);
-                        bool interfaceDispatched = false;
-                        if (rt) {
-                            // Receiver's static type is an interface head.
-                            if (rt->declaration &&
-                                rt->declaration->kind ==
-                                    ast::TypeDeclKind::Interface) {
-                                interfaceDispatched = true;
-                            } else if (!rt->declaration &&
-                                       rt->astNode && rt->astNode->name) {
-                                // A null-declaration Named with a head
-                                // name (e.g. IHas for an interface alias)
-                                // — also interface-dispatched.
-                                std::string_view head = rt->headName();
-                                if (head.size() > 0 && head.front() == 'I' &&
-                                    head[1] >= 'A' && head[1] <= 'Z') {
-                                    // Conservative: only call it an
-                                    // interface if the head starts with
-                                    // an uppercase letter after `I`.
-                                    // (Real interface names start with
-                                    // `I` followed by uppercase.)
-                                    interfaceDispatched = true;
-                                }
-                            }
-                        }
-                        // Also: an inherited (virtual/override) member
-                        // resolved to a parent-class PropertySymbol with
-                        // no decl — the inherited shape. We need the
-                        // parent to be a CLASS (not interface) with a
-                        // virtual/override member. This is rare (the
-                        // inheriting class usually carries its own
-                        // PropertyDecl) and conservative: only fire
-                        // when the member carries a virtual/override
-                        // modifier on the symbol.
-                        bool inheritedVirtual = false;
-                        if (ps->parent &&
-                            ps->parent->kind == ast::TypeDeclKind::Class) {
-                            for (auto m : ps->modifiers)
-                                if (m == "virtual" || m == "override") {
-                                    inheritedVirtual = true; break;
-                                }
-                        }
-                        if (interfaceDispatched || inheritedVirtual) return true;
-                    }
-                }
-            }
-        }
+        //
+        // The recognition itself now lives in `propertyReadIsRecognizedBorrow`
+        // — SHARED with §28.6's dispose-receiver rule, which reads the same
+        // borrow-ness fact — so the two rules cannot drift apart.
+        if (propertyReadIsRecognizedBorrow(init)) return true;
     }
     // An INDEXER access — a bare `coll[i]` / `arr[i]` (single-element read, NOT
     // the range-slice `arr[r]`; see the carve-out below). The element-slot table
@@ -10692,8 +10700,8 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
     // A field read (`obj.f`, or a bare `f` implicit-`this`), resolving to a
     // FieldSymbol. `this.<owned field>` is the admitted §28.7 dispose-then-
     // assign / #1230 destructor idiom; every other field read is a borrow the
-    // caller does not own. A property/indexer getter is NOT a FieldSymbol, so
-    // it is left to the conservative default (unenforced) — see the gap note.
+    // caller does not own. A property/indexer getter is NOT a FieldSymbol — it
+    // is read by the getter arm below.
     if (dynamic_cast<const ast::IdentifierExpr*>(&recv) ||
         dynamic_cast<const ast::MemberAccessExpr*>(&recv)) {
         if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(recv))) {
@@ -10705,6 +10713,34 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
                 "borrow, and an `owned` field is disposable only through "
                 "`this` (code of its declaring type); the field's actual "
                 "owner disposes it");
+            return;
+        }
+        // A GETTER's result — a property read (`obj.P`, or the bare `P`
+        // form) resolving to a PropertySymbol. §28.3's producers table:
+        // "Property access `obj.P` (instance getter) | Borrowed (source:
+        // `obj`)" and "Static property access `T.P` (class-typed result) |
+        // Borrowed (source: the declaring type's static storage)"; §28.6's
+        // borrow-receiver list names "a getter or other non-`owned` call
+        // result" among the receivers on which `Dispose()` is a compile
+        // error. A getter is a borrow-producing position (§28.6's A4 bullet:
+        // "properties and indexers do not carry `owned` ... so its return is
+        // always a borrow"), so the caller does not own the result and may
+        // not dispose it — the object that owns it does. The borrow-ness is
+        // read by the SAME predicate §28.10's borrow-pin uses
+        // (`propertyReadIsRecognizedBorrow`), so the two rules cannot
+        // disagree about what a getter hands back; a getter whose own
+        // declared type is mint-announcing (Task-family / iterable-family)
+        // hands the caller an owned frame instead and is admitted.
+        // // per §28.6, §28.3, §28.10
+        if (propertyReadIsRecognizedBorrow(recv)) {
+            report(
+                Severity::Error, loc,
+                "cannot call `Dispose()` on a getter result (§28.6 \"Who may "
+                "call Dispose()\", §28.3 *Producers*) — a property or indexer "
+                "getter is a borrow-producing position, so its result is a "
+                "borrow of the receiver and the caller does not own it; the "
+                "object that owns the value disposes it (expose a factory as "
+                "a method returning `owned T` instead)");
             return;
         }
     }
