@@ -26322,12 +26322,38 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // `var sub := s[a..b]` local owns the producer reference and must release it
     // at scope end. Recognize it by the IndexExpr's target being a string and
     // the index being a RangeExpr (the same shape codegen lowers to a slice).
+    //
+    // fix #7119 / §4.6 / stdlib §9.6 (v0.343): the same slice has a SECOND
+    // spelling — `s[r]` where `r` is a Range-typed VALUE (a variable, a call
+    // result) rather than a RangeExpr literal. The indexer lowering
+    // (LlvmBackend_Exprs.cpp) recognizes both spellings and funnels them
+    // through emitStringSliceBytes, which mints the same rc := 1 production
+    // (LlvmBackend_String.cpp), but the recognizer matched only the literal ⇒
+    // the consumer treated the slice as a BORROW, retained on top of the
+    // producer's +1, and the producer's reference was never dropped (MEASURED:
+    // 36 B in 2 allocations for one slice). §4.6: "`s[r]` for a `Range<int>`
+    // value `r` returns the substring spanning `r` ... The result is a fresh
+    // `string`" — the property stdlib §9.6 declares as
+    // `public pure readonly property [r: Range<int>]: string;`.
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(init)) {
-        if (ix->target && !ix->indices.empty() && ix->indices[0].value &&
-            dynamic_cast<const ast::RangeExpr*>(ix->indices[0].value.get())) {
-            auto* tt = ctx_.exprType(*ix->target);
-            return tt && tt->kind == sema::TypeRef::Kind::Primitive &&
-                   tt->primitive == sema::PrimitiveType::String;
+        if (ix->target && !ix->indices.empty() && ix->indices[0].value) {
+            // The index is a range in one of two spellings: a RangeExpr
+            // literal (`s[0..2]`) or a Range-typed value (`s[r]`) — exactly
+            // the two shapes the indexer lowering recognizes, and both mint
+            // the same rc := 1 production.
+            bool isRangeIndex =
+                dynamic_cast<const ast::RangeExpr*>(ix->indices[0].value.get())
+                    != nullptr;
+            if (!isRangeIndex) {
+                if (const sema::TypeRef* idxTy =
+                        ctx_.exprType(*ix->indices[0].value))
+                    isRangeIndex = isRangeType(idxTy);
+            }
+            if (isRangeIndex) {
+                auto* tt = ctx_.exprType(*ix->target);
+                return tt && tt->kind == sema::TypeRef::Kind::Primitive &&
+                       tt->primitive == sema::PrimitiveType::String;
+            }
         }
     }
     // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: a CALL to the inline
@@ -27088,13 +27114,16 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // by the escape walk (its +1 then leaks — the safe direction); the consumer
     // TRANSFERS the single reference (no extra retain is emitted), so the release
     // drops it exactly once. No double-free. The property getters (`Length`,
-    // `IsAscii`, `[i: int]`, `[r: Range<int>]: string`) and the bool/int methods
+    // `IsAscii`, `[i: int]`) and the bool/int methods
     // (`Equals`, `CompareTo`, `StartsWith`, `EndsWith`, `Contains`, `IndexOf`,
     // `LastIndexOf`, `GetHashCode`, `ToInt32`, `ToInt64`, `ToDouble`, `ToFloat`,
-    // `ToBoolean`, `GetField`, `CountOf`, `Split`, `ToCharArray`, `GetEnumerator`,
+    // `ToBoolean`, `CountOf`, `Split`, `ToCharArray`, `GetEnumerator`,
     // `AsSpan`) are NOT covered here because they either don't return `string` or
     // don't go through tryLowerStringMethod's rc=1 path; they keep the existing
-    // non-producer classification (the borrowed/identity reads).
+    // non-producer classification (the borrowed/identity reads). The slicing
+    // property `[r: Range<int>]: string` is not an instance METHOD — it is
+    // covered by the IndexExpr arm above, in both of its spellings since
+    // #7119.
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->callee) {
             if (auto* ma =
@@ -27133,6 +27162,34 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             return true;
                         // §9.6 Remove(startIndex[, count]) → inline mint.
                         if (m == "Remove" && (argc == 1 || argc == 2))
+                            return true;
+                        // fix #7119 / §9.6 / §28.9 (v0.343): the INSTANCE
+                        // `Repeat(count)` — the 1-arg spelling, `"x".Repeat(n)`
+                        // — repeats SELF n times. The 2-arg STATIC spelling
+                        // `string.Repeat(char, count)` is recognized in the
+                        // static-factory arm above; this is the sibling form
+                        // that arm never covered. tryLowerStringMethod's
+                        // `method == "Repeat" && call.args.size() == 1` arm
+                        // mints an inline malloc + initStringRc (rc := 1) ⇒ a
+                        // fresh +1 producer, and the consumer must TRANSFER
+                        // that reference instead of retaining on top of it
+                        // (MEASURED before this fix: 233 B in 2 allocations for
+                        // `"x".Repeat(200)`, 283 B for the shipped #6641
+                        // receiver `"c" + "x".Repeat(250) + "c"`).
+                        if (m == "Repeat" && argc == 1)
+                            return true;
+                        // fix #7119 / §9.6-ext / §28.9 (v0.343): `GetField(
+                        // delim, n)` — the §9.6-ext member that returns the
+                        // n-th 0-indexed field of SELF split by `delim` — also
+                        // mints a fresh +1 string (tryLowerStringMethod's
+                        // `method == "GetField" && call.args.size() == 2` arm
+                        // ends in the same initStringRc). MEASURED before this
+                        // fix: 34 B in 2 allocations. The comment above used to
+                        // list `GetField` among the members that "don't go
+                        // through tryLowerStringMethod's rc=1 path"; that was
+                        // false — GetField does return a `string` and does mint
+                        // at rc := 1, so it belonged here.
+                        if (m == "GetField" && argc == 2)
                             return true;
                     }
                     // stdlib §3.3 / #971: `span.ToString()` on a
