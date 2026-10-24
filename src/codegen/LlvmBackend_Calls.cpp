@@ -13797,8 +13797,33 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // §9.6: string.Join(separator, items: IEnumerable<string>): string
     if ((cls == "string" || cls == "String") && m == "Join" &&
         call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-        llvm::Value* sep = lowerExpr(*call.args[0].value);
-        if (!sep) return nullptr;
+        // fix #7165 (§22.5, stdlib §9.6, v0.343): a NAMED argument binds to
+        // the PARAMETER it names, never to the position it occupies — "named
+        // arguments may appear in any order after positional arguments. Each
+        // supplied argument binds exactly one parameter" (§22.5). Sema
+        // publishes that binding for a non-identity built-in binding
+        // (`checkBuiltinNamedArgs` -> `ctx_.setBuiltinCallBinding`; the vector
+        // maps PARAMETER index -> SOURCE argument index), and this arm
+        // consumes it, so `string.Join(items := parts, separator := ",")`
+        // reads the separator from the argument NAMED `separator` instead of
+        // from `call.args[0]`. With no binding (a positional call, or a named
+        // call already in declaration order) the parameters are read
+        // positionally, exactly as before.
+        //
+        // The parameter names are the registry's own (stdlib §9.6 declares
+        // `separator` then `items`); no second name table is introduced here.
+        const auto* bnd = ctx_.builtinCallBinding(call);
+        std::size_t sepArgIdx = 0;    // parameter 0: `separator`
+        std::size_t itemsArgIdx = 1;  // parameter 1: `items`
+        if (bnd && bnd->size() == 2) {
+            const int sepSrc = (*bnd)[0];
+            const int itemsSrc = (*bnd)[1];
+            if (sepSrc >= 0 && sepSrc < 2 && itemsSrc >= 0 && itemsSrc < 2) {
+                sepArgIdx = static_cast<std::size_t>(sepSrc);
+                itemsArgIdx = static_cast<std::size_t>(itemsSrc);
+            }
+        }
+        llvm::Value* sep = nullptr;
         // per stdlib §9.6 (#1182): `items` is an IEnumerable<string>, NOT just a
         // concrete Array<string>. A lazy LINQ query (`.Where(...)`/`.Select(...)`),
         // a vtable-backed IEnumerable, a LinkedList/Set/Range — none of these
@@ -13817,9 +13842,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // same element width the loop below indexes with.
         llvm::Value* matTemp = nullptr;
         llvm::Value* arr = nullptr;
-        {
+        // The two supplied argument expressions are lowered in CALL-SITE
+        // TEXTUAL order (§22.5: "a call's supplied argument expressions are
+        // evaluated in call-site textual order — left to right as written, for
+        // positional and named arguments alike; naming an argument changes
+        // which parameter it binds to, never when it runs"). The order in
+        // which the two expressions run therefore does not depend on which
+        // parameter each one binds to.
+        auto lowerSeparator = [&]() -> bool {
+            sep = lowerExpr(*call.args[sepArgIdx].value);
+            return sep != nullptr;
+        };
+        auto lowerItems = [&]() -> bool {
             sema::TypeRef* itElem = nullptr;
-            llvm::Value* lazy = lowerToLazyEnumerator(*call.args[1].value, itElem);
+            llvm::Value* lazy =
+                lowerToLazyEnumerator(*call.args[itemsArgIdx].value, itElem);
             if (lazy) {
                 auto* toArr =
                     declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
@@ -13829,8 +13866,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             } else {
                 // Not an IEnumerable source the lazy path recognizes — lower it
                 // directly (prior behavior; no worse than before for this case).
-                arr = lowerExpr(*call.args[1].value);
+                arr = lowerExpr(*call.args[itemsArgIdx].value);
             }
+            return arr != nullptr;
+        };
+        if (sepArgIdx < itemsArgIdx) {
+            if (!lowerSeparator()) return nullptr;
+            if (!lowerItems()) return nullptr;
+        } else {
+            if (!lowerItems()) return nullptr;
+            if (!lowerSeparator()) return nullptr;
         }
         if (!arr) return nullptr;
         // Emit inline join: iterate parts, concat sep+part (skip sep before first)
