@@ -2925,7 +2925,7 @@ std::string ExprTC::refOutNarrowedCopyOutHint(const ast::Expr& operand,
 
 // Defined with `substituteMemberType`, below.
 static bool ancestorGenericSubst(
-    const TypeRef* recvTy, const TypeSymbol* derived,
+    SemaContext& ctx, const TypeRef* recvTy, const TypeSymbol* derived,
     const TypeSymbol* parent, bool throughInterfaces,
     std::unordered_map<std::string_view, TypeRef*>& out,
     const std::unordered_set<std::string_view>* excludeNames);
@@ -3009,7 +3009,7 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                 for (Symbol* gp : b->genericParams)
                     if (gp) own.insert(gp->name);
                 std::unordered_map<std::string_view, TypeRef*> sub;
-                if (ancestorGenericSubst(nullptr, d->parent, b->parent,
+                if (ancestorGenericSubst(ctx_, nullptr, d->parent, b->parent,
                                          /*throughInterfaces=*/false, sub,
                                          &own) &&
                     !sub.empty())
@@ -3200,7 +3200,7 @@ const TypeRef* ExprTC::formalTypeAtReceiver(const TypeRef* pt,
         const TypeRef* rt = ctx_.exprType(*recvTarget);
         if (rt && rt->declaration && rt->declaration != par &&
             rt->declaration->kind == ast::TypeDeclKind::Interface &&
-            !ancestorGenericSubst(rt, rt->declaration, par,
+            !ancestorGenericSubst(ctx_, rt, rt->declaration, par,
                                   /*throughInterfaces=*/true, cs,
                                   &ownGenerics))
             cs.clear();
@@ -22105,7 +22105,7 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
 // a concrete receiver's class-level arguments reach an inherited member through
 // its base CLASS — so the walk itself must not be a second copy.
 static bool ancestorGenericSubst(
-    const TypeRef* recvTy, const TypeSymbol* derived,
+    SemaContext& ctx, const TypeRef* recvTy, const TypeSymbol* derived,
     const TypeSymbol* parent, bool throughInterfaces,
     std::unordered_map<std::string_view, TypeRef*>& out,
     const std::unordered_set<std::string_view>* excludeNames = nullptr);
@@ -22258,7 +22258,7 @@ ExprTC::constraintReceiverSubst(const ast::Expr* receiver,
             // the next bound, and if none supplies anything the caller sees the
             // empty map and runs the pre-existing check unchanged.
             return ancestorGenericSubst(
-                bound, bound->declaration, memberParent,
+                ctx_, bound, bound->declaration, memberParent,
                 /*throughInterfaces=*/true, out);
         });
     if (!found) out.clear();
@@ -25010,7 +25010,7 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
 // answer in both directions — when `parent` is not on the chain, or when a
 // generic link is unresolvable (`Base<U>` with no `U` in scope to bind it).
 static bool ancestorGenericSubst(
-    const TypeRef* recvTy, const TypeSymbol* derived,
+    SemaContext& ctx, const TypeRef* recvTy, const TypeSymbol* derived,
     const TypeSymbol* parent, bool throughInterfaces,
     std::unordered_map<std::string_view, TypeRef*>& out,
     const std::unordered_set<std::string_view>* excludeNames) {
@@ -25062,16 +25062,52 @@ static bool ancestorGenericSubst(
                 for (std::size_t gi = 0; gi < base->genericParams.size();
                      ++gi) {
                     TypeRef* arg = baseRef->genericArgs[gi];
-                    // Resolve a bare generic-param ref (`T`, no declaration)
-                    // through this level's bindings; a concrete arg passes
-                    // through unchanged.
-                    if (arg && arg->kind == TypeRef::Kind::Named &&
-                        !arg->declaration && arg->astNode &&
-                        arg->astNode->name &&
-                        arg->astNode->name->parts.size() == 1) {
-                        auto it = curArgsAt.find(arg->headName());
-                        if (it != curArgsAt.end()) arg = it->second;
-                    }
+                    // §14.1 / §3.6 rule 2 (v0.343): the base clause is an
+                    // INSTANTIATION SITE of the base's generic declaration, so
+                    // the argument it writes is read at the INSTANTIATION
+                    // (§3.6 rule 2 *Per-instantiation evaluation for
+                    // generics*: "the property is evaluated at each
+                    // instantiation, after substituting the type arguments"),
+                    // not at the declaration. The binding is therefore by
+                    // BINDING, not by NAME: this level's own bindings must be
+                    // substituted through the WHOLE argument, including a
+                    // CONSTRUCTED one (`Root<Array<U>>` binds Root's `T` to
+                    // `Array<U>`, whose inner `U` is THIS level's parameter
+                    // and must be substituted too).
+                    //
+                    // The pre-fix walk looked a BARE single-part name up in
+                    // this level's bindings and left every other shape —
+                    // a constructed argument above all — untouched, so
+                    // `Array<U>` stayed `Array<U>` and the inner parameter
+                    // was never substituted. That is the "bind by NAME only"
+                    // defect (#7115): the inherited member's type kept the
+                    // DERIVED class's parameter, which made the §5.1 question
+                    // at the index position undecidable and forced
+                    // #7064's check to fail OPEN over a whole class of index
+                    // arguments.
+                    //
+                    // The walker used here is `sema::substituteGenericArgs`
+                    // — the DECLARED SINGLE AUTHORITY for eager generic
+                    // substitution (src/sema/SubstArgs.hpp), which recurses
+                    // into Named-with-genericArgs, InlineArray element and
+                    // Function parameter/return. It is the SAME authority
+                    // `Resolver::applyGenericSubst` uses, so the two
+                    // base-chain walks (this one and
+                    // `Resolver::buildBaseClassGenericSubst`) now agree:
+                    // the override-matching walk already recursed, this one
+                    // did not.
+                    //
+                    // A parameter this level does NOT bind stays a bare
+                    // parameter reference (the walker leaves it alone), so
+                    // the map still carries an unsubstituted reference for
+                    // the genuinely-undecidable case — the conservative
+                    // direction #7064's fail-open relies on.
+                    if (arg)
+                        arg = sema::substituteGenericArgs(
+                            arg, sema::SubstArgs{ctx, curArgsAt, {},
+                                                 /*validateNestedInlineArrays=*/
+                                                 false,
+                                                 /*aliasChainParams=*/true});
                     if (base->genericParams[gi])
                         if (!excludeNames ||
                             !excludeNames->count(base->genericParams[gi]->name))
@@ -25210,7 +25246,7 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
         // which reproduces the inline loop it replaces EXACTLY — only a Class
         // base is traversable, and a class has at most one — so no program that
         // compiled through this arm before compiles differently now.
-        if (!ancestorGenericSubst(recvTy, derived, parent,
+        if (!ancestorGenericSubst(ctx_, recvTy, derived, parent,
                                   /*throughInterfaces=*/false, classSubst,
                                   excludeNames))
             return declared;  // ancestor not reached / unresolvable generic link
