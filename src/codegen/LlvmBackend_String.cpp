@@ -1477,6 +1477,46 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             : builder_.CreateSExt(v, i64(), signedName);
     };
 
+    // fix #7106 (§5.1, v0.343): fit an `int`-typed PARAMETER that must land in
+    // an i32 SLOT (the span struct's Start/Length are i32 fields) to that slot
+    // BY THE SOURCE'S SIGNEDNESS.
+    //
+    // ⚠ This is NOT `widenIntParam`: that helper widens to i64 — the width the
+    // runtime helpers take — while the span's Start/Length are i32. Copying the
+    // #7102 fix here would emit an i64 into an i32 struct field.
+    //
+    // The pre-existing code did `CreateTrunc(v, i32())` for every value that
+    // was not already i32. A `trunc` to a WIDER type is malformed IR, so a
+    // `byte` start (i8) aborted the compiler:
+    //
+    //     DestTy too big for Trunc
+    //       %4 = trunc i8 %3 to i32
+    //     bezelc: codegen error: IR verification failed (malformed IR emitted)
+    //
+    // ⇒ an ICE on a program §5.1 admits.
+    //
+    // §5.1 (v0.343): a `byte` above the signed midpoint is the `int` 200, not
+    // -56 ("A value of one type implicitly converts to another when no
+    // programmer-visible information is lost"; the table row
+    // `| byte | short, ushort, int, uint, long, ulong, float, double, decimal |`).
+    // ⇒ an UNSIGNED source (`byte`, `ushort`, `uint`, `ulong`, `char`) ZERO-
+    // extends; a SIGNED one (`sbyte`, `short`, `int`) SIGN-extends. A value
+    // already i32 is used as is. A WIDER one (i64) keeps the pre-existing
+    // trunc — `long → int` is never implicit (§5.1's never-implicit list), so
+    // that arm is unreachable for a well-typed program and is kept only so the
+    // helper never hands a non-i32 value to an i32 slot.
+    auto fitToI32 = [&](const ast::Expr* arg, llvm::Value* v) -> llvm::Value* {
+        if (!v || !v->getType()->isIntegerTy()) return v;
+        unsigned w = v->getType()->getIntegerBitWidth();
+        if (w == 32) return v;
+        if (w < 32) {
+            return typeRefIsUnsigned(ctx_.exprType(*arg))
+                ? builder_.CreateZExt(v, i32(), "fit32.z")
+                : builder_.CreateSExt(v, i32(), "fit32.s");
+        }
+        return builder_.CreateTrunc(v, i32(), "fit32.t");
+    };
+
     // §9.6 / §3.3 (#883): string.AsSpan() and its overloads → a ReadOnlyStringSpan
     // { Source = self (string ptr), Start, Length } over a contiguous code-point
     // range. Reuses the {ptr,i32,i32} span struct (buildArraySpan); the span's
@@ -1517,8 +1557,12 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         if (call.args.size() == 1 && call.args[0].value) {
             llvm::Value* start = getIntArg(0);
             if (!start) return nullptr;
-            if (!start->getType()->isIntegerTy(32))
-                start = builder_.CreateTrunc(start, i32());
+            // fix #7106 (§5.1, v0.343): fit the start to the i32 slot by the
+            // SOURCE's signedness. A `trunc` to a WIDER type is malformed IR,
+            // so a `byte` start (i8) used to abort the compiler with "DestTy
+            // too big for Trunc"; and a `byte` 200 must reach the i32 slot as
+            // 200 (§5.1), not -56.
+            start = fitToI32(call.args[0].value.get(), start);
             emitGuardThrow(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(start, builder_.getInt32(0)),
@@ -1532,10 +1576,12 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             llvm::Value* start = getIntArg(0);
             llvm::Value* len   = getIntArg(1);
             if (!start || !len) return nullptr;
-            if (!start->getType()->isIntegerTy(32))
-                start = builder_.CreateTrunc(start, i32());
-            if (!len->getType()->isIntegerTy(32))
-                len = builder_.CreateTrunc(len, i32());
+            // fix #7106 (§5.1, v0.343): same widen-by-signedness fit as the
+            // (start) arm above — the span's Start/Length are i32 slots, and a
+            // `trunc` to a WIDER type is malformed IR (the compiler-crash arm
+            // this replaces).
+            start = fitToI32(call.args[0].value.get(), start);
+            len   = fitToI32(call.args[1].value.get(), len);
             emitGuardThrow(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(start, builder_.getInt32(0)),
