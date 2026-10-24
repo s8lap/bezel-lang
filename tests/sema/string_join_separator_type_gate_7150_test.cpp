@@ -232,6 +232,95 @@ BEZEL_TEST(sema_string_join_separator_type_gate_7150,
     BEZEL_EXPECT_TRUE(rejectedAtARealLocation(r));
 }
 
+// ── THE THREE SIBLING SEPARATOR TYPES — the rows the #7150 gate covers but
+// the #7150 test file did not pin ────────────────────────────────────────
+//
+// The R35 #7150 reviewer measured SIX program-level verdict changes from
+// the #7150 gate, and its commit body named only ONE of them. Two of the
+// six were already pinned above (`string.Join(null, parts)` and the
+// un-narrowed `string?` parameter). The remaining FOUR were pinned by
+// NOTHING — no row in this file and no conformance-corpus row (MEASURED:
+// `grep -rl "string.Join" tests/conformance/rules/cases/` matches NOTHING).
+//
+// Three of those four are the gate's own §5.1 / §7 type family, and they
+// are pinned here:
+//
+//   * a `Object?` separator      ⇒ §7 (nullable, un-narrowed);
+//   * a `Object` separator       ⇒ §5.1 (an `Object` converts implicitly to
+//                                  no other type — `Object` to `string` is a
+//                                  downcast, which is never implicit);
+//   * a USER CLASS separator     ⇒ §5.1.
+//
+// The FOURTH is `string.Join(items := parts, separator := ",")`, which the
+// #7150 gate rejects only because it binds `ce.args[0]` POSITIONALLY — the
+// named-argument surface is name-based (§22.5) and `kStringParamNames`
+// (`src/common/BuiltinRegistry.cpp:571`) already carries the declared
+// names. That call's verdict is a KNOWN DEFECT with its own issue (**#7165**
+// — named arguments on built-in `string` members are lowered positionally,
+// so a legal program computes the wrong value). **It is deliberately NOT
+// pinned here**: pinning the current verdict would fight #7165's fix, which
+// must make that call BIND BY NAME and be ACCEPTED.
+//
+// FAIL-WITHOUT (MEASURED, on the tree before the #7150 pick, by reverting
+// `src/sema/ExprTypecheck_Calls.cpp` to the pick's PARENT and rebuilding):
+// the `Object?` separator COMPILED and SEGFAULTED at run time, and the
+// `Object` and user-class separators COMPILED and RAN — the `Object` one
+// printing `ab,cd` and the user-class one printing `abcd` (the separator
+// SILENTLY DROPPED). ⇒ each of the three rows below fails on that tree.
+
+BEZEL_TEST(sema_string_join_separator_type_gate_7150,
+           reject_object_nullable_separator) {
+    const std::string src =
+        "module M;\nclass C\n"
+        "  private static method Use(sep: Object?): int\n" +
+        std::string(kParts) +
+        "    Console.WriteLine(string.Join(sep, parts));\n"
+        "    return 0;\n"
+        "  end Use;\n"
+        "  public static method Main(): int\n"
+        "    return C.Use(\",\");\n"
+        "  end Main;\n"
+        "end C;\n";
+    auto r = runAot(src);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(nullableSeparator(r));
+    BEZEL_EXPECT_TRUE(rejectedAtARealLocation(r));
+}
+
+BEZEL_TEST(sema_string_join_separator_type_gate_7150,
+           reject_object_separator) {
+    const std::string src = prog(std::string(kParts) +
+                                  "    var sep: Object := \",\";\n"
+                                  "    Console.WriteLine(string.Join(sep, "
+                                  "parts));\n"
+                                  "    return 0;");
+    auto r = runAot(src);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(notConvertible(r));
+    BEZEL_EXPECT_TRUE(rejectedAtARealLocation(r));
+}
+
+BEZEL_TEST(sema_string_join_separator_type_gate_7150,
+           reject_user_class_separator) {
+    const std::string src =
+        "module M;\n"
+        "class Sep\n"
+        "  public method Text(): string return \",\"; end Text;\n"
+        "end Sep;\n"
+        "class C\n"
+        "  public static method Main(): int\n" +
+        std::string(kParts) +
+        "    var sep := new Sep();\n"
+        "    Console.WriteLine(string.Join(sep, parts));\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n";
+    auto r = runAot(src);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(notConvertible(r));
+    BEZEL_EXPECT_TRUE(rejectedAtARealLocation(r));
+}
+
 // ── ACCEPT-CONTROLS — the separators §9.6 DOES declare ────────────────────
 // Every control asserts a VALUE, so a control that stopped lowering would
 // fail here rather than silently returning something else.
