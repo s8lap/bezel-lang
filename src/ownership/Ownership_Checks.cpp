@@ -21303,67 +21303,26 @@ const ast::Expr* MethodOwnership::selectorLambdaMintingReturn(
     return mintingReturn;
 }
 
-// §28.3 / stdlib §5 (#1917, #1931): see the declaration comment. // per §28.3
-bool MethodOwnership::lazySelectSelectorReturnMints(const ast::Expr& retExpr) {
-    // A freshly-produced OWNED value: `new ClassType(...)`, an `owned`-returning
-    // call, a `move` result — producerState's exact §28.3 producer classifier.
-    if (producerState(retExpr) == OwnershipState::Owned) return true;
-    // A fresh STRING with no borrow source: string `+` concatenation, an
-    // interpolation, or (#1931) a call to a stdlib string-minting method on a
-    // string receiver. (A bare element / field / index read of a string is a
-    // BORROW — not one of these shapes — and stays admitted; a USER-DEFINED
-    // method returning a borrowed string is also left alone — the no-
-    // MethodDecl gate in isStdlibStringMintingCall keeps only the documented
-    // stdlib minting set in scope, never an arbitrary override.) // per §28.3
-    // (#1917, #1931)
-    const sema::TypeRef* rt = ctx_.exprType(retExpr);
-    const bool isString = rt && rt->kind == sema::TypeRef::Kind::Primitive &&
-                          rt->primitive == sema::PrimitiveType::String;
-    if (isString) {
-        if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&retExpr))
-            if (be->op == "+") return true;
-        if (dynamic_cast<const ast::InterpolatedStringExpr*>(&retExpr))
-            return true;
-        // §28.3 / stdlib §5 (#1931): a call to a STDLIB string-minting method
-        // (`s.ToUpper()`, `s.Substring(...)`, `s.Trim()`, `s.Replace(...)`,
-        // `s.PadLeft(...)`, `s.PadCenter(...)`, `s.Insert(...)`, `s.Remove(...)`,
-        // ...) mints a fresh string per element. The documented mint set is
-        // stdlib §9.6 `String` (v0.343) — every method whose contract is
-        // "returns a new `string` value; original unchanged". A user-defined
-        // override is left alone (over-rejection guard, same as #1917's
-        // `Select` gate); a non-string receiver and a non-string result are
-        // likewise excluded.
-        // // per §28.3 / stdlib §9.6 (#1931)
-        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&retExpr))
-            if (isStdlibStringMintingCall(*ce)) return true;
-    }
-    // A conditional projects a mint if EITHER arm mints.
-    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&retExpr)) {
-        if (cd->thenValue && lazySelectSelectorReturnMints(*cd->thenValue))
-            return true;
-        if (cd->elseValue && lazySelectSelectorReturnMints(*cd->elseValue))
-            return true;
-    }
-    return false;
-}
+namespace {
 
-// §28.3 / stdlib §9.6 (#1931): true when `ce` is a CALL to a STDLIB string-
+// §28.3 / stdlib §5 (#1931): true when `ce` is a CALL to a STDLIB string-
 // minting method on a string receiver — a documented-mint set whose contract
 // (stdlib §9.6 `String`, v0.343) is "returns a new `string` value; original
 // unchanged" and which therefore mints a fresh heap allocation per call. Used
-// by lazySelectSelectorReturnMints to extend the §28.3 minting-selector reject
+// by isFreshStringResult to extend the §28.3 minting-selector reject
 // to method-call selectors — the interprocedural gap left by #1917. The
 // user-MethodDecl gate (mirroring checkLazySelectMintingSelector's
 // `Select`-is-an-intrinsic gate) keeps the classification to the stdlib method
 // only; a user override that returns a borrowed string is left alone. // per
 // §28.3 / stdlib §9.6 (#1931)
-bool MethodOwnership::isStdlibStringMintingCall(const ast::CallExpr& ce) {
+bool stdlibStringMintingCall(const ast::CallExpr& ce,
+                             const sema::SemaContext& ctx) {
     // §28.3 (#1931): a USER override of a string-returning method may return a
     // borrow — only stdlib methods (no user MethodDecl) are classified as mint.
     // Mirrors checkLazySelectMintingSelector's gate for `Select` / `Min` / `Max`
     // (a user-defined method with the same name resolves to a MethodDecl and is
     // governed by its declared parameter/return modifiers). // per §28.3
-    if (common::calleeMethodDecl(ce, ctx_)) return false;
+    if (common::calleeMethodDecl(ce, ctx)) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
     if (!ma) return false;
     // Documented stdlib §9.6 string-mint set (v0.343). The set is DERIVED from
@@ -21383,13 +21342,11 @@ bool MethodOwnership::isStdlibStringMintingCall(const ast::CallExpr& ce) {
     // the gate classifies a CALL ON A STRING RECEIVER, and a static call's
     // "receiver" is the TYPE NAME `string`, not a string value. None of their
     // names is in the set below either.
-    // §9.6's `[r: Range<int>]` indexer (the slice form) is also outside this
-    // set, and by a different route: it is a PROPERTY, not a member CALL, so
-    // this predicate's shape never sees it. RECORDED GAP (NOT this fix): a
-    // slice selector (`Select(s => s[0..2])`) mints a fresh string — §4.6 "the
-    // result is a fresh `string`" — and is still ACCEPTED here (MEASURED: 72 B
-    // in 4 allocations for two elements). The Range-slice form is a separate
-    // gate from the §28.3 minting-SELECTOR gate.
+    // The set is CHECKED against the document, not only maintained by hand:
+    // scripts/check_string_mint_methods.py derives the expected set from
+    // stdlib §9.6 itself and fails closed on a mismatch, so a §9.6 member that
+    // is added without its transcription here turns the gate RED rather than
+    // silently un-minting.
     // // per stdlib §9.6 (v0.343)
     //
     // fix #7144 (§28.3, §9.6, v0.343): the list had been frozen at stdlib §9.6
@@ -21418,10 +21375,132 @@ bool MethodOwnership::isStdlibStringMintingCall(const ast::CallExpr& ce) {
     // uses for the `PopLast` / `PopFirst` / etc. receiver-type gate. // per
     // §28.3 (#1931)
     if (!ma->target) return false;
-    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    const sema::TypeRef* recvTy = ctx.exprType(*ma->target);
     if (!recvTy) return false;
     return recvTy->kind == sema::TypeRef::Kind::Primitive &&
            recvTy->primitive == sema::PrimitiveType::String;
+}
+
+// §4.6 / stdlib §9.6 (v0.343) (fix #7156): the §9.6 SLICE property —
+//
+//   public pure readonly property [r: Range<int>]: string;
+//
+// — indexed on a `string` receiver with a `Range`. §4.6: "`s[r]` for a
+// `Range<int>` value `r` returns the substring spanning `r` [...] The result
+// is a fresh `string`". So the slice MINTS a fresh runtime-managed string per
+// evaluation, exactly like the §9.6 member methods in the documented mint set.
+//
+// WHY THIS IS A SHAPE AND NOT A NAME. The §28.3 minting-selector gate used to
+// recognise a minting selector ONLY through a member CALL's name, so the
+// slice — a PROPERTY, not a call — was invisible to it: `Select(s => s[0..2])`
+// was ACCEPTED (MEASURED on the base tree: it LEAKED 72 B in 4 allocations for
+// two elements, and SEGFAULTED — a null read at 0x8 — when the slice raised
+// §4.6's IndexOutOfRangeException). Adding the next §9.6 member to the name
+// list could not have closed that, and the next §9.6 PROPERTY would not
+// close it either. This predicate keys on the SHAPE of the index expression, so
+// the gate asks "is the RESULT a fresh `string`" rather than "is this a call to
+// a member named X".
+//
+// The two conditions AND-ed, mirroring codegen's OWN producer recogniser for
+// the same shape (Emitter::isPlusOneStringProducer in
+// src/codegen/LlvmBackend_Setup.cpp) exactly, so the two phases cannot diverge
+// on what counts as a fresh slice:
+//   (a) the RECEIVER types as a `string`;
+//   (b) the index is a RANGE, in either of the two spellings the indexer
+//       lowering recognises: a range LITERAL (`s[0..2]`) or a `Range`-typed
+//       VALUE (`s[r]`, #7119) — the latter recognised on the builtin `Range<T>`
+//       SYMBOL (fix #6973), never on the spelling, so a user `record Range(...)`
+//       is excluded. A single-element read `s[i]` is §4.6's `char` read, not a
+//       slice, and is a BORROW. // per §4.6 / stdlib §9.6 (v0.343)
+bool isStringRangeSliceIndex(const ast::IndexExpr& ix,
+                             const sema::SemaContext& ctx) {
+    if (!ix.target) return false;
+    const sema::TypeRef* recvTy = ctx.exprType(*ix.target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Primitive ||
+        recvTy->primitive != sema::PrimitiveType::String)
+        return false;
+    if (ix.indices.empty() || !ix.indices[0].value) return false;
+    const ast::Expr* idx = ix.indices[0].value.get();
+    if (dynamic_cast<const ast::RangeExpr*>(idx)) return true;
+    const sema::TypeRef* idxTy = ctx.exprType(*idx);
+    return idxTy && idxTy->kind == sema::TypeRef::Kind::Named &&
+           idxTy->declaration && idxTy->declaration->isBuiltinRangeSym();
+}
+
+// §28.3 / §4.6 / stdlib §9.6 (v0.343) (fix #7156): THE RESULT-SHAPE
+// PREDICATE — "this expression's RESULT is a fresh `string`". §28.3's
+// minting-selector reject asks about the RESULT, not about the spelling of
+// the expression that produced it: a selector that projects a fresh owned
+// value per element launders it out through the projected sequence (stdlib §5
+// classifies the projected element as a receiver-sourced borrow), so the lazy
+// pipeline takes no disposal obligation on it and every minted projection
+// leaks.
+//
+// The four arms are SHAPES:
+//   (1) `s + t` — §4.6's concatenation;
+//   (2) an interpolation;
+//   (3) the §9.6 slice PROPERTY — §4.6's "the result is a fresh `string`";
+//   (4) a §9.6 MINTING MEMBER CALL (`s.ToUpper()`, `s.Substring(...)`, ...) —
+//       the documented mint set, which scripts/check_string_mint_methods.py
+//       checks against stdlib §9.6 itself.
+//
+// A bare element / field / index read of a string is a BORROW — not one of
+// these shapes — and stays admitted; a USER-DEFINED method returning a
+// borrowed string is also left alone (the no-MethodDecl gate in
+// isStdlibStringMintingCall keeps only the documented stdlib minting set in
+// scope, never an arbitrary override). // per §28.3 / §4.6 / stdlib §9.6
+// (v0.343)
+bool isFreshStringResult(const ast::Expr& e, const sema::SemaContext& ctx) {
+    // The RESULT must be a `string` at all: a fresh string is the question.
+    const sema::TypeRef* rt = ctx.exprType(e);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Primitive ||
+        rt->primitive != sema::PrimitiveType::String)
+        return false;
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e))
+        if (be->op == "+") return true;
+    if (dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) return true;
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+        if (isStringRangeSliceIndex(*ix, ctx)) return true;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e))
+        if (stdlibStringMintingCall(*ce, ctx)) return true;
+    return false;
+}
+
+}  // namespace
+
+// §28.3 / stdlib §5 (#1917, #1931): see the declaration comment. // per §28.3
+bool MethodOwnership::lazySelectSelectorReturnMints(const ast::Expr& retExpr) {
+    // A freshly-produced OWNED value: `new ClassType(...)`, an `owned`-returning
+    // call, a `move` result — producerState's exact §28.3 producer classifier.
+    if (producerState(retExpr) == OwnershipState::Owned) return true;
+    // A fresh STRING with no borrow source — the RESULT-SHAPE predicate
+    // (§4.6 / stdlib §9.6, v0.343): a `+` concatenation, an interpolation, the
+    // §9.6 slice property, or a stdlib string-minting method on a string
+    // receiver. (A bare element / field / index read of a string is a BORROW —
+    // not one of these shapes — and stays admitted; a USER-DEFINED method
+    // returning a borrowed string is also left alone — the no-MethodDecl gate in
+    // isStdlibStringMintingCall keeps only the documented stdlib minting set in
+    // scope, never an arbitrary override.) // per §28.3 (#1917, #1931, #7156)
+    if (isFreshStringResult(retExpr, ctx_)) return true;
+    // A conditional projects a mint if EITHER arm mints.
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&retExpr)) {
+        if (cd->thenValue && lazySelectSelectorReturnMints(*cd->thenValue))
+            return true;
+        if (cd->elseValue && lazySelectSelectorReturnMints(*cd->elseValue))
+            return true;
+    }
+    return false;
+}
+
+// §28.3 / stdlib §9.6 (#1931): true when `ce` is a CALL to a STDLIB string-
+// minting method on a string receiver. The predicate itself lives in the
+// file-local `stdlibStringMintingCall` above, so that the §28.3 minting-
+// selector gate can ask the single RESULT-SHAPE question ("is the result a
+// fresh `string`?") over every fresh-string shape at once — the member here
+// is the class-scoped entry point onto the same implementation.
+// // per §28.3 / stdlib §9.6 (#1931, #7156)
+bool MethodOwnership::isStdlibStringMintingCall(const ast::CallExpr& ce) {
+    return stdlibStringMintingCall(ce, ctx_);
 }
 
 // §30.5 / §30.4 (#834): true when `e`'s static type is an `OwningTask<...>`
