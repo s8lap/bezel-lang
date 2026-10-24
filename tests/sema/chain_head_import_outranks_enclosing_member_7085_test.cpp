@@ -374,6 +374,14 @@ end Outer;
 // error. ⇒ The warning must not offer one; it says what §11.6 says the
 // reachability IS (the coordinator's interim ruling on #7121: the warning
 // still fires — §2.7's warning row says warn).
+//
+// fix #7085 (round 4): the text's clause "the spelling this chain head now
+// takes" was FALSE — the chain head takes the SHADOWING type (MEASURED: at a
+// chain head the module-level `C` wins and the program prints 4; at a BARE
+// TYPE NAME in the same body the nested `Outer.C` wins and it prints 6).
+// §2.7's table has a row for each syntactic shape, and the bare name is a
+// different shape from the chain head. ⇒ The clause now says where the bare
+// name reaches the nested type, and says what the chain head takes.
 BEZEL_TEST(chain_head_import_outranks_enclosing_member_7085,
            chain_head_warning_for_a_generic_enclosing_type_offers_no_qualified_remedy_spec_2_7) {
     const std::string src = R"(
@@ -408,11 +416,271 @@ end Outer;
     BEZEL_EXPECT_TRUE(hasDiagnosticWith(
         r.diagnostics,
         "\xC2\xA7" "11.6 names it by its bare name inside that type's "
-                    "bodies"));
+                    "bodies — where a bare type name reaches it, though "
+                    "this chain head takes the shadowing type"));
+    // The false clause of round 3 must be gone: the chain head does NOT take
+    // the nested type's bare-name spelling.
+    BEZEL_EXPECT_FALSE(hasDiagnosticWith(
+        r.diagnostics, "the spelling this chain head now takes"));
     // The qualified remedy must NOT be offered here: `Outer.C` does not
     // compile (§11.6 / Appendix C.1's arity error).
     BEZEL_EXPECT_FALSE(
         hasDiagnosticWith(r.diagnostics, "qualify with `Outer.C`"));
+}
+
+// fix #7085 (round 4): the COMPLETE rule — a qualified remedy `Owner.Member`
+// exists iff `Owner` is non-generic AND `Member` is non-generic. Round 3
+// checked only the first half, so a GENERIC NESTED TYPE under a non-generic
+// owner was still offered `Outer.C` — which does NOT compile: §2.2 /
+// Appendix C.1 (a chain head fixes arity 0) rejects `Outer.C` naming a
+// generic type, and Appendix A.5 (a type-argument list attaches to the END
+// of a qualified type name) rejects `Outer.C<int>.N`.
+//
+// fix #7085 (round 5): the rule stays; the TEXT is re-derived, because
+// round 4's generic-nested text asserted "the nested type is generic, so NO
+// QUALIFIED SPELLING REACHES IT IN A TYPE POSITION" — MEASURED FALSE, for
+// this very case: `Outer.C<int>` reaches the nested TYPE (rc 0, stdout "6").
+// ⇒ The text now says what is true: `Outer.C` names the generic type
+// WITHOUT its arguments (the arity error), `Outer.C<...>` REACHES the nested
+// type, and no qualified spelling can then name one of its MEMBERS
+// (`Outer.C<...>.N` is A.5's error).
+BEZEL_TEST(chain_head_import_outranks_enclosing_member_7085,
+           chain_head_warning_for_a_generic_nested_type_offers_no_qualified_remedy_spec_2_2) {
+    const std::string src = R"(
+module Warn7;
+public class C
+  public class N
+    public method Get(): int return 4; end Get;
+  end N;
+end C;
+class Outer
+  public class C<U>
+    public class N
+      public method Get(): int return 6; end Get;
+    end N;
+  end C;
+  public class Inner
+    public static method Main(): int
+      using var n: C.N := new C.N();
+      Console.WriteLine(n.Get());
+      return 0;
+    end Main;
+  end Inner;
+end Outer;
+)";
+    auto r = bezel::test::parseAndResolveGated(src);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasChainHeadShadowWarning(r.diagnostics));
+    // MEASURED: `Outer.C` ⇒ rc 1 (Appendix C.1's arity error);
+    // `Outer.C<...>` ⇒ rc 0 and reaches the nested TYPE (stdout "6");
+    // `Outer.C<...>.N` ⇒ rc 1 (A.5). ⇒ The text says each of those, and
+    // says NO qualified spelling can then name one of its MEMBERS.
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "the nested type is generic, so `Outer.C` names it without its "
+        "arguments"));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "`Outer.C<...>` reaches the nested type itself"));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "no qualified spelling can then name one of its members"));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "the bare name with its own arguments reaches the type"));
+    // The false clause of round 4 must be gone: `Outer.C<...>` DOES reach
+    // the nested type, so the text must not deny a qualified spelling.
+    BEZEL_EXPECT_FALSE(hasDiagnosticWith(
+        r.diagnostics, "no qualified spelling reaches it in a type position"));
+    // The qualified remedy must NOT be offered: `Outer.C` does not compile
+    // (§2.2 / Appendix C.1's arity error).
+    BEZEL_EXPECT_FALSE(
+        hasDiagnosticWith(r.diagnostics, "qualify with `Outer.C`"));
+    // The declaring type is NOT generic here — the two no-remedy reasons are
+    // distinct and the row must pick the right one.
+    BEZEL_EXPECT_FALSE(hasDiagnosticWith(
+        r.diagnostics, "the enclosing type `Outer` is generic"));
+}
+
+// fix #7085 (round 4): the SAME half of the rule in the LOCAL branch — a
+// LOCAL enclosing type (§21.10: "The `GenericParams?` slot must be empty
+// (v1) — a local type declares no type parameters of its own") is never
+// generic, but its nested type may be. MEASURED: `Local.C` ⇒ rc 1 (the
+// arity error), so the local branch must offer no qualified remedy either.
+//
+// fix #7085 (round 5): the text is re-derived, for the same reason as the
+// type branch's: `Local.C<...>` REACHES the nested type (rc 0, stdout "6"),
+// so the text must not deny a qualified spelling.
+BEZEL_TEST(chain_head_import_outranks_enclosing_member_7085,
+           chain_head_warning_for_a_generic_nested_type_in_a_local_enclosing_type_offers_no_qualified_remedy_spec_2_2) {
+    const std::string src = R"(
+module Warn8;
+public class C
+  public class N
+    public method Get(): int return 4; end Get;
+  end N;
+end C;
+class Holder
+  public static method Main(): int
+    record Local
+      public class C<U>
+        public class N
+          public method Get(): int return 6; end Get;
+        end N;
+      end C;
+      public class Inner
+        public static method Go(): int
+          using var n: C.N := new C.N();
+          Console.WriteLine(n.Get());
+          return 0;
+        end Go;
+      end Inner;
+    end Local;
+    return Local.Inner.Go();
+  end Main;
+end Holder;
+)";
+    auto r = bezel::test::parseAndResolveGated(src);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasChainHeadShadowWarning(r.diagnostics));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "the nested type is generic, so `Local.C` names it without its "
+        "arguments"));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "`Local.C<...>` reaches the nested type itself"));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "no qualified spelling can then name one of its members"));
+    // The false clause of round 4 must be gone here too.
+    BEZEL_EXPECT_FALSE(hasDiagnosticWith(
+        r.diagnostics, "no qualified spelling reaches it in a type position"));
+    BEZEL_EXPECT_FALSE(
+        hasDiagnosticWith(r.diagnostics, "qualify with `Local.C`"));
+}
+
+// fix #7085 (round 4): BOTH generic — the declaring type AND the nested type.
+//
+// fix #7085 (round 5): round 4 resolved this tie by a claim the reviewer
+// MEASURED FALSE — that the static-member route is reachable "only when the
+// declaring type is generic too". It is not: with a NON-generic declaring
+// type, `Outer<int>.C.Make()` compiles and prints 7 as well, through a
+// PRE-EXISTING arity gap in the chain-head receiver path (the enclosing
+// segment's arguments are not checked there). ⇒ The tie is resolved by the
+// MEASURED facts instead:
+//   * the enclosing type is generic ⇒ no qualified spelling reaches the
+//     nested type in a type position at all (§11.6: `Outer.C` and
+//     `Outer.C<...>` are both the arity error);
+//   * the nested type is generic ⇒ the bare name inside the declaring
+//     type's bodies must carry its own arguments, and no qualified spelling
+//     can carry them and then name one of its members (A.5).
+// ⇒ The text says BOTH, and — because the only spelling that reaches the
+// nested type's static members today (`Outer<int>.C.Make()`) is a RAW
+// generic reference (§14.1: "Bezel has no raw and no open generic type
+// reference") — it claims NO static-member route.
+BEZEL_TEST(chain_head_import_outranks_enclosing_member_7085,
+           chain_head_warning_for_a_generic_nested_type_in_a_generic_enclosing_type_spec_2_2) {
+    const std::string src = R"(
+module Warn10;
+public class C
+  public class N
+    public method Get(): int return 4; end Get;
+  end N;
+end C;
+class Outer<T>
+  public class C<U>
+    public class N
+      public method Get(): int return 6; end Get;
+    end N;
+  end C;
+  public class Inner
+    public static method Main(): int
+      using var n: C.N := new C.N();
+      Console.WriteLine(n.Get());
+      return 0;
+    end Main;
+  end Inner;
+end Outer;
+)";
+    auto r = bezel::test::parseAndResolveGated(src);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasChainHeadShadowWarning(r.diagnostics));
+    // The enclosing type's genericity: no qualified spelling reaches the
+    // nested type in a type position (§11.6).
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "the enclosing type `Outer` is generic, so its nested type has no "
+        "qualified spelling"));
+    // The nested type's genericity: the bare name must carry its own
+    // arguments, and no qualified spelling can then name one of its
+    // members (A.5).
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "the nested type is generic, so that bare name must carry its own "
+        "arguments"));
+    BEZEL_EXPECT_TRUE(hasDiagnosticWith(
+        r.diagnostics,
+        "no qualified spelling can carry those arguments and then name one "
+        "of its members"));
+    // The false clause of round 4 must be gone.
+    BEZEL_EXPECT_FALSE(hasDiagnosticWith(
+        r.diagnostics, "no qualified spelling reaches it in a type position"));
+    // The static-member route must NOT be claimed: the only spelling that
+    // reaches it today is a RAW generic reference, which §14.1 forbids.
+    BEZEL_EXPECT_FALSE(hasDiagnosticWith(
+        r.diagnostics, "reaches it elsewhere through a static member"));
+    BEZEL_EXPECT_FALSE(
+        hasDiagnosticWith(r.diagnostics, "qualify with `Outer.C`"));
+}
+
+// fix #7085 (round 4): the REJECT→ACCEPT flip this stack introduces, PINNED.
+//
+// A chain head fixes arity 0 (§2.2), so an enclosing type's member that is
+// a GENERIC nested type is not a chain-head candidate at all — and §2.7's
+// chain-head row ranks the enclosing type's members LAST, so the
+// module-level `C` answers the chain head. MEASURED: on the base
+// `c74fb5b6` this program was REJECTED (the arity error, because the
+// enclosing member won and it is generic); at the tip it is ACCEPTED and
+// prints 4 — the module-level `C`'s nested `N`.
+//
+// ⇒ The acceptance is a behaviour flip and is pinned here: the program is
+// accepted, prints 4, and carries §2.7's warning (the AOT oracle cannot
+// see a warning, so the warning is read from the sema-only oracle).
+BEZEL_TEST(chain_head_import_outranks_enclosing_member_7085,
+           a_generic_enclosing_member_is_not_a_chain_head_candidate_spec_2_2) {
+    const std::string src = R"(
+module Warn9;
+public class C
+  public class N
+    public method Get(): int return 4; end Get;
+  end N;
+end C;
+class Outer
+  public class C<U>
+    public class N
+      public method Get(): int return 6; end Get;
+    end N;
+  end C;
+  public class Inner
+    public static method Main(): int
+      using var n: C.N := new C.N();
+      Console.WriteLine(n.Get());
+      return 0;
+    end Main;
+  end Inner;
+end Outer;
+)";
+    JitResult r = runAot(src);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "4\n");
+    // §2.7's warning row still polices the chain head (the AOT oracle fills
+    // its diagnostics only on a reject, so the warning is read from the
+    // sema-only oracle).
+    auto s = bezel::test::parseAndResolveGated(src);
+    BEZEL_EXPECT_FALSE(s.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasChainHeadShadowWarning(s.diagnostics));
 }
 
 // fix #7085 (round 3): a LOCAL enclosing type (§21.10) is not generic, so

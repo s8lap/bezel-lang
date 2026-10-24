@@ -4244,42 +4244,156 @@ static void warnChainHeadMemberShadowedByType(
         // because §2.7's warning row says warn and "the type wins for chain
         // purposes" is useful information).
         //
-        // MEASURED, the qualified spelling compiles for every NON-GENERIC
-        // declaring type: a module-level one, one nested in another type,
-        // one nested inside a generic type, a LOCAL type (§21.10), and one
-        // whose nested type is private or protected; and for a non-generic
-        // type BELOW a generic one (§11.6's "reaches a non-generic type
-        // enclosing it below the generic one").
+        // MEASURED, the qualified spelling `Owner.Member` compiles when
+        // the DECLARING type is non-generic AND the NESTED type is
+        // non-generic: for a module-level declaring type, one nested in
+        // another type, one nested inside a generic type, a LOCAL type
+        // (§21.10), and one whose nested type is private or protected; and
+        // for a non-generic type BELOW a generic one (§11.6's "reaches a
+        // non-generic type enclosing it below the generic one").
+        //
+        // fix #7085 (round 5): the spelling's EXISTENCE is decided by
+        // ARITY — the resolution rule §2.2 states ("a reference resolves
+        // to the first, in that rule's order, whose arity its type-argument
+        // list fixes") and §14.1 states ("Every such reference supplies
+        // exactly the declared number of type arguments"):
+        //
+        //   * the reference's type-argument list attaches to the LAST
+        //     segment (A.5), so the spelling `Owner.Member` carries NO
+        //     arguments at all — the head's arity is fixed at 0 by §11.6
+        //     ("A bare enclosing segment fixes arity 0") and the member's
+        //     by the empty list;
+        //   * ⇒ the spelling RESOLVES to the nested type iff the
+        //     DECLARING type's arity is 0 AND the NESTED type's arity is
+        //     0; otherwise the reference is Appendix C.1's arity error.
+        //
+        // The TEXT is read off the SAME two arities, so a sentence in the
+        // warning cannot claim a spelling the rule above rejects, nor deny
+        // one it admits — the defect class round 3 and round 4 both fell
+        // into (round 4's generic-nested text asserted "no qualified
+        // spelling reaches it in a type position" while `Outer.C<int>`
+        // reaches it: MEASURED rc 0, stdout "6").
+        //
+        // MEASURED — kind × genericity × position, every candidate
+        // spelling's rc and stdout (`4` = the module-level (shadowing)
+        // type, `6` = the declaring type's nested type, `5` / `7` = their
+        // static members):
+        //
+        //   declaring type non-generic / nested type non-generic
+        //     `Outer.C`             rc 0, "6"  (the remedy)
+        //     `Outer.C.N`           rc 0, "6"
+        //     bare `C`              rc 0, "6"
+        //   declaring type non-generic / nested type generic
+        //     `Outer.C`             rc 1  (Appendix C.1's arity error)
+        //     `Outer.C<...>`        rc 0, "6"  (the nested TYPE itself)
+        //     `Outer.C<...>.N`      rc 1  (A.5)
+        //     `Outer.C<...>.Make()` rc 1  (a parse error — A.5)
+        //     bare `C`              rc 1  (Appendix C.1's arity error)
+        //     bare `C<...>`         rc 0, "6"
+        //     bare `C<...>.N`       rc 1  (A.5)
+        //   declaring type generic / nested type non-generic
+        //     `Outer.C`             rc 1  (§11.6's arity error)
+        //     `Outer<int>.C`        rc 1  (A.5)
+        //     bare `C`              rc 0, "6"
+        //     `Outer<int>.C.Make()` rc 0, "7"  (a static member — the ONE
+        //       qualified route that is spec-legal here: the chain head
+        //       supplies the ENCLOSING type's arguments, and the nested
+        //       type is not generic, so the reference is not raw)
+        //   declaring type generic / nested type generic
+        //     `Outer.C`             rc 1  (§11.6's arity error)
+        //     `Outer.C<...>`        rc 1  (§11.6's arity error)
+        //     `Outer<int>.C`        rc 1  (A.5)
+        //     `Outer<int>.C<...>`   rc 1  (A.5)
+        //     bare `C<...>`         rc 0, "6"
+        //     `Outer<int>.C.Make()` rc 0, "7" — but ONLY through a
+        //       PRE-EXISTING arity gap in the chain-head receiver path
+        //       (the enclosing segment's arguments are not checked there),
+        //       and the reference is RAW (§14.1: "Bezel has no raw and no
+        //       open generic type reference") ⇒ it must not be advised.
+        //
+        // A LOCAL declaring type is never generic (§21.10: "The
+        // `GenericParams?` slot must be empty (v1) — a local type declares
+        // no type parameters of its own"), so it takes the non-generic
+        // rows above with the local type's own name: `Local.C` (rc 0,
+        // "6"), `Local.C<...>` (rc 0, "6"), `Local.C<...>.N` (rc 1, A.5).
         const auto* nts =
             dynamic_cast<const NestedTypeSymbol*>(shadowedEnclosingMember);
         const TypeSymbol* owner = nts ? nts->parent : nullptr;
+        const TypeSymbol* nested = nts ? nts->type : nullptr;
+        const bool ownerGeneric =
+            owner && !owner->genericParams.empty();
+        const bool nestedGeneric =
+            nested && !nested->genericParams.empty();
         const std::string head(headName);
+        const std::string ownerName =
+            (owner && !owner->name.empty()) ? std::string(owner->name) : head;
         const std::string prefix =
             std::string("warning: chain head `") + head +
             "` resolves to type `" + std::string(resolvedType->name) +
             "` while the enclosing type declares a same-named nested "
             "type — the type wins for chain purposes; ";
-        if (!owner || owner->genericParams.empty()) {
-            // The qualified spelling EXISTS (the declaring type is not
-            // generic) — MEASURED: it compiles in every such case.
-            std::string remedy = head;
-            if (owner && !owner->name.empty())
-                remedy = std::string(owner->name) + "." + head;
+        if (!ownerGeneric && !nestedGeneric) {
+            // The qualified spelling EXISTS (neither segment's arity is
+            // non-zero) — MEASURED: it compiles in every such case.
             ctx.diagnostics().report(
                 Severity::Warning, loc,
-                prefix + "qualify with `" + remedy +
+                prefix + "qualify with `" + ownerName + "." + head +
                     "` to reach the nested type (\xC2\xA7""2.7)");
-        } else {
+        } else if (ownerGeneric && !nestedGeneric) {
             ctx.diagnostics().report(
                 Severity::Warning, loc,
-                prefix + "the enclosing type `" +
-                    std::string(owner->name) +
+                prefix + "the enclosing type `" + ownerName +
                     "` is generic, so its nested type has no qualified "
                     "spelling: \xC2\xA7""11.6 names it by its bare name "
-                    "inside that type's bodies — the spelling this chain "
-                    "head now takes — and reaches it elsewhere through a "
-                    "static member or a local declared without a type "
-                    "annotation (\xC2\xA7""2.7, \xC2\xA7""11.6)");
+                    "inside that type's bodies — where a bare type name "
+                    "reaches it, though this chain head takes the shadowing "
+                    "type — and reaches it elsewhere through a static member "
+                    "or a local declared without a type annotation "
+                    "(\xC2\xA7""2.7, \xC2\xA7""11.6)");
+        } else if (!ownerGeneric && nestedGeneric) {
+            // The nested type is generic: the qualified spelling carries
+            // no arguments, so it is Appendix C.1's arity error — but the
+            // spelling WITH the nested type's own arguments reaches the
+            // TYPE (A.5 admits a type-argument list at the end of a
+            // qualified type name), and no qualified spelling can then
+            // name one of its members. MEASURED: `Outer.C<...>` ⇒ rc 0,
+            // "6"; `Outer.C<...>.N` ⇒ rc 1 (A.5).
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                prefix + "the nested type is generic, so `" + ownerName +
+                    "." + head +
+                    "` names it without its arguments — every reference "
+                    "supplies exactly the declared number of type arguments "
+                    "(\xC2\xA7""14.1) — while `" + ownerName + "." + head +
+                    "<...>` reaches the nested type itself (a type-argument "
+                    "list attaches to the end of a qualified type name, "
+                    "Appendix A.5); no qualified spelling can then name one "
+                    "of its members, and inside the declaring type's bodies "
+                    "the bare name with its own arguments reaches the type "
+                    "(\xC2\xA7""2.2, \xC2\xA7""2.7, \xC2\xA7""11.6)");
+        } else {
+            // BOTH segments carry arity: the enclosing type's forbids every
+            // qualified form in a type position (§11.6), and the nested
+            // type's forbids a bare reference (§14.1) — so no qualified
+            // spelling reaches the type at all, and the only route is the
+            // bare name with its own arguments inside the declaring type's
+            // bodies (§2.7's enclosing-type lookup). MEASURED: `Outer.C` and
+            // `Outer.C<...>` ⇒ rc 1 (§11.6); `Outer<int>.C` and
+            // `Outer<int>.C<...>` ⇒ rc 1 (A.5); bare `C<...>` ⇒ rc 0, "6".
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                prefix + "the enclosing type `" + ownerName +
+                    "` is generic, so its nested type has no qualified "
+                    "spelling: \xC2\xA7""11.6 names it by its bare name "
+                    "inside that type's bodies — where a bare type name "
+                    "reaches it, though this chain head takes the shadowing "
+                    "type — and the nested type is generic, so that bare "
+                    "name must carry its own arguments (a bare reference "
+                    "fixes arity 0, \xC2\xA7""14.1); no qualified spelling "
+                    "can carry those arguments and then name one of its "
+                    "members (a type-argument list attaches to the end of a "
+                    "qualified type name, Appendix A.5) "
+                    "(\xC2\xA7""2.2, \xC2\xA7""2.7, \xC2\xA7""11.6)");
         }
         return;
     }
