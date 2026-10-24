@@ -27154,7 +27154,19 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             return true;
                         // §9.6 PadLeft/PadRight(totalWidth[, paddingChar]) →
                         // bz_str_pad.
-                        if ((m == "PadLeft" || m == "PadRight") &&
+                        // fix #7133 / §9.6 / §28.9 (v0.343): `PadCenter` is the
+                        // THIRD member of the same Pad family and mints through
+                        // the SAME helper (bz_str_pad, whose `align` byte
+                        // selects the centered layout) — the runtime ends it in
+                        // `bz_string_init_rc`, so it hands the consumer a fresh
+                        // +1 producer exactly like its two siblings. Without
+                        // this arm a consumer (a bound local, a WriteLine
+                        // argument, a `+` operand, …) would classify the result
+                        // as a BORROW, RETAIN it on top of the producer's +1,
+                        // and the producer's reference would never be dropped —
+                        // the same leak #7119 measured for Repeat/GetField.
+                        if ((m == "PadLeft" || m == "PadRight" ||
+                             m == "PadCenter") &&
                             (argc == 1 || argc == 2))
                             return true;
                         // §9.6 Insert(startIndex, value) → inline mint.

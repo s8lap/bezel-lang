@@ -52,6 +52,13 @@
 // recorded divergence), and NOT a byte-widening defect. There is no site in
 // this file for it to fix.
 //
+// ⚠ THAT GAP IS NOW CLOSED (#7133, §9.6, v0.343). `PadCenter` has its own
+// codegen arm and its own lowering, and it reaches the SAME `bz_str_pad`
+// helper — so the `byte` width reaches it through the SAME `widenIntParam`
+// path this file fixes for `PadLeft`/`PadRight`. The `PadCenter` contract is
+// asserted in `tests/codegen/string_pad_center_7133_test.cpp`, not here.
+// This paragraph records the PRE-#7133 measurement and is kept as history.
+//
 // ORACLE CHOICE. The pre-fix symptom is a SILENT WRONG VALUE (exit 0), so the
 // rows assert the OUTPUT — a row that merely asserted "did not crash" would
 // be vacuous here. Every row that uses a `byte` width prints the LITERAL arm

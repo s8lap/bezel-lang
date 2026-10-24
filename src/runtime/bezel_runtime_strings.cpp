@@ -73,16 +73,23 @@ static void* bz_str_slice_cp(const bz_string_struct* s, int64_t start, int64_t c
     return strObj;
 }
 
-// §9.6 / #1295: PadLeft/PadRight — build a fresh +1 bz_string of `totalWidth`
-// code points by padding `self` with `padChar` (a code point). `leftAlign`
-// selects PadRight (self at the front, pad after) vs PadLeft (pad first, self
-// at the end). Strings store FIXED-WIDTH code points (width 1/2/4 bytes/cp,
+// §9.6 / #1295: PadLeft/PadRight/PadCenter — build a fresh +1 bz_string of
+// `totalWidth` code points by padding `self` with `padChar` (a code point).
+// `align` selects the layout:
+//   0 = PadLeft  (pad first, self after)
+//   1 = PadRight (self at the front, pad after)
+//   2 = PadCenter (the padding is split EVENLY; when the split is odd the
+//       EXTRA character goes to the RIGHT — stdlib §9.6: the padding is
+//       "split evenly; when it is odd, the extra character goes to the
+//       RIGHT: \"ab\".PadCenter(5) = \" ab  \"", i.e. one pad char on the
+//       left and two on the right for a 3-code-point padding).
+// Strings store FIXED-WIDTH code points (width 1/2/4 bytes/cp,
 // §4.6); the result width is the widest of self's width and the pad char's
 // width, and self's code points are widened into it. The previous inline
 // codegen assumed 1 byte per code point (memcpy'd the code-point COUNT as a
 // byte count and hard-stored width=1), corrupting any code point > U+00FF.
 extern "C" void* bz_str_pad(const void* self_p, int64_t totalWidth,
-                            int32_t padChar, int8_t leftAlign) {
+                            int32_t padChar, int8_t align) {
     const bz_string_struct* s = (const bz_string_struct*)self_p;
     int64_t selfLen = s ? s->len : 0;
     // No padding needed: return a fresh copy of the whole string (own +1),
@@ -102,7 +109,16 @@ extern "C" void* bz_str_pad(const void* self_p, int64_t totalWidth,
             else if (w == 2) ((uint16_t*)data)[(idx)] = (uint16_t)(cp);\
             else             ((uint32_t*)data)[(idx)] = (uint32_t)(cp);\
         } while (0)
-    if (leftAlign) {
+    if (align == 2) {
+        // PadCenter: the padding is split EVENLY; when the split is ODD the
+        // extra code point goes to the RIGHT (stdlib §9.6: "ab".PadCenter(5)
+        // = " ab  " — one pad char on the left, two on the right).
+        int64_t leftPad = padCount / 2;          // floor → the remainder is right
+        int64_t rightPad = padCount - leftPad;
+        for (int64_t i = 0; i < leftPad; ++i)    BZ_PAD_PUT(i, pc);
+        for (int64_t i = 0; i < selfLen; ++i)    BZ_PAD_PUT(leftPad + i, bz_str_cp(s, i));
+        for (int64_t i = 0; i < rightPad; ++i)   BZ_PAD_PUT(leftPad + selfLen + i, pc);
+    } else if (align == 1) {
         // PadRight: self at [0, selfLen), pad char fills [selfLen, totalWidth).
         for (int64_t i = 0; i < selfLen; ++i)   BZ_PAD_PUT(i, bz_str_cp(s, i));
         for (int64_t i = selfLen; i < totalWidth; ++i) BZ_PAD_PUT(i, pc);

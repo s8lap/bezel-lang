@@ -2365,7 +2365,18 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // so any code point > U+00FF was corrupted. Strings store fixed-width code
     // points (§4.6); the runtime builds the padded result at the correct width
     // (widest of self's width and the pad char's), widening self's code points.
-    if ((method == "PadLeft" || method == "PadRight") &&
+    //
+    // fix #7133 / §9.6 (v0.343): `PadCenter(totalWidth[, paddingChar])` joins
+    // the same arm. stdlib §9.6 declares it with the SAME "Pad contract (all
+    // three Pad members)" as PadLeft/PadRight — `totalWidth <= Length` returns
+    // the original string unchanged, `totalWidth < 0` raises
+    // ArgumentOutOfRangeException — and adds the centering rule: "PadCenter
+    // splits the padding evenly; when it is odd, the extra character goes to
+    // the RIGHT: \"ab\".PadCenter(5) = \" ab  \"". The runtime helper's `align`
+    // byte selects the layout (0 = PadLeft, 1 = PadRight, 2 = PadCenter), so
+    // the centered mode is the SAME helper with one more layout, not a new
+    // mechanism.
+    if ((method == "PadLeft" || method == "PadRight" || method == "PadCenter") &&
         !call.args.empty() && call.args[0].value) {
         llvm::Value* widthArg = lowerExpr(*call.args[0].value);
         if (!widthArg) return nullptr;
@@ -2377,6 +2388,23 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // conversion, so the two spellings must agree.
         llvm::Value* width64 = widenIntParam(call.args[0].value.get(), widthArg,
                                              "pad.s64", "pad.z64");
+        // §9.6 (v0.343): "Pad contract (all three Pad members): ...
+        // totalWidth < 0 raises ArgumentOutOfRangeException." The runtime
+        // helper answers a width <= Length with "the original string
+        // unchanged", so a NEGATIVE width would silently return the receiver
+        // instead of raising ⇒ the guard must be emitted BEFORE the call.
+        //
+        // ⚠ This guard is emitted for PadCenter only. The sibling Pad members
+        // answer a negative width with the receiver unchanged — a SEPARATE
+        // defect tracked by #7120 (which also covers `Repeat`'s count
+        // contract) — and changing their behaviour here would be an
+        // out-of-scope behaviour flip for this issue.
+        if (method == "PadCenter") {
+            llvm::Value* neg = builder_.CreateICmpSLT(width64,
+                                                      builder_.getInt64(0),
+                                                      "padc.neg");
+            emitGuardThrow(neg, "ArgumentOutOfRangeException");
+        }
         // Pad character: default space, or the 2nd arg (a code point, i32).
         llvm::Value* padCharI32 = builder_.getInt32(' ');
         if (call.args.size() >= 2 && call.args[1].value) {
@@ -2384,12 +2412,13 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             if (pc && pc->getType()->isIntegerTy(32)) padCharI32 = pc;
             else if (pc) padCharI32 = builder_.CreateZExtOrTrunc(pc, i32());
         }
-        // leftAlign = 1 for PadRight (self first, pad after); 0 for PadLeft.
-        llvm::Value* leftAlign =
-            builder_.getInt8(method == "PadRight" ? 1 : 0);
+        // align: 1 for PadRight (self first, pad after); 0 for PadLeft;
+        // 2 for PadCenter (padding split evenly, the odd extra on the RIGHT).
+        llvm::Value* align = builder_.getInt8(
+            method == "PadRight" ? 1 : (method == "PadCenter" ? 2 : 0));
         auto* fn = declareC("bz_str_pad", ptrTy(),
                             {ptrTy(), i64(), i32(), llvm::Type::getInt8Ty(llvm_)});
-        return builder_.CreateCall(fn, {self, width64, padCharI32, leftAlign},
+        return builder_.CreateCall(fn, {self, width64, padCharI32, align},
                                    "pad.result");
     }
 

@@ -31248,6 +31248,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "TrimEnd" || ma.member == "ToLower" ||
                         ma.member == "ToUpper" || ma.member == "Replace" ||
                         ma.member == "PadLeft" || ma.member == "PadRight" ||
+                        ma.member == "PadCenter" ||
                         ma.member == "Repeat" || ma.member == "Remove" ||
                         ma.member == "Insert" ||
                         ma.member == "GetField") {

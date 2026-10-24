@@ -1721,11 +1721,14 @@ int32_t bz_char_is_control(int32_t cp);
 int32_t bz_char_is_punctuation(int32_t cp);
 int32_t bz_char_to_upper(int32_t cp);
 int32_t bz_char_to_lower(int32_t cp);
-// §9.6 / #1295: PadLeft/PadRight — width-aware padding to `totalWidth` code
-// points with `padChar` (leftAlign=1 for PadRight, self-then-pad; 0 for PadLeft,
-// pad-then-self). Preserves code points > U+00FF (fixed-width storage, §4.6).
+// §9.6 / #1295: PadLeft/PadRight/PadCenter — width-aware padding to
+// `totalWidth` code points with `padChar` (align=1 for PadRight,
+// self-then-pad; 0 for PadLeft, pad-then-self; 2 for PadCenter, the padding
+// split evenly with the odd extra character on the RIGHT — §9.6:
+// "ab".PadCenter(5) = " ab  "). Preserves code points > U+00FF (fixed-width
+// storage, §4.6).
 void*   bz_str_pad(const void* self, int64_t totalWidth,
-                   int32_t padChar, int8_t leftAlign);
+                   int32_t padChar, int8_t align);
 // Replace(old, new): fresh string with all occurrences of `old` replaced.
 void*   bz_str_replace(const void* self, const void* old_str, const void* new_str);
 // Split(sep: char): fresh Array<string> split at every code point equal to sep.
