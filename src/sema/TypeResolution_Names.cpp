@@ -4287,7 +4287,10 @@ static void warnChainHeadMemberShadowedByType(
         //     `Outer.C`             rc 1  (Appendix C.1's arity error)
         //     `Outer.C<...>`        rc 0, "6"  (the nested TYPE itself)
         //     `Outer.C<...>.N`      rc 1  (A.5)
-        //     `Outer.C<...>.Make()` rc 1  (a parse error — A.5)
+        //     `Outer.C<...>.Make()` rc 0, "7"  (the nested type's OWN
+        //       type-argument list supplies its argument, and the declaring
+        //       type is not generic, so the reference is not raw — the
+        //       static member of the instantiated nested type)
         //     bare `C`              rc 1  (Appendix C.1's arity error)
         //     bare `C<...>`         rc 0, "6"
         //     bare `C<...>.N`       rc 1  (A.5)
@@ -4311,11 +4314,32 @@ static void warnChainHeadMemberShadowedByType(
         //       and the reference is RAW (§14.1: "Bezel has no raw and no
         //       open generic type reference") ⇒ it must not be advised.
         //
+        // RE-MEASURED on the tree that carries the #7135 pick (`c9c5b24c8e`):
+        // the whole 78-probe enumeration was re-run and diffed against the
+        // round-5 results. EXACTLY ONE row above moved, and it moved because
+        // #7135 added the `.`-successor commit at a DOTTED SEGMENT (§22.12,
+        // v0.343): `Outer.C<...>` used to leave its `<...>` to the
+        // relational-operator parser, so `Outer.C<...>.Make()` failed with
+        // "expected expression" — a PARSE error, which is what this row
+        // said before — and it now parses as an instantiated nested type,
+        // whose type arguments are applied (§11.6), so the reference is
+        // fully instantiated and the call is admitted.
+        //
+        // THREE other probes moved with it, and this table does not list
+        // those spellings, so they are recorded here rather than left
+        // silent: `Outer<int>.C<...>.Make()` in an EXPRESSION position is
+        // now rc 0, "7" (in BOTH the generic-declaring and the
+        // non-generic-declaring cell — the second of those is accepted only
+        // through the same chain-head arity gap the grid above records), and
+        // `Local.C<...>.Make()` is now rc 0, "7" (a LOCAL declaring type
+        // takes the non-generic rows above, so this follows the row above).
+        //
         // A LOCAL declaring type is never generic (§21.10: "The
         // `GenericParams?` slot must be empty (v1) — a local type declares
         // no type parameters of its own"), so it takes the non-generic
         // rows above with the local type's own name: `Local.C` (rc 0,
-        // "6"), `Local.C<...>` (rc 0, "6"), `Local.C<...>.N` (rc 1, A.5).
+        // "6"), `Local.C<...>` (rc 0, "6"), `Local.C<...>.N` (rc 1, A.5),
+        // `Local.C<...>.Make()` (rc 0, "7").
         const auto* nts =
             dynamic_cast<const NestedTypeSymbol*>(shadowedEnclosingMember);
         const TypeSymbol* owner = nts ? nts->parent : nullptr;
