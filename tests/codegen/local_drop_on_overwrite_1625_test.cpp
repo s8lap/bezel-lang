@@ -49,6 +49,7 @@
 #include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
+#include "support/aot_result_asserts.hpp"  // diagnosticMessageContains
 #include "support/codegen_support.hpp"
 #include "native_test_harness.hpp"
 #include "support/run_under_asan.hpp"
@@ -57,6 +58,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+using bezel::test::diagnosticMessageContains;
 using bezel::test::runAot;
 
 namespace {
@@ -165,21 +167,47 @@ BEZEL_TEST(local_drop_on_overwrite_1625,
     BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan/LSan clean (no leak, no double-free)
 }
 
-// §28.7 / #1625: self-assign `best := best` after best becomes owned must NOT
-// dispose the held value (the identity-guard prevents a use-after-free).
+// §28.3 bullet 1 / v0.339 (#6609): this row was a self-assign ASAN test —
+// `best := best` after `best` becomes owned must not dispose the held value
+// (the identity-guard prevents a use-after-free). It is a compile-time
+// REJECTION row now, and the flip is required by the spec rather than chosen.
+//
+// v0.339 added to §28.3's state-match rule, verbatim: "A self-assignment is no
+// exception: for an owned-state class-typed local `t`, `t := t;` stores the
+// unmarked read `t`, a borrow, into an owned-state LHS and is rejected at the
+// assignment by this rule, not a §28.7 discharge." `best` here is a
+// polymorphic-null local that has ADOPTED the owned state from
+// `best := new Cell()`, so `best := best;` is that case.
+//
+// The old assertion was an ASan-clean (rc == 0) run, which is now vacuous:
+// the program does not compile, so there is no native leg to sanitize and no
+// UAF to observe. The memory-safety claim it made is not lost, only made
+// unreachable — the identity-guard is still exercised by the SHAPE that
+// remains legal, §15.3's move-only self-assignment no-op, which is pinned as
+// `move_only_array_self_assign_noop_accepted_spec_15_3` in
+// tests/ownership/self_assignment_owned_local_6609_test.cpp (ROW 5). Dropping
+// the `runUnderASan` call here also drops one `if (rc == -1) return;`
+// swallowing guard, which the §3682 baseline records exactly (see
+// scripts/check_native_asan_leg_skips.py — re-run `--update` on the merged
+// tree, and note this file's baseline drops 4 -> 3).
+//
+// The diagnostic is pinned, not merely "has errors", so an unrelated rejection
+// cannot satisfy this row.
 BEZEL_TEST(local_drop_on_overwrite_1625,
-           asan_null_init_self_assign_no_uaf_spec_28_7) {
-    int rc = runUnderASan(
+           null_init_self_assign_rejected_spec_28_3_v0_339) {
+    std::string src =
         kCellHdr +
         "class C public static method Main(): int "
         "  var best: Cell? := null; "
         "  best := new Cell(); "
-        "  best := best; "    // identity-guard prevents UAF
+        "  best := best; "    // §28.3 v0.339: rejected, not a §28.7 discharge
         "  best?.Dispose(); "
         "  return 0; "
-        "end Main; end C;");
-    if (rc == -1) return;  // toolchain unavailable — skip
-    BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean (no use-after-free)
+        "end Main; end C;";
+    auto r = runAot(src);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "cannot self-assign"));
 }
 
 // ===========================================================================

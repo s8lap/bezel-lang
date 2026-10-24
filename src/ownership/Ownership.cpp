@@ -9278,6 +9278,129 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // silently killed).
             if (st.state == OwnershipState::Owned)
                 checkConsumeFreeze(id->name, as.target->span.begin, ctx_.exprSymbol(*id));
+            // fix #6609 (§28.3 bullet 1, v0.339): a SELF-ASSIGNMENT into an
+            // OWNED-STATE local. v0.339 added, verbatim: "A self-assignment is
+            // no exception: for an owned-state class-typed local `t`, `t := t;`
+            // stores the unmarked read `t`, a borrow, into an owned-state LHS
+            // and is rejected at the assignment by this rule, not a §28.7
+            // discharge."
+            //
+            // WHY IT IS HERE AND NOT IN SEMANTIC ANALYSIS. The sentence names
+            // this as the *state-match* rule of §28.3's reassignment bullet
+            // rejecting — "an owned-state LHS requires an owned RHS … a
+            // borrowed-state LHS requires a borrow (or `null`) RHS" — and the
+            // state-match question is answered only by this pass's dataflow
+            // (`st.state`, read here BEFORE `st.state = producerState(...)`
+            // below overwrites it). Sema cannot see it. And the reject must
+            // land on the same LHS-state arm the rule is written about, next
+            // to the two neighbours that already read `st.state` for a
+            // reassignment (the #3967 maybe-consumed arm above and §28.7's
+            // consume-site freeze immediately above), so no third reader of
+            // `st.state` is introduced.
+            //
+            // MEASURED on the parent (`3992d898`): the issue's repro — a
+            // class-typed owned local `var t := new Res(); t := t;` —
+            // COMPILES CLEAN, rc=0, the only diagnostic being the pre-existing
+            // §28.3 auto-drop *warning*. The control arm (the same file with
+            // `t := t;` removed) is rc=0 with the same warning, so the probe
+            // parses and the shape is real.
+            //
+            // WHAT MAKES THIS A §28.3 VIOLATION — the predicate, derived here
+            // and not taken from the issue. The spec sentence has three
+            // conjuncts and each is load-bearing:
+            //   (1) an OWNED-STATE LHS — `st.state == Owned`, the state this
+            //       pass has already computed for the tracked local at this
+            //       point. A Borrowed-state local self-assigning is FINE: the
+            //       rule's second half ("a borrowed-state LHS requires a
+            //       borrow … RHS") is satisfied by the unmarked read.
+            //   (2) the RHS IS the unmarked read of that SAME binding. Symbol
+            //       identity, not spelling: `ctx_.exprSymbol` on both sides, so
+            //       two locals sharing a name across bodies cannot alias, and
+            //       `t := u` (two distinct owned locals) is untouched.
+            //   (3) NOT a marked transfer. `t := move t` is the §28.3 /
+            //       §22.3 explicit-transfer spelling and is the sanctioned way
+            //       to express the same intent; `recordMovesIn` has already
+            //       consumed the source by this point, and the
+            //       `valueHasOwnedMarker` form diverted into
+            //       `handleMarkedOwnedAssignment` above. Both are excluded by
+            //       requiring a bare `IdentifierExpr` RHS with no marker.
+            //
+            // SCOPE — every exclusion below is MEASURED, not assumed, because
+            // `t := t` is an extremely common idiom and an over-broad arm
+            // breaks ordinary code:
+            //   * A MOVE-ONLY VALUE TYPE keeps its §15.3 no-op. §15.3
+            //     *Whole-value reassignment* states the no-op for whole-value
+            //     reassignment of "a move-only local or instance field" —
+            //     self-assignment `arr := arr;` — and `arr` there is exactly
+            //     the owning inline array. `isMoveOnlyValueType` is the one
+            //     authority for that property (it is what #3575 made ride on
+            //     the VALUE TYPE rather than on the spelling), so it is asked
+            //     about the TARGET's declared type. MEASURED
+            //     `var arr: [3 owned]Res := [...]; arr := arr;` rc=0 on the
+            //     parent and must stay rc=0 here — §15.3's own no-op, and the
+            //     pinned ROW 5 control.
+            //   * A PRIMITIVE or STRING local has no disposal obligation, so
+            //     `st.state` is not `Owned` and the arm never fires. MEASURED
+            //     `var i := 1; i := i;` and `var s := "a"; s := s;` are both
+            //     rc=0 on the parent and stay rc=0 (a self-assignment there is
+            //     the §28.3 adoption/poly-null region's ordinary code).
+            //   * A BORROW-STATE local — `var b := r; b := b;` — is the
+            //     borrowed-state half of the rule and is accepted. MEASURED
+            //     rc=0 on the parent, pinned as ROW 3.
+            //   * An `owned` FIELD self-assignment (`this.f := this.f;`) is
+            //     ALREADY rejected by `handleOwnedFieldAssignment` above with
+            //     the §28.3/§28.5 "a borrow cannot be stored into an `owned`
+            //     field" diagnostic. MEASURED rc=1 on the parent, unchanged
+            //     here — this arm is local-only, so it neither steals nor
+            //     duplicates that message. Pinned as ROW 4.
+            //
+            // NOT FIXED HERE, REPORTED: §28.3's state-match bullet is GENERAL —
+            // "Assigning a borrow to an owned-state LHS … is rejected" — and
+            // the self-assignment is the instance v0.339 named, not the only
+            // one. MEASURED on the parent, `var t := new Res(); t := r;` with
+            // `r` a `Res` PARAMETER is also accepted rc=0: the same violation
+            // through a different spelling. This arm is deliberately scoped to
+            // the named case; widening it to every borrow RHS is an
+            // expression-shape widening with its own blast radius (it would
+            // reject every `t := someBorrowingCall()` shape), which is exactly
+            // the scope creep CLAUDE.md forbids and which needs its own census.
+            // Filed as a follow-up.
+            if (st.state == OwnershipState::Owned && !as.valueHasOwnedMarker) {
+                // (2) the RHS is the unmarked read of THIS binding. Peel a
+                // force-unwrap (`t := t!` reads the same slot) exactly as
+                // `scanGetterReturns`'s own `isSelfAssignment` does; compare by
+                // SYMBOL identity, not by name.
+                const ast::Expr* rhs = lookThroughForceUnwrap(as.value.get());
+                const auto* rid =
+                    dynamic_cast<const ast::IdentifierExpr*>(rhs);
+                bool selfRead = false;
+                if (rid) {
+                    sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                    sema::Symbol* tsym = ctx_.exprSymbol(*id);
+                    selfRead = rsym && tsym && rsym == tsym;
+                }
+                // (3-exclusion) a move-only VALUE type keeps §15.3's no-op.
+                const char* moKind = nullptr;
+                bool moveOnlyTarget =
+                    common::isMoveOnlyValueType(ctx_.exprType(*as.target), ctx_,
+                                                moKind);
+                if (selfRead && !moveOnlyTarget)
+                    report(Severity::Error, as.target->span.begin,
+                           std::string("cannot self-assign `") +
+                               std::string(id->name) +
+                               "`: the right-hand side is an unmarked read of "
+                               "`" + std::string(id->name) +
+                               "`, which is a BORROW, and `" +
+                               std::string(id->name) +
+                               "` is in the OWNED state — §28.3's state match "
+                               "requires an owned-state LHS to receive an "
+                               "owned value (a fresh producer, or a named owned "
+                               "binding under the explicit transfer marker `x "
+                               ":= move y`). A self-assignment is no exception: "
+                               "it is not a §28.7 drop-and-replace discharge. "
+                               "Delete the statement, or spell the transfer "
+                               "explicitly with `move`");
+            }
             // fix #4329 (§28.3 / §28.7 / O4 silent-poison design, v0.298): at a
             // non-loop `if … then` / no-else merge, `joinInto`'s catch-all sets
             // the local's state to Poisoned while preserving its `obligationOrigin`
