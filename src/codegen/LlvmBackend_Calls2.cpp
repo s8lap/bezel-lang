@@ -1137,8 +1137,30 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* start = lowerExpr(*call.args[argForParam[1]].value);
         llvm::Value* count = lowerExpr(*call.args[argForParam[2]].value);
         if (!arr || !start || !count) return nullptr;
-        llvm::Value* start64 = builder_.CreateSExt(start, i64(), "from.start");
-        llvm::Value* count64 = builder_.CreateSExt(count, i64(), "from.count");
+        // fix #7192 (§5.1, v0.343): widen the window's start/length BY THE
+        // SOURCE's signedness, through the emitter-scope `widenIntParam` helper
+        // — the same rule the sibling string arms use (#6639/#7104/#7169).
+        //
+        // This used to be a bare `CreateSExt(start, i64())`, so an UNSIGNED
+        // source's high bit was read as a sign bit: a `byte` 200 arrived as
+        // -56 and the bounds guard raised IndexOutOfRangeException on an
+        // in-range window. §5.1 admits `byte → int` as a LOSSLESS implicit
+        // conversion (the table row
+        // `| byte | short, ushort, int, uint, long, ulong, float, double, decimal |`),
+        // so a `byte` 200 IS the `int` 200, never -56.
+        //
+        // ⚠ The widening is a PREREQUISITE of the bounds guard below, not an
+        // extra: the guard must test the window's §5.1 value.
+        //
+        // The argument expressions are the ones the binding permutation
+        // selected (`call.args[argForParam[k]]`), so a REORDERED named-argument
+        // call widens the value that actually fills the parameter.
+        llvm::Value* start64 = widenIntParam(
+            call.args[argForParam[1]].value.get(), start, "from.start.s",
+            "from.start.z");
+        llvm::Value* count64 = widenIntParam(
+            call.args[argForParam[2]].value.get(), count, "from.count.s",
+            "from.count.z");
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
         llvm::Value* n = builder_.CreateCall(lenFn, {arr}, "from.n");
         // start in [0, n]; count >= 0; start + count <= n.
