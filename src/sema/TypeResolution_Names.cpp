@@ -4172,10 +4172,30 @@ static bool reportGenericEnclosingSegment(DiagnosticEngine& diags,
 // wanted. `storageComponentType` answers the question for the member kinds
 // it covers (a field, a property); a nested type has no storage component,
 // so its own type is read here.
+//
+// The REMEDY differs by POSITION, and the VALUE position's text stays
+// byte-identical to its pre-#7085 text:
+//
+//   * VALUE position (the `warnChainHeadTypeShadows` site, called from
+//     ExprTypecheck_Exprs.cpp): the shadowed member is a VALUE member (a
+//     field, a property, a method, a const, an event) and `this.<X>`
+//     reaches it — §2.7's own example is `this.Data.W()`.
+//
+//   * TYPE position (this file's `resolveNamed`): the shadowed member is
+//     always a NESTED TYPE — a type body scope registers only the type's
+//     generic parameters and its nested types (`resolveTypeDecl`'s
+//     §11.3/#482 loop and the §21.10 local-type arm), never a value member
+//     — and `this.C` does not even PARSE in a type position (MEASURED:
+//     "expected type name"). §2.7's remedy for a shadowed member is "the
+//     enclosing type's name for statics", which for a nested type is
+//     `Outer.C` — the spelling that reaches it (MEASURED: `Outer.C.N`
+//     compiles and prints the nested type's value).
+enum class ChainHeadWarningPosition { Value, Type };
+
 static void warnChainHeadMemberShadowedByType(
     SemaContext& ctx, std::string_view headName,
     const TypeSymbol* resolvedType, const Symbol* shadowedEnclosingMember,
-    SourceLocation loc) {
+    SourceLocation loc, ChainHeadWarningPosition position) {
     if (!shadowedEnclosingMember || !resolvedType) return;
     const TypeRef* memberType =
         storageComponentType(shadowedEnclosingMember, ctx);
@@ -4204,6 +4224,26 @@ static void warnChainHeadMemberShadowedByType(
     if (!carveOut && memberTypeSym && memberTypeSym == resolvedType)
         carveOut = true;
     if (carveOut) return;
+    if (position == ChainHeadWarningPosition::Type) {
+        // fix #7085 (round 2): the TYPE position's shadowed member is a
+        // NESTED TYPE, and `this.<X>` does not parse in a type position —
+        // §2.7's remedy is "the enclosing type's name for statics", which
+        // for a nested type is `<EnclosingType>.<X>`.
+        const auto* nts =
+            dynamic_cast<const NestedTypeSymbol*>(shadowedEnclosingMember);
+        std::string remedy = std::string(headName);
+        if (nts && nts->parent && !nts->parent->name.empty())
+            remedy = std::string(nts->parent->name) + "." +
+                     std::string(headName);
+        ctx.diagnostics().report(
+            Severity::Warning, loc,
+            std::string("warning: chain head `") + std::string(headName) +
+                "` resolves to type `" + std::string(resolvedType->name) +
+                "` while the enclosing type declares a same-named nested "
+                "type — the type wins for chain purposes; qualify with `" +
+                remedy + "` to reach the nested type (\xC2\xA7""2.7)");
+        return;
+    }
     std::string memberKind = "member";
     if (dynamic_cast<const FieldSymbol*>(shadowedEnclosingMember))
         memberKind = "field";
@@ -4429,12 +4469,40 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // A LOCAL scope (a block, a method's parameters) sits INSIDE the type
         // body scope and is NOT deferred: §2.7 rule 1 puts local scope
         // first, at every head shape.
+        //
+        // fix #7085 (round 2): a type body scope registers TWO kinds of name
+        // — the type's NESTED TYPES and its GENERIC PARAMETERS (the
+        // `typeScope.names[g.name] = nullptr` markers `resolveTypeDecl`
+        // writes). Only the first kind is a MEMBER, and only a member is
+        // ranked last by §2.7's chain-head row. A type parameter is not a
+        // member, and §11.6 puts it out of scope in a nested type
+        // ENTIRELY ("The enclosing type's type parameters are therefore not
+        // in scope in a nested type's declaration … A reference to one is a
+        // compile error naming this rule"), so it is not "ranked last" — it
+        // must still be FOUND, so that §11.6's check fires and the
+        // §11.6/§14.1 diagnostic is emitted. Deferring it would let the
+        // name resolve outward to a module-level or imported type of the
+        // same name, and DELETE that compile error.
         chainHeadEnclosingMember = nullptr;
         chainHeadHasEnclosingMember = false;
         for (Scope* s = scope; s; s = s->parent) {
             auto it = s->names.find(first);
             if (it == s->names.end()) continue;
             if (isTypeBodyScope(s)) {
+                if (it->second == nullptr) {
+                    // A TYPE-PARAMETER marker (§11.6) — not a member.
+                    if (!chainHeadHasEnclosingMember) {
+                        // Nothing else binds the name: the marker binds it
+                        // (the name is unresolved as a type, and §11.6's
+                        // check below diagnoses the reference).
+                        break;
+                    }
+                    // An inner MEMBER already binds the name, and this
+                    // (outer) parameter is out of scope in a nested type
+                    // (§11.6) — so it is not a candidate at all; keep
+                    // looking outward for the earlier rule-1 positions.
+                    continue;
+                }
                 if (!chainHeadHasEnclosingMember) {
                     chainHeadEnclosingMember = it->second;
                     chainHeadHasEnclosingMember = true;
@@ -4545,14 +4613,23 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // presence, which would also match any real symbol (type name, etc.)
         // stored in the scope.
         bool isGeneric = false;
-        if (!qualifiedBuiltin)
-            for (Scope* s = scope; s; s = s->parent) {
-                auto it = s->names.find(first);
-                if (it != s->names.end() && it->second == nullptr) {
-                    isGeneric = true;
-                    break;
+        if (!qualifiedBuiltin) {
+            // fix #7085 (round 2): when the chain head bound the name to the
+            // enclosing type's MEMBER (the deferred one — §2.7's chain-head
+            // row ranks it last), a type-parameter marker further out is NOT
+            // a candidate for the name: §11.6 puts the enclosing type's type
+            // parameters out of scope in a nested type, so the name is the
+            // member's — and the member's own type wins the chain.
+            if (!chainHeadHasEnclosingMember) {
+                for (Scope* s = scope; s; s = s->parent) {
+                    auto it = s->names.find(first);
+                    if (it != s->names.end() && it->second == nullptr) {
+                        isGeneric = true;
+                        break;
+                    }
                 }
             }
+        }
         if (isGeneric) {
             // Generic parameter — record as a Named with no declaration.
             // Sema slice 3+ will treat generic-param TypeRefs specially.
@@ -6095,7 +6172,7 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         if (resolvedType)
             warnChainHeadMemberShadowedByType(
                 ctx_, first, resolvedType, chainHeadEnclosingMember,
-                t.span.begin);
+                t.span.begin, ChainHeadWarningPosition::Type);
     }
     // For multi-part QualifiedNames, descend through the looked-up symbol's
     // nested types for each subsequent part. Per Grammar A.8 / §11.3:
@@ -8095,7 +8172,8 @@ void warnChainHeadTypeShadows(
     // ONE text for the rule — the TYPE path (`resolveNamed`, this file)
     // calls the same helper, so the two positions cannot drift apart.
     warnChainHeadMemberShadowedByType(ctx, headName, resolvedType,
-                                       shadowedEnclosingMember, loc);
+                                       shadowedEnclosingMember, loc,
+                                       ChainHeadWarningPosition::Value);
 
     // (B) §2.7 consequence: a type named `A` in scope shadows an imported
     // module-name prefix `A.…` — warn when both readings exist. The local
