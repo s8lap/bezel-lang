@@ -1408,8 +1408,30 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                                    llvm::Value* self) {
     const auto& method = ma.member;
     if (!ma.target) return nullptr;
+    // §28.9: the caller (LlvmBackend_Exprs.cpp) pre-lowers a +1 producer
+    // receiver and releases it AFTER this call returns. A raise leaves that
+    // path unreachable ⇒ the producer's reference would leak. Remember the
+    // receiver here so that a guard can release it on the throw edge (the
+    // fix #6979 idiom — a plain `emitGuardThrow` leaks it).
+    llvm::Value* callerOwnedSelf = self;
     if (!self) self = lowerExpr(*ma.target);
     if (!self) return nullptr;
+
+    // A range guard that raises, releasing the caller-owned producer receiver
+    // on the throw edge FIRST (§28.9 — the exception unwinds past the
+    // caller's post-call release, and §31.4's built-in exceptions are
+    // trivial-dispose, so nothing else releases the receiver). With no
+    // caller-owned receiver this is exactly `emitGuardThrow`.
+    auto guardThrowReleasingSelf = [&](llvm::Value* cond, const char* name) {
+        if (!callerOwnedSelf) { emitGuardThrow(cond, name); return; }
+        auto* errBB = llvm::BasicBlock::Create(llvm_, "chk.err", currentFn_);
+        auto* cont = llvm::BasicBlock::Create(llvm_, "chk.cont", currentFn_);
+        builder_.CreateCondBr(cond, errBB, cont);
+        builder_.SetInsertPoint(errBB);
+        emitStringRelease(callerOwnedSelf);
+        emitThrowBuiltin(name);
+        builder_.SetInsertPoint(cont);
+    };
 
     // Helpers for extracting the first string argument.
     auto getStrArg = [&](size_t idx) -> llvm::Value* {
@@ -2394,17 +2416,17 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // unchanged", so a NEGATIVE width would silently return the receiver
         // instead of raising ⇒ the guard must be emitted BEFORE the call.
         //
-        // ⚠ This guard is emitted for PadCenter only. The sibling Pad members
-        // answer a negative width with the receiver unchanged — a SEPARATE
-        // defect tracked by #7120 (which also covers `Repeat`'s count
-        // contract) — and changing their behaviour here would be an
-        // out-of-scope behaviour flip for this issue.
-        if (method == "PadCenter") {
-            llvm::Value* neg = builder_.CreateICmpSLT(width64,
-                                                      builder_.getInt64(0),
-                                                      "padc.neg");
-            emitGuardThrow(neg, "ArgumentOutOfRangeException");
-        }
+        // fix #7120 (§9.6, v0.343): the guard now covers ALL THREE Pad
+        // members. `PadCenter` already had one; `PadLeft`/`PadRight` answered
+        // a negative width with the receiver unchanged, so the three members
+        // disagreed about the SAME §9.6 contract. They now share ONE guard —
+        // the same `width64` (widened by the source's signedness, §5.1) and
+        // the same comparison — so the three spellings cannot drift apart.
+        // `PadCenter`'s raise is NOT weakened: it is that same guard, shared.
+        llvm::Value* neg = builder_.CreateICmpSLT(width64,
+                                                  builder_.getInt64(0),
+                                                  "pad.neg");
+        guardThrowReleasingSelf(neg, "ArgumentOutOfRangeException");
         // Pad character: default space, or the 2nd arg (a code point, i32).
         llvm::Value* padCharI32 = builder_.getInt32(' ');
         if (call.args.size() >= 2 && call.args[1].value) {
@@ -2437,6 +2459,22 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // LOSSLESS conversion, so the two spellings must agree.
         llvm::Value* n64 = widenIntParam(call.args[0].value.get(), nArg,
                                          "rep.s64", "rep.z64");
+        // §9.6 (v0.343): the count contract — "count < 0 raises
+        // ArgumentOutOfRangeException; count = 0 is \"\"" — declared on the
+        // static `Repeat(c: char, count: int)` and, by "same count contract",
+        // on `Repeat(unit: string, count: int)`. The instance spelling
+        // repeats the RECEIVER as that unit, so it carries the same count
+        // contract.
+        //
+        // fix #7120 (§9.6, v0.343): the guard must be emitted BEFORE the
+        // `malloc` below. A negative count made `totalLen` negative, so
+        // `malloc` returned a 1-byte buffer and the copy loop wrote past it
+        // (heap-buffer-overflow ⇒ SIGSEGV without a sanitizer). `count = 0`
+        // is NOT an error (§9.6): `totalLen` is 0, the loop does not run and
+        // the result is "".
+        llvm::Value* repNeg = builder_.CreateICmpSLT(n64, builder_.getInt64(0),
+                                                     "rep.neg");
+        guardThrowReleasingSelf(repNeg, "ArgumentOutOfRangeException");
         llvm::Value* totalLen = builder_.CreateMul(selfLen, n64, "rep.total");
         auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
         auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});

@@ -1249,11 +1249,37 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* cnt = lowerExpr(*call.args[cntArgIdx].value);
         if (!ch || !cnt) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+        // fix #7120 (§5.1, §9.6, v0.343): widen the count to i64 BY THE
+        // SOURCE'S SIGNEDNESS, and RAISE on a negative count.
+        //
+        // §9.6 (v0.343) declares the count contract on the static
+        // `Repeat(c: char, count: int)`: "count < 0 raises
+        // ArgumentOutOfRangeException; count = 0 is \"\"". This arm used to
+        // CLAMP a negative count to 0 (an empty string) instead of raising,
+        // so the STATIC spelling silently disagreed with the INSTANCE
+        // spelling, which corrupted memory.
+        //
+        // ⚠ The widening is a PREREQUISITE of the guard, not an extra: the
+        // guard must test the count's §5.1 value, and §5.1 admits
+        // `byte → int` as a LOSSLESS conversion — an unsigned source must
+        // therefore ZERO-extend (a `byte` 200 is the int 200, never -56).
+        // The arm's old bare `CreateSExt` read the `byte` 200 as -56 and the
+        // clamp then hid it as 0 (that is the symptom #7117 reports; this
+        // widening repairs it). The count is now widened ONCE, and the SAME
+        // value is tested by the guard and used as the length.
+        const sema::TypeRef* cntTy = ctx_.exprType(*call.args[cntArgIdx].value);
         llvm::Value* count64 = cnt->getType()->isIntegerTy(64)
-            ? cnt : builder_.CreateSExt(cnt, i64());
-        // Clamp negative counts to 0 (an empty string).
-        llvm::Value* neg = builder_.CreateICmpSLT(count64, builder_.getInt64(0));
-        count64 = builder_.CreateSelect(neg, builder_.getInt64(0), count64);
+            ? cnt
+            : (typeRefIsUnsigned(cntTy)
+                   ? builder_.CreateZExt(cnt, i64(), "rep.z64")
+                   : builder_.CreateSExt(cnt, i64(), "rep.s64"));
+        // §9.6 (v0.343): "count < 0 raises ArgumentOutOfRangeException".
+        // The guard is emitted BEFORE the `malloc` below, so a negative count
+        // allocates nothing. `count = 0` is NOT an error (§9.6): the result
+        // is the empty string.
+        llvm::Value* neg = builder_.CreateICmpSLT(count64, builder_.getInt64(0),
+                                                  "rep.neg");
+        emitGuardThrow(neg, "ArgumentOutOfRangeException");
         llvm::Value* chI8 = builder_.CreateTrunc(
             ch->getType()->isIntegerTy(32) ? ch
                 : builder_.CreateSExt(ch, i32()), i32());  // keep i32 for memset
