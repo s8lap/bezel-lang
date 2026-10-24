@@ -3037,7 +3037,15 @@ static bz_lazy_t* bz_lazy_new(int32_t kind, int64_t esz) {
     e->kind = kind;
     e->esz = esz;
     e->idx = 0;
-    if (esz > 0) e->cur = malloc((size_t)esz);
+    // fix #7160 (stdlib §5, v0.343): the element slot is ZEROED, not merely
+    // allocated.  A projection whose result type is narrower than the
+    // element type the consumer reads (the bare method-reference spelling,
+    // where sema still types the result as the source element type) writes
+    // only its own width into the slot, and the consumer then reads the
+    // remaining bytes — with a plain malloc those bytes are uninitialized
+    // heap.  The slot is reused for every element and the producer always
+    // writes the same width, so zeroing it once keeps the tail deterministic.
+    if (esz > 0) e->cur = calloc(1, (size_t)esz);
     return e;
 }
 
