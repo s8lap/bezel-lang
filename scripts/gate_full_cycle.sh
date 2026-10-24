@@ -1117,6 +1117,57 @@ if ! python3 scripts/check_seam_accessor_conformance.py --strict \
 fi
 say "seam-accessor-conformance phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seamaccessor.log"))"
 
+# ── §9.6 STRING-MEMBER TRANSCRIPTION PHASE (R35, the #7144 reviewer's R and S) ─
+# Two tables in the compiler transcribe stdlib §9.6's `String` member list by
+# hand: `kMintMethods` (src/ownership/Ownership_Checks.cpp) and the arity
+# tables (src/sema/ExprTypecheck_Calls.cpp). A hand-maintained mirror of a
+# document drifts — and it HAS drifted: #7133 added `PadCenter` to §9.6 and
+# the mint set did not learn it, and #7153 added `PadCenter` and `ToString` to
+# §9.6 and the arity table did not learn them. Each omission let a program
+# through a gate that should have rejected it.
+#
+# These two ratchets DERIVE the expected set from the document itself, so a
+# new §9.6 member cannot be added without a matching transcription. Both fail
+# CLOSED (exit 2) when they cannot parse their inputs, so a broken checker
+# never reads as a pass.
+#
+# They are BUILD-FREE SOURCE ratchets: they read the document and the source
+# as text and compile nothing.
+#
+# ⚠ THE SCRIPT PATHS ARE SPELLED OUT AT EACH CALL SITE, not through a
+# variable. `scripts/ratchet_sweep.sh` DISCOVERS build-free source ratchets
+# by grepping this gate for the literal pattern `scripts/check_<name>.py`; a
+# `python3 "scripts/${_sm_check}.py"` loop is invisible to that grep, so the
+# two ratchets would be run by the gate but NEVER SWEPT — the one mechanism
+# that runs every build-free ratchet on a tree the gate did not build.
+# Keep the paths literal.
+run_string_ratchet() {
+  _sm_name="$1"
+  _sm_script="$2"
+  if ! python3 "$_sm_script" --self-test \
+        > "$LOGDIR/${TAG}_${_sm_name}.log" 2>&1; then
+    say "CYCLE FAILURE: ${_sm_name} SELF-TEST failed — the checker cannot"
+    say "  detect a mismatch, so its verdict means nothing. See"
+    say "  $LOGDIR/${TAG}_${_sm_name}.log"
+    sed -n '1,20p' "$LOGDIR/${TAG}_${_sm_name}.log" 2>/dev/null | sed 's/^/  | /' \
+      | tee -a "$CYCLE_LOG" >/dev/null
+    exit 1
+  fi
+  if ! python3 "$_sm_script" --strict \
+        >> "$LOGDIR/${TAG}_${_sm_name}.log" 2>&1; then
+    say "CYCLE FAILURE: ${_sm_name} reports a mismatch between stdlib §9.6"
+    say "  and the compiler's hand-maintained transcription of it — a member"
+    say "  §9.6 declares that the compiler does not know about. See"
+    say "  $LOGDIR/${TAG}_${_sm_name}.log"
+    sed -n '/check_string_/,$p' "$LOGDIR/${TAG}_${_sm_name}.log" \
+      2>/dev/null | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+    exit 1
+  fi
+  say "${_sm_name} phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_${_sm_name}.log"))"
+}
+run_string_ratchet check_string_mint_methods scripts/check_string_mint_methods.py
+run_string_ratchet check_string_arity_table scripts/check_string_arity_table.py
+
 # ── STRING-VIEW OWNERSHIP PHASE (#6469) ────────────────────────────────────
 # `ast::QualifiedName::parts` is a `std::vector<std::string_view>`
 # (src/ast/Node.hpp:42), and 139 `vector<string_view>` declarations exist
