@@ -95,7 +95,13 @@ BEZEL_TEST(math_convert_1037, math_clamp_still_works) {
     BEZEL_EXPECT_EQ(run(mainBody("return Math.Clamp(5, 1, 4);")), 4);
 }
 BEZEL_TEST(math_convert_1037, convert_toint32_still_works) {
-    BEZEL_EXPECT_EQ(run(mainBody("var x: int := Convert.ToInt32(7); return x;")), 7);
+    // stdlib §2.3 declares `ToInt32(value: string): int` — the `7` spelling
+    // this row used is REJECTED since #7218 (§5.1: no implicit conversion
+    // reaches a `string` parameter, and §22.6 admits a call that matches no
+    // declared form only when the argument converts to one), so the row
+    // reads the DECLARED form. The row's claim — that `Convert`'s statics
+    // are `Convert`'s own and still work (#1037) — is unchanged.
+    BEZEL_EXPECT_EQ(run(mainBody("var x: int := Convert.ToInt32(\"7\"); return x;")), 7);
 }
 
 // --- Math.Pi (stdlib §2.2, "public static const Pi: double := 3.14159...") ---

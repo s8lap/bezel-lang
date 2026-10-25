@@ -18403,6 +18403,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // against the declared non-nullable positions in the registry.
     checkBuiltinNullableArgs(ce, calleeSym);
 
+    // fix #7218 (stdlib §2.2, stdlib §2.3, §5.1, §22.6, v0.343): the same
+    // per-argument TYPE check for the built-in `Math` / `Convert` statics.
+    // Those classes have no user declaration, so their members have no
+    // MethodSymbol and no declared parameter type was ever checked against
+    // the argument: a wrongly-typed argument reached codegen and the
+    // compiler ABORTED inside the LLVM verifier (or, for a `bool`, silently
+    // produced a wrong value). §5.1's conversions apply "where the target
+    // type is known", and stdlib §2.2 / §2.3 declare it.
+    checkBuiltinMathConvertCallArgs(ce);
+
     // §22.5 (v0.283, #3398): the BINDING twin of the three per-argument
     // builtin checks around it. Those answer "is this argument's TYPE
     // admissible"; none of them asks which PARAMETER an argument binds to,
@@ -21098,6 +21108,337 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
             arg.value->span.begin,
             what + " (stdlib §3.1 declares " + std::string(form->decl) + ")",
             arg.value.get());  // §5.1 / §7.4 (#1191) — narrowing-aware
+    }
+}
+
+// fix #7218 (stdlib §2.2, stdlib §2.3, §5.1, §22.6, v0.343): the ARGUMENT
+// TYPES of a `Math` / `Convert` static member call.
+//
+// THE DEFECT. `Math` and `Convert` are compiler built-ins: they have no user
+// declaration and their members have no MethodSymbol, so §22.5's
+// per-argument assignability check (`checkCallArity` →
+// `checkArgsAgainstParams`) never ran for them, and `resolveMemberAccess`
+// typed the member by NAME alone. An argument of a type the declared
+// parameter does not take therefore reached codegen unchecked.
+//
+// MEASURED pre-fix on 94d0b7fd (one-line programs through `bezelc`):
+//   Math.Pow("not a double", 3)  -> "SIToFP source must be integer or
+//                                    integer vector" + "IR verification
+//                                    failed" — a COMPILER ABORT, with NO
+//                                    diagnostic and NO source location;
+//   Math.Abs("x")                -> "Both operands to ICmp instruction are
+//                                    not of the same type!" (the same abort);
+//   Convert.ToInt32(7.5)         -> "Load operand must be a pointer.";
+//   Math.Abs(true)               -> COMPILES and prints 1 — a SILENT WRONG
+//                                    ANSWER, because §5.1 lists "between
+//                                    integers and bool" as never implicit.
+//
+// §5.1 applies the implicit conversions "where the target type is known",
+// and for a built-in member the target type IS known — stdlib §2.2 declares
+// `Math.Pow(x: double, y: double): double` and stdlib §2.3 declares the
+// `Convert` family — so the argument must be checked against the declared
+// parameter type, and a call that matches NO declared form is an error
+// (§22.6). The check is the shape #7207 established for `StringBuilder`: a
+// TABLE of the declared forms, a §5.1 test per argument, and a diagnostic
+// naming the offending argument and the expected type.
+//
+// NOT CHECKED HERE, each for a stated reason:
+//   * the ARITY — a call at an arity no declared form has is a separate
+//     question (§22.5's arity rule; #7140's family for `string`, #7207's for
+//     `StringBuilder`);
+//   * `Math.Min` / `Max` / `Clamp` / `Sign` — their declared parameter type
+//     is the TYPE PARAMETER `T` (`where T: IComparable<T>` / `where T:
+//     INumber<T>`), so §5.1's "where the target type is known" does not hold
+//     there and the CONSTRAINT, not §5.1, governs the argument;
+//   * `Math.DivRem` — its first two arguments are already rejected AT THE
+//     SOURCE LOCATION by an existing stdlib-§2.2-citing diagnostic, so this
+//     check would only duplicate that one;
+//   * a NULLABLE argument — the nullability dimension is §7's, and this
+//     check judges the argument's TYPE. The §7 gate's registry rows (#6782)
+//     cover the `Convert` positions but not `Math`'s, so a nullable
+//     argument at a `Math` position is left exactly as it was.
+namespace {
+
+// The DECLARED parameter type at one position of one §2.2/§2.3 form.
+enum class MathConvertParamKind {
+    Unchecked,  // the declared type is a TYPE PARAMETER (`T`) or an `out`
+                // slot the out-variable machinery types: §5.1's "where the
+                // target type is known" does not hold at such a position
+    Bool,
+    Int,
+    Long,
+    Float,
+    Double,
+    Decimal,
+    String,
+};
+
+// One DECLARED FORM of one §2.2/§2.3 member: the class, the member, the
+// arity the form takes, the declared parameter kind at each of its (at most
+// two) positions, and the declared signature, quoted in the diagnostic.
+struct MathConvertSurfaceRow {
+    std::string_view head;
+    std::string_view member;
+    unsigned arity;
+    MathConvertParamKind param0;
+    MathConvertParamKind param1;
+    std::string_view decl;
+};
+
+// §2.2's and §2.3's listings, transcribed. One row per DECLARED FORM: a
+// member with two declared parameter types (`Abs`) or two declared arities
+// (`Round`) carries one row per form, and a member with neither carries one.
+const std::vector<MathConvertSurfaceRow>& builtinMathConvertSurface() {
+    static const std::vector<MathConvertSurfaceRow> kRows = {
+        // stdlib §2.2 `Math`.
+        {"Math", "Abs", 1, MathConvertParamKind::Int,
+         MathConvertParamKind::Unchecked, "`Abs(x: int): int`"},
+        {"Math", "Abs", 1, MathConvertParamKind::Long,
+         MathConvertParamKind::Unchecked, "`Abs(x: long): long`"},
+        {"Math", "Abs", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Abs(x: double): double`"},
+        {"Math", "Abs", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`Abs(x: decimal): decimal`"},
+        {"Math", "Sqrt", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Sqrt(x: double): double`"},
+        {"Math", "Pow", 2, MathConvertParamKind::Double,
+         MathConvertParamKind::Double, "`Pow(x: double, y: double): double`"},
+        {"Math", "Floor", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Floor(x: double): double`"},
+        {"Math", "Floor", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`Floor(x: decimal): decimal`"},
+        {"Math", "Ceiling", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Ceiling(x: double): double`"},
+        {"Math", "Ceiling", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`Ceiling(x: decimal): decimal`"},
+        {"Math", "Truncate", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Truncate(x: double): double`"},
+        {"Math", "Truncate", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`Truncate(x: decimal): decimal`"},
+        {"Math", "Round", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked,
+         "`Round(x: double, digits: int := 0): double`"},
+        {"Math", "Round", 2, MathConvertParamKind::Double,
+         MathConvertParamKind::Int, "`Round(x: double, digits: int := 0): double`"},
+        {"Math", "Fmod", 2, MathConvertParamKind::Double,
+         MathConvertParamKind::Double, "`Fmod(x: double, y: double): double`"},
+        {"Math", "IEEERemainder", 2, MathConvertParamKind::Double,
+         MathConvertParamKind::Double,
+         "`IEEERemainder(x: double, y: double): double`"},
+        // stdlib §2.3 `Convert`. The `Try*` forms' SECOND parameter is an
+        // `out` slot, whose type the out-variable machinery owns (§22.3).
+        {"Convert", "ToInt32", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToInt32(value: string): int`"},
+        {"Convert", "ToInt64", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToInt64(value: string): long`"},
+        {"Convert", "ToDouble", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToDouble(value: string): double`"},
+        {"Convert", "ToDecimal", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToDecimal(value: string): decimal`"},
+        {"Convert", "ToBoolean", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToBoolean(value: string): bool`"},
+        {"Convert", "TryToInt32", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToInt32(value: string, out result: int): bool`"},
+        {"Convert", "TryToInt64", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToInt64(value: string, out result: long): bool`"},
+        {"Convert", "TryToDouble", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToDouble(value: string, out result: double): bool`"},
+        {"Convert", "TryToDecimal", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToDecimal(value: string, out result: decimal): bool`"},
+        {"Convert", "TryToBoolean", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToBoolean(value: string, out result: bool): bool`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Int,
+         MathConvertParamKind::Unchecked, "`ToString(value: int): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Long,
+         MathConvertParamKind::Unchecked, "`ToString(value: long): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Float,
+         MathConvertParamKind::Unchecked, "`ToString(value: float): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`ToString(value: double): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`ToString(value: decimal): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Bool,
+         MathConvertParamKind::Unchecked, "`ToString(value: bool): string`"},
+        {"Convert", "ToString", 2, MathConvertParamKind::Int,
+         MathConvertParamKind::Int, "`ToString(value: int, toBase: int): string`"},
+        {"Convert", "ToString", 2, MathConvertParamKind::Long,
+         MathConvertParamKind::Int, "`ToString(value: long, toBase: int): string`"},
+    };
+    return kRows;
+}
+
+// The §5.1 target type of one kind, spelled for the diagnostic.
+std::string_view mathConvertTypeName(MathConvertParamKind k) {
+    switch (k) {
+        case MathConvertParamKind::Bool: return "bool";
+        case MathConvertParamKind::Int: return "int";
+        case MathConvertParamKind::Long: return "long";
+        case MathConvertParamKind::Float: return "float";
+        case MathConvertParamKind::Double: return "double";
+        case MathConvertParamKind::Decimal: return "decimal";
+        case MathConvertParamKind::String: return "string";
+        case MathConvertParamKind::Unchecked: break;
+    }
+    return {};
+}
+
+// "an `int`", "a `long`", … — one kind's phrase, with its article.
+std::string mathConvertTypePhrase(MathConvertParamKind k) {
+    const std::string_view name = mathConvertTypeName(k);
+    if (name.empty()) return {};
+    const char* article = k == MathConvertParamKind::Int ? "an " : "a ";
+    return std::string(article) + "`" + std::string(name) + "`";
+}
+
+// "an `int`, a `long` or a `double`" — the kinds a position admits.
+std::string mathConvertTypeList(const std::vector<MathConvertParamKind>& kinds) {
+    std::string out;
+    for (std::size_t i = 0; i < kinds.size(); ++i) {
+        if (!out.empty()) out += (i + 1 == kinds.size()) ? " or " : ", ";
+        out += mathConvertTypePhrase(kinds[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+    // The BUILT-IN `Math` / `Convert` only: they have no user declaration
+    // (`ts->decl == nullptr`), so their surface is EXACTLY §2.2's / §2.3's
+    // listing. A user-declared class named `Math` or `Convert` HAS a
+    // declaration, and its own members are checked by the ordinary
+    // user-method machinery — this check must not claim them.
+    auto* ts = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tgt));
+    if (!ts || ts->decl != nullptr) return;
+    const std::string_view head = ts->name;
+    if (head != "Math" && head != "Convert") return;
+    // The DECLARED FORMS of this member at this arity. A call at an arity no
+    // declared form has is NOT this check's question (the ARITY rule and
+    // #7140's family own it), so the check stands down.
+    std::vector<const MathConvertSurfaceRow*> forms;
+    for (const auto& row : builtinMathConvertSurface())
+        if (row.head == head && row.member == member &&
+            row.arity == ce.args.size())
+            forms.push_back(&row);
+    if (forms.empty()) return;
+    // The §22.5 BINDING: a named argument binds to the parameter it NAMES
+    // ("named arguments may appear in any order after positional arguments.
+    // Each supplied argument binds exactly one parameter"), so the parameter
+    // an argument supplies is read through the binder, not by position. The
+    // published binding (`ctx_.builtinCallBinding`) is NOT available here —
+    // it is published at the END of `typeCall` — so the binding is
+    // established LOCALLY, over the REGISTRY's declared names, exactly as
+    // #7207 does for `StringBuilder`; no second name table is introduced.
+    std::vector<int> paramToArg;
+    std::vector<std::string_view> paramNames;
+    for (const auto& cand : common::builtinParamNameCandidates(
+             head, member, ce.args.size())) {
+        BindResult br = bindArgsToParams(
+            sema::FormalsView::ofNames(cand.names, cand.required), ce.args,
+            ce.span.begin,
+            "call to built-in `" + std::string(head) + "." +
+                std::string(member) + "`",
+            /*emit=*/false);
+        if (!br.ok) continue;  // not this overload's binding
+        paramToArg = br.paramToArg;
+        paramNames = cand.names;
+        break;
+    }
+    // A call that binds no candidate (an unknown name, a double bind, a
+    // positional argument after a named one) keeps the POSITIONAL reading:
+    // `checkBuiltinNamedArgs` reports the §22.5 violation, and the arguments
+    // must still be type-checked here.
+    if (paramToArg.empty()) {
+        for (std::size_t i = 0; i < ce.args.size(); ++i)
+            paramToArg.push_back(static_cast<int>(i));
+    }
+    // §5.1: does this argument convert to the declared parameter type?
+    // `primitiveOperandMatchesParam` is the ONE §5.1 numeric test (identity,
+    // the widening table, and constant narrowing), and a `string`/`bool`
+    // parameter takes only its own type — §5.1's table has no conversion
+    // TO `string`, and lists "between integers and bool" as never implicit.
+    auto admits = [&](const ast::Expr* argExpr, TypeRef* argTy,
+                      MathConvertParamKind k) -> bool {
+        switch (k) {
+            case MathConvertParamKind::Unchecked: return true;
+            case MathConvertParamKind::String:
+                return argTy->kind == TypeRef::Kind::Primitive &&
+                       argTy->primitive == PrimitiveType::String;
+            case MathConvertParamKind::Bool:
+                return argTy->kind == TypeRef::Kind::Primitive &&
+                       argTy->primitive == PrimitiveType::Bool;
+            default: break;
+        }
+        const PrimitiveType pt =
+            k == MathConvertParamKind::Int     ? PrimitiveType::Int
+            : k == MathConvertParamKind::Long   ? PrimitiveType::Long
+            : k == MathConvertParamKind::Float  ? PrimitiveType::Float
+            : k == MathConvertParamKind::Double ? PrimitiveType::Double
+                                                 : PrimitiveType::Decimal;
+        return primitiveOperandMatchesParam(
+            argExpr, argTy, ctx_.primitiveTypeRef(pt, /*nullable=*/false),
+            /*allowConstantNarrowing=*/true);
+    };
+    const std::string stdlibCite =
+        head == "Math" ? "stdlib §2.2" : "stdlib §2.3";
+    for (std::size_t p = 0; p < forms.front()->arity; ++p) {
+        // The declared kinds at this position, across the declared forms.
+        std::vector<MathConvertParamKind> admitted;
+        for (const auto* f : forms) {
+            const MathConvertParamKind k = p == 0 ? f->param0 : f->param1;
+            if (k == MathConvertParamKind::Unchecked) continue;
+            if (std::find(admitted.begin(), admitted.end(), k) == admitted.end())
+                admitted.push_back(k);
+        }
+        if (admitted.empty()) continue;  // no declared type to check against
+        if (p >= paramToArg.size()) continue;
+        const int ai = paramToArg[p];
+        if (ai < 0) continue;  // the parameter takes its default
+        if (static_cast<std::size_t>(ai) >= ce.args.size()) continue;
+        const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+        if (!arg.value || arg.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule; skip.
+        if (!arg.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*arg.value);
+        if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+        // §7: the nullability gate (#6782) owns a NULLABLE argument at a
+        // non-nullable parameter — this check is about the argument's TYPE,
+        // so a nullable argument is left to that gate (whose registry rows
+        // cover the `Convert` positions but not `Math`'s).
+        if (argTy->nullable) continue;
+        bool ok = false;
+        for (MathConvertParamKind k : admitted)
+            if (admits(arg.value.get(), argTy, k)) { ok = true; break; }
+        if (ok) continue;
+        // The rejection: a located, spec-cited diagnostic naming the
+        // offending argument and the type §2.2 / §2.3 declares there — the
+        // shape #7207 established for `StringBuilder`.
+        std::string decls;
+        for (const auto* f : forms) {
+            if (!decls.empty()) decls += " / ";
+            decls += std::string(f->decl);
+        }
+        const std::string paramName =
+            p < paramNames.size() ? std::string(paramNames[p]) : std::string();
+        const std::string what =
+            paramName.empty()
+                ? "the argument at position " + std::to_string(p + 1)
+                : "the `" + paramName + "` argument";
+        ctx_.diagnostics().report(
+            Severity::Error, arg.value->span.begin,
+            "no matching overload of `" + std::string(head) + "." +
+                std::string(member) + "` — " + stdlibCite + " declares " +
+                decls + ", so " + what + " must be " +
+                mathConvertTypeList(admitted) + " (" + stdlibCite + "; §5.1)");
+        return;  // ONE diagnostic per call
     }
 }
 

@@ -4688,6 +4688,33 @@ private:
     // has a declaration, and its own members are checked by the ordinary
     // user-method machinery.
     void checkBuiltinStringBuilderCall(const ast::CallExpr& ce);
+    // fix #7218 (stdlib §2.2, stdlib §2.3, §5.1, §22.6, v0.343): the
+    // ARGUMENT TYPES of a `Math` / `Convert` static member call.
+    //
+    // `Math` and `Convert` are compiler built-ins with no user declaration,
+    // so their members have no MethodSymbol: §22.5's per-argument
+    // assignability check (`checkCallArity` → `checkArgsAgainstParams`) never
+    // ran for them, and `resolveMemberAccess` typed the member by NAME alone.
+    // An argument of a type the declared parameter does not take therefore
+    // reached codegen unchecked — and reached it as MALFORMED IR (the
+    // compiler ABORTED inside the LLVM verifier, with no diagnostic and no
+    // source location) or, for a `bool` argument, as a SILENT WRONG ANSWER.
+    //
+    // §5.1 applies the implicit conversions "where the target type is
+    // known", and for a built-in member the target type IS known (stdlib
+    // §2.2 declares `Math.Pow(x: double, y: double): double`; stdlib §2.3
+    // declares the `Convert` family), so the argument must be checked
+    // against the declared parameter type and a call that matches NO
+    // declared form is an error (§22.6).
+    //
+    // The check is the shape #7207 established for `StringBuilder`: a TABLE
+    // of the declared forms, a §5.1 test per argument, and a diagnostic
+    // naming the offending argument and the expected type.
+    //
+    // A user-declared class named `Math` or `Convert` is NOT this surface:
+    // it has a declaration, and its own members are checked by the ordinary
+    // user-method machinery.
+    void checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce);
     // fix #6782 (§7, §7.3, v0.340): the member and static twin of the check
     // above, for the built-in receivers and type names it does not claim. A
     // resolved `calleeSym` (user or imported method) is left to checkCallArity.
