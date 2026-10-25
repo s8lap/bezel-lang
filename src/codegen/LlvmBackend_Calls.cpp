@@ -11484,6 +11484,43 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateCall(fn, {recv, relFn});
             return recv;
         }
+        // fix #7221 (stdlib §3.1, §4.6, v0.343): the builder's current
+        // LENGTH — the quantity §3.1's `Insert`/`Remove` contract names as the
+        // bound — is the sum of its parts' code-point lengths, which is exactly
+        // what the `Length` PROPERTY reports (the property arm in
+        // LlvmBackend_Exprs.cpp; §4.6: a length is a count of CODE POINTS).
+        //
+        // The range guards below compare against THIS value, so the bound a
+        // program sees as `sb.Length` and the bound the guard enforces are one
+        // number by construction — one definition, one rule (the #7104/#7117
+        // lesson: two copies of a range rule drift).
+        auto sbContentLen = [&]() -> llvm::Value* {
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
+            llvm::Value* nParts = builder_.CreateCall(lenFn, {recv});
+            auto* sumSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), sumSlot);
+            auto* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.getInt64(0), idxSlot);
+            auto* condBB = llvm::BasicBlock::Create(llvm_, "sb.clen.c", currentFn_);
+            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sb.clen.b", currentFn_);
+            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sb.clen.e", currentFn_);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* ci = builder_.CreateLoad(i64(), idxSlot);
+            builder_.CreateCondBr(builder_.CreateICmpSLT(ci, nParts), bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* bi = builder_.CreateLoad(i64(), idxSlot);
+            llvm::Value* ep = builder_.CreateCall(ptrAtFn, {recv, bi, builder_.getInt64(SB_ESZ)});
+            llvm::Value* part = builder_.CreateLoad(ptrTy(), ep);
+            llvm::Value* plen = loadStringLen(part);
+            llvm::Value* curSum = builder_.CreateLoad(i64(), sumSlot);
+            builder_.CreateStore(builder_.CreateAdd(curSum, plen), sumSlot);
+            builder_.CreateStore(builder_.CreateAdd(bi, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+            builder_.SetInsertPoint(endBB);
+            return builder_.CreateLoad(i64(), sumSlot);
+        };
         // §3.1: Insert(index: int, value: string): StringBuilder — flatten,
         // insert, reset to one part (runtime helper). Returns this for chaining.
         // fix #3423 (§22.5, v0.283): apply the binding permutation so reordered
@@ -11497,8 +11534,58 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* idx = lowerExpr(*call.args[idxArgIdx].value);
             llvm::Value* val = lowerExpr(*call.args[valArgIdx].value);
             if (!idx || !val) return nullptr;
-            llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
-                ? idx : builder_.CreateSExt(idx, i64());
+            // fix #7221 (§5.1, v0.343): the index is widened by the SOURCE's
+            // signedness — a `byte` 200 is the `int` 200, never -56 (§5.1's
+            // lossless widening; the same rule the string family applies,
+            // #7102). The bare CreateSExt read it as -56, and the runtime
+            // helper then NO-OPped the negative index.
+            //
+            // The SAME widened value is the one the bound is tested on AND the
+            // one the runtime helper receives: a guard that tested one value
+            // while the mutation used another would leave a silent no-op
+            // behind — the very defect this fix closes.
+            llvm::Value* idx64 = widenIntParam(call.args[idxArgIdx].value.get(),
+                                               idx, "sb.ins.idx", "sb.ins.zidx");
+            // fix #7221 (stdlib §3.1, §4.6, v0.343): the POSITION contract.
+            //
+            // stdlib §3.1 (v0.343), Contracts paragraph, verbatim:
+            //   "`Insert` and `Remove` raise `IndexOutOfRangeException` when
+            //   the index or the `(startIndex, length)` window falls outside
+            //   `0..Length`."
+            //
+            // Before this guard the arm passed the index straight to the
+            // runtime helper, which NO-OPs an out-of-range index — the
+            // runtime's own comment says so ("Out-of-range (index < 0 or >
+            // Length) is a no-op here; the codegen-side bounds check raises
+            // IndexOutOfRangeException per the §3.1 v0.195 contract"). So
+            // `sb.Insert(99, "X")` returned a builder whose text was
+            // UNCHANGED and the program exited 0: the request the contract
+            // rejects was reported as a success.
+            //
+            // The bound is `0..Length` INCLUSIVE at both ends: §4.6 makes a
+            // length a count of CODE POINTS, so `Insert(0, …)` prepends,
+            // `Insert(Length, …)` appends, and both are INSIDE the bound and
+            // stay admitted; `Insert(-1, …)` and `Insert(Length+1, …)` are
+            // outside it and raise. The exception type is the one §3.1 names
+            // — the same shape the string twin landed in #7172.
+            llvm::Value* sbLen = sbContentLen();
+            llvm::Value* idxNeg = builder_.CreateICmpSLT(idx64,
+                                                         builder_.getInt64(0),
+                                                         "sb.ins.neg");
+            llvm::Value* idxBig = builder_.CreateICmpSGT(idx64, sbLen,
+                                                         "sb.ins.big");
+            llvm::Value* oor = builder_.CreateOr(idxNeg, idxBig, "sb.ins.oor");
+            // The guard RAISES. There is no caller-owned +1 producer to release
+            // on the throw edge: the receiver is an owned class instance (the
+            // parts list), not a `string` producer, so §28.9's producer-release
+            // idiom (the #6979/#7159 funnel) has no producer to release. The
+            // `value` argument is a BORROW parameter (stdlib §3.1 declares it
+            // without `owned`; spec §22.6), so the callee does not own its
+            // reference; its disposal belongs to the caller's full-expression
+            // boundary (§28.3 K8.1), which this guard does not change. The
+            // builder's own disposal is the caller's `using var`, and the
+            // unwind disposes it (CG21).
+            emitGuardThrow(oor, "IndexOutOfRangeException");
             auto* fn = declareC("bz_sb_insert", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), i64(), ptrTy()});
             builder_.CreateCall(fn, {recv, idx64, val});
@@ -11516,10 +11603,57 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* start = lowerExpr(*call.args[startArgIdx].value);
             llvm::Value* len   = lowerExpr(*call.args[lenArgIdx].value);
             if (!start || !len) return nullptr;
-            llvm::Value* start64 = start->getType()->isIntegerTy(64)
-                ? start : builder_.CreateSExt(start, i64());
-            llvm::Value* len64 = len->getType()->isIntegerTy(64)
-                ? len : builder_.CreateSExt(len, i64());
+            // fix #7221 (§5.1, v0.343): BOTH `int` parameters are widened by the
+            // SOURCE's signedness — a `byte` 200 is the `int` 200, never -56
+            // (the same rule the string family applies, #7102).
+            llvm::Value* start64 = widenIntParam(call.args[startArgIdx].value.get(),
+                                                 start, "sb.rm.start", "sb.rm.zstart");
+            llvm::Value* len64 = widenIntParam(call.args[lenArgIdx].value.get(),
+                                               len, "sb.rm.len", "sb.rm.zlen");
+            // fix #7221 (stdlib §3.1, §4.6, v0.343): the WINDOW contract.
+            //
+            // stdlib §3.1 (v0.343), Contracts paragraph, verbatim:
+            //   "`Insert` and `Remove` raise `IndexOutOfRangeException` when
+            //   the index or the `(startIndex, length)` window falls outside
+            //   `0..Length`."
+            //
+            // The WINDOW is the half-open range `[startIndex, startIndex +
+            // length)` of the builder's content: it must lie inside
+            // `0..Length`. So `startIndex` must be in `0..Length`, `length`
+            // must not be negative, and the window's END must not pass the
+            // content's end. Before this guard the arm passed both arguments
+            // straight to the runtime helper, which NO-OPs an out-of-range
+            // window (its own comment: "an out-of-range request is a no-op
+            // here (the SB is unchanged)") — so `sb.Remove(1, 99)` left the
+            // text unchanged and the program exited 0: a request the contract
+            // rejects was reported as a success.
+            //
+            // The bound is INCLUSIVE at both ends and in CODE POINTS (§4.6),
+            // exactly as the string twin's `Remove` guard is (#7168):
+            // `Remove(0, Length)` removes everything, `Remove(Length, 0)` is
+            // the empty window at the end — both INSIDE `0..Length` and
+            // admitted; `Remove(-1, 1)`, `Remove(Length+1, 1)` and a window
+            // that ends past the content raise.
+            llvm::Value* sbLen = sbContentLen();
+            llvm::Value* startNeg = builder_.CreateICmpSLT(start64,
+                                                           builder_.getInt64(0),
+                                                           "sb.rm.sneg");
+            llvm::Value* startBig = builder_.CreateICmpSGT(start64, sbLen,
+                                                           "sb.rm.sbig");
+            llvm::Value* lenNeg = builder_.CreateICmpSLT(len64,
+                                                         builder_.getInt64(0),
+                                                         "sb.rm.cneg");
+            llvm::Value* end64 = builder_.CreateAdd(start64, len64, "sb.rm.end");
+            llvm::Value* endBig = builder_.CreateICmpSGT(end64, sbLen,
+                                                         "sb.rm.ebig");
+            llvm::Value* oor = builder_.CreateOr(
+                builder_.CreateOr(startNeg, startBig, "sb.rm.oor1"),
+                builder_.CreateOr(lenNeg, endBig, "sb.rm.oor2"), "sb.rm.oor");
+            // The guard RAISES; there is no caller-owned +1 producer to release
+            // on the throw edge (the receiver is an owned class instance, and
+            // the `value`/`length` arguments are borrows — see the `Insert`
+            // arm's note).
+            emitGuardThrow(oor, "IndexOutOfRangeException");
             auto* fn = declareC("bz_sb_remove", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), i64(), i64()});
             builder_.CreateCall(fn, {recv, start64, len64});
@@ -11563,33 +11697,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return recv;  // allow chaining
         }
         if (m == "Length" || m == "Count") {
-            // Sum of lengths of all string parts
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-            llvm::Value* nParts = builder_.CreateCall(lenFn, {recv});
-            auto* sumSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), sumSlot);
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "sb.len.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sb.len.b", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sb.len.e", currentFn_);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, nParts), bodyBB, endBB);
-            builder_.SetInsertPoint(bodyBB);
-            llvm::Value* idx2 = builder_.CreateLoad(i64(), idxSlot);
-            llvm::Value* ep = builder_.CreateCall(ptrAtFn, {recv, idx2, builder_.getInt64(SB_ESZ)});
-            llvm::Value* part = builder_.CreateLoad(ptrTy(), ep);
-            llvm::Value* plen = loadStringLen(part);
-            llvm::Value* curSum = builder_.CreateLoad(i64(), sumSlot);
-            builder_.CreateStore(builder_.CreateAdd(curSum, plen), sumSlot);
-            builder_.CreateStore(builder_.CreateAdd(idx2, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(endBB);
-            llvm::Value* total = builder_.CreateLoad(i64(), sumSlot);
-            return builder_.CreateTrunc(total, i32());
+            // Sum of lengths of all string parts (§4.6 — a length is a count
+            // of CODE POINTS). fix #7221: the `Insert`/`Remove` guards above
+            // test the SAME quantity, so the property a program reads and the
+            // bound the guard enforces are one definition.
+            return builder_.CreateTrunc(sbContentLen(), i32());
         }
         // stdlib §3.1 / §8.5 / §18.5: `sb.ToString()` — the builder's OWN
         // declared `ToString(): string`, not the §8.5 type-name default.
