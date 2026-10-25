@@ -7576,6 +7576,40 @@ void MethodOwnership::checkReceiverCaptureCollectionStore(
 static bool isPatternATaskType(const sema::TypeRef* rt);
 static const sema::TypeRef* symbolTypeRef(const sema::Symbol* sym);
 
+sema::Symbol* MethodOwnership::objectTypedOwnedRootBorrowSource(
+    const ast::Expr& rhs) {
+    // fix #7103 (§28.3 *Producers*, §28.3 K1.5, §28.7 *Overwrite while
+    // borrowed*, v0.343). See the declaration's comment for the full
+    // rationale.
+    //
+    // Only a BARE IDENTIFIER root is admitted. Per §28.3 K1.5, "Reads of
+    // named bindings lend unless the position consumes (K3): an unmarked read
+    // of an owned binding is a borrow of the binding", while "Reads of
+    // storage lend: a field, property, indexer, or slot read is a borrow
+    // whose source is the storage's holder" — a member/index projection off
+    // an `Object`-typed value reads STORAGE, whose source is the storage's
+    // holder, and not the local binding this predicate is about.
+    const ast::Expr* core = peelTopCastBang(&rhs);
+    if (!dynamic_cast<const ast::IdentifierExpr*>(core)) return nullptr;
+    const ast::IdentifierExpr* root = identifierRootThroughCastBang(rhs);
+    if (!root) return nullptr;
+    // The root's OWN declared type must be the `Object` primitive — the kind
+    // the borrow-vs-copy gate reads as a value type. A class-typed root is
+    // already recognised by that gate, and a value-typed root is a copy.
+    const sema::TypeRef* rt = ctx_.exprType(*root);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Primitive ||
+        rt->primitive != sema::PrimitiveType::Object)
+        return nullptr;
+    // The root must be a local in the OWNED state — i.e. it holds a
+    // CLASSIFIED value (a class instance, or an owning collection), so the
+    // read is a reference alias rather than a copy (§28.3 K1.5: "an unmarked
+    // read of an owned binding is a borrow of the binding"). A local holding
+    // a runtime-managed value (a box) is never Owned.
+    sema::Symbol* sym = ctx_.exprSymbol(*root);
+    if (!isOwnedTrackedLocal(sym)) return nullptr;
+    return sym;
+}
+
 sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
     // §31.1 (issue #392) — a re-borrow of a catch-bound exception variable.
     // `var b := ex;` binds `b` to the in-flight exception's borrow; the source
@@ -7744,7 +7778,21 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
         dynamic_cast<const ast::MemberAccessExpr*>(shape1Core) ||
         dynamic_cast<const ast::NullCondMemberExpr*>(shape1Core) ||
         dynamic_cast<const ast::IndexExpr*>(shape1Core)) {
-        if (returnedExprMayBorrow(rhs)) {
+        // fix #7103 (§28.3 *Producers* "Local-variable read `x` where `x` is
+        // owned", §28.3 K1.5, §28.7 *Overwrite while borrowed*, v0.343): the
+        // borrow-vs-copy gate reads the `Object` primitive as a value type
+        // (the compiler's own `isBorrowableType` comment calls `string` and
+        // `Object` "runtime-managed reference types whose lifetime is not
+        // tied to any single owner"), so an `Object`-typed read of an OWNED
+        // local was never recorded as a borrow — and the consume-site freeze
+        // (§28.3 K5.2 / §28.7) could then not see the holder, so the
+        // overwrite-while-borrowed program was ACCEPTED and read freed
+        // memory. The state's Owned-ness, not the reader's static type,
+        // decides: per §28.3 K1.5, "an unmarked read of an owned binding is
+        // a borrow of the binding" whatever the reader's type is.
+        // See objectTypedOwnedRootBorrowSource's own comment.
+        if (returnedExprMayBorrow(rhs) ||
+            objectTypedOwnedRootBorrowSource(rhs) != nullptr) {
             if (const ast::IdentifierExpr* root =
                     identifierRootThroughCastBang(rhs)) {
                 sema::Symbol* sym = ctx_.exprSymbol(*root);

@@ -2417,6 +2417,50 @@ private:
     // value-typed projection by member name (still a copy, never a borrow).
     bool returnedExprMayBorrow(const ast::Expr& e) const;
 
+    // fix #7103 (§28.3 *Producers* "Local-variable read `x` where `x` is
+    // owned", §28.3 K1.5, §28.7 *Overwrite while borrowed*, v0.343): the
+    // borrow source of an `Object`-typed read of an OWNED local.
+    //
+    // Returns the root symbol when the read is a BORROW that the
+    // borrow-vs-copy gate (`returnedExprMayBorrow` -> `isBorrowableType`)
+    // cannot see, and nullptr otherwise.
+    //
+    // WHY THE GATE MISSES IT. `isBorrowableType` reads the `Object`
+    // PRIMITIVE kind as a value type — the compiler's OWN comment there
+    // calls `string` and `Object` "runtime-managed reference types whose
+    // lifetime is not tied to any single owner" (that sentence is the
+    // compiler's, not the spec's: §28.9's runtime-managed tier is `string`,
+    // `Type`, boxed value types and function-typed values, and `Object` is
+    // not on it) — so `returnedExprMayBorrow` answers FALSE for an
+    // `Object`-typed root and `borrowSourceForExpr`'s Shape 1 never records
+    // the borrow source. §28.3's *Producers* row for a local read of an OWNED
+    // local has NO carve-out for the reader's static type: "In a **borrowing
+    // position**, `x` retains ownership and the value is borrowed for the
+    // consuming operation." The STATE decides, not the static type.
+    //
+    // WHAT MAKES AN `Object`-typed ROOT DISCRIMINABLE. §28.3's *Ownership
+    // state of locals* makes the `unclassified` state the one that carries
+    // "no obligation and no source, so a read of it is no borrow" — and it
+    // applies to a local holding a RUNTIME-MANAGED value (a box, a `string`,
+    // a function value). The compiler has no `unclassified` state (that is
+    // issue #6609), so the OWNED state is the discriminator used here: a
+    // local in the OWNED state holds a CLASSIFIED value (a class instance, or
+    // an owning collection — §28.3's producers table), and per §28.3 K1.5
+    // "an unmarked read of an owned binding is a borrow of the binding" — a
+    // reference alias, never a copy. A local holding a box is never Owned,
+    // so it never reaches this predicate.
+    //
+    // SCOPE. Only the BARE-IDENTIFIER root of an `Object`-typed local is
+    // admitted. Per §28.3 K1.5, "Reads of named bindings lend unless the
+    // position consumes (K3): an unmarked read of an owned binding is a
+    // borrow of the binding", while "Reads of storage lend: a field,
+    // property, indexer, or slot read is a borrow whose source is the
+    // storage's holder" — so a member/index projection off an `Object`-typed
+    // value reads STORAGE, whose source is the storage's holder, and not the
+    // local binding this predicate is about. Only a bare identifier reads the
+    // binding.
+    sema::Symbol* objectTypedOwnedRootBorrowSource(const ast::Expr& rhs);
+
     // Walk the return value's expression and, for each path that ends
     // in a local-identifier root, verify the root isn't a `using var`.
     void checkBorrowEscapesOnReturn(const ast::Expr& e);
