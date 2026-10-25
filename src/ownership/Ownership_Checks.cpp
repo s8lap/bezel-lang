@@ -20786,6 +20786,13 @@ void MethodOwnership::checkDeferredActivationTempSitesExpr(const ast::Expr& e,
         // losers) through the receiver-sourced-borrow result classification.
         // // per §28.3 / stdlib §5 (#1915)
         checkMinMaxMintingSelector(*ce);
+        // §28.3 / stdlib §5 (#7201): the same laundering class for the §5
+        // COMBINER — a lazy `Zip(other, combine)` whose combiner mints a fresh
+        // cleanup-bearing value per pair leaks every minted combination (the
+        // combined element is a receiver-sourced borrow, so the pipeline takes
+        // no disposal obligation on it). Position-independent, like its two
+        // siblings above. // per §28.3 / stdlib §5 (#7201)
+        checkLazyZipMintingCombiner(*ce);
         // §28.3 *Diagnostics* "The trust-admission report" (v0.307, #4605):
         // a borrow held by a PENDING FRAME past the call that minted it.
         //
@@ -21244,8 +21251,129 @@ void MethodOwnership::checkMinMaxMintingSelector(const ast::CallExpr& ce) {
         "over a borrowed key and pick the owning element separately");
 }
 
-// §28.3 / stdlib §5 (#1917, #1915): see the declaration comment. Shared by the
-// `Select` and `Min`/`Max` minting-selector rejects. // per §28.3 / stdlib §5
+// §28.3 / stdlib §5 (#7201): reject a lazy `Zip<U,R>(other, combine)` whose
+// combiner MINTS a fresh cleanup-bearing value per PAIR. See the declaration
+// comment for the full contract. // per §28.3 / stdlib §5 (#7201)
+void MethodOwnership::checkLazyZipMintingCombiner(const ast::CallExpr& ce) {
+    // A LINQ `Zip` is a builtin intrinsic with NO user MethodDecl (mirrors
+    // checkLazySelectMintingSelector's gate): a user-defined method also named
+    // `Zip` resolves to a MethodDecl and its combiner's ownership is governed
+    // by its declared parameter modifier — leave it alone. // per §28.3 (#7201)
+    if (common::calleeMethodDecl(ce, ctx_)) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || ma->member != "Zip") return;
+    // stdlib §5: `Zip<U,R>(other: IEnumerable<U>, combine: (T, U) -> R)` — the
+    // COMBINER is the SECOND argument. A one-argument `Zip` is not this
+    // operator. // per §28.3 (#7201)
+    if (ce.args.size() != 2) return;
+    const ast::CallArgument& arg = ce.args[1];
+    if (arg.isDiscard || !arg.value || !arg.name.empty() ||
+        !arg.modifier.empty())
+        return;
+    // The combiner is a CALLBACK, spelled either as an inline lambda or as a
+    // method group. Both are recognised; a method group's mint is decided by
+    // the callee's own body (callbackMethodMintingReturn). // per §28.3 (#7201)
+    const ast::Expr* mintingReturn = nullptr;
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(arg.value.get())) {
+        mintingReturn = selectorLambdaMintingReturn(*lam);
+    } else {
+        // A method group (`Cat` / `C.Cat`). The resolved MethodSymbol carries
+        // the callee's AST body for a LOCAL method; an IMPORTED method has no
+        // body here, so the shape stays admitted (the "cannot prove it mints"
+        // direction). // per §28.3 (#7201)
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(
+            ctx_.exprSymbol(*arg.value));
+        if (!ms) return;
+        // SEAM-ACCESSOR: the method-reference combiner's AST body is a
+        // LOCAL-only fact — an imported member carries no AST here
+        // (`ms->decl` is null for every imported method), so the shape is then
+        // left admitted (the "cannot prove it mints" direction).
+        auto* mdecl = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!mdecl) return;
+        mintingReturn = callbackMethodMintingReturn(*mdecl);
+    }
+    if (!mintingReturn) return;
+    report(
+        Severity::Error, mintingReturn->span.begin,
+        "a lazy `Zip` combiner that mints a fresh owned value per pair "
+        "(a `new` of a class, an `owned`-returning call, or a fresh string "
+        "such as a `+` concatenation or an interpolation) launders that value "
+        "out through the zipped sequence — stdlib §5 classifies the combined "
+        "element as a receiver-sourced borrow, so the lazy pipeline takes no "
+        "disposal obligation on it and every minted combination leaks (no "
+        "consumer reclaims it: `ToArray` owns only the container, borrowing "
+        "elements, and no lazy materializer takes element ownership) — §28.3 "
+        "*Bare-type-parameter returns* (v0.194), the same launder the `Select` "
+        "and `Min`/`Max` minting-selector rejections forbid; combine the "
+        "elements into a borrow (a field, or an element itself), or build an "
+        "owning collection (`OwningArray<T>`) from the sources directly");
+}
+
+// §28.3 / stdlib §5 (#1917, #1915, #7201): the shared RETURN-PATH walk for a
+// §5 CALLBACK — the first `return`-path expression of a callback's BLOCK body
+// that MINTS a fresh cleanup-bearing value, or nullptr if none does.
+//
+// The walk visits the nested statement forms (if / elif / else, while, for,
+// do-end, try / catch / finally, case arms) and never crosses a NESTED LAMBDA
+// (its returns belong to it) — the same shape as the #1917 selector-body walk
+// it was extracted from.
+//
+// `mintPred` is the mint predicate, passed in because it is a MethodOwnership
+// member (lazySelectSelectorReturnMints) and this helper is file-local.
+namespace {
+
+template <class MintPred>
+const ast::Expr* mintingReturnInStmts(
+        const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+        MintPred mintPred) {
+    const ast::Expr* mintingReturn = nullptr;
+    std::function<void(const ast::Stmt&)> scan = [&](const ast::Stmt& s) {
+        if (mintingReturn) return;
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+            if (rs->value && mintPred(*rs->value))
+                mintingReturn = rs->value.get();
+            return;
+        }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+            for (const auto& bs : ifs->ifBranch.body) if (bs) scan(*bs);
+            for (const auto& el : ifs->elifBranches)
+                for (const auto& bs : el.body) if (bs) scan(*bs);
+            for (const auto& bs : ifs->elseBody) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+            for (const auto& bs : ws->body) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+            for (const auto& bs : fs->body) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+            for (const auto& bs : db->body) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+            for (const auto& bs : trys->body) if (bs) scan(*bs);
+            for (const auto& c : trys->catches) if (c.body) scan(*c.body);
+            for (const auto& bs : trys->finallyBody) if (bs) scan(*bs);
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+            for (const auto& arm : cs->arms)
+                for (const auto& bs : arm.stmts) if (bs) scan(*bs);
+            return;
+        }
+    };
+    for (const auto& s : stmts) if (s) scan(*s);
+    return mintingReturn;
+}
+
+}  // namespace
+
+// §28.3 / stdlib §5 (#1917, #1915, #7201): see the declaration comment. Shared
+// by the `Select`, `Min`/`Max` and `Zip` minting-callback rejects. // per §28.3
+// / stdlib §5
 const ast::Expr* MethodOwnership::selectorLambdaMintingReturn(
         const ast::LambdaExpr& lam) {
     // An `async` selector projects a Task frame, a different ownership contract.
@@ -21253,54 +21381,38 @@ const ast::Expr* MethodOwnership::selectorLambdaMintingReturn(
     // Does any return path of the selector mint a fresh value? Scan the `=> E`
     // body or the block body's `return` statements (never crossing a nested
     // lambda — its returns belong to it), mirroring the SB01-B return walk.
-    const ast::Expr* mintingReturn = nullptr;
-    auto note = [&](const ast::Expr& re) {
-        if (!mintingReturn && lazySelectSelectorReturnMints(re))
-            mintingReturn = &re;
-    };
     if (lam.exprBody) {
-        note(*lam.exprBody);
-    } else {
-        std::function<void(const ast::Stmt&)> scan = [&](const ast::Stmt& s) {
-            if (mintingReturn) return;
-            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-                if (rs->value) note(*rs->value);
-                return;
-            }
-            if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-                for (const auto& bs : ifs->ifBranch.body) if (bs) scan(*bs);
-                for (const auto& el : ifs->elifBranches)
-                    for (const auto& bs : el.body) if (bs) scan(*bs);
-                for (const auto& bs : ifs->elseBody) if (bs) scan(*bs);
-                return;
-            }
-            if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-                for (const auto& bs : ws->body) if (bs) scan(*bs);
-                return;
-            }
-            if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-                for (const auto& bs : fs->body) if (bs) scan(*bs);
-                return;
-            }
-            if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-                for (const auto& bs : db->body) if (bs) scan(*bs);
-                return;
-            }
-            if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
-                for (const auto& bs : trys->body) if (bs) scan(*bs);
-                for (const auto& c : trys->catches) if (c.body) scan(*c.body);
-                for (const auto& bs : trys->finallyBody) if (bs) scan(*bs);
-                return;
-            }
-            if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
-                for (const auto& arm : cs->arms)
-                    for (const auto& bs : arm.stmts) if (bs) scan(*bs);
-                return;
-            }
-        };
-        for (const auto& s : lam.stmts) if (s) scan(*s);
+        if (lazySelectSelectorReturnMints(*lam.exprBody))
+            return lam.exprBody.get();
+        return nullptr;
     }
-    return mintingReturn;
+    return mintingReturnInStmts(lam.stmts,
+        [this](const ast::Expr& e) { return lazySelectSelectorReturnMints(e); });
+}
+
+// §28.3 / stdlib §5 (#7201): the METHOD-REFERENCE half of the callback return
+// walk — the callee's OWN body. A §5 callback may be spelled as a method group
+// (`Zip(ys, Cat)`), and then the minting happens in the callee, not at the call
+// site; the callee's `=> E` body or its block body's `return` statements are
+// the return paths that decide the launder.
+//
+// An IMPORTED method has no AST body here (its MethodSymbol carries no
+// decl), so the caller cannot classify it and leaves the shape admitted — the
+// same "cannot prove it mints" direction the #1917 gate takes for a
+// method-reference SELECTOR.
+const ast::Expr* MethodOwnership::callbackMethodMintingReturn(
+        const ast::MethodDecl& decl) {
+    // An `async` method projects a Task frame, a different ownership contract.
+    for (auto m : decl.modifiers)
+        if (m == "async") return nullptr;
+    if (decl.exprBody) {
+        if (lazySelectSelectorReturnMints(*decl.exprBody))
+            return decl.exprBody.get();
+        return nullptr;
+    }
+    if (decl.bodyKind != ast::MethodBodyKind::Block) return nullptr;
+    return mintingReturnInStmts(decl.stmts,
+        [this](const ast::Expr& e) { return lazySelectSelectorReturnMints(e); });
 }
 
 namespace {

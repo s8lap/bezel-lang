@@ -241,12 +241,21 @@ BEZEL_TEST(linq_complete, zip_string_receiver_int_result_no_overflow_spec_5) {
 // compile ABORTED. Fails-without (compile abort → r.ran false → -999),
 // passes-with (compiles; "aa"+"x" = "aax", .Length = 3).
 //
-// NOTE: uses runAot (value oracle), NOT runAotChecked — a string-producing lazy
-// projection lambda leaks its owned result today (pre-existing, general to
-// Select/Zip; tracked as #1849), which LSan would flag. This test guards the
-// malformed-IR compile regression on the VALUE; #1849 covers the leak.
-BEZEL_TEST(linq_complete, zip_string_result_combiner_compiles_spec_5) {
-    BEZEL_EXPECT_EQ(run(
+// BEHAVIOUR FLIP (#7201): this row used to assert that the MINTING string-result
+// combiner COMPILES and yields 3. It no longer compiles: a `Zip` combiner that
+// MINTS a fresh value is the §28.3 laundering class (stdlib §5 classifies the
+// combined element as a receiver-sourced borrow, so the lazy pipeline takes no
+// disposal obligation on it and every minted combination leaks — 72 B in 4
+// allocations for this shape), and #7201 closes it by rejecting the launder at
+// the combiner, exactly as the `Select` (#1917) and `Min`/`Max` (#1915) gates
+// reject their minting selectors. The row now asserts the §28.3 REJECT.
+//
+// The MALFORMED-IR guard this row carried is preserved by its sibling below —
+// a BORROWING string-result combiner (`(p, q) => p`), which reaches codegen
+// with R = string and so exercises the same combine-trampoline return type,
+// and is admitted because it mints nothing.
+BEZEL_TEST(linq_complete, zip_string_result_combiner_rejected_spec_28_3) {
+    std::string src =
         "module M; import System.Collections.Generic; import System.Collections.Linq; "
         "class C public static method Main(): int "
         "  using var a: Array<string> := [\"aa\"]; "
@@ -254,7 +263,39 @@ BEZEL_TEST(linq_complete, zip_string_result_combiner_compiles_spec_5) {
         "  var n := 0; "
         "  for var v in a.Zip(b, lambda(p, q) => p + q) do n := n + v.Length; end; "
         "  return n; "
-        "end Main; end C;"), 3);
+        "end Main; end C;";
+    auto r = runAot(src);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool sawLaunder = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("`Zip` combiner that mints") != std::string::npos)
+            sawLaunder = true;
+    }
+    BEZEL_EXPECT_TRUE(sawLaunder);
+}
+
+// MALFORMED-IR regression (stdlib §5 Zip<U,R> / spec §29.4, v0.196), BORROWING
+// spelling: a `string`-RESULT combiner that MINTS NOTHING — `(p, q) => p`
+// returns the LEFT element's own string. R = string, so the combine closure
+// returns `ptr` (string) against a wrongly-`i32`-typed function would abort
+// the compile; the row pins that it COMPILES and yields the left element's
+// length (2). This is the malformed-IR guard the flipped row above (a MINTING
+// string-result combiner, now refused by #7201) can no longer carry — the
+// borrowing spelling still reaches codegen with R = string.
+//
+// Uses runAotChecked: the borrowed element is owned by the source array, so the
+// pipeline is leak-free and LSan stays silent.
+BEZEL_TEST(linq_complete, zip_string_result_borrow_combiner_compiles_spec_5) {
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; import System.Collections.Generic; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  using var a: Array<string> := [\"aa\"]; "
+        "  using var b: Array<string> := [\"x\"]; "
+        "  var n := 0; "
+        "  for var v in a.Zip(b, lambda(p, q) => p) do n := n + v.Length; end; "
+        "  return n; "
+        "end Main; end C;"), 2);
 }
 
 // Value-type control (stdlib §5 Zip<U,R> / spec §29.4, v0.196): un-annotated

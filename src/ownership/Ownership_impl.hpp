@@ -5696,13 +5696,35 @@ private:
     // deferred-activation walk visits (position-independent). // per §28.3 /
     // stdlib §5 (#1915)
     void checkMinMaxMintingSelector(const ast::CallExpr& ce);
+    // §28.3 / stdlib §5 (#7201): a lazy LINQ `Zip<U,R>(other, combine)` whose
+    // combiner MINTS a fresh cleanup-bearing value per PAIR — an inline lambda
+    // combiner (`lambda(a, b) => a + b`) or a METHOD-REFERENCE combiner whose
+    // own body mints (`Cat(a, b) => a + b`) — launders that value out through
+    // the zipped sequence's receiver-sourced-borrow classification (stdlib §5
+    // "Ownership at class-typed substitutions", the same rule the `Select`
+    // projection (#1917) and the `Min`/`Max` projection (#1915) follow): the
+    // lazy pipeline takes NO disposal obligation on the combined elements, so
+    // every minted combination leaks and no consumer reclaims it (`ToArray`
+    // owns only the CONTAINER, borrowing elements). Same §28.3 laundering
+    // class as the `Aggregate` minted-seed rejection; reject the launder at
+    // the combiner. Called for every CallExpr the deferred-activation walk
+    // visits (position-independent). // per §28.3 / stdlib §5 (#7201)
+    void checkLazyZipMintingCombiner(const ast::CallExpr& ce);
     // The first return-path expression of `lam` (an inline lambda selector) that
     // MINTS a fresh cleanup-bearing value (lazySelectSelectorReturnMints), or
     // nullptr if none does. Scans the `=> E` body or the block body's `return`
     // statements, never crossing a nested lambda (its returns belong to it) —
-    // mirrors the SB01-B return walk. Shared by the `Select` (#1917) and `Min`/
-    // `Max` (#1915) minting-selector rejects. // per §28.3 / stdlib §5
+    // mirrors the SB01-B return walk. Shared by the `Select` (#1917), `Min`/
+    // `Max` (#1915) and `Zip` (#7201) minting-callback rejects. // per §28.3 /
+    // stdlib §5
     const ast::Expr* selectorLambdaMintingReturn(const ast::LambdaExpr& lam);
+    // The first return-path expression of a METHOD-REFERENCE callback — the
+    // callee's OWN body — that MINTS a fresh cleanup-bearing value, or nullptr
+    // if none does. The same return-path walk as selectorLambdaMintingReturn,
+    // over the method's `=> E` body or its block body's `return` statements. An
+    // `async` method projects a Task frame (a different ownership contract) and
+    // is never a mint. // per §28.3 / stdlib §5 (#7201)
+    const ast::Expr* callbackMethodMintingReturn(const ast::MethodDecl& decl);
     // True when `retExpr` — a lazy `Select` selector's return value — mints a
     // fresh owned/heap value with no borrow source: an owned-class producer
     // (producerState == Owned), a fresh string (a `+` concatenation, an
