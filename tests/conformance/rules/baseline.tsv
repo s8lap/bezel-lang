@@ -3067,6 +3067,8 @@ l9_6_0027	fail	#7198 residual: the compiler admits a string in string.Join's ite
 l9_6_0028	pass	
 l9_6_0029	pass	
 l9_6_0030	pass	
+l9_6_0031	pass	
+l9_6_0032	pass	
 l9_7_0001	pass	
 l9_7_0002	pass	
 l9_8_0001	fail	divergence
