@@ -12188,6 +12188,48 @@ void Emitter::flushFfiExprTemps() {
     ffiExprTemps_.swap(keep);
 }
 
+// fix #7199 (§22.5, v0.343): the SOURCE argument index bound to PARAMETER `p`
+// of a built-in member call.
+//
+// §22.5 (v0.343): "named arguments may appear in any order after positional
+// arguments. Each supplied argument binds exactly one parameter", and "naming
+// an argument changes which parameter it binds to, never when it runs".
+//
+// Sema binds a built-in member's named arguments correctly and PUBLISHES that
+// binding — the `paramToArg` vector, PARAMETER index -> SOURCE argument index
+// (`ExprTC::checkBuiltinNamedArgs` -> `SemaContext::setBuiltinCallBinding`;
+// src/sema/ExprTypecheck_Calls.cpp, src/sema/SemaContext.hpp). An arm that
+// reads `call.args[p]` POSITIONALLY ignores that binding, so a reordered
+// named call hands each parameter the value of a DIFFERENT parameter:
+// `Math.Pow(y := 2, x := 3)` computed 2^3 = 8 where §22.5 and stdlib §2.2
+// (`Pow(x: double, y: double)`) require 3^2 = 9 (#7199).
+//
+// The registry's parameter order for a member (`kMathParamNames` /
+// `kConvertParamNames`, src/common/BuiltinRegistry.cpp) is the order these
+// arms already assumed positionally — `Pow/2` is {x, y}, `Fmod/2` and
+// `IEEERemainder/2` are {x, y}, `Round/2` is {x, digits}, `Min/2` and `Max/2`
+// are {a, b}, `Clamp/3` is {value, low, high}, `Convert.ToString/2` is
+// {value, toBase} — so PARAMETER p's source argument is `(*bnd)[p]`.
+//
+// A POSITIONAL call, and a named call already in DECLARATION order (the
+// identity permutation), publish NOTHING — for those the positional read is
+// the correct one, and the fallback below keeps it byte for byte.
+//
+// `nArgs` is the call's argument count: a binding that names an argument
+// index the call does not have is IGNORED and the positional read stands —
+// the same guard #7180's `srcArgIdx` applies in
+// src/codegen/LlvmBackend_String.cpp.
+static std::size_t builtinParamSourceArg(const std::vector<int>* bnd,
+                                          std::size_t p,
+                                          std::size_t nArgs) {
+    if (bnd && p < bnd->size()) {
+        const int ai = (*bnd)[p];
+        if (ai >= 0 && static_cast<std::size_t>(ai) < nArgs)
+            return static_cast<std::size_t>(ai);
+    }
+    return p;
+}
+
 llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -13641,8 +13683,31 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // Convert.ToString(n, radix: int): string — radix-based conversion.
         if (m == "ToString" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* arg = lowerExpr(*call.args[0].value);
-            llvm::Value* radix = lowerExpr(*call.args[1].value);
+            // fix #7199 (§22.5, v0.343): `value` and `toBase` are PARAMETERS;
+            // a named argument binds the parameter it NAMES, so each
+            // parameter's source argument comes from the published §22.5
+            // binding. Read positionally, the reordered call
+            // `Convert.ToString(toBase := 16, value := 255)` took the RADIX as
+            // the VALUE and the VALUE as the RADIX: it printed "16" where
+            // stdlib §2.3 (`ToString(value: int, toBase: int): string`)
+            // requires "ff" — a silently WRONG answer, with no diagnostic.
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            const std::size_t valSrc =
+                builtinParamSourceArg(bnd, 0, call.args.size());
+            const std::size_t baseSrc =
+                builtinParamSourceArg(bnd, 1, call.args.size());
+            llvm::Value* arg = nullptr;
+            llvm::Value* radix = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (valSrc <= baseSrc) {
+                arg = lowerExpr(*call.args[valSrc].value);
+                radix = lowerExpr(*call.args[baseSrc].value);
+            } else {
+                radix = lowerExpr(*call.args[baseSrc].value);
+                arg = lowerExpr(*call.args[valSrc].value);
+            }
             if (!arg || !radix) return nullptr;
             // Widen to i32.
             if (!arg->getType()->isIntegerTy(32))
@@ -14565,30 +14630,59 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
         }
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-            llvm::Value* a = lowerExpr(*call.args[0].value);
-            llvm::Value* b = lowerExpr(*call.args[1].value);
+            // fix #7199 (§22.5, v0.343): the two operands are PARAMETERS
+            // (`Min/2` and `Max/2` are {a, b}; `Pow/2` and `Fmod/2` are
+            // {x, y}; `Round/2` is {x, digits}), and a named argument binds
+            // the parameter it NAMES — §22.5 (v0.343): "named arguments may
+            // appear in any order after positional arguments. Each supplied
+            // argument binds exactly one parameter". Read positionally, the
+            // reordered call `Math.Pow(y := 2, x := 3)` computed 2^3 = 8
+            // where stdlib §2.2 (`Pow(x: double, y: double): double`)
+            // requires 3^2 = 9, and `Math.Round(digits := 3, x := 2.5)`
+            // scaled by 10^2.5 instead of 10^3 — both silently WRONG
+            // answers, with no diagnostic.
+            //
+            // The source argument of each parameter comes from the §22.5
+            // binding sema publishes (see `builtinParamSourceArg` above);
+            // with no binding (a positional call, or a named call already in
+            // declaration order) the positional read stands.
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            const std::size_t aSrc = builtinParamSourceArg(bnd, 0, call.args.size());
+            const std::size_t bSrc = builtinParamSourceArg(bnd, 1, call.args.size());
+            llvm::Value* a = nullptr;
+            llvm::Value* b = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (aSrc <= bSrc) {
+                a = lowerExpr(*call.args[aSrc].value);
+                b = lowerExpr(*call.args[bSrc].value);
+            } else {
+                b = lowerExpr(*call.args[bSrc].value);
+                a = lowerExpr(*call.args[aSrc].value);
+            }
             if (!a || !b) return nullptr;
-            a = mathConvertToT(a, call.args[0].value.get());   // #6948
-            b = mathConvertToT(b, call.args[1].value.get());
+            a = mathConvertToT(a, call.args[aSrc].value.get());   // #6948
+            b = mathConvertToT(b, call.args[bSrc].value.get());
             if (m == "Min") {
                 // Handle int or double operands.
                 if (a->getType()->isIntegerTy()) {
                     // per stdlib §2.2 (v0.340): ordering is T's own CompareTo,
                     // so byte/ushort/uint/ulong/char order unsigned (#6864).
-                    llvm::Value* cmp = mathUnsignedCmp(call.args[0].value.get())
+                    llvm::Value* cmp = mathUnsignedCmp(call.args[aSrc].value.get())
                         ? builder_.CreateICmpULT(a, b)
                         : builder_.CreateICmpSLT(a, b);
                     return builder_.CreateSelect(cmp, a, b, "min.result");
                 } else if (sema::MethodSymbol* cmpMs =
-                               comparableCompareTo(call.args[0].value.get())) {
+                               comparableCompareTo(call.args[aSrc].value.get())) {
                     // #1141: non-numeric IComparable<T> → a if a.CompareTo(b) <= 0.
                     llvm::Value* cmp =
-                        emitCompareToCmp(cmpMs, a, b, call.args[0].value.get());
+                        emitCompareToCmp(cmpMs, a, b, call.args[aSrc].value.get());
                     if (!cmp) return nullptr;
                     llvm::Value* le = builder_.CreateICmpSLE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(le, a, b, "min.cmp.result");
-                } else if (isStringArg(call.args[0].value.get())) {
+                } else if (isStringArg(call.args[aSrc].value.get())) {
                     // fix #2785 / stdlib §9.6: ordinal string ordering.
                     llvm::Value* cmp = emitStrCmp(a, b);
                     if (!cmp) return nullptr;
@@ -14596,7 +14690,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(le, a, b, "min.str.result");
                 } else if (llvm::Value* dcmp =
-                               isDecimalArg(call.args[0].value.get())
+                               isDecimalArg(call.args[aSrc].value.get())
                                    ? emitDecCmp(a, b) : nullptr) {
                     // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp.
                     llvm::Value* le = builder_.CreateICmpSLE(
@@ -14621,20 +14715,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
             if (m == "Max") {
                 if (a->getType()->isIntegerTy()) {
-                    llvm::Value* cmp = mathUnsignedCmp(call.args[0].value.get())
+                    llvm::Value* cmp = mathUnsignedCmp(call.args[aSrc].value.get())
                         ? builder_.CreateICmpUGT(a, b)
                         : builder_.CreateICmpSGT(a, b);
                     return builder_.CreateSelect(cmp, a, b, "max.result");
                 } else if (sema::MethodSymbol* cmpMs =
-                               comparableCompareTo(call.args[0].value.get())) {
+                               comparableCompareTo(call.args[aSrc].value.get())) {
                     // #1141: non-numeric IComparable<T> → a if a.CompareTo(b) >= 0.
                     llvm::Value* cmp =
-                        emitCompareToCmp(cmpMs, a, b, call.args[0].value.get());
+                        emitCompareToCmp(cmpMs, a, b, call.args[aSrc].value.get());
                     if (!cmp) return nullptr;
                     llvm::Value* ge = builder_.CreateICmpSGE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(ge, a, b, "max.cmp.result");
-                } else if (isStringArg(call.args[0].value.get())) {
+                } else if (isStringArg(call.args[aSrc].value.get())) {
                     // fix #2785 / stdlib §9.6: ordinal string ordering.
                     llvm::Value* cmp = emitStrCmp(a, b);
                     if (!cmp) return nullptr;
@@ -14642,7 +14736,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(ge, a, b, "max.str.result");
                 } else if (llvm::Value* dcmp =
-                               isDecimalArg(call.args[0].value.get())
+                               isDecimalArg(call.args[aSrc].value.get())
                                    ? emitDecCmp(a, b) : nullptr) {
                     // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp.
                     llvm::Value* ge = builder_.CreateICmpSGE(
@@ -14712,15 +14806,47 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // Math.Clamp(value, min, max): clamp value to [min, max].
         if (m == "Clamp" && call.args.size() == 3 &&
             call.args[0].value && call.args[1].value && call.args[2].value) {
-            llvm::Value* val = lowerExpr(*call.args[0].value);
-            llvm::Value* lo  = lowerExpr(*call.args[1].value);
-            llvm::Value* hi  = lowerExpr(*call.args[2].value);
-            if (!val || !lo || !hi) return nullptr;
-            val = mathConvertToT(val, call.args[0].value.get());   // #6948
-            lo  = mathConvertToT(lo, call.args[1].value.get());
-            hi  = mathConvertToT(hi, call.args[2].value.get());
+            // fix #7199 (§22.5, v0.343): `value`, `low` and `high` are
+            // PARAMETERS (stdlib §2.2: `Clamp<T>(value: T, low: T, high: T)`),
+            // and a named argument binds the parameter it NAMES. Read
+            // positionally, the reordered call
+            // `Math.Clamp(high := 10, value := 100, low := 0)` clamped 10
+            // between 100 and 0 and returned 0 where it must return 10 — a
+            // silently WRONG answer, with no diagnostic.
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            const std::size_t valSrc = builtinParamSourceArg(bnd, 0, call.args.size());
+            const std::size_t loSrc  = builtinParamSourceArg(bnd, 1, call.args.size());
+            const std::size_t hiSrc  = builtinParamSourceArg(bnd, 2, call.args.size());
+            llvm::Value* vals[3] = {nullptr, nullptr, nullptr};
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to. The three source
+            // indices are ordered ascending here (the source argument written
+            // first is the one whose index is smallest).
+            {
+                std::size_t srcOf[3] = {valSrc, loSrc, hiSrc};
+                std::size_t paramOf[3] = {0, 1, 2};
+                // insertion sort by source index (three elements)
+                for (std::size_t i = 1; i < 3; ++i) {
+                    std::size_t s = srcOf[i], p = paramOf[i];
+                    std::size_t j = i;
+                    while (j > 0 && srcOf[j - 1] > s) {
+                        srcOf[j] = srcOf[j - 1];
+                        paramOf[j] = paramOf[j - 1];
+                        --j;
+                    }
+                    srcOf[j] = s;
+                    paramOf[j] = p;
+                }
+                for (std::size_t k = 0; k < 3; ++k)
+                    vals[paramOf[k]] = lowerExpr(*call.args[srcOf[k]].value);
+            }
+            if (!vals[0] || !vals[1] || !vals[2]) return nullptr;
+            llvm::Value* val = mathConvertToT(vals[0], call.args[valSrc].value.get());   // #6948
+            llvm::Value* lo  = mathConvertToT(vals[1], call.args[loSrc].value.get());
+            llvm::Value* hi  = mathConvertToT(vals[2], call.args[hiSrc].value.get());
             if (val->getType()->isIntegerTy()) {
-                const bool uns = mathUnsignedCmp(call.args[0].value.get());
+                const bool uns = mathUnsignedCmp(call.args[valSrc].value.get());
                 llvm::Value* clamped = builder_.CreateSelect(
                     uns ? builder_.CreateICmpULT(val, lo)
                         : builder_.CreateICmpSLT(val, lo), lo, val);
@@ -14728,13 +14854,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     uns ? builder_.CreateICmpUGT(clamped, hi)
                         : builder_.CreateICmpSGT(clamped, hi), hi, clamped, "clamp.result");
             } else if (sema::MethodSymbol* cmpMs =
-                           comparableCompareTo(call.args[0].value.get())) {
+                           comparableCompareTo(call.args[valSrc].value.get())) {
                 // #1141: non-numeric IComparable<T> → value.CompareTo(lo) < 0 ?
                 // lo : (value.CompareTo(hi) > 0 ? hi : value).
                 llvm::Value* cmpLo =
-                    emitCompareToCmp(cmpMs, val, lo, call.args[0].value.get());
+                    emitCompareToCmp(cmpMs, val, lo, call.args[valSrc].value.get());
                 llvm::Value* cmpHi =
-                    emitCompareToCmp(cmpMs, val, hi, call.args[0].value.get());
+                    emitCompareToCmp(cmpMs, val, hi, call.args[valSrc].value.get());
                 if (!cmpLo || !cmpHi) return nullptr;
                 llvm::Value* ltLo = builder_.CreateICmpSLT(
                     cmpLo, llvm::ConstantInt::get(cmpLo->getType(), 0));
@@ -14742,7 +14868,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
                 llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
                 return builder_.CreateSelect(ltLo, lo, inner, "clamp.cmp.result");
-            } else if (isDecimalArg(call.args[0].value.get())) {
+            } else if (isDecimalArg(call.args[valSrc].value.get())) {
                 // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp,
                 // same shape as the CompareTo arm above. Each comparison is
                 // emitted EXACTLY ONCE — testing emitDecCmp in the `else if`
@@ -14764,7 +14890,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
                 llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
                 return builder_.CreateSelect(ltLo, lo, inner, "clamp.dec.result");
-            } else if (isStringArg(call.args[0].value.get())) {
+            } else if (isStringArg(call.args[valSrc].value.get())) {
                 // fix #2785 / stdlib §9.6: ordinal string ordering, same shape
                 // as the CompareTo arm above.
                 llvm::Value* cmpLo = emitStrCmp(val, lo);
@@ -14801,8 +14927,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // 2-arg group, so it no longer needs a name-to-libc table.
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value &&
             (m == "Fmod" || m == "IEEERemainder")) {
-            llvm::Value* a = lowerExpr(*call.args[0].value);
-            llvm::Value* b = lowerExpr(*call.args[1].value);
+            // fix #7199 (§22.5, v0.343): `x` and `y` are PARAMETERS (stdlib
+            // §2.2: `Fmod(x: double, y: double)` / `IEEERemainder(x: double,
+            // y: double)`), and a named argument binds the parameter it NAMES.
+            // Read positionally, the reordered call `Math.Fmod(y := 4, x := 10)`
+            // computed fmod(4, 10) = 4 where it must compute fmod(10, 4) = 2.
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            const std::size_t xSrc = builtinParamSourceArg(bnd, 0, call.args.size());
+            const std::size_t ySrc = builtinParamSourceArg(bnd, 1, call.args.size());
+            llvm::Value* a = nullptr;
+            llvm::Value* b = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (xSrc <= ySrc) {
+                a = lowerExpr(*call.args[xSrc].value);
+                b = lowerExpr(*call.args[ySrc].value);
+            } else {
+                b = lowerExpr(*call.args[ySrc].value);
+                a = lowerExpr(*call.args[xSrc].value);
+            }
             if (!a || !b) return nullptr;
             auto* dbl = llvm::Type::getDoubleTy(llvm_);
             if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
