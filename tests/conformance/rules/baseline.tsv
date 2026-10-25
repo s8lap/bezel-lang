@@ -3299,3 +3299,26 @@ s5_1_0144	pass
 s5_1_0145	pass	
 s5_1_0146	pass	
 s5_1_0147	pass	
+l3_1_0048	pass	
+l3_1_0049	pass	
+l3_1_0050	pass	
+l3_1_0051	pass	
+l3_1_0052	pass	
+l3_1_0053	pass	
+l3_1_0054	pass	
+l3_1_0055	pass	
+l3_1_0056	pass	
+l3_1_0057	pass	
+s22_5_0018	pass	
+s22_5_0019	pass	
+s22_5_0020	pass	
+s22_5_0021	fail	divergence
+l2_2_0015	pass	
+l2_2_0016	fail	divergence
+l2_2_0017	fail	divergence
+l2_2_0018	fail	divergence
+l2_3_0005	pass	
+l2_3_0006	fail	divergence
+s5_1_0025	fail	divergence
+s5_1_0026	pass	
+s28_7_0013	fail	divergence
