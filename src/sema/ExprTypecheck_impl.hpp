@@ -4700,10 +4700,17 @@ private:
     // compiler ABORTED inside the LLVM verifier, with no diagnostic and no
     // source location) or, for a `bool` argument, as a SILENT WRONG ANSWER.
     //
-    // §5.1 applies the implicit conversions "where the target type is
-    // known", and for a built-in member the target type IS known (stdlib
-    // §2.2 declares `Math.Pow(x: double, y: double): double`; stdlib §2.3
-    // declares the `Convert` family), so the argument must be checked
+    // §5.1 (v0.343) applies the implicit conversions at every position
+    // whose target type is DECLARED, and a built-in member's parameter type
+    // IS declared (stdlib §2.2 declares `Math.Pow(x: double, y: double):
+    // double`; stdlib §2.3 declares the `Convert` family). §22.6's stage 3
+    // (v0.343) is that applicability test — "Applicability over the
+    // (substituted) signatures: parameter types under the implicit
+    // conversions (§5.1)" — and §5.1's constant-narrowing paragraph
+    // (v0.343) puts a call argument among the positions the conversions
+    // apply at: "Constant narrowing applies at every position where this
+    // section's implicit conversions apply — there is no position carve-out:
+    // … call arguments (`Set(3)`) …". So the argument must be checked
     // against the declared parameter type and a call that matches NO
     // declared form is an error (§22.6).
     //

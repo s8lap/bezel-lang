@@ -26,13 +26,20 @@
 //
 // WHAT THE FIX DOES.
 //
-// §5.1 applies the implicit conversions "where the target type is known", and
-// for a built-in member the target type IS known — stdlib §2.2 declares
-// `Math.Pow(x: double, y: double): double` and stdlib §2.3 declares the
-// `Convert` family. The argument is therefore checked against the declared
-// parameter type, and a call that matches NO declared form is an error
-// (§22.6), reported at the CALL SITE with a located §5.1 diagnostic naming
-// the offending argument and the expected type.
+// §5.1 (v0.343) applies the implicit conversions at every position whose
+// target type is DECLARED, and a built-in member's parameter type IS
+// declared — stdlib §2.2 declares `Math.Pow(x: double, y: double): double`
+// and stdlib §2.3 declares the `Convert` family. §22.6's stage 3 (v0.343)
+// is that applicability test ("Applicability over the (substituted)
+// signatures: parameter types under the implicit conversions (§5.1)"), and
+// §5.1's constant-narrowing paragraph (v0.343) puts a call argument among
+// the positions the conversions apply at ("Constant narrowing applies at
+// every position where this section's implicit conversions apply — there is
+// no position carve-out: … call arguments (`Set(3)`) …"). The argument is
+// therefore checked against the declared parameter type, and a call that
+// matches NO declared form is an error (§22.6), reported at the CALL SITE
+// with a located §5.1 diagnostic naming the offending argument and the
+// expected type.
 //
 // NOTE ON THE PROOF HIERARCHY.
 //
@@ -44,7 +51,10 @@
 // merely changed the crash into a different crash would not pass.
 //
 // The acceptance rows are the controls: they must stay green on both arms
-// (the conforming spellings are unaffected by the check).
+// (the conforming spellings are unaffected by the check). The `long`
+// constant rows are the fix-forward's regression pins: they are green on the
+// BASE arm and were RED on the first #7218 commit, whose probe re-typed the
+// argument (see the comment above each row).
 
 #include <string>
 
@@ -318,6 +328,75 @@ BEZEL_TEST(math_convert_arg_type_7218,
 // both arms).
 // ===========================================================================
 
+// A `long` CONSTANT at `Math.Abs` must keep the `Abs(x: long): long` form
+// (stdlib §2.2, v0.343). §22.6's stage 4 (v0.343) ranks the EXACT match
+// above a candidate §5.1's constant narrowing reaches, and §5.1 (v0.343)
+// grades a narrowed candidate "as any other conversion is, never as an exact
+// match" — so a probe that re-typed the `long` constant to `int` before the
+// identity match was tried would select `Abs(int)`, and
+// `Abs(int.MinValue)` raises OverflowException on the `int` result.
+//
+// The first two rows below are the fix-forward's regression pins (the
+// fix-forward of #7218: the probe mutated the argument's recorded type).
+// They are green on the BASE arm (the base picks the `long` form by the
+// argument's own type) and were RED on the first #7218 commit.
+BEZEL_TEST(math_convert_arg_type_7218,
+           math_abs_long_constant_keeps_the_long_overload_2_2) {
+    BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Math.Abs(-2147483648L));")),
+                    "2147483648");
+}
+
+BEZEL_TEST(math_convert_arg_type_7218,
+           math_abs_long_constant_plus_int_keeps_the_long_overload_2_2) {
+    BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Math.Abs(2000000000L) + 2000000000);")),
+                    "4000000000");
+}
+
+// The NON-constant control: the narrowing never fires for a run-time value,
+// so this was never at risk — it is the row that shows the fix did not
+// change the run-time path.
+BEZEL_TEST(math_convert_arg_type_7218,
+           math_abs_long_variable_keeps_the_long_overload_2_2) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+                        "    var x: long := 2000000000L; "
+                        "    Console.WriteLine(Math.Abs(x) + 2000000000);")),
+                    "4000000000");
+}
+
+// §5.1's CONSTANT NARROWING still reaches an `int` parameter: a `long`
+// compile-time constant whose value fits `int` converts to it ("an
+// expression of integer type that is a compile-time constant implicitly
+// converts to any integer type whose range contains its value", §5.1,
+// v0.343). The narrowing is APPLICABILITY only and is never an exact match.
+BEZEL_TEST(math_convert_arg_type_7218,
+           math_round_long_constant_digits_narrows_5_1) {
+    BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Math.Round(3.14159, 2L));")),
+                    "3.14");
+}
+
+// The mirror of that row: a RUN-TIME `long` at an `int` parameter is NOT a
+// constant, so §5.1's narrowing does not reach it ("The rule applies to
+// constants only; a run-time `int` value still requires the explicit
+// `byte(x)` narrowing of §5.2", §5.1, v0.343) and §5.1's table has no
+// `long -> int` row — so no declared form of `Math.Round` applies and
+// §22.6 (v0.343) refuses the call.
+BEZEL_TEST(math_convert_arg_type_7218,
+           math_round_long_variable_digits_is_refused_5_1) {
+    auto r = runAot(prog(
+        "    var d: long := 2; "
+        "    Console.WriteLine(Math.Round(3.14159, d));"));
+    expectRefused(r, "no matching overload of `Math.Round`",
+                  "the `digits` argument must be an `int`");
+}
+
+// `Convert.ToString` declares a `long` overload (stdlib §2.3, v0.343): a
+// `long` constant must select it, not the `int` one.
+BEZEL_TEST(math_convert_arg_type_7218,
+           convert_tostring_long_constant_keeps_the_long_overload_2_3) {
+    BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Convert.ToString(255L));")),
+                    "255");
+}
+
 BEZEL_TEST(math_convert_arg_type_7218, math_pow_double_arguments_still_work_2_2) {
     BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Math.Pow(2.0, 10.0));")),
                     "1024");
@@ -354,8 +433,9 @@ BEZEL_TEST(math_convert_arg_type_7218,
 }
 
 // `Math.Min` / `Max` / `Clamp` declare a TYPE PARAMETER (`where T:
-// IComparable<T>`), so §5.1's "where the target type is known" does not hold
-// there: the constraint governs, and the check must not claim the call.
+// IComparable<T>`), so §22.6's stage-3 applicability has no concrete
+// parameter type to apply §5.1's table to there: the constraint governs,
+// and the check must not claim the call.
 BEZEL_TEST(math_convert_arg_type_7218, math_min_generic_argument_still_works_2_2) {
     BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Math.Min(3, 8));")),
                     "3");

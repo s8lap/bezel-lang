@@ -21133,10 +21133,17 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
 //                                    ANSWER, because §5.1 lists "between
 //                                    integers and bool" as never implicit.
 //
-// §5.1 applies the implicit conversions "where the target type is known",
-// and for a built-in member the target type IS known — stdlib §2.2 declares
-// `Math.Pow(x: double, y: double): double` and stdlib §2.3 declares the
-// `Convert` family — so the argument must be checked against the declared
+// §5.1 (v0.343) applies the implicit conversions at every position whose
+// target type is DECLARED, and a built-in member's parameter type IS
+// declared: stdlib §2.2 declares `Math.Pow(x: double, y: double): double`
+// and stdlib §2.3 declares the `Convert` family. §22.6's stage 3 (v0.343)
+// makes that the APPLICABILITY test of a call — "Applicability over the
+// (substituted) signatures: parameter types under the implicit conversions
+// (§5.1)" — and §5.1's constant-narrowing paragraph (v0.343) puts a call
+// argument among the positions the conversions apply at: "Constant
+// narrowing applies at every position where this section's implicit
+// conversions apply — there is no position carve-out: … call arguments
+// (`Set(3)`) …". So the argument must be checked against the declared
 // parameter type, and a call that matches NO declared form is an error
 // (§22.6). The check is the shape #7207 established for `StringBuilder`: a
 // TABLE of the declared forms, a §5.1 test per argument, and a diagnostic
@@ -21148,8 +21155,9 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
 //     `StringBuilder`);
 //   * `Math.Min` / `Max` / `Clamp` / `Sign` — their declared parameter type
 //     is the TYPE PARAMETER `T` (`where T: IComparable<T>` / `where T:
-//     INumber<T>`), so §5.1's "where the target type is known" does not hold
-//     there and the CONSTRAINT, not §5.1, governs the argument;
+//     INumber<T>`), so §22.6's stage-3 applicability has no concrete
+//     parameter type to apply §5.1's table to, and the CONSTRAINT, not
+//     §5.1, governs the argument;
 //   * `Math.DivRem` — its first two arguments are already rejected AT THE
 //     SOURCE LOCATION by an existing stdlib-§2.2-citing diagnostic, so this
 //     check would only duplicate that one;
@@ -21162,8 +21170,8 @@ namespace {
 // The DECLARED parameter type at one position of one §2.2/§2.3 form.
 enum class MathConvertParamKind {
     Unchecked,  // the declared type is a TYPE PARAMETER (`T`) or an `out`
-                // slot the out-variable machinery types: §5.1's "where the
-                // target type is known" does not hold at such a position
+                // slot the out-variable machinery types: §5.1's table has no
+                // concrete target type to apply to at such a position
     Bool,
     Int,
     Long,
@@ -21287,6 +21295,21 @@ std::string_view mathConvertTypeName(MathConvertParamKind k) {
     return {};
 }
 
+// The §5.1 target type of one kind, as the primitive it names.
+PrimitiveType mathConvertPrimitiveOf(MathConvertParamKind k) {
+    switch (k) {
+        case MathConvertParamKind::Bool: return PrimitiveType::Bool;
+        case MathConvertParamKind::Int: return PrimitiveType::Int;
+        case MathConvertParamKind::Long: return PrimitiveType::Long;
+        case MathConvertParamKind::Float: return PrimitiveType::Float;
+        case MathConvertParamKind::Double: return PrimitiveType::Double;
+        case MathConvertParamKind::Decimal: return PrimitiveType::Decimal;
+        case MathConvertParamKind::String: return PrimitiveType::String;
+        case MathConvertParamKind::Unchecked: break;
+    }
+    return PrimitiveType::None;
+}
+
 // "an `int`", "a `long`", … — one kind's phrase, with its article.
 std::string mathConvertTypePhrase(MathConvertParamKind k) {
     const std::string_view name = mathConvertTypeName(k);
@@ -21360,12 +21383,51 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
             paramToArg.push_back(static_cast<int>(i));
     }
     // §5.1: does this argument convert to the declared parameter type?
-    // `primitiveOperandMatchesParam` is the ONE §5.1 numeric test (identity,
-    // the widening table, and constant narrowing), and a `string`/`bool`
-    // parameter takes only its own type — §5.1's table has no conversion
-    // TO `string`, and lists "between integers and bool" as never implicit.
-    auto admits = [&](const ast::Expr* argExpr, TypeRef* argTy,
-                      MathConvertParamKind k) -> bool {
+    //
+    // The probe is TWO-PASS and it NEVER WRITES the argument's recorded type.
+    // The write is the whole point of the two passes:
+    //
+    //   * PASS 1 asks the IDENTITY and the §5.1 widening table of EVERY
+    //     declared kind at this position, in declaration order.
+    //     `primitiveOperandMatchesParam` with `allowConstantNarrowing=false`
+    //     is that test, and it writes nothing.
+    //   * PASS 2 asks §5.1's constant narrowing, and only if PASS 1
+    //     admitted nothing.
+    //
+    // WHY NOT ONE PASS. `narrowIntConstantToTarget` — the ONE §5.1
+    // constant-narrowing implementation — RE-TYPES the argument expression
+    // (`ctx_.setExprType`), and these built-ins pick their overload FROM
+    // THE ARGUMENT'S OWN TYPE (there is no overload resolution for them:
+    // `Math.Abs` has four declared forms and no MethodSymbol). A single
+    // pass that tried the declared kinds in table order therefore re-typed
+    // a `long` constant to `int` — `int` is reachable only by the
+    // narrowing — before the identity match on `long` was tried, and the
+    // `int` form then looked like the EXACT match. §22.6's stage 4 ranks
+    // EXACT matches, and §5.1 grades a narrowed candidate "as any other
+    // conversion is, never as an exact match" (v0.343) — so the
+    // mis-selected form changed the call's RESULT type:
+    // `Math.Abs(-2147483648L)` became `Abs(int)` and raised
+    // OverflowException on `int.MinValue`, and
+    // `Math.Abs(2000000000L) + 2000000000` overflowed at the `int + int`.
+    // MEASURED: base `94d0b7fd` prints 2147483648 and 4000000000; the
+    // one-pass probe printed an OverflowException for both.
+    //
+    // The narrowing is an APPLICABILITY fact here (§5.1: "Constant
+    // narrowing applies at every position where this section's implicit
+    // conversions apply — there is no position carve-out: … call arguments
+    // (`Set(3)`) …", v0.343), and the REWRITE that records it belongs to the
+    // overload-resolution machinery (`checkAssignable`), not to a probe.
+    // So PASS 2 asks the same question WITHOUT the rewrite: the same gates
+    // `narrowIntConstantToTarget` applies (an integer source, an integer
+    // target the ordinary widening table does not already admit) and the
+    // same range test (`fitsInIntType`, the shared one), over the same
+    // constant fold (`foldIntConstExprTC`).
+    //
+    // A `string`/`bool` parameter takes only its own type — §5.1's table
+    // has no conversion TO `string`, and lists "between integers and bool"
+    // as never implicit.
+    auto admitsByIdentityOrWidening = [&](TypeRef* argTy,
+                                           MathConvertParamKind k) -> bool {
         switch (k) {
             case MathConvertParamKind::Unchecked: return true;
             case MathConvertParamKind::String:
@@ -21376,15 +21438,31 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
                        argTy->primitive == PrimitiveType::Bool;
             default: break;
         }
-        const PrimitiveType pt =
-            k == MathConvertParamKind::Int     ? PrimitiveType::Int
-            : k == MathConvertParamKind::Long   ? PrimitiveType::Long
-            : k == MathConvertParamKind::Float  ? PrimitiveType::Float
-            : k == MathConvertParamKind::Double ? PrimitiveType::Double
-                                                 : PrimitiveType::Decimal;
         return primitiveOperandMatchesParam(
-            argExpr, argTy, ctx_.primitiveTypeRef(pt, /*nullable=*/false),
-            /*allowConstantNarrowing=*/true);
+            /*operandExpr=*/nullptr,  // no expression ⇒ the narrowing
+                                      // branch is unreachable, so this
+                                      // pass CANNOT write
+            argTy,
+            ctx_.primitiveTypeRef(mathConvertPrimitiveOf(k),
+                                  /*nullable=*/false),
+            /*allowConstantNarrowing=*/false);
+    };
+    auto admitsByConstantNarrowing = [&](const ast::Expr* argExpr,
+                                         TypeRef* argTy,
+                                         MathConvertParamKind k) -> bool {
+        if (k != MathConvertParamKind::Int && k != MathConvertParamKind::Long)
+            return false;
+        if (!argExpr || !argTy) return false;
+        if (argTy->kind != TypeRef::Kind::Primitive || argTy->nullable)
+            return false;
+        if (!isIntegerPrimitiveTypeForOverload(argTy->primitive)) return false;
+        const PrimitiveType pt = mathConvertPrimitiveOf(k);
+        if (!isIntegerPrimitiveTypeForOverload(pt)) return false;
+        if (pt == argTy->primitive) return false;              // identity
+        if (primitiveWidens(argTy->primitive, pt)) return false;  // the widening
+        auto cv = foldIntConstExprTC(*argExpr);
+        if (!cv) return false;
+        return fitsInIntType(*cv, pt);
     };
     const std::string stdlibCite =
         head == "Math" ? "stdlib §2.2" : "stdlib §2.3";
@@ -21416,7 +21494,13 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         if (argTy->nullable) continue;
         bool ok = false;
         for (MathConvertParamKind k : admitted)
-            if (admits(arg.value.get(), argTy, k)) { ok = true; break; }
+            if (admitsByIdentityOrWidening(argTy, k)) { ok = true; break; }
+        if (!ok)
+            for (MathConvertParamKind k : admitted)
+                if (admitsByConstantNarrowing(arg.value.get(), argTy, k)) {
+                    ok = true;
+                    break;
+                }
         if (ok) continue;
         // The rejection: a located, spec-cited diagnostic naming the
         // offending argument and the type §2.2 / §2.3 declares there — the
