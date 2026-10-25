@@ -247,4 +247,49 @@ inline bool ascribedReturnTypeProducesValue(const TypeRef* r) {
     return !(r && r->kind == TypeRef::Kind::Unit && !r->nullable);
 }
 
+// fix #6966 (§26.4 / §2.8.2, v0.343): does this type reference bind a FREE
+// type variable — the shape §26.4 gives an extension head's argument
+// positions ("each bare single-segment non-nullable identifier introduces a
+// block-level type parameter"), and the shape an extension head has when it
+// names no resolvable type at all?
+//
+// WHY THIS PREDICATE IS SHARED. Two sides must agree on it EXACTLY:
+//
+//   * the EXPORTER (module/ModuleMetadataBuilder.cpp) uses it to decide that
+//     an extension block's cross-module dispatch is not the exported
+//     `bz$ext$<T>$<M>` symbol, so the block is carried as a RESOLUTION-ONLY
+//     shape (its head, its `where` clause and its member names) rather than
+//     dropped; and
+//   * the IMPORTER (sema/ExprTypecheck.cpp) uses it to recognise such a
+//     carried block and REFUSE to dispatch it, naming the shape in the
+//     diagnostic §2.8.2 requires.
+//
+// If the two sides disagreed, the importer would either dispatch a block whose
+// exported symbol was compiled against the exporter's placeholder layout (a
+// silent wrong answer — the very defect #6966 is) or refuse a block that IS
+// dispatchable (a false rejection, §2.8.2's "No restrictions beyond
+// visibility"). One predicate, two call sites, no drift.
+//
+// The shape recognised here is a NAMED type reference with no resolved
+// declaration (`declaration == nullptr`):
+//
+//   * with NO type arguments — a bare identifier in an argument position
+//     (`extension Box<T>`) or a head that names no resolvable type
+//     (`extension Task`, a compiler built-in the artifact interface cannot
+//     identify); or
+//   * WITH type arguments — a bare built-in head (`extension Array<int>`)
+//     whose ARGUMENTS are then walked, so `extension Array<T>` and
+//     `extension Box<List<T>>` are recognised through their arguments.
+//
+// A type reference with a resolved declaration is a real, program-wide
+// identified type (§2.8.3 rule 3), so it never binds a free variable; only
+// its type arguments can.
+inline bool typeRefBindsFreeTypeVariable(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    if (t->declaration == nullptr && t->genericArgs.empty()) return true;
+    for (const TypeRef* ga : t->genericArgs)
+        if (typeRefBindsFreeTypeVariable(ga)) return true;
+    return false;
+}
+
 } // namespace bezel::sema

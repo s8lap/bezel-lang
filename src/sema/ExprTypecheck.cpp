@@ -11418,6 +11418,19 @@ static bool extensionTargetMatchesReceiver(
                     ta->declaration == nullptr && ta->astNode &&
                     ta->astNode->name && !ta->astNode->name->parts.empty() &&
                     freeVars.count(ta->astNode->name->parts.back());
+                // fix #6966 (§26.4 / §2.8.2, v0.343): an IMPORTED block's
+                // head is RECONSTRUCTED from the artifact interface, so its
+                // free type variable carries no AST node — the name rides in
+                // `importedName` instead (the same two-source read
+                // `collectFreeVarBinding` and the §26.5 candidate scan
+                // already use). Without this arm the reconstructed free
+                // variable was read as a CONCRETE type argument, so the
+                // reconstructed head never matched ANY receiver: the block
+                // was invisible to §26.5's search instead of being the
+                // candidate the importer must refuse and name (§2.8.2).
+                if (!taFree && ta->kind == TypeRef::Kind::Named &&
+                    ta->declaration == nullptr && !ta->importedName.empty())
+                    taFree = freeVars.count(ta->importedName) != 0;
                 if (taFree) continue;  // free var unifies with the receiver arg
                 if (!extensionTargetMatchesReceiver(ta, ra, freeVars))
                     return false;  // concrete arg must match exactly
@@ -13591,6 +13604,79 @@ bool ExprTC::extConstraintItemProvablyViolated(
     return false;
 }
 
+// fix #6966 (§26.4 / §2.8.2, v0.343): resolve the BOUND of an IMPORTED
+// extension block's `where` clause.
+//
+// WHY. The artifact interface carries a block's `where` clause as TEXT (the
+// §26.5 rule 4 diagnostic needs the source-like spelling), and the importer
+// re-parses that text into a throwaway AST the type resolver never sees
+// (module/ModuleLoader.cpp's extension reconstruction). So
+// `ctx.resolvedType(bound)` is null for an imported block's constraint — and
+// §26.5.1's APPLICABILITY FILTER ("a `where` clause is an applicability
+// filter, never a ranking signal") could not be evaluated at all: the block
+// would apply to EVERY receiver, and the importer would refuse (naming the
+// shape) a call the same-module program resolves through another block.
+//
+// WHAT THIS DOES. It resolves the bound's HEAD — the only part the §14.2
+// type-bound check reads (`groundSatisfiesTypeBound` compares declarations
+// and ignores generic args) — to a TypeRef in THIS context:
+//
+//   * a type the block's DEFINING module exports (looked up by its qualified
+//     name, then by its simple name, in that module's exported types only —
+//     never another imported module's same-named type, which would make the
+//     verdict depend on import order); then
+//   * a compiler-synthesized builtin interface (`IComparable`, `IEquatable`,
+//     `IEqualityComparer`, `IReadOnlySpan`, `INumber`, `ISteppable`,
+//     `IParsable` — stdlib §2.19).
+//
+// A bound that resolves to NOTHING stays unresolved: §26.5.1's filter then
+// keeps the candidate (the sound direction — a candidate that MIGHT apply is
+// never dropped), and the call is refused with the shape-naming diagnostic
+// rather than answered by a different block.
+//
+// A LOCAL block's bound is already resolved by the type resolver, so this
+// never runs for one: the local path is unchanged.
+static TypeRef* resolveImportedExtensionBound(
+    SemaContext& ctx, const ast::ExtensionDecl& decl, const ast::Type& bound) {
+    if (TypeRef* already = ctx.resolvedType(bound)) return already;
+    if (bound.kind != ast::TypeKind::Named) return nullptr;
+    if (!bound.name || bound.name->parts.empty()) return nullptr;
+    // §26.5 rule 4: the candidate is identified by what it HAS — its
+    // DEFINING MODULE among them. The ExtensionSymbol carries it (§2.8.3
+    // rule 3 / #2335).
+    const ExtensionSymbol* extSym = ctx.extensionSymbolOf(&decl);
+    if (extSym == nullptr) return nullptr;
+    std::string qualified;
+    for (std::size_t i = 0; i < bound.name->parts.size(); ++i) {
+        if (i) qualified += '.';
+        qualified += std::string(bound.name->parts[i]);
+    }
+    const std::string_view simple = bound.name->parts.back();
+    TypeSymbol* sym = nullptr;
+    if (const std::vector<TypeSymbol*>* types =
+            ctx.importedTypesOf(extSym->moduleName)) {
+        for (TypeSymbol* t : *types) {
+            if (t && t->qualifiedTypeName() == qualified) { sym = t; break; }
+        }
+        if (!sym) {
+            for (TypeSymbol* t : *types) {
+                if (t && t->qualifiedTypeName() == simple) { sym = t; break; }
+            }
+        }
+    }
+    if (!sym) sym = ctx.builtinInterfaceSym(simple);
+    if (!sym) return nullptr;  // unresolvable → keep the candidate (see above)
+    TypeRef* ref = ctx.makeTypeRef();
+    ref->kind = TypeRef::Kind::Named;
+    ref->declaration = sym;
+    ref->nullable = bound.nullable;
+    // The bound's type ARGUMENTS are deliberately NOT resolved: §14.2's
+    // type-bound check compares declarations and ignores generic args (a
+    // wrong-generic-arg conformer reads as SATISFYING — the sound direction).
+    ctx.setResolvedType(&bound, ref);
+    return ref;
+}
+
 // §26.4 (v0.277, #3336): per-extension-block applicability test. Walks every
 // `where T: c1, c2` clause, looks up T's substitution in `binding` (built from
 // the matched ancestor's generic args by collectFreeVarBinding), and asks
@@ -13615,6 +13701,15 @@ bool ExprTC::extWhereClauseProvablyViolated(
             if (kv.first == gc.typeParam) { arg = kv.second; break; }
         }
         if (!arg) continue;  // unbound — keep (see header note)
+        // fix #6966 (§26.4 / §2.8.2, v0.343): an IMPORTED block's `where`
+        // clause arrived as TEXT and was never resolved in this context, so
+        // resolve its bound before the item test reads it (the item test
+        // reads `ctx.resolvedType(item.typeArg)`).
+        for (const auto& item : gc.items) {
+            if (item.kind != "type" || !item.typeArg) continue;
+            if (ctx_.resolvedType(*item.typeArg)) continue;
+            resolveImportedExtensionBound(ctx_, decl, *item.typeArg);
+        }
         for (const auto& item : gc.items) {
             if (extConstraintItemProvablyViolated(item, arg))
                 return true;
@@ -13727,6 +13822,85 @@ Symbol* ExprTC::lookupExtensionMember(
         bool isStandardLibraryLinq = false;
         std::string stdHead;       // e.g. "IEnumerable<T>"
         std::string stdWhere;      // e.g. "where T: hashable" — usually empty
+        // fix #6966 (§26.4 / §2.8.2, v0.343): this candidate's block is an
+        // IMPORTED block whose cross-module dispatch is not the exported
+        // `bz$ext$<T>$<M>` symbol — a free-variable head (`extension Box<T>`)
+        // or a `where` clause. The block's SHAPE rides in the artifact
+        // interface so the importer can see it, but the importer CANNOT
+        // dispatch it: the exported symbol was compiled against the
+        // exporter's placeholder layout, and dispatching it importer-side
+        // needs the #783 monomorphization machinery, which does not exist for
+        // extension blocks yet. So when such a block WINS §26.5.1's
+        // specificity order, the call is REFUSED with a diagnostic naming
+        // the shape (§2.8.2) instead of binding some less specific block's
+        // member and silently answering a different question.
+        bool shapeOnly = false;
+    };
+    // fix #6966 (§26.4 / §2.8.2, v0.343): the diagnostic §2.8.2 requires when
+    // the block §26.5.1 selects is one the artifact interface can only carry
+    // as a SHAPE. §2.8.2: "An implementation unable to carry some body shape
+    // in its interface format must reject the export, or the import, with a
+    // diagnostic naming the shape; it must not alter the instantiation's
+    // semantics." The shape is named here as §26.5 rule 4 names a candidate:
+    // its defining module, its declared head including any `where` clause,
+    // and its declaration site.
+    //
+    // The lookup is SILENT on a no-match (the caller decides the "no member"
+    // wording), so this diagnostic is emitted only where the lookup is asked
+    // to report (`reportAmbiguity`) — the probe call sites (which only ask
+    // "does an extension with this name exist") stay silent.
+    auto reportShapeOnlyCandidate = [&](const ExtCandidate& c) {
+        if (!reportAmbiguity) return;
+        std::string moduleName;
+        if (auto it = importedExtensionModule_.find(c.ext);
+            it != importedExtensionModule_.end())
+            moduleName = it->second;
+        std::string head =
+            "extension " + spellExtHeadTypeRef(c.declaredHead);
+        const std::string where =
+            c.decl ? spellExtWhereClause(c.decl->genericConstraints)
+                   : std::string();
+        if (!where.empty()) head += " " + where;
+        std::string site;
+        if (c.decl && c.decl->span.begin.line != 0) {
+            site = "declared at ";
+            if (!c.decl->sourceFile.empty())
+                site += c.decl->sourceFile + ":";
+            else
+                site += "line ";
+            site += std::to_string(c.decl->span.begin.line);
+            if (!c.decl->sourceFile.empty())
+                site += ":" + std::to_string(c.decl->span.begin.column);
+            else
+                site += ", column " + std::to_string(c.decl->span.begin.column);
+        } else {
+            site = "declaration site not tracked across module imports";
+        }
+        std::string recvName(namedTypeSimpleName(receiver));
+        if (recvName.empty()) recvName = "?";
+        // The two reasons a block is resolution-only (§26.4): a free-variable
+        // head, and a `where` clause. Name the one that applies.
+        const std::string why =
+            where.empty()
+                ? "its head binds a free type variable, so the exported "
+                  "symbol was compiled against the exporting module's "
+                  "placeholder layout and dispatching it here would need "
+                  "importer-side monomorphization (§26.4)"
+                : "its `where` clause is an applicability filter (§26.5.1) "
+                  "that the exported symbol cannot express, so the block "
+                  "applies to some receivers and not others (§26.4)";
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "no member `" + std::string(name) + "` on type `" + recvName +
+                "`: the extension block `" + head + "` in module `" +
+                moduleName + "` (" + site + ") declares `" +
+                std::string(name) +
+                "`, and §26.5.1 selects that block for this receiver — but "
+                "the artifact interface cannot carry that block's shape: " +
+                why +
+                ". The importer therefore has no `" + std::string(name) +
+                "` to bind here; §2.8.2 requires this reject rather than a "
+                "silent binding of some other block's member");
     };
     std::vector<ExtCandidate> found;
     std::vector<std::unique_ptr<TypeRef>> ownedAncs;
@@ -13734,6 +13908,25 @@ Symbol* ExprTC::lookupExtensionMember(
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
         const TypeRef* target = ctx_.resolvedType(*decl->targetType);
+        // fix #6966 (§26.4 / §2.8.2, v0.343): is this block one the artifact
+        // interface can only carry as a SHAPE — an IMPORTED block whose head
+        // binds a free type variable (`extension Box<T>`) or that carries a
+        // `where` clause? Such a block's exported symbol was compiled against
+        // the exporter's placeholder layout, so the importer cannot dispatch
+        // it; when it WINS §26.5.1's specificity order the call must be
+        // refused with a diagnostic naming the shape, never answered by some
+        // less specific block's member.
+        //
+        // The predicate is the exporter's own (module/ModuleMetadataBuilder.cpp
+        // `convertExtension`), via the shared
+        // `sema::typeRefBindsFreeTypeVariable` — the two sides must classify
+        // a carried block identically, or the importer would dispatch a
+        // non-dispatchable block (a silent wrong answer) or refuse a
+        // dispatchable one (a false rejection).
+        const bool shapeOnlyBlock =
+            importedExtensionModule_.count(ext) != 0 &&
+            (!decl->genericConstraints.empty() ||
+             typeRefBindsFreeTypeVariable(target));
         // §26.5 (#773/#714): the extension's free type variables are EITHER
         // named in a `where T: …` constraint (`extension Bag<T> where T: class`)
         // OR introduced implicitly as the generic-arg placeholder name in the
@@ -13878,7 +14071,8 @@ Symbol* ExprTC::lookupExtensionMember(
             found.push_back({m, matchedAnc, target, ext, decl, std::move(binding),
                                  /*isStandardLibraryLinq=*/false,
                                  /*stdHead=*/std::string(),
-                                 /*stdWhere=*/std::string()});
+                                 /*stdWhere=*/std::string(),
+                                 /*shapeOnly=*/shapeOnlyBlock});
             break;
         }
     }
@@ -13976,6 +14170,7 @@ Symbol* ExprTC::lookupExtensionMember(
         return nullptr;
     }
     if (found.size() == 1) {
+        if (found[0].shapeOnly) reportShapeOnlyCandidate(found[0]);
         if (outBinding) *outBinding = found[0].binding;
         return found[0].member;
     }
@@ -14013,6 +14208,7 @@ Symbol* ExprTC::lookupExtensionMember(
     }
     if (maximal.size() == 1) {
         const ExtCandidate& winner = found[maximal[0]];
+        if (winner.shapeOnly) reportShapeOnlyCandidate(winner);
         if (outBinding) *outBinding = winner.binding;
         return winner.member;
     }
