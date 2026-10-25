@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.343 — October 2026**
+**Companion to the Bezel Language Specification, v0.344 — October 2026**
 
 The specification says what Bezel *is*; this document says *why*. It covers the places where two reasonable designs were possible and one was picked, where a familiar-looking rule rests on a less obvious one, and where something common elsewhere was deliberately left out. Each decision is recorded with the alternative it declined, what that alternative would have bought, and why it lost, so that decisions are revisited deliberately rather than relitigated from memory. Read it when a rule surprises you; each section stands alone.
 

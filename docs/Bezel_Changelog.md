@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.343 — October 2026**
+**Companion to the Bezel Language Specification, v0.344 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -14986,5 +14986,26 @@ The composition step resolved these seams:
 **Migration.** None: doc-only.
 
 **Checks.** `scripts/check_docs.sh` is clean.
+
+---
+
+### v0.344 changelog (v0.343 → v0.344)
+
+**Editorial: chapter 28 gains a map, and §28.3's thirteen parts are numbered.** On 2026-10-24 the owner asked how to make chapter 28, and §28.3 in particular, easier to read. Class: **editorial** (spec-change process §2). No rule, verdict or anchor moves.
+
+**The problem.** Chapter 28 is about 57,000 words. §28.3 alone is about 30,500, more than the other thirteen sections together, and its thirteen sub-headings were unnumbered.
+
+**The changes.**
+- **§28.3's parts are numbered §28.3.1 to §28.3.13**, from *The ownership kernel* to *Choosing a disposal form (recap)*.
+  - Every existing anchor is kept, so every link still resolves.
+  - A bare `§28.3` citation still names the whole section.
+  - No `§28.3.N` citation existed anywhere in the repository before this revision, so none changes meaning.
+- **A map at the head of §28.3**, placed before the glossary: one line per part saying what it decides.
+- **A *Chapter at a glance* table at the head of chapter 28**, after *Reading this chapter*. It pairs each common question with the section that answers it, and says that it points into the chapter without restating any rule. It also names Guide 1 and the writing reference's §4 as the introductions in plain prose.
+  - No prose summary was added. A second statement of the rules would be one more copy to keep in step, the drift proposal 0046 was written to end.
+
+**Migration.** None: doc-only.
+
+**Checks.** `scripts/check_docs.sh` (ANCHOR and BOOK included) and `scripts/check_src_citations.py` are clean.
 
 ---
