@@ -4664,6 +4664,30 @@ private:
     // covers the INSTANCE-receiver path only) — its former sibling
     // `IsNullOrEmpty` was retired entirely (fix #3854, stdlib §9.6, v0.290).
     void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
+    // fix #7207 (stdlib §3.1, v0.343): the DECLARED SURFACE of the built-in
+    // `StringBuilder` — the ARITY and the ARGUMENT TYPES of a member call.
+    //
+    // `StringBuilder` has no user declaration, so its member surface is
+    // EXACTLY what stdlib §3.1 documents for it (the #2457 diagnostic says
+    // so, where it rejects a member that is not on that surface). But nothing
+    // checked a call against that surface: the built-in members have no
+    // MethodSymbol, so §22.5's argument-count check (`checkCallArity`) never
+    // ran for them and `resolveMemberAccess` typed the member by NAME alone.
+    // A call at an arity §3.1 declares no form for was therefore a SILENT
+    // NO-OP (the call did nothing and the program printed a plausible wrong
+    // value), and an argument of a type the declared parameter does not take
+    // reached codegen as MALFORMED IR.
+    //
+    // The check is a TABLE of §3.1's declared forms (the same shape as
+    // #7140's `string` arity table): a call that matches no declared form is
+    // a compile error (§22.5/§22.6 — "a call that matches no declared form
+    // is a compile error"), and an argument that does not convert to its
+    // declared parameter is a compile error (§5.1).
+    //
+    // A user-declared class named `StringBuilder` is NOT this surface: it
+    // has a declaration, and its own members are checked by the ordinary
+    // user-method machinery.
+    void checkBuiltinStringBuilderCall(const ast::CallExpr& ce);
     // fix #6782 (§7, §7.3, v0.340): the member and static twin of the check
     // above, for the built-in receivers and type names it does not claim. A
     // resolved `calleeSym` (user or imported method) is left to checkCallArity.

@@ -18389,6 +18389,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // `string?` argument is rejected instead of silently accepted.
     checkBuiltinStringCallArgs(ce);
 
+    // fix #7207 (stdlib §3.1, v0.343): the built-in `StringBuilder` has no
+    // user declaration, so its member surface is EXACTLY §3.1's listing —
+    // and nothing checked a call against it (no MethodSymbol ⇒ no
+    // `checkCallArity`; the member was typed by NAME alone). The same
+    // per-argument assignability the user-method path runs is run here,
+    // against §3.1's declared parameter types, and a call at an arity §3.1
+    // declares no form for is rejected rather than silently ignored.
+    checkBuiltinStringBuilderCall(ce);
+
     // fix #6782 (§7, §7.3, v0.340): the same §7 null check for the built-in
     // members and statics the string-receiver check above does not reach,
     // against the declared non-nullable positions in the registry.
@@ -20825,6 +20834,270 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
             argTy, paramTy, a.value->span.begin,
             std::string("argument to `string.") + std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
+}
+
+// fix #7207 (stdlib §3.1, v0.343): the DECLARED SURFACE of the built-in
+// `StringBuilder` — the ARITY and the ARGUMENT TYPES of a member call.
+//
+// THE DEFECT. `StringBuilder` has no user declaration, so its member surface
+// is EXACTLY what stdlib §3.1 documents for it (the #2457 diagnostic says so
+// where it rejects a member that is not on that surface). But nothing checked
+// a call against that surface: the built-in members have no MethodSymbol, so
+// §22.5's argument-count check (`checkCallArity`) never ran for them, and
+// `resolveMemberAccess` typed the member by NAME alone.
+//
+// MEASURED pre-fix (on 7f30a995), each row = the call, the observed
+// behaviour:
+//
+//   sb.Replace()              -> compiles, runs, prints "hello"  (a SILENT
+//                                no-op: the declared form replaced nothing)
+//   sb.Replace("l")           -> the same silent no-op
+//   sb.Replace("l","L","x")   -> the surplus argument is DROPPED ("hello")
+//   sb.Replace('l','L')       -> MALFORMED IR ("Call parameter type does
+//                                not match function signature!")
+//   sb.Replace(3,4)           -> the same malformed IR
+//   sb?.Replace()             -> the same silent no-op (the null-conditional
+//                                spelling)
+//   sb.Append()               -> the same silent no-op
+//   sb.Append("a","b")        -> the surplus argument is DROPPED ("helloa")
+//   sb.AppendLine("a","b")    -> the same
+//   sb.AppendFormat("x")      -> the same
+//   sb.AppendFormat("x",[1],2)-> the same
+//   sb.Insert(0)              -> the same
+//   sb.Remove(0)              -> the same
+//   sb.Remove(0,1,2)          -> the same
+//   sb.Clear(1)               -> the same (the builder is NOT cleared)
+//   sb.Insert("x","y")        -> MALFORMED IR ("SExt only operates on
+//                                integer")
+//   sb.Remove("x","y")        -> the same
+//   sb.AppendFormat("x",3)    -> the same
+//
+// A silent no-op that prints a plausible wrong value is the top defect class
+// in this repository, and the malformed IR is an internal compiler error on
+// a program the spec rejects.
+//
+// THE FIX. A TABLE of §3.1's declared forms (the same shape as #7140's
+// `string` arity table): a call that matches no declared form is a compile
+// error (§22.5/§22.6), and an argument that does not convert to its declared
+// parameter is a compile error (§5.1). The check REJECTS; it adds no lowering.
+//
+// WHAT THE TABLE DOES NOT TYPE-CHECK, and why:
+//
+//   * `Append`'s and `AppendLine`'s VALUE parameter. §3.1 declares
+//     `Append(value: Object)` (plus the per-type overloads of #1355) and
+//     `AppendLine(value: string)`, but the compiler SHIPS the value-kind
+//     rendering for both — #6781 ("stdlib §3.1: Append(value) =
+//     Append(value.ToString())", cited to §3.1) — and a green test pins it
+//     (`codegen_stringbuilder_append_value_builtin_6781`). §5.1's "any type
+//     to `Object`" admits every type anyway, so a type check there could
+//     only ever REJECT an argument the shipped surface accepts.
+//
+//   * `Insert`'s VALUE parameter: #6807 already rejects a non-`string` value
+//     with its own located diagnostic, and two diagnostics for one argument
+//     would be noise.
+//
+//   * `ToString`: §8.1's universal `Object.ToString` arity check already
+//     rejects a call with arguments, the built-in `StringBuilder` receiver
+//     included.
+//
+//   * `Length` and `Capacity`: §3.1 declares them as PROPERTIES, so their
+//     call spelling (`sb.Length()`) is a call to a member §3.1 does not
+//     declare. The call spelling is left alone here: the property READ is
+//     the declared form and the compiler's own `Length`/`Count` lowering
+//     answers the call spelling with the length. A separate question from
+//     this one (and one this check does not open).
+namespace {
+
+// The declared parameter kind at one position of a §3.1 form.
+enum class StringBuilderParamKind {
+    Unchecked,    // §3.1's declared type admits the argument as it stands
+    String,       // §3.1 declares `string`
+    Int,          // §3.1 declares `int`
+    ObjectArray,  // §3.1 declares `Array<Object>`
+};
+
+// One declared form of one §3.1 member: the member, the arity that form
+// takes, the declared parameter kind at each of its (at most two) positions,
+// and the declared signature, quoted in the diagnostic.
+struct BuiltinStringBuilderSurfaceRow {
+    std::string_view member;
+    unsigned arity;
+    StringBuilderParamKind param0;
+    StringBuilderParamKind param1;
+    std::string_view decl;
+};
+
+// §3.1's listing, transcribed. The rows are the DECLARED forms, one per
+// arity per member (a member with two declared arities — `AppendLine` —
+// carries two rows).
+const std::vector<BuiltinStringBuilderSurfaceRow>& builtinStringBuilderSurface() {
+    static const std::vector<BuiltinStringBuilderSurfaceRow> kRows = {
+        {"Append", 1, StringBuilderParamKind::Unchecked,
+         StringBuilderParamKind::Unchecked,
+         "`Append(value: string): StringBuilder` and its per-type overloads"},
+        {"AppendLine", 0, StringBuilderParamKind::Unchecked,
+         StringBuilderParamKind::Unchecked, "`AppendLine(): StringBuilder`"},
+        {"AppendLine", 1, StringBuilderParamKind::Unchecked,
+         StringBuilderParamKind::Unchecked,
+         "`AppendLine(value: string): StringBuilder`"},
+        {"AppendFormat", 2, StringBuilderParamKind::String,
+         StringBuilderParamKind::ObjectArray,
+         "`AppendFormat(format: string, args: Array<Object>): StringBuilder`"},
+        {"Insert", 2, StringBuilderParamKind::Int,
+         StringBuilderParamKind::Unchecked,
+         "`Insert(index: int, value: string): StringBuilder`"},
+        {"Remove", 2, StringBuilderParamKind::Int, StringBuilderParamKind::Int,
+         "`Remove(startIndex: int, length: int): StringBuilder`"},
+        {"Replace", 2, StringBuilderParamKind::String,
+         StringBuilderParamKind::String,
+         "`Replace(oldValue: string, newValue: string): StringBuilder`"},
+        {"Clear", 0, StringBuilderParamKind::Unchecked,
+         StringBuilderParamKind::Unchecked, "`Clear(): StringBuilder`"},
+    };
+    return kRows;
+}
+
+}  // namespace
+
+void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
+    // #2581 / #2594: a built-in instance callee is EITHER a MemberAccessExpr
+    // (`recv.M(..)`) OR a NullCondMemberExpr (`recv?.M(..)`); the two are
+    // separate Expr kinds but share identical `target`/`member` fields, and
+    // the null-conditional form is the same hole on a separate path.
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+    TypeRef* recvTy = ctx_.exprType(*tgt);
+    // The BUILT-IN `StringBuilder` only: it has no user declaration, so its
+    // surface is §3.1's listing. A user-declared class named `StringBuilder`
+    // HAS a declaration (`recvTy->declaration`), and its own members are
+    // checked by the ordinary user-method machinery — this check must not
+    // claim them.
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return;
+    if (recvTy->headName() != "StringBuilder") return;
+    // The member must be ON the declared surface; a member that is not is
+    // the #2457 backstop's business (it rejects it, at codegen, with the
+    // diagnostic that names the rule).
+    const auto& surface = builtinStringBuilderSurface();
+    std::vector<const BuiltinStringBuilderSurfaceRow*> forms;
+    for (const auto& row : surface)
+        if (row.member == member) forms.push_back(&row);
+    if (forms.empty()) return;
+    // §22.5 / §22.6: a call that matches NO declared form is a compile
+    // error. The diagnostic names the arity §3.1 declares.
+    const BuiltinStringBuilderSurfaceRow* form = nullptr;
+    for (const auto* f : forms)
+        if (f->arity == ce.args.size()) { form = f; break; }
+    if (!form) {
+        std::string decls;
+        std::string expectation;
+        for (const auto* f : forms) {
+            if (!decls.empty()) decls += " / ";
+            decls += std::string(f->decl);
+            if (!expectation.empty()) expectation += " or ";
+            expectation += std::to_string(f->arity);
+        }
+        if (forms.size() == 1) expectation = "exactly " + expectation;
+        expectation += " argument(s)";
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "the call to `StringBuilder." + std::string(member) +
+            "` supplies " + std::to_string(ce.args.size()) +
+            " argument(s) but stdlib §3.1 declares " + decls + " — " +
+            expectation + " (§22.5/§22.6; stdlib §3.1)");
+        return;
+    }
+    // The §22.5 BINDING: a named argument binds to the parameter it NAMES
+    // ("named arguments may appear in any order after positional arguments.
+    // Each supplied argument binds exactly one parameter"), so the parameter
+    // an argument supplies is read through the binder, not by position.
+    // The published binding (`ctx_.builtinCallBinding`) is NOT available
+    // here — it is published at the END of `typeCall` — so the binding is
+    // established LOCALLY, with the SHARED §22.5 binder over the REGISTRY's
+    // declared names (the same construction #7191 uses), so no second name
+    // table is introduced.
+    std::vector<int> paramToArg;
+    std::vector<std::string_view> paramNames;
+    for (const auto& cand : common::builtinParamNameCandidates(
+             "StringBuilder", member, ce.args.size())) {
+        BindResult br = bindArgsToParams(
+            sema::FormalsView::ofNames(cand.names, cand.required), ce.args,
+            ce.span.begin,
+            "call to built-in `StringBuilder." + std::string(member) + "`",
+            /*emit=*/false);
+        if (!br.ok) continue;  // not this overload's binding
+        paramToArg = br.paramToArg;
+        paramNames = cand.names;
+        break;
+    }
+    // A call that binds no candidate (an unknown name, a double bind, a
+    // positional argument after a named one) keeps the POSITIONAL reading:
+    // `checkBuiltinNamedArgs` reports the §22.5 violation later, and the
+    // arguments must still be type-checked here.
+    if (paramToArg.empty()) {
+        for (std::size_t i = 0; i < ce.args.size(); ++i)
+            paramToArg.push_back(static_cast<int>(i));
+    }
+    const StringBuilderParamKind kinds[2] = {form->param0, form->param1};
+    for (std::size_t p = 0; p < 2; ++p) {
+        if (kinds[p] == StringBuilderParamKind::Unchecked) continue;
+        if (p >= paramToArg.size()) continue;
+        const int ai = paramToArg[p];
+        if (ai < 0 || static_cast<std::size_t>(ai) >= ce.args.size()) continue;
+        const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+        if (!arg.value || arg.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule; skip.
+        if (!arg.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*arg.value);
+        if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+        const std::string paramName =
+            p < paramNames.size() ? std::string(paramNames[p]) : std::string();
+        const std::string what =
+            paramName.empty()
+                ? std::string("argument to `StringBuilder.") + std::string(member) + "`"
+                : std::string("argument `") + paramName + "` to `StringBuilder." +
+                      std::string(member) + "`";
+        if (kinds[p] == StringBuilderParamKind::ObjectArray) {
+            // §3.1 declares `args: Array<Object>` — an array of objects, and
+            // only that: a class type is INVARIANT (§12.9), so `Array<int>` is
+            // not an `Array<Object>`. Anything else (an `Object`, an `int`)
+            // is not an array at all, and the runtime helper reads it as one.
+            const bool isObjectArray =
+                argTy->kind == TypeRef::Kind::Named &&
+                argTy->headName() == "Array" && !argTy->nullable &&
+                argTy->genericArgs.size() == 1 && argTy->genericArgs[0] &&
+                argTy->genericArgs[0]->kind == TypeRef::Kind::Primitive &&
+                argTy->genericArgs[0]->primitive == PrimitiveType::Object &&
+                !argTy->genericArgs[0]->nullable;
+            if (!isObjectArray) {
+                ctx_.diagnostics().report(
+                    Severity::Error, arg.value->span.begin,
+                    "no matching overload of `StringBuilder.AppendFormat` — "
+                    "stdlib §3.1 declares `AppendFormat(format: string, args: "
+                    "Array<Object>): StringBuilder`, so the `args` argument "
+                    "must be an `Array<Object>` (stdlib §3.1; §5.1)");
+            }
+            continue;
+        }
+        // §7: the nullability gate (#6782) owns a NULLABLE argument at a
+        // non-nullable parameter — `builtinParamIsNonNullable` says whether
+        // it applies at this position — so this check does not report it a
+        // second time.
+        if (argTy->nullable &&
+            common::builtinParamIsNonNullable("StringBuilder", member,
+                                               ce.args.size(),
+                                               static_cast<int>(p)))
+            continue;
+        const PrimitiveType declared =
+            kinds[p] == StringBuilderParamKind::String ? PrimitiveType::String
+                                                        : PrimitiveType::Int;
+        checkAssignable(
+            argTy, ctx_.primitiveTypeRef(declared, /*nullable=*/false),
+            arg.value->span.begin,
+            what + " (stdlib §3.1 declares " + std::string(form->decl) + ")",
+            arg.value.get());  // §5.1 / §7.4 (#1191) — narrowing-aware
     }
 }
 
