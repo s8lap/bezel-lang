@@ -2908,14 +2908,44 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // fix #7102 (§5.1, §9.6, v0.343): the `int` startIndex is widened by
         // the SOURCE's signedness (widenIntParam above). A `byte` 200 is the
         // `int` 200; the bare CreateSExt read it as -56, and the arm's clamp
-        // below then pinned the insertion to the front of the string.
+        // (removed by fix #7172 below) then pinned the insertion to the front
+        // of the string.
         llvm::Value* idx64 = widenIntParam(call.args[idxSrc].value.get(), idxV,
                                            "ins.idx", "ins.zidx");
-        // Clamp index to [0, selfLen]
-        llvm::Value* tooHigh = builder_.CreateICmpSGT(idx64, selfLen);
-        idx64 = builder_.CreateSelect(tooHigh, selfLen, idx64);
-        llvm::Value* tooLow = builder_.CreateICmpSLT(idx64, builder_.getInt64(0));
-        idx64 = builder_.CreateSelect(tooLow, builder_.getInt64(0), idx64);
+        // fix #7172 (§3.1, §9.6, §4.6, v0.343): the POSITION contract.
+        //
+        // stdlib §3.1 (v0.343), the `StringBuilder` twin's Contracts
+        // paragraph: "`Insert` and `Remove` raise `IndexOutOfRangeException`
+        // when the index or the `(startIndex, length)` window falls outside
+        // `0..Length`." §9.6 (v0.343) declares
+        //     public pure method Insert(startIndex: int, value: string): string;
+        // with NO contract paragraph of its own, so §3.1's twin is the only
+        // sentence that decides the behaviour — exactly as it decides
+        // `String.Remove` (#7168), whose twin arm raises it.
+        //
+        // Before this guard the arm CLAMPED the index to `[0, selfLen]`, so
+        // an out-of-range request returned a WRONG string with exit code 0 —
+        // the program reported success for a request the contract rejects.
+        // The bound is `0..Length` INCLUSIVE (both ends): `Insert(0, …)`
+        // prepends and `Insert(Length, …)` appends, and §4.6 makes a string's
+        // length a count of CODE POINTS, so the bound is in code points —
+        // the same bound the sibling `Remove` arm uses.
+        //
+        // The widened value (§5.1) is what the bound is tested on, so a `byte`
+        // 200 is the `int` 200 (#7102) and not -56.
+        llvm::Value* idxNeg = builder_.CreateICmpSLT(idx64,
+                                                     builder_.getInt64(0),
+                                                     "ins.sneg");
+        llvm::Value* idxBig = builder_.CreateICmpSGT(idx64, selfLen, "ins.sbig");
+        llvm::Value* oor = builder_.CreateOr(idxNeg, idxBig, "ins.soor");
+        // The guard RAISES, so it releases the caller-owned producer receiver
+        // on the throw edge (§28.9 — the #6979/#7159 idiom; see
+        // `emitGuardThrowReleasingString`). The `value` argument is a BORROW
+        // parameter (stdlib §2.6 — no `owned`), so the callee does not own
+        // its reference and must not release it; its disposal belongs to the
+        // caller's full-expression boundary (§28.3 K8.1), which is unchanged
+        // by this guard.
+        guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
         llvm::Value* resultLen = builder_.CreateAdd(selfLen, insLen, "ins.reslen");
         auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
         auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
