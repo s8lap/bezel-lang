@@ -810,24 +810,96 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             return builder_.CreateFAdd(v, byFp, "step.f");
         }
         if (v->getType()->isIntegerTy()) {
-            // Integers and char: advance the value (code point) by `by`,
-            // performed at the value's own width (wrapping, like `+`).
+            // Integers and char: advance the value (code point) by `by`, in
+            // T's own space (stdlib §2.19, v0.344) and CHECKED (spec §6.1,
+            // v0.344: "An operation whose mathematical result is not
+            // representable in the result type raises `OverflowException`").
             //
-            // NB (not the #7253 change): the "like `+`" is NOT what `+` does —
-            // `+` on an integer type is CHECKED (spec §6.1). What an advance
-            // that leaves T's range REPORTS is an OPEN question: spec §6.1
-            // raises for an integer arithmetic result that does not fit the
-            // result type, while spec §16.3 describes the same "advance in
-            // T's space" as stopping SILENTLY, raising nothing. A `Step` CALL
-            // must return a value, so §16.3's stop has no analogue here. The
-            // wrapping below is left exactly as it was — reporting it is a
-            // separate defect, with its own spec ruling, and this site only
-            // fixes the WIDENING of `by` (spec §5.1, stdlib §2.19).
-            unsigned w = v->getType()->getIntegerBitWidth();
-            llvm::Value* byW =
-                w < 64 ? builder_.CreateTrunc(by, v->getType(), "step.byw")
-                       : by;
-            return builder_.CreateAdd(v, byW, "step.i");
+            // fix #7262 (spec §6.1, v0.344; stdlib §2.19, v0.344). The
+            // previous code advanced "at the value's own width (wrapping,
+            // like `+`)" — a false premise on its face: `+` on an integer
+            // type is CHECKED (spec §6.1), and the advance is an operation
+            // with a result type (T), so §6.1 governs it exactly as it
+            // governs `+`. The comment also claimed the question of what an
+            // out-of-range advance REPORTS was open; it is not (§6.1), and a
+            // `Step` CALL must return a value, so §16.3's silent stop (which
+            // describes a RANGE's iteration, whose advance is a different
+            // member and is left untouched by this change) has no analogue
+            // here.
+            //
+            // THE TRAP — WHY THE WRAP ENTERED, AND WHERE THE CHECK MUST BE.
+            // The old code TRUNCATED `by` to T's width BEFORE the add, so
+            // the add itself could never overflow: the wrap entered through
+            // the TRUNCATION, not through the add, and a check on the
+            // truncated add could therefore never fire. The check must be
+            // made on the MATHEMATICAL result, computed in a type wide
+            // enough to hold it, BEFORE the narrowing back to T's width.
+            //
+            // i128, not i64: `by` is the `long` parameter's value and the
+            // value is T's, so the exact sum can leave i64 itself (T = int
+            // and by = long.MaxValue). The comparison is against T's
+            // REPRESENTABLE RANGE, not against the sign of `by`: a NEGATIVE
+            // `by` is a legitimate advance downwards and is rejected only
+            // when the result leaves T's range.
+            //
+            // `char` gets its OWN domain (spec §4.5, §5.2, §16.3, v0.344):
+            // the code-point space U+0000–U+10FFFF with the SURROGATE block
+            // U+D800–U+DFFF excluded, because a surrogate code point is not
+            // a valid `char` value. A plain i32 range check would admit the
+            // surrogates; §16.3's own rule that the surrogate block is not
+            // part of `char`'s value sequence is what excludes them.
+            llvm::Type* wideTy = builder_.getInt128Ty();
+            const bool unsT = isUnsignedPrim(pt);
+            // The value's own mathematical value, restored per T's signedness
+            // (`char` is unsigned, so its code point is zero-extended).
+            llvm::Value* vWide =
+                unsT ? builder_.CreateZExt(v, wideTy, "step.vw")
+                     : builder_.CreateSExt(v, wideTy, "step.vw");
+            // `by` is the declared `long` parameter's value, so it extends
+            // signed.
+            llvm::Value* byWide = builder_.CreateSExt(by, wideTy, "step.bw");
+            llvm::Value* sum = builder_.CreateAdd(vWide, byWide, "step.sum");
+            llvm::Value* lo;
+            llvm::Value* hi;
+            if (pt == P::Char) {
+                lo = llvm::ConstantInt::get(wideTy, 0);
+                hi = llvm::ConstantInt::get(wideTy, 0x10FFFF);
+            } else {
+                const unsigned w = v->getType()->getIntegerBitWidth();
+                if (unsT) {
+                    lo = llvm::ConstantInt::get(wideTy, 0);
+                    hi = llvm::ConstantInt::get(
+                        wideTy, llvm::APInt::getMaxValue(w).zext(128));
+                } else {
+                    lo = llvm::ConstantInt::get(
+                        wideTy, llvm::APInt::getSignedMinValue(w).sext(128));
+                    hi = llvm::ConstantInt::get(
+                        wideTy, llvm::APInt::getSignedMaxValue(w).sext(128));
+                }
+            }
+            using Cmp = llvm::CmpInst;
+            llvm::Value* under =
+                builder_.CreateICmp(Cmp::ICMP_SLT, sum, lo, "step.under");
+            llvm::Value* over =
+                builder_.CreateICmp(Cmp::ICMP_SGT, sum, hi, "step.over");
+            llvm::Value* bad = builder_.CreateOr(under, over, "step.bad");
+            if (pt == P::Char) {
+                // §4.5 / §5.2 / §16.3 (v0.344): U+D800–U+DFFF are surrogate
+                // code points and are not valid `char` values, so a result
+                // there is not representable in `char` (§6.1).
+                llvm::Value* sgLo = builder_.CreateICmp(
+                    Cmp::ICMP_SGE, sum,
+                    llvm::ConstantInt::get(wideTy, 0xD800), "step.sglo");
+                llvm::Value* sgHi = builder_.CreateICmp(
+                    Cmp::ICMP_SLE, sum,
+                    llvm::ConstantInt::get(wideTy, 0xDFFF), "step.sghi");
+                bad = builder_.CreateOr(
+                    bad, builder_.CreateAnd(sgLo, sgHi, "step.sg"), "step.bad2");
+            }
+            emitGuardThrow(bad, "OverflowException");
+            // The result is representable in T, so the narrowing back to T's
+            // width is exact.
+            return builder_.CreateTrunc(sum, v->getType(), "step.i");
         }
         return nullptr;
     }
