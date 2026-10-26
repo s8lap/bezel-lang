@@ -21590,6 +21590,26 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     };
     const std::string stdlibCite =
         head == "Math" ? "stdlib §2.2" : "stdlib §2.3";
+    // The DECLARED signatures at this arity, quoted in the diagnostics below.
+    std::string decls;
+    for (const auto* f : forms) {
+        if (!decls.empty()) decls += " / ";
+        decls += std::string(f->decl);
+    }
+    // fix #7286 (§22.6, v0.344): the STATIC TYPE of an argument at a call —
+    // "The argument's static type is its type at the call: a read of a binding
+    // §7.4 has narrowed non-null is of its non-nullable type … so a narrowed
+    // `d: Dog?` is exact at a `Dog` parameter". Sema keeps a narrowed read's
+    // exprType at the DECLARED `T?` (SemaContext.hpp:535-541 — "Sema keeps
+    // the read's exprType at the declared `T?` … so the narrowing must reach
+    // codegen through this table"), so the narrowing is read here, from the
+    // §7.4 facts, and the read's type is its non-nullable one.
+    auto effectiveArgType = [&](const ast::Expr* e) -> TypeRef* {
+        TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+        if (!t || !t->nullable) return t;
+        if (!isNarrowedNonNullRead(e)) return t;
+        return operandStaticTypeAt(e, t);
+    };
     for (std::size_t p = 0; p < forms.front()->arity; ++p) {
         // The declared kinds at this position, across the declared forms.
         std::vector<MathConvertParamKind> admitted;
@@ -21614,8 +21634,71 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         // §7: the nullability gate (#6782) owns a NULLABLE argument at a
         // non-nullable parameter — this check is about the argument's TYPE,
         // so a nullable argument is left to that gate (whose registry rows
-        // cover the `Convert` positions but not `Math`'s).
-        if (argTy->nullable) continue;
+        // cover the `Convert.To*` positions but not `Math`'s, and not
+        // `Convert.ToString` — see below).
+        if (argTy->nullable) {
+            // fix #7286 (§5.1 / §7.4 / §22.6, v0.344): the `toBase` parameter
+            // of `Convert.ToString(value, toBase)` is declared `int`
+            // (stdlib §2.3), and the §7 gate's registry has NO row for it —
+            // `common::builtinParamIsNonNullable` carries rows for the
+            // `Convert.To*` / `TryTo*` members at position 0 and for
+            // `Int32.Parse` / `TryParse`, but NONE for `Convert.ToString` —
+            // so the gate never claims this position, and a nullable radix
+            // reached codegen unchecked.
+            //
+            // MEASURED on the base arm: `Convert.ToString(255, r)` over
+            // `var r: int? := 16` COMPILED and printed "255" — the DECIMAL
+            // text of the value, not its radix-16 text "ff". A silently wrong
+            // answer in a program that compiles.
+            //
+            // THE RULE. §5.1's nullable lifting is ONE-WAY — "For any type
+            // `T`, `T` implicitly converts to `T?`" and "Each implicit
+            // conversion of this section also lifts to the nullable forms" —
+            // so an `int?` converts to NO non-nullable `int` parameter, and
+            // §22.6 makes that a compile error ("If no candidate is applicable
+            // at all — no candidate is reachable: a conversion §5.1 does not
+            // admit as implicit, … the call is a compile error with no
+            // candidates cited"). §7.4's narrowing is the ONE way a nullable
+            // reaches the parameter: §22.6 reads "a read of a binding §7.4
+            // has narrowed non-null is of its non-nullable type".
+            //
+            // The position is the `toBase` one only: every other position of
+            // this probe stays as it was (§7's gate owns it).
+            const bool isToBasePosition =
+                head == "Convert" && member == "ToString" &&
+                ce.args.size() == 2 && p == 1;
+            if (!isToBasePosition) continue;
+            if (!isNarrowedNonNullRead(arg.value.get())) {
+                const std::string paramName =
+                    p < paramNames.size() ? std::string(paramNames[p])
+                                          : std::string();
+                const std::string what =
+                    paramName.empty()
+                        ? "the argument at position " + std::to_string(p + 1)
+                        : "the `" + paramName + "` argument";
+                ctx_.diagnostics().report(
+                    Severity::Error, arg.value->span.begin,
+                    "no matching overload of `" + std::string(head) + "." +
+                        std::string(member) + "` — " + stdlibCite +
+                        " declares " + decls + ", so " + what + " must be " +
+                        mathConvertTypeList(admitted) + " (" + stdlibCite +
+                        "; §5.1): a `" + spellTypeRefForDiag(argTy) +
+                        "` is never implicitly convertible to an `" +
+                        std::string(mathConvertTypeName(admitted.front())) +
+                        "` (§5.1's nullable lifting converts a `T` to a `T?`, "
+                        "never the other way) — narrow it to non-null first "
+                        "(§7.4)");
+                return;  // ONE diagnostic per call
+            }
+            // A NARROWED read: the argument is read at its non-nullable type
+            // (§22.6), so the probe below sees the `int` it denotes. Publish
+            // the read, so codegen extracts the payload of the
+            // `{i8 hasValue; int}` carrier the read still loads
+            // (`SemaContext::markNarrowedValueRead`; the codegen half is
+            // LlvmBackend_Calls.cpp's `Convert.ToString`).
+            argTy = operandStaticTypeAt(arg.value.get(), argTy);
+            ctx_.markNarrowedValueRead(arg.value.get());
+        }
         bool ok = false;
         for (MathConvertParamKind k : admitted)
             if (admitsByIdentityOrWidening(argTy, k)) { ok = true; break; }
@@ -21629,11 +21712,6 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         // The rejection: a located, spec-cited diagnostic naming the
         // offending argument and the type §2.2 / §2.3 declares there — the
         // shape #7207 established for `StringBuilder`.
-        std::string decls;
-        for (const auto* f : forms) {
-            if (!decls.empty()) decls += " / ";
-            decls += std::string(f->decl);
-        }
         const std::string paramName =
             p < paramNames.size() ? std::string(paramNames[p]) : std::string();
         const std::string what =
@@ -21719,7 +21797,14 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
                 rankable = false;
                 break;
             }
-            TypeRef* argTy = ctx_.exprType(*arg.value);
+            // fix #7286 (§22.6, v0.344): the grid reads the argument's STATIC
+            // TYPE at the call — "a read of a binding §7.4 has narrowed
+            // non-null is of its non-nullable type" — so a NARROWED nullable
+            // is ranked at its non-nullable type. An UN-narrowed nullable is
+            // refused by the probe above (at the `toBase` position) or left
+            // to §7's gate (elsewhere), and stands the grid down here, as
+            // before.
+            TypeRef* argTy = effectiveArgType(arg.value.get());
             if (!argTy || argTy->kind == TypeRef::Kind::Error || argTy->nullable) {
                 rankable = false;
                 break;
