@@ -17815,6 +17815,67 @@ struct ParamEscapeWalker {
                t->primitive != P::String;
     }
 
+    // fix #6769 (§8.6 / §8.1 / §28.9, v0.344): is `e` of a non-nullable VALUE
+    // kind (record, enum, non-generic choice, numeric/bool/char primitive)?
+    // Such a receiver's `Equals(Object?)` and its `=` against an `Object`
+    // dispatch through the compiler-generated box-equals thunk, which only
+    // READS `other` (the same premise `lowerValueSemUniversalEquals` and
+    // #3480 rest on). Two spec facts make that thunk the ONLY reachable
+    // member, and both were CHECKED against the v0.344 text and against the
+    // compiler, not assumed:
+    //   - no value kind declares an `Equals` at `Object?`/`Object` (§9.2's
+    //     dispatch-modifier rule for records, §10.5 for enums, §35.2 for
+    //     choices): the compiler rejects it at the declaration ("a record
+    //     member `Equals` may not take `Object?`", MEASURED);
+    //   - a value kind's own-typed `Equals(other: T)` does not accept an
+    //     `Object` argument at all ("the argument `other` to call to `Equals`
+    //     has type `Object` which has no implicit conversion to the value
+    //     type", MEASURED) — so where the call compiles, the member reached is
+    //     the generated one.
+    // A `=`/`<>` the value kind OVERLOADS is a different member (§25.2: "the
+    // overloaded operators are invoked for `a = b` and `a <> b` directly ...
+    // they do not delegate to `Equals`"), and the `=`/`<>` arm below excludes
+    // it by the operator symbol sema resolved the expression to.
+    // A class or `Object` receiver is NOT in this set: a user `Equals`
+    // override may store its borrowed parameter (#3480's measured UAF).
+    bool isValueKindExpr(const ast::Expr* e) {
+        // Not inside a lambda: the closure captures the parameter's box and
+        // may outlive the call (same guard as `isUnboxedRead`).
+        if (!e || lambdaDepth != 0 || isTarget(e)) return false;
+        const sema::TypeRef* t = ctx.exprType(*e);
+        if (!t || t->nullable) return false;
+        using K = sema::TypeRef::Kind;
+        using P = sema::PrimitiveType;
+        if (t->kind == K::Primitive)
+            return t->primitive != P::None && t->primitive != P::Object &&
+                   t->primitive != P::String;
+        if (t->kind == K::Named && t->declaration && t->genericArgs.empty()) {
+            auto k = t->declaration->kind;
+            return k == ast::TypeDeclKind::Record ||
+                   k == ast::TypeDeclKind::Enum ||
+                   k == ast::TypeDeclKind::Choice;
+        }
+        return false;
+    }
+
+    // The bare type name `Console` — the auto-imported `System.Console`, and
+    // NOT a local, a parameter, or a USER type that shadows it (§2.3's
+    // always-available names are shadowable except §3.4's reserved row;
+    // §2.7's resolution order). stdlib §2.1: "The `Object` overloads invoke
+    // `ToString()`" — the stdlib's `Write`/`WriteLine` render the argument and
+    // keep nothing, so a call through them is a READ of the parameter's box.
+    // A user type named `Console` is NOT that class: its `Write`/`WriteLine`
+    // are the author's own members, whose bodies may STORE the argument.
+    bool isConsoleType(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id || id->name != "Console") return false;
+        auto* sym = ctx.exprSymbol(*id);
+        if (dynamic_cast<sema::LocalSymbol*>(sym) ||
+            dynamic_cast<sema::ParameterSymbol*>(sym))
+            return false;
+        return !sema::isUserDeclaredTypeSym(sym);
+    }
+
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
@@ -17833,10 +17894,36 @@ struct ParamEscapeWalker {
                                  b->left.get()) != nullptr;
                 bool rNull = dynamic_cast<const ast::NullLiteralExpr*>(
                                  b->right.get()) != nullptr;
-                expr(b->left.get(), /*safeRead=*/rNull || isUnboxedRead(
-                                                     b->left.get()));
-                expr(b->right.get(), /*safeRead=*/lNull || isUnboxedRead(
-                                                      b->right.get()));
+                // fix #6769 (§8.4 / §8.6, v0.344): `valueKind = param` /
+                // `param = valueKind` boxes the value side and compares
+                // through the box-equals thunk, which only READS the
+                // parameter's box.
+                //
+                // EXCEPT when the value kind OVERLOADS `=`/`<>`: §25.2
+                // ("the overloaded operators are invoked for `a = b` and
+                // `a <> b` directly ... they do not delegate to `Equals`")
+                // hands the comparison to the author's operator, whose body
+                // may STORE the parameter's box — §28.3's field-store
+                // residual admits an `Object` parameter into a field — and
+                // the caller's post-call release would then leave a DANGLING
+                // reference. MEASURED on this lane: the pre-fix arm kept the
+                // stored box alive and read it back as `V`; the arm without
+                // this guard released it and the stored value read back as
+                // NOT-`V` (a record and an enum, both with a heterogeneous
+                // `operator =`/`operator <>` pair). The DISCRIMINATOR is the
+                // member sema resolved the expression to (§25.2's resolution):
+                // a built-in comparison binds none ("Built-in primitive
+                // operators do not reach here", sema's own note).
+                bool userOperator = false;
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                        ctx.exprSymbol(*b)))
+                    userOperator = ms->isOperator;
+                bool lVal = !userOperator && isValueKindExpr(b->left.get());
+                bool rVal = !userOperator && isValueKindExpr(b->right.get());
+                expr(b->left.get(), /*safeRead=*/rNull || rVal ||
+                                        isUnboxedRead(b->left.get()));
+                expr(b->right.get(), /*safeRead=*/lNull || lVal ||
+                                         isUnboxedRead(b->right.get()));
                 return;
             }
             expr(b->left.get(), /*safeRead=*/isUnboxedRead(b->left.get()));
@@ -17853,7 +17940,23 @@ struct ParamEscapeWalker {
                     return;
                 }
                 expr(mem->target.get(), false);
-                for (auto& a : c->args) expr(a.value.get(), false);
+                // fix #6769 (§8.1 / §8.3 / §8.6, v0.344):
+                // `valueKind.Equals(param)` hands the parameter's box to the
+                // compiler-generated box-equals thunk, which only READS it
+                // (`isValueKindExpr`'s note gives the two spec facts that
+                // make the generated member the only reachable one).
+                // `Console.Write(param)` / `Console.WriteLine(param)`: the
+                // runtime renders the box and keeps nothing (stdlib §2.1:
+                // "The `Object` overloads invoke `ToString()`"); `isConsoleType`
+                // keeps a USER type named `Console` out of this set.
+                bool eqRead = (mem->member == "Equals" &&
+                               c->args.size() == 1 &&
+                               isValueKindExpr(mem->target.get())) ||
+                              (isConsoleType(mem->target.get()) &&
+                               (mem->member == "Write" ||
+                                mem->member == "WriteLine") &&
+                               c->args.size() == 1 && lambdaDepth == 0);
+                for (auto& a : c->args) expr(a.value.get(), eqRead);
                 return;
             }
             if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(
