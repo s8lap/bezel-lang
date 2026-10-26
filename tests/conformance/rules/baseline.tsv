@@ -1,4 +1,49 @@
 # Observed verdicts, banked by runner.py. A `fail` row is a recorded divergence between the spec and the implementation, not a case to edit. See README.md.
+s5_1_0148	pass	
+s5_1_0149	pass	
+s5_1_0150	pass	
+s7_4_0117	pass	
+s7_4_0118	pass	
+s7_4_0119	fail	#7302: the type fact does not compose through the early exit; the carrier stays nullable and the call is refused
+s17_14_0020	pass	
+s17_14_0021	pass	
+s22_6_0110	pass	
+s22_6_0111	pass	
+l2_2_0029	pass	
+l2_3_0010	pass	
+l2_3_0011	pass	
+l2_3_0012	pass	
+l2_3_0013	pass	
+l2_3_0014	pass	
+l2_3_0015	pass	
+l2_3_0016	pass	
+l2_3_0017	pass	
+l2_3_0018	pass	
+l2_3_0019	pass	
+l2_3_0020	pass	
+l2_3_0021	pass	
+l2_3_0022	pass	
+l2_18_0012	fail	#7265
+l2_18_0013	pass	
+l2_18_0014	pass	
+l2_18_0015	pass	
+l2_18_0016	fail	#7301: a non-finite double renders inf/-inf/nan, where stdlib 2.18 requires Infinity/-Infinity/NaN
+l2_18_0017	fail	#7303
+l2_18_0018	pass	
+l2_18_0019	fail	#7265
+l2_18_0020	fail	#7286
+l9_1_0008	pass	
+l9_1_0009	pass	
+l9_1_0010	pass	
+l9_1_0011	pass	
+l9_1_0012	pass	
+l9_1_0013	pass	
+l9_1_0014	pass	
+l9_1_0015	pass	
+l9_1_0016	fail	#7268
+l9_1_0017	pass	
+l9_1_0018	pass	
+l9_5_0004	fail	#7295
 s7_4_0108	pass	
 s7_4_0109	pass	
 s9_5_0008	pass	
