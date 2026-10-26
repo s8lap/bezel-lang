@@ -1,8 +1,270 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
+#include "sema/ConstFold.hpp"  // fix #7285: §17.14 constant folding for the radix argument (§5.1)
 
 namespace bezel::codegen {
+
+namespace {
+
+// fix #7285 (spec §5.1, v0.344): the §5.1 WIDENING table — the integer-family
+// types that implicitly convert to `int`. Read off §5.1's own table ("From |
+// Implicitly converts to"): `sbyte` → `int`, `byte` → `int`, `short` → `int`,
+// `ushort` → `int`, `char` → `int`. `int` itself is the identity and is not
+// listed; `uint`/`ulong`/`long` are NOT in it (they reach an `int` parameter
+// only through §5.1's constant narrowing, below).
+bool parseRadixWidensToInt(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::SByte:
+        case sema::PrimitiveType::Byte:
+        case sema::PrimitiveType::Short:
+        case sema::PrimitiveType::UShort:
+        case sema::PrimitiveType::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// The type's keyword spelling, as the diagnostic spells it.
+const char* parseRadixTypeName(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::Bool:    return "bool";
+        case sema::PrimitiveType::Char:    return "char";
+        case sema::PrimitiveType::String:  return "string";
+        case sema::PrimitiveType::Byte:    return "byte";
+        case sema::PrimitiveType::SByte:   return "sbyte";
+        case sema::PrimitiveType::Short:   return "short";
+        case sema::PrimitiveType::UShort:  return "ushort";
+        case sema::PrimitiveType::Int:     return "int";
+        case sema::PrimitiveType::UInt:    return "uint";
+        case sema::PrimitiveType::Long:    return "long";
+        case sema::PrimitiveType::ULong:   return "ulong";
+        case sema::PrimitiveType::Float:   return "float";
+        case sema::PrimitiveType::Double:  return "double";
+        case sema::PrimitiveType::Decimal: return "decimal";
+        case sema::PrimitiveType::Object:  return "Object";
+        case sema::PrimitiveType::None:    break;
+    }
+    return "<unresolved>";
+}
+
+// The §17.14 constant-expression nodes inside `e` — the forms the shared
+// folder resolves BY NAME (a `const` reference, a member-access constant).
+void collectParseRadixConstNodes(const ast::Expr& e,
+                                 std::vector<const ast::Expr*>& out) {
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        collectParseRadixConstNodes(*ue->operand, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        collectParseRadixConstNodes(*be->left, out);
+        collectParseRadixConstNodes(*be->right, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (ce->condition) collectParseRadixConstNodes(*ce->condition, out);
+        if (ce->thenValue) collectParseRadixConstNodes(*ce->thenValue, out);
+        if (ce->elseValue) collectParseRadixConstNodes(*ce->elseValue, out);
+        return;
+    }
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        out.push_back(&e);
+}
+
+// The §17.14 folder resolves an identifier by NAME; this site resolves it
+// through the SYMBOL sema recorded for the very node — scope-correct, and
+// never a flat name search that could capture a shadowed binding.
+using ParseRadixResolver =
+    std::function<std::optional<long long>(std::string_view, int)>;
+
+// fix #7285 (spec §17.14, v0.344): the compile-time-constant VALUE of a
+// `const` REFERENCE, folded through the SHARED folder (`sema::foldIntConst` —
+// ONE implementation, shared with the inline-array-size and const-evaluation
+// passes).
+//
+// A local `const` is a §17.14 constant expression only when sema classified
+// it so (`LocalSymbol::isCompileTimeConst`): a RUNTIME `const` — a
+// single-assignment binding with a non-constant initializer — is not one, and
+// §5.1's constant narrowing does not reach it. A class-level `const`
+// (stdlib §22.12) always is; sema recorded its typed integer value
+// (`ConstMemberSymbol::intValue`), and ModuleLoader carried it for an
+// IMPORTED const (whose AST decl does not exist).
+std::optional<long long> parseRadixConstSymbolValue(
+        sema::Symbol* sym, const ParseRadixResolver& resolveIdent, int depth) {
+    if (!sym || depth > 8) return std::nullopt;
+    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+        if (!ls->isCompileTimeConst) return std::nullopt;
+        auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(ls->decl);
+        if (!lcd || !lcd->value) return std::nullopt;
+        return sema::foldIntConst(*lcd->value, resolveIdent, depth + 1);
+    }
+    if (auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(sym)) {
+        if (cs->intValue) return *cs->intValue;
+        // SEAM-ACCESSOR: local-path cast; `cs->intValue` above is the
+        // wire-carried value of an IMPORTED const (whose AST decl does not
+        // exist), so that read and this one are the TWO SOURCES of one
+        // both-sources accessor. #3152
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
+        if (!cd || !cd->value) return std::nullopt;
+        return sema::foldIntConst(*cd->value, resolveIdent, depth + 1);
+    }
+    return std::nullopt;
+}
+
+// fix #7285 (spec §17.14, v0.344): the compile-time-constant value of `e`
+// when it is a §17.14 constant expression, else nullopt.
+//
+// The §17.14 SET and its arithmetic come from the SHARED folder
+// (`sema::foldIntConst`); only the name resolution is local — the symbol
+// sema recorded for the node, so the answer is scope-correct.
+std::optional<long long> parseRadixConstValue(const sema::SemaContext& ctx,
+                                               const ast::Expr& e) {
+    std::vector<const ast::Expr*> constNodes;
+    collectParseRadixConstNodes(e, constNodes);
+    ParseRadixResolver resolveIdent;
+    std::function<std::optional<long long>(const ast::Expr& base,
+                                           std::string_view member,
+                                           bool& errorSeen)>
+        resolveMemberAccess;
+    resolveIdent = [&](std::string_view name,
+                       int depth) -> std::optional<long long> {
+        if (depth > 8) return std::nullopt;
+        for (const ast::Expr* n : constNodes) {
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(n);
+            if (!id || id->name != name) continue;
+            return parseRadixConstSymbolValue(ctx.exprSymbol(*id),
+                                              resolveIdent, depth);
+        }
+        return std::nullopt;
+    };
+    resolveMemberAccess = [&](const ast::Expr& base, std::string_view member,
+                              bool& errorSeen) -> std::optional<long long> {
+        errorSeen = false;
+        for (const ast::Expr* n : constNodes) {
+            auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(n);
+            if (!ma || ma->member != member) continue;
+            if (!ma->target || &*ma->target != &base) continue;
+            return parseRadixConstSymbolValue(ctx.exprSymbol(*ma),
+                                              resolveIdent, 0);
+        }
+        return std::nullopt;
+    };
+    // A `const` REFERENCE — read through the symbol sema recorded for THIS
+    // node.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        return parseRadixConstSymbolValue(ctx.exprSymbol(e), resolveIdent, 0);
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return parseRadixConstSymbolValue(ctx.exprSymbol(*ma), resolveIdent, 0);
+    return sema::foldIntConst(e, resolveIdent, 0, resolveMemberAccess);
+}
+
+// fix #7285 (spec §5.1 / §17.14 / §22.6, v0.344): how the `radix: int`
+// parameter (stdlib §9.1) admits the argument.
+//
+// §5.1 admits it by IDENTITY (`int`), by §5.1's WIDENING table (`sbyte`,
+// `byte`, `short`, `ushort`, `char` → `int`), or by §5.1's CONSTANT
+// NARROWING — "the source may be a compile-time constant of any integer type
+// — not only `int` — and the target any integer type whose range contains
+// the value, across signedness". Nothing else binds: a `bool`, a `string`, a
+// `double`, a `decimal`, and a RUNTIME `uint`/`ulong`/`long` bind to no
+// declared parameter, and §22.6 makes that "a compile error with no
+// candidates cited".
+struct ParseRadixBinding {
+    bool binds = false;              // the argument reaches the `int` parameter
+    bool constantType = false;       // ... only by §5.1's constant narrowing
+    bool outOfRange = false;         // ... and its value does not fit `int`
+    bool unknown = false;            // the argument's type is unresolved
+    bool nullableArg = false;        // the argument's type is `T?`
+    bool signedArg = false;          // the argument's type is signed
+    sema::PrimitiveType argType = sema::PrimitiveType::None;
+    std::optional<long long> value;  // the folded value (constant narrowing)
+};
+
+ParseRadixBinding parseRadixBinding(const sema::SemaContext& ctx,
+                                     const ast::Expr& arg) {
+    ParseRadixBinding b;
+    const sema::TypeRef* ty = ctx.exprType(arg);
+    if (!ty || ty->kind == sema::TypeRef::Kind::Error) {
+        // The type is unresolved: another diagnostic owns this call, and
+        // this arm has no type to judge the argument by.
+        b.unknown = true;
+        return b;
+    }
+    if (ty->kind != sema::TypeRef::Kind::Primitive) return b;
+    const sema::PrimitiveType p = ty->primitive;
+    // §5.1's nullable lifting converts a `T` to a `T?` — never a `T?` to a
+    // `T` — so a NULLABLE argument reaches no non-nullable `int` parameter.
+    // The nullability gate (#6782) has no row for this position (the
+    // `Convert.ToString` check leaves it there too), and the lowering this
+    // replaces truncated the nullable COMPANION (`{i8, i32}`) to i32 —
+    // malformed IR, an aborted compiler. The refusal belongs here.
+    if (ty->nullable) {
+        b.nullableArg = true;
+        b.argType = p;
+        b.signedArg = (p == sema::PrimitiveType::SByte ||
+                       p == sema::PrimitiveType::Short ||
+                       p == sema::PrimitiveType::Int ||
+                       p == sema::PrimitiveType::Long);
+        return b;
+    }
+    b.argType = p;
+    b.signedArg = (p == sema::PrimitiveType::SByte ||
+                   p == sema::PrimitiveType::Short ||
+                   p == sema::PrimitiveType::Int ||
+                   p == sema::PrimitiveType::Long);
+    if (p == sema::PrimitiveType::Int) {
+        b.binds = true;  // the identity
+        return b;
+    }
+    if (parseRadixWidensToInt(p)) {
+        b.binds = true;  // §5.1's widening table
+        return b;
+    }
+    if (p == sema::PrimitiveType::UInt || p == sema::PrimitiveType::ULong ||
+        p == sema::PrimitiveType::Long) {
+        // §5.1's CONSTANT NARROWING — the only route by which these three
+        // types reach an `int` parameter.
+        b.constantType = true;
+        if (auto cv = parseRadixConstValue(ctx, arg)) {
+            // The range: `uint`/`ulong` are unsigned, `long` is signed; the
+            // target is `int`. A constant whose value does not fit is a
+            // COMPILE ERROR at the conversion site (§5.1) — never a silent
+            // truncation.
+            const long long lo =
+                (p == sema::PrimitiveType::Long) ? -2147483648LL : 0;
+            const long long hi = 2147483647LL;
+            if (*cv >= lo && *cv <= hi) {
+                b.binds = true;
+                b.value = *cv;
+            } else {
+                b.outOfRange = true;
+            }
+        }
+        return b;
+    }
+    return b;  // bool / string / float / double / decimal → binds to nothing
+}
+
+// The diagnostic's "why" clause — the §5.1 rule the argument misses.
+std::string parseRadixWhy(const ParseRadixBinding& b) {
+    const std::string tn = parseRadixTypeName(b.argType);
+    if (b.outOfRange)
+        return ": the compile-time constant's value does not fit `int`'s range";
+    if (b.constantType)
+        return ": a `" + tn + "` reaches an `int` parameter only as a "
+               "compile-time constant (§5.1's constant narrowing)";
+    if (b.nullableArg)
+        return ": a `" + tn + "?` is never implicitly convertible to an `int` "
+               "(§5.1's nullable lifting converts a `T` to a `T?`, never the "
+               "other way)";
+    if (b.argType == sema::PrimitiveType::None)
+        return ": the argument is never implicitly convertible to an `int`";
+    return ": a `" + tn + "` is never implicitly convertible to an `int`";
+}
+
+}  // namespace
 
 
 // stdlib §3.2 v0.136: Encoding.{Utf8,Utf16,Utf32,Ascii}.GetBytes/GetString/Name.
@@ -1736,6 +1998,19 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
          pt == P::SByte)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7285 (stdlib §9.1, v0.344): the declared operand is a
+        // `string` (or the span overload's `ReadOnlyStringSpan`). Anything
+        // else is NOT a parseable operand, and parseWindow's
+        // loadStringData on it emitted `%str.data = load ptr, i32 16` —
+        // malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A `string` lowers to a pointer
+        // and a span to the {ptr,i32,i32} record (isStringSpanValue), so
+        // the shape test discriminates them from an `int`, a `bool`, a
+        // `double` and a `decimal` operand exactly. A non-parseable
+        // operand is DROPPED, the way the `Parse(s, radix)` arm below
+        // drops a non-string first argument.
+        if (!strVal->getType()->isPointerTy() && !isStringSpanValue(strVal))
+            return nullptr;
         // #5296 / stdlib §9.1 (v0.313, #1810): the span overload. A
         // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3), not
         // a string pointer, so `loadStringData` on it was a StructGEP of a
@@ -1836,6 +2111,157 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         if (win.owned) emitStringRelease(win.owned);
         // fix #2938 / §22.3: flush any bracket on the normal-return edge.
         // The TryParse path never throws, so emit is always true.
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+        return ok;
+    }
+
+    // stdlib §9.1: `TryParse(s: string, radix: int, out result: int): bool`
+    // — the RADIX form of the integer TryParse family (shape (c) of the §1
+    // Try convention: false exactly where `Parse(s, radix)` raises, and the
+    // out parameter receives the default).
+    //
+    // fix #7285 (stdlib §9.1, v0.344): the form was NOT lowered at all — a
+    // 3-argument call matched no arm, so the whole call was dropped and the
+    // `out` slot kept its zero-initialized value (the #2434 "failed to
+    // lower" warning): `int.TryParse("ff", 16, out v)` returned false with
+    // v = 0 for EVERY input. The radix argument is bound by §5.1 exactly as
+    // at the `Parse(s, radix)` site below, and the two forms agree.
+    //
+    // fix #7285 (stdlib §9.1, v0.344) — THE FIRST ARGUMENT. The declared
+    // form is `TryParse(s: string, radix: int, out result: int): bool`, and
+    // stdlib §9.1 declares NO span overload of the radix form, so the first
+    // argument is a `string` and nothing else. This arm used to lower
+    // whatever it was handed into a string operand, so `int.TryParse(16, 16,
+    // out v)` emitted `%str.data = load ptr, i32 16` — malformed IR, and
+    // the compiler ABORTED with "IR verification failed (malformed IR
+    // emitted)". The sibling `Parse(s, radix)` arm below already guards its
+    // first argument exactly this way (and DROPS the call), so the same
+    // guard here restores the behaviour this arm had before it existed —
+    // the 3-argument form matched no arm at all and was dropped.
+    //
+    // The guard comes FIRST, before the radix's own check: a call whose
+    // first argument is not a string is not a `TryParse` call at all, so it
+    // must not acquire a radix diagnostic either — that would be a NEW
+    // rejection of a program that compiled before.
+    if (m == "TryParse" && call.args.size() == 3 &&
+        call.args[0].value && call.args[1].value &&
+        (call.args[2].value || call.args[2].isDiscard) &&
+        (pt == P::Int || pt == P::Long || pt == P::UInt || pt == P::ULong ||
+         pt == P::Short || pt == P::UShort || pt == P::Byte ||
+         pt == P::SByte)) {
+        {
+            auto* sTy = ctx_.exprType(*call.args[0].value);
+            if (!sTy || sTy->kind != sema::TypeRef::Kind::Primitive ||
+                sTy->primitive != P::String)
+                return nullptr;
+        }
+        const ParseRadixBinding rb =
+            parseRadixBinding(ctx_, *call.args[1].value);
+        if (!rb.binds) {
+            if (!rb.unknown)
+                ctx_.diagnostics().report(
+                    Severity::Error,
+                    call.args[1].value->span.begin,
+                    "no matching overload of `" +
+                        std::string(parseRadixTypeName(pt)) +
+                        ".TryParse` — stdlib §9.1 declares "
+                        "`TryParse(s: string, radix: int, out result: " +
+                        std::string(parseRadixTypeName(pt)) +
+                        "): bool`, "
+                        "so the `radix` argument must be an `int` "
+                        "(stdlib §9.1; §5.1)" + parseRadixWhy(rb));
+            return nullptr;
+        }
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        auto win = parseWindow(strVal);
+        llvm::Value* strData = win.data;
+        // The `out` slot — §22.3 (see the 2-argument TryParse arm above for
+        // the accessor-bracket discipline).
+        llvm::Type* et = nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[2], lowerPrimitive(pt), et, outArgs);
+        if (!outAddr) {
+            if (win.owned) emitStringRelease(win.owned);
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
+        // The radix, CONVERTED to the `int` the parameter declares (§5.1) —
+        // the same conversion the `Parse(s, radix)` site performs.
+        llvm::Value* radix = nullptr;
+        if (rb.value) {
+            radix = builder_.getInt32(static_cast<int32_t>(*rb.value));
+        } else {
+            radix = lowerExpr(*call.args[1].value);
+            if (!radix) return nullptr;
+            if (radix->getType()->isIntegerTy() &&
+                radix->getType()->getIntegerBitWidth() < 32)
+                radix = rb.signedArg ? builder_.CreateSExt(radix, i32())
+                                     : builder_.CreateZExt(radix, i32());
+        }
+        // strtoll/strtoull(data, &endptr, radix) — the value and the end
+        // pointer, for the format guard below.
+        const bool isULongR = (pt == P::ULong);
+        auto* strtoFnR = isULongR
+            ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
+            : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+        auto* endSlotR = entryAlloca(ptrTy());
+        llvm::Value* val64 = builder_.CreateCall(
+            strtoFnR, {strData, endSlotR, radix}, "tryp.val");
+        llvm::Value* endPtrR = builder_.CreateLoad(ptrTy(), endSlotR);
+        // ok = first-char not whitespace AND (endPtr != data) AND
+        // (*endPtr == '\0') — the §9.3 strict input grammar, the same guard
+        // the 2-argument TryParse arm and the `Parse(s, radix)` arm apply.
+        auto* i8TyR = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* fcR = builder_.CreateLoad(i8TyR, strData, "tryp.fc");
+        llvm::Value* fcWsR = builder_.CreateICmpULE(
+            fcR, llvm::ConstantInt::get(i8TyR, ' '), "tryp.fws");
+        llvm::Value* advR = builder_.CreateICmpNE(endPtrR, strData, "tryp.adv");
+        llvm::Value* endChR = builder_.CreateLoad(i8TyR, endPtrR, "tryp.end");
+        llvm::Value* atNulR = builder_.CreateICmpEQ(
+            endChR, llvm::ConstantInt::get(i8TyR, 0), "tryp.nul");
+        llvm::Value* ok = builder_.CreateAnd(
+            builder_.CreateNot(fcWsR),
+            builder_.CreateAnd(advR, atNulR), "tryp.ok");
+        // ulong additionally rejects a leading '-' (strtoull silently
+        // negates it) — the 2-argument TryParse arm's rule.
+        if (isULongR) {
+            llvm::Value* fcNeg = builder_.CreateICmpEQ(
+                fcR, llvm::ConstantInt::get(i8TyR, '-'), "tryp.neg");
+            ok = builder_.CreateAnd(ok, builder_.CreateNot(fcNeg), "tryp.okU");
+        }
+        // Store result: 0 on failure, the parsed value on success.
+        if (pt == P::Long || pt == P::ULong) {
+            llvm::Value* zero64 = builder_.getInt64(0);
+            llvm::Value* sel64 = builder_.CreateSelect(ok, val64, zero64, "tryp.sel");
+            storeTryParseOut(outAddr, et, sel64, ok);
+        } else {
+            // #1134 / stdlib §9.1: TryParse must return FALSE for an
+            // out-of-range value, not silently wrap the low bits.
+            int64_t rlo, rhi;
+            switch (pt) {
+                case P::Int:    rlo = INT32_MIN; rhi = INT32_MAX;  break;
+                case P::UInt:   rlo = 0;         rhi = UINT32_MAX; break;
+                case P::Short:  rlo = INT16_MIN; rhi = INT16_MAX;  break;
+                case P::UShort: rlo = 0;         rhi = UINT16_MAX; break;
+                case P::Byte:   rlo = 0;         rhi = UINT8_MAX;  break;
+                default:        rlo = INT8_MIN;  rhi = INT8_MAX;   break; // SByte
+            }
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateICmpSGE(
+                    val64, llvm::ConstantInt::getSigned(i64(), rlo)),
+                builder_.CreateICmpSLE(
+                    val64, llvm::ConstantInt::getSigned(i64(), rhi)),
+                "tryp.inrange");
+            ok = builder_.CreateAnd(ok, inRange, "tryp.ok2");
+            llvm::Type* tt = lowerPrimitive(pt);
+            llvm::Value* truncV = builder_.CreateTrunc(val64, tt);
+            llvm::Value* zeroV = llvm::ConstantInt::get(tt, 0);
+            llvm::Value* selV = builder_.CreateSelect(ok, truncV, zeroV, "tryp.sel");
+            storeTryParseOut(outAddr, et, selV, ok);
+        }
+        if (win.owned) emitStringRelease(win.owned);
         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return ok;
     }
@@ -1974,13 +2400,57 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             (pt == P::Int || pt == P::UInt || pt == P::Short ||
              pt == P::UShort || pt == P::Byte || pt == P::SByte ||
              pt == P::Long || pt == P::ULong)) {
+            // fix #7285 (spec §5.1 / §22.6, v0.344): the `radix: int`
+            // parameter (stdlib §9.1) admits the argument by IDENTITY, by
+            // §5.1's WIDENING table, or by §5.1's CONSTANT NARROWING. An
+            // argument that binds to NO declared parameter is a COMPILE
+            // ERROR (§22.6: "If no candidate is applicable at all … the call
+            // is a compile error with no candidates cited") — never a
+            // silently degraded call, and never malformed IR.
+            //
+            // The lowering this replaces truncated the radix to i32 whatever
+            // its type: a `bool` (i1) radix produced `trunc i1 to i32` and a
+            // `byte` (i8) radix produced `trunc i8 to i32` — a trunc to a
+            // WIDER type, which is malformed IR and ABORTED the compiler
+            // ("IR verification failed"); a `double`/`decimal`/`string` radix
+            // produced `trunc double to i32`, equally malformed; a NULLABLE
+            // radix produced `trunc {i8, i32} to i32`, equally malformed; and
+            // a `long`/`ulong` radix was silently truncated to 32 bits.
+            const ParseRadixBinding rb =
+                parseRadixBinding(ctx_, *call.args[1].value);
+            if (!rb.binds) {
+                if (!rb.unknown)
+                    ctx_.diagnostics().report(
+                        Severity::Error,
+                        call.args[1].value->span.begin,
+                        "no matching overload of `" +
+                            std::string(parseRadixTypeName(pt)) +
+                            ".Parse` — stdlib §9.1 declares "
+                            "`Parse(s: string, radix: int): " +
+                            std::string(parseRadixTypeName(pt)) +
+                            "`, so the `radix` "
+                            "argument must be an `int` (stdlib §9.1; §5.1)" +
+                            parseRadixWhy(rb));
+                return nullptr;
+            }
             llvm::Value* sArg = lowerExpr(*call.args[0].value);
-            llvm::Value* radix = lowerExpr(*call.args[1].value);
-            if (!sArg || !radix) return nullptr;
+            if (!sArg) return nullptr;
             llvm::Value* data = loadStringData(sArg);
-            // radix is `int` (i32) — strtoll/strtoull `base` parameter.
-            if (!radix->getType()->isIntegerTy(32))
-                radix = builder_.CreateTrunc(radix, i32());
+            // The radix, CONVERTED to the `int` the parameter declares (§5.1):
+            // a widened value is EXTENDED (a trunc to a wider type is
+            // malformed IR), and a constant-narrowed value IS its folded
+            // value — §5.1's constant narrowing converts BY VALUE.
+            llvm::Value* radix = nullptr;
+            if (rb.value) {
+                radix = builder_.getInt32(static_cast<int32_t>(*rb.value));
+            } else {
+                radix = lowerExpr(*call.args[1].value);
+                if (!radix) return nullptr;
+                if (radix->getType()->isIntegerTy() &&
+                    radix->getType()->getIntegerBitWidth() < 32)
+                    radix = rb.signedArg ? builder_.CreateSExt(radix, i32())
+                                         : builder_.CreateZExt(radix, i32());
+            }
             // strtoull for the unsigned 64-bit width (so the full magnitude is
             // captured); strtoll for everything else, range-checked below.
             bool isULongR = (pt == P::ULong);
