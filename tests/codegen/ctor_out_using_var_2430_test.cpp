@@ -63,16 +63,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic — guard
-// so an environment gap does not masquerade as this fix's own regression
-// (mirrors #2411's own test file / #1934 / #1833's identical guard).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Res — owned instance, destructor decrements a static counter read after
 // disposal: Res.alive == 0 at the end proves exactly-once disposal of every
@@ -123,7 +117,6 @@ BEZEL_TEST(ctor_out_using_var_2430,
         "    return Res.alive; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);   // pre-fix: does not even compile
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -163,7 +156,6 @@ BEZEL_TEST(ctor_out_using_var_2430,
         "    return Res.alive; "             // 0 -> +1 mint, -1 unwind-dispose
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -202,7 +194,6 @@ BEZEL_TEST(ctor_out_using_var_2430,
         "    return Res.alive; "   // x, y both out of scope now -> 0
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);
@@ -242,7 +233,6 @@ BEZEL_TEST(ctor_out_using_var_2430,
         "    return Res.alive; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     if (!r.ran) return;
     BEZEL_EXPECT_EQ(r.exitCode, 0);

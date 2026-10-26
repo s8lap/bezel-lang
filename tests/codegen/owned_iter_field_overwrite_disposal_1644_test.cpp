@@ -43,15 +43,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "runAotChecked: SKIP" diagnostic. clang
-// is required to build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Count non-overlapping occurrences of `needle` in `hay`.
 int countOccurrences(const std::string& hay, const std::string& needle) {
@@ -154,7 +149,6 @@ BEZEL_TEST(codegen_owned_iter_field_overwrite_1644,
     // WITHOUT the fix the first frame leaks (LSan: 32 bytes from bz$C$Gen) →
     // r.ran flips false. WITH the fix the run is LSan-clean.
     JitResult r = runAotChecked(kIEnumerableFieldOverwriteFramFreed);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -167,7 +161,6 @@ BEZEL_TEST(codegen_owned_iter_field_overwrite_1644,
     // "CELL-DISPOSED-1" never appears; WITH the fix it appears exactly once and
     // before "after-reset". Cell(2) (the new frame) is disposed once at scope end.
     JitResult r = runAotChecked(kIEnumerableFieldOverwriteDisposesCapture);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // LSan-clean: no leaked frame / capture
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 
@@ -194,7 +187,6 @@ BEZEL_TEST(codegen_owned_iter_field_overwrite_1644,
 BEZEL_TEST(codegen_owned_iter_field_overwrite_1644,
            plain_owned_class_field_overwrite_still_disposes_spec_28_7) {
     JitResult r = runAotChecked(kPlainClassFieldOverwriteStillDisposes);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // no leak / no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     // Cell(1) disposed on reassignment, Cell(2) at scope end — each exactly once.

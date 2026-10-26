@@ -79,12 +79,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 const char* kImport = "import System.Serialization; ";
 
@@ -127,7 +125,6 @@ BEZEL_TEST(serialization_manual_loop_backedge_double_free_2460,
         "  catch SerializationException => return 42; "
         "  end; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);         // no UAF / double-free (pre-fix: ASan abort)
     BEZEL_EXPECT_EQ(r.exitCode, 42);  // the missing-required-field error is still raised
 }
@@ -167,7 +164,6 @@ BEZEL_TEST(serialization_manual_loop_backedge_double_free_2460,
         "  catch SerializationException => return 42; "
         "  end; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);         // Target alone disposed cleanly, no leak
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -209,7 +205,6 @@ BEZEL_TEST(serialization_manual_loop_backedge_double_free_2460,
         "  end; "
         "  return 0; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }

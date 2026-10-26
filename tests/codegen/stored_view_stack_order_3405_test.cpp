@@ -102,14 +102,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
@@ -390,7 +386,6 @@ BEZEL_TEST(stored_view_stack_order_3405,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     // ASan/LSan clean via r.ran: the one element that left is discharged by
     // the loop and NOT re-disposed by the field's element-disposer pass, and
     // the two that stayed are disposed there exactly once.
@@ -449,7 +444,6 @@ BEZEL_TEST(stored_view_stack_order_3405,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // Unchanged by this fix — measured identical on 1e3861a and after.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "order=51020"));
@@ -531,7 +525,6 @@ BEZEL_TEST(stored_view_stack_order_3405,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // The two families must disagree — §4.11 gives the stack pop order and the
     // array (an `OwningArray`, no §4.11 reversal) front-to-back. A key-less

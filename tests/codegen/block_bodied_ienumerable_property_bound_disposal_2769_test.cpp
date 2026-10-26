@@ -108,13 +108,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Shared Holder + Item preamble for the IEnumerable<Item> tests — matches
 // the #2703 (B2) oracle's owning-field shape so the only thing under
@@ -245,7 +242,6 @@ BEZEL_TEST(codegen_block_bodied_ienumerable_property_bound_disposal_2769,
     std::string src = std::string("module M; ") + kHolderIEnumerableItem +
                       kBoundPlainVar;
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 25);
 }
@@ -260,7 +256,6 @@ BEZEL_TEST(codegen_block_bodied_ienumerable_property_bound_disposal_2769,
     std::string src = std::string("module M; ") + kHolderIEnumerableItem +
                       kUsingVarBlockGetter;
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 25);
 }
@@ -274,7 +269,6 @@ BEZEL_TEST(codegen_block_bodied_ienumerable_property_bound_disposal_2769,
     std::string src = std::string("module M; ") + kHolderIEnumerableItem +
                       kDirectForIn;
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 25);
 }
@@ -290,7 +284,6 @@ BEZEL_TEST(codegen_block_bodied_ienumerable_property_bound_disposal_2769,
 BEZEL_TEST(codegen_block_bodied_ienumerable_property_bound_disposal_2769,
            expression_bodied_class_typed_borrow_pin_still_pins_spec_28_10) {
     JitResult r = runAotChecked(kWidgetBorrowPinStillPins);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // Widget.live == 0 after Run()
 }

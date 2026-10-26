@@ -55,15 +55,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Count non-overlapping occurrences of `needle` in `hay`.
 int countOccurrences(const std::string& hay, const std::string& needle) {
@@ -165,7 +160,6 @@ const std::string kTemporaryCaptureless =
 BEZEL_TEST(owning_enumerator_temp_source_1641,
            temporary_source_no_leak_disposes_capture_spec_29_2) {
     JitResult r = runAotChecked(kTemporarySource);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
     BEZEL_EXPECT_TRUE(r.ran);            // LSan-clean: source frame + capture freed
     BEZEL_EXPECT_EQ(r.exitCode, 3);      // 1 + 2
     // Load-bearing: the temporary source's captured Cell(1) WAS disposed, exactly
@@ -178,7 +172,6 @@ BEZEL_TEST(owning_enumerator_temp_source_1641,
 BEZEL_TEST(owning_enumerator_temp_source_1641,
            temporary_source_captureless_no_frame_leak_spec_29_2) {
     JitResult r = runAotChecked(kTemporaryCaptureless);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // no leaked source frame
     BEZEL_EXPECT_EQ(r.exitCode, 6);      // 1 + 2 + 3
 }
@@ -201,7 +194,6 @@ BEZEL_TEST(owning_enumerator_temp_source_1641,
 BEZEL_TEST(owning_enumerator_temp_source_1641,
            named_source_control_not_double_disposed_spec_29_2) {
     JitResult r = runAotChecked(kNamedSource);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // no leak AND no double-free
     BEZEL_EXPECT_EQ(r.exitCode, 3);      // 1 + 2
     // The named source `g` disposes its captured Cell(1) exactly once (the

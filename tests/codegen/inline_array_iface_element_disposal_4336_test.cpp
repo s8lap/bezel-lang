@@ -47,13 +47,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// ASan toolchain skip-guard (mirrors #2548/#4317/#4336's harness helper).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 }  // namespace
 
@@ -105,7 +102,6 @@ const char* kLocalDeclInitLoop =
 BEZEL_TEST(inline_array_iface_element_disposal_4336,
            owning_local_decl_init_scope_end_disposal_spec_15_1_1_15_3) {
     JitResult r = runAotChecked(kLocalDeclInitLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 188);
     BEZEL_EXPECT_EQ(r.stdoutText, "");
@@ -157,7 +153,6 @@ const char* kWholeArrayReassignLoop =
 BEZEL_TEST(inline_array_iface_element_disposal_4336,
            owning_whole_array_reassign_disposes_displaced_spec_15_3) {
     JitResult r = runAotChecked(kWholeArrayReassignLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 232);
     BEZEL_EXPECT_EQ(r.stdoutText, "");
@@ -212,7 +207,6 @@ const char* kReturnStmtLoop =
 BEZEL_TEST(inline_array_iface_element_disposal_4336,
            owning_return_stmt_caller_disposes_callee_allocations_spec_15_1_1) {
     JitResult r = runAotChecked(kReturnStmtLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 188);
     BEZEL_EXPECT_EQ(r.stdoutText, "");
@@ -245,7 +239,6 @@ const char* kIntArrayLoop =
 BEZEL_TEST(inline_array_iface_element_disposal_4336,
            int_array_unaffected_by_disposal_paths_spec_15_1) {
     JitResult r = runAotChecked(kIntArrayLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 88);
     BEZEL_EXPECT_EQ(r.stdoutText, "");
@@ -293,7 +286,6 @@ const char* kOwnedLocalDeclLoop =
 BEZEL_TEST(inline_array_iface_element_disposal_4336,
            owned_interface_array_local_decl_init_disposes_spec_15_1_1) {
     JitResult r = runAotChecked(kOwnedLocalDeclLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 32);
     BEZEL_EXPECT_EQ(r.stdoutText, "");

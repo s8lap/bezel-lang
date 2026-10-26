@@ -69,13 +69,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// ASan toolchain skip-guard (matches the #2603 / #2606 / #2608 test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // ----------------------------------------------------------------------
 // (A) CARDINAL: an owned IReadOnlyList<Cell> field whose backing is an
@@ -234,7 +231,6 @@ const char* kConcreteOwningArrayLiteralControl =
 BEZEL_TEST(codegen_owning_literal_elem_disposer_2635,
            ireadonlylist_field_owning_literal_backing_elements_disposed_spec_28_11) {
     JitResult r = runAotChecked(kOwningLiteralBackedElements);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0 — disposed exactly once
 }
@@ -246,7 +242,6 @@ BEZEL_TEST(codegen_owning_literal_elem_disposer_2635,
 BEZEL_TEST(codegen_owning_literal_elem_disposer_2635,
            ireadonlylist_field_borrowing_literal_backing_not_disposed_spec_4_3) {
     JitResult r = runAotChecked(kBorrowingLiteralBackedElements);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0 — no double-free
 }
@@ -258,7 +253,6 @@ BEZEL_TEST(codegen_owning_literal_elem_disposer_2635,
 BEZEL_TEST(codegen_owning_literal_elem_disposer_2635,
            ireadonlylist_field_owning_literal_reassign_exactly_once_spec_28_11) {
     JitResult r = runAotChecked(kOwningLiteralReassign);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0 — 3 created, 3 disposed
 }
@@ -270,7 +264,6 @@ BEZEL_TEST(codegen_owning_literal_elem_disposer_2635,
 BEZEL_TEST(codegen_owning_literal_elem_disposer_2635,
            owningarray_field_literal_backing_static_path_unaffected_spec_28_5) {
     JitResult r = runAotChecked(kConcreteOwningArrayLiteralControl);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Cell.n = 0
 }

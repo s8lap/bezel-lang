@@ -49,15 +49,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway (mirrors #2004).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // (A) THE HEADLINE — a malformed literal fed to DateTime.Parse raises a
 // CATCHABLE FormatException, so the program reaches `return 0`. On base 9d2f00a
@@ -179,7 +174,6 @@ BEZEL_TEST(datetime_parse_uncatchable_2009, malformed_parse_is_caught_stdlib_2_5
 // =====================================================================
 BEZEL_TEST(datetime_parse_uncatchable_2009, all_malformed_shapes_throw_stdlib_2_5) {
     JitResult r = runAotChecked(kAllMalformedShapes);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
     BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: wild-pointer read on the first case
     BEZEL_EXPECT_EQ(r.exitCode, 88);
 }
@@ -190,7 +184,6 @@ BEZEL_TEST(datetime_parse_uncatchable_2009, all_malformed_shapes_throw_stdlib_2_
 // =====================================================================
 BEZEL_TEST(datetime_parse_uncatchable_2009, valid_renderings_still_parse_stdlib_2_5) {
     JitResult r = runAotChecked(kValidStillParses);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 55);
 }
@@ -201,7 +194,6 @@ BEZEL_TEST(datetime_parse_uncatchable_2009, valid_renderings_still_parse_stdlib_
 // =====================================================================
 BEZEL_TEST(datetime_parse_uncatchable_2009, tryparse_returns_false_no_throw_stdlib_2_5) {
     JitResult r = runAotChecked(kTryParseUnaffected);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 33);
 }

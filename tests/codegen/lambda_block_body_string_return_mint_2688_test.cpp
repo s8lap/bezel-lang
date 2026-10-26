@@ -68,14 +68,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // (A) The #2688 repro. Two borrowing `Dictionary<string,string>` locals each
 // take the same runtime-built string through `GetOrAdd` with a BLOCK-bodied
@@ -180,7 +176,6 @@ const char* kBlockBodyProducerReturnTransfers =
 BEZEL_TEST(codegen_lambda_block_body_string_return_mint_2688,
            get_or_add_block_body_factory_no_double_free_spec_28_11) {
     JitResult r = runAotChecked(kGetOrAddBlockBodyFactory);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
     BEZEL_EXPECT_TRUE(r.ran);          // no double-free (bug) and no leak
     BEZEL_EXPECT_EQ(r.exitCode, 142);  // both dictionaries still read back
 }
@@ -192,7 +187,6 @@ BEZEL_TEST(codegen_lambda_block_body_string_return_mint_2688,
 BEZEL_TEST(codegen_lambda_block_body_string_return_mint_2688,
            get_or_add_expression_body_factory_still_balanced_spec_27_3) {
     JitResult r = runAotChecked(kGetOrAddExpressionBodyFactory);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);         // no leak from a double-retain
     BEZEL_EXPECT_EQ(r.exitCode, 142);
 }
@@ -204,7 +198,6 @@ BEZEL_TEST(codegen_lambda_block_body_string_return_mint_2688,
 BEZEL_TEST(codegen_lambda_block_body_string_return_mint_2688,
            closure_call_block_body_borrow_return_no_double_free_spec_27_7) {
     JitResult r = runAotChecked(kClosureCallBlockBodyBorrowReturn);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 71);
 }
@@ -217,7 +210,6 @@ BEZEL_TEST(codegen_lambda_block_body_string_return_mint_2688,
 BEZEL_TEST(codegen_lambda_block_body_string_return_mint_2688,
            block_body_producer_return_transfers_without_extra_mint_spec_28_9) {
     JitResult r = runAotChecked(kBlockBodyProducerReturnTransfers);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 111);
 }

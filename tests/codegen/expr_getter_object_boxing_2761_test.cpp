@@ -93,14 +93,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // The issue's own repro, expression body. 41 iff a real box reached the caller.
 const char* kObjectExprGetter =
@@ -559,7 +555,6 @@ BEZEL_TEST(codegen_expr_getter_object_boxing_2761,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kClassExprGetterNoBox);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);   // LSan forces 1 on any leak
 }
@@ -571,7 +566,6 @@ BEZEL_TEST(codegen_expr_getter_object_boxing_2761,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kStringExprGetterNoBox);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -583,7 +577,6 @@ BEZEL_TEST(codegen_expr_getter_object_boxing_2761,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kIntExprGetterUnchanged);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }

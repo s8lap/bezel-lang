@@ -79,14 +79,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // (A) THE #2691 REPRO. `f`'s ascribed return type is the function type
 // `() -> int` and its BLOCK body returns the captured closure local `inner` — a
@@ -200,7 +196,6 @@ const char* kBlockBodyProducerReturnTransfers =
 BEZEL_TEST(codegen_lambda_closure_return_mint_agreement_2691,
            block_body_closure_return_captured_no_use_after_free_spec_28_9) {
     JitResult r = runAotChecked(kBlockBodyClosureReturnCaptured);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
     BEZEL_EXPECT_TRUE(r.ran);         // no UAF (the bug) and no leak
     BEZEL_EXPECT_EQ(r.exitCode, 42);  // the returned closure still computes 7
 }
@@ -212,7 +207,6 @@ BEZEL_TEST(codegen_lambda_closure_return_mint_agreement_2691,
 BEZEL_TEST(codegen_lambda_closure_return_mint_agreement_2691,
            expr_body_closure_return_captured_still_sound_spec_27_3) {
     JitResult r = runAotChecked(kExprBodyClosureReturnCaptured);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -224,7 +218,6 @@ BEZEL_TEST(codegen_lambda_closure_return_mint_agreement_2691,
 BEZEL_TEST(codegen_lambda_closure_return_mint_agreement_2691,
            block_body_closure_return_escaping_by_method_return_balanced_spec_27_7) {
     JitResult r = runAotChecked(kBlockBodyClosureReturnEscapesByMethodReturn);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
@@ -249,7 +242,6 @@ BEZEL_TEST(codegen_lambda_closure_return_mint_agreement_2691,
 BEZEL_TEST(codegen_lambda_closure_return_mint_agreement_2691,
            block_body_producer_return_transfers_without_extra_mint_spec_28_9) {
     JitResult r = runAotChecked(kBlockBodyProducerReturnTransfers);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }

@@ -82,12 +82,10 @@ int run(const std::string& src) {
     return r.ran ? r.exitCode : -999;
 }
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
@@ -152,7 +150,6 @@ BEZEL_TEST(dict_entry_key_release_capture_envdtor_4127,
 BEZEL_TEST(dict_entry_key_release_capture_envdtor_4127,
            var_first_captured_escaping_closure_leak_free) {
     JitResult r = runAotChecked(makeClosureProgram("var", "First()"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1000"));
 }
@@ -165,7 +162,6 @@ BEZEL_TEST(dict_entry_key_release_capture_envdtor_4127,
 BEZEL_TEST(dict_entry_key_release_capture_envdtor_4127,
            const_first_captured_escaping_closure_leak_free) {
     JitResult r = runAotChecked(makeClosureProgram("const", "First()"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1000"));
 }
@@ -178,7 +174,6 @@ BEZEL_TEST(dict_entry_key_release_capture_envdtor_4127,
 BEZEL_TEST(dict_entry_key_release_capture_envdtor_4127,
            var_last_captured_escaping_closure_leak_free) {
     JitResult r = runAotChecked(makeClosureProgram("var", "Last()"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=5500"));
 }
@@ -218,7 +213,6 @@ BEZEL_TEST(dict_entry_key_release_capture_envdtor_4127,
         "  end Main; "
         "end C;";
     JitResult r = runAotCheckedLenient(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=1000"));
 }

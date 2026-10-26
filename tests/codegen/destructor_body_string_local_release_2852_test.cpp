@@ -81,13 +81,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // sum over i in 1..20 of len("tg-{i}") = 9*4 + 11*5 = 91.
 constexpr int kLenSum20 = 91;
@@ -155,7 +152,6 @@ const char* kDestructorSelfFieldBorrow =
 BEZEL_TEST(codegen_destructor_body_string_local_release_2852,
            destructor_body_locals_are_released_spec_28_4) {
     JitResult r = runAotChecked(kDestructorBodyLocals);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
@@ -176,7 +172,6 @@ BEZEL_TEST(codegen_destructor_body_string_local_release_2852,
 BEZEL_TEST(codegen_destructor_body_string_local_release_2852,
            destructor_borrow_local_field_survives_every_disposal_spec_28_3) {
     JitResult r = runAotChecked(kDestructorSelfFieldBorrow);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }

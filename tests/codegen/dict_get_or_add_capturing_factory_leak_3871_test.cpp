@@ -87,14 +87,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent — mirrors dict_string_key_leak_3703_test.cpp / dict_get_or_add_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // A resource class: a static counter tracks live-vs-disposed instances and a
 // Tag field carries a per-instance value, set from the factory's capture.
@@ -133,7 +129,6 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_leak_3871,
         "  i := i + 1; "
         "end; "
         "return int(R._n <> 300); "));  // 0 iff every MISS-produced R is disposed
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -161,7 +156,6 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_leak_3871,
         "  i := i + 1; "
         "end; "
         "return int(R._n <> 300); "));  // 0 iff every pre-populated R is disposed
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -213,7 +207,6 @@ BEZEL_TEST(dict_get_or_add_capturing_factory_leak_3871,
         "end; "
         // One R stored by EACH of the two dicts per iteration == 600.
         "return int(R._n <> 600); "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

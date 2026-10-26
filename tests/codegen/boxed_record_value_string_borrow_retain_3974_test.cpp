@@ -105,15 +105,10 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-// Was this JitResult a SKIP (toolchain unavailable) rather than a real failure?
-// Matches the pattern in dict_box_value_nested_field_freer_3798_test.cpp and
-// aot_checked_lenient_2214_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // The issue's own non-generic control repro (verbatim from the issue body).
 // `s` is a plain local with its own `+1`; passing it as a bare identifier
@@ -149,7 +144,6 @@ BEZEL_TEST(boxed_record_value_string_borrow_retain_3974,
         "  return acc mod 100; "
         "end Main; end C;";
     JitResult r = runAotCheckedLenient(src);
-    if (wasSkipped(r)) return;
     // FAIL-WITHOUT pin: a UAF in the box's `string_retain` / `string_release`
     // path trips generated-code ASan, the runAotCheckedLenient impl reports
     // a sanitizer-failure diagnostic, and r.ran stays false. We do NOT
@@ -183,7 +177,6 @@ BEZEL_TEST(boxed_record_value_string_borrow_retain_3974,
         "  return acc mod 100; "
         "end Main; end C;";
     JitResult r = runAotCheckedLenient(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -212,7 +205,6 @@ BEZEL_TEST(boxed_record_value_string_borrow_retain_3974,
         "  return acc mod 100; "
         "end Main; end C;";
     JitResult r = runAotCheckedLenient(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
 }
 

@@ -77,13 +77,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 std::string sanitizerText(const JitResult& r) {
     std::string all;
@@ -251,7 +248,6 @@ const char* kSyncNeverIteratedFinally =
 BEZEL_TEST(codegen_iter_finally_dispose_string_local_release_2853,
            abandoned_sync_iterator_finally_body_string_local_releases_spec_29_7) {
     JitResult r = runAotChecked(kIteratorAbandonedWithFinally);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);              // 380 B / 20 pre-fix
     const std::string t = sanitizerText(r);
     BEZEL_EXPECT_EQ(t.find("detected memory leaks"), std::string::npos);
@@ -278,7 +274,6 @@ BEZEL_TEST(codegen_iter_finally_dispose_string_local_release_2853,
 BEZEL_TEST(codegen_iter_finally_dispose_string_local_release_2853,
            exhausted_sync_iterator_finally_body_releases_once_spec_29_7) {
     JitResult r = runAotChecked(kSyncExhaustedFinally);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     const std::string t = sanitizerText(r);
     BEZEL_EXPECT_EQ(t.find("detected memory leaks"), std::string::npos);
@@ -294,7 +289,6 @@ BEZEL_TEST(codegen_iter_finally_dispose_string_local_release_2853,
 BEZEL_TEST(codegen_iter_finally_dispose_string_local_release_2853,
            abandoned_async_iterator_finally_body_string_local_releases_spec_30_7) {
     JitResult r = runAotChecked(kAsyncIteratorAbandonedWithFinally);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     const std::string t = sanitizerText(r);
     BEZEL_EXPECT_EQ(t.find("detected memory leaks"), std::string::npos);

@@ -57,12 +57,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // The exact program the issue pins: an `IOwningEnumerable<T>` for-in whose
 // body does NOT explicitly discharge the loop variable (the §29.2/§28.3
@@ -223,7 +221,6 @@ void expectClean(const JitResult& r, const char* expectOut) {
 BEZEL_TEST(forin_owning_enumerable_loop_element_autodrop_3604,
            abandoned_undischarged_loop_element_disposed_on_29_7) {
     JitResult r = runAotChecked(abandonProgram());
-    if (wasSkipped(r)) return;
     expectClean(r, kAbandonedOut);
 }
 
@@ -235,7 +232,6 @@ BEZEL_TEST(forin_owning_enumerable_loop_element_autodrop_3604,
 BEZEL_TEST(forin_owning_enumerable_loop_element_autodrop_3604,
            abandoned_explicit_discharge_clean_29_7) {
     JitResult r = runAotChecked(workaroundProgram());
-    if (wasSkipped(r)) return;
     expectClean(r, kAbandonedOut);
     // No warning on `x` (the body discharged it explicitly via `using var u :=
     // owned x;`).
@@ -255,6 +251,5 @@ BEZEL_TEST(forin_owning_enumerable_loop_element_autodrop_3604,
 BEZEL_TEST(forin_owning_enumerable_loop_element_autodrop_3604,
            non_iterator_break_keeps_autodrop_on_29_2) {
     JitResult r = runAotChecked(nonIteratorBreakProgram());
-    if (wasSkipped(r)) return;
     expectClean(r, "t=0");
 }

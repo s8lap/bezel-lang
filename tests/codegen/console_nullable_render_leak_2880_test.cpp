@@ -91,12 +91,10 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 std::string out(const JitResult& r) {
     return r.ran ? r.stdoutText : std::string("<did-not-run>");
@@ -323,7 +321,6 @@ BEZEL_TEST(codegen_console_nullable_render_leak_2880,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kMintingRendersReleasedOnce);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: false (LSan: 240 allocations)
     BEZEL_EXPECT_EQ(r.exitCode, 41);   // and the values are still correct
 }
@@ -339,7 +336,6 @@ BEZEL_TEST(codegen_console_nullable_render_leak_2880,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kSentinelAndNullArms);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -363,7 +359,6 @@ BEZEL_TEST(codegen_console_nullable_render_leak_2880,
     for (int i = 0; i < 41; ++i) expected += "abcd\n";
     BEZEL_EXPECT_TRUE(out(plain) == expected);
     JitResult r = runAotCheckedLenient(kNullableStringUntouched);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }
@@ -379,7 +374,6 @@ BEZEL_TEST(codegen_console_nullable_render_leak_2880,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     JitResult r = runAotChecked(kEnumUserToStringArms);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // pre-fix: false (the minting arm leaked)
     BEZEL_EXPECT_EQ(r.exitCode, 41);
 }

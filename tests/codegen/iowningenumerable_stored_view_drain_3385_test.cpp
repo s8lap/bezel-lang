@@ -114,14 +114,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // The shared prelude: an owning collection field, the §28.6 stored-view face
 // at `IOwningEnumerable<Item>`, and a window onto the field's residual count.
@@ -172,7 +168,6 @@ BEZEL_TEST(iowningenumerable_stored_view_drain_3385,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     // Pre-fix: ASan heap-use-after-free in bz$elemDispose <- bz_array_free
     // <- C$DisposeCore — the field's disposer pass reached the elements the
     // loop had already discharged.
@@ -207,7 +202,6 @@ BEZEL_TEST(iowningenumerable_stored_view_drain_3385,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     // Pre-fix: the one discharged element was still in the field's array, so
     // the holder's disposer pass faulted on it (UAF). Post-fix the two
     // undrained elements are disposed exactly once, by the field's holder —
@@ -246,7 +240,6 @@ BEZEL_TEST(iowningenumerable_stored_view_drain_3385,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     // Pre-fix the borrowing slot 3 left every slot populated, so the second
     // loop replayed all three elements (the single-consumption violation
     // #3355's commit body recorded) and then double-disposed them.
@@ -296,7 +289,6 @@ BEZEL_TEST(iowningenumerable_stored_view_drain_3385,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     // `ran` is simultaneously the no-UAF and the no-LEAK assertion (ASan+LSan).
     // Without #3392 this leaks V's 24-byte frame; without THIS commit's slot-4
     // clone, V and C are the same pointer and #3392's claim double-frees it.

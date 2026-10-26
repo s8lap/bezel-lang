@@ -54,12 +54,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // (A) The real repro: a `long?` block-bodied lambda returning an `int` literal.
 // The payload must be widened i32 -> i64 before the `{ i8, i64 }` wrap.
@@ -185,7 +183,6 @@ BEZEL_TEST(codegen_lambda_block_nullable_return_2716,
 BEZEL_TEST(codegen_lambda_block_nullable_return_2716,
            string_block_lambda_still_mints_its_plus_one_2688) {
     JitResult r = runAotChecked(kStringBlockLambdaStillMints);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 64);
 }

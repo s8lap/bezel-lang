@@ -73,14 +73,12 @@ namespace {
 // runAotChecked returns r.ran=false (and an Error diagnostic naming the signal)
 // when the program crashes or a sanitizer fires — pre-fix every repro below
 // either SIGSEGVs at field disposal (the §29.7 broken vtable read) or triggers
-// LSan; post-fix every repro exits 0 with no leak. A skip ("SKIP" diagnostic)
-// is not expected because the suite requires clang to build, but guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// LSan; post-fix every repro exits 0 with no leak.
+//
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // #2778 canonical repro: an `owned` class FIELD typed `IEnumerable<int>` is
 // filled with a moved local `Array<int>`. At class disposal the §29.7 iterator-
@@ -177,7 +175,6 @@ BEZEL_TEST(codegen_ienumerable_field_init_no_segv_2778,
     // SIGSEGVs. Post-fix the wrap is correct, the for-in sums 6, and disposal
     // frees the wrap frame + backing array.
     JitResult r = runAotChecked(kArrayIntoIEnumerableField);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 6);
 }
@@ -189,7 +186,6 @@ BEZEL_TEST(codegen_ienumerable_field_init_no_segv_2778,
     // post-fix disposal walker also visits the autoprop-storage MemberSymbol
     // so the slot-1 Dispose reclaims the OWNING wrap.
     JitResult r = runAotChecked(kArrayIntoIEnumerableAutoProp);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 60);
 }
@@ -200,7 +196,6 @@ BEZEL_TEST(codegen_ienumerable_field_init_no_segv_2778,
     // but an initializer expression. The wrapping must happen at the
     // initializer site, not at a later assignment.
     JitResult r = runAotChecked(kArrayIntoIEnumerableFieldInit);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

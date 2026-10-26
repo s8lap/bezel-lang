@@ -119,7 +119,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
 // ⚠ FORWARD-LOOKING: the two not_armed rows below ASSERT a residual leak
 // that is a deliberate, permanently-accepted leak-over-UAF tradeoff —
 // #2746 item 3 for the aliasing-getter shape (case A), and the general
@@ -137,14 +136,11 @@ namespace {
 // CLEAN outcome — the flip this comment predicted, taken as sanctioned.
 // CASE A still pins its #2746-item-3 residual and is deliberately left
 // asserting the leak: the aliasing-GETTER exclusion was NOT tightened.
-// absent — mirrors string_index_arg_release_2717_test.cpp /
-// dict_call_arg_key_local_release_3886_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 std::string sanitizerText(const JitResult& r) {
     std::string all;
@@ -265,7 +261,6 @@ BEZEL_TEST(dict_shadow_class_string_key_guard_3897,
     // The load-bearing gate: pre-fix this is `heap-use-after-free` in main,
     // which expectLeakButNoMemoryError rejects explicitly.
     JitResult r = runAotChecked(kShadowDictIndexerAliasingGetter);
-    if (wasSkipped(r)) return;
     expectLeakButNoMemoryError(r);
 }
 
@@ -305,7 +300,6 @@ BEZEL_TEST(dict_shadow_class_string_key_guard_3897,
     // double-free and SEGV must all be absent. "no leak" alone would pass on
     // a program that simply stopped running.
     JitResult r = runAotChecked(kShadowDictGenericMethodAliasingReturn);
-    if (wasSkipped(r)) return;
     const std::string t = sanitizerText(r);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 4);          // the aliasing return still survives
@@ -328,7 +322,6 @@ BEZEL_TEST(dict_shadow_class_string_key_guard_3897,
 BEZEL_TEST(dict_shadow_class_string_key_guard_3897,
            shadow_dict_non_aliasing_element_stays_leak_free_spec_23_4) {
     JitResult r = runAotChecked(kShadowDictNonAliasingElementStaysClean);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);   // no leak report at all — fully clean
     BEZEL_EXPECT_EQ(r.exitCode, 20);
 }

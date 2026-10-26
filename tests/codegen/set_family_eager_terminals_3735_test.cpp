@@ -61,12 +61,10 @@ using bezel::test::runAotOut;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // `Box: IComparable<Box>` — the class element shared by the SortedSet and
 // OwningSet rows. `Pt` is the record element (auto-hashable, §9.2).
@@ -450,7 +448,6 @@ BEZEL_TEST(set_family_eager_terminals_3735,
         "      total := total + s.Sum() + s.Min() + s.Max() + s.ElementAt(1);\n"
         "    end;\n"
         "    Console.WriteLine($\"total={total}\");"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // (60 + 10 + 30 + 10) * 200 = 22000.
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("total=22000\n"));
@@ -467,7 +464,6 @@ BEZEL_TEST(set_family_eager_terminals_3735,
         "                     + s.First().Length + s.Last().Length;\n"
         "    end;\n"
         "    Console.WriteLine($\"total={total}\");"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // (13 + 4 + 4) * 200 = 4200.
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("total=4200\n"));
@@ -490,7 +486,6 @@ BEZEL_TEST(set_family_eager_terminals_3735,
         "                     + s.ElementAt(1).Value;\n"
         "    end;\n"
         "    Console.WriteLine($\"total={total}\");"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // (60 + 20) * 200 = 16000.
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("total=16000\n"));
@@ -510,7 +505,6 @@ BEZEL_TEST(set_family_eager_terminals_3735,
         "                     + s.First().Value;\n"
         "    end;\n"
         "    Console.WriteLine($\"total={total}\");"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // (60 + 30) * 200 = 18000.
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("total=18000\n"));

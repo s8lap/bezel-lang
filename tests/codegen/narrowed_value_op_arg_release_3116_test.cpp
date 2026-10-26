@@ -90,16 +90,10 @@ using bezel::test::diagnosticMessageContains;
 
 namespace {
 
-// ASan toolchain absence bail-out. Mirrors the helper in
-// narrowed_value_unbox_3090_test.cpp and the rest of the suite — when r.ran
-// is false the test "did not run", and the only legitimate cause the harness
-// recognises for that today is a SKIP diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 }  // namespace
 
@@ -129,7 +123,6 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
         "    return 7; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // Pre-fix the box leaked (24 B × 10000 = 240 KB, LSan-flagged); with
     // this fix the release runs, `acc` reaches the sentinel, Main returns
@@ -168,7 +161,6 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
         "    return 7; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // b == 10099 only when i == 9999 (Take(9999) = 9999 + 100 = 10099).
     // Pre-fix the box leaked (24 B × 10000 = 240 KB, LSan-flagged); with
@@ -251,7 +243,6 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     // fix #3903: a clean sema rejection at a real source location, naming
     // the operator and `Object` — never `hasErrors()`/`!ran` alone, which
     // could not tell this apart from the IR-verification crash it replaces.
@@ -283,7 +274,6 @@ BEZEL_TEST(codegen_narrowed_value_op_arg_release_3116,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     // fix #3895 (issue #3892): pin that the failure is SPECIFICALLY the
     // expected leak report, not a compiler crash / unrelated runtime signal
     // that a bare `!ran` cannot tell apart from the leak this row wants.

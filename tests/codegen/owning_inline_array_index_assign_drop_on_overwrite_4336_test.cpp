@@ -46,13 +46,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// ASan toolchain skip-guard (mirrors #2548/#4317's harness helper).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 }  // namespace
 
@@ -99,7 +96,6 @@ const char* kSingleIndexOverwriteLoop =
 BEZEL_TEST(owning_inline_array_index_assign_drop_on_overwrite_4336,
            single_index_overwrite_does_not_leak_spec_15_1_1_28_7) {
     JitResult r = runAotChecked(kSingleIndexOverwriteLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // Loop computes (5 chars * 200 iterations) = 1000 — the sink observable is
     // independent of the disposal semantics, but asserting it confirms the
@@ -142,7 +138,6 @@ const char* kSingleIndexNonOverwritten =
 BEZEL_TEST(owning_inline_array_index_assign_drop_on_overwrite_4336,
            single_index_non_overwritten_slot_does_not_double_dispose_spec_28_7) {
     JitResult r = runAotChecked(kSingleIndexNonOverwritten);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, (1 + 3) % 256);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -185,7 +180,6 @@ const char* kBorrowShapeOverwrite =
 BEZEL_TEST(owning_inline_array_index_assign_drop_on_overwrite_4336,
            single_index_write_into_borrow_slot_does_not_over_dispose_spec_15_1) {
     JitResult r = runAotChecked(kBorrowShapeOverwrite);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, (5 + 5) % 256);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());

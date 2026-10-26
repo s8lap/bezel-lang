@@ -66,14 +66,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Parse a trailing "HITS <number>" line from `r.stdoutText`.
 long parseHits(const std::string& text) {
@@ -163,7 +159,6 @@ const char* kLinkedListReturnAsIEnumerableReiterable =
 BEZEL_TEST(codegen_owning_linked_list_returned_as_ienumerable_3354,
            linked_list_return_as_ienumerable_no_uaf_28_9) {
     JitResult r = runAotChecked(kLinkedListReturnAsIEnumerable);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // no UAF on bz_llist_first_node
     BEZEL_EXPECT_EQ(parseHits(r.stdoutText), 300);
 }
@@ -176,7 +171,6 @@ BEZEL_TEST(codegen_owning_linked_list_returned_as_ienumerable_3354,
 BEZEL_TEST(codegen_owning_linked_list_returned_as_ienumerable_3354,
            linked_list_return_as_ienumerable_reiterable_29_11) {
     JitResult r = runAotChecked(kLinkedListReturnAsIEnumerableReiterable);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(parseHits(r.stdoutText), 360);
 }

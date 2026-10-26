@@ -59,15 +59,10 @@ int run(const std::string& program) {
     return r.ran ? r.exitCode : -999;
 }
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic (mirrors
-// the #2475/#1982/#1988/#1934 leak tests' own guard).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Per tests/README.md: runAot's WIFSIGNALED path also synthesizes an Error
 // diagnostic for a runtime crash, so a genuine compile-time rejection must
@@ -326,7 +321,6 @@ BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
     JitResult r = runAotChecked(choiceLoopCount(
         "choice Item I(x: int, y: int); end Item; ", "Item.I(i, i + 1)",
         /*throughGenericT=*/false));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);         // compiled + LSan-clean
     BEZEL_EXPECT_EQ(r.exitCode, 40);  // every render byte-correct (Length > 0)
 }
@@ -336,7 +330,6 @@ BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
     JitResult r = runAotChecked(choiceLoopCount(
         "choice Color Red, Green(value: int), Blue; end Color; ",
         "Color.Red", /*throughGenericT=*/false));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -351,7 +344,6 @@ BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
     JitResult r = runAotChecked(choiceLoopCount(
         "choice Named N(tag: string, n: int); end Named; ",
         "Named.N(\"item\", i)", /*throughGenericT=*/false));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
@@ -361,7 +353,6 @@ BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
     JitResult r = runAotChecked(choiceLoopCount(
         "choice Item I(x: int, y: int); end Item; ", "Item.I(i, i + 1)",
         /*throughGenericT=*/true));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }

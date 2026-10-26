@@ -80,13 +80,10 @@ using bezel::test::runAot;
 
 namespace {
 
-// ASan toolchain skip-guard (matches #2603 / #2598 / #2587 test pattern).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Disposable class whose destructor bumps a static counter, identical to
 // #1543 / #1594 / #2603's test scaffolding. Allows verification of disposal
@@ -167,7 +164,6 @@ BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
     // per §22.10 (v0.254) — "Silently dropping the parameter would be a leak"
     // reading; see file header.
     JitResult r = runAotChecked(kUnused);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // LSan-clean (the #3205 leak flips this)
     BEZEL_EXPECT_EQ(r.exitCode, 1);      // ResL._n == 1 (one r constructed + disposed)
 }
@@ -179,7 +175,6 @@ BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
 BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
            body_referenced_owned_primary_param_unchanged_spec_22_10) {
     JitResult r = runAotChecked(kUsed);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);      // counter unchanged from probe A's value
 }
@@ -193,7 +188,6 @@ BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
 BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
            init_consumed_owned_primary_param_unchanged_spec_22_10) {
     JitResult r = runAotChecked(kInitConsumed);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
@@ -263,7 +257,6 @@ BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
         "  do using var u := new DerivedL(new ResL(5)); end; "
         "  return ResL._n; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // LSan-clean (no leak through the base call)
     BEZEL_EXPECT_EQ(r.exitCode, 1);      // ResL disposed exactly once (via BaseL's capture)
 }

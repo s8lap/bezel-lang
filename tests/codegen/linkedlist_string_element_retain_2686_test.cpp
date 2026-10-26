@@ -67,14 +67,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // (A) The #2686 repro, reduced to a leak-neutral shape: a collection literal in
 // CALL-ARGUMENT position becomes an owned temp whose disposal releases each
@@ -195,7 +191,6 @@ const char* kProducerElementTransfersNotRetained =
 BEZEL_TEST(codegen_linkedlist_string_element_retain_2686,
            literal_temp_no_double_free_of_shared_string_spec_28_11) {
     JitResult r = runAotChecked(kLiteralTempReleasesUnretainedString);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
     BEZEL_EXPECT_TRUE(r.ran);          // no double-free (the bug) and no leak
     BEZEL_EXPECT_EQ(r.exitCode, 213);  // every element still readable
 }
@@ -207,7 +202,6 @@ BEZEL_TEST(codegen_linkedlist_string_element_retain_2686,
 BEZEL_TEST(codegen_linkedlist_string_element_retain_2686,
            add_first_last_with_using_var_disposal_balanced_spec_28_9) {
     JitResult r = runAotChecked(kAddFirstAddLastUsingVarBalanced);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 80);
 }
@@ -219,7 +213,6 @@ BEZEL_TEST(codegen_linkedlist_string_element_retain_2686,
 BEZEL_TEST(codegen_linkedlist_string_element_retain_2686,
            add_before_after_retain_element_not_node_spec_28_11) {
     JitResult r = runAotChecked(kAddBeforeAddAfterRetainElementNotNode);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 213);
 }
@@ -231,7 +224,6 @@ BEZEL_TEST(codegen_linkedlist_string_element_retain_2686,
 BEZEL_TEST(codegen_linkedlist_string_element_retain_2686,
            producer_element_transfers_without_extra_retain_spec_28_9) {
     JitResult r = runAotChecked(kProducerElementTransfersNotRetained);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);         // no leak from a double-retain
     BEZEL_EXPECT_EQ(r.exitCode, 213);
 }

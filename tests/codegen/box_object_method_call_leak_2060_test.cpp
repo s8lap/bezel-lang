@@ -54,15 +54,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "runAotChecked: SKIP" diagnostic.
-// clang is required to build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // §8.6 / §28.9 / #2060: the issue's exact pattern. A record `r` boxed into
 // `o: Object`, then `o.GetHashCode()` is called as a direct method call on the
@@ -150,7 +145,6 @@ BEZEL_TEST(codegen_box_object_method_call_2060,
     // r.ran false. WITH the fix the receiver is a safe read and the box is
     // released exactly once per iteration (no leak, no double-free).
     JitResult r = runAotChecked(kBoxObjectMethodCallLoop);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
 
     BEZEL_EXPECT_TRUE(r.ran);   // LSan-clean (the #2060 leak would flip this)
 }
@@ -162,7 +156,6 @@ BEZEL_TEST(codegen_box_object_method_call_2060,
 BEZEL_TEST(codegen_box_object_method_call_2060,
            object_method_call_int_box_two_calls_spec_8_6_28_9) {
     JitResult r = runAotChecked(kBoxIntMethodCallLoop);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
 }
@@ -175,7 +168,6 @@ BEZEL_TEST(codegen_box_object_method_call_2060,
 BEZEL_TEST(codegen_box_object_method_call_2060,
            null_cond_method_call_receiver_does_not_leak_spec_8_6_28_9) {
     JitResult r = runAotChecked(kBoxNullCondMethodCallLoop);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
 }

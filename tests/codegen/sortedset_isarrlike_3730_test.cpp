@@ -39,12 +39,10 @@ using bezel::test::runAotOut;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 std::string prog(const std::string& body) {
     return std::string("module M;\n"
@@ -154,7 +152,6 @@ BEZEL_TEST(sortedset_isarrlike_3730,
         "      total := total + st.Count;\n"
         "    end;\n"
         "    Console.WriteLine($\"total={total}\");"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("total=800\n"));
 }
@@ -176,7 +173,6 @@ BEZEL_TEST(sortedset_isarrlike_3730, string_elements_leak_free_200x) {
         "      total := total + w.Count;\n"
         "    end;\n"
         "    Console.WriteLine($\"total={total}\");"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // Per iteration: arr.Count=3, w.Count=1 ("apple" is the only >4-length
     // element) -> 4/iteration * 200 = 800.
@@ -236,7 +232,6 @@ BEZEL_TEST(sortedset_isarrlike_3730, class_elements_leak_free_200x) {
         "  end Main;\n"
         "end C;\n";
     auto r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // (30+10+20) * 200 = 12000.
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("total=12000\n"));

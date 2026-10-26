@@ -121,15 +121,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent — mirrors dict_string_key_leak_3703_test.cpp / dict_family_tryadd_
-// 3372_test.cpp.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 std::string prog(const std::string& mainBody) {
     return "module M; class C public static method Main(): int " + mainBody +
@@ -177,7 +172,6 @@ BEZEL_TEST(dict_indexer_set_key_local_release_3872,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // "shared" + digits(j): 7 chars for j in [0,9], 8 for [10,99], 9 for [100,199].
     int expected = 0;
@@ -209,7 +203,6 @@ BEZEL_TEST(dict_indexer_set_key_local_release_3872,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) {
@@ -242,7 +235,6 @@ BEZEL_TEST(dict_indexer_set_key_local_release_3872,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return R._n; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 200; ++j) {
@@ -299,7 +291,6 @@ BEZEL_TEST(dict_indexer_set_key_local_release_3872,
         "end; "
         "Console.WriteLine($\"total={total}\"); "
         "return 0; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     int expected = 0;
     for (int j = 0; j < 50; ++j) {

@@ -49,15 +49,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // 60 is the issue's repro sum: 20 iterations of `[1, 2]` yields 1 + 2 each,
 // repeated 20 times = 60. The exit-code pinning pins the enumeration value
@@ -102,7 +97,6 @@ BEZEL_TEST(forin_owned_field_ienumerable_property_2815,
         "  return total; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
     BEZEL_EXPECT_TRUE(r.ran);    // ASan-clean (wrapper frame freed exactly once)
     BEZEL_EXPECT_EQ(r.exitCode, kExpectedSum);  // 20 × (1+2) = 60
 }
@@ -137,7 +131,6 @@ BEZEL_TEST(forin_owned_field_ienumerable_property_2815,
         "  return total; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpectedSum);
 }
@@ -171,7 +164,6 @@ BEZEL_TEST(forin_owned_field_ienumerable_property_2815,
         "  return total; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpectedSum);
 }
@@ -209,7 +201,6 @@ BEZEL_TEST(forin_owned_field_ienumerable_property_2815,
         "  return total; "
         "end Main; end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kExpectedSum);
 }
