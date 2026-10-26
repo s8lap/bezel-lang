@@ -1037,6 +1037,18 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
         !rt->declaration && rt->astNode && rt->astNode->name &&
         rt->astNode->name->parts.size() == 1 &&
         !isBuiltinTypeRefName(rt->headName())) {
+        // fix #6870 (§14.2 / §11.8, v0.343): a type parameter whose
+        // constraints make it a REFERENCE (§14.2's `class` arm, or a
+        // class-type bound) is erased to a `ptr` in the ERASED TEMPLATE, not
+        // to the `int` placeholder — so its nullable companion `T?` is a
+        // nullable REFERENCE, i.e. a plain pointer (§7.1), not the
+        // `{i8, i32}` tagged value struct. Read the same predicate the
+        // non-nullable arm reads (typeParamErasedAsReference), and only
+        // where no active substitution binds the name — every specialization
+        // resolves the name through `genericSubst_` first.
+        if (genericSubst_.find(rt->headName()) == genericSubst_.end() &&
+            typeParamErasedAsReference(rt->headName()))
+            return ptrTy();
         if (!genericSubstSemaTy_.empty()) {
             sema::TypeRef nv;
             if (nullableTypeParamConcrete(rt, nv)) {
@@ -1056,8 +1068,22 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 // (IR-verify failure, `bezelc -c` exit 1). The same placeholder
                 // struct the template `bz$M.Inner$Head` already uses keeps the
                 // signature and every return in that body consistent.
-                if (isBareTypeParamRef(&nv))
+                if (isBareTypeParamRef(&nv)) {
+                    // fix #6870 (§14.2 / §11.8, v0.343): the
+                    // substitution may map this parameter onto ANOTHER, still-
+                    // unbound type parameter (`T → U`) — the pseudo-
+                    // specialization of an inner generic built from inside an
+                    // OUTER generic's body. When THAT parameter is itself
+                    // reference-constrained (`where U: class`), the nullable
+                    // form is a nullable REFERENCE (§7.1) — a plain pointer —
+                    // not the `{i8, i32}` tagged value struct the placeholder
+                    // arm below returns. The two must agree: the erased body
+                    // reads the value as the pointer the pseudo-
+                    // specialization's signature declares.
+                    if (typeParamErasedAsReference(nv.headName()))
+                        return ptrTy();
                     return nullablePrimStructTy(sema::PrimitiveType::Int);
+                }
                 // resolved to a reference type → plain ptr `?` lowering.
             } else {
                 // a type param with no active binding — fall to template rule.
@@ -1607,6 +1633,41 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                         "fallback and a pointer-sized type is truncated to "
                         "32 bits (#3577, residue of #3540).");
             }
+            // fix #6870 (§14.2 / §11.8, v0.343): a bare
+            // type parameter whose constraints make it a REFERENCE (§14.2's
+            // `class` arm, or a class-type bound) is erased to a `ptr` in the
+            // ERASED TEMPLATE, not to the `int` (i32) placeholder.
+            //
+            // WHY the placeholder was wrong here. The erased template is the
+            // body a caller runs when it instantiates the declaration at `int`;
+            // the placeholder therefore has to be able to hold what the
+            // substitution holds. For `where T: class` / `where T: SomeClass`
+            // `int` is NOT a legal substitution at all (§14.2's table) — so the
+            // placeholder is not a conservative stand-in for the parameter, it
+            // is a representation the parameter can never hold.
+            //
+            // An INTERFACE bound (`where T: IFoo`) is deliberately NOT covered
+            // here: §14.2 admits a RECORD for it as well as a class, and a
+            // record arrives BY VALUE where a class arrives as a pointer, so
+            // there is no single uniform erased representation and erasing
+            // the parameter as a pointer would be unsound. That shape is the
+            // remaining part of #6870.
+            //
+            // The erasure was observable: with `T` at i32, a `T`-typed
+            // receiver is an i32, so the interface/vtable dispatch has nothing
+            // to dispatch on (issue #484's non-pointer-receiver guard) and the
+            // member call did not lower at all — the compile stopped on the
+            // internal "#1386" diagnostic. With the reference erasure the
+            // receiver is a `ptr` and the member call dispatches through the
+            // runtime itable (`bz_itable_lookup`), exactly as the
+            // per-instantiation specialization does.
+            //
+            // ONLY the erased template is affected: a specialization resolves
+            // the name through `genericSubst_` (the arm above) before reaching
+            // this fallback, so its concrete type is untouched.
+            if (genericSubst_.find(rt->headName()) == genericSubst_.end() &&
+                typeParamErasedAsReference(rt->headName()))
+                return ptrTy();
             return i32();  // value-kind named — int
         case sema::TypeRef::Kind::InlineArray: {
             // §15.1: [N]T is an LLVM fixed-size array [N x elemType].
@@ -2319,6 +2380,20 @@ void Emitter::patchConcreteDerivedGenericBaseVtableAccessors() {
 
 
 llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
+    // fix #6870 (§14.2 / §11.8, v0.343): the ERASED layout of a
+    // generic class must use the SAME representation of a reference-constrained
+    // type parameter as the erased template's body and signature (a `ptr`, not
+    // the `int` placeholder) — otherwise the erased body's field read is typed
+    // differently from the erased layout's slot (an i32 load where the caller
+    // passes a pointer). Scoped to this computation; a specialized layout
+    // resolves the name through `genericSubst_` first and is unaffected.
+    struct ErasedRefParamsGuard {
+        Emitter& e;
+        ErasedRefParamsGuard(Emitter& em, const sema::TypeSymbol* ts) : e(em) {
+            e.pushErasedRefScopeForType(ts);
+        }
+        ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+    } erasedRefGuard(*this, t);
     // CG29: a record has no vtable header; route to recordStruct so every
     // classStruct caller (field access, etc.) gets the right layout.
     if (t->kind == ast::TypeDeclKind::Record) return recordStruct(t);
@@ -2624,6 +2699,17 @@ withRecordFootprint(llvm::LLVMContext& ctx,
 }
 
 llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
+    // fix #6870 (§14.2 / §11.8, v0.343): the ERASED layout of a
+    // generic record must use the same representation of a
+    // reference-constrained type parameter as the erased template's body and
+    // signature (a `ptr`, not the `int` placeholder) — the classStruct twin.
+    struct ErasedRefParamsGuard {
+        Emitter& e;
+        ErasedRefParamsGuard(Emitter& em, const sema::TypeSymbol* ts) : e(em) {
+            e.pushErasedRefScopeForType(ts);
+        }
+        ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+    } erasedRefGuard(*this, t);
     // §9.1 / §9.2: storage = non-static FieldSymbols (positional + body
     // fields) and body auto-properties (PropertySymbol), in declaration order.
     std::vector<const sema::Symbol*> storage;

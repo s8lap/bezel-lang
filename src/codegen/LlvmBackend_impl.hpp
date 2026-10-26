@@ -3713,6 +3713,90 @@ private:
     // a genuinely-unsupported name still reaches the #1847 diagnostic.
     std::unordered_set<std::string_view> templateGenericParamNames_;
 
+    // fix #6870 (§14.2 / §11.8, v0.343): the ERASED
+    // TEMPLATE's representation of a type parameter the `int` (i32) placeholder
+    // cannot stand for.
+    //
+    // Every generic declaration is also emitted once as an unspecialized
+    // TEMPLATE, whose type parameters are erased to the `int` placeholder.
+    // §11.8 leaves the realization strategy open — "An implementation may
+    // realize this by per-instantiation specialization or by shared code
+    // carrying a per-instantiation dispatch table … so long as the observable
+    // binding is the conforming type's member" — so the erased template is an
+    // implementation choice, and its erasure is only correct when `int` is a
+    // LEGAL substitution for the parameter: the placeholder must be able to
+    // hold whatever the substitution holds.
+    //
+    // §14.2's constraint table decides that. `where T: class` admits reference
+    // types only; `where T: SomeClass` admits that class and its descendants.
+    // For both bounds `int` is NOT a legal substitution, so the template's `T`
+    // is a REFERENCE, and erasing it to the i32 placeholder is not a
+    // conservative stand-in: it is a REPRESENTATION the parameter can never
+    // hold.
+    //
+    // An INTERFACE bound (`where T: IFoo`) is deliberately NOT covered:
+    // §14.2 admits a RECORD for it as well as a class, and a record arrives
+    // BY VALUE where a class arrives as a pointer, so there is no single
+    // uniform erased representation and erasing the parameter as a pointer
+    // would be UNSOUND. That shape is the remaining part of #6870.
+    //
+    // A TYPE-PARAMETER bound (`where T: U`) is not covered either — §14.2
+    // gives it subtype semantics and it admits value types ("at `U := long`
+    // it admits `long` alone"). The discriminator for it is the SCOPE (is the
+    // bound's spelling a declared type parameter of the enclosing scope?), not
+    // the NAME: a user's type parameter named after a builtin shadows it
+    // (§2.3) and its bound resolves IDENTICALLY to the builtin class's.
+    //
+    // The erasure was observable: inside the template, a `T`-typed receiver is
+    // an i32, so the interface/vtable dispatch has nothing to dispatch on
+    // (issue #484's non-pointer-receiver guard) and the member call does not
+    // lower at all — the compile stopped on the internal "#1386" diagnostic.
+    // With the reference erasure the receiver is a `ptr` and the member call
+    // dispatches through the runtime itable (`bz_itable_lookup`), exactly as
+    // the per-instantiation specialization does.
+    //
+    // The scopes hold, for every type parameter in scope, whether its
+    // constraints make it a REFERENCE (true) or admit a value type (false).
+    // It is consulted ONLY where no active substitution binds the name — i.e.
+    // only in the erased template; every specialization resolves the name
+    // through `genericSubst_` first and is unaffected.
+    //
+    // The scopes form a STACK, not a flat set, because the erased
+    // representation of a type parameter has to be read in the scope where the
+    // name is WRITTEN, while a substitution may carry it into a scope where
+    // the name is not declared at all: the pseudo-specialization `Inner$Head`
+    // of `Inner<T>` built from inside `Outer<U>`'s erased template substitutes
+    // `T → U`, so `Inner`'s field `T?` is really `U?` and `U` is declared by
+    // `Outer` — one scope out. The innermost scope that DECLARES the name
+    // wins, so a nested generic that reuses a name with different constraints
+    // still reads its own constraint, and a name that no inner scope declares
+    // falls back to the scope that does.
+    std::vector<std::unordered_map<std::string_view, bool>> erasedRefScopes_;
+
+    // fix #6870: push a scope for `ms` (its own type parameters plus its
+    // declaring type's). Defined in LlvmBackend_Calls2.cpp.
+    void pushErasedRefScope(const sema::MethodSymbol* ms);
+
+    // fix #6870: the same, for a declaring type alone (its own type
+    // parameters) — used where a type's ERASED layout is computed.
+    void pushErasedRefScopeForType(const sema::TypeSymbol* ts);
+
+    // fix #6870: pop the innermost scope.
+    void popErasedRefScope() {
+        if (!erasedRefScopes_.empty()) erasedRefScopes_.pop_back();
+    }
+
+    // fix #6870: is `name` a type parameter that erases as a reference in the
+    // current erased template? The innermost scope that DECLARES the name
+    // decides; a name no scope declares is not a type parameter in scope.
+    bool typeParamErasedAsReference(std::string_view name) const {
+        for (auto it = erasedRefScopes_.rbegin(); it != erasedRefScopes_.rend(); ++it) {
+            auto f = it->find(name);
+            if (f != it->end()) return f->second;
+        }
+        return false;
+    }
+
     // #383 / §28.8.1: true while emitting a class's compiler-generated Dispose
     // (a destructor body). A `using var u := move this._f;` inside a destructor
     // is NOT registered for disposal: the destructor's auto field-dispose pass

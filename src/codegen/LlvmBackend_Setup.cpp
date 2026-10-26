@@ -2380,6 +2380,20 @@ void Emitter::declareFunctions() {
             ci.bodyKind == ast::MethodBodyKind::Abstract)
             continue;
 
+        // fix #6870 (§14.2 / §11.8, v0.343): the ERASED TEMPLATE's
+        // signature must use the SAME representation of a reference-constrained
+        // type parameter as its body (see lowerTypeRef's erased-template
+        // fallback and pushErasedRefScope). The scope is pushed for this
+        // method and popped afterwards, so a nested computation cannot see a
+        // stale one.
+        struct ErasedRefParamsGuard {
+            Emitter& e;
+            ErasedRefParamsGuard(Emitter& em, const sema::MethodSymbol* m) : e(em) {
+                e.pushErasedRefScope(m);
+            }
+            ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+        } erasedRefGuard(*this, ms);
+
         llvm::Type* retTy = isMain(ms) ? i32()
                                        : lowerType(ci.returnType);
         std::vector<llvm::Type*> paramTys;
@@ -11074,6 +11088,18 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         ~CurrentMethodGuard() { slot = prev; }
     };
     CurrentMethodGuard methodGuard{currentMethod_, ms};
+    // fix #6870 (§14.2 / §11.8, v0.343): the ERASED TEMPLATE's body
+    // reads a reference-constrained type parameter as a `ptr` (not as the `int`
+    // placeholder) — the same representation declareFunctions gave this
+    // method's erased signature. The scope is pushed for this body and popped
+    // afterwards, so a nested emission cannot see a stale one.
+    struct ErasedRefParamsGuard {
+        Emitter& e;
+        ErasedRefParamsGuard(Emitter& em, const sema::MethodSymbol* m) : e(em) {
+            e.pushErasedRefScope(m);
+        }
+        ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+    } erasedRefGuard(*this, ms);
     // #4602: a record/enum/choice method's `this` is a value receiver.
     if (ms && !isStaticMethod(ms)) noteCdNonClassThisFn(ms->parent, fn);
     // §2.5 / §14.1 / #783: an IMPORTED method's `methodFns_` entry is an EXTERNAL

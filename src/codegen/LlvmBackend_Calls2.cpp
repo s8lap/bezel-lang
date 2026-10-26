@@ -6275,6 +6275,174 @@ bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
 }
 
 
+// fix #6870 (§14.2 / §11.8, v0.343): the name a `type` constraint's bound
+// SPELLS, when it is a BARE single-part name — the shape a §14.2
+// TYPE-PARAMETER bound (`where T: U`) takes.
+//
+// Mirrors sema's `constraintBoundBareName`
+// (src/sema/TypeResolution_Checks.cpp): a LOCAL bound is the AST node, and a
+// bare name is a `QualifiedName` with exactly one part; an IMPORTED bound is
+// a resolved TypeRef, and a type PARAMETER is precisely the case the loader
+// cannot resolve — a Named ref with a null declaration whose `importedName`
+// holds the spelling.
+static std::string_view constraintBoundSpelling(
+        const sema::GenericParamConstraint& c) {
+    if (c.kind != "type") return {};
+    if (c.astBound) {
+        if (!c.astBound->name || c.astBound->name->parts.size() != 1)
+            return {};
+        return c.astBound->name->parts.back();
+    }
+    const sema::TypeRef* b = c.importedBound;
+    if (!b || b->kind != sema::TypeRef::Kind::Named || b->declaration)
+        return {};
+    if (!b->genericArgs.empty()) return {};  // `IFoo<T>`, not a bare parameter
+    std::string_view n = b->importedName;
+    if (n.empty() || n.find('.') != std::string_view::npos) return {};
+    return n;
+}
+
+// fix #6870 (§14.2 / §11.8, v0.343): does `gp`'s constraint set confine it to
+// REFERENCE types — i.e. may every legal substitution be a reference?
+//
+// §14.2's table, for the two bounds that admit REFERENCE types only:
+//   * `where T: class` — "Non-nullable reference types only — classes
+//     (including `Array<T>`, `OwningArray<T>`, and other heap collection
+//     types), interfaces, `string`, function types." `int` is none of those.
+//   * `where T: SomeClass` — "Non-nullable subtypes of `SomeClass` (the class
+//     itself and its descendants). Class types only; interfaces do not extend
+//     classes in Bezel." `int` is not a class type.
+//
+// A constraint set admits a VALUE type iff EVERY one of its constraints
+// admits it (the admitted set is the intersection), so ONE reference-only
+// constraint is enough to confine the parameter — hence the ANY-match.
+//
+// ⚠ A TYPE-PARAMETER bound (`where T: U`) is NOT reference-only. §14.2
+// ("Type-parameter bounds"): the bound "has subtype semantics: a
+// substitution S for `T` satisfies `where T: U` exactly when S is non-nullable
+// and is a *subtype of* the substitution for `U`" — "at `U := Object` the bound
+// admits `Object` and every class type … **at `U := long` it admits `long`
+// alone**". So a type-parameter bound admits VALUE types whenever the
+// parameter it names does, and the erasure to `ptr` is UNSOUND for it.
+//
+// ⇒⇒ THE DISCRIMINATOR IS THE SCOPE, NOT THE NAME. A user's type parameter
+// named after a builtin (`class C<Exception> where Exception: INumber<Exception>`)
+// SHADOWS the always-available `Exception` (§2.3: "every other always-
+// available name may be shadowed by local declarations"), and the bound
+// `where T: Exception` is then a TYPE-PARAMETER bound (§14.2: a bound naming
+// "another type parameter — of the same declaration, or of the enclosing
+// type"). MEASURED: such a bound and the builtin CLASS bound resolve to
+// TypeRefs that are IDENTICAL in every observable field (`declaration ==
+// nullptr`, the same syntactic head name, an AST node, no generic arguments),
+// so NO test on the resolved type can tell them apart — only the scope can.
+//
+// The INTERFACE bound (`where T: IFoo`) is deliberately NOT answered here:
+// §14.2 admits "classes implementing it, records and enums implementing it,
+// interfaces extending it, and primitives conforming through their
+// standard-library declarations or the compiler-provided conformances" — so
+// an interface-bounded parameter may hold a VALUE type, and the erased
+// template then has no single uniform representation (a class substitution
+// arrives as a pointer, a record substitution by value — MEASURED on
+// `B$V$spec$Dog` vs `B$V$spec$Pt`). Erasing such a parameter as a pointer
+// would be UNSOUND, and erasing it as the `int` placeholder leaves the erased
+// body unable to dispatch an interface member through it — a gap #6870
+// tracks and this change does not close.
+//
+// The other constraint kinds admit `int` (`notnull`, `value`, `hashable`,
+// `new()` — a defaultable value type, `sendable`), so those keep the `int`
+// placeholder erasure exactly as today.
+//
+// `visibleTypeParams` is the set of type-parameter names the constraint can
+// name — the DECLARATION's own parameters plus, for a method's constraint, the
+// ENCLOSING TYPE's parameters (§14.2's "of the same declaration, or of the
+// enclosing type").
+static bool typeParamHasClassBound(
+        sema::SemaContext& ctx,
+        const sema::GenericParamSymbol* gp,
+        const std::unordered_set<std::string_view>& visibleTypeParams) {
+    if (!gp) return false;
+    for (const sema::GenericParamConstraint& c : gp->constraints) {
+        if (c.kind == "class") return true;
+        if (c.kind != "type") continue;
+        // §14.2: a TYPE-PARAMETER bound names another type parameter of the
+        // same declaration or of the enclosing type. It admits whatever that
+        // parameter admits — value types included ("at `U := long` it admits
+        // `long` alone") — so it never confines this parameter to references,
+        // and this parameter must never be erased to `ptr`.
+        //
+        // The check is by SPELLING against the enclosing scope's type
+        // parameters, because the resolved TypeRef cannot distinguish the two
+        // (see above). It does NOT end the scan: a sibling reference-only
+        // constraint still confines the parameter (`where T: U, class`).
+        std::string_view spelling = constraintBoundSpelling(c);
+        if (!spelling.empty() && visibleTypeParams.count(spelling))
+            continue;
+        const sema::TypeRef* b = c.importedBound;
+        if (!b && c.astBound) b = ctx.resolvedType(*c.astBound);
+        if (!b || b->kind != sema::TypeRef::Kind::Named) continue;
+        if (b->declaration) {
+            if (b->declaration->kind == ast::TypeDeclKind::Class) return true;
+            continue;
+        }
+        // A DECL-LESS Named bound that is NOT a type parameter of the
+        // enclosing scope: the always-available EXCEPTION classes (§2.3's
+        // always-available set, whose module is `System`) resolve that way —
+        // they have no `ast::TypeDecl` — and they are classes. Every other
+        // decl-less Named bound is a builtin INTERFACE (the collection
+        // family, `IDisposable`, …), which §14.2 does not confine to
+        // reference types.
+        if (common::isBuiltinExceptionName(b->headName())) return true;
+    }
+    return false;
+}
+
+// fix #6870: the type-parameter names of a declaration's parameter list.
+static void collectTypeParamNames(
+        const std::vector<sema::Symbol*>& params,
+        std::unordered_set<std::string_view>& out) {
+    for (const sema::Symbol* s : params)
+        if (auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s))
+            out.insert(gp->name);
+}
+
+void Emitter::pushErasedRefScope(const sema::MethodSymbol* ms) {
+    std::unordered_map<std::string_view, bool> scope;
+    if (ms) {
+        // The names a constraint of this method can name: the METHOD's own
+        // parameters and the ENCLOSING TYPE's (§14.2's "of the same
+        // declaration, or of the enclosing type").
+        std::unordered_set<std::string_view> methodNames, classNames;
+        collectTypeParamNames(ms->genericParams, methodNames);
+        if (ms->parent) collectTypeParamNames(ms->parent->genericParams, classNames);
+        std::unordered_set<std::string_view> allNames = methodNames;
+        allNames.insert(classNames.begin(), classNames.end());
+        // The enclosing TYPE's own parameters are constrained against the
+        // TYPE's scope (their own siblings) — the same set the type's own
+        // erased layout is computed with, so the two agree.
+        if (ms->parent)
+            for (const sema::Symbol* s : ms->parent->genericParams)
+                if (auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s))
+                    scope[gp->name] = typeParamHasClassBound(ctx_, gp, classNames);
+        // The method's own parameters are constrained against the wider scope.
+        for (const sema::Symbol* s : ms->genericParams)
+            if (auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s))
+                scope[gp->name] = typeParamHasClassBound(ctx_, gp, allNames);
+    }
+    erasedRefScopes_.push_back(std::move(scope));
+}
+
+void Emitter::pushErasedRefScopeForType(const sema::TypeSymbol* ts) {
+    std::unordered_map<std::string_view, bool> scope;
+    if (ts) {
+        std::unordered_set<std::string_view> names;
+        collectTypeParamNames(ts->genericParams, names);
+        for (const sema::Symbol* s : ts->genericParams)
+            if (auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s))
+                scope[gp->name] = typeParamHasClassBound(ctx_, gp, names);
+    }
+    erasedRefScopes_.push_back(std::move(scope));
+}
+
 // per §14.1/§14.2 + §26.5 (issue #391). Structurally unify a generic method's
 // declared return TypeRef against the concrete return type sema solved from the
 // call's target, binding any still-unbound method type parameter.
@@ -22669,6 +22837,17 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
 
 
 llvm::FunctionType* Emitter::methodFnType(const sema::MethodSymbol* ms) {
+    // fix #6870 (§14.2 / §11.8, v0.343): the erased template's
+    // function type must agree with the erased template's BODY — a
+    // reference-constrained type parameter is a `ptr` there, not the `int`
+    // placeholder. Scoped to this computation.
+    struct ErasedRefParamsGuard {
+        Emitter& e;
+        ErasedRefParamsGuard(Emitter& em, const sema::MethodSymbol* m) : e(em) {
+            e.pushErasedRefScope(m);
+        }
+        ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+    } erasedRefGuard(*this, ms);
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) {
         // §2.5 / §12 (issue #328 item 2): an IMPORTED method has no AST decl;
