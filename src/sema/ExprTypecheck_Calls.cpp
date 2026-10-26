@@ -21648,6 +21648,190 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
                 mathConvertTypeList(admitted) + " (" + stdlibCite + "; §5.1)");
         return;  // ONE diagnostic per call
     }
+
+    // fix #7266 (stdlib §2.3, v0.344; §22.6, v0.344): §22.6's RANKING step
+    // (stage 4) and its last step (the AMBIGUITY error), over the SAME
+    // declared forms the probe above collects.
+    //
+    // THE DEFECT. §2.3's `ToString` overload set declares one form per
+    // parameter type — `ToString(value: int)`, `ToString(value: long)`,
+    // `ToString(value: float)`, `ToString(value: double)`,
+    // `ToString(value: decimal)`, `ToString(value: bool)`, and the
+    // two-argument `ToString(value: int, toBase: int)` /
+    // `ToString(value: long, toBase: int)` — and §2.3 states the rule for
+    // them verbatim: "A `char` and the integer types other than `int` and
+    // `long` each convert to two or more of these parameter types and match
+    // none exactly, so the call is ambiguous and a compile error (§22.6)".
+    //
+    // The probe above answers §22.6's stage 3 (APPLICABILITY) and nothing
+    // more: it asks whether the argument converts to AT LEAST ONE of the
+    // declared kinds at the position, and it never asks §22.6's stage 4
+    // (RANKING). A `byte` converts to BOTH `int` and `long` and matches
+    // neither exactly, so the probe admitted it — `Convert.ToString(b, 10)`
+    // compiled and printed 200 — while the very same probe rejected a
+    // `ulong` (which converts to NEITHER `int` nor `long`, so NO candidate
+    // is applicable) with a "no matching overload" diagnostic. The same
+    // rule, the same call, opposite verdicts by argument type.
+    //
+    // THIS STEP IS THAT RULE'S NEXT STEP, NOT A SECOND RULE BESIDE IT. It
+    // ranks the candidates the probe already collected: §22.6 ranks an EXACT
+    // match above a conversion and leaves two conversions EQUAL ("two
+    // candidates that both require an implicit conversion at the same
+    // position are equally ranked there"), so a position where two or more
+    // applicable candidates CONVERT and none matches EXACTLY is a tie, and
+    // §22.6's last step reports the tie as "ambiguous" — a compile error.
+    // There is no type list here: the verdict follows from the declared
+    // forms and §5.1's table, so the next type to reach the position is
+    // judged by the same rule.
+    //
+    // THE `ulong` REJECTION IS NOT WEAKENED. `ulong` converts to neither
+    // `int` nor `long`, so no candidate is applicable, the probe's "no
+    // matching overload" diagnostic still fires first, and this step has no
+    // applicable candidate to rank.
+    //
+    // WHY THE `Convert` CLASS. §2.3 states the rule for `Convert`'s
+    // `ToString` overload set; §2.2 states no such rule for `Math` (the
+    // only stdlib section that states one is §2.3), and `Math.Abs` has its
+    // own dedicated §22.6 ambiguity check (#6955) that would double-report
+    // here. The `Math` family's uncovered shapes are enumerated for the
+    // coordinator instead of being changed under this issue.
+    if (head == "Convert" && forms.size() > 1) {
+        // The §22.6 grid: one entry per (declared form, argument position).
+        enum class Grade { Exact, Convert, NotApplicable };
+        const std::size_t arity = forms.front()->arity;
+        std::vector<std::vector<Grade>> grid(
+            forms.size(), std::vector<Grade>(arity, Grade::NotApplicable));
+        // The step stands down where another rule owns the call: a
+        // parameter that takes its DEFAULT is §22.6's defaulted-arity
+        // tie-break's business (this step does not model it), a §22.3
+        // modifier aliases the caller's slot, a §7 NULLABLE argument is
+        // §7's nullability gate's, and a discard or an unresolved type is
+        // not this step's question.
+        bool rankable = paramNames.size() >= arity && paramToArg.size() >= arity;
+        for (std::size_t p = 0; p < arity && rankable; ++p) {
+            const int ai = paramToArg[p];
+            if (ai < 0 || static_cast<std::size_t>(ai) >= ce.args.size()) {
+                rankable = false;
+                break;
+            }
+            const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+            if (!arg.value || arg.isDiscard || !arg.modifier.empty()) {
+                rankable = false;
+                break;
+            }
+            TypeRef* argTy = ctx_.exprType(*arg.value);
+            if (!argTy || argTy->kind == TypeRef::Kind::Error || argTy->nullable) {
+                rankable = false;
+                break;
+            }
+            for (std::size_t c = 0; c < forms.size() && rankable; ++c) {
+                const MathConvertParamKind k =
+                    p == 0 ? forms[c]->param0 : forms[c]->param1;
+                if (k == MathConvertParamKind::Unchecked) {
+                    rankable = false;
+                    break;
+                }
+                if (argTy->kind != TypeRef::Kind::Primitive) continue;
+                if (argTy->primitive == mathConvertPrimitiveOf(k)) {
+                    grid[c][p] = Grade::Exact;
+                } else if (admitsByIdentityOrWidening(argTy, k) ||
+                           admitsByConstantNarrowing(arg.value.get(), argTy, k)) {
+                    // §5.1's constant narrowing reaches a candidate only as
+                    // a CONVERSION ("graded as any other conversion is,
+                    // never as an exact match", v0.343) — so it never
+                    // separates two candidates.
+                    grid[c][p] = Grade::Convert;
+                }
+            }
+        }
+        if (rankable) {
+            // The APPLICABLE candidates: those with no inapplicable
+            // position.
+            std::vector<std::size_t> appl;
+            for (std::size_t c = 0; c < forms.size(); ++c) {
+                bool ok = true;
+                for (std::size_t p = 0; p < arity; ++p)
+                    if (grid[c][p] == Grade::NotApplicable) {
+                        ok = false;
+                        break;
+                    }
+                if (ok) appl.push_back(c);
+            }
+            // §22.6's stage 4: a candidate is better than another at a
+            // position iff it is EXACT there and the other CONVERTS; two
+            // conversions are equally ranked. A candidate is "unambiguously
+            // better" iff it is better-or-equal at EVERY position and
+            // strictly better at at least one.
+            auto betterOrEqualAt = [](Grade x, Grade y) {
+                return !(x == Grade::Convert && y == Grade::Exact);
+            };
+            auto strictlyBetterAt = [](Grade x, Grade y) {
+                return x == Grade::Exact && y == Grade::Convert;
+            };
+            bool decided = false;
+            for (std::size_t xi = 0; xi < appl.size() && !decided; ++xi) {
+                const std::size_t x = appl[xi];
+                bool dominates = true;
+                for (std::size_t yi = 0; yi < appl.size() && dominates; ++yi) {
+                    if (xi == yi) continue;
+                    const std::size_t y = appl[yi];
+                    bool betterOrEqual = true;
+                    bool anyStrict = false;
+                    for (std::size_t p = 0; p < arity; ++p) {
+                        if (!betterOrEqualAt(grid[x][p], grid[y][p])) {
+                            betterOrEqual = false;
+                            break;
+                        }
+                        if (strictlyBetterAt(grid[x][p], grid[y][p])) anyStrict = true;
+                    }
+                    if (!betterOrEqual || !anyStrict) dominates = false;
+                }
+                if (dominates) decided = true;
+            }
+            if (!decided && appl.size() > 1) {
+                // The tie: report it at the position where it happens — the
+                // position two or more applicable candidates convert at and
+                // none matches exactly.
+                std::size_t tiePos = arity;
+                for (std::size_t p = 0; p < arity && tiePos == arity; ++p) {
+                    int converts = 0;
+                    int exacts = 0;
+                    for (std::size_t c : appl) {
+                        if (grid[c][p] == Grade::Convert) ++converts;
+                        else if (grid[c][p] == Grade::Exact) ++exacts;
+                    }
+                    if (converts >= 2 && exacts == 0) tiePos = p;
+                }
+                if (tiePos < arity) {
+                    const auto& arg =
+                        ce.args[static_cast<std::size_t>(paramToArg[tiePos])];
+                    std::vector<std::string> candNames;
+                    std::vector<bool> fillsDefault(forms.size(), false);
+                    for (const auto* f : forms) {
+                        std::string n = std::string(member) + "(";
+                        n += std::string(paramNames[0]) + ": " +
+                             std::string(mathConvertTypeName(f->param0));
+                        if (f->arity > 1)
+                            n += ", " + std::string(paramNames[1]) + ": " +
+                                 std::string(mathConvertTypeName(f->param1));
+                        n += ")";
+                        candNames.push_back(n);
+                    }
+                    ctx_.diagnostics().report(
+                        Severity::Error, arg.value->span.begin,
+                        overloadAmbiguityMessage(
+                            "`" + std::string(head) + "." + std::string(member) +
+                                "`",
+                            candNames, appl, fillsDefault,
+                            "\nstdlib §2.3: an argument that converts to two or "
+                            "more of these parameter types and matches none "
+                            "exactly is ambiguous and a compile error "
+                            "(§22.6) — the remedy is an explicit cast to one "
+                            "parameter type, or the value's own `ToString()`"));
+                }
+            }
+        }
+    }
 }
 
 // fix #7140 (stdlib §9.6, v0.343): the ARITY of a built-in `string` member
