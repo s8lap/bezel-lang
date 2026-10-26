@@ -2506,42 +2506,88 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 if (isIntRecv && argIsInt) {
                                     llvm::Value* radix = lowerExpr(*call->args[0].value);
                                     if (!radix) return nullptr;
-                                    // Normalize receiver to i32 (or i64 for long).
-                                    bool isLong = (tt->primitive == P::Long ||
-                                                   tt->primitive == P::ULong);
-                                    if (isLong) {
-                                        if (!recv->getType()->isIntegerTy(64))
-                                            recv = builder_.CreateSExt(recv, i64());
-                                    } else {
-                                        if (!recv->getType()->isIntegerTy(32))
-                                            recv = builder_.CreateSExt(recv, i32());
+                                    // fix #7258 (stdlib §9.1, v0.344): the radix
+                                    // rendering shows the receiver's OWN value.
+                                    // §9.1: "`ToString(radix)` emits the
+                                    // lower-case digits — a `-` for a negative
+                                    // value followed by the magnitude's digits
+                                    // most significant first" and "T.Parse(n.
+                                    // ToString(radix), radix) is n for every value
+                                    // of every integer type and every admitted
+                                    // radix". So the value must reach the
+                                    // formatter UNCHANGED: an unsigned receiver is
+                                    // NOT sign-extended (a `byte` 200 is 200, not
+                                    // -56) and a 64-bit value is NOT narrowed to
+                                    // 32 bits (a `long` 4000000000 is
+                                    // 4000000000, not -294967296).
+                                    //
+                                    // The signedness is the RECEIVER's own TYPE's
+                                    // (the house predicate
+                                    // `isUnsignedTargetExpr`) — NEVER the bit
+                                    // width's: `int` and `uint` are both 32 bits
+                                    // and `long` and `ulong` are both 64 bits.
+                                    const bool recvUnsigned =
+                                        isUnsignedTargetExpr(*ma->target);
+                                    // The MAGNITUDE, in a common 64-bit domain:
+                                    // widened (never narrowed), value preserved.
+                                    llvm::Value* mag = recv;
+                                    if (!mag->getType()->isIntegerTy(64))
+                                        mag = recvUnsigned
+                                            ? builder_.CreateZExt(mag, i64(), "rts.zx")
+                                            : builder_.CreateSExt(mag, i64(), "rts.sx");
+                                    // A negative SIGNED value renders as '-' plus
+                                    // its magnitude's digits (§9.1); an unsigned
+                                    // value is never negative.
+                                    llvm::Value* isNeg = nullptr;
+                                    if (!recvUnsigned) {
+                                        isNeg = builder_.CreateICmpSLT(
+                                            mag, builder_.getInt64(0), "rts.neg");
+                                        mag = builder_.CreateSelect(
+                                            isNeg,
+                                            builder_.CreateSub(
+                                                builder_.getInt64(0), mag, "rts.m"),
+                                            mag, "rts.mag");
                                     }
-                                    // Resolve radix from a constant int.
-                                    const char* fmt = "%d";  // fallback: decimal
+                                    // Resolve radix from a constant int. An
+                                    // unadmitted radix keeps the decimal
+                                    // fallback (the §9.1 ArgumentException is a
+                                    // BANKED divergence — corpus l2_3_0003).
+                                    const char* fmt = "%s%llu";  // fallback: decimal
                                     bool isBinary = false;
                                     if (auto* cr = llvm::dyn_cast<llvm::ConstantInt>(radix)) {
                                         uint64_t r = cr->getZExtValue();
-                                        if (r == 16) fmt = isLong ? "%llx" : "%x";
-                                        else if (r == 8) fmt = isLong ? "%llo" : "%o";
+                                        if (r == 16) fmt = "%s%llx";
+                                        else if (r == 8) fmt = "%s%llo";
                                         else if (r == 2) isBinary = true;
-                                        else fmt = isLong ? "%lld" : "%d";
-                                    } else {
-                                        // Non-constant radix: fall back to decimal.
-                                        fmt = isLong ? "%lld" : "%d";
                                     }
                                     // Binary path: emit a bit-scan loop.
                                     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
                                     const unsigned BUF = 66;  // 64 bits + sign + NUL
                                     if (isBinary) {
-                                        // Reuse the Convert.ToString(n,2) inline logic.
-                                        // Widen to i64 so the same loop handles both int and long.
-                                        llvm::Value* n64 = isLong
-                                            ? recv
-                                            : builder_.CreateSExt(recv, i64());
+                                        // The MAGNITUDE's digits, MSB first; the
+                                        // sign byte comes first for a negative
+                                        // value (§9.1).
+                                        llvm::Value* off = builder_.getInt64(0);
+                                        llvm::Value* signByte =
+                                            llvm::ConstantInt::get(i8Ty, '0');
+                                        if (isNeg) {
+                                            off = builder_.CreateSelect(
+                                                isNeg, builder_.getInt64(1),
+                                                builder_.getInt64(0), "rts.off");
+                                            signByte = builder_.CreateSelect(
+                                                isNeg,
+                                                llvm::ConstantInt::get(i8Ty, '-'),
+                                                llvm::ConstantInt::get(i8Ty, '0'),
+                                                "rts.sigb");
+                                        }
+                                        llvm::Value* n64 = mag;
                                         auto* buf2 = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
                                         llvm::Value* b2Ptr = builder_.CreateGEP(
                                             llvm::ArrayType::get(i8Ty, BUF), buf2,
                                             {builder_.getInt64(0), builder_.getInt64(0)});
+                                        // The sign byte; the digits overwrite it
+                                        // when the value is not negative.
+                                        builder_.CreateStore(signByte, b2Ptr);
                                         llvm::Value* isZero = builder_.CreateICmpEQ(
                                             n64, builder_.getInt64(0));
                                         auto* zeroBB = llvm::BasicBlock::Create(
@@ -2553,13 +2599,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         builder_.CreateCondBr(isZero, zeroBB, nonBB);
                                         // zero → "0"
                                         builder_.SetInsertPoint(zeroBB);
+                                        llvm::Value* z0 = builder_.CreateGEP(
+                                            i8Ty, b2Ptr, off);
                                         builder_.CreateStore(
-                                            llvm::ConstantInt::get(i8Ty, '0'), b2Ptr);
+                                            llvm::ConstantInt::get(i8Ty, '0'), z0);
                                         llvm::Value* z1 = builder_.CreateGEP(
-                                            i8Ty, b2Ptr, builder_.getInt64(1));
+                                            i8Ty, b2Ptr,
+                                            builder_.CreateAdd(off,
+                                                builder_.getInt64(1)));
                                         builder_.CreateStore(
                                             llvm::ConstantInt::get(i8Ty, 0), z1);
-                                        llvm::Value* zlen = builder_.getInt64(1);
+                                        llvm::Value* zlen = builder_.CreateAdd(
+                                            off, builder_.getInt64(1));
                                         auto* zeroBBEnd = builder_.GetInsertBlock();
                                         builder_.CreateBr(binBB);
                                         // non-zero: scan MSB then emit each bit.
@@ -2598,7 +2649,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         llvm::Value* startBP = builder_.CreateLoad(
                                             i32(), bitPos);
                                         builder_.CreateStore(startBP, emBP);
-                                        builder_.CreateStore(builder_.getInt64(0), emLen);
+                                        builder_.CreateStore(off, emLen);
                                         auto* emCBB = llvm::BasicBlock::Create(
                                             llvm_, "bn2.ec", currentFn_);
                                         auto* emBBB = llvm::BasicBlock::Create(
@@ -2674,6 +2725,44 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         return so2;
                                     }
                                     // Non-binary: snprintf with the chosen format.
+                                    // The sign prefix: "-" for a negative SIGNED
+                                    // value, "" otherwise (§9.1's '-' followed by
+                                    // the magnitude's digits). The DIGITS
+                                    // themselves are the lower-case ones (§9.1).
+                                    llvm::Value* signPtr2 = nullptr;
+                                    {
+                                        auto* emptyData = llvm::ConstantDataArray::getString(
+                                            llvm_, "", true);
+                                        unsigned sid2 = stringLiteralIdx_++;
+                                        auto* emptyGV = new llvm::GlobalVariable(
+                                            *module_, emptyData->getType(), true,
+                                            llvm::GlobalValue::PrivateLinkage,
+                                            emptyData,
+                                            ".bz.rts.sign." + std::to_string(sid2));
+                                        emptyGV->setUnnamedAddr(
+                                            llvm::GlobalValue::UnnamedAddr::Global);
+                                        llvm::Value* emptyPtr = builder_.CreateInBoundsGEP(
+                                            emptyData->getType(), emptyGV,
+                                            {builder_.getInt64(0), builder_.getInt64(0)});
+                                        signPtr2 = emptyPtr;
+                                        if (isNeg) {
+                                            auto* minusData = llvm::ConstantDataArray::getString(
+                                                llvm_, "-", true);
+                                            unsigned mid2 = stringLiteralIdx_++;
+                                            auto* minusGV = new llvm::GlobalVariable(
+                                                *module_, minusData->getType(), true,
+                                                llvm::GlobalValue::PrivateLinkage,
+                                                minusData,
+                                                ".bz.rts.sign." + std::to_string(mid2));
+                                            minusGV->setUnnamedAddr(
+                                                llvm::GlobalValue::UnnamedAddr::Global);
+                                            llvm::Value* minusPtr = builder_.CreateInBoundsGEP(
+                                                minusData->getType(), minusGV,
+                                                {builder_.getInt64(0), builder_.getInt64(0)});
+                                            signPtr2 = builder_.CreateSelect(
+                                                isNeg, minusPtr, emptyPtr, "rts.sign");
+                                        }
+                                    }
                                     llvm::Constant* fmtData2 = llvm::ConstantDataArray::getString(
                                         llvm_, fmt, true);
                                     unsigned fid2 = stringLiteralIdx_++;
@@ -2696,7 +2785,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         {builder_.getInt64(0), builder_.getInt64(0)});
                                     llvm::Value* wr2 = builder_.CreateCall(
                                         snpFn2,
-                                        {bPtr3, builder_.getInt64(BUF), fmtGV2, recv},
+                                        {bPtr3, builder_.getInt64(BUF), fmtGV2, signPtr2, mag},
                                         "rts.wr");
                                     auto* mallocFn3 = declareC("malloc", ptrTy(), {i64()});
                                     auto* memcpyFn3 = declareC("memcpy", ptrTy(),

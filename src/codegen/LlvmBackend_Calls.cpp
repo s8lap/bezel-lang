@@ -13821,19 +13821,72 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 arg = lowerExpr(*call.args[valSrc].value);
             }
             if (!arg || !radix) return nullptr;
-            // Widen to i32.
-            if (!arg->getType()->isIntegerTy(32))
-                arg = builder_.CreateSExt(arg, i32());
-            // Select format based on radix (constant check).
-            const char* fmt = "%d";
+            // fix #7258 (stdlib §9.1, v0.344): `Convert.ToString(value, toBase)`
+            // "returns the text `value.ToString(toBase)` returns" (stdlib §2.3),
+            // and §9.1's text is the value's OWN digits — "T.Parse(n.ToString
+            // (radix), radix) is n for every value of every integer type and
+            // every admitted radix". So the argument is NOT narrowed to 32 bits
+            // (a `long` 4000000000 is 4000000000, not -294967296) and NOT
+            // sign-extended (an unsigned value is its own value).
+            //
+            // §2.3 declares the `value` parameter as `int` or `long` — both
+            // SIGNED — so the rendered text is the text of the value as BOUND
+            // to that parameter: the §5.1 widening conversion of the argument
+            // (zero-extending for an unsigned source type, which preserves its
+            // value) and then a SIGNED rendering.
+            //
+            // The signedness is the ARGUMENT's own TYPE's (the house predicate
+            // `isUnsignedTargetExpr`) — never the bit width's: `int` and `uint`
+            // are both 32 bits, `long` and `ulong` are both 64 bits.
+            const bool argUnsigned =
+                isUnsignedTargetExpr(*call.args[valSrc].value);
+            llvm::Value* mag = arg;
+            if (!mag->getType()->isIntegerTy(64))
+                mag = argUnsigned
+                    ? builder_.CreateZExt(mag, i64(), "rts.zx")
+                    : builder_.CreateSExt(mag, i64(), "rts.sx");
+            // The bound value is signed (the parameter is `int` or `long`), so a
+            // negative one renders as '-' plus its magnitude's digits (§9.1).
+            llvm::Value* isNeg = builder_.CreateICmpSLT(
+                mag, builder_.getInt64(0), "rts.neg");
+            mag = builder_.CreateSelect(
+                isNeg, builder_.CreateSub(builder_.getInt64(0), mag, "rts.m"),
+                mag, "rts.mag");
+            // The format family. The DIGITS are the lower-case ones (§9.1); an
+            // unadmitted radix keeps the decimal fallback (the §9.1
+            // ArgumentException is a BANKED divergence — corpus l2_3_0003).
+            const char* fmt = "%s%llu";  // fallback: decimal
+            bool isBinary = false;
             if (auto* cr = llvm::dyn_cast<llvm::ConstantInt>(radix)) {
                 uint64_t r = cr->getZExtValue();
-                if (r == 16) fmt = "%x";
-                else if (r == 8) fmt = "%o";
-                else if (r == 2) fmt = nullptr;  // handle below
+                if (r == 16) fmt = "%s%llx";
+                else if (r == 8) fmt = "%s%llo";
+                else if (r == 2) isBinary = true;
             }
-            if (fmt) {
+            if (!isBinary) {
                 // Use snprintf with the chosen format.
+                // The sign prefix: "-" for a negative value, "" otherwise
+                // (§9.1's '-' followed by the magnitude's digits). The DIGITS
+                // themselves are the lower-case ones (§9.1).
+                llvm::Value* signPtr = nullptr;
+                {
+                    auto* emptyData = llvm::ConstantDataArray::getString(llvm_, "", true);
+                    unsigned sid = stringLiteralIdx_++;
+                    auto* emptyGV = new llvm::GlobalVariable(*module_, emptyData->getType(), true,
+                        llvm::GlobalValue::PrivateLinkage, emptyData, ".bz.rsign." + std::to_string(sid));
+                    emptyGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                    llvm::Value* emptyPtr = builder_.CreateInBoundsGEP(
+                        emptyData->getType(), emptyGV, {builder_.getInt64(0), builder_.getInt64(0)});
+                    signPtr = emptyPtr;
+                    auto* minusData = llvm::ConstantDataArray::getString(llvm_, "-", true);
+                    unsigned mid = stringLiteralIdx_++;
+                    auto* minusGV = new llvm::GlobalVariable(*module_, minusData->getType(), true,
+                        llvm::GlobalValue::PrivateLinkage, minusData, ".bz.rsign." + std::to_string(mid));
+                    minusGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                    llvm::Value* minusPtr = builder_.CreateInBoundsGEP(
+                        minusData->getType(), minusGV, {builder_.getInt64(0), builder_.getInt64(0)});
+                    signPtr = builder_.CreateSelect(isNeg, minusPtr, emptyPtr, "rts.sign");
+                }
                 llvm::Constant* fmtData = llvm::ConstantDataArray::getString(llvm_, fmt, true);
                 unsigned fid = stringLiteralIdx_++;
                 auto* fmtGV = new llvm::GlobalVariable(*module_, fmtData->getType(), true,
@@ -13847,7 +13900,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
                 llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, 64));
                 llvm::Value* bufPtr = builder_.CreateGEP(llvm::ArrayType::get(i8Ty, 64), buf, {builder_.getInt64(0), builder_.getInt64(0)});
-                llvm::Value* written = builder_.CreateCall(snpFn, {bufPtr, builder_.getInt64(64), fmtGV, arg}, "snp.ret");
+                llvm::Value* written = builder_.CreateCall(snpFn, {bufPtr, builder_.getInt64(64), fmtGV, signPtr, mag}, "snp.ret");
                 auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
                 auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
                 llvm::Value* len64 = builder_.CreateSExt(written, i64());
@@ -13866,14 +13919,24 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return strObj;
             }
             // Binary (radix=2): emit a runtime bit-scan loop.
-            // Builds digits MSB-first into a 33-byte stack buffer.
+            // Builds the MAGNITUDE's digits MSB-first into a 66-byte stack
+            // buffer, with the sign byte first for a negative value (§9.1).
             auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            auto* buf2 = entryAlloca(llvm::ArrayType::get(i8Ty, 33));
+            const unsigned BUF = 66;  // 64 bits + sign + NUL
+            llvm::Value* off = builder_.CreateSelect(
+                isNeg, builder_.getInt64(1), builder_.getInt64(0), "rts.off");
+            llvm::Value* signByte = builder_.CreateSelect(
+                isNeg, llvm::ConstantInt::get(i8Ty, '-'),
+                llvm::ConstantInt::get(i8Ty, '0'), "rts.sigb");
+            auto* buf2 = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
             llvm::Value* b2Ptr = builder_.CreateGEP(
-                llvm::ArrayType::get(i8Ty, 33), buf2,
+                llvm::ArrayType::get(i8Ty, BUF), buf2,
                 {builder_.getInt64(0), builder_.getInt64(0)});
+            // The sign byte; the digits overwrite it when the value is not
+            // negative.
+            builder_.CreateStore(signByte, b2Ptr);
             // For n=0: just write "0"
-            llvm::Value* isZero = builder_.CreateICmpEQ(arg, builder_.getInt32(0));
+            llvm::Value* isZero = builder_.CreateICmpEQ(mag, builder_.getInt64(0));
             auto* zeroBB = llvm::BasicBlock::Create(llvm_, "bn.zero", currentFn_);
             auto* nonBB  = llvm::BasicBlock::Create(llvm_, "bn.nonz", currentFn_);
             auto* binBB  = llvm::BasicBlock::Create(llvm_, "bn.end",  currentFn_);
@@ -13881,10 +13944,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateCondBr(isZero, zeroBB, nonBB);
             // Zero: write "0\0"
             builder_.SetInsertPoint(zeroBB);
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, '0'), b2Ptr);
-            llvm::Value* z1 = builder_.CreateGEP(i8Ty, b2Ptr, builder_.getInt64(1));
+            llvm::Value* z0 = builder_.CreateGEP(i8Ty, b2Ptr, off);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, '0'), z0);
+            llvm::Value* z1 = builder_.CreateGEP(
+                i8Ty, b2Ptr, builder_.CreateAdd(off, builder_.getInt64(1)));
             builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), z1);
-            llvm::Value* zlen = builder_.getInt64(1);
+            llvm::Value* zlen = builder_.CreateAdd(off, builder_.getInt64(1));
             auto* zeroBBEnd = builder_.GetInsertBlock();
             builder_.CreateBr(binBB);
             // Non-zero: find highest set bit, then emit each bit MSB-first.
@@ -13894,10 +13959,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateStore(builder_.getInt32(0), lenS);
             // Find bit width: highest set bit position.
             // Use while loop: find highest bit.
-            auto* tmp = entryAlloca(i32());
-            builder_.CreateStore(arg, tmp);
+            auto* tmp = entryAlloca(i64());
+            builder_.CreateStore(mag, tmp);
             auto* bitPos = entryAlloca(i32());
-            builder_.CreateStore(builder_.getInt32(31), bitPos);
+            builder_.CreateStore(builder_.getInt32(63), bitPos);
             // Scan from MSB to find the first 1 bit.
             auto* fhBB = llvm::BasicBlock::Create(llvm_, "bn.fh", currentFn_);
             auto* fhBodyBB = llvm::BasicBlock::Create(llvm_, "bn.fhb", currentFn_);
@@ -13905,10 +13970,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateBr(fhBB);
             builder_.SetInsertPoint(fhBB);
             llvm::Value* bp = builder_.CreateLoad(i32(), bitPos);
-            llvm::Value* bv = builder_.CreateLoad(i32(), tmp);
-            llvm::Value* bit = builder_.CreateLShr(bv, bp);
+            llvm::Value* bv = builder_.CreateLoad(i64(), tmp);
+            llvm::Value* bit = builder_.CreateLShr(
+                bv, builder_.CreateZExt(bp, i64()));
             llvm::Value* isOne = builder_.CreateICmpEQ(
-                builder_.CreateAnd(bit, builder_.getInt32(1)), builder_.getInt32(1));
+                builder_.CreateAnd(bit, builder_.getInt64(1)), builder_.getInt64(1));
             llvm::Value* bpGe0 = builder_.CreateICmpSGT(bp, builder_.getInt32(0));
             builder_.CreateCondBr(builder_.CreateAnd(bpGe0, builder_.CreateNot(isOne)),
                 fhBodyBB, fhEndBB);
@@ -13921,7 +13987,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* emLen = entryAlloca(i64());
             llvm::Value* startBP = builder_.CreateLoad(i32(), bitPos);
             builder_.CreateStore(startBP, emBP);
-            builder_.CreateStore(builder_.getInt64(0), emLen);
+            builder_.CreateStore(off, emLen);
             auto* emCBB = llvm::BasicBlock::Create(llvm_, "bn.ec", currentFn_);
             auto* emBBB = llvm::BasicBlock::Create(llvm_, "bn.eb", currentFn_);
             auto* emEBB = llvm::BasicBlock::Create(llvm_, "bn.ee", currentFn_);
@@ -13932,8 +13998,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.SetInsertPoint(emBBB);
             llvm::Value* epB = builder_.CreateLoad(i32(), emBP);
             llvm::Value* lenV = builder_.CreateLoad(i64(), emLen);
-            llvm::Value* bArg = builder_.CreateLoad(i32(), tmp);
-            llvm::Value* d = builder_.CreateAnd(builder_.CreateLShr(bArg, epB), builder_.getInt32(1));
+            llvm::Value* bArg = builder_.CreateLoad(i64(), tmp);
+            llvm::Value* d = builder_.CreateAnd(
+                builder_.CreateLShr(bArg, builder_.CreateZExt(epB, i64())),
+                builder_.getInt64(1));
             llvm::Value* ch = builder_.CreateAdd(builder_.CreateTrunc(d, i8Ty),
                 llvm::ConstantInt::get(i8Ty, '0'));
             llvm::Value* dp = builder_.CreateGEP(i8Ty, b2Ptr, lenV);
