@@ -3497,9 +3497,11 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // fix #7214 (§27.6 / stdlib §5, v0.344): the RESULT type of a §5 callback
     // that is HELD IN A LOCAL — `var f := Cat; xs.Zip(ys, f)`.
     //
-    // §27.6: "a method reference forms a function value". The BARE spelling
-    // (`Cat`) is the one §27.6 forms as "a reference to a method", and it
-    // carries NO Function TypeRef on the EXPRESSION (issue #7182): sema's
+    // §27.6: "A reference's **formed type** ... is the callee's own signature
+    // read as a function type" — a method reference is a function value. The
+    // BARE spelling (`Cat`) is the one §27.6 forms as "a reference to a
+    // method", and it carries NO Function TypeRef on the EXPRESSION
+    // (issue #7182): sema's
     // call-resolution slice leaves it untyped, and fix #4897 (v0.307)
     // synthesized the missing type only inside `checkAssignable`, so it never
     // reached the expression — nor the INFERRED local that binds it, whose
@@ -3520,18 +3522,78 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     // declared type is consulted first: an ANNOTATED local
     // (`var f: (string, string) -> string := Cat;`) carries the Function
     // TypeRef already, and the identifier's own `exprType` carries it too.
+    //
+    // fix #7246 (§27.6 / stdlib §5, v0.344): the local may be an ALIAS of
+    // another local — `var f := Cat; var g := f; xs.Zip(ys, g);` — and then
+    // the initializer is an IDENTIFIER, which carries no type of its own, so
+    // the one-level recovery found nothing and the lowering still fell back
+    // to `i32` (measured: the same truncation #7214 removed for the
+    // one-level case — an ASan SEGV on the low 32 bits of the element
+    // pointer). The recovery therefore FOLLOWS THE CHAIN of local
+    // initializers: while the initializer is itself a reference to a local,
+    // the walk continues at that local.
+    //
+    // §27.6: "A reference's **formed type** ... is the callee's own signature
+    // read as a function type" — the reference IS a function value, so
+    // binding it to a local and then ALIASING that local is an ordinary use
+    // of the same value (§12.7's *Function-typed targets* reads the alias
+    // `var g := f;` as an ordinary binding), and stdlib §5's
+    // `Zip<U,R>(other, combine: (T,U) -> R)` takes a function VALUE, so the
+    // aliased spelling is an admitted combiner that owes the same lowering.
+    //
+    // The walk stops at the first local that carries a Function TypeRef of
+    // its own (an ANNOTATED local, `var f: (string, string) -> string := …;`)
+    // or whose initializer names a method reference; a local whose
+    // initializer is neither contributes no type and the walk stops there.
+    //
+    // The chain's NULLABILITY does not change the recovered type: the
+    // callback's RESULT type is a property of the method the chain names,
+    // and a nullable function-typed local along the chain
+    // (`var g: ((string, string) -> string)? := f;`) still names that same
+    // result type — only the reference's own nullability differs, and the
+    // §5 lowering reads the RESULT slot, not the reference's.
+    //
+    // The walk is CYCLE-GUARDED: a local initialised from itself, or a cycle
+    // of locals (`var a := b; var b := a;`), would otherwise loop forever, so
+    // a declaration already visited ends the walk. The hop bound is a second,
+    // belt-and-braces limit on a pathological chain.
     auto localHeldCallbackResultType = [&](size_t i) -> sema::TypeRef* {
         if (i >= call.args.size() || !call.args[i].value) return nullptr;
         const ast::Expr* a = call.args[i].value.get();
-        auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*a));
-        if (!ls) return nullptr;
-        if (ls->declType && ls->declType->kind == sema::TypeRef::Kind::Function &&
-            ls->declType->funcReturn)
-            return ls->declType->funcReturn;
-        if (!ls->decl) return nullptr;
-        LocalDeclInitView view = localDeclInitView(ls->decl);
-        if (!view.init || view.init == a) return nullptr;
-        return linqSelectorResultType(ctx_, view.init);
+        // The local declarations walked so far — the cycle guard's memory.
+        std::vector<const ast::Node*> seen;
+        const ast::Expr* cur = a;
+        for (unsigned hop = 0; hop < 64; ++hop) {
+            auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*cur));
+            // Not a local: the expression itself names the reference (the
+            // bare spelling) and the direct recovery applies. At the first
+            // hop this repeats the attempt the call site already made and
+            // found empty; at a later hop it cannot happen, because the walk
+            // only advances to an expression that names a local.
+            if (!ls) return linqSelectorResultType(ctx_, cur);
+            // The local's OWN declared type wins: an ANNOTATED local
+            // (`var f: (string, string) -> string := Cat;`) carries the
+            // Function TypeRef already, and so does the identifier's own
+            // `exprType` (read by `linqSelectorResultType` at the call
+            // sites, before this recovery is consulted at all).
+            if (ls->declType && ls->declType->kind == sema::TypeRef::Kind::Function &&
+                ls->declType->funcReturn)
+                return ls->declType->funcReturn;
+            if (!ls->decl) return nullptr;
+            if (std::find(seen.begin(), seen.end(), ls->decl) != seen.end())
+                return nullptr;  // cycle — stop rather than loop
+            seen.push_back(ls->decl);
+            LocalDeclInitView view = localDeclInitView(ls->decl);
+            if (!view.init || view.init == cur) return nullptr;
+            // The initializer is the reference the local binds. If it is
+            // ITSELF a local reference, follow it to that local; otherwise
+            // it is the method reference itself and the one-level recovery
+            // applies to it.
+            if (!dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*view.init)))
+                return linqSelectorResultType(ctx_, view.init);
+            cur = view.init;
+        }
+        return nullptr;
     };
 
     // #422 / §28.9 / §28.3: a LAZY operator stores its closure in the enumerator
