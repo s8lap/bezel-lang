@@ -390,6 +390,64 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
                "`GetHashCode`/`GetType` (\xC2\xA7""8.1); no user member or "
                "\xC2\xA7""26.5 extension provides `" + m + "`";
     }
+    // fix #7177 (§27.1 / §27.6 / §27.7 / §26.5, v0.344): a FUNCTION-typed
+    // receiver is the third value shape with no user `TypeSymbol` — the
+    // primitive and the unit type are the other two, and both are answered
+    // above. A function value (a method reference, §27.6, or a lambda, §27.5)
+    // has NO member table: §26.5 resolves `x.Foo` against the receiver's
+    // DECLARED type and its bases, and a function type declares neither, so
+    // the name resolves to nothing (§2.7). Without this arm the access was
+    // left untyped and unreported, and codegen degraded it to nothing.
+    //
+    // MEASURED on the pre-fix base (r30-c1 tip 40d1691f): `h.Id<int>.Get()`
+    // — a method reference over a generic method, §27.6 — compiled, ran,
+    // exited 0 and printed NOTHING (one #3079 internal-degradation
+    // warning); so did `h.Id<int>?.Get()`, `h?.Id<int>.Get()` and
+    // `h?.Id<int>?.Get()`. The same shape with a NON-EXISTENT member name
+    // (`h.Id<int>.Bogus()`) was equally silent, so the receiver was not
+    // rejected by any member-existence rule at all.
+    //
+    // The universal members stay admissible: the exemption at the top of
+    // this predicate already exempts them, and they ARE members of a function
+    // value — `h.Id<int>.ToString()` prints the function's signature
+    // ("(int) -> int"), MEASURED on the same base.
+    //
+    // fix #7177 rework (§8.1 / §8.7 / §26.5 rule 2 / §28.2 / §28.9,
+    // v0.344): TWO carve-outs.
+    //
+    // (1) `Dispose` and `ReferenceEquals` stay ADMISSIBLE on a function
+    // value.  §28.9 (v0.344) says a function-typed value's `Dispose()` is
+    // "a no-op (or, for types that are not classes and therefore have no
+    // `Dispose()` at all…)" — the spec contemplates the SPELLING and leaves
+    // its effect open, and the compiler has always implemented it as a REAL
+    // dispose on a closure cell (§28.2's checked-disposal guard; the
+    // `bz_closure_mark_disposed` helper, #4475), a behaviour the banked
+    // `closure_dispose_then_invoke_4475` rows pin.  Rejecting the spelling
+    // would be a silent behaviour flip on a spec-AMBIGUOUS point, so it
+    // stays admitted and the ambiguity is reported to the coordinator
+    // (a `spec-question`, not a code change).
+    //
+    // (2) A member an `extension Object` provides is NOT nameless and must
+    // not be rejected here.  §8.1 (v0.344): "function types reaching
+    // `Object` similarly via their reference-type heap representation" ⇒
+    // `Object` IS a base type of a function type, and §26.5 rule 2 searches
+    // the extension blocks "on `x`'s type, base types, or implemented
+    // interfaces".  The extension lookup itself now REACHES that base
+    // (`extensionFindMatchingAncestor`, ExprTypecheck.cpp), so a member an
+    // `extension Object` provides RESOLVES and this arm is never asked
+    // about it.  The message below is therefore drawn only for a name that
+    // NO reachable extension declares, and it says so.
+    if (recvTy->kind == TypeRef::Kind::Function) {
+        if (m == "Dispose" || m == "ReferenceEquals") return {};
+        return "no member `" + m +
+               "` on a function value: a function type (\xC2\xA7""27.1) "
+               "declares no members of its own — a function value is CALLED "
+               "(`f(x)`), not queried for members (\xC2\xA7""27.7); the "
+               "members reachable on one are the \xC2\xA7""8.1 universal "
+               "instance members and the \xC2\xA7""26.5 extension members of "
+               "its `Object` base (\xC2\xA7""8.1) — and none of those "
+               "declares `" + m + "`";
+    }
     return {};
 }
 

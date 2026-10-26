@@ -13290,8 +13290,34 @@ static const TypeRef* extensionFindMatchingAncestor(
                 case P::ULong: case P::Float: case P::Double: case P::Decimal:
                 case P::Char:
                     return target;
-                default: break;  // String/Object/Unit/Function — fall through
+                default: break;  // String/Object/Unit — fall through
             }
+        } else if (recv->kind == TypeRef::Kind::Function) {
+            // fix #7177 (§26.5 rule 2 / §8.1, v0.344): a FUNCTION type
+            // reaches `Object` "via their reference-type heap representation"
+            // (§8.1), so `Object` IS a base type of a function type, and
+            // §26.5 rule 2 searches the extension blocks "on `x`'s type,
+            // base types, or implemented interfaces". An `extension Object`
+            // block is therefore a CANDIDATE for a function-typed receiver.
+            //
+            // MEASURED on the pre-fix base (r30-c1 tip 40d1691f): with
+            // `extension Object { public method Leak(k: Keeper) => ... }`,
+            // `f.Leak(k)` over `var f: () -> int` COMPILED and did NOTHING —
+            // the extension never matched, the member access stayed untyped,
+            // and the call degraded to nothing (one #3079 internal-
+            // degradation warning). The corpus case `s28_3_0119` banks that
+            // program as ADMITTED (§28.3: "a capture-free one is admitted"),
+            // so the extension must REACH the function receiver.
+            //
+            // The receiver position of an extension whose head is `Object` is
+            // a SET-ERASING position (§28.3's closure bullet, §9.7: "the
+            // receiver position is borrow-erasing like a parameter of that
+            // type"), so §28.3's rule applies there: a function value with a
+            // non-empty source set is rejected and a CAPTURE-FREE one is
+            // admitted. The capture-bearing rejection is #5514's job and is
+            // NOT part of this change; what this arm restores is only that
+            // the extension REACHES the receiver at all.
+            return target;
         }
     }
     // Walk user-declared receiver's base type chain.

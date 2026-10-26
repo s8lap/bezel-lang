@@ -515,6 +515,32 @@ static const char* typeTest5146OperandKindLabel(const TypeRef* d) {
 // identifier `Message`" where the identical hierarchy declared in ONE module
 // resolved it.)
 
+// fix #7177 (§23.4 / §23.5, v0.344): does `t` — or a type it INHERITS an
+// indexer from — declare an indexer at all?  The question the §23.4
+// indexer gate asks of a VALUE receiver ("does this type declare an
+// indexer?"), reduced to the yes/no the type-name receiver gate asks.
+//
+// The walk mirrors the one the §23.4 indexer typing block does over the
+// receiver type and its base chain: a `PropertySymbol` with `isIndexer`
+// set.  A BUILT-IN class symbol (`isUserDeclaredTypeSym` false) carries no
+// member table at all, so the walk finds nothing for it — which is why the
+// caller asks the built-in question separately.
+bool typeDeclaresIndexer(const TypeSymbol* t) {
+    if (!t) return false;
+    std::vector<const TypeSymbol*> frontier{t};
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        const TypeSymbol* cur = frontier[i];
+        if (!cur) continue;
+        for (const Symbol* m : cur->members) {
+            const auto* ps = dynamic_cast<const PropertySymbol*>(m);
+            if (ps && ps->isIndexer) return true;
+        }
+        for (const TypeSymbol* b : cur->baseTypes)
+            if (b) frontier.push_back(b);
+    }
+    return false;
+}
+
 // §14.1 (#2006): REMOVED by fix #4229 — replaced by
 // `ExprTC::typeTestTargetMentionsTypeVariable`, a member that threads
 // `currentScopeGenericParamNames()` through `refOutParamTypeMentionsTypeParam`
@@ -4032,6 +4058,111 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (ix->target) {
             TypeRef* tt = ctx_.exprType(*ix->target);
+            // fix #7177 (§23.4 / §23.5 / §2.7, v0.344): the receiver of an
+            // index must be a VALUE.  A type name is not a value — §23.4
+            // (v0.344): "An indexer is a property whose name is replaced by
+            // `[parameters]`", and §23.5 (v0.344): "Static indexers are not
+            // supported" — so a type name can never be indexed even when the
+            // type DECLARES an indexer (an indexer is an INSTANCE member).
+            // §2.7 (v0.344) is the name-resolution rule behind the parallel
+            // §7.5 rejection: its table's "Head continued by `?.` or postfix
+            // `!`" row reads "these operators demand a nullable *value*;
+            // static access is spelled with `.` alone".
+            //
+            // MEASURED on the pre-fix base (r30-c1 tip 40d1691f), for a
+            // non-generic class `Plain` that declares `property [i: int]:
+            // int`:
+            //   * `Console.WriteLine(Plain[0]);` — compiled, ran, exited 0
+            //     and printed NOTHING (one #3079 internal-degradation
+            //     warning);
+            //   * `var z: int := Plain[0];` — compiled, ran and printed `0`:
+            //     a WRONG VALUE, not merely an empty output;
+            //   * `Plain[0] := 5;` — compiled with NO diagnostic at all.
+            // The GENERIC spelling `Box<int>[0]` behaved IDENTICALLY on a
+            // `Box<T>` that declares an indexer, so the issue's contrast
+            // ("the generic spelling is rejected, the non-generic one is
+            // accepted") was an artefact of the two probes declaring
+            // DIFFERENT indexers, not of their genericity: the verdict
+            // tracked only whether the type declared an indexer at all.  A
+            // type that declares NONE drew the existing §23.4 message
+            // ("type `X` does not declare an indexer — `a[i]` requires an
+            // indexer (§23.4)") and was rejected; a type that declares one
+            // was accepted and silently did nothing.
+            //
+            // The rule this gate implements, and the two messages it draws:
+            //   * the type declares NO indexer → the EXISTING §23.4 wording,
+            //     byte for byte, so the generic spelling's diagnostic (which
+            //     the issue's reviewers pinned) is unchanged and the
+            //     non-generic spelling now draws the SAME text;
+            //   * the type DOES declare one — or is a BUILT-IN class, whose
+            //     member table the compiler does not carry — → a new message
+            //     naming the type-name receiver, because "does not declare an
+            //     indexer" would be a falsehood there.
+            //
+            // A type name in receiver position is not itself wrong: §22.12's
+            // static-member form spells it (`Registry<int>.Register()`).  Only
+            // the INDEX on it is.  The parallel §7.5 rejection (a `?.` on a
+            // type name, #5452) is the same rule for the null-conditional
+            // operator.
+            if (TypeSymbol* recvTypeName =
+                    dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*ix->target))) {
+                if (!isUserDeclaredTypeSym(recvTypeName) ||
+                    typeDeclaresIndexer(recvTypeName)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        "the index operator `[]` cannot be applied to a type "
+                        "name (`" + std::string(recvTypeName->name) +
+                        "`); `a[i]` requires an indexer on a value — an "
+                        "indexer is an instance member and static indexers "
+                        "are not supported (§23.4 / §23.5)");
+                } else {
+                    // The EXISTING §23.4 wording, spelled once here so the
+                    // generic and the non-generic spelling of the same shape
+                    // draw the SAME text.  The `?` fallback mirrors the
+                    // §23.4 indexer gate's own spelling for a nameless type.
+                    const std::string tn =
+                        recvTypeName->name.empty()
+                            ? std::string("?")
+                            : std::string(recvTypeName->name);
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        std::string("type `") + tn +
+                            "` does not declare an indexer — "
+                            "`a[i]` requires an indexer (§23.4)");
+                }
+                // The value-receiver machinery below does not apply: there is
+                // no receiver VALUE to read an indexer from.  Clearing `tt`
+                // skips the §23.4 typing block; the `this`/`base` synthesis
+                // that precedes it cannot match a type name (its keyword test
+                // admits only `this` and `base`), so it stays inert.
+                tt = nullptr;
+            }
+            // fix #7177 (§23.4 / §27.1 / §27.7, v0.344): the INDEX form of
+            // the member-access hole a §27.6 method-reference value opens. A
+            // FUNCTION-typed receiver declares no members at all, so it
+            // declares no indexer either: `h.Id<int>[0]` names nothing to
+            // read. §23.4 (v0.344): "An indexer is a property whose name is
+            // replaced by `[parameters]`" — an index expression names a
+            // DECLARED indexer, and a function type declares none.
+            //
+            // MEASURED on the pre-fix base (r30-c1 tip 40d1691f): both
+            // `h.Id<int>[0]` and `h?.Id<int>[0]` compiled, ran, exited 0 and
+            // printed NOTHING (one #3079 internal-degradation warning each).
+            // The member-access twins (`h.Id<int>.Get()` and
+            // `h.Id<int>?.Get()`) are closed by the §27.1 arm of
+            // `closedValueSurfaceMemberReason` (ExprTypecheck_Calls.cpp).
+            if (tt && tt->kind == TypeRef::Kind::Function) {
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    "no indexer on a function value: `a[i]` requires an "
+                    "indexer (\xC2\xA7""23.4), and a function type "
+                    "(\xC2\xA7""27.1) declares no indexer of its own — a "
+                    "function value is CALLED (`f(x)`), not indexed "
+                    "(\xC2\xA7""27.7); no \xC2\xA7""26.5 extension can "
+                    "provide one either (\xC2\xA7""26.3: an extension block "
+                    "may not declare an indexer)");
+                tt = nullptr;
+            }
             // fix #2795 (§23.4 / §7.1 / §7.4, v0.240): the receiver type of a
             // `this`-rooted index. §23.4: "Inside a member of a class with its
             // own indexer, `this[i]` is required (the brackets need a left-hand
