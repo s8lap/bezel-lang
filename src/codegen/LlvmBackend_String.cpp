@@ -3258,15 +3258,22 @@ const sema::TypeRef* Emitter::recordMemberType(const sema::Symbol* m) {
 // declared member. // per stdlib §3.1 / §8.5 / §18.5
 llvm::Value* Emitter::emitStringBuilderToString(llvm::Value* sb) {
     if (!sb || !sb->getType()->isPointerTy()) return nullptr;
-    // Use the runtime helper to concatenate all string parts.
-    auto* outDataSlot = entryAlloca(ptrTy());
-    auto* outLenSlot  = entryAlloca(i64());
-    auto* fn = declareC("bz_strbuilder_to_string",
-                        llvm::Type::getVoidTy(llvm_),
+    // fix #7229 (spec §4.6 / stdlib §3.1, v0.344): the builder's content is
+    // flattened in the CODE-POINT domain and packed at ONE width — the widest
+    // of the parts' widths — and the runtime helper REPORTS that width. This
+    // used to store a hard-coded width of 1, so a width-2 part's
+    // two-bytes-per-code-point storage was read as one byte per code point and
+    // every code point above U+00FF was mangled; the length stored was the
+    // byte count, not the code-point count §4.6 defines.
+    auto* outDataSlot  = entryAlloca(ptrTy());
+    auto* outWidthSlot = entryAlloca(i8());
+    auto* fn = declareC("bz_strbuilder_flatten",
+                        i64(),
                         {ptrTy(), ptrTy(), ptrTy()});
-    builder_.CreateCall(fn, {sb, outDataSlot, outLenSlot});
-    llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
-    llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
+    // The helper returns the content's code-point count (§4.6's length).
+    llvm::Value* len = builder_.CreateCall(fn, {sb, outDataSlot, outWidthSlot});
+    llvm::Value* data  = builder_.CreateLoad(ptrTy(), outDataSlot);
+    llvm::Value* width = builder_.CreateLoad(i8(), outWidthSlot);
     // Build a bz.string object from the malloc'd buffer.
     // #422: allocate the full header size (now 32 bytes incl. rc), not
     // a hardcoded 24 — writing rc into field 3 of a 24-byte block would
@@ -3278,7 +3285,7 @@ llvm::Value* Emitter::emitStringBuilderToString(llvm::Value* sb) {
         builder_.CreateStructGEP(stringType(), sobj, 0));
     builder_.CreateStore(len,
         builder_.CreateStructGEP(stringType(), sobj, 1));
-    builder_.CreateStore(builder_.getInt8(1),
+    builder_.CreateStore(width,
         builder_.CreateStructGEP(stringType(), sobj, 2));
     initStringRc(sobj);  // #422: producer's reference, rc := 1
     return sobj;

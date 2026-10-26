@@ -956,6 +956,93 @@ extern "C" void* bz_str_from_char_array(const void* arr_p,
     return strObj;
 }
 
+// Write one code point into the `index`-th slot of a packed width-wide buffer.
+static inline void bz_put_cp(void* data, int64_t index, int8_t width, uint32_t cp) {
+    if (width == 1)      ((uint8_t*)data)[index]  = (uint8_t)cp;
+    else if (width == 2) ((uint16_t*)data)[index] = (uint16_t)cp;
+    else                 ((uint32_t*)data)[index] = cp;
+}
+
+// The builder's content, flattened in the CODE-POINT domain (spec §4.6).
+//
+// §4.6: a `string` stores each code point in `width` bytes (1, 2 or 4), the
+// width chosen PER STRING at construction from the largest code point in the
+// value. A builder's parts are strings, each with its OWN width, so the
+// builder's content is NOT the concatenation of the parts' BYTES: a width-1
+// part's byte and a width-2 part's two bytes are different code points, and a
+// byte-level concatenation of parts with DIFFERENT widths is not a
+// code-point concatenation at all.
+//
+// The content is therefore flattened in the code-point domain, and the result
+// is packed at ONE width — the WIDEST of the parts' widths, with the narrower
+// parts' code points re-encoded into it. That is the rule this compiler
+// already uses for the string `+` operator (Emitter::emitStringConcat in
+// LlvmBackend_String.cpp: the result's width is max(lhs, rhs) and the
+// narrower operand is widened code point by code point), and §4.6 makes the
+// choice of width invisible at the language level ("programs observe only the
+// `char` sequence and its length").
+//
+// out_cps: a malloc'd array of the content's code points (the caller frees
+//          it). out_count: the content's code-point count (§4.6's length).
+//          out_width: the width the flattened result is packed at.
+static void bz_sb_content_cps(bz_array_t* arr, uint32_t** out_cps,
+                              int64_t* out_count, int8_t* out_width) {
+    int64_t total = 0;
+    int8_t w = 1;
+    if (arr && arr->data) {
+        for (int64_t i = 0; i < arr->count; i++) {
+            void* sptr = ((void**)arr->data)[i];
+            if (!sptr) continue;
+            auto* s = (bz_string_struct*)sptr;
+            if (s->len <= 0) continue;
+            total += s->len;
+            if (s->width > w) w = s->width;
+        }
+    }
+    uint32_t* cps = (uint32_t*)malloc((size_t)(total > 0 ? total : 1) *
+                                       sizeof(uint32_t));
+    int64_t off = 0;
+    if (arr && arr->data) {
+        for (int64_t i = 0; i < arr->count; i++) {
+            void* sptr = ((void**)arr->data)[i];
+            if (!sptr) continue;
+            auto* s = (bz_string_struct*)sptr;
+            for (int64_t k = 0; k < s->len; k++) cps[off++] = bz_str_cp(s, k);
+        }
+    }
+    *out_cps = cps;
+    *out_count = total;
+    *out_width = w;
+}
+
+// fix #7229 (spec §4.6 / stdlib §3.1, v0.344): flatten the builder's parts
+// into ONE packed buffer of CODE POINTS.
+//
+// Returns the content's code-point count (§4.6's length) and fills `*out_data`
+// with a malloc'd buffer holding the content's code points at `*out_width`
+// bytes each, plus one width-sized NUL slot (the convention the other
+// width-aware runtime helpers here use). The caller owns `*out_data`; it
+// becomes the `string`'s data buffer.
+//
+// The width is the WIDEST of the parts' widths — see bz_sb_content_cps for
+// why, and for the spec's rule that the choice is invisible at the language
+// level.
+extern "C" int64_t bz_strbuilder_flatten(void* parts_arr, char** out_data,
+                                          int8_t* out_width) {
+    auto* arr = (bz_array_t*)parts_arr;
+    uint32_t* cps = nullptr;
+    int64_t count = 0;
+    int8_t w = 1;
+    bz_sb_content_cps(arr, &cps, &count, &w);
+    size_t bytes = (size_t)count * (size_t)w;
+    void* data = calloc(bytes + (size_t)w, 1);   // + width-sized NUL slot
+    for (int64_t i = 0; i < count; i++) bz_put_cp(data, i, w, cps[i]);
+    free(cps);
+    *out_data = (char*)data;
+    *out_width = w;
+    return count;
+}
+
 // per §3.1 (StringBuilder.ToString): flatten the builder's parts array into a
 // fresh, owned byte buffer (out_data, out_len). Each part is a +1 bz_string
 // (the builder owns a +1 per part from Append/ctor, #1185); this helper
@@ -963,6 +1050,17 @@ extern "C" void* bz_str_from_char_array(const void* arr_p,
 // — the builder's destructor / ResetTo path handles that (#1185). The caller
 // is responsible for freeing out_data via free(). Width-1 (byte) mode,
 // matching Append.
+//
+// LEGACY BYTE-LEVEL VIEW — NOT the builder's content. This helper concatenates
+// the parts' RAW BYTES, so it loses the per-string width (§4.6): for a part
+// wider than one byte per code point the byte blob is not the content's
+// code-point sequence, and a part of a DIFFERENT width makes the blob a
+// concatenation of two different encodings. The builder's own paths (its
+// ToString and its mutators) use bz_strbuilder_flatten, which flattens in
+// the code-point domain and reports the width. This helper remains for the
+// Object-vtable renderer (bz_sb_obj_tostring in bezel_runtime_refcounting.cpp),
+// whose caller cannot recover a width it is never told — see the #7229
+// residual.
 void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || arr->count == 0) {
@@ -1000,17 +1098,19 @@ void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len)
 // #1185), so before dropping the old parts each one is bz_string_release'd —
 // otherwise the retained +1 would leak. bz_string_release is null-safe and a
 // no-op on a sentinel/literal, so a null/never-stored slot is safe to pass.
-// Width-1 (byte) mode, matching Append/ToString.
+//
+// The mutators work in the CODE-POINT domain (spec §4.6 / stdlib §3.1,
+// v0.344): the index and length a caller passes count CODE POINTS — §4.6 makes
+// `s[i]` the char at code-point position i, and §3.1's bound is `0..Length`
+// with `Length` a count of code points — while the content they address is
+// the concatenation of the parts' code points. The previous implementation
+// addressed the parts' concatenated BYTES, so an in-range index could land in
+// the middle of a code point's storage (#7229).
 
-// Replace the entire parts list with one freshly-allocated +1 string holding
-// `data[0..len)` (which `bz_sb_set_*` then owns by transferring it in). Resets
+// Replace the entire parts list with ONE freshly-allocated +1 string part
+// holding `strObj` (which the builder then owns by transferring it in). Resets
 // the array's count to 0 and adds the single new part.
-static void bz_sb_reset_to(bz_array_t* arr, char* data, int64_t len) {
-    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
-    memcpy(strObj, &data, sizeof(void*));
-    memcpy(strObj + 8, &len, sizeof(int64_t));
-    strObj[16] = 1;                                  // width = 1 (byte mode)
-    bz_string_init_rc(strObj);                       // #422: producer ref, rc := 1
+static void bz_sb_reset_to(bz_array_t* arr, void* strObj) {
     // #1185: release each old owned part before dropping it (the builder owns a
     // +1 per part from Append/ctor). bz_string_release is null-/sentinel-safe.
     if (arr->data) {
@@ -1023,35 +1123,56 @@ static void bz_sb_reset_to(bz_array_t* arr, char* data, int64_t len) {
     bz_array_add(arr, &strObj, 8);
 }
 
-// per §3.1 (StringBuilder.Insert(index, value)): insert `value` at the
-// byte-offset `index` of the builder's flattened content. Out-of-range
+// Pack a code-point sequence into a fresh +1 bz.string at `width` bytes per
+// code point (§4.6). The builder takes the new part by transferring it in.
+static void* bz_sb_string_from_cps(const uint32_t* cps, int64_t count,
+                                   int8_t width) {
+    size_t bytes = (size_t)count * (size_t)width;
+    void* data = calloc(bytes + (size_t)width, 1);   // + width-sized NUL slot
+    for (int64_t i = 0; i < count; i++) bz_put_cp(data, i, width, cps[i]);
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &data, sizeof(void*));
+    memcpy(strObj + 8, &count, sizeof(int64_t));
+    strObj[16] = (uint8_t)width;
+    bz_string_init_rc(strObj);                       // #422: producer ref, rc := 1
+    return strObj;
+}
+
+// per §3.1 (StringBuilder.Insert(index, value)): insert `value`'s CODE POINTS
+// at the code-point index `index` of the builder's content. Out-of-range
 // (index < 0 or > Length) is a no-op here; the codegen-side bounds check
 // raises IndexOutOfRangeException per the §3.1 v0.195 contract. The insert
-// does NOT retain `value` — it COPIES `value`'s bytes into the new flat
+// does NOT retain `value` — it COPIES `value`'s code points into the new flat
 // buffer; the caller still owns the value. The builder resets to one part
 // (via bz_sb_reset_to), releasing the old +1 parts first.
 void bz_sb_insert(void* parts_arr, int64_t index, const void* value) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || !value) return;
-    char* flat; int64_t flen;
-    bz_strbuilder_to_string(parts_arr, &flat, &flen);  // current content
-    if (index < 0 || index > flen) { free(flat); return; }  // no-op on OOB
+    uint32_t* cps = nullptr;
+    int64_t count = 0;
+    int8_t w = 1;
+    bz_sb_content_cps(arr, &cps, &count, &w);        // current content
+    if (index < 0 || index > count) { free(cps); return; }  // no-op on OOB
     auto* v = (bz_string_struct*)value;
-    int64_t vbytes = v->len * v->width;
-    int64_t total = flen + vbytes;
-    char* buf = (char*)malloc((size_t)(total + 1));
-    memcpy(buf, flat, (size_t)index);                  // prefix
-    memcpy(buf + index, v->data, (size_t)vbytes);      // inserted value
-    memcpy(buf + index + vbytes, flat + index,
-           (size_t)(flen - index));                    // suffix
-    buf[total] = '\0';
-    free(flat);
-    bz_sb_reset_to(arr, buf, total);
+    int64_t vcount = v->len;
+    int8_t vw = v->width ? v->width : 1;
+    int8_t nw = w > vw ? w : vw;                     // the widest of the two
+    int64_t total = count + vcount;
+    uint32_t* out = (uint32_t*)malloc((size_t)(total > 0 ? total : 1) *
+                                       sizeof(uint32_t));
+    int64_t o = 0;
+    for (int64_t i = 0; i < index; i++) out[o++] = cps[i];      // prefix
+    for (int64_t i = 0; i < vcount; i++) out[o++] = bz_str_cp(v, i);  // value
+    for (int64_t i = index; i < count; i++) out[o++] = cps[i];  // suffix
+    free(cps);
+    void* strObj = bz_sb_string_from_cps(out, total, nw);
+    free(out);
+    bz_sb_reset_to(arr, strObj);
 }
 
-// per §3.1 (StringBuilder.Remove(startIndex, length)): remove `length` bytes
-// starting at byte offset `start_index` of the flattened builder content.
-// Per the §3.1 v0.195 contract, an out-of-range request raises
+// per §3.1 (StringBuilder.Remove(startIndex, length)): remove `length` CODE
+// POINTS starting at the code-point index `start_index` of the builder's
+// content. Per the §3.1 v0.195 contract, an out-of-range request raises
 // IndexOutOfRangeException at the codegen layer; the runtime clamps an
 // out-of-range window to a no-op (the SB is unchanged) so a stray caller
 // cannot corrupt the parts list. The builder resets to one part, releasing
@@ -1059,66 +1180,88 @@ void bz_sb_insert(void* parts_arr, int64_t index, const void* value) {
 void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr) return;
-    char* flat; int64_t flen;
-    bz_strbuilder_to_string(parts_arr, &flat, &flen);
+    uint32_t* cps = nullptr;
+    int64_t count = 0;
+    int8_t w = 1;
+    bz_sb_content_cps(arr, &cps, &count, &w);
     // §3.1 / §9.6 Remove: start and length must denote a valid range; an
     // out-of-range request is a no-op here (the SB is unchanged).
-    if (length < 0 || start_index < 0 || start_index + length > flen) {
-        free(flat);
+    if (length < 0 || start_index < 0 || start_index + length > count) {
+        free(cps);
         return;
     }
-    int64_t total = flen - length;
-    char* buf = (char*)malloc((size_t)(total + 1));
-    memcpy(buf, flat, (size_t)start_index);            // prefix
-    memcpy(buf + start_index, flat + start_index + length,
-           (size_t)(flen - start_index - length));     // suffix
-    buf[total] = '\0';
-    free(flat);
-    bz_sb_reset_to(arr, buf, total);
+    int64_t total = count - length;
+    uint32_t* out = (uint32_t*)malloc((size_t)(total > 0 ? total : 1) *
+                                       sizeof(uint32_t));
+    int64_t o = 0;
+    for (int64_t i = 0; i < start_index; i++) out[o++] = cps[i];   // prefix
+    for (int64_t i = start_index + length; i < count; i++) out[o++] = cps[i];  // suffix
+    free(cps);
+    void* strObj = bz_sb_string_from_cps(out, total, w);
+    free(out);
+    bz_sb_reset_to(arr, strObj);
 }
 
 // per §3.1 (StringBuilder.Replace(oldValue, newValue)): replace every
-// non-overlapping byte occurrence of `old_value` in the builder's flattened
-// content with `new_value`. The §3.1 v0.195 contract raises ArgumentException
-// for an empty oldValue; the runtime short-circuits that case (no-op). The
-// builder resets to one part, releasing the old +1 parts first. Replace
-// operates at the BYTE level (parts are width-1 byte strings); multi-byte
-// code points can be corrupted if old_value crosses a code-point boundary,
-// but StringBuilder is documented as operating on the byte representation
-// (Append(ReadOnlyStringSpan) is the per-code-point path, v0.222 / #1810).
+// non-overlapping occurrence of `old_value`'s CODE-POINT sequence in the
+// builder's content with `new_value`'s code points. The §3.1 v0.195 contract
+// raises ArgumentException for an empty oldValue; the runtime short-circuits
+// that case (no-op) — the rejection itself is #7228, not this fix. The
+// builder resets to one part, releasing the old +1 parts first.
+//
+// The match is over CODE POINTS, not over bytes: a byte-level match could
+// straddle a code point's storage (and a byte-level match of a width-1
+// `old_value` against a wider content could hit the low byte of a wide code
+// point), so the two operands are compared as code-point sequences whatever
+// their widths (§4.6).
 void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || !old_value || !new_value) return;
     auto* ov = (bz_string_struct*)old_value;
     auto* nv = (bz_string_struct*)new_value;
-    int64_t obytes = ov->len * ov->width;
-    if (obytes <= 0) return;                            // empty oldValue: no-op
-    char* flat; int64_t flen;
-    bz_strbuilder_to_string(parts_arr, &flat, &flen);
-    int64_t nbytes = nv->len * nv->width;
+    int64_t ocount = ov->len;
+    if (ocount <= 0) return;                          // empty oldValue: no-op
+    uint32_t* cps = nullptr;
+    int64_t count = 0;
+    int8_t w = 1;
+    bz_sb_content_cps(arr, &cps, &count, &w);
+    uint32_t* ocps = (uint32_t*)malloc((size_t)ocount * sizeof(uint32_t));
+    for (int64_t i = 0; i < ocount; i++) ocps[i] = bz_str_cp(ov, i);
+    int64_t ncount = nv->len;
+    uint32_t* ncps = (uint32_t*)malloc((size_t)(ncount > 0 ? ncount : 1) *
+                                        sizeof(uint32_t));
+    for (int64_t i = 0; i < ncount; i++) ncps[i] = bz_str_cp(nv, i);
     // First pass: count occurrences to size the result exactly.
     int64_t occ = 0;
-    for (int64_t i = 0; i + obytes <= flen;) {
-        if (memcmp(flat + i, ov->data, (size_t)obytes) == 0) { occ++; i += obytes; }
-        else i++;
+    for (int64_t i = 0; i + ocount <= count;) {
+        if (memcmp(cps + i, ocps, (size_t)ocount * sizeof(uint32_t)) == 0) {
+            occ++; i += ocount;
+        } else i++;
     }
-    if (occ == 0) { free(flat); return; }              // nothing to do
-    int64_t total = flen + occ * (nbytes - obytes);
-    char* buf = (char*)malloc((size_t)(total + 1));
+    if (occ == 0) {                                  // nothing to do
+        free(cps); free(ocps); free(ncps);
+        return;
+    }
+    int64_t total = count + occ * (ncount - ocount);
+    uint32_t* out = (uint32_t*)malloc((size_t)(total > 0 ? total : 1) *
+                                       sizeof(uint32_t));
     int64_t off = 0;
-    for (int64_t i = 0; i < flen;) {
-        if (i + obytes <= flen &&
-            memcmp(flat + i, ov->data, (size_t)obytes) == 0) {
-            memcpy(buf + off, nv->data, (size_t)nbytes);
-            off += nbytes;
-            i += obytes;
+    for (int64_t i = 0; i < count;) {
+        if (i + ocount <= count &&
+            memcmp(cps + i, ocps, (size_t)ocount * sizeof(uint32_t)) == 0) {
+            for (int64_t k = 0; k < ncount; k++) out[off++] = ncps[k];
+            i += ocount;
         } else {
-            buf[off++] = flat[i++];
+            out[off++] = cps[i++];
         }
     }
-    buf[total] = '\0';
-    free(flat);
-    bz_sb_reset_to(arr, buf, total);
+    free(cps); free(ocps); free(ncps);
+    int8_t nw = w;
+    int8_t nvw = nv->width ? nv->width : 1;
+    if (nvw > nw) nw = nvw;                           // the widest of the two
+    void* strObj = bz_sb_string_from_cps(out, total, nw);
+    free(out);
+    bz_sb_reset_to(arr, strObj);
 }
 
 // stdlib §3.1 AppendFormat(format, args): substitute the .NET-style composite
