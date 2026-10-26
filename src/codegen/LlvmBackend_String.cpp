@@ -1467,15 +1467,107 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // fix #7169 (§9.6, v0.343): the release set is a LIST (the funnel takes
     // one), so a member call that holds a producer receiver — and, later, a
     // producer `string` ARGUMENT — passes both.
-    llvm::Value* ownedSelf[] = {callerOwnedSelf};
+    //
+    // fix #7222 (§9.6 / §28.9 / §28.3 / §28.6, v0.344): the ARGUMENT half is
+    // now WIRED.
+    //
+    // * §28.3.4 (Producers, v0.344), the "Parameter `p` (no modifier)" row:
+    //   a plain parameter is "Borrowed (source: caller)" — so the ARGUMENT's
+    //   reference is the CALLER's to discharge, once the call is over.
+    // * §28.6 (v0.344): "the callee receives a parameter-sourced borrow ...
+    //   the callee further borrows for the duration of the call" — the callee
+    //   owns NO reference and must not release it. stdlib §9.6 (v0.344) agrees:
+    //   `Insert(startIndex: int, value: string): string` carries no `owned`
+    //   marker on `value`.
+    // * §28.9 (v0.344): `string` is runtime-managed — "the implementation
+    //   reclaims the production; how is not specified" — so a production the
+    //   implementation drops on the floor is a LEAK the §28.3 rules forbid.
+    //
+    // The §9.6 member path lowers its arguments HERE, and it never reaches the
+    // ORDINARY call path that discharges a producer argument after the call
+    // (LlvmBackend_Calls2.cpp's post-call release — the #429 block that
+    // `emitBorrowedStringArgPins` defers to). => the discharge belongs HERE,
+    // in the member path — and it is a FAMILY defect, not one arm's: `Replace`
+    // (an arm no earlier lane touched) leaked exactly as `Insert` did.
+    //
+    // MEASURED on the base tree (c9dfae6c), `--sanitize=address`:
+    //   ("a"+"b").Insert(1, "x"+"y")   → 35 B in 2 allocations (the VALUE's
+    //                                     producer reference, never released)
+    //   ("a"+"b").Insert(1, "z")       → clean (a literal carries no producer
+    //                                     reference to discharge)
+    //   ("a"+"b").Replace("a","x"+"y") → 35 B in 2 allocations
+    //   ("a"+"b").Insert(999,"x"+"y")  → 35 B in 2 allocations (the RAISE
+    //                                     edge — the throw path skipped the
+    //                                     normal-path discharge too)
+    // The ordinary (non-§9.6) call path was the control: the same producer
+    // passed to a USER method is discharged there and leaks nothing.
+    //
+    // => TWO edges need the release: the member's NORMAL return (below, the
+    // scope discharge) and the THROW edge (the funnel's list, which is built
+    // from the producers lowered SO FAR — a raise unwinds past the normal-path
+    // discharge, exactly as it unwinds past the caller's post-call release of
+    // the receiver).
+    std::vector<llvm::Value*> strArgProducers;
+
+    // The NORMAL-return discharge — the counterpart of the throw edge's
+    // release in `guardThrowReleasingSelf` below. It runs at the member's
+    // exit, exactly once, on the path that returns a value. (The two edges
+    // are mutually exclusive: the throw edge leaves the member, the normal
+    // edge returns from it.)
+    struct ArgProducerDischarge {
+        Emitter* E;
+        std::vector<llvm::Value*>* Producers;
+        ~ArgProducerDischarge() {
+            if (!E || Producers->empty()) return;
+            // A DIVERGED lowering (a `throw` in argument position, §17.12)
+            // leaves the current block TERMINATED — the unwind edge owns the
+            // temporaries there, and emitting into a terminated block is
+            // invalid IR ("Basic Block ... does not have a terminator").
+            if (E->diverged_) return;
+            llvm::BasicBlock* bb = E->builder_.GetInsertBlock();
+            if (!bb || bb->getTerminator()) return;
+            for (llvm::Value* v : *Producers) E->emitStringRelease(v);
+        }
+    };
+    ArgProducerDischarge argProducerDischarge{this, &strArgProducers};
+
+    // fix #7222: the release set a raise discharges — the receiver's producer
+    // plus every ARGUMENT producer lowered so far (§28.9 — a raise unwinds
+    // past the normal-path discharge, exactly as it unwinds past the caller's
+    // post-call release of the receiver).
+    auto ownedOnThrow = [&]() -> std::vector<llvm::Value*> {
+        std::vector<llvm::Value*> owned;
+        if (callerOwnedSelf) owned.push_back(callerOwnedSelf);
+        for (llvm::Value* v : strArgProducers) owned.push_back(v);
+        return owned;
+    };
     auto guardThrowReleasingSelf = [&](llvm::Value* cond, const char* name) {
-        emitGuardThrowReleasingString(cond, name, ownedSelf);
+        emitGuardThrowReleasingString(cond, name, ownedOnThrow());
+    };
+
+    // fix #7222 (§9.6 / §28.9 / §28.3, v0.344): the ONE funnel through which
+    // this member path lowers an ARGUMENT. It RECORDS the argument's +1
+    // producer reference so the discharge above can release it exactly once.
+    //
+    // `isPlusOneStringProducer` is the SAME predicate the ordinary call
+    // path's post-call release uses (LlvmBackend_Calls2.cpp), so the §9.6
+    // member path and the ordinary path agree on WHICH arguments carry a
+    // producer reference — a `string` concatenation, an interpolation, a
+    // string-valued call result, a string-valued property read, a range
+    // slice. An `int`/`char`/`Range` argument is never one (the predicate is
+    // keyed on the argument's string type), so the funnel is safe for every
+    // parameter kind.
+    auto lowerArg = [&](size_t idx) -> llvm::Value* {
+        if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
+        llvm::Value* v = lowerExpr(*call.args[idx].value);
+        if (v && isPlusOneStringProducer(call.args[idx].value.get()))
+            strArgProducers.push_back(v);
+        return v;
     };
 
     // Helpers for extracting the first string argument.
     auto getStrArg = [&](size_t idx) -> llvm::Value* {
-        if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
-        return lowerExpr(*call.args[idx].value);
+        return lowerArg(idx);
     };
     auto getIntArg = [&](size_t idx) -> llvm::Value* {
         if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
@@ -1502,7 +1594,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // precisely because it was NOT gated and the unwrap turned a clean ICE
         // into a silent wrong value. Do not route a new method through
         // getIntArg without adding it to `intPos` first.
-        return unwrapNarrowedNullableOperand(lowerExpr(*call.args[idx].value),
+        return unwrapNarrowedNullableOperand(lowerArg(idx),
                                              call.args[idx].value.get());
     };
     // fix #7169 (§9.6, v0.343): the §5.1 widening rules live in the EMITTER
@@ -1570,7 +1662,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // (r: Range<int>) — Start = r.Start, Length = element count.
         if (call.args.size() == 1 && call.args[0].value &&
             isRangeType(ctx_.exprType(*call.args[0].value))) {
-            llvm::Value* rv = lowerExpr(*call.args[0].value);
+            llvm::Value* rv = lowerArg(0);
             if (!rv || !rv->getType()->isStructTy()) return nullptr;
             llvm::Value* lo = builder_.CreateTrunc(
                 builder_.CreateExtractValue(rv, {0u}), i32(), "ss.r.lo");
@@ -1746,10 +1838,10 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             other = getStrArg(otherSrc);
             if (!other) return nullptr;
             if (!call.args[icSrc].value) return nullptr;
-            ignoreCase = lowerExpr(*call.args[icSrc].value);
+            ignoreCase = lowerArg(icSrc);
         } else {
             if (!call.args[icSrc].value) return nullptr;
-            ignoreCase = lowerExpr(*call.args[icSrc].value);
+            ignoreCase = lowerArg(icSrc);
             other = getStrArg(otherSrc);
             if (!other) return nullptr;
         }
@@ -1869,10 +1961,10 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             other = getStrArg(otherSrc);
             if (!other) return nullptr;
             if (!call.args[icSrc].value) return nullptr;
-            ic = lowerExpr(*call.args[icSrc].value);
+            ic = lowerArg(icSrc);
         } else {
             if (!call.args[icSrc].value) return nullptr;
-            ic = lowerExpr(*call.args[icSrc].value);
+            ic = lowerArg(icSrc);
             other = getStrArg(otherSrc);
             if (!other) return nullptr;
         }
@@ -1918,7 +2010,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 // narrowed non-null and its `{i8, i32}` box must be reduced to
                 // the code point `CreateICmpEQ` below compares against.
                 llvm::Value* needle = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[0].value), call.args[0].value.get());
+                    lowerArg(0), call.args[0].value.get());
                 if (!needle) return nullptr;
                 llvm::Value* len = loadStringLen(self);
                 auto* idxS = entryAlloca(i64());
@@ -1967,7 +2059,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 argTy->primitive == sema::PrimitiveType::Char) {
                 // fix #6547: same narrowed-`char?` unwrap as Contains above.
                 llvm::Value* needle = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[0].value), call.args[0].value.get());
+                    lowerArg(0), call.args[0].value.get());
                 if (!needle) return nullptr;
                 llvm::Value* len = loadStringLen(self);
                 auto* idxS = entryAlloca(i64());
@@ -2026,7 +2118,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 // written FIRST runs first, whatever parameter it binds to.
                 if (valSrc <= startSrc) {
                     needle = unwrapNarrowedNullableOperand(
-                        lowerExpr(*call.args[valSrc].value),
+                        lowerArg(valSrc),
                         call.args[valSrc].value.get());
                     if (!needle) return nullptr;
                     startV = getIntArg(startSrc);
@@ -2034,7 +2126,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                     startV = getIntArg(startSrc);
                     if (!startV) return nullptr;
                     needle = unwrapNarrowedNullableOperand(
-                        lowerExpr(*call.args[valSrc].value),
+                        lowerArg(valSrc),
                         call.args[valSrc].value.get());
                 }
                 if (!needle || !startV) return nullptr;
@@ -2097,13 +2189,13 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // in CALL-SITE TEXTUAL order — the expression written FIRST runs
             // first, whatever parameter it binds to.
             if (valSrc <= startSrc) {
-                sub = lowerExpr(*call.args[valSrc].value);
+                sub = lowerArg(valSrc);
                 if (!sub) return nullptr;
                 startVal = getIntArg(startSrc);
             } else {
                 startVal = getIntArg(startSrc);
                 if (!startVal) return nullptr;
-                sub = lowerExpr(*call.args[valSrc].value);
+                sub = lowerArg(valSrc);
             }
             if (!sub || !startVal) return nullptr;
             // Normalize start to i64 for the runtime.
@@ -2150,7 +2242,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             argTy->primitive == sema::PrimitiveType::Char) {
             // fix #6547: same narrowed-`char?` unwrap as Contains above.
             llvm::Value* needle = unwrapNarrowedNullableOperand(
-                lowerExpr(*call.args[0].value), call.args[0].value.get());
+                lowerArg(0), call.args[0].value.get());
             if (!needle) return nullptr;
             llvm::Value* len = loadStringLen(self);
             // Scan from len-1 down to 0.
@@ -2212,9 +2304,9 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         if (!hasLen || startSrc <= lenSrc) {
             startV = getIntArg(startSrc);
             if (!startV) return nullptr;
-            if (hasLen) countArg = lowerExpr(*call.args[lenSrc].value);
+            if (hasLen) countArg = lowerArg(lenSrc);
         } else {
-            countArg = lowerExpr(*call.args[lenSrc].value);
+            countArg = lowerArg(lenSrc);
             startV = getIntArg(startSrc);
             if (!startV) return nullptr;
         }
@@ -2284,17 +2376,17 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // first, whatever parameter it binds to.
             if (oldSrc <= newSrc) {
                 oldCh = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[oldSrc].value),
+                    lowerArg(oldSrc),
                     call.args[oldSrc].value.get());
                 newCh = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[newSrc].value),
+                    lowerArg(newSrc),
                     call.args[newSrc].value.get());
             } else {
                 newCh = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[newSrc].value),
+                    lowerArg(newSrc),
                     call.args[newSrc].value.get());
                 oldCh = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[oldSrc].value),
+                    lowerArg(oldSrc),
                     call.args[oldSrc].value.get());
             }
             if (!oldCh || !newCh) return nullptr;
@@ -2377,11 +2469,11 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
         // whatever parameter it binds to.
         if (oldSrc <= newSrc) {
-            oldStr = lowerExpr(*call.args[oldSrc].value);
-            newStr = lowerExpr(*call.args[newSrc].value);
+            oldStr = lowerArg(oldSrc);
+            newStr = lowerArg(newSrc);
         } else {
-            newStr = lowerExpr(*call.args[newSrc].value);
-            oldStr = lowerExpr(*call.args[oldSrc].value);
+            newStr = lowerArg(newSrc);
+            oldStr = lowerArg(oldSrc);
         }
         if (!oldStr || !newStr) return nullptr;
         auto* fn = declareC("bz_str_replace", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
@@ -2450,7 +2542,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // and `.Length` dereferenced null. (TrimStart/TrimEnd char-set overloads
         // are analogous but not yet wired; only Trim(set) is handled here.)
         if (method == "Trim" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* chars = lowerExpr(*call.args[0].value);
+            llvm::Value* chars = lowerArg(0);
             if (!chars) return nullptr;
             auto* fn = declareC("bz_str_trim_chars", ptrTy(), {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {self, chars}, "trim.chars.result");
@@ -2612,18 +2704,18 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // (the padding character's expression is evaluated between the two
         // only when the width is written first).
         if (!hasPad || widthSrc <= padSrc) {
-            llvm::Value* widthArg = lowerExpr(*call.args[widthSrc].value);
+            llvm::Value* widthArg = lowerArg(widthSrc);
             if (!widthArg) return nullptr;
             width64 = emitSection96CountContract(
-                    call.args[widthSrc].value.get(), widthArg, ownedSelf,
+                    call.args[widthSrc].value.get(), widthArg, ownedOnThrow(),
                     "pad.s64", "pad.z64", "pad.neg");
-            if (hasPad) padCharArg = lowerExpr(*call.args[padSrc].value);
+            if (hasPad) padCharArg = lowerArg(padSrc);
         } else {
-            padCharArg = lowerExpr(*call.args[padSrc].value);
-            llvm::Value* widthArg = lowerExpr(*call.args[widthSrc].value);
+            padCharArg = lowerArg(padSrc);
+            llvm::Value* widthArg = lowerArg(widthSrc);
             if (!widthArg) return nullptr;
             width64 = emitSection96CountContract(
-                    call.args[widthSrc].value.get(), widthArg, ownedSelf,
+                    call.args[widthSrc].value.get(), widthArg, ownedOnThrow(),
                     "pad.s64", "pad.z64", "pad.neg");
         }
         // Pad character: default space, or the 2nd arg (a code point, i32).
@@ -2644,7 +2736,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
 
     // §9.6: Repeat(n: int): string — repeat self n times.
     if (method == "Repeat" && call.args.size() == 1 && call.args[0].value) {
-        llvm::Value* nArg = lowerExpr(*call.args[0].value);
+        llvm::Value* nArg = lowerArg(0);
         if (!nArg) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
@@ -2676,7 +2768,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // function the static `Repeat(c: char, count: int)` arm calls, so
         // the two spellings cannot drift apart.
         llvm::Value* n64 = emitSection96CountContract(
-                call.args[0].value.get(), nArg, ownedSelf,
+                call.args[0].value.get(), nArg, ownedOnThrow(),
                 "rep.s64", "rep.z64", "rep.neg");
         llvm::Value* totalLen = builder_.CreateMul(selfLen, n64, "rep.total");
         auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
@@ -2718,8 +2810,8 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // Returns empty string if n is out of range.
     if (method == "GetField" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* delimArg = lowerExpr(*call.args[0].value);
-        llvm::Value* nArg = lowerExpr(*call.args[1].value);
+        llvm::Value* delimArg = lowerArg(0);
+        llvm::Value* nArg = lowerArg(1);
         if (!delimArg || !nArg) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
@@ -3057,7 +3149,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // end = start + count (if given), else = selfLen
         llvm::Value* end64;
         if (call.args.size() >= 2 && call.args[1].value) {
-            llvm::Value* cntV = lowerExpr(*call.args[countArgIdx].value);
+            llvm::Value* cntV = lowerArg(countArgIdx);
             if (!cntV) return nullptr;
             llvm::Value* cnt64 = widenIntParam(call.args[countArgIdx].value.get(),
                                                 cntV, "rm.cnt", "rm.zcnt");
@@ -3126,7 +3218,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // fix #6547: same narrowed-`char?` unwrap as Contains above. Without
             // it the `CreateSExt` two lines below sexted the `{i8, i32}` box.
             llvm::Value* sepCh = unwrapNarrowedNullableOperand(
-                lowerExpr(*call.args[0].value), call.args[0].value.get());
+                lowerArg(0), call.args[0].value.get());
             if (!sepCh) return nullptr;
             if (!sepCh->getType()->isIntegerTy(32))
                 sepCh = builder_.CreateSExt(sepCh, i32());
@@ -3139,7 +3231,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // bz_array_t*). No case existed → the call emitted nothing and the
         // uninitialized result array crashed on Count/dispose.
         if (argTy && argTy->kind == sema::TypeRef::Kind::Named) {
-            llvm::Value* seps = lowerExpr(*call.args[0].value);
+            llvm::Value* seps = lowerArg(0);
             if (!seps) return nullptr;
             auto* fn = declareC("bz_str_split_chars", ptrTy(), {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {self, seps}, "split.chars.result");
@@ -3150,7 +3242,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         if (!argTy || argTy->kind != sema::TypeRef::Kind::Primitive ||
             argTy->primitive != sema::PrimitiveType::String)
             return nullptr;
-        llvm::Value* delim = lowerExpr(*call.args[0].value);
+        llvm::Value* delim = lowerArg(0);
         if (!delim) return nullptr;
         auto* fn = declareC("bz_str_split_str", ptrTy(), {ptrTy(), ptrTy()});
         return builder_.CreateCall(fn, {self, delim}, "split.result");
