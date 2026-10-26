@@ -1001,6 +1001,40 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     const auto& m = ma->member;
     using P = sema::PrimitiveType;
 
+    // THE FIRST-ARGUMENT GUARD for the `Parse` / `TryParse` arms below.
+    //
+    // stdlib §9.1 declares `Parse(s: string): int` and `TryParse(s: string,
+    // out result: int): bool`; §9.2 declares the `double` / `float` forms,
+    // §9.3 the `decimal` form and §9.4 the `bool` form. Every one of them
+    // declares the first parameter as a `string`, and the NON-radix forms
+    // also have a `ReadOnlyStringSpan` overload (§9.1). An operand that is
+    // NEITHER is not a parseable operand, and these arms used to lower
+    // whatever they were handed into a string operand:
+    //   * a non-pointer operand produced malformed IR and ABORTED the
+    //     compiler ("Load operand must be a pointer" / "IR verification
+    //     failed (malformed IR emitted)");
+    //   * a CLASS INSTANCE — which lowers to a plain pointer, exactly like a
+    //     `string` — was read as TEXT out of the object's own bytes, i.e.
+    //     FOREIGN MEMORY, and SILENTLY.
+    //
+    // The test is the operand's STATIC TYPE (the primitive `string`) OR the
+    // LOWERED operand's SHAPE (the {ptr,i32,i32} `ReadOnlyStringSpan` record
+    // of §3.3). The shape alone is NOT enough — a class instance lowers to a
+    // pointer too — and the static type alone is not enough either, because
+    // the span overload's declared type is not the primitive `string`. The
+    // two together are exact.
+    //
+    // An operand whose static type sema could not determine (`nullptr`) is
+    // admitted on its SHAPE alone: a legal call must never be dropped on a
+    // typing accident.
+    auto isParseableOperand = [&](const ast::Expr& e, llvm::Value* v) -> bool {
+        const sema::TypeRef* t = ctx_.exprType(e);
+        if (!t) return v->getType()->isPointerTy() || isStringSpanValue(v);
+        if (t->kind == sema::TypeRef::Kind::Primitive && t->primitive == P::String)
+            return true;
+        return isStringSpanValue(v);
+    };
+
     // §11.8 / stdlib §2.19 (v0.176, #807): the compiler-provided conformance
     // members of the primitive tower. Reached only through a constrained type
     // parameter (sema rejects `int.Zero()` in ordinary code — §3.4's closed
@@ -2009,8 +2043,20 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // `double` and a `decimal` operand exactly. A non-parseable
         // operand is DROPPED, the way the `Parse(s, radix)` arm below
         // drops a non-string first argument.
-        if (!strVal->getType()->isPointerTy() && !isStringSpanValue(strVal))
-            return nullptr;
+        //
+        // fix #7290 (stdlib §9.1, v0.344): the SHAPE test above also
+        // admits a CLASS INSTANCE, because a class instance lowers to a
+        // plain pointer, exactly like a `string`. The arm then read the
+        // OBJECT'S OWN BYTES as a string descriptor and parsed them as
+        // TEXT — foreign memory, silently, with no abort and no
+        // diagnostic. So the guard now also requires the operand to BE a
+        // string: statically the primitive `string`, or — for the span
+        // overload — the {ptr,i32,i32} `ReadOnlyStringSpan` record of §3.3.
+        // The two arms of the family now agree: the three-argument
+        // `TryParse(s, radix, out result)` form below already refused a
+        // non-`string` first argument on the STATIC type alone (stdlib
+        // §9.1 declares no span overload of the radix form).
+        if (!isParseableOperand(*call.args[0].value, strVal)) return nullptr;
         // #5296 / stdlib §9.1 (v0.313, #1810): the span overload. A
         // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3), not
         // a string pointer, so `loadStringData` on it was a StructGEP of a
