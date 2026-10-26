@@ -1321,10 +1321,49 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
     // the two passes below share one cached {data,len} per arg — ToString is not
     // re-invoked (it allocates; calling it twice would double the tolerated leak
     // and could observe side effects twice). A null/undispatchable arg yields "".
-    struct ArgStr { const char* data; int64_t len; };
+    //
+    // fix #7272 (spec §28.9, v0.344; the slot-3 contract in
+    // src/codegen/LlvmBackend_String.cpp's `lowerObjectToString`): the slot-3
+    // renderer hands back a reference the CALLER owns — the same contract
+    // `lowerObjectToString` states and relies on ("the vtable thunks mint, a
+    // literal is an immortal sentinel on which retain/release are no-ops"), so
+    // the value is EITHER a fresh +1 heap string or an immortal sentinel. This
+    // helper is the caller: it borrows the rendered bytes and copies them into
+    // its own buffer, so the reference is ITS to discharge. It did not — the
+    // rendered string leaked (measured: 34 B / 2 allocations for a
+    // `StringBuilder` argument, whose render is `bz_strbuilder_to_string_obj`'s
+    // fresh +1). The release is DEFERRED past the second pass below, because
+    // the second pass memcpy's out of the rendered string's OWN data buffer,
+    // which the release frees.
+    //
+    // NOTE ON THE SPEC ANCHOR. §28.3 K1.6 (v0.344) says the runtime-managed
+    // types — `string` included — "carry no classification and no obligation",
+    // and §28.9 (v0.344) says of them that "how the runtime manages their
+    // lifecycle (reference counting, region allocation, or other) is not part
+    // of this specification". So the SPEC's ownership kernel imposes NO
+    // disposal obligation on the rendered string: the release below rests on
+    // the slot-3 contract and on the renderers' own minting behaviour, not on
+    // K1.1. (K1.1's "owned — the holder carries the disposal obligation"
+    // applies to a CLASSIFIED value, and a `string` is not one.)
+    //
+    // `bz_string_release` is null-safe and a no-op on the immortal sentinel, so
+    // a uniform release over every rendered argument is sound — the same
+    // reasoning `bz_sb_reset_to` (below) applies to the builder's own parts.
+    //
+    // THE STRUCT IS DELIBERATELY 16 BYTES — the SAME SIZE the pre-fix
+    // `{const char* data; int64_t len;}` was. The rendered string's DATA
+    // pointer is DERIVED from the owned string object rather than cached
+    // beside it, so this fix adds no field and grows no allocation. That
+    // matters: #7244's `string`-argument SEGFAULT reads the argument's DATA
+    // pointer as a vtable and then reads slot 3 out of the DATA BUFFER, so
+    // whether it faults depends on the bytes that follow the buffer — i.e. on
+    // the heap layout. Changing this allocation's size would silently change
+    // #7244's reproduction, and #7244 is a DIFFERENT defect this lane must not
+    // touch (it is named in the issue and left open below).
+    struct ArgStr { void* owned; int64_t len; };
     ArgStr* astr = (ArgStr*)malloc((size_t)(nargs > 0 ? nargs : 1) * sizeof(ArgStr));
     for (int64_t k = 0; k < nargs; k++) {
-        astr[k].data = "";
+        astr[k].owned = nullptr;
         astr[k].len = 0;
         void* obj = argSlots ? argSlots[k] : nullptr;
         if (!obj) continue;
@@ -1337,9 +1376,15 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
         void* strObj = ((bz_tostr_fn)toStrFnP)(obj);
         if (!strObj) continue;
         auto* s = (bz_string_struct*)strObj;
-        astr[k].data = (const char*)s->data;
         astr[k].len = s->len * (s->width ? s->width : 1);
+        astr[k].owned = strObj;                    // the +1 this helper owns
     }
+    // The rendered bytes live in the owned string's own data buffer; a
+    // null/undispatchable argument has no owned string and renders as "".
+    auto argData = [&](int64_t k) -> const char* {
+        return astr[k].owned ? (const char*)((bz_string_struct*)astr[k].owned)->data
+                             : "";
+    };
 
     // Parse one placeholder beginning at fb[i]=='{'. On success sets idx/close
     // (index of '}') and returns true; a malformed/empty index returns false.
@@ -1384,7 +1429,7 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
             int64_t idx = -1, close = -1;
             if (parsePlaceholder(i, idx, close)) {
                 if (idx >= 0 && idx < nargs && astr[idx].len > 0) {
-                    memcpy(buf + off, astr[idx].data, (size_t)astr[idx].len);
+                    memcpy(buf + off, argData(idx), (size_t)astr[idx].len);
                     off += astr[idx].len;
                 }
                 i = close + 1;
@@ -1395,6 +1440,26 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
         } else { buf[off++] = fb[i++]; }
     }
     buf[off] = '\0';
+
+    // fix #7272 (spec §28.9, v0.344; the slot-3 contract in
+    // src/codegen/LlvmBackend_String.cpp's `lowerObjectToString`): discharge
+    // the reference the slot-3 renderer handed us. The bytes are copied (the
+    // second pass above memcpy'd out of the rendered string's own data
+    // buffer), so this helper holds the last reference to it and nobody else
+    // will. The release is here — AFTER the second pass — because the second
+    // pass memcpy's out of the rendered string's own data buffer, which this
+    // frees.
+    //
+    // `bz_string_release` is null-safe and a no-op on the immortal literal
+    // sentinel (rc == BZ_STRING_RC_SENTINEL), so a uniform release over every
+    // rendered argument is sound: the renderers return EITHER a fresh +1 heap
+    // string (the default class/enum/record render, `bz_sb_obj_tostring`,
+    // `bz_array_obj_tostring`'s fallback, `bz_mutex_obj_tostring`,
+    // `bz_char_to_string`, `emitPrimitiveToString`) OR an immortal sentinel
+    // (the §8.5 default type name, the array's stamped descriptor name). This
+    // is the same reasoning `bz_sb_reset_to` applies to the builder's parts.
+    for (int64_t k = 0; k < nargs; k++)
+        if (astr[k].owned) bz_string_release(astr[k].owned);
     free(astr);
 
     // Wrap the formatted bytes as a fresh +1 width-1 part and append it (like
