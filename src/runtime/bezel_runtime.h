@@ -1738,12 +1738,24 @@ void*   bz_str_split_str(const void* self, const void* sep);
 // §9.6 / issue #654: ToCharArray(): owned Array<char> (elem_size=4, i32 code points).
 void*   bz_str_to_char_array(const void* self);
 
-// StringBuilder helper — concatenates an array of bz.string pointers.
-// Caller must free *out_data with free() after use.
+// StringBuilder helper — the `Object`-vtable renderer.
 // ---------------------------------------------------------------------------
-void bz_strbuilder_to_string(void* parts_arr,  // bz_array_t* of bz.string ptrs
-                              char** out_data,
-                              int64_t* out_len);
+// fix #7243 (spec §4.6 / stdlib §3.1, v0.344): render the builder's parts
+// (a bz_array_t* of bz.string ptrs) as ONE fresh +1 `bz.string` holding the
+// content's CODE POINTS at the narrowest width that fits the largest code
+// point in the value (§4.6's own rule — and the rule stdlib §9.6's `IsAscii`,
+// which answers the width in O(1), makes observable).
+//
+// This is the runtime twin of the codegen's `emitStringBuilderToString`
+// (src/codegen/LlvmBackend_String.cpp), which does the same thing through
+// bz_strbuilder_flatten: the builder's own `ToString()` and the `Object`
+// vtable's ToString slot are the SAME operation (§8.5), so they must render
+// the same text.
+//
+// It REPLACES the legacy byte-level `bz_strbuilder_to_string`, which had this
+// one caller and concatenated the parts' RAW BYTES — a byte blob is not a
+// code-point sequence (§4.6), so a wide content came back mangled.
+void* bz_strbuilder_to_string_obj(void* parts_arr);
 
 // fix #7229 (spec §4.6 / stdlib §3.1, v0.344): flatten the builder's parts
 // into ONE packed buffer of CODE POINTS. Returns the content's code-point
