@@ -1272,6 +1272,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #7293 (stdlib §9.3, v0.344): the declared operand is a `string`
+        // (or the span overload's `ReadOnlyStringSpan`). This arm used to
+        // lower whatever it was handed into a string operand, so
+        // `decimal.TryParse(1.5, out m)` emitted
+        //   %str.data = load ptr, double 1.500000e+00, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED, the way the integer tower's
+        // `TryParse` arm drops one.
+        if (!isParseableOperand(*call.args[0].value, s)) return nullptr;
         // #5296 / stdlib §9.3 (v0.313, #1810): the span overload. This is the
         // arm the `decimal.TryParse` KEYWORD spelling reaches (the class-name
         // spelling has its own copy in LlvmBackend_Calls.cpp, fixed by the same
@@ -1862,6 +1873,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         (pt == P::Double || pt == P::Float)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7293 (stdlib §9.2, v0.344): the declared operand is a `string`
+        // (or the span overload's `ReadOnlyStringSpan`). This arm used to
+        // lower whatever it was handed into a string operand, so
+        // `double.TryParse(1.5, out d)` emitted
+        //   %str.data = load ptr, double 1.500000e+00, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED, the way the integer tower's
+        // `TryParse` arm drops one.
+        if (!isParseableOperand(*call.args[0].value, strVal)) return nullptr;
         // #5296 / stdlib §9.2 (v0.313, #1810): the span overload — see the
         // integer tower arm above for the full rationale.
         auto win = parseWindow(strVal);
