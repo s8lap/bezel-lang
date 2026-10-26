@@ -963,6 +963,24 @@ static inline void bz_put_cp(void* data, int64_t index, int8_t width, uint32_t c
     else                 ((uint32_t*)data)[index] = cp;
 }
 
+// The storage width a code point needs (spec §4.6: "typically 1, 2, or 4 bytes
+// per code point, selected at construction based on the largest code point in
+// the value"). The narrowest width that holds the code point.
+static inline int8_t bz_cp_width(uint32_t cp) {
+    if (cp <= 0xFFu)   return 1;
+    if (cp <= 0xFFFFu) return 2;
+    return 4;
+}
+
+// The storage width a code-point SEQUENCE is packed at (spec §4.6): the
+// narrowest width that fits its largest code point.
+static int8_t bz_cps_width(const uint32_t* cps, int64_t count) {
+    uint32_t maxCp = 0;
+    for (int64_t i = 0; i < count; i++)
+        if (cps[i] > maxCp) maxCp = cps[i];
+    return bz_cp_width(maxCp);
+}
+
 // The builder's content, flattened in the CODE-POINT domain (spec §4.6).
 //
 // §4.6: a `string` stores each code point in `width` bytes (1, 2 or 4), the
@@ -974,21 +992,29 @@ static inline void bz_put_cp(void* data, int64_t index, int8_t width, uint32_t c
 // code-point concatenation at all.
 //
 // The content is therefore flattened in the code-point domain, and the result
-// is packed at ONE width — the WIDEST of the parts' widths, with the narrower
-// parts' code points re-encoded into it. That is the rule this compiler
-// already uses for the string `+` operator (Emitter::emitStringConcat in
-// LlvmBackend_String.cpp: the result's width is max(lhs, rhs) and the
-// narrower operand is widened code point by code point), and §4.6 makes the
-// choice of width invisible at the language level ("programs observe only the
-// `char` sequence and its length").
+// is packed at ONE width — the NARROWEST width that fits the LARGEST CODE
+// POINT IN THE VALUE (§4.6's own rule, and the rule this runtime's sibling
+// paths already use: bz_str_slice_cp and bz_str_replace's repack both select
+// the narrowest width that fits all of their code points).
+//
+// ⇒ THE WIDTH IS NOT INVISIBLE. §4.6 says the choice of width is invisible
+// "at the language level" in the sense that a program observes the `char`
+// sequence and its length — but stdlib §9.6 exposes `s.IsAscii` ("true iff
+// every code point < 128"), and the runtime answers it from the width in O(1).
+// A string therefore HAS to be stored at the narrowest width that fits its
+// value, or two `=`-equal strings could answer IsAscii differently. The
+// widest-part rule this file used before could not hold that: after a mutator
+// narrowed the content, the part kept the wide width, so `sb.Append("日");
+// sb.Replace("日","z")` produced a string `=`-equal to "z" whose IsAscii was
+// false while "z".IsAscii was true (#7229's F1).
 //
 // out_cps: a malloc'd array of the content's code points (the caller frees
 //          it). out_count: the content's code-point count (§4.6's length).
-//          out_width: the width the flattened result is packed at.
+// The caller packs the sequence at the width bz_cps_width gives it — the
+// narrowest width that fits its largest code point (§4.6).
 static void bz_sb_content_cps(bz_array_t* arr, uint32_t** out_cps,
-                              int64_t* out_count, int8_t* out_width) {
+                              int64_t* out_count) {
     int64_t total = 0;
-    int8_t w = 1;
     if (arr && arr->data) {
         for (int64_t i = 0; i < arr->count; i++) {
             void* sptr = ((void**)arr->data)[i];
@@ -996,7 +1022,6 @@ static void bz_sb_content_cps(bz_array_t* arr, uint32_t** out_cps,
             auto* s = (bz_string_struct*)sptr;
             if (s->len <= 0) continue;
             total += s->len;
-            if (s->width > w) w = s->width;
         }
     }
     uint32_t* cps = (uint32_t*)malloc((size_t)(total > 0 ? total : 1) *
@@ -1012,7 +1037,6 @@ static void bz_sb_content_cps(bz_array_t* arr, uint32_t** out_cps,
     }
     *out_cps = cps;
     *out_count = total;
-    *out_width = w;
 }
 
 // fix #7229 (spec §4.6 / stdlib §3.1, v0.344): flatten the builder's parts
@@ -1024,16 +1048,16 @@ static void bz_sb_content_cps(bz_array_t* arr, uint32_t** out_cps,
 // width-aware runtime helpers here use). The caller owns `*out_data`; it
 // becomes the `string`'s data buffer.
 //
-// The width is the WIDEST of the parts' widths — see bz_sb_content_cps for
-// why, and for the spec's rule that the choice is invisible at the language
-// level.
+// The width is the NARROWEST that fits the largest code point in the value —
+// see bz_sb_content_cps for why (§4.6's rule, and stdlib §9.6's IsAscii,
+// which the width answers in O(1)).
 extern "C" int64_t bz_strbuilder_flatten(void* parts_arr, char** out_data,
                                           int8_t* out_width) {
     auto* arr = (bz_array_t*)parts_arr;
     uint32_t* cps = nullptr;
     int64_t count = 0;
-    int8_t w = 1;
-    bz_sb_content_cps(arr, &cps, &count, &w);
+    bz_sb_content_cps(arr, &cps, &count);
+    int8_t w = bz_cps_width(cps, count);
     size_t bytes = (size_t)count * (size_t)w;
     void* data = calloc(bytes + (size_t)w, 1);   // + width-sized NUL slot
     for (int64_t i = 0; i < count; i++) bz_put_cp(data, i, w, cps[i]);
@@ -1092,12 +1116,13 @@ void bz_strbuilder_to_string(void* parts_arr, char** out_data, int64_t* out_len)
 }
 
 // ---------------------------------------------------------------------------
-// StringBuilder mutators (§3.1). Strategy: flatten the parts to one byte buffer,
-// apply the operation, and reset the parts array to a single fresh +1 part. The
-// builder OWNS each of its parts (Append retains / transfers a +1 per part,
-// #1185), so before dropping the old parts each one is bz_string_release'd —
-// otherwise the retained +1 would leak. bz_string_release is null-safe and a
-// no-op on a sentinel/literal, so a null/never-stored slot is safe to pass.
+// StringBuilder mutators (§3.1). Strategy: flatten the parts to one code-point
+// sequence, apply the operation, and reset the parts array to a single fresh
+// +1 part. The builder OWNS each of its parts (Append retains / transfers a
+// +1 per part, #1185), so before dropping the old parts each one is
+// bz_string_release'd — otherwise the retained +1 would leak.
+// bz_string_release is null-safe and a no-op on a sentinel/literal, so a
+// null/never-stored slot is safe to pass.
 //
 // The mutators work in the CODE-POINT domain (spec §4.6 / stdlib §3.1,
 // v0.344): the index and length a caller passes count CODE POINTS — §4.6 makes
@@ -1150,13 +1175,10 @@ void bz_sb_insert(void* parts_arr, int64_t index, const void* value) {
     if (!arr || !value) return;
     uint32_t* cps = nullptr;
     int64_t count = 0;
-    int8_t w = 1;
-    bz_sb_content_cps(arr, &cps, &count, &w);        // current content
+    bz_sb_content_cps(arr, &cps, &count);            // current content
     if (index < 0 || index > count) { free(cps); return; }  // no-op on OOB
     auto* v = (bz_string_struct*)value;
     int64_t vcount = v->len;
-    int8_t vw = v->width ? v->width : 1;
-    int8_t nw = w > vw ? w : vw;                     // the widest of the two
     int64_t total = count + vcount;
     uint32_t* out = (uint32_t*)malloc((size_t)(total > 0 ? total : 1) *
                                        sizeof(uint32_t));
@@ -1165,7 +1187,11 @@ void bz_sb_insert(void* parts_arr, int64_t index, const void* value) {
     for (int64_t i = 0; i < vcount; i++) out[o++] = bz_str_cp(v, i);  // value
     for (int64_t i = index; i < count; i++) out[o++] = cps[i];  // suffix
     free(cps);
-    void* strObj = bz_sb_string_from_cps(out, total, nw);
+    // The new part is stored at the NARROWEST width that fits the largest code
+    // point in the NEW value (§4.6) — not at the widest of the two operands'
+    // widths: the value's width is a property of the value, and a mutator may
+    // narrow the content.
+    void* strObj = bz_sb_string_from_cps(out, total, bz_cps_width(out, total));
     free(out);
     bz_sb_reset_to(arr, strObj);
 }
@@ -1182,8 +1208,7 @@ void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length) {
     if (!arr) return;
     uint32_t* cps = nullptr;
     int64_t count = 0;
-    int8_t w = 1;
-    bz_sb_content_cps(arr, &cps, &count, &w);
+    bz_sb_content_cps(arr, &cps, &count);
     // §3.1 / §9.6 Remove: start and length must denote a valid range; an
     // out-of-range request is a no-op here (the SB is unchanged).
     if (length < 0 || start_index < 0 || start_index + length > count) {
@@ -1197,7 +1222,11 @@ void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length) {
     for (int64_t i = 0; i < start_index; i++) out[o++] = cps[i];   // prefix
     for (int64_t i = start_index + length; i < count; i++) out[o++] = cps[i];  // suffix
     free(cps);
-    void* strObj = bz_sb_string_from_cps(out, total, w);
+    // The new part is stored at the NARROWEST width that fits the largest code
+    // point in the NEW value (§4.6) — a removal may narrow the content, and
+    // the width must follow the value (stdlib §9.6's IsAscii answers from the
+    // width in O(1)).
+    void* strObj = bz_sb_string_from_cps(out, total, bz_cps_width(out, total));
     free(out);
     bz_sb_reset_to(arr, strObj);
 }
@@ -1223,8 +1252,7 @@ void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value
     if (ocount <= 0) return;                          // empty oldValue: no-op
     uint32_t* cps = nullptr;
     int64_t count = 0;
-    int8_t w = 1;
-    bz_sb_content_cps(arr, &cps, &count, &w);
+    bz_sb_content_cps(arr, &cps, &count);
     uint32_t* ocps = (uint32_t*)malloc((size_t)ocount * sizeof(uint32_t));
     for (int64_t i = 0; i < ocount; i++) ocps[i] = bz_str_cp(ov, i);
     int64_t ncount = nv->len;
@@ -1256,10 +1284,11 @@ void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value
         }
     }
     free(cps); free(ocps); free(ncps);
-    int8_t nw = w;
-    int8_t nvw = nv->width ? nv->width : 1;
-    if (nvw > nw) nw = nvw;                           // the widest of the two
-    void* strObj = bz_sb_string_from_cps(out, total, nw);
+    // The new part is stored at the NARROWEST width that fits the largest code
+    // point in the NEW value (§4.6) — a replacement may narrow the content
+    // ("日" -> "z"), and the width must follow the value (stdlib §9.6's
+    // IsAscii answers from the width in O(1)).
+    void* strObj = bz_sb_string_from_cps(out, total, bz_cps_width(out, total));
     free(out);
     bz_sb_reset_to(arr, strObj);
 }

@@ -224,3 +224,68 @@ BEZEL_TEST(codegen_sb_width_spec_4_6, content_equals_the_source_literal) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "True\nTrue\n");
 }
+
+// -------------------------------------------------------------------------
+// THE WIDTH IS OBSERVABLE — the row that pins the width RULE.
+//
+// stdlib §9.6 (v0.344) declares, verbatim:
+//   `public pure readonly property IsAscii: bool;  // true iff every code
+//    point < 128 (O(1))`
+// and spec §4.6 (v0.344) exposes the same predicate: "A pure-ASCII string
+// (every code point in U+0000–U+007F) … Implementations expose this through
+// the runtime predicate `s.IsAscii: bool`".
+//
+// ⇒ A string's storage width is NOT invisible at the language level: the
+// runtime answers IsAscii from the width in O(1), so a string stored wider
+// than its value requires can answer IsAscii differently from a `=`-equal
+// string stored at its natural width.
+//
+// The case: a mutator NARROWS the content. "日" (U+65E5) replaced by "z"
+// leaves a one-code-point content whose only code point is 122 < 128 ⇒ the
+// result IS ASCII. The row asserts the VALUE (IsAscii is true) and that the
+// result is `=`-equal to the literal "z" — two `=`-equal strings must not
+// disagree on an observable.
+//
+// A builder that packs at the WIDEST of its parts' widths keeps the width-2
+// storage after the replacement and answers FALSE here, while the literal
+// "z" answers TRUE.
+// -------------------------------------------------------------------------
+BEZEL_TEST(codegen_sb_width_spec_4_6, replace_narrows_the_content_so_isascii_is_true) {
+    auto r = runAot(main_(
+        "  using var sb := new StringBuilder(); "
+        "  sb.Append(\"日\"); "
+        "  sb.Replace(\"日\", \"z\"); "
+        "  var t := sb.ToString(); "
+        "  Console.WriteLine(t.Length.ToString()); "
+        "  Console.WriteLine(int(t[0]).ToString()); "
+        "  Console.WriteLine(t.IsAscii.ToString()); "
+        "  var lit: string := \"z\"; "
+        "  Console.WriteLine(lit.IsAscii.ToString()); "
+        "  var eq: bool := t = lit; "
+        "  Console.WriteLine(eq.ToString()); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "1\n122\nTrue\nTrue\nTrue\n");
+}
+
+// #7229 / spec §4.6 + stdlib §9.6 (v0.344): the same rule on the REMOVE
+// path. "a" + "日" with the "日" removed leaves the one code point 'a' (97),
+// which is ASCII — the content must be stored at the width that fits THAT
+// value, not at the width the removed part had.
+BEZEL_TEST(codegen_sb_width_spec_4_6, remove_narrows_the_content_so_isascii_is_true) {
+    auto r = runAot(main_(
+        "  using var sb := new StringBuilder(); "
+        "  sb.Append(\"a\"); "
+        "  sb.Append(\"日\"); "
+        "  sb.Remove(1, 1); "
+        "  var t := sb.ToString(); "
+        "  Console.WriteLine(t.Length.ToString()); "
+        "  Console.WriteLine(int(t[0]).ToString()); "
+        "  Console.WriteLine(t.IsAscii.ToString()); "
+        "  var lit: string := \"a\"; "
+        "  Console.WriteLine(lit.IsAscii.ToString()); "
+        "  var eq: bool := t = lit; "
+        "  Console.WriteLine(eq.ToString()); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "1\n97\nTrue\nTrue\nTrue\n");
+}
+

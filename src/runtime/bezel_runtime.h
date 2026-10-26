@@ -1745,16 +1745,30 @@ void bz_strbuilder_to_string(void* parts_arr,  // bz_array_t* of bz.string ptrs
                               char** out_data,
                               int64_t* out_len);
 
+// fix #7229 (spec §4.6 / stdlib §3.1, v0.344): flatten the builder's parts
+// into ONE packed buffer of CODE POINTS. Returns the content's code-point
+// count (§4.6's length) and fills *out_data with a malloc'd buffer holding
+// the content's code points at *out_width bytes each; the caller owns that
+// buffer (it becomes the `string`'s data buffer). The width is the NARROWEST
+// that fits the largest code point in the value (§4.6) — stdlib §9.6's
+// `IsAscii` answers from the width in O(1), so the width must follow the
+// value.
+int64_t bz_strbuilder_flatten(void* parts_arr,  // bz_array_t* of bz.string ptrs
+                               char** out_data,
+                               int8_t* out_width);
+
 // ---------------------------------------------------------------------------
 // StringBuilder mutators (§3.1). A StringBuilder is a bz_array_t* of bz.string*
-// parts; its logical content is the concatenation of those parts. Each mutator
-// flattens the current parts to one buffer, applies the operation, and resets
-// the parts array to a single fresh +1 string part. The old part pointers are
+// parts; its logical content is the concatenation of those parts' CODE POINTS
+// (§4.6 — each part stores its code points at its own per-string width, so
+// the parts are not byte-concatenable). Each mutator flattens the current
+// parts to one code-point sequence, applies the operation, and resets the
+// parts array to a single fresh +1 string part. The old part pointers are
 // left as-is (the builder does not retain/own its parts — matching Append and
 // Clear, which never release them; a leak is tolerated, a double-free is not).
 // Each is a no-op on out-of-range arguments that would read out of bounds; the
 // index/length conventions match the §9.6 String forms.
-//   Insert(index, value): insert `value` (as bytes) at code-point `index`.
+//   Insert(index, value): insert `value`'s code points at code-point `index`.
 //   Remove(startIndex, length): delete `length` code points from `startIndex`.
 //   Replace(oldValue, newValue): replace every occurrence of `oldValue`.
 // `value`/`oldValue`/`newValue` are bz.string* (may be a literal/global).

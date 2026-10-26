@@ -3259,12 +3259,15 @@ const sema::TypeRef* Emitter::recordMemberType(const sema::Symbol* m) {
 llvm::Value* Emitter::emitStringBuilderToString(llvm::Value* sb) {
     if (!sb || !sb->getType()->isPointerTy()) return nullptr;
     // fix #7229 (spec §4.6 / stdlib §3.1, v0.344): the builder's content is
-    // flattened in the CODE-POINT domain and packed at ONE width — the widest
-    // of the parts' widths — and the runtime helper REPORTS that width. This
-    // used to store a hard-coded width of 1, so a width-2 part's
-    // two-bytes-per-code-point storage was read as one byte per code point and
-    // every code point above U+00FF was mangled; the length stored was the
-    // byte count, not the code-point count §4.6 defines.
+    // flattened in the CODE-POINT domain and packed at ONE width — the
+    // narrowest that fits the largest code point in the value (§4.6) — and the
+    // runtime helper REPORTS that width. This used to store a hard-coded width
+    // of 1, so a width-2 part's two-bytes-per-code-point storage was read as
+    // one byte per code point and every code point above U+00FF was mangled;
+    // the length stored was the byte count, not the code-point count §4.6
+    // defines. The width must follow the VALUE, not the parts' widths: a
+    // mutator may narrow the content, and stdlib §9.6's `IsAscii` answers
+    // from the width in O(1).
     auto* outDataSlot  = entryAlloca(ptrTy());
     auto* outWidthSlot = entryAlloca(i8());
     auto* fn = declareC("bz_strbuilder_flatten",
