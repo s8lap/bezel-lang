@@ -14391,7 +14391,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (!dst || src == dst) return v;
             const sema::TypeRef* st =
                 e ? resolveTypeParamRef(ctx_.exprType(*e)) : nullptr;
-            const bool srcUns = st && typeRefIsUnsigned(st);
+            // fix #7242 (spec §5.1, v0.344): the SIGNEDNESS of the source is
+            // now asked through the ONE predicate `isUnsignedTargetExpr`, which
+            // `mathToDouble` below uses too. The two converters in this file
+            // used to DISAGREE about unsignedness (this one `uitofp`'d an
+            // unsigned source, the `double`-parameter one `sitofp`'d it), which
+            // is what made #7242's silent wrong value possible.
+            const bool srcUns = e && isUnsignedTargetExpr(*e);
             // fix #6974: an integer or char operand reaches a decimal T through
             // the same §5.1 widening the `decimal(x)` cast and the binary
             // operators use (emitIntToDecimal honours unsigned sources).
@@ -14439,15 +14445,39 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // never-implicit list ("Between `decimal` and binary floats (`float`,
         // `double`)") does not admit it, and the front-end check reports the
         // refusal.
-        auto mathToDouble = [&](llvm::Value* v) -> llvm::Value* {
+        //
+        // fix #7242 (spec §5.1, v0.344): the integer arm is SIGNEDNESS-AWARE.
+        // §5.1's table admits `byte`/`ushort`/`uint`/`ulong`/`char` at
+        // `float`/`double`/`decimal`, so an UNSIGNED operand DOES reach a
+        // `double` PARAMETER (stdlib §2.2 declares `Sqrt(x: double): double`,
+        // `Pow(x: double, y: double): double`, `Fmod`/`IEEERemainder`, and the
+        // `Floor`/`Ceiling`/`Round`/`Truncate` family). `sitofp` SIGN-EXTENDS
+        // the source's bit pattern, so the `uint` 4000000000 (bit pattern
+        // 0xEE6B2800) was read as the `int32` -294967296:
+        // `Math.Sqrt(4000000000u)` computed sqrt(-294967296) = NaN, and
+        // `Math.Pow(4000000000u, 2.0)` computed (-294967296)^2. An
+        // unsigned-to-floating conversion must preserve the VALUE, not the bit
+        // pattern, so the LLVM instruction is `uitofp` — the SAME one
+        // `mathConvertToT` above already emits, and now selected by the SAME
+        // predicate (`isUnsignedTargetExpr`), so the two converters in this
+        // file can no longer disagree about unsignedness.
+        //
+        // The SIGNED path is untouched: an `int`/`long` operand keeps the
+        // `sitofp` it always had, so a negative value keeps its sign and every
+        // signed result is bit-for-bit what it was.
+        auto mathToDouble = [&](llvm::Value* v, const ast::Expr* srcE)
+                -> llvm::Value* {
             if (!v) return v;
             llvm::Type* dbl = llvm::Type::getDoubleTy(llvm_);
             llvm::Type* src = v->getType();
             if (src == dbl) return v;
             if (src->isFloatingPointTy())
                 return builder_.CreateFPExt(v, dbl, "math.fpext");
-            if (src->isIntegerTy())
-                return builder_.CreateSIToFP(v, dbl, "math.sitofp");
+            if (src->isIntegerTy()) {
+                const bool srcUns = srcE && isUnsignedTargetExpr(*srcE);
+                return srcUns ? builder_.CreateUIToFP(v, dbl, "math.uitofp")
+                              : builder_.CreateSIToFP(v, dbl, "math.sitofp");
+            }
             return v;
         };
         // Unsigned ordering predicate: T's own under an explicit list.
@@ -14707,13 +14737,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // the live arms use, so a re-declaration does not inherit the
             // aborting `sitofp`.)
             if (m == "IsNaN") {
-                arg = mathToDouble(arg);
+                arg = mathToDouble(arg, call.args[0].value.get());
                 return builder_.CreateFCmpUNO(arg, arg, "isnan");
             }
             // Math.IsInfinity(x): bool — compare with +/-infinity.
             if (m == "IsInfinity") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                arg = mathToDouble(arg);
+                arg = mathToDouble(arg, call.args[0].value.get());
                 auto* posInf = llvm::ConstantFP::getInfinity(dbl, false);
                 auto* negInf = llvm::ConstantFP::getInfinity(dbl, true);
                 llvm::Value* isPosInf = builder_.CreateFCmpOEQ(arg, posInf);
@@ -14723,7 +14753,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // Math.IsFinite(x): bool — not NaN and not infinity.
             if (m == "IsFinite") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                arg = mathToDouble(arg);
+                arg = mathToDouble(arg, call.args[0].value.get());
                 llvm::Value* isNaN = builder_.CreateFCmpUNO(arg, arg);
                 auto* posInf = llvm::ConstantFP::getInfinity(dbl, false);
                 auto* negInf = llvm::ConstantFP::getInfinity(dbl, true);
@@ -14767,7 +14797,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     m == "Truncate" ? llvm::Intrinsic::trunc :
                                       llvm::Intrinsic::rint;
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                arg = mathToDouble(arg);
+                arg = mathToDouble(arg, call.args[0].value.get());
                 auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), iid, {dbl});
                 return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
             }
@@ -14904,8 +14934,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // Math.Pow(b, e): double — libc pow()
             if (m == "Pow") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                a = mathToDouble(a);
-                b = mathToDouble(b);
+                a = mathToDouble(a, call.args[aSrc].value.get());
+                b = mathToDouble(b, call.args[bSrc].value.get());
                 auto* powFn = module_->getFunction("pow");
                 if (!powFn) {
                     auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
@@ -14919,9 +14949,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // round-half-to-even semantics as the one-argument form.
             if (m == "Round") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                a = mathToDouble(a);
+                a = mathToDouble(a, call.args[aSrc].value.get());
                 // `digits` is an int; widen to double for pow.
-                llvm::Value* digD = mathToDouble(b);
+                llvm::Value* digD = mathToDouble(b, call.args[bSrc].value.get());
                 auto* powFn = module_->getFunction("pow");
                 if (!powFn) {
                     auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
@@ -15090,8 +15120,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
             if (!a || !b) return nullptr;
             auto* dbl = llvm::Type::getDoubleTy(llvm_);
-            a = mathToDouble(a);
-            b = mathToDouble(b);
+            a = mathToDouble(a, call.args[xSrc].value.get());
+            b = mathToDouble(b, call.args[ySrc].value.get());
             const char* fn2 = m == "Fmod" ? "fmod" : "remainder";
             auto* fn = module_->getFunction(fn2);
             if (!fn) {
@@ -16366,9 +16396,24 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
             // Promote int arguments to double.
-            if (v->getType()->isIntegerTy())
-                v = builder_.CreateSIToFP(v, llvm::Type::getDoubleTy(llvm_));
-            else if (!v->getType()->isDoubleTy() && v->getType()->isFloatTy())
+            // fix #7242 (spec §5.1, v0.344): stdlib §2.5 declares
+            // `TimeSpan.FromDays(days: double)` and its `FromHours`/
+            // `FromMinutes`/`FromSeconds`/`FromMilliseconds` siblings, so an
+            // UNSIGNED operand reaches a `double` PARAMETER here too (§5.1's
+            // table admits `byte`/`ushort`/`uint`/`ulong`/`char` at `double`).
+            // `sitofp` would SIGN-EXTEND the source's bit pattern and convert
+            // the `uint` 4000000000 into the `int32` -294967296, so
+            // `TimeSpan.FromSeconds(4000000000u)` built a NEGATIVE span. The
+            // unsigned-to-floating conversion preserves the VALUE, so the
+            // instruction is `uitofp` — the same one `mathToDouble` above
+            // now emits, chosen by the same predicate. A signed operand keeps
+            // the `sitofp` it always had.
+            if (v->getType()->isIntegerTy()) {
+                const bool srcUns = isUnsignedTargetExpr(*call.args[0].value);
+                v = srcUns
+                    ? builder_.CreateUIToFP(v, llvm::Type::getDoubleTy(llvm_))
+                    : builder_.CreateSIToFP(v, llvm::Type::getDoubleTy(llvm_));
+            } else if (!v->getType()->isDoubleTy() && v->getType()->isFloatTy())
                 v = builder_.CreateFPExt(v, llvm::Type::getDoubleTy(llvm_));
             llvm::Value* r = llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), ratio);
             llvm::Value* prod = builder_.CreateFMul(v, r, "ts.product");
@@ -16955,9 +17000,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         llvm::Value* v = lowerExpr(*call.args[0].value);
                         if (!v) return nullptr;
                         auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                        if (v->getType()->isIntegerTy())
-                            v = builder_.CreateSIToFP(v, dbl);
-                        else if (v->getType()->isFloatTy())
+                        // fix #7242 (spec §5.1, v0.344): stdlib §2.5 declares
+                        // `DateTime.AddSeconds(seconds: double)` and its
+                        // `AddDays`/`AddHours`/`AddMinutes`/`AddMilliseconds`
+                        // siblings, so an UNSIGNED operand reaches a `double`
+                        // PARAMETER here too (§5.1's table admits `byte`/
+                        // `ushort`/`uint`/`ulong`/`char` at `double`).
+                        // `sitofp` would SIGN-EXTEND the source's bit pattern,
+                        // so `AddSeconds(4000000000u)` added a NEGATIVE
+                        // number of seconds. The unsigned-to-floating
+                        // conversion preserves the VALUE, so the instruction
+                        // is `uitofp` — the same one `mathToDouble` above now
+                        // emits, chosen by the same predicate. A signed
+                        // operand keeps the `sitofp` it always had.
+                        if (v->getType()->isIntegerTy()) {
+                            const bool srcUns =
+                                isUnsignedTargetExpr(*call.args[0].value);
+                            v = srcUns ? builder_.CreateUIToFP(v, dbl)
+                                       : builder_.CreateSIToFP(v, dbl);
+                        } else if (v->getType()->isFloatTy())
                             v = builder_.CreateFPExt(v, dbl);
                         return v;
                     };
