@@ -58,8 +58,9 @@
 // two behaviours are distinguishable:
 //
 //   * a call that RAN and failed writes the failure default (0) into it
-//     (stdlib §9.3: "TryParse returns false in every case where Parse would
-//     raise"; the out param gets the default) — this is the BASE arm, and it
+//     (stdlib §1's Try convention, shape (c): "assigns `default(T)`"; and
+//     §9.1's own inline comment, "// shape (c): false (out = 0)") — this is
+//     the BASE arm, and it
 //     is the arm that READ THE OBJECT'S BYTES;
 //   * a DROPPED call never writes it, so it keeps 7 — this is the FIXED arm.
 //
