@@ -22327,6 +22327,19 @@ static std::string_view primitiveKeywordHead(PrimitiveType p) {
         case PrimitiveType::Decimal: return "decimal";
         case PrimitiveType::Bool:    return "bool";
         case PrimitiveType::Char:    return "char";
+        // fix #7296 (§9.1, v0.344): the OTHER integer receivers. stdlib §9.1
+        // declares "SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64"
+        // and every one of them carries §9.1's `ToString(format: string)` /
+        // `ToString(radix: int)` pair, so the §7 nullability gate must reach
+        // their argument position too — the registry's rows for those heads
+        // are the other half of this (src/common/BuiltinRegistry.cpp).
+        case PrimitiveType::Byte:    return "byte";
+        case PrimitiveType::SByte:   return "sbyte";
+        case PrimitiveType::Short:   return "short";
+        case PrimitiveType::UShort:  return "ushort";
+        case PrimitiveType::UInt:    return "uint";
+        case PrimitiveType::Long:    return "long";
+        case PrimitiveType::ULong:   return "ulong";
         default:                     return {};  // `string` has its own check
     }
 }
@@ -22356,6 +22369,87 @@ void ExprTC::reportBuiltinArgIfNullable(const ast::Expr* arg,
             " is nullable but the target type is non-nullable (\xC2\xA7""7)");
 }
 
+// fix #7296 (§7 / §22.5, v0.344): the receiver head of a built-in call, and
+// whether the compiler HONOURS a parameter NAME there.
+//
+// This is `checkBuiltinNamedArgs`'s ONE claim decision, shared with the §7
+// nullability gate. The named-argument binder (#3398) is the only thing that
+// binds a NAME to a parameter: where it claims a call, the name carries the
+// POSITION and the argument's index is not its position; where it does NOT
+// claim the call, the name is neither matched nor rejected and the argument
+// binds POSITIONALLY — codegen lowers a built-in call by position (§22.5,
+// #3423), so the index IS the position.
+//
+// The §7 nullability gate reads a POSITION per argument, so it may trust that
+// read exactly where the name is NOT honoured. `honoured` is true for every
+// shape the binder claims, INCLUDING the shapes it rejects outright (its
+// Limitation 1, below): a rejected call never reaches codegen, so the gate's
+// position read is moot there — and the gate staying out of the way keeps one
+// diagnostic per call.
+static std::string_view builtinCallHeadHonouringArgNames(
+    SemaContext& ctx, const ast::CallExpr& ce, bool* honoured) {
+    *honoured = false;
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return {};
+    std::string_view head;
+    if (TypeRef* recvTy = ctx.exprType(*tgt)) {
+        if (recvTy->kind == TypeRef::Kind::Primitive) {
+            // Only `string` has a documented parameter-name surface here
+            // (stdlib §9.6); the other primitives are left unclaimed — so a
+            // name written there is NOT honoured and the argument binds
+            // positionally.
+            if (recvTy->primitive != PrimitiveType::String) return {};
+            head = "string";
+        } else if (recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration) {
+            // `headName()` is the alias-transparent read (#1462) and already
+            // falls back to the metadata `importedName` for a cross-module
+            // TypeRef with no astNode.
+            head = recvTy->headName();
+            if (head.empty()) return {};  // the §5 lazy sentinel, and kin
+            if (!common::isReservedBuiltinTypeName(head) &&
+                !common::isBuiltinExceptionName(head) &&
+                !common::isBuiltinNamedArgTableHead(head))
+                return {};
+        } else if (recvTy->kind == TypeRef::Kind::Named &&
+                   !recvTy->declaration->decl &&
+                   common::isBuiltinNamedArgTableHead(
+                       recvTy->declaration->name)) {
+            // Some built-in receivers DO carry a declaration: a
+            // `SemaContext::builtinClassSym` — a compiler-intrinsic
+            // `TypeSymbol` with `decl == nullptr`. `Encoding.UTF8` is one
+            // (ExprTypecheck_Calls.cpp stamps `builtinClassSym("Encoding")`
+            // on the singleton's TypeRef), so the declaration-less branch
+            // above never sees it and the whole §3.2 surface would be
+            // unclaimed.
+            //
+            // `decl == nullptr` alone does NOT mean "built-in" — an IMPORTED
+            // user `TypeSymbol` has no AST either — so the test is ANDed with
+            // the registry's own head set. A user class that happened to be
+            // named `Encoding` would resolve its member to a real
+            // `MethodSymbol` and be excluded by the `calleeSym` gate.
+            // Other `builtinClassSym` heads (DateTime, TimeSpan, Guid, Range,
+            // …) stay unclaimed: the registry carries no rows for them, and an
+            // unclaimed built-in costs a rejection that does not fire, never a
+            // false one.
+            head = recvTy->declaration->name;
+        } else {
+            return {};  // a user type: checkCallArity bound the call already
+        }
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+        // A static call `Head.M(...)`: the target is a bare type name with no
+        // value type. Nothing at that shape distinguishes a built-in static
+        // class from a user one, so only the heads
+        // `isBuiltinNamedArgTableHead` names are claimed — a user static call
+        // is bound by `checkCallArity` and never reaches here.
+        if (!common::isBuiltinNamedArgTableHead(id->name)) return {};
+        head = id->name;
+    } else {
+        return {};
+    }
+    *honoured = true;
+    return head;
+}
+
 void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
                                       Symbol* calleeSym) {
     // A resolved callee is a user or imported method, whose arguments
@@ -22383,13 +22477,44 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
         head = id->name;
     }
     if (head.empty()) return;
+    // fix #7296 (§7 / §22.5, v0.344): does the compiler HONOUR the NAME
+    // written on an argument at this call? `checkBuiltinNamedArgs` (#3398) is
+    // the only binder of a name to a parameter, and it claims the primitive
+    // receivers NOT AT ALL ("Only `string` has a documented parameter-name
+    // surface here (stdlib §9.6); the other primitives are left unclaimed").
+    // Where it does not claim the call, the name is neither matched nor
+    // rejected and the argument binds POSITIONALLY (codegen lowers a
+    // built-in call by position — §22.5, #3423) — so the argument's INDEX is
+    // its POSITION and this gate may check it.
+    //
+    // This is what closes the NAMED spelling of stdlib §9.1's
+    // `ToString(radix: int)` / `ToString(format: string)`: before it, the
+    // gate skipped every NAMED argument, so an un-narrowed `int?` written as
+    // `ToString(radix := r)` reached codegen un-owned and the call was
+    // SILENTLY ACCEPTED, while the positional spelling was refused and the
+    // mirror spelling (`Convert.ToString(value, toBase)`, stdlib §2.3) was
+    // refused too — two spellings of one overload disagreeing in ADMISSION.
+    bool anyNamed = false;
+    for (const auto& a : ce.args)
+        if (!a.name.empty()) { anyNamed = true; break; }
+    bool namesHonoured = false;
+    if (anyNamed) {
+        bool honoured = false;
+        (void)builtinCallHeadHonouringArgNames(ctx_, ce, &honoured);
+        namesHonoured = honoured;
+    }
     const std::string what = "argument to `" + std::string(head) + "." +
                              std::string(member) + "`";
     for (std::size_t i = 0; i < ce.args.size(); ++i) {
         const auto& a = ce.args[i];
-        // A named argument binds by name, not position: left to
-        // `checkBuiltinNamedArgs`, so the position read here is not trusted.
-        if (!a.value || a.isDiscard || !a.modifier.empty() || !a.name.empty())
+        // A named argument binds by name, not position, WHERE THE COMPILER
+        // HONOURS NAMES THERE: left to `checkBuiltinNamedArgs`, so the
+        // position read here is not trusted. Where the name is not honoured
+        // (fix #7296) the argument binds positionally and the index IS its
+        // position.
+        if (!a.value || a.isDiscard || !a.modifier.empty())
+            continue;
+        if (!a.name.empty() && namesHonoured)
             continue;
         if (!common::builtinParamIsNonNullable(head, member, ce.args.size(),
                                                i))
@@ -22498,54 +22623,14 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
     auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
     if (!tgt) return;
 
-    std::string_view head;
-    if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
-        if (recvTy->kind == TypeRef::Kind::Primitive) {
-            // Only `string` has a documented parameter-name surface here
-            // (stdlib §9.6); the other primitives are left unclaimed.
-            if (recvTy->primitive != PrimitiveType::String) return;
-            head = "string";
-        } else if (recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration) {
-            // `headName()` is the alias-transparent read (#1462) and already
-            // falls back to the metadata `importedName` for a cross-module
-            // TypeRef with no astNode.
-            head = recvTy->headName();
-            if (head.empty()) return;  // the §5 lazy sentinel, and kin
-            if (!common::isReservedBuiltinTypeName(head) &&
-                !common::isBuiltinExceptionName(head) &&
-                !common::isBuiltinNamedArgTableHead(head))
-                return;
-        } else if (recvTy->kind == TypeRef::Kind::Named &&
-                   !recvTy->declaration->decl &&
-                   common::isBuiltinNamedArgTableHead(
-                       recvTy->declaration->name)) {
-            // Some built-in receivers DO carry a declaration: a
-            // `SemaContext::builtinClassSym` — a compiler-intrinsic
-            // `TypeSymbol` with `decl == nullptr`. `Encoding.UTF8` is one
-            // (ExprTypecheck_Calls.cpp stamps `builtinClassSym("Encoding")`
-            // on the singleton's TypeRef), so the declaration-less branch
-            // above never sees it and the whole §3.2 surface would be
-            // unclaimed.
-            //
-            // `decl == nullptr` alone does NOT mean "built-in" — an IMPORTED
-            // user `TypeSymbol` has no AST either — so the test is ANDed with
-            // the registry's own head set. A user class that happened to be
-            // named `Encoding` would resolve its member to a real
-            // `MethodSymbol` and be excluded by the `calleeSym` gate above.
-            // Other `builtinClassSym` heads (DateTime, TimeSpan, Guid, Range,
-            // …) stay unclaimed: the registry carries no rows for them, and an
-            // unclaimed built-in costs a rejection that does not fire, never a
-            // false one.
-            head = recvTy->declaration->name;
-        } else {
-            return;  // a user type: checkCallArity bound the call already
-        }
-    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
-        if (!common::isBuiltinNamedArgTableHead(id->name)) return;
-        head = id->name;
-    } else {
-        return;
-    }
+    // fix #7296 (§7 / §22.5, v0.344): the CLAIM decision is ONE helper,
+    // shared with the §7 nullability gate — the gate may only read an
+    // argument's position where the compiler does NOT honour the name, and
+    // that is exactly what this helper answers.
+    bool honoured = false;
+    std::string_view head =
+        builtinCallHeadHonouringArgNames(ctx_, ce, &honoured);
+    if (!honoured) return;
 
     const std::string desc = std::string("call to built-in `") +
                              std::string(head) + "." + std::string(member) +

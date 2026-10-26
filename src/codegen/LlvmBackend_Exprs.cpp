@@ -1,5 +1,6 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "common/OwnershipFacts.hpp"  // fix #3189: calleeReturnsOwned — the M2 owned-return channel
+#include "common/BuiltinRegistry.hpp"  // fix #7286 fix-forward: builtinParamIsNonNullable — the §7 gate's own registry
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 #include "sema/ConstFold.hpp"  // fix #7271: §17.14 constant folding for the radix argument (§5.1)
 
@@ -149,6 +150,25 @@ bool radixWidensToInt(sema::PrimitiveType p) {
         default:
             return false;
     }
+}
+
+// fix #7286 fix-forward: the RENDERING BUFFER of an integer `ToString(...)`
+// — the stack buffer the snprintf rendering writes into — and the maximum
+// PADDING WIDTH that buffer can hold. 66 bytes hold the widest value the
+// formatters render (64 bits + a sign + the NUL); the width is bounded by
+// the buffer so a user-supplied width ("D100", "D99999999999") can never
+// outgrow it. The LITERAL format spelling and the RUNTIME format spelling
+// share the two constants, so the two spellings of one overload agree on
+// the bound.
+constexpr unsigned kToStringBuf = 66;
+constexpr unsigned kToStringMaxWidth = kToStringBuf - 1;
+
+// The unsigned minimum of two integers (a compare and a select — this
+// LLVM's IRBuilder has no integer min helper).
+llvm::Value* umin(llvm::IRBuilder<>& b, llvm::Value* a, llvm::Value* c,
+                  const char* name) {
+    llvm::Value* lt = b.CreateICmpULT(a, c, name);
+    return b.CreateSelect(lt, a, c, name);
 }
 
 // The type name, as the diagnostic spells it.
@@ -2607,6 +2627,48 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         printfFmt = std::string("%0") + digits + pfspec2;
                                     else
                                         printfFmt = spec == 'X' ? "%X" : "%d";
+                                    // fix #7286 fix-forward: the WIDTH in the
+                                    // literal is unbounded ("D1000000000"
+                                    // builds a 1000000000-wide field), and the
+                                    // rendering buffer is a fixed 66 bytes —
+                                    // so the width is clamped to what the
+                                    // buffer can hold, exactly as the RUNTIME
+                                    // format spelling clamps its run-time
+                                    // width. Only a digit run whose VALUE
+                                    // exceeds the bound is rewritten; a run
+                                    // within it (and every malformed suffix)
+                                    // keeps the format string verbatim, so the
+                                    // pre-existing spellings ("D4", "D4x")
+                                    // render exactly as they did.
+                                    if (!digits.empty()) {
+                                        std::size_t runLen = 0;
+                                        while (runLen < digits.size() &&
+                                               digits[runLen] >= '0' &&
+                                               digits[runLen] <= '9')
+                                            runLen++;
+                                        if (runLen > 0) {
+                                            // The digit run's value, saturating.
+                                            unsigned long long w = 0;
+                                            bool over = false;
+                                            for (std::size_t i = 0; i < runLen; i++) {
+                                                const unsigned d =
+                                                    (unsigned)(digits[i] - '0');
+                                                if (w > (kToStringMaxWidth - d) / 10ULL) {
+                                                    over = true;
+                                                    break;
+                                                }
+                                                w = w * 10ULL + d;
+                                            }
+                                            if (over || w > kToStringMaxWidth) {
+                                                printfFmt = std::string("%0") +
+                                                    std::to_string(
+                                                        (unsigned long long)
+                                                            kToStringMaxWidth) +
+                                                    digits.substr(runLen) +
+                                                    pfspec2;
+                                            }
+                                        }
+                                    }
                                     if (!recv->getType()->isIntegerTy(32))
                                         recv = builder_.CreateFPToSI(recv, i32());
                                 } else {
@@ -2625,21 +2687,40 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
                                 }
                                 auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-                                llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, 64));
-                                llvm::Value* bufPtr = builder_.CreateGEP(llvm::ArrayType::get(i8Ty, 64), buf, {builder_.getInt64(0), builder_.getInt64(0)});
-                                llvm::Value* wr = builder_.CreateCall(snpFn, {bufPtr, builder_.getInt64(64), fmtGV, recv}, "ts.wr");
+                                llvm::Value* buf = entryAlloca(
+                                    llvm::ArrayType::get(i8Ty, kToStringBuf));
+                                llvm::Value* bufPtr = builder_.CreateGEP(
+                                    llvm::ArrayType::get(i8Ty, kToStringBuf), buf,
+                                    {builder_.getInt64(0), builder_.getInt64(0)});
+                                llvm::Value* wr = builder_.CreateCall(
+                                    snpFn,
+                                    {bufPtr, builder_.getInt64(kToStringBuf), fmtGV,
+                                     recv},
+                                    "ts.wr");
                                 auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
                                 auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
                                 llvm::Value* l64 = builder_.CreateSExt(wr, i64());
-                                llvm::Value* dSz = builder_.CreateAdd(l64, builder_.getInt64(1));
+                                // fix #7286 fix-forward: snprintf's RETURN VALUE
+                                // is the length the output WOULD have had; the
+                                // bytes actually in the buffer are
+                                // `min(return, size - 1)`. Copying `l64` bytes
+                                // read past the buffer whenever the output was
+                                // truncated, and copied ADJACENT STACK BYTES
+                                // into the string the program receives.
+                                llvm::Value* written = umin(
+                                    builder_, l64,
+                                    builder_.getInt64(kToStringBuf - 1),
+                                    "ts.wlen");
+                                llvm::Value* dSz =
+                                    builder_.CreateAdd(written, builder_.getInt64(1));
                                 llvm::Value* dc = builder_.CreateCall(mallocFn, {dSz}, "ts.data");
-                                builder_.CreateCall(memcpyFn, {dc, bufPtr, l64});
-                                llvm::Value* np = builder_.CreateGEP(i8Ty, dc, l64);
+                                builder_.CreateCall(memcpyFn, {dc, bufPtr, written});
+                                llvm::Value* np = builder_.CreateGEP(i8Ty, dc, written);
                                 builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np);
                                 uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
                                 llvm::Value* so = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "ts.obj");
                                 builder_.CreateStore(dc, builder_.CreateStructGEP(stringType(), so, 0));
-                                builder_.CreateStore(l64, builder_.CreateStructGEP(stringType(), so, 1));
+                                builder_.CreateStore(written, builder_.CreateStructGEP(stringType(), so, 1));
                                 builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
                                     builder_.CreateStructGEP(stringType(), so, 2));
                                 initStringRc(so);  // #422: producer's reference, rc := 1
@@ -2660,6 +2741,94 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                                   tt->primitive == P::Short ||
                                                   tt->primitive == P::UShort);
                                 auto* argTy = ctx_.exprType(*call->args[0].value);
+                                // fix #7286: the pieces both renderings share —
+                                // a C string constant, and the snprintf
+                                // rendering that becomes a fresh Bezel
+                                // `string` (the shape the LITERAL format path
+                                // already uses).
+                                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                                // The rendering buffer: `kToStringBuf` bytes
+                                // (64 bits of value + a sign + the NUL).
+                                // A NUL-terminated C string constant, as a
+                                // pointer the renderers can pass on.
+                                auto globalCString = [&](const char* s) -> llvm::Value* {
+                                    auto* data = llvm::ConstantDataArray::getString(
+                                        llvm_, s, true);
+                                    unsigned id = stringLiteralIdx_++;
+                                    auto* gv = new llvm::GlobalVariable(
+                                        *module_, data->getType(), true,
+                                        llvm::GlobalValue::PrivateLinkage, data,
+                                        ".bz.rts.cstr." + std::to_string(id));
+                                    gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                                    return builder_.CreateInBoundsGEP(
+                                        data->getType(), gv,
+                                        {builder_.getInt64(0), builder_.getInt64(0)});
+                                };
+                                // The rendering: snprintf into a stack buffer,
+                                // then the fresh `string` the text becomes
+                                // (rc := 1, the producer's reference).
+                                auto emitSnprintfString =
+                                    [&](llvm::Value* fmtPtr,
+                                        llvm::ArrayRef<llvm::Value*> args) -> llvm::Value* {
+                                    auto* snpFn = module_->getFunction("snprintf");
+                                    if (!snpFn) {
+                                        auto* ft = llvm::FunctionType::get(
+                                            i32(), {ptrTy(), i64(), ptrTy()}, true);
+                                        snpFn = llvm::Function::Create(
+                                            ft, llvm::GlobalValue::ExternalLinkage,
+                                            "snprintf", module_.get());
+                                    }
+                                    auto* buf = entryAlloca(
+                                        llvm::ArrayType::get(i8Ty, kToStringBuf));
+                                    llvm::Value* bPtr = builder_.CreateGEP(
+                                        llvm::ArrayType::get(i8Ty, kToStringBuf), buf,
+                                        {builder_.getInt64(0), builder_.getInt64(0)});
+                                    std::vector<llvm::Value*> callArgs = {
+                                        bPtr, builder_.getInt64(kToStringBuf), fmtPtr};
+                                    for (llvm::Value* a : args) callArgs.push_back(a);
+                                    llvm::Value* wr =
+                                        builder_.CreateCall(snpFn, callArgs, "ts.wr");
+                                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                                    auto* memcpyFn = declareC("memcpy", ptrTy(),
+                                                               {ptrTy(), ptrTy(), i64()});
+                                    llvm::Value* l64 = builder_.CreateSExt(wr, i64());
+                                    // fix #7286 fix-forward: snprintf's RETURN
+                                    // VALUE is the length the output WOULD have
+                                    // had — the bytes actually in the buffer are
+                                    // `min(return, size - 1)`. Copying `l64`
+                                    // bytes out of the buffer read past it
+                                    // whenever the output was truncated, and
+                                    // copied ADJACENT STACK BYTES into the
+                                    // string the program receives. The written
+                                    // length is what the copy, the
+                                    // allocation, the NUL and the string's
+                                    // own length must all use.
+                                    llvm::Value* written = umin(
+                                        builder_, l64,
+                                        builder_.getInt64(kToStringBuf - 1),
+                                        "ts.wlen");
+                                    llvm::Value* dSz =
+                                        builder_.CreateAdd(written, builder_.getInt64(1));
+                                    llvm::Value* dc =
+                                        builder_.CreateCall(mallocFn, {dSz}, "ts.data");
+                                    builder_.CreateCall(memcpyFn, {dc, bPtr, written});
+                                    llvm::Value* np = builder_.CreateGEP(i8Ty, dc, written);
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty, 0), np);
+                                    uint64_t strBytes = module_->getDataLayout()
+                                        .getTypeAllocSize(stringType());
+                                    llvm::Value* so = builder_.CreateCall(
+                                        mallocFn, {builder_.getInt64(strBytes)}, "ts.obj");
+                                    builder_.CreateStore(
+                                        dc, builder_.CreateStructGEP(stringType(), so, 0));
+                                    builder_.CreateStore(
+                                        written, builder_.CreateStructGEP(stringType(), so, 1));
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty, 1),
+                                        builder_.CreateStructGEP(stringType(), so, 2));
+                                    initStringRc(so);  // #422: producer's reference, rc := 1
+                                    return so;
+                                };
                                 // fix #7271 (spec §5.1 / §22.6, v0.344): the
                                 // `radix: int` parameter (stdlib §9.1) admits
                                 // the argument by IDENTITY, by the §5.1
@@ -2685,10 +2854,73 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 bool radixIsNullable = false;
                                 bool radixConstType = false;
                                 bool radixConstOutOfRange = false;
+                                // fix #7286 fix-forward (§7 / §7.4 / §22.6,
+                                // v0.344): does the SEMANTIC §7 NULLABILITY
+                                // GATE own this call's argument position?
+                                //
+                                // The house's gate is `ExprTC::
+                                // reportBuiltinArgIfNullable` (#6782): for a
+                                // built-in call it reports "the argument to
+                                // `X.Y` is nullable but the target type is
+                                // non-nullable (§7)" — but it STANDS DOWN for a
+                                // §7.4-NARROWED read (`isNarrowedNonNullRead`),
+                                // and the registry row that reaches this position
+                                // is `common::builtinParamIsNonNullable`'s.
+                                //
+                                // So at a gate-owned position, a NULLABLE
+                                // argument that REACHED codegen is a §7.4-
+                                // NARROWED read: sema's gate already decided it
+                                // is legal, and §22.6 makes its type at the call
+                                // its NON-NULLABLE type ("a read of a binding
+                                // §7.4 has narrowed non-null is of its
+                                // non-nullable type ... so a narrowed `d: Dog?`
+                                // is exact at a `Dog` parameter"). This block's
+                                // own nullable rejection is therefore a SECOND
+                                // spelling of a decision sema already makes —
+                                // and a wrong one, for it rejected the narrowed
+                                // read the gate admits.
+                                //
+                                // The predicate is the REGISTRY's own (one
+                                // spelling, not a copy): `{"Int32", "ToString",
+                                // 1, 0}` is §9.1's `ToString(format: string)`
+                                // position, and the primitive keyword the
+                                // registry maps is the receiver's own.
+                                const bool gateOwnsPosition =
+                                    common::builtinParamIsNonNullable(
+                                        radixTypeName(tt->primitive), "ToString",
+                                        /*argCount=*/1, /*position=*/0);
+                                // fix #7286 (spec §17.14 / §5.1, v0.344): the
+                                // FOLDED value of the argument, when it is a
+                                // §17.14 constant expression. The RENDERER
+                                // needs it: an LLVM `ConstantInt` read cannot
+                                // see the value of a constant EXPRESSION the
+                                // compiler folds (`8u + 8u`), so the renderer
+                                // fell back to the DECIMAL text.
+                                std::optional<long long> foldedRadix;
+                                if (argTy &&
+                                    argTy->kind == sema::TypeRef::Kind::Primitive &&
+                                    argTy->primitive != P::String && !argTy->nullable)
+                                    foldedRadix =
+                                        radixConstValue(ctx_, *call->args[0].value);
                                 if (argTy &&
                                     argTy->kind == sema::TypeRef::Kind::Primitive) {
                                     const P pt = argTy->primitive;
-                                    if (argTy->nullable) {
+                                    // fix #7286 fix-forward (§7.4 / §22.6,
+                                    // v0.344): at a gate-owned position an
+                                    // ADMITTED nullable argument is a NARROWED
+                                    // read — §7.4's "assignment: ... and from a
+                                    // declaration whose initializer is such an
+                                    // `expr` — `var x: T? := expr;` ... which is
+                                    // the declaration's assignment" and §7.4's
+                                    // null test both establish the narrowing, and
+                                    // §22.6 makes the read's type at the call
+                                    // its NON-NULLABLE type. So it is judged as
+                                    // the non-nullable primitive it is — the
+                                    // same dispatch the non-nullable argument
+                                    // takes.
+                                    const bool narrowedNullable =
+                                        argTy->nullable && gateOwnsPosition;
+                                    if (argTy->nullable && !narrowedNullable) {
                                         // §7.10: a NULLABLE argument is the
                                         // NULLABILITY gate's question (the
                                         // house leaves it to that gate, exactly
@@ -2712,8 +2944,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         // route by which these three types
                                         // reach an `int` parameter.
                                         radixConstType = true;
-                                        if (auto cv = radixConstValue(
-                                                ctx_, *call->args[0].value)) {
+                                        if (foldedRadix) {
+                                            const long long cv = *foldedRadix;
                                             // The range: `uint`/`ulong` are
                                             // unsigned, `long` is signed; the
                                             // target is `int`. A constant
@@ -2724,17 +2956,68 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                             const long long lo =
                                                 (pt == P::Long) ? -2147483648LL : 0;
                                             const long long hi = 2147483647LL;
-                                            radixBinds = (*cv >= lo && *cv <= hi);
+                                            radixBinds = (cv >= lo && cv <= hi);
                                             radixConstOutOfRange = !radixBinds;
                                         }
                                     }
+                                }
+                                // fix #7286 (spec §5.1 / §7.1 / §22.6, v0.344):
+                                // a NULLABLE argument binds to NO §9.1
+                                // parameter. §5.1's nullable conversions lift
+                                // only to the NULLABLE form — "`S?` implicitly
+                                // converts to `T?` whenever `S` implicitly
+                                // converts to `T`" — so `int?` reaches
+                                // neither `ToString(radix: int)` nor
+                                // `ToString(format: string)`, and §7.1's "the
+                                // compiler enforces the distinction at every
+                                // assignment, parameter pass, and return"
+                                // is the rule that refuses it. §22.6: "If no
+                                // candidate is applicable at all … the call is
+                                // a compile error with no candidates cited."
+                                // A nullable radix used to be SILENTLY
+                                // ABSORBED and the program printed the
+                                // receiver's DECIMAL text.
+                                //
+                                // fix #7286 fix-forward (§7 / §7.4 / §22.6,
+                                // v0.344): this rejection applies ONLY where
+                                // the SEMANTIC §7 nullability gate does NOT own
+                                // the position. Where the gate DOES own it, the
+                                // gate has already decided — it rejects an
+                                // un-narrowed nullable argument and ADMITS a
+                                // §7.4-narrowed one — and a second spelling
+                                // here would contradict it (it rejected the
+                                // narrowed read the gate admits). The gate's
+                                // registry has no row for the other integer
+                                // receivers (`uint`, `long`, `ulong`, `byte`,
+                                // `sbyte`, `short`, `ushort`), so this block
+                                // still owns THOSE positions — and it still
+                                // over-rejects a NARROWED nullable there, which
+                                // is the residual D3 leaves open (the remedy:
+                                // the registry rows for those heads plus sema's
+                                // `primitiveKeywordHead` entries).
+                                if (isIntRecv && radixIsNullable && !gateOwnsPosition) {
+                                    std::string argName = "the argument";
+                                    if (argTy &&
+                                        argTy->kind == sema::TypeRef::Kind::Primitive)
+                                        argName = std::string("a nullable `") +
+                                            radixTypeName(argTy->primitive) + "`";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        call->args[0].value->span.begin,
+                                        "no matching overload of `ToString` — stdlib §9.1 "
+                                        "declares `ToString(radix: int): string` and "
+                                        "`ToString(format: string): string`, and a NULLABLE "
+                                        "argument binds to neither: " + argName +
+                                        " — §5.1's nullable conversions lift only to the "
+                                        "nullable form, so no §9.1 parameter admits it "
+                                        "(stdlib §9.1; §5.1; §7.1; §22.6)");
+                                    return nullptr;
                                 }
                                 // The rejection: a located, spec-cited
                                 // diagnostic naming the argument and the type
                                 // stdlib §9.1 declares there — the shape the
                                 // `Convert.ToString` check uses.
-                                if (isIntRecv && !radixIsString && !radixIsNullable &&
-                                    !radixBinds) {
+                                if (isIntRecv && !radixIsString && !radixBinds) {
                                     std::string argName = "the argument";
                                     if (argTy &&
                                         argTy->kind == sema::TypeRef::Kind::Primitive)
@@ -2758,9 +3041,234 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         "§5.1)" + why);
                                     return nullptr;
                                 }
+                                // fix #7286 (stdlib §9.1 / §2.18, v0.344): the
+                                // OTHER one-argument overload —
+                                // `ToString(format: string)` — with a RUNTIME
+                                // format argument. stdlib §9.1 declares `public
+                                // pure method ToString(format: string): string;`
+                                // and a `string` argument binds to it EXACTLY
+                                // (§22.6: the radix overload's `int` parameter
+                                // admits no `string`). The overload's parameter
+                                // is a `string` — the VALUE, not the literal
+                                // text — so the rendering is a RUNTIME one: the
+                                // format is read at run time and the rendering
+                                // dispatched on it. The old path handled only a
+                                // string LITERAL, so a format held in a
+                                // variable fell through to the no-format
+                                // renderer and printed the DECIMAL text.
+                                //
+                                // The VOCABULARY is the one the LITERAL path
+                                // already implements (stdlib §2.18's integer
+                                // row as the house renders it: `D`/`Dn`
+                                // decimal, `X`/`Xn` hex), so the two spellings
+                                // of the same overload AGREE. §2.18's wider
+                                // vocabulary (`B`, the lower-case `x`) and its
+                                // FormatException for an unrecognized specifier
+                                // are a separate gap, in BOTH spellings.
+                                if (isIntRecv && radixIsString) {
+                                    llvm::Value* fmtArg =
+                                        lowerExpr(*call->args[0].value);
+                                    if (!fmtArg) return nullptr;
+                                    // The format's VALUE, as UTF-8: a Bezel
+                                    // string's bytes are code points at the
+                                    // string's own width, so its bytes are not
+                                    // its characters (stdlib §3.1 — the
+                                    // runtime's own decoder).
+                                    auto* toUtf8 = declareC(
+                                        "bz_string_to_utf8z", ptrTy(), {ptrTy()});
+                                    llvm::Value* cf = builder_.CreateCall(
+                                        toUtf8, {fmtArg}, "fmt.u8");
+                                    // The specifier: the first code point.
+                                    llvm::Value* c0p = builder_.CreateGEP(
+                                        i8Ty, cf, {builder_.getInt64(0)}, "fmt.c0p");
+                                    llvm::Value* c0 = builder_.CreateLoad(
+                                        i8Ty, c0p, "fmt.c0");
+                                    llvm::Value* isD = builder_.CreateOr(
+                                        builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, 'D')),
+                                        builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, 'd')),
+                                        "fmt.isD");
+                                    llvm::Value* isX = builder_.CreateOr(
+                                        builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, 'X')),
+                                        builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, 'x')),
+                                        "fmt.isX");
+                                    // The digit suffix: the minimum digit
+                                    // count (stdlib §2.18's `Dn` / `Xn`).
+                                    //
+                                    // fix #7286 fix-forward: the utf8 buffer is
+                                    // `n*4+1` bytes (the runtime's own
+                                    // `bz_string_to_utf8z`), so for an EMPTY
+                                    // string it is ONE byte and a `+1` GEP
+                                    // pointed past its end — a one-byte heap
+                                    // over-read in `strspn`. The byte LENGTH
+                                    // bounds every read below: the suffix
+                                    // starts at offset 1 only when there IS a
+                                    // first byte, and at offset 0 otherwise
+                                    // (where the NUL is, so the digit run is
+                                    // empty and the specifier is not one this
+                                    // path renders).
+                                    auto* strlenFn = declareC(
+                                        "strlen", i64(), {ptrTy()});
+                                    llvm::Value* blen = builder_.CreateCall(
+                                        strlenFn, {cf}, "fmt.blen");
+                                    llvm::Value* hasSpec = builder_.CreateICmpUGT(
+                                        blen, builder_.getInt64(0), "fmt.hasspec");
+                                    llvm::Value* suffixOff = builder_.CreateSelect(
+                                        hasSpec, builder_.getInt64(1),
+                                        builder_.getInt64(0), "fmt.sfxoff");
+                                    llvm::Value* cf1 = builder_.CreateGEP(
+                                        i8Ty, cf, {suffixOff}, "fmt.cf1");
+                                    auto* strspnFn = declareC(
+                                        "strspn", i64(), {ptrTy(), ptrTy()});
+                                    llvm::Value* digitChars =
+                                        globalCString("0123456789");
+                                    llvm::Value* dlen = builder_.CreateCall(
+                                        strspnFn, {cf1, digitChars}, "fmt.dlen");
+                                    // The character right after the digit
+                                    // prefix must be the NUL — else the tail
+                                    // is not a width, and the specifier is not
+                                    // one this path renders.
+                                    llvm::Value* tailp = builder_.CreateGEP(
+                                        i8Ty, cf,
+                                        {builder_.CreateAdd(suffixOff, dlen)},
+                                        "fmt.tailp");
+                                    llvm::Value* tailc =
+                                        builder_.CreateLoad(i8Ty, tailp, "fmt.tail");
+                                    llvm::Value* tailOk = builder_.CreateICmpEQ(
+                                        tailc, llvm::ConstantInt::get(i8Ty, 0),
+                                        "fmt.tailok");
+                                    // The width: the digits' value.
+                                    auto* strtolFn = declareC(
+                                        "strtol", i64(), {ptrTy(), ptrTy(), i32()});
+                                    llvm::Value* width64 = builder_.CreateCall(
+                                        strtolFn,
+                                        {cf1, llvm::ConstantPointerNull::get(ptrTy()),
+                                         builder_.getInt32(10)},
+                                        "fmt.width");
+                                    // fix #7286 fix-forward: the width is
+                                    // USER-CONTROLLED at run time — the digit
+                                    // run is unbounded ("D99999999999" is
+                                    // 1215752191 after the truncation to i32),
+                                    // and the rendering buffer is a fixed
+                                    // 66 bytes. Bound the width by the buffer
+                                    // (the same bound the LITERAL spelling
+                                    // clamps its digit run to), so the padding
+                                    // can never outgrow the buffer.
+                                    llvm::Value* widthBounded = umin(
+                                        builder_, width64,
+                                        builder_.getInt64(kToStringMaxWidth),
+                                        "fmt.wbnd");
+                                    llvm::Value* width = builder_.CreateTrunc(
+                                        widthBounded, i32(), "fmt.w32");
+                                    // The buffer is the runtime's own; release
+                                    // it (every read above precedes this).
+                                    auto* freeFn = declareC(
+                                        "free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                                    builder_.CreateCall(freeFn, {cf});
+                                    // The recognized form: the specifier this
+                                    // path renders, with a digit suffix that is
+                                    // exactly digits.
+                                    llvm::Value* recognized = builder_.CreateAnd(
+                                        builder_.CreateOr(isD, isX), tailOk,
+                                        "fmt.rec");
+                                    auto* fmtBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.fmt", currentFn_);
+                                    auto* plainBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.plain", currentFn_);
+                                    auto* mrgBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.mrg", currentFn_);
+                                    builder_.CreateCondBr(recognized, fmtBB, plainBB);
+                                    builder_.SetInsertPoint(fmtBB);
+                                    // The value: the receiver's OWN (the
+                                    // literal format path's value), widened to
+                                    // the format's own width.
+                                    const bool recvIs64 =
+                                        recv->getType()->isIntegerTy(64);
+                                    // fix #7286 fix-forward: the SIGNEDNESS is
+                                    // the receiver's own TYPE's (the house
+                                    // predicate `isUnsignedTargetExpr`) —
+                                    // never the bit width's: `int` and `uint`
+                                    // are both 32 bits and `long` and `ulong`
+                                    // are both 64 bits.
+                                    const bool recvUnsigned =
+                                        isUnsignedTargetExpr(*ma->target);
+                                    llvm::Value* val = recv;
+                                    if (!recvIs64) {
+                                        val = recvUnsigned
+                                            ? builder_.CreateZExt(recv, i32(), "ts.zx")
+                                            : builder_.CreateSExt(recv, i32(), "ts.sx");
+                                    }
+                                    // fix #7286 fix-forward: the DECIMAL
+                                    // conversion must match the value's
+                                    // SIGNEDNESS: a SIGNED printf conversion
+                                    // renders a `uint` of 4000000000 as
+                                    // "-294967296" and a `ulong` of
+                                    // 18446744073709551615 as "-1", where the
+                                    // no-format rendering of the same value
+                                    // (stdlib §9.1: "The no-format `ToString()`
+                                    // ... emits the text `ToString(10)` emits")
+                                    // gives "4000000000" and
+                                    // "18446744073709551615". The widening
+                                    // above is right; feeding the result to a
+                                    // signed conversion was not.
+                                    //
+                                    // The HEX conversion needs no signedness
+                                    // arm: the `X` conversion renders the
+                                    // argument's BITS, so the same length
+                                    // modifier serves both.
+                                    llvm::Value* decFmt = globalCString(
+                                        recvIs64 ? (recvUnsigned ? "%0*llu" : "%0*ld")
+                                                 : (recvUnsigned ? "%0*u" : "%0*d"));
+                                    llvm::Value* hexFmt = globalCString(
+                                        recvIs64 ? "%0*lX" : "%0*X");
+                                    llvm::Value* fptr = builder_.CreateSelect(
+                                        isX, hexFmt, decFmt, "ts.fptr");
+                                    llvm::Value* sval =
+                                        emitSnprintfString(fptr, {width, val});
+                                    auto* fmtEnd = builder_.GetInsertBlock();
+                                    builder_.CreateBr(mrgBB);
+                                    // The unrecognized form: the no-format
+                                    // rendering (the literal path's own
+                                    // fallback for a specifier it does not
+                                    // render).
+                                    builder_.SetInsertPoint(plainBB);
+                                    llvm::Value* pval =
+                                        emitPrimitiveToString(recv, tt->primitive);
+                                    auto* plainEnd = builder_.GetInsertBlock();
+                                    builder_.CreateBr(mrgBB);
+                                    builder_.SetInsertPoint(mrgBB);
+                                    auto* phi = builder_.CreatePHI(ptrTy(), 2, "ts.str");
+                                    phi->addIncoming(sval, fmtEnd);
+                                    phi->addIncoming(pval, plainEnd);
+                                    return phi;
+                                }
                                 if (isIntRecv && radixBinds) {
                                     llvm::Value* radix = lowerExpr(*call->args[0].value);
                                     if (!radix) return nullptr;
+                                    // fix #7286 fix-forward (§7.4 / §22.6,
+                                    // v0.344): a §7.4-NARROWED nullable read is
+                                    // of its NON-NULLABLE type at the call, so
+                                    // the value that reaches the formatter is the
+                                    // PAYLOAD of the `{i8 hasValue; T}` carrier
+                                    // the read still loads — not the carrier.
+                                    // The house's own unwrap for this operand
+                                    // (`unwrapNarrowedNullableOperand`, keyed
+                                    // on the operand's own sema type) is the
+                                    // one spelling of it; it is a no-op for
+                                    // every non-nullable operand.
+                                    //
+                                    // The soundness precondition that helper
+                                    // names — "a SEMA GATE already rejects the
+                                    // un-narrowed form" — HOLDS here: the §7
+                                    // nullability gate (#6782) rejects an
+                                    // un-narrowed nullable argument at this
+                                    // position (see `gateOwnsPosition`), and a
+                                    // narrowed one is what reaches codegen.
+                                    radix = unwrapNarrowedNullableOperand(
+                                        radix, argTy);
                                     // fix #7258 (stdlib §9.1, v0.344): the radix
                                     // rendering shows the receiver's OWN value.
                                     // §9.1: "`ToString(radix)` emits the
@@ -2803,22 +3311,79 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                                 builder_.getInt64(0), mag, "rts.m"),
                                             mag, "rts.mag");
                                     }
-                                    // Resolve radix from a constant int. An
-                                    // unadmitted radix keeps the decimal
+                                    // The RADIX (fix #7286): the FOLDED §17.14
+                                    // value when the argument is a compile-time
+                                    // constant, else the RUNTIME value. The
+                                    // selection used to read the argument as an
+                                    // LLVM `ConstantInt`, which cannot see the
+                                    // value of a constant EXPRESSION the
+                                    // compiler folds (`8u + 8u`) nor of a
+                                    // runtime `int` radix — so an ADMITTED
+                                    // radix rendered the DECIMAL text.
+                                    // An unadmitted radix keeps the decimal
                                     // fallback (the §9.1 ArgumentException is a
                                     // BANKED divergence — corpus l2_3_0003).
                                     const char* fmt = "%s%llu";  // fallback: decimal
-                                    bool isBinary = false;
-                                    if (auto* cr = llvm::dyn_cast<llvm::ConstantInt>(radix)) {
-                                        uint64_t r = cr->getZExtValue();
+                                    bool isBinary = false;  // the compile-time radix 2
+                                    llvm::Value* rtIsBinary = nullptr;  // the runtime radix 2
+                                    llvm::Value* rtFmt = nullptr;       // the runtime format
+                                    if (foldedRadix) {
+                                        const uint64_t r = (uint64_t)*foldedRadix;
                                         if (r == 16) fmt = "%s%llx";
                                         else if (r == 8) fmt = "%s%llo";
                                         else if (r == 2) isBinary = true;
+                                    } else if (radix->getType()->isIntegerTy()) {
+                                        // A RUNTIME radix: the format is
+                                        // selected at RUN time (stdlib §9.1:
+                                        // "`ToString(radix)` emits the
+                                        // lower-case digits … and takes the
+                                        // same radix set" — 2, 8, 10 and 16).
+                                        llvm::Value* r64 = radix;
+                                        if (!r64->getType()->isIntegerTy(64)) {
+                                            const bool radixUnsigned =
+                                                isUnsignedTargetExpr(*call->args[0].value);
+                                            r64 = radixUnsigned
+                                                ? builder_.CreateZExt(r64, i64(), "rts.rzx")
+                                                : builder_.CreateSExt(r64, i64(), "rts.rsx");
+                                        }
+                                        llvm::Value* isHex = builder_.CreateICmpEQ(
+                                            r64, builder_.getInt64(16), "rts.hex");
+                                        llvm::Value* isOct = builder_.CreateICmpEQ(
+                                            r64, builder_.getInt64(8), "rts.oct");
+                                        rtIsBinary = builder_.CreateICmpEQ(
+                                            r64, builder_.getInt64(2), "rts.bin");
+                                        llvm::Value* decPtr = globalCString("%s%llu");
+                                        llvm::Value* hexPtr = globalCString("%s%llx");
+                                        llvm::Value* octPtr = globalCString("%s%llo");
+                                        rtFmt = builder_.CreateSelect(
+                                            isHex, hexPtr,
+                                            builder_.CreateSelect(isOct, octPtr, decPtr),
+                                            "rts.fmt");
                                     }
                                     // Binary path: emit a bit-scan loop.
-                                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-                                    const unsigned BUF = 66;  // 64 bits + sign + NUL
-                                    if (isBinary) {
+                                    //
+                                    // fix #7286: the radix 2 rendering is
+                                    // reached from the COMPILE-TIME radix and
+                                    // from the RUNTIME radix, so it sits behind
+                                    // a branch whose condition is the
+                                    // compile-time answer or the runtime
+                                    // comparison.
+                                    llvm::Value* binCond =
+                                        isBinary ? llvm::ConstantInt::getTrue(llvm_)
+                                                 : (rtIsBinary
+                                                        ? rtIsBinary
+                                                        : llvm::ConstantInt::getFalse(llvm_));
+                                    auto* binOuterBB = llvm::BasicBlock::Create(
+                                        llvm_, "rts.bin", currentFn_);
+                                    auto* snpOuterBB = llvm::BasicBlock::Create(
+                                        llvm_, "rts.snp", currentFn_);
+                                    auto* mrgOuterBB = llvm::BasicBlock::Create(
+                                        llvm_, "rts.mrg", currentFn_);
+                                    builder_.CreateCondBr(binCond, binOuterBB, snpOuterBB);
+                                    builder_.SetInsertPoint(binOuterBB);
+                                    llvm::Value* binVal = nullptr;
+                                    llvm::BasicBlock* binEnd = nullptr;
+                                    {
                                         // The MAGNITUDE's digits, MSB first; the
                                         // sign byte comes first for a negative
                                         // value (§9.1).
@@ -2836,9 +3401,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                                 "rts.sigb");
                                         }
                                         llvm::Value* n64 = mag;
-                                        auto* buf2 = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
+                                        auto* buf2 = entryAlloca(
+                                            llvm::ArrayType::get(i8Ty, kToStringBuf));
                                         llvm::Value* b2Ptr = builder_.CreateGEP(
-                                            llvm::ArrayType::get(i8Ty, BUF), buf2,
+                                            llvm::ArrayType::get(i8Ty, kToStringBuf), buf2,
                                             {builder_.getInt64(0), builder_.getInt64(0)});
                                         // The sign byte; the digits overwrite it
                                         // when the value is not negative.
@@ -2977,13 +3543,20 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                             llvm::ConstantInt::get(i8Ty, 1),
                                             builder_.CreateStructGEP(stringType(), so2, 2));
                                         initStringRc(so2);
-                                        return so2;
+                                        // fix #7286: the binary rendering is
+                                        // one arm of the radix dispatch, so
+                                        // it joins the merge instead of
+                                        // returning.
+                                        binVal = so2;
+                                        binEnd = builder_.GetInsertBlock();
+                                        builder_.CreateBr(mrgOuterBB);
                                     }
                                     // Non-binary: snprintf with the chosen format.
                                     // The sign prefix: "-" for a negative SIGNED
                                     // value, "" otherwise (§9.1's '-' followed by
                                     // the magnitude's digits). The DIGITS
                                     // themselves are the lower-case ones (§9.1).
+                                    builder_.SetInsertPoint(snpOuterBB);
                                     llvm::Value* signPtr2 = nullptr;
                                     {
                                         auto* emptyData = llvm::ConstantDataArray::getString(
@@ -3018,59 +3591,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                                 isNeg, minusPtr, emptyPtr, "rts.sign");
                                         }
                                     }
-                                    llvm::Constant* fmtData2 = llvm::ConstantDataArray::getString(
-                                        llvm_, fmt, true);
-                                    unsigned fid2 = stringLiteralIdx_++;
-                                    auto* fmtGV2 = new llvm::GlobalVariable(
-                                        *module_, fmtData2->getType(), true,
-                                        llvm::GlobalValue::PrivateLinkage, fmtData2,
-                                        ".bz.rts.fmt." + std::to_string(fid2));
-                                    fmtGV2->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-                                    auto* snpFn2 = module_->getFunction("snprintf");
-                                    if (!snpFn2) {
-                                        auto* ft2 = llvm::FunctionType::get(
-                                            i32(), {ptrTy(), i64(), ptrTy()}, true);
-                                        snpFn2 = llvm::Function::Create(
-                                            ft2, llvm::Function::ExternalLinkage,
-                                            "snprintf", module_.get());
-                                    }
-                                    auto* buf3 = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
-                                    llvm::Value* bPtr3 = builder_.CreateGEP(
-                                        llvm::ArrayType::get(i8Ty, BUF), buf3,
-                                        {builder_.getInt64(0), builder_.getInt64(0)});
-                                    llvm::Value* wr2 = builder_.CreateCall(
-                                        snpFn2,
-                                        {bPtr3, builder_.getInt64(BUF), fmtGV2, signPtr2, mag},
-                                        "rts.wr");
-                                    auto* mallocFn3 = declareC("malloc", ptrTy(), {i64()});
-                                    auto* memcpyFn3 = declareC("memcpy", ptrTy(),
-                                                               {ptrTy(), ptrTy(), i64()});
-                                    llvm::Value* l642 = builder_.CreateSExt(wr2, i64());
-                                    llvm::Value* dSz3 = builder_.CreateAdd(
-                                        l642, builder_.getInt64(1));
-                                    llvm::Value* dc3 = builder_.CreateCall(
-                                        mallocFn3, {dSz3}, "rts.d");
-                                    builder_.CreateCall(memcpyFn3, {dc3, bPtr3, l642});
-                                    llvm::Value* np4 = builder_.CreateGEP(
-                                        i8Ty, dc3, l642);
-                                    builder_.CreateStore(
-                                        llvm::ConstantInt::get(i8Ty, 0), np4);
-                                    uint64_t sBytes3 = module_->getDataLayout()
-                                        .getTypeAllocSize(stringType());
-                                    llvm::Value* so3 = builder_.CreateCall(
-                                        mallocFn3,
-                                        {builder_.getInt64(sBytes3)}, "rts.o");
-                                    builder_.CreateStore(
-                                        dc3,
-                                        builder_.CreateStructGEP(stringType(), so3, 0));
-                                    builder_.CreateStore(
-                                        l642,
-                                        builder_.CreateStructGEP(stringType(), so3, 1));
-                                    builder_.CreateStore(
-                                        llvm::ConstantInt::get(i8Ty, 1),
-                                        builder_.CreateStructGEP(stringType(), so3, 2));
-                                    initStringRc(so3);
-                                    return so3;
+                                    // fix #7286: the format is the compile-time
+                                    // one, or the RUN-time selection among the
+                                    // three admitted radices.
+                                    llvm::Value* fmtPtr =
+                                        rtFmt ? rtFmt : globalCString(fmt);
+                                    llvm::Value* snpVal = emitSnprintfString(
+                                        fmtPtr, {signPtr2, mag});
+                                    auto* snpEnd = builder_.GetInsertBlock();
+                                    builder_.CreateBr(mrgOuterBB);
+                                    // The merge: the radix dispatch's result.
+                                    builder_.SetInsertPoint(mrgOuterBB);
+                                    auto* phi = builder_.CreatePHI(ptrTy(), 2, "rts.str");
+                                    phi->addIncoming(binVal, binEnd);
+                                    phi->addIncoming(snpVal, snpEnd);
+                                    return phi;
                                 }
                             }
                             return emitPrimitiveToString(recv, tt->primitive);
