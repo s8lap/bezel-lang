@@ -1,6 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "common/OwnershipFacts.hpp"  // fix #3189: calleeReturnsOwned — the M2 owned-return channel
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
+#include "sema/ConstFold.hpp"  // fix #7271: §17.14 constant folding for the radix argument (§5.1)
 
 #include <limits>
 
@@ -14,6 +15,166 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
                                        void* ove_vtable, void* fe_vtable);
 
 namespace bezel::codegen {
+
+namespace {
+
+// The §17.14 constant-expression folder resolves an identifier by NAME; this
+// site resolves it through the SYMBOL sema recorded for the very node —
+// scope-correct, and never a flat name search that could capture a shadowed
+// binding (the discipline `constValueForPatternName` uses for the same
+// reason).
+using RadixConstResolver =
+    std::function<std::optional<long long>(std::string_view, int)>;
+
+// fix #7271 (spec §5.1 / §17.14, v0.344): the compile-time-constant VALUE of
+// a `const` REFERENCE (`sym`), folded through the SHARED folder
+// (`sema::foldIntConst` — ONE implementation, shared with the inline-array-
+// size and the const-evaluation passes).
+//
+// A local `const` is a §17.14 constant expression only when sema classified
+// it so (`LocalSymbol::isCompileTimeConst`): a RUNTIME `const` — a
+// single-assignment binding with a non-constant initializer — is not one, and
+// §5.1's constant narrowing does not reach it. A class-level `const`
+// (stdlib §22.12) always is; sema recorded its typed integer value, and
+// ModuleLoader carried it for an IMPORTED const (whose AST decl does not
+// exist).
+std::optional<long long> radixConstSymbolValue(
+        sema::Symbol* sym, const RadixConstResolver& resolveIdent, int depth) {
+    if (!sym || depth > 8) return std::nullopt;
+    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+        if (!ls->isCompileTimeConst) return std::nullopt;
+        auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(ls->decl);
+        if (!lcd || !lcd->value) return std::nullopt;
+        return sema::foldIntConst(*lcd->value, resolveIdent, depth + 1,
+                                   nullptr);
+    }
+    if (auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(sym)) {
+        if (cs->intValue) return *cs->intValue;
+        // SEAM-ACCESSOR: local-path cast; `cs->intValue` above is the
+        // wire-carried value of an IMPORTED const (whose AST decl does not
+        // exist), so that read and this one are the TWO SOURCES of one
+        // both-sources accessor. #3152
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
+        if (!cd || !cd->value) return std::nullopt;
+        return sema::foldIntConst(*cd->value, resolveIdent, depth + 1,
+                                   nullptr);
+    }
+    return std::nullopt;
+}
+
+// The `const`-bearing NODES inside `e` — the §17.14 forms only (a literal, a
+// `const` reference, a unary/binary operator over constant operands, an
+// if-expression). The shared folder's identifier and member-access resolvers
+// answer for exactly these.
+void collectRadixConstNodes(const ast::Expr& e,
+                             std::vector<const ast::Expr*>& out) {
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        collectRadixConstNodes(*ue->operand, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        collectRadixConstNodes(*be->left, out);
+        collectRadixConstNodes(*be->right, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (ce->condition) collectRadixConstNodes(*ce->condition, out);
+        if (ce->thenValue) collectRadixConstNodes(*ce->thenValue, out);
+        if (ce->elseValue) collectRadixConstNodes(*ce->elseValue, out);
+        return;
+    }
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        out.push_back(&e);
+}
+
+// fix #7271 (spec §5.1 / §17.14, v0.344): the compile-time-constant value of
+// `e` when it is a §17.14 constant expression, else nullopt.
+//
+// The §17.14 SET and its arithmetic come from the SHARED folder
+// (`sema::foldIntConst`); only the name resolution is local — the symbol
+// sema recorded for the node, so the answer is scope-correct.
+std::optional<long long> radixConstValue(const sema::SemaContext& ctx,
+                                          const ast::Expr& e) {
+    std::vector<const ast::Expr*> constNodes;
+    collectRadixConstNodes(e, constNodes);
+    RadixConstResolver resolveIdent;
+    std::function<std::optional<long long>(const ast::Expr& base,
+                                           std::string_view member,
+                                           bool& errorSeen)>
+        resolveMemberAccess;
+    resolveIdent = [&](std::string_view name,
+                       int depth) -> std::optional<long long> {
+        if (depth > 8) return std::nullopt;
+        for (const ast::Expr* n : constNodes) {
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(n);
+            if (!id || id->name != name) continue;
+            return radixConstSymbolValue(ctx.exprSymbol(*id), resolveIdent,
+                                         depth);
+        }
+        return std::nullopt;
+    };
+    resolveMemberAccess = [&](const ast::Expr& base, std::string_view member,
+                              bool& errorSeen) -> std::optional<long long> {
+        errorSeen = false;
+        for (const ast::Expr* n : constNodes) {
+            auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(n);
+            if (!ma || ma->member != member) continue;
+            if (!ma->target || &*ma->target != &base) continue;
+            return radixConstSymbolValue(ctx.exprSymbol(*ma), resolveIdent,
+                                         0);
+        }
+        return std::nullopt;
+    };
+    // A `const` REFERENCE — read through the symbol sema recorded for THIS
+    // node.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        return radixConstSymbolValue(ctx.exprSymbol(e), resolveIdent, 0);
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return radixConstSymbolValue(ctx.exprSymbol(*ma), resolveIdent, 0);
+    return sema::foldIntConst(e, resolveIdent, 0, resolveMemberAccess);
+}
+
+// The §5.1 widening table, read off the spec's own table (v0.344): the
+// integer-family types that implicitly widen to `int`. `int` itself is the
+// identity and is not listed.
+bool radixWidensToInt(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::SByte:
+        case sema::PrimitiveType::Byte:
+        case sema::PrimitiveType::Short:
+        case sema::PrimitiveType::UShort:
+        case sema::PrimitiveType::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// The type name, as the diagnostic spells it.
+const char* radixTypeName(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::Bool:    return "bool";
+        case sema::PrimitiveType::Char:    return "char";
+        case sema::PrimitiveType::String:  return "string";
+        case sema::PrimitiveType::Byte:    return "byte";
+        case sema::PrimitiveType::SByte:   return "sbyte";
+        case sema::PrimitiveType::Short:   return "short";
+        case sema::PrimitiveType::UShort:  return "ushort";
+        case sema::PrimitiveType::Int:     return "int";
+        case sema::PrimitiveType::UInt:    return "uint";
+        case sema::PrimitiveType::Long:    return "long";
+        case sema::PrimitiveType::ULong:   return "ulong";
+        case sema::PrimitiveType::Float:   return "float";
+        case sema::PrimitiveType::Double:  return "double";
+        case sema::PrimitiveType::Decimal: return "decimal";
+        case sema::PrimitiveType::Object:  return "Object";
+        case sema::PrimitiveType::None:    break;
+    }
+    return "<unresolved>";
+}
+
+}  // namespace
 
 // fix #5035 (§14.1 / §2.8.3, v0.307): true when `paramName` names a generic
 // parameter of `currentMethod` (the method whose body is CURRENTLY being
@@ -2499,11 +2660,105 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                                   tt->primitive == P::Short ||
                                                   tt->primitive == P::UShort);
                                 auto* argTy = ctx_.exprType(*call->args[0].value);
-                                bool argIsInt = argTy &&
-                                    argTy->kind == sema::TypeRef::Kind::Primitive &&
-                                    (argTy->primitive == P::Int ||
-                                     argTy->primitive == P::Long);
-                                if (isIntRecv && argIsInt) {
+                                // fix #7271 (spec §5.1 / §22.6, v0.344): the
+                                // `radix: int` parameter (stdlib §9.1) admits
+                                // the argument by IDENTITY, by the §5.1
+                                // widening table, or by §5.1's CONSTANT
+                                // NARROWING — a compile-time constant of ANY
+                                // integer type whose value fits `int`'s range,
+                                // ACROSS SIGNEDNESS ("a `uint`-typed constant
+                                // `7` is admissible where `int` is expected").
+                                // An argument that binds to NO declared
+                                // parameter is a COMPILE ERROR (§22.6) — never
+                                // a silently degraded call.
+                                //
+                                // The verdict is the ONE
+                                // `Convert.ToString(value, toBase)` already
+                                // gets (stdlib §2.3: "`ToString(value, toBase)`
+                                // returns the text `value.ToString(toBase)`
+                                // returns"), so the two spellings agree: the
+                                // `uint` literal is ADMITTED (and renders the
+                                // radix form), and a runtime `uint` is
+                                // REJECTED, at both spellings.
+                                bool radixBinds = false;
+                                bool radixIsString = false;
+                                bool radixIsNullable = false;
+                                bool radixConstType = false;
+                                bool radixConstOutOfRange = false;
+                                if (argTy &&
+                                    argTy->kind == sema::TypeRef::Kind::Primitive) {
+                                    const P pt = argTy->primitive;
+                                    if (argTy->nullable) {
+                                        // §7.10: a NULLABLE argument is the
+                                        // NULLABILITY gate's question (the
+                                        // house leaves it to that gate, exactly
+                                        // as the `Convert.ToString` check
+                                        // does), not this arm's.
+                                        radixIsNullable = true;
+                                    } else if (pt == P::String) {
+                                        // stdlib §9.1's OTHER one-argument
+                                        // overload: `ToString(format: string)`.
+                                        // Whether the FORMAT argument binds is
+                                        // that overload's question, not this
+                                        // arm's.
+                                        radixIsString = true;
+                                    } else if (pt == P::Int) {
+                                        radixBinds = true;  // identity
+                                    } else if (radixWidensToInt(pt)) {
+                                        radixBinds = true;  // §5.1 widening
+                                    } else if (pt == P::Long || pt == P::UInt ||
+                                               pt == P::ULong) {
+                                        // §5.1's constant narrowing: the ONLY
+                                        // route by which these three types
+                                        // reach an `int` parameter.
+                                        radixConstType = true;
+                                        if (auto cv = radixConstValue(
+                                                ctx_, *call->args[0].value)) {
+                                            // The range: `uint`/`ulong` are
+                                            // unsigned, `long` is signed; the
+                                            // target is `int`. A constant
+                                            // whose value does not fit is a
+                                            // COMPILE ERROR at the conversion
+                                            // site (§5.1) — never a silent
+                                            // truncation.
+                                            const long long lo =
+                                                (pt == P::Long) ? -2147483648LL : 0;
+                                            const long long hi = 2147483647LL;
+                                            radixBinds = (*cv >= lo && *cv <= hi);
+                                            radixConstOutOfRange = !radixBinds;
+                                        }
+                                    }
+                                }
+                                // The rejection: a located, spec-cited
+                                // diagnostic naming the argument and the type
+                                // stdlib §9.1 declares there — the shape the
+                                // `Convert.ToString` check uses.
+                                if (isIntRecv && !radixIsString && !radixIsNullable &&
+                                    !radixBinds) {
+                                    std::string argName = "the argument";
+                                    if (argTy &&
+                                        argTy->kind == sema::TypeRef::Kind::Primitive)
+                                        argName = std::string("a `") +
+                                            radixTypeName(argTy->primitive) + "`";
+                                    std::string why;
+                                    if (radixConstOutOfRange)
+                                        why = ": the compile-time constant's value does not fit `int`'s range";
+                                    else if (radixConstType)
+                                        why = ": " + argName +
+                                            " reaches an `int` parameter only as a compile-time constant (§5.1's constant narrowing)";
+                                    else
+                                        why = ": " + argName +
+                                            " is never implicitly convertible to an `int`";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        call->args[0].value->span.begin,
+                                        "no matching overload of `ToString` — stdlib §9.1 "
+                                        "declares `ToString(radix: int): string`, so the "
+                                        "`radix` argument must be an `int` (stdlib §9.1; "
+                                        "§5.1)" + why);
+                                    return nullptr;
+                                }
+                                if (isIntRecv && radixBinds) {
                                     llvm::Value* radix = lowerExpr(*call->args[0].value);
                                     if (!radix) return nullptr;
                                     // fix #7258 (stdlib §9.1, v0.344): the radix
