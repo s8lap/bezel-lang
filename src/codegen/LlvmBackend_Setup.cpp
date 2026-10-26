@@ -35944,16 +35944,60 @@ void Emitter::collectClosureReleaseEligible(
                     ? ctx_.resolvedType(*currentReturnTypeNode_)
                     : currentLambdaReturnSemaTy_) &&
         !isFnTy(asyncResultSemaType_);
-    // Find every `var` (non-using) closure LocalDecl whose initializer is a
-    // +1 closure producer: either a codegen-internal producer (a lambda /
-    // method reference — isPlusOneClosureProducer) or a call to a
-    // user-defined, locally-compiled method whose declared return type is a
-    // function type (#429 RETURN category — isUserMethodClosureReturnCall;
-    // the callee mints exactly +1 on return, so the caller's local transfers
-    // that single reference and must release it at scope end iff non-escaping).
-    // The escape walk decides which candidates are non-escaping. (Function-typed
-    // locals never appear in `using var` — §28.9 — but the isUsing guard
-    // mirrors the string path defensively.)
+    // Find every closure LocalDecl whose initializer is a +1 closure producer:
+    // either a codegen-internal producer (a lambda / method reference —
+    // isPlusOneClosureProducer) or a call to a user-defined, locally-compiled
+    // method whose declared return type is a function type (#429 RETURN
+    // category — isUserMethodClosureReturnCall; the callee mints exactly +1
+    // on return, so the caller's local transfers that single reference and
+    // must release it at scope end iff non-escaping). The escape walk decides
+    // which candidates are non-escaping.
+    //
+    // fix #7269 (§28.9, v0.344): the walk admits the `using var` SPELLING of
+    // a function-typed local as well as `var` / `const`. The old `!v.isUsing`
+    // guard rested on the OPPOSITE premise — this header used to claim
+    // "Function-typed locals never appear in `using var` — §28.9" — and so
+    // excluded EVERY `using var` local from the candidate walk: the
+    // producer's +1 on the closure cell was never released and the cell
+    // leaked. §28.9 (v0.344) says the opposite, verbatim: "Function-typed
+    // fields, parameters, and locals are not subject to `owned` annotations
+    // and carry no disposal obligation; a `using var` local of function type
+    // is nonetheless permitted (disposal at scope end is a no-op) and serves
+    // only the non-reassignability role (§28.10) — a plain `var` of function
+    // type scopes its captures identically (§28.3's closure bullet)."
+    //
+    // MEASURED on the parent commit (`bezelc --sanitize=address`, LSan):
+    //
+    //   using var c := lambda(): int => 42;  ->  64 byte(s) leaked in 1 alloc
+    //   var c := lambda(): int => 42;         ->  clean
+    //   const c := lambda(): int => 42;       ->  clean
+    //
+    // ⇒ THE THREE-SPELLING MATRIX, with the `using var` arm the odd one out
+    // — a direct contradiction of §28.9's own last clause ("a plain `var` of
+    // function type scopes its captures identically"). The same shape leaks
+    // through the #429 RETURN category (`using var g := MakeFn();`, 64 B / 1
+    // allocation, where the `var` twin is clean), because the arm below is
+    // shared by all four producer predicates.
+    //
+    // The exclusion is now scoped to what §28.9 actually excludes: a `using
+    // var` local that CARRIES A DISPOSAL OBLIGATION (a class-typed binding).
+    // Every producer predicate below mints a CLOSURE CELL, so every local
+    // this arm sees is function-typed — and §28.9 puts function-typed values
+    // on the runtime-managed tier, which "carries no disposal obligation" at
+    // all. ⇒ No `using var` local that reaches this arm is excluded by the
+    // obligation rule, so the `using var` spelling is admitted. The
+    // §28.9 no-op clause is about the DISPOSAL OBLIGATION (a function value
+    // is not a class, §8.7 — it has no `Dispose()` to call); it is NOT a
+    // licence to skip releasing the closure CELL, which is a heap object
+    // backing the value and is released by the plain-`var` spelling.
+    //
+    // WHAT IS *NOT* ADMITTED: the BORROW arm below (the `else` branch) still
+    // excludes `using var`. A borrow-initialized function-typed local's slot
+    // owns NOTHING at bind (the +1 belongs to the SOURCE), and admitting it
+    // would widen `returnedClosureLocalOwnsPlusOne`'s reach — a different
+    // defect, measured separately (both spellings are LSan-clean on that
+    // shape). The producer arm is the one that mints a reference the slot
+    // must release.
     //
     // fix #3402 (§21.1 / §27.5 / §28.9, v0.283): the scan covers a §21.1
     // runtime `const` local (ast::LocalConstDecl) as well as a plain `var`
@@ -36006,43 +36050,61 @@ void Emitter::collectClosureReleaseEligible(
         if (!s) return;
         {
             LocalDeclInitView v = localDeclInitView(s);
-            if (v.init && !v.isUsing) {
-                if (isPlusOneClosureProducer(v.init) ||
-                    isUserMethodClosureReturnCall(v.init) ||
-                    isLambdaClosureReturnCall(v.init) ||
-                    isAwaitedClosureReturnCall(v.init)) {
-                    candidates.push_back(s);
-                    // fix #3757 follow-up: this decl belongs to the body being
-                    // analyzed — see closureLocalCandidates_'s declaration.
+            // fix #7269 (§28.9, v0.344): the PRODUCER arm is admitted for the
+            // `using var` spelling of a function-typed local as well as for
+            // `var` / `const` — see the header comment above for the spec
+            // sentence, the measured three-spelling matrix, and why the
+            // exclusion is now scoped to a `using var` local that CARRIES A
+            // DISPOSAL OBLIGATION (a class-typed binding — every producer
+            // predicate below mints a closure CELL, so the locals this arm
+            // sees are function-typed, and §28.9's runtime-managed tier
+            // carries no obligation at all).
+            const bool closureProducer =
+                v.init && (isPlusOneClosureProducer(v.init) ||
+                           isUserMethodClosureReturnCall(v.init) ||
+                           isLambdaClosureReturnCall(v.init) ||
+                           isAwaitedClosureReturnCall(v.init));
+            if (closureProducer) {
+                candidates.push_back(s);
+                // fix #3757 follow-up: this decl belongs to the body being
+                // analyzed — see closureLocalCandidates_'s declaration.
+                closureLocalCandidates_.insert(
+                    static_cast<const void*>(s));
+            } else if (v.init && !v.isUsing) {
+                // fix #2714: BORROW-initialized closure-typed local.
+                // Gate on the LOCAL's resolved type being a non-nullable
+                // function type — the same gate `collectStringReleaseEligible`
+                // uses for its borrowCandidates arm (a `string?` borrow is
+                // also left alone there for the same reason: null/sentinel
+                // handling is unchanged and the retain/release are
+                // null-safe, but the conservative scope to non-nullable
+                // borrows is kept for this increment). Reads the type from
+                // the declared annotation, or — for an inferred
+                // `var g := f()` — from the initializer's exprType.
+                //
+                // fix #7269 (§28.9, v0.344): this arm still EXCLUDES the
+                // `using var` spelling — see the header comment above ("WHAT
+                // IS *NOT* ADMITTED"). A borrow-initialized function-typed
+                // local's slot owns nothing at bind (the +1 belongs to the
+                // SOURCE), and admitting it would widen
+                // `returnedClosureLocalOwnsPlusOne`'s reach — a different
+                // defect, measured separately (both spellings are LSan-clean
+                // on that shape).
+                const sema::TypeRef* lt = nullptr;
+                if (v.type) lt = ctx_.resolvedType(*v.type);
+                if (!lt) lt = ctx_.exprType(*v.init);
+                if (lt && !lt->nullable &&
+                    lt->kind == sema::TypeRef::Kind::Function) {
+                    borrowCandidates.push_back(s);
+                    closureBorrowAll_.insert(static_cast<const void*>(s));
+                    // fix #2714 follow-up: a borrow-initialized closure
+                    // local also belongs to THIS body — extend
+                    // closureLocalCandidates_ so returnedClosureLocalOwnsPlusOne
+                    // recognizes the borrow side the same way it recognizes
+                    // the producer side (mirrors #2817's parallel extension
+                    // of stringLocalCandidates_ to stringBorrowAll_).
                     closureLocalCandidates_.insert(
                         static_cast<const void*>(s));
-                } else {
-                    // fix #2714: BORROW-initialized closure-typed local.
-                    // Gate on the LOCAL's resolved type being a non-nullable
-                    // function type — the same gate `collectStringReleaseEligible`
-                    // uses for its borrowCandidates arm (a `string?` borrow is
-                    // also left alone there for the same reason: null/sentinel
-                    // handling is unchanged and the retain/release are
-                    // null-safe, but the conservative scope to non-nullable
-                    // borrows is kept for this increment). Reads the type from
-                    // the declared annotation, or — for an inferred
-                    // `var g := f()` — from the initializer's exprType.
-                    const sema::TypeRef* lt = nullptr;
-                    if (v.type) lt = ctx_.resolvedType(*v.type);
-                    if (!lt) lt = ctx_.exprType(*v.init);
-                    if (lt && !lt->nullable &&
-                        lt->kind == sema::TypeRef::Kind::Function) {
-                        borrowCandidates.push_back(s);
-                        closureBorrowAll_.insert(static_cast<const void*>(s));
-                        // fix #2714 follow-up: a borrow-initialized closure
-                        // local also belongs to THIS body — extend
-                        // closureLocalCandidates_ so returnedClosureLocalOwnsPlusOne
-                        // recognizes the borrow side the same way it recognizes
-                        // the producer side (mirrors #2817's parallel extension
-                        // of stringLocalCandidates_ to stringBorrowAll_).
-                        closureLocalCandidates_.insert(
-                            static_cast<const void*>(s));
-                    }
                 }
             } else if (!v.init && !v.isUsing && v.type) {
                 // fix #2107-follow-up (§27.5 / §28.9, v0.298): the no-init
@@ -44198,7 +44260,23 @@ void Emitter::collectCellFreeEligible(
             // the lambda is in "non-escaping" top-level position.
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                 ownFrameBindings.insert(static_cast<const void*>(ld));  // #4524
-                bool nonEsc = !ld->isUsing &&
+                // fix #7269 (§28.9, v0.344): the `using var` spelling of a
+                // FUNCTION-typed local scopes its captures IDENTICALLY to the
+                // plain-`var` spelling (§28.9's last clause: "a plain `var` of
+                // function type scopes its captures identically"), so the
+                // escape verdict that decides whether the CAPTURE CELL may be
+                // freed at scope end must not exclude it. The membership test
+                // IS the gate: a `using var` local is in
+                // `closureReleaseEligible_` only if the closure-release walk
+                // (collectClosureReleaseEligible, above) proved it
+                // non-escaping — the same proof the plain-`var` spelling is
+                // admitted on. Before this change the `!ld->isUsing` term made
+                // the capture cell of a `using var` closure leak where the
+                // plain-`var` twin's cell was reclaimed (MEASURED on the
+                // parent commit: `var k: int := 7; using var c := lambda():
+                // int => k;` leaked 76 byte(s) in 3 allocations; the `var`
+                // and `const` twins were clean).
+                bool nonEsc =
                     closureNonEscaping.count(static_cast<const void*>(ld));
                 // fix #2334: anchor `using var` initializers that are CallExpr
                 // (form 2 of §28.14) so the CallExpr handling in expr() can
