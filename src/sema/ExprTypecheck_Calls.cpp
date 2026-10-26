@@ -415,17 +415,62 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
     // fix #7177 rework (§8.1 / §8.7 / §26.5 rule 2 / §28.2 / §28.9,
     // v0.344): TWO carve-outs.
     //
-    // (1) `Dispose` and `ReferenceEquals` stay ADMISSIBLE on a function
-    // value.  §28.9 (v0.344) says a function-typed value's `Dispose()` is
-    // "a no-op (or, for types that are not classes and therefore have no
-    // `Dispose()` at all…)" — the spec contemplates the SPELLING and leaves
-    // its effect open, and the compiler has always implemented it as a REAL
-    // dispose on a closure cell (§28.2's checked-disposal guard; the
-    // `bz_closure_mark_disposed` helper, #4475), a behaviour the banked
-    // `closure_dispose_then_invoke_4475` rows pin.  Rejecting the spelling
-    // would be a silent behaviour flip on a spec-AMBIGUOUS point, so it
-    // stays admitted and the ambiguity is reported to the coordinator
-    // (a `spec-question`, not a code change).
+    // (1) `Dispose` is NOT a member of a function value, and the compiler
+    // ALREADY answers that exact question for the closest sibling IN THIS
+    // VERY PREDICATE: the `Object` arm above rejects `o.Dispose()` on the
+    // class-only rule (§8.7 / §28.2).  A function type is not a class
+    // either, so the two answers must agree — and they now do (#7260).
+    //
+    //     §28.9 (v0.344), the section's OPENING SENTENCE: "Their
+    //     `Dispose()` is a no-op (or, for types that are not classes and
+    //     therefore have no `Dispose()` at all, the type's lifetime is
+    //     managed by the runtime without user involvement)."
+    //
+    //     §28.9 (v0.344), the FUNCTION-TYPED bullet: "Function-typed
+    //     values — values of any function type `(T1, ..., Tn) -> R`,
+    //     regardless of whether they capture. … Function-typed fields,
+    //     parameters, and locals are not subject to `owned` annotations
+    //     and carry no disposal obligation; a `using var` local of
+    //     function type is nonetheless permitted (disposal at scope end is
+    //     a no-op) …"
+    //
+    //     §8.7 (v0.344): "`Dispose()` is class-only.  The compiler generates
+    //     `IDisposable` on every non-static class."  A function type is
+    //     not a class, so it has no `Dispose()` AT ALL — which is the
+    //     parenthetical §28.9's opening sentence spells out.
+    //
+    //     §28.2 (v0.344): "`Dispose()` is not on `Object`; it is
+    //     class-only."
+    //
+    // WHY THIS IS NOT A "NO-OP" BUT A REJECTION.  §28.9's parenthetical
+    // offers two behaviours — a no-op, or no `Dispose()` at all — and the
+    // SECOND one is the one that applies to a function type, because a
+    // function type is not a class.  The compiler already picked the
+    // second one for the closest sibling (`Object`, the `Primitive` arm
+    // above), with the class-only reason and the §8.7 / §28.2 citations,
+    // and the compiler must answer the same question the same way for the
+    // closest sibling.  A "no-op" reading would also be a behaviour
+    // CHANGE, not a status quo: the compiler has always implemented the
+    // spelling as a REAL dispose on a closure cell (§28.2's
+    // checked-disposal guard; the `bz_closure_mark_disposed` helper,
+    // #4475), so a "no-op" would have to become a new no-op — and a
+    // no-op `Dispose()` on a heap-allocated closure cell would still leave
+    // the reader asking what the cell's own lifetime is.
+    //
+    // The #7177 lane first REJECTED this spelling, and the review blocked
+    // it because two BANKED rows (`closure_dispose_then_invoke_4475`) pinned
+    // the compiler's real dispose — a `DisposedAccessException` in checked
+    // mode and a SIGSEGV in unchecked mode.  A banked row is evidence of
+    // the CURRENT behaviour, not of the CORRECT behaviour, and §28.9 is
+    // not ambiguous on this point.  So the spelling is REJECTED (#7260),
+    // and the two banked rows are re-pinned as rejection rows — which is
+    // STRICTLY STRONGER: the old rows asserted a runtime behaviour, the
+    // new rows assert a compile-time refusal.
+    //
+    // The message is the sibling `Object` rule's message — the same shape
+    // and the same citations (§8.7's class-only rule, §28.2, and §28.9's
+    // runtime-managed list), because the compiler must answer the same
+    // question the same way for the closest sibling.
     //
     // (2) A member an `extension Object` provides is NOT nameless and must
     // not be rejected here.  §8.1 (v0.344): "function types reaching
@@ -438,7 +483,28 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
     // about it.  The message below is therefore drawn only for a name that
     // NO reachable extension declares, and it says so.
     if (recvTy->kind == TypeRef::Kind::Function) {
-        if (m == "Dispose" || m == "ReferenceEquals") return {};
+        // `ReferenceEquals` IS a member of `Object` (§8.1 declares it
+        // `static ReferenceEquals(a: Object?, b: Object?): bool`), and §8.1
+        // puts `Object` in a function type's base chain, so a function value
+        // HAS it — dropping this carve-out would be an OVER-rejection, a
+        // member §8.1 admits becoming unreachable.  (Its permissive-static
+        // hole — `f.ReferenceEquals(c, c)` compiles and prints NOTHING — is a
+        // SEPARATE defect with its own fail-without; it is REPORTED, not
+        // fixed here.)
+        if (m == "ReferenceEquals") return {};
+        // `Dispose` is class-only (§8.7) and a function type is not a class
+        // (§28.2, §28.9) — the same ground, and the same answer, as the
+        // sibling `Object` rule above.  See the long comment above.
+        if (m == "Dispose") {
+            return "no member `Dispose` on a function value: `Dispose()` is "
+                   "class-only (\xC2\xA7""8.7, v0.340), and a function type is "
+                   "not a class, so `Dispose` is not one of its members "
+                   "(\xC2\xA7""28.2). A function-typed value's lifetime is "
+                   "managed by the runtime without user involvement "
+                   "(\xC2\xA7""28.9, v0.344); the values it captures keep "
+                   "their own disposal obligations (\xC2\xA7""28.9, "
+                   "\xC2\xA7""28.3).";
+        }
         return "no member `" + m +
                "` on a function value: a function type (\xC2\xA7""27.1) "
                "declares no members of its own — a function value is CALLED "

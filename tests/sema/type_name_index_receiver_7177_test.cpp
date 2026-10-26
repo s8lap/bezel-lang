@@ -70,17 +70,22 @@
 // stay admissible on a function value — `h.Id<int>.ToString()` prints the
 // function's signature, MEASURED on the same base.
 //
-// THAT ARM MUST NOT OVER-REACH, AND T2b PINS THE TWO NAMES IT MAY NOT
-// REJECT.  (a) `Dispose()` — §28.9 leaves a function-typed value's
-// `Dispose()` ambiguous ("a no-op (or, for types that are not classes and
-// therefore have no `Dispose()` at all…)") and the compiler implements it as
-// a REAL dispose on a closure cell (§28.2's checked-disposal guard, #4475);
-// the banked `closure_dispose_then_invoke_4475` rows pin that runtime half,
-// so the spelling stays ADMITTED.  (b) A member an `extension Object`
-// provides — §8.1 puts `Object` in a function type's base chain and §26.5
-// rule 2 searches the extension blocks on "x's type, base types, or
-// implemented interfaces", so the extension REACHES a function-typed
-// receiver and the member is not nameless.
+// THAT ARM MUST NOT OVER-REACH, AND T2b PINS THE NAMES IT MAY NOT REJECT.
+// (a) `Dispose()` IS NOT ONE OF THEM — it is REJECTED on a function-typed
+// receiver.  §28.9 (v0.344) says a function-typed value has "no `Dispose()`
+// at all" (it falls in the parenthetical "for types that are not classes and
+// therefore have no `Dispose()` at all"), because §8.7 (v0.344) makes
+// `Dispose()` class-only — "the compiler generates `IDisposable` on every
+// non-static class" — and a function type is not a class; §28.2 (v0.344)
+// says "`Dispose()` is not on `Object`; it is class-only".  The compiler
+// already answered the same question for the closest sibling — `o.Dispose()`
+// on an `Object` is rejected by the SAME predicate — so the two answers must
+// agree (#7260).  T2b(a) pins that REJECTION.
+// (b) A member an `extension Object` provides IS still ADMITTED — §8.1 puts
+// `Object` in a function type's base chain and §26.5 rule 2 searches the
+// extension blocks on "x's type, base types, or implemented interfaces", so
+// the extension REACHES a function-typed receiver and the member is not
+// nameless.
 //
 // TEST MATRIX:
 //   T1  the index-on-a-type-name family: each spelling is REJECTED with the
@@ -91,8 +96,10 @@
 //       FUNCTION-typed receiver are REJECTED. (The null-conditional-receiver
 //       twins are NOT rows here — their receiver is an UNTYPED bare `?.`
 //       method access, a different defect; see the note at the end of T2.)
-//   T2b the two carve-outs: `Dispose()` on a function value and a member an
-//       `extension Object` provides both stay ADMITTED.
+//   T2b the boundary of the arm: `Dispose()` on a function value is REJECTED
+//       (a function type is not a class, so it has no `Dispose()` at all —
+//       §28.9 / §8.7 / §28.2), while a member an `extension Object` provides
+//       still stays ADMITTED.
 //   T3  ACCEPT-CONTROLS that RUN and assert real values — every indexable
 //       and every §22.12-legal receiver family stays admitted.
 //   T4  the OVER-REJECTION guard: a declared generic PARAMETER whose name
@@ -344,25 +351,53 @@ BEZEL_TEST(sema_type_name_index_receiver_7177,
 // used to be rejected became accepted by this change.
 
 // ===========================================================================
-// T2b — THE TWO CARVE-OUTS THE FUNCTION-VALUE ARM MUST NOT OVER-REACH.
+// T2b — THE BOUNDARY OF THE FUNCTION-VALUE ARM.
 // The `Kind::Function` arm of `closedValueSurfaceMemberReason` answers "is
-// this member name nameless on a function-typed receiver?". Two names are
-// NOT nameless, and a rejection of either is a false rejection of a
-// spec-admitted program.
+// this member name nameless on a function-typed receiver?". One name is NOT
+// nameless — a member an `extension Object` provides — and a rejection of it
+// would be a false rejection of a spec-admitted program. `Dispose()` is the
+// other side of the boundary now: it is REJECTED, because a function type
+// is not a class and therefore has no `Dispose()` at all.
 // ===========================================================================
 
-// (a) `Dispose()` on a function-typed value. §28.9 (v0.344) says a
-// function-typed value's `Dispose()` is "a no-op (or, for types that are not
-// classes and therefore have no `Dispose()` at all…)" — the SPELLING is
-// contemplated and its EFFECT is left open, and §8.7's "the compiler
-// generates `IDisposable` on every non-static class" does not settle a
-// non-class. The compiler has always implemented it as a REAL dispose on a
-// closure cell (§28.2's checked-disposal guard; the `bz_closure_mark_disposed`
-// helper, #4475), and the banked `closure_dispose_then_invoke_4475` rows
-// pin that runtime half. So the spelling stays ADMITTED: rejecting it would
-// be a silent behaviour flip on a spec-ambiguous point.
+// (a) `Dispose()` on a function-typed value is REJECTED (FLIPPED by #7260).
 //
-// This row is a CONTROL, not a fail-without row: the BASE admitted it too.
+// §28.9 (v0.344), the section's opening sentence: "Their `Dispose()` is a
+// no-op (or, for types that are not classes and therefore have no `Dispose()`
+// at all, the type's lifetime is managed by the runtime without user
+// involvement)." Its function-typed bullet covers "values of any function type
+// `(T1, ..., Tn) -> R`, regardless of whether they capture" ... "Function-
+// typed fields, parameters, and locals are not subject to `owned` annotations
+// and carry no disposal obligation".
+//
+// ⇒⇒ A FUNCTION TYPE IS NOT A CLASS, so it falls in §28.9's PARENTHETICAL:
+// it has no `Dispose()` AT ALL. §8.7 (v0.344): "`Dispose()` is class-only.
+// The compiler generates `IDisposable` on every non-static class." §28.2
+// (v0.344): "`Dispose()` is not on `Object`; it is class-only."
+//
+// The compiler ALREADY answered the same question for the closest sibling,
+// IN THE SAME PREDICATE: `var o: Object := i; o.Dispose();` is REJECTED with
+// "no member `Dispose` on type `Object`: `Dispose()` is class-only (§8.7,
+// v0.340), and `Object` is not a class, so `Dispose` is not one of its
+// members (§28.2)". The two answers must agree, so the function-value arm
+// draws the same shape with the same citations plus §28.9 (#7260).
+//
+// THIS ROW WAS A CONTROL, NOT A FAIL-WITHOUT ROW: it asserted that
+// `c.Dispose()` COMPILES and exits 0, pinning the compiler's REAL dispose on
+// a closure cell (§28.2's checked-disposal guard; the `bz_closure_mark_disposed`
+// helper, #4475) — a `DisposedAccessException` in checked mode and a SIGSEGV
+// in unchecked mode. A banked row is evidence of the CURRENT behaviour, not
+// of the CORRECT behaviour, and §28.9 is not ambiguous on this point.
+//
+// ⇒⇒⇒⇒⇒ FLIPPED: the row now asserts the COMPILE-TIME REFUSAL, which is
+// STRICTLY STRONGER — the old row asserted a runtime behaviour, the new one
+// asserts that the compiler refuses a spelling §28.9 forbids.
+//
+// The row NAME is the banked #7177 name and is kept deliberately (it is the
+// identifier the coordinator tracks, and `scripts/handback_check.sh`'s
+// named-test check resolves a commit message's `Suite.name` against the tree
+// at the tip). The name now describes the PRE-#7260 behaviour; the BODY is
+// the truth.
 BEZEL_TEST(sema_type_name_index_receiver_7177,
            t2b_dispose_on_a_function_value_stays_admissible_spec_28_9) {
     auto r = runAot(
@@ -373,8 +408,21 @@ BEZEL_TEST(sema_type_name_index_receiver_7177,
         "    return 0; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(r, "no member `Dispose` on a function value"));
+    // The class-only reason, and the three sections it rests on.
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "`Dispose()` is class-only"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§8.7"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§28.2"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§28.9"));
+    // NOT the pre-fix symptoms, NOT a crash, NOT a codegen failure.
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "#3079"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "#2434"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "compiler CRASHED"));
+    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "terminated by signal"));
 }
 
 // (b) A member an `extension Object` provides. §8.1 (v0.344): "function
