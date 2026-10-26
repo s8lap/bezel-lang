@@ -36485,8 +36485,74 @@ void Emitter::collectStringReleaseEligible(
         {
             // fix #3416: LocalDecl OR §21.1 LocalConstDecl, decoded once.
             LocalDeclInitView v = localDeclInitView(s);
-            if (v.init && !v.isUsing) {
-                if (isPlusOneStringProducer(v.init)) {
+            // fix #7272 (narrow) / §28.10 (v0.344): the `using var` SPELLING
+            // of a +1 string producer is admitted to the PRODUCER arm below.
+            //
+            // WHAT WAS SUPPOSED TO RELEASE IT. The scope-end release of a
+            // string local is THIS function's producer arm
+            // (`stringReleaseEligible_`) armed by `armStringLocalRefcount`
+            // (:28551) as a `Disposal{stringRelease}` on the local's slot. The
+            // `using var` spelling was excluded from the candidate walk by the
+            // `!v.isUsing` term, so the local never entered
+            // `stringReleaseEligible_`, no scope-end release was armed, and the
+            // producer's +1 was never discharged — the leak this fixes.
+            // MEASURED (the base arm, `bezelc --sanitize=address`, LSan):
+            //
+            //   using var t := o.ToString();   ->  34 byte(s) in 2 allocations
+            //   var         t := o.ToString();  ->  clean
+            //   using var t := sb.ToString();  ->  34 byte(s) in 2 allocations
+            //   var         t := sb.ToString(); ->  clean
+            //   using var t := "a" + "b";      ->  35 byte(s) in 2 allocations
+            //   var         t := "a" + "b";     ->  clean
+            //
+            // and the object code agrees: the plain-`var` twin carries ONE
+            // extra `bz_string_release` (the scope-end release of its slot) that
+            // the `using var` twin does not.
+            //
+            // WHY THIS IS NOT A DOUBLE RELEASE. There is NO second path that
+            // could discharge the same reference. The `using var` declaration's
+            // OWN disposal path is `registerUsingDisposal` (:21334), and a
+            // `string` is a RUNTIME-MANAGED type (§28.9): it is not a class, so
+            // `classOfLocal` cannot classify it, and §28.10 says of it that
+            // "the disposal at scope end is a no-op (these types do not require
+            // disposal per §28.9)". The compiler's own §28.10 lint says the
+            // same — "`using var` `t` is vacuous — the RHS is a
+            // value-typed/runtime-managed value with no disposal obligation
+            // (§28.9)" — and that lint is CORRECT about the OBLIGATION and is
+            // kept. "No disposal obligation" is not a licence to skip
+            // releasing the runtime's own reference: §28.10's next words are
+            // "and the only effect is the reassignability restriction", so the
+            // `using var` spelling of a runtime-managed value must have the
+            // SAME runtime lifetime as the plain-`var` spelling. This is the
+            // same reading #7269 applied to the closure cell (whose own §28.9
+            // sentence is even more explicit: "a plain `var` of function type
+            // scopes its captures identically").
+            //
+            // WHY ONLY THE PRODUCER ARM. The producer arm is where the slot
+            // takes ownership of a reference the PRODUCER minted (+1), so the
+            // scope-end release discharges exactly that one reference. The
+            // BORROW arm below is deliberately NOT extended to the `using var`
+            // spelling: a borrow-initialized local's slot owns nothing at bind
+            // (the reference belongs to the SOURCE), admitting it would widen
+            // `returnedStringLocalOwnsPlusOne`'s reach (which answers "does
+            // this local own a +1 that a RETURN may transfer?"), and the
+            // borrow side of the `using var` spelling is measured CLEAN on its
+            // own (a literal, a field read, an alias of another local) — a
+            // different concern, not this defect. Same split #7269 made for
+            // the closure arm.
+            //
+            // `await using var` is EXCLUDED: the async disposal machinery
+            // (`registerUsingDisposal`'s `ld->isAwaitUsing` branch) owns that
+            // spelling, and this change does not reach into async.
+            const bool plusOneProducer =
+                v.init && isPlusOneStringProducer(v.init);
+            const ast::LocalDecl* usingLd =
+                v.isUsing ? dynamic_cast<const ast::LocalDecl*>(s) : nullptr;
+            const bool usingVarProducer =
+                plusOneProducer && v.isUsing &&
+                !(usingLd && usingLd->isAwaitUsing);
+            if (v.init && (!v.isUsing || usingVarProducer)) {
+                if (plusOneProducer) {
                     producerCandidates.push_back(s);
                     // fix #2817: this decl belongs to the body being analyzed.
                     stringLocalCandidates_.insert(static_cast<const void*>(s));
