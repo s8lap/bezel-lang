@@ -14418,6 +14418,38 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     : builder_.CreateFPTrunc(v, dst, "mm.conv");
             return v;
         };
+        // fix #7226 (spec §5.1, v0.344): the WIDENING of an operand to a
+        // `double` PARAMETER of a `Math` built-in. §5.1's table has the row
+        // "| `float` | `double` |", so a `float` argument reaches a `double`
+        // parameter (stdlib §2.2 declares `Pow(x: double, y: double): double`
+        // and its siblings) and the argument converts at the call site
+        // (§22.6's applicability stage reads the parameter types under
+        // §5.1's implicit conversions). The `double` lowerings converted such
+        // an operand with `sitofp`, which is ill-typed on an
+        // already-floating operand: the compiler ABORTED in the LLVM
+        // verifier ("SIToFP source must be integer or integer vector") on a
+        // LEGAL program.
+        //
+        // The operand is WIDENED, never the call refused: §5.1 admits the
+        // conversion, so refusing it would reject a legal program. A
+        // floating source widens with `fpext` (the same conversion
+        // `mathConvertToT` above already applies under an explicit type
+        // list); an integer source keeps the `sitofp` it always had. A
+        // `decimal` operand is a STRUCT and reaches neither arm — §5.1's
+        // never-implicit list ("Between `decimal` and binary floats (`float`,
+        // `double`)") does not admit it, and the front-end check reports the
+        // refusal.
+        auto mathToDouble = [&](llvm::Value* v) -> llvm::Value* {
+            if (!v) return v;
+            llvm::Type* dbl = llvm::Type::getDoubleTy(llvm_);
+            llvm::Type* src = v->getType();
+            if (src == dbl) return v;
+            if (src->isFloatingPointTy())
+                return builder_.CreateFPExt(v, dbl, "math.fpext");
+            if (src->isIntegerTy())
+                return builder_.CreateSIToFP(v, dbl, "math.sitofp");
+            return v;
+        };
         // Unsigned ordering predicate: T's own under an explicit list.
         auto mathUnsignedCmp = [&](const ast::Expr* firstArg) -> bool {
             return mathExplicitT ? typeRefIsUnsigned(mathExplicitT)
@@ -14670,17 +14702,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return sRes;
             }
             // Math.IsNaN(x): bool — NaN is not equal to itself.
+            // (sema refuses `Math.IsNaN` today — §2.2 does not declare it —
+            // so this arm is unreachable; the widening below is the same one
+            // the live arms use, so a re-declaration does not inherit the
+            // aborting `sitofp`.)
             if (m == "IsNaN") {
-                auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (!arg->getType()->isDoubleTy())
-                    arg = builder_.CreateSIToFP(arg, dbl);
+                arg = mathToDouble(arg);
                 return builder_.CreateFCmpUNO(arg, arg, "isnan");
             }
             // Math.IsInfinity(x): bool — compare with +/-infinity.
             if (m == "IsInfinity") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (!arg->getType()->isDoubleTy())
-                    arg = builder_.CreateSIToFP(arg, dbl);
+                arg = mathToDouble(arg);
                 auto* posInf = llvm::ConstantFP::getInfinity(dbl, false);
                 auto* negInf = llvm::ConstantFP::getInfinity(dbl, true);
                 llvm::Value* isPosInf = builder_.CreateFCmpOEQ(arg, posInf);
@@ -14690,8 +14723,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // Math.IsFinite(x): bool — not NaN and not infinity.
             if (m == "IsFinite") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (!arg->getType()->isDoubleTy())
-                    arg = builder_.CreateSIToFP(arg, dbl);
+                arg = mathToDouble(arg);
                 llvm::Value* isNaN = builder_.CreateFCmpUNO(arg, arg);
                 auto* posInf = llvm::ConstantFP::getInfinity(dbl, false);
                 auto* negInf = llvm::ConstantFP::getInfinity(dbl, true);
@@ -14735,8 +14767,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     m == "Truncate" ? llvm::Intrinsic::trunc :
                                       llvm::Intrinsic::rint;
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (!arg->getType()->isDoubleTy())
-                    arg = builder_.CreateSIToFP(arg, dbl);
+                arg = mathToDouble(arg);
                 auto* fn = llvm::Intrinsic::getDeclaration(module_.get(), iid, {dbl});
                 return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
             }
@@ -14873,8 +14904,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // Math.Pow(b, e): double — libc pow()
             if (m == "Pow") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
-                if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+                a = mathToDouble(a);
+                b = mathToDouble(b);
                 auto* powFn = module_->getFunction("pow");
                 if (!powFn) {
                     auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
@@ -14888,11 +14919,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // round-half-to-even semantics as the one-argument form.
             if (m == "Round") {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
+                a = mathToDouble(a);
                 // `digits` is an int; widen to double for pow.
-                llvm::Value* digD = b;
-                if (!digD->getType()->isDoubleTy())
-                    digD = builder_.CreateSIToFP(digD, dbl);
+                llvm::Value* digD = mathToDouble(b);
                 auto* powFn = module_->getFunction("pow");
                 if (!powFn) {
                     auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);
@@ -15061,8 +15090,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
             if (!a || !b) return nullptr;
             auto* dbl = llvm::Type::getDoubleTy(llvm_);
-            if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
-            if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
+            a = mathToDouble(a);
+            b = mathToDouble(b);
             const char* fn2 = m == "Fmod" ? "fmod" : "remainder";
             auto* fn = module_->getFunction(fn2);
             if (!fn) {
