@@ -1440,10 +1440,40 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         auto* fty = (pt == P::Float)
             ? llvm::Type::getFloatTy(llvm_)
             : llvm::Type::getDoubleTy(llvm_);
-        if (!a->getType()->isFloatingPointTy())
-            a = builder_.CreateSIToFP(a, fty, "ieee.a.fp");
-        if (!b->getType()->isFloatingPointTy())
-            b = builder_.CreateSIToFP(b, fty, "ieee.b.fp");
+        // fix #7251 (spec §5.1, v0.344): an INTEGER operand at a `double`
+        // parameter converts by VALUE, so an UNSIGNED source must use
+        // `uitofp` — the instruction that preserves the value — and never
+        // `sitofp`, which SIGN-EXTENDS the source's bit pattern. §5.1's
+        // widening table admits `byte`/`ushort`/`uint`/`ulong`/`char` at
+        // `float`/`double`, and stdlib §9.2 declares
+        // `IeeeEquals(a: double, b: double): bool` and
+        // `BitwiseEquals(a: double, b: double): bool`, so an unsigned
+        // argument DOES reach these parameters. The `uint` 4000000000 (bit
+        // pattern 0xEE6B2800) was read as the `int32` -294967296, so
+        // `Double.IeeeEquals(4000000000u, 4e9)` compared -294967296.0 with
+        // 4e9 and printed `False` — the two operands are the same number.
+        //
+        // `BitwiseEquals` needs no separate treatment: stdlib §9.2 declares
+        // its parameters as `double`, so §5.1's VALUE conversion happens
+        // FIRST and the member then compares the two `double`s' BIT
+        // PATTERNS. The integer 4000000000 converts to the `double` 4e9,
+        // whose bit pattern is the double's, so the answer is `True` — the
+        // same as `BitwiseEquals(4e9, 4e9)`. The `+0.0`/`-0.0` and NaN-payload
+        // distinctions the member draws are distinctions between the
+        // CONVERTED doubles and are untouched.
+        //
+        // The SIGNED path is untouched: an `int`/`long` operand keeps the
+        // `sitofp` it always had, so a negative signed operand keeps its
+        // sign and every signed result is bit-for-bit what it was.
+        auto ieeeToFp = [&](llvm::Value* v, const ast::Expr* srcE,
+                            const char* nm) -> llvm::Value* {
+            if (v->getType()->isFloatingPointTy()) return v;
+            if (srcE && isUnsignedTargetExpr(*srcE))
+                return builder_.CreateUIToFP(v, fty, std::string(nm) + ".uitofp");
+            return builder_.CreateSIToFP(v, fty, std::string(nm) + ".sitofp");
+        };
+        a = ieeeToFp(a, call.args[0].value.get(), "ieee.a");
+        b = ieeeToFp(b, call.args[1].value.get(), "ieee.b");
         if (m == "IeeeEquals") {
             // stdlib §9.2: fcmp oeq — ordered equal → false for any NaN.
             return builder_.CreateFCmpOEQ(a, b, "ieee.eq");
@@ -9413,8 +9443,38 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             if (declTy->isIntegerTy() && args[ai]->getType()->isFloatingPointTy())
                 args[ai] = builder_.CreateFPToSI(args[ai], declTy);
-            else if (declTy->isFloatingPointTy() && args[ai]->getType()->isIntegerTy())
-                args[ai] = builder_.CreateSIToFP(args[ai], declTy);
+            else if (declTy->isFloatingPointTy() && args[ai]->getType()->isIntegerTy()) {
+                // fix #7251 (spec §5.1, v0.344): an INTEGER argument at a
+                // `double` PARAMETER converts by VALUE, so an UNSIGNED source
+                // must use `uitofp` — the instruction that preserves the value
+                // — and never `sitofp`, which SIGN-EXTENDS the source's bit
+                // pattern. §5.1's widening table admits
+                // `byte`/`ushort`/`uint`/`ulong`/`char` at `float`/`double`,
+                // so an unsigned argument DOES reach a `double` parameter of a
+                // function type (§27.6). The `uint` 4000000000 (bit pattern
+                // 0xEE6B2800) was read as the `int32` -294967296, so
+                // `f(4000000000u)` against `f: (x: double) -> double` passed
+                // -294967296.0 and the callee printed `-294967296` instead of
+                // `4000000000`.
+                //
+                // The SOURCE EXPRESSION is the argument expression at the
+                // matching position: `args` carries the closure's env pointer
+                // at slot 0, so the args slot `ai` maps back to the
+                // funcParams index `ai - 1` and thence to `call.args[ai - 1]`
+                // — the same mapping the nullable-formal arm above uses.
+                //
+                // The SIGNED path is untouched: an `int`/`long` argument keeps
+                // the `sitofp` it always had, so a negative signed argument
+                // keeps its sign and every signed result is bit-for-bit what
+                // it was.
+                const ast::Expr* fpSrcE =
+                    (ai >= 1 && ai - 1 < call.args.size())
+                        ? call.args[ai - 1].value.get()
+                        : nullptr;
+                args[ai] = (fpSrcE && isUnsignedTargetExpr(*fpSrcE))
+                    ? builder_.CreateUIToFP(args[ai], declTy, "cl.arg.uitofp")
+                    : builder_.CreateSIToFP(args[ai], declTy, "cl.arg.sitofp");
+            }
             else if (declTy->isIntegerTy() && args[ai]->getType()->isIntegerTy()) {
                 unsigned db = declTy->getIntegerBitWidth();
                 unsigned sb = args[ai]->getType()->getIntegerBitWidth();
