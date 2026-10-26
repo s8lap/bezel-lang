@@ -62,6 +62,35 @@
 // NOT to `int` (§5.1: "Between signed and unsigned types of the same or
 // narrower width ... [is] never implicit"), so exactly ONE candidate is
 // applicable and §22.6 selects it — no ambiguity, no refusal.
+//
+// THE ADDITIONAL SHAPES PINNED HERE (the test-only follow-up).
+//
+// The fix flips more shapes than the nine refusal rows it shipped with,
+// and a behaviour flip must be pinned by a row. These rows close the
+// hole:
+//
+//   * the ONE-argument form over a `uint` VARIABLE — §5.1's table gives
+//     `uint` the conversions to `long`, `ulong`, `float`, `double` and
+//     `decimal`, so it converts to FOUR of the one-argument form's
+//     parameter types and matches none exactly;
+//   * the ONE-argument form over a `ulong` VARIABLE — §5.1's table gives
+//     `ulong` the conversions to `float`, `double` and `decimal`, three
+//     of that form's parameter types, and it matches none exactly;
+//   * the TWO-argument form over a `uint` CONSTANT THAT FITS `int` —
+//     §5.1's constant narrowing reaches the `int` form BY VALUE ("an
+//     expression of integer type that is a compile-time constant
+//     implicitly converts to any integer type whose range contains its
+//     value", across signedness), so the `int` form is APPLICABLE, and
+//     §22.6 grades the narrowing "as any other conversion is, never as
+//     an exact match", so it CONVERTS there and the `int` and `long`
+//     candidates tie.
+//
+// The NAMED-argument spellings of all three are pinned too: §22.5 binds
+// the argument to the parameter it names, and the ranking step then
+// judges the bound position, so the verdict is the positional one's.
+//
+// Each of the three has its own REMEDY row beside it (§2.3's "an
+// explicit cast to one parameter type"), which stays green on both arms.
 
 #include <string>
 
@@ -159,6 +188,22 @@ BEZEL_TEST(convert_tostring_ambiguity_7266,
         "    Console.WriteLine(Convert.ToString(sh, 10));")));
 }
 
+// A `uint` CONSTANT that fits `int`: §5.1's constant narrowing reaches
+// the `int` form BY VALUE ("an expression of integer type that is a
+// compile-time constant implicitly converts to any integer type whose
+// range contains its value", across signedness), so the `int` form is
+// APPLICABLE — and §22.6 grades the narrowing "as any other conversion
+// is, never as an exact match", so it CONVERTS at that position. The
+// `long` form converts too, and the two tie. (A `uint` VARIABLE is a
+// different question: §5.1 never converts `uint` to `int`, so the `int`
+// form is inapplicable and exactly one candidate remains — the CONTROL
+// row below.)
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_uint_constant_is_ambiguous_2_3) {
+    expectAmbiguous(runAot(prog(
+        "    Console.WriteLine(Convert.ToString(5U, 10));")));
+}
+
 // ===========================================================================
 // stdlib §2.3 — the ONE-argument form. The same rule over the same
 // declared forms: `int`, `long`, `float`, `double`, `decimal` and `bool`.
@@ -183,6 +228,31 @@ BEZEL_TEST(convert_tostring_ambiguity_7266,
         "    Console.WriteLine(Convert.ToString(5U));")));
 }
 
+// A `uint` VARIABLE: §5.1's table gives `uint` the conversions to
+// `long`, `ulong`, `float`, `double` and `decimal`, so it converts to
+// THREE of the one-argument form's parameter types (`long`, `float`,
+// `double`, `decimal`) and matches none exactly — §2.3's rule's own
+// shape, over the one-argument form.
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_one_arg_uint_value_is_ambiguous_2_3) {
+    expectAmbiguous(runAot(prog(
+        "    var u: uint := 5U; "
+        "    Console.WriteLine(Convert.ToString(u));")));
+}
+
+// A `ulong` VARIABLE: §5.1's table gives `ulong` the conversions to
+// `float`, `double` and `decimal` — three of the one-argument form's
+// parameter types — and it matches none exactly. (At the TWO-argument
+// form a `ulong` is a different question: `ulong` converts to neither
+// `int` nor `long`, so no candidate is applicable there and the §5.1
+// "no matching overload" wording fires — the CONTROL row below.)
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_one_arg_ulong_value_is_ambiguous_2_3) {
+    expectAmbiguous(runAot(prog(
+        "    var u: ulong := 5; "
+        "    Console.WriteLine(Convert.ToString(u));")));
+}
+
 // ===========================================================================
 // The NAMED-ARGUMENT spellings must behave like the positional one
 // (§22.5 binds the argument to the parameter it NAMES).
@@ -200,6 +270,33 @@ BEZEL_TEST(convert_tostring_ambiguity_7266,
     expectAmbiguous(runAot(prog(
         "    var b: byte := 200; "
         "    Console.WriteLine(Convert.ToString(value := b));")));
+}
+
+// The named spelling of the one-argument form over a `uint` VARIABLE:
+// §22.5 binds the argument to the parameter it NAMES, and the ranking
+// step then judges the bound position — so the verdict is the positional
+// one's.
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_named_one_arg_uint_value_is_ambiguous_2_3) {
+    expectAmbiguous(runAot(prog(
+        "    var u: uint := 5U; "
+        "    Console.WriteLine(Convert.ToString(value := u));")));
+}
+
+// The named spelling of the one-argument form over a `ulong` VARIABLE.
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_named_one_arg_ulong_value_is_ambiguous_2_3) {
+    expectAmbiguous(runAot(prog(
+        "    var u: ulong := 5; "
+        "    Console.WriteLine(Convert.ToString(value := u));")));
+}
+
+// The named spelling of the two-argument form over a `uint` CONSTANT
+// that fits `int`.
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_named_uint_constant_is_ambiguous_2_3) {
+    expectAmbiguous(runAot(prog(
+        "    Console.WriteLine(Convert.ToString(value := 5U, toBase := 10));")));
 }
 
 // ===========================================================================
@@ -312,5 +409,32 @@ BEZEL_TEST(convert_tostring_ambiguity_7266,
     BEZEL_EXPECT_EQ(runAotOut(prog(
                         "    var u: ulong := 5; "
                         "    Console.WriteLine(u.ToString());")),
+                    "5");
+}
+
+// The REMEDY for the three shapes the one-argument and the two-argument
+// forms refuse: an explicit cast to ONE parameter type makes that
+// candidate an exact match (§22.6's ranking step) and the call resolves.
+// A fix that made the remedy unreachable would not be a fix.
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_one_arg_uint_explicit_cast_remedy_renders_2_3) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+                        "    var u: uint := 5U; "
+                        "    Console.WriteLine(Convert.ToString(long(u)));")),
+                    "5");
+}
+
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_one_arg_ulong_explicit_cast_remedy_renders_2_3) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+                        "    var u: ulong := 5; "
+                        "    Console.WriteLine(Convert.ToString(double(u)));")),
+                    "5");
+}
+
+BEZEL_TEST(convert_tostring_ambiguity_7266,
+           convert_tostring_uint_constant_explicit_cast_remedy_renders_2_3) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+                        "    Console.WriteLine(Convert.ToString(int(5U), 10));")),
                     "5");
 }
