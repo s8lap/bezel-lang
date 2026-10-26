@@ -13861,6 +13861,17 @@ Symbol* ExprTC::lookupExtensionMember(
         // the shape (§2.8.2) instead of binding some less specific block's
         // member and silently answering a different question.
         bool shapeOnly = false;
+        // fix #7280 (§26.4 / §2.8.2, v0.344): this candidate's MEMBER is a
+        // GENERIC one (it declares type parameters of its own, §26.4) in an
+        // IMPORTED, otherwise DISPATCHABLE block. The block itself is
+        // dispatchable — its ordinary members cross the boundary with a
+        // concrete layout — but this member does not: there is no
+        // importer-side monomorphization for an extension block, and the
+        // exporter's one symbol per member name is compiled against the
+        // placeholder layout. So the refusal is PER MEMBER: the block's
+        // ordinary members keep dispatching, and only this one is refused
+        // (§2.8.2).
+        bool genericMember = false;
     };
     // fix #6966 (§26.4 / §2.8.2, v0.343): the diagnostic §2.8.2 requires when
     // the block §26.5.1 selects is one the artifact interface can only carry
@@ -13927,6 +13938,78 @@ Symbol* ExprTC::lookupExtensionMember(
                 ". The importer therefore has no `" + std::string(name) +
                 "` to bind here; §2.8.2 requires this reject rather than a "
                 "silent binding of some other block's member");
+    };
+    // fix #7280 (§26.4 / §2.8.2 / §26.5.1, v0.344): the SECOND refusal
+    // reason, and it is PER MEMBER rather than per block. The block-level
+    // reason above covers a RESOLUTION-ONLY block (a free-variable head or a
+    // `where` clause): every one of its members is un-dispatchable, so the
+    // block as a whole is refused. A DISPATCHABLE block (a ground head) is a
+    // different case: its ORDINARY members cross the boundary with a
+    // CONCRETE layout and are dispatchable, so they must keep working — but
+    // a GENERIC member of that same block (§26.4's "a generic method that
+    // declares the block's parameters before its own") has no importer-side
+    // monomorphization, and the exporter emits ONE symbol per extension
+    // member NAME (`bz$ext$<module>.<Target>$<M>`) compiled against the
+    // exporting module's PLACEHOLDER layout. Dispatching it here would call
+    // it with the wrong layout: MEASURED by carrying it anyway, an int-typed
+    // type argument "works" only by ABI luck (printed 7) and a record-typed
+    // one fails the LLVM verifier ("Call parameter type does not match
+    // function signature!"). So the member is refused — §2.8.2: "An
+    // implementation unable to carry some body shape in its interface format
+    // must reject the export, or the import, with a diagnostic naming the
+    // shape; it must not alter the instantiation's semantics."
+    auto reportGenericMemberCandidate = [&](const ExtCandidate& c) {
+        if (!reportAmbiguity) return;
+        std::string moduleName;
+        if (auto it = importedExtensionModule_.find(c.ext);
+            it != importedExtensionModule_.end())
+            moduleName = it->second;
+        const std::string head =
+            "extension " + spellExtHeadTypeRef(c.declaredHead);
+        std::string site;
+        if (c.decl && c.decl->span.begin.line != 0) {
+            site = "declared at ";
+            if (!c.decl->sourceFile.empty())
+                site += c.decl->sourceFile + ":";
+            else
+                site += "line ";
+            site += std::to_string(c.decl->span.begin.line);
+            if (!c.decl->sourceFile.empty())
+                site += ":" + std::to_string(c.decl->span.begin.column);
+            else
+                site += ", column " + std::to_string(c.decl->span.begin.column);
+        } else {
+            site = "declaration site not tracked across module imports";
+        }
+        std::string recvName(namedTypeSimpleName(receiver));
+        if (recvName.empty()) recvName = "?";
+        // The member's own type parameters — the shape that cannot cross.
+        std::string tpNames;
+        if (auto* ms = dynamic_cast<MethodSymbol*>(c.member)) {
+            for (Symbol* gp : ms->genericParams) {
+                if (!tpNames.empty()) tpNames += ", ";
+                if (gp) tpNames += "`" + std::string(gp->name) + "`";
+            }
+        }
+        if (tpNames.empty()) tpNames = "a type parameter";
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "no member `" + std::string(name) + "` on type `" + recvName +
+                "`: the extension block `" + head + "` in module `" +
+                moduleName + "` (" + site + ") declares `" +
+                std::string(name) +
+                "` as a GENERIC method (type parameters: " + tpNames +
+                "), and §26.5.1 selects that block for this receiver — but "
+                "the artifact interface cannot carry that member's shape: a "
+                "generic extension method has no importer-side "
+                "monomorphization (§26.4), and the exporter emits ONE symbol "
+                "per extension member NAME, compiled against the exporting "
+                "module's placeholder layout, so dispatching it here would "
+                "call it with the wrong layout. The importer therefore "
+                "refuses to bind `" +
+                std::string(name) +
+                "` here; §2.8.2 requires this reject rather than a silent "
+                "binding of some other block's member");
     };
     std::vector<ExtCandidate> found;
     std::vector<std::unique_ptr<TypeRef>> ownedAncs;
@@ -14094,11 +14177,25 @@ Symbol* ExprTC::lookupExtensionMember(
             // defers (the pre-#2328 comment in this slot). Adding a per-block
             // arity/argument-type tie-break here would be out of scope for the
             // fix; the call site can still surface an ambiguity in step 2.
+            // fix #7280 (§26.4 / §2.8.2, v0.344): is this the member the
+            // importer must refuse? Only an IMPORTED block's member can be
+            // refused (a same-module block monomorphizes its generic member
+            // locally and answers correctly), and only when the block is
+            // otherwise DISPATCHABLE — a resolution-only block is refused as
+            // a whole by the `shapeOnly` reason above, and reporting both
+            // would name the same defect twice.
+            bool genericMember = false;
+            if (!shapeOnlyBlock &&
+                importedExtensionModule_.count(ext) != 0) {
+                if (auto* msym = dynamic_cast<MethodSymbol*>(m))
+                    genericMember = !msym->genericParams.empty();
+            }
             found.push_back({m, matchedAnc, target, ext, decl, std::move(binding),
                                  /*isStandardLibraryLinq=*/false,
                                  /*stdHead=*/std::string(),
                                  /*stdWhere=*/std::string(),
-                                 /*shapeOnly=*/shapeOnlyBlock});
+                                 /*shapeOnly=*/shapeOnlyBlock,
+                                 /*genericMember=*/genericMember});
             break;
         }
     }
@@ -14197,6 +14294,8 @@ Symbol* ExprTC::lookupExtensionMember(
     }
     if (found.size() == 1) {
         if (found[0].shapeOnly) reportShapeOnlyCandidate(found[0]);
+        else if (found[0].genericMember)
+            reportGenericMemberCandidate(found[0]);
         if (outBinding) *outBinding = found[0].binding;
         return found[0].member;
     }
@@ -14235,6 +14334,7 @@ Symbol* ExprTC::lookupExtensionMember(
     if (maximal.size() == 1) {
         const ExtCandidate& winner = found[maximal[0]];
         if (winner.shapeOnly) reportShapeOnlyCandidate(winner);
+        else if (winner.genericMember) reportGenericMemberCandidate(winner);
         if (outBinding) *outBinding = winner.binding;
         return winner.member;
     }

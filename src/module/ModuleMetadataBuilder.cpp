@@ -2996,26 +2996,51 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
         // the member is never dispatched, so its signature rides the wire
         // for resolution alone.
         //
-        // A DISPATCHABLE block (a ground head) still skips its generic
-        // members: there the importer WOULD dispatch the carried member,
-        // and the exporter emits ONE symbol for an extension block's generic
-        // member (`bz$ext$<module>.<Target>$<M>`) compiled against the
-        // PLACEHOLDER layout — the importer would call it with the concrete
-        // layout. MEASURED by carrying it anyway: an int-typed type argument
-        // "works" only by ABI luck, and a value-typed one fails the LLVM
-        // verifier ("Call parameter type does not match function signature" —
-        // the placeholder pointer against the concrete `%record`). That is
-        // the #2884 unsoundness class, so the dispatch is not an option.
-        // The spelling (a ground head whose only visible member is generic)
-        // therefore has no exporter-side remedy; it is the residual of this
-        // fix and wants an importer-side flag.
-        if (!meth->genericParams.empty() && !outShapeOnly) continue;
+        // A DISPATCHABLE block (a ground head) skipped its generic members:
+        // there the importer WOULD dispatch the carried member, and the
+        // exporter emits ONE symbol for an extension block's generic member
+        // (`bz$ext$<module>.<Target>$<M>`) compiled against the PLACEHOLDER
+        // layout — the importer would call it with the concrete layout.
+        // MEASURED by carrying it anyway: an int-typed type argument "works"
+        // only by ABI luck, and a value-typed one fails the LLVM verifier
+        // ("Call parameter type does not match function signature" — the
+        // placeholder pointer against the concrete `%record`). That is the
+        // #2884 unsoundness class, so the DISPATCH is not an option.
+        //
+        // fix #7280 (§26.4 / §2.8.2 / §26.5.1, v0.344): the DISPATCH is not
+        // an option, but the CARRY is — and the carry is what the refusal
+        // needs. Skipping the member emptied `out.members`, and the
+        // `!out.members.empty()` rule below then DROPPED the whole block: the
+        // importer never saw the MORE SPECIFIC block, bound the exporting
+        // module's LESS SPECIFIC one, and answered with its value (measured:
+        // same-module printed 2, cross-module printed 1, exit 0 — the silent
+        // wrong answer #6966 fixed for the resolution-only spelling). So the
+        // generic member of a DISPATCHABLE block rides the wire as a SHAPE
+        // (its name, arity and type parameters — the three things the
+        // importer needs to RANK the block and to REFUSE the call naming the
+        // shape), exactly as #6966's resolution-only carriage carries a
+        // resolution-only block's ordinary members.
+        //
+        // The importer refuses that member (§2.8.2, implemented in
+        // sema/ExprTypecheck.cpp's `lookupExtensionMember`) instead of
+        // dispatching it; the refusal is PER MEMBER, so the block's ORDINARY
+        // members — whose exported symbols carry the CONCRETE layout and are
+        // dispatchable — keep working.
         if (!isExportedMember(meth->visibility, /*inInterface=*/false)) continue;
         if (dynamic_cast<const ast::MethodDecl*>(meth->decl) == nullptr) continue;
         MetaMember mm;
         if (convertMember(*meth, /*inInterface=*/false, ctx, mm,
-                          /*isGenericType=*/false, source))
+                          /*isGenericType=*/false, source)) {
+            // fix #7280: the SHAPE rides ALONE — a body must not cross for a
+            // member the importer may never dispatch (the exporter's one
+            // symbol per member name is compiled against the placeholder
+            // layout, so a body would advertise a dispatch that §2.8.2
+            // forbids). A RESOLUTION-ONLY block's member keeps its body
+            // (the #6966/#7223 carriage is unchanged).
+            if (!outShapeOnly && !meth->genericParams.empty())
+                mm.methodBodyText.clear();
             out.members.push_back(std::move(mm));
+        }
     }
     return !out.members.empty();
 }
@@ -3081,7 +3106,19 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
                 // instead of silently binding a less specific block.
                 if (converted && !shapeOnly)
                     for (const MetaMember& mm : me.members)
-                        exportedNames.insert(mm.name);
+                        // fix #7280 (§26.4 / §2.8.2, v0.344): a GENERIC
+                        // member of a DISPATCHABLE block rides the wire as a
+                        // SHAPE (§26.4's generic method cannot be carried
+                        // WITH a body, and the importer must not dispatch
+                        // it), so — exactly like a resolution-only block's
+                        // members above — its NAME stays in the "visible
+                        // but not exported" set: a ground generic block's
+                        // same-named member is still withheld (the #6898
+                        // rule), because the importer could otherwise bind
+                        // that member where the same-module program binds
+                        // the generic one.
+                        if (mm.genericParams.empty())
+                            exportedNames.insert(mm.name);
                 for (sema::Symbol* m : ext->members) {
                     bool visible = false;
                     if (auto* p = dynamic_cast<const sema::PropertySymbol*>(m))

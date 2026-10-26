@@ -7133,6 +7133,23 @@ static void loadMetadataPass2(
                 // with `extensionDecl`.
                 ms->parent = nullptr;
                 ms->scope = scope;
+                // fix #7280 (§26.4 / §2.8.2, v0.344): an extension member's
+                // OWN type parameters ride `MetaMember::genericParams` (the
+                // channel #7095 already ships for a method's type parameters),
+                // and the importer must set them: §26.4 reads an extension
+                // member as "a generic method that declares the block's
+                // parameters before its own", so a member that declares its
+                // own type parameters IS a generic method. The importer left
+                // the field empty, so it could not tell a GENERIC extension
+                // member from an ordinary one — and the §2.8.2 refusal
+                // (sema/ExprTypecheck.cpp's `lookupExtensionMember`) needs
+                // exactly that distinction: a generic extension member has no
+                // importer-side monomorphization, so it must be REFUSED
+                // rather than dispatched (the exporter's one symbol per
+                // extension member name is compiled against the exporting
+                // module's placeholder layout).
+                ms->genericParams =
+                    loader.convertGenericParams(mm.genericParams, scope);
                 ms->params = loader.convertParams(mm.params, scope);
                 ms->extensionDecl = decl.get();
                 ms->isPure = mm.isPure;
