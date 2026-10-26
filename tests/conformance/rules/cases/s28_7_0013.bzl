@@ -3,11 +3,11 @@
 //! section: 28.7
 //! title: reassigning an Object-typed owned local while a live local borrow of it exists is rejected
 //! rule: Reassigning a plain-var owned local while a live local borrow of
-//!   its current value exists is rejected by the consume-site freeze - the
-//!   implicit disposal would silently invalidate the borrow. The rule names a
-//!   LOCAL, not a class-typed local: the reader's static type does not decide
-//!   whether a use-after-free is diagnosed.
-//! cites: 28.7, 28.3
+//!   its current value exists is rejected by the consume-site freeze (§28.3.9)
+//!   - the implicit disposal would silently invalidate the borrow. The rule
+//!   names a LOCAL, not a class-typed local: the reader's static type does not
+//!   decide whether a use-after-free is diagnosed.
+//! cites: 28.7, 28.3.9
 //! expect: reject
 //! diagnostic: live
 //! issue: 7103

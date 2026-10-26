@@ -6,10 +6,10 @@
 //!   type `string`. §5.1's implicit-conversion table admits no conversion from
 //!   `int` to `string` (a `string` is not a numeric type and no reference
 //!   conversion reaches it), so the sole candidate of §22.6 is inapplicable and
-//!   the call is a compile error.
+//!   the call is a compile error: the `value` argument must be a `string`.
 //! cites: 5.1, 2.3, 22.6
 //! expect: reject
-//! diagnostic: not implicitly convertible
+//! diagnostic: must be a `string`
 //! issue: 7218
 module Conf;
 
