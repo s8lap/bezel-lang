@@ -3494,6 +3494,46 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         return rt->genericArgs[0];
     };
 
+    // fix #7214 (§27.6 / stdlib §5, v0.344): the RESULT type of a §5 callback
+    // that is HELD IN A LOCAL — `var f := Cat; xs.Zip(ys, f)`.
+    //
+    // §27.6: "a method reference forms a function value". The BARE spelling
+    // (`Cat`) is the one §27.6 forms as "a reference to a method", and it
+    // carries NO Function TypeRef on the EXPRESSION (issue #7182): sema's
+    // call-resolution slice leaves it untyped, and fix #4897 (v0.307)
+    // synthesized the missing type only inside `checkAssignable`, so it never
+    // reached the expression — nor the INFERRED local that binds it, whose
+    // `declType` is null for the same reason.
+    //
+    // So for the local-held spelling `linqSelectorResultType` finds no type at
+    // all and the §5 lowering falls back to its `i32` default. The
+    // consequence is the #7160 defect in its local-held form: the element
+    // slot is sized from the `i32` fallback and the trampoline calls the
+    // callback with an `i32` RESULT type, TRUNCATING the returned pointer; the
+    // consumer then dereferences the mangled element pointer (measured: ASan
+    // SEGV in the generated program, `xs.Zip(ys, f)` with a `string` combiner).
+    //
+    // The recovery reads the local's INITIALIZER — the reference the local
+    // binds — and asks the SAME method-reference recovery the bare spelling
+    // uses (`linqSelectorResultType` on the initializer), so the two
+    // spellings of one reference resolve to one result type. The local's own
+    // declared type is consulted first: an ANNOTATED local
+    // (`var f: (string, string) -> string := Cat;`) carries the Function
+    // TypeRef already, and the identifier's own `exprType` carries it too.
+    auto localHeldCallbackResultType = [&](size_t i) -> sema::TypeRef* {
+        if (i >= call.args.size() || !call.args[i].value) return nullptr;
+        const ast::Expr* a = call.args[i].value.get();
+        auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*a));
+        if (!ls) return nullptr;
+        if (ls->declType && ls->declType->kind == sema::TypeRef::Kind::Function &&
+            ls->declType->funcReturn)
+            return ls->declType->funcReturn;
+        if (!ls->decl) return nullptr;
+        LocalDeclInitView view = localDeclInitView(ls->decl);
+        if (!view.init || view.init == a) return nullptr;
+        return linqSelectorResultType(ctx_, view.init);
+    };
+
     // #422 / §28.9 / §28.3: a LAZY operator stores its closure in the enumerator
     // (e->closure) and invokes it LATER during iteration — so the closure must
     // OUTLIVE the call. When it was produced INLINE (a lambda literal, or a
@@ -3578,6 +3618,10 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // (an out-of-bounds read for every wider one).
         sema::TypeRef* retSemaType =
             linqSelectorResultType(ctx_, call.args[0].value.get());
+        // fix #7214 (§27.6 / stdlib §5, v0.344): the callback is HELD IN A
+        // LOCAL — `var f := Make; xs.Select(f)` — and the local-held spelling
+        // carries no Function TypeRef on the argument expression either.
+        if (!retSemaType) retSemaType = localHeldCallbackResultType(0);
         llvm::Type* outTy = i32();
         if (retSemaType) {
             if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
@@ -3697,6 +3741,10 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // a slot-sizing gap.
         sema::TypeRef* retSemaType =
             linqSelectorResultType(ctx_, call.args[0].value.get());
+        // fix #7214 (§27.6 / stdlib §5, v0.344): the callback is HELD IN A
+        // LOCAL — `var f := Make; xs.Select(f)` — and the local-held spelling
+        // carries no Function TypeRef on the argument expression either.
+        if (!retSemaType) retSemaType = localHeldCallbackResultType(0);
         llvm::Type* innerElemTy = i32();
         if (retSemaType) {
             if (!retSemaType->genericArgs.empty() && retSemaType->genericArgs[0])
@@ -3763,6 +3811,10 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // it).
         sema::TypeRef* retSemaType =
             linqSelectorResultType(ctx_, call.args[1].value.get());
+        // fix #7214 (§27.6 / stdlib §5, v0.344): the combiner is HELD IN A
+        // LOCAL — `var f := Cat; xs.Zip(ys, f)` — and the local-held spelling
+        // carries no Function TypeRef on the argument expression either.
+        if (!retSemaType) retSemaType = localHeldCallbackResultType(1);
         llvm::Type* outTy = i32();
         if (retSemaType) {
             if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
