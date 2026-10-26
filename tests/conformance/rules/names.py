@@ -325,6 +325,35 @@ def reserved_declarations(source):
     return sorted(found)
 
 
+def generic_call_names(code):
+    """Names used as a generic METHOD call: `Name<…>(`.
+
+    The angle-bracket span may itself hold a nested generic
+    (`F<Array<int>>(a)`), so the span is scanned with a depth counter: a
+    pattern that stops at the first `>` cannot see the `(` that makes the
+    shape a call, and it then reports the method's OWN name as an invented
+    type (case s14_1_0010). The `new` exclusion stays in the caller — a
+    generic TYPE is constructed with `new`, and that is a type use."""
+    names = set()
+    for m in re.finditer(r'(?<![.\w])([A-Z]\w*)\s*<', code):
+        depth = 1
+        i = m.end()
+        while i < len(code) and depth:
+            if code[i] == '<':
+                depth += 1
+            elif code[i] == '>':
+                depth -= 1
+            i += 1
+        if depth:
+            continue
+        j = i
+        while j < len(code) and code[j].isspace():
+            j += 1
+        if j < len(code) and code[j] == '(':
+            names.add(m.group(1))
+    return names
+
+
 def check_source(source, index, modules=()):
     own_types = declared_in(source)
     # A module qualifier (`System.Exception`, `System.Threading.Task`) is not a
@@ -350,6 +379,7 @@ def check_source(source, index, modules=()):
             continue
         for mod in qualifiers:
             code = re.sub(r'\b' + re.escape(mod) + r'\.(?=[A-Z])', '', code)
+        generic_calls = generic_call_names(code)
         for rx in TYPE_POSITION_RES:
             for m in rx.finditer(code):
                 name = m.group(1)
@@ -361,8 +391,10 @@ def check_source(source, index, modules=()):
                              r'choice|enum)\s+' + re.escape(name) + r'\b', code):
                     continue
                 # `Classify<int>(x)` is a generic method CALL; `new Array<int>()`
-                # and a bare `Array<int>` annotation are types.
-                if re.search(re.escape(name) + r'<[^<>]*>\s*\(', code) \
+                # and a bare `Array<int>` annotation are types. The call shape
+                # is read with a depth counter, so a NESTED type argument
+                # (`F<Array<int>>(a)`) is still a call.
+                if name in generic_calls \
                         and not re.search(r'\bnew\s+' + re.escape(name), code):
                     continue
                 unknown_types.add(name)
