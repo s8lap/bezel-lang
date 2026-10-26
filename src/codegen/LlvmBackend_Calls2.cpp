@@ -2588,6 +2588,21 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
+        // fix #7294 (stdlib §9.1 / §9.2 / §9.3, v0.344): the declared
+        // operand is a `string` (or the span overload's `ReadOnlyStringSpan`).
+        // This arm had NO first-argument guard at all, and it did not even
+        // lower the operand into a string operand — it fell through to
+        // `return arg`, so `int.Parse(true)` handed the `bool` back as the
+        // parse result and `int.Parse(o)` handed back the OBJECT'S POINTER
+        // (the program printed a heap address). For the `decimal` receiver
+        // the operand DID reach the parser: `decimal.Parse(o)` read the
+        // object's own bytes as a string descriptor and parsed them as TEXT
+        // — foreign memory — and `decimal.Parse(1.5)` emitted
+        //   %str.data = load ptr, double 1.500000e+00, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A non-parseable operand is
+        // DROPPED, the way the `Parse(s, radix)` arm drops one.
+        if (!isParseableOperand(*call.args[0].value, arg)) return nullptr;
         // #747 R42: `decimal.Parse(s)` reaches this primitive handler via the
         // lowercase keyword receiver (pt==Decimal). Route it to bz_decimal_parse
         // exactly like `Decimal.Parse` (§6.4 / fix #521); without this it fell
