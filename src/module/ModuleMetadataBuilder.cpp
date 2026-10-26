@@ -2973,7 +2973,43 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
         // refuse the call naming the shape); the member is never dispatched,
         // so its signature is carried for resolution alone.
         if (meth == nullptr || meth->isOperator) continue;
-        if (!meth->genericParams.empty()) continue;
+        //
+        // fix #7223 (§26.4 / §2.8.2 / §26.5.1, v0.344): a GENERIC method
+        // cannot be carried WITH A BODY — the importer has no
+        // monomorphization machinery for an extension block's generic member
+        // — so the method branch used to skip it outright. In a
+        // RESOLUTION-ONLY block (a free-variable head or a `where` clause)
+        // that skip emptied `out.members`, and the `!out.members.empty()`
+        // rule below then DROPPED the whole block: the importer never saw
+        // the more specific block, bound the exporting module's LESS
+        // SPECIFIC one, and answered with its value (measured: same-module
+        // printed 2, cross-module printed 1, exit 0 — a silent wrong
+        // answer, the #6966 failure mode).
+        //
+        // §2.8.2: "An implementation unable to carry some body shape in its
+        // interface format must reject the export, or the import, with a
+        // diagnostic naming the shape; it must not alter the
+        // instantiation's semantics." Carrying the SHAPE (the member's name
+        // and arity — the two things the importer needs to rank the block
+        // and to refuse the call naming the shape) is the same carriage
+        // #6966 established for a resolution-only block's ordinary members:
+        // the member is never dispatched, so its signature rides the wire
+        // for resolution alone.
+        //
+        // A DISPATCHABLE block (a ground head) still skips its generic
+        // members: there the importer WOULD dispatch the carried member,
+        // and the exporter emits ONE symbol for an extension block's generic
+        // member (`bz$ext$<module>.<Target>$<M>`) compiled against the
+        // PLACEHOLDER layout — the importer would call it with the concrete
+        // layout. MEASURED by carrying it anyway: an int-typed type argument
+        // "works" only by ABI luck, and a value-typed one fails the LLVM
+        // verifier ("Call parameter type does not match function signature" —
+        // the placeholder pointer against the concrete `%record`). That is
+        // the #2884 unsoundness class, so the dispatch is not an option.
+        // The spelling (a ground head whose only visible member is generic)
+        // therefore has no exporter-side remedy; it is the residual of this
+        // fix and wants an importer-side flag.
+        if (!meth->genericParams.empty() && !outShapeOnly) continue;
         if (!isExportedMember(meth->visibility, /*inInterface=*/false)) continue;
         if (dynamic_cast<const ast::MethodDecl*>(meth->decl) == nullptr) continue;
         MetaMember mm;
