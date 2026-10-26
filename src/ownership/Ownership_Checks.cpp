@@ -12673,6 +12673,82 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         // measured argument — see the bulk-storing branch's own comment).
         if (!src && fromLambdaBody && !bulkStoring)
             src = enclosingFrameOwnedLocalBorrowSource(*a.value, elemKinds);
+        // fix #7209 (§28.11 *Borrowing collections* → *Storing a borrow*,
+        // clause 2; §28.3 *Producers*; §28.9 *Trivial-dispose classes*,
+        // v0.343): the BUILT-IN COLLECTION-LITERAL element case the general
+        // machinery above structurally cannot see — the same gap #3706 closed
+        // at the FIELD sink, now closed at the COLLECTION sink.
+        //
+        // The gap: `ownedLocalBorrowSource` → `borrowSourceForExpr`'s Shape 1
+        // gates on `returnedExprMayBorrow` → `isBorrowableType`, and
+        // `isBorrowableType` answers FALSE for EVERY `Array<T>`-typed
+        // identifier — `Array<T>` is a builtin CLASS (stdlib §4.4,
+        // `public class Array<T>`) with no user `TypeDecl`, so it falls
+        // through the declaration-less Named branch to the
+        // builtin-exception-only carve-out. So a bare read of a
+        // collection-literal local is never seen as a borrow source, at ANY
+        // sink. (Its `states_` classification does not help either:
+        // `producerState`'s collection-literal arm reads the LITERAL's own
+        // `exprType`, which a target-typed literal does not carry, so the
+        // local is not tracked Owned either — measured: the bulk `AddRange`
+        // leg's `isOwnedTrackedLocal` gate misses the same local.)
+        //
+        // The spec: §28.3's *Producers* table classifies a "collection
+        // literal (`[1, 2, 3]`) targeting a reference type (`Array<T>`, …)" as
+        // **Owned**, and §28.9's *Trivial-dispose classes* says every
+        // trivial-dispose instance gets a compiler-inserted **free** at its
+        // holder's release point — "scope end for locals and `using var`" —
+        // and that the free "releases the instance's own allocation
+        // (including the intrinsic backing storage of the compiler-known
+        // borrowing collections)". So the local's backing IS reclaimed at the
+        // local's own scope end: the local is a scope-bound holder whose
+        // value dies there, and §28.11's clause 2 REJECTS "a borrow of a
+        // **scope-bound binding** … stored into a collection that provably
+        // outlives that scope — … or is a local of strictly wider scope".
+        //
+        // MEASURED (this issue): the `using var` spelling compiled clean and
+        // the run died with an ASan heap-use-after-free (READ of size 4 in
+        // `memcpy`, freed by `bz_array_free`, allocated by `bz_array_alloc`);
+        // the plain-`var` spelling compiled clean and LSan reported 144 B in
+        // 2 allocations leaked (the local's scope-end reclaim is declined
+        // because the value escaped — codegen's own escape walk — and nothing
+        // else reclaims it). Both spellings are the SAME program and the SAME
+        // rule; the user-class twin (`Array<R>` over a user `R`) is ALREADY
+        // rejected by this very check, which is the shape parity this fix
+        // restores.
+        //
+        // The recognizer is #3706's `borrowingArrayLiteralLocalFieldStoreSource`
+        // — the SAME predicate, so the field sink and the collection sink
+        // cannot drift: it is TYPE/SHAPE-based and independent of `states_`
+        // and of `isBorrowableType`, and it matches a plain `var` / `using
+        // var` / §21.1 `const` local bound directly to a fresh, non-dict
+        // `[...]` literal of the builtin `Array<T>` head. (Its `Array<T>`-only
+        // scope is #3706's own recorded limitation; `Set<T>` /
+        // `Dictionary<K,V>` literals are the identical K1.5 shape and share
+        // the gap — a filed follow-up, not a silent widening here.)
+        //
+        // Restricted to the ELEMENT store: the bulk `AddRange` arm above has
+        // its own resolution path (its argument is a COLLECTION whose elements
+        // are copied out — §28.11 *Value-copy members*), and the §15.4
+        // fresh-store warning below already covers a fresh literal argument.
+        //
+        // The recognizer also matches a §21.1 `const` local, but the
+        // depth comparison below cannot decide a `const` source:
+        // `localDepth_` records depths for `LocalDecl`s only (its own
+        // recorded scope), so a `const` source leaves the comparison
+        // undecided and the store is admitted. That spelling is illegal for
+        // a DIFFERENT reason — §21.1 rejects a runtime `const` whose
+        // initializer is an owned production, and a collection literal is one
+        // (§28.3's Producers table) — so it is a §21.1 rule's business, not
+        // this one, and it is filed separately.
+        bool srcIsBorrowingArrayLiteralLocal = false;
+        if (!src && !bulkStoring) {
+            if (sema::LocalSymbol* arrSrc =
+                    borrowingArrayLiteralLocalFieldStoreSource(*a.value)) {
+                src = arrSrc;
+                srcIsBorrowingArrayLiteralLocal = true;
+            }
+        }
         if (!src) {
             // §28.3 *Diagnostics* "The trust-admission report" (v0.307,
             // #4605). §28.11's store rule admits a borrow whose source is the
@@ -12703,6 +12779,48 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         if (!reject) continue;
         const std::string recvName =
             recvRoot ? std::string(recvRoot->name) : std::string("it");
+        // fix #7209 (§28.11 *Borrowing collections* → *Storing a borrow*,
+        // clause 2; §28.3 *Producers*; §28.9 *Trivial-dispose classes*,
+        // v0.343): the collection-literal element source gets its OWN
+        // wording, parallel to #3706's field-store diagnostic and to the
+        // user-class wording below — the general "borrow of `x` … is an
+        // owned scope-bound local" text would be TRUE of it (its backing IS
+        // reclaimed at its scope end), but it names no `owned` binding the
+        // program declares, and it would offer the owning-family `move`
+        // remedy, which does not compile for a builtin-class element (the
+        // `owned` parameter position rejects a builtin-class source as a
+        // borrow: "a borrow cannot be passed where an `owned` value is
+        // required", §28.8 — the same `isBorrowableType` gap this fix works
+        // around). The remedy this diagnostic offers is the one that
+        // compiles and that §28.11 clause 2 actually demands: keep the
+        // source alive at least as long as the collection.
+        if (srcIsBorrowingArrayLiteralLocal) {
+            report(
+                Severity::Error, a.value->span.begin,
+                std::string("collection literal local `") +
+                std::string(src->name) +
+                "` may not be passed to `." + std::string(m) + "(...)` on `" +
+                recvName + "` — `" + std::string(src->name) +
+                "` is a plain `Array<T>` collection literal, an OWNED atom "
+                "per K1.5 (\"reference-typed collection literals\"), whose "
+                "backing is reclaimed with the local's own scope end "
+                "(§28.9 / §28.11 collection-element ownership), and `" +
+                recvName +
+                (kind == RecvKind::Escapes
+                     ? "` is reachable beyond this method's scope (the "
+                       "receiver, a field, or a parameter)"
+                     : "` lives in an enclosing scope") +
+                ", which outlives it — so the collection would read "
+                "reclaimed memory once `" + std::string(src->name) +
+                "` is disposed (§28.11's borrowing-collection store rule: a "
+                "borrow of a scope-bound binding stored into a collection "
+                "that provably outlives that scope is rejected at the store "
+                "site. Keep `" + std::string(src->name) +
+                "` alive at least as long as `" + recvName +
+                "` — declare it in an enclosing scope, or move the "
+                "collection into the source's scope)");
+            continue;
+        }
         // fix #3746: an `owned` PARAMETER source gets the clause that is true
         // of it; the owned-local text below is unchanged.
         if (isOwnedParamSymbol(src)) {  // fix #5252: incl. set(owned) `value`

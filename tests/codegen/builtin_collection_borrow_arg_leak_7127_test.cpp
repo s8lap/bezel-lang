@@ -344,14 +344,22 @@ constexpr const char* kOwnedFormalTransfer =
 // NOT touch: freeing the array at its scope end there would turn the
 // pre-existing leak into a heap-use-after-free.
 //
-// ⚠ THIS PROGRAM STILL LEAKS (144 B / 2 allocations) — a PRE-EXISTING,
-// SEPARATE defect: the borrow escapes the inner scope into the outer
-// container and the compiler does not reject it (the ownership layer's
-// borrow-escape check has no arm for a builtin container insert). The row
-// pins the ABSENCE OF A MEMORY ERROR only, and runs with LeakSanitizer OFF
-// (`runAotCheckedLenient`) so the known leak does not fail it; a
-// use-after-free would still be caught by AddressSanitizer. The leak itself
-// is REPORTED to the coordinator, not fixed here.
+// ⚠ THIS PROGRAM IS NOW REJECTED AT COMPILE TIME (#7209, §28.11 *Borrowing
+// collections* → *Storing a borrow*, clause 2, v0.343). It used to compile
+// clean and LEAK (144 B / 2 allocations) — the borrow escaped the inner
+// scope into the outer container and the ownership layer had no arm for a
+// builtin container insert. #7209 added that arm: a borrow of a scope-bound
+// binding stored into a collection that provably outlives that scope "is
+// **rejected** at the store site", so the program no longer runs at all and
+// the use-after-free this row was watching for is now unreachable.
+//
+// ⇒⇒ THE ROW BELOW IS FLIPPED (a behaviour flip, named in #7209's commit
+// body): `container_insert_shape_is_not_freed_early` became
+// `container_insert_shape_is_rejected_before_it_runs`, and it now asserts the
+// REJECTION (the program does not run, and the diagnostic names §28.11)
+// instead of "it ran and printed 1". The assertion is STRENGTHENED, not
+// weakened: a compile-time rejection is a strictly stronger guarantee than
+// "no memory error was observed at run time".
 constexpr const char* kContainerInsert =
     "module M; class C public static method Main(): int "
     "  var l: Array<Array<int>> := []; "
@@ -360,6 +368,30 @@ constexpr const char* kContainerInsert =
     "    l.Add(a); "
     "  end do; "
     "  Console.WriteLine(l[0][0]); "
+    "  return 0; "
+    "end Main; end C;";
+
+// The POSITIVE CONTROL for the leak counter below: a program that DOES leak
+// must move the counter, so the "counter stays at zero" row cannot be
+// satisfied by a counter that never ticks.
+//
+// It used to be the container-insert shape, but #7209 REJECTS that shape at
+// compile time, so it no longer runs and no longer leaks — it cannot serve
+// as the control any more. This program leaks through a DIFFERENT and still
+// OPEN gap: a `Set<T>` collection-literal local stored into a FIELD is the
+// same K1.5 "reference-typed collection literals" shape as the `Array<T>`
+// one, and the field-store recognizer is scoped to the `Array<T>` head only
+// (#3706's own recorded limitation — the `Set<T>` / `Dictionary<K,V>`
+// widening is a filed follow-up), so the backing is never reclaimed.
+// MEASURED (this tree, `bezelc --sanitize=address`): "780 byte(s) leaked in
+// 8 allocation(s)".
+constexpr const char* kLeakySetFieldStore =
+    "module M; class Box public Items: Set<int> := []; end Box; "
+    "class C public static method Main(): int "
+    "  var b: Box := new Box(); "
+    "  var s: Set<int> := [1, 2, 3]; "
+    "  b.Items := s; "
+    "  Console.WriteLine(b.Items.Count); "
     "  return 0; "
     "end Main; end C;";
 
@@ -545,16 +577,25 @@ BEZEL_TEST(builtin_collection_borrow_arg_leak_7127,
 }
 
 // CONTROL 7: the CONTAINER-INSERT shape must NOT have become a
-// use-after-free. The program still leaks (a pre-existing, separate defect —
-// reported to the coordinator), so it runs with LeakSanitizer OFF; a
-// use-after-free would still be caught by AddressSanitizer.
+// use-after-free. #7209 (§28.11's borrowing-collection store rule, clause 2)
+// REJECTS the shape at compile time, so the program does not run at all — a
+// strictly stronger guarantee than the "no memory error at run time" this
+// row used to assert (the program used to compile clean and leak; it never
+// ran into a use-after-free because the local was never freed).
 BEZEL_TEST(builtin_collection_borrow_arg_leak_7127,
-           container_insert_shape_is_not_freed_early) {
+           container_insert_shape_is_rejected_before_it_runs) {
     auto r = runAotCheckedLenient(kContainerInsert);
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_EQ(r.stdoutText, "1\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // The rejection must be §28.11's borrowing-collection store rule, not
+    // some unrelated diagnostic that happens to fire.
+    bool namedRule = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("§28.11") != std::string::npos)
+            namedRule = true;
+    BEZEL_EXPECT_TRUE(namedRule);
 }
 
 // ══ THE LEAK COUNTER (a number, not a verdict) ══════════════════════════════
@@ -576,15 +617,18 @@ BEZEL_TEST(builtin_collection_borrow_arg_leak_7127,
 
 // The control for that row: a program that DOES leak must move the counter,
 // so the row above cannot be satisfied by a counter that never ticks.
+// The container-insert shape used to play this role; #7209 rejects it at
+// compile time, so the control is now a program that leaks through a
+// DIFFERENT and still-open gap (a `Set<T>` collection-literal local stored
+// into a field — see kLeakySetFieldStore).
 BEZEL_TEST(builtin_collection_borrow_arg_leak_7127,
            leak_counter_moves_for_a_program_that_leaks) {
     LeakEnv env("report");
     const std::size_t before = leakCount();
-    // The container-insert shape (CONTROL 7): MEASURED to leak 144 B / 2
-    // allocations on this tree — a PRE-EXISTING, SEPARATE defect, used here
-    // only as the oracle's own positive control.
-    auto r = runAot(kContainerInsert);
+    // MEASURED to leak 780 B / 8 allocations on this tree.
+    auto r = runAot(kLeakySetFieldStore);
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(leakCount(), before + 1);
 }

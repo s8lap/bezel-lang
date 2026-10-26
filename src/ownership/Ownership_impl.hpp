@@ -3265,6 +3265,20 @@ private:
     // `EscapeScope::Method` and `EscapeScope::LambdaBody` (it consults no
     // `states_` / `localDepth_` entry, mirroring the §9.7 record/span/choice
     // leg). Returns the local's symbol, or null.
+    //
+    // fix #7209 (§28.11 *Borrowing collections* → *Storing a borrow*,
+    // clause 2; v0.343): the SAME recognizer now also serves the §28.11
+    // COLLECTION-store sink (`checkCollectionBorrowStoreEscape`), where the
+    // same shape escaped the same way — the element store of a
+    // collection-literal local into a longer-lived collection was accepted,
+    // and the `using var` spelling then read freed memory (ASan
+    // heap-use-after-free) while the plain-`var` spelling leaked. The
+    // recognizer is deliberately SHARED so the two sinks cannot drift: the
+    // field store and the collection store decide the same question ("is
+    // this a bare read of a local whose backing is reclaimed at its own
+    // scope end?") and must answer it identically. Its name keeps the
+    // #3706 origin for the history; the .cpp carries the current contract.
+    // per §28.3, §28.9, §28.11
     sema::LocalSymbol* borrowingArrayLiteralLocalFieldStoreSource(
         const ast::Expr& e) const;
 
