@@ -10016,6 +10016,36 @@ void Emitter::fitUserOperatorArgs(
     }
 }
 
+// §6.2 (v0.344) mixed int/floating operator + §5.1 (v0.344) implicit
+// conversions: promote an operand to the floating type of the operation.
+//
+// §5.1 converts VALUES, not bit patterns, so the instruction depends on the
+// SIGNEDNESS of the operand's own declared type:
+//
+//   - an UNSIGNED source (`byte`/`ushort`/`uint`/`ulong`, and an enum with an
+//     unsigned underlying) converts with `uitofp`, which zero-extends;
+//   - a SIGNED source converts with `sitofp`, which sign-extends.
+//
+// Reading the bit pattern of a `uint` 4000000000 (0xEE6B2800) as SIGNED
+// yields the `int32` -294967296, so `1.5 + 4000000000u` computed
+// -294967294.5 instead of 4000000001.5.
+//
+// The signedness is decided by the CALLER, which knows the operand's source
+// expression; the ONE predicate for that question is `isUnsignedTargetExpr`
+// (the same one the `double`-parameter converter of #7242 uses), so the two
+// cannot disagree about it.
+//
+// A floating operand that is NARROWER than the operation's floating type is
+// widened with `fpext` (a `float` mixed with a `double` widens the `float`).
+static llvm::Value* promoteOperandToFP(llvm::IRBuilder<>& b, llvm::Value* v,
+                                        llvm::Type* fty, bool unsignedSrc) {
+    if (!v->getType()->isFloatingPointTy())
+        return unsignedSrc ? b.CreateUIToFP(v, fty) : b.CreateSIToFP(v, fty);
+    if (v->getType() != fty)
+        return b.CreateFPExt(v, fty);
+    return v;
+}
+
 llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     if (!bin.left || !bin.right) return nullptr;
     // CG: short-circuit `and`/`or` (§17) — the right operand is
@@ -11100,15 +11130,31 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                        ? l->getType()
                        : r->getType())
                 : (lFP ? l->getType() : r->getType());
-        auto toFP = [&](llvm::Value* v) -> llvm::Value* {
-            if (!v->getType()->isFloatingPointTy())
-                return builder_.CreateSIToFP(v, fty);  // §6.2 int promote
-            if (v->getType() != fty)
-                return builder_.CreateFPExt(v, fty);   // float → double
-            return v;
-        };
-        l = toFP(l);
-        r = toFP(r);
+        // fix #7250 (§6.2, §5.1, v0.344): the INTEGER operand of a mixed
+        // int/floating operator is promoted to the floating type, and §5.1
+        // converts VALUES, not bit patterns. The promotion therefore reads
+        // the operand's own signedness: an UNSIGNED source (`byte`,
+        // `ushort`, `uint`, `ulong`) converts with `uitofp` (a zero-
+        // extension), a SIGNED one with `sitofp` (a sign-extension).
+        //
+        // `sitofp` on the `uint` 4000000000 (bit pattern 0xEE6B2800) read
+        // it as the `int32` -294967296, so `1.5 + 4000000000u` computed
+        // -294967294.5 instead of 4000000001.5 — the same class of defect
+        // #7242 fixed for a `double` PARAMETER of a call, in a different
+        // mechanism (a binary operator, not a call).
+        //
+        // The signedness is asked through the ONE predicate
+        // `isUnsignedTargetExpr` — the same one the `double`-parameter
+        // converter of #7242 uses — so the two converters cannot disagree
+        // about it. `l` is the lowering of `bin.left` and `r` the lowering
+        // of `bin.right` (nothing between the operand lowering and here
+        // reorders them: the `this`-receiver load and the narrowed-nullable
+        // unwrap each keep their side), so each side's signedness is that
+        // of its own source expression.
+        const bool lUns = bin.left && isUnsignedTargetExpr(*bin.left);
+        const bool rUns = bin.right && isUnsignedTargetExpr(*bin.right);
+        l = promoteOperandToFP(builder_, l, fty, lUns);
+        r = promoteOperandToFP(builder_, r, fty, rUns);
         if (op == "+") return builder_.CreateFAdd(l, r);
         if (op == "-") return builder_.CreateFSub(l, r);
         if (op == "*") return builder_.CreateFMul(l, r);
@@ -11406,16 +11452,8 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     (plainSide == l) ? bin.left.get() : bin.right.get();
                 bool payUns   = structExpr && isUnsignedTargetExpr(*structExpr);
                 bool plainUns = plainExpr && isUnsignedTargetExpr(*plainExpr);
-                auto toFP = [&](llvm::Value* v, bool uns) -> llvm::Value* {
-                    if (!v->getType()->isFloatingPointTy())
-                        return uns ? builder_.CreateUIToFP(v, fty)
-                                   : builder_.CreateSIToFP(v, fty);
-                    if (v->getType() != fty)
-                        return builder_.CreateFPExt(v, fty);
-                    return v;
-                };
-                eqPayload = toFP(eqPayload, payUns);
-                plainSide = toFP(plainSide, plainUns);
+                eqPayload = promoteOperandToFP(builder_, eqPayload, fty, payUns);
+                plainSide = promoteOperandToFP(builder_, plainSide, fty, plainUns);
             }
             if (structSide && plainSide && nvTy && eqPayload &&
                 plainSide->getType() == eqPayload->getType()) {
@@ -11702,16 +11740,8 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                ? lPay->getType()
                                : rPay->getType())
                         : (lFP ? lPay->getType() : rPay->getType());
-                auto toFP = [&](llvm::Value* v, bool u) -> llvm::Value* {
-                    if (!v->getType()->isFloatingPointTy())
-                        return u ? builder_.CreateUIToFP(v, fty)
-                                 : builder_.CreateSIToFP(v, fty);
-                    if (v->getType() != fty)
-                        return builder_.CreateFPExt(v, fty);
-                    return v;
-                };
-                lPay = toFP(lPay, lUns);
-                rPay = toFP(rPay, rUns);
+                lPay = promoteOperandToFP(builder_, lPay, fty, lUns);
+                rPay = promoteOperandToFP(builder_, rPay, fty, rUns);
             } else if (lPay->getType()->isIntegerTy() &&
                        rPay->getType()->isIntegerTy() &&
                        lPay->getType() != rPay->getType()) {
