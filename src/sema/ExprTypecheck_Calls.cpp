@@ -21767,13 +21767,66 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     // matching overload" diagnostic still fires first, and this step has no
     // applicable candidate to rank.
     //
-    // WHY THE `Convert` CLASS. §2.3 states the rule for `Convert`'s
-    // `ToString` overload set; §2.2 states no such rule for `Math` (the
-    // only stdlib section that states one is §2.3), and `Math.Abs` has its
-    // own dedicated §22.6 ambiguity check (#6955) that would double-report
-    // here. The `Math` family's uncovered shapes are enumerated for the
-    // coordinator instead of being changed under this issue.
-    if (head == "Convert" && forms.size() > 1) {
+    // fix #7289 (stdlib §2.2, v0.344; §22.6, v0.344): THE SAME STEP NOW
+    // REACHES THE `Math` CLASS.
+    //
+    // WHY IT REACHES `Math` — THE HOUSE REASONING RE-EXAMINED. #7266 scoped
+    // its step to the `Convert` class because "§2.3 is the only section that
+    // states the ambiguity rule". That reason is a statement about where the
+    // rule is SPELLED OUT, not about where it APPLIES: §22.6's ranking step is
+    // general ("two candidates that both require an implicit conversion at the
+    // same position are equally ranked there", and "If no candidate is
+    // unambiguously better ... the call is ambiguous and is a compile error"),
+    // and stdlib §2.2 declares the very same SHAPE for three more members:
+    // `Floor(x: double): double` beside `Floor(x: decimal): decimal`, and the
+    // same pair for `Ceiling` and `Truncate`.
+    //
+    // THE DECISIVE ANCHOR IS THE RECORD OF THE RULE'S OWN LANDING. The
+    // decimal forms were added at v0.228 ("Math decimal symmetry", stdlib
+    // §2.2), and that revision's migration note in `docs/Bezel_Changelog.md`
+    // states the consequence in terms: "Newly rejected: a `Math.Floor`/
+    // `Ceiling`/`Truncate` call whose argument is an integer type or `char` —
+    // previously legal via the sole `double` overload's implicit conversion,
+    // now ambiguous under §22.6's equal-ranking rule (the `double` and
+    // `decimal` candidates tie); the remedy is an explicit conversion
+    // (`Math.Floor(double(n))`) — or reconsidering the call, since floor/
+    // ceiling of an already-integral value is a no-op (`Abs`/`Sign` are
+    // unaffected: their `int` overloads give exact matches)". => THE CLASS IS
+    // "AN INTEGER TYPE OR `char`" — `int` AND `long` INCLUDED, NOT ONLY THE
+    // NARROW TYPES: `Abs` is unaffected because it DECLARES an `int` overload
+    // (an exact match), and `Floor`/`Ceiling`/`Truncate` declare none, so
+    // every integer argument converts to BOTH `double` and `decimal` and
+    // matches NEITHER exactly.
+    //
+    // THE DECLARATIONS ARE NOT THE PROBLEM. The `double`/`decimal` pair is
+    // deliberate (stdlib §2.2, v0.228) and its consequence was accepted and
+    // recorded then; the compiler simply stopped ENFORCING it when `Math`
+    // became a built-in surface with no `MethodSymbol` to resolve against.
+    // So the remedy is this step, not a change to the normative document.
+    //
+    // `Math.Abs` IS NOT DOUBLE-REPORTED. Its four declared forms make the
+    // same tie for the same narrow types, but #6955's dedicated §22.6 check
+    // owns that member and RETURNS from `typeCall` before this probe runs, so
+    // the two never meet; and for the argument types the dedicated check does
+    // NOT refuse (`int`, `long`, `double`, `decimal` are exact matches, and
+    // `float` reaches only the `double` form) there is no tie here either.
+    // MEASURED, both arms: `Math.Abs` produces exactly ONE diagnostic.
+    //
+    // THE EXPLICIT TYPE-ARGUMENT LIST STANDS THE STEP DOWN (for the `Math`
+    // class). §14.5's all-or-nothing rule owns a call that carries one — no
+    // member of §2.2's `Math` declares a type parameter except the generic
+    // `Min`/`Max`/`Clamp`/`Sign`, which are not in this surface — and it
+    // REPORTS ("`Math.Floor` is given 1 explicit type argument(s), but it
+    // declares no type parameters"). Without this stand-down the same call
+    // would carry that diagnostic AND this one. MEASURED on the fix arm:
+    // `Math.Floor<int>(b)` reported TWO diagnostics before the stand-down and
+    // ONE after.
+    if (head == "Math") {
+        if (auto* macc =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            if (!macc->typeArgs.empty()) return;
+    }
+    if ((head == "Convert" || head == "Math") && forms.size() > 1) {
         // The §22.6 grid: one entry per (declared form, argument position).
         enum class Grade { Exact, Convert, NotApplicable };
         const std::size_t arity = forms.front()->arity;
@@ -21902,17 +21955,35 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
                         n += ")";
                         candNames.push_back(n);
                     }
+                    // The remedy note names the section that states the rule
+                    // for THIS class's declared forms — §2.3 for `Convert`,
+                    // §2.2 for `Math` — and the remedy that section's own
+                    // record gives (the v0.228 migration note for `Math`:
+                    // "the remedy is an explicit conversion
+                    // (`Math.Floor(double(n))`) — or reconsidering the call,
+                    // since floor/ceiling of an already-integral value is a
+                    // no-op").
+                    const std::string extraNote =
+                        head == "Math"
+                            ? "\nstdlib §2.2: an argument that converts to two "
+                              "or more of these parameter types and matches "
+                              "none exactly is ambiguous and a compile error "
+                              "(§22.6) — the remedy is an explicit conversion "
+                              "to one parameter type (`Math." +
+                                  std::string(member) + "(double(n))`) — or "
+                                  "reconsidering the call: the rounding of an "
+                                  "already-integral value is a no-op"
+                            : "\nstdlib §2.3: an argument that converts to two "
+                              "or more of these parameter types and matches "
+                              "none exactly is ambiguous and a compile error "
+                              "(§22.6) — the remedy is an explicit cast to one "
+                              "parameter type, or the value's own `ToString()`";
                     ctx_.diagnostics().report(
                         Severity::Error, arg.value->span.begin,
                         overloadAmbiguityMessage(
                             "`" + std::string(head) + "." + std::string(member) +
                                 "`",
-                            candNames, appl, fillsDefault,
-                            "\nstdlib §2.3: an argument that converts to two or "
-                            "more of these parameter types and matches none "
-                            "exactly is ambiguous and a compile error "
-                            "(§22.6) — the remedy is an explicit cast to one "
-                            "parameter type, or the value's own `ToString()`"));
+                            candNames, appl, fillsDefault, extraNote));
                 }
             }
         }

@@ -58,6 +58,19 @@
 // green on both arms — a signed operand must still convert exactly as it
 // did before.
 //
+// #7289 (stdlib §2.2, v0.344; §22.6, v0.344) — A LATER RULE CHANGED THE
+// SPELLING OF THE `Floor`/`Ceiling`/`Truncate` CALLS IN THIS FILE, NOT THEIR
+// EXPECTED VALUES. `Floor`/`Ceiling`/`Truncate` each declare a `double` form
+// AND a `decimal` form, so an INTEGER argument converts to both and matches
+// neither exactly: §22.6's equal-ranking rule makes the call ambiguous, and
+// the v0.228 changelog entry records exactly that ("Newly rejected: a
+// `Math.Floor`/`Ceiling`/`Truncate` call whose argument is an integer type
+// or `char` ... the remedy is an explicit conversion (`Math.Floor(double(n))`)").
+// The four affected rows below therefore spell those calls with the explicit
+// conversion, and their EXPECTED VALUES ARE UNCHANGED — the same numbers are
+// produced. `Round`, `Sqrt`, `Pow`, `Fmod` and `IEEERemainder` declare a
+// SINGLE parameter type, so they keep the implicit spelling.
+//
 // THE PROOF HIERARCHY.
 //
 // Every accepting row below FAILS pre-fix: the program either printed a
@@ -192,15 +205,24 @@ BEZEL_TEST(math_uint_double_7242, math_pow_int_long_uint_ulong_matrix_5_1) {
 // The matrix at `Floor` — the rounding family (`Floor`/`Ceiling`/`Round`/
 // `Truncate`, stdlib §2.2's `double` forms). The unsigned rows must report
 // the number itself; the signed rows must be unchanged.
+//
+// #7289 (stdlib §2.2, v0.344; §22.6, v0.344): `Floor` declares a `double`
+// form AND a `decimal` form, so an INTEGER argument converts to both and
+// matches neither exactly — the §22.6 ambiguity rule, which the v0.228
+// changelog entry records as "Newly rejected: a `Math.Floor`/`Ceiling`/
+// `Truncate` call whose argument is an integer type or `char`". The
+// argument is therefore spelled with the EXPLICIT CONVERSION that record
+// names as the remedy ("`Math.Floor(double(n))`"), which is the same value
+// the implicit call produced: the EXPECTED VALUES below are unchanged.
 BEZEL_TEST(math_uint_double_7242, math_floor_int_long_uint_ulong_matrix_5_1) {
     expectValue("    var i: int := 16; "
                 "    var l: long := 16L; "
                 "    var u: uint := 4000000000u; "
                 "    var ul: ulong := 4000000000UL; "
-                "    Console.WriteLine(Math.Floor(i)); "
-                "    Console.WriteLine(Math.Floor(l)); "
-                "    Console.WriteLine(Math.Floor(u)); "
-                "    Console.WriteLine(Math.Floor(ul));",
+                "    Console.WriteLine(Math.Floor(double(i))); "
+                "    Console.WriteLine(Math.Floor(double(l))); "
+                "    Console.WriteLine(Math.Floor(double(u))); "
+                "    Console.WriteLine(Math.Floor(double(ul)));",
                 "16\n16\n4e+09\n4e+09");
 }
 
@@ -223,10 +245,19 @@ BEZEL_TEST(math_uint_double_7242, math_fmod_int_long_uint_ulong_matrix_5_1) {
 // ===========================================================================
 
 // The rounding family at a `uint` argument (stdlib §2.2's `double` forms).
+//
+// #7289 (stdlib §2.2, v0.344; §22.6, v0.344): `Floor`/`Ceiling`/`Truncate`
+// each declare a `double` form AND a `decimal` form, so an integer argument
+// ties them (§22.6's equal-ranking rule) and is refused as ambiguous — the
+// v0.228 changelog entry's class: "an integer type or `char`". The three
+// affected calls are spelled with the EXPLICIT CONVERSION that record names
+// as the remedy; the EXPECTED VALUES below are unchanged. `Round` declares a
+// SINGLE form (stdlib §2.2: "Round(decimal) is the instance Decimal.Round"),
+// so it is NOT in the class and its two calls keep the implicit spelling.
 BEZEL_TEST(math_uint_double_7242, math_rounding_family_uint_widens_5_1) {
-    expectValue("    Console.WriteLine(Math.Floor(4000000000u)); "
-                "    Console.WriteLine(Math.Ceiling(4000000000u)); "
-                "    Console.WriteLine(Math.Truncate(4000000000u)); "
+    expectValue("    Console.WriteLine(Math.Floor(double(4000000000u))); "
+                "    Console.WriteLine(Math.Ceiling(double(4000000000u))); "
+                "    Console.WriteLine(Math.Truncate(double(4000000000u))); "
                 "    Console.WriteLine(Math.Round(4000000000u)); "
                 "    Console.WriteLine(Math.Round(4000000000u, 2));",
                 "4e+09\n4e+09\n4e+09\n4e+09\n4e+09");
@@ -241,12 +272,17 @@ BEZEL_TEST(math_uint_double_7242, math_ieeeremainder_uint_widens_5_1) {
 // §5.1's table admits `byte` and `ushort` at `double` too. A `byte` 200
 // (0xC8) sign-extends to -56, and a `ushort` 60000 (0xEA60) to -5536, so
 // the pre-fix `sitofp` produced sqrt of a NEGATIVE number for both.
+//
+// #7289 (stdlib §2.2, v0.344; §22.6, v0.344): the `Floor` call is spelled
+// with the EXPLICIT CONVERSION the v0.228 changelog entry names as the
+// remedy for the `double`/`decimal` tie; the EXPECTED VALUE below is
+// unchanged.
 BEZEL_TEST(math_uint_double_7242, math_byte_and_ushort_widen_5_1) {
     expectValue("    var b: byte := 200; "
                 "    var us: ushort := 60000; "
                 "    Console.WriteLine(Math.Sqrt(b)); "
                 "    Console.WriteLine(Math.Sqrt(us)); "
-                "    Console.WriteLine(Math.Floor(b));",
+                "    Console.WriteLine(Math.Floor(double(b)));",
                 "14.142135623730951\n244.94897427831782\n200");
 }
 
@@ -264,9 +300,14 @@ BEZEL_TEST(math_uint_double_7242, math_uint_variable_operand_widens_5_1) {
 // `sitofp` read it as -1.0 — the square root was of a NEGATIVE number and
 // the power was of -1.
 BEZEL_TEST(math_uint_double_7242, math_ulong_beyond_int64_widens_5_1) {
+    // #7289 (stdlib §2.2, v0.344; §22.6, v0.344): the `Floor` call is
+    // spelled with the EXPLICIT CONVERSION the v0.228 changelog entry names
+    // as the remedy for the `double`/`decimal` tie; the EXPECTED VALUE below
+    // is unchanged — the `ulong` still reaches the `double` with its VALUE
+    // intact, which is what this row is about.
     expectValue("    var big: ulong := 18446744073709551615UL; "
                 "    Console.WriteLine(Math.Sqrt(big)); "
-                "    Console.WriteLine(Math.Floor(big)); "
+                "    Console.WriteLine(Math.Floor(double(big))); "
                 "    Console.WriteLine(Math.Pow(big, 2.0));",
                 "4294967296\n18446744073709552000\n3.402823669209385e+38");
 }
