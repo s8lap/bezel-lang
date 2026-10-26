@@ -765,9 +765,25 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         llvm::Value* by = lowerExpr(*call.args[1].value);
         if (!v || !by) return nullptr;
-        // `by` is declared `long` — normalize to i64 first.
+        // `by` is declared `long` — normalize to i64 first. §5.1 (v0.344)
+        // converts VALUES, not bit patterns: the `uint` 4000000000 is
+        // 4000000000, not the `int32` -294967296 its low 32 bits read as, so
+        // an UNSIGNED source must ZERO-extend (`zext`) and a signed one
+        // sign-extend (`sext`) — a negative `by` keeps its sign.
+        //
+        // The signedness is the SOURCE EXPRESSION's own, read with
+        // `isUnsignedTargetExpr` — the house predicate the #7242 `double`-
+        // parameter converter and the #7250 mixed-operator fix use, so the
+        // three cannot disagree. It is NOT inferred from the bit width:
+        // `int` and `uint` are both 32 bits, `long` and `ulong` both 64.
+        //
+        // fix #7253 (spec §5.1, stdlib §2.19, v0.344): the widening was an
+        // unconditional `CreateSExt`, so an unsigned `by` arrived as a
+        // negative number.
         if (by->getType()->isIntegerTy() && !by->getType()->isIntegerTy(64))
-            by = builder_.CreateSExt(by, i64(), "step.by64");
+            by = isUnsignedTargetExpr(*call.args[1].value)
+                     ? builder_.CreateZExt(by, i64(), "step.by64")
+                     : builder_.CreateSExt(by, i64(), "step.by64");
         if (pt == P::Decimal) {
             // decimal: promote `by` and add via the runtime (§6.4 semantics).
             llvm::StructType* dst = decimalStructType();
@@ -796,6 +812,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         if (v->getType()->isIntegerTy()) {
             // Integers and char: advance the value (code point) by `by`,
             // performed at the value's own width (wrapping, like `+`).
+            //
+            // NB (not the #7253 change): the "like `+`" is NOT what `+` does —
+            // `+` on an integer type is CHECKED (spec §6.1). What an advance
+            // that leaves T's range REPORTS is an OPEN question: spec §6.1
+            // raises for an integer arithmetic result that does not fit the
+            // result type, while spec §16.3 describes the same "advance in
+            // T's space" as stopping SILENTLY, raising nothing. A `Step` CALL
+            // must return a value, so §16.3's stop has no analogue here. The
+            // wrapping below is left exactly as it was — reporting it is a
+            // separate defect, with its own spec ruling, and this site only
+            // fixes the WIDENING of `by` (spec §5.1, stdlib §2.19).
             unsigned w = v->getType()->getIntegerBitWidth();
             llvm::Value* byW =
                 w < 64 ? builder_.CreateTrunc(by, v->getType(), "step.byw")
