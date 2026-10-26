@@ -19440,16 +19440,60 @@ llvm::Value* Emitter::wrapArgForNullableValueFormal(llvm::Value* arg,
     return arg;
 }
 
+// fix #7263 (§5.1 "Implicit conversions", v0.344): is `t` a CONCRETE NUMERIC
+// PRIMITIVE — the only formal shape whose declared type §5.1's widening table
+// can convert an integer argument INTO?
+//
+// §5.1's table admits an unsigned integer at `long`/`ulong`/`float`/
+// `double`/`decimal`, and the widening "converts the VALUE" ("A value of one
+// type implicitly converts to another when no programmer-visible information
+// is lost"), so a `uint` argument at a `long` parameter is a legal call whose
+// value must arrive intact.
+//
+// The set is deliberately NARROW:
+//   * a NULLABLE primitive is excluded — a nullable value type is the tagged
+//     `{i8 hasValue; T}` carrier (spec §7.2), and that carrier's own payload
+//     widening is `wrapArgForNullableValueFormal`'s job (the #5046 / #4963
+//     lift), not a parameter-width question;
+//   * `bool` is excluded (spec §5.1: "Between integers and `bool`" is never
+//     implicit, and `i1` is not a width any widening applies to);
+//   * `string` / `Object` are excluded (reference types, not numeric);
+//   * a TYPE PARAMETER is excluded here — the caller resolves it through the
+//     active substitution first and asks again with the CONCRETE type.
+//
+// The answer is a POLICY question ("may this formal's declared type be the
+// target of a §5.1 widening?"), kept apart from the MECHANISM (the unsigned-
+// aware `coerceNumericToType`), which only a member of `Emitter` can reach.
+static bool isNumericFormalPrimitive(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Primitive || t->nullable)
+        return false;
+    using P = sema::PrimitiveType;
+    switch (t->primitive) {
+        case P::Byte: case P::SByte: case P::Short: case P::UShort:
+        case P::Int: case P::UInt: case P::Long: case P::ULong:
+        case P::Float: case P::Double: case P::Decimal: case P::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
 llvm::Value* Emitter::emitGenericSpecialization(
         sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
         const CallableInfo& ci,
         const std::vector<const ast::Expr*>* argExprs) {
     // Build the function type with concrete arg/ret types. Each param type
-    // defaults to its argument's LLVM type, BUT when the declared parameter is a
-    // nullable VALUE type `T?` (a bare value-type generic param under the active
-    // substitution) and the argument arrived as the bare `T` (or a null ptr),
-    // the specialized body reads the param as the tagged `{i8, T}` struct — so
-    // the argument must be wrapped HERE and the param typed as that struct.
+    // defaults to its argument's LLVM type, EXCEPT where the argument was
+    // converted into the DECLARED parameter type above (fix #7263, §5.1,
+    // v0.344) — a numeric formal now receives its argument already widened to
+    // the declared width, with the declared VALUE (an unsigned source
+    // zero-extends), and the parameter is typed as that declared type.
+    //
+    // The other exception is the nullable VALUE type `T?` (a bare value-type
+    // generic param under the active substitution): when the argument arrived
+    // as the bare `T` (or a null ptr), the specialized body reads the param as
+    // the tagged `{i8, T}` struct — so the argument must be wrapped HERE and
+    // the param typed as that struct.
     // Without this, a bare-`int` argument bound to a `T?` parameter leaves the
     // param as `i32`, and `v!` / `v ?? …` in the body extract a field from a
     // non-struct → LLVM GEP assertion crash (#846) / IR-verify failure (#845).
@@ -19472,8 +19516,82 @@ llvm::Value* Emitter::emitGenericSpecialization(
                               isUnsignedTargetExpr(*(*argExprs)[i]);
                 args[i] = wrapArgForNullableValueFormal(args[i], formal,
                                                          argUns);
+                // fix #7263 (§5.1, v0.344): the argument must reach the
+                // specialized parameter AT THE DECLARED PARAMETER TYPE.
+                //
+                // Until now the parameter's LLVM type was taken from the
+                // ARGUMENT (the `paramTys.push_back(args[i]->getType())`
+                // below), so an argument NARROWER than its declared formal
+                // reached the body unconverted — as an `i32` at a `long`
+                // (`i64`) parameter. The body then read the parameter at the
+                // DECLARED type, i.e. it applied the DECLARED type's
+                // SIGNEDNESS to the narrower's bit pattern: a `uint`
+                // 4000000000 (0xEE6B2800) was sign-extended to the `int64`
+                // -294967296, and the VALUE was lost.
+                //
+                // §5.1's widening table admits `uint` at `long`/`ulong`/
+                // `float`/`double`/`decimal` (and `byte`/`ushort` at every
+                // wider integer), and §5.1 converts the VALUE, not the bit
+                // pattern, so the conversion belongs HERE — at the generic
+                // call site, where the argument's SOURCE expression (and so
+                // its signedness) is still known. It CANNOT be recovered
+                // later: inside the body the parameter's type IS the declared
+                // `long`, so the unsignedness is already gone by then.
+                //
+                // The signedness is read through the ONE house predicate,
+                // `isUnsignedTargetExpr` (src/codegen/LlvmBackend_impl.hpp) —
+                // the same one the #7253 `Step` widening, the #7251
+                // `double`-parameter converter and the #5046 nullable lift
+                // use, so no two sites can disagree about an operand's
+                // signedness. It is NOT inferred from the bit width: `int`
+                // and `uint` are both 32 bits, `long` and `ulong` both 64.
+                //
+                // The conversion is the ORDINARY (non-generic) call path's
+                // own: `coerceNumericToType` with the source's real
+                // signedness, which is exactly what the plain path applies
+                // to the same argument at the same declared formal — so a
+                // generic and a plain parameter of the same declared type now
+                // receive the same value.
+                {
+                    // The DECLARED type of this parameter, resolved through the
+                    // active substitution when it is a bare type parameter
+                    // (`v: T` at `T = long`). An UNBOUND type parameter has no
+                    // declared concrete type and is left alone (the erased
+                    // `i32` placeholder must not become a conversion target).
+                    const sema::TypeRef* eff = formal;
+                    if (eff && eff->kind == sema::TypeRef::Kind::Named &&
+                        !eff->declaration) {
+                        eff = resolveTypeParamRef(eff);
+                        if (eff == formal) eff = nullptr;
+                    }
+                    if (isNumericFormalPrimitive(eff) &&
+                        !isByRefMod(ps->modifier)) {
+                        llvm::Type* want = lowerTypeRef(eff);
+                        llvm::Type* have = args[i]->getType();
+                        // Only a NUMERIC argument is converted: a `ref`/`out`
+                        // parameter's argument is the CALLER'S ADDRESS (spec
+                        // §22.3), and §5.1's widening table says nothing about
+                        // addresses. `i1` (`bool`) is excluded — §5.1 makes
+                        // every integer/`bool` conversion explicit.
+                        if (want && have != want &&
+                            (have->isIntegerTy() || have->isFloatingPointTy()) &&
+                            !have->isIntegerTy(1)) {
+                            llvm::Value* conv =
+                                coerceNumericToType(args[i], want, argUns);
+                            // Only adopt the conversion when it really produced
+                            // the declared type — `coerceNumericToType`
+                            // returns the value UNCHANGED for a pair §5.1
+                            // does not admit, and the parameter must then keep
+                            // the argument's own type (the pre-#7263 shape).
+                            if (conv->getType() == want) args[i] = conv;
+                        }
+                    }
+                }
             }
         }
+        // fix #7263 (§5.1, v0.344): the parameter's type is now the DECLARED
+        // parameter type (the argument was converted into it above), not the
+        // argument's own width.
         paramTys.push_back(args[i]->getType());
     }
     llvm::Function* specFn = buildSpecializedMethodFn(ms, ci, paramTys);
@@ -21439,6 +21557,53 @@ llvm::Value* Emitter::emitInlineGenericMethod(
                           isUnsignedTargetExpr(*(*argExprs)[argIdx]);
             llvm::Value* argVal = wrapArgForNullableValueFormal(
                 args[argIdx], formal, argUns);
+            // fix #7263 (§5.1, v0.344): the EXPRESSION-bodied twin of the
+            // conversion emitGenericSpecialization applies to a block-bodied
+            // generic method's parameters. This arm binds the parameter into
+            // the CALLER's own stack slot, and the slot was typed by the
+            // ARGUMENT's LLVM type — so an argument narrower than its
+            // declared formal reached the body unconverted, and the body read
+            // it at the DECLARED type (applying the declared type's
+            // SIGNEDNESS to the narrower's bit pattern: a `uint` 4000000000
+            // became the `int64` -294967296). With a `double` formal the slot
+            // stayed an `i32` and the body's own result was an `i32` where the
+            // declared `double` was required — an IR-verify failure ("Call
+            // parameter type does not match function signature!").
+            //
+            // §5.1 admits the conversion (the `uint`→`long`/`double` rows) and
+            // §5.1 converts the VALUE, so the conversion belongs HERE — at the
+            // generic call site, where the argument's source expression (and so
+            // its signedness, read through the house predicate
+            // `isUnsignedTargetExpr`) is still known. The signedness is NOT
+            // inferred from the bit width: `int` and `uint` are both 32 bits,
+            // `long` and `ulong` both 64.
+            {
+                const sema::TypeRef* eff = formal;
+                if (eff && eff->kind == sema::TypeRef::Kind::Named &&
+                    !eff->declaration) {
+                    eff = resolveTypeParamRef(eff);
+                    if (eff == formal) eff = nullptr;
+                }
+                // Only the EXPRESSION body reads this slot: a block-bodied
+                // generic method is monomorphized into its own function
+                // (emitGenericSpecialization -> buildSpecializedMethodFn ->
+                // bindParameters), which binds the parameter THERE and
+                // converts the argument at that site's own declared type —
+                // so converting here as well would only leave a DEAD
+                // conversion in the caller.
+                if (ci.bodyKind == ast::MethodBodyKind::Expression &&
+                    ci.exprBody && isNumericFormalPrimitive(eff)) {
+                    llvm::Type* want = lowerTypeRef(eff);
+                    llvm::Type* have = argVal->getType();
+                    if (want && have != want &&
+                        (have->isIntegerTy() || have->isFloatingPointTy()) &&
+                        !have->isIntegerTy(1)) {
+                        llvm::Value* conv =
+                            coerceNumericToType(argVal, want, argUns);
+                        if (conv->getType() == want) argVal = conv;
+                    }
+                }
+            }
             auto* slot = entryAlloca(argVal->getType());
             builder_.CreateStore(argVal, slot);
             paramSlots_[ms->params[pi]] = slot;
