@@ -19636,7 +19636,48 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 Severity::Error, init->span.begin,
                 unconstructedBuiltinNewNote(builtinNewName,
                                             "initialize this local"));
-        } else if (init && !ctx_.diagnostics().hasErrors()) {
+        } else if (init && !ctx_.diagnostics().hasErrors() &&
+                   // fix #7257 (§14.1, §3.6 rule 2, v0.344): in the
+                   // UNSPECIALIZED generic TEMPLATE body the initializer is
+                   // written against the ABSTRACT type parameter, whose
+                   // member surface is not known here — `x[0]` on a bare `T`
+                   // has no indexer to lower to, `x.ToString()` on a bare `T`
+                   // has no method to dispatch to. The template body is not
+                   // an instantiation: §3.6 rule 2 evaluates every generic
+                   // requirement PER INSTANTIATION, at the instantiation
+                   // site (§14.1 *Instantiation and its site*), and the
+                   // instantiation is what the LIVE call binds — the
+                   // specialization (`buildSpecializedMethodFn`, which
+                   // CLEARS this flag) or the inlined instantiation with the
+                   // substitution bound. What the ABSTRACT body fails to
+                   // lower says nothing about any instantiation's result, so
+                   // #2434's diagnostic — whose stated purpose is to expose a
+                   // lowering failure that CAN MATTER — has nothing to expose
+                   // here. The established precedent is #6757's gate in
+                   // LlvmBackend_Exprs.cpp, which lowers the dead template's
+                   // value SILENTLY on the same flag.
+                   //
+                   // THE ZERO-INITIALISED SLOT IS UNCHANGED: the store below
+                   // is outside this branch, so the template's local is still
+                   // deterministically zero-initialized. Only the REPORT is
+                   // suppressed, and only in the template body — every other
+                   // lowering failure (including the LIVE specialization's
+                   // own degrade, which is reported from the specialization
+                   // where the flag is clear) keeps #2434's warning.
+                   //
+                   // ⚠ THE ONE EXCEPTION, measured rather than assumed: an
+                   // IMPORTED generic method of a non-generic class is NOT
+                   // dead across a module boundary — the importer binds the
+                   // erased template itself (#6907), so the template body IS
+                   // the live code there. The flag cannot distinguish that
+                   // case (it is a fact about the IMPORTING module, not about
+                   // the body being emitted), so this suppression also silences
+                   // the template's warning in that one shape. The wrong
+                   // answer that shape can produce is a PRE-EXISTING defect
+                   // of the erased-template dispatch path (reported by the
+                   // more specific #2477), NOT of this site; `narrow #7257`
+                   // records it.
+                   !emittingGenericTemplateBody_) {
             ctx_.diagnostics().report(
                 Severity::Warning, init->span.begin,
                 "internal: lowerLocalDecl's initializer expression failed "
