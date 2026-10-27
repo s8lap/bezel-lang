@@ -21082,6 +21082,41 @@ const BuiltinStringSearchValueSlot* builtinStringSearchValueSlot(
     return nullptr;
 }
 
+// fix #7173 (spec §14.5 "Explicit lists are all-or-nothing", §27.6,
+// v0.345): an explicit type-argument list on a BUILT-IN member.
+//
+// THE DEFECT. §14.5: "An explicit type-argument list (`obj.Method<int>(args)`)
+// binds the declared type parameters in declaration order and must supply
+// exactly as many arguments as the method declares type parameters. A shorter
+// or a longer list is a compile error; there are no partial lists." A
+// built-in member has no MethodSymbol, so the compiler's own §14.5 check
+// (the one that reads `ms->genericParams.size()`) never ran for it, and the
+// list was simply IGNORED: `Debug.WriteLine<int>("x")`, `s.Split<int>(',')`
+// and `sb.Append<int>(5)` all compiled and ran.
+//
+// The message is the `Math` arm's own sentence (stdlib §2.2's `Math` head
+// reports the same shape — `Math.Abs<int>(x)`), so the two built-in heads
+// that reject an explicit list say the same thing.
+static std::string builtinExplicitTypeArgsMessage(std::string_view head,
+                                                  std::string_view member,
+                                                  std::size_t given) {
+    return "`" + std::string(head) + "." + std::string(member) +
+           "` is given " + std::to_string(given) +
+           " explicit type argument(s), but it declares no type parameters "
+           "— an explicit type-argument list must supply exactly as many "
+           "arguments as the method declares type parameters; there are no "
+           "partial lists (§14.5, §27.6, v0.345)";
+}
+
+// The number of explicit type arguments written on a call's callee.
+static std::size_t builtinCalleeTypeArgCount(const ast::Expr* callee) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        return ma->typeArgs.size();
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        return ncm->typeArgs.size();
+    return 0;
+}
+
 void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     auto [tgt, m] = builtinInstanceCallee(ce.callee.get());
     if (!tgt) return;
@@ -21089,6 +21124,16 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     if (!recvTy || recvTy->kind != TypeRef::Kind::Primitive ||
         recvTy->primitive != PrimitiveType::String)
         return;  // not a primitive `string` instance call (incl. `?.`)
+    // fix #7173 (§14.5, v0.345): an explicit type-argument list on a §9.6
+    // member — none of them declares a type parameter, so any list is a
+    // compile error (§14.5's all-or-nothing rule).
+    {
+        const std::size_t given = builtinCalleeTypeArgCount(ce.callee.get());
+        if (given)
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                builtinExplicitTypeArgsMessage("string", m, given));
+    }
     // `Equals` declares `other: string?` (§11.2 widening) — admissible; skip.
     if (m == "Equals") return;
     // Map (method, position, argPrimitiveKind) → the declared NON-nullable
@@ -21431,6 +21476,16 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
     for (const auto& row : surface)
         if (row.member == member) forms.push_back(&row);
     if (forms.empty()) return;
+    // fix #7173 (§14.5, v0.345): an explicit type-argument list on a §3.1
+    // member — none of them declares a type parameter, so any list is a
+    // compile error (§14.5's all-or-nothing rule).
+    {
+        const std::size_t given = builtinCalleeTypeArgCount(ce.callee.get());
+        if (given)
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                builtinExplicitTypeArgsMessage("StringBuilder", member, given));
+    }
     // §22.5 / §22.6: a call that matches NO declared form is a compile
     // error. The diagnostic names the arity §3.1 declares.
     const BuiltinStringBuilderSurfaceRow* form = nullptr;
@@ -22519,6 +22574,13 @@ static void checkBuiltinStringCallArity(SemaContext& ctx,
             isStatic = true;
             spec = findBuiltinStringArity(builtinStringStaticArities(), member);
             if (!spec) return;   // not a stdlib §9.6 static member at all
+            // fix #7173 (§14.5, v0.345): an explicit type-argument list on
+            // a §9.6 STATIC member — none of them declares a type parameter.
+            const std::size_t given = builtinCalleeTypeArgCount(ce.callee.get());
+            if (given)
+                ctx.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    builtinExplicitTypeArgsMessage("string", member, given));
         }
     }
     if (!spec) {
@@ -36765,6 +36827,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // §8.2 / issue #646: Debug static methods — all return unit.
             // Assert / WriteLine: leave untyped (void).
             // No return-type annotation needed.
+            //
+            // fix #7173 (spec §14.5 "Explicit lists are all-or-nothing",
+            // §27.6, v0.345): an explicit type-argument list on a §8.2
+            // member — neither `Assert` nor `WriteLine` declares a type
+            // parameter, so any list is a compile error. The head here is
+            // the BUILT-IN `Debug` class: this arm is inside the
+            // `!targetType->decl` block, so a user class that happens to
+            // share the name is not claimed here.
+            if (cls == "Debug" && !ma.typeArgs.empty())
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    builtinExplicitTypeArgsMessage("Debug", m, ma.typeArgs.size()));
 
             // §6.1 / §30.8: CancellationToken instance property reads.
             // Reached when tok was bound via `cts.Token` (builtinClassSym decl).
