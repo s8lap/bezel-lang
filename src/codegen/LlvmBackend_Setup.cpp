@@ -21990,6 +21990,86 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // method is not in methodFns_ yet, leave disposeAsyncFn null — emitDisposals
     // will use the sync fallback.
     if (ld->isAwaitUsing) {
+        // fix #7322 (§28.9 / §28.12, v0.344): CAN THIS BINDING'S SLOT HOLD A
+        // CLASS OBJECT AT ALL? The generic async-disposal arm below assumes it
+        // can: `d.asyncDispose = true` makes `emitDisposals` call
+        // `emitAsyncDisposeAwaitAndFree`, whose null-`disposeAsyncFn` fallback
+        // is `emitDisposeAndReclaim` -> `emitDynamicDispose` -> *load word 0,
+        // call vtable slot 2*. That fallback is only sound when word 0 IS a
+        // class vtable. For a VALUE-typed or RUNTIME-MANAGED right-hand side
+        // it is not, and the read is an out-of-bounds access:
+        //
+        //   await using var t := o.ToString();   word 0 of a bz.string is its
+        //                                          DATA pointer, so slot 2 is
+        //                                          read at data+16 — 14 bytes
+        //                                          past the end of the 2-byte
+        //                                          payload (ASan:
+        //                                          heap-buffer-overflow, READ
+        //                                          of size 8).
+        //   await using var x := 5;               the slot holds an i64; the
+        //                                          load reads past it (ASan:
+        //                                          stack-buffer-overflow).
+        //   await using var x := "hi";            slot 2 is a null pointer
+        //                                          (ASan: SEGV at 0x0).
+        //
+        // §28.12 (spec:7488) settles the shape: "`await using var` takes
+        // §28.10's admission unchanged — ... the value-type, runtime-managed
+        // and move-only right-hand sides ... Over an owned right-hand side
+        // with no `DisposeAsync` to await — a value-type, runtime-managed or
+        // move-only right-hand side, or an object whose class does not
+        // implement `IAsyncDisposable` — scope exit takes the synchronous
+        // disposal (or the no-op) and likewise awaits nothing." A value type
+        // and a runtime-managed value have NO CLASS, so their scope exit is
+        // the no-op; §28.12 (spec:7490) then reads "The `DisposeAsync` awaited
+        // is the run-time object's. `await using` selects the logical-disposal
+        // path by the class of the object the binding holds ... never by the
+        // binding's static type" — with no class there is no path to select.
+        //
+        // So the spelling must take §28.10's ARMS unchanged, which is what
+        // falling through to the plain chain below does (the #3449 precedent
+        // for the vtable-less builtin heads: "the SPELLING was deciding the
+        // disposal while the REPRESENTATION did not").
+        //
+        // WHY AN INTERFACE- OR `Object`-TYPED RIGHT-HAND SIDE IS NEVER
+        // MISCLASSIFIED AS VALUE-LIKE. Such a slot MAY hold a class instance
+        // (the static type only says what the holder promises), so it must
+        // keep the async path — and it does: the predicate below answers
+        // "may hold a class" for every class, interface, `Object`, type-
+        // parameter and declaration-less head, and "may NOT" only for the
+        // kinds §28.9 exhausts as carrying no obligation (the value types and
+        // the runtime-managed values). The predicate reads the slot's OWN
+        // REPRESENTATION (the effective type: the declared type when there is
+        // one, else the initializer's), which is what the disposal would read
+        // — not the runtime class of some object, which the compiler cannot
+        // know and §28.12 forbids it from using anyway.
+        auto awaitUsingSlotMayHoldClass = [&]() -> bool {
+            const sema::TypeRef* effTy = nullptr;
+            if (ld->type) effTy = ctx_.resolvedType(*ld->type);
+            if (!effTy && ld->initializer) effTy = ctx_.exprType(*ld->initializer);
+            // Unclassifiable: keep the pre-existing path (no new behaviour).
+            if (!effTy) return true;
+            if (effTy->kind == sema::TypeRef::Kind::Primitive) {
+                // `Object` is the ONE primitive that can hold a class
+                // instance (or a boxed value); every other primitive is a
+                // value type or a runtime-managed value (§28.9) — no class,
+                // no disposal obligation.
+                return effTy->primitive == sema::PrimitiveType::Object;
+            }
+            if (effTy->kind == sema::TypeRef::Kind::Named) {
+                // A declaration-less head (a type parameter, or a builtin
+                // class the #3449 gate did not claim) MAY be a class: keep
+                // the pre-existing path.
+                if (!effTy->declaration) return true;
+                // Class / interface: may hold a class instance.
+                if (effTy->declaration->kind == ast::TypeDeclKind::Class ||
+                    effTy->declaration->kind == ast::TypeDeclKind::Interface)
+                    return true;
+                // Record / enum / choice: a VALUE TYPE (§9 / §10 / §35.4) —
+                // no class, no disposal obligation.
+                return false;
+            }
+            return true;
+        };
         // fix #2739 (§30.5/§30.6, v0.240): an `await using var` bound to a
         // borrowing BUILTIN collection literal (`await using var xs: Array<int> :=
         // [k, k, k]`) MUST NOT route through the generic asyncDispose path below
@@ -22354,7 +22434,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // one side, a wild jump on the other. Filed separately by the
                 // #3449 review as its own shape; do not read the sentence above
                 // as covering it.
-            } else {
+            } else if (awaitUsingSlotMayHoldClass()) {
                 Disposal d{it->second, nullptr};
                 d.asyncDispose = true;
                 // Attempt to resolve the direct DisposeAsync function pointer.
@@ -22414,6 +22494,26 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // handles it).
                 disposeStack_.back().push_back(d);
                 return;
+            } else {
+                // fix #7322 (§28.9 / §28.12, v0.344): the right-hand side is
+                // VALUE-typed or RUNTIME-MANAGED — it has no class, so the
+                // scope exit is the NO-OP (§28.12:7488: "scope exit takes the
+                // synchronous disposal (or the no-op) and likewise awaits
+                // nothing"). Registering the async/class disposal here is
+                // what produced the out-of-bounds read (see
+                // `awaitUsingSlotMayHoldClass` above), so register NOTHING and
+                // FALL THROUGH to the plain chain below — the same arms the
+                // plain `using var` spelling reaches, which is what §28.12
+                // means by "takes §28.10's admission unchanged" (§28.10:7260:
+                // "the disposal at scope end is a no-op ... and the only effect
+                // is the reassignability restriction").
+                //
+                // The runtime-managed value's OWN reference is not affected by
+                // this: it is discharged by the string/closure machinery, which
+                // arms the scope-end release for the `using var` spelling and
+                // (with #7322) for this one too — §28.10's "the only effect
+                // is the reassignability restriction" means the two spellings
+                // have the SAME runtime lifetime.
             }
         }
     }
@@ -36652,9 +36752,11 @@ void Emitter::collectStringReleaseEligible(
             // different concern, not this defect. Same split #7269 made for
             // the closure arm.
             //
-            // `await using var` is EXCLUDED: the async disposal machinery
-            // (`registerUsingDisposal`'s `ld->isAwaitUsing` branch) owns that
-            // spelling, and this change does not reach into async.
+            // `await using var` was EXCLUDED here (as the async disposal
+            // machinery "owned" that spelling, #7306); fix #7322 admits it,
+            // because the async machinery no longer claims a value-typed or
+            // runtime-managed right-hand side at all — see
+            // `usingVarProducer` below.
             // A §21.1 `const` local is never a `using` binding (§21.1 - a
             // `const` binding never takes a disposal obligation; §28.10 -
             // `using var` is that spelling), so it is never `await using`
@@ -36673,8 +36775,34 @@ void Emitter::collectStringReleaseEligible(
                 // can never be a `using` binding.
                 v.isUsing ? dynamic_cast<const ast::LocalDecl*>(s) : nullptr;
             const bool usingVarProducer =
-                plusOneProducer && v.isUsing &&
-                !(usingLd && usingLd->isAwaitUsing);
+                plusOneProducer && v.isUsing;
+            // fix #7322 (§28.9 / §28.10 / §28.12, v0.344): the `await using
+            // var` spelling is ADMITTED to the producer arm beside the plain
+            // `using var` one. The exclusion this term used to carry rested on
+            // "the async disposal machinery owns that spelling" (#7306) — and
+            // with #7322 it no longer does: a value-typed or runtime-managed
+            // right-hand side has no class, so §28.12:7488 gives its scope exit
+            // the NO-OP ("scope exit takes the synchronous disposal (or the
+            // no-op) and likewise awaits nothing"). The async machinery's only
+            // remaining share of this spelling is the class-typed one, whose
+            // reference is not the runtime-managed value's.
+            //
+            // §28.10:7260 is the reason the admission is REQUIRED, not merely
+            // permitted: "`using var` accepts a value-type or runtime-managed
+            // right-hand side. For ordinary value types and runtime-managed
+            // types, the disposal at scope end is a no-op (these types do not
+            // require disposal per §28.9), and the only effect is the
+            // reassignability restriction." "No disposal obligation" is not a
+            // licence to skip releasing the runtime's OWN reference — the
+            // #7272 argument, verbatim — so the `await using` spelling must
+            // have the SAME runtime lifetime as the plain-`var` one, which
+            // owns the producer's +1 and releases it at scope end. Without
+            // this the `await using var t := o.ToString();` producer's +1
+            // leaked (the string itself, not just the reference).
+            //
+            // `usingLd` is still needed below: it distinguishes a §21.1
+            // `const` local from a `var` one, and it is the LOCALDECL-ONLY
+            // marker for the cast.
             // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a
             // VALUE-LIKE CHOICE local. The choice-payload constructor is not a
             // STRING producer, so `plusOneProducer` is false and
