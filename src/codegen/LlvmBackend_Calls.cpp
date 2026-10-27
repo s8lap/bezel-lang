@@ -16318,6 +16318,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             const ast::Expr* parseArg = call.args[0].value.get();
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7313 (stdlib §2.6, v0.344): `Guid` declares
+            // `Parse(s: string)` and NO `ReadOnlyStringSpan` overload, so an
+            // operand that is not a `string` is not a parseable operand. This
+            // arm had NO first-argument guard, so `Guid.Parse(16)` emitted
+            //   %guid.parse.ok = call i32 @bz_guid_parse(i32 16, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A class instance (a pointer, like
+            // a `string`) was read as TEXT out of the object's own bytes. A
+            // non-parseable operand is DROPPED — the shared guard.
+            // `spanOverloadDeclared` is false: §2.6 declares no span overload.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             llvm::AllocaInst* slot = makeGuidSlot();
             auto* fn = declareC("bz_guid_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "guid.parse.ok");
@@ -16363,6 +16376,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             const ast::Expr* parseArg = call.args[0].value.get();
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7313 (stdlib §2.6, v0.344): `Guid` declares
+            // `TryParse(s: string, out result: Guid)` and NO
+            // `ReadOnlyStringSpan` overload, so an operand that is not a
+            // `string` is not a parseable operand. This arm had NO
+            // first-argument guard, so `Guid.TryParse(16, out r)` emitted
+            //   %guid.tryp.ok = call i32 @bz_guid_try_parse(i32 16, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A non-parseable operand is
+            // DROPPED — the shared guard.
+            // `spanOverloadDeclared` is false: §2.6 declares no span overload.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
             std::vector<AccessorRefArg> outArgs;
@@ -16465,6 +16491,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7313 (stdlib §2.5, v0.344): `DateTime` declares
+            // `Parse(s: string)` and NO `ReadOnlyStringSpan` overload, so an
+            // operand that is not a `string` is not a parseable operand. This
+            // arm had NO first-argument guard, so `DateTime.Parse(16)` emitted
+            //   %dt.parse.ok = call i32 @bz_datetime_try_parse(i32 16, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A class instance (a pointer, like
+            // a `string`) was read as TEXT out of the object's own bytes. A
+            // non-parseable operand is DROPPED — the shared guard.
+            // `spanOverloadDeclared` is false: §2.5 declares no span overload.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             // Call bz_datetime_try_parse(str_p, &out_ticks) to validate+get ticks.
             auto* ticksSlot = entryAlloca(i64());
             auto* tryFn = declareC("bz_datetime_try_parse", i32(),
@@ -16481,6 +16520,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7313 (stdlib §2.5, v0.344): `DateTime` declares
+            // `TryParse(s: string, out result: DateTime)` and NO
+            // `ReadOnlyStringSpan` overload, so an operand that is not a
+            // `string` is not a parseable operand. This arm had NO
+            // first-argument guard, so `DateTime.TryParse(16, out r)` emitted
+            //   %dt.tryp.ok = call i32 @bz_datetime_try_parse(i32 16, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A non-parseable operand is
+            // DROPPED — the shared guard.
+            // `spanOverloadDeclared` is false: §2.5 declares no span overload.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
             std::vector<AccessorRefArg> outArgs;
@@ -17396,6 +17448,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7313 (stdlib §2.5, v0.344): `DateOnly` declares
+            // `Parse(s: string)` and NO `ReadOnlyStringSpan` overload, so an
+            // operand that is not a `string` is not a parseable operand. This
+            // arm had NO first-argument guard, so `DateOnly.Parse(16)` emitted
+            //   %do.parse.ok = call i32 @bz_datetime_try_parse(i32 16, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A class instance (a pointer, like
+            // a `string`) was read as TEXT out of the object's own bytes. A
+            // non-parseable operand is DROPPED — the shared guard.
+            // `spanOverloadDeclared` is false: §2.5 declares no span overload.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             // Parse date using bz_datetime_try_parse then divide by TICKS_PER_DAY.
             auto* ticksSlot = entryAlloca(i64());
             auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
@@ -17411,6 +17476,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "TryParse" && call.args.size() == 2 && call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7313 (stdlib §2.5, v0.344): `DateOnly` declares
+            // `TryParse(s: string, out result: DateOnly)` and NO
+            // `ReadOnlyStringSpan` overload, so an operand that is not a
+            // `string` is not a parseable operand. This arm had NO
+            // first-argument guard, so `DateOnly.TryParse(16, out r)` emitted
+            //   %do.tryp.ok = call i32 @bz_datetime_try_parse(i32 16, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A non-parseable operand is
+            // DROPPED — the shared guard.
+            // `spanOverloadDeclared` is false: §2.5 declares no span overload.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             auto* ticksSlot = entryAlloca(i64());
             auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot}, "do.tryp.ok");
@@ -17496,6 +17574,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7313 (stdlib §2.5, v0.344): `TimeOnly` declares
+            // `Parse(s: string)` and NO `ReadOnlyStringSpan` overload, so an
+            // operand that is not a `string` is not a parseable operand. This
+            // arm had NO first-argument guard, so `TimeOnly.Parse(16)` emitted
+            //   %to.parse.ok = call i32 @bz_timeonly_try_parse(i32 16, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A class instance (a pointer, like
+            // a `string`) was read as TEXT out of the object's own bytes. A
+            // non-parseable operand is DROPPED — the shared guard.
+            // `spanOverloadDeclared` is false: §2.5 declares no span overload.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             auto* msSlot = entryAlloca(i32());
             auto* tryFn = declareC("bz_timeonly_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, msSlot}, "to.parse.ok");
@@ -17508,6 +17599,19 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "TryParse" && call.args.size() == 2 && call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7313 (stdlib §2.5, v0.344): `TimeOnly` declares
+            // `TryParse(s: string, out result: TimeOnly)` and NO
+            // `ReadOnlyStringSpan` overload, so an operand that is not a
+            // `string` is not a parseable operand. This arm had NO
+            // first-argument guard, so `TimeOnly.TryParse(16, out r)` emitted
+            //   %to.tryp.ok = call i32 @bz_timeonly_try_parse(i32 16, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A non-parseable operand is
+            // DROPPED — the shared guard.
+            // `spanOverloadDeclared` is false: §2.5 declares no span overload.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             auto* msSlot = entryAlloca(i32());
             auto* tryFn = declareC("bz_timeonly_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, msSlot}, "to.tryp.ok");
