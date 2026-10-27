@@ -347,12 +347,34 @@ silent-acceptance inversions (`int_parse_int`, `int_parse_bool`, `int_parse_char
 * **RULE 1 — BYTE-DUPLICATE.** A cell is a byte-duplicate iff its whole program, normalised (comments
   and whitespace stripped), equals some corpus case's program the same way. **=> 0 cells.**
 * **RULE 2 — COVERED.** A cell is covered iff **the cell's OWN CALL EXPRESSION occurs VERBATIM in the
-  text of a corpus case file**. The cell's own call expression is the call under test, extracted
-  mechanically from the cell's own statements: a cell that declares a `subject` contributes the call
-  whose callee's last segment equals the subject's last segment; a cell that declares none contributes
-  the first call in its statements that is not the harness's `Console.WriteLine(...)` wrapper, not a
-  `new X(...)` constructor and not a readback of a local the cell itself binds; a method-reference cell
-  contributes the bound member name. **=> 9 cells are COVERED and 109 are NEW** (of 118):
+  text of a corpus case file**. **THE RULE IS PINNED HERE SO THAT ONE READING YIELDS ONE NUMBER SET —
+  THE ff3 REVIEW FOUND THAT THE EARLIER WORDING LEFT CHOICES OPEN ("does the receiver count? is the
+  `Console.WriteLine` wrapper stripped? is a call on a bound local the cell's own?"), AND A RULE THAT
+  YIELDS 12, 17, 22 OR 23 COVERED CELLS IS NOT A RULE.**
+
+  **THE EXTRACTION (mechanical):**
+  * A cell's **OWN STATEMENTS** are the grid's `pre` followed by its `body`, in that order.
+  * A **CALL EXPRESSION** is a callee — a `Name`, an `A.B`, or a parenthesised receiver followed by
+    `.Name` — with its argument list: the text running **from the start of the receiver** to the
+    matching `)`, with internal whitespace collapsed to one space. **A CALL NESTED INSIDE ANOTHER
+    CALL's ARGUMENT LIST IS A CALL EXPRESSION** (so `Console.WriteLine(int.Parse("16"))` yields both
+    `Console.WriteLine(int.Parse("16"))` and `int.Parse("16")`).
+  * A **CONSTRUCTOR** is a call expression whose callee is preceded by the `new` keyword.
+  * A **WRAPPER** is a call expression whose callee is `Console.WriteLine`.
+  * A **READBACK** is a call expression whose sole argument is exactly a local name bound by the
+    cell's own statements.
+  * If the cell **declares a `subject`**, its own call expression is the **first** call (in statement
+    order) whose callee's **last segment** equals the subject's last segment — **and if there is NO
+    such call, the subject's own dotted name** (a method-reference cell).
+  * Otherwise it is the **first** call (in statement order) that is not a constructor, not a wrapper
+    and not a readback.
+  * **THE COMPARISON IS A VERBATIM SUBSTRING TEST** on the **text of the corpus case file** — **no
+    normalisation, no receiver-normalisation, and no wrapper-stripping.**
+
+  **=> 9 cells are COVERED and 109 are NEW** (of 118 — the 109 include the 6 cells that have no
+  extractable call expression at all: `math_floor_narrowed`, `string_isascii_property`,
+  `string_isascii_width`, `sb_append_narrowed_int`, `object_holding_stringbuilder`,
+  `imported_user_class_stringbuilder_bare`):
 
   | cell | its own call expression | corpus cases |
   |---|---|---|
@@ -362,9 +384,20 @@ silent-acceptance inversions (`int_parse_int`, `int_parse_bool`, `int_parse_char
   | `double_tostring_format_c` | `(1.5).ToString("C")` | `l2_18_0017` |
   | `int_tostring_radix_narrowed` | `n.ToString(16)` | `l9_1_0013` |
   | `encoding_getstring_int_array` | `Encoding.UTF8.GetString(a)` | `s22_6_0102` |
-  | `encoding_getstring_byte_array` | `Encoding.UTF8.GetString(a)` | `s22_6_0102` (textually identical to the row above — the same expression, so the same hit) |
-  | `math_max_reference` | `Math.Max` | `l2_2_0011`, `l2_2_0014`, `s14_5_0017`–`0023`, `s22_5_0018`, `s27_6_0013`–`0020`, `s5_1_0132`/`0133` — **17 cases** |
+  | `sb_append_string` | `sb.Append("a")` | `l3_1_0001` |
+  | `math_max_reference` | `Math.Max` | `l2_2_0011`, `l2_2_0014`, `s14_5_0017`, `s14_5_0018`, `s14_5_0019`, `s14_5_0020`, `s14_5_0021`, `s14_5_0022`, `s14_5_0023`, `s22_5_0018`, `s27_6_0013`, `s27_6_0014`, `s27_6_0015`, `s27_6_0017`, `s27_6_0020`, `s5_1_0132`, `s5_1_0133` — **17 cases** |
   | `math_sign_reference` | `Math.Sign` | `l2_2_0004`, `l2_2_0010`, `l2_2_0012`, **`l2_2_0013`** |
+
+* **THE TABLE ABOVE IS MACHINE-DERIVED, AND IT IS THE PAIRED CORRECTION OF TWO ROWS THE EARLIER
+  VERSION GOT WRONG (2026-10-28, the ff3 review).** **=> `sb_append_string` **IS** COVERED: its own
+  call expression under the pinned rule is `sb.Append("a")`, and that text occurs **verbatim** in
+  `l3_1_0001` (`sb.Append("a").Append('b').Append(3);`). **=> `encoding_getstring_byte_array` is
+  **NOT** COVERED: under the same pinned rule its own call expression is `a.Add(65)` — the first call
+  in its statements that is not a constructor, a wrapper or a readback — and **no corpus case holds
+  `a.Add(65)` verbatim.** **=> THE COUNT IS UNCHANGED AT 9 COVERED / 109 NEW; TWO ROWS ARE
+  SWAPPED.** (THE EARLIER TABLE READ `encoding_getstring_byte_array`'s own expression AS
+  `Encoding.UTF8.GetString(a)` — WHICH IS THE **NEXT** CALL IN THAT CELL, NOT THE FIRST — AND SO
+  OVERLAPPED WITH THE ROW ABOVE IT.)
 
 * **THE OLD FIGURES ARE REPLACED, NOT ADDED TO.** The round-1 record's "3622 case files", "6 covered",
   "106 NEW" and "57 covered / 55 new" were three different file counts and two different rules; and
@@ -732,6 +765,29 @@ Six members are spec-questions and are **held out** of the lanes:
   `src/` and in `tests/`; §9.3 is the *decimal* section and says nothing about the out slot. This is a
   **§-citation class**, gate-enforceable by `scripts/check_src_citations.py`'s siblings, and it is the
   one member of the campaign that is a *documentation* defect.
+* **THE §2.18 PER-KIND SPECIFIER VOCABULARY (NO ISSUE NUMBER — THE TRACKER REFUSED THE
+  COORDINATOR's NEW-ISSUE CREATE THIS SESSION, SO IT IS RECORDED HERE AND ON #7334) — FILED BY THE
+  COORDINATOR, RULED "SPEC QUESTION, NEXT TRAIN" ON 2026-10-28.**
+  **THE QUESTION: DOES stdlib §2.18's PER-KIND TABLE MAKE `F`/`E`/`G`/`P` AN *UNRECOGNIZED
+  SPECIFIER* ON AN **INTEGER** RECEIVER?**
+  **THE TEXT (v0.345):** §2.18's table is per kind — *"Integers (`int`, `long`, `byte`, …) | `D`/`Dn`
+  decimal · `X`/`x` hex · `B` binary"* and *"Floating (`double`, `float`) | `F`/`Fn` · `E`/`En` ·
+  `G`/`Gn` · `P`/`Pn` · `R`"* — and the section says the table *"governs only the intrinsic types,
+  with the strict-fault rule applying **within each vocabulary**"* and *"An unrecognized specifier
+  raises `FormatException`"*.
+  **THE TWO READINGS: (a) STRICT — `F` IS NOT IN THE INTEGER VOCABULARY, SO `42.ToString("F2")`
+  RAISES `FormatException`; (b) LENIENT — THE SHARED ROUTINE ACCEPTS THE FLOATING SPECIFIERS ON AN
+  INTEGER OPERAND, SO IT RENDERS `"42.00"`.**
+  **WHY IT IS NOT A SMALL QUESTION: spec §18.5 SAYS A HOLE's FORMAT SPEC *"dispatches to
+  `ToString(format: string)`"*, SO UNDER THE STRICT READING `$"{i:F2}"` OVER AN INTEGER HOLE WOULD
+  ALSO RAISE — A LARGE, VISIBLE CHANGE ACROSS THE WHOLE SURFACE.**
+  **THE COORDINATOR'S RULING: **A SPEC QUESTION; IT GOES TO THE NEXT TRAIN; THE COMPILER DOES
+  **NOT** CHANGE ITS ANSWER IN THIS BATCH; NO CODE CHANGE.** THE COMPILER'S PIN MUST NOT READ AS A
+  NORMATIVE CLAIM, SO THE LANE'S ROW IS **AN AGREEMENT PIN** (its subject is that the two spellings
+  AGREE, which is #7311's invariant) **WITH A ONE-LINE COMMENT SAYING EXACTLY THAT, AND SAYING THE
+  CHOICE OF ANSWER IS AN OPEN SPEC QUESTION.** **=> THE QUESTION DOES **NOT** BLOCK #7334's FIX:
+  `F`/`E`/`G`/`P` **ARE** IN §2.18's FLOATING AND `decimal` ROWS. AND THE `decimal` ROW HAS **NO
+  `R`** AND HAS EXACT-ARITHMETIC (MIDPOINT) SEMANTICS, SO THE TWO PATHS MAY NOT BE THE SAME.**
 
 ## Siblings filed during the campaign
 
@@ -814,7 +870,7 @@ four files. **B1 — the ASan leg never read the sanitizer's verdict** (fixed: t
 model's `LEAK` and runtime-`CRASH` classes, a `value` cell requires `rc == 0` as well as the exact
 stdout, and the program runs under the house oracle's `ASAN_OPTIONS=detect_leaks=1:exitcode=99`; the
 skip counter was RIGHT and is kept). **B2 — the record contradicted itself on the live scope** (fixed:
-97, and the stale 98/92 is gone). **B3 — the corpus-dedup numbers were mutually contradictory and not
+90, and the stale 98/92 is gone). **B3 — the corpus-dedup numbers were mutually contradictory and not
 reproducible** (fixed: ONE rule, ONE number set, above). **B4 — the members table contradicted the
 grid's own measurements** (fixed: sixteen members re-derived, the live scope restated at 90, and the
 unmeasured backlog at 38). **A1 — the reject-cell count and the alternatives range were wrong** (fixed:
@@ -1192,6 +1248,67 @@ three tables it replaced — so they were fixed first, and each fix carries its 
 history (one run, before and after the flip: 2562 passed); the ASan leg of the whole corpus (the corpus
 was measured under the plain oracle, with the harness's ASan leg run over the seven filters); and the
 `src/codegen/**` and `src/runtime/**` behaviour (untouched).
+
+### Coordinator block — 2026-10-28 (the campaign's integrator steps)
+
+* **THE ANCHOR IS PICKED** (`2250daa52`) — *"fix #6825 #7284 #7290 #7293 #7294 #7295 #7299 #7300
+  #7323 narrow #6812 #7372: anchor the built-in call admission on ONE declared-signature table"* —
+  **NINE `fix` AND TWO `narrow`. THE LEDGER READS THE SUBJECT LINE ONLY, SO THE ANCHOR's PICK
+  CREDITS **NINE FIX ISSUES**; #6812 AND #7372 STAY OPEN (a `narrow` IS NOT A CLOSING KEYWORD).**
+  **THE PICK ORDER WAS FORCED: THE ENTRY CHAIN FIRST (it creates this record), THEN THE ANCHOR
+  (whose version of the record is the entry chain's version plus its own lane-record block) — THE
+  CONFLICT WAS RESOLVED MECHANICALLY, BY INSERTING THE ANCHOR's BLOCK LOCATED BY ITS OWN FIRST
+  LINE, NOT BY LINE NUMBERS.**
+* **THE ENTRY CHAIN IS PICKED** (`ce4ebc10`, `6c8f934f`, `c8728eb7`, `c5df4050`) — **kind `test`, no
+  closure.** ITS REVIEW (ff3) WAS **ACCEPT-W-NOTES**, AND ITS CROSS-CHECK **CONFIRMS THE ANCHOR's
+  PICK IS NOT HELD: on ff3's 118-cell grid the anchor moves **21 CELLS, EVERY ONE OF THEM
+  wrong -> OK, AND ZERO FROM OK**, in BOTH the plain and the ASan leg** (base class vector OK 69 / 22
+  ACCEPTED / 15 INTERNAL / 8 ABORT / 4 REJECTED = 49 wrong; anchor OK 90 / 14 / 3 / 7 / 4 = 28
+  wrong). **THE CAMPAIGN-2 DONE LINE IS **NOT** A GATE PHASE** — `scripts/gate.sh` is untouched by the
+  entry chain; the grid's wiring is the coordinator's adopted decision and is deferred to a separate
+  infra lane.**
+* **THE B3a LANE IS PICKED** (`68d5cbe3cc`, `b32b7add5a`, `b19567b1d9`) — **ONE closure, #7418.**
+  **THE REVIEW WAS "REJECT — NARROWLY, ON THE CLOSURE SCOPING ONLY": THE CODE IS SOUND (THE FOLD IS
+  REAL AND COMPLETE, THE EARLY RETURN INSIDE THE TYPE-CHECKING ARM **CANNOT** TURN A REJECTION INTO
+  AN ACCEPTANCE, NO PRE-EXISTING TEST ROW CHANGED VERDICT, THE LIT TRACK IS GREEN ON BOTH ARMS, AND
+  THE CORPUS DID NOT MOVE A ROW) — BUT `fix #7227 fix #7218` WERE FALSE CLOSURES, BECAUSE THE
+  `Math.Sign` CONSTRAINT IS **HALF**-ENFORCED: A **NON-PRIMITIVE CONFORMER** (A RECORD/CLASS
+  DECLARING `INumber<Self>`) STILL **ABORTS THE COMPILER**, AND THE **EXPLICIT-TYPE-ARGUMENT**
+  SPELLING (`Math.Sign<string>("x")` ABORTS; `Math.Sign<int>(true)` COMPILES AND PRINTS `-1`) BYPASSES
+  THE CHECK ENTIRELY. **THE TWO SUBJECTS ARE NOW `narrow #7227 narrow #7218`, WITH BOTH RESIDUAL
+  FAMILIES NAMED IN THE BODY.**
+* **THE ANCHOR's FOUR CORPUS ROWS ARE THE COORDINATOR's RE-BANK** (`s22_6_0112` `s22_6_0113`
+  `s22_6_0114` `l9_5_0004`) — **TOGETHER WITH `l9_6_0027` (the L5a lane's `string.Join` items
+  row), `l2_18_0012` / `l2_18_0017` / `l2_18_0027` (the L5b lane's three), `s28_12_0007` (campaign 1's
+  anchor row), AND THE TWO ADDED ROWS `s28_12_0020` / `s28_12_0021`. THE RE-BANK LANDS **LAST**, ON
+  THE FINAL TIP, EDITING `baseline.tsv` IN PLACE — **NEVER `runner.py --update` (IT RE-SORTS THE FILE
+  BY CASE-id WHILE THE FILE IS SECTION-ORDERED) AND NEVER `--classify` (IT WIPES ~66 PROSE NOTES).**
+* **THE INSTANCE LANES ARE RUNNING ON THE ANCHOR's TIP.** L5b (the FORMAT/RADIX RENDERING CONTRACT),
+  B4a (the `StringBuilder`/`string`/`Debug` HEADS — **it MUST REBASE ONTO THE ANCHOR **AND** B3a, AND
+  RE-DERIVE THE `constexpr std::array<BuiltinParamRow, N>` COUNT: THE COUNTS ARE NOT ADDITIVE**), and
+  L1 (the receiver's SYMBOL). **THE TABLE IN `src/common/BuiltinRegistry.cpp` IS SHARED BY B3a AND B4a
+  AT **ROW** LEVEL, SO THEY ARE PICKED ONE AT A TIME WITH THE SECOND REBASED ONTO THE FIRST.**
+* **THE COORDINATOR's OWN MEASUREMENTS THAT CHANGED A VERDICT:** the c2 anchor does **NOT** pre-empt
+  the L5b lane's #7336 (a runtime format on a bool/char receiver still COMPILES on the anchor's
+  `bezelc`, so the lane's RUNTIME `FormatException` is still reachable); the §28.9 VACUITY LINT's
+  REASON is wrong for an **INTERFACE**-typed source while a CLASS-typed source gets a different and
+  correct message (recorded on **#7241**); the `string`-SURFACE width family — **the LENGTH IS RIGHT
+  AND THE CONTENT IS WRONG, AND `s.Remove(0,1)` ON A WIDTH-2 STRING IS AN ASAN HEAP-BUFFER-OVERFLOW
+  **WRITE** (recorded on **#7244**; the fix site is `src/codegen/LlvmBackend_String.cpp`)**.
+* **THE TRACKER REFUSED EVERY NEW-ISSUE CREATE THIS SESSION, SO THE NEW DEFECTS LIVE AS COMMENTS
+  ON THEIR CLOSEST SIBLINGS** — the §2.18 specifier question on **#7334**, the §9.6 argument-type
+  family on **#7167** and **#6635**, the `string`-surface width family on **#7244**, the vacuity
+  lint's wording on **#7241**, the `Math.Sign` constraint bypass for a non-primitive conformer on
+  **#7227**, the `Math`/`Convert` nullable-box family on **#7297** / **#7232** / **#6647**, the
+  **RADIX-VALIDITY SIGSEGV** on **#7268** (`int.Parse("11", 37)` **SEGFAULTS** — radix 36 works, 37
+  crashes, because §9.1's radix alphabet is 36 symbols — and the `char` radix BINDS CORRECTLY per
+  §5.1's conversion table, so the crash is the **VALUE** defect, not a type question), the
+  **self-disposing iterator leak** on **#2623**, and the **`owned Task` FIELD HANG** on **#6194**.
+* **#7271 IS CLOSED AS NOT-A-DEFECT** (2026-10-28) — §5.1's CONSTANT NARROWING is **value-based, not
+  type-based**, so a `uint`-TYPED CONSTANT RADIX IS ADMISSIBLE AT AN `int` PARAMETER, AND THE
+  RENDERING IS CORRECT (`(255).ToString(16u)` PRINTS `"ff"`, NOT DECIMAL). **THE ISSUE's TITLE CLAIM
+  WAS FACTUALLY WRONG.** **#7285 KEEPS ONLY THE **NON-CONSTANT** `uint`/`ulong` TYPE-BINDING HALF AND
+  LOSES THE `char` SPELLING; #7268's CLASS IS WIDENED TO THE TWO PARSE SITES.**
 
 ## Exit review
 
