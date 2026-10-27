@@ -21635,6 +21635,7 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     // positional argument after a named one) keeps the POSITIONAL reading:
     // `checkBuiltinNamedArgs` reports the §22.5 violation, and the arguments
     // must still be type-checked here.
+    const bool bound = !paramToArg.empty();
     if (paramToArg.empty()) {
         for (std::size_t i = 0; i < ce.args.size(); ++i)
             paramToArg.push_back(static_cast<int>(i));
@@ -21766,6 +21767,42 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         if (!arg.modifier.empty()) continue;
         TypeRef* argTy = ctx_.exprType(*arg.value);
         if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+        // fix #6647 / #7232 (§7, §7.3, v0.343; §22.5, v0.343): the §7
+        // nullability gate (#6782) reads a POSITION by the argument's INDEX,
+        // so it SKIPS a NAMED argument wherever the compiler HONOURS the name
+        // — and `Math` and `Convert` are heads whose names the compiler
+        // honours (`isBuiltinNamedArgTableHead`). A nullable value written as
+        // a NAMED argument therefore reached codegen unchecked, and the
+        // compiler ABORTED with malformed IR:
+        //
+        //   var n: decimal? := x; Math.Abs(x := n)
+        //     -> "%abs.ismin = icmp eq { i8, %bz.decimal } %7, i5 0"
+        //        "bezelc: codegen error: IR verification failed"
+        //
+        // The BINDING is known here (§22.5 binds a named argument to the
+        // parameter it NAMES, and the binder ran above), so the named
+        // spelling is checked here — at the POSITION the name binds, which
+        // is the position the §7 gate could not read.
+        //
+        // The POSITIONAL spelling is NOT claimed here: the §7 gate already
+        // owns it (it runs earlier in `typeCall`, and it reads the same
+        // registry rows), so this check fires only for a NAMED argument and
+        // the two can never report the same argument twice.
+        if (bound && !arg.name.empty() &&
+            common::builtinParamIsNonNullable(head, member, ce.args.size(),
+                                               static_cast<int>(p))) {
+            // The gate reports only a NULLABLE argument (or the `null`
+            // literal); a named argument of a NON-nullable type is not its
+            // question, and the §5.1 probe below still is. So the call is
+            // ended here only when the gate actually SPOKE.
+            const std::size_t diagsBefore = ctx_.diagnostics().diagnostics().size();
+            reportBuiltinArgIfNullable(
+                arg.value.get(),
+                "argument to `" + std::string(head) + "." +
+                    std::string(member) + "`");
+            if (ctx_.diagnostics().diagnostics().size() > diagsBefore)
+                return;  // ONE diagnostic per call
+        }
         // §7: the nullability gate (#6782) owns a NULLABLE argument at a
         // non-nullable parameter — this check is about the argument's TYPE,
         // so a nullable argument is left to that gate (whose registry rows

@@ -175,6 +175,31 @@ BEZEL_TEST(math_convert_nullability_7232_7418,
     expectRefusedBySection7(r, "Math.Abs");
 }
 
+// The NAMED spelling. §22.5 binds a named argument to the parameter it
+// NAMES, and the §7 nullability gate reads a position by the argument's
+// INDEX — so it skips a named argument wherever the compiler honours the
+// name, and `Math` and `Convert` are heads whose names the compiler honours.
+// A nullable value written as a NAMED argument therefore reached codegen
+// unchecked, and the compiler ABORTED with malformed IR.
+//
+// The rows below are the ones the NAMED spelling reaches: the argument is
+// still `T?` at the call (it is not narrowed), so §7's gate owns it.
+BEZEL_TEST(math_convert_nullability_7232_7418,
+           convert_toint32_named_nullable_is_refused_7) {
+    auto r = runAot(prog(
+        "    var d: double? := null; "
+        "    Console.WriteLine(Convert.ToInt32(value := d));"));
+    expectRefusedBySection7(r, "Convert.ToInt32");
+}
+
+BEZEL_TEST(math_convert_nullability_7232_7418,
+           math_abs_named_nullable_is_refused_7) {
+    auto r = runAot(prog(
+        "    var d: double? := null; "
+        "    Console.WriteLine(Math.Abs(x := d));"));
+    expectRefusedBySection7(r, "Math.Abs");
+}
+
 // ===========================================================================
 // The `Convert` positions — the §7 gate already claimed them; they must keep
 // their own diagnostic and not acquire a second one.
@@ -219,6 +244,13 @@ BEZEL_TEST(math_convert_nullability_7232_7418,
            math_pow_double_arguments_still_work_2_2) {
     BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Math.Pow(2.0, 10.0));")),
                     "1024");
+}
+
+// The NAMED spelling of a CONFORMING argument is unaffected.
+BEZEL_TEST(math_convert_nullability_7232_7418,
+           math_abs_named_double_argument_still_works_2_2) {
+    BEZEL_EXPECT_EQ(runAotOut(prog("    Console.WriteLine(Math.Abs(x := -2.5));")),
+                    "2.5");
 }
 
 BEZEL_TEST(math_convert_nullability_7232_7418,
