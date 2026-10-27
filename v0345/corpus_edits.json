@@ -1,0 +1,47 @@
+[
+ {
+  "id": "comp/C2-7077-s11_6_0020-rule",
+  "action": "replace",
+  "path": "tests/conformance/rules/cases/s11_6_0020.bzl",
+  "old": "//! rule: A chain head that supplies the enclosing type's arguments (§2.7 rule 1, `Tree<int>.Node<int>\n//!   .Create()`) reaches that one type whatever the arguments, and §2.7 rule 1 continues the chain\n//!   \"against that type (nested type, enum constant, static member — each segment in turn)\"\n//!   (§11.6, §2.7, v0.340).\n",
+  "new": "//! rule: A chain head that supplies the enclosing type's arguments (§2.7 rule\n//!   1, `Tree<int>.Node<int>.Create()`) reaches that one type whatever the\n//!   arguments ... the rest of the chain resolves against that type's\n//!   members, declared or inherited (a nested type, an enum constant, a\n//!   static member — each segment in turn\n",
+  "banked": true,
+  "kind": "rule-corpus"
+ },
+ {
+  "id": "comp/C2-6903-s22_8_0009-rule",
+  "action": "replace",
+  "path": "tests/conformance/rules/cases/s22_8_0009.bzl",
+  "old": "//! rule: a `static readonly` field is assignable only in its own static field\n//!   initializer or in the declaring type's **static** constructor body,\n//!   spelled as the bare name or `TypeName.F` — an instance constructor of\n//!   the declaring type is not an assignment site for it, so no `new C()`\n//!   writes `C._s`.\n",
+  "new": "//! rule: a `static readonly` field is assignable only in its own static field\n//!   initializer or in the declaring type's **static** constructor body,\n//!   spelled as the bare name or `TypeName.F` ... and an instance constructor\n//!   of the declaring type is not an assignment site for it, so no `new C()`\n//!   writes `C._s`.\n",
+  "banked": true,
+  "kind": "rule-corpus"
+ },
+ {
+  "id": "comp/C1-0200-s28_2_0002-rule",
+  "action": "replace",
+  "path": "tests/conformance/rules/cases/s28_2_0002.bzl",
+  "old": "//! rule: `Dispose()` is not on `Object`; it is class-only. Records, enums, primitives,\n//!   and inline arrays do not implement `IDisposable`.\n",
+  "new": "//! rule: `Dispose()` is not on `Object`; it is class-only — a member of class\n//!   types and of the interfaces that are or extend `IDisposable` or declare\n//!   it (below), and of nothing else\n",
+  "banked": true,
+  "kind": "rule-corpus"
+ },
+ {
+  "id": "comp/F-8-s14_2_0032-rule",
+  "action": "replace",
+  "path": "tests/conformance/rules/cases/s14_2_0032.bzl",
+  "old": "//! rule: a substitution S for `T` satisfies `where T: U` exactly when S is\n//!   non-nullable and is a *subtype of* the substitution for `U` — identical\n//!   to it, a class derived from a class substitution (§12), or a type\n//!   conforming to an interface substitution ... — and by these three\n//!   relations only: no other implicit conversion of §5.1 satisfies the\n//!   bound, neither boxing to `Object`, numeric widening, nullable wrapping\n//!   nor a variance-induced conversion\n//!   ... At `U := Object` the bound admits `Object` and every class type, the\n//!   set a class bound names (`string`, interfaces and function types are\n//!   not classes, §8.1)\n",
+  "new": "//! rule: a substitution S for `T` satisfies `where T: U` exactly when S is\n//!   non-nullable and is a *subtype of* the substitution for `U` — identical\n//!   to it, a class derived from a class substitution (§12), or a type\n//!   conforming to an interface substitution ... — and by these three\n//!   relations only: no other implicit conversion of §5.1 satisfies the\n//!   bound, neither boxing to `Object`, numeric widening, nullable wrapping\n//!   nor a variance-induced conversion ... At `U := Object` the bound admits\n//!   `Object` and every class type, and nothing else: `string`, interfaces\n//!   and function types are not classes (§8.1)\n",
+  "banked": false,
+  "kind": "rule-corpus"
+ },
+ {
+  "id": "comp/F-8-s14_2_0035-rule",
+  "action": "replace",
+  "path": "tests/conformance/rules/cases/s14_2_0035.bzl",
+  "old": "//! rule: a substitution S for `T` satisfies `where T: U` exactly when S is\n//!   non-nullable and is a *subtype of* the substitution for `U` — identical\n//!   to it, a class derived from a class substitution (§12), or a type\n//!   conforming to an interface substitution ... — and by these three\n//!   relations only: no other implicit conversion of §5.1 satisfies the\n//!   bound, neither boxing to `Object`, numeric widening, nullable wrapping\n//!   nor a variance-induced conversion\n//!   ... At `U := Object` the bound admits `Object` and every class type, the\n//!   set a class bound names\n",
+  "new": "//! rule: a substitution S for `T` satisfies `where T: U` exactly when S is\n//!   non-nullable and is a *subtype of* the substitution for `U` — identical\n//!   to it, a class derived from a class substitution (§12), or a type\n//!   conforming to an interface substitution ... — and by these three\n//!   relations only: no other implicit conversion of §5.1 satisfies the\n//!   bound, neither boxing to `Object`, numeric widening, nullable wrapping\n//!   nor a variance-induced conversion ... At `U := Object` the bound admits\n//!   `Object` and every class type, and nothing else: `string`, interfaces\n//!   and function types are not classes (§8.1)\n",
+  "banked": false,
+  "kind": "rule-corpus"
+ }
+]
