@@ -21244,12 +21244,15 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
             const bool isNullLiteral =
                 argTy->nullable && argTy->primitive == PrimitiveType::Object &&
                 !isNarrowedNonNullRead(a.value.get());
-            // fix #6635 / #6636 (stdlib §9.6, §5.1, v0.345): an INTEGER
-            // search value reaches no declared overload.
-            const bool isInteger =
-                isIntegerPrimitiveTypeForOverload(argTy->primitive);
-            if (!isCharOrString && !(isNullLiteral && m != "IndexOf") &&
-                isInteger) {
+            // fix #6635 / #6636 / #6826 (stdlib §9.6, §5.1, v0.345): the
+            // argument's type must be one the DECLARED overload set names —
+            // a `char` or a `string` (or, for `Split`, an `Array<char>`).
+            //
+            // §5.1's reference conversions run the OTHER way: "any type to
+            // `Object`" is implicit, and `Object` to a `string` is a
+            // DOWNCAST, which is never implicit. So an `Object` argument
+            // reaches neither `char` nor `string` either.
+            if (!isCharOrString && !(isNullLiteral && m != "IndexOf")) {
                 ctx_.diagnostics().report(
                     Severity::Error, a.value->span.begin,
                     "`string." + std::string(m) + "` takes its " + slot->what +
