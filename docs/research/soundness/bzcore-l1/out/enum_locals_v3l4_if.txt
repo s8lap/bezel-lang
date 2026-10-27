@@ -1,0 +1,19 @@
+bounds: vars=3 len=4 features=locals --if   (1.4 s)
+baseline kernel:
+     67002  programs
+     44670  reject:K1.3-read-of-moved
+     12657  accept
+     12393  fault-never
+      6579  reject:state-match
+      2157  flag-read-at-release
+      1182  reject:K3-consume-of-non-owned
+      1068  reject:§28.6-dispose-of-borrow
+       780  accept-with-warning
+       780  §28.2-warned
+       378  reject:K5.2-frozen-overwrite
+       264  reject:K5.1-frozen-transfer
+       204  reject:K7.3-mixed-merge
+       132  fault-every
+       132  fault-some
+programs with a flag read of an already-disposed object at a release site, by site kind: {'explicit': 225, 'scope-end': 1698, 'overwrite': 300}
+T1/T2/T3 hold on every accepted program

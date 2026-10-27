@@ -1,0 +1,27 @@
+# Rule change: K5.3-b (borrow half only)
+rules: {'K5_3b_borrow': 'error'}
+bounds: vars=3 len=4 features=all   (12.2 s)
+
+## Newly accepted: 0
+## Newly rejected: 108
+    new a / brw b a / disp a / brw c b
+        runs: ok
+    new a / brw b a / disp a / fbrw c b
+        runs: FAULT
+    new a / brw b a / disp a / fmove c b
+        runs: FAULT
+    fault profile under the baseline: 60 fault on every execution, 0 on some execution, 48 never fault (pure over-rejection)
+    witness (every): new a / brw b a / disp a / fbrw c b
+    witness (never): new a / brw b a / disp a / brw c b
+    of the newly rejected, 0 carried a §28.2 warning at the baseline and 108 were silent
+## Newly unsound (accepted by the mutant, violating T1/T2/T3): 0
+## Newly warned (verdict unchanged): 0
+## Newly un-warned (verdict unchanged): 0
+## Trace changed (verdict unchanged): 0
+
+## Evaluation (paste-ready)
+Model: bzcore L1 (spec v0.345), bounds vars=3 len=4 features=all: 340036 programs, 71152 accepted at the baseline (3804 with a §28.2 warning), 0 violations.
+Under "K5.3-b (borrow half only)": 71044 accepted; 0 newly accepted (0 unsound), 108 newly rejected, 0 unsound among all accepted; 0 newly warned, 0 newly un-warned; trace changed in 0.
+Of the newly rejected programs, 60 fault on every execution, 0 on some execution and 48 never fault.
+Run-time residual: at the baseline 2142 accepted programs fault on every execution and 0 on some; under the change 2082 and 0 (checked-mode DisposedAccessException remains the backstop for these).
+Witness of a newly rejected program: new a / brw b a / disp a / brw c b (runs: ok)

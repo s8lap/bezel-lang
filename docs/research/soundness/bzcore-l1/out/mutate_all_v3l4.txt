@@ -1,0 +1,22 @@
+bounds: vars=3 len=4 features=all
+baseline: 340036 programs, 71152 accepted (3804 with warnings, 3804 §28.2-warned; fault profile every/some/never = 2142/0/69010), 0 violations  (5.9 s)
+
+| mutation | verdicts changed | newly accepted | of which unsound | newly rejected (every/some/never fault) | unsound among all accepted | warnings / trace only | witness |
+|---|---|---|---|---|---|---|---|
+| K5.1 deleted (transfers unfrozen) — the pre-v0.180 language | 90 | 90 | 54 | 0 (0/0/0) | 54 |  | new a / brw b a / send a / brw c b → RACE |
+| K5.2 deleted (drop-on-overwrite unfrozen) | 54 | 54 | 0 | 0 (0/0/0) | 0 |  | new a / brw b a / asg a / brw c b (runs: ok) (sound: the flag backstops it) |
+| K5.3-c: explicit Dispose() frozen under any live borrow | 108 | 0 | 0 | 108 (60/0/48) | 0 |  | newly rejected: new a / brw b a / disp a / brw c b (runs: ok) |
+| K5.3-a: dominated use of a killed borrow / same-variable use — warning only | 0 | 0 | 0 | 0 (0/0/0) | 0 | warned +108/−0 |  |
+| K5.3-b: dominated use of a killed borrow and same-variable dominated use — errors | 3597 | 0 | 0 | 3597 (2130/0/1467) | 0 |  | newly rejected: new a / disp a / brw b a (runs: ok) |
+| K5.3-b (borrow half only) | 108 | 0 | 0 | 108 (60/0/48) | 0 |  | newly rejected: new a / brw b a / disp a / brw c b (runs: ok) |
+| K5.3-b (same-variable half only) | 3489 | 0 | 0 | 3489 (2070/0/1419) | 0 |  | newly rejected: new a / disp a / brw b a (runs: ok) |
+| K7.3 weakened (owned ⊓ borrowed demotes to borrowed) | 0 | 0 | 0 | 0 (0/0/0) | 0 |  |  |
+| K7.4 weakened (owned ⊓ moved = owned) | 0 | 0 | 0 | 0 (0/0/0) | 0 |  |  |
+| K1.3 deleted (moved-from bindings readable) | 68211 | 68211 | 68211 | 0 (0/0/0) | 68211 |  | decl a / brw b a → STUCK |
+| K3.13 flipped (an unmarked read consumes) | 8220 | 3204 | 0 | 5016 (96/0/4920) | 0 | trace changed in 1158 | newly rejected: new a / brw b a / asgb b a (runs: ok) |
+| release sites of an explicitly-disposed binding run the disposer again (K3.9 post-state ignored) | 0 | 0 | 0 | 0 (0/0/0) | 0 | trace changed in 8412 | trace: new a / disp a (runs: ok) |
+| §28.2 use-after-dispose warning dropped | 0 | 0 | 0 | 0 (0/0/0) | 0 | warned +0/−3804 |  |
+| K8.4 deleted (a borrow of a temporary may escape its boundary) | 26853 | 26853 | 0 | 0 (0/0/0) | 0 |  | tbrw a (runs: ok) (sound: the flag backstops it) |
+| A5 deleted (a using var may be reassigned or moved out) | 26667 | 26667 | 0 | 0 (0/0/0) | 0 |  | using a / asg a (runs: ok) (sound: the flag backstops it) |
+| K3.15 deleted (no implicit disposal on the exception edge) | 0 | 0 | 4368 | 0 (0/0/0) | 4368 | trace changed in 4590 | new a / tthrow → T1-leak |
+| K9.5 flipped (the displaced value is disposed before the RHS is evaluated) | 0 | 0 | 0 | 0 (0/0/0) | 0 | trace changed in 17232 | trace: new a / asg a (runs: ok) |

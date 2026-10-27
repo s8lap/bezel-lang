@@ -1,0 +1,18 @@
+# Rule change: K5.3-a: dominated use of a killed borrow / same-variable use — warning only
+rules: {'K5_3b_borrow': 'warn'}
+bounds: vars=3 len=4 features=all   (11.4 s)
+
+## Newly accepted: 0
+## Newly rejected: 0
+## Newly unsound (accepted by the mutant, violating T1/T2/T3): 0
+## Newly warned (verdict unchanged): 108
+    new a / brw b a / disp a / brw c b
+    new a / brw b a / disp a / fbrw c b
+    new a / brw b a / disp a / fmove c b
+## Newly un-warned (verdict unchanged): 0
+## Trace changed (verdict unchanged): 0
+
+## Evaluation (paste-ready)
+Model: bzcore L1 (spec v0.345), bounds vars=3 len=4 features=all: 340036 programs, 71152 accepted at the baseline (3804 with a §28.2 warning), 0 violations.
+Under "K5.3-a: dominated use of a killed borrow / same-variable use — warning only": 71152 accepted; 0 newly accepted (0 unsound), 0 newly rejected, 0 unsound among all accepted; 108 newly warned, 0 newly un-warned; trace changed in 0.
+Run-time residual: at the baseline 2142 accepted programs fault on every execution and 0 on some; under the change 2142 and 0 (checked-mode DisposedAccessException remains the backstop for these).

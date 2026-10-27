@@ -1,0 +1,21 @@
+bounds: vars=3 len=4 features=all   (5.5 s)
+baseline kernel:
+    340036  programs
+     95577  reject:K1.3-read-of-moved
+     81336  reject:K8.4-temporary-escape
+     71152  accept
+     69010  fault-never
+     36852  reject:A5-move-out-of-using-var
+     26154  reject:§28.10-unmarked-owned-into-using-var
+     13911  reject:A5-reassign-using-var
+      6636  reject:state-match
+      6210  reject:K3-consume-of-non-owned
+      3804  accept-with-warning
+      3804  §28.2-warned
+      2142  fault-every
+      1788  reject:§28.6-dispose-of-borrow
+      1083  flag-read-at-release
+       294  reject:K5.1-frozen-transfer
+       126  reject:K5.2-frozen-overwrite
+programs with a flag read of an already-disposed object at a release site, by site kind: {'explicit': 405, 'termination': 135, 'scope-end': 528, 'overwrite': 6, 'unwind': 12, 'cascade': 12}
+T1/T2/T3 hold on every accepted program

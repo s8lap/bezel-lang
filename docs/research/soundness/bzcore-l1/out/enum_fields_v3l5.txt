@@ -1,0 +1,19 @@
+bounds: vars=3 len=5 features=locals,fields   (14.9 s)
+baseline kernel:
+    832158  programs
+    534450  reject:K1.3-read-of-moved
+    169632  accept
+    151194  fault-never
+     64248  reject:state-match
+     34212  reject:K3-consume-of-non-owned
+     27918  accept-with-warning
+     27918  §28.2-warned
+     18438  fault-every
+     17214  reject:§28.6-dispose-of-borrow
+      7752  reject:K5.1-frozen-transfer
+      6369  flag-read-at-release
+      4650  reject:K5.2-frozen-overwrite
+         6  K4.3-trust-residual (T3 under the recorded clause)
+K4.3 trust residual (T3 fails without the recorded slot-kill-by-move clause): 6 programs, e.g. new a / fbrw b a / fmove c a / send c / use b
+programs with a flag read of an already-disposed object at a release site, by site kind: {'explicit': 4227, 'scope-end': 1764, 'overwrite': 210, 'cascade': 336, 'slot-overwrite': 6}
+T1/T2/T3 hold on every accepted program

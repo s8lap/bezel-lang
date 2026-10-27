@@ -1,0 +1,91 @@
+A overwrite of a disposed binding under a live borrow
+    new a / brw b a / disp a / asg a / use b
+    verdict=accept warnings=[] bad=[]
+    runs=['FAULT']
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1), ('new', 3), ('new', 4), ('release', 2, 'overwrite')]
+B slot-displaced value disposed while a borrow of the slot lives
+    new a / fbrw b a / fmove q a / disp q / use b
+    verdict=accept warnings=[] bad=[]
+    runs=['FAULT']
+    trace=[('new', 1), ('new', 2), ('new', 3), ('disp', 1)]
+    free[ruling-as-worded] sites=1 runs=['UAF']
+C disposed then thrown; the arm reads it
+    new a / try { /   disp a /   throw a / } catch e { /   use e / }
+    verdict=accept warnings=['§28.2-use-after-dispose'] bad=[]
+    runs=['FAULT']
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1)]
+    free[ruling-as-worded] sites=1 runs=['UAF']
+D loop: borrow, kill, use, reassign
+    new a / while { /   brw b a /   disp a /   use b /   asg a / }
+    verdict=accept warnings=[] bad=[]
+    runs=['ok', 'FAULT', 'FAULT']
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1)]
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1)]
+E nested try: inner arm throws fresh; outer arm reads the moved binding
+    new a / try { /   try { /     throw a /   } catch e { /     tthrow /   } / } catch e { /   use a / }
+    verdict=reject:K1.3-read-of-moved warnings=[]
+F explicit Dispose of a using var
+    using a / disp a
+    verdict=accept warnings=[] bad=[]
+    runs=['ok']
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1), ('release', 2, 'scope-end')]
+    free[ruling-as-worded] sites=1 runs=['ok']
+    free[all-conditions] sites=1 runs=['ok']
+G borrow-pin keeps the borrow; Dispose under it faults later
+    new a / brw b a / usingb p b / disp a / use p
+    verdict=accept warnings=[] bad=[]
+    runs=['FAULT']
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1)]
+H uninit on one arm
+    decl a / if { /   asg a / } else { / } / use a
+    verdict=reject:K1.3-read-of-moved warnings=[]
+I throw arm absorbs (K7.5)
+    new a / if { /   throw a / } else { / } / use a
+    verdict=accept warnings=[] bad=[]
+    runs=['ok', 'ok']
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1)]
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1)]
+J store back the displaced value then dispose the holder
+    new a / fmove q a / fstm a q / disp a
+    verdict=accept warnings=[] bad=[]
+    runs=['ok']
+    trace=[('new', 1), ('new', 2), ('new', 3), ('disp', 3), ('disp', 2), ('disp', 1), ('release', 2, 'scope-end')]
+    free[ruling-as-worded] sites=1 runs=['ok']
+    free[all-conditions] sites=1 runs=['ok']
+K slot overwrite order (K9.5)
+    new a / fst a
+    verdict=accept warnings=[] bad=[]
+    runs=['ok']
+    trace=[('new', 1), ('new', 2), ('new', 3), ('disp', 1), ('disp', 2), ('disp', 3)]
+L send a holder whose slot is borrowed
+    new a / fbrw b a / send a / use b
+    verdict=reject:K5.1-frozen-transfer warnings=[]
+M move the holder; borrow of the slot survives through the new holder
+    new a / fbrw b a / move c a / use b
+    verdict=reject:K5.1-frozen-transfer warnings=[]
+N dispose in handler of an outer binding; use after try
+    new a / try { /   tthrow / } catch e { /   disp a / } / use a
+    verdict=accept warnings=['§28.2-use-after-dispose'] bad=[]
+    runs=['FAULT']
+    trace=[('new', 1), ('new', 2), ('new', 3), ('new', 4), ('disp', 2), ('disp', 1), ('disp', 4), ('disp', 3)]
+    free[ruling-as-worded] sites=1 runs=['UAF']
+O catch binding re-borrowed into an outer binding (K2.3)
+    new a / decl c / try { /   throw a / } catch e { /   asgb c e / } / use c
+    verdict=reject:K2.3-borrow-outlives-source warnings=[]
+P two kills on both arms then use through borrow
+    new a / brw b a / if { /   disp a / } else { /   disp a / } / use b
+    verdict=accept warnings=[] bad=[]
+    runs=['FAULT', 'FAULT']
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1)]
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1)]
+Q F1: slot-displaced value sent while a borrow of the slot lives (K4.3 residual)
+    new a / fbrw b a / fmove c a / send c / use b
+    verdict=accept warnings=[] bad=['RACE']
+    runs=['RACE']
+    trace=[('new', 1), ('new', 2), ('new', 3)]
+R conditional kill then unwind (condition 2 reader)
+    new a / if { / } else { /   disp a / } / tthrow
+    verdict=accept warnings=[] bad=[]
+    runs=['ok', 'ok']
+    trace=[('new', 1), ('new', 2), ('new', 3), ('new', 4), ('disp', 2), ('disp', 1), ('disp', 4), ('disp', 3)]
+    trace=[('new', 1), ('new', 2), ('disp', 2), ('disp', 1), ('new', 3), ('new', 4), ('noop', 2, 'unwind'), ('disp', 4), ('disp', 3)]

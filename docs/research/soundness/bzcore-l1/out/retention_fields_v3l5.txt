@@ -1,0 +1,15 @@
+bounds: vars=3 len=5 features=locals,fields   (17.6 s)
+baseline: 832158 programs, 169632 accepted, 58113 with an explicit Dispose() site; 6369 read the flag of an already-disposed object at a release site under the retaining heap
+
+| free-in-full rule | sites freed in full | accepted programs reading freed memory | by reader (variable or site kind) | witness |
+|---|---|---|---|---|
+| free everywhere (no condition) | 66126 | 20634 | {'a': 6038, 'scope-end': 1758, 'b': 6038, 'c': 6038, 'overwrite': 210, 'explicit': 210, 'cascade': 336, 'slot-overwrite': 6} | new a / disp a / fbrw b a |
+| condition 1 as worded: no live borrow of the value | 64362 | 19260 | {'a': 5580, 'scope-end': 1758, 'b': 5580, 'c': 5580, 'overwrite': 210, 'explicit': 210, 'cascade': 336, 'slot-overwrite': 6} | new a / disp a / fbrw b a |
+| condition 2 only: no later maybe-consumed release of the binding | 66126 | 20634 | {'a': 6038, 'scope-end': 1758, 'b': 6038, 'c': 6038, 'overwrite': 210, 'explicit': 210, 'cascade': 336, 'slot-overwrite': 6} | new a / disp a / fbrw b a |
+| the ruling: conditions 1 and 2 as worded | 64362 | 19260 | {'a': 5580, 'scope-end': 1758, 'b': 5580, 'c': 5580, 'overwrite': 210, 'explicit': 210, 'cascade': 336, 'slot-overwrite': 6} | new a / disp a / fbrw b a |
+| 1 + 2 + the binding itself dead after the call | 35208 | 6 | {'b': 2, 'c': 2, 'a': 2} | new a / fbrw b a / fmove c a / disp c / use b |
+| 1 + 2 + binding dead + slot-displaced values retained | 35148 | 0 | {} |  |
+| all but condition 1 | 36432 | 948 | {'b': 316, 'c': 316, 'a': 316} | new a / brw b a / disp a / fbrw c b |
+| all but condition 2 | 35148 | 0 | {} |  |
+
+readers: a variable name = a member access through it; overwrite / scope-end / unwind = a release site running the idempotent disposer; cascade = a holder's teardown; explicit = a repeated Dispose()
