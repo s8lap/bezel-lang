@@ -31,8 +31,8 @@
 //   | `decimal?:= 2.5m` "F2" | the carrier's bytes (a garbage decimal; the  | `2.50`       |
 //   |                         | value is NOT stable across builds - see   |              |
 //   |                         | the note at the `decimal` row below)      |              |
-//   | `bool?   := true`      | IR-verifier ABORT (trunc on a struct)   | `True`       |
-//   | `char?   := 'Z'`       | IR-verifier ABORT (a struct argument)   | `Z`          |
+//   | `bool?   := true`      | IR-verifier ABORT (trunc on a struct)   | compile error|
+//   | `char?   := 'Z'`       | IR-verifier ABORT (a struct argument)   | compile error|
 //   | `byte?   := 200`       | IR-verifier ABORT (zext on a struct)    | `200`        |
 //   | `short?  := 300`       | IR-verifier ABORT (sext on a struct)    | `300`        |
 //   | `int?    := 255` `(16)`| IR-verifier ABORT (sext on a struct)    | `ff`         |
@@ -102,10 +102,12 @@
 //     below therefore use the RADIX overload for the narrow and wide integer
 //     receivers, and the `D`/`X` literal overload for the 32-bit ones;
 //   * stdlib §2.18's table gives `bool` and `char` NO specifier ("a format
-//     spec on these is a compile error"), and the compiler compiles
-//     `bool.ToString("F4")` anyway — for the NON-nullable spelling too. The
-//     `bool?`/`char?` rows below pin the NULLABILITY property (the payload is
-//     rendered, not the carrier) and NOT the specifier's admissibility;
+//     spec on these is a compile error"), and the compiler compiled
+//     `bool.ToString("F4")` anyway — for the NON-nullable spelling too.
+//     CLOSED BY #7333: the `bool?`/`char?` rows below now assert the §2.18
+//     compile error, and the NULLABILITY property they used to pin (the
+//     payload is rendered, not the carrier) is still pinned by the numeric
+//     rows, whose receivers DO admit a specifier;
 //   * the literal `D` format on an UNSIGNED integer payload renders it through
 //     a SIGNED conversion (`var v: uint := 4000000000; v.ToString("D5")`
 //     prints "-294967296") — for the NON-nullable spelling too, so the
@@ -129,6 +131,7 @@
 namespace {
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 // A program whose `Main` body is `body`; every row below is one of these.
@@ -239,45 +242,40 @@ BEZEL_TEST(nullable_receiver_tostring_format_7319,
     BEZEL_EXPECT_EQ(r.stdoutText, "2.50\n");
 }
 
-// #7319 / spec §7.4 + §22.6 — the `bool` receiver (the base arm's failure was
-// a `trunc` of the `{i8, i1}` carrier). The rendered text is the value's own
-// no-format rendering — the text `true.ToString()` produces, which is the
-// answer the non-nullable `bool` receiver gives too.
+// #7333 / stdlib §2.18 (v0.344) — the `bool` receiver, at the NARROWED
+// spelling. §2.18's table gives `bool` NO specifier ("a format spec on these
+// is a compile error"), so `x.ToString("F4")` on a `bool` is a COMPILE ERROR —
+// at the non-nullable spelling and at this narrowed one alike (spec §22.6: at
+// this call site the receiver IS the `bool` it denotes).
 //
-// ⚠ §2.18's table gives `bool` NO specifier ("a format spec on these is a
-// compile error"), and the compiler compiles the NON-nullable `bool` spelling
-// anyway. That gap is a SEPARATE, receiver-independent defect (this lane
-// reports it); this row pins the NULLABILITY property — the payload is
-// rendered, not the carrier — and not the specifier's admissibility.
+// ⚠ THIS ROW FLIPPED WITH #7333. It pinned #7319's NULLABILITY property (the
+// payload is rendered, not the carrier) on a receiver whose specifier §2.18
+// does not admit; the property itself is still pinned by the numeric rows
+// above, whose receivers DO admit a specifier. The verdict is now the compile
+// error §2.18 requires — the oracle is a diagnostic at a REAL location, not
+// an exit code.
 BEZEL_TEST(nullable_receiver_tostring_format_7319,
-           the_narrowed_nullable_bool_receiver_formats_the_value_7_4) {
-    JitResult r = runAotChecked(
+           the_narrowed_nullable_bool_receiver_with_a_format_spec_is_rejected_2_18) {
+    JitResult r = runAot(
         prog(narrowed("var x: bool? := true;", "x.ToString(\"F4\")")));
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "True\n");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "a format spec requires an intrinsically-formattable receiver"));
 }
 
-// #7319 / spec §7.4 + §22.6 — the `char` receiver (the base arm's failure was
-// a runtime call typed for the bare payload, handed the `{i8, i32}` carrier).
-// The rendered text is the value's own no-format rendering — the text
-// `'Z'.ToString()` produces, which is the answer the non-nullable `char`
-// receiver gives too.
+// #7333 / stdlib §2.18 (v0.344) — the `char` receiver, at the NARROWED
+// spelling. §2.18's table gives `char` NO specifier, exactly as it gives
+// `bool` none ("a format spec on these is a compile error"), so
+// `x.ToString("F4")` on a `char` is a COMPILE ERROR.
 //
-// ⚠ §2.18's table gives `char` NO specifier, exactly as it gives `bool` none;
-// the same separate, receiver-independent gap applies, and the same caveat
-// about this row's scope applies.
+// ⚠ THIS ROW FLIPPED WITH #7333, for the same reason as the `bool` row above.
 BEZEL_TEST(nullable_receiver_tostring_format_7319,
-           the_narrowed_nullable_char_receiver_formats_the_value_7_4) {
-    JitResult r = runAotChecked(
+           the_narrowed_nullable_char_receiver_with_a_format_spec_is_rejected_2_18) {
+    JitResult r = runAot(
         prog(narrowed("var x: char? := 'Z';", "x.ToString(\"F4\")")));
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, "Z\n");
+    BEZEL_EXPECT_TRUE(bezel::test::failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(bezel::test::diagnosticMessageContains(
+        r, "a format spec requires an intrinsically-formattable receiver"));
 }
 
 // #7319 / spec §7.4 + §22.6 + stdlib §2.18 — the `uint` receiver. The hex

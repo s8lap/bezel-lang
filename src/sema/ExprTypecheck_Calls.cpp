@@ -10,6 +10,8 @@
 #include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
 #include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
 #include "sema/EnumValues.hpp"  // enumDeclaresValue — §5.4's checked enum cast (#3044)
+#include "sema/Formattability.hpp"  // §2.18/§18.5: the shared format-spec
+                                   // vocabulary predicate (fix #7333)
 #include "sema/LinqStdlibOverloads.hpp"  // fix #3726: shared stdlib §5 overload table (name + arity + where)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
@@ -10175,6 +10177,72 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             std::to_string(expectedArity) +
                             " argument(s) but the call supplies " +
                             std::to_string(nargs) + " (§8.1)");
+                }
+            }
+            // §2.18 / §18.5 (v0.344, fix #7333): a format spec on a `bool`
+            // or `char` receiver is a COMPILE ERROR — stdlib §2.18's
+            // specifier table gives `bool`, `char` and `string` an EMPTY
+            // vocabulary ("a format spec on these is a compile error"), so no
+            // specifier can ever apply to them.
+            //
+            // THE DECISION IS ABOUT THE RECEIVER'S TYPE, NOT ABOUT THE
+            // ARGUMENT. The argument is a `string` in every case; what §2.18
+            // decides is whether the RECEIVER'S type has a vocabulary that
+            // could contain the spec. The same predicate
+            // (`isFormattableOperandType`) decides the interpolation hole
+            // `$"{b:F4}"` — spec §18.5's "Format dispatch" makes a hole's spec
+            // a call to the operand's `ToString`, so the two spellings of one
+            // rule must agree, and before this gate the hole said "no" while
+            // the member call said nothing at all (`true.ToString("F4")`
+            // compiled and rendered "True").
+            //
+            // ONLY A SPEC THE COMPILER CAN SEE IS DECIDED HERE. The argument
+            // is a literal, so its content is known at compile time; a format
+            // string whose content is unknown (`b.ToString(fmt)`) is the
+            // RUNTIME spelling — issue #7336 — where an unrecognized
+            // specifier raises `FormatException` (stdlib §2.18, spec §18.5).
+            // This gate does not touch it, and it must not: a compile-time
+            // rejection of the runtime spelling would take that spelling away
+            // from the rule that owns it.
+            //
+            // `receiverHasTypeSpecificOverloads` (computed above) is exactly
+            // the case where the §8.1 universal-arity check does NOT fire:
+            // the receiver carries its own overloads (a primitive, or a value
+            // builtin). A user type keeps the universal `Object.ToString`
+            // surface, so its wrong-arity call is already reported by the
+            // arity check above — that is §8.1's error, not this rule's, and
+            // reporting both would be one mistake with two diagnostics.
+            //
+            // `string` is excluded on the same ground: stdlib §9.6 declares
+            // `ToString(): string` at arity 0, so the §9.6 arity gate
+            // already rejects `s.ToString("F4")` with the diagnostic that
+            // rule owns (§22.5; §9.6). The spec does not say which of the
+            // two rules owns the string receiver, so the existing error
+            // stands.
+            if (umName == "ToString" && ce.args.size() == 1 &&
+                    !targetIsStaticReceiver && receiverHasTypeSpecificOverloads &&
+                    umTarget) {
+                const ast::Expr* fmtArg = ce.args[0].value.get();
+                const bool specIsVisible =
+                    fmtArg != nullptr &&
+                    (dynamic_cast<const ast::StringLiteralExpr*>(fmtArg) !=
+                         nullptr ||
+                     dynamic_cast<const ast::VerbatimStringExpr*>(fmtArg) !=
+                         nullptr);
+                if (specIsVisible) {
+                    const TypeRef* recvTy = ctx_.exprType(*umTarget);
+                    if (recvTy && recvTy->kind == TypeRef::Kind::Primitive &&
+                            recvTy->primitive != PrimitiveType::String &&
+                            !isFormattableOperandType(recvTy)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "a format spec requires an intrinsically-formattable "
+                            "receiver (a numeric/temporal/Guid) or one "
+                            "implementing `IFormattable`; `" +
+                                std::string(primitiveSpellingForDiag(
+                                    recvTy->primitive)) +
+                                "` is neither (§2.18; §18.5)");
+                    }
                 }
             }
         }

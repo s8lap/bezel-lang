@@ -3,6 +3,8 @@
 #include "common/BuiltinRegistry.hpp"
 #include "common/OwnershipFacts.hpp"  // §35.7 (#2045): classifyChoiceType
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
+#include "sema/Formattability.hpp"  // §2.18/§18.5: the shared format-spec
+                                   // vocabulary predicate (fix #7333)
 #include "sema/GenericParams.hpp"  // genericParamCount / genericParamNameAt — #3143
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
@@ -201,74 +203,6 @@ std::string_view interpFormatPortion(const std::string& spec) {
                                                   : s.substr(colon + 1);
     }
     return s;
-}
-
-// §2.18: the intrinsically-formattable primitives (integers, floating, decimal).
-// bool/char/string/Object are NOT formattable — a format spec on them is a
-// compile error.
-bool isIntrinsicallyFormattablePrim(PrimitiveType p) {
-    using P = PrimitiveType;
-    switch (p) {
-        case P::Byte:  case P::SByte: case P::Short: case P::UShort:
-        case P::Int:   case P::UInt:  case P::Long:  case P::ULong:
-        case P::Float: case P::Double: case P::Decimal:
-            return true;
-        default:
-            return false;  // Bool, Char, String, Object, None
-    }
-}
-
-// The last name component of a Named TypeRef (declaration name, else the
-// AST/imported spelling). Empty when unavailable.
-std::string_view namedTypeName(const TypeRef* t) {
-    if (!t || t->kind != TypeRef::Kind::Named) return {};
-    if (t->declaration && !t->declaration->name.empty())
-        return t->declaration->name;
-    if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
-        return t->astNode->name->parts.back();
-    if (!t->importedName.empty()) return t->importedName;
-    return {};
-}
-
-// §2.18: the intrinsically-formattable temporal + Guid builtins.
-bool isIntrinsicTemporalOrGuid(std::string_view n) {
-    return n == "DateTime" || n == "DateOnly" || n == "TimeOnly" ||
-           n == "TimeSpan" || n == "Guid";
-}
-
-// §18.5 (v0.172): does `ts` (transitively) declare `: IFormattable`? IFormattable
-// is a null-declaration builtin interface, so it never lands in `baseTypes`;
-// the walk recurses through resolved base classes / user interfaces for the
-// `interface IMyFmt: IFormattable` case.
-//
-// fix #3139 (§18.5 / §2.5, family F1 of #3152): each level's own conformance
-// came from its `ast::TypeDecl` base list, which an IMPORTED type does not
-// have — so an imported `class Money: IFormattable` answered false and a
-// format spec on it was rejected with "`Money` is neither" while the identical
-// local declaration was accepted (measured). `sema::inheritsBuiltinInterface`
-// is the same transitive walk over the symbol, on both sides.
-bool declaresIFormattable(const TypeSymbol* ts) {
-    return inheritsBuiltinInterface(ts, "IFormattable");
-}
-
-// §18.5 / §2.18 (v0.172): may a hole with a real format spec apply to an operand
-// of type `t`? Nullable is transparent (null renders "null"; the spec applies to
-// the payload). An unresolved generic type parameter is admitted conservatively
-// (its concrete formattability is a bound-analysis question left to codegen).
-bool isFormattableOperandType(const TypeRef* t) {
-    if (!t) return true;  // already errored elsewhere; don't cascade
-    if (t->kind == TypeRef::Kind::Primitive)
-        return isIntrinsicallyFormattablePrim(t->primitive);
-    if (t->kind == TypeRef::Kind::Named) {
-        std::string_view n = namedTypeName(t);
-        if (isIntrinsicTemporalOrGuid(n)) return true;
-        if (t->declaration && declaresIFormattable(t->declaration)) return true;
-        // Unresolved generic type parameter (no declaration): admit.
-        if (!t->declaration) return true;
-        return false;  // plain class/record/enum/interface, Object
-    }
-    return true;  // non-Named/non-Primitive (unit/function/array): not reached
-                  // with a spec in practice; don't spuriously error.
 }
 
 // The source spelling of a primitive type, for diagnostics.
