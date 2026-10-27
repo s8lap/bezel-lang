@@ -1,7 +1,7 @@
 #!/bin/bash
 # Compile every example with the r35 pre-release in checked (default) and unchecked disposal
 # mode; record verdict, diagnostics, run output and exit code into results.md.
-B=${BEZELC:-/tmp/claude-0/-home-user-bezel-lang/3f619ddf-d843-5ab0-a977-e5b3105857a0/scratchpad/rel35/bezelc-0.0.0-f6863e62-linux-x86_64/bin/bezelc}
+B=${BEZELC:-bezelc}   # point BEZELC at the compiler (tested with the r35-f6863e62 pre-release)
 OUT=out; mkdir -p "$OUT"
 {
 echo "# Results — $($B --version 2>&1) — $(date -u +%F)"
