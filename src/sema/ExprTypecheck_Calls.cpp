@@ -21042,6 +21042,46 @@ builtinInstanceCallee(const ast::Expr* callee) {
     return {nullptr, {}};
 }
 
+// The SEARCH-VALUE position of a §9.6 member: the positions at which stdlib
+// §9.6 declares a value that is a `char` or a `string` (and nothing else).
+//
+//   Contains(value)      — `char` or `string`
+//   IndexOf(value, ...)  — `char` or `string`
+//   LastIndexOf(value)   — `char` or `string`
+//   Replace(old, new)    — `char` or `string`, at BOTH positions
+//   Split(separator)     — `char`, `string` or `Array<char>`
+//
+// The struct carries the WORDS the diagnostic quotes: what the parameter is
+// called, the declared overload set, and the §5.1 reason. §9.6 is the
+// citation for all three.
+struct BuiltinStringSearchValueSlot {
+    const char* what;  // "search value"
+    const char* as;    // "as a `char` or a `string`"
+    const char* why;   // "the argument's type converts to neither"
+};
+
+// The slot at (member, position), or nullptr when the position is not one.
+const BuiltinStringSearchValueSlot* builtinStringSearchValueSlot(
+    std::string_view member, std::size_t pos) {
+    static const BuiltinStringSearchValueSlot kCharOrString{
+        "search value", "as a `char` or a `string`",
+        "the argument's type converts to neither"};
+    static const BuiltinStringSearchValueSlot kReplacement{
+        "replacement value", "as a `char` or a `string`",
+        "the argument's type converts to neither"};
+    static const BuiltinStringSearchValueSlot kSeparator{
+        "separator", "as a `char`, a `string` or an `Array<char>`",
+        "the argument's type converts to none of them"};
+    if (pos == 0) {
+        if (member == "Contains" || member == "IndexOf" ||
+            member == "LastIndexOf" || member == "Replace")
+            return &kCharOrString;
+        if (member == "Split") return &kSeparator;
+    }
+    if (pos == 1 && member == "Replace") return &kReplacement;
+    return nullptr;
+}
+
 void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     auto [tgt, m] = builtinInstanceCallee(ce.callee.get());
     if (!tgt) return;
@@ -21167,6 +21207,56 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
                 "`char` or a `string` (stdlib \xC2\xA7""9.6); the argument's "
                 "type converts to neither (\xC2\xA7""5.1)");
             continue;
+        }
+        // fix #6635 (stdlib §9.6, §5.1, v0.345): the SEARCH VALUE of a §9.6
+        // member whose declared overload set is `char` or `string`. §9.6
+        // declares `Contains(value: char)`, `Contains(value: string)`,
+        // `LastIndexOf(value: char)`, `LastIndexOf(value: string)`,
+        // `Replace(oldChar: char, newChar: char)` and
+        // `Replace(oldValue: string, newValue: string)` — at those
+        // positions NOTHING ELSE is declared. §5.1 converts no integer type
+        // to a `char` or a `string` (its table has no such row, and its
+        // constant-narrowing clause narrows an integer to an INTEGER target
+        // only), so an `int` search value reaches no declared overload.
+        //
+        // Before this gate `paramKind` returned None for it, so the argument
+        // was never checked and reached codegen: `s.Contains(5)` emitted
+        // "Call parameter type does not match function signature!" — an
+        // `i32` handed to a `ptr` parameter — and the compiler ABORTED in the
+        // LLVM verifier. `s.Replace('a', 5)` did not even abort: the
+        // replacement was SILENTLY DROPPED and the program printed "bc".
+        //
+        // The same shape #6562 established for `IndexOf`, with the same
+        // dedicated message (a generic assignability message would name
+        // `string` as the target of an overload set that is `char` OR
+        // `string`).
+        const BuiltinStringSearchValueSlot* slot =
+            builtinStringSearchValueSlot(m, i);
+        if (slot) {
+            const bool isCharOrString =
+                argTy->primitive == PrimitiveType::Char ||
+                argTy->primitive == PrimitiveType::String;
+            // The `null` literal is typed `Object?` — §7's nullability gate
+            // owns that rejection (the #6782 rows pin its wording), so this
+            // gate stands down for it. `IndexOf` is not among the members
+            // this gate reaches: the #6562 message above has always been the
+            // one that fires there.
+            const bool isNullLiteral =
+                argTy->nullable && argTy->primitive == PrimitiveType::Object &&
+                !isNarrowedNonNullRead(a.value.get());
+            // fix #6635: an INTEGER search value reaches no declared
+            // overload. `Split`'s separator is #6636's scope.
+            const bool isInteger =
+                isIntegerPrimitiveTypeForOverload(argTy->primitive);
+            if (!isCharOrString && !(isNullLiteral && m != "IndexOf") &&
+                isInteger && m != "Split") {
+                ctx_.diagnostics().report(
+                    Severity::Error, a.value->span.begin,
+                    "`string." + std::string(m) + "` takes its " + slot->what +
+                        " at position " + std::to_string(i) + " " + slot->as +
+                        " (stdlib §9.6); " + slot->why + " (§5.1)");
+                continue;
+            }
         }
         // fix #6782 (§7, §7.3, v0.340): the `null` literal is typed `Object?`,
         // which is no char|string overload, so `paramKind` returned None at
