@@ -491,7 +491,11 @@ campaign is what is left after they run.
      the warning-site count at 0; a newly failing program is a lowering gap filed to its campaign.
    - **#4602**: bound checked-mode retention (keep the header word with the disposed flag, free the
      payload; header-only for arrays, dictionaries and closure cells), then default to checked, add
-     `--unchecked-disposal`, keep `--checked-disposal` as a no-op.
+     `--unchecked-disposal`, keep `--checked-disposal` as a no-op. **Amended:** at an explicit
+     `Dispose()` where the K5 liveness proves no borrow of the value survives, reclaim in full at the
+     call (no retention); retain only where a borrow may survive or the analysis is unsure (spans,
+     `Shared<T>`, collection elements, unknown provenance). Check elision is a later campaign, after
+     the soundness model checks its premise.
    - **#6358**: the dictionary records at construction that its keys are strings, and every free path
      (`bz_dict_free`, `Remove`, `Clear`, overwrite) releases them; no per-site emission.
    - **#1877 / #3379**: the 2026-07-24 refcounting ruling stands; split the umbrella into per-kind
