@@ -15180,14 +15180,14 @@ The composition step resolved these seams:
 
   *Spec-ahead-of-impl (tracking issues filed at landing):*
   - 0200: [#7273](https://github.com/s8lap/bezel-lang/issues/7273), retitled as the tracker: the `string`/`Type` arms, the interface member check, the `where T: class` gate, the extension check, the 23 + 1 rows. A note on [#7260](https://github.com/s8lap/bezel-lang/issues/7260).
-  - 0201: (tracker `C1-0201-impl`, filed when this revision merges); a note on [#7025](https://github.com/s8lap/bezel-lang/issues/7025).
-  - 0202: (tracker `C2-0202-impl`, filed when this revision merges), which re-cuts `s2_7_0039`.
-  - 0203: (tracker `C3-0203-impl`, filed when this revision merges), which names the flipping row and carries the overload rank. 0204: (tracker `F-0204-impl`, filed when this revision merges), with the `char?` row.
-  - `C2`: (tracker `C2-7077-impl`, filed when this revision merges); (tracker `C2-6903-impl`, filed when this revision merges) and (tracker `C2-6903-Q2`, filed when this revision merges) (the generic static constructor, to re-measure on `main`); (tracker `C2-6982-impl`, filed when this revision merges); #6764's deltas on [#6595](https://github.com/s8lap/bezel-lang/issues/6595), as a note.
-  - `C3`: (tracker `C3-7032-impl`, filed when this revision merges); #7034's row on [#5191](https://github.com/s8lap/bezel-lang/issues/5191), as a note; #6772 and #7281 are their own trackers, relabelled `spec-tracking`.
+  - 0201: [#7344](https://github.com/s8lap/bezel-lang/issues/7344); a note on [#7025](https://github.com/s8lap/bezel-lang/issues/7025).
+  - 0202: [#7347](https://github.com/s8lap/bezel-lang/issues/7347), which re-cuts `s2_7_0039`.
+  - 0203: [#7356](https://github.com/s8lap/bezel-lang/issues/7356), which names the flipping row and carries the overload rank. 0204: [#7351](https://github.com/s8lap/bezel-lang/issues/7351), with the `char?` row.
+  - `C2`: [#7346](https://github.com/s8lap/bezel-lang/issues/7346); [#7355](https://github.com/s8lap/bezel-lang/issues/7355) and [#7348](https://github.com/s8lap/bezel-lang/issues/7348) (the generic static constructor, to re-measure on `main`); [#7349](https://github.com/s8lap/bezel-lang/issues/7349); #6764's deltas on [#6595](https://github.com/s8lap/bezel-lang/issues/6595), as a note.
+  - `C3`: [#7350](https://github.com/s8lap/bezel-lang/issues/7350); #7034's row on [#5191](https://github.com/s8lap/bezel-lang/issues/5191), as a note; #6772 and #7281 are their own trackers, relabelled `spec-tracking`.
   - `E`: none new. #6956's compiler half stays on [#3850](https://github.com/s8lap/bezel-lang/issues/3850) (a note); notes on [#7262](https://github.com/s8lap/bezel-lang/issues/7262), [#7108](https://github.com/s8lap/bezel-lang/issues/7108), [#6895](https://github.com/s8lap/bezel-lang/issues/6895), [#6902](https://github.com/s8lap/bezel-lang/issues/6902) and [#7282](https://github.com/s8lap/bezel-lang/issues/7282).
-  - `F`: (tracker `F-6.2-corners`, filed when this revision merges); (tracker `F-19.3-binding`, filed when this revision merges) (the nullable binding's narrowing); (tracker `F-asyncdisposable`, filed when this revision merges) (conformance, the bound, the member, and the record, enum and choice rows).
-  - Not spec items: (tracker `C1-eager-free`, filed when this revision merges) (the explicit `Dispose()` path reclaims a class instance at the call, where §28.2 says logical disposal only).
+  - `F`: [#7352](https://github.com/s8lap/bezel-lang/issues/7352); [#7353](https://github.com/s8lap/bezel-lang/issues/7353) (the nullable binding's narrowing); [#7354](https://github.com/s8lap/bezel-lang/issues/7354) (conformance, the bound, the member, and the record, enum and choice rows).
+  - Not spec items: [#7345](https://github.com/s8lap/bezel-lang/issues/7345) (the explicit `Dispose()` path reclaims a class instance at the call, where §28.2 says logical disposal only).
 
   *Owner decisions recorded:*
   - The owner's 2026-10-08 delegation, and the 2026-10-27 direction for this train, which also asks that it land on a branch, not on `main`.
@@ -15195,7 +15195,7 @@ The composition step resolved these seams:
   - **#7275 was labelled `needs-owner-decision`** and is decided under the delegation (option (B) on `Step`, the `char` arm a code-point advance), for the owner's review.
   - The deviations from recorded recommendations are listed above.
 
-  *Filed:* (tracker `F-Q-alias-chain-head`, filed when this revision merges) (`spec-question`): an import alias at a chain head silently shadows a same-named enclosing member, because the *Warning* row fires only when the head resolves to a type. Not folded: the fix widens the row 0202 edits twice, and a §2.2 question decides its scope.
+  *Filed:* [#7343](https://github.com/s8lap/bezel-lang/issues/7343) (`spec-question`): an import alias at a chain head silently shadows a same-named enclosing member, because the *Warning* row fires only when the head resolves to a type. Not folded: the fix widens the row 0202 edits twice, and a §2.2 question decides its scope.
 
   *Decided or recorded rather than filed:* every other "to file" item of the lanes and critiques was folded by lane `F` (above) or is a compiler tracker (#6903's second question; the eager free). `F`'s critique notes that §28.12's "when a class implements both `IDisposable` and `IAsyncDisposable`" is now a tautology, harmless, and left.
 
