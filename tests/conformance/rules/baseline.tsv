@@ -2944,11 +2944,11 @@ l2_18_0012	fail	#7265
 l2_18_0013	pass	
 l2_18_0014	pass	
 l2_18_0015	pass	
-l2_18_0016	fail	#7301: a non-finite double renders inf/-inf/nan, where stdlib 2.18 requires Infinity/-Infinity/NaN
+l2_18_0016	pass	
 l2_18_0017	fail	#7303
 l2_18_0018	pass	
 l2_18_0019	fail	#7265
-l2_18_0020	fail	#7286
+l2_18_0020	pass	
 l2_18_0021	pass	
 l2_18_0022	pass	
 l2_18_0023	pass	
