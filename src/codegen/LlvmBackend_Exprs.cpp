@@ -2566,6 +2566,42 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             ma->member == "ToString") {
                             llvm::Value* recv = lowerExpr(*ma->target);
                             if (!recv) return nullptr;
+                            // fix #7319 (spec §7.4 / §22.6, v0.344): a
+                            // §7.4-NARROWED NULLABLE PRIMITIVE receiver is the
+                            // PAYLOAD, not the `{i8 hasValue; T}` CARRIER.
+                            //
+                            // §7.4: "Member access, method calls, and indexing
+                            // on a nullable value are compile errors unless the
+                            // compiler has narrowed it to non-null", and §22.6:
+                            // "a read of a binding §7.4 has narrowed non-null is
+                            // of its non-nullable type" — so at this call site
+                            // the receiver IS the `int` / `double` / `decimal`
+                            // it denotes, and stdlib §2.18's format overload
+                            // renders THAT value (its vocabulary table fixes
+                            // the rendering each intrinsic type gets).
+                            //
+                            // The carrier was reaching the formatter instead:
+                            // `recv` was the whole `{i8 hasValue; T}` struct,
+                            // so an `int?` printed the carrier's BYTES and a
+                            // `double?` reached an `fcmp` against a `double`
+                            // — malformed IR the verifier rejected (the
+                            // compiler aborted). This arm never asked
+                            // `tt->nullable`, the way the NO-ARGUMENT arm above
+                            // does; that arm delegates a nullable receiver to
+                            // `emitValueToString`, which branches on the tag
+                            // and renders the payload, and is why `x.ToString()`
+                            // was always right.
+                            //
+                            // The soundness precondition `unwrapNarrowedNullableOperand`
+                            // names — "a SEMA GATE already rejects the
+                            // un-narrowed form" — HOLDS here: sema's §7.4
+                            // member-access gate rejects an un-narrowed
+                            // nullable receiver ("member access `.ToString` on a
+                            // nullable value requires narrowing it to non-null
+                            // first (§7.4)"), so only a narrowed read reaches
+                            // this arm. The helper is a no-op for every
+                            // non-nullable receiver.
+                            recv = unwrapNarrowedNullableOperand(recv, tt);
                             // §9.3 (#1099B): decimal ToString(format) — route to
                             // the runtime decimal formatter (honors the "F"/"f"
                             // fixed-point specifier; other/malformed formats fall
