@@ -1,0 +1,105 @@
+=================== f10_field_store_on_moved
+--- --checked-disposal
+compile rc=1
+D:2
+D:1
+/bin/bash: line 195:  7860 Segmentation fault      ./$n.$mode
+exit=139
+--- --unchecked-disposal
+compile rc=1
+D:2
+D:1
+/bin/bash: line 195:  7877 Segmentation fault      ./$n.$mode
+exit=139
+=================== f11_adopted_local_overwrite_leak
+--- --checked-disposal
+compile rc=1
+D:4
+D:3
+END
+exit=0
+--- --unchecked-disposal
+compile rc=1
+D:4
+D:3
+END
+exit=0
+=================== f1_temp_field_escape
+--- --checked-disposal
+compile rc=1
+U:1
+END
+exit=0
+--- --unchecked-disposal
+compile rc=1
+U:1
+END
+exit=0
+=================== f4_move_of_borrow
+--- --checked-disposal
+compile rc=1
+U:2
+D:2
+D:1
+END
+exit=0
+--- --unchecked-disposal
+compile rc=1
+U:2
+D:2
+D:1
+/bin/bash: line 195:  8021 Segmentation fault      ./$n.$mode
+exit=139
+=================== f6_dispose_then_move_then_read
+--- --checked-disposal
+f6_dispose_then_move_then_read.bzl:35:17: warning: move from a local `a` already disposed at this point (§28.2) — use-after-dispose is undefined behaviour in unchecked mode and raises DisposedAccessException in checked mode
+compile rc=0
+D:2
+D:1
+/bin/bash: line 195:  8047 Segmentation fault      ./$n.$mode
+exit=139
+--- --unchecked-disposal
+f6_dispose_then_move_then_read.bzl:35:17: warning: move from a local `a` already disposed at this point (§28.2) — use-after-dispose is undefined behaviour in unchecked mode and raises DisposedAccessException in checked mode
+compile rc=0
+D:2
+D:1
+/bin/bash: line 195:  8080 Segmentation fault      ./$n.$mode
+exit=139
+=================== f7_using_var_moved_after_dispose
+--- --checked-disposal
+f7_using_var_moved_after_dispose.bzl:35:17: warning: move from a local `a` already disposed at this point (§28.2) — use-after-dispose is undefined behaviour in unchecked mode and raises DisposedAccessException in checked mode
+compile rc=0
+D:2
+D:1
+END
+exit=0
+--- --unchecked-disposal
+f7_using_var_moved_after_dispose.bzl:35:17: warning: move from a local `a` already disposed at this point (§28.2) — use-after-dispose is undefined behaviour in unchecked mode and raises DisposedAccessException in checked mode
+compile rc=0
+D:2
+D:1
+END
+exit=0
+=================== f8_borrow_pin_not_frozen
+--- --checked-disposal
+compile rc=1
+D:2
+D:1
+Unhandled exception: System.DisposedAccessException
+exit=70
+--- --unchecked-disposal
+compile rc=1
+D:2
+D:1
+U:0
+END
+exit=0
+=================== f9_uncaught_exception_not_disposed
+--- --checked-disposal
+compile rc=1
+Unhandled exception: Probe.E
+exit=70
+--- --unchecked-disposal
+compile rc=1
+Unhandled exception: Probe.E
+exit=70
