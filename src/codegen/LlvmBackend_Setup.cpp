@@ -21636,6 +21636,52 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // and DISPOSING A BORROW. #2769 / #2779 are immune because their gates are
     // syntactic and lowering-invariant; this one is not. Keep it local.
     bool pinned = ld->usingVarSourceIsBorrow;
+    // fix #7387 / §28.10 (v0.345): the BARE-IDENTIFIER PARAMETER borrow — the
+    // one borrow shape the ownership pass does NOT flag. §28.10's "using var
+    // initialized from a borrow" lists it: "an unmarked read of a borrow-state
+    // named binding (a plain parameter, a borrowing alias or loop variable, a
+    // captured owned binding inside a closure)" — "the `using var` does **not**
+    // assume a disposal obligation (derives: K2 — no obligation can be assumed
+    // from a borrow): at scope end, no `Dispose()` is called, because the value
+    // is not owned by this scope".
+    //
+    // The ownership pass's `usingVarSourceIsBorrow` flag does NOT cover it:
+    // its bare-id arm recognizes a tracked local (#1285/#2071) and an `owned`
+    // parameter (#3253) — a PLAIN parameter is neither, so the flag stayed
+    // clear and every disposal arm below registered a scope-end disposal for a
+    // BORROW. MEASURED on this tree (bezelc --sanitize=address, ASan):
+    //
+    //   public static method Take(src: IAsyncDisposable)
+    //     using var x := src;              <- the callee DISPOSES the borrow
+    //   ...
+    //   Take(src); src.Dispose();          <- the caller reads freed memory
+    //
+    //   ==1600653==ERROR: AddressSanitizer: heap-use-after-free, READ of size 8
+    //     freed by thread T0 here: #1 bz$Probe.Program$Take   <- the CALLEE
+    //     previously allocated by:          #1 bz$async$Probe.Program$Main$Resume
+    //
+    // The DECLARED-type spelling disposes it too (`using var x: Res := src;`),
+    // because `classOfLocal` reads the class off the DECLARED type and never
+    // reaches its own bare-identifier parameter test — the ASYMMETRY the issue
+    // reports ("the class-typed one is clean, the interface-typed one is not")
+    // is an artifact of the INFERRED spelling, not of the type: with a declared
+    // type BOTH shapes dispose the borrow.
+    //
+    // WHY THIS IS A CLASSIFICATION FIX AND NOT "DO NOT DISPOSE ANYTHING". The
+    // test is the OWNERSHIP CLASSIFICATION of the SOURCE (§28.3's K1): an
+    // `owned` parameter is an OWNED transfer and its `using var` twin still
+    // disposes (the ownership pass's own #3253 pin keeps that shape exactly as
+    // it was — this test declines it, so the flag alone decides it, and the
+    // flag says BORROW for that shape too, so the parameter's own §28.3 K3.14
+    // auto-drop remains the single disposer). A `ref` or `out` parameter is a
+    // borrow. Only the plain (non-`owned`) parameter is the borrow shape this
+    // adds, and the CALLER keeps the disposal obligation (§28.3).
+    //
+    // The ORDER matters: the #3418 lift below must still see this pin, because
+    // that lift is what keeps a §29.2-minted ITERATOR-FORMAT wrapper frame
+    // disposable — the frame is a FRESH allocation this declaration alone
+    // holds, and the borrow pin is about the SOURCE, not about the frame.
+    if (!pinned && usingVarRhsIsPlainParameterBorrow(ld)) pinned = true;
     if (pinned && iterFormatWrappedDecls_.count(ld)) pinned = false;
     if (pinned) return;
 
@@ -48853,8 +48899,68 @@ bool Emitter::taskLocalInitializerIsBorrowSource(const ast::LocalDecl* ld) {
 // // per §28.3 v0.190 SB-01, §28.10, §30.5
 bool Emitter::taskLocalOwnsFrame(const ast::LocalDecl* ld) {
     if (!ld || !taskTypeOfLocal(ld)) return false;
-    if (ld->isUsing) return !ld->usingVarSourceIsBorrow;
+    // fix #7387 / §28.10 (v0.345): the same borrow authority the disposal
+    // registration reads. A `using var` whose right-hand side is a PLAIN
+    // PARAMETER is a §28.10 borrow-pin — the caller keeps the frame's
+    // obligation — so this local owns no frame, exactly as the ownership
+    // pass's own pin says for every other borrow shape.
+    if (ld->isUsing)
+        return !ld->usingVarSourceIsBorrow &&
+               !usingVarRhsIsPlainParameterBorrow(ld);
     return !taskLocalInitializerIsBorrowSource(ld) && !ld->initializerCallIsBorrow;
+}
+
+
+// fix #7387 / §28.10 (v0.345): is this `using var` binding's RIGHT-HAND SIDE
+// an unmarked read of a PLAIN (non-`owned`) PARAMETER?
+//
+// §28.10, "`using var` initialized from a borrow" (v0.345): "When the
+// right-hand side of a `using var` declaration is a borrow rather than an
+// owned value (... an unmarked read of a **borrow-state** named binding (a
+// plain parameter, a borrowing alias or loop variable, a captured owned
+// binding inside a closure) ...), the `using var` does **not** assume a
+// disposal obligation (derives: K2 — no obligation can be assumed from a
+// borrow): at scope end, no `Dispose()` is called, because the value is not
+// owned by this scope."
+//
+// §28.3's K1 makes this an OWNERSHIP CLASSIFICATION question, and the
+// classification of a PARAMETER is decided by its modifier: a plain parameter
+// is a BORROW of the caller's value (§28.3: "a parameter is a borrow of the
+// caller's value"), an `owned` parameter is an OWNED TRANSFER, and an `out
+// owned` parameter is an owned recipient. So only the plain parameter is a
+// borrow, and the CALLER keeps the disposal obligation.
+//
+// The OWNERSHIP PASS's `usingVarSourceIsBorrow` flag does not cover this
+// shape (its bare-identifier arm recognizes a tracked local and an `owned`
+// parameter — #3253 — but not a plain parameter), so the answer is computed
+// here, in the codegen, from the SAME facts the flag is computed from. This
+// is the ONE authority for the question, so the disposal registration
+// (`registerUsingDisposal`) and this predicate cannot disagree — the
+// #3419 "duplicated classification predicates" shape.
+//
+// NOT IN SCOPE HERE (each has its own authority, and each is left exactly as
+// it was):
+//   * an `owned` parameter — the ownership pass's own #3253 pin covers it;
+//   * a tracked local — the ownership pass's #1285/#2071 pin covers it;
+//   * a `ref` parameter — `ref` is not an ownership transfer either, so it is
+//     a borrow; the modifier test below declines only `owned` / `out owned`,
+//     so a `ref` parameter IS reported as a borrow here;
+//   * a field read, an indexer access, a borrow-returning call — the
+//     ownership pass's positive recognition (#2128/#2137) covers them.
+bool Emitter::usingVarRhsIsPlainParameterBorrow(const ast::LocalDecl* ld) const {
+    if (!ld || !ld->initializer) return false;
+    // Only the BARE-IDENTIFIER spelling is a borrow of a named binding. A
+    // member access, an indexer, a call and the rest are the ownership pass's
+    // shapes, and the plain-`var` twin of each is handled there.
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get());
+    if (!id) return false;
+    if (id->name == "this" || id->name == "base") return false;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+    if (!ps) return false;
+    // §22.3 / §28.3: `owned` is an OWNED TRANSFER and `out owned` is an owned
+    // recipient; both are OWNED, not BORROWED. Everything else — a plain
+    // parameter, a `ref` parameter — is a borrow of the caller's value.
+    return ps->modifier != "owned" && ps->modifier != "out owned";
 }
 
 

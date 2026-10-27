@@ -20381,6 +20381,17 @@ private:
     // construction lowering retains each of them for an eligible local, so the
     // slot owns +1 on every active-case string either way.
     bool valueLikeChoiceLocalIsCopy(const ast::Node* ldNode) const;
+    // fix #7387 / §28.10 (v0.345): is this `using var` binding's RIGHT-HAND
+    // SIDE an unmarked read of a PLAIN (non-`owned`) PARAMETER — the one
+    // §28.10 borrow shape the ownership pass's `usingVarSourceIsBorrow` flag
+    // does not cover? §28.10's "`using var` initialized from a borrow" lists
+    // it ("an unmarked read of a borrow-state named binding (a plain
+    // parameter, ...)"), and the answer is BORROW: "the `using var` does not
+    // assume a disposal obligation ... at scope end, no `Dispose()` is called,
+    // because the value is not owned by this scope". §28.3's K1 makes this an
+    // OWNERSHIP CLASSIFICATION question, and the answer is BORROW for a plain
+    // parameter and OWNED for an `owned` one (an owned transfer).
+    bool usingVarRhsIsPlainParameterBorrow(const ast::LocalDecl* ld) const;
     // fix #7305 / §28.10 (v0.344): `allowUsingVar` admits the `using var`
     // SPELLING of a value-like choice local — §28.10 says of it that "the only
     // effect is the reassignability restriction", so the `using var` spelling
