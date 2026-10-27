@@ -17,8 +17,9 @@ prints how many cells are wrong.
     scripts/using_heads_grid.py --bezelc build/bezelc --out /var/tmp/... \
         [--filter class,string] [--jobs 8] [--timeout 60] [--report FILE]
 
-Exit status: 0 when every cell matches its expectation, 1 when at least one
-cell is wrong, 2 on a usage or infrastructure error.
+Exit status: 0 when no cell blocks the DONE verdict (no WRONG, no
+KNOWN-RED, no MISMATCH, no TIMEOUT), 1 when at least one cell blocks it, 2 on
+a usage or infrastructure error.
 
 THE THREE DIMENSIONS. A cell is (head kind) x (binding form) x (source kind),
 and the third dimension is spelled out rather than implicit:
@@ -85,13 +86,23 @@ ORACLE NOTES (the house's traps, honoured here):
     A NOVAC cell asserts it is ABSENT.
   * Every non-REJ cell must be CLEAN: no leak, no crash, no sanitizer report.
   * A cell that is red because a NAMED issue is still open is reported as
-    KNOWN-RED with that issue, and is NOT counted as WRONG. A cell that is red
-    for any other reason is WRONG, and the campaign is DONE when there are no
-    WRONG cells.
-  * The ASan leg must actually run. The summary prints
-    `NATIVE SANITIZER: 0 check(s) skipped` only when every executed cell ran
-    an ASan-instrumented binary; a cell whose program could not be linked
-    under ASan is counted as SKIPPED and the summary says so.
+    KNOWN-RED with that issue. A KNOWN-RED cell BLOCKS the DONE verdict just
+    like a WRONG one does (a red cell is red, whoever owns it), and a cell
+    that is red for any other reason is WRONG. The campaign is DONE when no
+    WRONG, no KNOWN-RED, no MISMATCH and no TIMEOUT cell is left.
+  * The ASan leg must actually run. Every cell's program is built with
+    `--sanitize=address`, and the summary prints
+    `NATIVE SANITIZER: <n> check(s) skipped`, where `<n>` is the number of
+    cells whose ASan check was skipped because the ASan RUNTIME was
+    unavailable — measured by inspecting each built executable for the
+    runtime (see `asan_skipped_count`). A program that fails to COMPILE or
+    to LINK is a REJECTED cell (a WRONG cell when the cell expected a run):
+    there is no SKIPPED verdict, and such a cell blocks the DONE verdict on
+    its own, so nothing is hidden by the sanitizer counter.
+  * A COMPILE TIMEOUT is its own verdict (TIMEOUT), it is NOT a sanitizer
+    skip, and it BLOCKS the DONE verdict: a cell whose program hung the
+    compiler is UNMEASURED, and a DONE instrument must not print YES with an
+    unmeasured cell.
 
 Every type and member used here exists in docs/Bezel_Standard_Library.md; the
 sections are cited at the head table. Do not add a member that is not there; a
@@ -104,8 +115,7 @@ import re
 import subprocess
 import sys
 
-CLEAN, LEAK, CRASH, CF, TIMEOUT, SKIPPED = (
-    'CLEAN', 'LEAK', 'CRASH', 'CF', 'TIMEOUT', 'SKIPPED')
+CLEAN, LEAK, CRASH, CF, TIMEOUT = ('CLEAN', 'LEAK', 'CRASH', 'CF', 'TIMEOUT')
 
 # The leak-oracle band (50-500). Every non-REJ cell loops this many times.
 LOOP_N = 60
@@ -1035,6 +1045,10 @@ def compile_program(bezelc, odir, progdir, name, src, timeout):
     with open(prog, 'w') as f:
         f.write(src)
     exe = f'{odir}/{name}.exe'
+    # A stale executable from an earlier run in the same `--out` directory must
+    # not be mistaken for THIS run's: the sanitizer counter reads it.
+    if os.path.exists(exe):
+        os.remove(exe)
     cmd = [bezelc, '--sanitize=address', '-o', exe, prog]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
@@ -1063,6 +1077,46 @@ def run_exe(exe, odir, name, run_timeout):
     cls, det = classify(True, r.returncode, r.stderr)
     lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
     return 'ran', cls, det, lines
+
+
+def asan_instrumented(exe):
+    """True iff the built executable carries the ASan runtime.
+
+    The grid's leak/crash verdicts are only sanitizer verdicts if the binary
+    it runs is ASan-instrumented. The house's
+    `NATIVE SANITIZER: n check(s) skipped` counts the cells whose check
+    could not run because the ASan RUNTIME was unavailable, and this is the
+    source of that number: an executable with no ASan runtime in it is a
+    cell whose sanitizer check was skipped.
+    """
+    try:
+        with open(exe, 'rb') as f:
+            blob = f.read()
+    except OSError:
+        return False
+    return b'__asan' in blob or b'libclang_rt.asan' in blob
+
+
+def asan_skipped_count(odir, cells):
+    """The number of cells whose ASan check was SKIPPED.
+
+    THE COUNTER. A cell's sanitizer check was skipped when the cell
+    produced an executable that carries NO ASan runtime: the runtime was
+    unavailable, so the cell's leak/crash verdict is not a sanitizer
+    verdict.
+
+    A cell that produced NO executable is NOT counted: a program rejected
+    at compile time has no sanitizer verdict to skip, and a cell that was
+    expected to run and did not build is a WRONG cell (or a TIMEOUT cell),
+    which blocks the DONE verdict on its own. Nothing is hidden by this
+    counter — an unmeasured cell blocks the verdict.
+    """
+    n = 0
+    for head, form in cells:
+        exe = os.path.join(odir, f'{head}__{form}.exe')
+        if os.path.exists(exe) and not asan_instrumented(exe):
+            n += 1
+    return n
 
 
 def run_cell(bezelc, odir, progdir, head, form, timeout, run_timeout, twins):
@@ -1249,13 +1303,60 @@ def check_agreement(rows, expectations=None):
     return out
 
 
+def blocking_count(jc):
+    """The number of cells that BLOCK the DONE verdict.
+
+    THE DONE CRITERION. "No WRONG cell, no KNOWN-RED cell, no SPELLING
+    MISMATCH and no TIMEOUT cell" — a red cell is red, whoever owns it, and a
+    cell whose program hung the compiler is UNMEASURED, so it must block too:
+    a DONE instrument must not print YES with an unmeasured cell. The
+    reviewer's demonstration: with the KNOWN-RED demotion and no tracker
+    check, a run printed "5 known-red" and EXITED 0 with five cells red and
+    leaking.
+
+    THE QUARANTINE. A quarantined cell (the `task` row, pending #6194) is
+    counted separately and never moves the DONE verdict: a row that flips
+    run-to-run cannot be part of a verdict that must not flip.
+    """
+    return (jc.get('WRONG', 0) + jc.get('KNOWN-RED', 0) +
+            jc.get('MISMATCH', 0) + jc.get('TIMEOUT', 0))
+
+
+def summary_lines(total, jc, asan_skipped, quarantined, quarantined_verdicts):
+    """The summary the grid prints, as LINES (so a test can assert on them).
+
+    `asan_skipped` is the count of cells whose ASan check was skipped
+    because the ASan RUNTIME was unavailable — its OWN counter (see
+    `asan_skipped_count`), never the timeout count. A TIMEOUT is reported in
+    the cells line as a TIMEOUT and it BLOCKS the verdict.
+    """
+    lines = [
+        f'{total} cells: {jc.get("OK", 0)} ok, {jc.get("WRONG", 0)} wrong, '
+        f'{jc.get("KNOWN-RED", 0)} known-red, {jc.get("MISMATCH", 0)} '
+        f'mismatch, {jc.get("UNDECIDED", 0)} undecided, '
+        f'{jc.get("N/A", 0)} n/a, {jc.get("TIMEOUT", 0)} timeout',
+    ]
+    if quarantined:
+        lines.append(
+            f'QUARANTINED: {len(quarantined)} cell(s) held out of the DONE '
+            f'count (pending {sorted(set(QUARANTINE.values()))[0]}): '
+            + ', '.join(f'{v} {k}' for k, v in
+                        sorted(quarantined_verdicts.items())))
+    lines.append(f'NATIVE SANITIZER: {asan_skipped} check(s) skipped')
+    blocking = blocking_count(jc)
+    if blocking:
+        lines.append(f'DONE: NO — {blocking} cell(s) block it (wrong + '
+                     'known-red + mismatch + timeout)')
+    else:
+        lines.append('DONE: YES — no cell blocks the verdict')
+    return lines
+
+
 def judge(results, check_issues=False):
     """The cells -> the counts, the DONE verdict, and the rows.
 
-    THE DONE CRITERION. "No WRONG cell and no KNOWN-RED cell and no
-    SPELLING MISMATCH" — a red cell is red, whoever owns it. The reviewer's
-    demonstration: with the KNOWN-RED demotion and no tracker check, a run
-    printed "5 known-red" and EXITED 0 with five cells red and leaking.
+    THE DONE CRITERION is `blocking_count`: no WRONG cell, no KNOWN-RED cell,
+    no SPELLING MISMATCH and no TIMEOUT cell.
 
     THE QUARANTINE. A quarantined cell (the `task` row, pending #6194) is
     counted separately and never moves the DONE verdict: a row that flips
@@ -1295,7 +1396,7 @@ def judge(results, check_issues=False):
     jc = {}
     for r in judged:
         jc[r[2]] = jc.get(r[2], 0) + 1
-    blocking = jc.get('WRONG', 0) + jc.get('KNOWN-RED', 0) + jc.get('MISMATCH', 0)
+    blocking = blocking_count(jc)
     done = blocking == 0
     return rows, counts, jc, quarantined, done, quarantined_verdicts
 
@@ -1382,16 +1483,10 @@ def main():
     for head, form, verdict, observed, detail in rows:
         print(f'{verdict:12s} {head:20s} {form:22s} {observed}')
     total = len(rows)
-    print(f'{total} cells: {jc.get("OK", 0)} ok, {jc.get("WRONG", 0)} wrong, '
-          f'{jc.get("KNOWN-RED", 0)} known-red, {jc.get("MISMATCH", 0)} '
-          f'mismatch, {jc.get("UNDECIDED", 0)} undecided, '
-          f'{jc.get("N/A", 0)} n/a, {jc.get("TIMEOUT", 0)} skipped')
-    if quarantined:
-        print(f'QUARANTINED: {len(quarantined)} cell(s) held out of the DONE '
-              f'count (pending {sorted(set(QUARANTINE.values()))[0]}): '
-              + ', '.join(f'{v} {k}' for k, v in
-                          sorted(quarantined_verdicts.items())))
-    print(f'NATIVE SANITIZER: {jc.get("TIMEOUT", 0)} check(s) skipped')
+    asan_skipped = asan_skipped_count(odir, cells)
+    for line in summary_lines(total, jc, asan_skipped, quarantined,
+                              quarantined_verdicts):
+        print(line)
 
     if args.twins:
         print('plain-var twins:')
@@ -1402,14 +1497,7 @@ def main():
     if args.report:
         write_report(rows, args.report)
         print(f'report written to {args.report}')
-    blocking = (jc.get('WRONG', 0) + jc.get('KNOWN-RED', 0) +
-                jc.get('MISMATCH', 0))
-    if blocking:
-        print(f'DONE: NO — {blocking} cell(s) block it (wrong + known-red + '
-              f'mismatch)')
-        return 1
-    print('DONE: YES — no cell blocks the verdict')
-    return 0
+    return 0 if done else 1
 
 
 if __name__ == '__main__':

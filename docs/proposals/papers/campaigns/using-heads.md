@@ -87,17 +87,29 @@ population — this is the §3419 "duplicated classification predicates" shape:
   `Type` token in the runtime-managed set), #7339, #3483, #7328, #5653, #3516,
   #3515 — the last six through the run-time half.
 * **The shapes of six are already fixed before the anchor (the anchor
-  generalises, it does not newly close): 6** — #7322, #7306 and #7283 (one
-  commit carries all three: `9bb9387f narrow #7322: the vacuous `await using`
-  shape is not an async disposal` — the same vacuous-`await using`-over-a-
-  runtime-managed-value shape), #7327 and #7337 (`87fdfa67 fix #7337, #7327`),
-  and #3493's dispatch half.
-  ⚠ **Three of those six ISSUES are still OPEN** — #7322, #7306 and #7283:
-  their shapes no longer reproduce, the issues are not closed, and the tracker
-  owns them. ⚠ **And #3493's dispatch half is re-derived by MEASUREMENT on
-  this tree, not by a citation**: the earlier text here cited `e9c564fd fix
-  #3494 / narrow #3493`, and that commit is **not an ancestor of `origin/main`
-  nor of this tree** (it lives on a diverged local `main`). MEASURED here
+  generalises, it does not newly close): 6** — #7322 and #7306 (both the
+  vacuous-`await using`-over-a-runtime-managed-value shape, fixed by
+  `9bb9387f narrow #7322: the vacuous `await using` shape is not an async
+  disposal`), #7283, #7327 and #7337 (fixed by `87fdfa67 fix #7337, #7327:
+  the `await using` slot predicate must decide by the right-hand side's
+  class` — **#7283 is the function-typed (`lambda()`) shape and #7327 is its
+  re-file**, so `87fdfa67` carries #7283, #7327 and #7337), and #3493's
+  dispatch half.
+  ⚠ **All three of #7322, #7306 and #7283 are CLOSED — the tracker owns
+  them.** MEASURED (`gh issue view <N> --json state,closedAt`): **#7306**
+  closed 2026-10-27T14:43:15Z, **#7283** closed 2026-10-27T14:43:18Z and
+  **#7322** closed 2026-10-27T14:43:21Z — all three closed **before** this
+  commit's own timestamp (2026-10-27T14:51:59Z). **Their fixing commits are
+  named by the issues' own closing comments**: **#7283 → `87fdfa67`** (the
+  closing comment quotes that commit's own ASan measurement: a
+  function-typed right-hand side fell through the predicate's switch, so the
+  closure's word 0 was read as a vtable), **#7306 → `9bb9387f`**, and **#7322
+  → `9bb9387f`** for its own part plus **`87fdfa67`** for the two shapes it
+  was split into (#7327 and #7337). ⚠ **And #3493's dispatch half is
+  re-derived by MEASUREMENT on this tree, not by a citation**: the earlier
+  text here cited `e9c564fd fix #3494 / narrow #3493`, and that commit is
+  **not an ancestor of `origin/main` nor of this tree** (it lives on a
+  diverged local `main`). MEASURED here
   (`await using var u: Base := new Der();` over a `virtual` base
   `DisposeAsync`): the program prints **`DER_DA`** — the derived override IS
   awaited — so the shape is fixed in this tree and the fix's commit cannot be
@@ -164,8 +176,13 @@ correct at v0.345.
 once** (`['DTOR']`, `['DA']`), and the `interface`/`field_store` cell asserts the
 owned interface-typed field's block is **freed** (no leak). Any anchor that
 "fixes" the dispatch by suppressing a disposal instead of dispatching it turns
-those cells red (a leak) or red twice (a double free / UAF). The grid's
-`NATIVE SANITIZER: 0 check(s) skipped` line is what makes that verdict real.
+those cells red (a leak) or red twice (a double free / UAF). Every cell's
+program is built with `bezelc --sanitize=address`, so the leak/crash verdicts
+are real sanitizer verdicts, and the grid's `NATIVE SANITIZER: 0 check(s)
+skipped` line is the counter that says **no cell's ASan check was skipped**
+(the ASan runtime was available for every cell that produced a binary; a cell
+whose program was rejected never reached the sanitizer at all — it is a WRONG
+cell, and it blocks the DONE verdict).
 
 
 **Membership.** `docs/proposals/papers/master-plan/work/out/campaign-members.tsv`,
@@ -182,15 +199,22 @@ rows where `campaign == using-heads`: **24 rows** (severity: 7 soundness, 3 cras
   "that their entry checks confirm", and this entry check does not confirm it —
   the shape is a §28.2/§28.6 question about the explicit `Dispose()` call's
   reclamation, which is `producer-temporaries`' subject, not the head-kind question.
-* **The tracker label query — ONE statement, measured once.** On **2026-10-28**
-  the query `gh issue list --label "campaign:using-heads" --state open --limit 100`
-  returned **37 OPEN** issues: the 22 still-open members of the campaign's 24,
-  **#7374**, the twelve newly filed **#7386–#7397**, and **#5355** and **#7146**
-  (older issues that carry the campaign label). An earlier section of this
-  record said the same query returned `[]` (0 issues) — that was true before
-  the §1.6 labelling sweep and is now superseded; the number above is the one
-  to quote, and it was measured on the date above. Membership below is still
-  from the TSV, as the brief directs.
+* **The tracker label query — ONE statement, measured twice, each number with
+  the date it belongs to.** At **this commit's own timestamp**
+  (2026-10-27T14:51:59Z = 2026-10-28 03:51 NZDT) the query
+  `gh issue list --label "campaign:using-heads" --state open --limit 100`
+  returned **34 OPEN** issues: the **19** still-open members of the campaign's
+  24 (24 minus the five closed — #7327, #7337, #7283, #7306 and #7322),
+  **#7374**, the twelve newly filed **#7386–#7397**, and **#5355** and
+  **#7146** (older issues that carry the campaign label) — 19 + 1 + 12 + 2 =
+  **34**. **The LIVE query, measured on 2026-10-28, returns 40**: six issues
+  have been labelled since — **#7405, #7406, #7412, #7415, #7416 and #7417**.
+  ⚠ The **37** that an earlier revision of this record quoted for "2026-10-28"
+  counted #7283, #7306 and #7322 as open; they had been closed eight minutes
+  before that commit, so **37 was wrong at its own stated date**. An earlier
+  section of this record said the same query returned `[]` (0 issues) — that
+  was true before the §1.6 labelling sweep and is now superseded. Membership
+  below is still from the TSV, as the brief directs.
 
 ## Members at entry
 
@@ -208,7 +232,7 @@ means the repro ran and produced the CORRECT behaviour.
 | 3471 | other | **reproduces** (code shape) | `Emitter::registerUsingDisposal` still carries the four collection predicates **twice**: `dictTypeOfLocal` / `linkedListTypeOfLocal` / `listInterfaceTypeOfLocal` / `collectionTypeOfLocal` each appear 2× in the function, `taskTypeOfLocal` 1×. Measured by counting the occurrences in the function body at HEAD. |
 | 3482 | soundness | **reproduces** | `await using var s := new T();` at `T = Stopwatch` → `ERROR: AddressSanitizer: SEGV on unknown address 0x000000000010 ... in bz$async$P3482.Wrap$Run$Resume.2` (`rax = 0x10`). The plain `using var` twin leaks `32 byte(s) in 1 allocation(s)` — the twins still disagree. |
 | 3483 | soundness | **reproduces** | `await using var d: IAsyncDisposable := new Res();` prints `DTOR` — the destructor, not the awaited `DisposeAsync` (`DA` never printed). |
-| 3493 | soundness | **moved — the dispatch half is fixed** | With a `virtual` base `DisposeAsync`, `await using var u: Base := new Der();` prints `DER_DA`: the derived override IS awaited (`e9c564fd`, "fix #3494 / narrow #3493"). The residual is #3515 (reclamation), which the fix's commit body names. |
+| 3493 | soundness | **moved — the dispatch half is fixed** | With a `virtual` base `DisposeAsync`, `await using var u: Base := new Der();` prints `DER_DA`: the derived override IS awaited. **MEASURED on this tree** — the fixing commit cannot be named from this tree's history (the earlier text here cited `e9c564fd fix #3494 / narrow #3493`, which is neither an ancestor of `origin/main` nor of this tree; see the anchor's section above). The residual is #3515 (reclamation), which the fix's commit body names. |
 | 3515 | leak | **reproduces** | `await using var u: Base := new Der();` with `public owned _d: Cell;` on `Der` → `Cell.n=1` (Der._d never disposed) and `SUMMARY: AddressSanitizer: 16 byte(s) leaked in 1 allocation(s)`. |
 | 3516 | soundness | **reproduces** | `await using var u: Abs := new AbsD();` (Abs declares `abstract DisposeAsync`) prints `ABSD_DTOR / ABS_DTOR` — the destructor chain, not `DA`. |
 | 5653 | soundness | **reproduces** | `await using var b: Base := new Der();` where `Base` declares no `DisposeAsync` prints `DER_DTOR / BASE_DTOR` — not `DA`. §28.12's own worked example demands `Der.DisposeAsync`. |
@@ -244,9 +268,9 @@ with the tracker.
 | # | fixing commit | re-scoping (with the deciding spec sentence QUOTED) |
 |---|---|---|
 | #2624 | none isolated by this lane | **blocked on a ruling.** The repro ran and produced the CORRECT behaviour, and the spec does not name the pending per-advance Task: §29.1's iterator protocol says *"Disposing the enumerator (`break`, exhaustion, or explicit `Dispose()`) disposes any outstanding yielded value the iterator still owns"* — the per-advance Task is not a yielded value, so whether it is part of the disposal obligation is not decided by the text. The ISSUE is OPEN. |
-| #7283 | `9bb9387f narrow #7322` (the vacuous `await using` shape) | **not a defect at HEAD.** A function value is runtime-managed, and §28.9 says *"None of them is a class, and none has a `Dispose()` member: `x.Dispose()` over a value of one of these types is a compile error"*, so the `await using` spelling of it carries no disposal obligation, and §28.12's "`await using var` takes §28.10's admission unchanged" admits it. The ISSUE is OPEN. |
-| #7306 | `9bb9387f narrow #7322` | as #7283, for a string (also runtime-managed, §28.9). The ISSUE is OPEN. |
-| #7322 | `9bb9387f narrow #7322` | as #7283; the commit names this issue. The ISSUE is OPEN. |
+| #7283 | `87fdfa67 fix #7337, #7327` (the function-typed `await using` shape; #7327 is its re-file) | **not a defect at HEAD.** A function value is runtime-managed, and §28.9 says *"None of them is a class, and none has a `Dispose()` member: `x.Dispose()` over a value of one of these types is a compile error"*, so the `await using` spelling of it carries no disposal obligation, and §28.12's "`await using var` takes §28.10's admission unchanged" admits it. **The ISSUE is CLOSED** (2026-10-27T14:43:18Z), fixed by **`87fdfa67`** — the commit is named in the issue's own closing comment. |
+| #7306 | `9bb9387f narrow #7322` (the vacuous `await using` shape) | as #7283, for a string (also runtime-managed, §28.9). **The ISSUE is CLOSED** (2026-10-27T14:43:15Z), fixed by **`9bb9387f`**. |
+| #7322 | `9bb9387f narrow #7322` (its own part) and `87fdfa67` (the two shapes it was split into: #7327 and #7337) | as #7283; the commit names this issue. **The ISSUE is CLOSED** (2026-10-27T14:43:21Z). |
 | #7327 | `87fdfa67 fix #7337, #7327` | **closed by the fix** — the commit is in `origin/main`. The ISSUE is CLOSED. |
 | #7337 | `87fdfa67 fix #7337, #7327` | **closed by the fix** — the commit is in `origin/main`. The ISSUE is CLOSED. |
 
@@ -364,18 +388,25 @@ scripts/using_heads_grid.py --bezelc build/bezelc --out /var/tmp/bezel-scratch/<
 name, the **form name**, the form's label and the head's label (so
 `--filter class` selects every head whose name or label contains `class`, and
 `--filter copy_await_source` selects the await-spelling copy cells). Exit
-status 0 when every cell matches and nothing blocks the DONE verdict, 1 when
-at least one cell is wrong (or is a KNOWN-RED, or the two spellings of a
-program disagree), 2 on a usage/infrastructure error (a filter that matches no
-cell is a usage error, not a pass). The summary prints
-`NATIVE SANITIZER: <n> check(s) skipped`; **n must be 0** — a cell whose program
-could not be linked under ASan is counted as skipped.
+status 0 when nothing blocks the DONE verdict (no WRONG, no KNOWN-RED, no
+MISMATCH and no TIMEOUT cell), 1 when at least one cell blocks it, 2 on a usage
+or infrastructure error (a filter that matches no cell is a usage error, not a
+pass). The summary prints `NATIVE SANITIZER: <n> check(s) skipped`; **n must
+be 0** — **`<n>` is the SANITIZER's own counter**: the number of cells whose
+ASan check was skipped because the ASan RUNTIME was unavailable (measured by
+inspecting each built executable for the runtime), and **not** the timeout
+count. A program that fails to compile or to link is a REJECTED cell — a
+WRONG cell when the cell expected a run — and it blocks the DONE verdict on
+its own; there is **no SKIPPED verdict**. A **COMPILE TIMEOUT** is its own
+verdict (`TIMEOUT`), it is **not** a sanitizer skip, and it **blocks** the
+DONE verdict: a cell whose program hung the compiler is UNMEASURED, and a
+DONE instrument must not print YES with an unmeasured cell.
 
 **Where it is WIRED (the reviewer's M2).** The grid itself is **not** at the
 gate: it compiles 153 programs and runs them under ASan, which is far too
 slow for a gate cycle, and its DONE verdict is the campaign's, not the
 repository's. What IS at the gate is the grid's **classifier**:
-`scripts/gate/tests/test_using_heads_grid.py` (19 tests) is discovered by
+`scripts/gate/tests/test_using_heads_grid.py` (30 tests) is discovered by
 `scripts/pregate.sh` (it runs `python3 -m unittest discover -s
 scripts/gate/tests`), so a change to the grid's needles, its KNOWN-RED
 mechanism, its quarantine, its agreement check or its report writer fails the
@@ -484,8 +515,9 @@ not counted wrong.
 * **A cell that is red because a NAMED issue is still open is reported as
   KNOWN-RED with that issue — and a KNOWN-RED cell BLOCKS the DONE verdict
   just like a wrong one does.** The campaign's DONE criterion is **"no WRONG
-  cell, no KNOWN-RED cell and no SPELLING MISMATCH"**: a red cell is red,
-  whoever owns it. (The grid's first version counted a KNOWN-RED as
+  cell, no KNOWN-RED cell, no SPELLING MISMATCH and no TIMEOUT cell"**: a red
+  cell is red, whoever owns it, and a cell whose program hung the compiler is
+  UNMEASURED. (The grid's first version counted a KNOWN-RED as
   not-wrong and consulted no tracker, so a filter run that printed "5
   known-red" **exited 0** with five cells red and leaking. A KNOWN-RED row
   must now name the commit that fixes the cell — that commit must exist in
@@ -511,29 +543,40 @@ not counted wrong.
   own there (its two cells keep the verdicts the reading below gives them).
 
 
-**Baseline on this tree, measured** (the fix-forward's script, against the
-compiler at `d9f11d15` — `git diff --name-only d9f11d15 origin/main` names **no
-`src/` file**, so the compiler under test is the same on both):
+**Baseline on this tree, measured** (the grid's script, against the compiler at
+`d9f11d15` — `git diff --name-only d9f11d15 origin/main` names **no `src/` file**,
+so the compiler under test is the same on both; the command is
+`python3 scripts/using_heads_grid.py --bezelc build/bezelc --out <dir> --jobs 10
+--timeout 60 --run-timeout 90 --report <file> --twins`):
 
 ```
-153 cells: 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 skipped
-QUARANTINED: 9 cell(s) held out of the DONE count (pending #6194): 6 OK, 3 WRONG
+153 cells: 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 timeout
+QUARANTINED: 9 cell(s) held out of the DONE count (pending #6194): the OK/WRONG split is UNSTABLE — it is NOT quoted as a point value (measured 5 OK/4 WRONG and 6 OK/3 WRONG on two runs of this tree, and 4 OK/5 WRONG on the reviewer's run)
 NATIVE SANITIZER: 0 check(s) skipped
-DONE: NO — 53 cell(s) block it (wrong + known-red + mismatch)
+DONE: NO — 53 cell(s) block it (wrong + known-red + mismatch + timeout)
 ```
+
+⚠ **The quarantined row's split is UNSTABLE and is deliberately NOT quoted as
+a point value.** The printed line always names the split of THAT run (the grid
+counts it), but the split flips run-to-run — it is which of the nine `task`
+cells hung, which is #6194's race — so the record quotes the **DONE number**,
+which is stable, and labels the split as unstable. (An earlier revision of
+this record quoted "6 OK, 3 WRONG" in one place and "5 OK, 4 WRONG" in another
+for the same row; both were true of a run, and neither is a property of the
+tree.)
 
 => **53 cells block the DONE verdict** — 43 WRONG + 2 KNOWN-RED + 8 MISMATCH —
 of the **135** cells the count covers (153 − 9 N/A − 9 quarantined). That is
 the campaign's DONE number: the campaign is DONE when it is **0** (no WRONG,
-no KNOWN-RED, no MISMATCH).
+no KNOWN-RED, no MISMATCH, no TIMEOUT).
 
 **The two-run determinism proof (the reviewer's H3).** Two consecutive runs of
 the same script on the same compiler, into two different `--out` directories:
 
 | | run A | run B |
 |---|---|---|
-| `153 cells:` | 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 skipped | 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 skipped |
-| `QUARANTINED:` | 9 cells: 6 OK, 3 WRONG | 9 cells: 5 OK, 4 WRONG |
+| `153 cells:` | 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 timeout | 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 timeout |
+| `QUARANTINED:` | the OK/WRONG split is UNSTABLE (that run: 5 OK, 4 WRONG) | the OK/WRONG split is UNSTABLE (that run: 6 OK, 3 WRONG) |
 | `DONE:` | **NO — 53 cell(s) block it** | **NO — 53 cell(s) block it** |
 
 and the two runs' report TSVs are **byte-identical on all 144 non-quarantined
@@ -575,12 +618,16 @@ compiler:
 | `value_choice` / `await_using_var` | WRONG `#7374` | WRONG `#7374` |
 
 (the whole grids: base `153 cells: 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0
-undecided, 9 n/a, 0 skipped` ⇒ `DONE: NO — 53 cell(s) block it`; fix `153
-cells: 84 ok, 43 wrong, 0 known-red, 8 mismatch, 0 undecided, 9 n/a, 0
-skipped` ⇒ `DONE: NO — 51 cell(s) block it`. The base's numbers are also the
-entry tree's own numbers, which is the expected result: `git diff --name-only
-d9f11d15 origin/main` names no `src/` file, so the two builds are the same
-compiler.)
+undecided, 9 n/a, 0 timeout` ⇒ `DONE: NO — 53 cell(s) block it (wrong +
+known-red + mismatch + timeout)`; fix `153 cells: 84 ok, 43 wrong, 0
+known-red, 8 mismatch, 0 undecided, 9 n/a, 0 timeout` ⇒ `DONE: NO — 51 cell(s)
+block it (wrong + known-red + mismatch + timeout)`. **The summary's FORMAT
+changed in the grid-discharge commit** — the timeout count is no longer
+labelled "skipped", and the DONE line names the timeout — so those two
+measurements are quoted in the current format; the NUMBERS are the same. The
+base's numbers are also the entry tree's own numbers, which is the expected
+result: `git diff --name-only d9f11d15 origin/main` names no `src/` file, so
+the two builds are the same compiler.)
 
 => the grid **discriminates the `var` source from the `const` source, and both
 from the `await using` spelling and from the parameter source**: the fix turns
@@ -724,8 +771,11 @@ except **`object_string`, whose twin LEAKS 2040B/120** — an `Object`-declared
 slot holding a runtime-managed string does not release it. That is why the
 `object_string` cells are the grid's only `TWIN` cells: the `using var`
 spelling inherits the twin's retention and adds none of its own (the defect is
-the `Object` slot's, not the `using var`'s — new-11). `generic_unconstrained`'s
-twin leaks 32B/1 (the same generic-head leak as #3482).
+the `Object` slot's, not the `using var`'s — new-11). The other two
+exceptions, measured in the same run: **`generic_unconstrained`'s twin leaks
+32B/1** (the same generic-head leak as #3482) and **`type_token`'s twin does
+not build at all** (CF — the `typeof` deferral, §17.10, so the twin has no
+runtime lifetime to compare).
 
 **Dedup against `tests/conformance/rules/cases/` (done FIRST, as the brief
 requires).** The corpus carries 18 `s28_10_*` and 29 `s28_12_*` cases. Mapping
@@ -763,7 +813,7 @@ exercises the same head kind and the same binding form):
 
 | issue | what it unblocks | asked on |
 |---|---|---|
-| **#3493** | **RULED, owner-approved 2026-10-27** (verified in the issue's comments). *"Ruling: dispatch on the run-time object, through a `DisposeAsync` dispatch-table slot (this issue's option 2)."* The issue's own words: *"A trailing `DisposeAsync` dispatch entry covers this issue, #5653 (a `Base` that does not implement `IAsyncDisposable`) and #3483's interface shape, with one path instead of three static special cases."* **What it rules:** the *mechanism* of the run-time dispatch — a trailing `DisposeAsync` entry on the `IAsyncDisposable` itab (the #2506 shape), not a per-site static special case. **What it leaves open:** (a) the physical-reclamation half stays with **#3515**, whose two routes (a synthetic vtable slot `DisposeAsync$reclaim` vs a trailing itab entry) are recorded in that issue and are NOT chosen by the ruling; (b) the abstract-class head **#3516** stays gated on #3515; (c) **#7339** (a run-time STRING in an `Object`-typed slot) is not named by the ruling — it is a *value* dispatch, not a `DisposeAsync` dispatch, and needs its own answer; (d) the class-typed head's `DisposeAsync` is already dispatched through the vtable slot (`e9c564fd`), so the ruling's itab route is for the heads that have no vtable. | 2026-10-27 (already ruled) |
+| **#3493** | **RULED, owner-approved 2026-10-27** (verified in the issue's comments). *"Ruling: dispatch on the run-time object, through a `DisposeAsync` dispatch-table slot (this issue's option 2)."* The issue's own words: *"A trailing `DisposeAsync` dispatch entry covers this issue, #5653 (a `Base` that does not implement `IAsyncDisposable`) and #3483's interface shape, with one path instead of three static special cases."* **What it rules:** the *mechanism* of the run-time dispatch — a trailing `DisposeAsync` entry on the `IAsyncDisposable` itab (the #2506 shape), not a per-site static special case. **What it leaves open:** (a) the physical-reclamation half stays with **#3515**, whose two routes (a synthetic vtable slot `DisposeAsync$reclaim` vs a trailing itab entry) are recorded in that issue and are NOT chosen by the ruling; (b) the abstract-class head **#3516** stays gated on #3515; (c) **#7339** (a run-time STRING in an `Object`-typed slot) is not named by the ruling — it is a *value* dispatch, not a `DisposeAsync` dispatch, and needs its own answer; (d) the class-typed head's `DisposeAsync` is already dispatched through the vtable slot (MEASURED on this tree: the program prints `DER_DA` — see the anchor's section above; the fixing commit cannot be named from this tree's history), so the ruling's itab route is for the heads that have no vtable. | 2026-10-27 (already ruled) |
 
 **No other ruling is needed for the campaign.** U1 (the anchor's static half) needs
 none: §28.9 (v0.345) already says which values have no `Dispose()`, and §28.10
@@ -960,6 +1010,105 @@ findings, which the coordinator files with exactly one `campaign:` label.)*
   `docs/proposals/papers/master-plan.md` (its §6 progress table is the
   coordinator's), no `tests/conformance/rules/baseline.tsv` row, and no issue
   was filed (the two new findings below are for the coordinator to file).
+
+### Grid-discharge lane `r36-c1-gridfix` — 2026-10-28 (rounds 2, 3 and 4)
+
+* **SHA(s):** one commit on branch `r36-c1-gridfix`, on top of the fix-forward
+  `3cc672c1` (branch `r36-c1-entry`, untouched by this lane). The commit is the
+  branch tip; its SHA moves on a rebase or an amend, so read it from
+  `git log -1 r36-c1-gridfix` (the pick ledger records the picked SHA). Base:
+  `3cc672c1`.
+* **Files changed:** `scripts/using_heads_grid.py` (the instrument),
+  `scripts/gate/tests/test_using_heads_grid.py` (the gate's classifier test:
+  **19 → 30 tests**), and this record. **No `src/` change** — the compiler is
+  untouched, so the base and the tip measure the same compiler. **No issue is
+  closed by this commit.**
+* **What this lane was for:** the non-author review of `3cc672c1` ruled
+  ACCEPT-W-NOTES with **three BLOCKING notes**, and this lane discharges them.
+  (D1) a COMPILE `TIMEOUT` was neither blocking nor honestly labelled; (D2)
+  the gate test did not guard the load-bearing fixes — four of the reviewer's
+  ten mutations SURVIVED; (D3) the record named three CLOSED issues as OPEN
+  and misattributed one fixing commit. **A second review of this lane's own
+  commit was a narrow REJECT** (D1 and D3 discharged, D2 NOT): four MORE
+  mutations survived, and the commit body over-claimed what its mutation
+  check had actually killed. **Round 3 (this commit)** adds the four missing
+  tests, strengthens the two MISMATCH tests, and states — mutation by
+  mutation — which test kills which mutation.
+* **D1 — the timeout is a VERDICT, it blocks, and it is not a sanitizer
+  skip.** `judge` now counts `TIMEOUT` in the blocking set (a cell whose
+  program hung the compiler is UNMEASURED, and a DONE instrument must not
+  print YES with an unmeasured cell); the `SKIPPED` verdict is GONE (no code
+  path produced it); the cells line reports the timeout count as
+  **`0 timeout`** (it used to say "skipped", and the sanitizer line carried
+  the SAME number, so the claim on the screen was false); and the sanitizer
+  line now has **its own counter** — `asan_skipped_count` measures, per cell,
+  whether the executable that was built carries the ASan runtime, and reports
+  the cells whose ASan check was skipped. The module docstring, the summary
+  and this record now say the same thing. **MEASURED on this tree: `NATIVE
+  SANITIZER: 0 check(s) skipped`** — the ASan runtime was available for every
+  cell that produced a binary.
+* **D2 — the gate test now guards the load-bearing behaviours.** Round 2's
+  tests are `test_the_classifier_pins_every_verdict` (the LEAK / CRASH /
+  CLEAN / CF verdicts), `test_a_warning_citing_the_section_does_not_make_a_
+  rej_cell_green` (the grid's own REJ branch, driven with the `warn_only`
+  fake compiler: a §28.10 WARNING beside an unrelated §28.3 ERROR),
+  `test_a_mismatch_in_the_run_family_blocks_the_done_verdict` (the agreement
+  check in the RUN family, not only the REJ family),
+  `test_a_timeout_cell_blocks_the_done_verdict`,
+  `test_the_sanitizer_counter_is_its_own_counter` and
+  `test_the_summary_names_the_timeout_and_keeps_the_sanitizer_separate`. The
+  `warn_only` fixture — which no test used — now emits exactly the pair the
+  reviewer described. **Round 3 (the second review's four survivors) adds
+  five**: `test_the_exit_status_matches_the_printed_verdict` (the exit status
+  is the ONLY thing a caller sees: a grid that prints "DONE: NO" and exits 0
+  reports a red campaign as a pass),
+  `test_a_stale_executable_is_removed_before_the_compile` (a stale binary in
+  the `--out` directory must not be counted as a cell's sanitizer check),
+  `test_the_vacuity_rule_is_driven_by_the_grid_own_branch` (the §28.9 VAC /
+  NOVAC rule, which governs 36 of the 153 cells, driven through the grid's
+  OWN branch with the `vacuous` fake),
+  `test_a_correct_section_rejection_makes_the_cell_green` (the REJ branch's
+  POSITIVE direction, driven with the `reject_2810` fake) and
+  `test_a_mismatch_blocks_the_done_verdict_on_its_own` (the MISMATCH as the
+  ONLY blocker: the fixture of the pre-existing MISMATCH test has BOTH cells
+  WRONG, so its WRONG blocks independently of the MISMATCH). **Both dead
+  fixtures are now live.** The 19 pre-existing test methods are AST-identical
+  to the base (`3cc672c1`); the stronger MISMATCH fixture is a NEW test, not
+  an edit of the old one. **The lane's own mutation check: NINE load-bearing
+  behaviours broken ONE AT A TIME each turn the gate test RED** (the nine RED
+  results, and the test each one kills, are in the commit body).
+* **D3 — the record's issue states and numbers are now the tracker's.** #7283,
+  #7306 and #7322 are **CLOSED** (#7306 at 2026-10-27T14:43:15Z, #7283 at
+  14:43:18Z and #7322 at 14:43:21Z — ~8 minutes BEFORE the commit that called
+  them open) and the record says so, with the
+  fixing commits the issues' own closing comments name: **#7283 → `87fdfa67`**
+  (the function-typed shape), **#7306 → `9bb9387f`**, **#7322 → `9bb9387f`**
+  for its own part plus `87fdfa67` for the two shapes it was split into. The
+  label query's number is now the one true at its stated date (**34** at this
+  commit's timestamp: 19 members + #7374 + 12 + 2) with the **live** count
+  (**40** on 2026-10-28) quoted separately. The quarantined split is labelled
+  **UNSTABLE** and is no longer quoted as a point value. The `e9c564fd`
+  citations are gone from the two places that carried them — the record's own
+  L4 answer says that commit cannot be named from this tree's history, so the
+  record must not cite it either.
+* **Measured on this tree** (two runs, into two `--out` directories):
+  `153 cells: 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0
+  timeout` · `NATIVE SANITIZER: 0 check(s) skipped` · `DONE: NO — 53 cell(s)
+  block it (wrong + known-red + mismatch + timeout)` — identical in both runs,
+  and the two report TSVs are byte-identical on all 144 non-quarantined rows.
+  The quarantined row's split differed between the two runs (5 OK/4 WRONG and
+  6 OK/3 WRONG), which is exactly why it is no longer quoted as a point value.
+  **A third run (round 3, into a third `--out` directory) gives the same DONE
+  number**: `153 cells: 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided,
+  9 n/a, 0 timeout` · `NATIVE SANITIZER: 0 check(s) skipped` · `DONE: NO — 53
+  cell(s) block it (wrong + known-red + mismatch + timeout)`.
+* **Also corrected here, of the same class:** the twins. The record said "every
+  head's twin is CLEAN except `object_string`"; MEASURED, `generic_unconstrained`'s
+  twin leaks 32B/1 and `type_token`'s twin does not build at all (CF — the
+  `typeof` deferral, §17.10). Both are now named.
+* **Not touched:** no normative document (`docs/Bezel_*.md`), no
+  `docs/proposals/papers/master-plan.md`, no `tests/conformance/rules/baseline.tsv`
+  row, no `src/` file, and no issue was filed or closed.
 
 ## Exit review
 

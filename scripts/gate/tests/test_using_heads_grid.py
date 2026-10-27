@@ -25,11 +25,26 @@ What is asserted — each item is a defect the reviewer demonstrated:
     DONE count and reported on its own line, so the verdict does not flip
     run-to-run;
   * the spelling-agreement check (§28.12's "takes §28.10's admission
-    UNCHANGED") detects a disagreement, and does NOT judge the head whose
-    spec question is the OWNER's;
+    UNCHANGED") detects a disagreement — in the RUN family as well as the
+    REJ family — and does NOT judge the head whose spec question is the
+    OWNER's;
+  * the classifier pins every verdict it can return (CLEAN / LEAK / CRASH /
+    CF), because a cell that leaks must be classified LEAK;
+  * a TIMEOUT cell (a program that hangs the compiler) BLOCKS the DONE
+    verdict, and the sanitizer counter is its OWN counter — a timeout is not
+    a sanitizer skip;
+  * the EXIT STATUS matches the printed verdict (a grid that prints "DONE:
+    NO" and exits 0 reports a red campaign as a pass), and a stale
+    executable in the `--out` directory cannot be counted as a cell's
+    sanitizer check;
+  * the §28.9 vacuity rule (36 of the 153 cells) is driven through the
+    grid's OWN VAC/NOVAC branch, and a rejection under the rule a cell names
+    makes that cell GREEN;
   * the report TSV has one row per cell with five fields, and two runs into
     different `--out` directories produce byte-identical bytes.
 """
+import contextlib
+import io
 import os
 import pathlib
 import subprocess
@@ -61,9 +76,11 @@ done
 case "$FAKE_MODE" in
   reject)      echo "$src:80:5: owned value in \`src\` would be dropped here without disposal (§28.3 — consider \`using var\`, explicit \`.Dispose()\`, \`move\`, or \`return\`)" >&2; exit 1;;
   reject_2810) echo "$src:80:5: an unmarked \`using var y := x;\` adopts a named owned binding (§28.10)" >&2; exit 1;;
-  warn_only)   echo "$src:80:5: warning: \`using var\` \`x\` pins a source that already outlives this scope (§28.10 / §21.1)" >&2; exit 0;;
-  vacuous)     echo "$src:80:5: warning: \`using var\` \`x\` is vacuous — the RHS is a value-typed/runtime-managed value with no disposal obligation (§28.9); use \`const x := …;\` for a fixed alias without the disposal hint (§28.10 / §21.1)" >&2; exit 0;;
-  *)           echo "$src:80:5: warning: nothing" >&2; exit 0;;
+  warn_only)   echo "$src:80:5: warning: \`using var\` \`x\` pins a source that already outlives this scope (§28.10 / §21.1)" >&2
+               echo "$src:80:5: owned value in \`src\` would be dropped here without disposal (§28.3 — consider \`using var\`, explicit \`.Dispose()\`, \`move\`, or \`return\`)" >&2; exit 1;;
+  vacuous)     echo "$src:80:5: warning: \`using var\` \`x\` is vacuous — the RHS is a value-typed/runtime-managed value with no disposal obligation (§28.9); use \`const x := …;\` for a fixed alias without the disposal hint (§28.10 / §21.1)" >&2
+               printf '#!/bin/bash\necho END\n' > "$out"; chmod +x "$out"; exit 0;;
+  *)           echo "$src:80:5: warning: nothing" >&2;;
 esac
 printf '#!/bin/bash\necho 42\n' > "$out"; chmod +x "$out"
 '''
@@ -80,6 +97,25 @@ def _fake_compiler(d, mode='default'):
 def _git(*args):
     return subprocess.run(['git', '-C', str(ROOT)] + list(args),
                           capture_output=True, text=True)
+
+
+def _run_main(argv):
+    """Drive the grid's `main()` and return (exit status, what it printed).
+
+    The exit status is the grid's DONE verdict as a shell sees it, and it is
+    the only thing a caller (the campaign's runner, a CI job) can see: a grid
+    that prints "DONE: NO" and exits 0 is a grid that reports a red campaign
+    as a pass.
+    """
+    old = sys.argv
+    sys.argv = ['using_heads_grid.py'] + list(argv)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = g.main()
+    finally:
+        sys.argv = old
+    return rc, buf.getvalue()
 
 
 class UsingHeadsGridTest(unittest.TestCase):
@@ -142,6 +178,49 @@ class UsingHeadsGridTest(unittest.TestCase):
                     'without disposal (§28.3 — consider `using var`, explicit '
                     '`.Dispose()`, `move`, or `return`)')
         self.assertFalse(g.VACUOUS_RE.search(must_use))
+
+    # ----------------------------------------------------------- classifier
+    def test_the_classifier_pins_every_verdict(self):
+        """The classifier is the heart of the leak oracle: a program that
+        leaks must be classified LEAK, one that crashes CRASH, a clean one
+        CLEAN, and one that would not build CF. (The reviewer's mutation
+        check showed that a `classify` that never reports LEAK left every
+        test GREEN.)"""
+        self.assertEqual(g.classify(False, 1, 'error: something'),
+                         (g.CF, 'compile failed'))
+        self.assertEqual(g.classify(True, 0, ''), (g.CLEAN, ''))
+        leak = ('==42==ERROR: LeakSanitizer: 2100 byte(s) leaked in 120 '
+                'allocation(s).')
+        self.assertEqual(g.classify(True, 0, leak), (g.LEAK, '2100B/120'))
+        crash = '==42==ERROR: AddressSanitizer: SEGV on unknown address 0x0'
+        self.assertEqual(g.classify(True, 0, crash), (g.CRASH, 'SEGV'))
+        self.assertEqual(g.classify(True, 3, ''), (g.CRASH, 'rc=3'))
+        self.assertEqual(g.classify(True, 0, 'free(): invalid pointer'),
+                         (g.CRASH, 'glibc'))
+
+    # ------------------------------------------------------- the REJ branch
+    def test_a_warning_citing_the_section_does_not_make_a_rej_cell_green(self):
+        """The grid's own REJ branch must match the needle against the lines
+        that REJECTED the program, not against a warning that happens to
+        cite the same section. The fake compiler emits a §28.10 WARNING
+        beside an unrelated §28.3 ERROR, so the cell (which claims §28.10's
+        rejection) must be WRONG — this is the admitting twin the
+        fix-forward claims to have closed."""
+        with tempfile.TemporaryDirectory() as d:
+            bezelc = _fake_compiler(d, 'warn_only')
+            os.makedirs(os.path.join(d, 'run'))
+            os.makedirs(os.path.join(d, 'programs'))
+            try:
+                out = g.run_cell(bezelc, os.path.join(d, 'run'),
+                                 os.path.join(d, 'programs'), 'class',
+                                 'copy_local_source', 30, 30, {})
+            finally:
+                os.environ.pop('FAKE_MODE', None)
+        _head, _form, verdict, observed, _detail = out
+        self.assertEqual(
+            verdict, 'WRONG',
+            'a §28.10 WARNING beside an unrelated §28.3 ERROR must not make '
+            f'the cell green (got {verdict!r}: {observed!r})')
 
     # ------------------------------------------------------------ known-red
     def test_known_red_rows_name_a_fixing_commit_that_exists(self):
@@ -230,6 +309,202 @@ class UsingHeadsGridTest(unittest.TestCase):
         _rows, _counts, jc, _q, done, _qv = g.judge(results)
         self.assertEqual(jc.get('MISMATCH', 0), 1)
         self.assertFalse(done)
+
+    def test_a_mismatch_blocks_the_done_verdict_on_its_own(self):
+        """The MISMATCH must be the ONLY blocker here: the plain cell is OK,
+        so a `blocking` set without MISMATCH would let this cell family
+        through — and a §28.12 "takes §28.10's admission UNCHANGED" violation
+        would then print "DONE: YES" once the other red cells are fixed.
+        (The fixture of the test above has BOTH cells WRONG, so its WRONG
+        blocks independently of the MISMATCH: the reviewer's mutation check
+        found that a MISMATCH removed from the blocking set left every test
+        GREEN.)"""
+        results = [('class', 'copy_local_source', 'OK',
+                    'rejected (§28.10)', ''),
+                   ('class', 'copy_await_source', 'WRONG',
+                    'compiled, expected rejection', '')]
+        out = g.check_agreement(results)
+        self.assertEqual(len(out), 1, f'expected one MISMATCH, got {out!r}')
+        self.assertEqual(out[0][2], 'MISMATCH')
+        _rows, _counts, jc, _q, done, _qv = g.judge(results)
+        self.assertEqual(jc.get('MISMATCH', 0), 1)
+        self.assertEqual(jc.get('WRONG', 0), 0,
+                         'this fixture must leave the MISMATCH as the only '
+                         'blocker')
+        self.assertFalse(done,
+                         'a MISMATCH must block the DONE verdict on its own')
+
+    def test_a_mismatch_in_the_run_family_blocks_the_done_verdict(self):
+        """The agreement check is load-bearing in the RUN family too: the two
+        spellings of a RUN cell must AGREE on the admission (§28.12), and a
+        disagreement blocks the DONE verdict. The fixture here is a RUN cell
+        — a REJ-family fixture does not exercise this path (the reviewer's
+        mutation check found the RUN-family comparison unpinned).
+
+        The plain cell is OK and the await cell is the one that was REJECTED:
+        the MISMATCH is then the only blocker, so a `blocking` set without
+        MISMATCH is caught here."""
+        rows = [('class', 'using_var', 'OK', 'clean, output []', ''),
+                ('class', 'await_using_var', 'WRONG',
+                 'rejected, expected a run', '')]
+        out = g.check_agreement(rows)
+        self.assertEqual(len(out), 1, f'expected one MISMATCH, got {out!r}')
+        self.assertEqual(out[0][2], 'MISMATCH')
+        _rows, _counts, jc, _q, done, _qv = g.judge(rows)
+        self.assertEqual(jc.get('MISMATCH', 0), 1)
+        self.assertEqual(jc.get('WRONG', 0), 0)
+        self.assertFalse(done, 'a MISMATCH must block the DONE verdict')
+
+    # ------------------------------------------------- the timeout / sanitizer
+    def test_a_timeout_cell_blocks_the_done_verdict(self):
+        """A cell whose program hangs the compiler is UNMEASURED. A DONE
+        instrument must not print YES with an unmeasured cell — the
+        reviewer's measurement: `judge([('class','using_var','TIMEOUT',
+        'compile timeout','')])` returned `done=True`."""
+        results = [('class', 'using_var', 'TIMEOUT', 'compile timeout', '')]
+        _rows, _counts, jc, _q, done, _qv = g.judge(results)
+        self.assertEqual(jc.get('TIMEOUT', 0), 1)
+        self.assertFalse(done, 'a TIMEOUT cell must block the DONE verdict')
+
+    def test_the_sanitizer_counter_is_its_own_counter(self):
+        """`NATIVE SANITIZER: n check(s) skipped` counts the cells whose
+        ASan check was skipped because the ASan RUNTIME was unavailable — it
+        is NOT the timeout count."""
+        with tempfile.TemporaryDirectory() as d:
+            odir = os.path.join(d, 'run')
+            os.makedirs(odir)
+            exe = os.path.join(odir, 'class__using_var.exe')
+            with open(exe, 'wb') as f:
+                f.write(b'not an asan binary')
+            self.assertEqual(
+                g.asan_skipped_count(odir, [('class', 'using_var')]), 1)
+            with open(exe, 'wb') as f:
+                f.write(b'\x00__asan_init\x00')
+            self.assertEqual(
+                g.asan_skipped_count(odir, [('class', 'using_var')]), 0)
+
+    def test_the_summary_names_the_timeout_and_keeps_the_sanitizer_separate(self):
+        """The cells line names the TIMEOUT cells; the sanitizer line carries
+        the SANITIZER counter; and the verdict is NO. The DONE line's FULL
+        parenthetical is pinned too: the record quotes that line verbatim, so
+        a dropped "+ timeout" would make the record's quote drift from the
+        code — the class of drift D3 exists to prevent."""
+        lines = g.summary_lines(1, {'TIMEOUT': 1}, 0, [], {})
+        text = '\n'.join(lines)
+        self.assertIn('1 timeout', text)
+        self.assertIn('NATIVE SANITIZER: 0 check(s) skipped', text)
+        self.assertIn('DONE: NO', text)
+        self.assertIn('wrong + known-red + mismatch + timeout', text)
+
+    # ------------------------------------------- the exit status, the counter
+    def test_the_exit_status_matches_the_printed_verdict(self):
+        """The exit status is the ONLY thing a caller sees. A grid that prints
+        "DONE: NO" and exits 0 reports a red campaign as a pass — the
+        reviewer's measurement with the mutant: "DONE: NO — 5 cell(s) block
+        it" and exit status 0."""
+        with tempfile.TemporaryDirectory() as d:
+            bezelc = _fake_compiler(d, 'default')
+            try:
+                # The fake's program prints 42, so the cell never reaches its
+                # END marker: it is WRONG, and it BLOCKS.
+                red_rc, red_out = _run_main(
+                    ['--bezelc', bezelc, '--out', os.path.join(d, 'red'),
+                     '--filter', 'string using_var', '--jobs', '2'])
+                # The `vacuous` fake's program prints END and emits the §28.9
+                # vacuity warning: the VAC cell is OK, and nothing blocks.
+                # (The fake reads FAKE_MODE when it RUNS, so the mode is
+                # switched here, not at the fake's creation.)
+                os.environ['FAKE_MODE'] = 'vacuous'
+                green_rc, green_out = _run_main(
+                    ['--bezelc', bezelc, '--out', os.path.join(d, 'green'),
+                     '--filter', 'value_choice using_var', '--jobs', '2'])
+            finally:
+                os.environ.pop('FAKE_MODE', None)
+        self.assertIn('DONE: NO', red_out)
+        self.assertEqual(red_rc, 1,
+                         'a grid that blocks the DONE verdict must exit 1')
+        self.assertIn('DONE: YES', green_out)
+        self.assertEqual(green_rc, 0,
+                         'a grid with nothing blocking must exit 0')
+
+    def test_a_stale_executable_is_removed_before_the_compile(self):
+        """A stale executable from an earlier run in the same `--out`
+        directory must not be mistaken for THIS run's: the sanitizer counter
+        reads it. With the guard gone, a stale NON-ASan binary makes the
+        counter report "1 check(s) skipped" for a cell that never built."""
+        with tempfile.TemporaryDirectory() as d:
+            bezelc = _fake_compiler(d, 'reject')
+            odir = os.path.join(d, 'run')
+            progdir = os.path.join(d, 'programs')
+            os.makedirs(odir)
+            os.makedirs(progdir)
+            exe = os.path.join(odir, 'class__using_var.exe')
+            with open(exe, 'wb') as f:
+                f.write(b'\x00a stale, non-ASan binary\x00')
+            try:
+                status, _clog = g.compile_program(
+                    bezelc, odir, progdir, 'class__using_var',
+                    'method Main()\nend Main;\n', 30)
+            finally:
+                os.environ.pop('FAKE_MODE', None)
+            self.assertEqual(status, 'rejected')
+            self.assertFalse(os.path.exists(exe),
+                             'a stale executable must not survive a compile '
+                             'that did not produce one')
+            self.assertEqual(
+                g.asan_skipped_count(odir, [('class', 'using_var')]), 0,
+                'a cell that produced NO executable has no sanitizer check to '
+                'skip, and must not be counted as one')
+
+    # ------------------------------------------------- the vacuity branch
+    def test_the_vacuity_rule_is_driven_by_the_grid_own_branch(self):
+        """The §28.9 vacuity rule governs 36 of the 153 cells: a VAC cell
+        asserts the vacuity warning IS there, a NOVAC cell asserts it is
+        ABSENT. The `vacuous` fake emits it, so the grid's own branch must
+        make the VAC cell green and the NOVAC cell red — with the rule
+        INVERTED both flip (the reviewer measured three cells' verdicts
+        flipping on `--filter string` with no test noticing)."""
+        with tempfile.TemporaryDirectory() as d:
+            bezelc = _fake_compiler(d, 'vacuous')
+            odir = os.path.join(d, 'run')
+            progdir = os.path.join(d, 'programs')
+            os.makedirs(odir)
+            os.makedirs(progdir)
+            try:
+                vac = g.run_cell(bezelc, odir, progdir, 'string',
+                                 'using_var', 30, 30, {})
+                novac = g.run_cell(bezelc, odir, progdir, 'builtin_collection',
+                                   'using_var', 30, 30, {})
+            finally:
+                os.environ.pop('FAKE_MODE', None)
+        self.assertEqual(vac[2], 'OK',
+                         'a VAC cell with the §28.9 vacuity warning must be '
+                         f'green (got {vac[2]!r}: {vac[3]!r})')
+        self.assertEqual(novac[2], 'WRONG',
+                         'a NOVAC cell must be red when the §28.9 vacuity '
+                         f'warning is emitted (got {novac[2]!r}: {novac[3]!r})')
+
+    def test_a_correct_section_rejection_makes_the_cell_green(self):
+        """The REJ branch's POSITIVE direction: a diagnostic that rejects the
+        program under the rule the cell names makes the cell GREEN. The
+        `reject_2810` fake rejects with §28.10 — the rule
+        `class/copy_local_source` names — so the cell must be OK. (Only the
+        NEGATIVE direction — a §28.10 warning must not make the cell green —
+        was pinned before.)"""
+        with tempfile.TemporaryDirectory() as d:
+            bezelc = _fake_compiler(d, 'reject_2810')
+            odir = os.path.join(d, 'run')
+            progdir = os.path.join(d, 'programs')
+            os.makedirs(odir)
+            os.makedirs(progdir)
+            try:
+                cell = g.run_cell(bezelc, odir, progdir, 'class',
+                                  'copy_local_source', 30, 30, {})
+            finally:
+                os.environ.pop('FAKE_MODE', None)
+        self.assertEqual(cell[2], 'OK',
+                         'a rejection under the rule the cell names must make '
+                         f'the cell green (got {cell[2]!r}: {cell[3]!r})')
 
     # ------------------------------------------------------------ the report
     def test_report_tsv_has_one_row_per_cell_and_five_fields(self):
