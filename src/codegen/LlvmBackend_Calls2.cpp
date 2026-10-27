@@ -945,6 +945,52 @@ llvm::Value* Emitter::emitStringFromFfiBuffer(llvm::Value* buf, bool wide) {
 }
 
 
+// THE ONE first-argument guard for the `Parse` / `TryParse` arms — the SHARED
+// spelling, used by every copy of those arms (fix #7299 / #7300; stdlib
+// §9.1 / §9.2 / §9.3 / §9.4 / §9.5, v0.344).
+//
+// stdlib §9.1 declares `Parse(s: string): int` and `TryParse(s: string, out
+// result: int): bool`; §9.2 declares the `double` / `float` forms; §9.3 the
+// `decimal` form; §9.4 the `bool` form; §9.5 the `char` form. Every one of
+// them declares the first parameter as a `string`, and §9.1 / §9.2 / §9.3 ALSO
+// declare a `ReadOnlyStringSpan` overload — §9.4 and §9.5 declare NONE, and
+// spec §5.1's implicit-conversion table has no span-to-string row, so a span
+// operand at `bool.Parse` / `char.Parse` is not a parseable operand either.
+// `spanOverloadDeclared` carries that per-receiver fact.
+//
+// The test is the operand's STATIC TYPE (the primitive `string`) OR the
+// LOWERED operand's SHAPE (the {ptr,i32,i32} `ReadOnlyStringSpan` record of
+// §3.3), the shape arm admitted only where the receiver DECLARES the span
+// overload. The shape alone is NOT enough — a class instance lowers to a
+// pointer too — and the static type alone is not enough either, because the
+// span overload's declared type is not the primitive `string`. The two
+// together are exact.
+//
+// An operand whose static type sema could not determine (`nullptr`) is
+// admitted on its SHAPE alone: a legal call must never be dropped on a typing
+// accident.
+//
+// `isSpanValue` is the caller's shape test (`Emitter::isStringSpanValue`),
+// passed in because the shape test is a private member of `Emitter` and this
+// helper is shared with the SECOND copy of these arms in
+// LlvmBackend_Calls.cpp (the `Decimal` / `Boolean` copies — #7300).
+bool sharedParseOperandAdmissible(
+        sema::SemaContext& ctx, const ast::Expr& e, llvm::Value* v,
+        llvm::function_ref<bool(llvm::Value*)> isSpanValue,
+        bool spanOverloadDeclared) {
+    const sema::TypeRef* t = ctx.exprType(e);
+    if (!t) {
+        // The static type is unknown — fall back to the SHAPE alone.
+        if (v->getType()->isPointerTy()) return true;
+        return spanOverloadDeclared && isSpanValue(v);
+    }
+    if (t->kind == sema::TypeRef::Kind::Primitive &&
+        t->primitive == sema::PrimitiveType::String)
+        return true;
+    return spanOverloadDeclared && isSpanValue(v);
+}
+
+
 llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -1001,38 +1047,20 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     const auto& m = ma->member;
     using P = sema::PrimitiveType;
 
-    // THE FIRST-ARGUMENT GUARD for the `Parse` / `TryParse` arms below.
+    // THE FIRST-ARGUMENT GUARD for the `Parse` / `TryParse` arms below — a
+    // thin wrapper over the ONE shared spelling,
+    // `sharedParseOperandAdmissible` above, which carries the policy and the
+    // shared history of the #7290 / #7293 / #7294 guards.
     //
-    // stdlib §9.1 declares `Parse(s: string): int` and `TryParse(s: string,
-    // out result: int): bool`; §9.2 declares the `double` / `float` forms,
-    // §9.3 the `decimal` form and §9.4 the `bool` form. Every one of them
-    // declares the first parameter as a `string`, and the NON-radix forms
-    // also have a `ReadOnlyStringSpan` overload (§9.1). An operand that is
-    // NEITHER is not a parseable operand, and these arms used to lower
-    // whatever they were handed into a string operand:
-    //   * a non-pointer operand produced malformed IR and ABORTED the
-    //     compiler ("Load operand must be a pointer" / "IR verification
-    //     failed (malformed IR emitted)");
-    //   * a CLASS INSTANCE — which lowers to a plain pointer, exactly like a
-    //     `string` — was read as TEXT out of the object's own bytes, i.e.
-    //     FOREIGN MEMORY, and SILENTLY.
-    //
-    // The test is the operand's STATIC TYPE (the primitive `string`) OR the
-    // LOWERED operand's SHAPE (the {ptr,i32,i32} `ReadOnlyStringSpan` record
-    // of §3.3). The shape alone is NOT enough — a class instance lowers to a
-    // pointer too — and the static type alone is not enough either, because
-    // the span overload's declared type is not the primitive `string`. The
-    // two together are exact.
-    //
-    // An operand whose static type sema could not determine (`nullptr`) is
-    // admitted on its SHAPE alone: a legal call must never be dropped on a
-    // typing accident.
-    auto isParseableOperand = [&](const ast::Expr& e, llvm::Value* v) -> bool {
-        const sema::TypeRef* t = ctx_.exprType(e);
-        if (!t) return v->getType()->isPointerTy() || isStringSpanValue(v);
-        if (t->kind == sema::TypeRef::Kind::Primitive && t->primitive == P::String)
-            return true;
-        return isStringSpanValue(v);
+    // `spanOverloadDeclared` says whether the RECEIVER's type declares the
+    // `ReadOnlyStringSpan` overload of this member: stdlib §9.1 / §9.2 /
+    // §9.3 do; §9.4 (Boolean) and §9.5 (Char) do NOT — so a span
+    // operand at `bool.Parse` / `char.Parse` is not a parseable operand either.
+    auto isParseableOperand = [&](const ast::Expr& e, llvm::Value* v,
+                                  bool spanOverloadDeclared) -> bool {
+        return sharedParseOperandAdmissible(ctx_, e, v,
+                                            &Emitter::isStringSpanValue,
+                                            spanOverloadDeclared);
     };
 
     // §11.8 / stdlib §2.19 (v0.176, #807): the compiler-provided conformance
@@ -1207,6 +1235,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #7299 (stdlib §9.5, v0.344): §9.5 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: char)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `char.Parse(16)`
+        // emitted
+        //   %str.len = load i64, i32 getelementptr inbounds nuw (%bz.string, i32 16, ...)
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, s, false)) return nullptr;
         llvm::Value* len = loadStringLen(s);
         llvm::Value* isOne = builder_.CreateICmpEQ(
             len, builder_.getInt64(1), "chp.one");
@@ -1218,6 +1258,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #7299 (stdlib §9.5, v0.344): §9.5 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: char)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `char.Parse(16)`
+        // emitted
+        //   %str.len = load i64, i32 getelementptr inbounds nuw (%bz.string, i32 16, ...)
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, s, false)) return nullptr;
         // fix #2938 / §22.3: §22.3-admitted accessor targets (property /
         // indexer) bracket through `resolveOutAddrWithBracket`; the write-back
         // flushes at the normal-return exit below.
@@ -1254,6 +1306,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #7299 (stdlib §9.5, v0.344): §9.5 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: char)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `char.Parse(16)`
+        // emitted
+        //   %str.len = load i64, i32 getelementptr inbounds nuw (%bz.string, i32 16, ...)
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, s, false)) return nullptr;
         llvm::Value* len = loadStringLen(s);
         llvm::Value* ok = builder_.CreateICmpEQ(
             len, builder_.getInt64(1), "chpon.ok");
@@ -1282,7 +1346,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // `string`) was read as TEXT out of the object's own bytes. A
         // non-parseable operand is DROPPED, the way the integer tower's
         // `TryParse` arm drops one.
-        if (!isParseableOperand(*call.args[0].value, s)) return nullptr;
+        if (!isParseableOperand(*call.args[0].value, s, true)) return nullptr;
         // #5296 / stdlib §9.3 (v0.313, #1810): the span overload. This is the
         // arm the `decimal.TryParse` KEYWORD spelling reaches (the class-name
         // spelling has its own copy in LlvmBackend_Calls.cpp, fixed by the same
@@ -1883,7 +1947,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // `string`) was read as TEXT out of the object's own bytes. A
         // non-parseable operand is DROPPED, the way the integer tower's
         // `TryParse` arm drops one.
-        if (!isParseableOperand(*call.args[0].value, strVal)) return nullptr;
+        if (!isParseableOperand(*call.args[0].value, strVal, true)) return nullptr;
         // #5296 / stdlib §9.2 (v0.313, #1810): the span overload — see the
         // integer tower arm above for the full rationale.
         auto win = parseWindow(strVal);
@@ -2078,7 +2142,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // `TryParse(s, radix, out result)` form below already refused a
         // non-`string` first argument on the STATIC type alone (stdlib
         // §9.1 declares no span overload of the radix form).
-        if (!isParseableOperand(*call.args[0].value, strVal)) return nullptr;
+        if (!isParseableOperand(*call.args[0].value, strVal, true)) return nullptr;
         // #5296 / stdlib §9.1 (v0.313, #1810): the span overload. A
         // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3), not
         // a string pointer, so `loadStringData` on it was a StructGEP of a
@@ -2341,6 +2405,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7299 (stdlib §9.4, v0.344): §9.4 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: bool)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `bool.Parse(16)`
+        // emitted
+        //   %str.data = load ptr, i32 16, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, strVal, false)) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
         // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
@@ -2391,6 +2467,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7299 (stdlib §9.4, v0.344): §9.4 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: bool)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `bool.Parse(16)`
+        // emitted
+        //   %str.data = load ptr, i32 16, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, strVal, false)) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
         auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
         llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
@@ -2421,6 +2509,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7299 (stdlib §9.4, v0.344): §9.4 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: bool)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `bool.Parse(16)`
+        // emitted
+        //   %str.data = load ptr, i32 16, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, strVal, false)) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
         auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
         llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
@@ -2602,7 +2702,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // — malformed IR, and the compiler ABORTED with "IR verification
         // failed (malformed IR emitted)". A non-parseable operand is
         // DROPPED, the way the `Parse(s, radix)` arm drops one.
-        if (!isParseableOperand(*call.args[0].value, arg)) return nullptr;
+        if (!isParseableOperand(*call.args[0].value, arg, true)) return nullptr;
         // #747 R42: `decimal.Parse(s)` reaches this primitive handler via the
         // lowercase keyword receiver (pt==Decimal). Route it to bz_decimal_parse
         // exactly like `Decimal.Parse` (§6.4 / fix #521); without this it fell

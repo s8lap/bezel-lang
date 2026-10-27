@@ -1,11 +1,23 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
+#include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #7299/#7300 shared parse guard)
 
 // §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
 extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
                                        void* ove_vtable, void* fe_vtable);
 
 namespace bezel::codegen {
+
+// fix #7299 / #7300: THE ONE first-argument guard for the `Parse` / `TryParse`
+// arms — defined in LlvmBackend_Calls2.cpp beside the arms it guards there,
+// and shared with THIS file's second copy of those arms (the `Decimal` and
+// `Boolean` copies). The `isSpanValue` callback is the caller's shape test
+// (`Emitter::isStringSpanValue`), passed in because the shape test is a
+// private member of `Emitter`.
+bool sharedParseOperandAdmissible(
+        sema::SemaContext& ctx, const ast::Expr& e, llvm::Value* v,
+        llvm::function_ref<bool(llvm::Value*)> isSpanValue,
+        bool spanOverloadDeclared);
 
 llvm::Value* Emitter::emitConsoleWrite(llvm::Value* strPtr, bool newline,
                                int fd) {
@@ -16176,6 +16188,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7299 (stdlib §9.4, v0.344): §9.4 declares
+            // `TryParse(s: string, out result: bool)` — and NO
+            // `ReadOnlyStringSpan` overload — so an operand that is not a
+            // `string` is not a parseable operand. This copy of the arm had NO
+            // first-argument guard, so `Boolean.TryParse(16, out b)` emitted
+            //   %str.data = load ptr, i32 16, align 8
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". The class-name spelling reaches
+            // this copy only after the Calls2 copy has DECLINED the operand, so
+            // the guard has to be here too (the symptom would merely move).
+            // A non-parseable operand is DROPPED — the shared guard.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, false))
+                return nullptr;
             llvm::Value* strData = loadStringData(strVal);
             // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
