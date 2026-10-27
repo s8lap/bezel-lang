@@ -3064,6 +3064,36 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         "§5.1)" + why);
                                     return nullptr;
                                 }
+                                // fix #7336 (stdlib §2.18 / §18.5, v0.345): a
+                                // RUNTIME format on a receiver whose type has
+                                // NO vocabulary raises `FormatException`.
+                                //
+                                // §2.18's last row gives `bool`, `char` and
+                                // `string` an EMPTY vocabulary — "| `bool`,
+                                // `char`, `string` | *(none)* | a format spec
+                                // on these is a compile error |" — so no format
+                                // argument can ever be recognized on them. The
+                                // LITERAL spelling is rejected at compile time
+                                // (sema, #7333), and a compile-time rejection
+                                // is IMPOSSIBLE for a format string whose
+                                // content is unknown at compile time — so the
+                                // rule lands where §2.18 puts the fault for a
+                                // specifier outside the vocabulary: "An
+                                // unrecognized specifier raises
+                                // `FormatException` (strict-fault, as
+                                // everywhere)".
+                                //
+                                // The rule is about the RECEIVER's TYPE, not
+                                // about the argument's content: the LITERAL
+                                // spelling rejects EVERY literal format on such
+                                // a receiver, so the RUNTIME spelling rejects
+                                // every runtime format too — the two spellings
+                                // of one rule must answer alike.
+                                if (radixIsString && !isIntRecv &&
+                                    (tt->primitive == P::Bool ||
+                                     tt->primitive == P::Char ||
+                                     tt->primitive == P::String))
+                                    return emitAlwaysFormatException();
                                 // fix #7286 (stdlib §9.1 / §2.18, v0.344): the
                                 // OTHER one-argument overload —
                                 // `ToString(format: string)` — with a RUNTIME

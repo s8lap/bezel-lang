@@ -74,13 +74,6 @@ std::string prog(const std::string& body) {
            "end C;\n";
 }
 
-// The exit code of a program that compiled and ran; -999 when it did not run
-// (a reject, a compiler crash, a signal, a timeout).
-int runExit(const std::string& p) {
-    JitResult r = runAot(p);
-    return r.ran ? r.exitCode : -999;
-}
-
 // The stdout of a program that compiled and ran; empty when it did not run.
 std::string runStdout(const std::string& p) {
     JitResult r = runAot(p);
@@ -299,31 +292,51 @@ BEZEL_TEST(format_spec_receiver_vocabulary_7333,
         "1.50\n");
 }
 
-// THE RUNTIME SPELLING IS #7336's, AND IT MUST STILL COMPILE. A format
-// string whose content is unknown at compile time cannot be a compile-time
+// THE RUNTIME SPELLING IS #7336's, AND IT STILL COMPILES. A format string
+// whose content is unknown at compile time cannot be a compile-time
 // rejection: stdlib §2.18 makes an unrecognized specifier a RUNTIME
-// `FormatException`, and that is where this spelling belongs. The row pins
-// the COMPILATION and the run — it does not pin the rendered text, which is
-// #7336's to fix.
+// `FormatException`, and that is where this spelling belongs. The program
+// COMPILES (the call is well-typed) and the `FormatException` is raised at
+// RUN time.
+//
+// THE VERDICT MOVED (#7336): the program used to compile and print
+// "compiled" — the no-format rendering ("True") — which is neither the
+// compile error the LITERAL spelling gives nor the fault the rule owns.
+// stdlib §2.18's last row gives `bool` an EMPTY vocabulary ("| `bool`,
+// `char`, `string` | *(none)* | a format spec on these is a compile error |
+// "), so no format argument can be recognized on it, and the rule for an
+// unrecognized specifier is the fault: "An unrecognized specifier raises
+// `FormatException` (strict-fault, as everywhere)".
 BEZEL_TEST(format_spec_receiver_vocabulary_7333,
-           a_bool_receiver_with_a_runtime_format_still_compiles_7336) {
-    BEZEL_EXPECT_EQ(runExit(
+           a_bool_receiver_with_a_runtime_format_raises_format_exception_7336) {
+    BEZEL_EXPECT_EQ(runStdout(
         prog("    var b := true;\n"
              "    var fmt: string := \"F4\";\n"
-             "    var s: string := b.ToString(fmt);\n"
-             "    Console.WriteLine(\"compiled\");\n")),
-        0);
+             "    var result := 0;\n"
+             "    try\n"
+             "      var s: string := b.ToString(fmt);\n"
+             "      result := 99;\n"
+             "    catch FormatException => result := 11;\n"
+             "    end;\n"
+             "    Console.WriteLine(result);\n")),
+        "11\n");
 }
 
-// The same for the `char` receiver.
+// The same for the `char` receiver — stdlib §2.18's last row gives `char`
+// the same EMPTY vocabulary.
 BEZEL_TEST(format_spec_receiver_vocabulary_7333,
-           a_char_receiver_with_a_runtime_format_still_compiles_7336) {
-    BEZEL_EXPECT_EQ(runExit(
+           a_char_receiver_with_a_runtime_format_raises_format_exception_7336) {
+    BEZEL_EXPECT_EQ(runStdout(
         prog("    var c := 'a';\n"
              "    var fmt: string := \"F4\";\n"
-             "    var s: string := c.ToString(fmt);\n"
-             "    Console.WriteLine(\"compiled\");\n")),
-        0);
+             "    var result := 0;\n"
+             "    try\n"
+             "      var s: string := c.ToString(fmt);\n"
+             "      result := 99;\n"
+             "    catch FormatException => result := 11;\n"
+             "    end;\n"
+             "    Console.WriteLine(result);\n")),
+        "11\n");
 }
 
 // spec §18.5: a hole WITHOUT a format spec formats via the value's ordinary
