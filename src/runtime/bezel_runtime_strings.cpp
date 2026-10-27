@@ -1791,3 +1791,173 @@ extern "C" void bz_rawbytes_free(void* rbp) {
     free(rb->ptr);
     free(rb);
 }
+
+// ---------------------------------------------------------------------------
+// stdlib §2.18 (v0.345) / fix #7334: the FLOATING row of the format-specifier
+// table, rendered from a format specifier that is only known at RUN time.
+//
+// §2.18's Floating row: "`F`/`Fn` fixed-point (n decimals, default 2) ·
+// `E`/`En` scientific (default 6) · `G`/`Gn` general (default 6) · `P`/`Pn`
+// percent (×100, `%` suffix, default 2) · `R` round-trip", and the row's
+// fault: "An unrecognized specifier raises `FormatException` (strict-fault, as
+// everywhere)".
+//
+// The LITERAL spelling of `ToString(format)` renders this table in
+// `emitWithFormatSpec` (src/codegen/LlvmBackend_String.cpp); the helpers
+// below are the RUN-time spelling's half of the SAME table, so the two
+// spellings of one specifier answer alike. Each rule below mirrors the
+// shared routine's, one by one:
+//
+//   * the letter is case-INSENSITIVE, and its CASE fixes the output case for
+//     `E`/`G` ("e" → "1.500000e+00", "E" → "1.500000E+00"); `F` and `P` have
+//     no case-sensitive output;
+//   * the digit count after the letter is optional; `F`/`P` default to two
+//     decimals and `E`/`G` to six;
+//   * the count is CLAMPED to 65 — the same bound the literal spelling clamps
+//     it to (fix #7286), so a huge count renders alike at both spellings;
+//   * `R` is the round-trip rendering and takes NO count ("R2" is not in the
+//     vocabulary);
+//   * `P` multiplies the value by 100 and appends a literal '%';
+//   * a NON-FINITE value renders as "NaN" / "Infinity" / "-Infinity" under
+//     EVERY floating specifier (stdlib §2.18, v0.344, #7301) — the names of
+//     the §9.2 constants, with no digits, no exponent and no '%' suffix;
+//   * an EMPTY format is the NO-FORMAT rendering (the plain ToString()), which
+//     is what the literal spelling of `ToString("")` renders.
+//
+// `fmt_p` is a bz_string {data,len,width,rc} — the lowered format argument.
+// Returns nullptr for a specifier outside the vocabulary; the codegen caller
+// then raises FormatException (§2.18's strict fault).
+// ---------------------------------------------------------------------------
+
+// The code point at index `i` of a bz_string: the internal storage holds code
+// points at the string's own width (1/2/4 bytes each — stdlib §3.1).
+static inline uint32_t bz_fmt_code_point(const bz_string_hdr* fh, int64_t i) {
+    if (fh->width == 1) return ((const uint8_t*)fh->data)[i];
+    if (fh->width == 2) return ((const uint16_t*)fh->data)[i];
+    return ((const uint32_t*)fh->data)[i];
+}
+
+// §2.18's floating vocabulary, decoded from a format string.
+struct bz_float_spec {
+    char kind;      // 'F', 'E', 'G', 'P' or 'R'
+    char conv;      // the output conversion: 'f', 'E'/'e', 'G'/'g'
+    int  count;     // the digit count (clamped to 65)
+    bool hasCount;  // a digit count was written
+};
+
+// Decode `fh` into §2.18's FLOATING row. Returns false when the specifier is
+// outside that row (the caller raises FormatException).
+static bool bz_decode_float_spec(const bz_string_hdr* fh, bz_float_spec* out) {
+    const int64_t n = fh->len;
+    if (n < 1 || !fh->data) return false;
+    const uint32_t c0 = bz_fmt_code_point(fh, 0);
+    if (c0 > 0x7F) return false;  // a non-ASCII code point is not a specifier
+    const char c = (char)c0;
+    const char up = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    if (up != 'F' && up != 'E' && up != 'G' && up != 'P' && up != 'R')
+        return false;
+    // The count after the letter is optional; a non-digit tail is not a count
+    // but an unrecognized specifier (§2.18's strict fault).
+    int count = 0;
+    bool hasCount = false;
+    for (int64_t i = 1; i < n; ++i) {
+        const uint32_t d = bz_fmt_code_point(fh, i);
+        if (d > 0x7F || d < '0' || d > '9') return false;
+        hasCount = true;
+        // The clamp: the LITERAL spelling rewrites a digit run whose value
+        // exceeds 65 to "65" (fix #7286), so the two spellings agree.
+        if (count <= 65) {
+            count = count * 10 + (int)(d - '0');
+            if (count > 65) count = 65;
+        }
+    }
+    out->kind = up;
+    out->count = count;
+    out->hasCount = hasCount;
+    switch (up) {
+        case 'F':
+            out->conv = 'f';
+            break;
+        case 'E':
+            out->conv = (c == 'e') ? 'e' : 'E';
+            break;
+        case 'G':
+            out->conv = (c == 'g') ? 'g' : 'G';
+            break;
+        case 'P':
+            out->conv = 'f';  // percent: ×100 and a '%' suffix
+            break;
+        default:  // 'R' — round-trip
+            // "R" takes NO count: "R2" is not in §2.18's floating vocabulary.
+            if (hasCount) return false;
+            out->conv = 'r';
+            break;
+    }
+    return true;
+}
+
+// Render `v` with the decoded §2.18 floating specifier.
+static void* bz_render_float_spec(double v, bool isFloat,
+                                  const bz_float_spec* sp) {
+    if (sp->kind == 'R') {
+        // "R" (round-trip): the SHORTEST rendering that reads back as the same
+        // value — the same text the no-format ToString() produces.
+        return isFloat ? bz_float_to_string_r((float)v) : bz_double_to_string_r(v);
+    }
+    // per stdlib §2.18 (v0.344, #7301): a NON-FINITE value renders as the
+    // NAME of its §9.2 constant under EVERY floating specifier — "NaN",
+    // "Infinity", "-Infinity", with no digits, no exponent and no '%' suffix.
+    // C's own "%f" prints "inf"/"nan", so a non-finite operand must not reach
+    // snprintf.
+    //
+    // The test is on the OPERAND, before the percent scale, exactly as the
+    // literal spelling does it: §2.18 speaks of the VALUE the caller holds, so
+    // a finite operand keeps the rendering it had — including the case where
+    // the ×100 of the percent specifier overflows to an infinity.
+    if (std::isnan(v) || std::isinf(v)) return bz_double_to_string_r(v);
+    const int prec = sp->hasCount
+        ? sp->count
+        : ((sp->kind == 'F' || sp->kind == 'P') ? 2 : 6);
+    const char* fmt;
+    switch (sp->kind) {
+        case 'F': fmt = "%.*f"; break;
+        case 'E': fmt = (sp->conv == 'e') ? "%.*e" : "%.*E"; break;
+        case 'G': fmt = (sp->conv == 'g') ? "%.*g" : "%.*G"; break;
+        default:  fmt = "%.*f%%"; break;  // 'P' — the percent specifier
+    }
+    const double val = (sp->kind == 'P') ? v * 100.0 : v;
+    const int n = snprintf(nullptr, 0, fmt, prec, val);
+    if (n < 0) return nullptr;
+    char* buf = (char*)malloc((size_t)n + 1);
+    if (!buf) return nullptr;
+    snprintf(buf, (size_t)n + 1, fmt, prec, val);
+    void* s = bz_make_string(buf, n);
+    free(buf);
+    return s;
+}
+
+// stdlib §2.18 (v0.345) / fix #7334: `double.ToString(format)` — the format
+// overload with a format specifier known only at RUN time.
+extern "C" void* bz_double_to_string_fmt(double v, const void* fmt_p) {
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    if (!fh) return nullptr;  // no format at all → FormatException
+    // An EMPTY format names no specifier, so it is the no-format rendering —
+    // what the literal spelling of `ToString("")` renders.
+    if (fh->len < 1) return bz_double_to_string_r(v);
+    bz_float_spec sp;
+    if (!bz_decode_float_spec(fh, &sp)) return nullptr;
+    return bz_render_float_spec(v, /*isFloat=*/false, &sp);
+}
+
+// stdlib §2.18 (v0.345) / fix #7334: `float.ToString(format)` — the format
+// overload with a format specifier known only at RUN time.
+extern "C" void* bz_float_to_string_fmt(float v, const void* fmt_p) {
+    const bz_string_hdr* fh = (const bz_string_hdr*)fmt_p;
+    if (!fh) return nullptr;  // no format at all → FormatException
+    if (fh->len < 1) return bz_float_to_string_r(v);
+    bz_float_spec sp;
+    if (!bz_decode_float_spec(fh, &sp)) return nullptr;
+    // The float is widened to double for the fixed/scientific/general
+    // renderings — exactly as the literal spelling does (an `FPExt`).
+    return bz_render_float_spec((double)v, /*isFloat=*/true, &sp);
+}

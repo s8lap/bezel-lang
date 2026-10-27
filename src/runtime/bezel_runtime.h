@@ -738,6 +738,12 @@ void* bz_guid_to_string_fmt(const bz_guid_t* g, const void* fmt_p);
 // the value used by no-format ToString() and the "R" specifier.
 void* bz_double_to_string_r(double v);
 void* bz_float_to_string_r(float v);
+// fix #7334 (stdlib §2.18, v0.345): the FLOATING row of the format-specifier
+// table, rendered from a format specifier known only at RUN time. Returns
+// nullptr for a specifier outside §2.18's floating vocabulary (the caller
+// raises FormatException); `fmt_p` is a bz_string*.
+void* bz_double_to_string_fmt(double v, const void* fmt_p);
+void* bz_float_to_string_fmt(float v, const void* fmt_p);
 // v0.172 (stdlib §2.18): integer "B"/"Bn" binary rendering; `value` is the
 // operand's natural-width bit pattern zero-extended to 64 bits.
 void* bz_ulong_to_binary(uint64_t value, int32_t min_digits);

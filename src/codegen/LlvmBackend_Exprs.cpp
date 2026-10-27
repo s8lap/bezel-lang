@@ -3168,6 +3168,68 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                      tt->primitive == P::Char ||
                                      tt->primitive == P::String))
                                     return emitAlwaysFormatException();
+                                // fix #7334 (stdlib §2.18, v0.345): the FLOATING
+                                // row of the format table — a `double`/`float`
+                                // receiver with a RUNTIME format string.
+                                //
+                                // The runtime-format arm below is gated on an
+                                // INTEGER receiver (`isIntRecv`), so a floating
+                                // receiver never reached it: it fell out of the
+                                // arm to the plain (no-format) rendering. So the
+                                // two spellings of one specifier gave two
+                                // answers — `1.5.ToString(f)` with `f := "F2"`
+                                // rendered "1.5" where `1.5.ToString("F2")`
+                                // rendered "1.50" — the defect this family's
+                                // brief names: "Two call sites producing two
+                                // answers is the defect; fixing one of them is
+                                // not a fix."
+                                //
+                                // §2.18's table is per KIND, and the FLOATING
+                                // row is "`F`/`Fn` fixed-point · `E`/`En`
+                                // scientific · `G`/`Gn` general · `P`/`Pn`
+                                // percent · `R` round-trip" — so the runtime
+                                // spelling dispatches over THAT vocabulary, and
+                                // the LITERAL spelling renders the same table in
+                                // the shared routine (`emitWithFormatSpec`).
+                                // The runtime helpers below are this arm's half
+                                // of the one table; the agreement rows in
+                                // `tests/codegen/runtime_format_float_receiver_7334_test.cpp`
+                                // pin the two halves against each other.
+                                //
+                                // The `decimal` row is NOT this arm's: §2.18's
+                                // decimal row is its own (`F`/`Fn`, `E`/`En`,
+                                // `G`, `P`/`Pn` — and NO `R`), and its EXACT
+                                // arithmetic is the decimal formatter's
+                                // (`bz_decimal_to_string_fmt`), which the
+                                // decimal arm above already routes BOTH
+                                // spellings to.
+                                if (radixIsString && !isIntRecv &&
+                                    (tt->primitive == P::Double ||
+                                     tt->primitive == P::Float)) {
+                                    llvm::Value* fmtArg =
+                                        lowerExpr(*call->args[0].value);
+                                    if (!fmtArg) return nullptr;
+                                    const bool isFloatRecv =
+                                        (tt->primitive == P::Float);
+                                    llvm::Type* fty = isFloatRecv
+                                        ? llvm::Type::getFloatTy(llvm_)
+                                        : llvm::Type::getDoubleTy(llvm_);
+                                    auto* fn = declareC(
+                                        isFloatRecv ? "bz_float_to_string_fmt"
+                                                    : "bz_double_to_string_fmt",
+                                        ptrTy(), {fty, ptrTy()});
+                                    llvm::Value* res = builder_.CreateCall(
+                                        fn, {recv, fmtArg}, "flt.fmt");
+                                    // nullptr → a specifier outside §2.18's
+                                    // floating vocabulary → FormatException
+                                    // (§2.18's strict fault).
+                                    llvm::Value* isNull = builder_.CreateICmpEQ(
+                                        res,
+                                        llvm::Constant::getNullValue(ptrTy()),
+                                        "flt.fmt.null");
+                                    emitGuardThrow(isNull, "FormatException");
+                                    return res;
+                                }
                                 // fix #7361 / #7303 (stdlib §2.18, v0.345; spec
                                 // §18.5, v0.345): the RUNTIME format spelling
                                 // renders the SAME table the LITERAL spelling
