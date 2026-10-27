@@ -1,0 +1,22 @@
+bounds: vars=2 len=3 features=all --try --while --body 2
+baseline: 1254922 programs, 347088 accepted (23616 with warnings, 23616 §28.2-warned; fault profile every/some/never = 13136/0/333952), 0 violations  (33.8 s)
+
+| mutation | verdicts changed | newly accepted | of which unsound | newly rejected (every/some/never fault) | unsound among all accepted | warnings / trace only | witness |
+|---|---|---|---|---|---|---|---|
+| K5.1 deleted (transfers unfrozen) — the pre-v0.180 language | 0 | 0 | 0 | 0 (0/0/0) | 0 |  |  |
+| K5.2 deleted (drop-on-overwrite unfrozen) | 0 | 0 | 0 | 0 (0/0/0) | 0 |  |  |
+| K5.3-c: explicit Dispose() frozen under any live borrow | 0 | 0 | 0 | 0 (0/0/0) | 0 |  |  |
+| K5.3-a: dominated use of a killed borrow / same-variable use — warning only | 0 | 0 | 0 | 0 (0/0/0) | 0 |  |  |
+| K5.3-b: dominated use of a killed borrow and same-variable dominated use — errors | 21100 | 0 | 0 | 21100 (13136/0/7964) | 0 |  | newly rejected: new a / disp a / brw b a (runs: ok) |
+| K5.3-b (borrow half only) | 0 | 0 | 0 | 0 (0/0/0) | 0 |  |  |
+| K5.3-b (same-variable half only) | 21100 | 0 | 0 | 21100 (13136/0/7964) | 0 |  | newly rejected: new a / disp a / brw b a (runs: ok) |
+| K7.3 weakened (owned ⊓ borrowed demotes to borrowed) | 0 | 0 | 0 | 0 (0/0/0) | 0 |  |  |
+| K7.4 weakened (owned ⊓ moved = owned) | 3926 | 3926 | 2376 | 0 (0/0/0) | 2376 | trace changed in 54 | new a / while { /   move b a / } → STUCK,T1-static-mismatch |
+| K1.3 deleted (moved-from bindings readable) | 285170 | 285170 | 283232 | 0 (0/0/0) | 283232 |  | decl a / brw b a → STUCK |
+| K3.13 flipped (an unmarked read consumes) | 19248 | 3388 | 0 | 15860 (352/0/15508) | 0 | trace changed in 6956 | newly rejected: new a / brw b a / asgb b a (runs: ok) |
+| release sites of an explicitly-disposed binding run the disposer again (K3.9 post-state ignored) | 0 | 0 | 0 | 0 (0/0/0) | 0 | trace changed in 40774 | trace: new a / disp a (runs: ok) |
+| §28.2 use-after-dispose warning dropped | 0 | 0 | 0 | 0 (0/0/0) | 0 | warned +0/−23616 |  |
+| K8.4 deleted (a borrow of a temporary may escape its boundary) | 115350 | 115350 | 0 | 0 (0/0/0) | 0 |  | tbrw a (runs: ok) (sound: the flag backstops it) |
+| A5 deleted (a using var may be reassigned or moved out) | 99808 | 99808 | 0 | 0 (0/0/0) | 0 |  | using a / asg a (runs: ok) (sound: the flag backstops it) |
+| K3.15 deleted (no implicit disposal on the exception edge) | 0 | 0 | 19840 | 0 (0/0/0) | 19840 | trace changed in 21880 | new a / tthrow → T1-leak |
+| K9.5 flipped (the displaced value is disposed before the RHS is evaluated) | 0 | 0 | 0 | 0 (0/0/0) | 0 | trace changed in 91730 | trace: new a / asg a (runs: ok) |

@@ -1,0 +1,15 @@
+bounds: vars=2 len=3 features=all --if --try --while --body 2   (42.1 s)
+baseline: 1263466 programs, 350174 accepted, 139199 with an explicit Dispose() site; 7286 read the flag of an already-disposed object at a release site under the retaining heap
+
+| free-in-full rule | sites freed in full | accepted programs reading freed memory | by reader (variable or site kind) | witness |
+|---|---|---|---|---|
+| free everywhere (no condition) | 161855 | 17352 | {'a': 6562, 'termination': 1094, 'scope-end': 2932, 'b': 6562, 'overwrite': 56, 'unwind': 32, 'catch-done': 152, 'e': 36} | new a / disp a / fbrw b a |
+| condition 1 as worded: no live borrow of the value | 161855 | 17352 | {'a': 6562, 'termination': 1094, 'scope-end': 2932, 'b': 6562, 'overwrite': 56, 'unwind': 32, 'catch-done': 152, 'e': 36} | new a / disp a / fbrw b a |
+| condition 2 only: no later maybe-consumed release of the binding | 161579 | 17076 | {'a': 6562, 'termination': 1094, 'scope-end': 2708, 'b': 6562, 'catch-done': 152, 'e': 36} | new a / disp a / fbrw b a |
+| the ruling: conditions 1 and 2 as worded | 161579 | 17076 | {'a': 6562, 'termination': 1094, 'scope-end': 2708, 'b': 6562, 'catch-done': 152, 'e': 36} | new a / disp a / fbrw b a |
+| 1 + 2 + the binding itself dead after the call | 137207 | 0 | {} |  |
+| 1 + 2 + binding dead + slot-displaced values retained | 137207 | 0 | {} |  |
+| all but condition 1 | 137207 | 0 | {} |  |
+| all but condition 2 | 137483 | 276 | {'scope-end': 224, 'overwrite': 56, 'unwind': 32} | new a / if { / } else { /   disp a / } |
+
+readers: a variable name = a member access through it; overwrite / scope-end / unwind = a release site running the idempotent disposer; cascade = a holder's teardown; explicit = a repeated Dispose()

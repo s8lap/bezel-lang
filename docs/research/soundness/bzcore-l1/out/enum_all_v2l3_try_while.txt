@@ -1,0 +1,20 @@
+bounds: vars=2 len=3 features=all --try --while --body 2   (33.5 s)
+baseline kernel:
+   1254922  programs
+    347678  reject:K1.3-read-of-moved
+    347088  accept
+    333952  fault-never
+    257410  reject:K8.4-temporary-escape
+    135086  reject:A5-move-out-of-using-var
+     68900  reject:§28.10-unmarked-owned-into-using-var
+     55382  reject:A5-reassign-using-var
+     23616  accept-with-warning
+     23616  §28.2-warned
+     18764  reject:state-match
+     15864  reject:K3-consume-of-non-owned
+     13136  fault-every
+      7028  flag-read-at-release
+      6566  reject:§28.6-dispose-of-borrow
+      2184  reject:K2.3-borrow-outlives-source
+programs with a flag read of an already-disposed object at a release site, by site kind: {'explicit': 3220, 'termination': 1052, 'scope-end': 2728, 'catch-done': 152, 'overwrite': 36, 'unwind': 4}
+T1/T2/T3 hold on every accepted program

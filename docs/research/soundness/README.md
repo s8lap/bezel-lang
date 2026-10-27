@@ -351,6 +351,12 @@ the ASan regression matrix; surviving mutants become corpus cases.
   mutation harness; `examples` reproduces eight worked spec shapes (v0.180 probe, 0047 §5.3's
   example, K5.2/K5.3 placements, K7.3 and K7.4 joins, Pattern 1 equalization, affinity) with
   the expected verdict and trace.
+- `bzcore-l1/` (added 2026-10-27): the model grown to proposal 0047's full Layer 1 (`using var`,
+  one owned field, unbound temporaries, `throw`/`try`, `while` with one back edge), a trace oracle
+  beside the verdict oracles, and a rule-change CLI (`check --mutation`, `check --define`). Its
+  README carries the re-run mutation table, the K5.3 a/b/c numbers used by proposals 0205/0206, the
+  #4602 free-at-`Dispose()` measurement, four findings and the printer interface for the
+  model-vs-compiler differential.
 - `data/soundness_issues.tsv`: the 475 `soundness` issues with labels, the source of §2.5's
   split.
 

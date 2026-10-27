@@ -1,0 +1,15 @@
+# Rule change: K5.3-b (borrow half only)
+rules: {'K5_3b_borrow': 'error'}
+bounds: vars=2 len=3 features=all --if --try --while --body 2   (65.7 s)
+
+## Newly accepted: 0
+## Newly rejected: 0
+## Newly unsound (accepted by the mutant, violating T1/T2/T3): 0
+## Newly warned (verdict unchanged): 0
+## Newly un-warned (verdict unchanged): 0
+## Trace changed (verdict unchanged): 0
+
+## Evaluation (paste-ready)
+Model: bzcore L1 (spec v0.345), bounds vars=2 len=3 features=all --if --try --while --body 2: 1263466 programs, 350174 accepted at the baseline (23668 with a §28.2 warning), 0 violations.
+Under "K5.3-b (borrow half only)": 350174 accepted; 0 newly accepted (0 unsound), 0 newly rejected, 0 unsound among all accepted; 0 newly warned, 0 newly un-warned; trace changed in 0.
+Run-time residual: at the baseline 13136 accepted programs fault on every execution and 24 on some; under the change 13136 and 24 (checked-mode DisposedAccessException remains the backstop for these).
