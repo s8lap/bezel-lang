@@ -1928,6 +1928,34 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return builder_.CreateICmpEQ(ai, bi, "bw.eq");
     }
 
+    // stdlib §9.2 (v0.344, #7310): the non-finite spellings are matched
+    // EXACTLY — the whole input must be "NaN", "Infinity" or "-Infinity",
+    // case-sensitively.  strtod/strtof accept a whole FAMILY of inf/nan
+    // spellings in any case ("inf", "infinity", "nan", "NAN", "+Infinity",
+    // "-NaN"), so the parse arms below must not decide by sniffing the first
+    // character.  The comparison is made against the INPUT TEXT, never
+    // against the parsed value: a finite spelling that overflows to an
+    // infinity ("1e999") must still raise OverflowException, not
+    // FormatException.
+    auto emitExactNonFiniteSpelling = [&](llvm::Value* textPtr) -> llvm::Value* {
+        auto* strcmpFn = declareC("strcmp", i32(), {ptrTy(), ptrTy()});
+        static const char* kSpellings[3] = {"NaN", "Infinity", "-Infinity"};
+        llvm::Value* any = nullptr;
+        for (int k = 0; k < 3; ++k) {
+            llvm::Constant* lit =
+                llvm::ConstantDataArray::getString(llvm_, kSpellings[k], true);
+            unsigned idx = stringLiteralIdx_++;
+            auto* gv = new llvm::GlobalVariable(*module_, lit->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, lit,
+                ".bz.fpnf." + std::to_string(idx));
+            llvm::Value* eq = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcmpFn, {textPtr, gv}),
+                builder_.getInt32(0), "fpnf.eq");
+            any = any ? builder_.CreateOr(any, eq, "fpnf.any") : eq;
+        }
+        return any;
+    };
+
     // double.TryParse / float.TryParse(s, out result): bool — stdlib §9.2
     // #1227: on failure, out result receives the default (0.0), not the partial
     // parse value (e.g. 1.5 for "1.5abc"). Per §9.3: "TryParse returns false
@@ -1997,31 +2025,38 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::ConstantInt::get(i8TyD, '+')),
             builder_.CreateICmpEQ(fcD,
                 llvm::ConstantInt::get(i8TyD, '-')), "tryp.isSignD");
-        llvm::Value* infMaskD = builder_.CreateOr(
-            builder_.CreateOr(
-                builder_.CreateICmpEQ(fcD,
-                    llvm::ConstantInt::get(i8TyD, 'i')),
-                builder_.CreateICmpEQ(fcD,
-                    llvm::ConstantInt::get(i8TyD, 'I'))),
-            builder_.CreateOr(
-                builder_.CreateICmpEQ(fcD,
-                    llvm::ConstantInt::get(i8TyD, 'n')),
-                builder_.CreateICmpEQ(fcD,
-                    llvm::ConstantInt::get(i8TyD, 'N'))),
-            "tryp.infMaskD");
-        llvm::Value* notDigitD = builder_.CreateAnd(
-            builder_.CreateAnd(
-                builder_.CreateNot(isSignD),
-                builder_.CreateNot(infMaskD)),
-            builder_.CreateICmpUGE(
-                builder_.CreateSub(fcD, llvm::ConstantInt::get(i8TyD, '0')),
-                llvm::ConstantInt::get(i8TyD, 10)), "tryp.ndigD");
         // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
         // per emitFloatParseOverflow: skip the optional sign before checking
         // for the hex form.  off = 0 if no sign, 1 if sign present.
         llvm::Value* offD = builder_.CreateZExt(isSignD, i64(), "tryp.offD");
         llvm::Value* fcOffD = builder_.CreateLoad(i8TyD,
             builder_.CreateGEP(i8TyD, strData, offD, "tryp.fcptr"), "tryp.fcOffD");
+        // stdlib §9.2 (v0.344, #7310): the non-finite spellings stand OUTSIDE
+        // the numeric grammar and are matched exactly, so the only thing this
+        // mask may decide is whether the numeric part STARTS with one of the
+        // non-finite letters ('i'/'I'/'n'/'N').  Whether the input IS one of
+        // the three admitted spellings is decided by the exact comparison
+        // below — a first-character sniff alone would admit "inf",
+        // "infinity", "nan", "INFINITY", "+Infinity" and "-NaN".
+        llvm::Value* nonFiniteLetterD = builder_.CreateOr(
+            builder_.CreateOr(
+                builder_.CreateICmpEQ(fcOffD,
+                    llvm::ConstantInt::get(i8TyD, 'i')),
+                builder_.CreateICmpEQ(fcOffD,
+                    llvm::ConstantInt::get(i8TyD, 'I'))),
+            builder_.CreateOr(
+                builder_.CreateICmpEQ(fcOffD,
+                    llvm::ConstantInt::get(i8TyD, 'n')),
+                builder_.CreateICmpEQ(fcOffD,
+                    llvm::ConstantInt::get(i8TyD, 'N'))),
+            "tryp.nfLetterD");
+        llvm::Value* notDigitD = builder_.CreateAnd(
+            builder_.CreateAnd(
+                builder_.CreateNot(isSignD),
+                builder_.CreateNot(nonFiniteLetterD)),
+            builder_.CreateICmpUGE(
+                builder_.CreateSub(fcD, llvm::ConstantInt::get(i8TyD, '0')),
+                llvm::ConstantInt::get(i8TyD, 10)), "tryp.ndigD");
         llvm::Value* isLeadingZeroD = builder_.CreateICmpEQ(
             fcOffD, llvm::ConstantInt::get(i8TyD, '0'), "tryp.lzeroD");
         // stdlib §9.2: the second character is read at position `off+1` when
@@ -2071,6 +2106,14 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                     builder_.CreateICmpEQ(lastCharD,
                         llvm::ConstantInt::get(i8TyD, '-')))),
             "tryp.blc");
+        // stdlib §9.2 (v0.344, #7310): a numeric part that starts with a
+        // non-finite letter is admitted only when the WHOLE input is exactly
+        // one of the three spellings §9.2 admits ("NaN", "Infinity",
+        // "-Infinity"); every other inf/nan spelling raises FormatException.
+        llvm::Value* exactNonFiniteD = emitExactNonFiniteSpelling(strData);
+        llvm::Value* nonFiniteOkD = builder_.CreateOr(
+            builder_.CreateNot(nonFiniteLetterD),
+            exactNonFiniteD, "tryp.nfok");
         llvm::Value* fmtOkD = builder_.CreateAnd(
             builder_.CreateAnd(
                 builder_.CreateAnd(
@@ -2078,7 +2121,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         builder_.CreateNot(fcWsD),
                         builder_.CreateNot(notDigitD)),
                     builder_.CreateAnd(advD, atNulD)),
-                builder_.CreateNot(badLastCharD)),
+                builder_.CreateAnd(
+                    builder_.CreateNot(badLastCharD),
+                    nonFiniteOkD)),
             builder_.CreateNot(isHexFloatD),
             "tryp.fmtok");
         // stdlib §9.2 (v0.314, #5199/#5368): a finite spelling that rounds to a
@@ -2850,32 +2895,39 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         llvm::ConstantInt::get(i8TyF, '+')),
                     builder_.CreateICmpEQ(fcF,
                         llvm::ConstantInt::get(i8TyF, '-')), "parse.isSignF");
-                // Detect "inf" / "INF" / "INF" spellings (case-insensitive).
-                llvm::Value* infMask = builder_.CreateOr(
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'i')),
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'I'))),
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'n')),
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'N'))),
-                    "parse.infMask");
-                llvm::Value* notDigitF = builder_.CreateAnd(
-                    builder_.CreateAnd(
-                        builder_.CreateNot(isSignF),
-                        builder_.CreateNot(infMask)),
-                    builder_.CreateICmpUGE(
-                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
-                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
                 // per emitFloatParseOverflow: skip the optional sign before checking
                 // for the hex form.  off = 0 if no sign, 1 if sign present.
                 llvm::Value* offF = builder_.CreateZExt(isSignF, i64(), "parse.offF");
                 llvm::Value* fcOffF = builder_.CreateLoad(i8TyF,
                     builder_.CreateGEP(i8TyF, data, offF, "parse.fcptr"), "parse.fcOffF");
+                // stdlib §9.2 (v0.344, #7310): the non-finite spellings stand
+                // OUTSIDE the numeric grammar and are matched exactly, so this
+                // mask may only decide whether the numeric part STARTS with
+                // one of the non-finite letters ('i'/'I'/'n'/'N').  Whether the
+                // input IS one of the three admitted spellings is decided by
+                // the exact comparison below — a first-character sniff alone
+                // would admit "inf", "infinity", "nan", "INFINITY",
+                // "+Infinity" and "-NaN".
+                llvm::Value* nonFiniteLetter = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'i')),
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'I'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'n')),
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'N'))),
+                    "parse.nfLetter");
+                llvm::Value* notDigitF = builder_.CreateAnd(
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isSignF),
+                        builder_.CreateNot(nonFiniteLetter)),
+                    builder_.CreateICmpUGE(
+                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
+                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
                     fcOffF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
                 // stdlib §9.2: the second character is read at position `off+1` when
@@ -2929,6 +2981,15 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                             builder_.CreateICmpEQ(lastChar,
                                 llvm::ConstantInt::get(i8TyF, '-')))),
                     "parse.blc");
+                // stdlib §9.2 (v0.344, #7310): a numeric part that starts with a
+                // non-finite letter is admitted only when the WHOLE input is
+                // exactly one of the three spellings §9.2 admits ("NaN",
+                // "Infinity", "-Infinity"); every other inf/nan spelling
+                // raises FormatException.
+                llvm::Value* exactNonFinite = emitExactNonFiniteSpelling(data);
+                llvm::Value* nonFiniteOk = builder_.CreateOr(
+                    builder_.CreateNot(nonFiniteLetter),
+                    exactNonFinite, "parse.nfok");
                 llvm::Value* validF = builder_.CreateAnd(
                     builder_.CreateAnd(
                         builder_.CreateAnd(
@@ -2936,7 +2997,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                                 builder_.CreateNot(fcWsF),
                                 builder_.CreateNot(notDigitF)),
                             builder_.CreateAnd(advF, atNulF)),
-                        builder_.CreateNot(badLastChar)),
+                        builder_.CreateAnd(
+                            builder_.CreateNot(badLastChar),
+                            nonFiniteOk)),
                     builder_.CreateNot(isHexFloatF),
                     "parse.vfmtF");
                 emitGuardThrow(builder_.CreateNot(validF, "parse.fmtbadF"),
@@ -3049,25 +3112,6 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         llvm::ConstantInt::get(i8TyF, '+')),
                     builder_.CreateICmpEQ(fcF,
                         llvm::ConstantInt::get(i8TyF, '-')), "parse.isSignF");
-                llvm::Value* infMask = builder_.CreateOr(
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'i')),
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'I'))),
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'n')),
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'N'))),
-                    "parse.infMask");
-                llvm::Value* notDigitF = builder_.CreateAnd(
-                    builder_.CreateAnd(
-                        builder_.CreateNot(isSignF),
-                        builder_.CreateNot(infMask)),
-                    builder_.CreateICmpUGE(
-                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
-                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 auto* i64t = llvm::Type::getInt64Ty(llvm_);
                 // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
                 // per emitFloatParseOverflow: skip the optional sign before checking
@@ -3075,6 +3119,33 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::Value* offF = builder_.CreateZExt(isSignF, i64(), "parse.offF");
                 llvm::Value* fcOffF = builder_.CreateLoad(i8TyF,
                     builder_.CreateGEP(i8TyF, win.data, offF, "parse.fcptr"), "parse.fcOffF");
+                // stdlib §9.2 (v0.344, #7310): the non-finite spellings stand
+                // OUTSIDE the numeric grammar and are matched exactly, so this
+                // mask may only decide whether the numeric part STARTS with
+                // one of the non-finite letters ('i'/'I'/'n'/'N').  Whether the
+                // input IS one of the three admitted spellings is decided by
+                // the exact comparison below — a first-character sniff alone
+                // would admit "inf", "infinity", "nan", "INFINITY",
+                // "+Infinity" and "-NaN".
+                llvm::Value* nonFiniteLetter = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'i')),
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'I'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'n')),
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'N'))),
+                    "parse.nfLetter");
+                llvm::Value* notDigitF = builder_.CreateAnd(
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isSignF),
+                        builder_.CreateNot(nonFiniteLetter)),
+                    builder_.CreateICmpUGE(
+                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
+                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
                     fcOffF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
                 // stdlib §9.2: the second character is read at position `off+1` when
@@ -3122,6 +3193,15 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                             builder_.CreateICmpEQ(lastChar,
                                 llvm::ConstantInt::get(i8TyF, '-')))),
                     "parse.blc");
+                // stdlib §9.2 (v0.344, #7310): a numeric part that starts with a
+                // non-finite letter is admitted only when the WHOLE window is
+                // exactly one of the three spellings §9.2 admits ("NaN",
+                // "Infinity", "-Infinity"); every other inf/nan spelling
+                // raises FormatException.
+                llvm::Value* exactNonFinite = emitExactNonFiniteSpelling(win.data);
+                llvm::Value* nonFiniteOk = builder_.CreateOr(
+                    builder_.CreateNot(nonFiniteLetter),
+                    exactNonFinite, "parse.nfok");
                 llvm::Value* validF = builder_.CreateAnd(
                     builder_.CreateAnd(
                         builder_.CreateAnd(
@@ -3129,7 +3209,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                                 builder_.CreateNot(fcWsF),
                                 builder_.CreateNot(notDigitF)),
                             builder_.CreateAnd(advF, atNulF)),
-                        builder_.CreateNot(badLastChar)),
+                        builder_.CreateAnd(
+                            builder_.CreateNot(badLastChar),
+                            nonFiniteOk)),
                     builder_.CreateNot(isHexFloatF),
                     "parse.vfmtF");
                 // §28.3 (v0.303): the owned window from bz_str_slice_cp must be
