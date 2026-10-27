@@ -90,7 +90,7 @@ rows where `campaign == builtin-call-admission`).
 | #6644 | other | RE-LABEL (MEASURED) | X-5 | re-label | - | a check-then-use of a captured nullable local is rejected (§7.4); campaign 5 |
 | #6646 | crash | RE-LABEL (rule) | X-5 | re-label | - | a nullable choice payload is stored without unwrapping; campaign 5 |
 | #6647 | crash | REPRODUCES (MEASURED) | B3 | B3a/B3b | Y | MEASURED grid: Math.Abs(decimal?) -> COMPILER ABORT |
-| #6648 | soundness | REPRODUCES (rule) | B3 | B3a/B3b | N | the CALL IS LEGAL; Math.Min/Max/Clamp have an UNTYPED RESULT (the gate would not reject the call) |
+| #6648 | soundness | FIXED (MEASURED) | B3 | B3a/B3b | N | MEASURED on HEAD `d9f11d15`: all three issue shapes are REJECTED with the located diagnostic "the initializer for `s` has a type that is not implicitly convertible to the target type (§5.1)" — `var s: string := Math.Max(3, 2)`, `var y: int := Math.Min(3.5, 2.0)` and `var y: int := Math.Clamp(3.5, 1.0, 2.0)`; grid cell `math_minmax_typed_result` is green |
 | #6659 | crash | RE-LABEL (rule) | X-8 | re-label | - | Set<T?>/Dictionary<K?,V> with a nullable key; campaigns 5 and 8 |
 | #6677 | crash | RE-LABEL (rule) | X-5 | re-label | - | `long? ?? int?` segfaults the compiler; campaign 5 |
 | #6689 | crash | RE-LABEL (rule) | X-lot | re-label | - | FileStream at a Stream parameter fails IR verification |
@@ -102,14 +102,14 @@ rows where `campaign == builtin-call-admission`).
 | #6755 | other | REPRODUCES (MEASURED) | B4 | B4a/B4b | N | MEASURED: `o is StringBuilder` on an Object-held StringBuilder answers False |
 | #6777 | other | REPRODUCES (rule) | B4 | B4a/B4b | N | interpolating a null StringBuilder? renders an empty string |
 | #6780 | other | REPRODUCES (MEASURED) | B4 | B4a/B4b | Y | Debug.WriteLine accepts a StringBuilder and writes an empty line |
-| #6782 | soundness | REPRODUCES (rule) | B6 | B6 | Y | TimeSpan.ToString(null)/DateTime.ToString(null) compile for a non-nullable format |
-| #6809 | crash | REPRODUCES (rule) | B4 | B4a/B4b | Y | StringBuilder Insert/Remove/Replace accept wrong types and arities -> malformed IR |
+| #6782 | soundness | FIXED (MEASURED) | B6 | B6 | Y | MEASURED on HEAD `d9f11d15`: `TimeSpan.ToString(null)` and `DateTime.ToString(null)` are both REJECTED with "the argument to `TimeSpan.ToString` is nullable but the target type is non-nullable (§7)"; grid cell `datetime_tostring_null` is green |
+| #6809 | crash | FIXED (MEASURED) | B4 | B4a/B4b | Y | MEASURED on HEAD `d9f11d15`: all four issue shapes are REJECTED with located §5.1/§22.5 diagnostics (`Replace(1,2)`, `Remove("a",1)`, `Insert("x","y")`, `Insert(0)`) and no malformed IR; the four grid cells `sb_replace_int`, `sb_insert_two_strings`, `sb_insert_zero` and `sb_remove_two_args` are green |
 | #6810 | other | REPRODUCES (rule) | B6 | B6 | Y | a named argument bypasses the null check on a non-nullable builtin string parameter |
 | #6811 | other | REPRODUCES (rule) | B6 | B6 | Y | builtin non-string reference parameters declared non-nullable accept null |
-| #6812 | other | REPRODUCES (rule) | B6 | B6 | Y | builtin non-nullable string parameters outside the #6782 table accept null |
+| #6812 | other | REPRODUCES (MEASURED) | B6 | B6 | Y | MEASURED on HEAD `d9f11d15`: the issue's named instance `Encoding.UTF8.GetBytes(null)` is now REJECTED (#6957's allowlist), but `Environment.GetInt(null)` and `File.ReadAllTextAsync(null)` still COMPILE — the two grid cells `sb_append_null` and `sb_append_null_literal` are green |
 | #6820 | other | REPRODUCES (MEASURED) | B4 | B4a/B4b | N | an Object local holding a StringBuilder misdispatches and SEGVs before reassignment |
 | #6823 | soundness | REPRODUCES (MEASURED) | B5 | B5 | N | a narrowed nullable value at a builtin non-string overload passes the carrier |
-| #6825 | other | REPRODUCES (MEASURED) | B6 | B6 | Y | long.ToString(null) is accepted (the #6782 map has no Int64 row) |
+| #6825 | other | REPRODUCES (MEASURED) | B6 | B6 | Y | MEASURED on HEAD `d9f11d15`: the ToString half is FIXED (`long.ToString(null)` is REJECTED, §7) but the Parse/TryParse half is LIVE — `long.Parse(null)`, `long.TryParse(null, out v)` (prints 0), `byte.Parse(null)` and `uint.Parse(null)` still COMPILE; grid cells `long_tostring_null` green, `long_parse_null` and `uint_parse_null` INTERNAL, `long_tryparse_null` ACCEPTED |
 | #6826 | other | REPRODUCES (MEASURED) | B4 | B4a/B4b | Y | MEASURED grid: string.Contains(Object) accepted and answers True |
 | #6845 | crash | REPRODUCES (MEASURED) | B0-symbol | re-label | Y | MEASURED: a user class named StringBuilder calling its own Insert -> SIGSEGV (rc -11) |
 | #6854 | crash | RE-LABEL (MEASURED) | X-13 | re-label | - | a `case` expression with a binding type pattern emits malformed IR (§19.3) |
@@ -155,34 +155,34 @@ rows where `campaign == builtin-call-admission`).
 | #7228 | other | REPRODUCES (rule) | B4 | B4a/B4b | N | StringBuilder.Replace with an empty oldValue silently no-ops (§3.1) |
 | #7229 | soundness | REPRODUCES (MEASURED) | B4 | B4a/B4b | N | the StringBuilder runtime mutators index BYTES while Length counts CODE POINTS |
 | #7232 | crash | REPRODUCES (MEASURED) | B3 | B3a/B3b | Y | MEASURED grid: Math.Floor(double?) -> COMPILER ABORT |
-| #7234 | other | REPRODUCES (rule) | B2 | B2a/B2b | Y | stdlib §2.3's ambiguity note is not implemented for Convert.ToString |
+| #7234 | other | FIXED (MEASURED) | B2 | B2a/B2b | Y | MEASURED on HEAD `d9f11d15`: `Convert.ToString('A')` and `Convert.ToString(255U)` are REJECTED as ambiguous (stdlib §2.3 / §22.6) and the int and long controls still print 255; both grid cells are green |
 | #7239 | crash | REPRODUCES (MEASURED) | B2 | B2a/B2b | Y | MEASURED grid: a runtime long at Convert.ToString's toBase -> rejected; the CONSTANT spelling compiles |
 | #7242 | other | FIXED (MEASURED) | B3 | B3a/B3b | N | MEASURED grid: Math.Sqrt(4000000000u) prints 63245.55 (was -nan) |
 | #7244 | crash | MOVED (MEASURED) | B4 | B4a/B4b | N | MEASURED grid: StringBuilder.AppendFormat with a string argument no longer SEGVs |
-| #7245 | other | REPRODUCES (rule) | B4 | B4a/B4b | N | String.IsAscii keys on the STORAGE WIDTH (§9.6) |
+| #7245 | other | REPRODUCES (MEASURED) | B4 | B4a/B4b | N | MEASURED on HEAD `d9f11d15`: grid cell `string_isascii_width` — `("a" + "日")[0..<1].IsAscii` prints "False" where stdlib §9.6 ("true iff every code point < 128") requires "True"; the property still keys on the STORAGE WIDTH |
 | #7246 | crash | RE-LABEL (rule) | X-lot | re-label | - | a local holding another local (a method reference) still SEGFAULTS |
 | #7249 | other | REPRODUCES (MEASURED) | B3 | B3a/B3b | N | MEASURED grid: TimeSpan.FromTicks(4000000000u) prints -294967296 |
 | #7252 | crash | MOVED (MEASURED) | B3 | B3a/B3b | N | MEASURED grid: DateTime.FromTicks(uint) no longer aborts; it prints -294967296 |
 | #7253 | other | REPRODUCES (MEASURED) | B3 | B3a/B3b | N | ISteppable<T>.Step sign-extends an unsigned by |
-| #7254 | other | RE-LABEL (rule) | B3 | re-label | N | **NOT A DEFECT** (ruled by the coordinator 2026-10-28, R2): stdlib §2.2 declares exactly four `Abs` overloads (int/long/double/decimal) and `uint` converts to THREE of them (`long`, `double`, `decimal`) and to NONE of them exactly, so §22.6 makes the call AMBIGUOUS and the compiler's rejection is CORRECT; the grid cell `math_abs_uint` pins that rejection |
+| #7254 | other | RE-LABEL (MEASURED) | B3 | re-label | N | **NOT A DEFECT** (ruled by the coordinator 2026-10-28, R2): stdlib §2.2 declares exactly four `Abs` overloads (int/long/double/decimal) and `uint` converts to THREE of them (`long`, `double`, `decimal`) and to NONE of them exactly, so §22.6 makes the call AMBIGUOUS and the compiler's rejection is CORRECT; grid cell `math_abs_uint` pins that rejection and is GREEN |
 | #7258 | other | REPRODUCES (rule) | B1 | B1 | N | the radix rendering is wrong for unsigned values and above Int32.MaxValue |
 | #7265 | crash | REPRODUCES (rule) | B2 | B2a/B2b | N | ToString(format) renders unsigned signed, ignores the binary spec, crashes for long/uint |
-| #7271 | other | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED grid: (255).ToString(16u) is accepted and renders the decimal text |
+| #7271 | other | FIXED (MEASURED) | B1 | B1 | Y | MEASURED on HEAD `d9f11d15`: `(255).ToString(16u)` now renders the RADIX form "ff", not the decimal text — the #7271 fix made an unsigned CONSTANT radix render the radix form; the tracker's demanded COMPILE ERROR is NOT required by §5.1 (v0.345)'s value-based constant narrowing across signedness, so what is left of the entry is a spec disagreement, not an admission defect; grid cell `int_tostring_radix_uint` is green |
 | #7274 | crash | REPRODUCES (rule) | B2 | B2a/B2b | N | a float and a double operand at Double.IeeeEquals/BitwiseEquals -> malformed IR |
 | #7277 | other | REPRODUCES (MEASURED) | B4 | B4a/B4b | N | MEASURED grid: the declared static Repeat(unit: string, count: int) overload is not implemented |
 | #7284 | crash | REPRODUCES (MEASURED) | B2 | B2a/B2b | Y | MEASURED grid: decimal.ToString(16) -> COMPILER ABORT (IR verification failed) |
-| #7285 | crash | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED grid: int.Parse("ff", true) is rejected; the uint radix is still accepted |
-| #7286 | other | REPRODUCES (rule) | B1 | B1 | Y | the radix class is not closed (nullable, constant, string and runtime radices) |
+| #7285 | crash | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED on HEAD `d9f11d15`: the `bool` and `string` radix shapes are now REJECTED (grid cell `int_parse_radix_bool` green) and the `uint`/`ulong` CONSTANT radix is ADMITTED and correct per §5.1 (v0.345) — but a `char` radix SEGFAULTS: `int.Parse("ff", 'a')` and `int.TryParse("ff", 'a', out v)` compile (rc 0) and die with SIGSEGV (rc 139); a radix VALUE outside stdlib §9.1's set {2, 8, 10, 16} reaches the parser unvalidated |
+| #7286 | other | FIXED (MEASURED) | B1 | B1 | Y | MEASURED on HEAD `d9f11d15`: all four named shapes are correct — a nullable radix is REJECTED (§7), `(255).ToString(8u+8u)` prints "ff", a string-VARIABLE format `(255).ToString(f)` prints "FF" and a run-time int radix prints "ff"; grid cell `int_parse_radix_string` is green, and the RED cell `int_tostring_radix_string` is the §2.18 format-vocabulary class (#7303), not a radix-admission shape |
 | #7287 | crash | REPRODUCES (rule) | B2 | B2a/B2b | N | the literal format overload aborts for every non-32-bit integer receiver |
 | #7290 | crash | MOVED (MEASURED) | B1 | B1 | Y | MEASURED: the abort is GONE; int.TryParse(16, out v) now compiles with an internal: degrade and prints False/0 |
 | #7291 | soundness | REPRODUCES (rule) | B2 | B2a/B2b | Y | Convert.ToString aborts when the VALUE argument is a nullable |
 | #7292 | other | REPRODUCES (rule) | B3 | B3a/B3b | N | the arguments of a named-argument call are evaluated twice (§22.5) |
-| #7293 | crash | REPRODUCES (rule) | B1 | B1 | Y | double/float/decimal TryParse abort when the first argument is not a string |
-| #7294 | soundness | REPRODUCES (rule) | B1 | B1 | Y | the one-argument int.Parse has no first-argument guard |
+| #7293 | crash | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED grid: `double_parse_int` is INTERNAL and `double_tryparse_int` is ACCEPTED — double/float/decimal TryParse abort when the first argument is not a string |
+| #7294 | soundness | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED grid: `int_parse_int`, `int_parse_double` and `int_parse_object` are all INTERNAL — the one-argument int.Parse has no first-argument guard |
 | #7295 | other | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED grid: char.Parse("a",16) -> internal: silent drop instead of a located error |
-| #7296 | other | REPRODUCES (rule) | B1 | B1 | Y | the named-argument spelling of a primitive ToString radix is owned by no nullability check |
+| #7296 | other | FIXED (MEASURED) | B1 | B1 | Y | MEASURED on HEAD `d9f11d15`: the NAMED-argument spelling is now nullability-checked like the positional one — `(255).ToString(radix := null)` is REJECTED (§7) and `(255).ToString(radix := 16)` prints "ff"; both grid cells are green |
 | #7297 | crash | REPRODUCES (MEASURED) | B3 | B3a/B3b | Y | MEASURED grid: Math.Floor(double?) -> COMPILER ABORT (both narrowed and un-narrowed) |
-| #7299 | crash | REPRODUCES (rule) | B1 | B1 | Y | the bool and char receivers of Parse/TryParse abort on a non-string first argument |
+| #7299 | crash | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED grid: the bool and char receivers of Parse/TryParse abort on a non-string first argument — `bool_parse_int`, `int_parse_bool` and `int_parse_char` are INTERNAL, `bool_tryparse_int` and `char_tryparse_int` are ACCEPTED |
 | #7300 | crash | MOVED (MEASURED) | B1 | B1 | Y | MEASURED: the abort is GONE; decimal.TryParse(1.5, out m) degrades silently (False/0) |
 | #7303 | other | REPRODUCES (MEASURED) | B2 | B2a/B2b | N | MEASURED grid: (1.5).ToString("C") prints 1.5 instead of raising FormatException |
 | #7304 | other | REPRODUCES (rule) | B1 | B1 | Y | `this`/`base` are still lowered as strings at int.TryParse |
@@ -192,16 +192,16 @@ rows where `campaign == builtin-call-admission`).
 | #7315 | other | REPRODUCES (rule) | B1 | B1 | Y | the parse-operand guard policy has three spellings and the radix arms disagree |
 | #7319 | crash | REPRODUCES (rule) | B2 | B2a/B2b | Y | ToString(format) on a nullable receiver formats the carrier; a double? receiver aborts |
 | #7320 | other | REPRODUCES (rule) | B1 | B1 | N | Guid.TryParse does not assign default(Guid) to its out slot on the false path |
-| #7323 | other | REPRODUCES (rule) | B1 | B1 | Y | the parse-operand guards DROP the call silently where §22.6 says a compile error |
+| #7323 | other | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED grid: `int_tryparse_double` is ACCEPTED — the parse-operand guards DROP the call silently where §22.6 says a compile error |
 | #7325 | other | FIXED (rule) | B1 | B1 | - | CLOSED 2026-10-27 by b1adfab95 (in origin/main) |
 | #7329 | crash | FIXED (rule) | B2 | B2a/B2b | - | CLOSED 2026-10-27 by 275fab52 (in origin/main) |
 | #7331 | crash | REPRODUCES (rule) | B2 | B2a/B2b | Y | Convert.ToString on a nullable operand renders the carrier's bytes; the radix form aborts |
 | #7333 | other | REPRODUCES (MEASURED) | B2 | B2a/B2b | Y | MEASURED grid: bool.ToString("F4") compiles (stdlib §2.18 says a compile error) |
-| #7336 | other | REPRODUCES (rule) | B2 | B2a/B2b | N | a runtime format string on a bool/char receiver prints the plain rendering |
+| #7336 | other | REPRODUCES (MEASURED) | B2 | B2a/B2b | N | MEASURED on HEAD `d9f11d15`: grid cell `char_tostring_format` is ACCEPTED — `('a').ToString("F4")` prints "a"; a RUNTIME format string prints the plain rendering too (`var f: string := "F4"; ('a').ToString(f)` prints "a"), where stdlib §2.18 wants a compile error for a spec on a char and a FormatException for the run-time spelling |
 | #7340 | other | RE-LABEL (rule) | B2 | B2a/B2b | - | the JSON deserializer's number grammar is looser than JSON's (stdlib §2.15) |
 | #7341 | other | FIXED (rule) | B2 | B2a/B2b | - | CLOSED 2026-10-27 by d9f8b36f (in origin/main) |
 | #7342 | other | REPRODUCES (rule) | B2 | B2a/B2b | N | a narrowed Guid? receiver overflows the stack |
 | #7358 | crash | REPRODUCES (rule) | B2 | B2a/B2b | N | a malformed format-specifier suffix on a narrow integer receiver emits invalid IR |
 | #7359 | other | REPRODUCES (MEASURED) | B2 | B2a/B2b | N | MEASURED grid: (255).ToString("x") prints FF where §2.18 says lower-case hex |
 | #7361 | other | REPRODUCES (rule) | B2 | B2a/B2b | N | the runtime-format spelling of X renders a 32-bit pattern for a narrow receiver |
-| #7362 | other | REPRODUCES (rule) | B2 | B2a/B2b | N | D on a floating receiver truncates instead of raising FormatException |
+| #7362 | other | REPRODUCES (MEASURED) | B2 | B2a/B2b | N | MEASURED grid: `double_tostring_format_d` is ACCEPTED — D on a floating receiver prints "3" instead of raising FormatException |

@@ -76,6 +76,7 @@ CONTEXT_FREE = frozenset({
     "argument(s) but stdlib §9.6 declares",
     "argument(s): stdlib §2.1 defines only",
     "expects `Array<byte>`",
+    "expects `Array<string>`",
     "is ambiguous: an imported public from",
     "shadows the always-available type",
 })
@@ -252,7 +253,12 @@ MEMBER = {
     'int_tryparse_string': '',
     'int_tryparse_int': '#7290',
     'int_tryparse_double': '#7323',
-    'int_tryparse_nullable': '#6812',
+    # A CONTROL, not a #6812 shape: `int.TryParse`'s string parameter is INSIDE
+    # the #6782 table (`{"Int32", "TryParse", 3, 0}` / `{"Int32", "TryParse", 2,
+    # 0}` in `common::kBuiltinNonNullableParams`), and #6812 names the members
+    # OUTSIDE it.  The cell exercises §7.4's initializer narrowing, which the
+    # tracker does not name.
+    'int_tryparse_nullable': '',
     'double_parse_string': '',
     'double_parse_int': '#7293',
     'double_tryparse_int': '#7293',
@@ -273,9 +279,13 @@ MEMBER = {
     'int_tostring_radix': '',
     'int_tostring_radix_uint': '#7271',
     'int_tostring_radix_null': '#7296',
+    'int_tostring_radix_null_named': '#7296',
     'int_tostring_radix_string': '#7286',
     'long_tostring_radix': '',
     'long_tostring_null': '#6825',
+    'long_parse_null': '#6825',
+    'long_tryparse_null': '#6825',
+    'uint_parse_null': '#6825',
     'int_tostring_format_d': '',
     'int_tostring_format_x': '#7359',
     'int_tostring_format_X': '#7359',
@@ -337,6 +347,7 @@ MEMBER = {
     'string_join_int_array': '',
     'string_isascii': '',
     'string_isascii_property': '#7245',
+    'string_isascii_width': '#7245',
     'debug_writeline_stringbuilder': '#6780',
     # B5 nullable carrier (campaign 5)
     'sb_append_narrowed_int': '',
@@ -392,8 +403,17 @@ C("int_parse_object", 'Console.WriteLine(int.Parse(o));',
   ("reject", R(F_overload("int.Parse"), F_convertible("int.Parse"))),
   pre="var o: Object := 1;", subject="int.Parse")
 C("int_parse_radix_ok", 'Console.WriteLine(int.Parse("ff", 16));', ("value", "255\n"))
-C("int_parse_radix_uint", 'Console.WriteLine(int.Parse("ff", 16u));',
-  ("reject", R(F_overload("int.Parse"), F_convertible("int.Parse"))), subject="int.Parse")
+# The radix is a `uint` CONSTANT, and the call is ADMITTED.
+# Spec §5.1 (v0.345), "Constant narrowing": "The rule is **value-based, not
+# type-based**: the source may be a compile-time constant of **any** integer type
+# — not only `int` — and the target any integer type whose range contains its
+# value, **across signedness** ... a `uint`-typed constant `7` is admissible
+# where `int` is expected".  16u is a compile-time constant whose value fits an
+# `int`, so the radix parameter's type is satisfied.  The #7285 fix landed
+# deliberately admits it; the anchor lane's control row
+# `uint_literal_radix_still_parses_hex` (tests/codegen/parse_radix_binding_7285_test.cpp)
+# pins the same verdict.  This cell PINS that verdict.
+C("int_parse_radix_uint", 'Console.WriteLine(int.Parse("ff", 16u));', ("value", "255\n"))
 C("int_parse_radix_string", 'Console.WriteLine(int.Parse("ff", "16"));',
   ("reject", R(F_overload("int.Parse"), F_convertible("int.Parse"))), subject="int.Parse")
 C("int_parse_radix_bool", 'Console.WriteLine(int.Parse("ff", true));',
@@ -407,10 +427,25 @@ C("int_tryparse_int", '_ := int.TryParse(16, out v);',
 C("int_tryparse_double", '_ := int.TryParse(1.5, out v);',
   ("reject", R(F_overload("int.TryParse"), F_convertible("int.TryParse"))),
   pre="var v: int := 0;", subject="int.TryParse")
-C("int_tryparse_nullable", '_ := int.TryParse(s, out v);',
-  ("reject", R(F_overload("int.TryParse"), F_convertible("int.TryParse"),
-               F_nullable("int.TryParse"))),
-  pre="var v: int := 0;\nvar s: string? := \"16\";", subject="int.TryParse")
+# The argument is a `string?` LOCAL, and the call is ADMITTED.
+# Spec §7.4 (v0.345) narrows a local "from a declaration whose initializer is
+# such an expr — `var x: T? := expr;`", so `s` is narrowed non-null from its
+# declaration onwards.  Spec §5.1 (v0.345) makes the word load-bearing in the
+# other direction: "so an **un-narrowed** `Animal?` is rejected at an `Object`
+# parameter" — the rejection belongs to the UN-NARROWED nullable, not to every
+# `T?` binding.  A read of a binding §7.4 has narrowed non-null is of its
+# non-nullable type (§22.6), so `s` reaches the `string` parameter.
+# This is the anti-over-rejection control for the nullability position; it is
+# the anchor lane's control row `int_tryparse_with_a_narrowed_local_is_admitted`
+# (tests/sema/builtin_call_admission_7372_test.cpp) verbatim — same program,
+# same expected stdout.
+#
+# NOTE: this cell is NOT a one-line expectation change.  A `value` cell is
+# graded on the program's stdout, so the body must PRINT: the parse result is
+# discarded and `v` is printed, exactly as the anchor's control row does.
+C("int_tryparse_nullable", '_ := int.TryParse(s, out v);\nConsole.WriteLine(v);',
+  ("value", "16\n"),
+  pre="var v: int := 0;\nvar s: string? := \"16\";")
 C("double_parse_string", 'Console.WriteLine(double.Parse("1.5"));', ("value", "1.5\n"))
 C("double_parse_int", 'Console.WriteLine(double.Parse(1));',
   ("reject", R(F_overload("double.Parse"), F_convertible("double.Parse"))), subject="double.Parse")
@@ -447,9 +482,24 @@ C("long_parse_intarg", 'Console.WriteLine(long.Parse(16));',
 
 # ------------------------------------------------------- B2 ToString/format
 C("int_tostring_radix", 'Console.WriteLine((255).ToString(16));', ("value", "ff\n"))
-C("int_tostring_radix_uint", 'Console.WriteLine((255).ToString(16u));',
-  ("reject", R(F_overload("int.ToString"), F_convertible("int.ToString"))), subject="int.ToString")
+# The radix is a `uint` CONSTANT, and the call is ADMITTED.
+# Spec §5.1 (v0.345), "Constant narrowing": "The rule is **value-based, not
+# type-based**: the source may be a compile-time constant of **any** integer type
+# — not only `int` — and the target any integer type whose range contains its
+# value, **across signedness** ... a `uint`-typed constant `7` is admissible
+# where `int` is expected".  16u is a compile-time constant whose value fits an
+# `int`, so the radix parameter's type is satisfied, and the radix text "ff" is
+# rendered.  This cell PINS that verdict (the #7271 fix made an unsigned
+# CONSTANT radix render the radix form).
+C("int_tostring_radix_uint", 'Console.WriteLine((255).ToString(16u));', ("value", "ff\n"))
 C("int_tostring_radix_null", 'Console.WriteLine((255).ToString(null));',
+  ("reject", R(F_overload("int.ToString"), F_nullable("int.ToString"))), subject="int.ToString")
+# #7296 is FIXED: the NAMED-argument spelling of a primitive ToString radix is
+# now nullability-checked like the positional one.  MEASURED on HEAD `d9f11d15`:
+# `(255).ToString(radix := null)` is REJECTED ("the argument to `int.ToString` is
+# nullable but the target type is non-nullable (§7)"), and `(255).ToString(radix :=
+# 16)` prints "ff".  This cell PINS that fix.
+C("int_tostring_radix_null_named", 'Console.WriteLine((255).ToString(radix := null));',
   ("reject", R(F_overload("int.ToString"), F_nullable("int.ToString"))), subject="int.ToString")
 # stdlib §2.18: "16" is not in the integer vocabulary (D/Dn/X/Xn/B), so the call is
 # ADMITTED and the format is unrecognized at RUN time -> FormatException.
@@ -457,6 +507,18 @@ C("int_tostring_radix_string", 'Console.WriteLine((255).ToString("16"));', ("fau
 C("long_tostring_radix", 'Console.WriteLine((255L).ToString(16));', ("value", "ff\n"))
 C("long_tostring_null", 'Console.WriteLine((255L).ToString(null));',
   ("reject", R(F_overload("long.ToString"), F_nullable("long.ToString"))), subject="long.ToString")
+# #6825's LIVE half: the `Parse`/`TryParse` statics on the heads the #6782 type
+# map missed (Long and the other integer kinds) still accept null.  MEASURED on
+# HEAD `d9f11d15`: `long.Parse(null)`, `long.TryParse(null, out v)` and
+# `uint.Parse(null)` all COMPILE (rc 0) — the defect.  The `ToString(null)` half
+# of #6825 is FIXED (the cell `long_tostring_null` is rejected today).
+C("long_parse_null", 'Console.WriteLine(long.Parse(null));',
+  ("reject", R(F_overload("long.Parse"), F_nullable("long.Parse"))), subject="long.Parse")
+C("long_tryparse_null", '_ := long.TryParse(null, out v);',
+  ("reject", R(F_overload("long.TryParse"), F_nullable("long.TryParse"))),
+  pre="var v: long := 0;", subject="long.TryParse")
+C("uint_parse_null", 'Console.WriteLine(uint.Parse(null));',
+  ("reject", R(F_overload("uint.Parse"), F_nullable("uint.Parse"))), subject="uint.Parse")
 C("int_tostring_format_d", 'Console.WriteLine((255).ToString("D"));', ("value", "255\n"))
 C("int_tostring_format_x", 'Console.WriteLine((255).ToString("x"));', ("value", "ff\n"))
 C("int_tostring_format_X", 'Console.WriteLine((255).ToString("X"));', ("value", "FF\n"))
@@ -607,6 +669,15 @@ C("string_isascii", 'Console.WriteLine("abc".IsAscii());',
                F_dispatch("String.IsAscii"), F_no_such_member("string", "IsAscii"))),
   subject="String.IsAscii")
 C("string_isascii_property", 'Console.WriteLine("abc".IsAscii);', ("value", "True\n"))
+# #7245's own SHAPE, which the cell above does NOT reach: the property is
+# defined by the CONTENT — stdlib §9.6 (v0.345): "public pure readonly property
+# IsAscii: bool;  // true iff every code point < 128 (O(1))" — while
+# `bz_string_is_ascii` answers false for any string whose STORAGE WIDTH is not
+# 1.  A one-code-point slice of "a" + "日" holds only 'a', so every code point
+# in it is < 128 and the property must answer TRUE.  MEASURED on HEAD
+# `d9f11d15`: it prints "False".
+C("string_isascii_width", 'Console.WriteLine(s.IsAscii);', ("value", "True\n"),
+  pre='var s := ("a" + "日")[0..<1];')
 C("debug_writeline_stringbuilder", '_ := sb.Append("x");\nDebug.WriteLine(sb);',
   ("reject", R(F_overload("Debug.WriteLine"), F_convertible("Debug.WriteLine"))),
   pre="var sb := new StringBuilder();", imports="import System.Diagnostics;",
@@ -713,7 +784,18 @@ ABORT_PAT = re.compile(r'IR verification failed|codegen error|Assertion|Aborted|
 # signal (the exit status is negative when the compiler was killed by one).
 SIGNAL_RC = -11
 
-CLASSES = ('OK', 'ACCEPTED', 'REJECTED', 'ABORT', 'INTERNAL')
+# --- the SANITIZER'S VERDICT at RUN time (B1) ---------------------------------
+# The campaign's DONE leg runs the cell under ASan, so the grid MUST read the
+# sanitizer's verdict: a program the sanitizer fails is not a pass.  These are
+# the model's shapes (`scripts/regression_matrix.py::classify()`): a sanitizer
+# error is a CRASH, a leak is a LEAK, and any other non-zero exit is a CRASH.
+# The house oracle's run-time options are `ASAN_OPTIONS=detect_leaks=1:exitcode=99`.
+ASAN_ERR_RE = re.compile(r'ERROR: AddressSanitizer: ([A-Za-z_-]+)')
+GLIBC_RE = re.compile(r'free\(\): |double free|invalid pointer|corrupted|Segmentation')
+LEAK_RE = re.compile(r'(\d+) byte\(s\) leaked in (\d+) allocation')
+RUN_ASAN_OPTIONS = 'detect_leaks=1:exitcode=99'
+
+CLASSES = ('OK', 'ACCEPTED', 'REJECTED', 'ABORT', 'INTERNAL', 'LEAK', 'CRASH')
 
 
 def _needle_hit(msg, want):
@@ -726,6 +808,15 @@ def _needle_hit(msg, want):
         return False
     needles = [want] if isinstance(want, str) else list(want)
     return any(n in msg for n in needles)
+
+
+def _run_env():
+    """The run-time environment for a cell's program: the house oracle's ASan
+    options (`detect_leaks=1:exitcode=99`), so the sanitizer's verdict is
+    VISIBLE to the classifier (B1)."""
+    env = dict(os.environ)
+    env['ASAN_OPTIONS'] = RUN_ASAN_OPTIONS
+    return env
 
 
 def classify_one(bezelc, progdir, outdir, cell, asan, timeout, run_timeout):
@@ -794,29 +885,48 @@ def classify_one(bezelc, progdir, outdir, cell, asan, timeout, run_timeout):
         return (name, campaign, subject, member, kind, want, 'INTERNAL',
                 '; '.join(w['msg'] for w in warns if 'internal:' in w['msg'])[:300], rel)
     try:
-        r = subprocess.run([exe], capture_output=True, text=True, errors='replace', timeout=run_timeout)
+        r = subprocess.run([exe], capture_output=True, text=True, errors='replace',
+                           timeout=run_timeout, env=_run_env())
     except subprocess.TimeoutExpired:
         return (name, campaign, subject, member, kind, want, 'ABORT', 'run timeout', rel)
     out = r.stdout or ''
     blob = out + (r.stderr or '')
+    # THE SANITIZER'S VERDICT COMES FIRST (B1): a leak or a crash is never what a
+    # cell expects, whatever the cell's expectation is.  The model's shape
+    # (`scripts/regression_matrix.py::classify()`) is adopted here.
+    m = ASAN_ERR_RE.search(blob)
+    if m:
+        return (name, campaign, subject, member, kind, want, 'CRASH',
+                'AddressSanitizer: ' + m.group(1), rel)
+    if GLIBC_RE.search(blob):
+        return (name, campaign, subject, member, kind, want, 'CRASH', 'glibc runtime error', rel)
+    if 'ERROR: LeakSanitizer' in blob:
+        lm = LEAK_RE.search(blob) or re.search(r'Direct leak of (\d+) byte\(s\) in (\d+) object', blob)
+        b, a = (lm.group(1), lm.group(2)) if lm else ('?', '?')
+        return (name, campaign, subject, member, kind, want, 'LEAK', f'{b}B/{a} leaked', rel)
+    if kind == 'fault':
+        # The EXPECTED runtime fault: a non-zero exit is what a fault cell wants.
+        if want in blob:
+            return (name, campaign, subject, member, kind, want, 'OK', 'fault raised', rel)
+        return (name, campaign, subject, member, kind, want, 'ACCEPTED',
+                f'no {want!r} in output {blob[:200]!r}', rel)
+    if r.returncode != 0:
+        # The program ran and died.  That is a CRASH, not a pass and not a
+        # "wrong answer": a cell whose expectation is a value or a noabort wants
+        # the program to run to completion.
+        return (name, campaign, subject, member, kind, want, 'CRASH',
+                f'rc={r.returncode} {blob[:200]!r}', rel)
     if kind == 'value':
         if out == want:
             return (name, campaign, subject, member, kind, want, 'OK', repr(out), rel)
         return (name, campaign, subject, member, kind, want, 'ACCEPTED',
                 f'printed {out!r}, want {want!r}', rel)
-    if kind == 'fault':
-        if want in blob:
-            return (name, campaign, subject, member, kind, want, 'OK', 'fault raised', rel)
-        return (name, campaign, subject, member, kind, want, 'ACCEPTED',
-                f'no {want!r} in output {blob[:200]!r}', rel)
     if kind == 'noabort':
         # The program must run to COMPLETION: a runtime fault is a wrong answer,
         # not a pass.  (The name says what it checks: the compiler must not abort
-        # AND the program must not fault.)
-        if r.returncode == 0:
-            return (name, campaign, subject, member, kind, want, 'OK', f'rc=0 {out!r}', rel)
-        return (name, campaign, subject, member, kind, want, 'ACCEPTED',
-                f'rc={r.returncode} {blob[:200]!r}', rel)
+        # AND the program must not fault.  A non-zero exit is caught above as a
+        # CRASH.)
+        return (name, campaign, subject, member, kind, want, 'OK', f'rc=0 {out!r}', rel)
     # kind == 'reject' but the program compiled: the wrong shape was admitted
     return (name, campaign, subject, member, kind, want, 'ACCEPTED',
             f'compiled and ran, printed {out!r}', rel)

@@ -22,10 +22,14 @@ What is asserted:
     reject cell turns that cell OK;
   * a diagnostic in NO family leaves the cell REJECTED (a false wrong only
     when the diagnostic is genuinely absent);
-  * the classifier's five classes: OK / ACCEPTED / REJECTED / ABORT / INTERNAL;
+  * the classifier's seven classes: OK / ACCEPTED / REJECTED / ABORT / INTERNAL /
+    LEAK / CRASH — the last two are the SANITIZER's verdict (B1), so a program the
+    sanitizer fails is never a clean pass;
   * a `reject` cell is OK only when the diagnostic contains one of its needles;
   * a `noabort` cell is OK only when the program exits 0 (a runtime FAULT is a
     wrong answer, not a pass);
+  * the reject cell set is PINNED exactly (count and names), so a cell whose
+    expectation KIND changes turns this suite RED (A2);
   * a `fault` cell is OK only when the fault text appears;
   * generation is deterministic, and the TSV's program path is CELL-RELATIVE,
     so two runs into different --out directories produce the same bytes.
@@ -59,6 +63,9 @@ case "$FAKE_MODE" in
   signal)      kill -SEGV $$ ;;
   internal)    echo "$src:1:1: warning: internal: lowerLocalDecl's initializer expression failed to lower" >&2; exit 0;;
   fault)       body='echo "Unhandled exception: System.IndexOutOfRangeException" >&2; exit 70';;
+  asan_crash)  body='echo "ERROR: AddressSanitizer: SEGV on unknown address 0x0" >&2; exit 1';;
+  asan_leak)   body='echo "ERROR: LeakSanitizer: detected memory leaks" >&2; echo "Direct leak of 32 byte(s) in 1 object(s) allocated from:" >&2; exit 99';;
+  died)        body='exit 3';;
   wrongvalue)  body='echo 999';;
   rightvalue)  body='echo 42';;
   *)           body='echo 42';;
@@ -89,12 +96,19 @@ def _needles(expect):
 
 
 def _anchored(alt, subject):
-    """True when the alternative names the cell's own subject (or its head or
-    its member), so a diagnostic about ANOTHER call cannot contain it."""
+    """True when the alternative names the cell's own subject (or its member as a
+    WORD, or its head as a QUALIFIER), so a diagnostic about ANOTHER call cannot
+    contain it.  A plain substring test is NOT enough: the word "string" occurs
+    inside "Array<string>", which would anchor a needle that names no call
+    (A3)."""
     head, _, short = subject.rpartition('.')
-    return bool(subject and subject in alt) or \
-           bool(short and short in alt) or \
-           bool(head and head in alt)
+    if subject and subject in alt:
+        return True
+    if short and re.search(r'\b' + re.escape(short) + r'\b', alt):
+        return True
+    if head and (head + '.') in alt:
+        return True
+    return False
 
 
 def _context_free(alt):
@@ -130,6 +144,34 @@ def _decoys(program, subject):
     return out
 
 
+# A2: the reject set is PINNED — both the count and the names.  Without this a
+# cell whose expectation KIND changes (a reject cell turned into a value cell)
+# leaves the suite green.
+REJECT_CELLS = [
+    'bool_parse_int', 'bool_tostring_format', 'bool_tryparse_int',
+    'builtin_typearg_arity', 'builtin_typearg_list', 'char_parse_radix',
+    'char_tostring_format', 'char_tryparse_int', 'convert_tostring_char',
+    'convert_tostring_radix_long', 'convert_tostring_uint', 'datetime_tostring_null',
+    'debug_writeline_stringbuilder', 'decimal_parse_double', 'decimal_tostring_radix',
+    'decimal_tryparse_double', 'double_parse_int', 'double_tryparse_int',
+    'encoding_getstring_int_array', 'guid_tryparse_int',
+    'imported_user_class_stringbuilder_bare', 'int_parse_bool', 'int_parse_char',
+    'int_parse_double', 'int_parse_int', 'int_parse_object', 'int_parse_radix_bool',
+    'int_parse_radix_string', 'int_tostring_radix_null',
+    'int_tostring_radix_null_named', 'int_tryparse_double',
+    'int_tryparse_int', 'long_parse_intarg', 'long_parse_null',
+    'long_tostring_null', 'long_tryparse_null', 'math_abs_decimal_nullable',
+    'math_abs_float', 'math_abs_uint', 'math_floor_nullable', 'math_floor_nullable_null',
+    'math_max_mixed', 'math_max_reference', 'math_minmax_typed_result',
+    'math_round_decimal', 'math_sign_bool', 'math_sign_reference', 'math_sign_string',
+    'sb_append_null', 'sb_append_null_literal', 'sb_insert_two_strings', 'sb_insert_zero',
+    'sb_remove_two_args', 'sb_replace_int', 'string_contains_int',
+    'string_contains_object', 'string_isascii', 'string_join_int_array',
+    'string_lastindexof_int', 'string_replace_object', 'string_split_int',
+    'string_tostring_format_bad', 'uint_parse_null',
+]
+
+
 class BuiltinAdmissionGridTest(unittest.TestCase):
     # ------------------------------------------------------------------ shape
     def test_every_reject_cell_lists_its_diagnostic_families(self):
@@ -137,12 +179,21 @@ class BuiltinAdmissionGridTest(unittest.TestCase):
         lands on another wording of the same family RED — which is what kept
         the grid from being the campaign's DONE instrument."""
         reject = [c for c in g.CELLS if c[4][0] == 'reject']
-        self.assertGreaterEqual(len(reject), 60)
+        self.assertEqual(len(reject), 63)
         for name, _e, _p, _b, expect, _i, _camp, subject, _lib, _m in reject:
             needles = _needles(expect)
             self.assertGreaterEqual(len(needles), 2, f'{name}: one guessed wording')
             for n in needles:
                 self.assertTrue(n and n.strip(), f'{name}: empty needle')
+
+    def test_the_reject_cell_set_is_pinned(self):
+        """A2: the suite must go RED when a cell's expectation KIND changes (a
+        reject cell turned into a value cell), so the reject set is pinned
+        EXACTLY — the count AND the names."""
+        reject = sorted(c[0] for c in g.CELLS if c[4][0] == 'reject')
+        self.assertEqual(reject, REJECT_CELLS)
+        # ... and the whole cell table's shape is pinned too.
+        self.assertEqual(len(g.CELLS), 118)
 
     def test_every_reject_cell_names_its_subject(self):
         """The subject is what makes a diagnostic about ANOTHER call unable to
@@ -150,6 +201,16 @@ class BuiltinAdmissionGridTest(unittest.TestCase):
         for name, _e, _p, _b, expect, _i, _camp, subject, _lib, _m in g.CELLS:
             if expect[0] == 'reject':
                 self.assertTrue(subject, f'{name}: a reject cell must name its subject')
+
+    def test_a_needle_naming_no_call_is_not_anchored(self):
+        """A3: `expects `Array<string>`` names a TYPE, not a call — the word
+        "string" occurs inside "Array<string>", so a plain substring test
+        anchored it for the wrong reason and the decoy test never ran for it."""
+        self.assertFalse(_anchored('expects `Array<string>`', 'string.Join'))
+        self.assertTrue(_anchored('`string.Join` expects `Array<string>`', 'string.Join'))
+        # ... and the needle is therefore context-free (it names no call).
+        self.assertTrue(_context_free('expects `Array<string>`'))
+        self.assertTrue(_context_free('expects `Array<byte>`'))
 
     def test_every_reject_alternative_is_anchored_or_a_context_free_phrase(self):
         """A bare phrase ("no matching overload of", "type argument") matches a
@@ -259,11 +320,46 @@ class BuiltinAdmissionGridTest(unittest.TestCase):
 
     def test_noabort_cell_rejects_a_runtime_fault(self):
         """D4: `noabort` must not be vacuous — a program that faults at RUN time
-        is a wrong answer, not a pass."""
+        is a wrong answer, not a pass.  Since B1 the fault is its own class:
+        CRASH (the program died), not a mere ACCEPTED."""
         row = self._classify('rightvalue', ('noabort', None))
         self.assertEqual(row[6], 'OK')
         row = self._classify('fault', ('noabort', None))
-        self.assertEqual(row[6], 'ACCEPTED')
+        self.assertEqual(row[6], 'CRASH')
+
+    def test_a_leak_is_its_own_class(self):
+        """B1: the campaign's DONE instrument must SEE the sanitizer's verdict.
+        A program the sanitizer fails is not a clean pass — it is a LEAK."""
+        row = self._classify('asan_leak', ('value', '42\n'))
+        self.assertEqual(row[6], 'LEAK')
+        self.assertIn('32B', row[7])
+
+    def test_a_sanitizer_crash_is_its_own_class(self):
+        """B1: an AddressSanitizer error is a CRASH, whatever the cell wants."""
+        row = self._classify('asan_crash', ('value', '42\n'))
+        self.assertEqual(row[6], 'CRASH')
+        self.assertIn('SEGV', row[7])
+
+    def test_a_value_cell_needs_a_zero_exit_code(self):
+        """B1: the `value` branch compared STDOUT ONLY, so a program that printed
+        the right text and then died was a clean pass.  A non-zero exit is a
+        CRASH."""
+        row = self._classify('died', ('value', '42\n'))
+        self.assertEqual(row[6], 'CRASH')
+        self.assertIn('rc=3', row[7])
+
+    def test_the_run_environment_carries_the_house_asan_options(self):
+        """B1: the cell's program runs under the house oracle's ASan options, so
+        a leak is reported at all (`detect_leaks=1`) and with a DISTINCT exit
+        code (`exitcode=99`)."""
+        env = g._run_env()
+        self.assertEqual(env.get('ASAN_OPTIONS'), 'detect_leaks=1:exitcode=99')
+
+    def test_the_sanitizer_verdict_beats_the_expected_fault(self):
+        """B1: the sanitizer's verdict is read FIRST — a `fault` cell whose
+        program leaks is a LEAK, not the expected fault."""
+        row = self._classify('asan_leak', ('fault', 'IndexOutOfRangeException'))
+        self.assertEqual(row[6], 'LEAK')
 
     def test_fault_cell_needs_the_fault_text(self):
         row = self._classify('fault', ('fault', 'IndexOutOfRangeException'))
