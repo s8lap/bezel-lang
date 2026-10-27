@@ -398,14 +398,14 @@ EXPECT = {
     # awaits nothing."
     ('class', 'await_using_var'): ('RUN', ['DTOR']),
     ('class', 'explicit_dispose'): ('RUN', ['DTOR']),
-    ('class', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    ('class', 'explicit_dispose_async'): ('REJ', ['§11.3', '§12.1', '§28.12']),
     # §28.10 "Adopting a named owned binding": an unmarked `using var y := x;`
     # over a named owned binding whose declared type is a class is a compile
     # error.
-    ('class', 'copy_local_source'): ('REJ', 'using var'),
+    ('class', 'copy_local_source'): ('REJ', '§28.10'),
     # §21.1: "The initializer of a runtime `const` must not be an owned
     # production" -- `new Res()` is one.
-    ('class', 'copy_const_source'): ('REJ', 'using var'),
+    ('class', 'copy_const_source'): ('REJ', '§21.1'),
     # A PARAMETER is not a "named owned binding" (§28.10's definition lists a
     # `var`/`using var` local, an owned iteration variable, an `out owned`
     # recipient, an owning-match arm binding, or an `owned` parameter), so the
@@ -425,8 +425,8 @@ EXPECT = {
     # using` ... the cascade and the chain follow exactly as if `await using`
     # had issued it" -- so the block must be reclaimed.
     ('class_async', 'explicit_dispose_async'): ('RUN', ['DA']),
-    ('class_async', 'copy_local_source'): ('REJ', 'using var'),
-    ('class_async', 'copy_const_source'): ('REJ', 'using var'),
+    ('class_async', 'copy_local_source'): ('REJ', '§28.10'),
+    ('class_async', 'copy_const_source'): ('REJ', '§21.1'),
     ('class_async', 'copy_param_source'): ('RUN', ['DTOR']),
     ('class_async', 'field_store'): ('RUN', ['DTOR']),
 
@@ -437,9 +437,9 @@ EXPECT = {
     # runs `Base`'s."
     ('derived_base', 'await_using_var'): ('RUN', ['DA', 'BASE_DTOR']),
     ('derived_base', 'explicit_dispose'): ('RUN', ['DER_DTOR', 'BASE_DTOR']),
-    ('derived_base', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
-    ('derived_base', 'copy_local_source'): ('REJ', 'using var'),
-    ('derived_base', 'copy_const_source'): ('REJ', 'using var'),
+    ('derived_base', 'explicit_dispose_async'): ('REJ', ['§11.3', '§12.1', '§28.12']),
+    ('derived_base', 'copy_local_source'): ('REJ', '§28.10'),
+    ('derived_base', 'copy_const_source'): ('REJ', '§21.1'),
     ('derived_base', 'copy_param_source'): ('RUN', ['DER_DTOR', 'BASE_DTOR']),
     ('derived_base', 'field_store'): ('RUN', ['DER_DTOR', 'BASE_DTOR']),
 
@@ -451,8 +451,8 @@ EXPECT = {
     ('interface', 'await_using_var'): ('RUN', ['DA']),
     ('interface', 'explicit_dispose'): ('RUN', ['DTOR']),
     ('interface', 'explicit_dispose_async'): ('RUN', ['DA']),
-    ('interface', 'copy_local_source'): ('REJ', 'using var'),
-    ('interface', 'copy_const_source'): ('REJ', 'using var'),
+    ('interface', 'copy_local_source'): ('REJ', '§28.10'),
+    ('interface', 'copy_const_source'): ('REJ', '§21.1'),
     ('interface', 'copy_param_source'): ('RUN', ['DTOR']),
     # §28.5: the owned field's cascade disposes the stored instance.
     ('interface', 'field_store'): ('RUN', ['DTOR']),
@@ -466,8 +466,8 @@ EXPECT = {
     ('abstract', 'await_using_var'): ('RUN', ['DA', 'ABS_DTOR']),
     ('abstract', 'explicit_dispose'): ('RUN', ['ABSD_DTOR', 'ABS_DTOR']),
     ('abstract', 'explicit_dispose_async'): ('RUN', ['DA', 'ABS_DTOR']),
-    ('abstract', 'copy_local_source'): ('REJ', 'using var'),
-    ('abstract', 'copy_const_source'): ('REJ', 'using var'),
+    ('abstract', 'copy_local_source'): ('REJ', '§28.10'),
+    ('abstract', 'copy_const_source'): ('REJ', '§21.1'),
     ('abstract', 'copy_param_source'): ('RUN', ['ABSD_DTOR', 'ABS_DTOR']),
     ('abstract', 'field_store'): ('RUN', ['ABSD_DTOR', 'ABS_DTOR']),
 
@@ -478,21 +478,21 @@ EXPECT = {
     ('generic_class', 'await_using_var'): ('RUN', ['DTOR'], ['body']),
     # A bare type parameter is a class-or-interface type in the generic body
     # (§28.1 clause 3), so `Dispose`/`DisposeAsync` are not members of it.
-    ('generic_class', 'explicit_dispose'): ('REJ', 'Dispose'),
-    ('generic_class', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    ('generic_class', 'explicit_dispose'): ('REJ', '§14.2'),
+    ('generic_class', 'explicit_dispose_async'): ('REJ', '§14.2'),
     # §28.10's bare-type-parameter clause: "using var y := x; over an `owned
     # x: T` is rejected once, in the body".
-    ('generic_class', 'copy_local_source'): ('REJ', 'using var'),
-    ('generic_class', 'copy_const_source'): ('REJ', 'using var'),
+    ('generic_class', 'copy_local_source'): ('REJ', '§28.10'),
+    ('generic_class', 'copy_const_source'): ('REJ', '§21.1'),
     ('generic_class', 'copy_param_source'): ('RUN', ['DTOR']),
     ('generic_class', 'field_store'): None,
 
     ('generic_unconstrained', 'using_var'): ('RUN', [], ['body']),
     ('generic_unconstrained', 'await_using_var'): ('RUN', [], ['body']),
-    ('generic_unconstrained', 'explicit_dispose'): ('REJ', 'Dispose'),
-    ('generic_unconstrained', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
-    ('generic_unconstrained', 'copy_local_source'): ('REJ', 'using var'),
-    ('generic_unconstrained', 'copy_const_source'): ('REJ', 'using var'),
+    ('generic_unconstrained', 'explicit_dispose'): ('REJ', '§14.2'),
+    ('generic_unconstrained', 'explicit_dispose_async'): ('REJ', '§14.2'),
+    ('generic_unconstrained', 'copy_local_source'): ('REJ', '§28.10'),
+    ('generic_unconstrained', 'copy_const_source'): ('REJ', '§21.1'),
     ('generic_unconstrained', 'copy_param_source'): ('RUN', []),
     ('generic_unconstrained', 'field_store'): None,
 
@@ -504,8 +504,8 @@ EXPECT = {
     ('string', 'await_using_var'): ('VAC', []),
     # §28.9: "none has a `Dispose()` member ... `x.Dispose()` over a value of one
     # of these types is a compile error".
-    ('string', 'explicit_dispose'): ('REJ', 'Dispose'),
-    ('string', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('string', 'explicit_dispose'): ('REJ', '§28.9'),
+    ('string', 'explicit_dispose_async'): ('REJ', ['§28.9', '§28.12']),
     ('string', 'copy_local_source'): ('VAC', []),
     ('string', 'copy_const_source'): ('VAC', []),
     ('string', 'copy_param_source'): ('VAC', []),
@@ -513,8 +513,8 @@ EXPECT = {
 
     ('function', 'using_var'): ('VAC', []),
     ('function', 'await_using_var'): ('VAC', []),
-    ('function', 'explicit_dispose'): ('REJ', 'Dispose'),
-    ('function', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('function', 'explicit_dispose'): ('REJ', '§28.9'),
+    ('function', 'explicit_dispose_async'): ('REJ', ['§27.1', '§28.9', '§28.12']),
     ('function', 'copy_local_source'): ('VAC', []),
     ('function', 'copy_const_source'): ('VAC', []),
     ('function', 'copy_param_source'): ('VAC', []),
@@ -528,8 +528,8 @@ EXPECT = {
     # "same lifetime as the plain-var twin".
     ('value_choice', 'using_var'): ('VAC', []),
     ('value_choice', 'await_using_var'): ('VAC', []),
-    ('value_choice', 'explicit_dispose'): ('REJ', 'Dispose'),
-    ('value_choice', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('value_choice', 'explicit_dispose'): ('REJ', '§35.8'),
+    ('value_choice', 'explicit_dispose_async'): ('REJ', ['§11.3', '§12.1', '§28.12']),
     ('value_choice', 'copy_local_source'): ('VAC', []),
     ('value_choice', 'copy_const_source'): ('VAC', []),
     ('value_choice', 'copy_param_source'): ('VAC', []),
@@ -542,11 +542,11 @@ EXPECT = {
     # left moved-from).
     ('owning_choice', 'using_var'): ('RUN', ['DTOR']),
     ('owning_choice', 'await_using_var'): ('RUN', ['DTOR']),
-    ('owning_choice', 'explicit_dispose'): ('REJ', 'Dispose'),
-    ('owning_choice', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('owning_choice', 'explicit_dispose'): ('REJ', '§35.8'),
+    ('owning_choice', 'explicit_dispose_async'): ('REJ', ['§11.3', '§12.1', '§28.12']),
     ('owning_choice', 'copy_local_source'): ('RUN', ['DTOR']),
     # §21.1: a move-only value is REJECTED as a `const` initializer.
-    ('owning_choice', 'copy_const_source'): ('REJ', 'using var'),
+    ('owning_choice', 'copy_const_source'): ('REJ', '§21.1'),
     # §15.3: "parameter passing is by value-move" -- the callee owns the value
     # and the unmarked copy adopts it.
     ('owning_choice', 'copy_param_source'): ('RUN', ['DTOR']),
@@ -564,8 +564,8 @@ EXPECT = {
     ('object_class', 'await_using_var'): ('RUN', ['DTOR']),
     # §8.7: "`Dispose()` is class-only ... On `Object` ... the name resolves to no
     # member, so a call in any spelling ... [is a] compile error".
-    ('object_class', 'explicit_dispose'): ('REJ', 'no member `Dispose`'),
-    ('object_class', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('object_class', 'explicit_dispose'): ('REJ', '§8.7'),
+    ('object_class', 'explicit_dispose_async'): ('REJ', ['§8.7', '§28.12']),
     ('object_class', 'copy_local_source'): ('RUN', ['DTOR']),
     ('object_class', 'copy_const_source'): ('RUN', ['DTOR']),
     ('object_class', 'copy_param_source'): ('RUN', ['DTOR']),
@@ -573,22 +573,22 @@ EXPECT = {
 
     ('object_string', 'using_var'): ('TWIN', []),
     ('object_string', 'await_using_var'): ('TWIN', []),
-    ('object_string', 'explicit_dispose'): ('REJ', 'Dispose'),
-    ('object_string', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('object_string', 'explicit_dispose'): ('REJ', '§8.7'),
+    ('object_string', 'explicit_dispose_async'): ('REJ', ['§8.7', '§28.12']),
     ('object_string', 'copy_local_source'): ('TWIN', []),
     ('object_string', 'copy_const_source'): ('TWIN', []),
     ('object_string', 'copy_param_source'): ('TWIN', []),
     ('object_string', 'field_store'): None,
 
     # -- Type token (typeof is deferred) --------------------------------------
-    ('type_token', 'using_var'): ('REJ', 'reflection is not yet implemented'),
-    ('type_token', 'await_using_var'): ('REJ', 'reflection is not yet implemented'),
-    ('type_token', 'explicit_dispose'): ('REJ', 'reflection is not yet implemented'),
-    ('type_token', 'explicit_dispose_async'): ('REJ', 'reflection is not yet implemented'),
-    ('type_token', 'copy_local_source'): ('REJ', 'reflection is not yet implemented'),
-    ('type_token', 'copy_const_source'): ('REJ', 'reflection is not yet implemented'),
-    ('type_token', 'copy_param_source'): ('REJ', 'reflection is not yet implemented'),
-    ('type_token', 'field_store'): ('REJ', 'reflection is not yet implemented'),
+    ('type_token', 'using_var'): ('REJ', '§17.10'),
+    ('type_token', 'await_using_var'): ('REJ', '§17.10'),
+    ('type_token', 'explicit_dispose'): ('REJ', '§17.10'),
+    ('type_token', 'explicit_dispose_async'): ('REJ', '§17.10'),
+    ('type_token', 'copy_local_source'): ('REJ', '§17.10'),
+    ('type_token', 'copy_const_source'): ('REJ', '§17.10'),
+    ('type_token', 'copy_param_source'): ('REJ', '§17.10'),
+    ('type_token', 'field_store'): ('REJ', '§17.10'),
 
     # -- built-in collection --------------------------------------------------
     # A collection literal is an owned producer (§28.3's producers table), so a
@@ -596,9 +596,9 @@ EXPECT = {
     ('builtin_collection', 'using_var'): ('NOVAC', []),
     ('builtin_collection', 'await_using_var'): ('NOVAC', []),
     ('builtin_collection', 'explicit_dispose'): ('NOVAC', []),
-    ('builtin_collection', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
-    ('builtin_collection', 'copy_local_source'): ('REJ', 'using var'),
-    ('builtin_collection', 'copy_const_source'): ('REJ', 'using var'),
+    ('builtin_collection', 'explicit_dispose_async'): ('REJ', ['§22.5', '§28.12']),
+    ('builtin_collection', 'copy_local_source'): ('REJ', '§28.10'),
+    ('builtin_collection', 'copy_const_source'): ('REJ', '§21.1'),
     ('builtin_collection', 'copy_param_source'): ('NOVAC', []),
     ('builtin_collection', 'field_store'): ('NOVAC', []),
 
@@ -609,9 +609,9 @@ EXPECT = {
     ('collection_literal', 'using_var'): ('NOVAC', []),
     ('collection_literal', 'await_using_var'): ('NOVAC', []),
     ('collection_literal', 'explicit_dispose'): ('NOVAC', []),
-    ('collection_literal', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
-    ('collection_literal', 'copy_local_source'): ('REJ', 'using var'),
-    ('collection_literal', 'copy_const_source'): ('REJ', 'using var'),
+    ('collection_literal', 'explicit_dispose_async'): ('REJ', ['§22.5', '§28.12']),
+    ('collection_literal', 'copy_local_source'): ('REJ', '§28.10'),
+    ('collection_literal', 'copy_const_source'): ('REJ', '§21.1'),
     ('collection_literal', 'copy_param_source'): ('NOVAC', []),
     ('collection_literal', 'field_store'): ('NOVAC', []),
 
@@ -619,7 +619,7 @@ EXPECT = {
     ('task', 'using_var'): ('NOVAC', []),
     ('task', 'await_using_var'): ('NOVAC', []),
     ('task', 'explicit_dispose'): ('NOVAC', []),
-    ('task', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    ('task', 'explicit_dispose_async'): ('REJ', ['§8.7', '§28.12']),
     ('task', 'copy_local_source'): ('NOVAC', []),
     ('task', 'copy_const_source'): ('NOVAC', []),
     ('task', 'copy_param_source'): ('NOVAC', []),
@@ -630,25 +630,89 @@ EXPECT = {
 # (§28.12), so it has the SAME expectation as the plain copy -- and its own
 # defect (#7374: the await spelling is admitted but never armed, so the copy's
 # reference is never released). The entries are derived, not re-typed, so the
-# two spellings can never drift apart.
+# two spellings can never drift apart -- and the derivation is a COPY of the
+# expectation, never the agreement itself: the agreement is checked by
+# `check_agreement`, which compares the two cells' OBSERVED verdicts.
+#
+# The derived needle is the plain cell's rule PLUS §28.12: the await spelling
+# is rejected under §28.10's rule, and a diagnostic that cites §28.12
+# instead (the rule that carries the admission UNCHANGED) decides the same
+# cell. A §28.3 must-use diagnostic cites NEITHER, so the await cell cannot
+# be green on the wrong rule again.
 for _h in list(HEADS):
     if (_h, 'copy_local_source') in EXPECT:
-        EXPECT[(_h, 'copy_await_source')] = EXPECT[(_h, 'copy_local_source')]
+        _plain = EXPECT[(_h, 'copy_local_source')]
+        if _plain is None:
+            EXPECT[(_h, 'copy_await_source')] = None
+        elif _plain[0] == 'REJ':
+            _needle = _plain[1]
+            if not isinstance(_needle, (list, tuple)):
+                _needle = [_needle]
+            EXPECT[(_h, 'copy_await_source')] = (
+                'REJ', list(_needle) + ['§28.12'])
+        else:
+            EXPECT[(_h, 'copy_await_source')] = _plain
 
 # Cells that are red TODAY because a NAMED issue is still open. The issue is
 # the one that owns the fix; a cell whose red is attributable to it is
-# reported as KNOWN-RED and is not counted as WRONG. The grid's DONE criterion
-# is "no WRONG cell".
+# reported as KNOWN-RED — and a KNOWN-RED cell BLOCKS the DONE verdict just
+# like a WRONG one does (see the DONE criterion in `judge`).
+#
+# A KNOWN-RED row MUST name the commit that fixes the cell, and that commit
+# must exist in the repository with the issue number in its subject. The
+# reviewer's demonstration: with an arbitrary string in KNOWN_RED and no
+# tracker check, `--filter value_choice` printed "5 known-red" and EXITED 0
+# with five cells RED AND LEAKING. A row that cannot name a fixing commit is
+# not a KNOWN-RED row at all: the cell is WRONG, and the record carries the
+# attribution. (#7374 and #7357 have no fixing commit yet, so their cells are
+# WRONG and the campaign's U1c lane owns them.)
 KNOWN_RED = {
-    # (head, form) -> (issue, needle): the cell is red TODAY because the named
-    # issue is still open, and the red LOOKS like `needle`. A red that does not
-    # carry the needle is a DIFFERENT defect and is counted WRONG.
-    ('value_choice', 'await_using_var'): ('#7374', 'LEAK'),
-    ('value_choice', 'copy_await_source'): ('#7374', 'LEAK'),
-    ('value_choice', 'copy_local_source'): ('#7316', 'LEAK'),
-    ('value_choice', 'copy_const_source'): ('#7316', 'LEAK'),
-    ('value_choice', 'copy_param_source'): ('#7357', 'LEAK'),
+    # (head, form) -> (issue, needle, fixing commit)
+    ('value_choice', 'copy_local_source'): ('#7316', 'LEAK', 'b6053a68'),
+    ('value_choice', 'copy_const_source'): ('#7316', 'LEAK', 'b6053a68'),
 }
+
+# Cells QUARANTINED from the DONE count. The `task` row is unstable: #6194's
+# hang makes the same program on the SAME compiler hang on one run and
+# complete on the next (the reviewer's C11(d) measured 100 ok / 39 wrong on
+# one run and 99 ok / 40 wrong on the next, the flipping cell being
+# `task/await_using_var`). A DONE instrument whose verdict flips run-to-run
+# is not an instrument, so the row is counted separately and REPORTED as its
+# own line until #6194 lands. A quarantined cell never makes the DONE verdict
+# worse and never makes it better.
+QUARANTINE = {
+    # (head, form) -> the issue whose landing lifts the quarantine
+    ('task', 'using_var'): '#6194',
+    ('task', 'await_using_var'): '#6194',
+    ('task', 'explicit_dispose'): '#6194',
+    ('task', 'explicit_dispose_async'): '#6194',
+    ('task', 'copy_local_source'): '#6194',
+    ('task', 'copy_await_source'): '#6194',
+    ('task', 'copy_const_source'): '#6194',
+    ('task', 'copy_param_source'): '#6194',
+    ('task', 'field_store'): '#6194',
+}
+
+# §28.12: "`await using var` takes §28.10's admission UNCHANGED". The two
+# spellings of the same program must AGREE on the admission. The grid used to
+# DERIVE the await cell's expectation from the plain cell's, which means a
+# lane that relaxed the plain cell's expectation relaxed both — the grid could
+# not see a disagreement at all. These pairs are compared instead: the two
+# cells' ADMISSION verdicts (rejected / not rejected) must match, and a
+# mismatch is its own verdict.
+#
+# A head in OPEN_QUESTION is NOT judged here: the spec question is the OWNER's,
+# and the grid must not settle it by adding a verdict of its own.
+# `object_class` is that head (§28.12's "unchanged" against §28.10's "Adopting
+# a named owned binding" over an `Object`-declared binding — the record's open
+# question 1). Its two cells keep the verdicts the record's reading gives
+# them, and the record's question and its held-out hunk stay as they are.
+AGREEMENT_PAIRS = [
+    ('using_var', 'await_using_var'),
+    ('copy_local_source', 'copy_await_source'),
+]
+OPEN_QUESTION = {'object_class'}
+
 
 # ---------------------------------------------------------------------------
 # Program construction
@@ -894,7 +958,11 @@ def all_cells(filt=None):
     out = []
     for h in HEADS:
         for f, flabel in FORMS:
-            if toks and not any(t in f'{h} {flabel} {HEADS[h][0]}' for t in toks):
+            # The form's NAME is matchable, not only its label: the record
+            # documented `--filter copy_local_source`, and the filter did not
+            # match it (exit 2, "no cells match the filter").
+            if toks and not any(t in f'{h} {f} {flabel} {HEADS[h][0]}'
+                                for t in toks):
                 continue
             out.append((h, f))
     return out
@@ -906,8 +974,42 @@ def all_cells(filt=None):
 
 LEAK_RE = re.compile(r'(\d+) byte\(s\) leaked in (\d+) allocation')
 GLIBC_RE = re.compile(r'free\(\): |double free|invalid pointer|corrupted')
-VACUOUS_RE = re.compile(r'is vacuous')
+# The §28.9 VACUITY lint, recognised by the RULE it names and not by the
+# lint's wording: the lint says "`using var` `x` is vacuous — … (§28.9) …",
+# and it is a WARNING. A needle on the wording alone ("is vacuous") is an
+# implementation string, and it breaks the moment the message is reworded —
+# which the house calls a behaviour flip. The § marker is the rule, and the
+# compiler cites its rule in every diagnostic.
+VACUOUS_RE = re.compile(r'warning:.*§28\.9')
 DIAG_RE = re.compile(r'warning:|error:')
+
+
+def needle_hit(log, needle):
+    """True iff `log` holds the cell's needle.
+
+    A needle is a string or a LIST of acceptable markers; ANY one of them
+    suffices. A list is how a cell names a rule that more than one section
+    can decide (`['§11.3', '§12.1', '§28.12']` for a member that is not
+    declared), and it is how a cell stays green when the SAME rule is cited
+    under a different section after a fix.
+
+    What a needle may NOT be: a generic token that a NEIGHBOURING rule's
+    diagnostic also carries. "using var" is the compiler's §28.3 must-use
+    remedy, so a cell that named it was green on §28.3's rule while claiming
+    §28.10's — and it went RED when a lane implemented §28.10 properly (the
+    §28.10 diagnostic's remedies are `move x` and a `var`/`const` binding,
+    not "using var"). Every REJ needle therefore names a §.
+    """
+    if isinstance(needle, (list, tuple)):
+        return any(n in log for n in needle)
+    return needle in log
+
+
+def flatten(text):
+    """One line, no tabs: the report TSV's detail column must not split a row
+    across physical lines (12 of the 153 rows did, before this)."""
+    return (text or '').replace('\\', '\\\\').replace('\t', ' ').replace(
+        '\r', ' ').replace('\n', ' | ')
 
 
 def classify(compiled, rc, err):
@@ -964,7 +1066,26 @@ def run_exe(exe, odir, name, run_timeout):
 
 
 def run_cell(bezelc, odir, progdir, head, form, timeout, run_timeout, twins):
-    """One cell. -> (head, form, verdict, observed, detail)."""
+    """One cell. -> (head, form, verdict, observed, detail).
+
+    The detail column carries a CELL-RELATIVE program path
+    (`programs/<cell>.bzl`), so two runs into different `--out`
+    directories produce byte-identical report TSVs.
+    """
+    head_, form_, verdict, observed, detail = _run_cell(
+        bezelc, odir, progdir, head, form, timeout, run_timeout, twins)
+    name = f'{head}__{form}'
+    absolute = os.path.join(progdir, name + '.bzl')
+    relative = os.path.join('programs', name + '.bzl')
+    if isinstance(detail, (list, tuple)):
+        detail = ' '.join(str(x) for x in detail)
+    detail = (detail or '').replace(absolute, relative)
+    observed = (observed or '').replace(absolute, relative)
+    return head_, form_, verdict, observed, detail
+
+
+def _run_cell(bezelc, odir, progdir, head, form, timeout, run_timeout, twins):
+    """One cell, before the path rewrite. -> (head, form, verdict, observed, detail)."""
     built = build(head, form)
     if built is None:
         return head, form, 'N/A', 'not applicable', ''
@@ -986,12 +1107,22 @@ def run_cell(bezelc, odir, progdir, head, form, timeout, run_timeout, twins):
         return head, form, 'UNDECIDED', f'{cls} {det} output {lines[:6]}', ''
     if expect[0] == 'REJ':
         if status == 'compiled':
-            return head, form, 'WRONG', 'compiled, expected rejection', clog[:400]
-        needle = expect[1]
-        if needle not in clog:
             first = next((ln for ln in clog.splitlines()
                           if ln.strip() and 'warning' not in ln), '')
-            return head, form, 'WRONG', f'rejected, but no {needle!r} in the diagnostic', first
+            return head, form, 'WRONG', 'compiled, expected rejection', first
+        needle = expect[1]
+        # The needle must be found in the diagnostic that REJECTED the
+        # program — the non-warning lines — and not anywhere in the log: a
+        # warning that happens to cite the section (the §28.10 borrow-pin
+        # note does) would otherwise make the cell green on a diagnostic that
+        # did not decide it.
+        rejecting = '\n'.join(ln for ln in clog.splitlines()
+                              if ln.strip() and 'warning:' not in ln)
+        if not needle_hit(rejecting, needle):
+            first = next((ln for ln in clog.splitlines()
+                          if ln.strip() and 'warning' not in ln), '')
+            return head, form, 'WRONG', (
+                f'rejected, but no {needle!r} in the diagnostic'), first
         return head, form, 'OK', f'rejected ({needle})', ''
     if status != 'compiled':
         first = next((ln for ln in clog.splitlines()
@@ -1052,6 +1183,159 @@ def measure_twins(bezelc, odir, progdir, timeout, run_timeout):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Judging
+# ---------------------------------------------------------------------------
+
+
+def _row(rows, head, form):
+    for r in rows:
+        if r[0] == head and r[1] == form:
+            return r
+    return None
+
+
+def admission(verdict, observed, expect):
+    """Did the program COMPILE? True = admitted, False = rejected, None = the
+    cell says nothing about the admission.
+
+    The spelling-agreement check needs this: §28.12's "`await using var` takes
+    §28.10's admission UNCHANGED" is a claim about the ADMISSION, not about
+    the runtime behaviour, so the two spellings are compared on it.
+    """
+    if observed.startswith('rejected'):
+        return False
+    if observed.startswith('compiled'):
+        return True
+    if expect is not None and expect[0] != 'REJ' and verdict in ('OK', 'WRONG'):
+        # A RUN-family cell that is not OK still COMPILED (it crashed, leaked,
+        # printed the wrong output, or hung at run time) — the program was
+        # admitted either way.
+        return True
+    return None
+
+
+def check_agreement(rows, expectations=None):
+    """§28.12's "takes §28.10's admission UNCHANGED" — the two spellings of the
+    same program must AGREE on the admission.
+
+    Returns a list of (head, form, verdict, observed) overrides. A head in
+    OPEN_QUESTION is NOT judged: the spec question is the OWNER's, and the
+    grid must not settle it by counting the cell wrong (the record keeps the
+    question open, and the held-out hunk with it).
+    """
+    if expectations is None:
+        expectations = EXPECT
+    out = []
+    for head in HEADS:
+        for plain_form, await_form in AGREEMENT_PAIRS:
+            p = _row(rows, head, plain_form)
+            a = _row(rows, head, await_form)
+            if p is None or a is None:
+                continue
+            pa = admission(p[2], p[3], expectations.get((head, plain_form)))
+            aa = admission(a[2], a[3], expectations.get((head, await_form)))
+            if pa is None or aa is None or pa == aa:
+                continue
+            if head in OPEN_QUESTION:
+                # The OWNER's question — the grid adds no verdict of its own.
+                continue
+            out.append((head, await_form, 'MISMATCH',
+                        f'the two spellings disagree: {plain_form} is '
+                        f'{"admitted" if pa else "rejected"} and '
+                        f'{await_form} is '
+                        f'{"admitted" if aa else "rejected"} (§28.12 '
+                        "takes §28.10's admission unchanged)"))
+    return out
+
+
+def judge(results, check_issues=False):
+    """The cells -> the counts, the DONE verdict, and the rows.
+
+    THE DONE CRITERION. "No WRONG cell and no KNOWN-RED cell and no
+    SPELLING MISMATCH" — a red cell is red, whoever owns it. The reviewer's
+    demonstration: with the KNOWN-RED demotion and no tracker check, a run
+    printed "5 known-red" and EXITED 0 with five cells red and leaking.
+
+    THE QUARANTINE. A quarantined cell (the `task` row, pending #6194) is
+    counted separately and never moves the DONE verdict: a row that flips
+    run-to-run cannot be part of a verdict that must not flip.
+    """
+    overrides = dict(((h, f), (v, o)) for h, f, v, o in
+                     check_agreement(results))
+    rows = []
+    quarantined_verdicts = {}
+    for head, form, verdict, observed, detail in results:
+        if (head, form) in overrides:
+            v, o = overrides[(head, form)]
+            # The mismatch is the cell's HEADLINE verdict — the grid's whole
+            # point is to see the disagreement — and the cell's own reason
+            # stays in the text.
+            verdict = v
+            observed = f'{o} [cell: {observed}]'
+        if verdict == 'WRONG':
+            known = KNOWN_RED.get((head, form))
+            if known and (known[1] in observed or known[1] in detail):
+                if check_issues and not issue_is_open(known[0]):
+                    observed = (f'{observed} [{known[0]} — the issue is CLOSED, '
+                                'so this is not a KNOWN-RED]')
+                else:
+                    verdict = 'KNOWN-RED'
+                    observed = f'{observed} [{known[0]}, fixed by {known[2]}]'
+        if (head, form) in QUARANTINE:
+            quarantined_verdicts[verdict] = quarantined_verdicts.get(
+                verdict, 0) + 1
+            verdict = 'QUARANTINED'
+        rows.append((head, form, verdict, observed, detail))
+    counts = {}
+    for r in rows:
+        counts[r[2]] = counts.get(r[2], 0) + 1
+    quarantined = [r for r in rows if r[2] == 'QUARANTINED']
+    judged = [r for r in rows if r[2] != 'QUARANTINED']
+    jc = {}
+    for r in judged:
+        jc[r[2]] = jc.get(r[2], 0) + 1
+    blocking = jc.get('WRONG', 0) + jc.get('KNOWN-RED', 0) + jc.get('MISMATCH', 0)
+    done = blocking == 0
+    return rows, counts, jc, quarantined, done, quarantined_verdicts
+
+
+def issue_is_open(number):
+    """Is the issue OPEN? A live check, used only with `--check-issues`: the
+    grid itself needs no network, so the tracker is consulted only when the
+    caller asks for it. An issue that cannot be reached counts as OPEN (the
+    grid must not promote a KNOWN-RED to WRONG because the network is down).
+    """
+    tag = number.lstrip('#')
+    try:
+        p = subprocess.run(['gh', 'issue', 'view', tag, '--json', 'state'],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    if p.returncode != 0:
+        return True
+    try:
+        return '"OPEN"' in p.stdout or 'OPEN' in p.stdout
+    except Exception:
+        return True
+
+
+def write_report(rows, path):
+    """The report TSV: ONE row per cell, FIVE fields per row, no embedded
+    newline or tab, and a CELL-RELATIVE program path.
+
+    The absolute path is what made two runs into different `--out` directories
+    differ byte-for-byte; the multi-line detail is what split 12 of the 153
+    rows across physical lines (166 lines for 154 expected, 12 rows with the
+    wrong field count and one empty).
+    """
+    with open(path, 'w') as f:
+        f.write('head\tform\tverdict\tobserved\tdetail\n')
+        for head, form, verdict, observed, detail in rows:
+            f.write('\t'.join((head, form, verdict, flatten(observed),
+                               flatten(detail))) + '\n')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--bezelc', default='build/bezelc')
@@ -1062,7 +1346,11 @@ def main():
     ap.add_argument('--run-timeout', type=int, default=120)
     ap.add_argument('--report', default='')
     ap.add_argument('--twins', action='store_true',
-                    help='also measure each head\'s plain-var twin')
+                    help="also measure each head's plain-var twin")
+    ap.add_argument('--check-issues', action='store_true',
+                    help='consult the tracker: a KNOWN-RED whose issue is '
+                         'CLOSED is not a KNOWN-RED (needs the network; the '
+                         'grid itself never needs it)')
     args = ap.parse_args()
 
     bezelc = os.path.abspath(args.bezelc)
@@ -1088,34 +1376,22 @@ def main():
     order = {c: i for i, c in enumerate(cells)}
     results.sort(key=lambda r: order[(r[0], r[1])])
 
-    wrong = known_red = ok = undecided = na = skipped = 0
-    rows = []
-    for head, form, verdict, observed, detail in results:
-        if verdict == 'WRONG':
-            known = KNOWN_RED.get((head, form))
-            if known and (known[1] in observed or known[1] in detail):
-                verdict = 'KNOWN-RED'
-                observed = f'{observed} [{known[0]}]'
-        if verdict == 'OK':
-            ok += 1
-        elif verdict == 'WRONG':
-            wrong += 1
-        elif verdict == 'KNOWN-RED':
-            known_red += 1
-        elif verdict == 'UNDECIDED':
-            undecided += 1
-        elif verdict == 'N/A':
-            na += 1
-        elif verdict == 'TIMEOUT':
-            skipped += 1
-        rows.append((head, form, verdict, observed, detail))
-
+    (rows, counts, jc, quarantined, done,
+     quarantined_verdicts) = judge(results,
+                                  check_issues=args.check_issues)
     for head, form, verdict, observed, detail in rows:
-        print(f'{verdict:10s} {head:20s} {form:22s} {observed}')
+        print(f'{verdict:12s} {head:20s} {form:22s} {observed}')
     total = len(rows)
-    print(f'{total} cells: {ok} ok, {wrong} wrong, {known_red} known-red, '
-          f'{undecided} undecided, {na} n/a, {skipped} skipped')
-    print(f'NATIVE SANITIZER: {skipped} check(s) skipped')
+    print(f'{total} cells: {jc.get("OK", 0)} ok, {jc.get("WRONG", 0)} wrong, '
+          f'{jc.get("KNOWN-RED", 0)} known-red, {jc.get("MISMATCH", 0)} '
+          f'mismatch, {jc.get("UNDECIDED", 0)} undecided, '
+          f'{jc.get("N/A", 0)} n/a, {jc.get("TIMEOUT", 0)} skipped')
+    if quarantined:
+        print(f'QUARANTINED: {len(quarantined)} cell(s) held out of the DONE '
+              f'count (pending {sorted(set(QUARANTINE.values()))[0]}): '
+              + ', '.join(f'{v} {k}' for k, v in
+                          sorted(quarantined_verdicts.items())))
+    print(f'NATIVE SANITIZER: {jc.get("TIMEOUT", 0)} check(s) skipped')
 
     if args.twins:
         print('plain-var twins:')
@@ -1124,12 +1400,16 @@ def main():
             print(f'  {h:24s} {cls} {det}')
 
     if args.report:
-        with open(args.report, 'w') as f:
-            f.write('head\tform\tverdict\tobserved\tdetail\n')
-            for head, form, verdict, observed, detail in rows:
-                f.write(f'{head}\t{form}\t{verdict}\t{observed}\t{detail}\n')
+        write_report(rows, args.report)
         print(f'report written to {args.report}')
-    return 1 if wrong else 0
+    blocking = (jc.get('WRONG', 0) + jc.get('KNOWN-RED', 0) +
+                jc.get('MISMATCH', 0))
+    if blocking:
+        print(f'DONE: NO — {blocking} cell(s) block it (wrong + known-red + '
+              f'mismatch)')
+        return 1
+    print('DONE: YES — no cell blocks the verdict')
+    return 0
 
 
 if __name__ == '__main__':

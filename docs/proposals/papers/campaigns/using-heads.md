@@ -86,10 +86,23 @@ population — this is the §3419 "duplicated classification predicates" shape:
 * **Closes 8:** #3482 (a monomorphization-aware representation key), #7338 (the
   `Type` token in the runtime-managed set), #7339, #3483, #7328, #5653, #3516,
   #3515 — the last six through the run-time half.
-* **Already closed before the anchor (the anchor generalises, it does not newly
-  close): 6** — #7322, #7306 (#9bb9387f narrow #7322), #7327, #7283, #7337
-  (`87fdfa67 fix #7337, #7327`) and #3493's dispatch half (`e9c564fd fix #3494 /
-  narrow #3493`).
+* **The shapes of six are already fixed before the anchor (the anchor
+  generalises, it does not newly close): 6** — #7322, #7306 and #7283 (one
+  commit carries all three: `9bb9387f narrow #7322: the vacuous `await using`
+  shape is not an async disposal` — the same vacuous-`await using`-over-a-
+  runtime-managed-value shape), #7327 and #7337 (`87fdfa67 fix #7337, #7327`),
+  and #3493's dispatch half.
+  ⚠ **Three of those six ISSUES are still OPEN** — #7322, #7306 and #7283:
+  their shapes no longer reproduce, the issues are not closed, and the tracker
+  owns them. ⚠ **And #3493's dispatch half is re-derived by MEASUREMENT on
+  this tree, not by a citation**: the earlier text here cited `e9c564fd fix
+  #3494 / narrow #3493`, and that commit is **not an ancestor of `origin/main`
+  nor of this tree** (it lives on a diverged local `main`). MEASURED here
+  (`await using var u: Base := new Der();` over a `virtual` base
+  `DisposeAsync`): the program prints **`DER_DA`** — the derived override IS
+  awaited — so the shape is fixed in this tree and the fix's commit cannot be
+  named from this tree's history. #3493 itself is OPEN, and its residual
+  (#3515, the reclamation half) is not.
 * **Does NOT close 10:** #1531 and #1603 (the direct `DisposeAsync()` path is
   `Emitter::lowerAwait`'s special case in src/codegen/LlvmBackend_Async.cpp — a
   different site), #2623 (the owned-field cascade in
@@ -169,10 +182,15 @@ rows where `campaign == using-heads`: **24 rows** (severity: 7 soundness, 3 cras
   "that their entry checks confirm", and this entry check does not confirm it —
   the shape is a §28.2/§28.6 question about the explicit `Dispose()` call's
   reclamation, which is `producer-temporaries`' subject, not the head-kind question.
-* The tracker label query **agrees with nothing yet**: `gh api 'repos/s8lap/bezel-lang/issues?state=open&labels=campaign:using-heads&per_page=100&page=1'`
-  returns `[]` (0 issues) — the §1.6 labelling sweep has not been applied. The
-  labels themselves exist (`campaign:using-heads` is in `gh label list`). Membership
-  above is from the TSV, as the brief directs.
+* **The tracker label query — ONE statement, measured once.** On **2026-10-28**
+  the query `gh issue list --label "campaign:using-heads" --state open --limit 100`
+  returned **37 OPEN** issues: the 22 still-open members of the campaign's 24,
+  **#7374**, the twelve newly filed **#7386–#7397**, and **#5355** and **#7146**
+  (older issues that carry the campaign label). An earlier section of this
+  record said the same query returned `[]` (0 issues) — that was true before
+  the §1.6 labelling sweep and is now superseded; the number above is the one
+  to quote, and it was measured on the date above. Membership below is still
+  from the TSV, as the brief directs.
 
 ## Members at entry
 
@@ -209,13 +227,28 @@ means the repro ran and produced the CORRECT behaviour.
 | 7357 | leak | **reproduces** | The `using var` copy of a **PARAMETER** source → `35 byte(s) leaked in 2 allocation(s)`; of a **NULLABLE** source → the same; and the **plain-`var`** copy of a PARAMETER source → the same. Symmetric, exactly as the issue says. |
 
 **Membership, as the tracker sees it.** The plan's §3 campaign-1 row lists
-**24** members (the TSV this lane read). The label sweep has since run, and
-`gh issue view` over `campaign:using-heads` shows **23 open**: **#7327 and
-#7337 are CLOSED** (both were in the TSV; both measured "does not reproduce"
-here, which is consistent with their closure), and **#7374 is NEW** — the
-`await using var` copy of a value-like choice local, filed off the #7316
-review and labelled with this campaign. The grid's `value_choice` /
-`copy_await_source` cell is #7374's exact spelling, and it is red.
+**24** members (the TSV this lane read). **#7327 and #7337 are CLOSED** (both
+were in the TSV; both measured "does not reproduce" here, which is consistent
+with their closure), and **#7374 is NEW** — the `await using var` copy of a
+value-like choice local, filed off the #7316 review and labelled with this
+campaign. The grid's `value_choice` / `copy_await_source` cell is #7374's
+exact spelling, and it is red. The campaign's label count is stated ONCE, in
+the anchor's section above (the query, the date and the number).
+
+**The six "does not reproduce" rows, re-scoped (§2.3: a member is closed by a
+fix commit OR re-scoped with a recorded reason — split / blocked-on-ruling /
+"not a defect", with the spec sentence quoted).** None of the six is closed by
+this lane; the re-scoping is what the §2.3 rule asks for, and the ISSUES stay
+with the tracker.
+
+| # | fixing commit | re-scoping (with the deciding spec sentence QUOTED) |
+|---|---|---|
+| #2624 | none isolated by this lane | **blocked on a ruling.** The repro ran and produced the CORRECT behaviour, and the spec does not name the pending per-advance Task: §29.1's iterator protocol says *"Disposing the enumerator (`break`, exhaustion, or explicit `Dispose()`) disposes any outstanding yielded value the iterator still owns"* — the per-advance Task is not a yielded value, so whether it is part of the disposal obligation is not decided by the text. The ISSUE is OPEN. |
+| #7283 | `9bb9387f narrow #7322` (the vacuous `await using` shape) | **not a defect at HEAD.** A function value is runtime-managed, and §28.9 says *"None of them is a class, and none has a `Dispose()` member: `x.Dispose()` over a value of one of these types is a compile error"*, so the `await using` spelling of it carries no disposal obligation, and §28.12's "`await using var` takes §28.10's admission unchanged" admits it. The ISSUE is OPEN. |
+| #7306 | `9bb9387f narrow #7322` | as #7283, for a string (also runtime-managed, §28.9). The ISSUE is OPEN. |
+| #7322 | `9bb9387f narrow #7322` | as #7283; the commit names this issue. The ISSUE is OPEN. |
+| #7327 | `87fdfa67 fix #7337, #7327` | **closed by the fix** — the commit is in `origin/main`. The ISSUE is CLOSED. |
+| #7337 | `87fdfa67 fix #7337, #7327` | **closed by the fix** — the commit is in `origin/main`. The ISSUE is CLOSED. |
 
 **Summary of the 24:** **reproduces 15** (#1531, #1603, #2623, #3471, #3482, #3483,
 #3515, #3516, #5653, #6194, #7316, #7326, #7328, #7339, #7357) · **does not
@@ -290,12 +323,15 @@ is reviewed; owner-ruled §4.7 rule 7 then allows file-disjoint concurrency):
    abstract head (which is gated on it). Members: #3515, #3516. Grid rows:
    `abstract`, `derived_base` (`field_store`).
 4. **U1c lane (Opus, SOUNDNESS)** — the copy path. Members: #7316, #7357, #7374,
-   new-9, new-10. Grid rows: the `copy_local_source`, `copy_await_source`,
-   `copy_const_source` and `copy_param_source` rows of every head. **Start with
-   new-10**: the `using var` copy of a PARAMETER disposes the borrowed
-   parameter (a heap-use-after-free, measured with a 20-line repro), and it is
-   the one cell in the family that is a memory-safety defect rather than a
-   leak. The `value_like choice` copy cells are #7316/#7374/#7357.
+   new-9, new-10, new-12, new-13. Grid rows: the `copy_local_source`,
+   `copy_await_source`, `copy_const_source` and `copy_param_source` rows of
+   every head. **Start with new-10** (#7387): the `using var` copy of an
+   INTERFACE-typed PARAMETER disposes the borrowed parameter (a
+   heap-use-after-free, measured with a 20-line repro), and it is the one cell
+   in the family that is a memory-safety defect rather than a leak. Then
+   new-12 (the same shape over an OWNED parameter — the fault is inside the
+   callee) and new-13 (the builtin-collection head — a double free of the
+   array block). The `value_like choice` copy cells are #7316/#7374/#7357.
 5. **U1d + U2e lane (Sonnet, sema)** — the `await using` admission and the
    `IAsyncDisposable` conformance. Members: #7326, #7354. Not a disposal lane, so
    it may run beside the ownership lanes once the anchor lands.
@@ -320,16 +356,55 @@ deterministic, needs no network, and writes only under `--out`.
 
 ```
 scripts/using_heads_grid.py --bezelc build/bezelc --out /var/tmp/bezel-scratch/<lane>/grid \
-    [--filter class,string] [--jobs 10] [--timeout 60] [--run-timeout 90] [--report FILE] [--twins]
+    [--filter class,string] [--jobs 10] [--timeout 60] [--run-timeout 90] [--report FILE] \
+    [--twins] [--check-issues]
 ```
 
-`--filter` is a comma-separated list of SUBSTRINGS matched against the head name,
-the form name and the head's label (so `--filter class` selects every head whose
-name or label contains `class`). Exit status 0 when every cell matches, 1 when at
-least one cell is wrong, 2 on a usage/infrastructure error (a filter that matches
-no cell is a usage error, not a pass). The summary prints
+`--filter` is a comma-separated list of SUBSTRINGS matched against the head
+name, the **form name**, the form's label and the head's label (so
+`--filter class` selects every head whose name or label contains `class`, and
+`--filter copy_await_source` selects the await-spelling copy cells). Exit
+status 0 when every cell matches and nothing blocks the DONE verdict, 1 when
+at least one cell is wrong (or is a KNOWN-RED, or the two spellings of a
+program disagree), 2 on a usage/infrastructure error (a filter that matches no
+cell is a usage error, not a pass). The summary prints
 `NATIVE SANITIZER: <n> check(s) skipped`; **n must be 0** — a cell whose program
 could not be linked under ASan is counted as skipped.
+
+**Where it is WIRED (the reviewer's M2).** The grid itself is **not** at the
+gate: it compiles 153 programs and runs them under ASan, which is far too
+slow for a gate cycle, and its DONE verdict is the campaign's, not the
+repository's. What IS at the gate is the grid's **classifier**:
+`scripts/gate/tests/test_using_heads_grid.py` (19 tests) is discovered by
+`scripts/pregate.sh` (it runs `python3 -m unittest discover -s
+scripts/gate/tests`), so a change to the grid's needles, its KNOWN-RED
+mechanism, its quarantine, its agreement check or its report writer fails the
+gate. The test uses a FAKE `bezelc` (a shell script), so it is build-free
+and takes no compiler. The campaign's DONE run is the grid itself, run by hand
+by the campaign's lanes and quoted in this record.
+
+**The report TSV (the reviewer's M3/M4).** `--report FILE` writes one line
+per cell and five TAB-separated fields — `head`, `form`, `verdict`,
+`observed`, `detail` — plus a header. The detail column is **flattened** (a
+newline becomes " | ", a tab a space), so no row splits across physical lines,
+and the program path in it is **cell-relative** (`programs/<head>__<form>.bzl`),
+so two runs into two different `--out` directories produce **byte-identical**
+TSVs. Both properties are asserted in the gate test.
+
+**What a cell's needle must be.** A `REJ` cell's needle names the RULE it
+decides — a `§` marker (`§28.10`, `§21.1`, `§8.7`, `§35.8`, `§14.2`, `§17.10`,
+`§22.5`, `§27.1`, `§11.3`), or a list of markers when more than one section can
+decide the same cell (`['§11.3', '§12.1', '§28.12']` for a member that is not
+declared). **A generic token is never a discriminator.** The grid's first
+version named `"using var"` for the copy cells, and that token is the §28.3
+must-use diagnostic's REMEDY — so a cell that claimed §28.10's "Adopting a
+named owned binding" was green on §28.3's rule, and it would have gone RED
+when a lane implemented §28.10 properly (that diagnostic's remedies are
+`move x` and a `var`/`const` binding, not "using var"). The needle is matched
+against the diagnostic that **rejected** the program, not against the whole
+compile log: a warning that happens to cite the section (the §28.10 borrow-pin
+note does) must not make a cell green.
+
 
 **The three dimensions.** A cell is **(head kind) × (binding form) × (source
 kind)**, and the third one is spelled out rather than implicit, because a
@@ -361,14 +436,23 @@ collapsed dimension is a silently unpinned variant:
   source is a BORROW, so the callee's copy is a borrow-pin that disposes
   nothing (§28.10's "`using var` initialized from a borrow"). The `await
   using` spelling of the copy takes §28.10's admission **unchanged** (§28.12),
-  so its expectation is DERIVED from the plain copy's rather than re-typed —
-  the two spellings cannot drift apart — but it is a separate cell, because
-  the await spelling has its own defect (#7374: it is admitted but never
-  armed, so the copy's reference is never released).
+  so the grid does not merely RE-TYPE the plain copy's expectation — it
+  **COMPARES** the two: each head's `using var` / `await using var` pair and
+  its `copy_local_source` / `copy_await_source` pair must agree on the
+  ADMISSION, and a disagreement is its own verdict (`MISMATCH`), which blocks
+  the DONE verdict like a wrong cell. (The grid's first version DERIVED the
+  await cell's expectation from the plain cell's — a copied expectation, which
+  is exactly the kind of drift the comparison forbids; that is the reviewer's
+  H2.) The await cells keep their own needle (`§28.10` or `§28.12`), so a
+  correct §28.10 implementation makes them green on the RIGHT rule, and the
+  `object_class` pair is **not** compared — that is the OWNER's open question
+  (see "Questions for the next train"), and the grid adds no verdict of its
+  own there.
 
 17 × 9 = **153 cells**, 9 of which are N/A (the form does not exist for that
 head — e.g. `owned` is inadmissible on an `Object` field, §28.1), so **144
-runnable cells**.
+runnable cells** — of which the 9 `task` cells are QUARANTINED (see the
+oracle discipline below), leaving **135** cells the DONE verdict covers.
 
 **Expectation kinds.** `REJ:<needle>` (must be rejected with a diagnostic
 holding the needle), `RUN:<markers>` (must compile, run clean under ASan, and
@@ -398,53 +482,122 @@ not counted wrong.
   code alone. Every cell runs the ASan-instrumented binary, so the leak/crash
   verdicts are real sanitizer verdicts.
 * **A cell that is red because a NAMED issue is still open is reported as
-  KNOWN-RED with that issue, and is NOT counted as WRONG.** The campaign's DONE
-  criterion is "no WRONG cell". The KNOWN-RED rows today are the four
-  `value_choice` cells (#7316, #7357, #7374) — see the table below.
+  KNOWN-RED with that issue — and a KNOWN-RED cell BLOCKS the DONE verdict
+  just like a wrong one does.** The campaign's DONE criterion is **"no WRONG
+  cell, no KNOWN-RED cell and no SPELLING MISMATCH"**: a red cell is red,
+  whoever owns it. (The grid's first version counted a KNOWN-RED as
+  not-wrong and consulted no tracker, so a filter run that printed "5
+  known-red" **exited 0** with five cells red and leaking. A KNOWN-RED row
+  must now name the commit that fixes the cell — that commit must exist in
+  the repository and its subject must name the issue — and `--check-issues`
+  re-promotes a KNOWN-RED whose issue is CLOSED to a wrong cell. A cell whose
+  issue has no fixing commit yet is a WRONG cell; the record carries the
+  attribution.) The KNOWN-RED rows today are the two `value_choice` copy
+  cells that #7316's fix (`b6053a68`) covers — see the table below.
+* **The `task` row is QUARANTINED out of the DONE count** until #6194 lands.
+  #6194's hang makes the same program on the SAME compiler hang on one run
+  and complete on the next, so a DONE verdict that included the row would
+  flip run-to-run. The quarantined cells are counted separately and reported
+  on their own line; they never make the verdict better and never make it
+  worse.
+* **The two spellings of a program must AGREE (§28.12: "`await using var`
+  takes §28.10's admission UNCHANGED").** The grid compares each head's
+  `using var` and `await using var` cells, and its `copy_local_source` and
+  `copy_await_source` cells, on the ADMISSION (rejected or not). A
+  disagreement is its own verdict (`MISMATCH`) and it blocks the DONE verdict
+  like a wrong cell. The `object_class` head is NOT judged this way: §28.12's
+  "unchanged" against §28.10's adoption rule over an `Object`-declared
+  binding is the OWNER's open question, and the grid adds no verdict of its
+  own there (its two cells keep the verdicts the reading below gives them).
 
-**Baseline on HEAD (`d9f11d15`), measured:**
+
+**Baseline on this tree, measured** (the fix-forward's script, against the
+compiler at `d9f11d15` — `git diff --name-only d9f11d15 origin/main` names **no
+`src/` file**, so the compiler under test is the same on both):
 
 ```
-153 cells: 98 ok, 41 wrong, 5 known-red, 0 undecided, 9 n/a, 0 skipped
+153 cells: 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 skipped
+QUARANTINED: 9 cell(s) held out of the DONE count (pending #6194): 6 OK, 3 WRONG
 NATIVE SANITIZER: 0 check(s) skipped
+DONE: NO — 53 cell(s) block it (wrong + known-red + mismatch)
 ```
 
-=> **41 cells are WRONG on HEAD** (plus 5 KNOWN-RED), of the 144 runnable ones.
-That is the campaign's DONE number: the campaign is DONE when it is **0 WRONG**.
+=> **53 cells block the DONE verdict** — 43 WRONG + 2 KNOWN-RED + 8 MISMATCH —
+of the **135** cells the count covers (153 − 9 N/A − 9 quarantined). That is
+the campaign's DONE number: the campaign is DONE when it is **0** (no WRONG,
+no KNOWN-RED, no MISMATCH).
+
+**The two-run determinism proof (the reviewer's H3).** Two consecutive runs of
+the same script on the same compiler, into two different `--out` directories:
+
+| | run A | run B |
+|---|---|---|
+| `153 cells:` | 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 skipped | 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 skipped |
+| `QUARANTINED:` | 9 cells: 6 OK, 3 WRONG | 9 cells: 5 OK, 4 WRONG |
+| `DONE:` | **NO — 53 cell(s) block it** | **NO — 53 cell(s) block it** |
+
+and the two runs' report TSVs are **byte-identical on all 144 non-quarantined
+rows**
+(`diff <(grep -v QUARANTINED reportA.tsv) <(grep -v QUARANTINED reportB.tsv)`
+⇒ no difference at all). The only rows that differ are the nine **quarantined**
+`task` rows, and there the difference is *which* of them hung on that run
+(#6194's hang) — the DONE verdict is identical, which is the whole point of
+the quarantine. (Before the quarantine, the same race made the DONE line flip
+between 100 ok/39 wrong and 99 ok/40 wrong **on one build**.)
+
+**The coverage gap the grid DECLARES (the reviewer's L6).** Master plan §3's
+head-kind list says *"Object holding EACH OF THESE"* (ten heads), and the grid
+carries **two** `Object`-declared shapes (`object_class`, `object_string`).
+The gap is **eight Object-declared heads × 9 binding forms = 72 cells**, and
+they are ABSENT — not red, not green, simply not measured. The eight heads are:
+derived-behind-base, interface, abstract, generic `T` (×2), function value,
+value-like choice, owning choice. **The DONE number above therefore covers 153
+of the 225 cells the master plan's head-kind list implies**, and the campaign
+is not DONE until the 72 are added (or the owner rules that the two
+`Object`-declared shapes stand for the eight). This lane adds none of them: it
+is a read-mostly entry check and the fix-forward's scope was the instrument,
+not the coverage.
 
 **The fail-without / fail-with proof for the grid's new cells.** The grid is
 new, so it has no fail-without of its own; the #7316 fix (`b6053a68`, "narrow
 #7316: a `using var` copy of a value-like choice local releases the payload at
-scope end") is the one commit that moves a cell, so it is the proof. A second
-worktree was built at that commit and the SAME grid was run against its
+scope end") is the one commit that moves a cell, so it is the proof. Two
+worktrees are built at the two commits — `d9f11d15` (the base) and
+`b6053a68` (the fix) — and the SAME (fix-forward) grid is run against each
 compiler:
 
 | cell | base (`d9f11d15`) | fix (`b6053a68`) |
 |---|---|---|
 | `value_choice` / `copy_local_source` | KNOWN-RED `#7316` | **OK** |
 | `value_choice` / `copy_const_source` | KNOWN-RED `#7316` | **OK** |
-| `value_choice` / `copy_await_source` | KNOWN-RED `#7374` | KNOWN-RED `#7374` |
-| `value_choice` / `copy_param_source` | KNOWN-RED `#7357` | KNOWN-RED `#7357` |
-| `value_choice` / `await_using_var` | KNOWN-RED `#7374` | KNOWN-RED `#7374` |
+| `value_choice` / `copy_await_source` | WRONG `#7374` | WRONG `#7374` |
+| `value_choice` / `copy_param_source` | WRONG `#7357` | WRONG `#7357` |
+| `value_choice` / `await_using_var` | WRONG `#7374` | WRONG `#7374` |
 
-(the whole grids: base `153 cells: 98 ok, 41 wrong, 5 known-red, 0 undecided, 9
-n/a, 0 skipped`; fix `153 cells: 101 ok, 40 wrong, 3 known-red, 0 undecided, 9
-n/a, 0 skipped`)
+(the whole grids: base `153 cells: 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0
+undecided, 9 n/a, 0 skipped` ⇒ `DONE: NO — 53 cell(s) block it`; fix `153
+cells: 84 ok, 43 wrong, 0 known-red, 8 mismatch, 0 undecided, 9 n/a, 0
+skipped` ⇒ `DONE: NO — 51 cell(s) block it`. The base's numbers are also the
+entry tree's own numbers, which is the expected result: `git diff --name-only
+d9f11d15 origin/main` names no `src/` file, so the two builds are the same
+compiler.)
 
 => the grid **discriminates the `var` source from the `const` source, and both
 from the `await using` spelling and from the parameter source**: the fix turns
 the two it covers green and leaves the two it does not (#7374, #7357) red.
 The `const` source and the `await using` spelling were unpinned by anything
-before this lane; they are now cells.
+before this lane; they are now cells. Note also that the fix's two green cells
+carry **no KNOWN-RED** on the fix arm: a KNOWN-RED is a *demotion of a red
+cell*, so a cell the fix turns green is simply green — the demotion is not a
+state a cell can be in for ever.
 
-(Three `task` cells flip between the two builds — `task/using_var`,
-`task/await_using_var` and `task/field_store` hang on one build and not on
-the other. That is #6194's hang, and it means the `Task` row of the grid is
-**unstable until #6194 lands**; a DONE run must treat the `Task` row as
-"expected unstable" until then. The other 150 cells are stable across the two
-builds.)
+(The `Task` row is QUARANTINED, and the quarantine is what replaced the old
+"three `task` cells flip between the two builds" note: the row's cells hang
+on one run and not on the next **on the same compiler**, so it is counted
+separately and never moves the DONE verdict. See the determinism proof above.)
 
-**The wrong cells on HEAD, with the member each belongs to:**
+**The wrong cells on this tree, with the member each belongs to (43 rows; the
+headline and the table agree):**
 
 | cell | observed | member |
 |---|---|---|
@@ -470,35 +623,98 @@ builds.)
 | `string` / `copy_local_source` | LEAK 2040B/120 | the `using var` copy of a runtime-managed value (new-9) |
 | `string` / `copy_await_source` | LEAK 2040B/120 | as above, in the `await using` spelling |
 | `string` / `copy_const_source` | LEAK 2040B/120 | as above, with a `const` source |
-| `function` / `copy_local_source` | LEAK 3840B/60 | as above |
+| `string` / `explicit_dispose` | rejected, but no `§28.9` in the diagnostic | the diagnostic says only *"string member `.Dispose` is not yet supported in codegen"* — **it names no rule** (see "diagnostics that name no rule", below) |
+| `string` / `explicit_dispose_async` | rejected, but no `§28.9`/`§28.12` in the diagnostic | as above, for `.DisposeAsync` |
+| `function` / `copy_local_source` | LEAK 3840B/60 | as `string` / `copy_local_source` |
 | `function` / `copy_await_source` | LEAK 3840B/60 | as above |
 | `function` / `copy_const_source` | LEAK 3840B/60 | as above |
 | `function` / `copy_param_source` | LEAK 3840B/60 | as above, with a parameter source |
-| `interface` / `copy_param_source` | **CRASH: heap-use-after-free** | the callee disposes a BORROWED parameter (new-10) |
-| `owning_choice` / `copy_param_source` | **CRASH: heap-use-after-free** | as above (new-10) |
-| `builtin_collection` / `copy_param_source` | **CRASH: double free** | as above (new-10) |
-| `collection_literal` / `copy_param_source` | **CRASH: double free** | as above (new-10) |
-| `task` / `copy_param_source` | CRASH: SEGV | #6194's family (new-10) |
+| `value_choice` / `await_using_var` | LEAK 2100B/120 | **#7374** — the `await using var` copy of a value-like choice local leaks (new-3) |
+| `value_choice` / `copy_await_source` | LEAK 2100B/120 | **#7374** — the `await using var` spelling of the copy (new-3) |
+| `value_choice` / `copy_param_source` | LEAK 2100B/120 | **#7357** — the parameter-source copy still leaks |
+| `interface` / `copy_param_source` | **CRASH: heap-use-after-free** | the callee's `using var` DISPOSES the BORROWED parameter; the caller then reads freed memory (new-10 / **#7387**) |
+| `owning_choice` / `copy_param_source` | **CRASH: heap-use-after-free** | the callee's `using var` copy disposes the block the callee's own binding still owns — the free AND the read are in the callee's frame (new-12) |
+| `builtin_collection` / `copy_param_source` | **CRASH: attempting a double free** | the collection's array block is freed twice, both frees in the caller's frame (new-13) |
+| `collection_literal` / `copy_param_source` | **CRASH: attempting a double free** | as above (new-13) |
 | `object_class` / `await_using_var` | rejected, expected a run | §28.12's "takes §28.10's admission unchanged" (new-2) |
 | `object_class` / `copy_await_source` | rejected, expected a run | as above, in the `await using` spelling (new-2) |
+| `object_class` / `explicit_dispose_async` | rejected, but no `§8.7`/`§28.12` in the diagnostic | the program is rejected by a **§28.6 borrow** diagnostic instead (*"cannot call `Dispose()` on `x`: it is a borrow (an alias) of `s`, which still owns it"*) — the cell asked for the §8.7 "no such member" rejection |
 | `object_string` / `explicit_dispose_async` | compiled, expected rejection | §8.7 (`DisposeAsync` is a member only of a type that declares it) — new-5 |
 | `collection_literal` / `using_var` | a §28.9 vacuity warning where none is due | #7092 / `s28_10_0016` |
 | `collection_literal` / `await_using_var` | a §28.9 vacuity warning where none is due | as above |
+| `collection_literal` / `copy_await_source` | compiled, expected rejection | as `collection_literal` / `copy_local_source` |
 | `collection_literal` / `copy_const_source` | compiled, expected rejection | §21.1 (a `const` initializer must not be an owned production) |
-| `task` / `using_var` | run timeout (hang) | #6194 |
-| `task` / `copy_const_source` | run timeout (hang) | #6194 |
-| `task` / `field_store` | run timeout (hang) | #6194 |
 
-**The KNOWN-RED cells on HEAD** (red, attributed to an open issue, not counted
-wrong):
+**The MISMATCH cells on this tree (8 rows)** — the two spellings of the same
+program disagree on the ADMISSION, which §28.12 forbids ("`await using var`
+takes §28.10's admission UNCHANGED"). Every one of them is the same shape: the
+plain `copy_local_source` spelling is **admitted** (the §28.10 rejection does
+not exist yet) and the `copy_await_source` spelling is **rejected** — by §28.3's
+must-use error, which is the *neighbouring* rule.
 
-| cell | observed | issue |
+| cell | the disagreement |
+|---|---|
+| `class` / `copy_await_source` | `copy_local_source` admitted, `copy_await_source` rejected (§28.3) |
+| `class_async` / `copy_await_source` | as above |
+| `derived_base` / `copy_await_source` | as above |
+| `interface` / `copy_await_source` | as above |
+| `abstract` / `copy_await_source` | as above |
+| `generic_class` / `copy_await_source` | as above |
+| `generic_unconstrained` / `copy_await_source` | as above |
+| `builtin_collection` / `copy_await_source` | as above |
+
+(The ninth `copy_await_source` cell, `collection_literal`, is a **WRONG** cell
+in its own right — both spellings are admitted there, so the two AGREE and
+there is no mismatch to report.)
+
+**The KNOWN-RED cells on this tree (2 rows)** — red, attributed to an open
+issue, **and still blocking the DONE verdict** (the reviewer's M1: a red cell
+is red, whoever owns it):
+
+| cell | observed | issue | fixing commit |
+|---|---|---|---|
+| `value_choice` / `copy_local_source` | LEAK 2100B/120 | **#7316** — the `using var` copy of a value-like choice local leaks | `b6053a68` (not yet in `origin/main`) |
+| `value_choice` / `copy_const_source` | LEAK 2100B/120 | **#7316** — the same, with a `const` source | `b6053a68` (not yet in `origin/main`) |
+
+**The cells that were KNOWN-RED in the grid's first version and are now WRONG.**
+The first version demoted five `value_choice` cells to KNOWN-RED with no fixing
+commit and no tracker consultation; three of them had **no commit that fixes
+them**, so the fix-forward's rule ("a KNOWN-RED row must name the fixing
+commit, and a cell whose issue has no fixing commit is a WRONG cell") demotes
+them back:
+
+| cell | issue | why it is not a KNOWN-RED row |
 |---|---|---|
-| `value_choice` / `await_using_var` | LEAK 2100B/120 | **#7374** — the `await using var` copy of a value-like choice local leaks |
-| `value_choice` / `copy_local_source` | LEAK 2100B/120 | **#7316** — the `using var` copy of a value-like choice local leaks (fixed on `b6053a68`, not yet in `origin/main`) |
-| `value_choice` / `copy_const_source` | LEAK 2100B/120 | **#7316** — the same, with a `const` source |
-| `value_choice` / `copy_await_source` | LEAK 2100B/120 | **#7374** — the `await using var` spelling of the copy |
-| `value_choice` / `copy_param_source` | LEAK 2100B/120 | **#7357** — the parameter-source copy still leaks |
+| `value_choice` / `await_using_var` | #7374 | no fixing commit exists yet |
+| `value_choice` / `copy_await_source` | #7374 | no fixing commit exists yet |
+| `value_choice` / `copy_param_source` | #7357 | no fixing commit exists yet |
+
+**Diagnostics that name no rule.** Two of the wrong cells are red because the
+compiler's diagnostic carries **no `§` marker at all**, so the grid cannot
+discriminate the rule the cell claims:
+
+* `string` / `explicit_dispose` ⇒ *"string member `.Dispose` is not yet
+  supported in codegen"*;
+* `string` / `explicit_dispose_async` ⇒ *"string member `.DisposeAsync` is not
+  yet supported in codegen"*.
+
+The REJECTION is right (§28.9: *"None of them is a class, and none has a
+`Dispose()` member: `x.Dispose()` over a value of one of these types is a
+compile error"*), but the diagnostic makes no claim the reader can check — the
+house rule that every diagnostic cite the rule it enforces is not met here.
+This is a **compiler** finding, reported to the coordinator; the grid cannot
+relax it, because a needle that accepts an unnamed diagnostic is exactly the
+generic-token needle the reviewer's H1 forbids.
+
+**The `type_token` row is pinned to a DEFERRAL, and #487 will re-author it.**
+All nine `type_token` cells are green because the program is rejected with
+*"reflection is not yet implemented: 'typeof'"* — the `typeof` deferral
+(#487), not any disposal rule. The cells' needle is therefore `§17.10`, and
+they measure the deferral, not the head kind: **when #487 lands, every one of
+the nine must be re-authored** (the `typeof` right-hand side will then reach
+the disposal rules and the cells' expectations become the real ones). The row
+is kept as it is — it is a real head kind, and a deferral-pinned row that says
+so is better than a row that pretends to measure §28.9.
 
 **The plain-`var` twins.** §28.10 makes the `using var` spelling's RUNTIME
 LIFETIME the same as the plain-`var` twin's ("the only effect is the
@@ -650,7 +866,9 @@ findings, which the coordinator files with exactly one `campaign:` label.)*
 | new-7 | the `await using` spelling of a `Task` and of an `owned Task` field hang | `await using var x := tcs.Task;` and `h.F := tcs.Task` → both hang under AOT | §28.10, §30.5 | using-heads (U3c, with #6194) |
 | new-8 | `await using var` outside an async method is admitted (the §30.2 twin is not) | `public static method Main() … await using var t := o.ToString();` → compiles | §28.12 ("`await using` is valid only inside an async method or async lambda") | using-heads (U1d, with #7326) |
 | new-9 | the `using var` copy of a RUNTIME-MANAGED value (a `string`, a function value) leaks the copy's reference | `var src := o.ToString(); using var x := src;` ×60 → `2040 byte(s) leaked in 120 allocation(s)`; the plain-`var` twin is CLEAN; the `await using var` spelling of the same copy leaks too | §28.10 ("the disposal at scope end is a no-op ... and the only effect is the reassignability restriction") | using-heads (U1c, with #7316) |
-| new-10 | the `using var` copy of a PARAMETER DISPOSES the borrowed parameter — a use-after-free | `public static method Take(src: IAsyncDisposable) using var x := src; end Take;` called with `var src: IAsyncDisposable := new Res(); Take(src); src.Dispose();` → `DTOR` is printed by the CALLEE and the caller then reads freed memory: `ERROR: AddressSanitizer: heap-use-after-free ... freed by thread T0 here: #1 ... in bz$P.Program$Take` | §28.10 ("When the right-hand side of a `using var` declaration is a borrow ... the `using var` does **not** assume a disposal obligation ... at scope end, no `Dispose()` is called, because the value is not owned by this scope"), §28.2 | using-heads (U1c — a NEW soundness defect; the grid's `interface`, `owning_choice` and `builtin_collection` `copy_param_source` cells) |
+| new-10 | the `using var` binding of an **INTERFACE-typed** parameter DISPOSES the borrowed parameter — the callee frees it and the CALLER then reads freed memory | `public static method Take(src: IAsyncDisposable) using var x := src; end Take;` called with `var src: IAsyncDisposable := new Res(); Take(src); src.Dispose();` → `DTOR` is printed by the CALLEE and the caller then reads freed memory: `ERROR: AddressSanitizer: heap-use-after-free … freed by thread T0 here: #1 … in bz$P.Program$Take` — the FREE is in `Program$Take`, the READ is in `Program$Main$Resume` | §28.10 ("When the right-hand side of a `using var` declaration is a borrow … the `using var` does **not** assume a disposal obligation … at scope end, no `Dispose()` is called, because the value is not owned by this scope"), §28.2 | using-heads (U1c — a NEW soundness defect; **#7387**, filed; the grid's `interface` / `copy_param_source` cell) |
+| new-12 | the `using var` copy of an **OWNED** parameter disposes the block the callee's own binding still owns — the fault is entirely INSIDE the callee | `public static method Take(owned src: OChoice) using var x := src; end Take;` called with `Take(move src);` → `ERROR: AddressSanitizer: heap-use-after-free … freed by thread T0 here: #1 … in bz$G…Program$Take` and the READ is in the SAME frame (`Program$Take`) — the callee frees the block and then reads it. The caller is unaffected: it moved the value away and never touches it again | §28.10 (the `using var` copy of an owned binding must not dispose a block the enclosing binding still owns), §28.2 | using-heads (U1c — **NOT YET FILED**; the coordinator files it; the grid's `owning_choice` / `copy_param_source` cell) |
+| new-13 | the `using var` copy of a **BUILTIN-COLLECTION** parameter frees the collection's ARRAY block twice — a double free, both frees in the CALLER's frame | `public static method Take(src: Array<int>) using var x := src; end Take;` → `ERROR: AddressSanitizer: attempting double-free on … in bz_array_free` — and BOTH frees are in `Program$Main$Resume` (the collection is freed once by the `using var` copy and once by the caller's own binding) | §28.10 (the `using var` copy of a runtime-managed collection must not take a second disposal obligation on the same array block), §28.2 | using-heads (U1c — **NOT YET FILED**; the coordinator files it; the grid's `builtin_collection` and `collection_literal` / `copy_param_source` cells) |
 | new-11 | an `Object`-declared slot holding a runtime-managed string does not release it | `var s: Object := o.ToString();` → the plain-`var` twin leaks `2040 byte(s) in 120 allocation(s)`; the `await using var x: Object := o.ToString();` spelling (the corpus's `s28_12_0026`) does not | §28.9 ("the type's lifetime is managed by the runtime without user involvement"), §28.10 | using-heads (the `Object`-slot family; the grid's `object_string` twin) |
 
 ## Lane records
@@ -686,6 +904,62 @@ findings, which the coordinator files with exactly one `campaign:` label.)*
 * **Not touched:** no normative document (`docs/Bezel_*.md`), no
   `docs/proposals/papers/master-plan.md` (its §6 progress table is the
   coordinator's), and no `tests/conformance/rules/baseline.tsv` row.
+
+### Fix-forward lane `r36-c1-entry` — 2026-10-28 (round 1)
+
+* **SHA(s):** one commit on top of the entry commit `2381f534`, on branch
+  `r36-c1-entry`. The entry commit's non-author review returned **ACCEPT-W-NOTES
+  on the RECORD** and **"the grid must NOT land as the campaign's DONE
+  instrument yet"** — three HIGH defects (H1 the nine `copy_await_source`
+  cells are green on §28.3's must-use rather than on §28.10's rule; H2 the
+  grid cannot detect §28.12's "`await using var` takes §28.10's admission
+  unchanged"; H3 the grid's verdict is not reproducible on ONE build), four
+  MEDIUM (M1 the KNOWN-RED demotion was unearned; M2 the grid was wired into
+  no gate; M3 the report TSV was malformed; M4 the TSV embedded an absolute
+  path) and ten LOW. This lane is that fix-forward.
+* **Files changed:** `scripts/using_heads_grid.py` (the instrument),
+  `scripts/gate/tests/test_using_heads_grid.py` (NEW — 19 tests; the grid's
+  CLASSIFIER is now at every gate, via `scripts/pregate.sh`'s
+  `python3 -m unittest discover -s scripts/gate/tests`), and this record.
+* **No `src/` change** — the compiler is untouched, so the base and the tip
+  measure the same compiler and the "fail-without" is the compiler's, not the
+  script's.
+* **The H2 decision (the one the brief left to the lane).** The grid
+  **COMPARES** the two spellings instead of copying an expectation: each
+  head's `using var` / `await using var` pair and its `copy_local_source` /
+  `copy_await_source` pair must agree on the ADMISSION, and a disagreement is
+  its own verdict (`MISMATCH`), which blocks the DONE verdict like a wrong
+  cell. (The alternative — an extra "the two spellings must agree" cell —
+  would have added 17 more cells and a second set of expectations to keep in
+  step; the comparison reuses the cells that already exist and needs no
+  second authority.) The `object_class` head is EXCLUDED from the comparison:
+  §28.12's "unchanged" against §28.10's adoption rule over an `Object`-declared
+  binding is the OWNER's open question, and the grid must not settle it by
+  counting a cell wrong. The record's open question and the held-out hunk are
+  unchanged.
+* **The needle audit (H1) — every REJ cell's needle, old → new.** The old
+  needles were `"using var"` (the §28.3 must-use diagnostic's REMEDY, not a
+  rule), `"no member `Dispose`"`, `"no member `DisposeAsync`"`, `"is
+  vacuous"`, `"reflection is not yet implemented"` and `"(using var)"` — all
+  implementation wordings, and each of them a token that a NEIGHBOURING rule's
+  diagnostic can contain. Every one is now a `§` marker naming the rule the
+  cell decides, and the needle is matched against the diagnostic that
+  **rejected** the program (a warning that cites the same section no longer
+  makes a cell green). The complete list is in the commit body.
+* **Measured:** see the baseline, the two-run determinism proof and the
+  fail-without/fail-with table above; the DONE criterion is **no WRONG, no
+  KNOWN-RED, no MISMATCH**.
+* **The reviewer's perturbation, re-run after the changes:** two currently-OK
+  cells of the `value_choice` head were flipped in a SCRATCH COPY of the
+  script (`using_var`'s expected markers and `explicit_dispose`'s needle). The
+  grid reported **both as WRONG** — *"output [] != expected
+  ['PERTURBED_MARKER', …]"* and *"rejected, but no '§28.10' in the
+  diagnostic"* — and the head's count went from `3 ok, 3 wrong, 2 known-red`
+  to `1 ok, 5 wrong, 2 known-red`, exit 1. The grid is not a no-op.
+* **Not touched:** no normative document (`docs/Bezel_*.md`), no
+  `docs/proposals/papers/master-plan.md` (its §6 progress table is the
+  coordinator's), no `tests/conformance/rules/baseline.tsv` row, and no issue
+  was filed (the two new findings below are for the coordinator to file).
 
 ## Exit review
 
