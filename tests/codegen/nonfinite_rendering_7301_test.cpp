@@ -269,6 +269,16 @@ BEZEL_TEST(nonfinite_rendering_7301, nan_renders_by_value_not_by_origin) {
 // spellings only: every finite rendering must be byte-identical before and
 // after the fix. These rows are green on BOTH arms, and that is the point:
 // they are the over-reach check.
+//
+// ONE ROW MOVED, AND NOT BECAUSE OF THE NON-FINITE RULE: the `E` and `G`
+// rows of the member spelling now render what the INTERPOLATION spelling
+// renders ("3.333333E-01", "0.333333"), because the member spelling is
+// routed through the SHARED formatting routine (#7311). §2.18's table fixes
+// the digit count only for `F` ("n decimals, default 2") and leaves `E` and
+// `G` to the house's shared rendering, which is six — so the two spellings
+// of one specifier AGREE, which is the whole point of the shared routine.
+// The finite values are still finite renderings: that is what this row is
+// the over-reach check for.
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(nonfinite_rendering_7301, control_finite_renderings_are_unchanged) {
@@ -284,7 +294,7 @@ BEZEL_TEST(nonfinite_rendering_7301, control_finite_renderings_are_unchanged) {
              "    Console.WriteLine((0.0 * -1.0).ToString(\"F2\"));\n"
              "    Console.WriteLine(1e21.ToString());\n"
              "    Console.WriteLine(1e-7.ToString());\n"),
-        "1\n0.1\n0.3333\n0.3333333333333333\n3.33e-01\n0.33\n0.1\n-0\n-0.00\n"
+        "1\n0.1\n0.3333\n0.3333333333333333\n3.333333E-01\n0.333333\n0.1\n-0\n-0.00\n"
         "1e+21\n1e-07\n");
 }
 

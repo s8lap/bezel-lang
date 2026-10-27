@@ -2638,287 +2638,116 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 bezelFmt = processStringText(sl->text, false);
                             }
                             if (!bezelFmt.empty()) {
-                                // Translate Bezel format spec to printf format.
-                                // "Fn" / "fn" → "%.Nf" (fixed decimal)
-                                // "En" / "en" → "%.Ne" (scientific)
-                                // "Gn" / "gn" → "%.Ng" (general)
-                                // "X" / "x" → "%X" / "%x" (hex integer)
-                                // "D" / "d" → "%d" (decimal integer)
-                                std::string printfFmt;
-                                char spec = std::toupper(bezelFmt[0]);
-                                std::string digits = bezelFmt.size() > 1 ? bezelFmt.substr(1) : "";
-                                using P = sema::PrimitiveType;
-                                bool isFP = tt->primitive == P::Double || tt->primitive == P::Float;
-                                // fix #7301 (stdlib §2.18, v0.344): the floating
-                                // specifiers render a non-finite value by NAME
-                                // ("Infinity" / "-Infinity" / "NaN"), so the
-                                // snprintf path below must not see one.
-                                bool fpFormat = false;
-                                if ((spec == 'F' || spec == 'G' || spec == 'E') && isFP) {
-                                    char pfspec = spec == 'F' ? 'f' : (spec == 'E' ? 'e' : 'g');
-                                    printfFmt = "%." + (digits.empty() ? "2" : digits) + pfspec;
-                                    fpFormat = true;
-                                    // Widen float to double for snprintf.
-                                    if (tt->primitive == P::Float)
-                                        recv = builder_.CreateFPExt(recv, llvm::Type::getDoubleTy(llvm_));
-                                } else if (spec == 'X' || spec == 'D') {
-                                    // §18.5: D/X with digits = min width, zero-padded.
-                                    // D5 → %05d, X4 → %04X.
-                                    //
-                                    // fix #7329 (stdlib §2.18, v0.344): the
-                                    // receiver of the integer row's `D`/`X`
-                                    // specifiers may be an integer of ANY
-                                    // width — the table names `long` and
-                                    // `byte` explicitly, so every width is
-                                    // CONFORMING and the specifiers must WORK
-                                    // at every width. This arm converted the
-                                    // receiver with `CreateFPToSI(recv,
-                                    // i32())` — an FP→SI conversion applied
-                                    // to an INTEGER payload — which is
-                                    // malformed IR for every width but 32
-                                    // ("FPToSI source must be FP or FP
-                                    // vector"), so the compiler ABORTED on a
-                                    // `byte`/`sbyte`/`short`/`ushort`/`long`/
-                                    // `ulong` receiver.
-                                    //
-                                    // The value is now widened the way the
-                                    // interpolation path's
-                                    // `emitWithFormatSpec` widens it (in
-                                    // src/codegen/LlvmBackend_String.cpp): to
-                                    // i64, sign-extended for a signed
-                                    // receiver and zero-extended for an
-                                    // unsigned one (the `D` decimal), and
-                                    // zero-extended for `X` (the natural-width
-                                    // BIT PATTERN), with the conversion
-                                    // carrying the `ll` length modifier so the
-                                    // full 64 bits are read — a bare `%d`/`%X`
-                                    // reads only 32 of them.
-                                    //
-                                    // The SIGNEDNESS is the RECEIVER's own
-                                    // TYPE's (the house predicate
-                                    // `isUnsignedTargetExpr`) — never the bit
-                                    // width's: `int` and `uint` are both 32
-                                    // bits and `long` and `ulong` are both 64
-                                    // bits. stdlib §2.18's integer row gives
-                                    // "`D`/`Dn` decimal" — the DECIMAL of the
-                                    // value the caller holds — so an unsigned
-                                    // receiver renders its unsigned value.
-                                    //
-                                    // A FLOATING receiver keeps the rendering
-                                    // it had (the value truncated to an int by
-                                    // `fptosi`), and a MALFORMED tail keeps
-                                    // its format string verbatim (and so its
-                                    // 32-bit conversion), exactly as before.
-                                    const bool recvIsInt =
-                                        recv->getType()->isIntegerTy();
-                                    const bool recvUnsigned = recvIsInt &&
-                                        isUnsignedTargetExpr(*ma->target);
-                                    // The digit tail: the specifier's own count
-                                    // (all digits) or a malformed suffix.
-                                    std::size_t runLen = 0;
-                                    while (runLen < digits.size() &&
-                                           digits[runLen] >= '0' &&
-                                           digits[runLen] <= '9')
-                                        runLen++;
-                                    const bool tailOk = (runLen == digits.size());
-                                    // The C conversion that renders the value.
-                                    std::string pfspec2;
-                                    if (recvIsInt && tailOk) {
-                                        if (spec == 'X')
-                                            pfspec2 = "llX";
-                                        else
-                                            pfspec2 = recvUnsigned ? "llu"
-                                                                   : "lld";
-                                    } else {
-                                        pfspec2 = (spec == 'X' ? "X" : "d");
-                                    }
-                                    if (!digits.empty())
-                                        printfFmt = std::string("%0") + digits + pfspec2;
-                                    else
-                                        printfFmt = "%" + pfspec2;
-                                    // fix #7286 fix-forward: the WIDTH in the
-                                    // literal is unbounded ("D1000000000"
-                                    // builds a 1000000000-wide field), and the
-                                    // rendering buffer is a fixed 66 bytes —
-                                    // so the width is clamped to what the
-                                    // buffer can hold, exactly as the RUNTIME
-                                    // format spelling clamps its run-time
-                                    // width. Only a digit run whose VALUE
-                                    // exceeds the bound is rewritten; a run
-                                    // within it (and every malformed suffix)
-                                    // keeps the format string verbatim, so the
-                                    // pre-existing spellings ("D4", "D4x")
-                                    // render exactly as they did.
-                                    if (!digits.empty()) {
-                                        if (runLen > 0) {
-                                            // The digit run's value, saturating.
-                                            unsigned long long w = 0;
-                                            bool over = false;
-                                            for (std::size_t i = 0; i < runLen; i++) {
-                                                const unsigned d =
-                                                    (unsigned)(digits[i] - '0');
-                                                if (w > (kToStringMaxWidth - d) / 10ULL) {
-                                                    over = true;
-                                                    break;
-                                                }
-                                                w = w * 10ULL + d;
-                                            }
-                                            if (over || w > kToStringMaxWidth) {
-                                                printfFmt = std::string("%0") +
-                                                    std::to_string(
-                                                        (unsigned long long)
-                                                            kToStringMaxWidth) +
-                                                    digits.substr(runLen) +
-                                                    pfspec2;
-                                            }
-                                        }
-                                    }
-                                    // The VALUE the conversion reads.
-                                    if (recvIsInt) {
-                                        if (tailOk) {
-                                            // Widen to i64 — never narrowed:
-                                            // the `D` decimal preserves the
-                                            // value (sign-extended for a signed
-                                            // receiver, zero-extended for an
-                                            // unsigned one) and the `X` bit
-                                            // pattern is the receiver's own
-                                            // natural width's (zero-extended, so
-                                            // a `byte` 255 renders "FF", not
-                                            // "FFFFFFFF").
-                                            const bool zeroExt =
-                                                (spec == 'X') || recvUnsigned;
-                                            if (!recv->getType()->isIntegerTy(64))
-                                                recv = zeroExt
-                                                    ? builder_.CreateZExt(recv, i64())
-                                                    : builder_.CreateSExt(recv, i64());
-                                        } else if (!recv->getType()->isIntegerTy(32)) {
-                                            // A malformed tail keeps the 32-bit
-                                            // conversion it had (`%d`/`%X` read
-                                            // 32 bits).
-                                            recv = builder_.CreateTrunc(recv, i32());
-                                        }
-                                    } else if (!recv->getType()->isIntegerTy(32)) {
-                                        // A FLOATING receiver: the value is
-                                        // truncated to an int by `fptosi` (the
-                                        // rendering it had).
-                                        recv = builder_.CreateFPToSI(recv, i32());
-                                    }
-                                } else {
-                                    return emitPrimitiveToString(recv, tt->primitive);
-                                }
-                                // per stdlib §2.18 (v0.344, #7301): "The
-                                // no-format `ToString()` and every floating
-                                // specifier (`F`, `E`, `G` and `P`, with or
-                                // without a digit count, and `R`) render a NaN
-                                // as `NaN`, positive infinity as `Infinity` and
-                                // negative infinity as `-Infinity` — the names
-                                // of the `NaN`, `PositiveInfinity` and
-                                // `NegativeInfinity` constants (§9.2) — with no
-                                // digits, no exponent and no `%` suffix."
+                                // fix #7311 (stdlib §2.18, v0.345): the
+                                // MEMBER-CALL spelling of `ToString(format)`
+                                // now goes through the SHARED formatting
+                                // routine — `emitWithFormatSpec`, the SAME
+                                // routine the interpolation hole path uses —
+                                // so the two call sites cannot produce two
+                                // answers.
                                 //
-                                // C's own "%.2f" prints "inf" / "nan", so a
-                                // non-finite operand must not reach it. The
-                                // FINITE operand keeps the byte-identical
-                                // rendering it had: the snprintf path below is
-                                // unchanged and is reached only for a finite
-                                // operand.
-                                llvm::BasicBlock* nfBB = nullptr;
-                                llvm::BasicBlock* finBB = nullptr;
-                                llvm::BasicBlock* mergeBB = nullptr;
-                                llvm::Value* nfStr = nullptr;
-                                if (fpFormat) {
-                                    llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
-                                    llvm::Value* isNanV = builder_.CreateFCmpUNO(
-                                        recv, recv, "ts.isnan");
-                                    llvm::Value* isPosInfV = builder_.CreateFCmpOEQ(
-                                        recv, llvm::ConstantFP::getInfinity(dblTy),
-                                        "ts.isposinf");
-                                    llvm::Value* isNegInfV = builder_.CreateFCmpOEQ(
-                                        recv, llvm::ConstantFP::getInfinity(dblTy, true),
-                                        "ts.isneginf");
-                                    llvm::Value* nonFiniteV = builder_.CreateOr(
-                                        builder_.CreateOr(isNanV, isPosInfV),
-                                        isNegInfV, "ts.nonfinite");
-                                    nfBB = llvm::BasicBlock::Create(
-                                        llvm_, "ts.nonfinite", currentFn_);
-                                    finBB = llvm::BasicBlock::Create(
-                                        llvm_, "ts.finite", currentFn_);
-                                    mergeBB = llvm::BasicBlock::Create(
-                                        llvm_, "ts.merge", currentFn_);
-                                    builder_.CreateCondBr(nonFiniteV, nfBB, finBB);
-                                    builder_.SetInsertPoint(nfBB);
-                                    // The runtime's non-finite rendering IS
-                                    // §2.18's spelling (it is the same text
-                                    // the no-format ToString() and the "R"
-                                    // specifier produce), so this one runtime
-                                    // entry serves the specifier path too.
-                                    auto* nfFn = declareC("bz_double_to_string_r",
-                                                         ptrTy(), {dblTy});
-                                    nfStr = builder_.CreateCall(nfFn, {recv},
-                                                                "dbl.nonfinite");
-                                    builder_.CreateBr(mergeBB);
-                                    builder_.SetInsertPoint(finBB);
+                                // §2.18's specifier table is the vocabulary,
+                                // and the table is per KIND: the Integers row
+                                // names `D`/`Dn`, `X`/`x` and `B`; the
+                                // Floating row names `F`/`Fn`, `E`/`En`,
+                                // `G`/`Gn`, `P`/`Pn` and `R`; the last row
+                                // gives `bool`, `char` and `string` an EMPTY
+                                // vocabulary ("a format spec on these is a
+                                // compile error"). §2.18 also fixes the fault
+                                // for a specifier outside the vocabulary:
+                                // "An unrecognized specifier raises
+                                // `FormatException` (strict-fault, as
+                                // everywhere)".
+                                //
+                                // The old member-call block implemented a
+                                // PARTIAL copy of that vocabulary — `D`, `X`
+                                // and the floating `F`/`E`/`G`, with the
+                                // letter case folded away and no `B` — and
+                                // every other specifier silently rendered the
+                                // receiver's plain text. That partial copy IS
+                                // this family's defect set:
+                                //   #7359  the case-folded "x" rendered upper-case
+                                //   #7265  no `B`, and an unsigned receiver rendered signed
+                                //   #7303  an unrecognized specifier ("C") rendered the plain text
+                                //   #7362  "D" on a floating receiver truncated the value
+                                //   #7358  a malformed tail on a narrow receiver emitted invalid IR
+                                //   #7311  the two call sites disagreed
+                                //
+                                // The shared routine owns the vocabulary, the
+                                // signedness, the widening and the
+                                // FormatException for an unrecognized
+                                // specifier. This arm keeps only the
+                                // receiver-kind gates the routine does not
+                                // have.
+                                using P = sema::PrimitiveType;
+                                // §2.18's last row: `bool`, `char` and `string`
+                                // have an EMPTY vocabulary, so a format spec on
+                                // one of them is an error. The LITERAL spelling
+                                // is rejected at compile time (sema, #7333); this
+                                // is the same rule at the code-generation level,
+                                // and it is the rule the RUNTIME spelling
+                                // raises (#7336).
+                                if (tt->primitive == P::Bool ||
+                                    tt->primitive == P::Char ||
+                                    tt->primitive == P::String)
+                                    return emitAlwaysFormatException();
+                                // §18.5's alignment prefix (",WIDTH[:FORMAT]")
+                                // is an INTERPOLATION form, not a §2.18
+                                // specifier: §2.18's table names no such
+                                // specifier, and a specifier outside the
+                                // vocabulary raises FormatException.
+                                if (bezelFmt[0] == ',')
+                                    return emitAlwaysFormatException();
+                                // fix #7286 (stdlib §2.18, v0.345): the COUNT
+                                // in a count-bearing specifier is UNBOUNDED
+                                // ("D1000000000" is a 1000000000-wide field)
+                                // and the rendering must not be sized by it —
+                                // a 1000000000-byte field is a 1 GB
+                                // allocation. The count is clamped to what
+                                // the rendering buffer can hold — the SAME
+                                // bound the RUNTIME format spelling clamps
+                                // its width to, so the two spellings of one
+                                // specifier agree. Only a digit run whose
+                                // VALUE exceeds the bound is rewritten; a run
+                                // within it (and a malformed tail) is left
+                                // verbatim, so every in-range spelling
+                                // renders exactly as it did.
+                                std::string fmtSpec = bezelFmt;
+                                {
+                                    std::size_t runLen = 0;
+                                    while (runLen + 1 < fmtSpec.size() &&
+                                           fmtSpec[runLen + 1] >= '0' &&
+                                           fmtSpec[runLen + 1] <= '9')
+                                        runLen++;
+                                    if (runLen > 0) {
+                                        const unsigned long long bound =
+                                            (unsigned long long)kToStringMaxWidth;
+                                        unsigned long long w = 0;
+                                        bool over = false;
+                                        for (std::size_t i = 0; i < runLen; i++) {
+                                            const unsigned d =
+                                                (unsigned)(fmtSpec[1 + i] - '0');
+                                            if (w > (bound - d) / 10ULL) {
+                                                over = true;
+                                                break;
+                                            }
+                                            w = w * 10ULL + d;
+                                        }
+                                        if (over || w > bound)
+                                            fmtSpec = fmtSpec.substr(0, 1) +
+                                                      std::to_string(bound) +
+                                                      fmtSpec.substr(1 + runLen);
+                                    }
                                 }
-                                // Emit snprintf with the translated format.
-                                llvm::Constant* fmtData = llvm::ConstantDataArray::getString(
-                                    llvm_, printfFmt, true);
-                                unsigned fid = stringLiteralIdx_++;
-                                auto* fmtGV = new llvm::GlobalVariable(*module_, fmtData->getType(), true,
-                                    llvm::GlobalValue::PrivateLinkage, fmtData, ".bz.ts.fmt." + std::to_string(fid));
-                                fmtGV->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-                                auto* snpFn = module_->getFunction("snprintf");
-                                if (!snpFn) {
-                                    auto* ft = llvm::FunctionType::get(i32(), {ptrTy(), i64(), ptrTy()}, true);
-                                    snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
-                                }
-                                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-                                llvm::Value* buf = entryAlloca(
-                                    llvm::ArrayType::get(i8Ty, kToStringBuf));
-                                llvm::Value* bufPtr = builder_.CreateGEP(
-                                    llvm::ArrayType::get(i8Ty, kToStringBuf), buf,
-                                    {builder_.getInt64(0), builder_.getInt64(0)});
-                                llvm::Value* wr = builder_.CreateCall(
-                                    snpFn,
-                                    {bufPtr, builder_.getInt64(kToStringBuf), fmtGV,
-                                     recv},
-                                    "ts.wr");
-                                auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-                                auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-                                llvm::Value* l64 = builder_.CreateSExt(wr, i64());
-                                // fix #7286 fix-forward: snprintf's RETURN VALUE
-                                // is the length the output WOULD have had; the
-                                // bytes actually in the buffer are
-                                // `min(return, size - 1)`. Copying `l64` bytes
-                                // read past the buffer whenever the output was
-                                // truncated, and copied ADJACENT STACK BYTES
-                                // into the string the program receives.
-                                llvm::Value* written = umin(
-                                    builder_, l64,
-                                    builder_.getInt64(kToStringBuf - 1),
-                                    "ts.wlen");
-                                llvm::Value* dSz =
-                                    builder_.CreateAdd(written, builder_.getInt64(1));
-                                llvm::Value* dc = builder_.CreateCall(mallocFn, {dSz}, "ts.data");
-                                builder_.CreateCall(memcpyFn, {dc, bufPtr, written});
-                                llvm::Value* np = builder_.CreateGEP(i8Ty, dc, written);
-                                builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np);
-                                uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-                                llvm::Value* so = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "ts.obj");
-                                builder_.CreateStore(dc, builder_.CreateStructGEP(stringType(), so, 0));
-                                builder_.CreateStore(written, builder_.CreateStructGEP(stringType(), so, 1));
-                                builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-                                    builder_.CreateStructGEP(stringType(), so, 2));
-                                initStringRc(so);  // #422: producer's reference, rc := 1
-                                if (fpFormat) {
-                                    builder_.CreateBr(mergeBB);
-                                    builder_.SetInsertPoint(mergeBB);
-                                    llvm::PHINode* strPhi =
-                                        builder_.CreatePHI(ptrTy(), 2, "ts.str");
-                                    strPhi->addIncoming(nfStr, nfBB);
-                                    strPhi->addIncoming(so, finBB);
-                                    return strPhi;
-                                }
-                                return so;
+                                // The shared routine. It returns null only for
+                                // an operand it cannot format at all; every
+                                // other outcome — including the
+                                // FormatException for an unrecognized
+                                // specifier — is a value.
+                                if (llvm::Value* r =
+                                        emitWithFormatSpec(recv, fmtSpec, tt))
+                                    return r;
+                                return emitAlwaysFormatException();
                             }
                             // stdlib §9.1 (#518): ToString(radix: int) — the arg is an
                             // integer (not a string format literal). Route to the same

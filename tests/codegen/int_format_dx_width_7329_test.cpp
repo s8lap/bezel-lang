@@ -115,16 +115,18 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_byte_x4_hex_padded) {
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("00C8\n"));
 }
 
-// The lower-case spelling of the hex specifier ("`X`/`x` hex"). The MEMBER
-// spelling case-folds the specifier letter, so it renders the same text as
-// the upper-case one here — a divergence of its own (the interpolation
-// spelling renders it lower-case), reported by this lane and not changed here.
+// The lower-case spelling of the hex specifier ("`X`/`x` hex (upper/lower)",
+// stdlib §2.18's integer row). The letter fixes the CASE of the digits, so
+// "x" renders lower-case and "X" upper-case — the member spelling and the
+// interpolation spelling now agree. (Before the shared-routing fix the
+// member spelling case-folded the letter and rendered "x" upper-case; that
+// divergence is #7359's, and this row now pins the spec's answer.)
 BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_byte_x_lower_case_spelling) {
     JitResult r = runAot(prog("var b: byte := 200;", "b.ToString(\"x\")"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("C8\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("c8\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +172,7 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_sbyte_x_lower_case_spelling) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("FB\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("fb\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +216,7 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_short_x_lower_case_spelling) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("FED4\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("fed4\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +260,7 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_ushort_x_lower_case_spelling) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("FDE8\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("fde8\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +372,7 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_uint_x_lower_case_spelling) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("EE6B2800\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("ee6b2800\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +416,7 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_long_x_lower_case_spelling) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("12A05F200\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("12a05f200\n"));
 }
 
 // The NEGATIVE 64-bit value: the signed decimal is "-5" and the hex spelling
@@ -481,7 +483,7 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_ulong_x_lower_case_spelling) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("F9CCD8A1C5080000\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("f9ccd8a1c5080000\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -489,16 +491,32 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_ulong_x_lower_case_spelling) {
 // not reach past the integer row's own `D`/`X` vocabulary.
 // ---------------------------------------------------------------------------
 
-// A FLOATING receiver keeps its rendering: the `D` spelling truncates the
-// value to an int and the `F` spelling is the fixed-point rendering. (The
-// floating specifiers are the numeric row's own vocabulary, not the integer
-// row's.)
-BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_double_d_control) {
-    JitResult r = runAot(prog("", "(3.5).ToString(\"D\")"));
+// A FLOATING receiver has no `D` in its vocabulary. stdlib §2.18's table
+// gives the Floating row `F`/`Fn`, `E`/`En`, `G`/`Gn`, `P`/`Pn` and `R`, and
+// the Integers row `D`/`Dn`, `X`/`x` and `B` — so a `D` on a `double` is an
+// UNRECOGNIZED specifier for that kind, and §2.18 says what an unrecognized
+// specifier does: "An unrecognized specifier raises `FormatException`
+// (strict-fault, as everywhere)". The value is NOT truncated to an int.
+BEZEL_TEST(int_format_dx_width_7329,
+           stdlib_2_18_double_d_raises_format_exception) {
+    JitResult r = runAot(
+        "module M;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var result := 0;\n"
+        "    try\n"
+        "      var s: string := (3.5).ToString(\"D\");\n"
+        "      result := 99;\n"
+        "    catch FormatException => result := 11;\n"
+        "    end;\n"
+        "    Console.WriteLine(result);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("3\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("11\n"));
 }
 
 BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_double_f2_control) {
@@ -509,25 +527,42 @@ BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_double_f2_control) {
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("3.50\n"));
 }
 
-// The BINARY specifier ("`B` binary" in the integer row) is a separate
-// divergence of the member spelling — it is not in the `D`/`X` vocabulary
-// this lane fixes, so the plain rendering is what it produces here. The row
-// is a control: it says the `D`/`X` fix did not reach it.
-BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_byte_b_binary_control) {
+// The BINARY specifier ("`B` binary" in the integer row) renders the
+// receiver's natural-width bit pattern in binary digits — the same rendering
+// the interpolation spelling gives. (Before the shared-routing fix the
+// member spelling had no `B` at all and rendered the receiver's plain text;
+// that gap is #7265's.)
+BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_byte_b_binary) {
     JitResult r = runAot(prog("var b: byte := 200;", "b.ToString(\"B\")"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("200\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("11001000\n"));
 }
 
-// A MALFORMED suffix (a tail that is not the specifier's digit count) keeps
-// the format string it had, verbatim — the promise #7286's fix-forward made
-// for the pre-existing spellings.
-BEZEL_TEST(int_format_dx_width_7329, stdlib_2_18_malformed_suffix_control) {
-    JitResult r = runAot(prog("", "(255).ToString(\"D4x\")"));
+// A MALFORMED suffix (a tail that is not the specifier's digit count) is not
+// the specifier with a 0 count: it is an UNRECOGNIZED specifier, and
+// stdlib §2.18 says what that does — "An unrecognized specifier raises
+// `FormatException` (strict-fault, as everywhere)". The member spelling used
+// to keep the format string verbatim and render "00ffd".
+BEZEL_TEST(int_format_dx_width_7329,
+           stdlib_2_18_malformed_suffix_raises_format_exception) {
+    JitResult r = runAot(
+        "module M;\n"
+        "public class Program\n"
+        "  public static method Main(): int\n"
+        "    var result := 0;\n"
+        "    try\n"
+        "      var s: string := (255).ToString(\"D4x\");\n"
+        "      result := 99;\n"
+        "    catch FormatException => result := 11;\n"
+        "    end;\n"
+        "    Console.WriteLine(result);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end Program;\n");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("00ffd\n"));
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("11\n"));
 }

@@ -273,13 +273,20 @@ BEZEL_TEST(format_spec_receiver_vocabulary_7333,
 }
 
 // stdlib §2.18's floating row: "`E`/`En` scientific" — 5.0 with "E" is
-// "5.00e+00".
+// "5.000000E+00" (the digit count is the house's shared rendering's, six;
+// §2.18 fixes the default only for `F`).
+//
+// THE TEXT MOVED: the member spelling used to render "5.00e+00" — two
+// decimals, lower-case exponent — while the interpolation spelling rendered
+// "5.000000E+00". The member spelling is now routed through the SHARED
+// formatting routine (#7311), so the two spellings of one specifier AGREE,
+// and this row pins the shared answer.
 BEZEL_TEST(format_spec_receiver_vocabulary_7333,
            a_double_receiver_with_an_E_spec_still_compiles_2_18) {
     BEZEL_EXPECT_EQ(runStdout(
         prog("    var d := 5.0;\n"
              "    Console.WriteLine(d.ToString(\"E\"));\n")),
-        "5.00e+00\n");
+        "5.000000E+00\n");
 }
 
 // stdlib §2.18's `decimal` row: "`F`/`Fn`, `E`/`En`, `G`, `P`/`Pn`" — 1.5m
