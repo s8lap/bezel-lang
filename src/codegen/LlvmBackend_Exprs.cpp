@@ -2664,11 +2664,78 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 } else if (spec == 'X' || spec == 'D') {
                                     // §18.5: D/X with digits = min width, zero-padded.
                                     // D5 → %05d, X4 → %04X.
-                                    char pfspec2 = spec == 'X' ? 'X' : 'd';
+                                    //
+                                    // fix #7329 (stdlib §2.18, v0.344): the
+                                    // receiver of the integer row's `D`/`X`
+                                    // specifiers may be an integer of ANY
+                                    // width — the table names `long` and
+                                    // `byte` explicitly, so every width is
+                                    // CONFORMING and the specifiers must WORK
+                                    // at every width. This arm converted the
+                                    // receiver with `CreateFPToSI(recv,
+                                    // i32())` — an FP→SI conversion applied
+                                    // to an INTEGER payload — which is
+                                    // malformed IR for every width but 32
+                                    // ("FPToSI source must be FP or FP
+                                    // vector"), so the compiler ABORTED on a
+                                    // `byte`/`sbyte`/`short`/`ushort`/`long`/
+                                    // `ulong` receiver.
+                                    //
+                                    // The value is now widened the way the
+                                    // interpolation path's
+                                    // `emitWithFormatSpec` widens it (in
+                                    // src/codegen/LlvmBackend_String.cpp): to
+                                    // i64, sign-extended for a signed
+                                    // receiver and zero-extended for an
+                                    // unsigned one (the `D` decimal), and
+                                    // zero-extended for `X` (the natural-width
+                                    // BIT PATTERN), with the conversion
+                                    // carrying the `ll` length modifier so the
+                                    // full 64 bits are read — a bare `%d`/`%X`
+                                    // reads only 32 of them.
+                                    //
+                                    // The SIGNEDNESS is the RECEIVER's own
+                                    // TYPE's (the house predicate
+                                    // `isUnsignedTargetExpr`) — never the bit
+                                    // width's: `int` and `uint` are both 32
+                                    // bits and `long` and `ulong` are both 64
+                                    // bits. stdlib §2.18's integer row gives
+                                    // "`D`/`Dn` decimal" — the DECIMAL of the
+                                    // value the caller holds — so an unsigned
+                                    // receiver renders its unsigned value.
+                                    //
+                                    // A FLOATING receiver keeps the rendering
+                                    // it had (the value truncated to an int by
+                                    // `fptosi`), and a MALFORMED tail keeps
+                                    // its format string verbatim (and so its
+                                    // 32-bit conversion), exactly as before.
+                                    const bool recvIsInt =
+                                        recv->getType()->isIntegerTy();
+                                    const bool recvUnsigned = recvIsInt &&
+                                        isUnsignedTargetExpr(*ma->target);
+                                    // The digit tail: the specifier's own count
+                                    // (all digits) or a malformed suffix.
+                                    std::size_t runLen = 0;
+                                    while (runLen < digits.size() &&
+                                           digits[runLen] >= '0' &&
+                                           digits[runLen] <= '9')
+                                        runLen++;
+                                    const bool tailOk = (runLen == digits.size());
+                                    // The C conversion that renders the value.
+                                    std::string pfspec2;
+                                    if (recvIsInt && tailOk) {
+                                        if (spec == 'X')
+                                            pfspec2 = "llX";
+                                        else
+                                            pfspec2 = recvUnsigned ? "llu"
+                                                                   : "lld";
+                                    } else {
+                                        pfspec2 = (spec == 'X' ? "X" : "d");
+                                    }
                                     if (!digits.empty())
                                         printfFmt = std::string("%0") + digits + pfspec2;
                                     else
-                                        printfFmt = spec == 'X' ? "%X" : "%d";
+                                        printfFmt = "%" + pfspec2;
                                     // fix #7286 fix-forward: the WIDTH in the
                                     // literal is unbounded ("D1000000000"
                                     // builds a 1000000000-wide field), and the
@@ -2683,11 +2750,6 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     // pre-existing spellings ("D4", "D4x")
                                     // render exactly as they did.
                                     if (!digits.empty()) {
-                                        std::size_t runLen = 0;
-                                        while (runLen < digits.size() &&
-                                               digits[runLen] >= '0' &&
-                                               digits[runLen] <= '9')
-                                            runLen++;
                                         if (runLen > 0) {
                                             // The digit run's value, saturating.
                                             unsigned long long w = 0;
@@ -2711,8 +2773,36 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                             }
                                         }
                                     }
-                                    if (!recv->getType()->isIntegerTy(32))
+                                    // The VALUE the conversion reads.
+                                    if (recvIsInt) {
+                                        if (tailOk) {
+                                            // Widen to i64 — never narrowed:
+                                            // the `D` decimal preserves the
+                                            // value (sign-extended for a signed
+                                            // receiver, zero-extended for an
+                                            // unsigned one) and the `X` bit
+                                            // pattern is the receiver's own
+                                            // natural width's (zero-extended, so
+                                            // a `byte` 255 renders "FF", not
+                                            // "FFFFFFFF").
+                                            const bool zeroExt =
+                                                (spec == 'X') || recvUnsigned;
+                                            if (!recv->getType()->isIntegerTy(64))
+                                                recv = zeroExt
+                                                    ? builder_.CreateZExt(recv, i64())
+                                                    : builder_.CreateSExt(recv, i64());
+                                        } else if (!recv->getType()->isIntegerTy(32)) {
+                                            // A malformed tail keeps the 32-bit
+                                            // conversion it had (`%d`/`%X` read
+                                            // 32 bits).
+                                            recv = builder_.CreateTrunc(recv, i32());
+                                        }
+                                    } else if (!recv->getType()->isIntegerTy(32)) {
+                                        // A FLOATING receiver: the value is
+                                        // truncated to an int by `fptosi` (the
+                                        // rendering it had).
                                         recv = builder_.CreateFPToSI(recv, i32());
+                                    }
                                 } else {
                                     return emitPrimitiveToString(recv, tt->primitive);
                                 }
