@@ -31,7 +31,11 @@
 // MEASURED on the base arm (LeakSanitizer, `bezelc --sanitize=address`):
 //
 //     x.ToString("F4")    ->  "39 byte(s) leaked in 2 allocation(s)"
-//     pInf.ToString("F2") ->  "36 byte(s) leaked in 2 allocation(s)"
+//     pInf.ToString("F2") ->  "41 byte(s) leaked in 2 allocation(s)"
+//
+// (the non-finite figure is 41, not the 36 measured on the arm BEFORE
+// #7301: that arm rendered "inf" — 3 bytes — where this one renders
+// "Infinity" — 8 bytes. The same two allocations, a longer data buffer.)
 //
 // and unbounded in a loop: 200 iterations of the local-binding shape leaked
 // 7800 bytes in 400 allocations — one allocation pair per call.
@@ -312,8 +316,36 @@ BEZEL_TEST(codegen_tostring_format_discharge_7312,
     BEZEL_EXPECT_EQ(r.stdoutText, std::to_string(kIterations * 7) + "\n");
 }
 
+// #7312 / stdlib §9.1's `ToString(radix: int)` + spec §28.9 — the RADIX
+// overload of the same one-argument `ToString` family. It is a DISTINCT
+// overload (an `int` parameter, not the `string` format), and it mints its
+// own fresh rc=1 string, so it leaked exactly as the format overload did:
+// MEASURED on the base arm, 200 iterations of `n.ToString(16)` leaked 7000
+// bytes in 400 allocations. The format rows above would not catch a
+// regression of THIS half — the fix teaches the classifier both one-
+// argument overloads, and this row pins the radix one.
+//
+// stdlib §9.1 (v0.344) fixes the rendering: "`ToString(radix)` emits the
+// lower-case digits — a `-` for a negative value followed by the magnitude's
+// digits most significant first, a single `0` for zero, never a leading zero
+// otherwise — and takes the same radix set, raising `ArgumentException` for
+// any other." So 255 in base 16 is "ff" — TWO code points, which is what the
+// expected stdout below asserts.
+BEZEL_TEST(codegen_tostring_format_discharge_7312,
+           the_radix_form_is_discharged_9_1) {
+    JitResult r = runAotChecked(prog(
+        "    var n := 255;\n" + loop200(
+            "      var s: string := n.ToString(16);\n"
+            "      t := t + s.Length;\n") +
+        "    Console.WriteLine(t);\n"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::to_string(kIterations * 2) + "\n");
+}
+
 // ---------------------------------------------------------------------------
-// THE OVER-RELEASE ORACLE — green on both arms, and it MUST stay green.
+// THE OVER-RELEASE ORACLE — RED on the base arm, GREEN on the fix arm.
 // ---------------------------------------------------------------------------
 
 // #7312 / stdlib §2.18's ROUND TRIP + spec §28.9 — the result must SURVIVE
@@ -323,6 +355,18 @@ BEZEL_TEST(codegen_tostring_format_discharge_7312,
 // the buffer would already be freed and the read would fault under
 // generated-code ASan. The comparison pins that the text is still the value
 // §2.18 rendered.
+//
+// WHY IT IS RED ON THE BASE ARM AND MUST BE GREEN ON THE FIX ARM. On the
+// base arm the bound local is a BORROW: the binding retained the result on
+// top of the producer's +1 and the producer's reference was never dropped,
+// so the program leaks and the row fails on the LSan verdict (it is one of
+// the nine base-arm failures). On the fix arm the binding TRANSFERS the
+// producer's +1 into the slot and the scope-end release drops it, so the
+// program is leak-clean — AND the read still works, because the reference
+// was discharged at scope end and not before the read. That combination is
+// what makes this row the over-release oracle: it fails on the base arm
+// (the leak) and it would fail on the fix arm too if the reference were
+// discharged too EARLY (the read would fault under generated-code ASan).
 //
 // WHY THE COMPARISON AND NOT A `double.Parse(s)` CALL. Passing the local to a
 // USER method makes it ESCAPE, and an escaping producer local is not given a
