@@ -1,6 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
+#include "common/DisposalKind.hpp"   // §28.9/§28.12: the shared disposal anchor
 #include "common/OwnershipFacts.hpp"  // #1414 stage 4: shared ownership-facts core
 #include "sema/ConstFold.hpp"
 #include "sema/TypeResolution.hpp"  // #2069: sema::typeArgRuntimeReified (strict oracle)
@@ -557,7 +558,7 @@ llvm::Value* Emitter::choiceCaseConstant(const ast::Expr& e) {
     if (!cc) return nullptr;
     // The qualified-name form `Opt.None` resolves the MemberAccess to the
     // ChoiceCaseSymbol but the exprType is the choice type (sema,
-    // ExprTypecheck_Calls.cpp:11479). Recover the choice TypeSymbol from
+    // `ExprTC::resolveMemberAccess`). Recover the choice TypeSymbol from
     // the case's parent (a more authoritative source than exprType, which
     // may be null in early codegen paths).
     auto* choiceTy = dynamic_cast<sema::TypeSymbol*>(cc->parent);
@@ -876,7 +877,8 @@ std::vector<int> Emitter::importedFormalToArg(
 // fix #3268 (§22.5 / §2.8.2, v0.244): the IMPORTED-CONSTRUCTOR twin of the
 // method `importedFormalToArg` above. The rule is byte-identical — every
 // `sema::formalParam*` accessor the method version consults is itself
-// overloaded for `ConstructorSymbol` (Symbol.hpp:1298-1399), so the only
+// overloaded for `ConstructorSymbol` (Symbol.hpp's `formalParam*` accessors),
+// so the only
 // difference is the symbol kind. Sema's `checkImportedNewExprArgs` now
 // publishes the same `bindArgsToParams` binding on the
 // `SemaContext::setNewExprPositionalBinding` side table (#3196's machinery),
@@ -958,7 +960,8 @@ llvm::Value* Emitter::importedDefaultArgValue(const sema::MethodSymbol& ms,
     // — `MetaParam::type` is on the wire since the format's REC_SCALARS record,
     // so the importer has the exact type to lower, and the T spelling in the
     // text is decorative. Mirrors the local-twin codegen path
-    // (LlvmBackend_Assign.cpp:10867), which is also `getNullValue(lowerType(…))`
+    // (`Emitter::fillOmittedParamDefaults`), which is also
+    // `getNullValue(lowerType(…))`
     // for a `DefaultExpr`, so a same-module call and an imported call produce
     // the same lowered zero value (§2.8.3 rule 4).
     if (text.size() >= 8 && text.compare(0, 8, "default(") == 0) {
@@ -1422,7 +1425,8 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
             // fallback other inherited-member dispatch sites use for this
             // exact shape (LlvmBackend_Setup.cpp's
             // resolveSynthesizedDeserializeCallTarget,
-            // LlvmBackend_Calls.cpp:10559, LlvmBackend_Exprs.cpp:3987) is to
+            // `Emitter::tryLowerBuiltinClassCall`, `Emitter::lowerExprInner`)
+            // is to
             // resolve the qualifier's SYMBOL instead and check whether it is
             // a TypeSymbol; synthesize a bare TypeRef (declaration only, no
             // generic args) from it, exactly as computeAncestorGenericSubst's
@@ -2935,7 +2939,8 @@ void Emitter::declareImportedFunctions() {
     //       16 instead of 99. Same shape reproduced on a record.
     //
     //   (2) Without pre-declaration, the record-side fix at
-    //       LlvmBackend_Exprs2.cpp:9732 (fix #4022) can't run — it needs the
+    //       `Emitter::lowerNew` (LlvmBackend_Exprs2.cpp, fix #4022) can't
+    //       run — it needs the
     //       call to land on the SAME LLVM `Function` object the linker
     //       resolves to the exporter's compiled ctor.
     //
@@ -5192,7 +5197,8 @@ void Emitter::declareVtables() {
     // must dispatch through it identically to a same-module interface (§11.2's
     // interface-matching contract makes no artifact distinction). Unlike the
     // METHOD case (#426/#328), which fails LOUD (ifaceMethodIndex_.find sites gate
-    // and bail dispatch entirely, e.g. LlvmBackend_Calls2.cpp:6634-6636), the
+    // and bail dispatch entirely, e.g. `sharedEventHandlerAdmissible` in
+    // LlvmBackend_Calls2.cpp), the
     // property/event lookup sites (lowerVirtualPropertyGet/-Set in
     // LlvmBackend_Exprs.cpp, eventSourcePtr in LlvmBackend_Calls2.cpp) each fall
     // through to OTHER fallback paths that are also unpopulated for an
@@ -6678,16 +6684,17 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
     std::string_view last = name->parts.back();
     // fix #2845 / §19.3 / §2.8.3 rule 4 (v0.240): an IMPORTED class's
     // TypeSymbol lives in `ctx_.importedSymbols()` — `ctx_.symbols()` is
-    // local-only (SemaContext.hpp:90's `symbols_`), so a bare type-test
+    // local-only (`SemaContext::symbols_`), so a bare type-test
     // pattern over an imported class (`case o of Dog` with `import Lib`
     // declaring `class Dog`) never matched the local pass and the caller
     // saw the #1847 "is not supported by the backend" diagnostic. The
     // descriptor itself is already declared by the imported-types pass
     // above (the ExternalLinkage `td$<Type>` entry) — we just have to
     // look it up. Mirrors the widening the #2844 fix applied to the
-    // DestructuringPattern head lookup (patternMatches, Exprs2.cpp:9793)
-    // and the established pattern in LlvmBackend_Stmts.cpp:7657-7666 and
-    // LlvmBackend_Assign.cpp:10008-10020.
+    // DestructuringPattern head lookup (`patternMatches`)
+    // and the established pattern in `Emitter::elementPolicyFor`
+    // (LlvmBackend_Stmts.cpp) and `Emitter::wrapAsIEnumerableForTarget`
+    // (LlvmBackend_Assign.cpp).
     // fix #4076 (§19.3/§27.8, v0.294): a `type` alias of a class/interface
     // used as a bare type-test pattern (`AliasOfDog`) resolves `s` to a
     // `sema::TypeAliasSymbol`, a distinct kind the `TypeSymbol` dynamic_cast
@@ -8220,7 +8227,7 @@ void Emitter::emitInvariantCheck(llvm::Value* thisVal,
             // constructed instance unwinds under §22.9's ordinary
             // machinery." §22.9's ordinary throw-edge cleanup is
             // Dispose + free (see emitConstructorBody's cleanupBB at
-            // ~LlvmBackend_Setup.cpp:10391 — `specializedDisposerCoreFor`
+            // `specializedDisposerCoreFor`
             // runs the destructor body + every owned field + base
             // chain, then `free(obj)`). At construction-exit `thisVal`
             // IS the heap allocation the new site owns; without this
@@ -10063,8 +10070,8 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                     patchSlot(/*isSet=*/true, sit2->second);
             }
             auto* newItabArrTy = llvm::ArrayType::get(ptrTy(), newItabElems.size());
-            // fix #3543: see the §2.8.3 rule 3 itab$ sibling comment at
-            // line 4831 (the class-vtable itab$) for the rationale. The shape
+            // fix #3543: see the §2.8.3 rule 3 itab$ sibling comment
+            // (the class-vtable itab$) for the rationale. The shape
             // here is the imported-generic-instantiation re-emit twin.
             auto* newItabGV = new llvm::GlobalVariable(
                 *module_, newItabArrTy, /*isConstant=*/true,
@@ -10082,8 +10089,8 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         newItmapElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
         auto* newItmapArrTy =
             llvm::ArrayType::get(ptrTy(), newItmapElems.size());
-        // fix #3543: see the §2.8.3 rule 3 itmap$ sibling comment at
-        // line 4851 (the class-vtable itmap$) for the rationale. The shape
+        // fix #3543: see the §2.8.3 rule 3 itmap$ sibling comment
+        // (the class-vtable itmap$) for the rationale. The shape
         // here is the imported-generic-instantiation re-emit twin.
         specItmapGV = new llvm::GlobalVariable(
             *module_, newItmapArrTy, /*isConstant=*/true,
@@ -11254,7 +11261,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
 
-    // §28.3 (line 4910): compute which owned locals/params are unwind-disposal
+    // §28.3: compute which owned locals/params are unwind-disposal
     // ELIGIBLE (never moved / disposed / reassigned) before lowering, so
     // registration can consult unwindIneligible_. Block bodies only — an
     // expression body has no statements that could leak an owned local on
@@ -11451,7 +11458,8 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         // fix #4434 (§27.5 / §28.9, v0.298): walk closure-typed locals to
         // classify captured-cell status BEFORE the recursive
         // `collectClosureReleaseEligible(lam.stmts)` calls inside lowerLambda
-        // (LlvmBackend_Exprs2.cpp:3045) clobber the outer scope's set. See
+        // (LlvmBackend_Exprs2.cpp's `Emitter::lowerLambda`) clobber the outer
+        // scope's set. See
         // `collectCapturedCellClosureLocals` for the full rationale — kept
         // SEPARATE from `collectClosureReleaseEligible` precisely because
         // that helper is invoked from BOTH function entry AND every nested
@@ -11839,7 +11847,8 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // §5.1 (#1778): a numeric arrow-body result narrower than the
             // declared return type is implicitly WIDENED (`=> 42` for a `long`
             // method, `=> 1.5f` for a `double`, `=> byte(5)` for `int`, …).
-            // The ReturnStmt path (LlvmBackend_Stmts.cpp ~line 1383) applies the
+            // The ReturnStmt path (the ReturnStmt arm of `Emitter::lowerStmt`)
+            // applies the
             // same coercion; the arrow path emitted the bare narrow value as the
             // `ret` operand (e.g. `ret i32` into an `i64` function) — malformed
             // IR that fails the verifier for VALID code. A no-op for ptr/struct
@@ -13207,7 +13216,7 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     currentCaughtName_ = {};
     unwindScopeDepth_ = 0;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
-    // §28.3 (line 4910): eligibility of owned ctor params for unwind disposal.
+    // §28.3: eligibility of owned ctor params for unwind disposal.
     unwindIneligible_.clear();
     unwindIneligibleFn_ = fn;
     collectUnwindIneligible(cd->body);
@@ -13223,8 +13232,9 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // its §28.14 release half by calling consumeLastLambdaCapturedCells() —
     // the helper reads `lastLambdaCapturedCells_`, which `boxLocalSlot`
     // populates ONLY when `currentFn_ == cellFreeEligibleFn_`. emitFunctionBody
-    // sets that token (line 9346) so method bodies already track and free
-    // their captured cells; emitConstructorBody never did, so a chain-call
+    // sets that token (`Emitter::emitFunctionBody`) so method bodies
+    // already track and free their captured cells; emitConstructorBody never
+    // did, so a chain-call
     // ctor with a lambda argument (which allocates a fresh capture cell for
     // each captured local/param inside lowerLambda) leaked that cell at the
     // chain-call site. Mirror the function-body setup: token + collect on the
@@ -13285,10 +13295,10 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // end `bz_array_free` was never emitted on the unconsumed branch —
     // leaking the local every construction (issue's measured 20468 B / 602
     // allocs over 300 iterations × 2 holders, where the if-branch consumes
-    // and the else-branch does not). Mirror the method-body call site at
-    // line 9358 here so the path-sensitive walker (the matching fix in
-    // `collectBorrowingArrayFreeEligible`'s candidates loop, this file
-    // ~28134) runs against the ctor body too. The token
+    // and the else-branch does not). Mirror the method-body call site in
+    // `Emitter::emitFunctionBody` here so the path-sensitive walker (the
+    // matching fix in `collectBorrowingArrayFreeEligible`'s candidates loop)
+    // runs against the ctor body too. The token
     // `borrowingArrayFreeEligibleFn_` is set right after so the
     // lowerLocalDecl / scope-end-disposal consumers gate on this exact
     // function — same staleness discipline every method-body call applies.
@@ -14315,8 +14325,10 @@ void Emitter::emitInitEntryBody(const sema::TypeSymbol* ts, llvm::Function* fn,
     // swapped `currentFn_` (lambda body, the six property/indexer accessor
     // emitters, buildSpecializedMethodFn, the three Layout.cpp thunks,
     // genericInstSfinitFn, the specialized disposers — see the audit at
-    // Setup.cpp:4013 and Disposal.cpp:1519 / :4119). Pre-fix, the clear at
-    // line 11082 dropped any Disposals the caller had pushed before
+    // `Emitter::declareImportedPropertySetters` and
+    // `Emitter::emitOwnedFieldDisposals` / `Emitter::emitVtablelessBuiltinRelease`).
+    // Pre-fix, the clear in `Emitter::emitFunctionBody` dropped any Disposals
+    // the caller had pushed before
     // emitInstanceInitFunction was invoked, leaving a temporary produced in
     // a field initializer without a `disposeStack_` backstop and letting a
     // later iteration over `initFns_` see stale entries from this class.
@@ -15600,8 +15612,10 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // leak per call (LSan Direct in `bz$M.Derived$ctor`, measured 20000+8000
     // +2000 B / 500 iters) because the chain-call lowering path never
     // released the producer's +1 on return. The non-chain `new T(args)` site
-    // already does this (LlvmBackend_Exprs2.cpp:7945 fix #2305), as does the
-    // generic-method-call site (LlvmBackend_Calls2.cpp:10780 fix #1073): this
+    // already does this (LlvmBackend_Exprs2.cpp's `Emitter::lowerNew`, fix
+    // #2305), as does the
+    // generic-method-call site (LlvmBackend_Calls2.cpp's
+    // `Emitter::lowerCallDispatch`, fix #1073): this
     // site was the missing twin. Collect the closures BEFORE the call, install
     // the unwind edge that drops them on a throw, then release on normal
     // return — exactly the #1073/#2305 discipline the `lowerNew`/`lowerCall`
@@ -15780,7 +15794,8 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             // measurement pinned at 4 B/iter × 500 = 2000 B over the
             // repro's 500 iterations (LSan Direct in
             // `bz$M.Derived$ctor`). Mirrors `lowerCall`'s §28.14 release
-            // loop at LlvmBackend_Calls2.cpp:11052 — gated on the same
+            // loop in LlvmBackend_Calls2.cpp's `Emitter::lowerCallDispatch` —
+            // gated on the same
             // vector the closure release uses, so it is exactly as wide
             // and never misses a slot. The helper re-runs every per-cell
             // soundness check (#966 / #1017 owner-disposal deferral,
@@ -15804,7 +15819,7 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             // every entry — owner-disposal deferral still pushes onto
             // `disposeStack_[ownerScopeIdx]` if a higher-scope disposal
             // reads through the cell (the helper's `if (disposeStack_
-            // .empty())` at line 16259, however, would never fire here:
+            // .empty())` check, however, would never fire here:
             // we just pushed the transient scope, and that scope is at
             // index 0). Empty after — the transient scope is local to
             // this site.
@@ -15815,7 +15830,7 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                 // scope. Push a transient scope, let the helper register
                 // the cell-free on it, then drain it here at the
                 // chain-call's normal-return edge. The helper's
-                // `disposeStack_.back().push_back(dc)` at line 16379
+                // `disposeStack_.back().push_back(dc)`
                 // writes to THIS scope (now at index 0), not to a
                 // stale empty stack.
                 //
@@ -17309,7 +17324,7 @@ void Emitter::bindParameters(llvm::Function* fn, bool hasThis,
             llvm::AllocaInst* slot = entryAlloca(arg.getType());
             builder_.CreateStore(&arg, slot);
             if (psym) paramSlots_[psym] = slot;
-            // §28.3 (line 4910): an `owned` parameter is auto-disposed on an
+            // §28.3: an `owned` parameter is auto-disposed on an
             // exception unwind out of the method. Defer its registration until
             // the function-body root dispose scope exists (lowerScopedBlock
             // registers pendingOwnedParams_ into the outermost scope), since no
@@ -17776,7 +17791,7 @@ llvm::Value* Emitter::lowerCollectionLiteralElementOrUnitNull(
 // reclaims, the scope-end `bz_array_free(arr, elemDispose)` walked freed
 // pointers. MEASURED (single module, no import): `var arr: Array<Cell> := [];
 // arr.Add(Cell.MakeIt(1));` → heap-use-after-free, READ of size 8 in
-// `bz$elemDispose` <- `bz_array_free` (bezel_runtime_collections.cpp:348);
+// `bz$elemDispose` <- the runtime's `bz_array_free`);
 // exit 1, no leak traded for it. The same program with `new Array<Cell>()` in
 // place of the `[]` literal is CLEAN (exit 0) — isolating the stamp to the
 // literal path. Elements reach the array only through `.Add`, which stores
@@ -18635,7 +18650,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // in `wrapAsIEnumerableForTarget` in the same commit. An imported
             // declaration's type is reconstructed from module metadata and has
             // NO `astNode` — its head is `TypeRef::importedName`, which
-            // `headName()` already falls back to (src/sema/TypeRef.hpp:80) — so
+            // `headName()` already falls back to (`TypeRef::headName`) — so
             // the conjunct left all three false for every imported-typed
             // initializer, the raw collection pointer was stored in the
             // `IEnumerable<T>` local, and the following for-in vtable-dispatched
@@ -18798,8 +18813,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // (rc 139), the identical symptom the RETURN / ARGUMENT coercion
                 // faces show. Route through `wrapSortedSetAsIEnumerable`, the
                 // SAME helper the explicit `.GetEnumerator()` and `for x in s`
-                // surfaces already use (`LlvmBackend_Calls2.cpp:14146` /
-                // `LlvmBackend_Stmts.cpp:8900`), so the local-decl face is
+                // surfaces already use (the `wrapSortedSetAsIEnumerable` call
+                // sites in LlvmBackend_Calls2.cpp / LlvmBackend_Stmts.cpp), so the
+                // local-decl face is
                 // structurally identical to those rather than a separately
                 // (and incorrectly) re-derived one. SortedSet is ALWAYS
                 // hash-backed (`where T: IComparable<T>` excludes class elements),
@@ -19841,7 +19857,8 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // fix #4425 (§27.5 / §28.9, v0.301): the prior `v &&` guard REQUIRED a
     // non-null init — `var f: () -> int;` (no init, just a typed annotation)
     // also enters `closureReleaseEligible_` via the no-init typed local path
-    // (the candidates walker at line 28303+ runs it through the escape walk
+    // (the candidates walker in `collectClosureReleaseEligible` runs it
+    // through the escape walk
     // and, after the override extension this commit installs, arms release for
     // reassigned + never-called + not-returned + non-captured-cell locals),
     // but lowerLocalDecl's `v &&` guard rejected it because `v` was nullptr
@@ -19849,15 +19866,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // LATER — at the `f := lambda(...)` AssignmentStmt lowering — but
     // disposeStack_ entries registered here run at SCOPE END, after every
     // assignment has executed. bz_closure_release is null-safe (verified
-    // against the runtime header at src/runtime/bezel_runtime_refcounting.cpp
-    // line 331), so an armed disposal on a still-null slot is a no-op, and
+    // against the runtime header's `bz_closure_release`), so an armed
+    // disposal on a still-null slot is a no-op, and
     // a non-null slot at scope end releases the cell exactly once — matching
     // the `var f := lambda()` shape the existing `v &&` guard already
     // accepted. The "no captured cell" guard inside this if-body stays sound:
     // a captured-cell slot would be in cellVars_ and the envdtor would own
     // the cell's release; the closureRelease disposal would double-free.
     // closureReleaseEligible_ is gated to non-captured-cell locals (via the
-    // override's `!w.isCapturedCellSlot_` check at line 28478), so the new
+    // override's `!w.isCapturedCellSlot_` check), so the new
     // `v`-relaxed condition is exactly the same set of locals the existing
     // `v &&` guard accepted, plus the no-init typed case the prior guard
     // excluded.
@@ -20621,7 +20638,7 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     // of a property read (`this.Seq` MemberAccessExpr, the #2779 path).
     // Inside the declaring class itself the read is bare `Seq`
     // (IdentifierExpr resolving to the same PropertySymbol), and
-    // `wrapPropertyArrayAsIEnumerable` (LlvmBackend_Exprs.cpp:6210) wraps
+    // `wrapPropertyArrayAsIEnumerable` (LlvmBackend_Exprs.cpp) wraps
     // it through the bare-`this` computed-getter arm, recording the FRAME
     // in `propReadIterWrappedExprs_` keyed on the IdentifierExpr. The
     // MemberAccessExpr-only claim path above never saw the entry, so this
@@ -20640,7 +20657,7 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     // the same iterator-format property read inside the declaring class —
     // the indexer form `this[0]`, an IndexExpr resolving to the indexer's
     // PropertySymbol. `wrapPropertyArrayAsIEnumerable`
-    // (LlvmBackend_Assign.cpp:2301) is the third call site and records the
+    // (`Emitter::lowerIndexerGet`) is the third call site and records the
     // FRAME in `propReadIterWrappedExprs_` keyed on the IndexExpr, but the
     // IdentifierExpr-only claim arm below never sees that key — `init`
     // `dynamic_cast`s to `nullptr`, the wrap entry is unreachable, and the
@@ -20662,7 +20679,7 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
     // and recorded identically, but a declaring-class indexer read reaches
     // the wrap-creator through the same expression-body path the
     // IdentifierExpr spelling does (the `wrapPropertyArrayAsIEnumerable`
-    // call at LlvmBackend_Assign.cpp:2301 sits on the EXPRESSION-body
+    // call in `Emitter::lowerIndexerGet` sits on the EXPRESSION-body
     // arm of `lowerPropertyRead`-for-indexer); the expression-body
     // narrowing matches the surface this fix actually touches.
     if (!ownsSource) {
@@ -21300,6 +21317,27 @@ std::string_view Emitter::newExprBuiltinHead(const ast::NewExpr* ne) {
     // exprType probe, not this one). So requiring a declaration-less TypeRef
     // costs nothing here and is what excludes the imported user class.
     if (rt->declaration) return {};
+    // fix #3482 (§28.12 / §28.9, v0.345): a MONOMORPHIZED type-parameter
+    // head. `new T()` resolves to the type parameter `T`, whose SPELLING is
+    // not a built-in head — but the instantiation's CONCRETE type is, and
+    // that is the type the slot's representation is. Without this the head
+    // stayed unnameable at a monomorphized head, and BOTH spellings were
+    // wrong there: the `await using` twin read word 0 of the value as a
+    // class vtable (ASan: SEGV @0x10) and the plain `using var` twin
+    // registered no disposal at all (32 B leaked / 1 allocation).
+    //
+    // The resolution is the ONE the anchor's representation key uses
+    // (`common::representationOf`), so the head name and the representation
+    // cannot disagree — the #3419 shape this file has been bitten by twice.
+    // fix #3482
+    {
+        const sema::TypeRef* concrete =
+            common::representationOf(rt, &genericSubstSemaTy_);
+        if (concrete && concrete != rt) {
+            std::string_view head = builtinTypeName(concrete);
+            if (!head.empty()) return head;
+        }
+    }
     if (builtinTypeName(rt).empty()) return {};
     return ne->type->name->parts[0];
 }
@@ -21317,14 +21355,26 @@ std::string_view Emitter::usingVarBuiltinHeadName(
     const sema::TypeRef* headTy = nullptr;
     if (ld->type) {
         headTy = ctx_.resolvedType(*ld->type);
-        headName = builtinTypeName(headTy);
+        // fix #3482 (§28.12 / §28.9, v0.345): the head is the slot's
+        // REPRESENTATION, so it is resolved MONOMORPHIZATION-AWARE: a
+        // declared `T` names the instantiation's concrete type, not the
+        // parameter. The same key the anchor's representation uses
+        // (`common::representationOf`), so the head name and the
+        // representation cannot disagree.
+        headName = builtinTypeName(
+            common::representationOf(headTy, &genericSubstSemaTy_));
+        if (!headName.empty())
+            headTy = common::representationOf(headTy, &genericSubstSemaTy_);
     }
     if (headName.empty() && ld->initializer) {
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
             headName = newExprBuiltinHead(ne);
         if (headName.empty()) {
             headTy = ctx_.exprType(*ld->initializer);
-            headName = builtinTypeName(headTy);
+            headName = builtinTypeName(
+                common::representationOf(headTy, &genericSubstSemaTy_));
+            if (!headName.empty())
+                headTy = common::representationOf(headTy, &genericSubstSemaTy_);
         }
     }
     if (headTyOut) *headTyOut = headTy;
@@ -21335,6 +21385,112 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (disposeStack_.empty()) return;
     auto it = locals_.find(ld);
     if (it == locals_.end()) return;
+
+    // fix #3483 / #7328 / #5653 / #3516 / #3515 / #7338 / #3482 (§28.12,
+    // v0.345): THE ANCHOR's two CODEGEN pieces, extracted as local lambdas so
+    // the two call sites that need them — the BUILT-IN-INTERFACE arm below and
+    // the `await using` block further down — cannot drift apart (#3419's
+    // "duplicated classification predicates" shape).
+    //
+    // (1) The slot's REPRESENTATION: the right-hand side's OWN type. §28.12:
+    // "`await using` selects the logical-disposal path by the class of the
+    // object the binding HOLDS ... never by the binding's static type". For a
+    // `new C()` right-hand side it is the CONSTRUCTED type — the RUNTIME
+    // class. It is read from the `new` node's own type, because a COERCING
+    // binding (`await using var d: IAsyncDisposable := new Solo();`) types
+    // the initializer with the DECLARED type, and the declared type says only
+    // what the holder PROMISES. Resolved MONOMORPHIZATION-AWARE through the
+    // live instantiation's substitution, so a `new T()` at `T = Stopwatch` can
+    // be named at all (#3482).
+    auto awaitUsingRepresentation =
+        [&](const ast::LocalDecl* d) -> const sema::TypeRef* {
+        const sema::TypeRef* repTy = nullptr;
+        if (d->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(d->initializer.get())) {
+                if (ne->type) repTy = ctx_.resolvedType(*ne->type);
+            }
+            if (!repTy) repTy = ctx_.exprType(*d->initializer);
+        }
+        return common::representationOf(repTy, &genericSubstSemaTy_);
+    };
+    // (2) The `await using` slot's CLASS disposal: the awaited
+    // `DisposeAsync` and §28.12 step 2's reclamation, both keyed on the
+    // REPRESENTATION's class.
+    auto registerAwaitUsingClassDisposal = [&](const ast::LocalDecl* d,
+                                               const sema::TypeRef* repTy,
+                                               llvm::AllocaInst* slot) {
+        Disposal dd{slot, nullptr};
+        dd.asyncDispose = true;
+        const sema::TypeSymbol* cls = nullptr;
+        if (!d->usingVarSourceIsBorrow && repTy &&
+            repTy->kind == sema::TypeRef::Kind::Named)
+            cls = repTy->declaration;
+        if (!cls) cls = classOfLocal(d);
+        if (cls && cls->kind == ast::TypeDeclKind::Class) {
+            sema::MethodSymbol* dams = findMethodByName(cls, "DisposeAsync");
+            if (dams) {
+                auto fnIt = methodFns_.find(dams);
+                if (fnIt != methodFns_.end()) {
+                    dd.disposeAsyncFn = fnIt->second;
+                    // fix #3470 / §28.12 step 2: carry the class this single
+                    // resolution answered, so the emit site's physical
+                    // reclamation (disposerReclaimFns_) is keyed on the SAME
+                    // answer as the DisposeAsync call and cannot drift from
+                    // it.
+                    //
+                    // fix #3515 (§28.12 step 2, v0.345): the step 2
+                    // RECLAMATION is keyed on the class whose reclamation the
+                    // awaited `DisposeAsync` belongs to. The pre-fix key was
+                    // the DECLARED class, which stranded a derived level's
+                    // `owned` fields behind a base-typed head. The key is the
+                    // REPRESENTATION's class — the runtime class — EXCEPT
+                    // where the declared class has a reclamation of its own:
+                    // that exception is the per-level rule §28.12 step 2
+                    // states ("at each level of the reclamation chain the
+                    // destructor body is skipped if that level declares or
+                    // overrides a non-`abstract` `DisposeAsync`"), which the
+                    // base chain (`Emitter::emitBaseDisposeChain`, in a file
+                    // this lane does not own) does not implement — it chains
+                    // to each base's CORE, so a base level's destructor body
+                    // runs even when that level declares a non-abstract
+                    // `DisposeAsync`. Re-keying the reclamation onto the
+                    // runtime class would therefore RUN a destructor body
+                    // §28.12 step 2 says to skip, so the pre-fix key is kept
+                    // until the chain implements the rule. #3515's remaining
+                    // half is that chain.
+                    {
+                        const sema::TypeSymbol* declCls = classOfLocal(d);
+                        if (declCls &&
+                            disposerReclaimFns_.count(declCls))
+                            dd.asyncDisposeCls = declCls;
+                        else
+                            dd.asyncDisposeCls = cls;
+                    }
+                    // fix #3493 / §28.12 step 1 (v0.283): the SAME `dams`
+                    // this resolution already answered, asked of the
+                    // authority that already decides "does this method
+                    // dispatch through the vtable" — `vtableSlot_`, populated
+                    // by `buildVtable` in `declareVtables()`, which runs
+                    // before any body is lowered. No second classification:
+                    // `isVirtual` decides membership, and this reads its
+                    // result.
+                    //
+                    // Absent ⇒ non-virtual ⇒ §12.2's no-hiding rule means no
+                    // subclass can declare a `DisposeAsync` at all, so
+                    // `disposeAsyncFn` is already the only implementation any
+                    // runtime type in this slot can have, and the direct call
+                    // stays exact.
+                    auto vsIt = vtableSlot_.find(dams);
+                    if (vsIt != vtableSlot_.end())
+                        dd.disposeAsyncVSlot =
+                            static_cast<int>(vsIt->second);
+                }
+            }
+        }
+        // disposeAsyncFn == null → sync fallback (emitDisposals handles it).
+        disposeStack_.back().push_back(dd);
+    };
 
     // §28.10 / §28.3 (v0.184, #1661): a `using var` the ownership pass flagged a
     // BORROW-PIN registers NO disposal — its real owner disposes it. This holds
@@ -21517,6 +21673,23 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         bool srcIsNamedOwner = false;
         if (rawUserClassInBuiltinInterfaceSlot(ld, &srcIsNamedOwner)) {
             if (srcIsNamedOwner) return;
+            // fix #3483 / #7328 (§28.12, v0.345): an `await using` binding at
+            // a BUILT-IN INTERFACE head must NOT take this SYNCHRONOUS
+            // vtable-slot-2 disposal. §28.12: "the `DisposeAsync` awaited is
+            // the run-time object's ... through any interface —
+            // `IAsyncDisposable` or one deriving from it ... or another such
+            // as `IDisposable`, which every class implements. Only an object
+            // whose class does not implement `IAsyncDisposable` takes the
+            // synchronous disposal". Registering the sync disposal here ran
+            // the DESTRUCTOR and never awaited the `DisposeAsync` (#3483,
+            // #7328). The `await using` block below decides the slot's
+            // obligation; this arm remains its twin for the `using var`
+            // spelling.
+            if (ld->isAwaitUsing) {
+                registerAwaitUsingClassDisposal(
+                    ld, awaitUsingRepresentation(ld), it->second);
+                return;
+            }
             Disposal d{it->second, nullptr};
             d.dynamicDispose = true;
             disposeStack_.back().push_back(d);
@@ -21562,7 +21735,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // change with "none of the six is `IAsyncDisposable`". That is FALSE, and
     // the false half is IN this list: stdlib §4.13 (v0.283) declares
     // `public interface IOwningAsyncEnumerable<T>: IAsyncDisposable where T:
-    // class` (Bezel_Standard_Library.md:2441). THREE iteration interfaces carry
+    // class` (stdlib §4.13). THREE iteration interfaces carry
     // `IAsyncDisposable` — `IAsyncEnumerator`, `IOwningAsyncEnumerator` and
     // `IOwningAsyncEnumerable` — not two. The over-broad reading came from the
     // #1525 paragraph above, which is correct about `IAsyncEnumerable`
@@ -22065,7 +22238,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         //
         //   await using var f := lambda() => 1;          -> SEGV.
         //
-        // §28.12:7490 decides the shape: "`await using` selects the
+        // §28.12 decides the shape: "`await using` selects the
         // logical-disposal path by the class of the object the binding HOLDS
         // ... never by the binding's static type", and it names the
         // `Object`-typed and interface-typed bindings as the ones that
@@ -22075,97 +22248,59 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         // the RIGHT-HAND SIDE's own type, so the predicate now reads it too
         // and takes the NARROWER answer for the RUNTIME-MANAGED values
         // (§28.9 — a `string`, a function value): they have NO class, so
-        // §28.12:7488's "scope exit takes the synchronous disposal (or the
+        // §28.12's "scope exit takes the synchronous disposal (or the
         // no-op) and likewise awaits nothing" is the whole of it.
         //
         // THE MIRROR, MEASURED: a CLASS right-hand side keeps the async path.
         // `await using var u: Object := new Solo();` still awaits Solo's
         // DisposeAsync (the initializer's type is the class Solo), so the
-        // narrowing does not cost a class its asynchronous disposal — §28.12:7490's
+        // narrowing does not cost a class its asynchronous disposal — §28.12's
         // "through `Object`" case is exactly this one.
         //
         // The narrowed shapes take the PLAIN chain's arms — the same arms the
         // plain `using var` spelling reaches, which is what §28.12 means by
-        // "takes §28.10's admission unchanged" (§28.10:7260 — "the disposal at
+        // "takes §28.10's admission unchanged" (§28.10 — "the disposal at
         // scope end is a no-op ... and the only effect is the reassignability
         // restriction") — so the two twins agree again.
         // per §28.12, §28.9, §28.10, fix #7337, fix #7327
-        auto typeMayHoldClass = [](const sema::TypeRef* t) -> int {
-            // 1 = may hold a class object, 0 = may NOT, -1 = unclassifiable.
-            if (!t) return -1;
-            switch (t->kind) {
-            case sema::TypeRef::Kind::Primitive:
-                // `Object` is the ONE primitive that can hold a class
-                // instance (or a boxed value); every other primitive is a
-                // value type or a runtime-managed value (§28.9) — no class,
-                // no disposal obligation.
-                return t->primitive == sema::PrimitiveType::Object ? 1 : 0;
-            case sema::TypeRef::Kind::Named:
-                // A declaration-less head (a type parameter, or a builtin
-                // class the #3449 gate did not claim) MAY be a class: keep
-                // the pre-existing path.
-                if (!t->declaration) return 1;
-                // Class / interface: may hold a class instance.
-                if (t->declaration->kind == ast::TypeDeclKind::Class ||
-                    t->declaration->kind == ast::TypeDeclKind::Interface)
-                    return 1;
-                // Record / enum / choice: a VALUE TYPE (§9 / §10 / §35.4) —
-                // no class, no disposal obligation.
-                return 0;
-            case sema::TypeRef::Kind::Function:
-                // §28.9: a FUNCTION-TYPED value is runtime-managed — it
-                // "carries no disposal obligation", and "a `using var` local
-                // of function type is nonetheless permitted (disposal at
-                // scope end is a no-op)". A function value is not a class,
-                // so there is no vtable to dispatch on: its word 0 is not
-                // one, and reading it as one is the out-of-bounds read this
-                // arm removes (#7327).
-                return 0;
-            default:
-                // The unit type, an inline array, an error type: not
-                // classifiable here — keep the pre-existing path.
-                return -1;
-            }
-        };
-        auto awaitUsingSlotMayHoldClass = [&]() -> bool {
-            const sema::TypeRef* initTy =
-                ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr;
-            // The EFFECTIVE type: the declared type when there is one, else
-            // the initializer's (as #7322 read it).
-            const sema::TypeRef* declTy =
-                ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
-            if (!declTy) declTy = initTy;
-            int declAns = typeMayHoldClass(declTy);
-            // Unclassifiable (-1): keep the pre-existing path (may hold a
-            // class) — no new behaviour.
-            bool mayHold = (declAns != 0);
-            // fix #7337: the RIGHT-HAND SIDE's own kind is the axis
-            // (§28.12:7490 — "never by the binding's static type"). A
-            // RUNTIME-MANAGED value (§28.9 — a `string`, a function value)
-            // has NO class: word 0 of one is a data pointer, not a vtable,
-            // so the class disposal over it is the out-of-bounds read this
-            // arm removes. An `Object`-declared (or interface-declared)
-            // binding over such a right-hand side therefore takes the
-            // NO-OP path, whatever the declaration says.
-            //
-            // WHY ONLY THE RUNTIME-MANAGED VALUES NARROW, AND NOT THE VALUE
-            // TYPES. A value-typed right-hand side stored into an `Object`
-            // slot is BOXED (§8.6) into a runtime box — a heap object whose
-            // word 0 IS a vtable, so the class path is sound for it (and it
-            // is what reclaims the box today). The runtime-managed values
-            // are the ones whose word 0 is NOT a vtable, and they are the
-            // ones §28.9 exempts from manual disposal outright. A
-            // FUNCTION-typed right-hand side is runtime-managed too (§28.9)
-            // and is the second hole the predicate had (#7327).
-            if (initTy) {
-                bool initIsRuntimeManaged =
-                    (initTy->kind == sema::TypeRef::Kind::Primitive &&
-                     initTy->primitive == sema::PrimitiveType::String) ||
-                    initTy->kind == sema::TypeRef::Kind::Function;
-                if (initIsRuntimeManaged) mayHold = false;
-            }
-            return mayHold;
-        };
+        // fix #3483 / #7328 / #5653 / #3516 / #3515 / #7338 / #3482
+        // (§28.12, v0.345): THE ANCHOR's CODEGEN call site.
+        //
+        // The slot's REPRESENTATION is the right-hand side's OWN type (§28.12:
+        // "`await using` selects the logical-disposal path by the class of the
+        // object the binding HOLDS ... never by the binding's static type"),
+        // resolved MONOMORPHIZATION-AWARE through the live instantiation's
+        // substitution (`common::representationOf`), so a `new T()` at
+        // `T = Stopwatch` can be named at all (#3482).
+        //
+        // The classification is `common::classifyDisposal` — the ONE authority
+        // the sema side reads too (`MethodOwnership::rhsIsDisposableClassType`
+        // reads its `carriesObligation`). It REPLACES the local
+        // `typeMayHoldClass` / `awaitUsingSlotMayHoldClass` lambdas, which
+        // answered ONE BIT from the DECLARED type and had no runtime-managed
+        // arm that could name the `Type` token (#7338).
+        //
+        // TWO QUESTIONS, TWO ANSWERS, and the order matters:
+        //   * the SLOT's storage — may it hold a class instance at all? That
+        //     is the DECLARED type's question. A value-typed right-hand side
+        //     stored into an `Object` slot is BOXED (§8.6) into a runtime box
+        //     whose word 0 IS a vtable, so the class path stays sound for it.
+        //   * the VALUE's kind — is it runtime-managed (§28.9: a `string`, the
+        //     `Type` token, a function value)? Those have NO class: word 0 of
+        //     one is a data pointer, not a vtable, so the class disposal over
+        //     it is the out-of-bounds read this arm removes (#7327, #7338).
+        const sema::TypeRef* repTy = awaitUsingRepresentation(ld);
+        // The SLOT's storage: the declared type when there is one, else the
+        // representation's (as #7322 read it).
+        const sema::TypeRef* declTy =
+            ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+        if (!declTy) declTy = repTy;
+        const common::DisposalVerdict slotVerdict =
+            common::classifyDisposal(declTy, ctx_);
+        // A runtime-managed right-hand side has no class, whatever the
+        // declaration says.
+        const bool slotMayHoldClass =
+            slotVerdict.mayHoldClass && !common::isRuntimeManagedValue(repTy);
         // fix #2739 (§30.5/§30.6, v0.240): an `await using var` bound to a
         // borrowing BUILTIN collection literal (`await using var xs: Array<int> :=
         // [k, k, k]`) MUST NOT route through the generic asyncDispose path below
@@ -22530,77 +22665,41 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // one side, a wild jump on the other. Filed separately by the
                 // #3449 review as its own shape; do not read the sentence above
                 // as covering it.
-            } else if (awaitUsingSlotMayHoldClass()) {
-                Disposal d{it->second, nullptr};
-                d.asyncDispose = true;
-                // Attempt to resolve the direct DisposeAsync function pointer.
-                const sema::TypeSymbol* cls = classOfLocal(ld);
-                if (!cls && ld->initializer) {
-                    // inferred: try the initializer's resolved type.
-                    if (auto* rt = ctx_.exprType(*ld->initializer)) {
-                        if (rt->kind == sema::TypeRef::Kind::Named)
-                            cls = rt->declaration;
-                    }
-                }
-                if (cls && cls->kind == ast::TypeDeclKind::Class) {
-                    sema::MethodSymbol* dams =
-                        findMethodByName(cls, "DisposeAsync");
-                    if (dams) {
-                        auto fnIt = methodFns_.find(dams);
-                        if (fnIt != methodFns_.end()) {
-                            d.disposeAsyncFn = fnIt->second;
-                            // fix #3470 / §28.12 step 2: carry the class this
-                            // single resolution answered, so the emit site's
-                            // physical reclamation (disposerReclaimFns_) is
-                            // keyed on the SAME answer as the DisposeAsync
-                            // call and cannot drift from it.
-                            //
-                            // ⚠ This assignment was relocated during the
-                            // #3449/#3470 integration: fix #3449 moved this
-                            // resolution into the `else` arm, so #3470's copy
-                            // landed at a site that no longer exists. Taking
-                            // either side of that conflict verbatim would have
-                            // been wrong — HEAD alone leaves asyncDisposeCls
-                            // unset and silently disables #3470's reclamation;
-                            // the incoming side alone reinstates a duplicate
-                            // resolution at the retired location.
-                            d.asyncDisposeCls = cls;
-                            // fix #3493 / §28.12 step 1 (v0.283): the SAME
-                            // `dams` this resolution already answered, asked of
-                            // the authority that already decides "does this
-                            // method dispatch through the vtable" —
-                            // `vtableSlot_`, populated by `buildVtable` in
-                            // `declareVtables()`, which runs before any body is
-                            // lowered. No second classification: `isVirtual`
-                            // decides membership, and this reads its result.
-                            //
-                            // Absent ⇒ non-virtual ⇒ §12.2's no-hiding rule
-                            // means no subclass can declare a `DisposeAsync` at
-                            // all, so `disposeAsyncFn` is already the only
-                            // implementation any runtime type in this slot can
-                            // have, and the direct call stays exact.
-                            auto vsIt = vtableSlot_.find(dams);
-                            if (vsIt != vtableSlot_.end())
-                                d.disposeAsyncVSlot =
-                                    static_cast<int>(vsIt->second);
-                        }
-                    }
-                }
-                // disposeAsyncFn == null → sync fallback (emitDisposals
-                // handles it).
-                disposeStack_.back().push_back(d);
+            } else if (slotMayHoldClass) {
+                // THE ANCHOR's class arm: the awaited `DisposeAsync` and
+                // §28.12 step 2's reclamation, both keyed on the slot's
+                // REPRESENTATION's class — the runtime class for a `new C()`
+                // right-hand side, and NEVER the binding's static type.
+                // §28.12: "`await using` selects the logical-disposal path by
+                // the class of the object the binding HOLDS ... never by the
+                // binding's static type", and: "through a base-class static
+                // type that does not implement `IAsyncDisposable` (`await
+                // using var b: Base := new Der();` with `class Der: Base,
+                // IAsyncDisposable` awaits `Der.DisposeAsync`, skips `Der`'s
+                // destructor and runs `Base`'s)".
+                //
+                // The pre-fix code resolved the DECLARED class
+                // (`classOfLocal`), and that is what made these shapes wrong:
+                // an INTERFACE head names no class at all (#3483, #7328 — the
+                // awaited `DisposeAsync` was never resolved and the destructor
+                // ran instead), a BASE head names the BASE (#5653 — `Base`
+                // has no `DisposeAsync`, so the async cleanup was skipped), an
+                // ABSTRACT head names a declaration with no body to await
+                // (#3516), and the §28.12 step 2 reclamation was keyed on the
+                // base, stranding the derived level's `owned` fields (#3515).
+                registerAwaitUsingClassDisposal(ld, repTy, it->second);
                 return;
             } else {
                 // fix #7322 (§28.9 / §28.12, v0.344): the right-hand side is
                 // VALUE-typed or RUNTIME-MANAGED — it has no class, so the
-                // scope exit is the NO-OP (§28.12:7488: "scope exit takes the
+                // scope exit is the NO-OP (§28.12: "scope exit takes the
                 // synchronous disposal (or the no-op) and likewise awaits
                 // nothing"). Registering the async/class disposal here is
                 // what produced the out-of-bounds read (see
                 // `awaitUsingSlotMayHoldClass` above), so register NOTHING and
                 // FALL THROUGH to the plain chain below — the same arms the
                 // plain `using var` spelling reaches, which is what §28.12
-                // means by "takes §28.10's admission unchanged" (§28.10:7260:
+                // means by "takes §28.10's admission unchanged" (§28.10:
                 // "the disposal at scope end is a no-op ... and the only effect
                 // is the reassignability restriction").
                 //
@@ -23774,7 +23873,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // degraded behavior.
     //
     // Why a NEW arm rather than widening `usingVarOwnsClassObjectDynamically`:
-    // that predicate's `isClassOrInterfaceRef` (line 33388) explicitly
+    // that predicate's `isClassOrInterfaceRef` explicitly
     // requires `rt->declaration`, and the #2921/#4326 vtable-classification
     // derivation forces the subtraction in the OTHER direction — adding
     // these names to a "class-like" check would also widen the explicit-
@@ -24418,7 +24517,7 @@ bool Emitter::registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld) {
     if (!rt || rt->kind != sema::TypeRef::Kind::InlineArray || !rt->arrayOwned)
         return false;  // not a move-only owning inline array — caller continues.
     // From here it IS a move-only owning inline array: handle it (return true)
-    // so the using/task/unwind chain is bypassed (§28.10 line 2025: `using var`
+    // so the using/task/unwind chain is bypassed (§28.10: `using var`
     // has no disposal effect on a move-only array; the auto-dispose below runs
     // regardless). Whether we actually register disposal depends on transfer.
     if (emittingDisposerBody_) return true;
@@ -24512,7 +24611,7 @@ bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
 // right-hand side. For ordinary value types and runtime-managed types, the
 // disposal at scope end is a no-op (these types do not require disposal per
 // §28.9), and the only effect is the reassignability restriction" — spec
-// §28.10, line 7260); it does NOT decide whether the value is copied. A
+// §28.10); it does NOT decide whether the value is copied. A
 // value type is copied on assignment (§3.6), so `b` holds an INDEPENDENT copy
 // of the choice value and must own its own reference to the runtime-managed
 // payload string (§28.9) — exactly as its plain-`var` twin does. The two
@@ -24568,7 +24667,7 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     LocalDeclInitView v = localDeclInitView(ldNode);
     if (!v.init) return nullptr;
     // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a value-like
-    // choice local. §28.10 (spec §28.10, line 7260) says of a value-typed
+    // choice local. §28.10 (spec §28.10) says of a value-typed
     // right-hand side that "the disposal at scope end is a no-op (these types
     // do not require disposal per §28.9), and the only effect is the
     // reassignability restriction" — so the `using var` spelling must have the
@@ -24734,7 +24833,7 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
 
 
 void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
-    // §28.3 (line 4910): a plain `var` owned local is auto-disposed when an
+    // §28.3: a plain `var` owned local is auto-disposed when an
     // exception unwinds out of its scope (an `unwindOnly` Disposal — normal exit
     // skips it). Only register the conservative eligible subset (see
     // unwindOwnedLocalClass + unwindIneligible_) so the unwind disposal can
@@ -24759,7 +24858,7 @@ void Emitter::registerUnwindOwnedLocal(const ast::LocalDecl* ld) {
 
 void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
                                        llvm::AllocaInst* slot) {
-    // §28.3 (line 4910): an `owned` parameter is auto-disposed when an exception
+    // §28.3: an `owned` parameter is auto-disposed when an exception
     // unwinds out of its method (same unwindOnly mechanism as plain owned
     // locals). Registered in the outermost scope so it covers the whole body.
     if (disposeStack_.empty()) return;
@@ -24793,8 +24892,8 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // (genericSubst_/genericSubstSemaTy_) binds T to a concrete class/interface
     // for this specialization. Fall back through resolveTypeParamRef, mirroring
     // the other disposal-registration sites that already handle this case
-    // (usingVarOwnsClassObjectMoveInit and the local-variable tracking near
-    // line 6640). The Disposal below carries `cls = nullptr` regardless (the
+    // (usingVarOwnsClassObjectMoveInit and the local-variable tracking).
+    // The Disposal below carries `cls = nullptr` regardless (the
     // `dynamicDispose`/`unwindOnly` path already dispatches through the live
     // object's own vtable, exactly as it does for an interface-typed slot), so
     // no further plumbing of the resolved type is needed here.
@@ -24882,7 +24981,7 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // every element it still held were never freed. The compiler had already
     // promised otherwise, in the very diagnostic that fires at this site:
     // "owned parameter `elements` is implicitly disposed at the end of the
-    // method (§28.3 auto-drop)". §28.3 (v0.240, line 6621): "Every owned local
+    // method (§28.3 auto-drop)". §28.3 (v0.240): "Every owned local
     // (and undischarged `owned` parameter) is disposed exactly once on every
     // path by the affine auto-drop"; §28.11 for the owning family: "The
     // collection's `Dispose()` cascades through every element."
@@ -25603,8 +25702,9 @@ struct UnwindIneligibleWalker {
                 // walker may leave a symbol unwind-ELIGIBLE only when the codegen
                 // NULLS its slot at the transfer, so the null-guarded unwindOnly
                 // disposal skips the transferred value on the post-transfer edge.
-                // After the fix (LlvmBackend_Assign.cpp:14676), buildOrderedArgs
-                // handles `move x` by unwrapping the MoveExpr to its operand
+                // After the fix (`Emitter::buildOrderedArgs` in
+                // LlvmBackend_Assign.cpp), it handles `move x` by unwrapping the
+                // MoveExpr to its operand
                 // identifier and recording that identifier in transferredOwnedArgSlots,
                 // so nullTransferredOwnedLocalSlot nulls the slot — the invariant
                 // holds for both a bare-id and a `move x` source, and `M(move x)`
@@ -25947,7 +26047,7 @@ struct UnwindIneligibleWalker {
                 expr(ld->initializer.get(), /*consuming=*/false);
                 return;
             }
-            // fix #3039 / §28.3 K3.13 (v0.240 line 6273): an UNMARKED, NON-`using`
+            // fix #3039 / §28.3 K3.13 (v0.240): an UNMARKED, NON-`using`
             // `var alias := <owned source>;` where the source is a bare-id named
             // owned local (plain `var`, non-`using`) or `owned` parameter is a
             // BORROW — K3.13 verbatim: "An **unmarked read of a class-typed
@@ -25956,9 +26056,9 @@ struct UnwindIneligibleWalker {
             // just copies the pointer); `r` keeps the obligation, and the
             // auto-drop branch in `registerUnwindOwnedParam` (#3035, v0.240) now
             // covers the NORMAL exit (`ps->autoDropAtScopeEnd` ⇒
-            // `dynamicDispose`). On the EXCEPTION edge (K3.15, v0.240 line 6275:
+            // `dynamicDispose`). On the EXCEPTION edge (K3.15, v0.240:
             // "The exception edge performs the same implicit disposal as the
-            // normal edge"), the residual bail at line 15254 dropped the
+            // normal edge"), the residual bail dropped the
             // `unwindOnly` registration for a parameter the walker had over-
             // conservatively tainted — the catch-all below walked the source as
             // `consuming=true`, mirroring `using var` (the W7L2 #3035 fix only
@@ -27427,8 +27527,9 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // `string.Repeat(c: char, count: int)` (2 args, lowerStaticCall → inline
     // malloc + initStringRc). Each is a builtin (no resolved MethodSymbol —
     // isUserMethodStringReturnCall below never sees them), each hands the caller
-    // exactly +1, and each lowers in LlvmBackend_Calls2.cpp (~line 466 / 485 /
-    // 622). The same family as the #2199 instance string-transforming methods;
+    // exactly +1, and each lowers in `Emitter::tryLowerStringMethod`
+    // (LlvmBackend_String.cpp). The same family as the #2199 instance
+    // string-transforming methods;
     // the static factories were the residual from the same gap. Without the
     // recognition, `var s := string.From('A')` etc. retain the result at bind
     // (rc 1→2) and release at scope end (rc 2→1) — never dropping the
@@ -28018,7 +28119,8 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // never-defined declaration of the INSTANCE mangling that
                     // nothing ever calls, because the read lowering checks
                     // `importedStaticPropGetterFns_` FIRST and dispatches to the
-                    // STATIC stub instead (LlvmBackend_Exprs.cpp:6826). That
+                    // STATIC stub instead (`importedStaticPropGetterFns_` in
+                    // LlvmBackend_Exprs.cpp). That
                     // static stub is a DIFFERENT function with a DIFFERENT
                     // signature (no `this`) and is NOT normalized by this fix.
                     // Classifying such a read +1 therefore released a borrow
@@ -28088,8 +28190,8 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // its +1 through the task result slot to this read site, where the
     // consumer's `var f := <task>.Result` slot claims ownership and releases it
     // at scope end. The runtime does NOT retain a string when copying into the
-    // task result buffer (bz_task_complete memcpy's the pointer at
-    // bezel_runtime_concurrency.cpp:737, no refcount change), so the read site
+    // task result buffer (bz_task_complete memcpy's the pointer — the
+    // runtime's `bz_task_complete` — with no refcount change), so the read site
     // is the SOLE owner of the +1 after the producer exits — without this
     // recognition the bind-time retain adds an extra +1 the producer never
     // had, and the result string leaks at scope end (18500 B / 1000 iters per
@@ -29548,7 +29650,7 @@ void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
     // takes the `allowUsingVar` opt-in, exactly as the scope-end registration
     // below does, so the two spellings of the copy retain and release
     // symmetrically — §28.10: "the only effect is the reassignability
-    // restriction" (spec §28.10, line 7260), so the runtime lifetime of the
+    // restriction" (spec §28.10), so the runtime lifetime of the
     // `using var` copy must be the plain-`var` copy's. The `await using var`
     // spelling stays refused: the mint refuses it (§28.12 owns that spelling,
     // #7306), and the eligibility membership gate above never admits it.
@@ -29859,8 +29961,8 @@ bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i) {
 //
 // MEASURED on the base tree (`bezelc --sanitize=address`, LSan):
 //   `var a: Array<string> := ["x","y"]; string.Join(",", a);`
-//       → 208 B / 2 allocations leaked (the `bz_array_alloc` header at
-//         collections.cpp:252 and its backing store at :257);
+//       → 208 B / 2 allocations leaked (the `bz_array_alloc` header and
+//         its backing store);
 //   `var a: Array<string> := ["x","y"]; Console.WriteLine(a);`
 //       → the SAME 208 B / 2 allocations — the two are ONE site (#6889);
 //   `var b: Array<char> := ['a','b','c']; string.From(b, 0, 3);`
@@ -31103,7 +31205,7 @@ struct StringEscapeWalker {
                         // "CString" / "WString" / "RawBytes"). Either path
                         // produces the same identifier set for the three
                         // FFI-buffer classes (per #2809's `isFfiBufferTypeRef`
-                        // discipline, LlvmBackend_Calls.cpp:711).
+                        // discipline, `isFfiBufferTypeRef`).
                         std::string_view recvName;
                         if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named) {
                             if (!recvTy->headName().empty())
@@ -31118,8 +31220,8 @@ struct StringEscapeWalker {
                             // declared parameter modifier for these (when
                             // resolvable) is plain (no `owned`), and the
                             // codegen lowers them as plain bz_array_t* / void*
-                            // borrows (see RawBytes.CopyTo arm in
-                            // LlvmBackend_Calls.cpp:7264 — `dest` is
+                            // borrows (see the `RawBytes.CopyTo` arm in
+                            // LlvmBackend_Calls.cpp — `dest` is
                             // `lowerExpr`ed as a bare pointer with no
                             // ownership transfer). Sound: the destination is
                             // copied into, not retained.
@@ -31620,7 +31722,8 @@ struct StringEscapeWalker {
             // because the upstream expr() walk decides per-leaf). Preserved
             // verbatim from the #2023 commit to avoid disturbing the
             // existing string-walk soundness. The stringReleaseMode gate
-            // was implicit via the early-return at line 24266 — with
+            // was implicit via the early-return in `Emitter::unwindOwnedLocalClass`
+            // — with
             // borrowingArrayMode's parallel relaxation now sharing the
             // function body, gate explicitly here.
             if (!safeArg && stringReleaseMode &&
@@ -33026,11 +33129,11 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // A method reference used as a VALUE: a bare IdentifierExpr (a static method
     // of the current type) or a MemberAccessExpr `T.M` / `obj.M` whose resolved
     // symbol is a MethodSymbol — the exact shape codegen lowers to a fresh +1
-    // closure cell via makeMethodThunk (LlvmBackend_Exprs.cpp:1204/1214,
-    // LlvmBackend_Layout.cpp makeMethodThunk). A method *call* is a distinct
+    // closure cell via makeMethodThunk (LlvmBackend_Exprs.cpp's
+    // `Emitter::lowerExprInner`, LlvmBackend_Layout.cpp makeMethodThunk). A method *call* is a distinct
     // CallExpr node (never an IdentifierExpr / MemberAccessExpr), so this cannot
     // misfire on a call. (Sema defers a method reference's Function type to the
-    // call-resolution slice — ExprTypecheck_Calls.cpp:1904 leaves exprType unset
+    // call-resolution slice — `ExprTC::resolveOverload` leaves exprType unset
     // for a bare reference — so we key off the symbol kind, which sema DOES set,
     // matching codegen exactly.) A property/field reference has a
     // Property/Field symbol, not a MethodSymbol, so it is not treated as a
@@ -33038,8 +33141,8 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // safe.
     if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*init))) {
         // A bare IdentifierExpr method reference is lowered to a cell ONLY for a
-        // static method (Exprs.cpp:1204 gates on isStaticMethod); an instance
-        // `obj.M` member access is lowered to a cell for either (Exprs.cpp:1214).
+        // static method (`Emitter::lowerExprInner` gates on isStaticMethod);
+        // an instance `obj.M` member access is lowered to a cell for either.
         // Match those gates exactly so eligibility never arms a release for an
         // init that did not actually produce a +1 cell.
         if (dynamic_cast<const ast::MemberAccessExpr*>(init)) return true;
@@ -33059,7 +33162,8 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // 8 B on the read-twice repro). Mirror the MethodSymbol branch's exact
     // shape — `MemberAccessExpr` is the only AST node that reaches
     // `makePropertyThunk` (the property-as-function-value gate is keyed off a
-    // MemberAccessExpr in LlvmBackend_Exprs.cpp:5673) — AND the
+    // MemberAccessExpr in LlvmBackend_Exprs.cpp's `Emitter::lowerExprInner`) —
+    // AND the
     // producer-emission gates that code applies: the property reference's
     // exprType must be Function (target-typed promotion, §27.6 — sema
     // retypes `o.N` to `() -> T` when the bound slot is function-typed; a
@@ -33158,7 +33262,8 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // closure cell, exactly as the qualified `this.n` form does. The
     // MemberAccessExpr branch missed this case ("only MemberAccessExpr reaches
     // makePropertyThunk" — superseded: the bare-identifier function-value
-    // position check at LlvmBackend_Exprs.cpp:6328 also calls makePropertyThunk
+    // position check in LlvmBackend_Exprs.cpp's `Emitter::lowerExprInner` also
+    // calls makePropertyThunk
     // with receiverVal = currentThis_), so a bare property reference was not
     // recognised as a +1 producer and emitReturn emitted an extra retain →
     // rc=2 on return, stored into the caller's local without an additional
@@ -34265,7 +34370,7 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     // WILD-FREES. MEASURED on this tree's base (plain rc=139
     // `Segmentation fault (core dumped)`; ASan `SEGV ... in
     // __asan::Allocator::Deallocate` <- free <- bz_array_free_dynamic
-    // (bezel_runtime_collections.cpp:351) <- bz$M.Holder$Reset), 500
+    // (the runtime's `bz_array_free_dynamic`) <- bz$M.Holder$Reset), 500
     // reassignments per row:
     //
     //   owned _f: IList<int>;  _f := new MyL();  _f := new MyL();   <- this site
@@ -35254,14 +35359,14 @@ struct ClosureEscapeWalker {
     bool escaped = false;
     // fix #2107-follow-up (§27.5 / §28.9, v0.298): true when the ONLY escape
     // observed for `target` came from a direct reassignment to `target`
-    // itself (the AssignmentStmt / IncrementStmt arms at line 27630-27640
-    // below — these mark `escaped = true` because the old reference is
+    // itself (the AssignmentStmt / IncrementStmt arms below — these mark
+    // `escaped = true` because the old reference is
     // overwritten). When this is the case AND `target` is CALLED in this
     // body, the call-site release is unsound (would free the cell after the
     // FIRST call, leaving the SECOND call's read on a freed pointer — exit
     // 139 SIGSEGV, lambda_divergent_2107's
     // spec_27_3_divergent_under_reassign_target). The post-walk override in
-    // collectClosureReleaseEligible (line 27846 below) re-arms scope-end
+    // collectClosureReleaseEligible re-arms scope-end
     // release in that exact shape: the cell stays alive across calls, scope-
     // end fires once at function exit. NOT an escape through a captured
     // lambda's body or a `return f` transfer — those still leak the +1
@@ -35376,8 +35481,8 @@ struct ClosureEscapeWalker {
     // `closureReleaseEligible_` so its scope-end release balances the +1
     // (the LHS release still fires, both decrements, the cell is freed once
     // — `bz_closure_release` is rc-based and safe to fire on multiple slots
-    // pointing at the same cell, verified against
-    // src/runtime/bezel_runtime_refcounting.cpp line 336). Distinct from
+    // pointing at the same cell, verified against the runtime header's
+    // `bz_closure_release`). Distinct from
     // `escapedDueToReassign`: that flag fires when target IS the LHS of an
     // AssignmentStmt (a `y := ...` reassign, fix #4425 / lane-35 / #2107-
     // follow-up). #4473 fires when target IS the RHS of an AssignmentStmt
@@ -35424,7 +35529,7 @@ struct ClosureEscapeWalker {
     // parameter slot — the `lambdaRef := y` shape where `lambdaRef` is a
     // closure-typed local/parameter in this function and `y` is the walked
     // target. Mirrors `lowerClosureLocalReassign`'s own localSlot/exprType
-    // gates (lines 26681–26690): bare-identifier LHS only (the same shape
+    // gates: bare-identifier LHS only (the same shape
     // `lowerClosureLocalReassign` admits — a member access, array index,
     // parameter slot, etc. takes a different path through the emit
     // pipeline and is not the leak shape this fix targets), resolved
@@ -36031,7 +36136,7 @@ struct ClosureEscapeWalker {
             // fix #4473 (§27.5 / §28.9, v0.301): the read-into path — when
             // target appears as the RHS of an AssignmentStmt whose LHS is
             // a same-scope closure-typed local or parameter slot, the
-            // `lowerClosureLocalReassign` emit path (lines 26674 ff.)
+            // `lowerClosureLocalReassign` emit path
             // retains the newVal and stores it into the LHS slot, but the
             // RHS slot (target's slot) is left pointing at the cell — the
             // +1 it still holds must be balanced by the RHS's scope-end
@@ -36077,7 +36182,7 @@ struct ClosureEscapeWalker {
             // disjunction that does not depend on call count (a
             // non-reassigned read-into local has its +1 retained by
             // `lowerClosureLocalReassign` even when calleeCallCount is
-            // 0, see `LlvmBackend_Calls2.cpp` line 6585 — the call-site
+            // 0, see `emitClosureCall` in LlvmBackend_Calls2.cpp — the call-site
             // release arm only fires for reassigned locals).
             //
             // Requires BOTH conditions: LHS is a closure-typed local/
@@ -36182,9 +36287,10 @@ struct ClosureEscapeWalker {
 // slot is captured by a downstream lambda (`isCapturedCellSlot_`) AND whether
 // the walker also saw a reassignment to that slot. Kept SEPARATE from
 // `collectClosureReleaseEligible` because that helper is called from BOTH
-// function entry (LlvmBackend_Setup.cpp:9473 — the global pre-scan) AND from
-// `lowerLambda` for every nested lambda body
-// (LlvmBackend_Exprs2.cpp:3045 — `collectClosureReleaseEligible(lam.stmts)`,
+// function entry (`Emitter::collectClosureReleaseEligible`'s call in
+// LlvmBackend_Setup.cpp — the global pre-scan) AND from `lowerLambda` for
+// every nested lambda body (LlvmBackend_Exprs2.cpp's `Emitter::lowerLambda` —
+// `collectClosureReleaseEligible(lam.stmts)`,
 // a per-nested-lambda re-scan whose results feed THIS lambda's release
 // discipline, not the enclosing function's). Recursive invocation would
 // clobber the enclosing function's captured-cell verdict before
@@ -36193,11 +36299,11 @@ struct ClosureEscapeWalker {
 //
 // THIS walker is invoked ONCE per function/method body at function entry —
 // same site as `collectClosureReleaseEligible(*ci.stmts)` at
-// LlvmBackend_Setup.cpp:9473 — and never from `lowerLambda`. That keeps the
+// LlvmBackend_Setup.cpp — and never from `lowerLambda`. That keeps the
 // sets stable across the body's lowering: a nested lambda's collect pass
 // clears and repopulates `closureReleaseEligible_` for its OWN scope, but
 // `closureLocalCapturedCellReassigned_` keeps its function-entry values
-// until the function exit (cleared at line 9369-9378 above).
+// until the function exit (cleared above).
 void Emitter::collectCapturedCellClosureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     closureLocalCapturedCell_.clear();
@@ -36263,10 +36369,11 @@ void Emitter::collectClosureReleaseEligible(
     // fix #4434 (§27.5 / §28.9, v0.298): `closureLocalCapturedCell_` and
     // `closureLocalCapturedCellReassigned_` are NOT cleared here — those
     // sets are populated by `collectCapturedCellClosureLocals` (called from
-    // function entry only — see LlvmBackend_Setup.cpp line 9473+1), which
+    // function entry only — see the call in LlvmBackend_Setup.cpp), which
     // runs once per function and must NOT be reset by the recursive
     // `collectClosureReleaseEligible(lam.stmts)` from lowerLambda
-    // (LlvmBackend_Exprs2.cpp:3045). consumeLastLambdaCapturedCells reads
+    // (LlvmBackend_Exprs2.cpp's `Emitter::lowerLambda`).
+// consumeLastLambdaCapturedCells reads
     // these sets when the function body's nested lambdas lower their cells
     // into disposeStack_; the verdict must reflect the OWNING scope's
     // walker, not the most-recently-entered nested lambda's.
@@ -36580,7 +36687,7 @@ void Emitter::collectClosureReleaseEligible(
         // (above), which runs ONLY at function entry — NOT here. The
         // captured-cell verdict must reflect the OWNING scope's walker;
         // the recursive `collectClosureReleaseEligible(lam.stmts)` from
-        // lowerLambda at LlvmBackend_Exprs2.cpp:3045 would otherwise erase
+        // lowerLambda in LlvmBackend_Exprs2.cpp would otherwise erase
         // the outer function's verdict before
         // `consumeLastLambdaCapturedCells` reads it. The post-walk override
         // gate below consults the SEPARATE `closureLocalCapturedCell_` set
@@ -36647,8 +36754,8 @@ void Emitter::collectClosureReleaseEligible(
         // `closureReleaseEligible_`; the RHS's scope-end release then
         // drops the cell's rc by 1 (the LHS's scope-end release drops
         // the second +1 — `bz_closure_release` is rc-based and safe to
-        // fire on multiple slots pointing at the same cell, verified
-        // against src/runtime/bezel_runtime_refcounting.cpp line 336).
+        // fire on multiple slots pointing at the same cell, verified against
+        // the runtime header's `bz_closure_release`).
         // DISTINCT FROM #4425: #4425 fixes the
         // `escapedDueToReassign` arm (target IS the AssignmentStmt LHS,
         // a reassign) by extending the call-count disjunction to
@@ -36658,8 +36765,8 @@ void Emitter::collectClosureReleaseEligible(
         // disjunction that does not depend on the call count (a call
         // does NOT consume a +1 for non-reassigned locals — the
         // LocalSymbol arm of `emitClosureCall` only emits a call-site
-        // release for reassigned locals, see
-        // src/codegen/LlvmBackend_Calls2.cpp line 6585 — so any
+        // release for reassigned locals, see `emitClosureCall` in
+        // LlvmBackend_Calls2.cpp — so any
         // `lambdaRef := y` retains a +1 that ONLY the RHS's scope-end
         // release can balance). The `!w.isCapturedCellSlot_` guard
         // parallels the existing reassign arm: a captured-cell RHS
@@ -36921,13 +37028,13 @@ void Emitter::collectStringReleaseEligible(
             // `using var` one. The exclusion this term used to carry rested on
             // "the async disposal machinery owns that spelling" (#7306) — and
             // with #7322 it no longer does: a value-typed or runtime-managed
-            // right-hand side has no class, so §28.12:7488 gives its scope exit
+            // right-hand side has no class, so §28.12 gives its scope exit
             // the NO-OP ("scope exit takes the synchronous disposal (or the
             // no-op) and likewise awaits nothing"). The async machinery's only
             // remaining share of this spelling is the class-typed one, whose
             // reference is not the runtime-managed value's.
             //
-            // §28.10:7260 is the reason the admission is REQUIRED, not merely
+            // §28.10 is the reason the admission is REQUIRED, not merely
             // permitted: "`using var` accepts a value-type or runtime-managed
             // right-hand side. For ordinary value types and runtime-managed
             // types, the disposal at scope end is a no-op (these types do not
@@ -36952,7 +37059,7 @@ void Emitter::collectStringReleaseEligible(
             // plain-`var` twin takes the `valueLikeChoiceLocalMintsStringPayload`
             // arm below and IS clean, and §28.10 requires the two spellings to
             // have the SAME runtime lifetime ("the only effect is the
-            // reassignability restriction", spec §28.10, line 7260).
+            // reassignability restriction", spec §28.10).
             //
             // WHY THIS IS NOT "WIDEN THE `using var` GATE". The gate stays
             // exactly as #7272 left it: the BORROW arm below is still NOT
@@ -37016,7 +37123,7 @@ void Emitter::collectStringReleaseEligible(
                 // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a
                 // VALUE-LIKE CHOICE local — the arm the plain-`var` twin takes
                 // above, reached here because the outer gate is false for it.
-                // §28.10 (line 7260): "the only effect is the reassignability
+                // §28.10: "the only effect is the reassignability
                 // restriction" — so the runtime lifetime is the plain-`var`
                 // twin's, which owns the construction's +1 payload and releases
                 // it at scope end. Classified here, armed by
@@ -37343,7 +37450,7 @@ static bool isProvablyFreshImportedRecordFactoryMethod_(
     if (!ms || !recTs) return false;
     if (ms->decl) return false;  // locals: let isProvablyFreshRecordFactoryMethod handle.
     // Guard (a): must be static. mirrors Emitter::isStaticMethod's body
-    // (LlvmBackend_impl.hpp:2964) which is private — duplicated locally
+    // (`resolveSlotParam`) which is private — duplicated locally
     // rather than reaching into Emitter's privates.
     bool isStatic = ms->isOperator;  // §25: operators are always static
     for (auto mod : ms->modifiers) {
@@ -38514,7 +38621,7 @@ bool Emitter::isFreshRecordConstructionOfExactType(
                 // "provably fresh" is sound ONLY because the CALLER-side
                 // suppression is ALREADY shipped and is call-wide, not
                 // context-specific: `calleeReturnMayAliasArgUnretained`
-                // (walkCallArgs, ~line 23561) marks EVERY call whose callee
+                // (`walkCallArgs`) marks EVERY call whose callee
                 // returns a Record/Choice as "may alias an arg unretained",
                 // which withholds ALL of that call's own argument-locals
                 // from their own scope-end release — so the single +1 the
@@ -39751,7 +39858,7 @@ bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
 // The three recognizers above all end in a `dynamic_cast<CallExpr*>`, so a
 // receiver that is a `new` expression matches NONE of them and the whole
 // reclaim is skipped. That is a gap in the CLASSIFIER, not a misclassification:
-// `isFreshOwnedClassProducer` (OwnershipFacts.cpp:452), the shared owned-producer
+// `isFreshOwnedClassProducer` (OwnershipFacts.cpp), the shared owned-producer
 // predicate, also answers false here — it ends in
 // `rt->declaration->kind == TypeDeclKind::Class`, and every builtin collection
 // is DECLARATION-LESS (stdlib §4.4–§4.11 declare them without a TypeDecl), so
@@ -39790,8 +39897,8 @@ bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
 //     `bz_dict_free` / `bz_array_free` by the receiver's own backing).
 //
 // MEASURED on this fix's parent, 400 iterations of `(new Set<int>()).Count`:
-// 141,152 B in 802 allocations (`bz_dict_alloc_generic` +
-// bezel_runtime_collections.cpp:1083, one table plus one header per
+// 141,152 B in 802 allocations (`bz_dict_alloc_generic` in the runtime —
+// one table plus one header per
 // iteration); `bz_dict_free` is emitted 0 times. The `Array<int>` twin
 // `(new Array<int>()).Count` leaks the same way — `bz_array_free` is likewise
 // never emitted — which is why the predicate is keyed on the head registry
@@ -39861,10 +39968,11 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
     // collection-free sites in the backend now name one classification.
     bool freeIsLlist = isLinkedListTypeName(recvTy);
     // The set-family half: `Set`/`OwningSet`/`SortedSet`, the triple the Set
-    // member arms already name (LlvmBackend_Calls.cpp:2445). Held as its own
+    // member arms already name (LlvmBackend_Calls.cpp's Set-family heads).
+    // Held as its own
     // fact because TWO later decisions need it — which runtime free to call
     // (`SortedSet` is deliberately NOT in `kDictionaryNames` even though
-    // BuiltinRegistry.cpp:210-212 documents that it "shares the generic-key
+    // BuiltinRegistry.cpp documents that it "shares the generic-key
     // hash table", so `isDictTypeName` alone would free a `SortedSet<string>`
     // through `bz_array_free` — a wrong-free, not a missed free), and whether
     // `bz_set_string_keys_release`'s "read the string pointer from each key
@@ -39888,8 +39996,8 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
     // element lives at all (the element is the KEY slot, and `e.val` is unset).
     // Measured on a first draft of this arm that fell through with the array
     // disposer still in `elemDisp`: ASan SEGV, `bz_string_release` on address
-    // 0x19 via `bz$strElemRelease` called from `bz_dict_free`
-    // (bezel_runtime_collections.cpp:868) — a wild pointer read, i.e. the
+    // 0x19 via `bz$strElemRelease` called from `bz_dict_free` — a wild
+    // pointer read, i.e. the
     // disposer was aimed at the wrong column. The dict arm therefore keeps
     // `elemDisp` NULL, which is what the two pre-existing dict arms in this
     // function already pass for exactly this reason.
@@ -39983,7 +40091,7 @@ void Emitter::freeUnboundOwnedBorrowingArrayTemp(
     //
     // Reading the slot from `genericArgs[1]` is what makes it correct rather
     // than merely plausible: `bz_dict_free` applies its second argument to
-    // `e.val` (bezel_runtime_collections.cpp:868), which is exactly the column
+    // `e.val` (the runtime's `bz_dict_free`), which is exactly the column
     // `genericArgs[1]` describes, so the thunk is aimed where the reference
     // lives — the same alignment `#6352`'s comment above records as the thing
     // its own first draft got wrong when it passed the ARRAY disposer here.
@@ -41972,7 +42080,8 @@ struct BoxEscapeWalker {
             // longer-lived location, so the call cannot cause the box to be
             // retained. This matches codegen reality: `bz_box_retain` is emitted
             // ONLY for lambda capture and class-field store (lowerLambda /
-            // Setup:5421), never for a plain method-call receiver. So when the
+            // the class-field store in LlvmBackend_Setup.cpp), never for a plain
+            // method-call receiver. So when the
             // callee is a member access (regular OR null-conditional) whose
             // target IS the tracked local, the receiver read is safe (skip the
             // walk — the box's rc is unchanged by the call). The CALL'S ARGS are
@@ -46602,7 +46711,8 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                     // body scan, which genuinely needs the AST node.
                     // SEAM-ACCESSOR: local-path cast; the imported case is
                     // handled via sema::methodReturnsOwned just below
-                    // (same #3189 pattern as :17825); `md` is only used
+                    // (same #3189 pattern as `Emitter::lowerLocalDecl`); `md` is
+                    // only used
                     // later for a LOCAL-only concern. #3152
                     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
                     bool isOwned = sema::methodReturnsOwned(*ms, ctx_);
@@ -47499,7 +47609,7 @@ llvm::Value* Emitter::materializeCollectionLiteralForArg(
 //
 // The static call's signature: `owned C<U>` return → a bare `ptr` (a
 // heap-object pointer), no receiver argument (it's static). `methodFns_[ms]`
-// is populated by `declareFunctions()` (line 1726) which runs before any
+// is populated by `declareFunctions()`, which runs before any
 // method body is lowered, so the LLVM function pointer is already available.
 //
 // Returns null when `collTy` is not a user-defined FCL target or the signature
@@ -47525,8 +47635,8 @@ llvm::Value* Emitter::materializeUserTypeCollectionLiteral(
 
     // Walk the user type's members for a PUBLIC STATIC method named exactly
     // `FromCollectionLiteral` (§15.4.1: name-based recognition). The walk
-    // mirrors the sema-side gate (ExprTypecheck_Calls.cpp lines 397-413) and
-    // §15.4.1's "the method must be public, must be static, must be declared
+    // mirrors the sema-side gate and §15.4.1's "the method must be public,
+    // must be static, must be declared
     // directly on the collection type" rule. Multiple matches decline — the
     // sema side already rejects declaring both forms, so anything reaching
     // here should be exactly one.
@@ -47600,8 +47710,8 @@ llvm::Value* Emitter::materializeUserTypeCollectionLiteral(
     // Build a heap-allocated bz_array_t<U> as the span's backing storage, fill
     // it with the n element values via bz_array_add, and pass it as the
     // source field of the ReadOnlyArraySpan<U> value. The span's indexer reads
-    // through bz_array_len / bz_array_get (LlvmBackend_Assign.cpp lines 374
-    // and 383), so the source MUST be a real bz_array_t* — not a raw element
+    // through bz_array_len / bz_array_get (the collection indexer in
+    // LlvmBackend_Assign.cpp), so the source MUST be a real bz_array_t* — not a raw element
     // buffer; the spec's "the storage for the span may be stack-allocated"
     // allowance is interpreted to mean "the backing is allocated by codegen
     // and released after the call" (consistent with the lifetime rule and
@@ -47786,7 +47896,7 @@ const sema::TypeRef* Emitter::builtinByteArrayTypeRef() {
     return tr;
 }
 
-// #1501 / stdlib §6.7 (line 2884) / §30.10: build (once) a concrete
+// #1501 / stdlib §6.7 / §30.10: build (once) a concrete
 // `Array<Task>` sema::TypeRef for the Task.WhenAny/WhenAll `tasks` argument.
 // `Task.WhenAny(tasks: Array<Task>)` and `Task.WhenAll(tasks: Array<Task>)`
 // are compiler intrinsics with no MethodDecl params, so — exactly like the
@@ -47826,7 +47936,7 @@ const sema::TypeRef* Emitter::builtinTaskArrayTypeRef() {
     return tr;
 }
 
-// #1501 / stdlib §6.7 (line 2884) / §30.10: lower the `tasks` argument of
+// #1501 / stdlib §6.7 / §30.10: lower the `tasks` argument of
 // Task.WhenAny/WhenAll. When the argument is an inline collection literal
 // `[t1, t2, …]` (the natural "select" idiom pairing WhenAny with per-branch
 // Receive tasks), materialize it into an owned `Array<Task>` temporary via the
@@ -47902,7 +48012,7 @@ llvm::Value* Emitter::lowerByteArrayFactoryArg(const ast::Expr& argExpr) {
     // #998 / §28.3: when the argument is a plain `var` (non-using) local of
     // collection type (e.g. `var b: Array<byte>`), no scope-end disposal is
     // registered at declaration time — the non-using lowerStmt path calls only
-    // registerUnwindOwnedLocal, which skips collections (§28.3 line 4910 covers
+    // registerUnwindOwnedLocal, which skips collections (§28.3 covers
     // class instances, not collection builtins). Register the caller's array for
     // scope-end disposal here, on the NORMAL AND UNWIND paths, so the factory
     // merely borrows the bytes while the caller disposes exactly once at scope end.
@@ -48415,7 +48525,8 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         // so `dictTy->headName() == "SortedDictionary"` can no longer hold at
         // this call site; the retarget was also the path that leaked the
         // backing table (#3517 item 1). `lowerNew`'s own retarget
-        // (LlvmBackend_Exprs2.cpp:5474) is untouched — `new
+        // (`Emitter::storePrimaryCtorPositionalArgs` in LlvmBackend_Exprs2.cpp)
+        // is untouched — `new
         // SortedDictionary<K, V>()` remains legal and unaffected.
         auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
                                  {i64(), ptrTy(), ptrTy()});
@@ -48853,7 +48964,7 @@ const sema::TypeSymbol* Emitter::classOfLocal(const ast::LocalDecl* ld) {
 bool Emitter::lowerScopedBlock(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                       std::size_t startIdx) {
     disposeStack_.emplace_back();
-    // §28.3 (line 4910): the function-body ROOT scope (the first one pushed)
+    // §28.3: the function-body ROOT scope (the first one pushed)
     // owns the unwind disposal of the method's `owned` parameters. Register them
     // here, where a scope finally exists, then clear so nested scopes don't
     // re-register. (A lambda/thunk body that opens its own root scope inherits

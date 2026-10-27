@@ -12,6 +12,7 @@
 
 #include "ast/Node.hpp"
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
+#include "common/DisposalKind.hpp"   // §28.9/§28.10: the shared disposal anchor
 #include "common/OwnershipFacts.hpp"   // #1414 stage 4: shared ownership-facts core
 #include "common/PatternAResultCollection.hpp"  // fix #4338: isPatternAResultCollectionHead
 #include "flow/CFG.hpp"
@@ -727,7 +728,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     if (isAsync_) {
         annotateSuspendLocals(*cfg);
         addCompletionEdges(*cfg);
-        // SB01-C1 (§30.5 line 7341, v0.190, #1786): record the plain owned task
+        // SB01-C1 (§30.5, v0.190, #1786): record the plain owned task
         // locals that are borrow-awaited, so the endState gate below auto-drops
         // them (their ordinary §28.3 scope-end discharge) rather than the
         // suspend-local hard reject. // per §30.5, §28.3
@@ -1360,11 +1361,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // never marks) has no suspend-local signal to gate on, so it keeps the
             // reject. // per §28.12/§30.5
             //
-            // SB01-C1/D2 (§30.5 line 7341/7351, §28.12, v0.190, #1786/#1868): a
+            // SB01-C1/D2 (§30.5, §28.12, v0.190, #1786/#1868): a
             // plain owned TASK local is exempted from the suspend-local reject
-            // even when it crosses a suspend point — §30.5 admits it (line 7351)
+            // even when it crosses a suspend point — §30.5 admits it
             // and says it "keeps its ordinary §28.3 discharge (auto-drop at scope
-            // end)" (line 7341), exactly like an admitted `using var` task
+            // end)", exactly like an admitted `using var` task
             // suspend-local. Codegen disposes it at scope end via the task path
             // (bz_task_fire_and_forget, LlvmBackend_Stmts #445), which fires on
             // EVERY reachable terminal edge: the normal fall-off/return
@@ -8520,112 +8521,27 @@ bool MethodOwnership::typeIsProvablyTrivialDisposeClass(
 }
 
 bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
+    // THE ANCHOR (§28.9 / §28.10, v0.345): the shared authority
+    // `common::classifyDisposal` answers this question for BOTH sides — the
+    // sema/ownership pass here and the codegen registration
+    // (`Emitter::registerUsingDisposal`). Two near-answering authorities, each
+    // answering a DIFFERENT question, each with a different population, is
+    // the #3419 "duplicated classification predicates" shape; #7338 was that
+    // shape biting: the §28.9 vacuity lint and the codegen predicate
+    // DISAGREED about the `Type` token, and the codegen side took the CLASS
+    // disposal path over an interned runtime value.
+    //
+    // The verdict's `carriesObligation` is EXACTLY this predicate's old
+    // answer — a class/interface with a destructor or an `owned` field, or a
+    // disposable built-in head — so the lint's behaviour is unchanged. It is
+    // deliberately NOT `common::isNonTrivialDisposeClass`: fix #3588 kept
+    // these two apart on purpose, and that predicate's comment records the
+    // five axes on which they differ (base chain, owning inline array,
+    // captured `owned` primary-ctor parameter, `static owned` field, and the
+    // imported carried verdict). The anchor does not change that decision —
+    // it changes who ANSWERS it, so the two sites cannot drift.
     if (!rt) return false;
-    if (rt->kind != sema::TypeRef::Kind::Named) return false;
-    // Path 1: user class/interface with disposal obligation. Walk the
-    // declaration's members for a destructor or `owned` field — a COARSER
-    // relative of the §28.9 non-trivial-dispose test. False for a value type
-    // (record/enum/inline-array) — those are never disposable.
-    //
-    // This walk is deliberately NOT `common::isNonTrivialDisposeClass` (which
-    // this file does call, at the §28.3 auto-drop gate above). It serves the
-    // §28.10 vacuous-pin lint and differs on purpose: it also matches
-    // INTERFACES, it pairs with the builtin head-name table in Path 2 below,
-    // and it does not walk base chains. (A prior version of this comment
-    // claimed the shared predicate could not be called here because it "lives
-    // in sema::ExprTC and pulling it in would create a circular dependency";
-    // #2654 disproved that by relocating the body to `common::` as a free
-    // function, so the reason recorded here is now the real one — the two
-    // predicates answer different questions. Per #2666 / #2671 note 1.)
-    //
-    // fix #3588 (§28.10 / §28.9, v0.286) RE-EXAMINED AND KEPT SEPARATE. That
-    // change collapsed the three genuine copies of §28.9's classification onto
-    // `common::isNonTrivialDisposeClass` and deliberately left this one where
-    // it is. Read side by side, the two answer differently on five axes — and
-    // in BOTH directions, so no argument to the shared predicate recovers
-    // this one:
-    //   1. BASE CHAIN. This scans `rt->declaration->members` and stops; the
-    //      shared predicate walks up the base classes. A derived class whose
-    //      destructor or `owned` field is on the BASE -> false here, true
-    //      there.
-    //   2. OWNING INLINE ARRAY (`[N owned]T?` / `[N owned]T`, §15.1.1). No arm
-    //      here; §28.9's third disqualifier there (#2666) -> false / true.
-    //   3. CAPTURED `owned` PRIMARY-CTOR PARAMETER (§22.10). The loop below
-    //      reads `fs->modifiers`, and a positional field's `FieldSymbol` never
-    //      has that vector populated (`SymbolCollection.cpp:441-455` sets
-    //      `posParam` and leaves `modifiers` empty) — the modifier lives at
-    //      `fs->posParam->modifier`, which only the shared predicate reads.
-    //      -> false / true.
-    //   4. `static owned` FIELD. The loop below does not exclude `static`;
-    //      the shared predicate does, because §22.12 rule 4 / §22.13 dispose
-    //      a static at process exit, not with the instance. -> TRUE here,
-    //      false there. (Code-level; §22.12 rule 2 makes the declaration hard
-    //      to reach for a user class type — measured: `public static owned r:
-    //      R? := null;` is rejected outright — so treat this axis as a latent
-    //      difference, not a live one.)
-    //   5. IMPORTED CARRIED VERDICT. This never reads
-    //      `importedNonTrivialDispose`; the shared predicate consults it per
-    //      level (#3191). An imported destructor-bearing class -> false here,
-    //      true there.
-    // And the two are not even total over the same domain: Path 2 below
-    // answers for a declaration-less builtin head from
-    // `isDisposableBuiltinHeadName`, where the shared predicate — which takes
-    // a `TypeSymbol*` — has no argument to be called with at all.
-    //
-    // (The "it also matches INTERFACES" line above is about the KIND GATE, not
-    // about an answer: an interface can declare neither a destructor nor a
-    // field — measured, both are parse errors in an interface body — so Path 1
-    // returns false for an interface either way. Kept because the gate is
-    // deliberate, corrected here so it is not read as a sixth axis.)
-    //
-    // Collapsing these would move the §28.10 vacuity lint on every reachable
-    // axis, in the direction that recommends a `const` remedy which leaks
-    // (#2812's measured shape). // per §28.10, fix #3588
-    if (rt->declaration) {
-        if (rt->declaration->kind != ast::TypeDeclKind::Class &&
-            rt->declaration->kind != ast::TypeDeclKind::Interface)
-            return false;
-        for (sema::Symbol* m : rt->declaration->members) {
-            if (dynamic_cast<sema::DestructorSymbol*>(m)) return true;
-            auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
-            if (!fs) continue;
-            for (auto mod : fs->modifiers) {
-                if (mod == "owned") return true;
-            }
-        }
-        return false;
-    }
-    // Path 2: built-in named type with no user TypeDecl. Consult the SHARED
-    // authority — common::isDisposableBuiltinHeadName — that the codegen auto-
-    // drop chain (registerUsingDisposal, LlvmBackend_Setup.cpp) also consults at
-    // its end-of-chain guard. fix #2992 (§28.3 / §28.9 / §28.10, v0.240): this
-    // was a private hand-list that DISAGREED with codegen's per-arm enumeration
-    // — 13 names (the borrowing collections Array/Stack/Queue/Set/SortedSet/
-    // Dictionary/SortedDictionary/LinkedList, plus Stopwatch, Random, Atomic,
-    // AtomicInteger, Buffer) were claimed by the chain but absent here, so a
-    // factory-call `using var x := MakeArr()` over `Array<T>` fired the vacuous-
-    // pin warning on a real disposal (measured). The two now consult one table;
-    // the rationale for each name's disposal obligation lives in the shared
-    // table's own comments. // per §28.3 / §28.9 / §28.10, fix #2992
-    //
-    // fix #2812 (§28.9 / §28.10 / §32.6, v0.240): an IMPORTED named type has
-    // no astNode (the loader has no AST to set it on; #495's `importedName`
-    // side channel carries the textual name instead). The pre-fix early-return
-    // below answered false for every imported type, so a `using var c :=
-    // L.dup(…)` over an imported method's `owned CString` return — exactly
-    // the FFI-buffer shape §32.6 names — was misclassified as not-disposable
-    // and the §28.10 vacuity warning fired with a `const c := …` remedy that
-    // would leak the malloc'd buffer (#2826 sibling). Fix: also read the
-    // importedName field and consult the same predicate, so the result is
-    // the SAME verbatim membership test the local-occurrence path produces
-    // (headName already routes through importedName when astNode is null;
-    // reusing the same field keeps the two paths incapable of drifting).
-    // // per §28.9, §28.10, §32.6, #2812
-    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
-        return common::isDisposableBuiltinHeadName(rt->headName());
-    if (!rt->importedName.empty())
-        return common::isDisposableBuiltinHeadName(rt->importedName);
-    return false;
+    return common::classifyDisposal(rt, ctx_).carriesObligation;
 }
 
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
