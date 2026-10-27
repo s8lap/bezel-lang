@@ -15394,6 +15394,7 @@ The composition step resolved these seams:
   - **K7:** the meet over if-expression arms. Patterns 1 and 2 of §28.3.3 remain the statement forms; they are not repeated.
   - **K8:** a temporary that lends within its statement, and the binding that would carry its borrow past it.
   - **K9:** the replacing `move` and the nullable bare take; then, in a block of its own, the rejected bare take of a non-nullable field.
+- **Bare statements.** A statement-level example is written as bare statements beside only the declarations it needs (a class whose field or method is the point, or a bare method), the doc-example corpus hosts such a block with the manifest note `wrap:mixed`, and leaving out the `class Example` and `Run` wrappers saves 24 lines.
 - **One example per clause, not per sub-clause.** The sub-clauses an example covers are named in its comments. K5's clauses 4, 7 and 8 are left to their home sections, which carry worked examples: Pattern A chaining (§30.5), §28.14's storage admission and §30.12's guards.
 - **The map of §28.3** says that each kernel clause now closes with an example.
 

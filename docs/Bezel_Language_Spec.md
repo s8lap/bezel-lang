@@ -6333,15 +6333,11 @@ end Widget;
 *Example.* A fresh production is owned, an unmarked read lends, and a `move` leaves the binding moved-from:
 
 ```bezel
-class Example
-  public static method Run()
-    var a := new Widget("a");     // owned: a fresh production (K1.5)
-    var b := a;                   // borrowed: an unmarked read of an owned binding lends (K1.5)
-    Console.WriteLine(b.Name);
-    using var c := move a;        // `c` owned; `a` moved-from (K1.3)
-    Console.WriteLine(a.Name);    // error (K1.3): `a` is unreadable until reassigned
-  end Run;
-end Example;
+var a := new Widget("a");     // owned: a fresh production (K1.5)
+var b := a;                   // borrowed: an unmarked read of an owned binding lends (K1.5)
+Console.WriteLine(b.Name);
+using var c := move a;        // `c` owned; `a` moved-from (K1.3)
+Console.WriteLine(a.Name);    // error (K1.3): `a` is unreadable until reassigned
 ```
 
 <a id="sec-kernel-k2"></a>
@@ -6365,15 +6361,15 @@ class Shelf
   private owned _top: Widget := new Widget("top");
   public method Top(): Widget => _top;          // allowed (K2.4): a receiver-sourced borrow
   public method Pick(w: Widget): Widget => w;   // error (K2.4): a plain return announces the receiver, not `w`
-  public static method Run(outer: Widget)
-    var keep := outer;                          // allowed (K2.3): `outer` outlives `keep`
-    do
-      using var inner := new Widget("inner");
-      keep := inner;                            // error (K2.3): the borrow would outlive its source `inner`
-    end;
-    Console.WriteLine(keep.Name);
-  end Run;
 end Shelf;
+
+using var outer := new Widget("outer");
+var keep := outer;                          // allowed (K2.3): `outer` outlives `keep`
+do
+  using var inner := new Widget("inner");
+  keep := inner;                            // error (K2.3): the borrow would outlive its source `inner`
+end;
+Console.WriteLine(keep.Name);
 ```
 
 <a id="sec-kernel-k3"></a>
@@ -6405,15 +6401,15 @@ end Shelf;
 class Box
   private owned _w: Widget? := null;
   public method Put(owned w: Widget) => _w := w;  // K3.1: the owned field announces the store; no marker
-  public static method Run(box: Box)
-    var a := new Widget("a");
-    box.Put(move a);                // K3.3: an owned argument takes the marker
-    var b := new Widget("b");
-    var c := move b;                // K3.4: a marked binding transfer; `b` is moved-from
-    c := new Widget("c");           // K3.11: displaces "b", disposed after the right-hand side
-    _ := c;                         // K3.9: the discard disposes "c" at the statement's end
-  end Run;
 end Box;
+
+using var box := new Box();
+var a := new Widget("a");
+box.Put(move a);                // K3.3: an owned argument takes the marker
+var b := new Widget("b");
+var c := move b;                // K3.4: a marked binding transfer; `b` is moved-from
+c := new Widget("c");           // K3.11: displaces "b", disposed after the right-hand side
+_ := c;                         // K3.9: the discard disposes "c" at the statement's end
 ```
 
    Three principles govern the enumeration:
@@ -6425,17 +6421,14 @@ end Box;
 *Example.* The marker is written where nothing else announces the consume (K3.13), and an undischarged value is disposed at its scope's end (K3.14):
 
 ```bezel
-class Example
-  public static method Take(owned w: Widget) => w.Dispose();
-  public static method Run()
-    var a := new Widget("a");
-    var b := a;                     // a borrow: an unmarked read never consumes (K3.13)
-    Take(new Widget("t"));          // a fresh producer takes no marker (K3.13)
-    Take(a);                        // error (K3.13, §22.3): this call consumes `a`; write `Take(move a)`
-    using var u := new Widget("u"); // a `using var`: disposed at scope end, no warning
-    var v := new Widget("v");       // auto-dropped at scope end, with the must-use warning (K3.14)
-  end Run;
-end Example;
+public static method Take(owned w: Widget) => w.Dispose();
+
+var a := new Widget("a");
+var b := a;                     // a borrow: an unmarked read never consumes (K3.13)
+Take(new Widget("t"));          // a fresh producer takes no marker (K3.13)
+Take(a);                        // error (K3.13, §22.3): this call consumes `a`; write `Take(move a)`
+using var u := new Widget("u"); // a `using var`: disposed at scope end, no warning
+var v := new Widget("v");       // auto-dropped at scope end, with the must-use warning (K3.14)
 ```
 
 <a id="sec-kernel-k4"></a>
@@ -6456,18 +6449,15 @@ The [consume table](#sec-consume-table) records the verdicts these bits decide, 
 *Example.* An explicit `Dispose()` while a borrow lives is permitted (K4.2). The flag catches a later use on the path where the kill ran (K4.1), and a use that the kill precedes on every path is [§28.2](#sec-checked-disposal)'s compile error:
 
 ```bezel
-class Example
-  public static method Run(flag: bool)
-    var a := new Widget("a");
-    var b := a;                         // a live local borrow of the value `a` holds
-    if flag then a.Dispose(); end;      // allowed (K4.2, K5.3): a site-announced kill is not frozen
-    Console.WriteLine(b.Name);          // flag true: DisposedAccessException in checked mode (K4.1)
-    var c := new Widget("c");
-    var d := c;
-    c.Dispose();
-    Console.WriteLine(d.Name);          // error (§28.2): the disposal of `c` precedes this use on every path
-  end Run;
-end Example;
+var flag := new Random().NextBoolean();
+var a := new Widget("a");
+var b := a;                         // a live local borrow of the value `a` holds
+if flag then a.Dispose(); end;      // allowed (K4.2, K5.3): a site-announced kill is not frozen
+Console.WriteLine(b.Name);          // flag true: DisposedAccessException in checked mode (K4.1)
+var c := new Widget("c");
+var d := c;
+c.Dispose();
+Console.WriteLine(d.Name);          // error (§28.2): the disposal of `c` precedes this use on every path
 ```
 
 *Example.* A plain field that holds a parameter's borrow is admitted on the field-held trust clause (K4.3), and the trust-admission report ([§28.3](#sec-diagnostics)) names the store:
@@ -6501,30 +6491,22 @@ end Tag;
 *Example.* A transfer (clause 1) and a drop-on-overwrite (clause 2) of a binding are frozen while a borrow of its value is live:
 
 ```bezel
-class Example
-  public static method Run()
-    var a := new Widget("a");
-    var b := a;                    // a live local borrow of the value `a` holds
-    var c := move a;               // error (K5.1): cannot consume `a` while the borrow held by `b` is live
-    var x := new Widget("x");
-    var y := x;
-    x := new Widget("x2");         // error (K5.2): the store would dispose the value `y` borrows
-    Console.WriteLine(b.Name + y.Name);
-  end Run;
-end Example;
+var a := new Widget("a");
+var b := a;                    // a live local borrow of the value `a` holds
+var c := move a;               // error (K5.1): cannot consume `a` while the borrow held by `b` is live
+var x := new Widget("x");
+var y := x;
+x := new Widget("x2");         // error (K5.2): the store would dispose the value `y` borrows
+Console.WriteLine(b.Name + y.Name);
 ```
 
 *Example.* A live closure is a live local borrow of its captures' sources (clause 5):
 
 ```bezel
-class Example
-  public static method Run()
-    var a := new Widget("a");
-    var show := lambda() => a.Name;   // a live closure: a live local borrow of `a` (K5.5)
-    var c := move a;                  // error (K5.1, K5.5): cannot consume `a` while `show` is live
-    Console.WriteLine(show());
-  end Run;
-end Example;
+var a := new Widget("a");
+var show := lambda() => a.Name;   // a live closure: a live local borrow of `a` (K5.5)
+var c := move a;                  // error (K5.1, K5.5): cannot consume `a` while `show` is live
+Console.WriteLine(show());
 ```
 
 *Example.* A field is not frozen (clause 6): the store runs, and the borrow it leaves stale faults at its next use. The store is in another method, so [§28.7](#sec-reassigning-owned-fields)'s rule for a use after a dominating field write does not reach the use; with `_w := new Widget("second");` written in `Show` in place of the call, the use would be that rule's compile error:
@@ -6553,16 +6535,14 @@ end Shelf;
 *Example.* An iterator's frame carries the sources of its plain arguments, so a returned frame is admitted exactly where every caller re-establishes them:
 
 ```bezel
-class Example
-  public static method Names(w: Widget): IEnumerable<string>
-    yield return w.Name;
-  end Names;
-  public static method Forward(w: Widget): IEnumerable<string> => Names(w);  // allowed (K6.2): every caller re-establishes `w`
-  public static method Local(): IEnumerable<string>
-    using var w := new Widget("local");
-    return Names(w);               // error (K6.2): the returned frame carries the `using var` `w`
-  end Local;
-end Example;
+public static method Names(w: Widget): IEnumerable<string>
+  yield return w.Name;
+end Names;
+public static method Forward(w: Widget): IEnumerable<string> => Names(w);  // allowed (K6.2): every caller re-establishes `w`
+public static method Local(): IEnumerable<string>
+  using var w := new Widget("local");
+  return Names(w);               // error (K6.2): the returned frame carries the `using var` `w`
+end Local;
 ```
 
 <a id="sec-kernel-k7"></a>
@@ -6579,15 +6559,12 @@ The direction is deliberate: rejection at 3 rather than demotion is what makes t
 *Example.* The meet over expression arms; Patterns 1 and 2 of [§28.3](#sec-ownership-state-of-locals) are the statement forms:
 
 ```bezel
-class Example
-  public static method Run(flag: bool)
-    var a := new Widget("a");
-    var c := (if flag then new Widget("b") else move a);  // owned ⊓ owned (K7.1); `a` consumed only when selected
-    Console.WriteLine(a.Name);                        // error (K7.4): `a` is maybe-consumed after the join
-    var d := (if flag then c else new Widget("d"));   // error (K7.3): borrowed ⊓ owned (an unmarked `c` lends)
-    var e := (if flag then c else null);              // borrowed: the null arm absorbs (K7.5)
-  end Run;
-end Example;
+var flag := new Random().NextBoolean();
+var a := new Widget("a");
+var c := (if flag then new Widget("b") else move a);  // owned ⊓ owned (K7.1); `a` consumed only when selected
+Console.WriteLine(a.Name);                        // error (K7.4): `a` is maybe-consumed after the join
+var d := (if flag then c else new Widget("d"));   // error (K7.3): borrowed ⊓ owned (an unmarked `c` lends)
+var e := (if flag then c else null);              // borrowed: the null arm absorbs (K7.5)
 ```
 
 <a id="sec-kernel-k8"></a>
@@ -6605,11 +6582,10 @@ end Example;
 class Shelf
   private owned _top: Widget := new Widget("top");
   public method Top(): Widget => _top;
-  public static method Run()
-    Console.WriteLine(new Shelf().Top().Name);  // allowed (K8.4): a borrow within the boundary; disposed at its end (K8.1)
-    var t := new Shelf().Top();                 // error (K8.4): `t` would borrow from a temporary disposed at this statement's end
-  end Run;
 end Shelf;
+
+Console.WriteLine(new Shelf().Top().Name);  // allowed (K8.4): a borrow within the boundary; disposed at its end (K8.1)
+var t := new Shelf().Top();                 // error (K8.4): `t` would borrow from a temporary disposed at this statement's end
 ```
 
 <a id="sec-kernel-k9"></a>
