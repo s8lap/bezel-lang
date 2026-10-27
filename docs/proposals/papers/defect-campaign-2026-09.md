@@ -1,3 +1,5 @@
+> **Superseded 2026-10-27** by the campaigns of [`master-plan.md`](master-plan.md); the family outcomes are measured in [`master-plan/MEASUREMENTS.md`](master-plan/MEASUREMENTS.md). Kept as the record of the family method.
+
 # Defect campaign plan — 2026-09 (the memory-safety and crash families)
 
 *Supporting record (not a numbered proposal). Written 2026-09-17 at the close of the
@@ -5,7 +7,7 @@
 sequenced work-list for the **bug-fixing** mode the project is now in: which open defects are
 the same defect, in what order to take them, and what makes a family done. It complements
 [`implementation-roadmap-2026-07.md`](implementation-roadmap-2026-07.md) and
-[`master-plan.md`](master-plan.md), both of which sequence **features** (proposals, R0–R8
+[`master-plan-2026-07.md`](master-plan-2026-07.md), both of which sequence **features** (proposals, R0–R8
 tracks) and say nothing about the bug population. Nothing here is normative; it opens and
 closes no issue by itself.*
 
@@ -788,7 +790,7 @@ it unblocks.
   `[v0.184]`…): roughly a third of the open population. They are feature work sequenced by
   `implementation-roadmap-2026-07.md` and the per-revision landing comments; the current mode
   is bug-fixing, and #4454 asks the owner whether that backlog is policy or drift.
-- **Stdlib proposal trackers** (#1376–#1461, "Proposal 00NN"): sequenced by `master-plan.md`.
+- **Stdlib proposal trackers** (#1376–#1461, "Proposal 00NN"): sequenced by `master-plan-2026-07.md`.
 - **Gate, build and infrastructure issues** (#2100, #2117, #2323, #2441, #3222, #3673,
   #3678, #3691, #3698, #3715, #3734, #3737, #3739, #3781, #4252 and the like): real, and some
   are Phase 0-adjacent, but they do not change what the compiler does. The oracle holes

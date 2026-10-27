@@ -184,7 +184,7 @@ Per this proposal's §1.4, candidate 2. **Reopening bar:** a demonstration that 
 
 ### D9 — This must sequence before #3247
 
-#3247 (master plan, charter C9 — `docs/proposals/papers/master-plan.md:141`) promotes `FromCollectionLiteral` to *"a real `ICollectionLiteralTarget` static interface member"*, a path spec §11.8 records as chosen precisely because it costs no source change (`Bezel_Language_Spec.md:2068`): *"promoting the name-recognized `FromCollectionLiteral` (§15.4.1) to a real `ICollectionLiteralTarget<T>` … both signatures were chosen for zero-source-change promotion."*
+#3247 (master plan, charter C9 — `docs/proposals/papers/master-plan-2026-07.md:141`) promotes `FromCollectionLiteral` to *"a real `ICollectionLiteralTarget` static interface member"*, a path spec §11.8 records as chosen precisely because it costs no source change (`Bezel_Language_Spec.md:2068`): *"promoting the name-recognized `FromCollectionLiteral` (§15.4.1) to a real `ICollectionLiteralTarget<T>` … both signatures were chosen for zero-source-change promotion."*
 
 That zero-source-change property is a property of **the current signature**. Promote first and the wrong parameter type is frozen into a declared interface member, after which fixing it is an interface-surface change under spec §2.8.6 rather than a four-line spec edit. ▲ **This proposal sequences first**; #3247's promotion then carries the corrected signature and keeps its zero-source-change claim intact.
 

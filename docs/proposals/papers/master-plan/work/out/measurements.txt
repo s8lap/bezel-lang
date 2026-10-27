@@ -1,0 +1,476 @@
+# Tracker measurement, as of 2026-10-27 (data: 1613 open, 5339 closed, 6952 issues)
+
+## Open issues by label (an issue carries several)
+
+ 1057  bug
+  567  codegen
+  353  sema
+  283  ownership
+  262  soundness
+  259  spec-tracking
+  168  leak
+  142  stdlib
+   81  test-infra
+   79  enhancement
+   51  async
+   42  cross-module
+   40  compiler-crash
+   31  iterators
+   28  RFC
+   27  documentation
+   16  rule-corpus
+   12  serialization
+   11  parser
+    7  design-review
+    7  runtime
+    7  spec
+    5  unconfirmed
+    4  semantics
+    3  question
+    3  ecosystem
+    2  driver
+    2  docs
+    2  spec-question
+    1  refactor
+    1  ratchet
+    1  memory-safety
+    1  infra
+    1  spec-defect
+  113  (no label)
+
+## Open issues by area (first matching component label, else title keywords)
+
+  660  codegen
+  375  sema
+  153  ownership
+   86  stdlib
+   84  test-infra
+   71  unclassified
+   63  spec
+   41  spec-tracking
+   39  enhancement/design
+   11  docs
+   11  async
+    8  cross-module
+    3  serialization
+    3  ecosystem
+    3  parser
+    1  iterators
+    1  runtime
+
+## Open issues by severity (label first, then title keywords)
+
+  828  other
+  263  soundness
+  154  leak
+  112  leak(title)
+   60  crash(title)
+   49  silent(title)
+   45  soundness(title)
+   37  over-accept(title)
+   34  crash
+   31  over-reject(title)
+
+## Spec chapters cited in open titles (1249 citations in 905 titles)
+
+  273  §28
+  102  §22
+   75  §9
+   67  §14
+   64  §27
+   63  §8
+   58  §7
+   56  §12
+   54  §30
+   48  §2
+   46  §5
+   36  §15
+   32  §11
+   32  §29
+   31  §35
+   29  §19
+   28  §4
+   23  §17
+   20  §3
+   17  §21
+   16  §26
+   14  §23
+   11  §31
+    9  §6
+    8  §18
+    6  §16
+    6  §25
+    5  §10
+    4  §32
+    4  §20
+
+Top sections:
+  115  §28.3
+   43  §28.9
+   38  §5.1
+   30  §14.2
+   30  §22.6
+   26  §8.6
+   25  §7.4
+   25  §27.6
+   25  §9.2
+   23  §27.5
+   22  §19.3
+   19  §14.1
+   17  §30.5
+   17  §15.4
+   17  §12.7
+   16  §28.14
+   16  §28.11
+   16  §12.1
+   16  §9.7
+   15  §22.12
+   15  §11.2
+   14  §28.12
+   14  §3.6
+   13  §28.6
+   13  §2.8
+   13  §14.5
+   12  §22.3
+   12  §30.1
+   12  §28.2
+   11  §8.5
+   11  §15.1
+   10  §7.5
+   10  §9.6
+   10  §22.10
+    9  §28.8
+    9  §29.2
+    9  §29.11
+    9  §8.3
+    9  §2.7
+    8  §12.9
+
+stdlib sections:
+    9  stdlib §5
+    8  stdlib §6.5
+    6  stdlib §4.14
+    5  stdlib §2.2
+    4  stdlib §2.15
+    4  stdlib §9.1
+    3  stdlib §7.1
+    3  stdlib §1
+    3  stdlib §9.2
+    3  stdlib §2.13
+    3  stdlib §2.5
+    3  stdlib §9.8
+    3  stdlib §2.1
+    3  stdlib §2.18
+    3  stdlib §4.1
+
+## Open issues by age (days since created)
+
+  443  <7d
+  602  7-30d
+  412  30-90d
+  156  90-180d
+    0  >180d
+median age 14 d; oldest #446 (143 d)
+
+## Self-declared siblings / residuals (title or body; an issue can match several)
+
+  235  sibling
+  156  residual
+  261  found while
+  346  pre-existing
+  141  follow-up
+    3  split from
+  132  twin
+  186  same mechanism
+  957  any of the above (59% of open)
+  430  titles that name another issue number
+
+## spec-tracking trackers (259 open)
+
+By revision named in the title:
+    2  v0.187
+    2  v0.195
+    1  v0.202
+    1  v0.227
+    1  v0.228
+    1  v0.229
+    2  v0.231
+    1  v0.232
+    1  v0.233
+    2  v0.258
+    1  v0.259
+    1  v0.263
+    1  v0.264
+    2  v0.268
+    1  v0.282
+    2  v0.286
+    3  v0.288
+    3  v0.290
+    2  v0.292
+    1  v0.293
+    2  v0.294
+    3  v0.296
+    2  v0.297
+    1  v0.299
+    1  v0.301
+    3  v0.307
+    1  v0.311
+    2  v0.314
+   10  v0.320
+   18  v0.321
+    8  v0.322
+    7  v0.323
+    1  v0.324
+    1  v0.325
+    4  v0.327
+    7  v0.328
+    1  v0.330
+    7  v0.331
+    6  v0.332
+    3  v0.333
+   24  v0.334
+   10  v0.335
+    4  v0.336
+    4  v0.337
+   18  v0.338
+   22  v0.339
+    6  v0.340
+   14  v0.345
+Proposals named in titles: 0077×3, 0123×3, 0122×2, 0136×2, 0162×2, 0035×1, 0042×1, 0067×1, 0096×1, 0097×1, 0099×1, 0107×1, 0112×1, 0113×1, 0124×1, 0125×1, 0127×1, 0128×1, 0129×1, 0131×1
+  111  of them read as questions (title contains 'spec-question', a '?' or a modal)
+
+## Opened vs closed per ISO week (all issues; last 16 weeks)
+
+week        opened  closed   net   (open at week end, reconstructed)
+2026-W29     295     185   +110   314
+2026-W30     148     220    -72   242
+2026-W31     345     320    +25   267
+2026-W32     442     268   +174   441
+2026-W33     189     169    +20   461
+2026-W34     108     177    -69   392
+2026-W35     291     215    +76   468
+2026-W36     359     309    +50   518
+2026-W37     355     295    +60   578
+2026-W38     160     183    -23   555
+2026-W39     589     397   +192   747
+2026-W40     292     283     +9   756
+2026-W41     431     353    +78   834
+2026-W42     626     343   +283   1117
+2026-W43     770     297   +473   1590
+2026-W44     121      98    +23   1613
+
+## Topic clusters (title keyword match, overlapping)
+
+cluster                          open  sound  crash  leak  spec-trk  opened30d closed30d  closed-ever  medAge  bug-share
+disposal-scope-end                 349     96      8   136        55        244       241          961      14  0.27
+string-format-parse                287     41     23    68        39        228       213          708       6  0.29
+generics-instantiation             268     57     18    21        62        200       320          825      14  0.25
+numeric-ops                        266     59     28    18        32        219       283          861       7  0.24
+owned-collections-literals         222     49     15    58        31        173       191          688      12  0.24
+interfaces-dispatch-extensions     201     41     12    16        46        162       217          672      13  0.23
+nullable-narrowing                 192     39     17    14        32        134       183          671      14  0.22
+records-equality-hash              190     33     10    26        45        141       210          722      14  0.21
+spans-borrows                      190     71      3    29        49        127       203          669      19  0.22
+test-infra-gate                    160     18      7    15        14         72        71          309      34  0.34
+closures-captures                  137     34      8    55        11         82       100          422      19  0.25
+async-tasks                        137     42      8    27        27         72        80          416      24  0.25
+iterators-enumerables              125     41     10    30        16         72        82          404      14  0.24
+diagnostics-wording                110     11      4    16        12         76        73          286      10  0.28
+cross-module                       103     21     12     9        10         66       100          457      13  0.18
+statics-init                        96     14      3    17        14         61       100          384      14  0.20
+exceptions-unwind                   91     17      4    13        21         54        78          408      14  0.18
+choice-match                        87     21      9    14        23         66        68          211      14  0.29
+contracts-pure                      33      9      0     2         6         17        17          116      25  0.22
+serialization                       21      2      0     0         5          5         7           68      77  0.24
+parser-grammar                      19      1      0     1         7         10        30          129      24  0.13
+extern-ffi                          18      4      3     1         2          9        12          103      34  0.15
+
+(bug-share = open / (open + closed-ever) for the cluster: how much of the cluster's history is still open)
+
+## Exclusive partition (first matching cluster in table order)
+
+  229  disposal-scope-end
+  160  generics-instantiation
+  138  owned-collections-literals
+  137  closures-captures
+  136  (none)
+  135  nullable-narrowing
+  123  string-format-parse
+  109  iterators-enumerables
+   93  async-tasks
+   63  test-infra-gate
+   57  records-equality-hash
+   34  cross-module
+   34  numeric-ops
+   32  spans-borrows
+   28  interfaces-dispatch-extensions
+   28  choice-match
+   21  exceptions-unwind
+   19  diagnostics-wording
+   16  statics-init
+    8  serialization
+    8  contracts-pure
+    3  extern-ffi
+    2  parser-grammar
+
+## camelCase identifiers (mechanisms) named in open titles, top 60
+
+    5  runAotChecked
+    4  checkRead
+    3  checkAssignable
+    2  runJit
+    2  ignoreUnknownFields
+    2  astNode
+    2  isStringFallbackTarget
+    2  newSema
+    2  lowerTypeTest
+    2  leaksAtLeast
+    2  typeRefEqual
+    2  toBase
+    1  xxHash
+    1  ownership::checkOwnership
+    1  emitBaseDisposeChain
+    1  disposerCoreFns
+    1  lowerIndexerCompound
+    1  lowerIndexerSet
+    1  emitProducerRelease
+    1  isObjectOrInterfaceTarget
+    1  lowerLocalDecl
+    1  iterElemIsOwnedClass
+    1  iterElemSemaTy
+    1  genericArgs
+    1  lowerNew
+    1  currentReturnTypeNode
+    1  ensureExprGetterThunk
+    1  genericSubst
+    1  registerIterableSourceDisposal
+    1  collectSuspendLocals
+    1  wrapArrayAsIOwningEnumerator
+    1  isOwningCollectionDrainAliasCall
+    1  isVoidTy
+    1  typeNameForDiag
+    1  isSubtype
+    1  registerUsingDisposal
+    1  isAwaitUsing
+    1  usingVarBuiltinHeadName
+    1  emitChainCall
+    1  emitVirtualGenericDispatch
+    1  unitArg
+    1  lowerIEnumerableFor
+    1  lowerTypeRef
+    1  runRecordConstructor
+    1  kSchemaVersion
+    1  buildRecordValue
+    1  emitOwnFieldInit
+    1  enumMachineryElementName
+    1  allocSize
+    1  collectCaseArmBorrowSourcesStmt
+    1  isValidRangeElementType
+    1  unifyArgSubst
+    1  specializedBoxVtableFor
+    1  emitModule
+    1  emitObjectFile
+    1  forceSanitizeAddress
+    1  emitAsyncLambda
+    1  sharedCellEnvdtorFreeOwner
+    1  genericArg
+    1  closureBorrowAll
+
+## Source files named in open titles/bodies (first 2000 chars), top 40
+
+  110  ExprTypecheck_Calls.cpp
+  100  LlvmBackend_Setup.cpp
+   75  Ownership_Checks.cpp
+   67  ExprTypecheck.cpp
+   66  TypeResolution_Checks.cpp
+   57  Ownership.cpp
+   40  LlvmBackend_Calls.cpp
+   40  LlvmBackend_Stmts.cpp
+   36  LlvmBackend_Assign.cpp
+   34  TypeResolution_Names.cpp
+   34  LlvmBackend_Exprs.cpp
+   33  ExprTypecheck_Exprs.cpp
+   32  LlvmBackend_impl.hpp
+   32  bezel_runtime_collections.cpp
+   28  LlvmBackend_Layout.cpp
+   23  LlvmBackend_Disposal.cpp
+   21  Setup.cpp
+   21  ModuleLoader.cpp
+   17  OwnershipFacts.cpp
+   16  LlvmBackend_Async.cpp
+   16  LlvmBackend_String.cpp
+   15  SymbolCollection.cpp
+   14  DefiniteAssignment.cpp
+   13  bezel_runtime_refcounting.cpp
+   12  aot_support.hpp
+   11  BuiltinRegistry.cpp
+   11  LlvmBackend_Iterators.cpp
+    8  Driver.cpp
+    8  Ownership_impl.hpp
+    8  TypeResolution.cpp
+    8  bezel_runtime_strings.cpp
+    7  Sendability.cpp
+    6  test_main.cpp
+    6  ExprTypecheck_impl.hpp
+    6  Symbol.hpp
+    5  LlvmBackend_Serialization.cpp
+    5  bezel_runtime_concurrency.cpp
+    5  Assign.cpp
+    4  TypeRef.hpp
+    4  bezel_runtime_time.cpp
+
+## Discussion volume
+
+comments per open issue: median 0, mean 0.56, 1028 with none
+body length: median 2161 chars, 0 under 200 chars
+
+## Landing rhythm on origin/main, 2026-10-04 .. 2026-10-27 (24 days, 1735 commits)
+
+kind        total  per-day
+fix          1131    47.1
+test/bank     315    13.1
+other         216     9.0
+infra          37     1.5
+spec           31     1.3
+docs            5     0.2
+
+distinct issues named in fix/narrow subjects: 870
+
+fix commits touching src/<area> (a commit can touch several):
+  489  src/sema
+  475  src/codegen
+   85  src/ownership
+   42  src/runtime
+   26  src/common
+   19  src/module
+   18  src/parser
+    7  src/ast
+    1  src/driver
+    1  src/support
+    1  src/lexer
+    1  src/flow
+
+per day:
+2026-09-14  fix=1
+2026-10-01  other=1
+2026-10-04  fix=54  infra=2  other=7  test/bank=7
+2026-10-05  fix=65  infra=1  other=3  test/bank=14
+2026-10-06  docs=1  fix=42  infra=4  other=14  test/bank=8
+2026-10-07  fix=64  infra=6  other=20  spec=1  test/bank=6
+2026-10-08  fix=26  infra=3  other=9  spec=17  test/bank=8
+2026-10-09  fix=41  other=25  spec=1  test/bank=18
+2026-10-12  fix=27  other=31  test/bank=5
+2026-10-13  fix=52  other=39  spec=4  test/bank=23
+2026-10-14  fix=155  infra=4  other=8  test/bank=50
+2026-10-15  fix=66  infra=2  other=1  test/bank=23
+2026-10-17  fix=52  test/bank=12
+2026-10-18  docs=2  fix=64  infra=1  other=14  test/bank=21
+2026-10-19  fix=18  infra=1  other=1  test/bank=9
+2026-10-20  fix=56  other=8  spec=1  test/bank=10
+2026-10-21  fix=75  infra=5  other=2  spec=1  test/bank=25
+2026-10-22  fix=136  infra=3  other=15  test/bank=12
+2026-10-23  docs=1  fix=24  infra=1  other=11  spec=3  test/bank=20
+2026-10-24  fix=36  infra=1  spec=1  test/bank=15
+2026-10-25  docs=1  fix=33  infra=2  other=1  test/bank=12
+2026-10-26  fix=7  other=2  test/bank=1
+2026-10-27  fix=37  infra=1  other=4  spec=2  test/bank=16
