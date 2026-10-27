@@ -23,17 +23,33 @@ static inline uint32_t bz_str_cp(const bz_string_struct* s, int64_t i) {
     return ((const uint32_t*)s->data)[i];
 }
 
-// stdlib §9.6: IsAscii — 1 iff every code point < 128. A width≥2 string holds
-// at least one code point ≥ 256, so it is never ASCII (the O(1) case); a width-1
-// string is Latin-1 (code points ≤ 255), so a byte in [128,255] still defeats
-// ASCII — scan for one. (#741)
+// stdlib §9.6: IsAscii — "true iff every code point < 128".
+//
+// #7245: the predicate is defined by the CONTENT, never by the storage width.
+// §4.6 (v0.344) makes the width an invisible implementation detail ("The choice
+// of width is invisible at the language level; programs observe only the `char`
+// sequence and its length"), and it is only *typically* the narrowest that
+// fits the value — a legal string may carry a wider width than its content
+// needs (e.g. the range slice of a wide string, whose result keeps the source
+// width). The old shortcut `if (s->width != 1) return 0;` therefore reported
+// FALSE for an all-ASCII string that merely happened to be stored two bytes
+// per code point. Answer from the code points instead: scan in the code-point
+// domain so that every legal width gives the same, content-determined answer.
+//
+// The stdlib's "(O(1))" note presumes the width is always the narrowest that
+// fits (§4.6), which would make "width ≥ 2 ⇒ some code point ≥ 256 ⇒ not
+// ASCII" a constant-time decision. That premise does not hold for every legal
+// width, so the answer is computed from the content; a width-1 string still
+// needs the scan for a byte in [128,255].
 int32_t bz_string_is_ascii(const void* sp) {
     const bz_string_struct* s = (const bz_string_struct*)sp;
-    if (!s || s->len == 0) return 1;            // empty string is ASCII
-    if (s->width != 1) return 0;                // ≥2-byte code points ⇒ not ASCII
-    const uint8_t* d = (const uint8_t*)s->data;
+    if (!s || s->len == 0) return 1;            // the empty string is ASCII
+    // Every string the runtime builds stores 1, 2 or 4 bytes per code point
+    // (§4.6). A width outside that set is malformed; answer conservatively
+    // rather than reading the buffer with a width it does not have.
+    if (s->width != 1 && s->width != 2 && s->width != 4) return 0;
     for (int64_t i = 0; i < s->len; ++i)
-        if (d[i] >= 128) return 0;
+        if (bz_str_cp(s, i) >= 128) return 0;    // a code point ≥ 128 defeats ASCII
     return 1;
 }
 
