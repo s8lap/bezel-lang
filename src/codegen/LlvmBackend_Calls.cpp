@@ -16625,8 +16625,29 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "MaxValue" && call.args.empty())
             return builder_.getInt64(3155378975999999999LL);
         // DateTime.FromTicks(ticks: long): DateTime (identity)
+        //
+        // fix #7252 (spec §5.1, v0.345): the parameter is a `long`, so an
+        // UNSIGNED argument is CONVERTED at the call — §5.1's table admits
+        // `uint` → `long` — and §5.1 converts VALUES, not bit patterns. This
+        // arm returned the argument's own value at the ARGUMENT'S OWN WIDTH:
+        // a `uint` 4000000000 arrived as the `int32` -294967296 (and, before
+        // the IR verifier's complaint about it was addressed, as an i32 where
+        // an i64 was expected, which ABORTED the compiler). The widening is
+        // now SIGNEDNESS-AWARE: an unsigned source ZERO-extends (`zext`,
+        // which preserves the value) and a signed source keeps the `sext` it
+        // always had, so a negative `ticks` keeps its sign. The signedness
+        // is read with `isUnsignedTargetExpr` — the house predicate the
+        // #7242 `double`-parameter converter and the #7253 `Step` widening
+        // use — and NOT from the bit width (`int` and `uint` are both 32
+        // bits, `long` and `ulong` both 64).
         if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
-            return lowerExpr(*call.args[0].value);
+            llvm::Value* v = lowerExpr(*call.args[0].value);
+            if (!v) return nullptr;
+            if (!v->getType()->isIntegerTy(64))
+                v = isUnsignedTargetExpr(*call.args[0].value)
+                        ? builder_.CreateZExt(v, i64())
+                        : builder_.CreateSExt(v, i64());
+            return v;
         }
         // per §2.5 / #648: DateTime.Parse(s: string): DateTime — accepts the
         // type's own rendered forms (round-trip `yyyy-MM-ddTHH:mm:ss`, an
@@ -16706,11 +16727,22 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dt.tryp.bool");
         }
         // per stdlib §2.5 / #1357: DateTime.FromUnixTimeSeconds(seconds: long): DateTime
+        //
+        // fix #7249 / #7252 (spec §5.1, v0.345): the THIRD tick-carrying
+        // conversion of this shape — the parameter is a `long`, so an
+        // UNSIGNED argument is CONVERTED at the call (§5.1's table admits
+        // `uint` → `long`) and §5.1 converts VALUES, not bit patterns. The
+        // arm widened the argument with an UNCONDITIONAL `sext`, so the
+        // `uint` 4000000000 arrived as -294967296 SECONDS. The widening is
+        // now SIGNEDNESS-AWARE, exactly as at the two `FromTicks` arms:
+        // an unsigned source zero-extends, a signed source keeps its sign.
         if (m == "FromUnixTimeSeconds" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* sec = lowerExpr(*call.args[0].value);
             if (!sec) return nullptr;
             if (!sec->getType()->isIntegerTy(64))
-                sec = builder_.CreateSExt(sec, i64());
+                sec = isUnsignedTargetExpr(*call.args[0].value)
+                          ? builder_.CreateZExt(sec, i64())
+                          : builder_.CreateSExt(sec, i64());
             auto* fn = declareC("bz_datetime_from_unix_seconds", i64(), {i64()});
             return builder_.CreateCall(fn, {sec}, "dt.fromux");
         }
