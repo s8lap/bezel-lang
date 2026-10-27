@@ -21244,12 +21244,12 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
             const bool isNullLiteral =
                 argTy->nullable && argTy->primitive == PrimitiveType::Object &&
                 !isNarrowedNonNullRead(a.value.get());
-            // fix #6635: an INTEGER search value reaches no declared
-            // overload. `Split`'s separator is #6636's scope.
+            // fix #6635 / #6636 (stdlib §9.6, §5.1, v0.345): an INTEGER
+            // search value reaches no declared overload.
             const bool isInteger =
                 isIntegerPrimitiveTypeForOverload(argTy->primitive);
             if (!isCharOrString && !(isNullLiteral && m != "IndexOf") &&
-                isInteger && m != "Split") {
+                isInteger) {
                 ctx_.diagnostics().report(
                     Severity::Error, a.value->span.begin,
                     "`string." + std::string(m) + "` takes its " + slot->what +
