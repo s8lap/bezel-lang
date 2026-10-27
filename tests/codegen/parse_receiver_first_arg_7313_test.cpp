@@ -58,11 +58,28 @@
 // The COMPILER'S OUTCOME (the program must compile, link and run, and the
 // compiler must never reach LLVM's IR verifier) AND the program's OUTPUT.
 //
-// The `out` slot is the discriminator. A call that RAN and failed writes the
-// failure default into the slot (`default(T)` — stdlib §1's Try convention,
-// shape (c)); a DROPPED call never writes it, so it keeps its pre-set value.
+// The `out` slot is the discriminator. A DROPPED call never writes it, so it
+// keeps its pre-set value; a call that RAN and failed writes the failure
+// default into the slot (`default(T)` — stdlib §1's Try convention, shape (c)).
 // The rows pre-set the slot to a distinguishable value, so the fixed arm
 // prints that value where a call that ran and failed printed the default.
+//
+// ⚠ THE `default(T)` HALF OF THAT RULE IS NOT UNIVERSAL: `Guid` IS THE
+// EXCEPTION. `bz_guid_try_parse` returns 0 WITHOUT writing the `out` slot on
+// failure — `guid_parse_str` copies its output only on success, and the
+// sibling `bz_guid_parse` memsets its output on failure where the try form
+// does not (src/runtime/bezel_runtime_decimal_guid.cpp) — so a `Guid`
+// `TryParse` that ran and failed ALSO leaves the slot untouched, rather than
+// writing `default(Guid)`. That is the open defect #7320, not a property of
+// this file's remedy. It is why there is no `Guid.TryParse` class-instance
+// row here (see the comment block on the absent class-instance row below):
+// for `Guid` the pre-fix and post-fix outputs would be byte-identical, and
+// the row would pin nothing.
+//
+// SO: the failure default is written on the false path for DateTime,
+// DateOnly and TimeOnly (their runtimes assign it), and NOT for Guid. The
+// DISCRIMINATOR every row here relies on is the DROPPED-call half, which
+// holds for all four receivers without exception.
 
 #include <string>
 
