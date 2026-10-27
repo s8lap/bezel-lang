@@ -16051,6 +16051,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7300 (stdlib §9.3, v0.344): the declared operand is a
+            // `string` (or the span overload's `ReadOnlyStringSpan`). This copy
+            // of the arm had NO first-argument guard, so it lowered whatever it
+            // was handed into a string operand. The class-name spelling
+            // `Decimal.Parse` reaches this copy only after the Calls2 copy has
+            // DECLINED the operand, so `decimal.Parse(1.5)` emitted
+            //   call void @bz_decimal_parse(double 1.500000e+00, ...)
+            // — malformed IR, and the compiler ABORTED with "IR verification
+            // failed (malformed IR emitted)". A class instance (a pointer, like
+            // a `string`) was read as TEXT out of the object's own bytes — and
+            // `decimal.Parse(o)` reported a FormatException for it. A
+            // non-parseable operand is DROPPED — the shared guard.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, true))
+                return nullptr;
+            // #5296 / stdlib §9.3 (v0.313, #1810): the span overload — a
+            // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3),
+            // not a bz.string, so it must be materialized before it reaches
+            // bz_decimal_parse. The `TryParse` copy below does the same, and so
+            // does the Calls2 copy of this arm.
+            auto win = parseWindow(strVal);
             llvm::AllocaInst* slot = makeDecSlot();
             // per fix #521: pass OverflowException and FormatException vtables
             // so the runtime stores the correct exception in bz_exc on failure.
@@ -16068,8 +16089,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             };
             auto* fn = declareC("bz_decimal_parse", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-            builder_.CreateCall(fn, {strVal, slot, getOVEVtable(), getFEVtable()});
+            builder_.CreateCall(fn, {win.str, slot, getOVEVtable(), getFEVtable()});
             emitPendingCheck();  // per fix #521: runtime sets bz_exc on parse failure
+            // Release the materialized window on the normal (non-throw) exit.
+            if (win.owned) emitStringRelease(win.owned);
             return builder_.CreateLoad(dst, slot, "dec.parsed");
         }
 
@@ -16078,6 +16101,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #7300 (stdlib §9.3, v0.344): the declared operand is a
+            // `string` (or the span overload's `ReadOnlyStringSpan`). This copy
+            // of the arm had NO first-argument guard, so
+            // `decimal.TryParse(1.5, out m)` emitted
+            //   %str.data = load ptr, double 1.500000e+00, align 8
+            // and then
+            //   %dec.tryp.ok = call i32 @bz_decimal_try_parse(double 1.500000e+00, ptr %1)
+            // — malformed IR, and the compiler ABORTED with "Call parameter
+            // type does not match function signature". A class instance (a
+            // pointer, like a `string`) was read as TEXT out of the object's
+            // own bytes. A non-parseable operand is DROPPED — the shared
+            // guard.
+            if (!sharedParseOperandAdmissible(ctx_, *call.args[0].value, strVal,
+                                              &Emitter::isStringSpanValue, true))
+                return nullptr;
             // #5296 / stdlib §9.3 (v0.313, #1810): the span overload. A
             // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3),
             // not a bz.string, so it was passed straight to the
