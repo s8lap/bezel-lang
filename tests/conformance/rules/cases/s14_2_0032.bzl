@@ -8,10 +8,9 @@
 //!   conforming to an interface substitution ... — and by these three
 //!   relations only: no other implicit conversion of §5.1 satisfies the
 //!   bound, neither boxing to `Object`, numeric widening, nullable wrapping
-//!   nor a variance-induced conversion
-//!   ... At `U := Object` the bound admits `Object` and every class type, the
-//!   set a class bound names (`string`, interfaces and function types are
-//!   not classes, §8.1)
+//!   nor a variance-induced conversion ... At `U := Object` the bound admits
+//!   `Object` and every class type, and nothing else: `string`, interfaces
+//!   and function types are not classes (§8.1)
 //! cites: 14.2, 5.1
 //! expect: reject
 //! diagnostic: constraint
