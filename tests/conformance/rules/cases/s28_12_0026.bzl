@@ -8,7 +8,6 @@
 //!   compile-time pin as under `using var`, with the same freeze on the source.
 //! cites: 28.12, 28.9, 28.10
 //! expect: run
-//! issue: 7337
 //! output: [1]
 
 module Conf;

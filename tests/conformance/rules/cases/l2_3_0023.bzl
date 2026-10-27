@@ -8,7 +8,6 @@
 //!   family these conversions mirror
 //! cites: 2.3, 9.2
 //! expect: run
-//! issue: 7324
 //! output: [+.5] -> FMT
 //!   [.5] -> FMT
 

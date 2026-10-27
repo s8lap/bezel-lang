@@ -6,7 +6,6 @@
 //!   raise; the `out` parameter receives the default value.
 //! cites: 2.3, 9.2
 //! expect: run
-//! issue: 7324
 //! stdout: False
 
 module Conf;

@@ -9,7 +9,7 @@
 //!   `"007.5"` and `"6.02E+23"` are admitted.
 //! cites: 9.2
 //! expect: run
-//! issue: 7324
+//! issue: 7341
 //! output: [5.e3] -> FMT
 
 module Conf;

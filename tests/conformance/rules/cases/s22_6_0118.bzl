@@ -10,8 +10,6 @@
 //! cites: 22.6, 5.1, 2.3
 //! expect: reject
 //! diagnostic: overload
-//! issue: 7323
-
 module Conf;
 
 public class Program

@@ -6,7 +6,6 @@
 //!   is non-null and narrows to the non-nullable form.
 //! cites: 12.7, 7.4, 9.1, 2.18
 //! expect: run
-//! issue: 7319
 //! stdout: 00005
 
 module Conf;

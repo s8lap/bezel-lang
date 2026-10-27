@@ -8,7 +8,6 @@
 //!   synchronous disposal (or the no-op) and likewise awaits nothing.
 //! cites: 28.12, 28.9
 //! expect: run
-//! issue: 7322
 //! output: [1]
 
 module Conf;
