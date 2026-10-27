@@ -1,14 +1,8 @@
-# Campaign builtin-call-admission — members at entry (189 rows)
-
-Companion to `docs/proposals/papers/campaigns/builtin-call-admission.md`. Measured on `origin/main` `d9f11d15` with this lane's `build/bezelc`.
-`evidence` MEASURED = a repro was compiled and run on HEAD; `rule` = the mechanism was read from the issue body and no repro was built (see the record's *COVERAGE* section for the list of what was not measured).
-`B0` = would ONE signature-based admission gate have REJECTED this call before the arm ran: `Y` yes, `N` no (the call was legal or the defect is elsewhere), `-` not a builtin call (the gate's reach does not cover it).
-
 | # | sev | HEAD status | sub-family | lane | B0 leverage | evidence |
 |---|---|---|---|---|---|---|
 | #1701 | other | RE-LABEL (rule) | X-spec | re-label | - | constraint-vs-direct TryParse surface split; not a call admission defect |
 | #1765 | soundness | RE-LABEL (rule) | X-13 | re-label | - | Ptr<T>.Load/Store is a codegen stub, not a call admission defect |
-| #1792 | other | REPRODUCES (rule) | B1 | B1 | N | char.Parse/TryParse/ParseOrNull + bool.ParseOrNull not admitted in sema (stdlib §2.19/§9.5) |
+| #1792 | other | FIXED (MEASURED) | B1 | B1 | - | STALE PREMISE (MEASURED): char.Parse("a") prints a; char.TryParse("a", out c) prints True/a; char.ParseOrNull("a")->not null, ("zz")->null; bool.ParseOrNull("true")->not null, ("nope")->null |
 | #2094 | other | RE-LABEL (rule) | X-lot | re-label | - | Counter<K> implementation deferred; needs intrinsic class machinery |
 | #2221 | soundness | RE-LABEL (MEASURED) | X-4 | re-label | - | Array<T>.Sort on class elements is an ownership UAF, not admission |
 | #2253 | other | REPRODUCES (rule) | B2 | B2a/B2b | N | decimal ToString("Fn") vs "Pn"/"En" rounding disagree (stdlib §2.18) |
@@ -68,19 +62,19 @@ Companion to `docs/proposals/papers/campaigns/builtin-call-admission.md`. Measur
 | #6228 | other | RE-LABEL (rule) | X-7 | re-label | Y | interface witness picks the wrong overload for generic instantiations; campaign 7 |
 | #6235 | other | RE-LABEL (rule) | X-lot | re-label | - | generic choice chain compile time is exponential |
 | #6239 | other | RE-LABEL (rule) | X-7 | re-label | - | property read through a generic choice's interface prints 0; campaign 7 |
-| #6253 | other | REPRODUCES (rule) | B0-amb | re-label | Y | E(Exception?)/E(ArgumentException?) is ambiguous for an ArgumentException? |
-| #6254 | crash | REPRODUCES (rule) | B0-infer | re-label | Y | a single generic candidate bound only by a bare null |
+| #6253 | other | REPRODUCES (rule) | B0-amb | re-label | - | a USER static class S: E(Exception?)/E(ArgumentException?) is ambiguous (§22.6) — not a builtin call |
+| #6254 | crash | REPRODUCES (rule) | B0-infer | re-label | - | a USER generic method M<T>(x: T?) — not a builtin call |
 | #6255 | crash | REPRODUCES (rule) | B5 | B5 | N | narrowed int? at a long parameter fails IR verification (missing unwrap) |
 | #6295 | crash | REPRODUCES (rule) | B0-typearg | re-label | Y | Math.Max<T> false rejection under a constraint; wrong type-arg count crashes |
 | #6307 | other | RE-LABEL (rule) | X-7 | re-label | - | interface dispatch of a generic method runs the wrong body; campaign 7 |
-| #6530 | other | REPRODUCES (rule) | B0-symbol | re-label | Y | the range-index guard over-rejects a type parameter NAMED after a builtin |
+| #6530 | other | REPRODUCES (rule) | B0-symbol | re-label | - | a type-parameter NAME guard over-rejects — not a builtin call |
 | #6635 | crash | REPRODUCES (MEASURED) | B4 | B4a/B4b | Y | MEASURED grid: string.Contains(1) -> COMPILER ABORT (IR verification failed) |
 | #6636 | soundness | REPRODUCES (MEASURED) | B4 | B4a/B4b | Y | MEASURED grid: string.Split(1) -> internal: permissive-acceptance note, prints 0 |
 | #6637 | soundness | REPRODUCES (MEASURED) | B5 | B5 | N | MEASURED grid: Array<int>.IndexOf with a narrowed int? returns -1 |
 | #6644 | other | RE-LABEL (MEASURED) | X-5 | re-label | - | a check-then-use of a captured nullable local is rejected (§7.4); campaign 5 |
 | #6646 | crash | RE-LABEL (rule) | X-5 | re-label | - | a nullable choice payload is stored without unwrapping; campaign 5 |
 | #6647 | crash | REPRODUCES (MEASURED) | B3 | B3a/B3b | Y | MEASURED grid: Math.Abs(decimal?) -> COMPILER ABORT |
-| #6648 | soundness | REPRODUCES (rule) | B3 | B3a/B3b | Y | Math.Min/Max/Clamp over double/int/long have an untyped result |
+| #6648 | soundness | REPRODUCES (rule) | B3 | B3a/B3b | N | the CALL IS LEGAL; Math.Min/Max/Clamp have an UNTYPED RESULT (the gate would not reject the call) |
 | #6659 | crash | RE-LABEL (rule) | X-8 | re-label | - | Set<T?>/Dictionary<K?,V> with a nullable key; campaigns 5 and 8 |
 | #6677 | crash | RE-LABEL (rule) | X-5 | re-label | - | `long? ?? int?` segfaults the compiler; campaign 5 |
 | #6689 | crash | RE-LABEL (rule) | X-lot | re-label | - | FileStream at a Stream parameter fails IR verification |
@@ -106,7 +100,7 @@ Companion to `docs/proposals/papers/campaigns/builtin-call-admission.md`. Measur
 | #6860 | crash | RE-LABEL (MEASURED) | X-lot | re-label | - | the compiler segfaults on a `+` chain of 1500+ terms |
 | #6864 | soundness | FIXED (MEASURED) | B3 | B3a/B3b | N | MEASURED: Math.Max(3u,4000000000u) now prints 4000000000 (was 3) |
 | #6865 | soundness | FIXED (MEASURED) | B3 | B3a/B3b | N | MEASURED: Math.Min('a','b') now prints a (was 97) |
-| #6872 | other | RE-LABEL (rule) | X-13 | re-label | Y | a builtin Type value accepted at an int/string location (§5.1) |
+| #6872 | other | RE-LABEL (rule) | X-13 | re-label | - | an ASSIGNMENT (a builtin Type value at an int/string location), not a call |
 | #6873 | crash | RE-LABEL (rule) | X-5 | re-label | - | null at a Type? parameter emits malformed IR; campaign 5 |
 | #6881 | other | RE-LABEL (rule) | X-13 | re-label | - | a banked corpus row flipped after #6782 (a test row, not a defect) |
 | #6884 | crash | REPRODUCES (MEASURED) | B3 | B3a/B3b | N | Math.Max/Min with mixed argument types -> malformed IR |
@@ -125,7 +119,7 @@ Companion to `docs/proposals/papers/campaigns/builtin-call-admission.md`. Measur
 | #7090 | other | RE-LABEL (MEASURED) | X-lot | re-label | - | a property reference over a builtin interface head is accepted and jumps into a value |
 | #7093 | other | RE-LABEL (rule) | X-lot | re-label | - | a bare member reference: concrete head rejected, interface head admitted (§27.6) |
 | #7098 | soundness | REPRODUCES (rule) | B0-arity | re-label | Y | a method group over a builtin member silently non-lowers on a signature mismatch |
-| #7108 | soundness | REPRODUCES (MEASURED) | B4 | B4a/B4b | N | MEASURED grid: string.Remove(253) on a 2-char string: no bounds check |
+| #7108 | soundness | FIXED (MEASURED) | B4 | B4a/B4b | N | MEASURED: the out-of-bounds read is GONE — "ab".Remove(253) raises IndexOutOfRangeException, which is what stdlib §9.6 requires; fixed by c0c9e3f9 (fix #7168), in origin/main |
 | #7118 | crash | RE-LABEL (MEASURED) | X-lot | re-label | - | Array<T>.AsSpan(start) truncates a byte startIndex -> malformed IR |
 | #7129 | other | REPRODUCES (MEASURED) | B4 | B4a/B4b | N | MEASURED grid: string.Repeat("ab",3) rejected - the declared string overload is not implemented |
 | #7130 | other | REPRODUCES (rule) | B5 | B5 | N | the ?. spelling of the string instance methods is rejected in codegen (§7.5) |
