@@ -21425,169 +21425,80 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
 //     is the TYPE PARAMETER `T` (`where T: IComparable<T>` / `where T:
 //     INumber<T>`), so §22.6's stage-3 applicability has no concrete
 //     parameter type to apply §5.1's table to, and the CONSTRAINT, not
-//     §5.1, governs the argument;
+//     §5.1, governs the argument. (The `Sign` constraint is enforced in
+//     `typeCall` — fix #7227 — beside its `Min`/`Max`/`Clamp` sibling);
 //   * `Math.DivRem` — its first two arguments are already rejected AT THE
 //     SOURCE LOCATION by an existing stdlib-§2.2-citing diagnostic, so this
 //     check would only duplicate that one;
 //   * a NULLABLE argument — the nullability dimension is §7's, and this
 //     check judges the argument's TYPE. The §7 gate's registry rows (#6782)
-//     cover the `Convert` positions but not `Math`'s, so a nullable
-//     argument at a `Math` position is left exactly as it was.
+//     are read out of the SAME table, and they now cover the `Math`
+//     positions as well as the `Convert` ones (fix #7232 / #7418), so a
+//     nullable argument at a `Math` position is claimed by §7's gate and
+//     never reaches this check.
+//
+// THE FOLD (fix #7418, campaign 2 `builtin-call-admission`). The DECLARED
+// FORMS this check reads are the rows of the ONE built-in parameter table
+// (`common::kBuiltinParams`), which carries each form's parameter NAME
+// (§22.5), parameter TYPE (§5.1) and parameter NULLABILITY (§7.3) in ONE
+// row. Before the fold the `Math` / `Convert` surface had its own
+// parameter-type table (`builtinMathConvertSurface`, 34 rows) BESIDE the one
+// table, so the two could disagree — and the `Math` positions were not
+// claimed by the §7 nullability gate at all, which is why `Math.Abs(null)`
+// reached codegen and ABORTED the compiler with malformed IR.
 namespace {
 
-// The DECLARED parameter type at one position of one §2.2/§2.3 form.
-enum class MathConvertParamKind {
-    Unchecked,  // the declared type is a TYPE PARAMETER (`T`) or an `out`
-                // slot the out-variable machinery types: §5.1's table has no
-                // concrete target type to apply to at such a position
-    Bool,
-    Int,
-    Long,
-    Float,
-    Double,
-    Decimal,
-    String,
-};
+// The DECLARED parameter type at one position of one DECLARED FORM of a
+// stdlib §2.2 / §2.3 member, read out of the ONE built-in parameter table
+// (`common::kBuiltinParams`, src/common/BuiltinRegistry.cpp).
+//
+// The table's `kinds[p]` is a `BuiltinParamType` bit set. A DECLARED FORM
+// declares ONE type at a position, so the set has one member; `kBPTAny` (the
+// zero value) means the position carries no type opinion — a type PARAMETER
+// (`Math.Min`'s `T`), or a member whose argument is already refused at the
+// source location (`Math.DivRem`) — and `kBPTOut` marks an `out` slot, whose
+// type the out-variable machinery owns (§22.3).
+//
+// per §22.5 / §22.6 / §5.1 / §7.3, stdlib §2.2 / §2.3, fix #7418
 
-// One DECLARED FORM of one §2.2/§2.3 member: the class, the member, the
-// arity the form takes, the declared parameter kind at each of its (at most
-// two) positions, and the declared signature, quoted in the diagnostic.
-struct MathConvertSurfaceRow {
-    std::string_view head;
-    std::string_view member;
-    unsigned arity;
-    MathConvertParamKind param0;
-    MathConvertParamKind param1;
-    std::string_view decl;
-};
-
-// §2.2's and §2.3's listings, transcribed. One row per DECLARED FORM: a
-// member with two declared parameter types (`Abs`) or two declared arities
-// (`Round`) carries one row per form, and a member with neither carries one.
-const std::vector<MathConvertSurfaceRow>& builtinMathConvertSurface() {
-    static const std::vector<MathConvertSurfaceRow> kRows = {
-        // stdlib §2.2 `Math`.
-        {"Math", "Abs", 1, MathConvertParamKind::Int,
-         MathConvertParamKind::Unchecked, "`Abs(x: int): int`"},
-        {"Math", "Abs", 1, MathConvertParamKind::Long,
-         MathConvertParamKind::Unchecked, "`Abs(x: long): long`"},
-        {"Math", "Abs", 1, MathConvertParamKind::Double,
-         MathConvertParamKind::Unchecked, "`Abs(x: double): double`"},
-        {"Math", "Abs", 1, MathConvertParamKind::Decimal,
-         MathConvertParamKind::Unchecked, "`Abs(x: decimal): decimal`"},
-        {"Math", "Sqrt", 1, MathConvertParamKind::Double,
-         MathConvertParamKind::Unchecked, "`Sqrt(x: double): double`"},
-        {"Math", "Pow", 2, MathConvertParamKind::Double,
-         MathConvertParamKind::Double, "`Pow(x: double, y: double): double`"},
-        {"Math", "Floor", 1, MathConvertParamKind::Double,
-         MathConvertParamKind::Unchecked, "`Floor(x: double): double`"},
-        {"Math", "Floor", 1, MathConvertParamKind::Decimal,
-         MathConvertParamKind::Unchecked, "`Floor(x: decimal): decimal`"},
-        {"Math", "Ceiling", 1, MathConvertParamKind::Double,
-         MathConvertParamKind::Unchecked, "`Ceiling(x: double): double`"},
-        {"Math", "Ceiling", 1, MathConvertParamKind::Decimal,
-         MathConvertParamKind::Unchecked, "`Ceiling(x: decimal): decimal`"},
-        {"Math", "Truncate", 1, MathConvertParamKind::Double,
-         MathConvertParamKind::Unchecked, "`Truncate(x: double): double`"},
-        {"Math", "Truncate", 1, MathConvertParamKind::Decimal,
-         MathConvertParamKind::Unchecked, "`Truncate(x: decimal): decimal`"},
-        {"Math", "Round", 1, MathConvertParamKind::Double,
-         MathConvertParamKind::Unchecked,
-         "`Round(x: double, digits: int := 0): double`"},
-        {"Math", "Round", 2, MathConvertParamKind::Double,
-         MathConvertParamKind::Int, "`Round(x: double, digits: int := 0): double`"},
-        {"Math", "Fmod", 2, MathConvertParamKind::Double,
-         MathConvertParamKind::Double, "`Fmod(x: double, y: double): double`"},
-        {"Math", "IEEERemainder", 2, MathConvertParamKind::Double,
-         MathConvertParamKind::Double,
-         "`IEEERemainder(x: double, y: double): double`"},
-        // stdlib §2.3 `Convert`. The `Try*` forms' SECOND parameter is an
-        // `out` slot, whose type the out-variable machinery owns (§22.3).
-        {"Convert", "ToInt32", 1, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked, "`ToInt32(value: string): int`"},
-        {"Convert", "ToInt64", 1, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked, "`ToInt64(value: string): long`"},
-        {"Convert", "ToDouble", 1, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked, "`ToDouble(value: string): double`"},
-        {"Convert", "ToDecimal", 1, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked, "`ToDecimal(value: string): decimal`"},
-        {"Convert", "ToBoolean", 1, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked, "`ToBoolean(value: string): bool`"},
-        {"Convert", "TryToInt32", 2, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked,
-         "`TryToInt32(value: string, out result: int): bool`"},
-        {"Convert", "TryToInt64", 2, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked,
-         "`TryToInt64(value: string, out result: long): bool`"},
-        {"Convert", "TryToDouble", 2, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked,
-         "`TryToDouble(value: string, out result: double): bool`"},
-        {"Convert", "TryToDecimal", 2, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked,
-         "`TryToDecimal(value: string, out result: decimal): bool`"},
-        {"Convert", "TryToBoolean", 2, MathConvertParamKind::String,
-         MathConvertParamKind::Unchecked,
-         "`TryToBoolean(value: string, out result: bool): bool`"},
-        {"Convert", "ToString", 1, MathConvertParamKind::Int,
-         MathConvertParamKind::Unchecked, "`ToString(value: int): string`"},
-        {"Convert", "ToString", 1, MathConvertParamKind::Long,
-         MathConvertParamKind::Unchecked, "`ToString(value: long): string`"},
-        {"Convert", "ToString", 1, MathConvertParamKind::Float,
-         MathConvertParamKind::Unchecked, "`ToString(value: float): string`"},
-        {"Convert", "ToString", 1, MathConvertParamKind::Double,
-         MathConvertParamKind::Unchecked, "`ToString(value: double): string`"},
-        {"Convert", "ToString", 1, MathConvertParamKind::Decimal,
-         MathConvertParamKind::Unchecked, "`ToString(value: decimal): string`"},
-        {"Convert", "ToString", 1, MathConvertParamKind::Bool,
-         MathConvertParamKind::Unchecked, "`ToString(value: bool): string`"},
-        {"Convert", "ToString", 2, MathConvertParamKind::Int,
-         MathConvertParamKind::Int, "`ToString(value: int, toBase: int): string`"},
-        {"Convert", "ToString", 2, MathConvertParamKind::Long,
-         MathConvertParamKind::Int, "`ToString(value: long, toBase: int): string`"},
-    };
-    return kRows;
-}
-
-// The §5.1 target type of one kind, spelled for the diagnostic.
-std::string_view mathConvertTypeName(MathConvertParamKind k) {
-    switch (k) {
-        case MathConvertParamKind::Bool: return "bool";
-        case MathConvertParamKind::Int: return "int";
-        case MathConvertParamKind::Long: return "long";
-        case MathConvertParamKind::Float: return "float";
-        case MathConvertParamKind::Double: return "double";
-        case MathConvertParamKind::Decimal: return "decimal";
-        case MathConvertParamKind::String: return "string";
-        case MathConvertParamKind::Unchecked: break;
+// The §5.1 target type of one declared kind, spelled for the diagnostic.
+std::string_view mathConvertTypeName(std::uint32_t kind) {
+    switch (kind) {
+        case common::kBPTBool: return "bool";
+        case common::kBPTInt: return "int";
+        case common::kBPTLong: return "long";
+        case common::kBPTFloat: return "float";
+        case common::kBPTDouble: return "double";
+        case common::kBPTDecimal: return "decimal";
+        case common::kBPTString: return "string";
+        default: return {};
     }
-    return {};
 }
 
 // The §5.1 target type of one kind, as the primitive it names.
-PrimitiveType mathConvertPrimitiveOf(MathConvertParamKind k) {
-    switch (k) {
-        case MathConvertParamKind::Bool: return PrimitiveType::Bool;
-        case MathConvertParamKind::Int: return PrimitiveType::Int;
-        case MathConvertParamKind::Long: return PrimitiveType::Long;
-        case MathConvertParamKind::Float: return PrimitiveType::Float;
-        case MathConvertParamKind::Double: return PrimitiveType::Double;
-        case MathConvertParamKind::Decimal: return PrimitiveType::Decimal;
-        case MathConvertParamKind::String: return PrimitiveType::String;
-        case MathConvertParamKind::Unchecked: break;
+PrimitiveType mathConvertPrimitiveOf(std::uint32_t kind) {
+    switch (kind) {
+        case common::kBPTBool: return PrimitiveType::Bool;
+        case common::kBPTInt: return PrimitiveType::Int;
+        case common::kBPTLong: return PrimitiveType::Long;
+        case common::kBPTFloat: return PrimitiveType::Float;
+        case common::kBPTDouble: return PrimitiveType::Double;
+        case common::kBPTDecimal: return PrimitiveType::Decimal;
+        case common::kBPTString: return PrimitiveType::String;
+        default: return PrimitiveType::None;
     }
-    return PrimitiveType::None;
 }
 
 // "an `int`", "a `long`", … — one kind's phrase, with its article.
-std::string mathConvertTypePhrase(MathConvertParamKind k) {
-    const std::string_view name = mathConvertTypeName(k);
+std::string mathConvertTypePhrase(std::uint32_t kind) {
+    const std::string_view name = mathConvertTypeName(kind);
     if (name.empty()) return {};
-    const char* article = k == MathConvertParamKind::Int ? "an " : "a ";
+    const char* article = kind == common::kBPTInt ? "an " : "a ";
     return std::string(article) + "`" + std::string(name) + "`";
 }
 
 // "an `int`, a `long` or a `double`" — the kinds a position admits.
-std::string mathConvertTypeList(const std::vector<MathConvertParamKind>& kinds) {
+std::string mathConvertTypeList(const std::vector<std::uint32_t>& kinds) {
     std::string out;
     for (std::size_t i = 0; i < kinds.size(); ++i) {
         if (!out.empty()) out += (i + 1 == kinds.size()) ? " or " : ", ";
@@ -21610,14 +21521,16 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     if (!ts || ts->decl != nullptr) return;
     const std::string_view head = ts->name;
     if (head != "Math" && head != "Convert") return;
-    // The DECLARED FORMS of this member at this arity. A call at an arity no
-    // declared form has is NOT this check's question (the ARITY rule and
-    // #7140's family own it), so the check stands down.
-    std::vector<const MathConvertSurfaceRow*> forms;
-    for (const auto& row : builtinMathConvertSurface())
-        if (row.head == head && row.member == member &&
-            row.arity == ce.args.size())
-            forms.push_back(&row);
+    // The DECLARED FORMS of this member at this arity, read out of the ONE
+    // built-in parameter table (`common::kBuiltinParams`) — the same table the
+    // admission gate and the §7 nullability gate read, so the parameter
+    // NAME (§22.5), the parameter TYPE (§5.1) and the parameter NULLABILITY
+    // (§7.3) of a form cannot disagree.
+    //
+    // A call at an arity no declared form has is NOT this check's question
+    // (the ARITY rule and #7140's family own it), so the check stands down.
+    const std::vector<common::BuiltinParamForm> forms =
+        common::builtinParamForms(head, member, ce.args.size());
     if (forms.empty()) return;
     // The §22.5 BINDING: a named argument binds to the parameter it NAMES
     // ("named arguments may appear in any order after positional arguments.
@@ -21695,13 +21608,12 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     // has no conversion TO `string`, and lists "between integers and bool"
     // as never implicit.
     auto admitsByIdentityOrWidening = [&](TypeRef* argTy,
-                                           MathConvertParamKind k) -> bool {
+                                           std::uint32_t k) -> bool {
         switch (k) {
-            case MathConvertParamKind::Unchecked: return true;
-            case MathConvertParamKind::String:
+            case common::kBPTString:
                 return argTy->kind == TypeRef::Kind::Primitive &&
                        argTy->primitive == PrimitiveType::String;
-            case MathConvertParamKind::Bool:
+            case common::kBPTBool:
                 return argTy->kind == TypeRef::Kind::Primitive &&
                        argTy->primitive == PrimitiveType::Bool;
             default: break;
@@ -21717,8 +21629,8 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     };
     auto admitsByConstantNarrowing = [&](const ast::Expr* argExpr,
                                          TypeRef* argTy,
-                                         MathConvertParamKind k) -> bool {
-        if (k != MathConvertParamKind::Int && k != MathConvertParamKind::Long)
+                                         std::uint32_t k) -> bool {
+        if (k != common::kBPTInt && k != common::kBPTLong)
             return false;
         if (!argExpr || !argTy) return false;
         if (argTy->kind != TypeRef::Kind::Primitive || argTy->nullable)
@@ -21736,9 +21648,10 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         head == "Math" ? "stdlib §2.2" : "stdlib §2.3";
     // The DECLARED signatures at this arity, quoted in the diagnostics below.
     std::string decls;
-    for (const auto* f : forms) {
+    for (const auto& f : forms) {
         if (!decls.empty()) decls += " / ";
-        decls += std::string(f->decl);
+        // The standard library's own words for the form, quoted.
+        decls += "`" + std::string(f.sig) + "`";
     }
     // fix #7286 (§22.6, v0.344): the STATIC TYPE of an argument at a call —
     // "The argument's static type is its type at the call: a read of a binding
@@ -21754,12 +21667,14 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         if (!isNarrowedNonNullRead(e)) return t;
         return operandStaticTypeAt(e, t);
     };
-    for (std::size_t p = 0; p < forms.front()->arity; ++p) {
+    for (std::size_t p = 0; p < forms.front().total; ++p) {
         // The declared kinds at this position, across the declared forms.
-        std::vector<MathConvertParamKind> admitted;
-        for (const auto* f : forms) {
-            const MathConvertParamKind k = p == 0 ? f->param0 : f->param1;
-            if (k == MathConvertParamKind::Unchecked) continue;
+        std::vector<std::uint32_t> admitted;
+        for (const auto& f : forms) {
+            const std::uint32_t k = p < f.kinds.size() ? f.kinds[p] : 0;
+            // No type opinion at this position: a type PARAMETER, an `out`
+            // slot, or a member whose argument is refused elsewhere.
+            if (k == 0 || (k & common::kBPTOut)) continue;
             if (std::find(admitted.begin(), admitted.end(), k) == admitted.end())
                 admitted.push_back(k);
         }
@@ -21844,10 +21759,10 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
             ctx_.markNarrowedValueRead(arg.value.get());
         }
         bool ok = false;
-        for (MathConvertParamKind k : admitted)
+        for (std::uint32_t k : admitted)
             if (admitsByIdentityOrWidening(argTy, k)) { ok = true; break; }
         if (!ok)
-            for (MathConvertParamKind k : admitted)
+            for (std::uint32_t k : admitted)
                 if (admitsByConstantNarrowing(arg.value.get(), argTy, k)) {
                     ok = true;
                     break;
@@ -21973,7 +21888,7 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     if ((head == "Convert" || head == "Math") && forms.size() > 1) {
         // The §22.6 grid: one entry per (declared form, argument position).
         enum class Grade { Exact, Convert, NotApplicable };
-        const std::size_t arity = forms.front()->arity;
+        const std::size_t arity = forms.front().total;
         std::vector<std::vector<Grade>> grid(
             forms.size(), std::vector<Grade>(arity, Grade::NotApplicable));
         // The step stands down where another rule owns the call: a
@@ -22007,9 +21922,9 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
                 break;
             }
             for (std::size_t c = 0; c < forms.size() && rankable; ++c) {
-                const MathConvertParamKind k =
-                    p == 0 ? forms[c]->param0 : forms[c]->param1;
-                if (k == MathConvertParamKind::Unchecked) {
+                const std::uint32_t k =
+                    p < forms[c].kinds.size() ? forms[c].kinds[p] : 0;
+                if (k == 0 || (k & common::kBPTOut)) {
                     rankable = false;
                     break;
                 }
@@ -22089,13 +22004,13 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
                         ce.args[static_cast<std::size_t>(paramToArg[tiePos])];
                     std::vector<std::string> candNames;
                     std::vector<bool> fillsDefault(forms.size(), false);
-                    for (const auto* f : forms) {
+                    for (const auto& f : forms) {
                         std::string n = std::string(member) + "(";
                         n += std::string(paramNames[0]) + ": " +
-                             std::string(mathConvertTypeName(f->param0));
-                        if (f->arity > 1)
+                             std::string(mathConvertTypeName(f.kinds[0]));
+                        if (f.total > 1)
                             n += ", " + std::string(paramNames[1]) + ": " +
-                                 std::string(mathConvertTypeName(f->param1));
+                                 std::string(mathConvertTypeName(f.kinds[1]));
                         n += ")";
                         candNames.push_back(n);
                     }
