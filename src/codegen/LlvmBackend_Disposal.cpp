@@ -1392,7 +1392,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 }
             }
             if (!fieldTy) fieldTy = ctx_.importedMemberType(m);
-            if (fieldTy && isVtableBackedIEnumerableType(fieldTy)) {
+            if (fieldTy && isVtableBackedIteratorFrameType(fieldTy)) {
             // `hasOwnedModifier` keys on `modifiers`; MemberSymbol inherits
             // that vector from Symbol. We mirror the FieldSymbol arm's
             // `isOwnedIteratorInterfaceField` gate explicitly because the

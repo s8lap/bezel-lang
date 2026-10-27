@@ -11533,15 +11533,57 @@ private:
         // Field's posParam branch (#1543); capturedOwnedPrimaryParamType is
         // defined further below (forward-declared use is fine — same class).
         if (fs->posParam)
-            return isVtableBackedIEnumerableType(
+            return isVtableBackedIteratorFrameType(
                 capturedOwnedPrimaryParamType(fs));
         if (!hasOwnedModifier(fs)) return false;
         // #662 foundation B: imported field — type from importedMemberType.
         if (!fs->decl)
-            return isVtableBackedIEnumerableType(ctx_.importedMemberType(fs));
+            return isVtableBackedIteratorFrameType(ctx_.importedMemberType(fs));
         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
         if (!fd || !fd->type) return false;
-        return isVtableBackedIEnumerableType(ctx_.resolvedType(*fd->type));
+        return isVtableBackedIteratorFrameType(ctx_.resolvedType(*fd->type));
+    }
+
+    // fix #2623 / §28.5 / §29.7 / §30.7 (v0.345): the ASYNC sibling of the
+    // `isVtableBackedIEnumerableType` shape the sync arm above covers — a
+    // declaration-less Named type whose runtime value is the ASYNC ITERATOR
+    // FRAME (§30.7): `IAsyncEnumerator<T>` / `IOwningAsyncEnumerator<T>`.
+    //
+    // The async iterator frame's vtable is [0]=td, [1]=Dispose,
+    // [2]=MoveNextAsync, [3]=Current, [4]=GetAsyncEnumerator — the SAME
+    // slot-1 Dispose the sync iterator format has (the async frame carries no
+    // `DisposeAsync`: §30.7 says the SYNCHRONOUS fallback (§29.7) runs for an
+    // iterator-format `await using`). So the same slot-1 dispatch frees the
+    // frame and runs the pending `finally` chain.
+    //
+    // The heads are read from the SHARED classifier, not spelled here:
+    // `common::isIterFormatEnumeratorHead` is the four-head enumerator set and
+    // `common::isSyncIterFormatEnumeratorHead` its synchronous half, so the
+    // async half is the difference — the same "read the shared head classifier"
+    // discipline #3419 established (and the reason the sync
+    // `isVtableBackedIEnumerableType` is NOT widened: that predicate drives
+    // the §29.2 `for` desugaring, which is a disjoint lowering path).
+    bool isVtableBackedAsyncEnumeratorType(const sema::TypeRef* rt) {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (rt->genericArgs.empty() || !rt->genericArgs[0]) return false;
+        std::string_view n = builtinTypeName(rt);
+        if (n.empty()) return false;
+        return common::isIterFormatEnumeratorHead(n) &&
+               !common::isSyncIterFormatEnumeratorHead(n);
+    }
+
+    // The two iterator-frame shapes the owned-FIELD disposal admits: the sync
+    // iterator format (IEnumerable<T> / IOwningEnumerable<T>) and the async
+    // iterator format (IAsyncEnumerator<T> / IOwningAsyncEnumerator<T>). Both
+    // are disposed through the SAME slot-1 dispatch (see
+    // `emitOwnedFieldDisposals`'s iterField arm), which picks the iterator
+    // arm or the class arm at RUN TIME (the discriminator answers "is word 0 a
+    // REGISTERED vtable?", so a user class implementing the interface takes
+    // the class arm and the frame takes the slot-1 arm). // per §29.7, §30.7
+    bool isVtableBackedIteratorFrameType(const sema::TypeRef* rt) {
+        return isVtableBackedIEnumerableType(rt) ||
+               isVtableBackedAsyncEnumeratorType(rt);
     }
 
     // #595 / §12 / §31: detect whether a user-defined class or any of its user-
