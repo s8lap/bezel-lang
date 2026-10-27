@@ -494,7 +494,9 @@ campaign is what is left after they run.
      `--unchecked-disposal`, keep `--checked-disposal` as a no-op. **Amended:** at an explicit
      `Dispose()` where the K5 liveness proves no borrow of the value survives, reclaim in full at the
      call (no retention); retain only where a borrow may survive or the analysis is unsure (spans,
-     `Shared<T>`, collection elements, unknown provenance). Check elision is a later campaign, after
+     `Shared<T>`, collection elements, unknown provenance). Also retain where a later release of the same binding
+     (scope end, overwrite, a repeated `Dispose()`) is reached on a *maybe-consumed* join and would
+     read the flag; where the explicitly-disposed post-state is static there, emit nothing. Check elision is a later campaign, after
      the soundness model checks its premise.
    - **#6358**: the dictionary records at construction that its keys are strings, and every free path
      (`bz_dict_free`, `Remove`, `Clear`, overwrite) releases them; no per-site emission.
