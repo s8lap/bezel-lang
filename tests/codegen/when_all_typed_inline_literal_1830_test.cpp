@@ -1,4 +1,4 @@
-// Codegen — issue #1830 (spec §6.7 / stdlib §6.7 line 2875, v0.217):
+// Codegen — issue #1830 (spec §6.7 / stdlib §6.7, v0.217):
 // `Task.WhenAll<T>` invoked over an INLINE collection literal whose aggregate
 // is awaited for its `Array<T>` result. Pre-fix, the compiler aborted in
 // `emitAsyncMethod` with an LLVM `DataLayout` assertion: the result local

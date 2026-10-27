@@ -6,7 +6,7 @@
 //
 // §14.2 + §3.6 hashable row clause (e) (v0.338): stdlib §5 declares
 // `ToDictionary<TKey>(key: (T) -> TKey): owned Dictionary<TKey, T> where
-// TKey: hashable` (Bezel_Standard_Library.md:3701-3702) — "an ordinary
+// TKey: hashable` (stdlib §5) — "an ordinary
 // member-level `where` clause … the ordinary constraint form of language
 // spec §14.2 … on the member's own type parameter". A function type is not
 // hashable (§3.6 clause (e): a lambda equals only itself), so the call is a

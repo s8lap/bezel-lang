@@ -3,7 +3,7 @@
 // `xs.GroupBy(...)`.
 //
 // AUTHORITY. spec §5 (v0.298) / stdlib §5 define `IGrouping<TKey, T> : IEnumerable<T>`
-// and stdlib §5 line 3076 declares `public method Key: TKey;` plus the §29
+// and stdlib §5 declares `readonly property Key: TKey;` plus the §29
 // enumerable contract. spec §15.4 governs heap collections — `Array<T>` is a
 // BORROWING collection, so its slot stores an element reference WITHOUT
 // disposal obligation on the array side. spec §28.11 v0.135 fixes the §28.11

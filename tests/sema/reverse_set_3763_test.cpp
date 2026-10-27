@@ -40,14 +40,14 @@
 // later widening of the predicate cannot land silently.
 //
 // Citations verified verbatim against docs/ at v0.287:
-//   stdlib §5 (line 3544): "public method Reverse(): IEnumerable<T;"
-//   stdlib §5 naming note (line 3608, v0.195): "on an `Array<T>` receiver,
+//   stdlib §5: "public method Reverse(): IEnumerable<T;"
+//   stdlib §5 naming note (v0.195): "on an `Array<T>` receiver,
 //     instance resolution commits to the in-place `Reverse()` before
 //     extensions are consulted (spec §26.5 rule 1 …); the lazy operator
 //     applies only where the receiver's static type has no instance
 //     `Reverse`."
-//   stdlib §4.4 `Array<T>` (line 1583): "public method Reverse();  // in place"
-//   stdlib §4.5 `OwningArray<T>` (line 1678): "public method Reverse();"
+//   stdlib §4.4 `Array<T>`: "public method Reverse();  // in place"
+//   stdlib §4.5 `OwningArray<T>`: "public method Reverse();"
 //   — those two, plus `Span<T>`/`ReadOnlySpan<T>` and `ArraySpan<T>` (§4.15),
 //   are the ONLY types in the document that declare an instance `Reverse()`.
 //   §4.10 `Set<T>`/`OwningSet<T>`, §4.18 `SortedSet<T>`, §4.6/§4.7

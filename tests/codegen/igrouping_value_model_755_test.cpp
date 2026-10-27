@@ -1,11 +1,11 @@
 // Codegen — the `IGrouping<TKey, T>` value model (issue #755, and the four
 // defects #2265 records in the #1296 lowering it supersedes).
 //
-// Spec: stdlib §5 (`GroupBy<TKey>(key): IEnumerable<IGrouping<TKey, T>>` at
-// line 3067; `IGrouping<TKey, T>: IEnumerable<T>` at 3076; `ToArray(): owned
-// Array<T>` at 3070; `Single(): T; // throws if not exactly one` at 3020 and
-// the `InvalidOperationException` / `IndexOutOfRangeException` fault list at
-// 3089; the GroupBy paragraph at 3099, whose own worked example is
+// Spec: stdlib §5 (`GroupBy<TKey>(key): IEnumerable<IGrouping<TKey, T>>`;
+// `IGrouping<TKey, T>: IEnumerable<T>`; `ToArray(): owned Array<T>`;
+// `Single(): T; // throws if not exactly one`; the
+// `InvalidOperationException` / `IndexOutOfRangeException` fault list; and the
+// GroupBy paragraph, whose own worked example is
 // `for var g in … do using var items := g.ToArray(); … end;`), language spec
 // §29.2 (desugaring of `for`), §29.11 (enumeration), §28.9 (runtime-managed
 // value disposal), v0.226.
@@ -32,12 +32,12 @@
 //        sentinel's shape, and an IGrouping's element type is genericArgs[1],
 //        not [0]), so `var a := g.ToArray(); a.Count` lowered to 0 AND the
 //        materialized array was never reclaimed — a wrong value plus a leak,
-//        on the exact idiom stdlib §5:3099 prescribes.
+//        on the exact idiom stdlib §5 prescribes.
 //   #2265: the #1296 lowering that patched a subset of the terminals by hand
 //        returned the grouping's OWN array from `ToArray()` (aliasing what
 //        `bz_grouping_free` frees), lowered `Single()` as a bare `arr[0]` with
 //        no arity check, and `ElementAt(i)` as unchecked pointer arithmetic —
-//        neither of the two faults stdlib §5:3089 requires — and admitted
+//        neither of the two faults stdlib §5 requires — and admitted
 //        Min/Max into its name filter without a body for them.
 //
 // THE FIX. An `IGrouping<TKey, T>` receiver/source is restated as its element
@@ -88,7 +88,7 @@ namespace {
 // exitCode pins) stays exactly where it was.
 
 // ---------------------------------------------------------------------------
-// [17] Inner `for var el in g` over an IGrouping — stdlib §5:3076 + spec §29.2.
+// [17] Inner `for var el in g` over an IGrouping — stdlib §5 + spec §29.2.
 // xs = [1,2,3,4] keyed `x mod 2` → groups {1,3} and {2,4}; the inner loop sums
 // every element of every group → 10. Before the fix this did not compile at
 // all ("not yet implemented: codegen for this for statement").
@@ -201,9 +201,9 @@ const char* kGroupingSelectorTerminals =
     "end C;";
 
 // ---------------------------------------------------------------------------
-// #2265 item 1 — `g.ToArray()` is a FRESH copy (stdlib §5:3070 `owned
+// #2265 item 1 — `g.ToArray()` is a FRESH copy (stdlib §5 — `owned
 // Array<T>`), reclaimed at its own scope end and independent of the grouping.
-// This is the exact idiom stdlib §5:3099 prescribes for aggregating a group
+// This is the exact idiom stdlib §5 prescribes for aggregating a group
 // more than once. Mutating the copy must not disturb the grouping: the copy is
 // bumped by 100 per element, then the GROUP is summed again — 2 elements,
 // copy sum 9 + 200 = 209, group sum still 9 → 209 + 9 = 218.
@@ -248,7 +248,7 @@ const char* kGroupingToArrayCount =
 
 // ---------------------------------------------------------------------------
 // #2265 item 2 — `Single()` faults unless the group holds exactly one element
-// (stdlib §5:3020 + the §5:3089 fault list). The value form first: xs = [7]
+// (stdlib §5 + its fault list). The value form first: xs = [7]
 // keyed constant → one group of one → 7.
 // ---------------------------------------------------------------------------
 const char* kGroupingSingleOnOneElement =
@@ -287,7 +287,7 @@ const char* kGroupingSingleFaultsOnTwo =
 
 // ---------------------------------------------------------------------------
 // #2265 item 3 — `ElementAt(i)` bounds-checks against the group's size
-// (stdlib §5:3089 `IndexOutOfRangeException`). Before the fix this was
+// (stdlib §5 `IndexOutOfRangeException`). Before the fix this was
 // unchecked pointer arithmetic: an ASan heap-buffer-overflow read. In-range
 // first (5), then out of range → caught → 66; total 71.
 // ---------------------------------------------------------------------------
@@ -340,7 +340,7 @@ const char* kForOverGroupingFromFirst =
 // pre-fix compiler: [17] did not compile at all, [20] returned 8 (and
 // leaked), the selector terminals returned the empty-sequence default,
 // `ToArray()` returned an untyped/aliased array, and Single/ElementAt
-// skipped their stdlib §5:3089 faults.
+// skipped their stdlib §5 faults.
 // =====================================================================
 
 BEZEL_TEST(igrouping_value_model_755,

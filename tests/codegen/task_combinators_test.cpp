@@ -2,7 +2,7 @@
 //
 // Tests for Task.FromResult<T>, Task.WhenAll, Task.WhenAny, Task.FireAndForget,
 // and `using var` Task disposal. These derive from Bezel_Standard_Library_0_130.md
-// §6.7 (lines 2852-2886) and language spec §30.5 / §30.10.
+// §6.7 and language spec §30.5 / §30.10.
 //
 // Like async_test.cpp, the async emitter accumulates LLVM module state across
 // runs, so these tests compile to native executables and check exit codes.
@@ -161,7 +161,7 @@ int compileAndRunCheckedDisposal(const std::string& source) {
 }  // namespace
 
 // ============================================================
-// stdlib §6.7 line 2855: Task.FromResult<T>(value: T): Task<T>
+// stdlib §6.7: Task.FromResult<T>(value: T): Task<T>
 // ============================================================
 
 // §6.7 / §30.10: `var x := await Task.FromResult(42)` — the task is already
@@ -222,7 +222,7 @@ BEZEL_TEST(task_combinators_6_7, from_result_using_var_await_then_dispose) {
 }
 
 // ============================================================
-// stdlib §6.7 line 2872: Task.WhenAll(tasks: Array<Task>): Task
+// stdlib §6.7: Task.WhenAll(tasks: Array<Task>): Task
 // ============================================================
 
 // §6.7: Task.WhenAll on an array of already-completed tasks (from
@@ -374,7 +374,7 @@ BEZEL_TEST(task_combinators_6_7, when_all_with_delays_cross_thread) {
 }
 
 // ============================================================
-// stdlib §6.7 line 2884: Task.WhenAny(tasks: Array<Task>): Task<int>  (v0.162/#1332)
+// stdlib §6.7: Task.WhenAny(tasks: Array<Task>): Task<int>  (v0.162/#1332)
 // ============================================================
 // WhenAny now produces Task<int> (winner INDEX), not Task<Task> (winner task ptr).
 // Task<Task> was unconstructible under §30.5; an int index is unambiguous and safe.
@@ -484,7 +484,7 @@ BEZEL_TEST(task_combinators_6_7, when_any_delay_race_winner_index) {
 }
 
 // ============================================================
-// #1501 / stdlib §6.7 (line 2884) §30.10 / §30.15: Task.WhenAny over an
+// #1501 / stdlib §6.7 §30.10 / §30.15: Task.WhenAny over an
 // INLINE Array<Task> literal of Channel<T>.Receive() tasks — the natural
 // "select" idiom. Before the fix, `Task.WhenAny([ta, tb])` (an inline
 // CollectionLiteralExpr argument, as opposed to every pre-existing test
@@ -570,7 +570,7 @@ BEZEL_TEST(task_combinators_1501, when_any_inline_literal_over_channel_receive_l
 }
 
 // ============================================================
-// #1616 / stdlib §6.7 (line 2872) / §30.10: Task.WhenAll over an INLINE
+// #1616 / stdlib §6.7 / §30.10: Task.WhenAll over an INLINE
 // Array<Task> literal — the exact WhenAny-inline-literal bug (#1501) in the
 // sibling WhenAll branch, which had never been given the lowerTaskArrayArg
 // fix. WhenAll is a compiler intrinsic with no MethodDecl param, so sema
@@ -629,7 +629,7 @@ BEZEL_TEST(task_combinators_1616, when_all_inline_literal_bound_tasks) {
         7);
 }
 
-// #1830 / stdlib §6.7 (line 2875) / §30.10: the CONSUMED half of the typed
+// #1830 / stdlib §6.7 / §30.10: the CONSUMED half of the typed
 // `Task.WhenAll<T>(Array<Task<T>>): Task<Array<T>>` inline-literal shape — the
 // awaiter READS the aggregate `Array<int>` rather than discarding it. This pins
 // that #1830's literal-element fallback actually produces the results the sema
@@ -651,7 +651,7 @@ BEZEL_TEST(task_combinators_1830, when_all_typed_inline_literal_results_in_order
 }
 
 // ============================================================
-// stdlib §6.7 line 2885: Task.FireAndForget(owned task: Task)
+// stdlib §6.7: Task.FireAndForget(owned task: Task)
 // ============================================================
 
 // §6.7: Task.FireAndForget with an already-completed task. The task is freed

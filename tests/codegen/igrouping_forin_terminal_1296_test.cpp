@@ -103,8 +103,8 @@ const char* kForInGroupBySumViaTemp =
 // CORRECTED for #755/#2265 item 2. This source used to include `g.Single()`
 // and expect 29 — i.e. it asserted that `Single()` on a TWO-element group
 // yields its first element. That is not what the standard library says:
-// stdlib §5:3020 declares `Single(): T; // throws if not exactly one` and
-// §5:3089 names `InvalidOperationException`. The #1296 lowering had no arity
+// stdlib §5 declares `Single(): T; // throws if not exactly one` and names
+// `InvalidOperationException`. The #1296 lowering had no arity
 // check (it emitted a bare `arr[0]`), and the expectation encoded that missing
 // fault as correct. The `Single()` contract now has its own tests below (one
 // pinning the value on a genuine one-element group, one pinning the fault on a

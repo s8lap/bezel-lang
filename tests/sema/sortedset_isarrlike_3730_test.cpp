@@ -44,7 +44,7 @@
 //     declared members: constructor(), Count, Add, TryAdd, Contains, Remove,
 //     Clear, First, Last — no Get/Peek/Pop/Dequeue/PopFirst/PopLast/PopAt/
 //     IndexOf/Length, no Try-extraction family beyond TryAdd.
-//   stdlib line 1467: "public interface IReadOnlyCollection<out T>:
+//   stdlib §4.1: "public interface IReadOnlyCollection<out T>:
 //     IEnumerable<T>" — so stdlib §5's `extension IEnumerable<T>` block
 //     applies to a SortedSet receiver normatively.
 

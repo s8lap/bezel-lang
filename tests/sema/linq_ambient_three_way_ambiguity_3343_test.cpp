@@ -132,7 +132,7 @@ BEZEL_TEST(sema_lin_q_ambient_three_way_ambiguity_3343,
 
 // ============================================================================
 // The predicate-arity variant of the same shape. §5 declares `First(pred)`
-// over `IEnumerable<T>` (stdlib §5 line 3515), so the 1-arg call also
+// over `IEnumerable<T>` (stdlib §5), so the 1-arg call also
 // admits a §5 candidate.
 // ============================================================================
 BEZEL_TEST(sema_lin_q_ambient_three_way_ambiguity_3343,
@@ -270,7 +270,7 @@ BEZEL_TEST(sema_lin_q_ambient_three_way_ambiguity_3343,
 
 // ============================================================================
 // §5's constrained block: `extension IEnumerable<T> where T: hashable`
-// declares `Contains(value: T)` (stdlib §5 second block, line 3587).
+// declares `Contains(value: T)` (stdlib §5 second block).
 // The §5 candidate's `stdHead` / `stdWhere` distinguishes the constrained
 // block from the main one — when a user block shadows `Contains`, the
 // diagnostic names the §5 candidate with its `where` clause spelled out
@@ -300,7 +300,7 @@ BEZEL_TEST(sema_lin_q_ambient_three_way_ambiguity_3343,
     // the block cannot be removed (the rationale, not the rule alone).
     BEZEL_EXPECT_TRUE(msg.find("auto-imported via §2.3") != std::string::npos);
     // The §5 candidate for `Contains` lives in the `where T: hashable`
-    // constrained block (stdlib §5 second block, line 3585). The rule-4
+    // constrained block (stdlib §5 second block). The rule-4
     // diagnostic must spell the where clause as part of the declared head —
     // "declared head including any where clause" (§26.5.1 v0.278) applies
     // uniformly to stdlib and user candidates.

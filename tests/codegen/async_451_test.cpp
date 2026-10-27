@@ -1,9 +1,9 @@
 // Codegen — async/await gap completions (#451).
 //
 // (A) Task.WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>
-//     stdlib §6.7 line 2875 / spec §30.10.
+//     stdlib §6.7 / spec §30.10.
 // (B) Task.Delay(ms, token: CancellationToken): Task  — token cancellation.
-//     stdlib §6.7 lines 2867-2870 / spec §30.8.
+//     stdlib §6.7 / spec §30.8.
 // (C) await inside a catch GUARD (catch E when await ...) — confirmed clean
 //     diagnostic (not a crash).
 //
@@ -118,7 +118,7 @@ bool compileFails(const std::string& source) {
 }  // namespace
 
 // ===========================================================================
-// (A) Task.WhenAll<T> — stdlib §6.7 line 2875
+// (A) Task.WhenAll<T> — stdlib §6.7
 // ===========================================================================
 //
 // fix #4670 / §30.5 (v0.307): `Task.WhenAll<T>(tasks)` returns `Task<Array<T>>`
@@ -135,7 +135,7 @@ bool compileFails(const std::string& source) {
 // — Pattern B — and are NOT affected; their `using var arr := await wa;`
 // stays exactly as-is.
 
-// §6.7 line 2875: WhenAll<T> over Task<int> — collects three int results
+// §6.7: WhenAll<T> over Task<int> — collects three int results
 // into Array<int>. The indexed results should be [10, 20, 30] in order.
 // Main returns results[0] + results[1] + results[2] = 60.
 // Derived from: stdlib §6.7 WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>.
@@ -154,7 +154,7 @@ BEZEL_TEST(whenall_generic_results_451, int_results_sum) {
         60);
 }
 
-// §6.7 line 2875: WhenAll<T> on an empty Array<Task<int>> produces an
+// §6.7: WhenAll<T> on an empty Array<Task<int>> produces an
 // immediately-complete Task<Array<int>> whose result is an empty array.
 // Count == 0, so Main returns 0.
 BEZEL_TEST(whenall_generic_results_451, empty_array_produces_empty_result) {
@@ -169,7 +169,7 @@ BEZEL_TEST(whenall_generic_results_451, empty_array_produces_empty_result) {
         0);
 }
 
-// §6.7 line 2875: WhenAll<T> with a bool result. Each Task<bool> has value
+// §6.7: WhenAll<T> with a bool result. Each Task<bool> has value
 // true (1 byte). Collect three and check they are all true. Returns 3 if all
 // three are true, otherwise 0.
 BEZEL_TEST(whenall_generic_results_451, bool_results_collected) {
@@ -191,7 +191,7 @@ BEZEL_TEST(whenall_generic_results_451, bool_results_collected) {
         3);
 }
 
-// §6.7 line 2875 + §30.10: WhenAll<T> cross-thread with genuinely-async
+// §6.7 + §30.10: WhenAll<T> cross-thread with genuinely-async
 // Task<int> producers (Task.FromResult is sync; use async helpers). Run 3×.
 // Each async helper awaits Task.Delay then returns a value; WhenAll collects.
 BEZEL_TEST(whenall_generic_results_451, async_producers_cross_thread) {
@@ -214,7 +214,7 @@ BEZEL_TEST(whenall_generic_results_451, async_producers_cross_thread) {
         BEZEL_EXPECT_EQ(compileAndRun(src), 24);
 }
 
-// §6.7 line 2875 + §30.9 (#443 fault propagation): WhenAll<T> where one
+// §6.7 + §30.9 (#443 fault propagation): WhenAll<T> where one
 // input Task<int> faults. The aggregate should propagate the fault; the
 // result array is NOT produced. With no enclosing handler, exits 70.
 BEZEL_TEST(whenall_generic_results_451, one_faulted_propagates) {
@@ -234,7 +234,7 @@ BEZEL_TEST(whenall_generic_results_451, one_faulted_propagates) {
         70);
 }
 
-// §6.7 line 2875 + §30.9: WhenAll<T> fault caught by enclosing try.
+// §6.7 + §30.9: WhenAll<T> fault caught by enclosing try.
 // The catch fires; x := 42.
 BEZEL_TEST(whenall_generic_results_451, faulted_caught) {
     BEZEL_EXPECT_EQ(compileAndRun(
@@ -259,11 +259,11 @@ BEZEL_TEST(whenall_generic_results_451, faulted_caught) {
 }
 
 // ===========================================================================
-// (A2) Task.WhenAllOwned<T> — stdlib §6.7 lines 2942-2944
+// (A2) Task.WhenAllOwned<T> — stdlib §6.7
 //      OwningTask<T> combinator variant (T: class)
 // ===========================================================================
 
-// §6.7 line 2942 / §30.10: WhenAllOwned with an empty OwningArray produces an
+// §6.7 / §30.10: WhenAllOwned with an empty OwningArray produces an
 // immediately-complete OwningTask<OwningArray<T>>. Await result's Count == 0.
 BEZEL_TEST(when_all_owned_451, empty_array_produces_empty_result) {
     BEZEL_EXPECT_EQ(compileAndRun(
@@ -284,7 +284,7 @@ BEZEL_TEST(when_all_owned_451, empty_array_produces_empty_result) {
         0);
 }
 
-// §6.7 line 2942 / §30.10: WhenAllOwned with two already-completed OwningTask<Box>
+// §6.7 / §30.10: WhenAllOwned with two already-completed OwningTask<Box>
 // (from Task.FromOwnedResult). Results collected; Value fields are 10 and 20.
 // Returns arr[0].Value + arr[1].Value = 30.
 // Derived from: stdlib §6.7 WhenAllOwned<T>(tasks: OwningArray<OwningTask<T>>):
@@ -313,7 +313,7 @@ BEZEL_TEST(when_all_owned_451, two_tasks_results_collected) {
         30);
 }
 
-// §6.7 line 2942 / §30.10: WhenAllOwned cross-thread: each OwningTask<Box>
+// §6.7 / §30.10: WhenAllOwned cross-thread: each OwningTask<Box>
 // awaits Task.Delay before returning a new Box. Tasks run concurrently (they
 // are started before WhenAllOwned is called). Collect 3 boxes; sum = 1+2+3=6.
 BEZEL_TEST(when_all_owned_451, async_producers_cross_thread) {
@@ -344,10 +344,10 @@ BEZEL_TEST(when_all_owned_451, async_producers_cross_thread) {
 }
 
 // ===========================================================================
-// (B) Task.Delay(ms, token: CancellationToken) — stdlib §6.7 lines 2867-2870
+// (B) Task.Delay(ms, token: CancellationToken) — stdlib §6.7
 // ===========================================================================
 
-// §6.7 line 2868 / §30.8: Delay(ms, CancellationToken.None) behaves the same
+// §6.7 / §30.8: Delay(ms, CancellationToken.None) behaves the same
 // as Delay(ms): the None token never cancels, so the delay runs normally.
 // Awaiting it returns normally; Main exits 5.
 // Note: this passes CancellationToken.None INLINE. The local-variable form
@@ -365,7 +365,7 @@ BEZEL_TEST(delay_cancel_451, none_token_delay_runs_normally) {
         BEZEL_EXPECT_EQ(compileAndRun(src), 5);
 }
 
-// §6.7 line 2868 / §30.8: Delay with an already-cancelled token produces an
+// §6.7 / §30.8: Delay with an already-cancelled token produces an
 // immediately-faulted Task. Awaiting it throws OperationCanceledException.
 // With no enclosing handler, exits 70.
 BEZEL_TEST(delay_cancel_451, pre_cancelled_token_faults_immediately) {
@@ -381,7 +381,7 @@ BEZEL_TEST(delay_cancel_451, pre_cancelled_token_faults_immediately) {
         70);
 }
 
-// §6.7 line 2868 / §30.8: pre-cancelled Delay fault is caught by a catch arm.
+// §6.7 / §30.8: pre-cancelled Delay fault is caught by a catch arm.
 // The OperationCanceledException should be catchable; x := 77.
 BEZEL_TEST(delay_cancel_451, pre_cancelled_fault_caught) {
     BEZEL_EXPECT_EQ(compileAndRun(
@@ -401,7 +401,7 @@ BEZEL_TEST(delay_cancel_451, pre_cancelled_fault_caught) {
         77);
 }
 
-// §6.7 line 2868 / §30.8: Delay with a token that is NOT yet cancelled runs
+// §6.7 / §30.8: Delay with a token that is NOT yet cancelled runs
 // normally. After the delay completes (no cancellation), exits 6.
 BEZEL_TEST(delay_cancel_451, not_yet_cancelled_delay_runs) {
     const std::string src =
@@ -416,7 +416,7 @@ BEZEL_TEST(delay_cancel_451, not_yet_cancelled_delay_runs) {
         BEZEL_EXPECT_EQ(compileAndRun(src), 6);
 }
 
-// §6.7 line 2870 / §30.8: Delay(TimeSpan, token). The TimeSpan overload with
+// §6.7 / §30.8: Delay(TimeSpan, token). The TimeSpan overload with
 // a None token still runs normally (same as Delay(TimeSpan)). Exits 8.
 // Token passed inline to avoid pre-existing CancellationToken.None-in-frame bug.
 BEZEL_TEST(delay_cancel_451, timespan_overload_none_token) {

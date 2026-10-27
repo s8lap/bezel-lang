@@ -1,4 +1,4 @@
-// Codegen — fix #3761 / stdlib §5 line 3594, §4.8 (v0.286):
+// Codegen — fix #3761 / stdlib §5, §4.8 (v0.286):
 // `Dictionary<K, V>.Single()` typed correctly by sema but
 // `LlvmBackend_Calls.cpp`'s `isDict` block had NO `Single` arm (only
 // First/Last/ElementAt from narrow #3576), so the call fell through to
@@ -10,7 +10,7 @@
 //
 // THE FIX. Add a `m == "Single"` arm to the same predicate the #3576
 // First/Last/ElementAt arm sits inside, with the spec's throwing contract
-// (stdlib §5 line 3594: "`First`/`Last`/`Single`/`ElementAt` throw
+// (stdlib §5: "`First`/`Last`/`Single`/`ElementAt` throw
 // `InvalidOperationException` (or `IndexOutOfRangeException` for
 // `ElementAt`) on missing-element"). For `Single` "missing-element" means
 // the source has anything other than exactly one entry — covered by a
@@ -160,7 +160,7 @@ BEZEL_TEST(dictionary_single_3761, dictionary_single_empty_throws_5) {
 // ---------------------------------------------------------------------------
 // T5 — multi-entry dict Single() must throw InvalidOperationException.
 // `Single` is stricter than `First`/`Last`: even with entries present, the
-// count must be exactly 1 (stdlib §5 line 3594 + §5.1's "throws unless
+// count must be exactly 1 (stdlib §5 + §5.1's "throws unless
 // exactly one matches" wording for Single(pred)). 200x under ASan/LSan
 // proves the throw path leaks no snapshot spine arrays either.
 // ---------------------------------------------------------------------------

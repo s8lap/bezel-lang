@@ -12,7 +12,7 @@
 // ⚠ NOT because none of them is `IAsyncDisposable`. That claim was made in an
 // earlier revision of this header and it is FALSE: stdlib §4.13 (v0.283)
 // declares `public interface IOwningAsyncEnumerable<T>: IAsyncDisposable where
-// T: class` (Bezel_Standard_Library.md:2441), so THREE iteration interfaces
+// T: class` (stdlib §4.13), so THREE iteration interfaces
 // carry `IAsyncDisposable` — IAsyncEnumerator, IOwningAsyncEnumerator and
 // IOwningAsyncEnumerable — and the third of them IS in this set.
 //
@@ -448,7 +448,7 @@ BEZEL_TEST(await_using_iterator_format_disposal_3437,
 
 // ── THE SIXTH HEAD, and the one that decides the RATIONALE:
 // `IOwningAsyncEnumerable<T>` IS declared `: IAsyncDisposable` (stdlib §4.13,
-// v0.283, Bezel_Standard_Library.md:2441). It belongs in the arm's set anyway,
+// v0.283). It belongs in the arm's set anyway,
 // because no `DisposeAsync` is reachable through an iterator-format frame and
 // §28.12/§29.7 define the synchronous fallback as the degraded behaviour. This is
 // therefore the row that distinguishes the two justifications: it passes under

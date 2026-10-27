@@ -77,7 +77,7 @@
 // `System.Collections.Linq` declares no `OfType` row (`grep -n OfType
 // docs/Bezel_Standard_Library.md` is empty); §4.18 `SortedSet<T>` declares
 // `public class SortedSet<T>: IReadOnlyCollection<T> where T: IComparable<T>`
-// and stdlib line 1467 declares `public interface IReadOnlyCollection<out T>:
+// and stdlib §4.1 declares `public interface IReadOnlyCollection<out T>:
 // IEnumerable<T>`, which is why §5 applies to a `SortedSet` at all and why 3711
 // is a defect rather than a non-member.
 

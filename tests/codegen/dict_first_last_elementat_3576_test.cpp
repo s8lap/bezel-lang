@@ -31,7 +31,7 @@
 // why a shared helper is a separate, larger unification, filed as #3717),
 // then decode ONLY the one index the terminal's own guard selects (empty ->
 // InvalidOperationException for First/Last; out of range ->
-// IndexOutOfRangeException for ElementAt, stdlib §5 line 3594).
+// IndexOutOfRangeException for ElementAt, stdlib §5).
 //
 // NARROWED OFF (AT THE TIME THIS FIX LANDED): a STRING key. Measured (200x
 // under ASan/LSan): the entry's VALUE was correct, but the rebuilt
@@ -202,7 +202,7 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_class_value_first_4_8) {
 }
 
 // ---------------------------------------------------------------------------
-// stdlib §5 line 3594 — throwing contracts
+// stdlib §5 — throwing contracts
 // ---------------------------------------------------------------------------
 
 // The empty/out-of-range guard runs BEFORE this fix's snapshot allocation
@@ -494,7 +494,7 @@ BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_first_last_elem
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=10200"));
 }
 
-// stdlib §5 line 3594: Single() over a one-entry string-keyed Dictionary —
+// stdlib §5: Single() over a one-entry string-keyed Dictionary —
 // same isDict arm, same disposal mechanism, exact-count oracle. 200x under
 // ASan/LSan.
 BEZEL_TEST(dict_first_last_elementat_3576, dictionary_string_key_single_no_leak_3720) {

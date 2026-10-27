@@ -157,7 +157,7 @@ const std::vector<StaticCase>& allStaticCases() {
         // BitConverter has its own rejectBuiltinStatic() arm (line
         // ~17989, fix #3344) producing a different message that now
         // cites §2.12 (BitConverter's actual stdlib section — stdlib
-        // line 552, the v0.103 section header is
+        // §2.12's section header is
         // `### 2.12 ``BitConverter```, not §3.4 which is
         // `ReadOnlyAsciiByteSpan (retired v0.188)`). The needle here
         // pins the wording the source emits today — including the §2.12

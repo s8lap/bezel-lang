@@ -27,9 +27,9 @@
 //
 // Per stdlib verification (not inferred from what the compiler special-cases):
 //   - Dictionary (§4.8): declares `Keys: IReadOnlyCollection<K>` /
-//     `Values: IReadOnlyCollection<V>` (lines 1845-1846). KEPT in
+//     `Values: IReadOnlyCollection<V>`. KEPT in
 //     isKnownProperty.
-//   - OwningDictionary (§4.9): declares the same (lines 1922-1923). KEPT.
+//   - OwningDictionary (§4.9): declares the same. KEPT.
 //   - SortedDictionary (§4.17): declares Count, [key], ContainsKey,
 //     Contains, TryGetValue, GetOrNull, Remove, Clear, FirstKey, LastKey —
 //     NO Keys/Values. REMOVED from isKnownProperty (now correctly

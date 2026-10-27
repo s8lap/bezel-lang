@@ -259,7 +259,7 @@ BEZEL_TEST(range_contains_pure_contract_3279,
 
 // Negative — `requires(x in s)` over a ReadOnlySpan<int> receiver is
 // REJECTED. ReadOnlySpan<T>.Contains is a plain method (stdlib §4.14,
-// lines 2746/2778), so `in` over a ReadOnlySpan receiver fails the
+// so `in` over a ReadOnlySpan receiver fails the
 // §22.15 calls-to-pure-members rule.
 BEZEL_TEST(range_contains_pure_contract_3279,
            requires_in_readonly_span_rejected_spec_22_15_issue_3279) {
@@ -278,7 +278,7 @@ BEZEL_TEST(range_contains_pure_contract_3279,
 }
 
 // Negative — `requires(x in s)` over a Span<int> receiver is REJECTED.
-// Span<T>.Contains is a plain method (stdlib §4.14, lines 2589/2652),
+// Span<T>.Contains is a plain method (stdlib §4.14),
 // so `in` over a Span receiver fails the §22.15 rule.
 BEZEL_TEST(range_contains_pure_contract_3279,
            requires_in_span_rejected_spec_22_15_issue_3279) {
@@ -298,7 +298,7 @@ BEZEL_TEST(range_contains_pure_contract_3279,
 
 // Negative — `requires(x in s)` over an ArraySpan<int> receiver is
 // REJECTED. ArraySpan<T>.Contains is a plain method (stdlib §4.15,
-// line 3119), same rule.
+// same rule.
 BEZEL_TEST(range_contains_pure_contract_3279,
            requires_in_array_span_rejected_spec_22_15_issue_3279) {
     auto r = parseSemaAll(
@@ -317,7 +317,7 @@ BEZEL_TEST(range_contains_pure_contract_3279,
 
 // Negative — `requires(x in s)` over a ReadOnlyArraySpan<int> receiver
 // is REJECTED. ReadOnlyArraySpan<T>.Contains is a plain method (stdlib
-// §4.15, line 3184), same rule.
+// §4.15), same rule.
 BEZEL_TEST(range_contains_pure_contract_3279,
            requires_in_readonly_array_span_rejected_spec_22_15_issue_3279) {
     auto r = parseSemaAll(
