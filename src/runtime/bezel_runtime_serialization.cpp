@@ -1362,14 +1362,37 @@ static double bz_jder_parse_float(bz_binder_t* d) {
     int64_t start = d->pos;
     if (d->data[d->pos] == '-') ++d->pos;
     while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    // stdlib §2.15 (v0.344, #7341): JSON's number grammar requires AT LEAST
+    // ONE DIGIT after the '.', so a point with no digit after it is invalid
+    // ("1.e3" is not a JSON number).  The check below used to look only at
+    // the LAST character of the token, so the defect was caught only when the
+    // point ended the token ("1.", "1.e") and NOT when an exponent followed
+    // it ("1.e3" was read as 1000).  The digit count is therefore counted
+    // HERE, where the fraction is scanned, and the point is rejected when the
+    // fraction is empty.
+    int64_t fracDigits = 0;
+    bool sawPoint = false;
     if (d->pos < d->len && d->data[d->pos] == '.') {
+        sawPoint = true;
         ++d->pos;
+        int64_t fracStart = d->pos;
         while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+        fracDigits = d->pos - fracStart;
     }
     if (d->pos < d->len && (d->data[d->pos] == 'e' || d->data[d->pos] == 'E')) {
         ++d->pos;
         if (d->pos < d->len && (d->data[d->pos] == '+' || d->data[d->pos] == '-')) ++d->pos;
         while (d->pos < d->len && d->data[d->pos] >= '0' && d->data[d->pos] <= '9') ++d->pos;
+    }
+    // stdlib §2.15 (v0.344, #7341): a point with NO digit after it is not a
+    // JSON number, whatever exponent follows it ("1.e3" is invalid).  The
+    // last-character test below catches the point only when it ENDS the token
+    // ("1.", "1.e"), so the empty fraction is rejected here, where it is
+    // scanned.  The message is the one the last-character test already uses,
+    // so the inputs it already rejected keep their diagnostic.
+    if (sawPoint && fracDigits == 0) {
+        bz_ser_throw_at_json("JSON float has invalid form (§2.15)", d);
+        return 0.0;
     }
     int64_t numlen = d->pos - start;
     if (numlen > 50) { bz_ser_throw_at_json("JSON float too long (§2.15)", d); return 0.0; }

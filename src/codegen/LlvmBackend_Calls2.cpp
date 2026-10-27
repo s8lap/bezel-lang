@@ -1956,6 +1956,51 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return any;
     };
 
+    // stdlib §9.2 (v0.344, #7341): the grammar is "optionally a `.` followed by
+    // ONE OR MORE DIGITS", so a point with NO digit after it is a grammar
+    // violation.  The arms' "the LAST character strtod consumed must not be
+    // '.', 'e', 'E', '+' or '-'" test looks only at the FINAL character, so
+    // "5.e3" - whose last character is a digit - was admitted (the point was
+    // rejected only at the END of the input, as in "5." and "5.e").  This
+    // decides the rule directly: the input must have NO '.', or the character
+    // IMMEDIATELY AFTER the first '.' must be a digit.  Only the FIRST '.'
+    // can matter - a second one would have stopped strtod ("1.2.3"), which
+    // the trailing-garbage test rejects already.  The comparison is against
+    // the INPUT TEXT, so it does not disturb the range paragraph ("1e999"
+    // still reports out-of-range).  The span form carries the string form's
+    // contract (§9.2: "the span forms carry the string forms' contract"), so
+    // all three arms below share this one helper.
+    auto emitPointFollowedByDigit = [&](llvm::Value* textPtr) -> llvm::Value* {
+        auto* i8 = llvm::Type::getInt8Ty(llvm_);
+        auto* strchrFn = declareC("strchr", ptrTy(), {ptrTy(), i32()});
+        llvm::Value* dotPtr = builder_.CreateCall(
+            strchrFn, {textPtr, builder_.getInt32('.')}, "pfd.dot");
+        llvm::Value* hasDot = builder_.CreateNot(
+            builder_.CreateIsNull(dotPtr), "pfd.has");
+        // The byte AFTER the point.  With no point at all the address degrades
+        // to the FIRST byte of the input, which is always in bounds, so the
+        // load never runs off the end of the buffer (the parse input is
+        // NUL-terminated: the string buffer carries a terminator slot and
+        // parseWindow materializes a terminated window).
+        llvm::Value* dotOrText = builder_.CreateSelect(
+            hasDot, dotPtr, textPtr, "pfd.sel");
+        llvm::Value* dotIdx = builder_.CreateSub(
+            builder_.CreatePtrToInt(dotOrText, i64()),
+            builder_.CreatePtrToInt(textPtr, i64()), "pfd.idx");
+        llvm::Value* afterAddr = builder_.CreateGEP(
+            i8, textPtr,
+            builder_.CreateAdd(dotIdx, builder_.getInt64(1), "pfd.one"),
+            "pfd.after");
+        llvm::Value* loadAddr = builder_.CreateSelect(
+            hasDot, afterAddr, textPtr, "pfd.addr");
+        llvm::Value* afterChar = builder_.CreateLoad(i8, loadAddr, "pfd.ch");
+        llvm::Value* afterIsDigit = builder_.CreateICmpULT(
+            builder_.CreateSub(afterChar, llvm::ConstantInt::get(i8, '0')),
+            llvm::ConstantInt::get(i8, 10), "pfd.dig");
+        return builder_.CreateOr(
+            builder_.CreateNot(hasDot), afterIsDigit, "pfd.ok");
+    };
+
     // double.TryParse / float.TryParse(s, out result): bool — stdlib §9.2
     // #1227: on failure, out result receives the default (0.0), not the partial
     // parse value (e.g. 1.5 for "1.5abc"). Per §9.3: "TryParse returns false
@@ -2119,6 +2164,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* nonFiniteOkD = builder_.CreateOr(
             builder_.CreateNot(nonFiniteLetterD),
             exactNonFiniteD, "tryp.nfok");
+        // stdlib §9.2 (v0.344, #7341): a point with NO digit after it is a
+        // grammar violation, whatever exponent follows it.
+        llvm::Value* pointOkD = emitPointFollowedByDigit(strData);
         llvm::Value* fmtOkD = builder_.CreateAnd(
             builder_.CreateAnd(
                 builder_.CreateAnd(
@@ -2129,7 +2177,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 builder_.CreateAnd(
                     builder_.CreateNot(badLastCharD),
                     nonFiniteOkD)),
-            builder_.CreateNot(isHexFloatD),
+            builder_.CreateAnd(
+                builder_.CreateNot(isHexFloatD),
+                pointOkD),
             "tryp.fmtok");
         // stdlib §9.2 (v0.314, #5199/#5368): a finite spelling that rounds to a
         // non-finite value is out of range -> false (before the out store, so a
@@ -3003,6 +3053,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::Value* nonFiniteOk = builder_.CreateOr(
                     builder_.CreateNot(nonFiniteLetter),
                     exactNonFinite, "parse.nfok");
+                // stdlib §9.2 (v0.344, #7341): a point with NO digit after it
+                // is a grammar violation, whatever exponent follows it.
+                llvm::Value* pointOk = emitPointFollowedByDigit(data);
                 llvm::Value* validF = builder_.CreateAnd(
                     builder_.CreateAnd(
                         builder_.CreateAnd(
@@ -3013,7 +3066,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         builder_.CreateAnd(
                             builder_.CreateNot(badLastChar),
                             nonFiniteOk)),
-                    builder_.CreateNot(isHexFloatF),
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isHexFloatF),
+                        pointOk),
                     "parse.vfmtF");
                 emitGuardThrow(builder_.CreateNot(validF, "parse.fmtbadF"),
                                "FormatException");
@@ -3223,6 +3278,10 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::Value* nonFiniteOk = builder_.CreateOr(
                     builder_.CreateNot(nonFiniteLetter),
                     exactNonFinite, "parse.nfok");
+                // stdlib §9.2 (v0.344, #7341): a point with NO digit after it
+                // is a grammar violation, whatever exponent follows it.  The
+                // span form carries the string form's contract (§9.2:5265).
+                llvm::Value* pointOk = emitPointFollowedByDigit(win.data);
                 llvm::Value* validF = builder_.CreateAnd(
                     builder_.CreateAnd(
                         builder_.CreateAnd(
@@ -3233,7 +3292,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         builder_.CreateAnd(
                             builder_.CreateNot(badLastChar),
                             nonFiniteOk)),
-                    builder_.CreateNot(isHexFloatF),
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isHexFloatF),
+                        pointOk),
                     "parse.vfmtF");
                 // §28.3 (v0.303): the owned window from bz_str_slice_cp must be
                 // released on every exit path.  emitGuardThrow branches to an
