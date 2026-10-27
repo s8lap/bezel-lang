@@ -13227,6 +13227,36 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     }
 
     if (cls == "Convert") {
+        // stdlib §9.2 (v0.344, #7310/#7324): the non-finite spellings stand
+        // OUTSIDE the numeric grammar and are matched EXACTLY - the whole
+        // input must be "NaN", "Infinity" or "-Infinity", case-sensitively.
+        // strtod accepts a whole FAMILY of inf/nan spellings in any case
+        // ("inf", "infinity", "nan", "NAN", "+Infinity", "-NaN"), so these
+        // arms must not decide by sniffing the first character.  The
+        // comparison is made against the INPUT TEXT, never against the
+        // parsed value: a finite spelling that overflows to an infinity
+        // ("1e999") must still raise OverflowException, not
+        // FormatException.  This is the house helper of the §9 Parse family
+        // (LlvmBackend_Calls2.cpp, #7310); it is reproduced here because
+        // that one is a function-local lambda in another translation unit.
+        auto emitExactNonFiniteSpelling = [&](llvm::Value* textPtr) -> llvm::Value* {
+            auto* strcmpFn = declareC("strcmp", i32(), {ptrTy(), ptrTy()});
+            static const char* kSpellings[3] = {"NaN", "Infinity", "-Infinity"};
+            llvm::Value* any = nullptr;
+            for (int k = 0; k < 3; ++k) {
+                llvm::Constant* lit =
+                    llvm::ConstantDataArray::getString(llvm_, kSpellings[k], true);
+                unsigned idx = stringLiteralIdx_++;
+                auto* gv = new llvm::GlobalVariable(*module_, lit->getType(), true,
+                    llvm::GlobalValue::PrivateLinkage, lit,
+                    ".bz.fpnf." + std::to_string(idx));
+                llvm::Value* eq = builder_.CreateICmpEQ(
+                    builder_.CreateCall(strcmpFn, {textPtr, gv}),
+                    builder_.getInt32(0), "cv.fpnf.eq");
+                any = any ? builder_.CreateOr(any, eq, "cv.fpnf.any") : eq;
+            }
+            return any;
+        };
         if (call.args.size() == 1 && call.args[0].value) {
             // Convert.ToInt32(s: string): int — §2.3 / #1238
             // #1238: replaced atoi (silent 0 on bad input) with strtoll +
@@ -13318,40 +13348,51 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 llvm::Value* echCd = builder_.CreateLoad(i8Cd, epCd, "cvtd.ech");
                 llvm::Value* nulCd = builder_.CreateICmpEQ(
                     echCd, llvm::ConstantInt::get(i8Cd, 0), "cvtd.nul");
-                // stdlib §9.2 (v0.314, #5199/#5368): the first character (after
-                // optional sign) must be a digit — reject ".5", etc.  Allow '+'
-                // and '-' as the first char (they are checked separately), and
-                // 'i'/'n' for the inf/nan spellings accepted by strtod (#4890).
+                // stdlib §9.2 (v0.344, #7324): the optional sign is followed by
+                // ONE OR MORE DIGITS (or by one of the three admitted
+                // non-finite spellings).  The sign is NOT a waiver for the
+                // digit test: the digit is read at the character AFTER the
+                // sign, so "+.5" and "-.5" are rejected.
                 llvm::Value* isSignCd = builder_.CreateOr(
                     builder_.CreateICmpEQ(fcCd,
                         llvm::ConstantInt::get(i8Cd, '+')),
                     builder_.CreateICmpEQ(fcCd,
                         llvm::ConstantInt::get(i8Cd, '-')), "cvtd.isSign");
-                llvm::Value* infMaskCd = builder_.CreateOr(
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcCd,
-                            llvm::ConstantInt::get(i8Cd, 'i')),
-                        builder_.CreateICmpEQ(fcCd,
-                            llvm::ConstantInt::get(i8Cd, 'I'))),
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcCd,
-                            llvm::ConstantInt::get(i8Cd, 'n')),
-                        builder_.CreateICmpEQ(fcCd,
-                            llvm::ConstantInt::get(i8Cd, 'N'))),
-                    "cvtd.infMask");
-                llvm::Value* notDigitCd = builder_.CreateAnd(
-                    builder_.CreateAnd(
-                        builder_.CreateNot(isSignCd),
-                        builder_.CreateNot(infMaskCd)),
-                    builder_.CreateICmpUGE(
-                        builder_.CreateSub(fcCd, llvm::ConstantInt::get(i8Cd, '0')),
-                        llvm::ConstantInt::get(i8Cd, 10)), "cvtd.ndig");
                 // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
                 // per emitFloatParseOverflow: skip the optional sign before checking
                 // for the hex form.  off = 0 if no sign, 1 if sign present.
                 llvm::Value* offCd = builder_.CreateZExt(isSignCd, i64(), "cvtd.off");
                 llvm::Value* fcOffCd = builder_.CreateLoad(i8Cd,
                     builder_.CreateGEP(i8Cd, data, offCd, "cvtd.fcptr"), "cvtd.fcOff");
+                // stdlib §9.2 (v0.344, #7310/#7324): the non-finite spellings
+                // stand OUTSIDE the numeric grammar and are matched exactly,
+                // so this mask may only decide whether the numeric part
+                // STARTS with one of the non-finite letters ('i'/'I'/'n'/'N').
+                // Whether the input IS one of the three admitted spellings is
+                // decided by the exact comparison below - a first-character
+                // sniff alone would admit "inf", "infinity", "nan",
+                // "INFINITY", "+Infinity" and "-NaN".
+                llvm::Value* nonFiniteLetterCd = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffCd,
+                            llvm::ConstantInt::get(i8Cd, 'i')),
+                        builder_.CreateICmpEQ(fcOffCd,
+                            llvm::ConstantInt::get(i8Cd, 'I'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffCd,
+                            llvm::ConstantInt::get(i8Cd, 'n')),
+                        builder_.CreateICmpEQ(fcOffCd,
+                            llvm::ConstantInt::get(i8Cd, 'N'))),
+                    "cvtd.nfLetter");
+                // stdlib §9.2 (v0.344, #7324): the digit test reads the
+                // character AFTER the optional sign, so a signed bare point
+                // ("+.5", "-.5") has no digit before the point and is
+                // rejected.
+                llvm::Value* notDigitCd = builder_.CreateAnd(
+                    builder_.CreateNot(nonFiniteLetterCd),
+                    builder_.CreateICmpUGE(
+                        builder_.CreateSub(fcOffCd, llvm::ConstantInt::get(i8Cd, '0')),
+                        llvm::ConstantInt::get(i8Cd, 10)), "cvtd.ndig");
                 llvm::Value* isLeadingZeroCd = builder_.CreateICmpEQ(
                     fcOffCd, llvm::ConstantInt::get(i8Cd, '0'), "cvtd.lzero");
                 // stdlib §9.2: the second character is read at position `off+1` when
@@ -13405,6 +13446,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                             builder_.CreateICmpEQ(lastCharCd,
                                 llvm::ConstantInt::get(i8Cd, '-')))),
                     "cvtd.blc");
+                // stdlib §9.2 (v0.344, #7310/#7324): a numeric part that
+                // starts with a non-finite letter is admitted only when the
+                // WHOLE input is exactly one of the three spellings §9.2
+                // admits ("NaN", "Infinity", "-Infinity"); every other
+                // inf/nan spelling raises FormatException.  The comparison
+                // is against the INPUT TEXT, never against the parsed value,
+                // so a finite spelling that overflows to an infinity
+                // ("1e999") still raises OverflowException.
+                llvm::Value* exactNonFiniteCd = emitExactNonFiniteSpelling(data);
+                llvm::Value* nonFiniteOkCd = builder_.CreateOr(
+                    builder_.CreateNot(nonFiniteLetterCd),
+                    exactNonFiniteCd, "cvtd.nfok");
                 llvm::Value* validCd = builder_.CreateAnd(
                     builder_.CreateAnd(
                         builder_.CreateAnd(
@@ -13412,7 +13465,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                 builder_.CreateNot(fcWsCd),
                                 builder_.CreateNot(notDigitCd)),
                             builder_.CreateAnd(advCd, nulCd)),
-                        builder_.CreateNot(badLastCharCd)),
+                        builder_.CreateAnd(
+                            builder_.CreateNot(badLastCharCd),
+                            nonFiniteOkCd)),
                     builder_.CreateNot(isHexFloatCd),
                     "cvtd.vfmt");
                 emitGuardThrow(builder_.CreateNot(validCd, "cvtd.fmtbad"),
@@ -13606,40 +13661,49 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* endChTd = builder_.CreateLoad(i8td, endPtrTd, "tryd.end");
             llvm::Value* atNulTd = builder_.CreateICmpEQ(
                 endChTd, llvm::ConstantInt::get(i8td, 0), "tryd.nul");
-            // stdlib §9.2 (v0.314, #5199/#5368): the first character (after
-            // optional sign) must be a digit — reject ".5", etc.  Allow '+'
-            // and '-' as the first char (they are checked separately), and
-            // 'i'/'n' for the inf/nan spellings accepted by strtod (#4890).
+            // stdlib §9.2 (v0.344, #7324): the optional sign is followed by
+            // ONE OR MORE DIGITS (or by one of the three admitted non-finite
+            // spellings).  The sign is NOT a waiver for the digit test: the
+            // digit is read at the character AFTER the sign, so "+.5" and
+            // "-.5" are rejected.
             llvm::Value* isSignTd = builder_.CreateOr(
                 builder_.CreateICmpEQ(fcTd,
                     llvm::ConstantInt::get(i8td, '+')),
                 builder_.CreateICmpEQ(fcTd,
                     llvm::ConstantInt::get(i8td, '-')), "tryd.isSign");
-            llvm::Value* infMaskTd = builder_.CreateOr(
-                builder_.CreateOr(
-                    builder_.CreateICmpEQ(fcTd,
-                        llvm::ConstantInt::get(i8td, 'i')),
-                    builder_.CreateICmpEQ(fcTd,
-                        llvm::ConstantInt::get(i8td, 'I'))),
-                builder_.CreateOr(
-                    builder_.CreateICmpEQ(fcTd,
-                        llvm::ConstantInt::get(i8td, 'n')),
-                    builder_.CreateICmpEQ(fcTd,
-                        llvm::ConstantInt::get(i8td, 'N'))),
-                "tryd.infMask");
-            llvm::Value* notDigitTd = builder_.CreateAnd(
-                builder_.CreateAnd(
-                    builder_.CreateNot(isSignTd),
-                    builder_.CreateNot(infMaskTd)),
-                builder_.CreateICmpUGE(
-                    builder_.CreateSub(fcTd, llvm::ConstantInt::get(i8td, '0')),
-                    llvm::ConstantInt::get(i8td, 10)), "tryd.ndig");
             // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
             // per emitFloatParseOverflow: skip the optional sign before checking
             // for the hex form.  off = 0 if no sign, 1 if sign present.
             llvm::Value* offTd = builder_.CreateZExt(isSignTd, i64(), "tryd.off");
             llvm::Value* fcOffTd = builder_.CreateLoad(i8td,
                 builder_.CreateGEP(i8td, strData, offTd, "tryd.fcptr"), "tryd.fcOff");
+            // stdlib §9.2 (v0.344, #7310/#7324): the non-finite spellings stand
+            // OUTSIDE the numeric grammar and are matched exactly, so this
+            // mask may only decide whether the numeric part STARTS with one
+            // of the non-finite letters ('i'/'I'/'n'/'N').  Whether the input
+            // IS one of the three admitted spellings is decided by the exact
+            // comparison below - a first-character sniff alone would admit
+            // "inf", "infinity", "nan", "INFINITY", "+Infinity" and "-NaN".
+            llvm::Value* nonFiniteLetterTd = builder_.CreateOr(
+                builder_.CreateOr(
+                    builder_.CreateICmpEQ(fcOffTd,
+                        llvm::ConstantInt::get(i8td, 'i')),
+                    builder_.CreateICmpEQ(fcOffTd,
+                        llvm::ConstantInt::get(i8td, 'I'))),
+                builder_.CreateOr(
+                    builder_.CreateICmpEQ(fcOffTd,
+                        llvm::ConstantInt::get(i8td, 'n')),
+                    builder_.CreateICmpEQ(fcOffTd,
+                        llvm::ConstantInt::get(i8td, 'N'))),
+                "tryd.nfLetter");
+            // stdlib §9.2 (v0.344, #7324): the digit test reads the character
+            // AFTER the optional sign, so a signed bare point ("+.5", "-.5")
+            // has no digit before the point and is rejected.
+            llvm::Value* notDigitTd = builder_.CreateAnd(
+                builder_.CreateNot(nonFiniteLetterTd),
+                builder_.CreateICmpUGE(
+                    builder_.CreateSub(fcOffTd, llvm::ConstantInt::get(i8td, '0')),
+                    llvm::ConstantInt::get(i8td, 10)), "tryd.ndig");
             llvm::Value* isLeadingZeroTd = builder_.CreateICmpEQ(
                 fcOffTd, llvm::ConstantInt::get(i8td, '0'), "tryd.lzero");
             // stdlib §9.2: the second character is read at position `off+1` when
@@ -13689,6 +13753,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         builder_.CreateICmpEQ(lastCharTd,
                             llvm::ConstantInt::get(i8td, '-')))),
                 "tryd.blc");
+            // stdlib §9.2 (v0.344, #7310/#7324): a numeric part that starts
+            // with a non-finite letter is admitted only when the WHOLE input
+            // is exactly one of the three spellings §9.2 admits ("NaN",
+            // "Infinity", "-Infinity"); every other inf/nan spelling is
+            // rejected.  The comparison is against the INPUT TEXT, never
+            // against the parsed value, so a finite spelling that overflows
+            // to an infinity ("1e999") still reports out-of-range.
+            llvm::Value* exactNonFiniteTd = emitExactNonFiniteSpelling(strData);
+            llvm::Value* nonFiniteOkTd = builder_.CreateOr(
+                builder_.CreateNot(nonFiniteLetterTd),
+                exactNonFiniteTd, "tryd.nfok");
             llvm::Value* okTd = builder_.CreateAnd(
                 builder_.CreateAnd(
                     builder_.CreateAnd(
@@ -13696,7 +13771,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                             builder_.CreateNot(fcWsTd),
                             builder_.CreateNot(notDigitTd)),
                         builder_.CreateAnd(advTd, atNulTd)),
-                    builder_.CreateNot(badLastCharTd)),
+                    builder_.CreateAnd(
+                        builder_.CreateNot(badLastCharTd),
+                        nonFiniteOkTd)),
                 builder_.CreateNot(isHexFloatTd),
                 "tryd.fmtok");
             // stdlib §2.3 / §9.2 (v0.314, #5199/#5368): out-of-range -> false.
