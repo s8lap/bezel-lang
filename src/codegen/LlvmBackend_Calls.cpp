@@ -3277,6 +3277,63 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // fix-forward added, so that arm keeps working.
     bool isStrBld = (builtinTypeName(recvTy) == "StringBuilder");
 
+    // fix #6159 (§26.5 rule 1 + rule 2, v0.345; stdlib §3.1 / §4.1 / §4.4):
+    // the `Length` / `Count` built-in arms below recognise the built-in by
+    // its NAME.  §26.5 rule 1 commits instance resolution only when the
+    // receiver's DECLARED type (or a base type) DECLARES an instance member
+    // of that name — "of any arity, applicability, or accessibility".
+    // Otherwise rule 2 admits the extension blocks, and the user's extension
+    // is the SELECTED candidate; §22.6 binds the call to the selected
+    // candidate.  A built-in that answers a call bound to the user's
+    // extension silently DROPS the user's code (the program printed the
+    // built-in's number instead of the extension's).
+    //
+    // The discriminator is the RESOLVED CALLEE SYMBOL — sema stamps the
+    // selected extension's MethodSymbol on the member-access callee (the
+    // same symbol the extension lowering in LlvmBackend_Calls2.cpp reads) —
+    // not the member NAME.  This is the same discipline #7217 / #6845
+    // applied to the receiver's own type: the built-in answers by the
+    // receiver's DECLARED SURFACE, not by a name that happens to match.
+    //
+    // The decline happens here, BEFORE any receiver IR is emitted, so the
+    // receiver expression is evaluated exactly once (the extension lowering
+    // lowers it again).
+    if (m == "Length" || m == "Count") {
+        auto* ms =
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+        if (isExtensionMethod(ms)) {
+            // §26.5 rule 1's test: does the receiver's declared surface (its
+            // own declarations plus the INHERITED ones — the stdlib's
+            // "Block-by-name" convention says "extension resolution commits
+            // to instance members by name, inherited ones included") declare
+            // a member of this name?
+            const std::string_view head = builtinTypeName(recvTy);
+            bool declaresName = false;
+            if (m == "Length") {
+                // stdlib §3.1 StringBuilder, §4.14 OwningBuffer and §4.19
+                // FrozenArray declare `Length`; every collection head
+                // declares `Count` instead (stdlib §4.4's "Count vs Length"
+                // convention: "A type declares one or the other, never both").
+                declaresName = common::isBuiltinIntLengthPropertyHead(head);
+            } else {
+                // stdlib §4.4–§4.11 and §4.17–§4.18 declare (or inherit)
+                // `Count`; the six collection INTERFACES inherit it from
+                // `IReadOnlyCollection<T>` (stdlib §4.1).
+                bool ifaceOwning = false;
+                declaresName =
+                    common::isPlainBuiltinCollectionHead(head) ||
+                    common::isOwningCollectionHead(head) ||
+                    common::isBuiltinIntCountPropertyHead(head) ||
+                    isListInterfaceName(recvTy, &ifaceOwning) ||
+                    isCollectionInterfaceName(recvTy);
+            }
+            // The receiver's surface does not declare the name, so rule 1 did
+            // not commit and the user's extension is the selected candidate:
+            // decline here and let the extension lowering lower it.
+            if (!declaresName) return nullptr;
+        }
+    }
+
     // §28.6 / §28.11 (v0.213, axiom A8 retired, #2081): `.DisposeElements()` is
     // gone from the collection surface. Sema (ExprTypecheck_Calls) rejects it on
     // a CONCRETE collection receiver, but an INTERFACE-typed receiver
