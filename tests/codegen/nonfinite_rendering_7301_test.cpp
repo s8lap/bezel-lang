@@ -2,8 +2,7 @@
 // a non-finite `double` or `float` rendered as "inf" / "-inf" / "nan" where
 // the document names "Infinity" / "-Infinity" / "NaN".
 //
-// THE SPEC SENTENCE (docs/Bezel_Standard_Library.md line 1162, stdlib §2.18,
-// v0.344):
+// THE SPEC SENTENCE (stdlib §2.18, v0.344):
 //
 //   "**Non-finite `double` and `float` values.** The no-format `ToString()`
 //   and every floating specifier (`F`, `E`, `G` and `P`, with or without a
@@ -17,8 +16,7 @@
 //   under `=` (language spec §4.3.1), and does not carry its sign or payload
 //   bits, which `BitConverter` (§2.12) carries."
 //
-// AND the document's own worked example (docs/Bezel_Standard_Library.md line
-// 222, stdlib §2.3, v0.344):
+// AND the document's own worked example (stdlib §2.3, v0.344):
 //
 //   "… `Convert.ToString(true)` is `"True"`, `Convert.ToString(0.1f)` is
 //   `"0.1"` and `Convert.ToString(1.0 / 0.0)` is `"Infinity"`."

@@ -258,7 +258,7 @@ BEZEL_TEST(range_contains_pure_contract_3279,
 // =========================================================================
 
 // Negative — `requires(x in s)` over a ReadOnlySpan<int> receiver is
-// REJECTED. ReadOnlySpan<T>.Contains is a plain method (stdlib §4.14,
+// REJECTED. ReadOnlySpan<T>.Contains is a plain method (stdlib §4.14),
 // so `in` over a ReadOnlySpan receiver fails the
 // §22.15 calls-to-pure-members rule.
 BEZEL_TEST(range_contains_pure_contract_3279,
@@ -297,7 +297,7 @@ BEZEL_TEST(range_contains_pure_contract_3279,
 }
 
 // Negative — `requires(x in s)` over an ArraySpan<int> receiver is
-// REJECTED. ArraySpan<T>.Contains is a plain method (stdlib §4.15,
+// REJECTED. ArraySpan<T>.Contains is a plain method (stdlib §4.15),
 // same rule.
 BEZEL_TEST(range_contains_pure_contract_3279,
            requires_in_array_span_rejected_spec_22_15_issue_3279) {
