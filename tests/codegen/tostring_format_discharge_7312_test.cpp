@@ -360,7 +360,7 @@ BEZEL_TEST(codegen_tostring_format_discharge_7312,
 // base arm the bound local is a BORROW: the binding retained the result on
 // top of the producer's +1 and the producer's reference was never dropped,
 // so the program leaks and the row fails on the LSan verdict (it is one of
-// the nine base-arm failures). On the fix arm the binding TRANSFERS the
+// the ten base-arm failures). On the fix arm the binding TRANSFERS the
 // producer's +1 into the slot and the scope-end release drops it, so the
 // program is leak-clean — AND the read still works, because the reference
 // was discharged at scope end and not before the read. That combination is
