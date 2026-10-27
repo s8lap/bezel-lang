@@ -2050,12 +2050,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 builder_.CreateICmpEQ(fcOffD,
                     llvm::ConstantInt::get(i8TyD, 'N'))),
             "tryp.nfLetterD");
+        // stdlib §9.2 (v0.344, #7325): the digit rule applies to the
+        // character AFTER the optional sign — §9.2's grammar is "an optional
+        // sign (`+` or `-`), THEN one or more of the digits 0-9" — so a
+        // SIGNED BARE POINT ("+.5") has NO digit at all and is rejected,
+        // exactly as the unsigned bare point (".5") is.  This test used to
+        // read the FIRST character and to be WAIVED outright whenever that
+        // character was a sign, so a signed bare point slipped through.
         llvm::Value* notDigitD = builder_.CreateAnd(
-            builder_.CreateAnd(
-                builder_.CreateNot(isSignD),
-                builder_.CreateNot(nonFiniteLetterD)),
+            builder_.CreateNot(nonFiniteLetterD),
             builder_.CreateICmpUGE(
-                builder_.CreateSub(fcD, llvm::ConstantInt::get(i8TyD, '0')),
+                builder_.CreateSub(fcOffD, llvm::ConstantInt::get(i8TyD, '0')),
                 llvm::ConstantInt::get(i8TyD, 10)), "tryp.ndigD");
         llvm::Value* isLeadingZeroD = builder_.CreateICmpEQ(
             fcOffD, llvm::ConstantInt::get(i8TyD, '0'), "tryp.lzeroD");
@@ -2921,12 +2926,20 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         builder_.CreateICmpEQ(fcOffF,
                             llvm::ConstantInt::get(i8TyF, 'N'))),
                     "parse.nfLetter");
+                // stdlib §9.2 (v0.344, #7325): the digit rule applies to the
+                // character AFTER the optional sign — §9.2's grammar is "an
+                // optional sign (`+` or `-`), THEN one or more of the digits
+                // 0-9" — so a SIGNED BARE POINT ("+.5") has NO digit at all
+                // and is rejected, exactly as the unsigned bare point (".5")
+                // is.  This test used to read the FIRST character and to be
+                // WAIVED outright whenever that character was a sign, so a
+                // signed bare point slipped through.  Both the string form
+                // and the span form carry the same contract (§9.2: "the span
+                // forms carry the string forms' contract").
                 llvm::Value* notDigitF = builder_.CreateAnd(
-                    builder_.CreateAnd(
-                        builder_.CreateNot(isSignF),
-                        builder_.CreateNot(nonFiniteLetter)),
+                    builder_.CreateNot(nonFiniteLetter),
                     builder_.CreateICmpUGE(
-                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
+                        builder_.CreateSub(fcOffF, llvm::ConstantInt::get(i8TyF, '0')),
                         llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
                     fcOffF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
@@ -3139,12 +3152,20 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         builder_.CreateICmpEQ(fcOffF,
                             llvm::ConstantInt::get(i8TyF, 'N'))),
                     "parse.nfLetter");
+                // stdlib §9.2 (v0.344, #7325): the digit rule applies to the
+                // character AFTER the optional sign — §9.2's grammar is "an
+                // optional sign (`+` or `-`), THEN one or more of the digits
+                // 0-9" — so a SIGNED BARE POINT ("+.5") has NO digit at all
+                // and is rejected, exactly as the unsigned bare point (".5")
+                // is.  This test used to read the FIRST character and to be
+                // WAIVED outright whenever that character was a sign, so a
+                // signed bare point slipped through.  Both the string form
+                // and the span form carry the same contract (§9.2: "the span
+                // forms carry the string forms' contract").
                 llvm::Value* notDigitF = builder_.CreateAnd(
-                    builder_.CreateAnd(
-                        builder_.CreateNot(isSignF),
-                        builder_.CreateNot(nonFiniteLetter)),
+                    builder_.CreateNot(nonFiniteLetter),
                     builder_.CreateICmpUGE(
-                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
+                        builder_.CreateSub(fcOffF, llvm::ConstantInt::get(i8TyF, '0')),
                         llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
                     fcOffF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
