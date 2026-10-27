@@ -656,7 +656,7 @@ constexpr std::array<BuiltinParamRow, 300> kBuiltinParams = {{
     {"Math", "Round", 2, 1, 0x03, {"x", "digits", "", "", "", "", "", ""}, {kBPTDouble, kBPTInt, 0, 0, 0, 0, 0, 0}, "Round(x: double, digits: int := 0): double"},
     {"Math", "Truncate", 1, 1, 0x01, {"x", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "Truncate(x: double): double"},
     {"Math", "Truncate", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTDecimal, 0, 0, 0, 0, 0, 0, 0}, "Truncate(x: decimal): decimal"},
-    {"Math", "Sign", 1, 1, 0x00, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Sign", 1, 1, 0x01, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Math", "Fmod", 2, 2, 0x03, {"x", "y", "", "", "", "", "", ""}, {kBPTDouble, kBPTDouble, 0, 0, 0, 0, 0, 0}, "Fmod(x: double, y: double): double"},
     {"Math", "IEEERemainder", 2, 2, 0x03, {"x", "y", "", "", "", "", "", ""}, {kBPTDouble, kBPTDouble, 0, 0, 0, 0, 0, 0}, "IEEERemainder(x: double, y: double): double"},
     {"Math", "DivRem", 3, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},

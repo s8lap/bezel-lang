@@ -18609,6 +18609,82 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // fix #7227 (stdlib §2.2, stdlib §2.19, spec §14.2, v0.343):
+        // `Math.Sign`'s TYPE-PARAMETER CONSTRAINT — the sibling of the
+        // `Min`/`Max`/`Clamp` `where T: IComparable<T>` block above, and the
+        // one the block above's own comment names as the shape of the rule.
+        //
+        // WHAT THE DEFECT WAS. stdlib §2.2 declares
+        //   `public static method Sign<T>(x: T): int where T: INumber<T>;`
+        // and stdlib §2.19's conformance table says the primitive NUMERIC
+        // TOWER conforms to `INumber<T>`, while `char` conforms to
+        // `ISteppable<char>` and `IParsable<char>` ONLY ("`char` is not an
+        // `INumber<T>` conformer", #6956) and `bool` and `string` conform to
+        // NONE of the three. The sibling constraints ARE enforced (the
+        // `Min`/`Max`/`Clamp` block above), so `Math.Sign` was the odd one
+        // out: `Math.Sign(true)` compiled and SILENTLY returned -1 — a
+        // SILENT WRONG ANSWER, because §14.2's rule is a REJECTION, never a
+        // coercion — and `Math.Sign("x")` reached codegen and ABORTED the
+        // compiler inside the LLVM verifier ("Both operands to ICmp
+        // instruction are not of the same type!").
+        //
+        // THE RULE. §14.2 (v0.343): a type argument that does not satisfy
+        // the declared constraint is rejected at the call.
+        //
+        // THE VERDICT IS THE STANDARD LIBRARY'S OWN CONFORMANCE TABLE
+        // (`primitiveConformsToStaticIface`, stdlib §2.19), so the rejection
+        // cannot invent a conformance: the numeric tower is admitted, and
+        // `bool`, `char` and `string` are refused.
+        //
+        // WHAT IS NOT CLAIMED HERE. A NAMED argument type is not judged: the
+        // standard library lets a user type conform by DECLARING
+        // `INumber<Self>` and supplying the statics (stdlib §2.19), and that
+        // conformance question belongs to the compiler's own machinery, not
+        // to this gate. A NULLABLE argument is §7's question — the §7
+        // nullability gate owns the non-nullable positions (§7.3), and §14.2
+        // reads the type AT THE CALL, where a §7.4 narrowing has already
+        // discharged the nullability: an UN-narrowed `string?` is §7's to
+        // refuse, a §7.4-NARROWED one is a `string` at the call and is this
+        // constraint's to judge.
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+            if (ma->member == "Sign" && ma->typeArgs.empty() && ma->target &&
+                !ce.args.empty() && ce.args[0].value &&
+                !ctx_.exprSymbol(*ma)) {
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ma->target.get())) {
+                    if (tid->name == "Math") {
+                        // §22.6 (v0.343): "The argument's static type is
+                        // its type at the call: a read of a binding §7.4 has
+                        // narrowed non-null is of its non-nullable type" — so
+                        // a §7.4-NARROWED `string?` argument is a `string` AT
+                        // THE CALL, and the constraint is judged on THAT type.
+                        // `operandStaticTypeAt` is the ONE helper that reads
+                        // the operand's static type that way (§7.11); the
+                        // declared type alone left a narrowed non-conforming
+                        // argument unjudged and the call reached codegen and
+                        // ABORTED the compiler inside the LLVM verifier.
+                        TypeRef* argTy = operandStaticTypeAt(
+                            ce.args[0].value.get(),
+                            ctx_.exprType(*ce.args[0].value));
+                        if (argTy && !argTy->nullable &&
+                            argTy->kind == TypeRef::Kind::Primitive &&
+                            !primitiveConformsToStaticIface(argTy->primitive,
+                                                             "INumber")) {
+                            ctx_.diagnostics().report(
+                                Severity::Error,
+                                ce.args[0].value->span.begin,
+                                "type argument `" +
+                                    std::string(spellTypeRefForDiag(argTy)) +
+                                    "` does not satisfy the constraint `where T: "
+                                    "INumber<T>` — `Math.Sign` requires an "
+                                    "argument type that conforms to `INumber<T>` "
+                                    "(§14.2, stdlib §2.2, stdlib §2.19)");
+                        }
+                    }
+                }
+            }
+        }
     }
     // CallExpr where the callee is a constructor reference (e.g.
     // `T(args)` form — rare in Bezel since `new T(args)` is the
