@@ -4,6 +4,11 @@
 // lowering now uses llvm.rint (same round-half-to-even in the default FP
 // environment, which Bezel cannot change; `rint` exists in glibc and musl).
 // Rows pin the exact banker's semantics of both overloads, exact stdout.
+//
+// The NON-FINITE arms of the first row ("inf" / "-inf" / "nan") became the
+// §2.18 spellings with #7301 (stdlib §2.18, v0.344): "Infinity" /
+// "-Infinity" / "NaN" — the names of the §9.2 constants. The ROUNDING arms
+// are unchanged.
 #include <string>
 
 #include "support/aot_support.hpp"
@@ -34,7 +39,7 @@ class C
     return 0;
   end Main;
 end C;
-)"), "0\n2\n2\n-0\n-2\n-4\n4503599627370497\ninf\n-inf\nnan\n-inf\n-inf");
+)"), "0\n2\n2\n-0\n-2\n-4\n4503599627370497\nInfinity\n-Infinity\nNaN\n-Infinity\n-Infinity");
 }
 
 BEZEL_TEST(math_round_6761, digits_overload_spec_2_2) {

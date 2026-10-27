@@ -1046,9 +1046,49 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
         } else {
             return nullptr;
         }
+        // per stdlib §2.18 (v0.344, #7301): a non-finite value renders as
+        // "Infinity" / "-Infinity" / "NaN" — the names of the §9.2 constants,
+        // with no digits, no exponent and no '%' suffix — under EVERY
+        // floating specifier. C's own "%.2f" (and "%.2f%%") print "inf" /
+        // "nan" instead, so a non-finite operand must not reach snprintf.
+        //
+        // The test is on the OPERAND, before the percent scale: §2.18 speaks
+        // of the VALUE the caller holds, so a FINITE operand keeps the
+        // rendering it had — including the case where the ×100 of the percent
+        // specifier overflows to an infinity.
+        //
+        // The finite operand keeps the byte-identical rendering it had: the
+        // snprintf path below is unchanged and is only reached when the
+        // operand is finite.
+        llvm::Value* isNanF = builder_.CreateFCmpUNO(dv, dv, "fmt.isnan");
+        llvm::Value* isPosInfF = builder_.CreateFCmpOEQ(
+            dv, llvm::ConstantFP::getInfinity(dblTy), "fmt.isposinf");
+        llvm::Value* isNegInfF = builder_.CreateFCmpOEQ(
+            dv, llvm::ConstantFP::getInfinity(dblTy, /*Negative=*/true),
+            "fmt.isneginf");
+        llvm::Value* nonFiniteF = builder_.CreateOr(
+            builder_.CreateOr(isNanF, isPosInfF), isNegInfF, "fmt.nonfinite");
         if (scale != 1.0)
             dv = builder_.CreateFMul(dv, llvm::ConstantFP::get(dblTy, scale));
-        return emitSnprintfToString(snprintfFmt, dv);
+        auto* nfBB = llvm::BasicBlock::Create(llvm_, "fmt.nonfinite", currentFn_);
+        auto* finBB = llvm::BasicBlock::Create(llvm_, "fmt.finite", currentFn_);
+        auto* mergeBB = llvm::BasicBlock::Create(llvm_, "fmt.merge", currentFn_);
+        builder_.CreateCondBr(nonFiniteF, nfBB, finBB);
+        builder_.SetInsertPoint(nfBB);
+        // The runtime's non-finite rendering IS §2.18's spelling (it is the
+        // same text the no-format ToString() and the "R" specifier produce),
+        // so this one runtime entry serves the specifier path too.
+        auto* nfFn = declareC("bz_double_to_string_r", ptrTy(), {dblTy});
+        llvm::Value* nfStr = builder_.CreateCall(nfFn, {dv}, "dbl.nonfinite");
+        builder_.CreateBr(mergeBB);
+        builder_.SetInsertPoint(finBB);
+        llvm::Value* finStr = emitSnprintfToString(snprintfFmt, dv);
+        builder_.CreateBr(mergeBB);
+        builder_.SetInsertPoint(mergeBB);
+        llvm::PHINode* strPhi = builder_.CreatePHI(ptrTy(), 2, "fmt.str");
+        strPhi->addIncoming(nfStr, nfBB);
+        strPhi->addIncoming(finStr, finBB);
+        return strPhi;
     } else {
         // #1123: widen to i64 by the operand's signedness. For `X` (hex), format
         // the operand's natural-width BIT PATTERN — zero-extend so a sub-32-bit

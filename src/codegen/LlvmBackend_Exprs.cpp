@@ -2613,9 +2613,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 std::string digits = bezelFmt.size() > 1 ? bezelFmt.substr(1) : "";
                                 using P = sema::PrimitiveType;
                                 bool isFP = tt->primitive == P::Double || tt->primitive == P::Float;
+                                // fix #7301 (stdlib §2.18, v0.344): the floating
+                                // specifiers render a non-finite value by NAME
+                                // ("Infinity" / "-Infinity" / "NaN"), so the
+                                // snprintf path below must not see one.
+                                bool fpFormat = false;
                                 if ((spec == 'F' || spec == 'G' || spec == 'E') && isFP) {
                                     char pfspec = spec == 'F' ? 'f' : (spec == 'E' ? 'e' : 'g');
                                     printfFmt = "%." + (digits.empty() ? "2" : digits) + pfspec;
+                                    fpFormat = true;
                                     // Widen float to double for snprintf.
                                     if (tt->primitive == P::Float)
                                         recv = builder_.CreateFPExt(recv, llvm::Type::getDoubleTy(llvm_));
@@ -2674,6 +2680,59 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 } else {
                                     return emitPrimitiveToString(recv, tt->primitive);
                                 }
+                                // per stdlib §2.18 (v0.344, #7301): "The
+                                // no-format `ToString()` and every floating
+                                // specifier (`F`, `E`, `G` and `P`, with or
+                                // without a digit count, and `R`) render a NaN
+                                // as `NaN`, positive infinity as `Infinity` and
+                                // negative infinity as `-Infinity` — the names
+                                // of the `NaN`, `PositiveInfinity` and
+                                // `NegativeInfinity` constants (§9.2) — with no
+                                // digits, no exponent and no `%` suffix."
+                                //
+                                // C's own "%.2f" prints "inf" / "nan", so a
+                                // non-finite operand must not reach it. The
+                                // FINITE operand keeps the byte-identical
+                                // rendering it had: the snprintf path below is
+                                // unchanged and is reached only for a finite
+                                // operand.
+                                llvm::BasicBlock* nfBB = nullptr;
+                                llvm::BasicBlock* finBB = nullptr;
+                                llvm::BasicBlock* mergeBB = nullptr;
+                                llvm::Value* nfStr = nullptr;
+                                if (fpFormat) {
+                                    llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
+                                    llvm::Value* isNanV = builder_.CreateFCmpUNO(
+                                        recv, recv, "ts.isnan");
+                                    llvm::Value* isPosInfV = builder_.CreateFCmpOEQ(
+                                        recv, llvm::ConstantFP::getInfinity(dblTy),
+                                        "ts.isposinf");
+                                    llvm::Value* isNegInfV = builder_.CreateFCmpOEQ(
+                                        recv, llvm::ConstantFP::getInfinity(dblTy, true),
+                                        "ts.isneginf");
+                                    llvm::Value* nonFiniteV = builder_.CreateOr(
+                                        builder_.CreateOr(isNanV, isPosInfV),
+                                        isNegInfV, "ts.nonfinite");
+                                    nfBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.nonfinite", currentFn_);
+                                    finBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.finite", currentFn_);
+                                    mergeBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.merge", currentFn_);
+                                    builder_.CreateCondBr(nonFiniteV, nfBB, finBB);
+                                    builder_.SetInsertPoint(nfBB);
+                                    // The runtime's non-finite rendering IS
+                                    // §2.18's spelling (it is the same text
+                                    // the no-format ToString() and the "R"
+                                    // specifier produce), so this one runtime
+                                    // entry serves the specifier path too.
+                                    auto* nfFn = declareC("bz_double_to_string_r",
+                                                         ptrTy(), {dblTy});
+                                    nfStr = builder_.CreateCall(nfFn, {recv},
+                                                                "dbl.nonfinite");
+                                    builder_.CreateBr(mergeBB);
+                                    builder_.SetInsertPoint(finBB);
+                                }
                                 // Emit snprintf with the translated format.
                                 llvm::Constant* fmtData = llvm::ConstantDataArray::getString(
                                     llvm_, printfFmt, true);
@@ -2724,6 +2783,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
                                     builder_.CreateStructGEP(stringType(), so, 2));
                                 initStringRc(so);  // #422: producer's reference, rc := 1
+                                if (fpFormat) {
+                                    builder_.CreateBr(mergeBB);
+                                    builder_.SetInsertPoint(mergeBB);
+                                    llvm::PHINode* strPhi =
+                                        builder_.CreatePHI(ptrTy(), 2, "ts.str");
+                                    strPhi->addIncoming(nfStr, nfBB);
+                                    strPhi->addIncoming(so, finBB);
+                                    return strPhi;
+                                }
                                 return so;
                             }
                             // stdlib §9.1 (#518): ToString(radix: int) — the arg is an

@@ -703,16 +703,34 @@ static void* bz_render_shortest(const char* sciBuf, int sciLen) {
     return bz_make_string(sciBuf, sciLen);
 }
 
+// per stdlib §2.18 (v0.344, #7301): the rendering of a NON-FINITE value.
+//
+// "The no-format `ToString()` and every floating specifier (`F`, `E`, `G` and
+// `P`, with or without a digit count, and `R`) render a NaN as `NaN`, positive
+// infinity as `Infinity` and negative infinity as `-Infinity` — the names of
+// the `NaN`, `PositiveInfinity` and `NegativeInfinity` constants (§9.2) — with
+// no digits, no exponent and no `%` suffix."
+//
+// So the spelling is the NAME of the §9.2 constant, not C's "nan"/"inf"/
+// "-inf" (which is what "%g" prints). The rendering is by VALUE and not by
+// origin: the NaN test comes first, so every NaN — whatever its sign bit and
+// payload — renders "NaN".
+static void* bz_render_non_finite(double v) {
+    if (std::isnan(v)) return bz_make_string("NaN", 3);
+    if (std::isinf(v) && v > 0) return bz_make_string("Infinity", 8);
+    return bz_make_string("-Infinity", 9);
+}
+
 // per stdlib §2.18 (R format / no-format ToString()): double round-trip.
 // Search 1..17 — IEEE 754 double's exact-decimal precision is 17 digits.
 extern "C" void* bz_double_to_string_r(double v) {
-    // NaN / the infinities have no digit-string/notation choice to make;
-    // render them exactly as before this fix (out of #5079's scope, which is
-    // about the shortest-string choice for FINITE values).
+    // NaN / the infinities have no digit-string/notation choice to make: the
+    // spelling is fixed by §2.18 (v0.344, #7301) and is the SAME under every
+    // floating specifier, so this one rendering serves the no-format
+    // ToString(), the "R" specifier and (through the same runtime entry) the
+    // F/E/G/P specifier paths.
     if (std::isnan(v) || std::isinf(v)) {
-        char buf[64];
-        int n = snprintf(buf, sizeof(buf), "%g", v);
-        return bz_make_string(buf, n);
+        return bz_render_non_finite(v);
     }
     char buf[64];
     int n = 0;
@@ -727,10 +745,10 @@ extern "C" void* bz_double_to_string_r(double v) {
 // per stdlib §2.18 (R format / no-format ToString()): float round-trip.
 // Search 1..9 — IEEE 754 float's exact-decimal precision is 9 digits.
 extern "C" void* bz_float_to_string_r(float v) {
+    // per stdlib §2.18 (v0.344, #7301): the same three spellings as the
+    // double's — "NaN", "Infinity", "-Infinity".
     if (std::isnan(v) || std::isinf(v)) {
-        char buf[64];
-        int n = snprintf(buf, sizeof(buf), "%g", (double)v);
-        return bz_make_string(buf, n);
+        return bz_render_non_finite((double)v);
     }
     char buf[64];
     int n = 0;
