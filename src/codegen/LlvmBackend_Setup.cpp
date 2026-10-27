@@ -37036,14 +37036,29 @@ void Emitter::collectStringReleaseEligible(
             // takes ownership of a reference the PRODUCER minted (+1), so the
             // scope-end release discharges exactly that one reference. The
             // BORROW arm below is deliberately NOT extended to the `using var`
-            // spelling: a borrow-initialized local's slot owns nothing at bind
-            // (the reference belongs to the SOURCE), admitting it would widen
+            // spelling at THIS revision — a borrow-initialized local's slot
+            // owns nothing at bind (the reference belongs to the SOURCE),
+            // admitting it would widen
             // `returnedStringLocalOwnsPlusOne`'s reach (which answers "does
             // this local own a +1 that a RETURN may transfer?"), and the
             // borrow side of the `using var` spelling is measured CLEAN on its
             // own (a literal, a field read, an alias of another local) — a
             // different concern, not this defect. Same split #7269 made for
             // the closure arm.
+            //
+            // fix #7388 (v0.345) CORRECTS the reasoning above, which held that
+            // "a borrow-initialized local's slot owns nothing at bind (the
+            // reference belongs to the SOURCE)". That is FALSE for the
+            // plain-`var` twin: `armStringLocalRefcount` retains EVERY member
+            // of `stringBorrowAll_` at bind, so a borrow-initialized local's
+            // slot owns its OWN +1 and releases it at scope end. The premise
+            // being wrong is what left the `using var` spelling of a COPY
+            // unadmitted — and a copy of a local is exactly the shape whose
+            // SOURCE is a local (the plain-`var` twin's own source). The
+            // #7388 arm below admits the spelling, and the
+            // `returnedStringLocalOwnsPlusOne` reach it widens is the SAME
+            // reach the plain-`var` twin already has — which is the point:
+            // §28.10 says the two spellings differ only in reassignability.
             //
             // `await using var` was EXCLUDED here (as the async disposal
             // machinery "owned" that spelling, #7306); fix #7322 admits it,
@@ -37125,7 +37140,56 @@ void Emitter::collectStringReleaseEligible(
             const bool usingVarChoice =
                 v.isUsing && !(usingLd && usingLd->isAwaitUsing) &&
                 choicePayloadTy != nullptr;
-            if (v.init && (!v.isUsing || usingVarProducer)) {
+            // fix #7388 / §28.9 / §28.10 (v0.345): the `using var` SPELLING of
+            // a BORROW-initialized string local — the COPY of a string local.
+            //
+            // §28.10 (v0.345): "`using var` accepts a value-type or
+            // runtime-managed right-hand side. For ordinary value types and
+            // runtime-managed types, the disposal at scope end is a no-op
+            // (these types do not require disposal per §28.9), and the only
+            // effect is the reassignability restriction." §28.9's exemption is
+            // from MANUAL disposal; it is NOT a licence to skip releasing the
+            // runtime's OWN reference. So the `using var` spelling of a
+            // runtime-managed value must have the SAME RUNTIME LIFETIME as its
+            // plain-`var` twin — the #7272 argument, applied to the BORROW side.
+            //
+            // MEASURED on this tree's base (e4a55c95), bezelc --sanitize=address
+            // (LSan), loop x60:
+            //
+            //   var src := o.ToString(); using var x := src;  -> 2040 B / 120 allocs
+            //   var src := o.ToString(); var         x := src;  -> CLEAN
+            //
+            // THE MECHANISM, measured: the leak is in the SOURCE, not in the
+            // copy. The copy was never classified (the gate below refused the
+            // `using var` spelling), so it took NO retain at bind; and because
+            // it took no retain, the escape walk's copy relaxation (the #2764
+            // `borrowRetainedAliases` arm) did not fire for it, so the walk
+            // tainted the SOURCE as escaping — and the source's producer +1 was
+            // then never discharged. Admitting the spelling to the BORROW arm
+            // fixes both halves at once: the copy takes its own +1 at bind
+            // (the plain-`var` twin's behaviour, `armStringLocalRefcount`'s
+            // unconditional retain over `stringBorrowAll_`) and releases it at
+            // scope end, and the walk's relaxation then keeps the source
+            // eligible for its own release.
+            //
+            // WHY THE BORROW ARM IS ADMITTED AND NOT A NEW ARM. The borrow arm
+            // is where a borrow-initialized string local's +1 is minted and
+            // discharged; the plain-`var` twin of this shape already takes it.
+            // A `using var` binding is the SAME local with a reassignability
+            // restriction (§28.10), so it is the SAME shape.
+            //
+            // `returnedStringLocalOwnsPlusOne` — the one consumer the #7272
+            // note warned about — asks "does this local own a +1 that a RETURN
+            // may transfer?". For a borrow local the answer is "only if it has
+            // no scope-end release" (`!stringBorrowRetainEligible_.count`), and
+            // that stays consistent here: the `using var` copy is in
+            // `stringBorrowRetainEligible_` exactly when it is non-escaping,
+            // and then it has a scope-end release, so a return mints a fresh
+            // +1. When it IS escaping it has no scope-end release, so a return
+            // may transfer its +1 — the plain-`var` twin's answer, unchanged.
+            const bool usingVarBorrow =
+                v.isUsing && !plusOneProducer && !choicePayloadTy;
+            if (v.init && (!v.isUsing || usingVarProducer || usingVarBorrow)) {
                 if (plusOneProducer) {
                     producerCandidates.push_back(s);
                     // fix #2817: this decl belongs to the body being analyzed.

@@ -481,7 +481,15 @@ const char* kNullableCopyTarget =
     "  end Main; "
     "end C;";
 
-// (M) a `using var` copy target — excluded by the `!ld->isUsing` gate.
+// (M) a `using var` copy target.
+//
+// WAS: "excluded by the `!ld->isUsing` gate" — the copy was never classified,
+// so it took no retain at bind, and (because it took no retain) the escape
+// walk's copy relaxation did not fire for it, so the walk tainted the SOURCE
+// as escaping and the source's +1 was never discharged. fix #7388 (§28.9 /
+// §28.10, v0.345) admits the `using var` spelling to the BORROW arm, so the
+// copy owns its own +1 (as its plain-`var` twin always did) and the source
+// keeps its own release.
 const char* kUsingVarCopyTarget =
     "module M; class C "
     "  public static method Main(): int "
@@ -735,10 +743,24 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
 
+// fix #7388 (§28.9 / §28.10, v0.345): case (M) LEFT the exclusion list.
+//
+// WAS: `expectLeakButNoMemoryError(r)` — this row ASSERTED the residual
+// leak. §28.10 (v0.345) says the `using var` spelling of a runtime-managed
+// value differs from its plain-`var` twin ONLY in the reassignability
+// restriction ("the disposal at scope end is a no-op (these types do not
+// require disposal per §28.9), and the only effect is the reassignability
+// restriction"), and §28.9's exemption is from MANUAL disposal, not from
+// releasing the runtime's own reference — so the twin's runtime lifetime is
+// the requirement, and the `using var` copy was the side that did not meet it.
+//
+// The row's new expectation: the program is CLEAN — `ran` is true (no
+// sanitizer report at all) and the exit code is the program's own.
 BEZEL_TEST(codegen_string_local_copy_release_2764,
-           using_var_copy_target_is_deliberately_excluded_spec_28_10) {
+           using_var_copy_target_is_released_spec_28_9) {
     JitResult r = runAotChecked(kUsingVarCopyTarget);
-    expectLeakButNoMemoryError(r);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
 
 BEZEL_TEST(codegen_string_local_copy_release_2764,
