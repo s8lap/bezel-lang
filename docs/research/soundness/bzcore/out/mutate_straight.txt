@@ -1,0 +1,13 @@
+baseline: 308526 programs, 50529 accepted (5760 with warnings), 0 violations
+
+| mutation | verdicts changed | newly accepted | of which unsound | newly rejected | unsound among all accepted | witness |
+|---|---|---|---|---|---|---|
+| K5.1 deleted (transfers unfrozen) — the pre-v0.180 language | 432 | 432 | 246 | 0 | 246 | new a / brw b a / send a / use b → RACE |
+| K5.2 deleted (drop-on-overwrite unfrozen) | 408 | 408 | 0 | 0 | 0 | new a / brw b a / asg a / use b (sound: the flag backstops it) |
+| K5.3 flipped (explicit Dispose() frozen too) | 402 | 0 | 0 | 402 | 0 |  |
+| K7.3 weakened (owned ⊓ borrowed demotes to borrowed) | 0 | 0 | 0 | 0 | 0 |  |
+| K7.4 weakened (owned ⊓ moved = owned) | 0 | 0 | 0 | 0 | 0 |  |
+| K1.3 deleted (moved-from bindings readable) | 31800 | 31800 | 31680 | 0 | 31680 | decl a / use a → STUCK |
+| K3.13 flipped (an unmarked read consumes) | 15696 | 5958 | 0 | 9738 | 0 | new a / brw b a / asg b (sound: the flag backstops it) |
+| scope end disposes explicitly-disposed bindings again (K3.9 post-state ignored) | 0 | 0 | 0 | 0 | 0 |  |
+| §28.2 use-after-dispose warning dropped | 0 | 0 | 0 | 0 | 0 | only warnings change: 5760 → 1992 warned programs |

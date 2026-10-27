@@ -34,3 +34,4 @@ Each matrix crosses kinds of value with positions they can reach and records, pe
 | [2026-08-21](2026-08-21-gate-performance-measured.md) | Gate performance: the audit's model, measured (2026-08-21) |
 | [2026-09-02](2026-09-02-in-memory-test-execution.md) | Running the test suite from memory: what the disk is actually doing (2026-09-02) |
 | [2026-09-29](2026-09-29-scripting-tier-and-direct-emitter.md) | A scripting tier for Bezel without a garbage collector, and a direct-emit backend (2026-09-29) |
+| [2026-10-27](soundness/README.md) | How to know an ownership-rule change has not regressed soundness: a rule-to-test pin map, a toy executable model of the ownership kernel with rule mutation, and a staged plan (matrix gate, executable model, proposal 0047's proofs) |

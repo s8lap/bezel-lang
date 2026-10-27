@@ -1,0 +1,13 @@
+baseline: 67002 programs, 12327 accepted (450 with warnings), 0 violations
+
+| mutation | verdicts changed | newly accepted | of which unsound | newly rejected | unsound among all accepted | witness |
+|---|---|---|---|---|---|---|
+| K5.1 deleted (transfers unfrozen) — the pre-v0.180 language | 78 | 78 | 36 | 0 | 36 | new a / brw b a / send a / use b → RACE |
+| K5.2 deleted (drop-on-overwrite unfrozen) | 72 | 72 | 0 | 0 | 0 | new a / brw b a / asg a / use b (sound: the flag backstops it) |
+| K5.3 flipped (explicit Dispose() frozen too) | 60 | 0 | 0 | 60 | 0 |  |
+| K7.3 weakened (owned ⊓ borrowed demotes to borrowed) | 144 | 144 | 144 | 0 | 144 | new a / decl b / if { /   asg b / } else { /   asgb b a / } → T1-leak |
+| K7.4 weakened (owned ⊓ moved = owned) | 3303 | 3303 | 2499 | 0 | 5139 | new a / if { / } else { /   disp a / } / send a → T1-disposed-then-sent |
+| K1.3 deleted (moved-from bindings readable) | 7857 | 7857 | 7260 | 0 | 7260 | decl a / use a → STUCK |
+| K3.13 flipped (an unmarked read consumes) | 2646 | 1008 | 0 | 1638 | 0 | new a / brw b a / asg b (sound: the flag backstops it) |
+| scope end disposes explicitly-disposed bindings again (K3.9 post-state ignored) | 0 | 0 | 0 | 0 | 1521 | new a / if { / } else { /   disp a / } → T1-machinery-redispose |
+| §28.2 use-after-dispose warning dropped | 0 | 0 | 0 | 0 | 0 | only warnings change: 450 → 177 warned programs |
