@@ -24313,7 +24313,8 @@ bool Emitter::valueLikeChoiceLocalIsCopy(const ast::Node* ldNode) const {
 
 const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
         const ast::Node* ldNode,
-        std::vector<const ast::Expr*>* retainedArgs) const {
+        std::vector<const ast::Expr*>* retainedArgs,
+        bool allowUsingVar) const {
     // fix #2115 / §28.9 / §35.4: classify a `var` choice local for scope-end
     // managed-payload release. The value-like choice struct is a value-typed
     // stack slot; a +1 producer string stored into a case payload
@@ -24336,7 +24337,26 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // all-null view (any other node kind) answers "not a candidate" through the
     // `!v.init` test — the same answer the old `!ld` test gave.
     LocalDeclInitView v = localDeclInitView(ldNode);
-    if (!v.init || v.isUsing) return nullptr;
+    if (!v.init) return nullptr;
+    // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a value-like
+    // choice local. §28.10 (spec §28.10, line 7260) says of a value-typed
+    // right-hand side that "the disposal at scope end is a no-op (these types
+    // do not require disposal per §28.9), and the only effect is the
+    // reassignability restriction" — so the `using var` spelling must have the
+    // SAME RUNTIME LIFETIME as the plain-`var` spelling, which owns the
+    // construction's +1 payload and releases it at scope end. The plain-`var`
+    // twin is classified here and the `using var` twin was not: the
+    // `v.isUsing` term here refused it, so a `using var` value-like choice
+    // local was never a candidate and never got a scope-end release — the
+    // payload leaked. `allowUsingVar` (the caller's opt-in) admits that
+    // spelling; `await using var` stays refused EITHER WAY, because the async
+    // disposal machinery owns that spelling (#7306).
+    if (v.isUsing) {
+        if (!allowUsingVar) return nullptr;
+        const ast::LocalDecl* uld =
+            dynamic_cast<const ast::LocalDecl*>(ldNode);
+        if (uld && uld->isAwaitUsing) return nullptr;  // #7306
+    }
     // Resolve the choice type (the declared annotation wins; else the
     // initializer's inferred type), through the active substitution so a
     // generic choice at a concrete instantiation resolves to its specialized
@@ -29221,7 +29241,14 @@ void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
     if (emittingDisposerBody_) return;  // a disposer walks fields directly
     if (currentFn_ != stringReleaseEligibleFn_) return;
     if (!valueLikeChoiceStrReleaseEligible_.count(declNode)) return;
-    const sema::TypeRef* rt = valueLikeChoiceLocalMintsStringPayload(ld);
+    // fix #7305 / §28.10 (v0.344): `allowUsingVar` — the `using var` SPELLING
+    // of a value-like choice local is armed here exactly as its plain-`var`
+    // twin is (§28.10: "the only effect is the reassignability restriction" —
+    // the runtime lifetime must be the same). The membership gate above is
+    // what admits the spelling: a `using var` local that the escape walk did
+    // not clear never reaches this line.
+    const sema::TypeRef* rt = valueLikeChoiceLocalMintsStringPayload(
+        ld, /*retainedArgs=*/nullptr, /*allowUsingVar=*/true);
     if (!rt || !rt->declaration) return;  // defensive — eligibility is stale
     Disposal d{slot, nullptr};
     d.valueLikeChoiceStrRelease = true;
@@ -36551,12 +36578,41 @@ void Emitter::collectStringReleaseEligible(
             const bool usingVarProducer =
                 plusOneProducer && v.isUsing &&
                 !(usingLd && usingLd->isAwaitUsing);
+            // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a
+            // VALUE-LIKE CHOICE local. The choice-payload constructor is not a
+            // STRING producer, so `plusOneProducer` is false and
+            // `usingVarProducer` is false — the outer gate below was therefore
+            // FALSE for a `using var` choice local, so the decl was never
+            // classified at all and never armed for a scope-end release. Its
+            // plain-`var` twin takes the `valueLikeChoiceLocalMintsStringPayload`
+            // arm below and IS clean, and §28.10 requires the two spellings to
+            // have the SAME runtime lifetime ("the only effect is the
+            // reassignability restriction", spec §28.10, line 7260).
+            //
+            // WHY THIS IS NOT "WIDEN THE `using var` GATE". The gate stays
+            // exactly as #7272 left it: the BORROW arm below is still NOT
+            // reached for a `using var` local, and the PRODUCER arm still
+            // admits only a `using var` whose initializer is a +1 producer.
+            // The `using var` VALUE-LIKE CHOICE local gets its OWN arm (the
+            // `else if` after the gate), so nothing else about the `using var`
+            // spelling changes.
+            //
+            // `await using var` is EXCLUDED here exactly as it is excluded
+            // above: the async disposal machinery owns that spelling (#7306).
+            const sema::TypeRef* choicePayloadTy =
+                v.init ? valueLikeChoiceLocalMintsStringPayload(
+                             s, /*retainedArgs=*/nullptr,
+                             /*allowUsingVar=*/true)
+                       : nullptr;
+            const bool usingVarChoice =
+                v.isUsing && !(usingLd && usingLd->isAwaitUsing) &&
+                choicePayloadTy != nullptr;
             if (v.init && (!v.isUsing || usingVarProducer)) {
                 if (plusOneProducer) {
                     producerCandidates.push_back(s);
                     // fix #2817: this decl belongs to the body being analyzed.
                     stringLocalCandidates_.insert(static_cast<const void*>(s));
-                } else if (valueLikeChoiceLocalMintsStringPayload(s)) {
+                } else if (choicePayloadTy) {
                     // fix #2115: a value-like choice local whose construction
                     // mints +1 string payload(s) — released at scope end iff
                     // non-escaping (the walk below).
@@ -36591,6 +36647,19 @@ void Emitter::collectStringReleaseEligible(
                             static_cast<const void*>(s));
                     }
                 }
+            } else if (usingVarChoice) {
+                // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a
+                // VALUE-LIKE CHOICE local — the arm the plain-`var` twin takes
+                // above, reached here because the outer gate is false for it.
+                // §28.10 (line 7260): "the only effect is the reassignability
+                // restriction" — so the runtime lifetime is the plain-`var`
+                // twin's, which owns the construction's +1 payload and releases
+                // it at scope end. Classified here, armed by
+                // armValueLikeChoiceStrRelease, released by the same
+                // tag-switched walk the `var` twin uses.
+                valueLikeChoiceCandidates.push_back(s);
+                // fix #2817: see the producer branch above.
+                stringLocalCandidates_.insert(static_cast<const void*>(s));
             } else if (!v.init && !v.isUsing && v.type &&
                        // LOCALDECL-ONLY: a `const` local always has an initializer (§21.1), so it never reaches this no-initializer arm
                        dynamic_cast<const ast::LocalDecl*>(s)) {
@@ -36694,7 +36763,18 @@ void Emitter::collectStringReleaseEligible(
                 static_cast<const void*>(ld)))
             continue;
         std::vector<const ast::Expr*> borrowArgs;
-        if (!valueLikeChoiceLocalMintsStringPayload(ld, &borrowArgs)) continue;
+        // fix #7305 / §28.10 (v0.344): `allowUsingVar` — the `using var`
+        // SPELLING of a value-like choice local is armed here exactly as its
+        // plain-`var` twin is. THIS IS LOAD-BEARING: the borrow-arg retain at
+        // the §35.3 construction site is gated on the argument node being in
+        // `valueLikeChoiceStrReleaseEligible_` (LlvmBackend_Calls2.cpp), and
+        // the scope-end release of the local releases those same strings. A
+        // release without the matching retain would drive the refcount
+        // negative — the runtime's over-release guard aborts the process — so
+        // the two must be admitted together.
+        if (!valueLikeChoiceLocalMintsStringPayload(ld, &borrowArgs,
+                                                     /*allowUsingVar=*/true))
+            continue;
         for (const ast::Expr* a : borrowArgs)
             retainedCtorArgs.insert(static_cast<const void*>(a));
     }

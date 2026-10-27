@@ -20381,9 +20381,17 @@ private:
     // construction lowering retains each of them for an eligible local, so the
     // slot owns +1 on every active-case string either way.
     bool valueLikeChoiceLocalIsCopy(const ast::Node* ldNode) const;
+    // fix #7305 / §28.10 (v0.344): `allowUsingVar` admits the `using var`
+    // SPELLING of a value-like choice local — §28.10 says of it that "the only
+    // effect is the reassignability restriction", so the `using var` spelling
+    // must have the SAME runtime lifetime as the plain-`var` spelling. False
+    // (the default) keeps the pre-#7305 answer: "not a candidate". The
+    // `await using var` spelling is refused EITHER WAY — the async disposal
+    // machinery owns that spelling (#7306).
     const sema::TypeRef* valueLikeChoiceLocalMintsStringPayload(
         const ast::Node* ldNode,
-        std::vector<const ast::Expr*>* retainedArgs = nullptr) const;
+        std::vector<const ast::Expr*>* retainedArgs = nullptr,
+        bool allowUsingVar = false) const;
     // fix #2115: register (if eligible) the scope-end managed-payload release of
     // a value-like choice local. Called from lowerLocalDecl after the slot store;
     // gated on valueLikeChoiceStrReleaseEligible_ (the escape walk's verdict) so
