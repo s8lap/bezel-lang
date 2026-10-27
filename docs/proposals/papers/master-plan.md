@@ -578,35 +578,51 @@ from the label query and the corpus runner. Status ∈ QUEUED · ENTRY · ACTIVE
 
 | # | campaign | track | status | entry date | members at entry (S/C/L/other) | closed | re-scoped | in-scope siblings filed / triaged | corpus fails in scope (entry → now) | grid cells wrong (entry → now) | blocked on | last session | next action |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | enablers | — | standing | — | — | — | — | — | — | — | — | — | #2924/#7145 errors; #4602 bounded retention, then default flip (ruled 2026-10-27) |
-| 1 | using-heads | ownership | ENTRY | 2026-10-28 | 24 (7/3/5/9) | 0 | 0 | 0 / 0 | §28.10: 4, §28.12: 6 (+3 unbanked) → — | 41 wrong + 5 known-red (153 cells) | — | R36 | ENTRY LANDED (record + grid on `r36-c1-entry` @ `2381f534`, under review); U1 SPLITS into U1a/U1c/U1d — dispatch the U1c anchor lane |
-| 2 | builtin-call-admission | sema | ENTRY | 2026-10-28 | 189 (33/53/0/103) | 0 | 0 | 0 / 0 | stdlib §2: 31, §3: 2, §9: 8 → — | 48 wrong (110 cells) | — | R36 | ENTRY LANDED (record + grid on `r36-c2-entry` @ `8a356f9c` + `87c1e94f`, under review); the grid's 39 PREDICTED reject needles block the DONE line (N1) |
+| 0 | enablers | — | standing | — | — | — | — | — | — | — | — | — | #2924/#7145 errors; #4602 bounded retention, then default flip (ruled 2026-10-27). The Appendix-B sweep found 4 enabler defects, filed as #7398–#7401 (`fetch_issues.sh`'s stale page cache, `out/clusters.tsv` not ignored, `campaigns.py`'s 35 double-seeded numbers, `sept_plan_outcome.py`'s broken path) — a campaign-0 lane will take them when a slot frees |
+| 1 | using-heads | ownership | ACTIVE | 2026-10-28 | 24 (7/3/5/9) | 0 | 0 | 13 / 2 | §28.10: 4, §28.12: 9 (6 banked + 3 unbanked) → — | 39–40 wrong + 5 known-red (153 cells) — **NOT REPRODUCIBLE** (the `Task` row flips between runs on one build) | the grid's 3 HIGH defects (fix-forward in flight) | R36 | ENTRY REVIEWED — ACCEPT-W-NOTES **on the record**; the **GRID may not land** (H1 nine `copy_await_source` cells are green on §28.3's diagnostic, not §28.10's; H2 the grid cannot detect §28.12's "admission unchanged"; H3 the baseline is not reproducible). Fix-forward in flight on `r36-c1-entry`; the U1c ANCHOR lane dispatched (7 issues: #3482 #7338 #3483 #7328 #5653 #3516 #3515; #7339 held out for the owner) |
+| 2 | builtin-call-admission | sema | ACTIVE | 2026-10-28 | **122** (19/31/0/72) — the entry check RE-CLUSTERED the 189 (67 re-labelled out, 1 in) | 0 | 0 | 0 / 69 | stdlib §2: 31, §3: 2, §9: 8 → — | 48 wrong (110 cells) — 39 of 60 reject needles **PREDICT** a diagnostic the compiler does not produce today, so a correct fix can leave the grid red | the grid's N1 (a predicted needle is not a measured one) | R36 | ENTRY REVIEWED — ACCEPT-W-NOTES with 7 defects (N1 blocking) → fix-forward in flight on `r36-c2-entry`; the B0 ANCHOR lane dispatched (`src/common/BuiltinRegistry.*`, `src/sema/*`) |
 | 3 | enumerable-heads | ownership | QUEUED | — | 125 (43/9/27/46) | 0 | 0 | 0 / 0 | §29: 7, stdlib §5: 1 → — | — | campaign 1 | — | — |
 | 4 | producer-temporaries | ownership | QUEUED | — | 148 (14/7/98/29) | 0 | 0 | 0 / 0 | §28.3/§28.9 subset → — | — | campaign 3 | — | — |
-| 5 | nullable-carrier | sema | QUEUED | — | 54 (14/0/0/40) | 0 | 0 | 0 / 0 | §7: tbd | — | campaign 2 | — | — |
+| 5 | nullable-carrier | sema | QUEUED | — | 70 (19/9/0/42) — **+15 re-labelled by campaign 2's entry check**, +1 filed | 0 | 0 | 0 / 15 | §7: tbd | — | campaign 2 | — | — |
 | 6 | closures-cells | ownership | QUEUED | — | 111 (24/3/49/35) | 0 | 0 | 0 / 0 | §27.5/§28.14 subset | — | campaign 4 | — | — |
-| 7 | generic-boundaries | sema | QUEUED | — | 88 (17/13/3/55) | 0 | 0 | 0 / 0 | §14: tbd | generics matrix: 1 ambiguous | campaign 5 | — | — |
-| 8 | collection-elements | ownership/runtime | QUEUED | — | 77 (13/1/30/33) | 0 | 0 | 0 / 0 | stdlib §4: 22, §6: 23 | — | campaign 4 | — | — |
+| 7 | generic-boundaries | sema | QUEUED | — | 97 (18/13/3/63) — **+9 re-labelled by campaign 2's entry check** | 0 | 0 | 0 / 9 | §14: tbd | generics matrix: 1 ambiguous | campaign 5 | — | — |
+| 8 | collection-elements | ownership/runtime | QUEUED | — | 89 (17/2/30/40) — **+9 re-labelled by campaign 2's entry check**, +3 filed | 0 | 0 | 0 / 9 | stdlib §4: 22, §6: 23 | — | campaign 4 | — | — |
 | 9 | borrow-provenance | ownership | QUEUED | — | 96 (30/1/17/48) | 0 | 0 | 0 / 0 | §28.3: 9, §28.6: 2, §28.14: 4, §9.7: 6 | matrices: 0 open at v0.336 | soundness Stage 0; a train | — | — |
 | 10 | choice-payloads | ownership | QUEUED | — | 30 (10/6/10/4) | 0 | 0 | 0 / 0 | §35: tbd | — | campaign 4 | — | — |
-| 11 | async-frames | ownership | QUEUED | — | 32 (16/1/7/8) | 0 | 0 | 0 / 0 | §30: 7 | — | campaigns 1, 6 | — | — |
+| 11 | async-frames | ownership | QUEUED | — | 35 (16/2/7/10) — **+1 re-labelled by campaign 2's entry check**, +2 filed | 0 | 0 | 0 / 1 | §30: 7 | — | campaigns 1, 6 | — | — |
 | 12 | cross-module | sema | QUEUED | — | 25 (9/2/4/10) | 0 | 0 | 0 / 0 | §2.5/§2.8: tbd | `imported_symbol_reads` baseline 31 → 0 | campaign 7 | — | — |
-| 13 | records-statics-misc | mixed | QUEUED | — | 49 (9/0/1/39) | 0 | 0 | 0 / 0 | §8, §22: tbd | — | — | — | re-cluster at entry |
+| 13 | records-statics-misc | mixed | QUEUED | — | 71 (12/3/1/55) — **+19 re-labelled by campaign 2's entry check**, +3 filed | 0 | 0 | 0 / 19 | §8, §22: tbd | — | — | — | re-cluster at entry |
 
 **Session handback format** (three lines under the table): *Landed:* `fix #…` × n, members closed n,
 grid cells cleared n. *Blocked:* rulings awaited, with dates asked. *Asked:* new spec questions filed
 (numbers), labels added (count).
 
+**The four STANDING buckets are not numbered campaigns and are NOT rows above** — they are the
+enablers and the two unclaimed queues, and their live counts are: `campaign:infra-oracles` 166,
+`spec-trains` 223, `features-proposals` 99, `parking-lot` 92. **The 13 numbered rows above sum to
+1061 and the 17 buckets to 1641 — the whole open, non-PR issue set** (measured 2026-10-28 03:30
+NZDT). *This is a table-shape gap, not a wrong number: the 13 numbered campaigns are the ones
+with an entry check, and the four standing buckets were only in §3's prose.*
+
 **R36 session handback (2026-10-28, in progress — the run ends 2026-10-30 02:00 NZDT).**
 *Landed:* `narrow #7316` and `narrow #7333` picked onto staging (2 fix issues; UNATTRIBUTED 0);
 #1792 and #7108 closed as fixed (each with a coordinator measurement; #7108's mechanism was already
-closed under #7168). *Blocked:* the two campaign grids are not yet their campaigns' DONE instruments
-— campaign 2's 39 PREDICTED reject needles (a correct fix could leave the grid red), campaign 1's
-`Task` cells hang on one build and not on another; both entry commits are under review. *Asked:* 8
-spec questions filed from the certain-faults research (#7378–#7384) + 11 campaign-1 defects
-(#7387–#7397) + 2 codegen discriminators (#7385, #7386) + the 23 campaign-2 measurement comments;
-labels applied by the Appendix B sweep. **=> THE GATE CADENCE (owner directive 2026-10-28): ONE GATE
-CARRIES 60–100 ISSUE CLOSURES, NOT 5. => THE HAUL IS ACCUMULATED; DO NOT GATE A SMALL ONE.**
+closed under #7168). *Blocked:* **neither campaign grid is yet its campaign's DONE instrument** —
+campaign 1's grid has three HIGH defects (H1 nine `copy_await_source` cells are green on §28.3's
+must-use diagnostic, NOT §28.10's adoption rule, so a correct fix can turn them RED; H2 the grid
+cannot detect §28.12's "takes §28.10's admission UNCHANGED"; H3 two runs of the same script on the
+same build gave 100 ok/39 wrong and 99 ok/40 wrong — the `Task` row flips), and campaign 2's 39
+PREDICTED reject needles (a correct fix could leave the grid red). **=> THE CAMPAIGNS' RECORDS MAY
+LAND; THEIR GRIDS MAY NOT, UNTIL THE FIX-FORWARDS LAND.** *Asked:* 8 spec questions filed from the
+certain-faults research (#7378–#7384) + 11 campaign-1 defects (#7387–#7397) + 2 codegen
+discriminators (#7385, #7386) + 4 enabler defects (#7398–#7401) + the 23 campaign-2 measurement
+comments. **THE LABELLING IS DONE AND VERIFIED: the Appendix-B sweep applied 1607 labels, and the
+tracker now has 0 double-labelled and 0 unlabelled open issues (1641 = the sum of the 17 buckets);
+campaign 2's entry check then re-labelled 69 issues out of `campaign:builtin-call-admission` into
+the campaigns that own them (the review confirmed the table: 77 unique ids, exclusive, every row
+with a destination) and #7363 was labelled.** **=> THE GATE CADENCE (owner directive 2026-10-28):
+ONE GATE CARRIES 60–100 ISSUE CLOSURES, NOT 5. => THE HAUL IS ACCUMULATED; DO NOT GATE A SMALL
+ONE.**
 
 ---
 
