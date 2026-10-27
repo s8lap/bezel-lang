@@ -504,7 +504,11 @@ campaign is what is left after they run.
      call (no retention); retain only where a borrow may survive or the analysis is unsure (spans,
      `Shared<T>`, collection elements, unknown provenance). Also retain where a later release of the same binding
      (scope end, overwrite, a repeated `Dispose()`) is reached on a *maybe-consumed* join and would
-     read the flag; where the explicitly-disposed post-state is static there, emit nothing. Check elision is a later campaign, after
+     read the flag; where the explicitly-disposed post-state is static there, emit nothing. **Corrected after the
+     model's trace oracle** (`bzcore` L1): free in full only where the disposed binding itself is also
+     dead after the call (a §28.2-warned later use retains until proposal 0205 lands), a slot borrowed
+     through a field counts as a surviving borrow, and the exception-unwind edge is a fourth flag
+     reader treated like scope end. Check elision is a later campaign, after
      the soundness model checks its premise.
    - **#6358**: the dictionary records at construction that its keys are strings, and every free path
      (`bz_dict_free`, `Remove`, `Clear`, overwrite) releases them; no per-site emission.
