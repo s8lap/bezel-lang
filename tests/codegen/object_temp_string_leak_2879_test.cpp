@@ -244,12 +244,22 @@ const char* kBoundObjectNoOverRelease =
 // ===========================================================================
 // (G) Debug.WriteLine sibling — #1032's special-lowered path, parallel to
 // Console.WriteLine. Both must close the leak.
+//
+// BEHAVIOUR FLIP (fix #6780, stdlib §8.2 v0.345). This row's producer was
+// `Fresh(): Object`, and the call handed that `Object` to `Debug.WriteLine`.
+// stdlib §8.2 declares `WriteLine(message: string)`, and §5.1 makes no
+// `Object` -> `string` conversion implicit (`Object` -> `string` is a
+// DOWNCAST), so that program was never a legal one: §22.6 makes it a compile
+// error. Fix #6780 closes that admission, so the producer here is declared
+// `Fresh(): string` — the same producer shape, typed the way §8.2's declared
+// parameter requires. The row's assertions are unchanged (the program must
+// run, exit 0, and leak nothing).
 // ===========================================================================
 const char* kDebugWriteLineProducer =
     "module M2879G; import System.Diagnostics; "
     "public class H2879G "
     "  public S: string := \"h\"; "
-    "  public method Fresh(): Object => \"x\" + S; "
+    "  public method Fresh(): string => \"x\" + S; "
     "end H2879G; "
     "public class C2879G "
     "  public static method Main(): int "

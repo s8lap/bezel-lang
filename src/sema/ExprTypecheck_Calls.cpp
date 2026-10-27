@@ -23009,6 +23009,9 @@ std::string_view builtinParamHeadSection(std::string_view head) {
     if (head == "DateTime" || head == "DateOnly" || head == "TimeOnly" ||
         head == "TimeSpan")
         return "stdlib §2.5";
+    // fix #6780 (stdlib §8.2, v0.345): the `Debug` class — the section that
+    // declares its surface.
+    if (head == "Debug") return "stdlib §8.2";
     return "stdlib §9.1";
 }
 
@@ -23017,13 +23020,20 @@ std::string_view builtinParamHeadSection(std::string_view head) {
 // `StringBuilder` / `Math` / `Convert` receiver is owned by the check that
 // already reads that surface, and this gate stands down there so that one
 // call never draws two diagnostics.
+//
+// fix #6780 (stdlib §8.2, v0.345): `Debug` joins the reach. It is a
+// PURE-STATIC class whose whole surface — `WriteLine(message: string)` and
+// `Assert(condition: bool, message: string := "")` — the ONE table now
+// carries, and until these rows existed NO check read it: a `Debug` call was
+// admitted whatever it was given.
 bool isBuiltinValueParamHead(std::string_view head) {
     return head == "SByte" || head == "Byte" || head == "Int16" ||
            head == "UInt16" || head == "Int32" || head == "UInt32" ||
            head == "Int64" || head == "UInt64" || head == "Double" ||
            head == "Float" || head == "Decimal" || head == "Boolean" ||
            head == "Char" || head == "Guid" || head == "DateTime" ||
-           head == "DateOnly" || head == "TimeOnly" || head == "TimeSpan";
+           head == "DateOnly" || head == "TimeOnly" || head == "TimeSpan" ||
+           head == "Debug";
 }
 
 }  // namespace

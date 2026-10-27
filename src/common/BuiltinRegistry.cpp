@@ -591,7 +591,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 300> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 303> kBuiltinParams = {{
     {"string", "From", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"string", "From", 3, 3, 0x00, {"buffer", "start", "length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"string", "FromCStringPointer", 1, 1, 0x00, {"p", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
@@ -679,6 +679,20 @@ constexpr std::array<BuiltinParamRow, 300> kBuiltinParams = {{
     {"Convert", "TryToDouble", 2, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryToDouble(value: string, out result: double): bool"},
     {"Convert", "TryToDecimal", 2, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryToDecimal(value: string, out result: decimal): bool"},
     {"Convert", "TryToBoolean", 2, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryToBoolean(value: string, out result: bool): bool"},
+    // stdlib §8.2 — the `Debug` class. It is a PURE-STATIC utility class with
+    // exactly two members, and its whole surface is here: `WriteLine(message:
+    // string)` and `Assert(condition: bool, message: string := "")`. The
+    // `Assert` forms are two rows because the table keys a row on the
+    // ARGUMENT COUNT (§22.5): the one-argument form and the two-argument
+    // form. Before these rows the `Debug` head was in NO table at all, so
+    // nothing checked a `Debug` call against §8.2: `Debug.WriteLine(<a
+    // StringBuilder>)` compiled and wrote an EMPTY LINE, `Debug.WriteLine(5)`
+    // aborted the compiler in the LLVM verifier ("Call parameter type does
+    // not match function signature!"), `Debug.WriteLine("a", "b")` DROPPED the
+    // surplus argument, and `Debug.Assert(<a string>)` aborted it too.
+    {"Debug", "WriteLine", 1, 1, 0x01, {"message", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "WriteLine(message: string)"},
+    {"Debug", "Assert", 1, 1, 0x01, {"condition", "", "", "", "", "", "", ""}, {kBPTBool, 0, 0, 0, 0, 0, 0, 0}, "Assert(condition: bool)"},
+    {"Debug", "Assert", 2, 2, 0x03, {"condition", "message", "", "", "", "", "", ""}, {kBPTBool, kBPTString, 0, 0, 0, 0, 0, 0}, "Assert(condition: bool, message: string)"},
     {"DateTime", "", 3, 3, 0x00, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"DateTime", "", 8, 6, 0x00, {"year", "month", "day", "hour", "minute", "second", "millisecond", "kind"}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"DateOnly", "", 3, 3, 0x00, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},

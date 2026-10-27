@@ -186,15 +186,27 @@ const char* kInterfaceInterpolationProducer =
 // ===========================================================================
 // (D) Debug.WriteLine through interface dispatch — debug sibling, special-
 // lowered path (mirrors shape G of the #2879 file).
+//
+// BEHAVIOUR FLIP (fix #6780, stdlib §8.2 v0.345). The producer was declared
+// `Fresh(): Object` and that `Object` was handed to `Debug.WriteLine`.
+// stdlib §8.2 declares `WriteLine(message: string)`, and §5.1 makes no
+// `Object` -> `string` conversion implicit, so the program was never a legal
+// one. Fix #6780 closes that admission, so the interface method and its
+// implementation are declared `Fresh(): string` — the same dispatch shape,
+// typed the way §8.2's declared parameter requires. The row's assertions are
+// unchanged (the program must run, exit 0, and leak nothing). The
+// `Object`-typed producer through interface dispatch stays covered by rows
+// (A), (B), (C) and (G), whose sinks (`Console.WriteLine`, `Console.Write`
+// and the §18.5 interpolation hole) declare an `Object` parameter.
 // ===========================================================================
 const char* kInterfaceDebugWriteLineProducer =
     "module M3349D; import System.Diagnostics; "
     "public interface IFresh3349D "
-    "  method Fresh(): Object; "
+    "  method Fresh(): string; "
     "end IFresh3349D; "
     "public class H3349IfaceD: IFresh3349D "
     "  public S: string := \"h\"; "
-    "  public method Fresh(): Object => \"x\" + S; "
+    "  public method Fresh(): string => \"x\" + S; "
     "end H3349IfaceD; "
     "public class C3349D "
     "  public static method Main(): int "
