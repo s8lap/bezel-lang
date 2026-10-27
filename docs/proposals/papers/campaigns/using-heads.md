@@ -86,6 +86,12 @@ population — this is the §3419 "duplicated classification predicates" shape:
 * **Closes 8:** #3482 (a monomorphization-aware representation key), #7338 (the
   `Type` token in the runtime-managed set), #7339, #3483, #7328, #5653, #3516,
   #3515 — the last six through the run-time half.
+  **⚠ THIS IS THE ENTRY LANE's **PREDICTION**, NOT THE ANCHOR's MEASURED OUTCOME, AND IT IS
+  SUPERSEDED BY THE ANCHOR LANE's BLOCK BELOW. MEASURED 2026-10-28 BY THE EXIT REVIEW: **#7339,
+  #3483 AND #3515 ARE ALL OPEN** — #3483's family is an owned `IAsyncDisposable` RETURN (it needs
+  the #3493 ruling's itab route) and #3515's is the PER-LEVEL RECLAMATION CHAIN (a file the anchor
+  lane does not own). THE ANCHOR's OWN `fix` SUBJECT NAMES **FIVE**: #3482 #7338 #7328 #5653
+  #3516, WITH `narrow #3483 #3515`. **THE EIGHT HERE MUST NOT BE READ AS THE CLOSURE SET.**
 * **The shapes of six are already fixed before the anchor (the anchor
   generalises, it does not newly close): 6** — #7322 and #7306 (both the
   vacuous-`await using`-over-a-runtime-managed-value shape, fixed by
@@ -207,8 +213,12 @@ rows where `campaign == using-heads`: **24 rows** (severity: 7 soundness, 3 cras
   24 (24 minus the five closed — #7327, #7337, #7283, #7306 and #7322),
   **#7374**, the twelve newly filed **#7386–#7397**, and **#5355** and
   **#7146** (older issues that carry the campaign label) — 19 + 1 + 12 + 2 =
-  **34**. **The LIVE query, measured on 2026-10-28, returns 40**: six issues
-  have been labelled since — **#7405, #7406, #7412, #7415, #7416 and #7417**.
+  **34**. **The LIVE query, measured on 2026-10-28 at the `5ea3e73d` timestamp, returned 40**:
+  six issues had been labelled since — **#7405, #7406, #7412, #7415, #7416 and #7417**.
+  **⚠ RE-DATED BY THE EXIT REVIEW (2026-10-28, later the same day): THE LIVE COUNT IS NOW **39
+  OPEN / 4 CLOSED** — #7416 CLOSED SINCE. **THE LABEL COUNT IS A PROPERTY OF A **MOMENT**, NOT OF
+  THE CAMPAIGN, SO EVERY COUNT IN THIS RECORD IS DATED AND NONE OF THEM IS "LIVE" IN THE SENSE OF
+  BEING CURRENT.**
   ⚠ The **37** that an earlier revision of this record quoted for "2026-10-28"
   counted #7283, #7306 and #7322 as open; they had been closed eight minutes
   before that commit, so **37 was wrong at its own stated date**. An earlier
@@ -267,7 +277,7 @@ with the tracker.
 
 | # | fixing commit | re-scoping (with the deciding spec sentence QUOTED) |
 |---|---|---|
-| #2624 | none isolated by this lane | **blocked on a ruling.** The repro ran and produced the CORRECT behaviour, and the spec does not name the pending per-advance Task: §29.1's iterator protocol says *"Disposing the enumerator (`break`, exhaustion, or explicit `Dispose()`) disposes any outstanding yielded value the iterator still owns"* — the per-advance Task is not a yielded value, so whether it is part of the disposal obligation is not decided by the text. The ISSUE is OPEN. |
+| #2624 | none isolated by this lane | **blocked on a ruling.** The repro ran and produced the CORRECT behaviour, and the spec does not name the pending per-advance Task: §29.1's iterator protocol says (spec line 7771, **quoted**: *"Disposing the enumerator (`break` from a `for` or `await for` loop, exhaustion, or `Dispose()`/`DisposeAsync()` on a manually-held enumerator) disposes any outstanding yielded value the iterator **owns**"*) — the per-advance Task is not a yielded value, so whether it is part of the disposal obligation is not decided by the text. The ISSUE is OPEN. |
 | #7283 | `87fdfa67 fix #7337, #7327` (the function-typed `await using` shape; #7327 is its re-file) | **not a defect at HEAD.** A function value is runtime-managed, and §28.9 says *"None of them is a class, and none has a `Dispose()` member: `x.Dispose()` over a value of one of these types is a compile error"*, so the `await using` spelling of it carries no disposal obligation, and §28.12's "`await using var` takes §28.10's admission unchanged" admits it. **The ISSUE is CLOSED** (2026-10-27T14:43:18Z), fixed by **`87fdfa67`** — the commit is named in the issue's own closing comment. |
 | #7306 | `9bb9387f narrow #7322` (the vacuous `await using` shape) | as #7283, for a string (also runtime-managed, §28.9). **The ISSUE is CLOSED** (2026-10-27T14:43:15Z), fixed by **`9bb9387f`**. |
 | #7322 | `9bb9387f narrow #7322` (its own part) and `87fdfa67` (the two shapes it was split into: #7327 and #7337) | as #7283; the commit names this issue. **The ISSUE is CLOSED** (2026-10-27T14:43:21Z). |
@@ -566,9 +576,15 @@ for the same row; both were true of a run, and neither is a property of the
 tree.)
 
 => **53 cells block the DONE verdict** — 43 WRONG + 2 KNOWN-RED + 8 MISMATCH —
-of the **135** cells the count covers (153 − 9 N/A − 9 quarantined). That is
-the campaign's DONE number: the campaign is DONE when it is **0** (no WRONG,
-no KNOWN-RED, no MISMATCH, no TIMEOUT).
+of the **135** cells the count covers (153 − 9 N/A − 9 quarantined). **THAT WAS
+THE CAMPAIGN'S DONE NUMBER **AT `d9f11d15`**, THE TREE THIS BLOCK MEASURES, AND IT IS EXACT FOR
+IT.** **THE CAMPAIGN'S DONE NUMBER **AT THE CURRENT TIP** IS **39**, MEASURED 2026-10-28 ON
+`2250daa52` BY THE EXIT REVIEW: **31 WRONG + 0 KNOWN-RED + 8 MISMATCH + 0 TIMEOUT** OF THE SAME
+135 CELLS — `153 cells: 96 ok, 31 wrong, 0 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 timeout`,
+`DONE: NO — 39 cell(s) block it (wrong + known-red + mismatch + timeout)`. **THE MOVE IS SPLIT
+BETWEEN TWO LANES AND BOTH ARE MEASURED WITH THIS RECORD's OWN INSTRUMENT: THE **ANCHOR**
+(`e4a55c95`) MOVED **8** CELLS (53 → 45) AND THE **U1c COPIES LANE** MOVED **6** (45 → 39).** THE
+CAMPAIGN IS DONE WHEN THE NUMBER IS **0** (no WRONG, no KNOWN-RED, no MISMATCH, no TIMEOUT).
 
 **The two-run determinism proof (the reviewer's H3).** Two consecutive runs of
 the same script on the same compiler, into two different `--out` directories:
@@ -597,9 +613,31 @@ derived-behind-base, interface, abstract, generic `T` (×2), function value,
 value-like choice, owning choice. **The DONE number above therefore covers 153
 of the 225 cells the master plan's head-kind list implies**, and the campaign
 is not DONE until the 72 are added (or the owner rules that the two
-`Object`-declared shapes stand for the eight). This lane adds none of them: it
+`Object`-declared shapes stand for the eight).
+**⚠ CORRECTED BY THE EXIT REVIEW's FINDING 12 (2026-10-28): THE "225" AND THE "72" ARE BOTH
+WRONG, IN OPPOSITE DIRECTIONS. **THE PLAN's HEAD-KIND LIST NAMES **TEN** HEADS BEFORE "Object
+holding each of these" — class, derived-behind-base, interface, abstract, generic `T` (×2), string,
+function value, value-like choice, owning choice — **TEN** OBJECT-EXPANDABLE HEADS, PLUS `Type`,
+built-in collection, **ASYNC ENUMERATOR** AND `Task`: **24 HEADS × 9 = 216 CELLS**, NOT 225.
+AND THE GRID's SEVENTEENTH HEAD, `collection_literal`, IS **ONE THE PLAN DOES NOT NAME** — so the
+earlier figure counted the grid's EXTRA head as if the plan had named it, and in exchange DROPPED
+THE PLAN's `async enumerator` HEAD FROM THE GAP. **=> THE TRUE GAP IS **81 CELLS** (NINE MISSING
+HEADS × 9), NOT 72 — THE NINTH BEING THE **ASYNC ENUMERATOR**, **AND #2623 IS A MEMBER WHOSE HEAD
+KIND IS THEREFORE NOT MEASURED AT ALL.** THE DONE NUMBER ABOVE COVERS **153 OF THE 216** CELLS THE
+PLAN IMPLIES. THE INSTRUMENT IS NOT CHANGED BY THIS EDITION — `scripts/using_heads_grid.py` IS THE
+COORDINATOR's FILE AND ADDING A HEAD IS AN INSTRUMENT CHANGE THAT MUST BE REVIEWED AND RE-BASED;
+THE NEXT LANE PROPOSES THE CELLS AND THE COORDINATOR MAKES THE CHANGE.** This lane adds none of them: it
 is a read-mostly entry check and the fix-forward's scope was the instrument,
 not the coverage.
+
+**⚠ A COVERAGE HOLE IN THE INSTRUMENT ITSELF — THE EXIT REVIEW's FINDING 11 (2026-10-28).**
+**THE `object_class` HEAD's CELLS EXPECT `('RUN', ['DTOR'])` — A PLAIN RUN, WHICH DOES NOT LOOK AT
+A WARNING — AND THE §28.9 **VACUITY WARNING FIRES WRONGLY** ON AN `Object`-DECLARED CLASS BINDING
+AT **BOTH** `d9f11d15` AND THE TIP** ("the RHS is a value-typed/runtime-managed value", WHILE THE
+RUNTIME VALUE IS A CLASS INSTANCE). **=> THAT DEFECT — THE RECORD's OWN QUESTION 2 — IS INVISIBLE TO
+THE DONE VERDICT: THE GRID'S DONE LINE CAN BE SATISFIED WHILE IT STANDS.** **THE `object_class`
+CELLS NEED `NOVAC`, NOT `RUN`.** THE GRID SCRIPT IS THE COORDINATOR's FILE; THE CHANGE IS NOT MADE
+BY THIS EDITION AND IS THE NEXT LANE's PROPOSAL.
 
 **The fail-without / fail-with proof for the grid's new cells.** The grid is
 new, so it has no fail-without of its own; the #7316 fix (`b6053a68`, "narrow
@@ -892,6 +930,18 @@ $ python3 tests/conformance/rules/runner.py build/bezelc --baseline <copy> --fil
   the DONE criterion "the `s28_10_*`/`s28_12_*` fail rows re-banked" has nine
   rows to re-bank under §28.12, not five, once the three unbanked ones are
   banked. The other 13 unclassified §28.12 rows PASS.
+* **⚠ RE-MEASURED BY THE EXIT REVIEW (2026-10-28): THE "9" ABOVE IS NOW **6**, AND THE TWO
+  `s28_12_0020` / `s28_12_0021` ROWS **NOW PASS** — THE ANCHOR FIXED THEM (THE GRID's
+  `value_choice/copy_local_source` AND `value_choice/copy_const_source` CELLS WERE KNOWN-RED AT
+  `d9f11d15` AND ARE OK AT `e4a55c95` AND AT THE TIP).** **SO: §28.12's IN-SCOPE DIVERGENCE COUNT
+  IS **6** — 5 BANKED `fail` ROWS (`s28_12_0003` `s28_12_0005` `s28_12_0006` `s28_12_0008`
+  `s28_12_0015`) PLUS `s28_12_0013`, WHICH STILL FAILS WITH NO BASELINE ROW. `s28_12_0007` IS THE
+  **KNOWN LAST-STEP RE-BANK** (BANKED `fail`, NOW PASSING) AND **MUST BE RE-BANKED `pass`** —
+  IT IS NOT A DIVERGENCE. AND `s28_12_0020` / `s28_12_0021` **MUST BE ADDED AS `pass` ROWS, NOT
+  `fail`** — THE EARLIER "EXPECTED `body / ASYNC`, GOT `body / SYNC`" IS NO LONGER TRUE OF THE
+  TREE.** THE WHOLE CORPUS ON THE TIP READS **3693 cases, 0 REGRESSION, 6 UNBANKED**, AND ALL SIX
+  UNBANKED ROWS ARE "BANKED `fail`, NOW PASSING" — `s28_12_0007` (CAMPAIGN 1's),
+  `s22_6_0112`/`s22_6_0113`/`s22_6_0114`/`l9_5_0004` (CAMPAIGN 2's ANCHOR) AND `l9_6_0027`.
 
 This lane did **not** edit `tests/conformance/rules/baseline.tsv` (the brief
 forbids it): the three unbanked rows are the coordinator's to bank, and
@@ -900,7 +950,14 @@ forbids it): the three unbanked rows are the coordinator's to bank, and
 
 ## Questions for the next train
 
-*(filed spec-question numbers — the coordinator files; this lane cannot.)*
+**⚠ THE EXIT REVIEW's FINDING 9: THIS LIST'S PREAMBLE CLAIMED FILED SPEC-QUESTION NUMBERS AND
+LISTED NONE. **THE HONEST STATEMENT IS THIS: **EVERY QUESTION IN THIS LIST IS AN **IMPLEMENTATION
+DEFECT**, NOT A SPEC QUESTION — EXCEPT WHERE A §-CITATION IS NAMED AS THE GOVERNING SENTENCE, AND
+THEN THE QUESTION IS "WHICH SECTION GOVERNS", NOT "WHAT SHOULD IT SAY".** THE ONLY OPEN ISSUE
+CARRYING BOTH `spec-question` AND `campaign:using-heads` IS **#7412** ("may a `using var` be the
+operand of `throw`?"), **WHICH IS NOT IN THIS LIST** — IT IS A QUESTION FOR THE NEXT TRAIN AND IS
+CARRIED BY ITS OWN ISSUE. **THE TRACKER REFUSED THE COORDINATOR's NEW-ISSUE CREATE THIS SESSION, SO
+NO NEW SPEC-QUESTION ISSUE EXISTS FOR ANY QUESTION HERE.**
 
 1. **The `Object`-declared `await using` admission.** §28.12 says "`await using var`
    takes §28.10's admission unchanged". §28.10's "Adopting a named owned binding"
@@ -934,11 +991,19 @@ forbids it): the three unbanked rows are the coordinator's to bank, and
    COMPILER'S OWN CONVENTION, AS THE SYNC TWIN ALREADY DOES) ON **#7393**.
    §8.7 ALSO REQUIRES THE DIAGNOSTIC TO *"NAME THE DISCHARGE POINTS"*, AND THE
    ASYNC SPELLING'S OUTPUT NAMES NONE.
-4. **Whether the `Type` token belongs in the anchor's runtime-managed set.**
+4. ~~**Whether the `Type` token belongs in the anchor's runtime-managed set.**~~
    #7338 asks for it; §28.9 lists `Type` explicitly, so the answer is yes and no
    train is needed — but §28.12's `await using` sentence does not say what
    happens to a `Type` head, so a ruling would make it explicit. Recorded here so
    the coordinator can decide whether it is worth a train.
+   **⇒ STRUCK BY THE EXIT REVIEW's FINDING 8: **THIS QUESTION NAMES **#7338**, AND **#7338 IS
+   CLAIMED BY THE ANCHOR's OWN COMMIT** (`e4a55c95 fix #3482 #7338 #7328 #5653 #3516 narrow #3483
+   #3515`) — SO IT IS **NOT** HELD OUT, AND A QUESTION THAT NAMES AN ISSUE A LANE HAS TAKEN IS NOT
+   A QUESTION FOR THE NEXT TRAIN. IT IS **ANSWERED BY THE ANCHOR** (§28.9 LISTS `Type` EXPLICITLY);
+   THE RULING THE QUESTION SOUGHT — THAT §28.12's `await using` SENTENCE DOES NOT SAY WHAT HAPPENS
+   TO A `Type` HEAD — REMAINS, AND IT IS A **SPEC-CLARIFICATION** CANDIDATE, NOT A LANE'S HOLD-OUT.
+   **⇒ THE COORDINATOR's NOTE: A "QUESTION" THAT NAMES NO LANE'S HOLD-OUT AND IS ANSWERED BY A
+   SHIPPED COMMIT IS A NOTE, NOT A TRAIN ITEM.****
 
 ## Siblings filed during the campaign
 
@@ -954,7 +1019,7 @@ paraphrase.)*
 
 | # | defect | minimal repro | §-citation | campaign |
 |---|---|---|---|---|
-| new-1 | a direct `DisposeAsync()` on a plain-`var` local leaks the receiver's block | `var x := new AsyncRes(); await x.DisposeAsync();` → `16 byte(s) leaked in 1 allocation(s)`; the `using var` spelling of the same program is clean | §28.12 step 2 ("a **direct `DisposeAsync()` call** awaited outside `await using` … the cascade and the chain follow exactly as if `await using` had issued it"), §28.2 ("the free there is logical disposal followed by reclamation: the idempotent `Dispose()`, a no-op where the flag is already set, **then the release of the block**") | using-heads (U2d, with #1531) |
+| new-1 | a direct `DisposeAsync()` on a plain-`var` local leaks the receiver's block | `var x := new AsyncRes(); await x.DisposeAsync();` → `16 byte(s) leaked in 1 allocation(s)`; the `using var` spelling of the same program is clean | §28.12 step 2 (spec lines 7480 / 7482, **quoted**: *"The cascade and the chain are the same regardless of which logical-disposal path ran"* and *"Asynchronous cleanup runs only where the program wrote `await using` … or awaited a direct `DisposeAsync()` call"*), §28.2 (spec lines 6230 / 6244, **quoted**: *"`Dispose()` on any class instance is idempotent: the first call performs the disposal; subsequent calls are no-ops"* and *"**The compiler-inserted free.**"*) — **THE EARLIER WORDING OF BOTH WAS A PARAPHRASE, NOT A QUOTATION; THE HOUSE RULE IS THAT A QUOTED §-SENTENCE IS EVIDENCE AND A PARAPHRASE IS A CLAIM, SO THE SPEC's OWN WORDS ARE GIVEN HERE** | using-heads (U2d, with #1531) |
 | new-2 | the `await using` spelling and the plain `using var` spelling disagree on the admission of an `Object`-declared borrow | `var s: Object := new Res(); await using var x: Object := s;` → rejected ("owned value in `s` would be dropped here without disposal"); the `using var` twin compiles | §28.12 ("`await using var` takes §28.10's admission unchanged"), §28.10, §28.3 | using-heads (U1b) |
 | new-3 | the `await using` spelling of a value-like choice leaks the payload where the plain-`var` twin does not | `await using var x := VChoice.Note("a" + "b");` ×60 → `2100 byte(s) leaked in 120 allocation(s)`; the plain-`var` twin is clean; the plain `using var` spelling is clean | §28.10 ("the only effect is the reassignability restriction"), §28.12 | using-heads (U1c) |
 | new-4 | an `owned IAsyncDisposable?` field's cascade does not free the stored instance | `public owned F: IAsyncDisposable? := null;` + `h.F := new AsyncRes();` → `16 byte(s) leaked in 1 allocation(s)` | §28.5 (the owned-field cascade), §28.12 (the run-time object's `DisposeAsync`) | using-heads (U2a) |
@@ -1194,6 +1259,605 @@ paraphrase.)*
   COPY, and the copy's own reference is never armed, never released, or is a
   BORROWED value disposed by the callee). #7339 IS HELD OUT FOR THE OWNER.
 
+### U1c COPIES lane `r36-c1-u1c` — 2026-10-28 (the record was MISSING this block — the exit
+### review's FINDING 2; master plan §2.5 wants one block per handback, and this lane's three picks
+### carried NO record update)
+
+**COMMITS (picked onto staging):** `6e31b592` fix #7387, `1a8bf0ae` fix #7388, `c5e8992d` fix #7374.
+**REVIEWER: ACCEPT-W-NOTES.**
+
+* **#7387 — a `using var` binding of a BORROWED PARAMETER DISPOSED THE CALLEE's BORROW — THE CALLER
+  THEN READ FREED MEMORY.** The lane's reviewer measured that this fix ALSO REMOVED A **DOUBLE
+  FREE**: `builtin_collection/copy_param_source` AND `collection_literal/copy_param_source` BOTH
+  CRASHED WITH *"ERROR: AddressSanitizer: attempting double-free"* ON THE BASE AND NOW EXIT 0 WITH
+  NO REPORT. **THE COORDINATOR RE-MEASURED #7416's OWN REPRO INDEPENDENTLY AND CLOSED #7416.**
+* **#7388 — the `using var` COPY of a RUNTIME-MANAGED VALUE LEAKED THE COPY's OWN REFERENCE** — THE
+  PLAIN-`var` TWIN WAS CLEAN. (THIS IS THE FIX THAT MAKES THE `LlvmBackend_Setup.cpp` COMMENT ABOUT
+  THE "`using var` COPY … get NO retain" **FALSE**; THE U2/U3 LANE CORRECTED THAT COMMENT.)
+* **#7374 — the `await using var` COPY of a VALUE-LIKE CHOICE LOCAL WAS NEVER ARMED** — THE AWAITED
+  SPELLING OF #7316's SHAPE.
+* **THE GRID CELLS THIS LANE MOVED **WRONG → OK** (MEASURED BY THE EXIT REVIEW WITH THIS RECORD's
+  OWN INSTRUMENT, SIX CELLS): `interface/copy_param_source`, `string/copy_local_source`,
+  `string/copy_await_source`, `string/copy_const_source`, `value_choice/await_using_var`,
+  `value_choice/copy_await_source`. **THE EXIT REVIEW's SPLIT IS DIFFERENT FROM PLAN §6's ACCOUNT:
+  THE **ANCHOR** MOVED 8 (53 → 45) AND **THIS** LANE MOVED 6 (45 → 39).**
+* **#7357 IS HELD OUT: THE LEAK IS IN THE SOURCE's **PRODUCER +1** AND IS SYMMETRIC (A CALLEE THAT
+  IGNORES ITS PARAMETER LEAKS IDENTICALLY), SO IT IS NOT A COPY DEFECT.**
+* **THE `task` GRID ROW IS **QUARANTINED** — #6194's FLAKY HANG (2/20 ON THE BASE, 1/20 ON THE TIP)
+  — SO THE CAMPAIGN'S DONE INSTRUMENT **STILL HAS A FLAKY ROW** AND THE CAMPAIGN IS NOT DONE. **THE
+  U2/U3 LANE's FIX (BELOW) REMOVES THE DOUBLE FREE ENTIRELY, SO IT **MAY UN-QUARANTINE** THE ROW —
+  BUT THAT FIX IS **NOT PICKED** YET.**
+
+### U2/U3 lane `r36-c1-u2u3` — 2026-10-28 (the record was MISSING this block too — the exit review's
+### FINDING 2)
+
+**COMMITS: `4823c418` fix #2623, `fc09c0ca` fix #6194, `cdf348ec` (a COMMENT-ONLY COMMIT, NAMES NO
+ISSUE ON PURPOSE). **STILL **UNPICKED** AT THE TIME OF THIS EDITION — #2623 AND #6194 ARE **STILL
+OPEN** IN THE TRACKER, AND THE EXIT REVIEW CONFIRMED THE THREE COMMITS ARE **NOT ANCESTORS** OF THE
+TIP.**
+
+* **#2623 — AN `owned` FIELD HOLDING AN **ASYNC ITERATOR** WAS NOT DISPOSED WHEN ITS OWNER WAS.**
+  §28.5 (the owned-field cascade) + §29.7 (a partially-consumed iterator's `Dispose` runs the
+  pending `finally` and frees the frame) + §30.7 (the async iterator frame's vtable is
+  `[0]=td,[1]=Dispose,[2]=MoveNextAsync,[3]=Current,[4]=GetAsyncEnumerator` — the **same slot-1
+  Dispose** the sync format has). **THE MECHANISM: `Emitter::isOwnedIteratorInterfaceField`
+  RECOGNISED THE **SYNCHRONOUS** ITERATOR-FORMAT HEADS ONLY, SO AN `owned IAsyncEnumerator<T>` FIELD
+  MATCHED **NO ARM AT ALL** AND WAS SKIPPED BY THE CASCADE.** THE LANE WIDENED THE CLASSIFIER
+  (VIA `common::isIterFormatEnumeratorHead` MINUS `common::isSyncIterFormatEnumeratorHead` — THE
+  SYNC `isVtableBackedIEnumerableType` IS DELIBERATELY **NOT** WIDENED, IT DRIVES THE §29.2 `for`
+  DESUGARING) AND THE **EXISTING** slot-1 DISPATCH FREES THE FRAME.
+* **#6194 — THE `using var` / `await using var` OF A STORED-TASK SOURCE's `Task` PROPERTY **HUNG**
+  UNDER AOT.** §30.11 (v0.345): *"The **source owns the task object** its `Task` property exposes. A
+  read of the property is a **borrow** of the task … there is no first-read ownership transfer"*;
+  *"the source's disposal is the task's single disposal."* **THE DEFECT: THE `using var` SPELLING
+  REGISTERED A SCOPE-END DISPOSAL (THE PLAIN-`var` TWIN DOES NOT), THAT DISPOSAL FIRE-AND-FORGOT AND
+  **FREED** THE TCS's INNER TASK, THE TCS's OWN SCOPE-END RELEASE THEN READ THE **SAME** INNER TASK
+  AGAIN (`bz_tcs_task` → `bz_task_is_error`) — A USE-AFTER-FREE — AND THE FIRST LOCK ON THE FREED
+  TASK's `std::mutex` BLOCKS FOREVER, SO THE PROGRAM **HANGS**; UNDER ASAN THE PENDING-TASK VARIANT
+  IS A **SEGV**.** THE FIX IS AT `Emitter::registerUsingDisposal` (THE PIN DECISION), AT
+  `Emitter::taskLocalOwnsFrame` (THE OWNS-THE-FRAME AUTHORITY) AND AT A NEW
+  `Emitter::usingVarRhsIsStoredTaskPropertyBorrow`.
+* **THE COMMENT-ONLY COMMIT CORRECTED A STALE COMMENT IN `src/codegen/LlvmBackend_Setup.cpp`** — THE
+  ONE THAT SAID A `using var` COPY, A `string?`-DECLARED COPY AND AN `object`-DECLARED COPY ARE
+  "all NOT in the set, get NO retain". **IT IS SPLIT INTO THE PART THAT IS STILL TRUE AND THE PARTS
+  THAT ARE NOT, EACH NAMING THE FIX THAT CHANGED IT** — **AND THE COORDINATOR's OWN PREMISE WAS
+  CORRECTED BY THE LANE: THE `object`-DECLARED HALF's *MEMBERSHIP* CLAIM IS TRUE, BUT ITS
+  *OPERATIVE* CLAIM ("get NO retain, AND SO MUST KEEP TAINTING THE SOURCE") IS **FALSE** SINCE
+  #2900 — IT RETAINS AND DOES NOT TAINT THE SOURCE.**
+* **FIVE ISSUES THE LANE MEASURED AND **DID NOT** CLOSE: #1531, #1603 (a direct `DisposeAsync()`
+  needs the §28.12 step-2 **physical reclamation** ACROSS A SUSPEND POINT — a multi-hour change in
+  the state machine, and the abandoned-task variant needs A `bz_task_then` CONTINUATION WITH A
+  PER-CLASS RECLAIM TRAMPOLINE ON THE GENERIC `CallExpr` PATH), #3471 (the DUPLICATION IS REAL AND
+  THE LANE RE-COUNTED IT — `dictTypeOfLocal` 2, `linkedListTypeOfLocal` 2, `listInterfaceTypeOfLocal`
+  2, `collectionTypeOfLocal` 2, `taskTypeOfLocal` 1 — BUT THE REPAIR REWIRES THE WHOLE
+  BUILTIN-COLLECTION DISPOSAL FAMILY AND THE ISSUE ITSELF DEMANDS A GRID THE COORDINATOR OWNS),
+  #7326 and #7354-shape-3 (BOTH **SEMA** SHAPES — **THE NEXT LANE's**).
+* **TWO NEW DEFECTS, RECORDED AS COMMENTS ON THEIR CLOSEST SIBLINGS (THE TRACKER REFUSED THE
+  COORDINATOR's NEW-ISSUE CREATE): THE **SELF-DISPOSING ITERATOR LEAK** ON **#2623** (AN ITERATOR
+  THAT DISPOSES ITSELF FROM INSIDE ITS OWN `finally` LEAKS — **SYNC AND ASYNC**; THE SYNC TWIN
+  LEAKS TODAY ON A TREE **WITHOUT** THE FIX, SO IT IS **PRE-EXISTING**, NOT SOMETHING #2623 INVENTED)
+  AND THE **`owned Task` FIELD HANG** ON **#6194** (AN `owned Task` FIELD MAY BE ASSIGNED A STORED
+  TASK, AND THE PROGRAM **HANGS**; §28.3 / §30.11, AND GUIDE 1's "A BORROW OF A LOCAL MAY NEVER
+  LAND IN A FIELD" SAYS IT MUST BE REJECTED).**
+
 ## Exit review
 
-*(to be written by a fresh reviewer who is not a campaign lane -- master plan §2.4.)*
+**⚠ A COORDINATOR's NOTE ON THIS SECTION (2026-10-28).** IT IS PASTED **VERBATIM** FROM THE
+REVIEWER's HAND-BACK, INCLUDING ITS OWN `### MODEL` TRAILER, AND IT IS THE REVIEWER's TEXT, NOT THE
+COORDINATOR's. **THE LINE NUMBERS IT CITES ("Line 568 reads …") REFER TO THE RECORD **AS IT WAS
+BEFORE** THE COORDINATOR's EDITION OF 2026-10-28 — THE EDITION ADDED TEXT ABOVE THIS SECTION, SO
+**EVERY LINE NUMBER IN IT HAS DRIFTED** (BY +60 OR SO). THE REVIEWER's *SUBSTANCE* IS UNCHANGED AND
+ITS FILE/SHA REFERENCES (`d9f11d15`, `e4a55c95`, `2250daa52`, the cell names, the corpus row ids)
+ARE STILL EXACT. **THE COORDINATOR's EDITION APPLIED THE REVIEWER's SIXTEEN ACTION LINES
+(`c1-exit-review-notes.md`) AS FOLLOWS: F1 (the DONE number, now 39 at the tip), F2 (the two missing
+lane-record blocks — the U1c copies lane and the U2/U3 lane), F3 (the §28.12 count 9 → 6), F5 (the
+anchor's "Closes 8" marked as a prediction), F6 (the label count re-dated), F7 (three paraphrases
+marked and the spec's own words given), F8 (question 4 struck), F9 (the questions preamble corrected),
+F11 (the grid's `object_class` vacuity blind spot recorded) and F12 (the coverage arithmetic 225 →
+216 and the gap 72 → 81). **F4 (CLOSING #7316 BY MEASUREMENT) AND F10 (THE TRACKER's COUNTERS) ARE
+TRACKER ACTIONS, NOT RECORD EDITS, AND ARE NOT IN THIS FILE.***
+
+*Reviewer:* a fresh non-author reviewer — **not** a campaign-1 lane, not the author of any commit in
+this campaign. *Model:* `MiniMax-M3.1-Flash` (1M context). *Date:* 2026-10-28.
+*Trees measured:* the staging tip **`2250daa52`** ("fix #6825 #7284 #7290 #7293 #7294 #7295 #7299
+#7300 #7323 narrow #6812 #7372"), built from scratch at `/mnt/fast/worktrees/r36-rev-c1-exit`; the
+record's own baseline tree **`d9f11d15`**; the anchor's tree **`e4a55c95`**. Scratch and reports:
+`/var/tmp/bezel-scratch/r36-rev-c1-exit/` (`report.tsv` = tip, `report-base.tsv` = `d9f11d15`,
+`report-anc.tsv` = `e4a55c95`, `corpus.log`, `grid.log`, `gridbase.log`, `gridanc.log`).
+*Every claim below is labelled **MEASURED** (I ran it), **QUOTED** (I read it in a file, an issue
+or a commit) or **HYPOTHESIS**.*
+
+### (A) THE AUDIT — is the record true?
+
+**(A1) THE GRID — THE RECORD'S HEADLINE NUMBER IS TRUE FOR ITS OWN TREE AND STALE FOR THE
+CAMPAIGN.** MEASURED on **`2250daa52`** (the current tip), with the command the brief names:
+
+```
+$ python3 scripts/using_heads_grid.py --bezelc build/bezelc --out <scratch> --jobs 6 \
+      --timeout 60 --run-timeout 120 --report <scratch>.tsv
+153 cells: 96 ok, 31 wrong, 0 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 timeout
+QUARANTINED: 9 cell(s) held out of the DONE count (pending #6194): 5 OK, 4 WRONG
+NATIVE SANITIZER: 0 check(s) skipped
+DONE: NO — 39 cell(s) block it (wrong + known-red + mismatch + timeout)
+```
+
+(EXIT = 1. **The DONE line is `39`, not the record's `53`.** The campaign-2 anchor that landed on
+the tip did **not** move a cell: the plan's own measurement on `c5e8992d` also reads 39.)
+
+MEASURED on **`d9f11d15`** — the tree the record's baseline block names — with the **same (tip)**
+grid script, because the script did not exist at `d9f11d15` (it was added by `65f30f7e`):
+
+```
+153 cells: 82 ok, 43 wrong, 2 known-red, 8 mismatch, 0 undecided, 9 n/a, 0 timeout
+QUARANTINED: 9 cell(s) held out of the DONE count (pending #6194): 3 OK, 6 WRONG
+NATIVE SANITIZER: 0 check(s) skipped
+DONE: NO — 53 cell(s) block it (wrong + known-red + mismatch + timeout)
+```
+
+**=> THE RECORD'S QUOTES OF THE DONE LINE ARE CHARACTER-FOR-CHARACTER EXACT — FOR THEIR OWN
+TREE.** The record quotes the line five times; I checked each:
+
+| the record's quote | where | tree it belongs to | my verdict |
+|---|---|---|---|
+| `DONE: NO — 53 cell(s) block it (wrong + known-red + mismatch + timeout)` | the baseline block | `d9f11d15` | **MEASURED EXACT** (em dash included) |
+| the same, `53` | the fail-without table's **base** arm | `d9f11d15` | **MEASURED EXACT** |
+| `DONE: NO — 51 cell(s) block it (wrong + known-red + mismatch + timeout)` | the fail-without table's **fix** arm (`b6053a68`) | `b6053a68` | **NOT RE-MEASURED** (not an ancestor of the tip; I did not build it). Its arithmetic is consistent (84 ok + 43 wrong + 0 known-red + 8 mismatch = 135; 43+0+8+0 = 51). |
+| the same, `53` | the grid-discharge lane's own block | that lane's tree | **NOT RE-MEASURED** directly; that tree's compiler is the `d9f11d15` compiler, and my `d9f11d15` measurement reads the same 53. |
+| the same, `53` | the grid-discharge lane's third run | that lane's tree | as above. |
+
+**(A2) THE CELL CENSUS AT `d9f11d15` IS EXACT — I DIFFED IT CELL-FOR-CELL.** MEASURED: the
+record's 43-row wrong-cell table is **identical, 43/43, name for name**, to the `WRONG` set of my
+`d9f11d15` report; the record's **8 MISMATCH** rows are exactly the eight `*/copy_await_source`
+cells (`class`, `class_async`, `derived_base`, `interface`, `abstract`, `generic_class`,
+`generic_unconstrained`, `builtin_collection`); the record's **2 KNOWN-RED** rows are exactly
+`value_choice/copy_local_source` and `value_choice/copy_const_source`, with the same detail
+(`LEAK: 2100B/120 [#7316, fixed by b6053a68]`). The record's "the quarantined row's split is
+UNSTABLE and is deliberately not quoted as a point value" is also right: I measured `3 OK / 6 WRONG`
+on the base run and `5 OK / 4 WRONG` on the tip run, against the record's `5/4`, `6/3` and `4/5`.
+**The grid section of this record is the strongest part of it.**
+
+**(A3) THE FAIL-WITHOUT, PER LANE, FROM THE CAMPAIGN'S OWN INSTRUMENT — AND THE MOVE IS SPLIT
+DIFFERENTLY FROM THE PLAN'S ACCOUNT.** MEASURED by running the same grid on three trees:
+
+| tree | cells | DONE |
+|---|---|---|
+| `d9f11d15` (the record's baseline) | 82 ok, 43 wrong, **2 known-red**, 8 mismatch | **53** |
+| `e4a55c95` (the anchor) | 90 ok, 37 wrong, **0 known-red**, 8 mismatch | **45** |
+| `2250daa52` (the tip) | 96 ok, 31 wrong, **0 known-red**, 8 mismatch | **39** |
+
+* The **ANCHOR** moved **8** cells wrong/known-red → OK: `abstract/await_using_var`,
+  `derived_base/await_using_var`, `generic_unconstrained/{using_var, await_using_var,
+  copy_param_source}`, `interface/await_using_var`, `value_choice/{copy_local_source,
+  copy_const_source}` (53 → 45).
+* The **U1c COPIES LANE** moved **6** cells wrong → OK: `interface/copy_param_source`,
+  `string/{copy_local_source, copy_await_source, copy_const_source}`,
+  `value_choice/{await_using_var, copy_await_source}` (45 → 39).
+
+**=> THIS IS THE FAIL-WITHOUT THE BRIEF ASKS FOR, PER LANE, AND IT IS STRONGER THAN A SYNTHETIC
+REVERT: each lane's cells are RED on the tree before it and GREEN on the tree after it, measured
+with the campaign's own DONE instrument.** The `value_choice` copy cells the copies lane was
+supposed to own are green at the tip; the `interface/copy_param_source` cell is green at the tip and
+CRASHES (heap-use-after-free) at `d9f11d15`; the anchor's five cells are green at the anchor's tree
+and red at `d9f11d15`.
+
+**=> FINDING 1 (HIGH): the record's DONE number is stale, and the record does not say so.**
+Line 568 reads "=> **53 cells block the DONE verdict** … **That is the campaign's DONE number**".
+MEASURED, the campaign's DONE number at the tip is **39**. The record's header dates its numbers to
+`d9f11d15`, but the DONE-instrument section does not carry that date next to the number it calls the
+campaign's, and no lane block after the anchor updates it. This is the D3 class the grid's own
+review note exists to eliminate, in the one number the campaign is judged by.
+
+**=> FINDING 2 (HIGH): the record carries NO lane block for the U1c COPIES LANE, and none for the
+U2/U3 lane.** MEASURED: the record's last commit is `e3e6bb38` (2026-10-28 08:01:34 +13:00); the
+copies lane's three commits (`6e31b592`, `1a8bf0ae`, `c5e8992d`) are dated 08:17:20 +13:00 — **after**
+the record was last written — and `git show --stat` on all three touches **no record file**, which
+master plan §2.5 requires ("the record is updated **in the same commit** as the pick that changes
+it"). The U2/U3 lane (`4823c418`, `fc09c0ca`, `cdf348ec`) has handed back and is under review; its
+block is not there either. The record is therefore missing two lane records and the whole
+45 → 39 half of the campaign's story.
+
+**(A4) THE CORPUS ROWS IN SCOPE.** MEASURED with the corpus runner, read-only, on a **copy** of
+`tests/conformance/rules/baseline.tsv` (`--baseline <copy>`; `--update` and `--classify` were never
+run; the repo's baseline is byte-identical to the copy afterwards, md5 `d0613037…`):
+
+```
+$ python3 tests/conformance/rules/runner.py build/bezelc --baseline <copy> --filter 28.10
+18 cases: 13 ok, 4 known-divergent, 1 unclassified, 0 REGRESSION, 0 UNBANKED
+$ python3 tests/conformance/rules/runner.py build/bezelc --baseline <copy> --filter 28.12
+29 cases: 7 ok, 5 known-divergent, 16 unclassified, 0 REGRESSION, 1 UNBANKED
+$ python3 tests/conformance/rules/runner.py build/bezelc --baseline <copy>
+3693 cases: 3157 ok, 234 known-divergent, 296 unclassified, 0 REGRESSION, 6 UNBANKED
+```
+
+* **§28.10: the record's `4` is TRUE** (4 banked-`fail` rows: `s28_10_0009`, `s28_10_0013`,
+  `s28_10_0015`, `s28_10_0016`).
+* **§28.12: the record's `9` is STALE.** MEASURED today: **5 known-divergent** (`s28_12_0003`,
+  `s28_12_0005`, `s28_12_0006`, `s28_12_0008`, `s28_12_0015`) **+ 1 UNBANKED** (`s28_12_0007` — a
+  row still banked `fail` whose case now **passes**) **+ 1 unbanked failure** (`s28_12_0013`, which
+  still fails with the record's own expected/got). `s28_12_0020` and `s28_12_0021` now **pass**
+  (the anchor fixed them) and have no baseline row.
+  **=> FINDING 3 (MEDIUM): the record's "the true divergence count in scope is 4 (§28.10) and 9
+  (§28.12)" is true for `d9f11d15` and is now 4 and 6. The one `UNBANKED` row is the KNOWN
+  LAST-STEP RE-BANK the brief names — `s28_12_0007` — and it is NOT a defect; the two rows the
+  coordinator is to add (`s28_12_0020`, `s28_12_0021`) must be banked `pass`, not `fail`.**
+* The six `UNBANKED` rows of the whole corpus are all "banked `fail`, now passing": `s28_12_0007`
+  (campaign 1's), `s22_6_0112/0113/0114` and `l9_5_0004` (campaign 2's anchor), `l9_6_0027`
+  (`62735ebc`).
+
+**(A5) THE ISSUE STATES — EVERY ISSUE THE RECORD NAMES, RE-CHECKED.** MEASURED with
+`gh issue view <N> --json state,closedAt` (and the label list) for **all 24 members, all 13
+siblings, the anchor's seven, and every issue the record's tables cite**:
+
+* **The 24 entry members: the record's census is TRUE.** 19 OPEN, 5 CLOSED — **#7283**
+  (2026-10-27T14:43:18Z), **#7306** (14:43:15Z), **#7322** (14:43:21Z), **#7327** (11:51:16Z),
+  **#7337** (11:49:03Z) — exactly the five the record names, with the record's timestamps.
+* **The coordinator's D3 correction is RIGHT.** MEASURED from the issues' own closing comments:
+  **#7283 → `87fdfa67`** (and `9bb9387f`), **#7306 → `9bb9387f`**, **#7322 → `9bb9387f`** for its
+  own part and `87fdfa67` for the two shapes it split into, **#7327 → `87fdfa67`** (its closing
+  comment names `87fdfa67`, pushed to `origin/main` as `b04c9f9b`), **#7337 → `87fdfa67`**. The
+  record's D3 block is true as written.
+* **#7416** (new-13) is CLOSED, and its closing comment names the fixing commit (`b920a546`, picked
+  as `6e31b59228`) with the coordinator's own ASan measurement — **the D3 class is satisfied there
+  too.**
+* **The U2/U3 lane's two members are still OPEN** (#2623, #6194) — MEASURED, and its three commits
+  are **not** ancestors of the tip (`4823c418`, `fc09c0ca`, `cdf348ec`: "NOT ancestor"), so the
+  tracker has not been told anything they did.
+* **The anchor's five `fix`-named issues are still OPEN** (#3482, #7338, #7328, #5653, #3516), and
+  so are the copies lane's three (#7387, #7388, #7374): their closing keywords fire only when
+  `r30-c1` reaches the default branch. Not a defect — but the tracker states will move at the merge
+  and the record's issue table will need a pass then.
+* **=> FINDING 4 (MEDIUM): #7316 is measurably FIXED and will never close by itself.** MEASURED:
+  the grid's `value_choice/copy_local_source` and `value_choice/copy_const_source` cells were
+  KNOWN-RED `[#7316, fixed by b6053a68]` at `d9f11d15` and are **OK** at `e4a55c95` and at the tip
+  — the ANCHOR closed them. But no commit's **subject** names #7316 (the anchor's body mentions it
+  once, in a citation), so the closing keyword never fires and **#7316 is still OPEN**. The
+  coordinator should close it by measurement, naming the commit that fixed it.
+* **=> FINDING 5 (MEDIUM): the record's "Closes 8" in the anchor's one-page contradicts the
+  tracker and the record's own lane block.** QUOTED: "**Closes 8:** #3482 … #7338 … #7339, #3483,
+  … #7328, #5653, #3516, #3515". MEASURED: **#7339, #3483 and #3515 are all OPEN**, and the
+  record's own anchor lane block says "#3483's is an `owned IAsyncDisposable` RETURN … #3515's is
+  the PER-LEVEL reclamation chain" and "#7339 IS HELD OUT FOR THE OWNER". The one-page section is
+  the entry lane's **prediction**; the record never marks it as superseded, so a reader meets
+  "Closes 8" and then a tracker that says three of the eight are open.
+
+**(A6) THE LABEL COUNTS — LIVE, NOT MEMORY.** MEASURED now:
+`gh issue list --label campaign:using-heads --state open --limit 200` → **39**; `--state closed` →
+**4**; all → 43. The record distinguishes the two counts and the distinction is honoured: the
+**"at this commit's timestamp"** count of **34** is arithmetically 19 + 1 (#7374) + 12
+(#7386–#7397) + 2 (#5355, #7146) ✓, and the **"LIVE, measured on 2026-10-28"** count of **40**
+was TRUE at the commit that wrote it (`5ea3e73d`, 2026-10-27T18:59:31Z — before #7416 closed at
+19:18:52Z). **=> FINDING 6 (LOW): the "LIVE" number is one stale today (39, not 40) — a dated
+number reading as a current one. The label count is a property of a moment, not of the campaign;
+the record should date it as a timestamp rather than as "LIVE".**
+
+**(A7) THE RULINGS — EVERY QUOTED §-SENTENCE CHECKED AGAINST THE SPEC, WITH THE NEIGHBOURS.**
+
+* **The #3493 ruling is VERBATIM.** MEASURED from the issue's own last comment: *"Ruling: dispatch
+  on the run-time object, through a `DisposeAsync` dispatch-table slot (this issue's option 2)."*
+  Owner-approved 2026-10-27 ✓, and the record's account of what it leaves open (the reclamation
+  half with #3515, #3516 gated on it, #7339 not named) matches the issue's text ✓. #3493 is OPEN
+  ✓, as the record says.
+* **§28.9 (v0.345), line 7158 — VERBATIM, neighbours included.** The record quotes "None of them
+  is a class, and none has a `Dispose()` member: `x.Dispose()` over a value of one of these types
+  is a compile error" ✓ and the neighbouring clause "the type's lifetime is managed by the runtime
+  without user involvement" ✓ (the record cites it for new-11), and "`string` — the list's FIRST
+  ENTRY" ✓ (the record's #7273 answer says so; MEASURED: `string` is the first bullet, `Type` the
+  second — which also settles the record's question 4's premise that "§28.9 lists `Type`
+  explicitly" ✓).
+* **§28.12 (v0.345), line 7506 — VERBATIM**: "`await using` selects the logical-disposal path by
+  the class of the object the binding **holds** … **never by the binding's static type**" ✓, and
+  the record's reading of it (the static type decides only what is known before run time) is the
+  sentence's own next clause ✓.
+* **§28.12 (v0.345), line 7504 — VERBATIM**: "`await using var` takes §28.10's admission
+  unchanged" ✓, and the neighbour sentence the record's question 1 depends on is there too ("Over a
+  borrow right-hand side … the binding assumes no obligation, so scope exit disposes nothing").
+* **§28.10 (v0.345), line 7276 — VERBATIM**: "the disposal at scope end is a no-op … and the only
+  effect is the reassignability restriction" ✓.
+* **§28.10 (v0.345), the borrow paragraph — VERBATIM**: "the `using var` does **not** assume a
+  disposal obligation …: at scope end, no `Dispose()` is called, because the value is not owned by
+  this scope" ✓ (the record's new-10 citation is exact).
+* **§8.7 (v0.345), line 1182 — VERBATIM**: "`DisposeAsync()` is a member only of a type that
+  declares or inherits it" ✓, **and the neighbour the record's question 3 leans on is there**:
+  "the diagnostic naming the discharge points" ✓.
+* **§28.12 (v0.345), line 7475 — VERBATIM**: "only a class implements it — a record, enum or
+  choice that lists it, or lists an interface extending it, is a compile error at the declaration"
+  ✓ (the record's new-6).
+* **§28.12 (v0.345), line 7502 — VERBATIM**: "`await using` is valid only inside an async method
+  or async lambda" ✓.
+* **=> FINDING 7 (MEDIUM): three of the record's "quoted" §-sentences are PARAPHRASES presented as
+  quotations.** (a) new-1's **§28.2** "the free there is logical disposal followed by reclamation:
+  the idempotent `Dispose()`, a no-op where the flag is already set, then the release of the block"
+  — **no such sentence is in the spec**; §28.2 says "`Dispose()` on any class instance is
+  idempotent: the first call performs the disposal; subsequent calls are no-ops" (line 6230) and
+  "**The compiler-inserted free.**" (line 6244). (b) new-1's **§28.12 step 2** "a **direct
+  `DisposeAsync()` call** awaited outside `await using` … the cascade and the chain follow exactly
+  as if `await using` had issued it" — the spec says "The cascade and the chain are the same
+  regardless of which logical-disposal path ran" (line 7480) and "Asynchronous cleanup runs only
+  where the program wrote `await using` … or awaited a direct `DisposeAsync()` call" (line 7482).
+  (c) #2624's **§29.1** "Disposing the enumerator (`break`, exhaustion, or explicit `Dispose()`)
+  disposes any outstanding yielded value the iterator still owns" — the spec (line 7771) reads
+  "Disposing the enumerator (`break` from a `for` or `await for` loop, exhaustion, or
+  `Dispose()`/`DisposeAsync()` on a manually-held enumerator) disposes any outstanding yielded value
+  the iterator **owns**". **All three rulings' OUTCOMES survive** (and (b)'s replacement sentence
+  is stronger), but the record must either quote the spec verbatim or mark the sentence a
+  paraphrase. The house rule is that a quoted §-sentence is evidence; a paraphrase is a claim.
+
+**(A8) THE QUESTIONS FOR THE NEXT TRAIN — THE HOLD-OUT, AND THE FILING.**
+
+* **Question 3 (#7393) is HELD OUT** ✓ MEASURED: no commit anywhere claims #7393 (`git log --all
+  --grep="#7393"` reaches only the two record commits that *mention* it).
+* **Question 1 (#7390's shape) is HELD OUT** ✓ MEASURED: no commit claims #7390, and the grid's
+  `object_class/await_using_var` and `object_class/copy_await_source` cells are still WRONG at the
+  tip ("rejected, expected a run"), so the shape is unfixed.
+* **=> FINDING 8 (MEDIUM): question 4 is NOT held out.** It names **#7338**, and **#7338 is
+  claimed by the anchor's own commit** (`e4a55c95 fix #3482 #7338 #7328 #5653 #3516 narrow #3483
+  #3515`) — MEASURED. The record's question 4 says "the answer is yes and no train is needed", so
+  the question is answered; it should be struck from the "Questions for the next train" list or
+  marked as answered by the anchor, because as it stands it names an issue a lane has taken.
+* **=> FINDING 9 (LOW): the section's preamble claims filed spec-question numbers and lists none.**
+  QUOTED: "*(filed spec-question numbers — the coordinator files; this lane cannot.)*". MEASURED:
+  the only OPEN issue carrying both `spec-question` and `campaign:using-heads` is **#7412** ("may a
+  `using var` be the operand of `throw`?"), and **#7412 is not in the record's four**. Master plan
+  §1.5 asks for the question to be *filed* and the hunk held out; nothing of the four is filed.
+
+**(A9) THE LANE RECORDS' CLAIMS — WHAT I RE-MEASURED AND WHAT I DID NOT.**
+
+* **RE-MEASURED (the anchor, the U1c copies lane):** the fail-without for both, in the campaign's
+  own DONE instrument, as set out in (A3). This is a *stronger* measurement than a synthetic
+  revert of the `src/` files, because the cells are the campaign's own and they are RED on the
+  pre-lane tree and GREEN on the post-lane tree.
+* **RE-MEASURED (the members I named for the next lane):** **#7326 REPRODUCES** — `await using
+  var t := o.ToString();` in a non-async `static method Main()` **compiles** (rc = 0), with only the
+  §28.9 vacuity warning, against §28.12 (v0.345): "`await using` is valid only inside an async
+  method or async lambda". **#7354 REPRODUCES in two of its four shapes** — a `record` declaring
+  `IAsyncDisposable` **compiles** (against §28.12: "a record, enum or choice that lists it … is a
+  compile error at the declaration"), and a generic method with `where T: IDisposable` **compiles**.
+* **NOT RE-MEASURED:** the other 22 members' per-row repros (they are QUOTED from the record); the
+  copies lane's and the anchor's gtest rows under `scripts/agent_check.sh`; the U2/U3 lane's
+  fail-without (it is under a separate review); the grid's 17-mutation check (I ran the gate's own
+  30 grid tests instead, inside the 1093 below); the `b6053a68` arm of the fail-without table; the
+  `object_string` twin leak and #2624's repro.
+
+**(A10) THE CHECKERS (all run on `2250daa52`).**
+
+* `python3 -m unittest discover -s scripts/gate/tests` → **Ran 1093 tests … OK** (includes the grid
+  classifier's 30 tests — MEASURED: `scripts/gate/tests/test_using_heads_grid.py` holds 30 `def
+  test_`).
+* `python3 scripts/pregate_stale_needles.py` → `stale_needles: 7 removed literal(s) in src/, 2 gone
+  from HEAD, 0 test hit(s)` — **no candidate**, exit 0.
+* `bash scripts/check_docs.sh` → `check_docs: OK` (PIN clean, VERSION clean at v0.345; one
+  **advisory**: "1 §-refs to undefined section numbers: [spec] §4.12").
+* `python3 scripts/check_commit_trailers.py --range origin/main..HEAD` → `clean (29 commit(s))`.
+* `python3 scripts/check_toolchain_skip_surface.py --list` → `--- checked_calls=3642
+  support_calls=3659 absorbing_sites=0 ---`, and the plain run prints a **FAILURE**:
+
+  > "checked_calls ROSE: baseline 3626, tree has 3642 (+16) … it is paired here with
+  > `absorbing_sites` not falling … Either bank a drop in `absorbing_sites` alongside the rise, or
+  > verify the new call site does not absorb a toolchain SKIP."
+
+  **=> FINDING 10 (HIGH, gate-facing): the toolchain-SKIP ratchet is RED on the staging tip.**
+  MEASURED: `origin/main` (`e7d55d02`) reads OK at 3627/3644/0; the staging branch's baseline says
+  3626/3643/0 (`dbe770ee`, a re-bank that is NOT on `origin/main`) and the tip measures
+  3642/3659/0. The rise is the branch's own lane commits — MEASURED per commit: `e4a55c95` +3,
+  `e44ba7aa` +5, `6e31b592` +7, `1a8bf0ae` +6, `c5e8992d` +5. **`scripts/ratchet_sweep.sh` on the
+  tip: `1 of 23 RED — do NOT launch a gate`**, and that one RED is this checker; `pregate.sh:113`
+  runs the sweep, so **pregate will block the gate** until the coordinator banks or disposes of it.
+  Two things make that a decision rather than a formality: (i) `--update` **refuses** a
+  `checked_calls` rise unless `absorbing_sites` strictly falls, and it is already **0** — while the
+  checker's own rule text says "checked_calls may rise, but only when `absorbing_sites` did **not**
+  rise", which is satisfied here; the message demands a strict *fall* that is impossible from 0.
+  (ii) `scripts/gate_full_cycle.sh:825` runs the same checker with `--strict` and keys its
+  toolchain-skip phase on the **exit code**, which is **0 even on a failure** (as the brief warns)
+  — so the cycle's own phase would report GREEN on this RED. The ratchet needs the coordinator's
+  decision (bank with `--force` and the rule-text justification, or fix the checker's rule), and the
+  gate phase's blindness to a RED ratchet is worth its own issue.
+
+**(A11) TWO COVERAGE HOLES IN THE DONE INSTRUMENT — THE CAMPAIGN'S OWN DEFECTS THAT THE GRID
+CANNOT SEE.**
+
+* **=> FINDING 11 (MEDIUM): the grid has NO cell for the record's own question 2.** MEASURED: the
+  §28.9 vacuity warning **fires wrongly** on `var s: Object := new Res(); using var x: Object := s;`
+  — "the RHS is a value-typed/runtime-managed value" — at **both** `d9f11d15` and `2250daa52`,
+  while the runtime value is a CLASS instance (§28.9's exempt set is `{string, Type, boxed value
+  types, function values}`; §28.12: "never by the binding's static type"). The grid's
+  `object_class/using_var` cell is **GREEN** because its expectation is `('RUN', ['DTOR'])` — a
+  plain RUN, which does not look at the warning. The defect the record's question 2 describes is
+  therefore invisible to the DONE verdict: §2.3's "the DONE instrument is green" can be satisfied
+  while this defect stands. The `object_class` head's cells need `NOVAC`, not `RUN`.
+* **=> FINDING 12 (MEDIUM): the grid has no `async enumerator` head, although the plan's head-kind
+  list has one and #2623 is a member.** MEASURED: the grid's 17 heads are `abstract,
+  builtin_collection, class, class_async, collection_literal, derived_base, function,
+  generic_class, generic_unconstrained, interface, object_class, object_string, owning_choice,
+  string, task, type_token, value_choice` — **no async-iterator head**, so #2623's head kind is
+  not measured at all. The record's coverage-gap section counts the gap as **72** cells (the eight
+  Object-declared heads × 9) and says the DONE number "covers 153 of the **225** cells the master
+  plan's head-kind list implies"; the plan's list (campaign 1's "Entry check") reads `{class,
+  derived-behind-base, interface, abstract, generic `T` (class-constrained / unconstrained), string,
+  function value, value-like choice, owning choice, `Object` holding each of these, `Type`,
+  built-in collection, **async enumerator**, `Task`}` — **ten** heads before "Object holding each of
+  these", **ten** Object-expandable heads, plus `Type`, built-in collection, async enumerator and
+  `Task` — i.e. **24** heads × 9 = **216** cells, and the grid's seventeenth head
+  (`collection_literal`) is one the plan does not name. So the record's **225** counts the grid's
+  extra head as if the plan had named it, and in exchange drops the plan's `async enumerator` head
+  from the gap: the true gap is **81** cells (nine missing heads × 9), not 72.
+
+**(A12) §2.3's CORPUS LINE, READ LITERALLY.** QUOTED (master plan §2.3): "every rule-corpus case
+citing the campaign's sections is `pass`, or its `fail` row carries an `issue:` header pointing at
+an OPEN issue labelled for another campaign or a ruling". MEASURED: the baseline's third column is a
+free-text note, and **five of the nine in-scope `fail` rows carry only the note `divergence`** —
+`s28_10_0009`, `s28_12_0003`, `s28_12_0005`, `s28_12_0006`, `s28_12_0015` — with no issue number.
+`scripts/check_toolchain_skip_surface.py` aside, that line does not read as met today.
+
+### THE VERDICT ON THE CAMPAIGN
+
+**NOT CLOSED.** MEASURED, with the failing line named: master plan §2.3's **"the DONE instrument
+is green"** fails — 39 cells block it (31 WRONG + 8 MISMATCH, and the `task` row is quarantined);
+**"every member at entry is closed by a `fix #N` commit or re-scoped"** fails — 19 of the 24 entry
+members are OPEN in the tracker, and of the anchor's and the copies lane's eight `fix`-named
+issues none has closed yet (their closing keywords fire at the merge), with #7316 fixed but
+**unclaimed** (Finding 4); and the corpus line is not met in the form §2.3 writes it (A12). The
+record itself is the best-documented artefact in the run — its grid census is exact, its D3
+corrections are true, its quotes are nearly all verbatim — but it is **three commits and 39 cells
+behind its own campaign**, and its two missing lane blocks are the reason.
+
+**THE RESIDUALS, NAMED.** (1) the DONE number 53 → 39 and the two missing lane blocks
+(Findings 1, 2); (2) the stale §28.12 divergence count 9 → 6 plus the pending re-bank of
+`s28_12_0007` and the two new `pass` rows (Finding 3); (3) the "Closes 8" contradiction (Finding
+5); (4) the three paraphrased §-sentences (Finding 7); (5) question 4's hold-out breach and the
+unfiled questions (Findings 8, 9); (6) the two DONE-instrument coverage holes (Findings 11, 12);
+(7) the RED toolchain-SKIP ratchet the gate cannot see (Finding 10).
+
+### (B) THE NEXT LANE
+
+**THE RULING: THE NEXT LANE IS **NOT** CAMPAIGN 2's CONTINUATION AND **NOT** A NEW CAMPAIGN 3.**
+It is **campaign 1's own next lane**, because campaign 1's DONE lines FAIL, and master plan §2.4
+says so in terms: "The coordinator then flips §6 to `DONE` or, **if a DONE line fails, to `ACTIVE`
+with the failing line as the next lane**." The reasoning, on the plan's own rules:
+
+* **A new campaign 3 is ruled out twice over.** Master plan §3's campaign-3 row says its
+  dependency is "**campaign 1 (shares `registerUsingDisposal`)**", and campaign 1 is not DONE; and
+  §1.2's WIP rule allows a **second** ACTIVE campaign only in the **other track**, "**Never
+  three**" — campaign 3 is an **ownership**-track campaign, the same track as campaign 1, so it
+  cannot be the second ACTIVE campaign while campaign 1 is ACTIVE. Campaign 3's declared file set
+  (`LlvmBackend_Assign/_Calls2/_Calls3/_Iterators/_Setup/_Stmts.cpp`) also overlaps campaign 1's
+  `LlvmBackend_Setup.cpp` and campaign 2's.
+* **Campaign 2's continuation is ruled out as the next dispatch.** Campaign 2 already has its
+  anchor landed (`2250daa52`) and **three instance lanes in flight** (L5b, B3a, B4a), which hold
+  `src/sema/ExprTypecheck_Calls.cpp`, `ExprTypecheck_Exprs.cpp`, `ExprTypecheck_impl.hpp`,
+  `src/sema/Formattability.hpp`, `src/common/BuiltinRegistry.*`, `src/codegen/LlvmBackend_Calls.cpp`,
+  `LlvmBackend_Exprs.cpp` and `LlvmBackend_Setup.cpp` (MEASURED by diffing each branch against
+  `origin/main`). A further campaign-2 lane would collide with its own lanes, and campaign 2 is
+  not waiting on the pool.
+* **Campaign 1's remaining lanes are otherwise blocked**, so the only dispatchable lane is the
+  sema one: the **U3 lane is in flight** (`r36-c1-u2u3`, handback under review, not picked) and
+  holds `LlvmBackend_Setup.cpp`, `LlvmBackend_impl.hpp` and `LlvmBackend_Disposal.cpp`; the
+  **U2a** lane (#3483, the #3493 itab route) wants `LlvmBackend_Setup.cpp` +
+  `LlvmBackend_Async.cpp`; the **U2c** lane (#3515, the per-level reclamation chain) wants
+  `LlvmBackend_Disposal.cpp` (`Emitter::emitBaseDisposeChain`); the **U2d** lane (#1531, #1603,
+  #7389) is an async/disposal lane and is therefore **serialised** behind the in-flight U3 lane by
+  the one-disposal-lane rule; the **U0** lane (#3471) is the record's own "last" cleanup and wants
+  `LlvmBackend_Setup.cpp`; and **#7357** is correctly held out (its leak is in the source's
+  producer +1 and is symmetric, so no copy-shaped fix can close it).
+
+**THE NEXT LANE — NAMED, DISPATCHABLE, AND SPECIFIED.**
+
+* **Campaign:** 1 (`using-heads`), sub-family **U1d + U2e** — the record's own lane-plan item 5,
+  "**U1d + U2e lane (Sonnet, sema)** — the `await using` admission and the `IAsyncDisposable`
+  conformance. Members: #7326, #7354. Not a disposal lane, so it may run beside the ownership lanes
+  once the anchor lands." The anchor has landed and been reviewed ✓.
+* **Branch / worktree:** `r36-c1-u1d-u2e` on the NVMe (a free worktree; do not reuse a lane's).
+* **Members (all OPEN, none claimed by a commit, none a `spec-question`/`spec-defect` — MEASURED):**
+  **#7326** (`await using` outside an async method is admitted; §28.12, v0.345), **#7354**
+  (`IAsyncDisposable` conformance: the `where T: IDisposable` bound, the `Dispose()` member, and
+  the record/enum/choice declaration rejections; §28.12 + stdlib §2.10, v0.345), plus the two
+  filed siblings that are the same two shapes — **#7396** (new-8, the filed twin of #7326) and
+  **#7394** (new-6, the filed twin of #7354's record/choice shape). **#7412 is excluded**: it
+  carries `spec-question` and is therefore undispatchable.
+* **Hot files (declared, and disjoint from every lane in flight):**
+  `src/sema/ExprTypecheck.cpp` — the `await using` admission (the `isAwaitUsing` site, where
+  `Symbol.hpp`'s flag is set) — and `src/sema/TypeResolution.cpp` / `TypeResolution_Checks.cpp` /
+  `TypeResolution_Names.cpp` — the `IAsyncDisposable` conformance walk. **The lane must NOT touch**
+  `src/sema/ExprTypecheck_impl.hpp`, `ExprTypecheck_Calls.cpp`, `ExprTypecheck_Exprs.cpp`,
+  `src/sema/Formattability.hpp`, `src/common/BuiltinRegistry.*` (campaign 2's in-flight sets),
+  `src/codegen/LlvmBackend_Setup.cpp`, `LlvmBackend_impl.hpp`, `LlvmBackend_Disposal.cpp` (the
+  in-flight U3 lane), `src/common/DisposalKind.*`, `src/ownership/Ownership.cpp` (the anchor's),
+  or `scripts/using_heads_grid.py` (the DONE instrument — the coordinator's; the lane proposes cells
+  to the coordinator rather than editing the instrument itself).
+* **Tier:** **Sonnet** (the record's own tier for this lane; it is a sema admission lane, not a
+  disposal lane, and the two members are admission/conformance rules, not memory-safety defects).
+* **THE FIRST MEASUREMENT THE LANE MUST MAKE — three things, in this order:**
+  1. **Re-measure the members on the tip and record each verdict**: the #7326 program (a
+     non-async `Main` with `await using var t := o.ToString();`) and the four #7354 shapes
+     (`where T: IDisposable`; `var d: IAsyncDisposable := move r; d.Dispose();`; a `record`
+     declaring `IAsyncDisposable`; a `choice` declaring `IAsyncDisposable`) — under the ASan AOT
+     path, with the specific diagnostic asserted, not just an exit code. **I have already
+     measured three of them at the tip** (Finding A9): #7326 compiles (rc = 0), the `record`
+     shape compiles, and the `where T: IDisposable` shape compiles. The lane re-measures and
+     records all four.
+  2. **The site-availability check (master plan §4.7 rule 7's file-disjointness, done BEFORE any
+     edit)**: prove that the `await using` async-context rejection can be implemented in
+     `src/sema/ExprTypecheck.cpp` alone and the `IAsyncDisposable` declaration-site rejection in
+     `src/sema/TypeResolution*.cpp` alone, i.e. **without** `ExprTypecheck_impl.hpp` or any of
+     campaign 2's files. **If either shape cannot be fixed without touching a file another lane
+     holds, the lane stops and reports that, and the lane re-scopes to U2e alone** (its site is
+     `TypeResolution*.cpp` either way).
+  3. **Re-derive the DONE baseline, not copy it**: run the grid on the tip BEFORE the lane starts
+     and confirm the number it inherits is **`DONE: NO — 39 cell(s) block it (wrong + known-red +
+     mismatch + timeout)`** (MEASURED on `2250daa52`; the record's `53` is stale — Finding 1), and
+     add to the campaign record the lane's own **proposed** grid cells — a `REJ` cell over an
+     `await using` in a non-async body (needle **§28.12**) and `REJ` cells for the record/choice
+     declaration (needle **§28.12**) — with the note that the `object_class` head's cells must
+     become `NOVAC` rather than `RUN` (Finding 11) and that the grid still has no
+     `async enumerator` head (Finding 12).
+
+**THE NEXT CAMPAIGN'S FIRST LANE — NAMED, CONTINGENT.** Master plan §2.4 requires the exit review
+to name it, so it is named here; **it is not dispatchable today** and must not be dispatched until
+campaign 1 exits.
+
+* **Campaign:** **3 — `enumerable-heads`** (ownership track; §29.2, §29.11, §28.6, §21.4/§21.5,
+  §26.5; stdlib §5, §4; label `campaign:enumerable-heads`).
+* **First lane:** the **E0 ANCHOR lane** — "E0 (Opus) alone first" (master plan §3's lane split),
+  one bridge keyed on the **runtime representation**, consulted at every face.
+* **Tier:** **Opus** (an anchor lane; master plan §1.3 "one **anchor lane** (Opus, always) until
+  the anchor lands and is reviewed").
+* **Hot files (master plan §3, campaign 3's "Shared code path"):** `wrapAsIEnumerableForTarget`
+  and its gate, `lowerIEnumerableFor`, `wrapArrayAsIOwningEnumerator`,
+  `registerIterableSourceDisposal`, the §5 terminal arms' minting gate and `freeFreshInputTemp`,
+  and the getter-frame faces (`propBlockGetterReturnKinds_`, `kPropGetterReturnMint`) — spread over
+  `src/codegen/LlvmBackend_Assign.cpp`, `LlvmBackend_Calls2.cpp`, `LlvmBackend_Calls3.cpp`,
+  `LlvmBackend_Iterators.cpp`, `LlvmBackend_Setup.cpp`, `LlvmBackend_Stmts.cpp`. **Note the
+  collision:** `LlvmBackend_Setup.cpp` is held by campaign 1's U3 lane and by campaign 2's lanes
+  today; campaign 3's anchor must be re-scoped to the `_Calls2/_Calls3/_Iterators/_Assign/_Stmts`
+  files, or wait for campaign 1's exit.
+* **First members (dispatchable once campaign 1 exits):** the E0 anchor's own instance members —
+  **#6393** (a bare slot pointer with no +1), **#6409** and **#6451** (the getter frames).
+  MEASURED: all three are OPEN, carry `campaign:enumerable-heads`, carry **no**
+  `spec-question`/`spec-defect`, and are claimed by no commit. **#6387 is EXCLUDED** — MEASURED, it
+  is already claimed by `a59b3e5d narrow #6387` (2026-10-18), which is on `origin/main` and on the
+  tip, so it is not an unclaimed member. **#2331** ("RULING NEEDED") is excluded — it needs an owner
+  ruling. The plan's two spec-question candidates, **#4740** and **#2331**, are OPEN but carry only
+  `bug` + `campaign:enumerable-heads`; the coordinator should label them `spec-question` before they
+  are dispatched (127 issues currently carry `campaign:enumerable-heads`; 0 of them carry a spec
+  label).
+* **THE FIRST MEASUREMENT:** the **entry check** (master plan §2.2) — re-measure all 125 members on
+  HEAD (G's 19 are 60–105 days old; #3469 is the known moved one) and run the **face ×
+  representation grid** once on HEAD to record the baseline: faces {local, return, getter (block /
+  arrow / virtual / interface-dispatched), argument (owned formal / borrowed formal / interface
+  formal), field store, `for` (with `break`, with `await`/`yield` in the body), `_ :=` discard,
+  interpolation hole, extension receiver} × representations {Array family, Set/Dictionary snapshot,
+  sorted snapshot, lazy pipeline (eager and lazy terminals), sync iterator frame, async iterator
+  frame, user class implementing `IEnumerable<T>`, string as `IEnumerable<char>`,
+  `IOwningEnumerable<T>` heads, imported each}; every cell correct or rejected, never a wild jump.
+  The DONE line is: the grid green under ASan; the §29 corpus `fail` rows (7) and the stdlib §5 row
+  (1) re-banked; `enumerable_grid_spellings.baseline` **lower**; and the `itmap$` wild-jump
+  signature absent from every cell's ASan log.
+
+### WHAT I DID **NOT** CHECK
+
+* The **`b6053a68` arm** of the record's fail-with-out table (its `DONE: NO — 51 …` quote) — not
+  built, not re-measured.
+* The **grid-discharge lane's own tree** (its two `53` quotes) — not built; I measured `d9f11d15`
+  with the tip's script instead and read the same 53.
+* The grid's **17-mutation check** — not re-run; I ran the gate's own 30 grid tests (inside the
+  1093) and the instrument's own three-tree behaviour.
+* The **copies lane's and the anchor's gtest rows** under `scripts/agent_check.sh` — not run; the
+  fail-without was measured through the grid, cell for cell, which is the campaign's own instrument.
+* The **U2/U3 lane's** fail-without (`4823c418`, `fc09c0ca`) — not re-measured; it is under a
+  separate review. Its issue states and its non-picked status I did check.
+* **22 of the 24 members' per-row repros** — QUOTED from the record, not re-measured (only #7326
+  and two of #7354's four shapes, above).
+* The `object_string` twin leak, #2624's repro, the §29.1 ruling's outcome, the `type_token`
+  deferral row, the coverage-gap arithmetic's *intent*, the `9 n/a` cells' reasons, and the
+  `--twins` variant of the grid (I ran the brief's command without `--twins`; the record's baseline
+  used `--twins` and the cell count is 153 either way).
+* **Campaign 2's** grid, record, and lanes' correctness — read only for the file sets and the
+  `campaign:builtin-call-admission` label counts.
+* The **full suite** and the **gate** — not run (the coordinator's).
+* `scripts/ratchet_sweep.sh` — **run to completion**: `1 of 23 RED — do NOT launch a gate`, the one
+  RED being `check_toolchain_skip_surface` (Finding 10). The other 22 ratchets are GREEN.
+* The **lit track** — not run (`agent_check.sh --lit` is opt-in since R30 and the brief does not ask
+  for it).
+
+### MODEL
+
+`model=MiniMax-M3.1-Flash (1M context)`
