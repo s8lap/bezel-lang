@@ -7278,9 +7278,29 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // alone, so an IMPORTED `StringBuilder` (astNode-less, head in
             // `importedName`) reaches this arm too instead of the string
             // fallback's field-1 read.
-            bool isSB = (tt && tt->kind == sema::TypeRef::Kind::Named &&
-                         !tt->declaration &&
-                         tt->headName() == "StringBuilder");
+            //
+            // fix #7217 #6845 (§2.3 / §2.2, v0.345): the discriminator is the
+            // receiver's SYMBOL, not its HEAD NAME.  §2.3's always-available-
+            // names table lists `StringBuilder` (stdlib §3.1) as SHADOWABLE,
+            // and §2.2 makes a current-module declaration shadow an
+            // auto-imported name, so a user's own `class StringBuilder` is a
+            // DISTINCT type whose own members resolve.  `builtinTypeName` is
+            // empty for a user type and for an imported user type, so a
+            // user-declared class named `StringBuilder` keeps its OWN `Length`
+            // member instead of being summed as a builtin parts-list.
+            //
+            // `builtinTypeName` rather than the bare `!tt->declaration` this
+            // used to carry: it is the ONE predicate that reads BOTH TypeRef
+            // shapes a builtin reaches codegen in (the source-level
+            // annotation and the `builtinClassSym` factory result), and it
+            // rejects the IMPORTED user type as well as the same-module one
+            // (a populated `moduleName`, the #2997 discriminator).  It sees
+            // through a transparent type alias too (#1462 / §27.8 —
+            // `aliasResolvedHead`) — but so does `headName()`, which reads the
+            // same field first, so the alias shape is UNCHANGED by this edit
+            // (measured: `type SB := StringBuilder` lowers identically before
+            // and after).
+            bool isSB = (builtinTypeName(tt) == "StringBuilder");
             if (isSB) {
                 llvm::Value* sb = lowerExpr(*ma->target);
                 if (sb) {

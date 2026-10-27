@@ -3252,7 +3252,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // Check for StringBuilder
     // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
     // (astNode-less, head in `importedName`) must match the same arm.
-    bool isStrBld = (recvTy && recvTy->headName() == "StringBuilder");
+    //
+    // fix #7217 #6845 (§2.3 / §2.2, v0.345): the discriminator is the
+    // receiver's SYMBOL, not its HEAD NAME.  §2.3's always-available-names
+    // table lists `StringBuilder` (stdlib §3.1) as SHADOWABLE, and §2.2 makes
+    // a current-module declaration shadow an auto-imported name, so a user's
+    // own `class StringBuilder` is a DISTINCT type whose own members resolve.
+    // `builtinTypeName` is empty for a user type
+    // (a same-module user class carries a real `ast::TypeDecl` in its
+    // declaration) and for an IMPORTED user type (a populated `moduleName`),
+    // so a user-declared class named `StringBuilder` is no longer claimed by
+    // this arm.  Before this, the builtin arm ran on the user's object: the
+    // user's own method was SILENTLY DROPPED (#7217 — the program printed
+    // only "after") or the builtin's `bz_sb_*` runtime ran on a foreign object
+    // and SEGV'd (#6845 — `bz_sb_content_cps` on the user's instance).
+    //
+    // `builtinTypeName` rather than a bare `!recvTy->declaration` guard: it is
+    // the ONE predicate that already reads both TypeRef shapes a builtin
+    // reaches codegen in (the source-level annotation, declaration == null, and
+    // the `builtinClassSym` factory result), it sees through a transparent
+    // type alias (#1462 / §27.8 — `aliasResolvedHead`), and it keeps the
+    // #5390 / §2.3 `Buffer` -> `__Buffer` intrinsic-rename mapping.  It also
+    // sees through the IMPORTED spelling (`importedName`) the #6776
+    // fix-forward added, so that arm keeps working.
+    bool isStrBld = (builtinTypeName(recvTy) == "StringBuilder");
 
     // §28.6 / §28.11 (v0.213, axiom A8 retired, #2081): `.DisposeElements()` is
     // gone from the collection surface. Sema (ExprTypecheck_Calls) rejects it on
