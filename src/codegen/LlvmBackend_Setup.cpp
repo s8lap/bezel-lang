@@ -24351,9 +24351,21 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // payload leaked. `allowUsingVar` (the caller's opt-in) admits that
     // spelling; `await using var` stays refused EITHER WAY, because the async
     // disposal machinery owns that spelling (#7306).
+    // A §21.1 `const` local never reaches the `isAwaitUsing` test below: it is
+    // not a `using` binding at all (§21.1 - a `const` binding never takes a
+    // disposal obligation; §28.10 - `using var` is that spelling), so the
+    // refusal has nothing to refuse for it. The `using`/`await using` spelling
+    // is admitted by the parser only on a `var` binding (see Parser_Stmts.cpp).
+    // See the LOCALDECL-ONLY marker at the cast.
     if (v.isUsing) {
         if (!allowUsingVar) return nullptr;
         const ast::LocalDecl* uld =
+            // LOCALDECL-ONLY: a §21.1 `const` local CANNOT reach this cast:
+            // the `v.isUsing` gate above is read through the shared
+            // `Emitter::localDeclInitView`, which reports isUsing FALSE for
+            // every `const` local - a runtime `const` is an
+            // `ast::LocalConstDecl` (no `isUsing` member at all), so it can
+            // never be a `using` binding.
             dynamic_cast<const ast::LocalDecl*>(ldNode);
         if (uld && uld->isAwaitUsing) return nullptr;  // #7306
     }
@@ -36571,9 +36583,22 @@ void Emitter::collectStringReleaseEligible(
             // `await using var` is EXCLUDED: the async disposal machinery
             // (`registerUsingDisposal`'s `ld->isAwaitUsing` branch) owns that
             // spelling, and this change does not reach into async.
+            // A §21.1 `const` local is never a `using` binding (§21.1 - a
+            // `const` binding never takes a disposal obligation; §28.10 -
+            // `using var` is that spelling), so it is never `await using`
+            // either, and the `isAwaitUsing` exclusion below has nothing to
+            // exclude for it. The `using`/`await using` spelling is admitted
+            // by the parser only on a `var` binding (see Parser_Stmts.cpp).
+            // See the LOCALDECL-ONLY marker at the cast.
             const bool plusOneProducer =
                 v.init && isPlusOneStringProducer(v.init);
             const ast::LocalDecl* usingLd =
+                // LOCALDECL-ONLY: a §21.1 `const` local CANNOT reach this
+                // cast: the ternary evaluates it only when `v.isUsing` is
+                // true, and `v.isUsing` (shared `Emitter::localDeclInitView`)
+                // is FALSE for every `const` local - a runtime `const` is an
+                // `ast::LocalConstDecl` (no `isUsing` member at all), so it
+                // can never be a `using` binding.
                 v.isUsing ? dynamic_cast<const ast::LocalDecl*>(s) : nullptr;
             const bool usingVarProducer =
                 plusOneProducer && v.isUsing &&
