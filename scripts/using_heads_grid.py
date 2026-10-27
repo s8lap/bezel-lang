@@ -1,0 +1,1136 @@
+#!/usr/bin/env python3
+"""using_heads_grid.py — the campaign-1 (`using-heads`) DONE grid.
+
+THE GRID. A cell is (head kind) x (binding form). The head kind is what the
+`using var` / `await using` binding's RIGHT-HAND SIDE carries; the binding form
+is the spelling the program uses. Every cell has ONE expectation, taken from the
+spec, and the grid is GREEN only when every cell's observed behaviour matches
+its expectation.
+
+WHY THIS SHAPE. It is `scripts/regression_matrix.py`'s shape: a deterministic
+generator of .bzl programs, compiled with `bezelc --sanitize=address`, run, and
+classified into CLEAN / LEAK / CRASH / CF / TIMEOUT. The difference is the
+oracle: regression_matrix compares two builds against each other ("worse than
+the reference"); this grid compares one build against the SPEC, per cell, and
+prints how many cells are wrong.
+
+    scripts/using_heads_grid.py --bezelc build/bezelc --out /var/tmp/... \
+        [--filter class,string] [--jobs 8] [--timeout 60] [--report FILE]
+
+Exit status: 0 when every cell matches its expectation, 1 when at least one
+cell is wrong, 2 on a usage or infrastructure error.
+
+THE THREE DIMENSIONS. A cell is (head kind) x (binding form) x (source kind),
+and the third dimension is spelled out rather than implicit:
+
+  * HEAD KIND — what the right-hand side carries (a class, a class behind a
+    base, an interface-typed head, an abstract head, a generic head, a string,
+    a function value, a value-like choice, an owning choice, an `Object`-
+    declared head, a `Type` token, a built-in collection, a `Task`).
+  * BINDING FORM — the spelling: `using var`, `await using var`, an explicit
+    `Dispose()`, an explicit `DisposeAsync()`, a COPY of a source binding, an
+    owned field store.
+  * SOURCE KIND — for the COPY form only, where the copy's SOURCE comes from:
+    a `var` local read by the plain `using var` spelling, the same `var` local
+    read by the `await using var` spelling, a §21.1 `const` local, or a
+    PARAMETER. These are four different programs with four different
+    obligations, so they are four cells. Collapsing them into one cell would
+    leave the `const`, the parameter and the `await using` variants unpinned: a
+    future change could regress any of them without the grid noticing. (The
+    `const` and parameter variants are #7316's and #7357's shapes; the `await
+    using` spelling of the copy is #7374's.)
+
+THE EXPECTATIONS. Each cell carries the spec sentence that decides it; the
+sentence is quoted in the cell's comment and in the record
+(`docs/proposals/papers/campaigns/using-heads.md`). The load-bearing ones:
+
+  §28.10  "For ordinary value types and runtime-managed types, the disposal at
+           scope end is a no-op (these types do not require disposal per
+           §28.9), and the only effect is the reassignability restriction."
+  §28.12  "`await using var` takes §28.10's admission unchanged ... Over an
+           owned right-hand side with no `DisposeAsync` to await ... scope exit
+           takes the synchronous disposal (or the no-op) and likewise awaits
+           nothing."
+  §28.12  "The `DisposeAsync` awaited is the run-time object's. `await using`
+           selects the logical-disposal path by the class of the object the
+           binding holds ... never by the binding's static type. ... through
+           `Object`, and through any interface ... Only an object whose class
+           does not implement `IAsyncDisposable` takes the synchronous disposal
+           above."
+  §28.12  step 1: "For `await using`, the awaited `DisposeAsync()` performs
+           whatever asynchronous cleanup the class defines; the destructor body
+           (if any) is not also run, because `DisposeAsync` supersedes it."
+  §28.12  step 2: "owned fields are disposed in reverse declaration order and
+           the base class's reclamation chains, once, immediately after logical
+           disposal has completed".
+  §28.9   "None of them is a class, and none has a `Dispose()` member:
+           `x.Dispose()` over a value of one of these types is a compile error."
+  §28.2   "`Dispose()` on any class instance is idempotent: the first call
+           performs the disposal; subsequent calls are no-ops."
+  §21.1   "The initializer of a runtime `const` must not be an owned production."
+
+ORACLE NOTES (the house's traps, honoured here):
+
+  * EVERY cell that can make a leak claim LOOPS its operation LOOP_N times.
+    A one-shot LSan repro is vacuous: the dead frame's stale pointer reads as
+    a root, so a one-shot program can report nothing while the leak is real.
+    A cell that claims "must not leak" needs the loop too, or it cannot fail.
+    LOOP_N is 60, inside the 50-500 band.
+  * Every RUN-family cell asserts the program's PRINTED OUTPUT, not just its
+    exit code: a program that printed the wrong thing is a different defect
+    from one that leaked, and a compile-time rejection must not masquerade as
+    a clean run.
+  * A VAC cell asserts the §28.9 vacuity warning IS present (the compiler
+    knows the binding carries no obligation) AND that the program runs clean.
+    A NOVAC cell asserts it is ABSENT.
+  * Every non-REJ cell must be CLEAN: no leak, no crash, no sanitizer report.
+  * A cell that is red because a NAMED issue is still open is reported as
+    KNOWN-RED with that issue, and is NOT counted as WRONG. A cell that is red
+    for any other reason is WRONG, and the campaign is DONE when there are no
+    WRONG cells.
+  * The ASan leg must actually run. The summary prints
+    `NATIVE SANITIZER: 0 check(s) skipped` only when every executed cell ran
+    an ASan-instrumented binary; a cell whose program could not be linked
+    under ASan is counted as SKIPPED and the summary says so.
+
+Every type and member used here exists in docs/Bezel_Standard_Library.md; the
+sections are cited at the head table. Do not add a member that is not there; a
+stdlib gap is an issue, not a generator patch.
+"""
+import argparse
+import concurrent.futures
+import os
+import re
+import subprocess
+import sys
+
+CLEAN, LEAK, CRASH, CF, TIMEOUT, SKIPPED = (
+    'CLEAN', 'LEAK', 'CRASH', 'CF', 'TIMEOUT', 'SKIPPED')
+
+# The leak-oracle band (50-500). Every non-REJ cell loops this many times.
+LOOP_N = 60
+
+# ---------------------------------------------------------------------------
+# The head table. Every entry:
+#   (label, decl, rhs, extra_preamble, param_type)
+#
+#   decl   the declared type of the binding (None = inferred)
+#   rhs    the right-hand side expression
+#   extra  extra declarations the head needs
+#   ptype  the type of the PARAMETER the copy's source is passed as (the
+#          copy's third dimension)
+# ---------------------------------------------------------------------------
+
+PRELUDE = '''import System.Threading;
+
+public class Res
+  public constructor()
+  end constructor;
+
+  destructor
+    Console.WriteLine("DTOR");
+  end destructor;
+end Res;
+
+public class AsyncRes: IAsyncDisposable
+  public constructor()
+  end constructor;
+
+  public async method DisposeAsync(): Task
+    await Task.Delay(0);
+    Console.WriteLine("DA");
+  end DisposeAsync;
+
+  destructor
+    Console.WriteLine("DTOR");
+  end destructor;
+end AsyncRes;
+
+public class Base
+  public constructor()
+  end constructor;
+
+  destructor
+    Console.WriteLine("BASE_DTOR");
+  end destructor;
+end Base;
+
+public class Der: Base, IAsyncDisposable
+  public constructor()
+  end constructor;
+
+  public async method DisposeAsync(): Task
+    await Task.Delay(0);
+    Console.WriteLine("DA");
+  end DisposeAsync;
+
+  destructor
+    Console.WriteLine("DER_DTOR");
+  end destructor;
+end Der;
+
+public abstract class Abs: IAsyncDisposable
+  public constructor()
+  end constructor;
+
+  public abstract method DisposeAsync(): Task;
+
+  destructor
+    Console.WriteLine("ABS_DTOR");
+  end destructor;
+end Abs;
+
+public class AbsD: Abs
+  public constructor()
+  end constructor;
+
+  public async override method DisposeAsync(): Task
+    await Task.Delay(0);
+    Console.WriteLine("DA");
+  end DisposeAsync;
+
+  destructor
+    Console.WriteLine("ABSD_DTOR");
+  end destructor;
+end AbsD;
+
+public choice VChoice Note(text: string), Empty; end VChoice;
+
+public choice OChoice Text(owned r: Res), Empty; end OChoice;
+'''
+
+# head key -> (label, ty, rhs, extra, ptype)
+HEADS = {
+    'class': (
+        'class (own destructor, no IAsyncDisposable)',
+        None, 'new Res()', '', 'Res'),
+    'class_async': (
+        'class implementing IAsyncDisposable',
+        None, 'new AsyncRes()', '', 'AsyncRes'),
+    'derived_base': (
+        'derived behind a base that has no DisposeAsync',
+        'Base', 'new Der()', '', 'Base'),
+    'interface': (
+        'interface-typed head (IAsyncDisposable)',
+        'IAsyncDisposable', 'new AsyncRes()', '', 'IAsyncDisposable'),
+    'abstract': (
+        'abstract-class head with an abstract DisposeAsync',
+        'Abs', 'new AbsD()', '', 'Abs'),
+    'generic_class': (
+        'generic T, class-constrained (new T() at T = Res)',
+        None, 'new T()', '', 'T'),
+    'generic_unconstrained': (
+        'generic T, new()-constrained at T = Stopwatch (vtable-less head)',
+        None, 'new T()', '', 'T'),
+    'string': (
+        'string (runtime-managed, §28.9)',
+        None, 'o.ToString()', '', 'string'),
+    'function': (
+        'function value (runtime-managed, §28.9)',
+        None, 'lambda(): int => 1', '', '(int) -> int'),
+    'value_choice': (
+        'value-like choice (§35.4)',
+        None, 'VChoice.Note("a" + "b")', '', 'VChoice'),
+    'owning_choice': (
+        'owning choice (§35.4)',
+        None, 'OChoice.Text(move osrc)', '', 'OChoice'),
+    'object_class': (
+        'Object holding a class',
+        'Object', 's', '', 'Object'),
+    'object_string': (
+        'Object holding a runtime-managed string',
+        'Object', 's', '', 'Object'),
+    'type_token': (
+        'Type token (§28.9) - typeof is deferred (§17.10, #487)',
+        'Object', 'typeof(Int32)', '', 'Object'),
+    'builtin_collection': (
+        'built-in collection (Array<int>)',
+        'Array<int>', 'new Array<int>(3, 0)', '', 'Array<int>'),
+    'collection_literal': (
+        'built-in collection LITERAL (an owned producer, §28.3)',
+        'Array<int>', '[1, 2, 3]', '', 'Array<int>'),
+    'task': (
+        'Task (a borrow read of tcs.Task)',
+        None, 'tcs.Task', '', 'Task<int>'),
+}
+
+# The extra declarations each head needs beyond PRELUDE, and the setup lines
+# each head's program needs before the binding under test.
+HEAD_SETUP = {
+    'string': '    var o := 1;\n',
+    'function': '',
+    'value_choice': '',
+    'owning_choice': '    var osrc := new Res();\n',
+    'object_class': '    var s: Object := new Res();\n',
+    'object_string': '    var o := 1;\n    var s: Object := o.ToString();\n',
+    'type_token': '',
+    'builtin_collection': '',
+    'collection_literal': '',
+    'task': '    using var tcs := new TaskCompletionSource<int>();\n',
+    'generic_class': '',
+    'generic_unconstrained': '',
+}
+
+# The parameter DECLARATION the copy's source is passed as. A move-only head's
+# parameter must be `owned` (§15.3: a move-only value is passed BY VALUE-MOVE,
+# and the `move` call-site marker is only valid on an `owned` parameter).
+PARAM_DECL = {
+    'class': 'src: Res',
+    'class_async': 'src: AsyncRes',
+    'derived_base': 'src: Base',
+    'interface': 'src: IAsyncDisposable',
+    'abstract': 'src: Abs',
+    'generic_class': 'src: T',
+    'generic_unconstrained': 'src: T',
+    'string': 'src: string',
+    'function': 'src: () -> int',
+    'value_choice': 'src: VChoice',
+    'owning_choice': 'owned src: OChoice',
+    'object_class': 'src: Object',
+    'object_string': 'src: Object',
+    'type_token': 'src: Object',
+    'builtin_collection': 'src: Array<int>',
+    'collection_literal': 'src: Array<int>',
+    'task': 'src: Task<int>',
+}
+
+# Heads whose setup must live OUTSIDE the loop (the Task head's
+# TaskCompletionSource has to outlive the loop: the loop's first iteration's
+# scope-end disposal awaits the uncompleted task -- that is #6194's hang).
+SETUP_OUTSIDE_LOOP = {'task'}
+
+# The generic heads run through a monomorphized wrapper, so the binding under
+# test lives INSIDE the wrapper's method and the program body is a call.
+GENERIC_CALL = {
+    'generic_class': '    await GW<Res>.Run();',
+    'generic_unconstrained': '    await GU<Stopwatch>.Run();',
+}
+
+GENERIC_DECL = {
+    'generic_class': '',
+    'generic_unconstrained': 'import System.Diagnostics;\n',
+}
+
+GENERIC_CLASS = {
+    'generic_class': 'GW',
+    'generic_unconstrained': 'GU',
+}
+
+# A holder with an owned field, for the `field store` binding form.
+FIELD_HOLDER = {
+    'class': 'public class Holder\n'
+             '  public owned F: Res? := null;\n'
+             '  public constructor() end constructor;\n'
+             'end Holder;\n',
+    'class_async': 'public class Holder\n'
+                   '  public owned F: AsyncRes? := null;\n'
+                   '  public constructor() end constructor;\n'
+                   'end Holder;\n',
+    'derived_base': 'public class Holder\n'
+                    '  public owned F: Base? := null;\n'
+                    '  public constructor() end constructor;\n'
+                    'end Holder;\n',
+    'interface': 'public class Holder\n'
+                 '  public owned F: IAsyncDisposable? := null;\n'
+                 '  public constructor() end constructor;\n'
+                 'end Holder;\n',
+    'abstract': 'public class Holder\n'
+                '  public owned F: Abs? := null;\n'
+                '  public constructor() end constructor;\n'
+                'end Holder;\n',
+    'builtin_collection': 'public class Holder\n'
+                          '  public owned F: Array<int>? := null;\n'
+                          '  public constructor() end constructor;\n'
+                          'end Holder;\n',
+    'collection_literal': 'public class Holder\n'
+                          '  public owned F: Array<int>? := null;\n'
+                          '  public constructor() end constructor;\n'
+                          'end Holder;\n',
+    'task': 'public class Holder\n'
+            '  public owned F: Task<int>? := null;\n'
+            '  public constructor() end constructor;\n'
+            'end Holder;\n',
+}
+
+# ---------------------------------------------------------------------------
+# The binding forms.
+#
+# `copy_of_using_var` is spelled `copy_local_source` / `copy_const_source` /
+# `copy_param_source` because the copy's SOURCE is a third dimension: a `var`
+# local, a §21.1 `const` local, or a parameter. See the module docstring.
+# ---------------------------------------------------------------------------
+
+FORMS = [
+    ('using_var', 'using var'),
+    ('await_using_var', 'await using var'),
+    ('explicit_dispose', 'explicit Dispose()'),
+    ('explicit_dispose_async', 'explicit DisposeAsync()'),
+    ('copy_local_source', 'copy of a `var` local source'),
+    ('copy_await_source', 'copy of a `var` local source, `await using` spelling'),
+    ('copy_const_source', 'copy of a `const` source'),
+    ('copy_param_source', 'copy of a parameter source'),
+    ('field_store', 'owned field store'),
+]
+
+# ---------------------------------------------------------------------------
+# Expectations.
+#
+#   ('REJ', needle)   the compile must be REJECTED with a diagnostic holding
+#                     `needle`
+#   ('RUN', markers)  the program must compile, run CLEAN under ASan, and print
+#                     exactly `markers` (once per loop iteration)
+#   ('VAC', markers)  as RUN, and the §28.9 vacuity warning must be present
+#   ('NOVAC', markers) as RUN, and the §28.9 vacuity warning must be ABSENT
+#   None              the spec does not decide the cell (a spec question); the
+#                     cell is reported as UNDECIDED and is NOT counted wrong
+#
+# A third element, when present, is the list of lines the program prints AFTER
+# the loop (the generic heads' "body" marker).
+# ---------------------------------------------------------------------------
+
+EXPECT = {
+    # -- class (own destructor, no IAsyncDisposable) -------------------------
+    # §28.10: "the disposal at scope end is a no-op" applies to VALUE types and
+    # runtime-managed types only; a class head disposes its destructor chain.
+    ('class', 'using_var'): ('RUN', ['DTOR']),
+    # §28.12: "an object whose class does not implement `IAsyncDisposable` --
+    # scope exit takes the synchronous disposal (or the no-op) and likewise
+    # awaits nothing."
+    ('class', 'await_using_var'): ('RUN', ['DTOR']),
+    ('class', 'explicit_dispose'): ('RUN', ['DTOR']),
+    ('class', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    # §28.10 "Adopting a named owned binding": an unmarked `using var y := x;`
+    # over a named owned binding whose declared type is a class is a compile
+    # error.
+    ('class', 'copy_local_source'): ('REJ', 'using var'),
+    # §21.1: "The initializer of a runtime `const` must not be an owned
+    # production" -- `new Res()` is one.
+    ('class', 'copy_const_source'): ('REJ', 'using var'),
+    # A PARAMETER is not a "named owned binding" (§28.10's definition lists a
+    # `var`/`using var` local, an owned iteration variable, an `out owned`
+    # recipient, an owning-match arm binding, or an `owned` parameter), so the
+    # unmarked copy of a parameter is a BORROW-PIN: no disposal, and the
+    # caller keeps the obligation. The destructor runs once, in the caller.
+    ('class', 'copy_param_source'): ('RUN', ['DTOR']),
+    ('class', 'field_store'): ('RUN', ['DTOR']),
+
+    # -- class implementing IAsyncDisposable --------------------------------
+    # §28.12 step 1: "the awaited `DisposeAsync()` performs whatever
+    # asynchronous cleanup the class defines; the destructor body (if any) is
+    # not also run, because `DisposeAsync` supersedes it."
+    ('class_async', 'using_var'): ('RUN', ['DTOR']),
+    ('class_async', 'await_using_var'): ('RUN', ['DA']),
+    ('class_async', 'explicit_dispose'): ('RUN', ['DTOR']),
+    # §28.12 step 2: "a direct `DisposeAsync()` call awaited outside `await
+    # using` ... the cascade and the chain follow exactly as if `await using`
+    # had issued it" -- so the block must be reclaimed.
+    ('class_async', 'explicit_dispose_async'): ('RUN', ['DA']),
+    ('class_async', 'copy_local_source'): ('REJ', 'using var'),
+    ('class_async', 'copy_const_source'): ('REJ', 'using var'),
+    ('class_async', 'copy_param_source'): ('RUN', ['DTOR']),
+    ('class_async', 'field_store'): ('RUN', ['DTOR']),
+
+    # -- derived behind a base that has no DisposeAsync (§28.12's own example)
+    ('derived_base', 'using_var'): ('RUN', ['DER_DTOR', 'BASE_DTOR']),
+    # §28.12: "`await using var b: Base := new Der();` with `class Der: Base,
+    # IAsyncDisposable` awaits `Der.DisposeAsync`, skips `Der`'s destructor and
+    # runs `Base`'s."
+    ('derived_base', 'await_using_var'): ('RUN', ['DA', 'BASE_DTOR']),
+    ('derived_base', 'explicit_dispose'): ('RUN', ['DER_DTOR', 'BASE_DTOR']),
+    ('derived_base', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    ('derived_base', 'copy_local_source'): ('REJ', 'using var'),
+    ('derived_base', 'copy_const_source'): ('REJ', 'using var'),
+    ('derived_base', 'copy_param_source'): ('RUN', ['DER_DTOR', 'BASE_DTOR']),
+    ('derived_base', 'field_store'): ('RUN', ['DER_DTOR', 'BASE_DTOR']),
+
+    # -- interface-typed head (IAsyncDisposable) ----------------------------
+    ('interface', 'using_var'): ('RUN', ['DTOR']),
+    # §28.12: "through `Object`, and through any interface -- `IAsyncDisposable`
+    # or one deriving from it, whose `DisposeAsync` dispatches as any interface
+    # member does".
+    ('interface', 'await_using_var'): ('RUN', ['DA']),
+    ('interface', 'explicit_dispose'): ('RUN', ['DTOR']),
+    ('interface', 'explicit_dispose_async'): ('RUN', ['DA']),
+    ('interface', 'copy_local_source'): ('REJ', 'using var'),
+    ('interface', 'copy_const_source'): ('REJ', 'using var'),
+    ('interface', 'copy_param_source'): ('RUN', ['DTOR']),
+    # §28.5: the owned field's cascade disposes the stored instance.
+    ('interface', 'field_store'): ('RUN', ['DTOR']),
+
+    # -- abstract-class head with an abstract DisposeAsync -------------------
+    ('abstract', 'using_var'): ('RUN', ['ABSD_DTOR', 'ABS_DTOR']),
+    # §28.12 step 2: "the destructor body is skipped if that level declares or
+    # overrides a non-`abstract` `DisposeAsync`, and runs if that level does not
+    # -- ... a level whose `DisposeAsync` is `abstract` ... [is] cleaned up
+    # exactly as on the synchronous path."
+    ('abstract', 'await_using_var'): ('RUN', ['DA', 'ABS_DTOR']),
+    ('abstract', 'explicit_dispose'): ('RUN', ['ABSD_DTOR', 'ABS_DTOR']),
+    ('abstract', 'explicit_dispose_async'): ('RUN', ['DA', 'ABS_DTOR']),
+    ('abstract', 'copy_local_source'): ('REJ', 'using var'),
+    ('abstract', 'copy_const_source'): ('REJ', 'using var'),
+    ('abstract', 'copy_param_source'): ('RUN', ['ABSD_DTOR', 'ABS_DTOR']),
+    ('abstract', 'field_store'): ('RUN', ['ABSD_DTOR', 'ABS_DTOR']),
+
+    # -- generic T ----------------------------------------------------------
+    # The binding lives inside the monomorphized wrapper; "body" is printed
+    # after the loop.
+    ('generic_class', 'using_var'): ('RUN', ['DTOR'], ['body']),
+    ('generic_class', 'await_using_var'): ('RUN', ['DTOR'], ['body']),
+    # A bare type parameter is a class-or-interface type in the generic body
+    # (§28.1 clause 3), so `Dispose`/`DisposeAsync` are not members of it.
+    ('generic_class', 'explicit_dispose'): ('REJ', 'Dispose'),
+    ('generic_class', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    # §28.10's bare-type-parameter clause: "using var y := x; over an `owned
+    # x: T` is rejected once, in the body".
+    ('generic_class', 'copy_local_source'): ('REJ', 'using var'),
+    ('generic_class', 'copy_const_source'): ('REJ', 'using var'),
+    ('generic_class', 'copy_param_source'): ('RUN', ['DTOR']),
+    ('generic_class', 'field_store'): None,
+
+    ('generic_unconstrained', 'using_var'): ('RUN', [], ['body']),
+    ('generic_unconstrained', 'await_using_var'): ('RUN', [], ['body']),
+    ('generic_unconstrained', 'explicit_dispose'): ('REJ', 'Dispose'),
+    ('generic_unconstrained', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    ('generic_unconstrained', 'copy_local_source'): ('REJ', 'using var'),
+    ('generic_unconstrained', 'copy_const_source'): ('REJ', 'using var'),
+    ('generic_unconstrained', 'copy_param_source'): ('RUN', []),
+    ('generic_unconstrained', 'field_store'): None,
+
+    # -- runtime-managed (§28.9) ----------------------------------------------
+    # §28.9: "a `using var` local of function type is nonetheless permitted
+    # (disposal at scope end is a no-op)"; §28.10: "the disposal at scope end is
+    # a no-op ... and the only effect is the reassignability restriction".
+    ('string', 'using_var'): ('VAC', []),
+    ('string', 'await_using_var'): ('VAC', []),
+    # §28.9: "none has a `Dispose()` member ... `x.Dispose()` over a value of one
+    # of these types is a compile error".
+    ('string', 'explicit_dispose'): ('REJ', 'Dispose'),
+    ('string', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('string', 'copy_local_source'): ('VAC', []),
+    ('string', 'copy_const_source'): ('VAC', []),
+    ('string', 'copy_param_source'): ('VAC', []),
+    ('string', 'field_store'): None,
+
+    ('function', 'using_var'): ('VAC', []),
+    ('function', 'await_using_var'): ('VAC', []),
+    ('function', 'explicit_dispose'): ('REJ', 'Dispose'),
+    ('function', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('function', 'copy_local_source'): ('VAC', []),
+    ('function', 'copy_const_source'): ('VAC', []),
+    ('function', 'copy_param_source'): ('VAC', []),
+    ('function', 'field_store'): None,
+
+    # -- value-like / owning choice (§35.4) ----------------------------------
+    # §28.10: "the disposal at scope end is a no-op" -- but the RUNTIME
+    # LIFETIME must be the plain-`var` twin's (the §35.3 construction's +1 on
+    # the payload string must be released at scope end either way). The twin is
+    # measured CLEAN for this head (see `--twins`), so "must not leak" IS
+    # "same lifetime as the plain-var twin".
+    ('value_choice', 'using_var'): ('VAC', []),
+    ('value_choice', 'await_using_var'): ('VAC', []),
+    ('value_choice', 'explicit_dispose'): ('REJ', 'Dispose'),
+    ('value_choice', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('value_choice', 'copy_local_source'): ('VAC', []),
+    ('value_choice', 'copy_const_source'): ('VAC', []),
+    ('value_choice', 'copy_param_source'): ('VAC', []),
+    ('value_choice', 'field_store'): None,
+
+    # §35.4: an owning choice's active case's `owned` payload IS disposed at
+    # scope end; and §28.10: "Where `x` is a local of move-only value type ...
+    # the unmarked form **adopts**" -- so the copy of a move-only local is
+    # ADMITTED and carries the payload to the copy's scope end (the source is
+    # left moved-from).
+    ('owning_choice', 'using_var'): ('RUN', ['DTOR']),
+    ('owning_choice', 'await_using_var'): ('RUN', ['DTOR']),
+    ('owning_choice', 'explicit_dispose'): ('REJ', 'Dispose'),
+    ('owning_choice', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('owning_choice', 'copy_local_source'): ('RUN', ['DTOR']),
+    # §21.1: a move-only value is REJECTED as a `const` initializer.
+    ('owning_choice', 'copy_const_source'): ('REJ', 'using var'),
+    # §15.3: "parameter passing is by value-move" -- the callee owns the value
+    # and the unmarked copy adopts it.
+    ('owning_choice', 'copy_param_source'): ('RUN', ['DTOR']),
+    ('owning_choice', 'field_store'): None,
+
+    # -- Object-declared ------------------------------------------------------
+    ('object_class', 'using_var'): ('RUN', ['DTOR']),
+    # §28.12: "`await using var` takes §28.10's admission unchanged". §28.10's
+    # "Adopting a named owned binding" rejection needs a CLASS or INTERFACE
+    # declared type; `s` is declared `Object`, which is neither (§8.7), so the
+    # binding is a BORROW-PIN and the program is ADMITTED -- exactly as the
+    # plain `using var` twin of the same program is. The two spellings must
+    # agree; today the `await using` spelling REJECTS the program the plain
+    # spelling admits.
+    ('object_class', 'await_using_var'): ('RUN', ['DTOR']),
+    # §8.7: "`Dispose()` is class-only ... On `Object` ... the name resolves to no
+    # member, so a call in any spelling ... [is a] compile error".
+    ('object_class', 'explicit_dispose'): ('REJ', 'no member `Dispose`'),
+    ('object_class', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('object_class', 'copy_local_source'): ('RUN', ['DTOR']),
+    ('object_class', 'copy_const_source'): ('RUN', ['DTOR']),
+    ('object_class', 'copy_param_source'): ('RUN', ['DTOR']),
+    ('object_class', 'field_store'): None,
+
+    ('object_string', 'using_var'): ('TWIN', []),
+    ('object_string', 'await_using_var'): ('TWIN', []),
+    ('object_string', 'explicit_dispose'): ('REJ', 'Dispose'),
+    ('object_string', 'explicit_dispose_async'): ('REJ', 'Dispose'),
+    ('object_string', 'copy_local_source'): ('TWIN', []),
+    ('object_string', 'copy_const_source'): ('TWIN', []),
+    ('object_string', 'copy_param_source'): ('TWIN', []),
+    ('object_string', 'field_store'): None,
+
+    # -- Type token (typeof is deferred) --------------------------------------
+    ('type_token', 'using_var'): ('REJ', 'reflection is not yet implemented'),
+    ('type_token', 'await_using_var'): ('REJ', 'reflection is not yet implemented'),
+    ('type_token', 'explicit_dispose'): ('REJ', 'reflection is not yet implemented'),
+    ('type_token', 'explicit_dispose_async'): ('REJ', 'reflection is not yet implemented'),
+    ('type_token', 'copy_local_source'): ('REJ', 'reflection is not yet implemented'),
+    ('type_token', 'copy_const_source'): ('REJ', 'reflection is not yet implemented'),
+    ('type_token', 'copy_param_source'): ('REJ', 'reflection is not yet implemented'),
+    ('type_token', 'field_store'): ('REJ', 'reflection is not yet implemented'),
+
+    # -- built-in collection --------------------------------------------------
+    # A collection literal is an owned producer (§28.3's producers table), so a
+    # `using var` over one draws NO §28.9 vacuity warning.
+    ('builtin_collection', 'using_var'): ('NOVAC', []),
+    ('builtin_collection', 'await_using_var'): ('NOVAC', []),
+    ('builtin_collection', 'explicit_dispose'): ('NOVAC', []),
+    ('builtin_collection', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    ('builtin_collection', 'copy_local_source'): ('REJ', 'using var'),
+    ('builtin_collection', 'copy_const_source'): ('REJ', 'using var'),
+    ('builtin_collection', 'copy_param_source'): ('NOVAC', []),
+    ('builtin_collection', 'field_store'): ('NOVAC', []),
+
+    # -- built-in collection LITERAL -----------------------------------------
+    # A collection literal is an OWNED PRODUCER (§28.3's producers table), so a
+    # `using var` over one draws NO §28.9 vacuity warning -- the corpus case
+    # s28_10_0016 (#7092) says the compiler draws one anyway.
+    ('collection_literal', 'using_var'): ('NOVAC', []),
+    ('collection_literal', 'await_using_var'): ('NOVAC', []),
+    ('collection_literal', 'explicit_dispose'): ('NOVAC', []),
+    ('collection_literal', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    ('collection_literal', 'copy_local_source'): ('REJ', 'using var'),
+    ('collection_literal', 'copy_const_source'): ('REJ', 'using var'),
+    ('collection_literal', 'copy_param_source'): ('NOVAC', []),
+    ('collection_literal', 'field_store'): ('NOVAC', []),
+
+    # -- Task -----------------------------------------------------------------
+    ('task', 'using_var'): ('NOVAC', []),
+    ('task', 'await_using_var'): ('NOVAC', []),
+    ('task', 'explicit_dispose'): ('NOVAC', []),
+    ('task', 'explicit_dispose_async'): ('REJ', 'DisposeAsync'),
+    ('task', 'copy_local_source'): ('NOVAC', []),
+    ('task', 'copy_const_source'): ('NOVAC', []),
+    ('task', 'copy_param_source'): ('NOVAC', []),
+    ('task', 'field_store'): ('NOVAC', []),
+}
+
+# The `await using` spelling of the copy takes §28.10's admission UNCHANGED
+# (§28.12), so it has the SAME expectation as the plain copy -- and its own
+# defect (#7374: the await spelling is admitted but never armed, so the copy's
+# reference is never released). The entries are derived, not re-typed, so the
+# two spellings can never drift apart.
+for _h in list(HEADS):
+    if (_h, 'copy_local_source') in EXPECT:
+        EXPECT[(_h, 'copy_await_source')] = EXPECT[(_h, 'copy_local_source')]
+
+# Cells that are red TODAY because a NAMED issue is still open. The issue is
+# the one that owns the fix; a cell whose red is attributable to it is
+# reported as KNOWN-RED and is not counted as WRONG. The grid's DONE criterion
+# is "no WRONG cell".
+KNOWN_RED = {
+    # (head, form) -> (issue, needle): the cell is red TODAY because the named
+    # issue is still open, and the red LOOKS like `needle`. A red that does not
+    # carry the needle is a DIFFERENT defect and is counted WRONG.
+    ('value_choice', 'await_using_var'): ('#7374', 'LEAK'),
+    ('value_choice', 'copy_await_source'): ('#7374', 'LEAK'),
+    ('value_choice', 'copy_local_source'): ('#7316', 'LEAK'),
+    ('value_choice', 'copy_const_source'): ('#7316', 'LEAK'),
+    ('value_choice', 'copy_param_source'): ('#7357', 'LEAK'),
+}
+
+# ---------------------------------------------------------------------------
+# Program construction
+# ---------------------------------------------------------------------------
+
+
+def _bind(ty, rhs, form):
+    """The binding statement(s) for a form. Returns a list of source lines."""
+    ann = f': {ty}' if ty else ''
+    if form == 'using_var':
+        return [f'    using var x{ann} := {rhs};']
+    if form == 'await_using_var':
+        return [f'    await using var x{ann} := {rhs};']
+    if form == 'explicit_dispose':
+        return [f'    var x{ann} := {rhs};', '    x.Dispose();']
+    if form == 'explicit_dispose_async':
+        return [f'    var x{ann} := {rhs};', '    await x.DisposeAsync();']
+    if form == 'copy_local_source':
+        return [f'    var src{ann} := {rhs};', '    using var x := src;']
+    if form == 'copy_await_source':
+        return [f'    var src{ann} := {rhs};', '    await using var x := src;']
+    if form == 'copy_const_source':
+        return [f'    const src{ann} := {rhs};', '    using var x := src;']
+    if form == 'field_store':
+        return ['    var h := new Holder();', f'    h.F := {rhs};']
+    raise KeyError(form)
+
+
+def modname(head, form):
+    """A unique module name per program: the AOT bincache and the link step
+    both key on the module name, so two programs sharing one would collide."""
+    return 'G' + ''.join(ch if ch.isalnum() else '_' for ch in f'{head}_{form}')
+
+
+def _wrap_loop(lines, n=LOOP_N):
+    """Put the binding lines inside a counting loop.
+
+    THE LEAK ORACLE. A one-shot LSan repro is vacuous (the dead frame's stale
+    pointer reads as a root), so every cell that can make a leak claim loops.
+    """
+    inner = [ln.replace('    ', '      ') for ln in lines]
+    return (['    var i := 0;', f'    while i < {n} do'] + inner +
+            ['      i := i + 1;', '    end;'])
+
+
+def _loop_body(setup, lines, n=LOOP_N):
+    """The loop body: the head's SETUP and the binding, one iteration each.
+
+    The setup lives INSIDE the loop so that every iteration builds a FRESH
+    right-hand side: a head whose source is consumed (`move osrc`) or whose
+    value is a per-iteration allocation needs one per iteration for the leak
+    accounting to mean anything.
+    """
+    inner = []
+    if setup:
+        inner.extend(setup.rstrip('\n').split('\n'))
+    inner.extend(lines)
+    return _wrap_loop(inner, n)
+
+
+def _param_source_program(head, ty, rhs, extra, setup):
+    """The `copy_param_source` program: the copy's SOURCE is a PARAMETER.
+
+    The callee receives the value as a plain parameter -- a BORROW, so the
+    callee's `using var x := src;` is a borrow-pin and disposes nothing
+    (§28.10's "`using var` initialized from a borrow"). The caller keeps the
+    obligation and disposes the value itself, so the destructor (if any) runs
+    in the caller.
+
+    A class-typed head's caller-side disposal is spelled `src.Dispose();`; an
+    `Object`-declared head's is the scope-end auto-disposal (§8.7: `Object` has
+    no `Dispose` member); a move-only head's is the callee's, because a
+    move-only value is passed BY VALUE-MOVE (§15.3).
+    """
+    label, _, _, _, ptype = HEADS[head]
+    call = 'Take(src);'
+    dispose = ''
+    if head in ('class', 'class_async', 'derived_base', 'interface',
+                'abstract', 'builtin_collection'):
+        dispose = 'src.Dispose();'
+    elif head == 'owning_choice':
+        # The value is move-only: it is passed BY VALUE-MOVE (§15.3), so the
+        # callee owns it and disposes it; the caller must not.
+        call = 'Take(move src);'
+    src_decl = f'var src{": " + ty if ty else ""} := {rhs};'
+    lines = [src_decl, call] + ([dispose] if dispose else [])
+    body = _loop_body(setup, lines)
+    decls = PRELUDE + extra
+    decls += (f'public class Program\n'
+              f'  public static method Take({PARAM_DECL[head]})\n'
+              f'    using var x := src;\n'
+              f'  end Take;\n'
+              f'  public static async method Main(): Task\n'
+              + '\n'.join(body) + '\n'
+              '    Console.WriteLine("END");\n'
+              '  end Main;\n'
+              'end Program;\n')
+    return ('module ' + modname(head, 'copy_param_source') + ';\n' + decls)
+
+
+def _generic_param_program(head):
+    """The `copy_param_source` program for a monomorphized head: the whole
+    thing lives inside the wrapper, because the call site's type is the
+    substituted type."""
+    cls = GENERIC_CLASS[head]
+    call = GENERIC_CALL[head].replace('await ', '').replace('.Run()', '.Take()')
+    call = call.strip()
+    decls = PRELUDE
+    decls += (f'public class {cls}<T> where T: new()\n'
+              '  public static method Take()\n'
+              '    var i := 0;\n'
+              f'    while i < {LOOP_N} do\n'
+              '      var src := new T();\n'
+              '      Inner(src);\n'
+              '      i := i + 1;\n'
+              '    end;\n'
+              '  end Take;\n'
+              '  public static method Inner(src: T)\n'
+              '    using var x := src;\n'
+              '  end Inner;\n'
+              f'end {cls};\n')
+    body = [call, '    Console.WriteLine("END");']
+    return ('module ' + modname(head, 'copy_param_source') + ';\n' +
+            GENERIC_DECL.get(head, '') + decls +
+            'public class Program\n'
+            '  public static async method Main(): Task\n' +
+            '\n'.join(body) + '\n'
+            '  end Main;\n'
+            'end Program;\n')
+
+
+def build(head, form):
+    """-> (source, expectation) for a cell, or None when the cell is not
+    applicable (the form does not exist for that head)."""
+    if (head, form) not in EXPECT:
+        return None
+    if form == 'field_store' and head not in FIELD_HOLDER:
+        return None
+    label, ty, rhs, extra = HEADS[head][0], HEADS[head][1], HEADS[head][2], HEADS[head][3]
+    setup = HEAD_SETUP.get(head, '')
+    decls = PRELUDE + extra
+    expect = EXPECT[(head, form)]
+    if form == 'copy_param_source':
+        if head in GENERIC_CLASS:
+            return _generic_param_program(head), expect
+        return _param_source_program(head, ty, rhs, extra, setup), expect
+    if head in GENERIC_CALL:
+        # The binding under test lives inside the monomorphized wrapper; the
+        # program body is the call. The wrapper's method is async so that the
+        # `await using var` form is admitted (§28.12's validity restriction).
+        cls = GENERIC_CLASS[head]
+        lines = _bind(ty, rhs, form)
+        wrapper = (f'public class {cls}<T> where T: new()\n'
+                   '  public static async method Run(): Task\n' +
+                   '\n'.join(_wrap_loop(lines)) + '\n'
+                   '    Console.WriteLine("body");\n'
+                   '  end Run;\n'
+                   f'end {cls};\n')
+        decls += wrapper
+        body = [GENERIC_CALL[head], '    Console.WriteLine("END");']
+        src = ('module ' + modname(head, form) + ';\n' + GENERIC_DECL.get(head, '') + decls +
+               'public class Program\n'
+               '  public static async method Main(): Task\n' +
+               '\n'.join(body) + '\n'
+               '  end Main;\n'
+               'end Program;\n')
+        return src, expect
+    body = []
+    lines = _bind(ty, rhs, form)
+    outside = setup if head in SETUP_OUTSIDE_LOOP else ''
+    inside = '' if head in SETUP_OUTSIDE_LOOP else setup
+    if outside:
+        body.extend(outside.rstrip('\n').split('\n'))
+    if expect is None or expect[0] != 'REJ':
+        # Every cell that can make a leak claim loops, and the head's setup
+        # lives inside the loop so that every iteration builds a fresh
+        # right-hand side.
+        body.extend(_loop_body(inside, lines))
+    else:
+        if inside:
+            body.extend(inside.rstrip('\n').split('\n'))
+        body.extend(lines)
+    if head == 'task':
+        # the Task head needs a TaskCompletionSource and a completed result
+        body.append('    _ := tcs.TrySetResult(77);')
+    body.append('    Console.WriteLine("END");')
+    if form == 'field_store':
+        decls += FIELD_HOLDER.get(head, '')
+    src = ('module ' + modname(head, form) + ';\n' + decls +
+           'public class Program\n'
+           '  public static async method Main(): Task\n' +
+           '\n'.join(body) + '\n'
+           '  end Main;\n'
+           'end Program;\n')
+    return src, expect
+
+
+def build_twin(head):
+    """The plain-`var` twin of a head's binding: the same setup, the same
+    right-hand side, but the plain `var` spelling. §28.10 makes the `using var`
+    spelling's RUNTIME LIFETIME the same as this twin's, so a cell's
+    "must not leak" claim is equivalent to "same lifetime as this twin" when
+    the twin is CLEAN. The twin's class is measured per head by `--twins`."""
+    label, ty, rhs, extra = HEADS[head][0], HEADS[head][1], HEADS[head][2], HEADS[head][3]
+    if head in GENERIC_CLASS:
+        cls = GENERIC_CLASS[head]
+        decls = PRELUDE
+        decls += (f'public class {cls}<T> where T: new()\n'
+                  '  public static async method Run(): Task\n'
+                  f'    var x := new T();\n'
+                  '    Console.WriteLine("body");\n'
+                  '  end Run;\n'
+                  f'end {cls};\n')
+        body = [GENERIC_CALL[head], '    Console.WriteLine("END");']
+        return ('module ' + modname(head, 'twin') + ';\n' +
+                GENERIC_DECL.get(head, '') + decls +
+                'public class Program\n'
+                '  public static async method Main(): Task\n' +
+                '\n'.join(body) + '\n'
+                '  end Main;\n'
+                'end Program;\n')
+    setup = HEAD_SETUP.get(head, '')
+    ann = f': {ty}' if ty else ''
+    body = []
+    outside = setup if head in SETUP_OUTSIDE_LOOP else ''
+    inside = '' if head in SETUP_OUTSIDE_LOOP else setup
+    if outside:
+        body.extend(outside.rstrip('\n').split('\n'))
+    body.extend(_loop_body(inside, [f'    var x{ann} := {rhs};']))
+    if head == 'task':
+        body.append('    _ := tcs.TrySetResult(77);')
+    body.append('    Console.WriteLine("END");')
+    return ('module ' + modname(head, 'twin') + ';\n' + PRELUDE + extra +
+            'public class Program\n'
+            '  public static async method Main(): Task\n' +
+            '\n'.join(body) + '\n'
+            '  end Main;\n'
+            'end Program;\n')
+
+
+def all_cells(filt=None):
+    toks = [t for t in (filt or '').split(',') if t]
+    out = []
+    for h in HEADS:
+        for f, flabel in FORMS:
+            if toks and not any(t in f'{h} {flabel} {HEADS[h][0]}' for t in toks):
+                continue
+            out.append((h, f))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+LEAK_RE = re.compile(r'(\d+) byte\(s\) leaked in (\d+) allocation')
+GLIBC_RE = re.compile(r'free\(\): |double free|invalid pointer|corrupted')
+VACUOUS_RE = re.compile(r'is vacuous')
+DIAG_RE = re.compile(r'warning:|error:')
+
+
+def classify(compiled, rc, err):
+    if not compiled:
+        return CF, 'compile failed'
+    m = re.search(r'ERROR: AddressSanitizer: ([A-Za-z_-]+)', err)
+    if m:
+        return CRASH, m.group(1)
+    if GLIBC_RE.search(err):
+        return CRASH, 'glibc'
+    if 'ERROR: LeakSanitizer' in err:
+        lm = LEAK_RE.search(err)
+        b, a = (lm.group(1), lm.group(2)) if lm else ('?', '?')
+        return LEAK, f'{b}B/{a}'
+    if rc != 0:
+        return CRASH, f'rc={rc}'
+    return CLEAN, ''
+
+
+def compile_program(bezelc, odir, progdir, name, src, timeout):
+    """Compile one program. -> ('compiled'|'rejected'|'timeout', log)."""
+    prog = f'{progdir}/{name}.bzl'
+    with open(prog, 'w') as f:
+        f.write(src)
+    exe = f'{odir}/{name}.exe'
+    cmd = [bezelc, '--sanitize=address', '-o', exe, prog]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, errors='replace')
+    except subprocess.TimeoutExpired:
+        return 'timeout', 'compile timeout'
+    clog = p.stdout + p.stderr
+    with open(f'{odir}/{name}.clog', 'w') as f:
+        f.write(clog)
+    if p.returncode != 0:
+        return 'rejected', clog
+    return 'compiled', clog
+
+
+def run_exe(exe, odir, name, run_timeout):
+    """Run a compiled program. -> ('ran'|'timeout', class, detail, stdout)."""
+    try:
+        r = subprocess.run([exe], capture_output=True, text=True,
+                           timeout=run_timeout, errors='replace')
+    except subprocess.TimeoutExpired:
+        return 'timeout', TIMEOUT, 'run timeout', []
+    with open(f'{odir}/{name}.out', 'w') as f:
+        f.write(r.stdout)
+    with open(f'{odir}/{name}.err', 'w') as f:
+        f.write(r.stderr)
+    cls, det = classify(True, r.returncode, r.stderr)
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    return 'ran', cls, det, lines
+
+
+def run_cell(bezelc, odir, progdir, head, form, timeout, run_timeout, twins):
+    """One cell. -> (head, form, verdict, observed, detail)."""
+    built = build(head, form)
+    if built is None:
+        return head, form, 'N/A', 'not applicable', ''
+    src, expect = built
+    name = f'{head}__{form}'
+    status, clog = compile_program(bezelc, odir, progdir, name, src, timeout)
+    if status == 'timeout':
+        return head, form, 'TIMEOUT', 'compile timeout', ''
+    if expect is None:
+        # The spec does not decide this cell: RUN it and report what happens,
+        # so the ruling can be made against an observation.
+        if status != 'compiled':
+            first = next((ln for ln in clog.splitlines()
+                          if ln.strip() and 'warning' not in ln), '')
+            return head, form, 'UNDECIDED', f'rejected: {first[:120]}', ''
+        st, cls, det, lines = run_exe(f'{odir}/{name}.exe', odir, name, run_timeout)
+        if st != 'ran':
+            return head, form, 'UNDECIDED', 'run timeout (hang)', ''
+        return head, form, 'UNDECIDED', f'{cls} {det} output {lines[:6]}', ''
+    if expect[0] == 'REJ':
+        if status == 'compiled':
+            return head, form, 'WRONG', 'compiled, expected rejection', clog[:400]
+        needle = expect[1]
+        if needle not in clog:
+            first = next((ln for ln in clog.splitlines()
+                          if ln.strip() and 'warning' not in ln), '')
+            return head, form, 'WRONG', f'rejected, but no {needle!r} in the diagnostic', first
+        return head, form, 'OK', f'rejected ({needle})', ''
+    if status != 'compiled':
+        first = next((ln for ln in clog.splitlines()
+                      if ln.strip() and 'warning' not in ln), '')
+        return head, form, 'WRONG', 'rejected, expected a run', first
+    st, cls, det, lines = run_exe(f'{odir}/{name}.exe', odir, name, run_timeout)
+    if st != 'ran':
+        return head, form, 'WRONG', 'run timeout (hang)', ''
+    if cls == CRASH:
+        return head, form, 'WRONG', f'{cls}: {det}', lines[:4]
+    if expect[0] == 'TWIN':
+        # §28.10: the `using var` spelling's RUNTIME LIFETIME must be the
+        # plain-`var` twin's. The twin's class is the reference.
+        tcls, tdet = twins.get(head, ('?', '?'))
+        if cls != tcls:
+            return head, form, 'WRONG', (
+                f'leak {cls}:{det} != the plain-var twin\'s {tcls}:{tdet}'), ''
+    elif cls != CLEAN:
+        return head, form, 'WRONG', f'{cls}: {det}', lines[:4]
+    if 'END' not in lines:
+        return head, form, 'WRONG', 'the program did not reach its END marker', lines[:4]
+    lines = [ln for ln in lines if ln != 'END']
+    want = list(expect[1])
+    tail = list(expect[2]) if len(expect) > 2 else []
+    # The loop prints the per-iteration markers LOOP_N times; the tail lines
+    # come after the loop.
+    want_full = want * LOOP_N + tail
+    if lines != want_full:
+        got = lines[:6]
+        return head, form, 'WRONG', f'output {got} != expected {want_full[:6]}', ''
+    if expect[0] == 'VAC' and not VACUOUS_RE.search(clog):
+        return head, form, 'WRONG', 'no §28.9 vacuity warning in the compile log', ''
+    if expect[0] == 'NOVAC' and VACUOUS_RE.search(clog):
+        return head, form, 'WRONG', 'a §28.9 vacuity warning was emitted where none is due', ''
+    return head, form, 'OK', f'clean, output {want}', ''
+
+
+def measure_twins(bezelc, odir, progdir, timeout, run_timeout):
+    """Measure each head's plain-`var` twin. The twin's class is the reference
+    §28.10's "the only effect is the reassignability restriction" is measured
+    against: a cell's "must not leak" claim is equivalent to "same lifetime as
+    the twin" exactly when the twin is CLEAN. The twins are also a finding in
+    their own right: a twin that LEAKS is an `Object`-slot retention the
+    `using var` spelling inherits."""
+    out = {}
+    for h in HEADS:
+        name = f'{h}__twin'
+        status, clog = compile_program(bezelc, odir, progdir, name,
+                                       build_twin(h), timeout)
+        if status != 'compiled':
+            out[h] = ('CF', 'compile failed')
+            continue
+        st, cls, det, lines = run_exe(f'{odir}/{name}.exe', odir, name, run_timeout)
+        if st != 'ran':
+            out[h] = ('TIMEOUT', 'run timeout')
+            continue
+        out[h] = (cls, det)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--bezelc', default='build/bezelc')
+    ap.add_argument('--out', default='/var/tmp/bezel-scratch/using-heads-grid')
+    ap.add_argument('--filter', default='')
+    ap.add_argument('--jobs', type=int, default=8)
+    ap.add_argument('--timeout', type=int, default=60)
+    ap.add_argument('--run-timeout', type=int, default=120)
+    ap.add_argument('--report', default='')
+    ap.add_argument('--twins', action='store_true',
+                    help='also measure each head\'s plain-var twin')
+    args = ap.parse_args()
+
+    bezelc = os.path.abspath(args.bezelc)
+    if not os.path.exists(bezelc):
+        print(f'using_heads_grid: no compiler at {bezelc}', file=sys.stderr)
+        return 2
+    cells = all_cells(args.filter)
+    if not cells:
+        print('using_heads_grid: no cells match the filter', file=sys.stderr)
+        return 2
+    odir = os.path.join(args.out, 'run')
+    progdir = os.path.join(args.out, 'programs')
+    os.makedirs(odir, exist_ok=True)
+    os.makedirs(progdir, exist_ok=True)
+
+    twins = measure_twins(bezelc, odir, progdir, args.timeout, args.run_timeout)
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        futs = [ex.submit(run_cell, bezelc, odir, progdir, h, f,
+                          args.timeout, args.run_timeout, twins) for h, f in cells]
+        for fut in futs:
+            results.append(fut.result())
+    order = {c: i for i, c in enumerate(cells)}
+    results.sort(key=lambda r: order[(r[0], r[1])])
+
+    wrong = known_red = ok = undecided = na = skipped = 0
+    rows = []
+    for head, form, verdict, observed, detail in results:
+        if verdict == 'WRONG':
+            known = KNOWN_RED.get((head, form))
+            if known and (known[1] in observed or known[1] in detail):
+                verdict = 'KNOWN-RED'
+                observed = f'{observed} [{known[0]}]'
+        if verdict == 'OK':
+            ok += 1
+        elif verdict == 'WRONG':
+            wrong += 1
+        elif verdict == 'KNOWN-RED':
+            known_red += 1
+        elif verdict == 'UNDECIDED':
+            undecided += 1
+        elif verdict == 'N/A':
+            na += 1
+        elif verdict == 'TIMEOUT':
+            skipped += 1
+        rows.append((head, form, verdict, observed, detail))
+
+    for head, form, verdict, observed, detail in rows:
+        print(f'{verdict:10s} {head:20s} {form:22s} {observed}')
+    total = len(rows)
+    print(f'{total} cells: {ok} ok, {wrong} wrong, {known_red} known-red, '
+          f'{undecided} undecided, {na} n/a, {skipped} skipped')
+    print(f'NATIVE SANITIZER: {skipped} check(s) skipped')
+
+    if args.twins:
+        print('plain-var twins:')
+        for h in HEADS:
+            cls, det = twins.get(h, ('?', '?'))
+            print(f'  {h:24s} {cls} {det}')
+
+    if args.report:
+        with open(args.report, 'w') as f:
+            f.write('head\tform\tverdict\tobserved\tdetail\n')
+            for head, form, verdict, observed, detail in rows:
+                f.write(f'{head}\t{form}\t{verdict}\t{observed}\t{detail}\n')
+        print(f'report written to {args.report}')
+    return 1 if wrong else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
