@@ -591,7 +591,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 303> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 305> kBuiltinParams = {{
     {"string", "From", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"string", "From", 3, 3, 0x00, {"buffer", "start", "length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"string", "FromCStringPointer", 1, 1, 0x00, {"p", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
@@ -633,12 +633,31 @@ constexpr std::array<BuiltinParamRow, 303> kBuiltinParams = {{
     {"Encoding", "GetBytes", 2, 2, 0x00, {"s", "destination", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Encoding", "GetString", 1, 1, 0x00, {"bytes", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Encoding", "GetByteCount", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"StringBuilder", "Append", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"StringBuilder", "AppendLine", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"StringBuilder", "AppendFormat", 2, 2, 0x01, {"format", "args", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"StringBuilder", "Insert", 2, 2, 0x02, {"index", "value", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"StringBuilder", "Remove", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"StringBuilder", "Replace", 2, 2, 0x03, {"oldValue", "newValue", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #7207-fold (stdlib §3.1, v0.345): the §3.1 `StringBuilder`
+    // surface lives HERE — in the ONE declared-signature table — and not in
+    // a second parallel table. Before the fold these six rows carried only
+    // the §22.5 NAMES, and the declared KINDS and SIGNATURES the diagnostic
+    // quotes lived in a separate eight-row table inside the checker; the
+    // two could drift (the `AppendLine()` and `Clear()` forms §3.1 declares
+    // were in the checker only, and absent here).
+    //
+    // `kinds[p]` is the declared parameter TYPE (§5.1). §3.1 declares
+    // `Append(value: string)` among SEVEN overloads (`string` / `char` /
+    // `Object` / `bool` / the numeric primitives / `ReadOnlyStringSpan`), so
+    // that position carries NO type opinion (`0`) — a table that has not
+    // transcribed a position costs a rejection that does not fire, never a
+    // false one. `AppendFormat`'s SECOND position declares
+    // `args: Array<Object>`, and the kind vocabulary has no ARRAY bit, so
+    // that one position is checked by the checker itself, keyed by the
+    // member.
+    {"StringBuilder", "Append", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Append(value: string): StringBuilder"},
+    {"StringBuilder", "AppendLine", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(): StringBuilder"},
+    {"StringBuilder", "AppendLine", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(value: string): StringBuilder"},
+    {"StringBuilder", "AppendFormat", 2, 2, 0x01, {"format", "args", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "AppendFormat(format: string, args: Array<Object>): StringBuilder"},
+    {"StringBuilder", "Insert", 2, 2, 0x02, {"index", "value", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Insert(index: int, value: string): StringBuilder"},
+    {"StringBuilder", "Remove", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {kBPTInt, kBPTInt, 0, 0, 0, 0, 0, 0}, "Remove(startIndex: int, length: int): StringBuilder"},
+    {"StringBuilder", "Replace", 2, 2, 0x03, {"oldValue", "newValue", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, "Replace(oldValue: string, newValue: string): StringBuilder"},
+    {"StringBuilder", "Clear", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Clear(): StringBuilder"},
     {"Math", "Abs", 1, 1, 0x01, {"x", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Abs(x: int): int"},
     {"Math", "Abs", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTLong, 0, 0, 0, 0, 0, 0, 0}, "Abs(x: long): long"},
     {"Math", "Abs", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "Abs(x: double): double"},

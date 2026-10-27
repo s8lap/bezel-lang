@@ -21401,53 +21401,29 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
 //     this one (and one this check does not open).
 namespace {
 
-// The declared parameter kind at one position of a §3.1 form.
-enum class StringBuilderParamKind {
-    Unchecked,    // §3.1's declared type admits the argument as it stands
-    String,       // §3.1 declares `string`
-    Int,          // §3.1 declares `int`
-    ObjectArray,  // §3.1 declares `Array<Object>`
-};
+// The DECLARED FORMS of a §3.1 member live in the ONE table —
+// `common::kBuiltinParams`, the same table every other built-in head is
+// admitted by. A row carries the member, the ARITY of the form, the §22.5
+// parameter NAMES, the declared parameter KIND at each position, and the
+// DECLARED SIGNATURE the diagnostic quotes — so the surface, the names and
+// the kinds cannot drift apart.
+//
+// ONE position's kind does not fit that table's kind vocabulary: §3.1
+// declares `AppendFormat(format: string, args: Array<Object>)`, and the
+// vocabulary names the scalar and reference kinds only — it has no bit for
+// an ARRAY (the same gap §9.6's `Split(separators: Array<char>)` has). That
+// one position keeps its own check below, keyed by the member.
 
-// One declared form of one §3.1 member: the member, the arity that form
-// takes, the declared parameter kind at each of its (at most two) positions,
-// and the declared signature, quoted in the diagnostic.
-struct BuiltinStringBuilderSurfaceRow {
-    std::string_view member;
-    unsigned arity;
-    StringBuilderParamKind param0;
-    StringBuilderParamKind param1;
-    std::string_view decl;
-};
-
-// §3.1's listing, transcribed. The rows are the DECLARED forms, one per
-// arity per member (a member with two declared arities — `AppendLine` —
-// carries two rows).
-const std::vector<BuiltinStringBuilderSurfaceRow>& builtinStringBuilderSurface() {
-    static const std::vector<BuiltinStringBuilderSurfaceRow> kRows = {
-        {"Append", 1, StringBuilderParamKind::Unchecked,
-         StringBuilderParamKind::Unchecked,
-         "`Append(value: string): StringBuilder` and its per-type overloads"},
-        {"AppendLine", 0, StringBuilderParamKind::Unchecked,
-         StringBuilderParamKind::Unchecked, "`AppendLine(): StringBuilder`"},
-        {"AppendLine", 1, StringBuilderParamKind::Unchecked,
-         StringBuilderParamKind::Unchecked,
-         "`AppendLine(value: string): StringBuilder`"},
-        {"AppendFormat", 2, StringBuilderParamKind::String,
-         StringBuilderParamKind::ObjectArray,
-         "`AppendFormat(format: string, args: Array<Object>): StringBuilder`"},
-        {"Insert", 2, StringBuilderParamKind::Int,
-         StringBuilderParamKind::Unchecked,
-         "`Insert(index: int, value: string): StringBuilder`"},
-        {"Remove", 2, StringBuilderParamKind::Int, StringBuilderParamKind::Int,
-         "`Remove(startIndex: int, length: int): StringBuilder`"},
-        {"Replace", 2, StringBuilderParamKind::String,
-         StringBuilderParamKind::String,
-         "`Replace(oldValue: string, newValue: string): StringBuilder`"},
-        {"Clear", 0, StringBuilderParamKind::Unchecked,
-         StringBuilderParamKind::Unchecked, "`Clear(): StringBuilder`"},
-    };
-    return kRows;
+// The DECLARED SIGNATURE of a §3.1 form, as the diagnostic quotes it:
+// "`Replace(oldValue: string, newValue: string): StringBuilder`".
+static std::string builtinStringBuilderDecl(std::string_view member,
+                                             const common::BuiltinParamForm& f) {
+    std::string decl = "`" + std::string(f.sig) + "`";
+    // §3.1 declares SEVEN `Append` overloads (`value: string` / `char` /
+    // `Object` / `bool` / the numeric primitives / `ReadOnlyStringSpan`); the
+    // table carries the `string` form, and the message notes the rest.
+    if (member == "Append") decl += " and its per-type overloads";
+    return decl;
 }
 
 }  // namespace
@@ -21470,11 +21446,12 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
     if (recvTy->headName() != "StringBuilder") return;
     // The member must be ON the declared surface; a member that is not is
     // the #2457 backstop's business (it rejects it, at codegen, with the
-    // diagnostic that names the rule).
-    const auto& surface = builtinStringBuilderSurface();
-    std::vector<const BuiltinStringBuilderSurfaceRow*> forms;
-    for (const auto& row : surface)
-        if (row.member == member) forms.push_back(&row);
+    // diagnostic that names the rule). The declared forms are read from the
+    // ONE table (`common::kBuiltinParams`) — the same rows every other
+    // built-in head is admitted by.
+    const std::vector<common::BuiltinParamForm> forms =
+        common::builtinParamForms("StringBuilder", member,
+                                  common::kBuiltinAnyArity);
     if (forms.empty()) return;
     // fix #7173 (§14.5, v0.345): an explicit type-argument list on a §3.1
     // member — none of them declares a type parameter, so any list is a
@@ -21488,17 +21465,17 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
     }
     // §22.5 / §22.6: a call that matches NO declared form is a compile
     // error. The diagnostic names the arity §3.1 declares.
-    const BuiltinStringBuilderSurfaceRow* form = nullptr;
-    for (const auto* f : forms)
-        if (f->arity == ce.args.size()) { form = f; break; }
+    const common::BuiltinParamForm* form = nullptr;
+    for (const auto& f : forms)
+        if (f.total == ce.args.size()) { form = &f; break; }
     if (!form) {
         std::string decls;
         std::string expectation;
-        for (const auto* f : forms) {
+        for (const auto& f : forms) {
             if (!decls.empty()) decls += " / ";
-            decls += std::string(f->decl);
+            decls += builtinStringBuilderDecl(member, f);
             if (!expectation.empty()) expectation += " or ";
-            expectation += std::to_string(f->arity);
+            expectation += std::to_string(f.total);
         }
         if (forms.size() == 1) expectation = "exactly " + expectation;
         expectation += " argument(s)";
@@ -21541,9 +21518,15 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
         for (std::size_t i = 0; i < ce.args.size(); ++i)
             paramToArg.push_back(static_cast<int>(i));
     }
-    const StringBuilderParamKind kinds[2] = {form->param0, form->param1};
     for (std::size_t p = 0; p < 2; ++p) {
-        if (kinds[p] == StringBuilderParamKind::Unchecked) continue;
+        // §3.1 declares `args: Array<Object>` at `AppendFormat`'s SECOND
+        // position — the one kind the table's vocabulary cannot express (it
+        // names the scalar and reference kinds only).
+        const bool objectArrayPosition = (member == "AppendFormat" && p == 1);
+        const std::uint32_t kind =
+            (!objectArrayPosition && p < form->kinds.size()) ? form->kinds[p]
+                                                              : 0u;
+        if (!objectArrayPosition && kind == 0) continue;  // no type opinion
         if (p >= paramToArg.size()) continue;
         const int ai = paramToArg[p];
         if (ai < 0 || static_cast<std::size_t>(ai) >= ce.args.size()) continue;
@@ -21561,7 +21544,7 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
                 ? std::string("argument to `StringBuilder.") + std::string(member) + "`"
                 : std::string("argument `") + paramName + "` to `StringBuilder." +
                       std::string(member) + "`";
-        if (kinds[p] == StringBuilderParamKind::ObjectArray) {
+        if (objectArrayPosition) {
             // §3.1 declares `args: Array<Object>` — an array of objects, and
             // only that: a class type is INVARIANT (§12.9), so `Array<int>` is
             // not an `Array<Object>`. Anything else (an `Object`, an `int`)
@@ -21577,9 +21560,10 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
                 ctx_.diagnostics().report(
                     Severity::Error, arg.value->span.begin,
                     "no matching overload of `StringBuilder.AppendFormat` — "
-                    "stdlib §3.1 declares `AppendFormat(format: string, args: "
-                    "Array<Object>): StringBuilder`, so the `args` argument "
-                    "must be an `Array<Object>` (stdlib §3.1; §5.1)");
+                    "stdlib §3.1 declares " +
+                        builtinStringBuilderDecl(member, *form) +
+                        ", so the `args` argument "
+                        "must be an `Array<Object>` (stdlib §3.1; §5.1)");
             }
             continue;
         }
@@ -21593,12 +21577,12 @@ void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
                                                static_cast<int>(p)))
             continue;
         const PrimitiveType declared =
-            kinds[p] == StringBuilderParamKind::String ? PrimitiveType::String
-                                                        : PrimitiveType::Int;
+            kind == common::kBPTInt ? PrimitiveType::Int : PrimitiveType::String;
         checkAssignable(
             argTy, ctx_.primitiveTypeRef(declared, /*nullable=*/false),
             arg.value->span.begin,
-            what + " (stdlib §3.1 declares " + std::string(form->decl) + ")",
+            what + " (stdlib §3.1 declares " +
+                builtinStringBuilderDecl(member, *form) + ")",
             arg.value.get());  // §5.1 / §7.4 (#1191) — narrowing-aware
     }
 }
