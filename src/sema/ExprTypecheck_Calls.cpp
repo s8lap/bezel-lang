@@ -6348,7 +6348,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // lowered.
             if (recvPt == PrimitiveType::String && mm == "Join" &&
                 ce.args.size() == 2) {
-                std::size_t sepArgIdx = 0;  // parameter 0 is `separator`
+                std::size_t sepArgIdx = 0;   // parameter 0 is `separator`
+                std::size_t itemsArgIdx = 1; // parameter 1 is `items`
                 for (const auto& f : common::builtinParamNameCandidates(
                          tid->name, "Join", ce.args.size())) {
                     BindResult br = bindArgsToParams(
@@ -6357,11 +6358,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         /*emit=*/false);
                     if (!br.ok) continue;  // not this overload's binding
                     for (std::size_t p = 0; p < f.names.size(); ++p) {
-                        if (f.names[p] != "separator") continue;
                         const int src = br.paramToArg[p];
-                        if (src >= 0 &&
-                            static_cast<std::size_t>(src) < ce.args.size())
+                        if (src < 0 ||
+                            static_cast<std::size_t>(src) >= ce.args.size())
+                            continue;
+                        if (f.names[p] == "separator")
                             sepArgIdx = static_cast<std::size_t>(src);
+                        else if (f.names[p] == "items")
+                            itemsArgIdx = static_cast<std::size_t>(src);
                     }
                     break;
                 }
@@ -6376,6 +6380,68 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             sepArg.value->span.begin,
                             "separator argument to `string.Join`",
                             sepArg.value.get());  // §5.1 / §7.4
+                    }
+                }
+                // fix #7167 / #7198 (stdlib §9.6, §5.1, §12.9, v0.344): the
+                // ITEMS parameter — the other half of `string.Join`.
+                //
+                // stdlib §9.6 declares
+                //   public static method Join(separator: string, items: IEnumerable<string>): string;
+                // so `items` takes an `IEnumerable<string>`. §5.1's table
+                // lists no implicit conversion into one from an `Array<int>`
+                // or from a `string`: §4.6 makes a `string` an
+                // `IEnumerable<char>`, never an `IEnumerable<string>`, and
+                // §4.4 makes an `Array<T>` an `IEnumerable<T>` — with the
+                // element type it names, not a different one.
+                //
+                // The #7150 gate above covered the SEPARATOR only, so the
+                // call was HALF-gated: the items slot was never checked, and
+                // an ill-typed value reached the lowering, where the items
+                // are materialised as 8-byte pointer elements — so an
+                // `Array<int>` was read past the end of its allocation (the
+                // ASan heap-buffer-overflow READ #7167 measured) and a
+                // `string` was read as a pointer to a `bz_string` header that
+                // is not one.
+                //
+                // The check is a §5.1 ASSIGNABILITY check against the
+                // DECLARED parameter type, so the whole §5.1/§12.9 machinery
+                // decides it: an `Array<string>` is an `IEnumerable<string>`
+                // (§4.4) and is admitted; an `Array<int>` is not, because
+                // `IEnumerable<T>` is COVARIANT (`out T`) and `int` is not a
+                // supertype of `string` (§12.9); a `string` is not, because
+                // it is an `IEnumerable<char>` (§4.6). The `null` literal is
+                // rejected by the §7 rule, which the same call reaches.
+                //
+                // The argument is bound by NAME (§22.5), exactly as the
+                // separator above is: `string.Join(items := x, separator := s)`
+                // supplies `x` to the `items` parameter whichever order the
+                // two arguments are written in.
+                const auto& itemsArg = ce.args[itemsArgIdx];
+                if (itemsArg.value && !itemsArg.isDiscard) {
+                    TypeRef* itemsTy = ctx_.exprType(*itemsArg.value);
+                    if (itemsTy) {
+                        // The DECLARED parameter type, `IEnumerable<string>`.
+                        TypeRef* elemTy = ctx_.makeTypeRef();
+                        elemTy->kind = TypeRef::Kind::Primitive;
+                        elemTy->primitive = PrimitiveType::String;
+                        TypeRef* declaredItems = ctx_.makeTypeRef();
+                        declaredItems->kind = TypeRef::Kind::Named;
+                        // A built-in interface carries NO TypeSymbol (§2.5 /
+                        // #495): the name is what identifies it, and §12.9's
+                        // variance for it is the built-in table's.
+                        declaredItems->declaration = nullptr;
+                        declaredItems->importedName = "IEnumerable";
+                        declaredItems->genericArgs.push_back(elemTy);
+                        // The `what` names BOTH the parameter and the type
+                        // the parameter must have, so the diagnostic says
+                        // which slot is wrong and what it must be — the
+                        // same information §22.5's ordinary argument check
+                        // gives for a declared method.
+                        checkAssignable(
+                            itemsTy, declaredItems, itemsArg.value->span.begin,
+                            "items argument to `string.Join` (expected "
+                            "`IEnumerable<string>`)",
+                            itemsArg.value.get());  // §5.1 / §7 / §12.9
                     }
                 }
             }
