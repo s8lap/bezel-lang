@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.347 — October 2026**
+**Companion to the Bezel Language Specification, v0.348 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15410,5 +15410,84 @@ The composition step resolved these seams:
 **Migration.** None: doc-only.
 
 **Checks.** `scripts/check_docs.sh` is clean, with the code-generation reference's three pin lines at v0.347. EXTRACT finds 540 fragments, 5 more than v0.346: the extractor reads the fifteen new blocks (the fourteen examples and the shared class) as 5 fragments and 10 error cases. `scripts/check_proposals.sh` and `corpus.py lint --strict` are clean.
+
+---
+
+### v0.348 changelog (v0.347 → v0.348)
+
+**Editorial: examples for the sections that are hardest to read from prose alone.** On 2026-10-27 the owner asked for more examples in places "that are either more complex or less common in other languages", because readers understand formal rules better from examples. Class: **editorial** (spec-change process §2). No rule, verdict, grammar or diagnostic changes.
+
+**The problem.** A measurement of prose words per code block put fourteen sections near the top. Each ran to 2,000–6,000 words of rules with no fenced example, among them the borrow lifetime rules (§28.3.8), factory methods and sourceless returns (§28.3.6), scoped callback parameters (§28.14), records that carry borrows (§9.7), single-use lazy queries (§29.11), `async` frames (§30.1), sendable types and spawning (§30.14), dotted-name resolution (§2.7), and contract tiers (§22.16).
+
+**The changes.** Short examples in the v0.347 house style: an `*Example.*` lead, `// error (…)` on each rejected line, and the checked-mode outcome where only the disposed flag decides. Statement examples are bare statements beside only the declarations they need. Each example sits after the rule it illustrates and adds no rule. The work ran as three lanes, each reviewed by a non-author critic:
+
+**Lane A: examples for §28.3.5–§28.3.11, §28.14, §9.7 and §15.3.** Eighteen blocks under fourteen rules, 292 lines added, no line changed. Each block has an italic `*Example.*` lead, `// error (…)` on a rejected line, and a checked-mode outcome where the runtime backstop decides. A statement example is written as bare statements, with only the declarations it needs. There is no `class Example … method Run()` scaffolding; a method whose signature matters is written by itself. These sections are outside §28.3.1's heading, so §28.3.1's shared `Widget` class is not prepended to them. Each block instead declares its own one-line `Item` class, or, where the disposal order is the point, a `Res` class whose destructor prints.
+
+- **§28.3.5 The announcement table:** what a caller receives from rows 1, 4 and 5. A bare-type-parameter result is a borrow at `T = Item` too, and consuming one of its sources while it is live is the consume-site freeze.
+- **§28.3.6 Factory methods and sourceless returns:**
+  - the admissible static signatures, beside the two the rule rejects at the declaration: a plain class return, and a bare `T` with an empty source set;
+  - *Calls mint*: a forwarded minting call, a stored collection re-exposed through a property or at its concrete type, and the rejected borrow return under `IEnumerable<T>`;
+  - *Concrete-slot function bodies*: a lambda that produces a value needs an `owned` slot.
+- **§28.3.7 Move semantics:**
+  - the marker at an `owned` argument, and two rejected spellings: the marker on a fresh producer and at an `owned` field store;
+  - the marker on a borrow: an unmarked alias is a borrow, so `move` over it has nothing to transfer.
+- **§28.3.8 Borrow lifetime rules**, after the bullet list, one block per bullet:
+  - the field-store bullet: a plain parameter is admitted under the residual, while an `owned` parameter and a `using var` are rejected;
+  - the local-scope bullet at a loop back edge;
+  - the closure bullet's sink rule, in two blocks: a capture-bearing closure may be invoked or passed, but not returned; and only a capture-free one may be stored in a field.
+- **§28.3.9 The consume-site freeze:** `Both(x, move x)`, and a lazy-query local that freezes its source.
+- **§28.3.10 Owned-local discharge:** a plain `var`, a `using var` and a `finally` on one cleanup stack. Both edges print the same reverse-declaration order.
+- **§28.3.11 Unbound owned temporaries:**
+  - the full-expression boundary, the binding atom's tighter boundary, the `case` extension, and a temporary disposed during an argument's unwind;
+  - a plain-parameter store that dangles at the statement's end, beside a deferred-activation frame that admits a temporary only when it is consumed within the expression.
+- **§28.14 Scoped callback parameters:**
+  - a `scoped` constructor callback bounded by a `using var` holder, with its K5.7 freeze, its rejected non-`using var` holder, and the call-bounded default's rejected store;
+  - the class-typed scoped construction, where a fresh producer is rejected.
+- **§9.7 Records and disposal:** a borrow-bearing record beside a `string` record. The block shows the null-source field, the receiver-sourced return, and the three rejections: the plain-parameter return, the instance-field store, and the temporary source.
+- **§15.3 Move-only value types:** an owning inline array moves on a plain binding and an unmarked argument, and drops on whole-value reassignment. The `move` marker is rejected at a move-only argument.
+
+**How lane A's examples were checked.**
+
+- **The r35 release compiler** (`bezelc 0.0.0-f6863e62`, `--checked-disposal`) ran every block in three forms: whole, with its error lines removed, and with one error line at a time. It agrees with every rejection except these:
+  - the §28.3.9 block compiles: [#5972](https://github.com/s8lap/bezel-lang/issues/5972) for the argument-order shape, and [#5698](https://github.com/s8lap/bezel-lang/issues/5698) for frame locals;
+  - the first §28.3.8 closure block compiles: an expression-bodied method that returns a lambda over a plain parameter is accepted ([#7450](https://github.com/s8lap/bezel-lang/issues/7450));
+  - the second §28.3.7 block compiles: `move` of a local borrow is accepted ([#7403](https://github.com/s8lap/bezel-lang/issues/7403)).
+- **Runs** match the comments except for three leaks: the receiver temporary in §28.3.11's first block ([#6775](https://github.com/s8lap/bezel-lang/issues/6775)), the late disposal of a stored temporary in its second block ([#5294](https://github.com/s8lap/bezel-lang/issues/5294)), and the by-value-move parameter in §15.3 ([#5874](https://github.com/s8lap/bezel-lang/issues/5874)).
+- **The executable model** (`docs/research/soundness/bzcore-l1/`) agrees wherever its fragment reaches a shape: the freeze over a borrowed result, the marker on a borrow, the back-edge borrow, the unwind order, and the temporary's boundary.
+- **The doc-example extractor** reads the new blocks as 2 fragments and 16 error cases. Fifteen of them need the manifest note `wrap:mixed` at the next corpus regeneration; the lane record lists them. With the notes, `run_case` passes 15 of them with r35. The other three fail as known failures, each block holding only the line r35 misses: the second §28.3.7 block, the first §28.3.8 closure block and the §28.3.9 block. Lane A adds two fragments to EXTRACT's count (539 → 541 on the base tree).
+
+**Lane B: examples for §29.11, §30.1 and §30.14.**
+- **§29.11 Multiple enumeration: three examples.**
+  - A lazy query spent by `Count()` and then rejected in a second `for`, with a materialized `ToArray()` enumerated twice.
+  - Consumption points 2 and 3: a further deferred operator and an `IEnumerable<T>` argument. Beside them are the must-use lint's two halves (a spent `var` query stays silent; a never-spent one warns) and the runtime `InvalidOperationException` inside an untracked callee.
+  - The terminal-accessor provenance warning: `First()` over a minting same-unit iterator warns, the same call over a concrete collection is silent, and the first remedy (using each element in the loop body) is shown.
+- **§30.1 `async` methods: a shared `Conn` class and six examples**, one after each rule paragraph:
+  - a span parameter is rejected, and a heap-owned window and `CancellationToken` are admitted;
+  - `out` on an `async` method is rejected, and on a non-`async` `Task`-returning method it is admitted;
+  - a span crossing an `await` is rejected over a plain parameter and admitted over a `using var` of the body;
+  - an `owned` argument moves into the frame and is adopted on entry, with the printed order;
+  - the settlement obligation: awaited before the source's scope ends, then abandoned through `Task.FireAndForget` with its checked-mode outcome;
+  - the `return` operand under `Task<T>` at a class `T`: an owned value or a `return await` chain, and a borrow rejected.
+- **§30.14 Multiple domains and sendable types: three examples.**
+  - Sendable types, through `Channel<T>`'s `sendable` constraint. A sealed class with an `owned` sendable field and a plain record are admitted. An open class, a non-`owned` class field and a function type inside a record are rejected, each with its rule.
+  - Spawning: a class argument crossing by `move`, and three rejections: a capturing entry, a transfer under a live borrow (the consume-site freeze), and a class on the plain argument row.
+  - An async entry: a static `async` method reference, whose join is awaited in the spawning domain.
+- The examples illustrate the existing rules and add none. Each one sits after the paragraph it illustrates and is written as bare statements beside only the declarations it needs, with an `*Example.*` lead, `// error (…)` on each rejected line, and the checked-mode outcome where a case is backstopped.
+- Checks: `check_docs.sh` EXTRACT gives 544 fragments on this lane alone, 5 more than v0.346. The 13 new blocks extract as 5 fragments and 8 error cases. Seven of them need the `wrap:mixed` note at the next doc-corpus regeneration. On r35, the [#1523](https://github.com/s8lap/bezel-lang/issues/1523) async entry and the terminal-accessor warning ([#3047](https://github.com/s8lap/bezel-lang/issues/3047), lint B) are known gaps.
+
+
+**Lane C: examples for §2.7, §14.2, §3.6, §9.4, §22.3, §22.15 and §22.16.**
+- **Examples for seven rule clusters (lane C), editorial.** Short examples, each placed under the rule it illustrates and adding no rule, are added to: §2.7 (the head-shape table — a chain head ranks the enclosing type's members last and the `property Color: Color` idiom draws no warning; a bare value read finds the member first; a chain head that resolves to a type never falls back to a same-named field; *Through nesting* — an enclosing static by bare name, an enclosing instance member only through an instance); §14.2 (`value` excludes `int?`, which `new()` admits as defaultable, and an enum without a zero-valued constant is not defaultable; a `where T: U` bound admits no widening or boxing; a constraint turning on a type parameter is decided by that parameter's own constraints); §3.6 (auto-hashable computed from structure; a generic type's member-body equality use rejects `Tally<Ref>` wherever it is named, rule 2); §9.4 (a record member body may not store into its receiver, while a constructor, an external store through a binding and a store beyond a class-typed hop may; the receiver value is fixed at the call); §22.3 (a `ref` parameter is never narrowed and is narrowed through a local copy; `out` copies out on normal return only; a `ref` argument has the referent type exactly and a bare variable names its declared location; a property target is read once and written back once); §22.15 (the pure body's frame-local mutation, field store, function-value invocation and non-pure call; purity never dropped by an override, and may be added); §22.16 (call-site discharge of `requires` and a constant call folding `false`; a `static requires` over a parameter, discharged by a constant call and rejected at any other; an override adds `ensures` but declares no `requires`). Statement-level examples carry no wrapper class or method. 20 blocks; the extractor yields 6 fragment and 14 error cases, none chained; 11 of them need the corpus's `wrap:mixed` note.
+
+
+**Compiler gaps found while checking the examples**, filed with campaign labels:
+- an expression-bodied method returning a lambda over a plain parameter is accepted ([#7450](https://github.com/s8lap/bezel-lang/issues/7450));
+- `First`/`FirstOrNull`/`ElementAt` run the whole source, and `Naturals().First()` never returns ([#7452](https://github.com/s8lap/bezel-lang/issues/7452));
+- a `pure` body admits every standard-library call and construction ([#7453](https://github.com/s8lap/bezel-lang/issues/7453));
+- a stale warning on whole-value reassignment of an owning inline array ([#7451](https://github.com/s8lap/bezel-lang/issues/7451)).
+
+**Doc corpus.** No corpus file is committed (the #1380 rule). The cases that need the manifest note `wrap:mixed`, plus two expectation notes, are recorded for the next regeneration on [#4505](https://github.com/s8lap/bezel-lang/issues/4505). The §29.11 terminal-accessor warning stays tracked on [#3047](https://github.com/s8lap/bezel-lang/issues/3047), as lint B.
+
+**Migration:** doc-only.
 
 ---
