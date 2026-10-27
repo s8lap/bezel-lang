@@ -1,0 +1,2352 @@
+{
+ "spec": "0.344",
+ "clauses": {
+  "K1": {
+   "title": "Value classification",
+   "tagged_blocks": 7,
+   "mentioning_blocks": 22,
+   "corpus_direct": 12,
+   "corpus_by_section": 200,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 7,
+   "matrix_open": 1
+  },
+  "K1.1": {
+   "title": "1. owned -- the holder carries the disposal obligation: dispose exactly once, on every path.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 0,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "K1.2": {
+   "title": "2. borrowed -- no obligation; validity is bounded by the borrow's source set (K2).",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 0,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K1.3": {
+   "title": "3. moved-from -- the obligation has transferred out; the binding is unreadable until reassigned, and discharge machinery skips it (\u00a728.8.1).",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 0,
+   "corpus_direct": 1,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K1.4": {
+   "title": "4. maybe-consumed -- the K7 join of owned with moved-from or explicitly-disposed; unreadable until reassigned (a reassignment displaces per path and leaves the binding owned, \u00a728.3 State match); scope-end disposal is per-path.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 0,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K1.5": {
+   "title": "5. Atoms. Fresh productions are owned: new, reference-typed collection literals, owned-returning calls, move results, owned operator results. Reads of storage lend: a field, property, indexer, or slot read is a borrow whose source is the storage's holder. Reads of named bindings lend unless the position consumes (K3): an unmarked read of an owned binding is a borrow of the binding. Calls lend by default: an instance method's plain (non-owned) class-typed return is a borrow whose source is the receiver -- sound jointly with the callee-side admission rules (K2.4). A static callee's plain class- or interface-typed return is admissible only where the declared type announces the classification (type-announced, K2.4/K6.2), and is otherwise rejected at the declaration (the static-return rule, Factory methods below). (The Producers table below is the worked enumeration; the announcement table beside it is the per-callee-kind matrix for calls.)",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 6,
+   "corpus_direct": 3,
+   "corpus_by_section": 35,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "K1.6": {
+   "title": "6. The runtime-managed exemption; the trivial-dispose ceremony exemption. Values of runtime-managed type (string, Type, boxed value types, function values) and of ordinary value type carry no classification and no obligation; owned markers over them are inadmissible or erased per instantiation (\u00a728.1). Trivial-dispose class instances (\u00a728.9) carry the classification and the free obligation, but the obligation's user-visible content is empty and its discharge is never demanded of the program: any undischarged trivial-dispose value is freed silently by the compiler at its owner's release point -- no warning (the ceremony exemption), no user code (the class has none to run; the free sets the disposed flag, \u00a728.2). The exemption is ceremony-only: the borrow half of the machinery -- source sets, escape checks, the freeze -- is demanded over trivial-sourced references everywhere, and every rule of this chapter reads them by its letter.",
+   "tagged_blocks": 5,
+   "mentioning_blocks": 12,
+   "corpus_direct": 14,
+   "corpus_by_section": 184,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 20,
+   "matrix_open": 0
+  },
+  "K1.7": {
+   "title": "7. One holder. An obligation has exactly one holder at a time; every transfer moves it, never copies it. Copy-semantics holders (record fields) therefore cannot hold obligations (\u00a728.5).",
+   "tagged_blocks": 5,
+   "mentioning_blocks": 6,
+   "corpus_direct": 10,
+   "corpus_by_section": 206,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K2": {
+   "title": "The source algebra",
+   "tagged_blocks": 4,
+   "mentioning_blocks": 13,
+   "corpus_direct": 2,
+   "corpus_by_section": 187,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 9,
+   "matrix_open": 0
+  },
+  "K2.1": {
+   "title": "1. Weakest source bounds. A borrow is valid only where every source in its set is live; equivalently, it is bounded by its weakest source.",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 7,
+   "corpus_direct": 5,
+   "corpus_by_section": 170,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "K2.2": {
+   "title": "2. Union under composition. Joins, ?? and arm meets, transitive re-borrows, and frame carriage combine borrows by taking the union of their source sets.",
+   "tagged_blocks": 3,
+   "mentioning_blocks": 7,
+   "corpus_direct": 9,
+   "corpus_by_section": 147,
+   "corpus_direct_fail": 1,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K2.3": {
+   "title": "3. Escape must be bounded. A borrow may not reach a holder -- a binding of wider scope, a field, a collection, a frame, a return -- whose lifetime the checker cannot bound by the borrow's source set. Where scopes are statically comparable (locals, temporaries, loop back edges), violation is rejected. Where they are not, an admission is made only under K4's posture: a structural, decidable check at the site plus a recorded residual obligation with a named backstop (\u00a728.3, \u00a728.11).",
+   "tagged_blocks": 7,
+   "mentioning_blocks": 13,
+   "corpus_direct": 46,
+   "corpus_by_section": 215,
+   "corpus_direct_fail": 3,
+   "matrix_cells": 5,
+   "matrix_open": 0
+  },
+  "K2.4": {
+   "title": "4. Signature-level re-establishment. A callee's declared signature announces its result's source set -- the type-announced classification: read off the declared, pre-substitution type, K6.2 being the frame instance -- as a function of the call's receiver and arguments -- the bare-type-parameter source set, the deferred-activation frame's carried sources -- and every caller re-establishes the set against its own actuals. A borrow whose source no caller could re-establish (a scope-bound local, a temporary, a parameter source the signature does not announce) may not be returned.",
+   "tagged_blocks": 13,
+   "mentioning_blocks": 20,
+   "corpus_direct": 51,
+   "corpus_by_section": 135,
+   "corpus_direct_fail": 3,
+   "matrix_cells": 2,
+   "matrix_open": 0
+  },
+  "K3": {
+   "title": "Discharge and consumption",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 5,
+   "corpus_direct": 3,
+   "corpus_by_section": 46,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "K3.1": {
+   "title": "| K3.1 | store into an owned field or owning-collection slot, including through a set(owned) accessor (\u00a723.3) | none -- the declared slot announces (marker-free) | moved-from -- a later read is an error until reassigned | frozen (K5.1) | none here -- the new holder's |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 7,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 11,
+   "matrix_open": 0
+  },
+  "K3.2": {
+   "title": "| K3.2 | return under an owned return type, or under an unmarked mint-announcing return type -- Task-family in a non-async body, iterable-family in a non-iterator body (\u00a729.5 bars plain return in iterator bodies) -- and, in an async body, the result operand of return under an OwningTask<T> return type or a Task<T> at a class or interface T: the task's result, \u00a730.5's Pattern B transfer and Pattern A kind 1 (disposed by the awaiter or by the task's teardown, as \u00a730.5 states) | none -- the declared return type announces (marker-free) | moved-from | frozen (K5.1) | none here -- the caller's, on the call's normal completion; the callee's return slot on a raise from a cleanup on the return edge (\u00a728.3 The return slot) |",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 6,
+   "corpus_direct": 4,
+   "corpus_by_section": 152,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 10,
+   "matrix_open": 0
+  },
+  "K3.3": {
+   "title": "| K3.3 | an owned argument (\u00a722.3) | move x at the call site | moved-from | frozen (K5.1) | none here -- the callee's |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  },
+  "K3.4": {
+   "title": "| K3.4 | a marked binding or assignment transfer -- var y := move x;, y := move x;, using var y := move x; (the anonymous adoption using var _ := move x; included, \u00a717.13) -- the marked owning-match scrutinee case move x of \u2026 (\u00a735.5) -- and the marked arm transfer: move x as an if-expression branch or an expression-case arm result (\u00a720, \u00a719.2), consuming on the path where its arm is selected | move x | moved-from (an arm: on the selected path; joins per K7.4) | frozen (K5.1) | none here -- the new holder's |",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 10,
+   "corpus_direct": 0,
+   "corpus_by_section": 14,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 3,
+   "matrix_open": 0
+  },
+  "K3.12": {
+   "title": "| K3.12 | for move-only values (\u00a715.3), any store into an owning location | none (\u00a715.3's scope note: unmarked assignment and plain passing move) | moved-from | frozen (K5.1) | none here -- the new holder's |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 6,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 6,
+   "matrix_open": 0
+  },
+  "K3.5": {
+   "title": "| K3.5 | the operand of a Pattern B await (\u00a730.5) | none -- the keyword announces | moved-from | unfrozen (K4.2, K5.3)\u2020 | at the await, on all outgoing edges including fault and cancel (\u00a730.5) |",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 3,
+   "corpus_direct": 3,
+   "corpus_by_section": 16,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 7,
+   "matrix_open": 0
+  },
+  "K3.6": {
+   "title": "| K3.6 | the owned parameter-or-plain-local source of a Pattern A chaining return await (\u00a730.5) | return await -- the form is the keyword | moved-from | unfrozen (K5.4: by the criterion -- (i) at the form, (ii) by the intact-referent disjunct) | none at the site -- deferred to the outer task's teardown, transitively (no flag the K4.1 backstop can schedule) |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 4,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K3.7": {
+   "title": "| K3.7 | the operand of yield return in an owning iterator (\u00a729.2) | none -- the declared owning interface announces | moved-from | frozen (K5.1; \u00a729.2) | none here -- the consumer's |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  },
+  "K3.8": {
+   "title": "| K3.8 | the operand of throw (\u00a731.1) | none -- the keyword announces | moved-from | unfrozen (K4.2, K5.3)\u2020 | after the matching catch arm completes, or at termination if uncaught (\u00a731.1) |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 2,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 6,
+   "matrix_open": 0
+  },
+  "K3.9": {
+   "title": "| K3.9 | explicit disposal of an owned binding -- the marker-free discard _ := x; (\u00a717.13), or a Dispose() or direct DisposeAsync() call (x.Dispose(), x?.Dispose(), x!.Dispose(), and the same spellings of DisposeAsync(), awaited or not, \u00a728.12) on an owned receiver, the receiver-classification rules, including the declaring-type field admission, being \u00a728.6's (an override's chained base.DisposeAsync() is \u00a728.12's chain, not a position of this row) | the discard statement itself, or the Dispose() / DisposeAsync() call -- no marker | explicitly-disposed -- straight-line use afterward is \u00a728.2's mandatory use-after-dispose warning | unfrozen (K4.2, K5.3)\u2020 | logical disposal at the end of the discard statement (\u00a717.13) or at the call (for DisposeAsync(), completing at the returned task's terminal state, \u00a728.12); reclamation at the holder's release point (\u00a728.2's compiler-inserted free) |",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 8,
+   "corpus_direct": 3,
+   "corpus_by_section": 35,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 11,
+   "matrix_open": 0
+  },
+  "K3.11": {
+   "title": "| K3.11 | reassignment of an owned location -- a consume of the displaced value (drop-on-overwrite, \u00a728.7) | the kill of the displaced value is unspelled; the RHS follows the state-match rule (Ownership state of locals below) | none arises -- the kill's subject is the displaced value; the binding takes the new value and stays readable | frozen at a binding (K5.2); slot overwrites are outside the freeze (K5.6) | after the RHS is evaluated (RHS-first; K9.5 is the slot analog); where that disposal raises, the store is abandoned and the location keeps the logically disposed value to its next release point (\u00a728.7) |",
+   "tagged_blocks": 4,
+   "mentioning_blocks": 11,
+   "corpus_direct": 5,
+   "corpus_by_section": 162,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 10,
+   "matrix_open": 1
+  },
+  "K3.13": {
+   "title": "13. Marker economy. A consume is spelled by the transfer marker (move x) except at a marker-free position, where the target or keyword already announces it -- the table's Spelling column is the definition site of which is which. An unmarked read of a class-typed binding never consumes: var b := a; is always a borrow for class-typed a. (Move-only value types move on unmarked assignment and plain parameter passing, per \u00a715.3's own scope note; K3.12.) Fresh producers need no marker anywhere (no live binding is invalidated).",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 11,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 5,
+   "matrix_open": 0
+  },
+  "K3.14": {
+   "title": "14. Affinity. An owned value that reaches its scope's end undischarged and not moved-from is disposed there implicitly; the implicit drop of a plain-var local or undischarged owned parameter carries the must-use warning (a lint over a sound program; not at a trivial-dispose value -- K1.6's ceremony exemption).",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 8,
+   "corpus_direct": 0,
+   "corpus_by_section": 156,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  },
+  "K3.15": {
+   "title": "15. Edge parity. The exception edge performs the same implicit disposal as the normal edge, on the single establishment-ordered cleanup stack; the only difference is the lint. Unbound temporaries join the same stack at their production.",
+   "tagged_blocks": 3,
+   "mentioning_blocks": 6,
+   "corpus_direct": 5,
+   "corpus_by_section": 151,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 19,
+   "matrix_open": 0
+  },
+  "K4": {
+   "title": "Kills, site-announcement, and the backstop posture",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K4.1": {
+   "title": "1. The backstop. Disposal is idempotent and flag-setting; in checked disposal mode (\u00a728.2) any later use through any alias faults deterministically as DisposedAccessException, and unchecked mode is the same language with the check elided. This is the runtime backstop every trust admission names.",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 16,
+   "corpus_direct": 3,
+   "corpus_by_section": 191,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 33,
+   "matrix_open": 1
+  },
+  "K4.2": {
+   "title": "2. Site-announced kills. A kill that is both keyword-visible at the kill site and flag-backstopped is site-announced, and is permitted while borrows of the value live: the announcement is the reader's notice and the flag is the safety net. The closed set is exactly the consume table's three rows tagged K4.2 -- explicit disposal (Dispose(), a direct DisposeAsync() call, or the discard), throw x, and Pattern B await of an owned operand (a borrowed operand's award spends the task and kills nothing, \u00a730.5) -- with each kill's post-state and disposal moment in the table's columns.",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 9,
+   "corpus_direct": 4,
+   "corpus_by_section": 27,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 10,
+   "matrix_open": 0
+  },
+  "K4.3": {
+   "title": "3. Recorded trust, or nothing. Where an admission's temporal guarantee can neither be statically compared (K2.3) nor flag-backstopped -- the domain clause (\u00a728.3's field-store bullet, clause 4): a borrowed-from object transferred to, or made reachable from, another domain stays alive, so no flag is ever set -- the rule must either reject statically or carry an individually recorded trust clause. The recorded clauses (field-held, collection-held, comparer-held and frame-held borrows versus domain transfer; \u00a728.3, stdlib \u00a74, \u00a730.1) are the model's honest limit, and no new admission may be made without recording its clause or its backstop. No clause covers a static-held borrow, and none is needed: a borrow of anything but static storage is stored into no static field or static property (\u00a728.3's Static stores) -- across domains the flag is no backstop, so the always-live holder admits only what lives as long as it does. (A borrow held inside an object a static references is that object's field-, collection- or frame-held clause, with \u00a722.12 rule 4's confinement obligation where the static is warned.) The recorded set is enumerable, and the trust-admission report mode (\u00a728.3) enumerates it at every site.",
+   "tagged_blocks": 4,
+   "mentioning_blocks": 12,
+   "corpus_direct": 31,
+   "corpus_by_section": 219,
+   "corpus_direct_fail": 2,
+   "matrix_cells": 28,
+   "matrix_open": 0
+  },
+  "K5": {
+   "title": "The freeze",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 10,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 21,
+   "matrix_open": 0
+  },
+  "K5.1": {
+   "title": "1. the family-1 transfers and owning-iterator yield return (the table's rows K3.1-K3.4, K3.7, K3.12) are frozen -- each fails (ii): an obligation-moving kill sets no flag, and its surviving borrows' referents are neither flagged nor guaranteed intact for the borrows' whole life;",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 1,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 3,
+   "matrix_open": 0
+  },
+  "K5.2": {
+   "title": "2. drop-on-overwrite of a binding (row K3.11) is frozen although it disposes -- it fails (i): the reassignment is not keyword-visible as a kill of the old value, and the flag it does set is irrelevant once (i) fails;",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 2,
+   "matrix_open": 0
+  },
+  "K5.3": {
+   "title": "3. the K4.2 site-announced kills (rows K3.5, K3.8, K3.9) are unfrozen -- each satisfies (i), and satisfies (ii) wherever the surviving borrows are backstopped by the kill's own flag, which is every case but the two recorded in clauses 7 and 8;",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 4,
+   "corpus_direct": 0,
+   "corpus_by_section": 156,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  },
+  "K5.4": {
+   "title": "4. a Pattern A chaining return await x (row K3.6) is unfrozen by the criterion: (i) holds -- the return await keywords are the kill site (\u00a730.5) -- and (ii) holds because every borrow that survives the kill has its referent left intact and disposal-tracked: the new holder (the outer task) cannot dispose the chained task before the body, finally blocks included, completes, so no surviving borrow needs a flag;",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 2,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K5.5": {
+   "title": "5. the freeze is body-local by construction -- the clause bounds what liveness means, not what is frozen: liveness is the backward dataflow over one body, borrows are traced through using var pins, an argument or operand of the same full expression evaluated before the consume and used by its call or operator (\u00a728.3), live closures, locals of borrow-bearing record or inline-array type or of choice types that hold borrows (\u00a79.7; \u00a715.1.2; \u00a735.4's holds-borrows property), and locals -- a for desugaring's hidden __source (\u00a729.2) included -- holding an iterator or enumerator frame or a lazy query (K6), each a live local borrow of every source the frame carries, transitively through the frames and closures it carries, as a live closure value is of its captures' sources, the frame's own disposal -- explicit, at a using var's scope end, or K3.14's auto-drop -- counting as a use, since a partially-consumed frame's disposal runs its pending cleanup (\u00a729.7) (\u00a728.3 Frame locals); and this is why a closure may not consume its captured owned bindings (K2 + decidability);",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 4,
+   "corpus_direct": 5,
+   "corpus_by_section": 151,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 13,
+   "matrix_open": 0
+  },
+  "K5.6": {
+   "title": "6. fields and collection slots are not frozen -- the clause bounds what the freeze's subject is: slot aliases are not body-local, and a slot kill disposes -- the K4 backstop is real there; the slot kill by move is instead governed by K4.3's domain clause (\u00a728.3, \u00a728.7, \u00a728.11);",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 7,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 21,
+   "matrix_open": 0
+  },
+  "K5.7": {
+   "title": "7. a \u00a728.14 storage admission freezes the admitted captures against the site-announced kills as well -- a derivation from (ii), not an exception: the surviving borrow lives in a stored callback whose invocation site is statically invisible at the kill, and the storage admission's promise is a fully static bound, so a runtime flag is not an admissible backstop for it -- stated with its reason at \u00a728.14, under axiom A11's forms (the freeze's subject is the captured binding: a captured or passed borrow of a slot's current value -- class- or interface-typed, or a span over it -- keeps clause 6's runtime-checked posture under this admission as under any other, \u00a728.14 scoped construction);",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 5,
+   "corpus_direct": 2,
+   "corpus_by_section": 28,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 3,
+   "matrix_open": 0
+  },
+  "K5.8": {
+   "title": "8. a \u00a730.12 guard's site-announced kills are frozen while borrows sourced from the guard live -- likewise a derivation from (ii): killing a guard sets the disposed flag on the guard, while the surviving borrows reference the lock's interior, on which no flag is set, the lock released out from under them -- stated with its reason at \u00a730.12.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 2,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K6": {
+   "title": "Frames are values",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 8,
+   "corpus_direct": 2,
+   "corpus_by_section": 173,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  },
+  "K6.1": {
+   "title": "1. The bound. Carried sources must outlive the frame's bound: settlement for a task (\u00a730.1); completion or disposal for an iterator frame (\u00a729.4, \u00a729.7); the single consumption point for a lazy query, which is thereby affine (\u00a729.11); an iterator frame minted over an owned or move-only parameter keeps the iterator frame's bound and is affine by the same rule (\u00a729.8).",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 4,
+   "corpus_direct": 0,
+   "corpus_by_section": 30,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 8,
+   "matrix_open": 0
+  },
+  "K6.2": {
+   "title": "2. Announcement by declared type. Frame-carrying classification is type-announced -- keyed on the callee's declared, pre-substitution return type: a Task-family type, a \u00a729.3/\u00a730.7 iterable or enumerator interface, a lazy query -- and every caller re-establishes the carried set against its own actuals (K2.4). This is what admits returning a composed frame, and what rejects a returned frame carrying a scope-bound local, using var, or temporary.",
+   "tagged_blocks": 5,
+   "mentioning_blocks": 9,
+   "corpus_direct": 3,
+   "corpus_by_section": 183,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "K6.3": {
+   "title": "3. Containers: calls mint, storage lends. A call whose declared return type is mint-announcing -- a Task-family type, or an iterable-family type (a \u00a729.3/\u00a730.7 iterable or enumerator interface, or a lazy query) -- produces a fresh owned frame at every call site; a read of frame storage (property, field, slot) lends a borrow of the storage; callee-side, the unmarked mint-announcing return type transfers the container like an owned return (axiom A15's self-returning enumerator excepted).",
+   "tagged_blocks": 6,
+   "mentioning_blocks": 8,
+   "corpus_direct": 9,
+   "corpus_by_section": 177,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 5,
+   "matrix_open": 0
+  },
+  "K6.4": {
+   "title": "4. Frames versus the freeze. Frame-held borrows live in the frame, not in any local borrow binding. A task's are not traced by K5: their outlives-obligation is the K4.3-recorded settlement clause (\u00a730.1), discharged trivially by awaiting before any source's scope exits and structurally by TaskScope; the abandonment idioms carry the residual explicitly, under \u00a730.1's bans on a holds-borrows parameter and on a caller-sourced holds-borrows local across a suspension, a binding an async lambda captures from its enclosing scope among them. An iterator, enumerator or lazy-query frame is traced by K5.5 through the local that holds it, as a closure value is through its local: its carried sources are frozen while that local is live against the silent kills, the site-announced kills staying unfrozen under their flag, which reaches a read through a span the frame may hold (\u00a729.4) as it reaches any member access (\u00a728.2); the K4.3 frame clause still names the residual for a frame no traced local holds.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 1,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 8,
+   "matrix_open": 0
+  },
+  "K6.5": {
+   "title": "5. Interaction with K8. A frame sourced by an unbound temporary must itself be consumed to its bound within the same full expression; a frame that escapes the expression is rejected -- the reject-not-extend posture.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 1,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "K7": {
+   "title": "The join rule",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 5,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 7,
+   "matrix_open": 0
+  },
+  "K7.1": {
+   "title": "1. owned \u2293 owned = owned, obligation carried forward (for expression arms: exactly one arm's value exists at runtime, so exactly one obligation);",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "K7.2": {
+   "title": "2. borrowed \u2293 borrowed = borrowed, carrying the union of the arms' source sets (K2.2);",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 1,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "K7.3": {
+   "title": "3. owned \u2293 borrowed = rejected -- no single state is correct, and demoting owned would silently drop an obligation; the program equalizes the arms first;",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "K7.4": {
+   "title": "4. owned \u2293 moved-from and owned \u2293 explicitly-disposed = maybe-consumed -- unreadable after the join, no flow around a back edge into a use; scope-end disposal per-path;",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 6,
+   "corpus_direct": 1,
+   "corpus_by_section": 11,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 10,
+   "matrix_open": 0
+  },
+  "K7.5": {
+   "title": "5. null-literal and bottom-typed (throw) arms absorb to the other arm's state.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 2,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 3,
+   "matrix_open": 0
+  },
+  "K8": {
+   "title": "The full-expression boundary",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 10,
+   "corpus_direct": 0,
+   "corpus_by_section": 156,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 6,
+   "matrix_open": 0
+  },
+  "K8.1": {
+   "title": "1. Unbound owned temporaries are disposed at their full expression's end, after their uses, in reverse production order -- on the normal edge as on the exception edge, where the pass runs during unwinding.",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 3,
+   "corpus_direct": 22,
+   "corpus_by_section": 134,
+   "corpus_direct_fail": 2,
+   "matrix_cells": 13,
+   "matrix_open": 0
+  },
+  "K8.2": {
+   "title": "2. Conditions and guards are per-evaluation boundaries: temporaries never accumulate across iterations.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 1,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 2,
+   "matrix_open": 0
+  },
+  "K8.3": {
+   "title": "3. A case scrutinee's boundary is the whole construct -- pattern bindings are borrows of the scrutinee, and the temporary survives arm selection, guard evaluation, and the selected arm's completion -- in statement position exactly as in expression position.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 2,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 8,
+   "matrix_open": 0
+  },
+  "K8.4": {
+   "title": "4. A temporary is an admissible borrow source only within its boundary; a borrow or frame that would escape it is rejected, never lifetime-extended -- the language has no general lifetime-extension mechanism (\u00a79.7; rationale \u00a75.24). The escapes rejected are every escape K2.3 can compare -- among them a binding, store, capture, return or yield return of the borrow in the producing body -- and every retention a declaration announces -- among them a returned frame (K6.5), a frame carrying the borrow taken by an owned parameter or owning slot (Task.FireAndForget, \u00a728.3), a borrow-bearing record's field or a holds-borrows choice's payload (\u00a79.7, \u00a735.4), a scoped parameter (\u00a728.14), and a ref or out location. A plain parameter announces none: a callee that stores it holds the borrow under the borrowed-field rule's or the borrowing-collection store rule's recorded residual (\u00a728.3, \u00a728.11), and the temporary is still disposed at its boundary (K8.1).",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 5,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 6,
+   "matrix_open": 0
+  },
+  "K8.5": {
+   "title": "5. A binding atom (\u00a717.15) is the boundary for its own bindings: a binding whose initializer is an owned production is a named unbound owned temporary whose boundary is the atom -- disposed at the atom's completion if undischarged, after the body's evaluation, in reverse clause order; clause 4 applies to the atom boundary verbatim.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  },
+  "K9": {
+   "title": "Fields are object state, not scope state",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 13,
+   "matrix_open": 0
+  },
+  "K9.1": {
+   "title": "1. every plain read of an owned field lends (K1.5); the only owned read of an owned field or an owning slot is the replacing move (\u00a728.8.1): move x.f with e -- and move coll[i] with e -- stores the owned value e into the location and yields the displaced value, owned, in one step with no intermediate state; where the location's declared type is nullable, move x.f alone stores null;",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 3,
+   "corpus_direct": 3,
+   "corpus_by_section": 35,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 7,
+   "matrix_open": 0
+  },
+  "K9.2": {
+   "title": "2. an owned location never holds a hole: a non-nullable owned field or owning slot holds a live value at every instant, a nullable one holds a live value or null, and the moved-from state is a state of bindings only (K1) -- so no path carries a restoration obligation, no code can observe a location between a take and a store, and a destructor cascade meets live values and nulls only;",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 5,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 20,
+   "matrix_open": 2
+  },
+  "K9.3": {
+   "title": "3. a constructor's move is governed by definite assignment before first assignment (\u00a77.9); a destructor body reads and takes the fields of the object it tears down as any other body does -- the replacing move, or the bare take at a nullable field -- and may dispose one its own class declares early (\u00a728.6), the cascade's later call being the no-op; no body takes a non-nullable owned location bare (\u00a728.8.1);",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 2,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 7,
+   "matrix_open": 1
+  },
+  "K9.4": {
+   "title": "4. static owned storage -- a static owned field, and the slots of a static readonly owning inline array (\u00a722.12 note (h)) -- admits no move, no slot store and no explicit disposal: it is the always-live source (K2), whose referent every borrow of it may be held against as process-lived, so it is neither taken nor replaced and is disposed only by the exit pass (\u00a728.8.1, \u00a722.12, \u00a722.13, \u00a728.6);",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 4,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 16,
+   "matrix_open": 0
+  },
+  "K9.5": {
+   "title": "5. drop-on-overwrite (K3.11) is RHS-first, so a throwing RHS leaves the slot untouched and still-owned, and a throwing disposer of the displaced value leaves that value at the slot, logically disposed, to the slot's next release point (\u00a728.7); the replacing move evaluates its replacement first by the same order, and its exchange disposes nothing -- the displaced value is its result.",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 9,
+   "matrix_open": 1
+  },
+  "A1": {
+   "title": "| A1 | Retired. The prior axiom and its decision record are in the changelog. | -- | -- |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 2,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "A2": {
+   "title": "| A2 | Retired. The prior axiom and its decision record are in the changelog. | -- | -- |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 1,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "A3": {
+   "title": "| A3 | The two-container async design: Task<T> (class T) = shared borrows, OwningTask<T> = single owned transfer | \u00a730.5; rationale \u00a712.1-\u00a712.2 | A surface design choice (fan-out vs. acquisition); the kernel checks both, forces neither. |",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 3,
+   "corpus_direct": 5,
+   "corpus_by_section": 14,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 2,
+   "matrix_open": 0
+  },
+  "A4": {
+   "title": "| A4 | Accessor read faces are lend-only: property and indexer types carry no owned, and a getter may not return a fresh owned value; set(owned) is the marker-free write face (K3.1) | \u00a728.6, \u00a723 | Signature predictability: every accessor read classifies as a borrow with no marker position available; factories are methods. |",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 4,
+   "corpus_direct": 3,
+   "corpus_by_section": 191,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "A5": {
+   "title": "| A5 | using var is a scope pin: non-reassignable, never movable out | \u00a728.10; rationale \u00a75.23 | Declared-intent form; scope-pinning is its entire meaning (kept strict deliberately at the affine transition). |",
+   "tagged_blocks": 5,
+   "mentioning_blocks": 6,
+   "corpus_direct": 9,
+   "corpus_by_section": 191,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 12,
+   "matrix_open": 0
+  },
+  "A6": {
+   "title": "| A6 | A Task-family value -- Task, Task<T>, OwningTask<T>, nullability stripped and read at the operand's declared, pre-substitution type (\u00a717.13) -- may not be discarded, by _ := \u2026 or by the anonymous using var _ := \u2026 binding; Task.FireAndForget is the routed spelling | \u00a717.13; rationale \u00a75.23 | Semantic, not memory: abandoning a running operation is a decision, not a disposal. |",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 3,
+   "corpus_direct": 0,
+   "corpus_by_section": 14,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  },
+  "A7": {
+   "title": "| A7 | The transfer marker is not admitted in ??-operand or operator-operand position: identifier-operand move there is rejected, and a named owned binding written bare is a borrow arm (K3.13). (The arm half -- if-expression branches, expression-case arm results -- is a K3.4 derivation.) | \u00a728.3, \u00a722.3 | Recorded liftable bound, purely semantic -- the marker parses in these positions. The ?? half awaits the null-evaluated-transfer ruling; the operator half is settled (#3560): move-only operands bind borrows (\u00a725.2). Recorded: docs/proposals/DECLINED.md, Marked transfer in ??-operand and operator-operand position. |",
+   "tagged_blocks": 4,
+   "mentioning_blocks": 5,
+   "corpus_direct": 8,
+   "corpus_by_section": 192,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "A8": {
+   "title": "| A8 | Retired. The prior axiom and its decision record are in the changelog. | -- | -- |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 2,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "A9": {
+   "title": "| A9 | The two collection families: borrowing by default, owning as separately named types | \u00a728.11; rationale \u00a75.3 | The recorded resolution; the declined merged-generic form is rationale \u00a75.3/\u00a75.11's record. |",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 3,
+   "corpus_direct": 24,
+   "corpus_by_section": 13,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "A10": {
+   "title": "| A10 | Stdlib certification grants: CancellationToken's source-outlives-settlement certification; the \u00a730.11 completion-source callback admission -- a named carve beside \u00a728.14, not a derivation of it | \u00a730.1, \u00a730.8, \u00a730.11 | A named allowlist of trust granted to specific stdlib types -- by construction not derivable; each entry normatively stated at its type. |",
+   "tagged_blocks": 4,
+   "mentioning_blocks": 5,
+   "corpus_direct": 11,
+   "corpus_by_section": 194,
+   "corpus_direct_fail": 1,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "A11": {
+   "title": "| A11 | The \u00a728.14 bounding-object resolution forms (1-5) and the ratified v1 admission bounds | \u00a728.14 | Decidability engineering: the chosen static story for \"capture source outlives bounding object\"; several bounds marked liftable. |",
+   "tagged_blocks": 4,
+   "mentioning_blocks": 6,
+   "corpus_direct": 2,
+   "corpus_by_section": 184,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "A12": {
+   "title": "| A12 | Pattern A chaining's disposal-timing dispensation for a using var source (deferral to the outer task's teardown) | \u00a730.5 kind 2 | A recorded timing carve against A5's pin -- not a move (the slot lives in the frame); exactly-once is preserved transitively. |",
+   "tagged_blocks": 2,
+   "mentioning_blocks": 3,
+   "corpus_direct": 5,
+   "corpus_by_section": 14,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  },
+  "A13": {
+   "title": "| A13 | Retired. The prior axiom and its decision record are in the changelog. | -- | -- |",
+   "tagged_blocks": 0,
+   "mentioning_blocks": 1,
+   "corpus_direct": 0,
+   "corpus_by_section": 0,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 0,
+   "matrix_open": 0
+  },
+  "A14": {
+   "title": "| A14 | No owned generic type arguments; owning semantics live in named types | \u00a728.1, \u00a714.4; rationale \u00a75.3/\u00a75.11 | Named types capture owning semantics without generic substitution machinery; the declined design is rationale \u00a75.3/\u00a75.11's record. |",
+   "tagged_blocks": 1,
+   "mentioning_blocks": 2,
+   "corpus_direct": 5,
+   "corpus_by_section": 17,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 1,
+   "matrix_open": 0
+  },
+  "A15": {
+   "title": "| A15 | The self-returning enumerator: a class implementing both IEnumerable<T> and IEnumerator<T> may return this; from its own GetEnumerator() body, and the disposal of a self-returned frame runs Dispose() without reclaiming | \u00a728.3 (rows 2-3), \u00a729.1, \u00a729.2 | The announcement table's callee-side set is closed and admits no borrow return; this is a borrow, so the \u00a729.1 form cannot be a derivation -- K6.3 demands a fresh or owned frame and this return is neither. Recorded as a closed three-conjunct admission rather than a widening of the set, every column's caller-side classification unchanged; the non-reclaiming disposal is the half that makes it sound where the receiver is a borrow the caller does not own (#3289). |",
+   "tagged_blocks": 3,
+   "mentioning_blocks": 5,
+   "corpus_direct": 0,
+   "corpus_by_section": 156,
+   "corpus_direct_fail": 0,
+   "matrix_cells": 4,
+   "matrix_open": 0
+  }
+ },
+ "blocks": [
+  {
+   "section": "28.1",
+   "title": "Where the `owned` modifier can appear",
+   "kind": "heading",
+   "line": 6172,
+   "tags": [],
+   "words": 426,
+   "corpus_direct": 0,
+   "corpus_section": 10,
+   "matrix_cells_section": 34,
+   "tests_section": 84
+  },
+  {
+   "section": "28.1",
+   "title": "Type requirement",
+   "kind": "bold",
+   "line": 6193,
+   "tags": [],
+   "words": 552,
+   "corpus_direct": 1,
+   "corpus_section": 10,
+   "matrix_cells_section": 34,
+   "tests_section": 84
+  },
+  {
+   "section": "28.2",
+   "title": "The `IDisposable` contract",
+   "kind": "heading",
+   "line": 6205,
+   "tags": [],
+   "words": 489,
+   "corpus_direct": 0,
+   "corpus_section": 12,
+   "matrix_cells_section": 59,
+   "tests_section": 194
+  },
+  {
+   "section": "28.2",
+   "title": "The compiler-inserted free",
+   "kind": "bold",
+   "line": 6229,
+   "tags": [
+    "K4.2",
+    "K7.4"
+   ],
+   "words": 949,
+   "corpus_direct": 1,
+   "corpus_section": 12,
+   "matrix_cells_section": 59,
+   "tests_section": 194
+  },
+  {
+   "section": "28.2",
+   "title": "Scoped-callback backstop",
+   "kind": "bold",
+   "line": 6242,
+   "tags": [],
+   "words": 47,
+   "corpus_direct": 0,
+   "corpus_section": 12,
+   "matrix_cells_section": 59,
+   "tests_section": 194
+  },
+  {
+   "section": "28.3",
+   "title": "Local variables, ownership, and borrows",
+   "kind": "heading",
+   "line": 6245,
+   "tags": [],
+   "words": 108,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3",
+   "title": "Map of this section",
+   "kind": "bold",
+   "line": 6254,
+   "tags": [],
+   "words": 234,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3",
+   "title": "Glossary",
+   "kind": "bold",
+   "line": 6270,
+   "tags": [],
+   "words": 249,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "The ownership kernel (K1\u2013K9)",
+   "kind": "heading",
+   "line": 6281,
+   "tags": [],
+   "words": 66,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K1 \u2014 Value classification",
+   "kind": "bold",
+   "line": 6286,
+   "tags": [],
+   "words": 673,
+   "corpus_direct": 1,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K2 \u2014 The source algebra",
+   "kind": "bold",
+   "line": 6305,
+   "tags": [],
+   "words": 330,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K3 \u2014 Discharge and consumption",
+   "kind": "bold",
+   "line": 6319,
+   "tags": [],
+   "words": 47,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "The consume table",
+   "kind": "bold",
+   "line": 6322,
+   "tags": [],
+   "words": 1146,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K4 \u2014 Kills, site-announcement, and the backstop posture",
+   "kind": "bold",
+   "line": 6348,
+   "tags": [],
+   "words": 589,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K5 \u2014 The freeze",
+   "kind": "bold",
+   "line": 6363,
+   "tags": [
+    "A11"
+   ],
+   "words": 836,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K6 \u2014 Frames are values",
+   "kind": "bold",
+   "line": 6379,
+   "tags": [
+    "A15"
+   ],
+   "words": 490,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K7 \u2014 The join rule",
+   "kind": "bold",
+   "line": 6388,
+   "tags": [],
+   "words": 157,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K8 \u2014 The full-expression boundary",
+   "kind": "bold",
+   "line": 6399,
+   "tags": [],
+   "words": 340,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.1",
+   "title": "K9 \u2014 Fields are object state, not scope state",
+   "kind": "bold",
+   "line": 6408,
+   "tags": [],
+   "words": 391,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.2",
+   "title": "The axiom register (A1\u2013A15)",
+   "kind": "heading",
+   "line": 6417,
+   "tags": [],
+   "words": 775,
+   "corpus_direct": 1,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.3",
+   "title": "Ownership state of locals",
+   "kind": "heading",
+   "line": 6440,
+   "tags": [],
+   "words": 273,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.3",
+   "title": "State match on reassignment",
+   "kind": "bold",
+   "line": 6448,
+   "tags": [
+    "K1.7",
+    "K3.11"
+   ],
+   "words": 409,
+   "corpus_direct": 2,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.3",
+   "title": "A runtime-managed RHS into a classified local",
+   "kind": "bold",
+   "line": 6457,
+   "tags": [
+    "K1.6",
+    "K1.7",
+    "K3.11"
+   ],
+   "words": 159,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.3",
+   "title": "Adoption",
+   "kind": "bold",
+   "line": 6459,
+   "tags": [
+    "K1.7",
+    "K3.11"
+   ],
+   "words": 1015,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.4",
+   "title": "Producers",
+   "kind": "heading",
+   "line": 6496,
+   "tags": [
+    "A7"
+   ],
+   "words": 1802,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.4",
+   "title": "Consuming positions for an owned-local read",
+   "kind": "bold",
+   "line": 6531,
+   "tags": [
+    "A7"
+   ],
+   "words": 284,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.5",
+   "title": "The announcement table",
+   "kind": "heading",
+   "line": 6542,
+   "tags": [
+    "A15",
+    "K2.4",
+    "K6.2",
+    "K6.3"
+   ],
+   "words": 1697,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.5",
+   "title": "The sources an argument contributes (derives: [K2.2](#sec-kernel-k2) +",
+   "kind": "bold",
+   "line": 6566,
+   "tags": [
+    "K2.2",
+    "K2.4"
+   ],
+   "words": 362,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "Factory methods and sourceless returns",
+   "kind": "heading",
+   "line": 6577,
+   "tags": [],
+   "words": 430,
+   "corpus_direct": 2,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "Calls mint for the mint-announcing families (derives: [K6.2](#sec-kern",
+   "kind": "bold",
+   "line": 6589,
+   "tags": [
+    "A15",
+    "A4",
+    "K2.4",
+    "K6.2",
+    "K6.3"
+   ],
+   "words": 1071,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "Caller side",
+   "kind": "bold",
+   "line": 6608,
+   "tags": [],
+   "words": 758,
+   "corpus_direct": 4,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "Callee side",
+   "kind": "bold",
+   "line": 6619,
+   "tags": [],
+   "words": 630,
+   "corpus_direct": 1,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "`Task`-family substitutions are excluded from bare-parameter function ",
+   "kind": "bold",
+   "line": 6630,
+   "tags": [
+    "K1",
+    "K2.4",
+    "K6.3"
+   ],
+   "words": 291,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "A type parameter occurs in a function type at depth one only (derives:",
+   "kind": "bold",
+   "line": 6632,
+   "tags": [
+    "K1.6",
+    "K2.4"
+   ],
+   "words": 308,
+   "corpus_direct": 4,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "Function values a generic body forms over its type parameters (derives",
+   "kind": "bold",
+   "line": 6634,
+   "tags": [
+    "K2.3",
+    "K2.4"
+   ],
+   "words": 694,
+   "corpus_direct": 7,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "Exported mint slots (derives: [K2.4](#sec-kernel-k2) + [K6.3](#sec-ker",
+   "kind": "bold",
+   "line": 6639,
+   "tags": [
+    "K2.4",
+    "K6.3"
+   ],
+   "words": 753,
+   "corpus_direct": 9,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "Concrete-slot function bodies (derives: [K2.4](#sec-kernel-k2) \u2014 the r",
+   "kind": "bold",
+   "line": 6650,
+   "tags": [
+    "K2.4"
+   ],
+   "words": 391,
+   "corpus_direct": 2,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.6",
+   "title": "Iterator and iterable returns (derives: [K6.2](#sec-kernel-k6) + [K6.3",
+   "kind": "bold",
+   "line": 6652,
+   "tags": [
+    "K6.2",
+    "K6.3"
+   ],
+   "words": 147,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.7",
+   "title": "Move semantics for owned locals",
+   "kind": "heading",
+   "line": 6654,
+   "tags": [
+    "A5"
+   ],
+   "words": 611,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.7",
+   "title": "Captured owned bindings (derives: [K2](#sec-kernel-k2) + [K5.5](#sec-k",
+   "kind": "bold",
+   "line": 6697,
+   "tags": [
+    "K2",
+    "K5.5"
+   ],
+   "words": 143,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.8",
+   "title": "Borrow lifetime rules",
+   "kind": "heading",
+   "line": 6700,
+   "tags": [
+    "K2.3",
+    "K2.4",
+    "K4.3",
+    "K8.1"
+   ],
+   "words": 5576,
+   "corpus_direct": 22,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.8",
+   "title": "A `ref` or plain `out` location outlives the call",
+   "kind": "bold",
+   "line": 6744,
+   "tags": [
+    "K2.2",
+    "K2.3",
+    "K2.4"
+   ],
+   "words": 502,
+   "corpus_direct": 4,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.9",
+   "title": "The consume-site freeze",
+   "kind": "heading",
+   "line": 6747,
+   "tags": [],
+   "words": 340,
+   "corpus_direct": 3,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.9",
+   "title": "Frame locals",
+   "kind": "bold",
+   "line": 6753,
+   "tags": [
+    "K2.1",
+    "K2.2",
+    "K5.5"
+   ],
+   "words": 241,
+   "corpus_direct": 5,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.9",
+   "title": "Span-carried borrows and the site-announced kills",
+   "kind": "bold",
+   "line": 6755,
+   "tags": [
+    "K4.1",
+    "K5.3"
+   ],
+   "words": 135,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.9",
+   "title": "Unborrowed reassignment stays legal",
+   "kind": "bold",
+   "line": 6757,
+   "tags": [],
+   "words": 78,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.9",
+   "title": "Scope",
+   "kind": "bold",
+   "line": 6759,
+   "tags": [],
+   "words": 330,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.10",
+   "title": "Owned-local discharge requirement",
+   "kind": "heading",
+   "line": 6766,
+   "tags": [],
+   "words": 74,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.10",
+   "title": "Auto-drop (affine)",
+   "kind": "bold",
+   "line": 6770,
+   "tags": [
+    "K3.14"
+   ],
+   "words": 149,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.10",
+   "title": "Must-use warning ([K3.14](#sec-kernel-k3)'s lint)",
+   "kind": "bold",
+   "line": 6772,
+   "tags": [],
+   "words": 379,
+   "corpus_direct": 9,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.10",
+   "title": "Exception-path discharge",
+   "kind": "bold",
+   "line": 6783,
+   "tags": [
+    "K3.15"
+   ],
+   "words": 442,
+   "corpus_direct": 1,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "Unbound owned temporaries",
+   "kind": "heading",
+   "line": 6796,
+   "tags": [
+    "K1",
+    "K3.15",
+    "K8"
+   ],
+   "words": 244,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "The return slot",
+   "kind": "bold",
+   "line": 6800,
+   "tags": [
+    "K3.15",
+    "K3.2"
+   ],
+   "words": 309,
+   "corpus_direct": 4,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "The scoped-bind pinned slot ([\u00a730.5](#sec-the-scoped-await-bind))",
+   "kind": "bold",
+   "line": 6802,
+   "tags": [],
+   "words": 102,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "The full expression boundary",
+   "kind": "bold",
+   "line": 6804,
+   "tags": [],
+   "words": 95,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "`case` scrutinees extend the boundary",
+   "kind": "bold",
+   "line": 6806,
+   "tags": [],
+   "words": 90,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "Binding-atom bindings are named temporaries",
+   "kind": "bold",
+   "line": 6808,
+   "tags": [],
+   "words": 484,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "A callee that stores a plain argument",
+   "kind": "bold",
+   "line": 6816,
+   "tags": [],
+   "words": 242,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "Deferred-activation callees (derives: [K2.4](#sec-kernel-k2) + [K6](#s",
+   "kind": "bold",
+   "line": 6820,
+   "tags": [
+    "K2.4",
+    "K6"
+   ],
+   "words": 156,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "The capture-set contribution",
+   "kind": "bold",
+   "line": 6822,
+   "tags": [],
+   "words": 276,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "Temporaries as sources",
+   "kind": "bold",
+   "line": 6824,
+   "tags": [],
+   "words": 230,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.11",
+   "title": "Returning a deferred-activation frame (derives: [K6.2](#sec-kernel-k6)",
+   "kind": "bold",
+   "line": 6827,
+   "tags": [
+    "K2.4",
+    "K6.2"
+   ],
+   "words": 459,
+   "corpus_direct": 3,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.12",
+   "title": "Diagnostics",
+   "kind": "heading",
+   "line": 6830,
+   "tags": [
+    "A5"
+   ],
+   "words": 71,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.12",
+   "title": "The trust-admission report",
+   "kind": "bold",
+   "line": 6834,
+   "tags": [
+    "A10"
+   ],
+   "words": 643,
+   "corpus_direct": 8,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.3.13",
+   "title": "Choosing a disposal form (recap)",
+   "kind": "heading",
+   "line": 6845,
+   "tags": [],
+   "words": 423,
+   "corpus_direct": 0,
+   "corpus_section": 156,
+   "matrix_cells_section": 200,
+   "tests_section": 1021
+  },
+  {
+   "section": "28.4",
+   "title": "The `destructor`",
+   "kind": "heading",
+   "line": 6863,
+   "tags": [],
+   "words": 272,
+   "corpus_direct": 4,
+   "corpus_section": 8,
+   "matrix_cells_section": 31,
+   "tests_section": 79
+  },
+  {
+   "section": "28.4",
+   "title": "The destructor body runs on disposal, never on construction unwind \u2014 h",
+   "kind": "bold",
+   "line": 6897,
+   "tags": [],
+   "words": 294,
+   "corpus_direct": 0,
+   "corpus_section": 8,
+   "matrix_cells_section": 31,
+   "tests_section": 79
+  },
+  {
+   "section": "28.4",
+   "title": "Destructors should not throw; behavior is defined when one does",
+   "kind": "bold",
+   "line": 6899,
+   "tags": [],
+   "words": 306,
+   "corpus_direct": 0,
+   "corpus_section": 8,
+   "matrix_cells_section": 31,
+   "tests_section": 79
+  },
+  {
+   "section": "28.5",
+   "title": "Owned fields",
+   "kind": "heading",
+   "line": 6906,
+   "tags": [
+    "A14",
+    "K1.6",
+    "K1.7"
+   ],
+   "words": 394,
+   "corpus_direct": 5,
+   "corpus_section": 22,
+   "matrix_cells_section": 24,
+   "tests_section": 116
+  },
+  {
+   "section": "28.5",
+   "title": "Generic class fields",
+   "kind": "bold",
+   "line": 6934,
+   "tags": [
+    "K1.6"
+   ],
+   "words": 279,
+   "corpus_direct": 3,
+   "corpus_section": 22,
+   "matrix_cells_section": 24,
+   "tests_section": 116
+  },
+  {
+   "section": "28.6",
+   "title": "Leak prevention",
+   "kind": "heading",
+   "line": 6939,
+   "tags": [
+    "A4",
+    "K1.5",
+    "K1.7",
+    "K2.3",
+    "K3.9",
+    "K4.1",
+    "K4.3",
+    "K9.1"
+   ],
+   "words": 1395,
+   "corpus_direct": 3,
+   "corpus_section": 38,
+   "matrix_cells_section": 34,
+   "tests_section": 157
+  },
+  {
+   "section": "28.6",
+   "title": "After an explicit `Dispose()` of an owned field, or of a slot of an ow",
+   "kind": "bold",
+   "line": 6991,
+   "tags": [],
+   "words": 489,
+   "corpus_direct": 5,
+   "corpus_section": 38,
+   "matrix_cells_section": 34,
+   "tests_section": 157
+  },
+  {
+   "section": "28.6",
+   "title": "No element-borrow disposal",
+   "kind": "bold",
+   "line": 6995,
+   "tags": [],
+   "words": 776,
+   "corpus_direct": 2,
+   "corpus_section": 38,
+   "matrix_cells_section": 34,
+   "tests_section": 157
+  },
+  {
+   "section": "28.7",
+   "title": "Reassigning owned fields and locals \u2014 drop-on-overwrite",
+   "kind": "heading",
+   "line": 7021,
+   "tags": [],
+   "words": 0,
+   "corpus_direct": 0,
+   "corpus_section": 11,
+   "matrix_cells_section": 30,
+   "tests_section": 85
+  },
+  {
+   "section": "28.7",
+   "title": "Assignment to an owned field or owned local disposes the displaced val",
+   "kind": "bold",
+   "line": 7023,
+   "tags": [
+    "K3.11"
+   ],
+   "words": 360,
+   "corpus_direct": 3,
+   "corpus_section": 11,
+   "matrix_cells_section": 30,
+   "tests_section": 85
+  },
+  {
+   "section": "28.7",
+   "title": "Overwrite while borrowed",
+   "kind": "bold",
+   "line": 7033,
+   "tags": [],
+   "words": 84,
+   "corpus_direct": 0,
+   "corpus_section": 11,
+   "matrix_cells_section": 30,
+   "tests_section": 85
+  },
+  {
+   "section": "28.7",
+   "title": "Ordering and exceptions",
+   "kind": "bold",
+   "line": 7035,
+   "tags": [],
+   "words": 365,
+   "corpus_direct": 0,
+   "corpus_section": 11,
+   "matrix_cells_section": 30,
+   "tests_section": 85
+  },
+  {
+   "section": "28.8",
+   "title": "Ownership transfer",
+   "kind": "heading",
+   "line": 7038,
+   "tags": [],
+   "words": 355,
+   "corpus_direct": 0,
+   "corpus_section": 4,
+   "matrix_cells_section": 3,
+   "tests_section": 108
+  },
+  {
+   "section": "28.8.1",
+   "title": "The `move` expression",
+   "kind": "heading",
+   "line": 7074,
+   "tags": [
+    "A5",
+    "A7"
+   ],
+   "words": 774,
+   "corpus_direct": 8,
+   "corpus_section": 30,
+   "matrix_cells_section": 56,
+   "tests_section": 105
+  },
+  {
+   "section": "28.8.1",
+   "title": "No location ever holds a hole",
+   "kind": "bold",
+   "line": 7085,
+   "tags": [],
+   "words": 875,
+   "corpus_direct": 5,
+   "corpus_section": 30,
+   "matrix_cells_section": 56,
+   "tests_section": 105
+  },
+  {
+   "section": "28.8.1",
+   "title": "A raise from the consuming call does not hand the obligation back",
+   "kind": "bold",
+   "line": 7137,
+   "tags": [],
+   "words": 248,
+   "corpus_direct": 0,
+   "corpus_section": 30,
+   "matrix_cells_section": 56,
+   "tests_section": 105
+  },
+  {
+   "section": "28.9",
+   "title": "Runtime-managed types",
+   "kind": "heading",
+   "line": 7140,
+   "tags": [],
+   "words": 848,
+   "corpus_direct": 0,
+   "corpus_section": 20,
+   "matrix_cells_section": 50,
+   "tests_section": 612
+  },
+  {
+   "section": "28.9",
+   "title": "Accessor faces are uniform across type kinds",
+   "kind": "bold",
+   "line": 7161,
+   "tags": [
+    "K1.6"
+   ],
+   "words": 2079,
+   "corpus_direct": 2,
+   "corpus_section": 20,
+   "matrix_cells_section": 50,
+   "tests_section": 612
+  },
+  {
+   "section": "28.10",
+   "title": "`using var`",
+   "kind": "heading",
+   "line": 7222,
+   "tags": [
+    "A5",
+    "A7"
+   ],
+   "words": 732,
+   "corpus_direct": 0,
+   "corpus_section": 14,
+   "matrix_cells_section": 30,
+   "tests_section": 139
+  },
+  {
+   "section": "28.10",
+   "title": "Adopting a named owned binding (derives: [K3.4](#sec-kernel-k3))",
+   "kind": "bold",
+   "line": 7243,
+   "tags": [
+    "A5",
+    "A6",
+    "K3.4"
+   ],
+   "words": 491,
+   "corpus_direct": 0,
+   "corpus_section": 14,
+   "matrix_cells_section": 30,
+   "tests_section": 139
+  },
+  {
+   "section": "28.10",
+   "title": "The anonymous binding",
+   "kind": "bold",
+   "line": 7256,
+   "tags": [
+    "A6"
+   ],
+   "words": 121,
+   "corpus_direct": 0,
+   "corpus_section": 14,
+   "matrix_cells_section": 30,
+   "tests_section": 139
+  },
+  {
+   "section": "28.10",
+   "title": "The compiler-introduced slot",
+   "kind": "bold",
+   "line": 7258,
+   "tags": [
+    "K2"
+   ],
+   "words": 609,
+   "corpus_direct": 0,
+   "corpus_section": 14,
+   "matrix_cells_section": 30,
+   "tests_section": 139
+  },
+  {
+   "section": "28.11",
+   "title": "Collection element ownership",
+   "kind": "heading",
+   "line": 7285,
+   "tags": [
+    "A9",
+    "K1",
+    "K2.3",
+    "K4.3"
+   ],
+   "words": 1001,
+   "corpus_direct": 4,
+   "corpus_section": 37,
+   "matrix_cells_section": 54,
+   "tests_section": 235
+  },
+  {
+   "section": "28.11",
+   "title": "Storing a borrow (derives: [K2.3](#sec-kernel-k2))",
+   "kind": "bold",
+   "line": 7327,
+   "tags": [
+    "K2.3"
+   ],
+   "words": 430,
+   "corpus_direct": 6,
+   "corpus_section": 37,
+   "matrix_cells_section": 54,
+   "tests_section": 235
+  },
+  {
+   "section": "28.11",
+   "title": "Value-copy members",
+   "kind": "bold",
+   "line": 7336,
+   "tags": [
+    "A9"
+   ],
+   "words": 2137,
+   "corpus_direct": 20,
+   "corpus_section": 37,
+   "matrix_cells_section": 54,
+   "tests_section": 235
+  },
+  {
+   "section": "28.12",
+   "title": "Asynchronous disposal",
+   "kind": "heading",
+   "line": 7449,
+   "tags": [],
+   "words": 615,
+   "corpus_direct": 3,
+   "corpus_section": 14,
+   "matrix_cells_section": 29,
+   "tests_section": 22
+  },
+  {
+   "section": "28.12",
+   "title": "Implicit discharge is synchronous",
+   "kind": "bold",
+   "line": 7466,
+   "tags": [],
+   "words": 927,
+   "corpus_direct": 6,
+   "corpus_section": 14,
+   "matrix_cells_section": 29,
+   "tests_section": 22
+  },
+  {
+   "section": "28.12",
+   "title": "The `DisposeAsync` awaited is the run-time object's",
+   "kind": "bold",
+   "line": 7490,
+   "tags": [],
+   "words": 234,
+   "corpus_direct": 0,
+   "corpus_section": 14,
+   "matrix_cells_section": 29,
+   "tests_section": 22
+  },
+  {
+   "section": "28.13",
+   "title": "Shared ownership: `Shared<T>` and `Weak<T>`",
+   "kind": "heading",
+   "line": 7495,
+   "tags": [],
+   "words": 930,
+   "corpus_direct": 1,
+   "corpus_section": 8,
+   "matrix_cells_section": 4,
+   "tests_section": 46
+  },
+  {
+   "section": "28.14",
+   "title": "Scoped callback parameters: storage-bounded capture",
+   "kind": "heading",
+   "line": 7521,
+   "tags": [
+    "A11",
+    "K2.3",
+    "K5.7"
+   ],
+   "words": 153,
+   "corpus_direct": 0,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "The `scoped` modifier",
+   "kind": "bold",
+   "line": 7525,
+   "tags": [
+    "A11",
+    "K5.7"
+   ],
+   "words": 1136,
+   "corpus_direct": 2,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "Quiescence",
+   "kind": "bold",
+   "line": 7545,
+   "tags": [],
+   "words": 101,
+   "corpus_direct": 0,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "The call-bounded default (derives: [K2.4](#sec-kernel-k2) \u2014 a plain si",
+   "kind": "bold",
+   "line": 7547,
+   "tags": [
+    "K2.4"
+   ],
+   "words": 407,
+   "corpus_direct": 0,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "The stdlib retention register",
+   "kind": "bold",
+   "line": 7551,
+   "tags": [
+    "A10"
+   ],
+   "words": 455,
+   "corpus_direct": 1,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "Call-bounded \u00d7 deferred activation (unified across the deferred-activa",
+   "kind": "bold",
+   "line": 7555,
+   "tags": [
+    "K3",
+    "K6.1",
+    "K6.2",
+    "K6.3"
+   ],
+   "words": 657,
+   "corpus_direct": 0,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "Class- and interface-typed `scoped` parameters: scoped construction",
+   "kind": "bold",
+   "line": 7561,
+   "tags": [],
+   "words": 860,
+   "corpus_direct": 3,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "v1 admission bounds (ratified; axiom [A11](#sec-axiom-register))",
+   "kind": "bold",
+   "line": 7572,
+   "tags": [
+    "A11"
+   ],
+   "words": 613,
+   "corpus_direct": 0,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "Interaction with the type system",
+   "kind": "bold",
+   "line": 7582,
+   "tags": [],
+   "words": 94,
+   "corpus_direct": 0,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "28.14",
+   "title": "Relation to \u00a730.11",
+   "kind": "bold",
+   "line": 7584,
+   "tags": [
+    "A10"
+   ],
+   "words": 82,
+   "corpus_direct": 0,
+   "corpus_section": 30,
+   "matrix_cells_section": 32,
+   "tests_section": 101
+  },
+  {
+   "section": "30.5",
+   "title": "Result lifetime and task disposal",
+   "kind": "heading",
+   "line": 8066,
+   "tags": [
+    "A10",
+    "A12",
+    "A3",
+    "K1",
+    "K2",
+    "K4.3",
+    "K6"
+   ],
+   "words": 1551,
+   "corpus_direct": 2,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  },
+  {
+   "section": "30.5",
+   "title": "Copyable value type, `string`, or runtime-managed result:",
+   "kind": "bold",
+   "line": 8101,
+   "tags": [],
+   "words": 178,
+   "corpus_direct": 0,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  },
+  {
+   "section": "30.5",
+   "title": "`Task<T>` for class or interface T (Pattern A)",
+   "kind": "bold",
+   "line": 8110,
+   "tags": [
+    "K1",
+    "K2"
+   ],
+   "words": 856,
+   "corpus_direct": 0,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  },
+  {
+   "section": "30.5",
+   "title": "The scoped await-bind",
+   "kind": "bold",
+   "line": 8144,
+   "tags": [
+    "K2.1"
+   ],
+   "words": 413,
+   "corpus_direct": 0,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  },
+  {
+   "section": "30.5",
+   "title": "Which declarations qualify",
+   "kind": "bold",
+   "line": 8155,
+   "tags": [],
+   "words": 286,
+   "corpus_direct": 0,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  },
+  {
+   "section": "30.5",
+   "title": "`.Result` in lockstep",
+   "kind": "bold",
+   "line": 8157,
+   "tags": [],
+   "words": 28,
+   "corpus_direct": 0,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  },
+  {
+   "section": "30.5",
+   "title": "Error participation:",
+   "kind": "bold",
+   "line": 8159,
+   "tags": [],
+   "words": 55,
+   "corpus_direct": 0,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  },
+  {
+   "section": "30.5",
+   "title": "`OwningTask<T>` for class or interface T (Pattern B)",
+   "kind": "bold",
+   "line": 8161,
+   "tags": [
+    "K1",
+    "K3",
+    "K3.5",
+    "K4.2"
+   ],
+   "words": 1148,
+   "corpus_direct": 3,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  },
+  {
+   "section": "30.5",
+   "title": "Disposing an unsettled task",
+   "kind": "bold",
+   "line": 8226,
+   "tags": [
+    "A12",
+    "A3",
+    "K1"
+   ],
+   "words": 732,
+   "corpus_direct": 3,
+   "corpus_section": 19,
+   "matrix_cells_section": 67,
+   "tests_section": 108
+  }
+ ],
+ "drift": {
+  "total": 435,
+  "hold": 193,
+  "paraphrase": 242,
+  "short": 0
+ },
+ "all_drift": {
+  "total": 3336,
+  "hold": 1099
+ }
+}

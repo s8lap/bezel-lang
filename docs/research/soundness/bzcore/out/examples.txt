@@ -1,0 +1,71 @@
+--- v0.180 probe (rationale §5.1): borrow, then transfer to a domain, then use the borrow
+    new x
+    brw b x
+    send x
+    use b
+    verdict: reject:K5.1-frozen-transfer  warnings: []  (expected reject:K5.1-frozen-transfer) OK
+--- 0047 §5.3 example: var b := x; var y := move x; use b
+    new x
+    brw b x
+    move y x
+    use b
+    verdict: reject:K5.1-frozen-transfer  warnings: []  (expected reject:K5.1-frozen-transfer) OK
+--- K5.3: explicit Dispose() under a live borrow is admitted; the later use faults deterministically
+    new x
+    brw b x
+    disp x
+    use b
+    verdict: accept  warnings: []  (expected accept) OK
+    run: FAULT  events: [('disp', 1), ('fault', 'b')]
+--- K5.2 (§28.7 Overwrite while borrowed): drop-on-overwrite under a live borrow is frozen
+    new x
+    brw b x
+    asg x
+    use b
+    verdict: reject:K5.2-frozen-overwrite  warnings: []  (expected reject:K5.2-frozen-overwrite) OK
+--- K7.3 (§28.3.3 mixed merge): owned on one arm, borrowed on the other, is rejected at the join
+    decl x
+    new a
+    if {
+      asg x
+    } else {
+      asgb x a
+    }
+    use x
+    verdict: reject:K7.3-mixed-merge  warnings: []  (expected reject:K7.3-mixed-merge) OK
+--- §28.3.3 Pattern 1: equalize to borrowed — both arms bind x to a source that outlives the merge
+    decl x
+    new a
+    new b
+    if {
+      asgb x a
+    } else {
+      asgb x b
+    }
+    use x
+    verdict: accept  warnings: []  (expected accept) OK
+    run: ok     events: [('disp', 2), ('disp', 1)]
+    run: ok     events: [('disp', 2), ('disp', 1)]
+--- K7.4: a conditional kill joins to maybe-consumed; the later read is rejected
+    new a
+    if {
+      disp a
+    } else {
+    }
+    use a
+    verdict: reject:K1.3-read-of-moved  warnings: []  (expected reject:K1.3-read-of-moved) OK
+--- K3.14 affinity: an undischarged owned local is disposed at scope end (trace has one disp)
+    new a
+    {
+      new b
+      use b
+    }
+    use a
+    verdict: accept  warnings: []  (expected accept) OK
+    run: ok     events: [('disp', 2), ('disp', 1)]
+--- §28.2: straight-line use after an explicit kill is a warning, and faults in checked mode
+    new a
+    disp a
+    use a
+    verdict: accept  warnings: ['§28.2-use-after-dispose']  (expected accept) OK
+    run: FAULT  events: [('disp', 1), ('fault', 'a')]

@@ -1,0 +1,2 @@
+baseline kernel: {'programs': 308526, 'accept': 50529, 'reject:K1.3-read-of-moved': 125736, 'reject:K3-consume-of-non-owned': 90177, 'accept-with-warning': 5760, 'reject:state-match': 32256, 'reject:§28.6-dispose-of-borrow': 5682, 'reject:K5.2-frozen-overwrite': 1518, 'reject:K5.1-frozen-transfer': 2628}
+T1/T2/T3 hold on every accepted program
