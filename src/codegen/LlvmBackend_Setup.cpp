@@ -32334,15 +32334,35 @@ struct StringEscapeWalker {
             // aliasing shape in the language.
             //
             // WHY THE SET MEMBERSHIP TEST AND NOT THE SYNTAX. Only a
-            // stringBorrowAll_ member is retained. A `using var` copy, a
-            // `string?`-declared copy (`var o: string? := built;`), an
-            // `object`-declared/boxing copy, and a copy declared in a LAMBDA
-            // body (whose LocalDecls collectStringReleaseEligible never scans —
-            // it recurses into if/while/for/do/try/case bodies only) are all
-            // NOT in the set, get NO retain, and so must keep tainting the
-            // source: relaxing for them would free `built` while an
-            // un-retained alias still named it (a use-after-free — strictly
-            // worse than the bounded leak). `const other := built;` is a
+            // stringBorrowAll_ member is retained. The premise this paragraph
+            // used to state is now FALSE for three of the four shapes it
+            // listed, so they are split:
+            //
+            //   * IN THE SET, AND IT DOES RETAIN. The `using var` copy of a
+            //     borrow-initialized string local — fix #7388 (v0.345) admitted
+            //     the `using var` spelling to the borrow arm (the
+            //     `usingVarBorrow` gate), so the copy is a stringBorrowAll_
+            //     member, takes its own +1 at bind, and releases it at scope
+            //     end. The `string?`-declared copy (`var o: string? := built;`)
+            //     has been a member since fix #5245 (v0.313) and likewise
+            //     retains. Each of them therefore also takes the relaxation
+            //     below, so the SOURCE keeps its own release.
+            //   * NOT IN THIS SET, BUT IT DOES RETAIN, IN A SEPARATE ONE. An
+            //     `object`-declared/boxing copy is not a stringBorrowAll_
+            //     member; fix #2900 (v0.240) admits it to the separate
+            //     objectStringBorrowAll_ set (collectObjectStringReleaseEligible),
+            //     which retains at bind and releases at scope end, and which
+            //     has its own relaxation arm below. It does not taint the
+            //     source either.
+            //   * NOT IN ANY SET, AND IT GETS NO RETAIN. A copy declared in a
+            //     LAMBDA body (whose LocalDecls collectStringReleaseEligible
+            //     never scans — it recurses into if/while/for/do/try/case
+            //     bodies only) is in neither set, so it gets NO retain and
+            //     must keep tainting the source: relaxing for it would free
+            //     `built` while an un-retained alias still named it (a
+            //     use-after-free — strictly worse than the bounded leak).
+            //
+            // `const other := built;` is a
             // LocalConstDecl, a different node handled by its own arm below
             // — which since #3416 carries this same relaxation, because #3416
             // admits a §21.1 `const` to stringBorrowAll_ and so retains it at
