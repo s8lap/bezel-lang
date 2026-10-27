@@ -21682,6 +21682,36 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // disposable — the frame is a FRESH allocation this declaration alone
     // holds, and the borrow pin is about the SOURCE, not about the frame.
     if (!pinned && usingVarRhsIsPlainParameterBorrow(ld)) pinned = true;
+    // fix #6194 / §30.11 / §28.10 (v0.345): a `using var` (or `await using
+    // var`) over a STORED-TASK SOURCE's `Task` property is a §28.10
+    // BORROW-PIN. §30.11: "The **source owns the task object** its `Task`
+    // property exposes. A read of the property is a **borrow** of the task ...
+    // there is no first-read ownership transfer ... the source's disposal is
+    // the task's single disposal." The binding therefore assumes NO
+    // obligation: at scope end nothing is disposed of the task — the SOURCE
+    // disposes it, exactly once, when it is itself disposed.
+    //
+    // MEASURED on this tree's base (c5e8992d), AOT, ASan:
+    //
+    //   using var tcs := new TaskCompletionSource<int>();
+    //   using var t  := tcs.Task;      -> rc=124 (HANG, 20 s limit)
+    //   using var tcs := new TaskCompletionSource<int>();
+    //   var      t  := tcs.Task;      -> rc=77  (correct)
+    //
+    // The mechanism, measured with a debugger: the `using var` over the
+    // property read registered a `d.task` scope-end disposal (the plain-`var`
+    // twin does not — `taskLocalInitializerIsBorrowSource` reads a member
+    // access as a storage READ, so the plain twin owns no frame). That
+    // disposal fire-and-forgot the TCS's INNER task at scope end, freeing it;
+    // the TCS's own scope-end release then read the SAME inner task again
+    // (`bz_tcs_task` → `bz_task_is_error`) — a use-after-free, which under
+    // ASan is a SEGV when the task is still pending and a HANG (a lock on a
+    // destroyed mutex) when the task was already complete. The `await using`
+    // spelling hangs the same way.
+    //
+    // §30.11 names the canonical spelling `return await tcs.Task;`, which
+    // works today; this is the BOUND spelling of the same borrow.
+    if (!pinned && usingVarRhsIsStoredTaskPropertyBorrow(ld)) pinned = true;
     if (pinned && iterFormatWrappedDecls_.count(ld)) pinned = false;
     if (pinned) return;
 
@@ -49043,7 +49073,13 @@ bool Emitter::taskLocalOwnsFrame(const ast::LocalDecl* ld) {
     // pass's own pin says for every other borrow shape.
     if (ld->isUsing)
         return !ld->usingVarSourceIsBorrow &&
-               !usingVarRhsIsPlainParameterBorrow(ld);
+               !usingVarRhsIsPlainParameterBorrow(ld) &&
+               // fix #6194 / §30.11 (v0.345): a `using var` over a stored-task
+               // source's `Task` property is a borrow of the SOURCE's storage
+               // — the source owns the task and disposes it exactly once, at
+               // its own disposal — so this local owns no frame either. The
+               // same authority the disposal registration reads.
+               !usingVarRhsIsStoredTaskPropertyBorrow(ld);
     return !taskLocalInitializerIsBorrowSource(ld) && !ld->initializerCallIsBorrow;
 }
 
@@ -49098,6 +49134,59 @@ bool Emitter::usingVarRhsIsPlainParameterBorrow(const ast::LocalDecl* ld) const 
     // recipient; both are OWNED, not BORROWED. Everything else — a plain
     // parameter, a `ref` parameter — is a borrow of the caller's value.
     return ps->modifier != "owned" && ps->modifier != "out owned";
+}
+
+
+// fix #6194 / §30.11 / §28.10 (v0.345): is this `using var` binding's
+// RIGHT-HAND SIDE a read of a STORED-TASK SOURCE's `Task` property?
+//
+// §30.11 (v0.345), "Task-object ownership", verbatim: "The **source owns the
+// task object** its `Task` property exposes. A read of the property is a
+// **borrow** of the task, sourced at the source object's location — the same
+// receiver-sourced notion as an owned-field read (§28.6) — and is admitted
+// wherever §30.5 admits a task borrow with that source: for the canonical
+// `using var tcs` shape, the borrow is bounded by `tcs`'s scope, so
+// `return await tcs.Task;` inside the scope (every example below) is
+// well-formed ... **there is no first-read ownership transfer.**" And:
+// "For either kind, a **never-awaited** task is disposed exactly once, by the
+// source at source disposal."
+//
+// So the read is a BORROW of the source's storage, and §28.10's "`using var`
+// initialized from a borrow" makes the binding a BORROW-PIN: "the `using var`
+// does **not** assume a disposal obligation (derives: K2 — no obligation can
+// be assumed from a borrow): at scope end, no `Dispose()` is called, because
+// the value is not owned by this scope." The SOURCE keeps the obligation and
+// disposes the task exactly once, at its own disposal.
+//
+// The OWNERSHIP PASS's `usingVarSourceIsBorrow` flag does not cover this
+// shape: it positively recognizes a field read, an indexer access, a
+// borrow-returning call and the bare-id shapes — "Builtin/interface-
+// dispatched property reads and calls (no resolved body) remain adopting" —
+// and the `Task` property of a `TaskCompletionSource` /
+// `OwningTaskCompletionSource` is a builtin property read. So the answer is
+// computed here, in the codegen, from the SAME facts the disposal
+// registration reads. This is the ONE authority for the question, so the
+// disposal registration (`registerUsingDisposal`) and `taskLocalOwnsFrame`
+// cannot disagree.
+//
+// NOT IN SCOPE HERE: an ordinary class's own `Task`-named property. The
+// receiver's type is the discriminator — §30.11's rule is about the STORED
+// TASK of a stored-task SOURCE, and a user class's `Task` property is a
+// borrow of that class's own storage by §28.6's ordinary receiver-sourced
+// accessor rule, which this predicate deliberately does not re-decide.
+bool Emitter::usingVarRhsIsStoredTaskPropertyBorrow(
+    const ast::LocalDecl* ld) const {
+    if (!ld || !ld->initializer) return false;
+    auto* ma =
+        dynamic_cast<const ast::MemberAccessExpr*>(ld->initializer.get());
+    if (!ma || ma->member != "Task" || !ma->target) return false;
+    // The receiver's type is the discriminator: the stored-task sources and
+    // nothing else. `builtinTypeName` is the same authority the TCS call
+    // lowering (`tryLowerTcsCall`) and the TCS scope-end release
+    // (`emitTcsRelease`) read, so the three cannot disagree about what a
+    // TaskCompletionSource is.
+    std::string_view rcn = builtinTypeName(ctx_.exprType(*ma->target));
+    return rcn == "TaskCompletionSource" || rcn == "OwningTaskCompletionSource";
 }
 
 

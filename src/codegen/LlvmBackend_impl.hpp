@@ -20392,6 +20392,21 @@ private:
     // OWNERSHIP CLASSIFICATION question, and the answer is BORROW for a plain
     // parameter and OWNED for an `owned` one (an owned transfer).
     bool usingVarRhsIsPlainParameterBorrow(const ast::LocalDecl* ld) const;
+    // fix #6194 / §30.11 / §28.10 (v0.345): is this `using var` binding's
+    // RIGHT-HAND SIDE a read of a stored-task source's `Task` property? §30.11
+    // ("Task-object ownership"): "The **source owns the task object** its
+    // `Task` property exposes. A read of the property is a **borrow** of the
+    // task, sourced at the source object's location ... there is no first-read
+    // ownership transfer ... the source's disposal is the task's single
+    // disposal." So the read is a BORROW, and §28.10's "`using var`
+    // initialized from a borrow" makes the binding a borrow-PIN: it assumes no
+    // disposal obligation, and at scope end nothing is disposed of the task —
+    // the SOURCE disposes it, exactly once. The ownership pass's
+    // `usingVarSourceIsBorrow` flag does not cover this shape (a builtin
+    // property read is not one of the shapes it positively recognizes), so the
+    // answer is computed here, in the codegen, from the SAME facts the
+    // disposal registration reads.
+    bool usingVarRhsIsStoredTaskPropertyBorrow(const ast::LocalDecl* ld) const;
     // fix #7305 / §28.10 (v0.344): `allowUsingVar` admits the `using var`
     // SPELLING of a value-like choice local — §28.10 says of it that "the only
     // effect is the reassignability restriction", so the `using var` spelling
