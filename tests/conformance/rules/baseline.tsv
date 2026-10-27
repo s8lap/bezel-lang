@@ -1,74 +1,4 @@
 # Observed verdicts, banked by runner.py. A `fail` row is a recorded divergence between the spec and the implementation, not a case to edit. See README.md.
-s5_1_0148	pass	
-s5_1_0149	pass	
-s5_1_0150	pass	
-s7_4_0117	pass	
-s7_4_0118	pass	
-s7_4_0119	fail	#7302: the type fact does not compose through the early exit; the carrier stays nullable and the call is refused
-s17_14_0020	pass	
-s17_14_0021	pass	
-s22_6_0110	pass	
-s22_6_0111	pass	
-l2_2_0029	pass	
-l2_3_0010	pass	
-l2_3_0011	pass	
-l2_3_0012	pass	
-l2_3_0013	pass	
-l2_3_0014	pass	
-l2_3_0015	pass	
-l2_3_0016	pass	
-l2_3_0017	pass	
-l2_3_0018	pass	
-l2_3_0019	pass	
-l2_3_0020	pass	
-l2_3_0021	pass	
-l2_3_0022	pass	
-l2_18_0012	fail	#7265
-l2_18_0013	pass	
-l2_18_0014	pass	
-l2_18_0015	pass	
-l2_18_0016	fail	#7301: a non-finite double renders inf/-inf/nan, where stdlib 2.18 requires Infinity/-Infinity/NaN
-l2_18_0017	fail	#7303
-l2_18_0018	pass	
-l2_18_0019	fail	#7265
-l2_18_0020	fail	#7286
-l9_1_0008	pass	
-l9_1_0009	pass	
-l9_1_0010	pass	
-l9_1_0011	pass	
-l9_1_0012	pass	
-l9_1_0013	pass	
-l9_1_0014	pass	
-l9_1_0015	pass	
-l9_1_0016	fail	#7268
-l9_1_0017	pass	
-l9_1_0018	pass	
-l9_5_0004	fail	#7295
-s7_4_0108	pass	
-s7_4_0109	pass	
-s9_5_0008	pass	
-s9_5_0009	pass	
-s12_7_0042	pass	
-s12_7_0043	pass	
-s17_8_0004	pass	
-s21_5_0006	pass	
-s21_5_0007	pass	
-s21_5_0008	pass	
-s21_5_0009	pass	
-s21_5_0010	pass	
-s21_5_0011	pass	
-s27_8_0013	pass	
-s27_8_0014	pass	
-s28_10_0017	pass	
-s31_2_0013	pass	
-l4_1_0049	pass	
-l4_1_0050	pass	
-l4_1_0051	pass	
-l4_1_0052	pass	
-l4_2_0008	pass	
-l4_4_0046	pass	
-l5_0023	pass	
-l5_1_0004	pass	
 case-id	verdict	note
 s1_3_0001	pass	
 s1_3_0002	pass	
@@ -196,6 +126,9 @@ s3_6_0047	pass
 s3_6_0048	pass	
 s3_6_0049	pass	
 s3_6_0050	pass	
+s3_6_0051	pass	
+s3_6_0052	pass	
+s3_6_0053	pass	
 s4_1_0001	pass	
 s4_1_0002	pass	
 s4_1_0003	pass	
@@ -259,6 +192,8 @@ s5_1_0021	pass
 s5_1_0022	pass	
 s5_1_0023	pass	
 s5_1_0024	pass	
+s5_1_0025	pass	
+s5_1_0026	pass	
 s5_1_0055	pass	
 s5_1_0116	pass	
 s5_1_0117	pass	
@@ -266,8 +201,34 @@ s5_1_0118	pass
 s5_1_0119	pass	
 s5_1_0121	pass	
 s5_1_0122	pass	
+s5_1_0123	pass	
+s5_1_0124	pass	
+s5_1_0125	pass	
 s5_1_0126	pass	
 s5_1_0127	pass	
+s5_1_0128	pass	
+s5_1_0129	pass	
+s5_1_0130	pass	
+s5_1_0131	pass	
+s5_1_0132	pass	
+s5_1_0133	pass	
+s5_1_0134	pass	
+s5_1_0135	pass	
+s5_1_0136	pass	
+s5_1_0137	pass	
+s5_1_0138	pass	
+s5_1_0139	pass	
+s5_1_0140	pass	
+s5_1_0141	pass	
+s5_1_0142	pass	
+s5_1_0143	pass	
+s5_1_0144	pass	
+s5_1_0145	pass	
+s5_1_0146	pass	
+s5_1_0147	pass	
+s5_1_0148	pass	
+s5_1_0149	pass	
+s5_1_0150	pass	
 s5_2_0001	pass	
 s5_2_0002	pass	
 s5_2_0003	pass	
@@ -304,6 +265,8 @@ s6_1_0006	pass
 s6_1_0007	pass	
 s6_2_0001	pass	
 s6_2_0002	pass	
+s6_2_0003	pass	
+s6_2_0004	pass	
 s6_3_0001	pass	
 s6_3_0002	pass	
 s6_3_0003	pass	
@@ -370,6 +333,37 @@ s7_4_0059	pass
 s7_4_0060	pass	
 s7_4_0061	pass	
 s7_4_0062	pass	
+s7_4_0063	pass	
+s7_4_0064	pass	
+s7_4_0065	pass	
+s7_4_0066	pass	
+s7_4_0067	pass	
+s7_4_0068	pass	
+s7_4_0069	pass	
+s7_4_0070	pass	
+s7_4_0071	pass	
+s7_4_0072	pass	
+s7_4_0073	pass	
+s7_4_0074	pass	
+s7_4_0075	pass	
+s7_4_0076	pass	
+s7_4_0077	pass	
+s7_4_0078	pass	
+s7_4_0079	pass	
+s7_4_0080	pass	
+s7_4_0081	pass	
+s7_4_0082	pass	
+s7_4_0083	pass	
+s7_4_0084	pass	
+s7_4_0085	pass	
+s7_4_0086	pass	
+s7_4_0087	pass	
+s7_4_0088	pass	
+s7_4_0089	pass	
+s7_4_0090	pass	
+s7_4_0091	pass	
+s7_4_0092	pass	
+s7_4_0093	pass	
 s7_4_0094	pass	
 s7_4_0095	pass	
 s7_4_0096	pass	
@@ -384,6 +378,8 @@ s7_4_0104	pass
 s7_4_0105	pass	
 s7_4_0106	pass	
 s7_4_0107	pass	
+s7_4_0108	pass	
+s7_4_0109	pass	
 s7_4_0110	pass	
 s7_4_0111	pass	
 s7_4_0112	pass	
@@ -391,6 +387,9 @@ s7_4_0113	pass
 s7_4_0114	pass	
 s7_4_0115	pass	
 s7_4_0116	pass	
+s7_4_0117	pass	
+s7_4_0118	pass	
+s7_4_0119	fail	#7302: the type fact does not compose through the early exit; the carrier stays nullable and the call is refused
 s7_5_0001	pass	
 s7_5_0002	pass	
 s7_5_0003	pass	
@@ -404,6 +403,9 @@ s7_5_0010	pass
 s7_5_0011	pass	
 s7_5_0012	pass	
 s7_5_0013	pass	
+s7_5_0014	pass	
+s7_5_0016	pass	
+s7_5_0017	pass	
 s7_5_0018	fail	#7130: the `?.` spelling of a string instance method is rejected in codegen, though §7.5 defines it
 s7_6_0001	pass	
 s7_6_0002	pass	
@@ -506,10 +508,17 @@ s8_3_0071	pass
 s8_3_0072	pass	
 s8_3_0073	pass	
 s8_3_0074	pass	
+s8_3_0075	pass	
+s8_3_0076	pass	
+s8_3_0077	pass	
 s8_4_0001	pass	
 s8_4_0002	pass	
 s8_4_0003	pass	
 s8_4_0004	fail	divergence
+s8_4_0005	pass	
+s8_4_0006	pass	
+s8_4_0007	pass	
+s8_4_0008	pass	
 s8_5_0001	pass	
 s8_5_0002	pass	
 s8_5_0003	fail	divergence
@@ -557,6 +566,8 @@ s9_2_0020	pass
 s9_2_0029	pass	
 s9_2_0031	pass	
 s9_2_0032	fail	#6147
+s9_2_0033	pass	
+s9_2_0034	pass	
 s9_3_0001	pass	
 s9_3_0002	pass	
 s9_3_0003	pass	
@@ -578,6 +589,8 @@ s9_5_0004	pass
 s9_5_0005	pass	
 s9_5_0006	pass	
 s9_5_0007	fail	divergence
+s9_5_0008	pass	
+s9_5_0009	pass	
 s9_6_0001	pass	
 s9_6_0002	pass	
 s9_6_0003	pass	
@@ -666,6 +679,7 @@ s11_1_0002	pass
 s11_1_0003	pass	
 s11_1_0004	pass	
 s11_1_0005	pass	
+s11_1_0006	pass	
 s11_2_0001	pass	
 s11_2_0002	pass	
 s11_2_0003	pass	
@@ -757,6 +771,7 @@ s11_2_0129	fail	#6030
 s11_2_0130	pass	
 s11_2_0161	pass	
 s11_2_0162	pass	
+s11_2_0163	fail	#6785
 s11_3_0001	pass	
 s11_3_0002	pass	
 s11_3_0003	pass	
@@ -780,6 +795,24 @@ s11_6_0001	pass
 s11_6_0002	pass	
 s11_6_0003	pass	
 s11_6_0004	pass	
+s11_6_0005	pass	
+s11_6_0006	pass	
+s11_6_0007	pass	
+s11_6_0008	pass	
+s11_6_0009	pass	
+s11_6_0010	pass	
+s11_6_0011	pass	
+s11_6_0012	pass	
+s11_6_0013	pass	
+s11_6_0014	pass	
+s11_6_0015	pass	
+s11_6_0016	pass	
+s11_6_0017	pass	
+s11_6_0018	pass	
+s11_6_0019	pass	
+s11_6_0020	pass	
+s11_6_0021	pass	
+s11_6_0022	pass	
 s11_7_0001	pass	
 s11_7_0002	pass	
 s11_7_0003	pass	
@@ -797,6 +830,7 @@ s11_7_0014	pass
 s11_7_0015	pass	
 s11_7_0016	pass	
 s11_7_0017	pass	
+s11_7_0018	pass	
 s11_8_0001	pass	
 s11_8_0002	pass	
 s11_8_0003	fail	divergence
@@ -847,6 +881,9 @@ s12_1_0074	pass
 s12_2_0001	pass	
 s12_2_0002	pass	
 s12_2_0003	pass	
+s12_2_0004	pass	
+s12_2_0005	pass	
+s12_2_0006	pass	
 s12_3_0001	pass	
 s12_4_0001	pass	
 s12_4_0002	pass	
@@ -863,6 +900,11 @@ s12_7_0003	pass
 s12_7_0004	pass	
 s12_7_0037	pass	
 s12_7_0038	pass	
+s12_7_0039	pass	
+s12_7_0040	pass	
+s12_7_0041	pass	
+s12_7_0042	pass	
+s12_7_0043	pass	
 s12_8_0001	pass	
 s12_8_0002	pass	
 s12_8_0003	pass	
@@ -877,6 +919,11 @@ s12_9_0008	pass
 s12_9_0009	pass	
 s12_9_0010	pass	
 s12_9_0011	pass	
+s12_9_0012	pass	
+s12_9_0013	pass	
+s12_9_0014	pass	
+s12_9_0015	pass	
+s12_9_0016	pass	
 s12_10_0001	pass	
 s12_10_0002	pass	
 s12_10_0003	pass	
@@ -911,11 +958,13 @@ s13_7_0004	pass
 s13_7_0005	pass	
 s13_7_0006	pass	
 s14_1_0001	pass	
+s14_1_0004	pass	
 s14_1_0005	pass	
 s14_1_0006	pass	
 s14_1_0007	pass	
 s14_1_0008	pass	
 s14_1_0009	pass	
+s14_1_0010	pass	
 s14_2_0001	pass	
 s14_2_0002	pass	
 s14_2_0003	pass	
@@ -958,6 +1007,8 @@ s14_2_0084	pass
 s14_2_0085	pass	
 s14_2_0086	pass	
 s14_2_0087	pass	
+s14_2_0088	pass	
+s14_2_0089	fail	#7086
 s14_4_0001	pass	
 s14_4_0002	pass	
 s14_4_0003	pass	
@@ -977,6 +1028,7 @@ s14_5_0010	pass
 s14_5_0011	pass	
 s14_5_0012	pass	
 s14_5_0013	pass	
+s14_5_0015	pass	
 s14_5_0016	pass	
 s14_5_0017	pass	
 s14_5_0018	pass	
@@ -1076,6 +1128,11 @@ s16_6_0002	pass
 s16_6_0003	pass	
 s16_6_0004	pass	
 s16_6_0005	pass	
+s16_6_0006	pass	
+s16_6_0007	pass	
+s16_6_0008	pass	
+s16_6_0009	pass	
+s16_6_0010	pass	
 s17_1_0001	pass	
 s17_1_0003	pass	
 s17_1_0006	pass	
@@ -1132,6 +1189,8 @@ s17_5_0032	fail	#6625
 s17_5_0033	pass	
 s17_5_0035	pass	
 s17_5_0036	pass	
+s17_5_0037	pass	
+s17_5_0038	pass	
 s17_6_0001	pass	
 s17_6_0002	pass	
 s17_6_0003	pass	
@@ -1154,6 +1213,7 @@ s17_7_0011	pass
 s17_8_0001	pass	
 s17_8_0002	pass	
 s17_8_0003	pass	
+s17_8_0004	pass	
 s17_9_0001	pass	
 s17_9_0002	pass	
 s17_9_0004	pass	
@@ -1185,6 +1245,18 @@ s17_11_0060	pass
 s17_11_0061	pass	
 s17_11_0062	pass	
 s17_11_0063	pass	
+s17_11_0064	pass	
+s17_11_0065	pass	
+s17_11_0066	pass	
+s17_11_0067	pass	
+s17_11_0068	pass	
+s17_11_0069	pass	
+s17_11_0070	pass	
+s17_11_0071	pass	
+s17_11_0072	pass	
+s17_11_0073	pass	
+s17_11_0074	pass	
+s17_11_0075	pass	
 s17_12_0001	pass	
 s17_12_0002	pass	
 s17_12_0003	pass	
@@ -1221,6 +1293,10 @@ s17_14_0014	pass
 s17_14_0015	pass	
 s17_14_0016	pass	
 s17_14_0017	pass	
+s17_14_0018	pass	
+s17_14_0019	pass	
+s17_14_0020	pass	
+s17_14_0021	pass	
 s17_15_0001	pass	
 s17_15_0002	pass	
 s17_15_0004	pass	
@@ -1286,6 +1362,9 @@ s19_3_0069	pass
 s19_3_0070	pass	
 s19_3_0071	pass	
 s19_3_0072	pass	
+s19_3_0073	pass	
+s19_3_0074	pass	
+s19_3_0075	pass	
 s19_3_0076	pass	
 s19_3_0077	pass	
 s19_3_0078	pass	
@@ -1306,6 +1385,11 @@ s19_4_0036	pass
 s19_5_0001	pass	
 s19_5_0002	pass	
 s19_5_0003	pass	
+s19_5_0004	pass	
+s19_5_0005	pass	
+s19_5_0006	pass	
+s19_5_0007	pass	
+s19_5_0008	pass	
 s19_6_0001	pass	
 s19_6_0002	pass	
 s19_6_0003	pass	
@@ -1342,6 +1426,7 @@ s20_0014	pass
 s21_1_0001	pass	
 s21_1_0002	pass	
 s21_1_0003	pass	
+s21_1_0004	pass	
 s21_2_0001	pass	
 s21_4_0001	pass	
 s21_4_0002	pass	
@@ -1352,6 +1437,12 @@ s21_5_0002	pass
 s21_5_0003	pass	
 s21_5_0004	pass	
 s21_5_0005	pass	
+s21_5_0006	pass	
+s21_5_0007	pass	
+s21_5_0008	pass	
+s21_5_0009	pass	
+s21_5_0010	pass	
+s21_5_0011	pass	
 s21_6_0001	pass	
 s21_7_0001	pass	
 s21_7_0002	pass	
@@ -1382,6 +1473,18 @@ s21_10_0010	pass
 s21_10_0011	pass	
 s21_10_0012	pass	
 s21_10_0013	pass	
+s21_10_0014	pass	
+s21_10_0015	pass	
+s21_10_0016	pass	
+s21_10_0017	pass	
+s21_10_0018	pass	
+s21_10_0019	pass	
+s21_10_0020	pass	
+s21_10_0021	pass	
+s21_10_0022	pass	
+s21_10_0023	pass	
+s21_10_0024	pass	
+s21_10_0025	pass	
 s21_10_0026	pass	
 s21_10_0027	pass	
 s21_10_0028	pass	
@@ -1411,6 +1514,10 @@ s22_3_0048	pass
 s22_3_0049	pass	
 s22_3_0050	pass	
 s22_3_0051	pass	
+s22_3_0052	pass	
+s22_3_0053	pass	
+s22_3_0054	pass	
+s22_3_0055	fail	#7086
 s22_3_0056	fail	#7124: §22.3's move call-site marker is not enforced at a function-value invoke
 s22_4_0001	pass	
 s22_4_0002	pass	
@@ -1432,6 +1539,15 @@ s22_5_0009	pass
 s22_5_0010	pass	
 s22_5_0011	pass	
 s22_5_0012	pass	
+s22_5_0013	pass	
+s22_5_0014	pass	
+s22_5_0015	pass	
+s22_5_0016	pass	
+s22_5_0017	pass	
+s22_5_0018	pass	
+s22_5_0019	pass	
+s22_5_0020	pass	
+s22_5_0021	fail	divergence
 s22_6_0001	pass	
 s22_6_0002	pass	
 s22_6_0003	pass	
@@ -1461,11 +1577,27 @@ s22_6_0086	pass
 s22_6_0087	pass	
 s22_6_0088	pass	
 s22_6_0089	pass	
+s22_6_0094	pass	
+s22_6_0095	pass	
+s22_6_0096	fail	#6593
+s22_6_0097	pass	
+s22_6_0098	pass	
+s22_6_0099	pass	
+s22_6_0100	fail	#6747
 s22_6_0101	pass	
 s22_6_0102	pass	
 s22_6_0103	pass	
 s22_6_0104	pass	
 s22_6_0105	pass	
+s22_6_0106	pass	
+s22_6_0107	pass	
+s22_6_0108	pass	
+s22_6_0109	pass	
+s22_6_0110	pass	
+s22_6_0111	pass	
+s22_6_0112	fail	divergence
+s22_6_0113	fail	divergence
+s22_6_0114	fail	divergence
 s22_7_0001	pass	
 s22_7_0002	pass	
 s22_7_0003	pass	
@@ -1498,6 +1630,12 @@ s22_8_0016	pass
 s22_8_0017	pass	
 s22_8_0018	pass	
 s22_8_0019	pass	
+s22_8_0020	pass	
+s22_8_0021	pass	
+s22_8_0022	pass	
+s22_8_0023	pass	
+s22_8_0024	pass	
+s22_8_0025	pass	
 s22_9_0001	pass	
 s22_9_0002	pass	
 s22_9_0003	pass	
@@ -1521,6 +1659,9 @@ s22_10_0016	pass
 s22_10_0017	pass	
 s22_10_0018	pass	
 s22_10_0019	pass	
+s22_10_0020	pass	
+s22_10_0021	pass	
+s22_10_0022	pass	
 s22_10_0023	pass	
 s22_10_0024	pass	
 s22_10_0025	pass	
@@ -1831,6 +1972,8 @@ s27_8_0004	pass
 s27_8_0005	pass	
 s27_8_0006	pass	
 s27_8_0007	pass	
+s27_8_0013	pass	
+s27_8_0014	pass	
 s28_0001	pass	
 s28_0002	pass	
 s28_1_0001	pass	
@@ -2069,6 +2212,10 @@ s28_7_0005	pass
 s28_7_0006	pass	
 s28_7_0007	pass	
 s28_7_0009	pass	
+s28_7_0010	pass	
+s28_7_0011	pass	
+s28_7_0012	pass	
+s28_7_0013	pass	
 s28_8_0001	pass	
 s28_8_0002	pass	
 s28_8_0003	pass	
@@ -2123,6 +2270,7 @@ s28_10_0013	fail	#5644
 s28_10_0014	pass	
 s28_10_0015	fail	#5582
 s28_10_0016	fail	#7092
+s28_10_0017	pass	
 s28_11_0001	pass	
 s28_11_0002	pass	
 s28_11_0003	pass	
@@ -2137,6 +2285,8 @@ s28_11_0011	pass
 s28_11_0012	pass	
 s28_11_0013	pass	#5631
 s28_11_0014	pass	
+s28_11_0040	pass	
+s28_11_0041	pass	
 s28_12_0001	pass	
 s28_12_0002	pass	
 s28_12_0003	fail	divergence
@@ -2149,6 +2299,7 @@ s28_12_0009	pass
 s28_12_0010	pass	
 s28_12_0011	pass	
 s28_12_0012	pass	
+s28_12_0015	fail	divergence
 s28_13_0001	pass	
 s28_13_0002	pass	
 s28_13_0003	pass	
@@ -2211,6 +2362,8 @@ s29_3_0003	pass
 s29_3_0004	pass	
 s29_3_0005	pass	
 s29_3_0006	pass	
+s29_3_0007	pass	
+s29_3_0008	pass	
 s29_4_0001	pass	
 s29_4_0002	pass	
 s29_4_0003	pass	
@@ -2279,6 +2432,7 @@ s30_2_0001	pass
 s30_2_0002	pass	
 s30_2_0003	pass	
 s30_2_0004	pass	
+s30_2_0005	pass	
 s30_2_0006	pass	
 s30_2_0007	pass	
 s30_2_0008	pass	
@@ -2391,6 +2545,15 @@ s31_1_0008	pass
 s31_1_0009	pass	
 s31_1_0010	pass	
 s31_1_0011	fail	divergence
+s31_1_0012	pass	
+s31_1_0013	pass	
+s31_1_0014	pass	
+s31_1_0015	pass	
+s31_1_0016	pass	
+s31_1_0017	pass	
+s31_1_0018	pass	
+s31_1_0019	pass	
+s31_1_0020	pass	
 s31_2_0001	pass	
 s31_2_0002	pass	
 s31_2_0003	pass	
@@ -2403,6 +2566,7 @@ s31_2_0009	pass
 s31_2_0010	pass	
 s31_2_0011	pass	
 s31_2_0012	fail	divergence
+s31_2_0013	pass	
 s31_2_1_0001	pass	
 s31_2_1_0002	pass	
 s31_2_1_0003	pass	
@@ -2661,10 +2825,43 @@ l2_2_0011	pass
 l2_2_0012	pass	
 l2_2_0013	pass	
 l2_2_0014	pass	
+l2_2_0015	pass	
+l2_2_0016	fail	divergence
+l2_2_0017	fail	divergence
+l2_2_0018	fail	divergence
+l2_2_0019	pass	
+l2_2_0020	pass	
+l2_2_0021	pass	
+l2_2_0022	pass	
+l2_2_0023	pass	
+l2_2_0024	pass	
+l2_2_0025	pass	
+l2_2_0026	pass	
+l2_2_0027	pass	
+l2_2_0028	pass	
+l2_2_0029	pass	
 l2_3_0001	pass	
 l2_3_0002	pass	
 l2_3_0003	fail	divergence
 l2_3_0004	pass	
+l2_3_0005	pass	
+l2_3_0006	fail	divergence
+l2_3_0007	pass	
+l2_3_0008	pass	
+l2_3_0009	pass	
+l2_3_0010	pass	
+l2_3_0011	pass	
+l2_3_0012	pass	
+l2_3_0013	pass	
+l2_3_0014	pass	
+l2_3_0015	pass	
+l2_3_0016	pass	
+l2_3_0017	pass	
+l2_3_0018	pass	
+l2_3_0019	pass	
+l2_3_0020	pass	
+l2_3_0021	pass	
+l2_3_0022	pass	
 l2_4_0001	pass	
 l2_4_0002	pass	
 l2_4_0003	pass	
@@ -2677,11 +2874,13 @@ l2_5_0005	fail	divergence
 l2_5_0006	pass	
 l2_5_0007	pass	
 l2_5_0008	fail	divergence
+l2_5_0009	pass	
 l2_6_0001	pass	
 l2_6_0002	pass	
 l2_6_0003	fail	divergence
 l2_6_0004	pass	
 l2_6_0005	pass	
+l2_6_0006	pass	
 l2_7_0001	pass	
 l2_7_0002	pass	
 l2_7_0003	pass	
@@ -2739,6 +2938,23 @@ l2_18_0006	pass
 l2_18_0007	pass	
 l2_18_0008	pass	
 l2_18_0009	pass	
+l2_18_0010	pass	
+l2_18_0011	pass	
+l2_18_0012	fail	#7265
+l2_18_0013	pass	
+l2_18_0014	pass	
+l2_18_0015	pass	
+l2_18_0016	fail	#7301: a non-finite double renders inf/-inf/nan, where stdlib 2.18 requires Infinity/-Infinity/NaN
+l2_18_0017	fail	#7303
+l2_18_0018	pass	
+l2_18_0019	fail	#7265
+l2_18_0020	fail	#7286
+l2_18_0021	pass	
+l2_18_0022	pass	
+l2_18_0023	pass	
+l2_18_0024	pass	
+l2_18_0025	pass	
+l2_18_0026	pass	
 l2_19_0001	pass	
 l2_19_0002	pass	
 l2_19_0003	pass	
@@ -2764,6 +2980,18 @@ l3_1_0004	pass
 l3_1_0005	fail	divergence
 l3_1_0006	pass	
 l3_1_0047	pass	
+l3_1_0048	pass	
+l3_1_0049	pass	
+l3_1_0050	pass	
+l3_1_0051	pass	
+l3_1_0052	pass	
+l3_1_0053	pass	
+l3_1_0054	pass	
+l3_1_0055	pass	
+l3_1_0056	pass	
+l3_1_0057	pass	
+l3_1_0058	pass	
+l3_1_0059	pass	
 l3_2_0001	pass	
 l3_2_0002	pass	
 l3_2_0003	pass	
@@ -2788,6 +3016,10 @@ l4_1_0045	fail	#4704
 l4_1_0046	pass	
 l4_1_0047	pass	
 l4_1_0048	pass	
+l4_1_0049	pass	
+l4_1_0050	pass	
+l4_1_0051	pass	
+l4_1_0052	pass	
 l4_2_0001	fail	divergence
 l4_2_0002	fail	divergence
 l4_2_0003	pass	
@@ -2795,6 +3027,7 @@ l4_2_0004	pass
 l4_2_0005	pass	
 l4_2_0006	pass	
 l4_2_0007	pass	
+l4_2_0008	pass	
 l4_3_0001	fail	divergence
 l4_3_0002	pass	
 l4_3_0003	pass	
@@ -2815,6 +3048,7 @@ l4_4_0012	pass
 l4_4_0013	pass	
 l4_4_0044	pass	
 l4_4_0045	pass	
+l4_4_0046	pass	
 l4_5_0001	pass	
 l4_5_0002	pass	
 l4_5_0003	pass	
@@ -2872,6 +3106,7 @@ l4_11_0003	pass
 l4_11_0004	pass	
 l4_11_0005	pass	
 l4_11_0006	pass	
+l4_11_0007	pass	
 l4_12_0001	pass	
 l4_12_0002	pass	
 l4_12_0003	pass	
@@ -2916,6 +3151,8 @@ l4_18_0001	pass
 l4_18_0002	pass	
 l4_18_0003	pass	
 l4_18_0004	pass	
+l4_18_0005	pass	
+l4_18_0006	pass	
 l4_19_0001	pass	
 l4_19_0002	pass	
 l4_19_0003	pass	
@@ -2961,9 +3198,15 @@ l5_0015	pass
 l5_0016	pass	
 l5_0017	pass	
 l5_0018	pass	
+l5_0019	pass	
+l5_0020	pass	
+l5_0021	pass	
+l5_0022	pass	
+l5_0023	pass	
 l5_1_0001	pass	
 l5_1_0002	pass	
 l5_1_0003	pass	
+l5_1_0004	pass	
 l6_1_0001	pass	
 l6_1_0002	pass	
 l6_1_0003	pass	
@@ -3072,6 +3315,17 @@ l9_1_0004	pass
 l9_1_0005	pass	
 l9_1_0006	fail	divergence
 l9_1_0007	pass	
+l9_1_0008	pass	
+l9_1_0009	pass	
+l9_1_0010	pass	
+l9_1_0011	pass	
+l9_1_0012	pass	
+l9_1_0013	pass	
+l9_1_0014	pass	
+l9_1_0015	pass	
+l9_1_0016	fail	#7268
+l9_1_0017	pass	
+l9_1_0018	pass	
 l9_2_0001	pass	
 l9_2_0002	pass	
 l9_3_0001	pass	
@@ -3082,10 +3336,11 @@ l9_4_0002	pass
 l9_5_0001	pass	
 l9_5_0002	pass	
 l9_5_0003	pass	
+l9_5_0004	fail	#7295
 l9_6_0001	pass	
 l9_6_0002	pass	
 l9_6_0003	pass	
-l9_6_0004	pass
+l9_6_0004	pass	
 l9_6_0005	pass	
 l9_6_0006	pass	
 l9_6_0007	pass	
@@ -3141,245 +3396,3 @@ l10_5_0002	fail	divergence
 l10_5_0003	pass	
 l10_6_0001	fail	divergence
 l10_6_0002	pass	
-s7_4_0063	pass	
-s7_4_0064	pass	
-s7_4_0065	pass	
-s7_4_0066	pass	
-s7_4_0067	pass	
-s7_4_0068	pass	
-s7_4_0069	pass	
-s7_4_0070	pass	
-s7_4_0071	pass	
-s7_4_0072	pass	
-s7_4_0073	pass	
-s7_4_0074	pass	
-s7_4_0075	pass	
-s7_5_0014	pass	
-s9_2_0033	pass	
-s9_2_0034	pass	
-s11_1_0006	pass	
-s17_5_0037	pass	
-s17_5_0038	pass	
-l5_0019	pass	
-s21_10_0014	pass	
-s21_10_0015	pass	
-s21_10_0016	pass	
-s21_10_0017	pass	
-s22_3_0052	pass	
-s22_3_0053	pass	
-s22_3_0054	pass	
-s28_7_0010	pass	
-s28_7_0011	pass	
-s28_7_0012	pass	
-l4_11_0007	pass	
-l4_18_0005	pass	
-l4_18_0006	pass	
-s5_1_0123	pass	
-s12_2_0004	pass	
-s12_2_0005	pass	
-s12_2_0006	pass	
-s21_10_0018	pass	
-s21_10_0019	pass	
-s21_10_0020	pass	
-s21_10_0021	pass	
-s21_10_0022	pass	
-s21_10_0023	pass	
-s21_10_0024	pass	
-s21_10_0025	pass	
-s22_6_0094	pass	
-s22_6_0095	pass	
-s31_1_0012	pass	
-s31_1_0013	pass	
-s31_1_0014	pass	
-s31_1_0015	pass	
-s31_1_0016	pass	
-s31_1_0017	pass	
-s31_1_0018	pass	
-s31_1_0019	pass	
-s31_1_0020	pass	
-s3_6_0051	pass	
-s3_6_0052	pass	
-s3_6_0053	pass	
-s5_1_0124	pass	
-s5_1_0125	pass	
-s7_4_0076	pass	
-s7_4_0077	pass	
-s7_4_0078	pass	
-s7_4_0079	pass	
-s7_4_0080	pass	
-s7_4_0081	pass	
-s7_4_0082	pass	
-s7_4_0083	pass	
-s7_4_0084	pass	
-s7_4_0085	pass	
-s7_4_0086	pass	
-s7_4_0087	pass	
-s7_4_0088	pass	
-s7_4_0089	pass	
-s7_4_0090	pass	
-s7_4_0091	pass	
-s7_4_0092	pass	
-s7_4_0093	pass	
-s7_5_0016	pass	
-s7_5_0017	pass	
-s8_3_0075	pass	
-s8_3_0076	pass	
-s8_3_0077	pass	
-s8_4_0005	pass	
-s11_2_0163	fail	#6785
-s11_7_0018	pass	
-s12_7_0039	pass	
-s12_7_0040	pass	
-s12_7_0041	pass	
-s12_9_0012	pass	
-s12_9_0013	pass	
-s12_9_0014	pass	
-s12_9_0015	pass	
-s12_9_0016	pass	
-s14_5_0015	pass	
-s22_6_0096	fail	#6593
-s22_6_0097	pass	
-s22_6_0098	pass	
-s22_6_0099	pass	
-s22_6_0100	fail	#6747
-s22_10_0020	pass	
-s22_10_0021	pass	
-s22_10_0022	pass	
-l2_18_0010	pass	
-l2_18_0011	pass	
-l5_0020	pass	
-l5_0021	pass	
-l5_0022	pass	
-s5_1_0128	pass	
-s5_1_0129	pass	
-s5_1_0130	pass	
-s5_1_0131	pass	
-s17_14_0018	pass	
-s22_6_0106	pass	
-s22_6_0107	pass	
-s22_6_0108	pass	
-s22_6_0109	pass	
-s5_1_0132	pass	
-s5_1_0133	pass	
-s29_3_0007	pass	
-s29_3_0008	pass	
-s30_2_0005	pass	
-s16_6_0006	pass	
-s16_6_0007	pass	
-s16_6_0008	pass	
-s16_6_0009	pass	
-s16_6_0010	pass	
-s8_4_0006	pass	
-s8_4_0007	pass	
-s8_4_0008	pass	
-s19_5_0004	pass	
-s19_5_0005	pass	
-s19_5_0006	pass	
-s19_5_0007	pass	
-s19_5_0008	pass	
-s19_3_0073	pass	
-s19_3_0074	pass	
-s19_3_0075	pass	
-s22_8_0020	pass	
-s22_8_0021	pass	
-s22_8_0022	pass	
-s22_8_0023	pass	
-s22_8_0024	pass	
-s22_8_0025	pass	
-s6_2_0003	pass	
-s6_2_0004	pass	
-s17_14_0019	pass	
-s11_6_0005	pass	
-s11_6_0006	pass	
-s11_6_0007	pass	
-s11_6_0008	pass	
-s14_1_0004	pass	
-s14_2_0088	pass	
-s14_2_0089	fail	#7086
-s17_11_0064	pass	
-s17_11_0065	pass	
-s17_11_0066	pass	
-s17_11_0067	pass	
-s17_11_0068	pass	
-s17_11_0069	pass	
-s17_11_0070	pass	
-s17_11_0071	pass	
-s17_11_0072	pass	
-s17_11_0073	pass	
-s17_11_0074	pass	
-s17_11_0075	pass	
-s22_3_0055	fail	#7086
-s22_5_0013	pass	
-s22_5_0014	pass	
-s22_5_0015	pass	
-s22_5_0016	pass	
-s22_5_0017	pass	
-s28_11_0040	pass	
-s28_11_0041	pass	
-s5_1_0134	pass	
-s5_1_0135	pass	
-s5_1_0136	pass	
-s11_6_0009	pass	
-s11_6_0010	pass	
-s11_6_0011	pass	
-s11_6_0012	pass	
-s11_6_0013	pass	
-s11_6_0014	pass	
-s11_6_0015	pass	
-s11_6_0016	pass	
-s11_6_0017	pass	
-s11_6_0018	pass	
-s11_6_0019	pass	
-s11_6_0020	pass	
-s11_6_0021	pass	
-s11_6_0022	pass	
-s5_1_0137	pass	
-s5_1_0138	pass	
-s5_1_0139	pass	
-s5_1_0140	pass	
-s5_1_0141	pass	
-s5_1_0142	pass	
-s5_1_0143	pass	
-s5_1_0144	pass	
-s5_1_0145	pass	
-s5_1_0146	pass	
-s5_1_0147	pass	
-l3_1_0048	pass	
-l3_1_0049	pass	
-l3_1_0050	pass	
-l3_1_0051	pass	
-l3_1_0052	pass	
-l3_1_0053	pass	
-l3_1_0054	pass	
-l3_1_0055	pass	
-l3_1_0056	pass	
-l3_1_0057	pass	
-l3_1_0058	pass	
-l3_1_0059	pass	
-s22_5_0018	pass	
-s22_5_0019	pass	
-s22_5_0020	pass	
-s22_5_0021	fail	divergence
-l2_2_0015	pass	
-l2_2_0016	fail	divergence
-l2_2_0017	fail	divergence
-l2_2_0018	fail	divergence
-l2_3_0005	pass	
-l2_3_0006	fail	divergence
-s5_1_0025	pass	
-s5_1_0026	pass	
-s28_7_0013	pass	
-l2_2_0019	pass	
-l2_2_0020	pass	
-l2_2_0021	pass	
-l2_2_0022	pass	
-l2_2_0023	pass	
-l2_2_0024	pass	
-l2_2_0025	pass	
-l2_2_0026	pass	
-l2_2_0027	pass	
-l2_2_0028	pass	
-l2_3_0007	pass	
-l2_3_0008	pass	
-l2_3_0009	pass	
-s14_1_0010	pass	
