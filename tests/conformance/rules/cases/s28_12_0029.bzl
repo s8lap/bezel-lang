@@ -2,11 +2,11 @@
 //! doc: spec
 //! section: 28.12
 //! title: plain using at an IDisposable static type runs the run-time object's destructor
-//! rule: `await using` selects the logical-disposal path by the class of the object
-//!   the binding holds — as the synchronous path selects the destructor chain
-//!   it runs ([§28.4](#sec-the-destructor)) — never by the binding's static
-//!   type.
-//! cites: 28.12, 28.4
+//! rule: For plain `using` (or a synchronous `Dispose()` call) on a class that
+//!   implements both, the destructor body runs synchronously and
+//!   `DisposeAsync` is **not** invoked — the class's two cleanup paths are
+//!   alternatives, not a sequence.
+//! cites: 28.12
 //! expect: run
 //! output: body
 //!   SYNC
