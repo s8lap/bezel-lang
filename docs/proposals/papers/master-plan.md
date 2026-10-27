@@ -59,8 +59,9 @@ one per sub-family from the campaign's lane plan, each file-disjoint by declarat
 **reviewer** per handback (review-contract); a **harvest lane** per 4–6 picks. A lane brief names the
 campaign, the sub-family, its members, the shared code path, and the DONE instrument it must extend
 (§2.3). The standing rule *"at most one disposal/ownership/async/iterator lane at a time"* serialises
-most of the ownership track; §4.7 asks the owner to relax it to *file-disjoint within a campaign once
-the anchor has landed*. Until ruled, serialise.
+most of the ownership track. **Owner-ruled 2026-10-27 (§4.7):** inside a campaign, once its anchor has
+landed and been reviewed, ownership-track lanes may run concurrently when their declared hot-file sets
+are disjoint; before the anchor lands, serialise.
 
 **1.4 An issue outside the active campaign is triaged, not worked.** Triage = add exactly one
 `campaign:<slug>` label from §3 (or `parking-lot` if none fits), nothing else. Triage happens in the
@@ -479,16 +480,26 @@ campaign is what is left after they run.
    `CLAUDE.md` apply unchanged.
 7. **Lane concurrency inside a campaign (asks the owner).** The standing rule allows one
    disposal/ownership/async/iterator lane at a time. Inside an ownership-track campaign, after the anchor
-   has landed and been reviewed, the plan asks that this become *file-disjoint by declared hot-file
-   sets*, with the coordinator checking the sets against `claims.tsv` before dispatch. Until the owner
-   rules, campaigns serialise.
-8. **Owner decisions are batched at campaign boundaries.** The first session sends one message with
-   every ruling the first three campaigns need, each with the two or three options the issue already
-   states: **#3493** (the `await using` dispatch point), **#2924/#7145** (`internal:` pointer-degrade
-   sites become errors), **#4602** (checked disposal as the default), **#6358** (string-key
-   co-ownership in dictionaries), **#1877/#3379** (the §28.9 foundation — campaign 4's outer boundary),
-   the soundness research's Stage 0 scheduling, and the two `CLAUDE.md` changes this plan asks for
-   (the WIP/intake rule in §1 and rule 7 above). Later campaigns add theirs at their entry check.
+   has landed and been reviewed, this becomes *file-disjoint by declared hot-file sets*, with the
+   coordinator checking the sets against `claims.tsv` before dispatch. **Owner-approved 2026-10-27**
+   and written into `CLAUDE.md` *Pools*. Before the anchor lands, campaigns serialise.
+8. **Owner decisions are batched at campaign boundaries.** The first batch was asked and **ruled on
+   2026-10-27** (owner-approved; each ruling is posted on its issue):
+   - **#3493**: dispatch `await using` on the run-time object through a `DisposeAsync` dispatch-table
+     slot (option 2), covering #5653 and #3483 too; reclamation stays with #3515, then #3516.
+   - **#2924 / #7145**: every `internal:` degrade site becomes `Severity::Error`, with a ratchet holding
+     the warning-site count at 0; a newly failing program is a lowering gap filed to its campaign.
+   - **#4602**: bound checked-mode retention (keep the header word with the disposed flag, free the
+     payload; header-only for arrays, dictionaries and closure cells), then default to checked, add
+     `--unchecked-disposal`, keep `--checked-disposal` as a no-op.
+   - **#6358**: the dictionary records at construction that its keys are strings, and every free path
+     (`bz_dict_free`, `Remove`, `Clear`, overwrite) releases them; no per-site emission.
+   - **#1877 / #3379**: the 2026-07-24 refcounting ruling stands; split the umbrella into per-kind
+     sub-issues at campaign 4's entry, each fixed as refcount adoption for that kind.
+   - **Soundness research Stage 0** (the pinmap): a campaign-0 enabler, required before campaign 9's
+     entry check, not before.
+   - **`CLAUDE.md`**: the WIP/intake rule (§1.2, §1.4) and rule 7 above are now standing rules there.
+   Later campaigns add theirs at their entry check.
 9. **Progress is reported in one table (§6), updated at the end of every session**, in the same
    commit that updates the campaign record. Each row's numbers are produced by the label query and the
    corpus runner, not typed from memory; the session's handback to the owner is that table plus three
@@ -539,15 +550,15 @@ from the label query and the corpus runner. Status ∈ QUEUED · ENTRY · ACTIVE
 
 | # | campaign | track | status | entry date | members at entry (S/C/L/other) | closed | re-scoped | in-scope siblings filed / triaged | corpus fails in scope (entry → now) | grid cells wrong (entry → now) | blocked on | last session | next action |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | enablers | — | standing | — | — | — | — | — | — | — | #2924/#7145, #4602 rulings | — | ask the rulings (§4.8) |
-| 1 | using-heads | ownership | QUEUED | — | 24 (7/3/5/9) | 0 | 0 | 0 / 0 | §28.10: 2, §28.12: 5 → — | — | #3493 (U2 only) | — | ENTRY: re-measure 24, build the head × form grid |
+| 0 | enablers | — | standing | — | — | — | — | — | — | — | — | — | #2924/#7145 errors; #4602 bounded retention, then default flip (ruled 2026-10-27) |
+| 1 | using-heads | ownership | QUEUED | — | 24 (7/3/5/9) | 0 | 0 | 0 / 0 | §28.10: 2, §28.12: 5 → — | — | — | — | ENTRY: re-measure 24, build the head × form grid |
 | 2 | builtin-call-admission | sema | QUEUED | — | 189 (33/53/0/103) | 0 | 0 | 0 / 0 | stdlib §2: 25, §3: 3, §9: 6 → — | — | — | — | ENTRY after 1's entry lane is dispatched (other track) |
 | 3 | enumerable-heads | ownership | QUEUED | — | 125 (43/9/27/46) | 0 | 0 | 0 / 0 | §29: 7, stdlib §5: 1 → — | — | campaign 1 | — | — |
-| 4 | producer-temporaries | ownership | QUEUED | — | 148 (14/7/98/29) | 0 | 0 | 0 / 0 | §28.3/§28.9 subset → — | — | campaign 3; #1877/#3379 (boundary) | — | — |
+| 4 | producer-temporaries | ownership | QUEUED | — | 148 (14/7/98/29) | 0 | 0 | 0 / 0 | §28.3/§28.9 subset → — | — | campaign 3 | — | — |
 | 5 | nullable-carrier | sema | QUEUED | — | 54 (14/0/0/40) | 0 | 0 | 0 / 0 | §7: tbd | — | campaign 2 | — | — |
 | 6 | closures-cells | ownership | QUEUED | — | 111 (24/3/49/35) | 0 | 0 | 0 / 0 | §27.5/§28.14 subset | — | campaign 4 | — | — |
 | 7 | generic-boundaries | sema | QUEUED | — | 88 (17/13/3/55) | 0 | 0 | 0 / 0 | §14: tbd | generics matrix: 1 ambiguous | campaign 5 | — | — |
-| 8 | collection-elements | ownership/runtime | QUEUED | — | 77 (13/1/30/33) | 0 | 0 | 0 / 0 | stdlib §4: 22, §6: 23 | — | #6358; campaign 4 | — | — |
+| 8 | collection-elements | ownership/runtime | QUEUED | — | 77 (13/1/30/33) | 0 | 0 | 0 / 0 | stdlib §4: 22, §6: 23 | — | campaign 4 | — | — |
 | 9 | borrow-provenance | ownership | QUEUED | — | 96 (30/1/17/48) | 0 | 0 | 0 / 0 | §28.3: 9, §28.6: 2, §28.14: 4, §9.7: 6 | matrices: 0 open at v0.336 | soundness Stage 0; a train | — | — |
 | 10 | choice-payloads | ownership | QUEUED | — | 30 (10/6/10/4) | 0 | 0 | 0 / 0 | §35: tbd | — | campaign 4 | — | — |
 | 11 | async-frames | ownership | QUEUED | — | 32 (16/1/7/8) | 0 | 0 | 0 / 0 | §30: 7 | — | campaigns 1, 6 | — | — |
