@@ -76,16 +76,16 @@ using var t := DoTelemetryAsync();        // unsupervised: disposed at scope end
 
 Both are abandonment idioms, and abandonment carries the one temporal obligation in this chapter (spec §30.1): a suspended frame holds *borrows* of its receiver and plain arguments until the task **settles**. Once you stop supervising, nothing lexically bounds that moment. Awaiting before your borrows' owners go away discharges the obligation trivially; `TaskScope` (§4) discharges it structurally. Abandon only tasks whose inputs are owned (transferred in), copied, `string`/value-typed, or otherwise guaranteed to outlive the operation. A violation faults as `DisposedAccessException` in checked disposal mode.
 
-**The trap: a borrowing collection slot is not a holder.** A borrowing `Array<Task<T>>` slot takes no ownership, so pushing a freshly-minted task into one compiles — and abandons the task at the end of the statement (stdlib §6.7, the recorded #1813 ruling). The compiler **warns right here** (spec §15.4's fresh-store lint, extended to the task family): the diagnostic names the abandonment and the two sanctioned spellings, so the trap announces itself instead of waiting for checked mode:
+**The trap: a borrowing collection slot is not a holder.** A borrowing `Array<Task<T>>` slot takes no ownership, so pushing a freshly-minted task into one would abandon the task at the end of the statement (stdlib §6.7, the recorded #1813 ruling). The compiler **rejects it right here** (spec §15.4's fresh-store rule, which covers the task family): the diagnostic names the abandonment and the two sanctioned spellings, so the trap announces itself at compile time instead of waiting for checked mode:
 
 ```bezel
 var tasks := new Array<Task<string>>();
-tasks.Add(File.ReadAllTextAsync(path));   // compiles — but WARNS (spec §15.4): the fresh
-                                          //   task has no holder and is abandoned when
-                                          //   the statement ends
+tasks.Add(File.ReadAllTextAsync(path));   // ERROR (spec §15.4): the fresh task has no
+                                          //   holder and would be abandoned when the
+                                          //   statement ends
 ```
 
-The two sanctioned spellings — the ones the warning names: give each task a **named holder** and build the borrowed array over the names (below, §4), or use the owning family (`OwningArray<OwningTask<T>>` with the owning `Task.WhenAll`/`WhenEach` overloads — the same names, the parameter type distinguishing them and the `move` marker spelling the transfer: `Task.WhenAll(move tasks)`, spec §22.3/stdlib §6.7) for dynamically-sized fan-in. Dynamic fan-in over fresh tasks is an ownership-transfer scenario by construction.
+The two sanctioned spellings — the ones the diagnostic names: give each task a **named holder** and build the borrowed array over the names (below, §4), or use the owning family (`OwningArray<OwningTask<T>>` with the owning `Task.WhenAll`/`WhenEach` overloads — the same names, the parameter type distinguishing them and the `move` marker spelling the transfer: `Task.WhenAll(move tasks)`, spec §22.3/stdlib §6.7) for dynamically-sized fan-in. Dynamic fan-in over fresh tasks is an ownership-transfer scenario by construction.
 
 ---
 
@@ -102,15 +102,15 @@ using var conn := await ConnectAsync(url);     // yours; disposed at scope end
 await using var s := await OpenSessionAsync(); // await using for async-disposable results
 ```
 
-The await is *owned-consuming with respect to its operand*: awaiting an owned task local consumes the task itself, with no separate discharge needed. This is exactly how resource acquisition reads (`using var token := await sem.AcquireAsync();`, stdlib §6.3). The single-award rule is enforced twice over:
+The await is *owned-consuming with respect to its operand*: awaiting an owned task local consumes the task itself, with no separate discharge needed. This is exactly how resource acquisition reads (`using var token := await sem.AcquireAsync();`, stdlib §6.3). The single-award rule is enforced at compile time wherever the compiler can see the second award, and at run time everywhere else:
 
 ```bezel
 using var t := sem.AcquireAsync();     // OwningTask<SemaphoreToken>
 using var tok := await t;              // first award: the token is yours
-using var tok2 := await t;             // runtime InvalidOperationException: already spent
+using var tok2 := await t;             // ERROR: `t` was already awarded above — bind a fresh task
 ```
 
-With a *plain owned local* operand the compiler catches the retry statically instead — the first await leaves the binding moved-from, and the second await is a use of a moved-from binding (spec §30.5). Either way, one task, one award.
+Through a *plain owned local* the first await also consumes the binding, so the retry is a moved-from read as well (spec §30.5). A second award the first does not dominate — the second iteration of a loop that awaits a task bound outside it, a retry after a `try` whose protected block awarded — raises `InvalidOperationException` at run time (spec §30.4). Either way, one task, one award.
 
 **Pattern A** needs the task pinned, because the result borrows *from* it:
 

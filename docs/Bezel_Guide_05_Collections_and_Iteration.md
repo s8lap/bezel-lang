@@ -345,7 +345,7 @@ method Header(): Span<byte>
 end Header;
 ```
 
-The fix is Guide 1 §3's: let the *caller* own the buffer and pass a span down, or return the owned buffer itself. Inside the method, a `move` or reassignment of the buffer is a compile error while a span over it is live; disposing it early (`buf.Dispose()`) is not, and the next read through the span faults in checked mode (spec §28.2, §28.3) — use the span first, dispose after. The one exception is deliberate. `ReadOnlyStringSpan` is an ordinary record, not borrow-bearing: its `Source` is a `string`, runtime-managed, and the reference itself keeps the string alive. So string spans may sit in fields and cross `await` freely (stdlib §3.3); `ToString()` materializes a plain `string` when an API wants one.
+The fix is Guide 1 §3's: let the *caller* own the buffer and pass a span down, or return the owned buffer itself. Inside the method, a `move` or reassignment of the buffer is a compile error while a span over it is live; disposing it early (`buf.Dispose()`) is not — but a read through the span that the disposal always precedes is rejected at the read, and one it precedes on only some paths faults in checked mode (spec §28.2, §28.3) — use the span first, dispose after. The one exception is deliberate. `ReadOnlyStringSpan` is an ordinary record, not borrow-bearing: its `Source` is a `string`, runtime-managed, and the reference itself keeps the string alive. So string spans may sit in fields and cross `await` freely (stdlib §3.3); `ToString()` materializes a plain `string` when an API wants one.
 
 The payoff of the view types is **reuse without allocation** — one buffer, many operations. The encode idiom (stdlib §3.2/§9.6) is the model:
 

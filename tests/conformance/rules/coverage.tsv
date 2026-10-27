@@ -44,12 +44,12 @@ spec	5.2	Explicit conversions	9	1	14	0	0	4	0	10	covered
 spec	5.3	Nullable casts	3	1	6	0	0	1	0	5	covered
 spec	5.4	Enum casts	3	3	7	0	0	1	0	6	covered
 spec	6	Arithmetic and Overflow	0	0	0	0	0	0	0	0	n/a
-spec	6.1	Integer arithmetic	3	0	7	0	0	2	0	5	covered
+spec	6.1	Integer arithmetic	5	1	7	0	0	2	0	5	covered
 spec	6.2	Mixed-type arithmetic	2	1	4	0	0	1	0	3	covered
 spec	6.3	Floating-point arithmetic	0	0	3	0	0	0	0	3	covered
-spec	6.4	Decimal arithmetic	1	0	2	0	0	0	0	2	covered
+spec	6.4	Decimal arithmetic	2	1	2	0	0	0	0	2	covered
 spec	6.5	Bitwise operations	1	1	5	0	0	2	0	3	covered
-spec	6.6	Compound assignments	12	4	19	0	0	8	0	11	covered
+spec	6.6	Compound assignments	14	5	19	0	0	8	0	11	covered
 spec	7	Nullability	0	0	0	0	0	0	0	0	n/a
 spec	7.1	Non-nullable and nullable types	0	0	2	0	0	1	0	1	covered
 spec	7.2	Nullable value types	0	0	1	0	0	0	0	1	covered
@@ -103,7 +103,7 @@ spec	12.3	base.Member	0	0	1	0	0	0	0	1	covered
 spec	12.4	Sealing	3	1	6	2	0	4	0	0	covered
 spec	12.5	Abstract classes and members	1	1	2	0	0	2	0	0	covered
 spec	12.6	async and abstract	1	0	1	0	0	1	0	0	covered
-spec	12.7	Type tests: is, is not, as	6	4	13	1	0	3	0	9	covered
+spec	12.7	Type tests: is, is not, as	6	4	16	1	0	3	0	12	covered
 spec	12.8	Constructor chaining	2	2	4	1	0	3	0	0	covered
 spec	12.9	Variance	6	1	16	5	0	8	0	3	covered
 spec	12.10	Inheritance cycles	2	1	6	0	0	5	0	1	covered
@@ -125,20 +125,20 @@ spec	14.6	Recursive instantiation	4	1	5	1	0	3	0	1	covered
 spec	15	Arrays	0	0	0	0	0	0	0	0	n/a
 spec	15.1	Inline arrays	12	4	11	0	0	7	0	4	covered
 spec	15.1.1	Owning inline arrays	3	1	8	0	0	2	0	6	covered
-spec	15.1.2	Members and operations	6	2	2	0	0	1	0	1	covered
+spec	15.1.2	Members and operations	7	3	2	0	0	1	0	1	covered
 spec	15.1.3	FFI	1	0	1	1	0	0	0	0	covered
 spec	15.2	Heap arrays	0	0	2	0	0	0	0	2	covered
 spec	15.3	Move-only value types	18	9	17	2	0	8	0	7	covered
-spec	15.4	Collection literals	11	2	14	0	0	7	1	6	covered
+spec	15.4	Collection literals	12	2	14	0	0	7	1	6	covered
 spec	15.4.1	The user-defined sequence-literal protocol	8	0	6	0	0	3	0	3	covered
 spec	15.5	Length and Count	0	0	1	0	0	0	0	1	covered
 spec	15.6	Slicing	1	0	3	0	0	2	0	1	covered
 spec	16	Range Expressions	0	0	0	0	0	0	0	0	n/a
 spec	16.1	Construction	2	1	4	1	0	1	0	2	covered
 spec	16.2	Open-ended ranges	1	0	2	1	0	0	0	1	covered
-spec	16.3	The Range<T> type	2	1	9	0	0	1	0	8	covered
+spec	16.3	The Range<T> type	2	2	9	0	0	1	0	8	covered
 spec	16.4	Stride	4	0	5	0	0	3	1	1	covered
-spec	16.5	Iteration	0	0	2	0	0	0	1	1	covered
+spec	16.5	Iteration	0	1	2	0	0	0	1	1	covered
 spec	16.6	Empty ranges and equal-bound ranges	3	2	10	0	1	2	3	4	covered
 spec	17	Expressions and Operators	0	0	0	0	0	0	0	0	n/a
 spec	17.1	Precedence	0	1	5	0	0	0	0	5	covered
@@ -192,7 +192,7 @@ spec	22.2	Expression-bodied methods	0	0	4	3	0	1	0	0	covered
 spec	22.3	Parameter modifiers	7	4	24	6	0	13	0	5	covered
 spec	22.4	Inline out declarations	6	3	9	2	0	4	0	3	covered
 spec	22.5	Optional parameters and named arguments	3	1	20	0	0	8	0	12	covered
-spec	22.6	Overloading	0	7	54	2	0	32	0	20	covered
+spec	22.6	Overloading	0	7	59	2	0	35	0	22	covered
 spec	22.7	Constructors	4	4	16	2	0	5	0	9	covered
 spec	22.8	Field initializers	8	2	25	6	0	17	0	2	covered
 spec	22.9	Owned fields and exception safety	0	1	4	0	0	0	0	4	covered
@@ -237,31 +237,31 @@ spec	27.7.1	Equality of function values	3	1	9	0	0	0	0	9	covered
 spec	27.8	Type aliases	1	1	14	0	0	1	0	13	covered
 spec	28	Resource Management	2	0	2	0	1	0	0	1	covered
 spec	28.1	Where the owned modifier can appear	1	2	10	7	0	3	0	0	covered
-spec	28.2	The IDisposable contract	0	5	13	4	0	4	3	2	covered
+spec	28.2	The IDisposable contract	0	6	13	4	0	4	3	2	covered
 spec	28.3	Local variables, ownership, and borrows	3	29	176	43	15	72	9	37	covered
 spec	28.3.1	The ownership kernel (K1–K9)	8	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.2	The axiom register (A1–A15)	5	0	0	0	0	0	0	0	UNCOVERED
-spec	28.3.3	Ownership state of locals	7	0	0	0	0	0	0	0	UNCOVERED
+spec	28.3.3	Ownership state of locals	8	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.4	Producers	7	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.5	The announcement table	10	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.6	Factory methods and sourceless returns	20	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.7	Move semantics for owned locals	3	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.8	Borrow lifetime rules	27	0	0	0	0	0	0	0	UNCOVERED
-spec	28.3.9	The consume-site freeze	4	0	0	0	0	0	0	0	UNCOVERED
+spec	28.3.9	The consume-site freeze	8	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.10	Owned-local discharge requirement	1	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.11	Unbound owned temporaries	9	0	0	0	0	0	0	0	UNCOVERED
-spec	28.3.12	Diagnostics	1	0	0	0	0	0	0	0	UNCOVERED
+spec	28.3.12	Diagnostics	2	0	0	0	0	0	0	0	UNCOVERED
 spec	28.3.13	Choosing a disposal form (recap)	2	0	0	0	0	0	0	0	UNCOVERED
 spec	28.4	The destructor	1	1	8	0	0	2	0	6	covered
 spec	28.5	Owned fields	9	1	22	8	0	9	0	5	covered
 spec	28.6	Leak prevention	3	5	68	17	0	42	0	9	covered
-spec	28.7	Reassigning owned fields and locals — drop-on-overwrite	1	3	12	1	0	2	0	9	covered
+spec	28.7	Reassigning owned fields and locals — drop-on-overwrite	4	4	12	1	0	2	0	9	covered
 spec	28.8	Ownership transfer	1	1	4	1	1	1	0	1	covered
 spec	28.8.1	The move expression	2	2	30	7	0	14	0	9	covered
 spec	28.9	Runtime-managed types	9	6	20	1	6	5	5	3	covered
-spec	28.10	using var	6	4	17	3	1	5	0	8	covered
+spec	28.10	using var	6	4	18	3	1	5	0	9	covered
 spec	28.11	Collection element ownership	0	4	39	8	3	19	2	7	covered
-spec	28.12	Asynchronous disposal	1	7	15	0	1	1	2	11	covered
+spec	28.12	Asynchronous disposal	1	7	29	0	1	1	2	25	covered
 spec	28.13	Shared ownership: Shared<T> and Weak<T>	2	1	8	0	0	3	0	5	covered
 spec	28.14	Scoped callback parameters: storage-bounded capture	22	10	30	1	1	17	0	11	covered
 spec	29	Iteration	0	0	0	0	0	0	0	0	n/a
@@ -282,13 +282,13 @@ spec	30	Asynchronous Programming	0	0	0	0	0	0	0	0	n/a
 spec	30.1	async methods	18	7	17	6	0	10	1	0	covered
 spec	30.2	await	2	0	10	1	0	1	0	8	covered
 spec	30.3	The Task, Task<T>, and OwningTask<T> types	7	1	9	0	0	2	0	7	covered
-spec	30.4	Multiple awaiters	2	0	3	0	0	0	0	3	covered
+spec	30.4	Multiple awaiters	3	1	3	0	0	0	0	3	covered
 spec	30.5	Result lifetime and task disposal	0	5	19	7	0	6	0	6	covered
 spec	30.6	Async lambdas	1	0	7	2	0	1	0	4	covered
 spec	30.7	Async iterators	0	1	12	4	0	5	0	3	covered
 spec	30.8	Cancellation	1	0	2	1	0	0	0	1	covered
 spec	30.9	Exception handling in async methods	8	0	9	1	0	1	0	7	covered
-spec	30.10	Standard library task helpers	10	0	13	1	0	3	0	9	covered
+spec	30.10	Standard library task helpers	11	0	13	1	0	3	0	9	covered
 spec	30.11	TaskCompletionSource<T> and OwningTaskCompletionSource<T>	1	0	11	0	0	6	0	5	covered
 spec	30.12	Thread synchronization	1	1	3	1	0	1	0	1	covered
 spec	30.13	Runtime model	0	0	0	0	0	0	0	0	n/a
@@ -346,10 +346,10 @@ stdlib	1	Conventions	7	0	6	0	0	0	0	6	covered
 stdlib	2	System (auto-imported)	0	0	0	0	0	0	0	0	n/a
 stdlib	2.1	Console	2	0	4	0	0	0	0	4	covered
 stdlib	2.2	Math	1	0	29	0	0	6	0	23	covered
-stdlib	2.3	Convert	1	0	22	0	0	8	0	14	covered
+stdlib	2.3	Convert	1	0	24	0	0	8	0	16	covered
 stdlib	2.4	Environment	1	0	4	0	0	0	0	4	covered
 stdlib	2.5	DateTime, TimeSpan, DateOnly, TimeOnly	5	0	9	0	0	0	0	9	covered
-stdlib	2.6	Guid	5	0	6	0	0	1	0	5	covered
+stdlib	2.6	Guid	5	0	7	0	0	1	0	6	covered
 stdlib	2.7	Random	0	0	5	0	0	0	0	5	covered
 stdlib	2.8	IComparable<T>	0	0	3	1	0	1	0	1	covered
 stdlib	2.9	IEquatable<T>	0	0	3	0	0	1	0	2	covered
@@ -358,10 +358,10 @@ stdlib	2.11	Subscription	1	0	2	0	0	1	0	1	covered
 stdlib	2.12	BitConverter	5	0	4	0	0	0	0	4	covered
 stdlib	2.13	The Type class	4	0	8	1	1	0	0	6	covered
 stdlib	2.14	Serialization vocabulary	6	0	6	3	0	3	0	0	covered
-stdlib	2.15	Concrete serialization formats	8	0	5	0	0	1	0	4	covered
+stdlib	2.15	Concrete serialization formats	10	0	9	0	0	1	0	8	covered
 stdlib	2.16	Shared<T> and Weak<T>	0	0	5	0	0	1	0	4	covered
 stdlib	2.17	Built-in exception types (cross-reference)	0	0	2	0	0	0	0	2	covered
-stdlib	2.18	IFormattable and format specifiers (#812/#1339)	3	0	26	0	0	2	0	24	covered
+stdlib	2.18	IFormattable and format specifiers (#812/#1339)	3	0	27	0	0	2	0	25	covered
 stdlib	2.19	INumber<T>, ISteppable<T>, IParsable<T>, and the collection-literal target pair (#807)	5	0	5	0	0	2	0	3	covered
 stdlib	2.20	Result<T, E>	2	0	8	0	0	1	0	7	covered
 stdlib	2.21	ScopeGuard	1	0	5	0	0	0	0	5	covered
@@ -418,7 +418,7 @@ stdlib	8.1	Stopwatch	0	0	3	0	0	0	0	3	covered
 stdlib	8.2	Debug	0	0	1	0	0	0	0	1	covered
 stdlib	9	Primitive type members	0	0	0	0	0	0	0	0	n/a
 stdlib	9.1	Integer types	5	0	18	0	0	0	0	18	covered
-stdlib	9.2	Double and Float	6	0	2	0	0	0	0	2	covered
+stdlib	9.2	Double and Float	6	0	11	0	0	0	0	11	covered
 stdlib	9.3	Decimal	4	0	3	0	0	0	0	3	covered
 stdlib	9.4	Boolean	1	0	2	0	0	0	0	2	covered
 stdlib	9.5	Char	4	0	4	0	0	1	0	3	covered

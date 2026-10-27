@@ -3,12 +3,10 @@
 //! section: 28.10
 //! title: an explicit Dispose of a borrow-pin's source is a site-announced kill the pin leaves unfrozen
 //! rule: The using var still pins the borrow's source for the duration of the
-//!   scope — the borrow stays live until the using-var's scope ends and the
-//!   consume-site freeze then governs every consume of the source in that
-//!   range: the frozen kills (a move, a transfer, a reassignment of the
-//!   binding) are compile errors, and the site-announced kills stay unfrozen
-//!   under their flag backstop — an explicit `Dispose()` of the source is
-//!   permitted, and a read through the pinned binding afterwards raises
+//!   scope ... the site-announced kills stay unfrozen under their flag
+//!   backstop ... an explicit `Dispose()` of the source is permitted; a read
+//!   through the pinned binding that the disposal dominates is §28.2's
+//!   compile error, and one the disposal reaches on only some paths raises
 //!   `DisposedAccessException` in checked disposal mode.
 //! cites: 28.10, 28.3, 28.2
 //! expect: accept

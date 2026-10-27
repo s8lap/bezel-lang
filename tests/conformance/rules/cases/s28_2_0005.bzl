@@ -2,9 +2,9 @@
 //! doc: spec
 //! section: 28.2
 //! title: a conditional dispose joins to maybe-consumed and a later read is rejected
-//! rule: A conditional kill is treated more strictly: at a join of an explicitly-
-//!   disposed path with a still-owned path the variable is maybe-consumed and a
-//!   later use is a compile error.
+//! rule: A conditional kill of the variable: at a join of an
+//!   explicitly-disposed path with a still-owned path the variable is
+//!   maybe-consumed and a later use is a compile error.
 //! expect: reject
 //! diagnostic: consumed
 module Conf;
