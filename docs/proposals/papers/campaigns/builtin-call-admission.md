@@ -32,60 +32,75 @@ discriminator (`Emitter::builtinTypeName`, S12, replacing the three head-name-on
 ## Members at entry
 
 189 members at entry (`docs/proposals/papers/master-plan/work/out/campaign-members.tsv`, rows where
-`campaign == builtin-call-admission`). **186 are OPEN at HEAD**; three were closed on 2026-10-27 and are
-recorded as `fixed-by`:
+`campaign == builtin-call-admission`). **184 are OPEN at HEAD**; **five** were closed on 2026-10-27:
 
-| # | closed by | in `origin/main`? |
+| # | closed | in `origin/main`? |
 |---|---|---|
-| #7325 | `b1adfab95` (fix #7325 — the floating Parse arms reject a signed bare point) | yes |
-| #7329 | `275fab52` (fix #7329 — the integer row's D and X specifiers work at every width) | yes |
-| #7341 | `d9f8b36f` (fix #7341 — a point with no digits after it is rejected) | yes |
+| #7325 | 2026-10-27T11:49 by `b1adfab95` (fix #7325 — the floating Parse arms reject a signed bare point) | yes |
+| #7329 | 2026-10-27T11:49 by `275fab52` (fix #7329 — the integer row's D and X specifiers work at every width) | yes |
+| #7341 | 2026-10-27T11:49 by `d9f8b36f` (fix #7341 — a point with no digits after it is rejected) | yes |
+| #1792 | **2026-10-27T13:43 by the coordinator (s8lap)** — the premise was stale (measured below) | — |
+| #7108 | **2026-10-27T13:43 by the coordinator (s8lap)** — the mechanism is fixed by `c0c9e3f9` (*fix #7168*) | yes |
 
 **Re-measured on HEAD `d9f11d15` (bezelc built in this lane's worktree).** Verdicts:
 
 | status | count |
 |---|---|
-| `reproduces` (the symptom is still present) | 92 |
+| `reproduces` (the symptom is still present) | 91 |
 | `moved` (the symptom changed class: crash → silent drop, crash → wrong value) | 6 |
 | `fixed` (the mechanism is GONE, though the tracker entry is still open) | 8 |
-| `re-label` (the mechanism is **not** a builtin-call-admission defect — it belongs to another campaign) | 77 |
+| `re-label` (the mechanism is **not** a builtin-call-admission defect — it belongs to another campaign, or the report's premise is wrong) | 78 |
 | `spec-question` (the spec does not decide it) | 6 |
 
-**=> THE CAMPAIGN'S LIVE SCOPE IS 98 MEMBERS** (92 `reproduces` + 6 `moved`), not 189.
+**=> THE CAMPAIGN'S LIVE SCOPE IS 97 MEMBERS** (91 `reproduces` + 6 `moved`), not 189. **ONE MEMBER LEFT THE LIVE SCOPE UNDER THE COORDINATOR'S R2 RULING (2026-10-28): #7254 (`Math.Abs(4000000000u)`) is NOT A DEFECT — the call is ambiguous under §22.6 and the compiler's rejection is correct — so it is re-labelled, and its grid cell `math_abs_uint` now pins that correct rejection.** (The `lane`
+column says which lane owns the FIX; 11 of those 97 are owned by the `re-label` lane — their symptom
+still reproduces, but the fix is a re-label, not an admission fix.)
 
-**TWO MEMBERS' PREMISES ARE STALE (both re-derived on HEAD, both MEASURED):**
+**TWO MEMBERS' PREMISES ARE STALE — AND BOTH ARE NOW CLOSED IN THE TRACKER (2026-10-27T13:43, by the
+coordinator `s8lap`); this lane re-derived them and did not file anything:**
 * **#1792** ("direct char.Parse/TryParse/ParseOrNull and bool.ParseOrNull unhandled in sema") — **STALE.**
   Measured: `char.Parse("a")` prints `a`; `char.TryParse("a", out c)` prints `True` / `c = 'a'`;
   `char.ParseOrNull("a")` is not null and `char.ParseOrNull("zz")` IS null; `bool.ParseOrNull("true")`
   is not null and `bool.ParseOrNull("nope")` IS null. All four members it names behave per stdlib
-  §2.19/§9.5 today.
+  §2.19/§9.5 today. **CLOSED 2026-10-27.**
 * **#7108** ("string.Remove has no start-index bounds check: Remove(253) on a 252-char string reads
   past the end") — **STALE.** Measured: `"ab".Remove(253)` and a 252-char `s.Remove(253)` both raise
   `System.IndexOutOfRangeException`, which is exactly what stdlib §9.6 requires. The fix is
-  `c0c9e3f9` (*fix #7168*), which IS in `origin/main`.
-  **=> Both are candidates for closing as fixed; the coordinator files the closure.**
+  `c0c9e3f9` (*fix #7168*), which IS in `origin/main`. **CLOSED 2026-10-27.**
 
 ### COVERAGE — stated explicitly
 
-* **74 of 189 members carry FULL MEASURED evidence on HEAD** — a repro was compiled and run with this
-  lane's `build/bezelc`, and the observed output/diagnostic/abort is the evidence. Sources: the six
+**The count is the STATUS column of the members table, recounted mechanically (the numbers below are
+the table's, not an estimate): 73 measured / 116 rule-only.**
+
+* **73 of 189 members carry FULL MEASURED evidence on HEAD** — a repro was compiled and run with this
+  lane's `build/bezelc`, and the observed output/diagnostic/abort is the evidence. Breakdown by status:
+  `reproduces` 39 + `re-label` 22 + `fixed` 5 + `moved` 6 + `spec-question` 1. Sources: the six
   §3 spot-checks (below), a mechanical sweep over every complete program in every issue body (55
-  members), the 110-cell DONE grid (26 members named in its cells), and the two re-derived stale
-  premises (#1792, #7108).
-* **115 of 189 carry a TITLE-RULE verdict only** — the mechanism was read from the issue body (which
-  quotes the governing stdlib sentence and, for most, the measuring reviewer), but **no repro was built**.
+  members), the DONE grid's cells (47 distinct members — the map is below), and the two re-derived
+  stale premises (#1792, #7108).
+* **116 of 189 carry a TITLE-RULE verdict only** — the mechanism was read from the issue body (which
+  quotes the governing stdlib sentence and, for most, the measuring reviewer), but **no repro was
+  built**. Breakdown by severity: `other` 75, `crash` 26, `soundness` 15.
   For the ~90 rule-matched members §3 asks to "confirm or re-label", this reading **is** the deliverable:
-  each was confirmed in-campaign or re-labelled to another campaign (see the table's `outcome` column).
-* **NOT measured (41 rows; 24 of them are LIVE campaign-2 defects):** 26 crash members — #4255, #4805,
-  #5978, #6056, #6100, #6126, #6254, #6255, #6295, #6646, #6659, #6677, #6689, #6809, #6873, #7030,
-  #7246, #7265, #7274, #7287, #7293, #7299, #7319, #7329, #7331, #7358 — and 15 soundness members —
-  #1765, #2625, #2647, #2730, #4126, #4481, #4790, #5409, #6648, #6782, #6983, #7098, #7189, #7291,
-  #7294. Their issue bodies contain no compilable program, so each needs a hand-written repro before it
-  can be counted as measured. **17 of the 41 are RE-LABEL rows** (they leave the campaign anyway), so
-  **the campaign's own unmeasured backlog is 24, not 41**. **This is the entry lane's largest gap and
-  the first thing the next lanes must close.**
-* **74 of the 115 unmeasured members are severity `other`** (the §3 "rule-matched" set); those are the
-  ones §3 explicitly asks to *confirm or re-label*, and each has been re-labelled.
+  each was confirmed in-campaign or re-labelled to another campaign (see the table's `HEAD status`
+  column).
+* **THE CAMPAIGN'S OWN UNMEASURED BACKLOG IS 52 LIVE MEMBERS, NOT 24.** Of the 116 rule-only rows,
+  **52 are LIVE campaign-2 defects** (`reproduces` or `moved` by rule) — they are in scope, their
+  mechanism is stated, and **no repro was built for them**. The other 63 rule-only rows are
+  re-labelled (55), fixed (3) or spec-questions (5): they leave the campaign or need no repro.
+* **THE 52 SPLIT IN TWO, and the split is measured, not asserted:**
+  * **19** have **no compilable program in their issue body at all** — a repro must be written from
+    scratch. They are #4126, #6254, #6255, #6295, #6648, #6782, #6809, #7098, #7189, #7265,
+    #7274, #7287, #7291, #7293, #7294, #7299, #7319, #7331, #7358.
+  * **33** have a program in the body that **the sweep's extractor did not turn into a runnable
+    module** — MEASURED: the sweep covered 55 members' bodies (60 extracted programs) and **touched
+    none of these 33**; each needs the body program rebuilt or a fresh repro.
+  * (The earlier "41 rows / 24 live" figure was the narrower list of members whose bodies carry no
+    program at all, over BOTH statuses: 41 rows = 20 re-label + 19 live `reproduces` + 1 `fixed`
+    (#7329) + 1 `spec-question` (#4481). **24 was wrong: it is 19 live members.**)
+* **75 of the 116 rule-only members are severity `other`** (the §3 "rule-matched" set); those are the
+  ones §3 explicitly asks to *confirm or re-label*, and each has been re-labelled or confirmed.
 
 The full 189-row table (one row per member: severity, HEAD status, evidence, sub-family, lane,
 B0 leverage) is in `docs/proposals/papers/campaigns/builtin-call-admission-members.md`, on this branch.
@@ -117,20 +132,20 @@ the tracker, 5 fixed — are excluded); the numerator is the members the family'
 |---|---|---|---|---|
 | **B1** Parse/TryParse/radix | 15 | 13 | **0.87** | **SURVIVES** |
 | **B2** ToString(format)/Convert rendering | 22 | 7 | 0.32 | **SPLITS** → B2a (admission) / B2b (rendering contract) |
-| **B3** Math/Convert argument typing | 15 | 6 | 0.40 | **SPLITS** → B3a (argument typing) / B3b (widening + evaluation order) |
+| **B3** Math/Convert argument typing | 14 | 6 | 0.43 | **SPLITS** → B3a (argument typing) / B3b (widening + evaluation order) |
 | **B4** StringBuilder and string member arms | 23 | 7 | 0.30 | **SPLITS** → B4a (admission) / B4b (the `bz_sb_*` runtime contract) |
 | **B5** nullable carrier at a builtin position | 7 | 0 | **0.00** | **DOES NOT SURVIVE** — a narrowed `T?` is *legal* (§7.4), so no admission gate rejects it; the rule is campaign 5's unwrap-before-consume |
 | **B6** null at a non-nullable builtin parameter | 5 | 5 | **1.00** | **SURVIVES** |
 | **B0x** the plan's own B0-named members (symbol-not-name, type-argument arity, ambiguity, constraint, inference, method-group arity) | 11 | 7 | **0.64** | **SURVIVES** |
-| **X** re-labelled away (77) + spec-questions (6) | 0 | 0 | — | **not this campaign** — see *Re-labels* |
+| **X** re-labelled away (78) + spec-questions (6) | 0 | 0 | — | **not this campaign** — see *Re-labels* |
 
 **#6648 was re-classified on review from Y to N**: `Math.Min/Max/Clamp` over double/int/long have an
 UNTYPED RESULT, but **the CALL IS LEGAL** — a parameter-TYPE table does not reach it, so by this
 record's own definition it is not a gate rejection.
 
 **The falsification rule's verdict on the PLAN'S B0 CLAIM: it FAILS.** One signature-based admission
-gate would have rejected **at most 52 of the 189 members (27.5 %)**, and **at most 45 of the 98 LIVE
-defect members (45.9 %)**. Both figures are below one half, so B0 as a single sub-family is **split**.
+gate would have rejected **at most 52 of the 189 members (27.5 %)**, and **at most 45 of the 97 LIVE
+defect members (46.4 %)**. Both figures are below one half, so B0 as a single sub-family is **split**.
 The anchor is therefore **not one function**; see below.
 
 **THE FIGURE IS AN UPPER BOUND, NOT A MEASUREMENT OF A GATE.** It is a per-member classification —
@@ -141,10 +156,10 @@ review as **not builtin calls at all** — #6253 and #6254 are USER static/gener
 ASSIGNMENT, and #6530 is a type-parameter NAME guard; left as Y they would have read 30.6 % instead of
 27.5 %. **The split verdict is unaffected — the true figure can only be lower.**
 
-### Re-labels (77 members — 77 unique, exclusive, every row with a destination)
+### Re-labels (78 members — 78 unique, exclusive, every row with a destination)
 
-The table below assigns each of the **77** re-labelled members to **exactly one** destination. The
-number of unique ids is 77 and no id appears twice.
+The table below assigns each of the **78** re-labelled members to **exactly one** destination. The
+number of unique ids is 78 and no id appears twice.
 
 | destination | n | members |
 |---|---|---|
@@ -154,11 +169,18 @@ number of unique ids is 77 and no id appears twice.
 | campaign 13 — records/statics/contracts/misc (+ the stdlib §4/§5 members outside campaign 2's scope) | 19 | #1765 #2651 #2662 #3943 #4790 #4805 #5961 #6007 #6035 #6056 #6058 #6078 #6106 #6151 #6187 #6751 #6854 #6872 #6881 |
 | campaign 1 — using-heads / disposal | 2 | #5355 #7146 |
 | campaign 11 — async frames | 1 | #6100 |
-| campaign 2 — in-campaign but NOT an admission defect (diagnostic wording, §15.1 tier, enablers, §-citation classes) | 8 | #5409 #5911 #6027 #6029 #7149 #7308 #7309 #7340 |
+| campaign 2 — in-campaign but NOT an admission defect (diagnostic wording, §15.1 tier, enablers, §-citation classes, a report whose premise is wrong — #7254) | 9 | #5409 #5911 #6027 #6029 #7149 #7254 #7308 #7309 #7340 |
 | parking-lot (out of the campaign's declared sections; no campaign claims the mechanism) | 14 | #1701 #2094 #2313 #3826 #4255 #4797 #6235 #6689 #6860 #7030 #7090 #7093 #7118 #7246 |
 
-**=> 77 of 189 members (41 %) are not builtin-call-admission defects at all.** The campaign's live
-scope is **98 members** (92 `reproduces` + 6 `moved`), not 189.
+**=> 78 of 189 members (41 %) are not builtin-call-admission defects at all.** The campaign's live
+scope is **97 members** (91 `reproduces` + 6 `moved`), not 189.
+
+**THE NINE "IN-CAMPAIGN BUT NOT AN ADMISSION DEFECT" ROWS — SAID ONCE, HERE.** Those nine
+(#5409 #5911 #6027 #6029 #7149 #7254 #7308 #7309 #7340) **STAY IN CAMPAIGN 2** — they are not re-labelled
+away to another campaign — but they are **not admission defects** (a diagnostic's wording, a §15.1
+tier, an enabler, a §-citation class), so they are **NOT counted in the live scope of 98**: the live
+scope counts only the members whose symptom still `reproduces` (92) or `moved` (6). They are in the
+campaign's 189 and in its §-citation sweep, but they are not in its DONE line.
 
 ### Lane plan (order, hot files, model tier)
 
@@ -216,24 +238,33 @@ what the compiler must do with it: accept with this **exact** output, reject wit
 raise this fault, or at minimum not abort the compiler.
 
 **Where it lives:** `scripts/builtin_admission_grid.py` on this branch (`r36-c2-entry`). It is
-gate-runnable: `BEZEL_AOT_FORCE_SANITIZE=address scripts/builtin_admission_grid.py --out DIR
---bezelc build/bezelc` compiles every cell with `--sanitize=address` and prints
-`NATIVE SANITIZER: N check(s) skipped`.
+**run BY HAND at the gate**, exactly like its model `scripts/regression_matrix.py`:
+`BEZEL_AOT_FORCE_SANITIZE=address scripts/builtin_admission_grid.py --out DIR --bezelc build/bezelc`
+compiles every cell with `--sanitize=address` and prints `NATIVE SANITIZER: N check(s) skipped`.
+**Nothing in `scripts/gate.sh` or `scripts/pregate.sh` runs it** — the pregate runs only the
+build-free phases, and the grid needs a compiler. **=> The campaign's DONE line ("all 109 campaign-2
+cells are OK") is a MANUAL step at every gate until the coordinator wires the grid into the gate; the
+wiring decision is the coordinator's, and until then "green at every gate" means "green when somebody
+runs it".**
 
-**Cells: 110.** Classes: `OK` / `ACCEPTED` (compiled and ran, but not as the expectation says) /
+**Cells: 113.** Classes: `OK` / `ACCEPTED` (compiled and ran, but not as the expectation says) /
 `REJECTED` (rejected, but not as the expectation says) / `ABORT` (the compiler aborted) / `INTERNAL`
 (compiled with an `internal:` note — a silent acceptance inversion).
 
-**BASELINE — cells wrong on HEAD `d9f11d15` (MEASURED, both legs):**
+**BASELINE — cells wrong on HEAD `d9f11d15`, with THIS lane's `build/bezelc` (MEASURED, both legs):**
 
 | leg | cells | wrong | OK | ACCEPTED | REJECTED | ABORT | INTERNAL | sanitizer |
 |---|---|---|---|---|---|---|---|---|
-| plain | 110 | **48** | 62 | 25 | 2 | 8 | 13 | `NATIVE SANITIZER: 0 check(s) skipped` |
-| `BEZEL_AOT_FORCE_SANITIZE=address` | 110 | **48** | 62 | 25 | 2 | 8 | 13 | `NATIVE SANITIZER: 0 check(s) skipped` |
+| plain | 113 | **49** | 64 | 26 | 2 | 8 | 13 | `NATIVE SANITIZER: 0 check(s) skipped` |
+| `BEZEL_AOT_FORCE_SANITIZE=address` | 113 | **49** | 64 | 26 | 2 | 8 | 13 | `NATIVE SANITIZER: 0 check(s) skipped` |
 
-**48 is the campaign's number to drive to zero**, of which **47 are campaign 2's own** and **1 belongs
+**49 is the campaign's number to drive to zero**, of which **48 are campaign 2's own** and **1 belongs
 to campaign 5** (the `math_floor_narrowed` cell — see the campaign split below). The grid reports the
-per-campaign split itself (`--campaign 2` / `--campaign 5`).
+per-campaign split itself (`--campaign 2` / `--campaign 5`). The TSV is **byte-identical across two
+different `--out` directories** (the detail column carries cell-relative paths). **A per-cell diff
+against the previous baseline shows NO cell changed class** — the needle rewrite (below) changed
+nothing that was already measured; the two new cross-module cells are `OK`, and the third new cell
+(`math_abs_float`, added for the coordinator's R2 ruling) is `ACCEPTED`.
 
 **THE CAMPAIGN SPLIT (D13).** Four cells exercise a §7.4-**narrowed** nullable at a builtin
 position: `math_floor_narrowed`, `sb_append_narrowed_int`, `int_tostring_radix_narrowed`,
@@ -241,7 +272,7 @@ position: `math_floor_narrowed`, `sb_append_narrowed_int`, `int_tostring_radix_n
 admission gate rejects these calls** — they are the **unwrap**, which is **campaign 5's** mechanism.
 **=> Campaign 2's anchor does NOT include the unwrap.** Those four cells are tagged `campaign = "5"`
 in the grid and are excluded from campaign 2's DONE line; the campaign's DONE line is
-**"all 106 campaign-2 cells are OK"**, and campaign 5 owns its own four. (If the owner instead folds
+**"all 109 campaign-2 cells are OK"**, and campaign 5 owns its own four. (If the owner instead folds
 the unwrap into campaign 2's anchor, the tag is one constant in the cell table.)
 
 The 8 `ABORT` cells are compiler aborts (`math_floor_nullable`, `math_floor_narrowed`,
@@ -251,13 +282,18 @@ silent-acceptance inversions (`int_parse_int`, `int_parse_bool`, `int_parse_char
 `int_parse_object`, `long_parse_intarg`, `bool_parse_int`, `char_parse_radix`, `decimal_parse_double`,
 `double_parse_int`, `string_split_int`, `string_isascii`, `math_sign_reference`).
 
-**Corpus dedup (done FIRST, as required):** of the 110 cells, **0 are byte-identical to an existing
-corpus case and 17 are already covered, loosely, by an existing corpus case** — `l9_1_0011` (int.Parse
-radix), `l9_4_0001` (bool.Parse), `l2_18_0012` (the integer format row), `l2_18_0017` (the format
-fault), `l1_0004` (the StringBuilder surface), `s22_6_0102` (the Encoding surface), `s5_1_0148` (a
-§5.1 conversion). **93 cells are NEW.** (The dedup is a normalised-text match against all 3693 files in
-`tests/conformance/rules/cases/`; the "loose" match requires the cell's distinctive call to appear in
-the corpus case's program.)
+**Corpus dedup — RE-RUN on this branch against all 3622 case files in
+`tests/conformance/rules/cases/` (the review round-1 figures were not re-run; these are):**
+* **0 cells are byte-identical to an existing corpus case** (normalised: comments and whitespace
+  stripped).
+* **6 cells' own call EXPRESSION appears verbatim in a corpus case**: `int_parse_radix_ok`
+  (`l9_1_0011`), `int_tostring_radix` (`l9_1_0008`), `int_tostring_format_x` (`l2_18_0012`),
+  `double_tostring_format_c` (`l2_18_0017`), `encoding_getstring_int_array` (`s22_6_0102`),
+  `math_sign_reference` (`l2_2_0004`/`l2_2_0010`/`l2_2_0012`/`l2_2_0022`).
+* **106 cells are NEW** under that rule.
+* Under the LOOSER rule ("the cell's MEMBER appears in some corpus case"), **57 are covered and 55 are
+  new**. Both rules are stated so the number is checkable; the first draft's "17 loosely covered, 93
+  new, 3693 files" did not state its rule and has been replaced.
 
 ### The grid's own fixes (review round 1) — what changed and why
 
@@ -269,21 +305,168 @@ the corpus case's program.)
 | `debug_writeline_stringbuilder` | `reject` (green for the wrong reason) | **`reject`, import `System.Diagnostics`** | the old cell imported `System`, so `Debug` was undeclared and the cell was green on "`Debug` is declared in `System.Diagnostics`". With the right import the call COMPILES and writes an empty line — that is **#6780**, a live member. |
 | `string_remove_oob` | `noabort` (vacuous: rc 70 was OK) | **`fault` / `IndexOutOfRangeException`** | stdlib §9.6: "a `startIndex` above `Length` … raises `IndexOutOfRangeException`". Measured: `"ab".Remove(253)` raises it. **=> #7108's mechanism is GONE** (fixed by `c0c9e3f9`, *fix #7168*, in `origin/main`) — the tracker entry is stale. |
 | the `noabort` kind | `nocrash` (ignored the exit code) | **renamed `noabort`, and it now requires rc == 0** | a runtime FAULT is a wrong answer, not a pass. The 3 remaining `noabort` cells (`math_abs_decimal` — now a `value` cell, `sb_appendformat_string`, `sb_append_narrowed_int`) all exit 0 today. |
-| **all 60 reject cells** | `want = None` ("any error will do") | **every reject cell now NAMES its needle** | D5: the `C()` helper RAISES if a reject cell has no needle, so the shape cannot regress. The needles are transcribed from the compiler's own diagnostic families (`no matching overload of \`X\``, `ambiguous call to \`X\``, `is nullable but the target type is non-nullable`, `not implicitly convertible to the target type`, `supplies N argument(s) but stdlib §X declares`, `expects \`Array<byte>\``, `inconsistent type-argument inference`, `is a reference to a generic method`, `type argument`). |
+| **all 60 reject cells** | `want = None` ("any error will do") | **every reject cell now NAMES its needle** | D5: the `C()` helper RAISES if a reject cell has no needle, so the shape cannot regress. |
+| **all 60 reject cells (review round 2)** | **ONE guessed wording each** (21 transcribed from the compiler's own wording, **39 predicted**) | **every reject cell now lists the DIAGNOSTIC FAMILIES it accepts** (2–8 alternatives each, built by the `F_*` family helpers) | **N1, the last gap to the DONE instrument.** A fix that lands on a different wording of the SAME family must still turn the cell green, and a fix that lands on a DIFFERENT family must turn it red. The `C()` helper now also RAISES if a reject cell lists fewer than two alternatives. |
+| **the two bare needles** | `"no matching overload of"` (6 cells), `"type argument"` (2 cells) | **member-specific**: `F_overload("int.Parse")` → ``no matching overload of `int.Parse` ``, ``no applicable overload of `int.Parse` ``, ``no matching overload for `int.Parse` ``; `F_typearg("Console.WriteLine")` → ``explicit type argument(s)``, ```Console.WriteLine` declares no type parameter`, ```Console.WriteLine` is not a generic method``` | a bare family head matches a diagnostic about a DIFFERENT call in the same program (the D3 failure mode). |
+| the brittle needles | `"supplies 1 argument(s) but stdlib §3.1 declares"` (exact count + section) | `F_arity` lists four: the counted form, the section-pinned-but-uncounted form, the member-qualified form, and the `expects N argument(s)` rewording | a reworded arity message must not turn a correct fix into a red cell. |
+| — | the TSV had no subject column | **every cell names its `subject`** (the built-in member it is about) | the subject is what makes a diagnostic about another call unable to satisfy the cell; the self-test proves it. |
+| — | — | **NEW: `imported_user_class_stringbuilder_qualified` and `imported_user_class_stringbuilder_bare`** | **N5, the cross-module face.** See *The cross-module face* below. |
+| `math_abs_float` | — | **NEW cell**: `reject` | **R2 (coordinator, 2026-10-28).** stdlib §2.2 declares four `Abs` overloads (int/long/double/decimal); §5.1 gives `float` → `double` **and nothing else**, and puts `decimal` ↔ the binary floats on its never-implicit list — so a `float` argument converts to exactly ONE parameter type and the call must resolve to `Abs(double)` and return `double`. `var f: float := Math.Abs(-1.5f);` must therefore be **REJECTED** (`double` → `float` never narrows implicitly). MEASURED on HEAD: the compiler types the result `float` and ACCEPTS it — that is #7061. |
+| `math_abs_uint` | `reject` (unchanged) | **comment added; the cell STANDS** | **R2.** `uint` converts to THREE of the four declared parameter types (`long`, `double`, `decimal`) and to NONE of them exactly, so §22.6 makes the call ambiguous and the rejection is CORRECT. **#7254 IS NOT A DEFECT** — this cell is now the guard against a lane "fixing" a correct rejection. |
+| `string_repeat_string` | value "ababab" (unchanged) | **comment added; the cell STANDS** | **R3 (coordinator, 2026-10-28).** stdlib §9.6 declares `Repeat(c: char, count: int)` and `Repeat(unit: string, count: int)` side by side; the declared overload MUST BE IMPLEMENTED, and the gate may not reject a declared overload. The compiler's `char`-only surface is a defect (#7129, #7277), not a contract. |
+| — | — | **NEW: the grid carries the CELL→MEMBER map** (`MEMBER` in `scripts/builtin_admission_grid.py`) | the record's cell→member table is now machine-checkable: the module raises if a cell has no entry or an entry names no cell, and the self-test checks both. |
 | every cell | the TSV's detail column embedded the ABSOLUTE program path | **cell-relative path** | two runs into different `--out` directories now produce **byte-identical** TSVs (verified). |
 | — | the `clean` expectation kind was dead code | **removed** | — |
+
+### The reject needles are FAMILIES, not one guessed wording (N1)
+
+**THE PROBLEM (measured by the reviewer, confirmed here).** A reject cell that names ONE wording is a
+ratchet that turns RED on a *correct* fix that words the same diagnostic differently, and — if the
+wording is a bare family head — a ratchet that can turn GREEN on a diagnostic about a **different**
+call in the same program. The compiler has **at least three** "no such member" families:
+``string member `.M` is not yet supported in codegen``, ``'T' has no static method or property 'M' (§3.4)``,
+``type 'T' has no static method or property 'M' (§3.4)``.
+
+**THE FIX.** Every reject cell's needle is now a **LIST** — the diagnostic FAMILIES a correct fix may
+use — built by the family helpers in `scripts/builtin_admission_grid.py`:
+
+| family | the alternatives it offers | the compiler's own wording it is transcribed from |
+|---|---|---|
+| `F_overload(subject)` | ``no matching overload of `X` ``, ``no applicable overload of `X` ``, ``no matching overload for `X` `` | `ExprTypecheck_Calls.cpp` (`"no matching overload of `" + head + "."`) |
+| `F_convertible(subject)` | `not implicitly convertible to the target type`, ``the argument to `X` has a type that is not implicitly convertible to the target type`` | `ExprTypecheck.cpp` (§5.1) |
+| `F_nullable(subject)` | `is nullable but the target type is non-nullable`, ``the argument to `X` is nullable but the target type is non-nullable`` | `ExprTypecheck.cpp` (§7) |
+| `F_arity(subject, §, N)` | the counted form, the section-pinned form, the member-qualified form, the `expects N argument(s)` rewording | `ExprTypecheck_Calls.cpp` (`"the call to `StringBuilder.M` supplies N argument(s) but stdlib §3.1 declares"`, and the §9.6 string form) |
+| `F_ambiguous(subject)` | ``ambiguous call to `X` ``, ``ambiguous call to X``, `` `X` is ambiguous`` | `ExprTypecheck_Calls.cpp` (`overloadAmbiguityMessage`) |
+| `F_dispatch(subject)` | ``cannot dispatch member 'M' ``, ``member `M` on `string` is not yet supported in codegen``, ``string member `.M` is not yet supported in codegen`` | `LlvmBackend_Calls2.cpp` (the dispatch backstop) and `ExprTypecheck_Calls.cpp` |
+| `F_no_such_member(receiver, member)` | the three "no such member" wordings | `ExprTypecheck_Calls.cpp` |
+| `F_property(subject)` | `` `M` is a property``, ``property `M` `` | — (the property-vs-method shape) |
+| `F_typearg(subject)` | `explicit type argument(s)`, `` `X` declares no type parameter``, `` `X` is not a generic method`` | `ExprTypecheck_Calls.cpp` (§14) |
+| `F_inference(subject)` | `inconsistent type-argument inference`, ``no matching overload of `X` `` | `ExprTypecheck_Calls.cpp` (§14.1) |
+| `F_generic_ref(subject)` | `is a reference to a generic method`, `` `X` is a reference to a generic method``, `` `X` names no type argument`` | `ExprTypecheck_Calls.cpp` |
+| `F_initializer(subject, v)` | `the initializer for`, ``the initializer for `v` has a type that is not implicitly convertible to the target type`` | `ExprTypecheck.cpp` |
+| `F_ambiguous_name(subject)` | ``bare name `M` is ambiguous``, `is ambiguous: an imported public from`, `shadows the always-available type` | `ExprTypecheck_Calls.cpp` (§2.3) |
+
+**WHERE THE "NO SUCH MEMBER" FAMILIES ARE AND ARE NOT ACCEPTED — and why.** A fix can only say "no
+such member" where the called FORM has no member at all. **MEASURED on HEAD: not one of the 60 reject
+cells produces a "no such member" diagnostic** (the member exists in the form it is called), so the
+three no-such-member families are accepted **only** by `string_isascii` — whose method spelling of a
+PROPERTY really has no member. For the other 59 the member exists, so the plausible families are the
+overload / conversion / nullability / arity ones, and those are what the cells accept.
+
+**THE RESIDUAL RISK, STATED.** A dozen family phrases carry **no member name** (the compiler's own
+wording for them has none) — they are listed in `CONTEXT_FREE` in the grid and are the only
+alternatives that are not anchored to the cell's subject. **They are safe here because each cell's
+program has exactly one call under test and its only other call is a `Console.WriteLine` of that
+call's own result** — a type the stdlib fixes, so no §5.1 or §7 diagnostic can arise at the outer
+call. The self-test proves the complementary half mechanically: **no anchored alternative of any cell
+is satisfied by a diagnostic about another call in the same program.**
+
+### The cross-module face (N5)
+
+**The gap the reviewer named: no cell covered a class named like a builtin IMPORTED from another
+module.** The imported-name resolution is a distinct path (cf. #5313/#5355's imported-name family).
+**MEASURED HERE (not asserted), on HEAD `d9f11d15`, with a two-module build (`bezelc -c lib.bzl -o
+lib.o` then `bezelc --import lib.o app.bzl`):**
+
+* the **qualified** spelling `Lib.StringBuilder` calls the **user's own** `Replace` — the program
+  prints `USER-REPLACE` then `after`, **rc 0**. **The imported shape is ALREADY SAFE.**
+* the **bare** spelling `StringBuilder` (with `import Lib;` in scope) is **REJECTED by sema**:
+  ``bare name `StringBuilder` is ambiguous: an imported public from `Lib` shadows the always-available
+  type; qualify it via a module-qualified name (e.g. `Lib.StringBuilder`) or an import alias
+  (§2.3 / §2.2, v0.309; fix #5140)``.
+
+**Both are now CELLS, not prose** — a cell that pins an already-correct behaviour is worth more than
+a note: `imported_user_class_stringbuilder_qualified` (expects `value` `USER-REPLACE\nafter\n`) and
+`imported_user_class_stringbuilder_bare` (expects `reject`). **Both are `OK` on HEAD**, so the
+baseline's wrong-cell count is unchanged; the grid now fails if the imported path regresses.
+
+### The cell→member map
+
+**The grid carries the map** (`MEMBER` in `scripts/builtin_admission_grid.py`): every cell names the
+tracker member it covers, or `''` for a CONTROL cell (the legal spelling of a call the tracker does
+not name). The module **raises** if a cell has no entry or an entry names no cell, and the self-test
+checks both. **75 of the 113 cells cover a tracker member (47 distinct); 38 are controls.**
+
+| member | cells |
+|---|---|
+| #6635 | `string_contains_int`, `string_lastindexof_int` |
+| #6636 | `string_split_int` |
+| #6647 | `math_abs_decimal_nullable` |
+| #6648 | `math_minmax_typed_result` |
+| #6755 | `object_holding_stringbuilder` |
+| #6780 | `debug_writeline_stringbuilder` |
+| #6782 | `datetime_tostring_null` |
+| #6809 | `sb_insert_two_strings`, `sb_insert_zero`, `sb_remove_two_args`, `sb_replace_int` |
+| #6812 | `int_tryparse_nullable`, `sb_append_null`, `sb_append_null_literal` |
+| #6825 | `long_tostring_null` |
+| #6826 | `string_contains_object`, `string_replace_object` |
+| #6864 | `math_max_uint` |
+| #6865 | `math_min_char` |
+| #6884 | `math_max_mixed` |
+| #6942 | `math_max_reference`, `math_sign_reference` |
+| #6957 | `encoding_getstring_int_array` |
+| #7061 | `math_abs_float` |
+| #7108 | `string_remove_oob` |
+| #7129 | `string_repeat_string` |
+| #7173 | `builtin_typearg_arity`, `builtin_typearg_list` |
+| #7180 | `string_compareto_named_reordered`, `string_equals_named_ordered`, `string_equals_named_reordered` |
+| #7217 | `imported_user_class_stringbuilder_qualified`, `user_class_named_stringbuilder` |
+| #7227 | `math_sign_bool`, `math_sign_string` |
+| #7234 | `convert_tostring_char`, `convert_tostring_uint` |
+| #7239 | `convert_tostring_radix_long` |
+| #7242 | `math_sqrt_uint` |
+| #7244 | `sb_appendformat_string` |
+| #7245 | `string_isascii_property` |
+| #7254 | `math_abs_uint` |
+| #7271 | `int_tostring_radix_uint` |
+| #7284 | `decimal_tostring_radix` |
+| #7285 | `int_parse_radix_bool`, `int_parse_radix_uint` |
+| #7286 | `int_parse_radix_string`, `int_tostring_radix_string` |
+| #7290 | `int_tryparse_int` |
+| #7293 | `double_parse_int`, `double_tryparse_int` |
+| #7294 | `int_parse_double`, `int_parse_int`, `int_parse_object` |
+| #7295 | `char_parse_radix` |
+| #7296 | `int_tostring_radix_null` |
+| #7297 | `math_floor_narrowed`, `math_floor_nullable`, `math_floor_nullable_null` |
+| #7299 | `bool_parse_int`, `bool_tryparse_int`, `char_tryparse_int`, `int_parse_bool`, `int_parse_char` |
+| #7300 | `decimal_parse_double`, `decimal_tryparse_double` |
+| #7303 | `double_tostring_format_bad`, `double_tostring_format_c` |
+| #7323 | `int_tryparse_double` |
+| #7333 | `bool_tostring_format` |
+| #7336 | `char_tostring_format` |
+| #7359 | `int_tostring_format_X`, `int_tostring_format_x` |
+| #7362 | `double_tostring_format_d` |
+
+**75 of the 113 cells cover a tracker member (47 distinct); the other 38 are CONTROL cells** — the
+legal spelling of a call the tracker does not name (their program must still compile and print what
+the cell says). The authoritative list is the `MEMBER` dict in the grid;
+`scripts/builtin_admission_grid.py --list` prints `cell  member  subject` for every cell, and the
+TSV carries a `member` column.
 
 ### The grid's self-test (D11)
 
 **`scripts/gate/tests/test_builtin_admission_grid.py`** — pregate runs
 `python3 -m unittest discover -s scripts/gate/tests`, so this is picked up automatically. It is
 **build-free**: a fake `bezelc` (a shell script) stands in for the compiler and for the generated
-program, so the generator, the classifier and the cell table are exercised end to end in ~0.3 s.
-Ten tests, all green:
-* every `reject` cell names a non-empty diagnostic needle (D5, structural);
+program, so the generator, the classifier and the cell table are exercised end to end in ~0.6 s.
+**Seventeen tests, all green** (the whole discovery: 1056 tests, OK, 2 skipped):
+* every `reject` cell lists **at least two** diagnostic alternatives (D5 + N1, structural);
+* every `reject` cell names its **subject** (structural);
+* every reject alternative is **anchored** (it names the cell's own subject, its head or its
+  member) **or** is one of the compiler's context-free family phrases — a bare phrase such as
+  "no matching overload of" would match a diagnostic about a DIFFERENT call (the D3 failure mode);
+* **no diagnostic about another call in the same program satisfies any cell** — the false-OK mirror
+  of D3, proved over every cell's decoys;
+* **the classification is STABLE within a family**: every alternative of every reject cell turns that
+  cell `OK` (this is the perturbation test the reviewer asked for: a fix that words the same
+  diagnostic differently still turns the grid green);
+* **a diagnostic in NO family leaves the cell `REJECTED`** — the cell is a false wrong only when the
+  diagnostic is genuinely absent;
 * the cell names are unique, generation is deterministic, and every campaign tag is known;
-* `reject` is `OK` **only** when the diagnostic contains the needle, and `REJECTED` (not `OK`) when
-  it does not — the failure mode that let D3 slip through;
+* every cell has a `MEMBER` entry and every entry names a cell (the map's completeness);
+* the cross-module cells exist and really import a second module;
+* `reject` is `OK` **only** when the diagnostic contains one of its needles, and `REJECTED` (not
+  `OK`) when it does not;
 * a compiler abort and a compiler **signal** are the `ABORT` class;
 * an `internal:` degrade is the `INTERNAL` class;
 * a `value` cell checks the **exact** output;
@@ -314,24 +497,88 @@ drops the call with **no diagnostic at all** is not reachable by that ruling. Th
 `USER-REPLACE`, with **no** `internal:` note. **Only a sema refusal fixes that one**, which is why the
 anchor's refusal (not the severity flip) is the load-bearing half.
 
-| # | what it unblocks | asked on |
-|---|---|---|
-| **R2** | **Is the stdlib's declared signature authoritative when the compiler's current acceptance contradicts it?** Two live cases: #7061 (`Math.Abs(float)` is typed `float`; the stdlib rationale says it resolves to `Abs(double)` and returns `double`) and #7254 (`Math.Abs(4000000000u)` is rejected as ambiguous although §5.1 admits `uint` at both `long` and `double`). Both are **acceptance-vs-declaration** conflicts, and the answer decides whether the gate *rejects* or *accepts-and-rewrites`. | 2026-10-28 (asked of the coordinator) |
-| **R3** | **`string.Repeat(unit: string, count: int)`** — stdlib §9.6 declares it; the compiler implements only the `char` overload and rejects the `string` one (#7129, #7277). Implementing it *adds* an accepted program; the gate's rule would reject it. §9.6 says implement — the coordinator should confirm the gate must not "fix" this by rejecting a declared overload. | 2026-10-28 (asked of the coordinator) |
+**R2 AND R3 ARE RULED — by the coordinator, on 2026-10-28.** The rulings are recorded here with the
+arithmetic that decided them, because the record's reasoning is the campaign's reasoning: a ruling
+without its arithmetic is a ruling the next lane cannot check.
 
-**THE GRID ALREADY PRE-COMMITS TO R2 AND R3**, so neither can be answered by changing the grid:
+### R2 — the stdlib's declared signature is authoritative (RULED 2026-10-28)
+
+**THE ANSWER: YES — AND THERE IS NO SEPARATE "ACCEPTANCE-VS-DECLARATION" QUESTION TO ANSWER. A BUILTIN
+CALL IS RESOLVED AGAINST THE DECLARED OVERLOAD SET, WITH §5.1's CONVERSION TABLE AND §22.6's RANKING.
+WHERE THE COMPILER'S CURRENT BEHAVIOUR CONTRADICTS THAT RESOLUTION, THE COMPILER IS WRONG.**
+
+The reason there is no separate question is that **the declared set and the conversion table together
+decide each case — and they decide them DIFFERENTLY, which is exactly what the two live cases turn
+on.**
+
+**stdlib §2.2 (v0.345) declares exactly FOUR `Math.Abs` overloads:**
+```
+public static pure method Abs(x: int): int;
+public static pure method Abs(x: long): long;
+public static pure method Abs(x: double): double;
+public static pure method Abs(x: decimal): decimal;
+```
+**There is no `float` overload and no `uint` overload.** And **spec §5.1 (v0.345)'s table says:**
+* `float` → `double` — **and nothing else**;
+* `uint` → `long`, `ulong`, `float`, `double`, `decimal`;
+* **"Between `decimal` and binary floats (`float`, `double`)" is on §5.1's NEVER-IMPLICIT list** — so
+  `float → decimal` does **not** exist, and `float → int` / `float → long` do not exist either
+  (nothing narrows implicitly).
+
+**=> #7061 (`Math.Abs(float)`): THE COMPILER IS WRONG. IT MUST RESOLVE TO `Abs(double)` AND RETURN
+`double`.** A `float` argument converts to **exactly one** of the four parameter types (`double`) —
+`float → decimal` is never implicit and `float → int`/`float → long` do not exist — so **there is no
+ambiguity and no rejection: there is ONE candidate, and the result type is `double`.** **=> #7061 IS
+A DEFECT**, and the grid's new cell `math_abs_float` pins it: `var f: float := Math.Abs(-1.5f);` must
+be **REJECTED**, because `double → float` never narrows implicitly (§5.1). MEASURED on HEAD
+`d9f11d15`: the compiler types the result `float` and **accepts** that assignment — that is #7061.
+
+**=> #7254 (`Math.Abs(4000000000u)`): THE COMPILER IS RIGHT. THE CALL IS AMBIGUOUS AND MUST BE A
+COMPILE ERROR (§22.6).** A `uint` argument converts to **three** of the four parameter types — `long`,
+`double` AND `decimal` — and to **none** of them exactly, so §22.6's ambiguity rule applies.
+**=> #7254 IS NOT A DEFECT: THE RECORD SAYS SO EXPLICITLY, SO THAT NO LANE "FIXES" A CORRECT
+REJECTION AND BREAKS THE GRID.** (The neighbouring sentence stdlib §2.3 gives for `Convert.ToString` —
+"A `char` and the integer types other than `int` and `long` each convert to two or more of these
+parameter types and match none exactly, so the call is ambiguous and a compile error (§22.6)" — says
+the same about the same parameter-type family, so the grid's `convert_tostring_char` and
+`convert_tostring_uint` cells STAND as REJECTs.) **#7254 is therefore re-labelled OUT of the live
+scope** (it was `reproduces`, now `re-label`), which is why the live scope is 97 and not 98.
+
+### R3 — `string.Repeat(unit: string, count: int)` (RULED 2026-10-28)
+
+**THE ANSWER: THE DECLARED OVERLOAD MUST BE IMPLEMENTED. THE GATE MUST NOT REJECT A DECLARED
+OVERLOAD.**
+
+**stdlib §9.6 (v0.345) declares BOTH, side by side:**
+```
+public static pure method Repeat(c: char, count: int): string;      // count < 0 raises
+public static pure method Repeat(unit: string, count: int): string; // same count contract; Repeat("", n) = ""
+```
+**The compiler implements only the `char` overload and rejects the `string` one (#7129, #7277). THAT IS
+A DEFECT IN THE COMPILER, NOT A CONTRACT TO BE ENFORCED.** The compiler's current `char`-only surface
+does not become the contract by being what the compiler happens to do. **=> #7129 AND #7277 ARE FIXES
+(IMPLEMENT THE DECLARED OVERLOAD), NOT REJECTIONS — AND THE GRID CELL `string_repeat_string`, WHICH
+EXPECTS THE VALUE "ababab", STANDS.**
+
+### The rule the anchor implements, in one sentence
+
+**THE STDLIB'S DECLARED SURFACE IS THE CONTRACT. THE GATE MAY NOT REJECT A CALL THE STDLIB DECLARES,
+AND MAY NOT ACCEPT A CALL THE STDLIB DOES NOT DECLARE — EXCEPT WHERE THE SPEC SAYS OTHERWISE.**
+
+**WHAT THE RULINGS DID TO THE GRID: NOTHING HAD TO CHANGE.** The grid already pre-committed to both
+answers, so no cell's expectation contradicts a ruling:
 * **R2** — `math_abs_uint` expects a **REJECT** ("ambiguous call to `Math.Abs`", the wording §22.6's
-  ambiguity rule produces today) and `convert_tostring_uint` expects a **REJECT** ("ambiguous call to
-  `Convert.ToString`", stdlib §2.3's ambiguity note). If the owner rules that the stdlib's rationale
-  wins and `Math.Abs(uint)` must be ADMITTED, these two cells' expectations change.
-* **R3** — `string_repeat_string` expects **value "ababab"**, i.e. the DECLARED `Repeat(unit: string,
-  count: int)` overload must WORK (§9.6). If the owner rules that the compiler's `char`-only surface
-  is the contract, that cell's expectation changes to `reject`.
+  ambiguity rule produces) and it **STANDS**; `convert_tostring_uint` and `convert_tostring_char`
+  expect a **REJECT** ("ambiguous call to `Convert.ToString`", stdlib §2.3's ambiguity note) and they
+  **STAND**.
+* **R3** — `string_repeat_string` expects **value "ababab"**, i.e. the DECLARED
+  `Repeat(unit: string, count: int)` overload must WORK (§9.6), and it **STANDS**.
+* **ONE CELL WAS ADDED** for R2's first half: `math_abs_float` (expects a REJECT — the result type
+  must be `double`), and it is the **only** cell whose expectation the rulings created.
 
 **§3 says campaign 2 has "none hard". THAT IS TRUE, AND IT IS NOW PROVEN RATHER THAN ASSUMED:** the
-diagnostic half and the severity half are both settled by existing authorities, and the two open
-questions (R2, R3) each touch **two** cells of a 110-cell instrument and are answerable without a
-rule change. **No ruling blocks the anchor.**
+diagnostic half and the severity half are settled by existing authorities, R2 and R3 are **RULED**,
+and no ruling blocks the anchor. **NO RULING IS OUTSTANDING.**
 
 ## Questions for the next train (filed spec-question numbers)
 
@@ -363,17 +610,21 @@ in the hand-back with a minimal repro and a §-citation (see *Lane records*).
   `docs/proposals/papers/campaigns/builtin-call-admission-members.md` (the 189-row table),
   `scripts/builtin_admission_grid.py` (the DONE instrument) and
   `scripts/gate/tests/test_builtin_admission_grid.py` (its self-test). **No `src/` file was touched.**
-* **Rows:** 189 members re-measured (72 with full MEASURED evidence; the 117 others by title rule, and
-  the unmeasured list is named above). 110 grid cells built and run twice (plain + ASan).
+* **Rows:** 189 members re-measured (73 with full MEASURED evidence; the 116 others by title rule, and
+  the unmeasured list is named above). 113 grid cells built and run twice (plain + ASan).
 * **Fail-without proof:** not applicable — this lane changed no compiler behaviour, so there is no
   behaviour to prove fail-without. The instrument's *baseline* is the fail-without for the lanes that
   follow: each lane's cell must go from its entry CLASS to `OK` with the fix and stay at its entry
   CLASS without it.
-* **Matrix result:** `scripts/builtin_admission_grid.py` — **110 cells, 48 wrong** on HEAD (47 of them
+* **Matrix result:** `scripts/builtin_admission_grid.py` — **113 cells, 49 wrong** on HEAD (48 of them
   campaign 2's own, 1 campaign 5's), both legs identical, `NATIVE SANITIZER: 0 check(s) skipped` in
-  both, and the TSV is byte-identical across two different `--out` directories.
-* **Self-test:** `scripts/gate/tests/test_builtin_admission_grid.py` — 10 tests, build-free, green;
-  pregate runs it via `python3 -m unittest discover -s scripts/gate/tests`.
+  both, and the TSV is byte-identical across two different `--out` directories. **Measured on this
+  lane's `build/bezelc` at `d9f11d15`** — `origin/main` has since moved to `9be24022`, whose four
+  commits touch **no `src/` file** (`git diff --stat d9f11d15 origin/main -- src/` is empty), so the
+  compiler and the baseline are unchanged.
+* **Self-test:** `scripts/gate/tests/test_builtin_admission_grid.py` — 17 tests, build-free, green;
+  pregate runs it via `python3 -m unittest discover -s scripts/gate/tests` (the whole discovery:
+  1056 tests, OK, 2 skipped).
 
 **FIX-FORWARD (review round 1, ACCEPT-W-NOTES).** The reviewer accepted the record and its numbers but
 barred the grid from being the DONE instrument until five grid defects were fixed. All five are fixed,
@@ -386,8 +637,33 @@ the baseline moved 47 → 48, one cell was renamed in expectation (`string_isasc
 `nocrash` kind was renamed `noabort` and now requires exit code 0, **every reject cell now names its
 diagnostic needle**, and **four cells are tagged `campaign = "5"`** and are excluded from campaign 2's
 DONE line.
+
+**FIX-FORWARD (review round 2, ACCEPT-W-NOTES).** The reviewer confirmed every number and the
+perturbation test, but found **seven defects, one of them blocking the DONE instrument** (N1: 39 of
+the 60 reject needles were PREDICTED single wordings, so a correct fix landing on a different wording
+of the same family turned the cell RED). All seven are fixed. **THE CHANGED FILES ARE
+`scripts/builtin_admission_grid.py`, `scripts/gate/tests/test_builtin_admission_grid.py` and the two
+documentation files** — and the changed cells are:
+* **EVERY ONE OF THE 60 REJECT CELLS** now carries a LIST of the diagnostic families it accepts
+  (2–8 alternatives each, built by the `F_*` helpers) — the per-cell lists are in
+  *The reject needles are families* above, and every list is in the grid's cell table;
+* the two bare needles (`"no matching overload of"`, `"type argument"`) are gone — member-specific now;
+* the brittle arity needles now list four wordings;
+* `imported_user_class_stringbuilder_qualified` and `imported_user_class_stringbuilder_bare` are NEW
+  (the cross-module face, N5) — both `OK` on HEAD;
+* **THE CELL COUNT MOVED 110 → 113 AND THE TSV GAINED TWO COLUMNS** (`subject`, `member`).
+  **THE BASELINE IS 113 cells, 49 wrong** (48 campaign 2 + 1 campaign 5): the rewrite of the needles
+  changed **no** cell's class (a per-cell diff against the previous baseline says so), and the ONE new
+  cell — `math_abs_float`, added for the coordinator's R2 ruling — is the 49th wrong cell (it is
+  `ACCEPTED` today: the compiler types `Math.Abs(-1.5f)` as `float`).
+  **=> THE L0 ANCHOR LANE MUST RE-READ THE GRID AND RE-MEASURE ONCE MORE.**
+* the L1 lane's commit `02e0d371` (the codegen receiver discriminator) turns
+  `user_class_named_stringbuilder` from `ACCEPTED` to `OK`; **on a tree that carries it the baseline
+  is 48 wrong, not 49** (the L1 lane measured 47 of 110 cells when the grid had 110 cells and no
+  `math_abs_float`) — that measurement is the L1 lane's, not this lane's: **this lane's numbers are
+  measured on THIS lane's `bezelc` at `d9f11d15`**, and the fix changes nothing in the needle sets.
 * **THE B0 LEVERAGE COUNT — the number this lane was sent to produce: AT MOST 52 of the 189 members
-  (27.5 %), and at most 45 of the 98 LIVE defect members (45.9 %).** Both are below one half ⇒
+  (27.5 %), and at most 45 of the 97 LIVE defect members (46.4 %).** Both are below one half ⇒
   **B0 splits**; the anchor is a table + two admission points, not one function, and B2, B3, B4 each
   split into an admission half and a non-admission half. The figure is an **UPPER BOUND** (a
   per-member classification, not an execution of a gate) and it can only fall.

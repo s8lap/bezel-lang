@@ -1,8 +1,24 @@
+# Campaign builtin-call-admission — members at entry (189 rows)
+
+Measured on `origin/main` `d9f11d15` by the entry lane `r36-c2-entry` (this lane's `build/bezelc`).
+One row per member of the campaign's 189 (`docs/proposals/papers/master-plan/work/out/campaign-members.tsv`,
+rows where `campaign == builtin-call-admission`).
+
+**Columns.**
+* `HEAD status` — `reproduces` (the symptom is still present), `moved` (the symptom changed class),
+  `fixed` (the mechanism is gone), `re-label` (the mechanism is not an admission defect — it belongs
+  to another campaign), `spec-question` (the spec does not decide it); followed by the EVIDENCE kind.
+* `evidence` — **`MEASURED`** means a repro was compiled and run on that HEAD and the observed
+  output / diagnostic / abort is the evidence; **`rule`** means the mechanism was read from the issue
+  body (which quotes the governing stdlib sentence) and **no repro was built**.
+* `B0 leverage` — **`Y`** means: **would ONE signature-based admission gate have REJECTED this call before the arm ran?** The gate is **B0**: resolve every builtin call against its **DECLARED signature from the stdlib index, before lowering**. **`N`** means it would not; **`-`** means the member is not a builtin call at all. The figure is an **upper bound** — a per-member classification, not an execution of a gate — so it can only be **lower**.
+* `sub-family` / `lane` — the §3 sub-family and the lane the member falls to.
+
 | # | sev | HEAD status | sub-family | lane | B0 leverage | evidence |
 |---|---|---|---|---|---|---|
 | #1701 | other | RE-LABEL (rule) | X-spec | re-label | - | constraint-vs-direct TryParse surface split; not a call admission defect |
 | #1765 | soundness | RE-LABEL (rule) | X-13 | re-label | - | Ptr<T>.Load/Store is a codegen stub, not a call admission defect |
-| #1792 | other | FIXED (MEASURED) | B1 | B1 | - | STALE PREMISE (MEASURED): char.Parse("a") prints a; char.TryParse("a", out c) prints True/a; char.ParseOrNull("a")->not null, ("zz")->null; bool.ParseOrNull("true")->not null, ("nope")->null |
+| #1792 | other | FIXED (MEASURED) | B1 | B1 | - | ALREADY CLOSED 2026-10-27T13:43 by the coordinator (s8lap); the premise was stale: char.Parse("a") prints a; char.TryParse("a", out c) prints True/a; char.ParseOrNull("a")->not null, ("zz")->null; bool.ParseOrNull("true")->not null, ("nope")->null |
 | #2094 | other | RE-LABEL (rule) | X-lot | re-label | - | Counter<K> implementation deferred; needs intrinsic class machinery |
 | #2221 | soundness | RE-LABEL (MEASURED) | X-4 | re-label | - | Array<T>.Sort on class elements is an ownership UAF, not admission |
 | #2253 | other | REPRODUCES (rule) | B2 | B2a/B2b | N | decimal ToString("Fn") vs "Pn"/"En" rounding disagree (stdlib §2.18) |
@@ -113,13 +129,13 @@
 | #7016 | other | REPRODUCES (rule) | B5 | B5 | N | ?. on a declared builtin-interface member emits nothing or zero-initializes |
 | #7028 | other | REPRODUCES (rule) | B4 | B4a/B4b | N | Encoding.GetBytes/GetString through an Encoding-typed variable has no dispatch arm |
 | #7030 | crash | RE-LABEL (rule) | X-lot | re-label | - | a lambda body reading q.IsEmpty on a Range<T> fails IR verification |
-| #7061 | other | REPRODUCES (rule) | B3 | B3a/B3b | Y | Math.Abs(float) is typed float where the stdlib rationale says it resolves to double |
+| #7061 | other | REPRODUCES (MEASURED) | B3 | B3a/B3b | Y | MEASURED grid: `Math.Abs(-1.5f)` is typed float, so `var f: float := Math.Abs(-1.5f)` COMPILES; per R2 (coordinator, 2026-10-28) it must resolve to `Abs(double)` and return double, and `double` -> `float` never narrows implicitly (§5.1) |
 | #7066 | soundness | RE-LABEL (MEASURED) | X-7 | re-label | - | a same-module `var r: T? := x;` degrades; campaign 7 |
 | #7089 | soundness | RE-LABEL (MEASURED) | X-5 | re-label | - | a §12.7-narrowed record carrier handed to a record consumer; campaign 5 |
 | #7090 | other | RE-LABEL (MEASURED) | X-lot | re-label | - | a property reference over a builtin interface head is accepted and jumps into a value |
 | #7093 | other | RE-LABEL (rule) | X-lot | re-label | - | a bare member reference: concrete head rejected, interface head admitted (§27.6) |
 | #7098 | soundness | REPRODUCES (rule) | B0-arity | re-label | Y | a method group over a builtin member silently non-lowers on a signature mismatch |
-| #7108 | soundness | FIXED (MEASURED) | B4 | B4a/B4b | N | MEASURED: the out-of-bounds read is GONE — "ab".Remove(253) raises IndexOutOfRangeException, which is what stdlib §9.6 requires; fixed by c0c9e3f9 (fix #7168), in origin/main |
+| #7108 | soundness | FIXED (MEASURED) | B4 | B4a/B4b | N | ALREADY CLOSED 2026-10-27T13:43 by the coordinator (s8lap); MEASURED: the out-of-bounds read is GONE — "ab".Remove(253) raises IndexOutOfRangeException, which is what stdlib §9.6 requires; fixed by c0c9e3f9 (fix #7168), in origin/main |
 | #7118 | crash | RE-LABEL (MEASURED) | X-lot | re-label | - | Array<T>.AsSpan(start) truncates a byte startIndex -> malformed IR |
 | #7129 | other | REPRODUCES (MEASURED) | B4 | B4a/B4b | N | MEASURED grid: string.Repeat("ab",3) rejected - the declared string overload is not implemented |
 | #7130 | other | REPRODUCES (rule) | B5 | B5 | N | the ?. spelling of the string instance methods is rejected in codegen (§7.5) |
@@ -148,7 +164,7 @@
 | #7249 | other | REPRODUCES (MEASURED) | B3 | B3a/B3b | N | MEASURED grid: TimeSpan.FromTicks(4000000000u) prints -294967296 |
 | #7252 | crash | MOVED (MEASURED) | B3 | B3a/B3b | N | MEASURED grid: DateTime.FromTicks(uint) no longer aborts; it prints -294967296 |
 | #7253 | other | REPRODUCES (MEASURED) | B3 | B3a/B3b | N | ISteppable<T>.Step sign-extends an unsigned by |
-| #7254 | other | REPRODUCES (MEASURED) | B3 | B3a/B3b | N | Math.Abs(4000000000u) rejected as ambiguous though §5.1 admits uint at long and double |
+| #7254 | other | RE-LABEL (rule) | B3 | re-label | N | **NOT A DEFECT** (ruled by the coordinator 2026-10-28, R2): stdlib §2.2 declares exactly four `Abs` overloads (int/long/double/decimal) and `uint` converts to THREE of them (`long`, `double`, `decimal`) and to NONE of them exactly, so §22.6 makes the call AMBIGUOUS and the compiler's rejection is CORRECT; the grid cell `math_abs_uint` pins that rejection |
 | #7258 | other | REPRODUCES (rule) | B1 | B1 | N | the radix rendering is wrong for unsigned values and above Int32.MaxValue |
 | #7265 | crash | REPRODUCES (rule) | B2 | B2a/B2b | N | ToString(format) renders unsigned signed, ignores the binary spec, crashes for long/uint |
 | #7271 | other | REPRODUCES (MEASURED) | B1 | B1 | Y | MEASURED grid: (255).ToString(16u) is accepted and renders the decimal text |
