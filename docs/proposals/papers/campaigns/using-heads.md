@@ -753,6 +753,30 @@ This is a **compiler** finding, reported to the coordinator; the grid cannot
 relax it, because a needle that accepts an unnamed diagnostic is exactly the
 generic-token needle the reviewer's H1 forbids.
 
+**THE SPEC QUESTION IS ANSWERED, AND THE COORDINATOR'S MEASUREMENT SAYS WHICH
+ANSWER.** The issue that tracks the diagnostic — **#7273** — was filed against
+the **v0.344** text, where §28.9 read *"Their `Dispose()` is a no-op (or, for
+types that are not classes and therefore have no `Dispose()` at all …)"* and the
+coordinator's ruling on it was **WITHDRAWN** (the spec was in tension). **§28.9
+AT v0.345 READS DIFFERENTLY AND DECISIVELY**: *"The following types are exempt
+from manual disposal (K1.6's runtime-managed exemption). **None of them is a
+class, and none has a `Dispose()` member (§8.7): `x.Dispose()` over a value of
+one of these types is a compile error**, and a `using var`, a discard or scope
+end over such a value disposes nothing …"* — and `string` is the list's FIRST
+ENTRY. §8.7 supplies the `DisposeAsync` half: *"`DisposeAsync()` is a member
+only of a type that declares or inherits it"*, and a `string` declares and
+inherits neither.
+
+**=> THE CELL EXPECTATIONS ARE SETTLED (§28.9 for the `string` head), AND #7273
+IS A PLAIN COMPILER DEFECT, NOT A SPEC QUESTION.** THE COORDINATOR POSTED THE
+`v0.345` READING, THE `.DisposeAsync` TWIN (WHICH #7273'S TITLE AND BODY DO
+NOT NAME), AND THE FACT THAT **THE TWO `string` CELLS ARE RED ON THIS ISSUE**
+ON #7273. **#7273 STAYS IN THE `spec-trains` BUCKET** — THE TRACKER HAS **0
+DOUBLE-LABELLED AND 0 UNLABELLED** OPEN ISSUES, SO A SECOND BUCKET LABEL WOULD
+BREAK THAT INVARIANT. **THE DEPENDENCY HERE IS A CROSS-CAMPAIGN DEPENDENCY,
+NOT MEMBERSHIP: CAMPAIGN 1'S GRID CANNOT CLEAR ITS TWO `string` CELLS UNTIL
+#7273 LANDS.**
+
 **The `type_token` row is pinned to a DEFERRAL, and #487 will re-author it.**
 All nine `type_token` cells are green because the program is rejected with
 *"reflection is not yet implemented: 'typeof'"* — the `typeof` deferral
@@ -894,7 +918,23 @@ forbids it): the three unbanked rows are the coordinator's to bank, and
    types, function values}`; `Object` is not on it and the runtime value is a
    class. §28.12: "never by the binding's static type". → a campaign-1
    implementation defect (the lint must classify by the representation).
-3. **Whether the `Type` token belongs in the anchor's runtime-managed set.**
+3. **The `Object`-declared `DisposeAsync` precedence — NOW A MEASURED FINDING, NOT
+   A QUESTION (the coordinator, 2026-10-28).** The grid's
+   `object_class` / `explicit_dispose_async` cell expects the **§8.7** "no such
+   member" rejection. **MEASURED BY THE COORDINATOR: THE SYNC TWIN EMITS BOTH
+   RULES** (*"no member `Dispose` on type `Object`: `Dispose()` is class-only
+   (§8.7, v0.340) …"* **AND** the §28.6 borrow error), **AND THE ASYNC TWIN
+   EMITS ONLY THE §28.6 BORROW ERROR — THE §8.7 TYPE-LEVEL REJECTION IS
+   ABSENT ENTIRELY.** **=> IT IS NOT A PRECEDENCE DIFFERENCE, IT IS A MISSING
+   CHECK: ONE MECHANISM (THE §8.7 TYPE-LEVEL CHECK FOR `DisposeAsync` IS NOT
+   APPLIED ON A TYPE THAT DOES NOT DECLARE OR INHERIT IT) EXPLAINS BOTH #7393's
+   DIRECT CASE (THE PROGRAM COMPILES) AND THIS BORROW CASE (THE §8.7 ERROR IS
+   MASKED BY THE §28.6 RULE).** THE COORDINATOR POSTED THE MEASUREMENT AND THE
+   RECOMMENDED ORDER (TYPE-LEVEL FIRST, THE §28.6 BORROW ERROR SECOND — THE
+   COMPILER'S OWN CONVENTION, AS THE SYNC TWIN ALREADY DOES) ON **#7393**.
+   §8.7 ALSO REQUIRES THE DIAGNOSTIC TO *"NAME THE DISCHARGE POINTS"*, AND THE
+   ASYNC SPELLING'S OUTPUT NAMES NONE.
+4. **Whether the `Type` token belongs in the anchor's runtime-managed set.**
    #7338 asks for it; §28.9 lists `Type` explicitly, so the answer is yes and no
    train is needed — but §28.12's `await using` sentence does not say what
    happens to a `Type` head, so a ruling would make it explicit. Recorded here so
@@ -902,8 +942,15 @@ forbids it): the three unbanked rows are the coordinator's to bank, and
 
 ## Siblings filed during the campaign
 
-*(none filed yet — this is the entry record; the rows below are the entry lane's
-findings, which the coordinator files with exactly one `campaign:` label.)*
+*(**13 of 13 rows are FILED.** The coordinator filed them with exactly one
+`campaign:` label each, on 2026-10-28: new-1 → #7389, new-2 → #7390, new-3 →
+#7391, new-4 → #7392, new-5 → #7393, new-6 → #7394, new-7 → #7395, new-8 →
+#7396, new-9 → #7388, new-10 → #7387, new-11 → #7397, **new-12 → #7415**,
+**new-13 → #7416**. The two the entry lane left explicitly to the coordinator
+— new-12 and new-13 — were **re-measured by the coordinator independently**
+before being filed, and the repros below are the GRID'S OWN CELLS, generated
+from `scripts/using_heads_grid.py` so the repro is the campaign's and not a
+paraphrase.)*
 
 | # | defect | minimal repro | §-citation | campaign |
 |---|---|---|---|---|
@@ -917,8 +964,8 @@ findings, which the coordinator files with exactly one `campaign:` label.)*
 | new-8 | `await using var` outside an async method is admitted (the §30.2 twin is not) | `public static method Main() … await using var t := o.ToString();` → compiles | §28.12 ("`await using` is valid only inside an async method or async lambda") | using-heads (U1d, with #7326) |
 | new-9 | the `using var` copy of a RUNTIME-MANAGED value (a `string`, a function value) leaks the copy's reference | `var src := o.ToString(); using var x := src;` ×60 → `2040 byte(s) leaked in 120 allocation(s)`; the plain-`var` twin is CLEAN; the `await using var` spelling of the same copy leaks too | §28.10 ("the disposal at scope end is a no-op ... and the only effect is the reassignability restriction") | using-heads (U1c, with #7316) |
 | new-10 | the `using var` binding of an **INTERFACE-typed** parameter DISPOSES the borrowed parameter — the callee frees it and the CALLER then reads freed memory | `public static method Take(src: IAsyncDisposable) using var x := src; end Take;` called with `var src: IAsyncDisposable := new Res(); Take(src); src.Dispose();` → `DTOR` is printed by the CALLEE and the caller then reads freed memory: `ERROR: AddressSanitizer: heap-use-after-free … freed by thread T0 here: #1 … in bz$P.Program$Take` — the FREE is in `Program$Take`, the READ is in `Program$Main$Resume` | §28.10 ("When the right-hand side of a `using var` declaration is a borrow … the `using var` does **not** assume a disposal obligation … at scope end, no `Dispose()` is called, because the value is not owned by this scope"), §28.2 | using-heads (U1c — a NEW soundness defect; **#7387**, filed; the grid's `interface` / `copy_param_source` cell) |
-| new-12 | the `using var` copy of an **OWNED** parameter disposes the block the callee's own binding still owns — the fault is entirely INSIDE the callee | `public static method Take(owned src: OChoice) using var x := src; end Take;` called with `Take(move src);` → `ERROR: AddressSanitizer: heap-use-after-free … freed by thread T0 here: #1 … in bz$G…Program$Take` and the READ is in the SAME frame (`Program$Take`) — the callee frees the block and then reads it. The caller is unaffected: it moved the value away and never touches it again | §28.10 (the `using var` copy of an owned binding must not dispose a block the enclosing binding still owns), §28.2 | using-heads (U1c — **NOT YET FILED**; the coordinator files it; the grid's `owning_choice` / `copy_param_source` cell) |
-| new-13 | the `using var` copy of a **BUILTIN-COLLECTION** parameter frees the collection's ARRAY block twice — a double free, both frees in the CALLER's frame | `public static method Take(src: Array<int>) using var x := src; end Take;` → `ERROR: AddressSanitizer: attempting double-free on … in bz_array_free` — and BOTH frees are in `Program$Main$Resume` (the collection is freed once by the `using var` copy and once by the caller's own binding) | §28.10 (the `using var` copy of a runtime-managed collection must not take a second disposal obligation on the same array block), §28.2 | using-heads (U1c — **NOT YET FILED**; the coordinator files it; the grid's `builtin_collection` and `collection_literal` / `copy_param_source` cells) |
+| new-12 | the `using var` copy of an **OWNED** parameter disposes the block the callee's own binding still owns — the fault is entirely INSIDE the callee | `public static method Take(owned src: OChoice) using var x := src; end Take;` called with `Take(move src);` → `ERROR: AddressSanitizer: heap-use-after-free … freed by thread T0 here: #1 … in bz$G…Program$Take` and the READ is in the SAME frame (`Program$Take`) — the callee frees the block and then reads it. The caller is unaffected: it moved the value away and never touches it again | §28.10 (the `using var` copy of an owned binding must not dispose a block the enclosing binding still owns), §28.2 | using-heads (U1c — **#7415, FILED 2026-10-28 by the coordinator**; the grid's `owning_choice` / `copy_param_source` cell) |
+| new-13 | the `using var` copy of a **BUILTIN-COLLECTION** parameter frees the collection's ARRAY block twice — a double free, both frees in the CALLER's frame | `public static method Take(src: Array<int>) using var x := src; end Take;` → `ERROR: AddressSanitizer: attempting double-free on … in bz_array_free` — and BOTH frees are in `Program$Main$Resume` (the collection is freed once by the `using var` copy and once by the caller's own binding) | §28.10 (the `using var` copy of a runtime-managed collection must not take a second disposal obligation on the same array block), §28.2 | using-heads (U1c — **#7416, FILED 2026-10-28 by the coordinator**; the grid's `builtin_collection` and `collection_literal` / `copy_param_source` cells) |
 | new-11 | an `Object`-declared slot holding a runtime-managed string does not release it | `var s: Object := o.ToString();` → the plain-`var` twin leaks `2040 byte(s) in 120 allocation(s)`; the `await using var x: Object := o.ToString();` spelling (the corpus's `s28_12_0026`) does not | §28.9 ("the type's lifetime is managed by the runtime without user involvement"), §28.10 | using-heads (the `Object`-slot family; the grid's `object_string` twin) |
 
 ## Lane records
@@ -1110,6 +1157,43 @@ findings, which the coordinator files with exactly one `campaign:` label.)*
   `docs/proposals/papers/master-plan.md`, no `tests/conformance/rules/baseline.tsv`
   row, no `src/` file, and no issue was filed or closed.
 
+### Anchor lane `r36-c1-anchor` (the U1c ANCHOR) -- 2026-10-28
+
+* **SHA(s):** one commit -- `eb84aca4`, PICKED as `e4a55c95` on the staging
+  branch `r30-c1`. Subject: *fix #3482 #7338 #7328 #5653 #3516 narrow #3483
+  #3515: one shared using-heads disposal anchor -- the owned-interface return
+  and the per-level reclamation chain stay open*. Six files, +1146/-377.
+* **WHAT IT IS:** ONE shared authority -- `common::classifyDisposal`
+  (`src/common/DisposalKind.{hpp,cpp}`) -- that replaces THREE near-answering
+  predicates (the codegen lambdas `typeMayHoldClass` /
+  `awaitUsingSlotMayHoldClass`, `MethodOwnership::rhsIsDisposableClassType`,
+  and the by-name-only `Emitter::usingVarBuiltinHeadName`) and answers as a
+  **KIND** -- NONE / CLASS-SYNC / CLASS-ASYNC / VALUE-LIKE PAYLOAD / MOVE-ONLY
+  -- rather than a boolean. The key is the SLOT'S REPRESENTATION, not the
+  binding's declared type (spec §28.12: "`await using` selects the
+  logical-disposal path by the class of the object the binding **holds** ...
+  never by the binding's static type").
+* **THE TWO `narrow`s NAME THEIR OPEN FAMILIES:** #3483's is an `owned
+  IAsyncDisposable` RETURN (it needs the #3493 ruling's itab route) and
+  #3515's is the PER-LEVEL reclamation chain
+  (`Emitter::emitBaseDisposeChain`, a file the lane does not own).
+* **THE REVIEW (non-author, ACCEPT-W-NOTES) RAISED ONE GATE-BLOCKING
+  MUST-FIX:** the corpus row `s28_12_0007` is left UNBANKED (the fix moves it
+  from banked `fail` to observed `pass`), and `s28_12_0020` / `s28_12_0021`
+  have NO baseline row at all. **THE COORDINATOR RE-BANKS, ON THE FINAL TIP
+  OF THE BATCH -- NEVER THE LANE.**
+* **AND THE REVIEW CORRECTED THE COORDINATOR's OWN EARLIER CLAIM ABOUT
+  #7339 (the retraction is posted on that issue):** the leak **DOES** reproduce
+  on BOTH arms -- **58 B in 3 allocations** -- and **IDENTICALLY** for the
+  `const` and the `using var` twin, so the `await using` BINDING IS NOT THE
+  CAUSE. (The issue records 34 B; the numbers differ, the shape does not.) The
+  anchor neither fixes nor worsens it, and **#7339 STAYS OPEN ON ITS OWN
+  TERMS** (runtime dispatch on the slot's value).
+* **THE U1c "COPIES" LANE IS DISPATCHED ON THIS TIP** (4 members: #7387
+  #7388 #7374 #7357 -- a `using var` / `await using var` binding that takes a
+  COPY, and the copy's own reference is never armed, never released, or is a
+  BORROWED value disposed by the callee). #7339 IS HELD OUT FOR THE OWNER.
+
 ## Exit review
 
-*(to be written by a fresh reviewer who is not a campaign lane — master plan §2.4.)*
+*(to be written by a fresh reviewer who is not a campaign lane -- master plan §2.4.)*
