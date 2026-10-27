@@ -16764,11 +16764,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "FromSeconds")      return fromDouble(10000000.0);
         if (m == "FromMilliseconds") return fromDouble(10000.0);
         // per stdlib §2.5 / #1357: TimeSpan.FromTicks(ticks: long): TimeSpan (identity).
+        //
+        // fix #7249 (spec §5.1, v0.345): the parameter is a `long`, so an
+        // UNSIGNED argument is CONVERTED at the call — §5.1's table admits
+        // `uint` → `long` — and §5.1 converts VALUES, not bit patterns. The
+        // arm widened the argument with an UNCONDITIONAL `sext`, a
+        // SIGN-extending widening, so the `uint` 4000000000 (the bit pattern
+        // 0xEE6B2800) arrived as the `int32` -294967296. The widening is now
+        // SIGNEDNESS-AWARE: an unsigned source ZERO-extends (`zext`, which
+        // preserves the value) and a signed source keeps the `sext` it always
+        // had, so a negative `ticks` keeps its sign. The signedness is read
+        // with `isUnsignedTargetExpr` — the house predicate the #7242
+        // `double`-parameter converter and the #7253 `Step` widening use —
+        // and NOT from the bit width (`int` and `uint` are both 32 bits,
+        // `long` and `ulong` both 64).
         if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
             if (!v->getType()->isIntegerTy(64))
-                v = builder_.CreateSExt(v, i64());
+                v = isUnsignedTargetExpr(*call.args[0].value)
+                        ? builder_.CreateZExt(v, i64())
+                        : builder_.CreateSExt(v, i64());
             return v;
         }
     }
