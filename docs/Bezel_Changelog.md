@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.346 — October 2026**
+**Companion to the Bezel Language Specification, v0.347 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15371,5 +15371,43 @@ The composition step resolved these seams:
   - **For the implementing commits (banked, not edited here):** 0205 — `s28_2_0003`, `s28_2_0004`, `s28_2_0011`, `s28_2_0012`, `s28_2_0013`, `s17_13_0006`, `s28_10_0012`, `s28_3_0036`, `s28_3_0037`, `s9_4_0008`, `l6_6_0004`; 0206 — `s28_7_0005` (`accept` → `reject`); 0207 — `s15_4_0016`, `l4_4_0011`, `l4_9_0007` (`warn` → `reject`) and `s30_10_0013` (its fixture re-cut to named bindings, keeping `run`); 0208 — `s16_5_0001` (`warn` → `reject`); 0209 — `s30_4_0002` (`run` → `reject`). `s2_7_0039` stays slated for 0202's re-cut (v0.345).
   - **The doc-example corpus** is not regenerated ([#1380](https://github.com/s8lap/bezel-lang/issues/1380)). Two committed cases drift textually with lane `G`'s edits, their verdicts holding: `codegen_0053` (`error`, the §7.2 pair) and `guide4_0005` (`skip`).
   - **Coverage gaps not written** (recorded in the proposals and trackers): 0205's holder and same-variable rows; 0206's window rows; 0208's index, divisor and literal rows; 0209's eight rows; the #7343 warning; the #7360 matrix.
+
+---
+
+### v0.347 changelog (v0.346 → v0.347)
+
+**Editorial: each clause of the ownership kernel gets a short example.** On 2026-10-27 the owner asked for examples in §28.3: "A lot of people reading section 28.3 will appreciate illustrations of rules rather than just formal prose." Class: **editorial** (spec-change process §2). No rule, verdict, decline record or anchor moves. No document other than the spec changes, apart from the version headers and the code-generation reference's pins.
+
+**The problem.** §28.3.1 states the kernel, K1 to K9, the principles every ownership rule derives from. It had no code at all. A reader had to turn a clause's prose into a program in their head, or go looking for one in the sections the clause derives.
+
+**The changes.**
+- **One shared class.** A `Widget` with a `Name` and a destructor that prints what it disposes is declared once, at the head of §28.3.1. A short paragraph says the examples illustrate the clauses and add no rule. It also gives the comment convention: a comment names the clause a line exercises, `// error (…)` marks a line the cited rule rejects, and a case left to the runtime backstop gives its checked-mode outcome.
+- **Fourteen examples, each placed after the clause it illustrates** (K9 has two), each 4 to 13 lines:
+  - **K1:** owned, borrowed and moved-from, and the read the moved-from state forbids.
+  - **K2:** a plain return's announced source (K2.4), and a borrow that would outlive its source (K2.3).
+  - **The consume table:** one row from each family (K3.1, K3.3, K3.4, K3.9, K3.11), every line accepted.
+  - **K3.13 and K3.14:** where the marker is and is not written, and the must-use auto-drop.
+  - **K4:** an explicit `Dispose()` under a live borrow is permitted (K4.2). A use on the path where the kill ran faults in checked mode (K4.1). A use the kill precedes on every path is §28.2's compile error, the v0.346 rule.
+  - **K4.3:** a plain field holding a parameter's borrow, on the field-held trust clause.
+  - **K5:** a frozen transfer and a frozen drop-on-overwrite (clauses 1 and 2), a closure keeping a borrow live (clause 5), and an unfrozen field store whose stale borrow faults (clause 6). The prose beside the last says why §28.7's window does not reach it.
+  - **K6:** a returned iterator frame, admitted over a parameter and rejected over a `using var`.
+  - **K7:** the meet over if-expression arms. Patterns 1 and 2 of §28.3.3 remain the statement forms; they are not repeated.
+  - **K8:** a temporary that lends within its statement, and the binding that would carry its borrow past it.
+  - **K9:** the replacing `move` and the nullable bare take; then, in a block of its own, the rejected bare take of a non-nullable field.
+- **One example per clause, not per sub-clause.** The sub-clauses an example covers are named in its comments. K5's clauses 4, 7 and 8 are left to their home sections, which carry worked examples: Pattern A chaining (§30.5), §28.14's storage admission and §30.12's guards.
+- **The map of §28.3** says that each kernel clause now closes with an example.
+
+**How the examples were checked.**
+- **The executable model** (`docs/research/soundness/bzcore-l1/`) gives each example's verdict, where its fragment reaches the shape. For K4 that is the v0.346 rules (the model's K5.3-b mutation). K2.4, K3.13's marker error, K4.3, K5.5, the call in the K5.6 example, K6, K7.5 and K9.2 lie outside the model's fragment, which has no calls. The K8 example's call form is checked through the model's field-read form of the same clause.
+- **The r35 release compiler** (`bezelc 0.0.0-f6863e62`) gives the same verdict on ten of the fourteen, in `--checked-disposal` mode, and it shows the K4 and K5.6 run-time faults. The other four:
+  - **The K4 example's dominated use is accepted** — [#7441](https://github.com/s8lap/bezel-lang/issues/7441), proposal 0205's holder leg (v0.346).
+  - **The K8 example's escaping binding is accepted** — K8.4 is not enforced ([#7445](https://github.com/s8lap/bezel-lang/issues/7445)). [#7402](https://github.com/s8lap/bezel-lang/issues/7402) reports the field-read form and [#6775](https://github.com/s8lap/bezel-lang/issues/6775) the missing disposal.
+  - **Both K9 examples: the replacing `move` does not parse, and the bare take is accepted** — [#5923](https://github.com/s8lap/bezel-lang/issues/5923), the v0.336 tracker. The bare take is in a block of its own so that each of the two gaps fails its own corpus case; in one block, the parse error would have made the error case pass.
+
+  The doc-example corpus is not regenerated here (#1380). These blocks join it at the next merge-by-content regeneration. There the K4 and K8 error cases fail as known failures, and so do both K9 cases until #5923 lands: the fragment does not parse, and the bare take compiles.
+
+**Migration.** None: doc-only.
+
+**Checks.** `scripts/check_docs.sh` is clean, with the code-generation reference's three pin lines at v0.347. EXTRACT finds 540 fragments, 5 more than v0.346: the extractor reads the fifteen new blocks (the fourteen examples and the shared class) as 5 fragments and 10 error cases. `scripts/check_proposals.sh` and `corpus.py lint --strict` are clean.
 
 ---
