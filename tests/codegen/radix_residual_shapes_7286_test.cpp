@@ -447,12 +447,34 @@ BEZEL_TEST(radix_residual_shapes_7286, runtime_format_string_is_read_at_run_time
                     std::string("FF\n255\n"));
 }
 
-// A specifier this path does not render falls back to the no-format
-// rendering — what the LITERAL spelling does for the same specifier.
-BEZEL_TEST(radix_residual_shapes_7286, runtime_format_string_unrecognized_specifier) {
-    BEZEL_EXPECT_EQ(runAot(progWithArg(
-        "", "    var fmt: string := \"Q\";\n", "fmt")).stdoutText,
-                    std::string("255\n"));
+// A specifier OUTSIDE stdlib §2.18's vocabulary raises `FormatException` —
+// the same answer the LITERAL spelling gives for the same specifier, and the
+// answer §2.18 states: "An unrecognized specifier raises `FormatException`
+// (strict-fault, as everywhere)".
+//
+// THE TEXT MOVED (#7361): this row used to pin the FALLBACK — the no-format
+// rendering ("255") — because the runtime spelling had no vocabulary of its
+// own and rendered the plain text for every specifier it did not know. The
+// literal spelling faulted for the same specifier, so the two spellings of
+// one rule disagreed.
+BEZEL_TEST(radix_residual_shapes_7286,
+           runtime_format_string_unrecognized_specifier_raises_format_exception) {
+    BEZEL_EXPECT_EQ(runAot(
+        "module M;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var fmt: string := \"Q\";\n"
+        "    var result := 0;\n"
+        "    try\n"
+        "      var s: string := (255).ToString(fmt);\n"
+        "      result := 99;\n"
+        "    catch FormatException => result := 11;\n"
+        "    end;\n"
+        "    Console.WriteLine(result);\n"
+        "    return 0;\n"
+        "  end Main;\n"
+        "end C;\n").stdoutText,
+                    std::string("11\n"));
 }
 
 // ---------------------------------------------------------------------------

@@ -2852,6 +2852,64 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     initStringRc(so);  // #422: producer's reference, rc := 1
                                     return so;
                                 };
+                                // The EXACT-size rendering: the two-pass idiom
+                                // of `emitSnprintfToString`, with the format's
+                                // LENGTH known only at RUN time. The
+                                // fixed-buffer variant above truncates at 65
+                                // bytes, and the fixed-point rendering of a
+                                // wide value is wider than that ("F65" of a
+                                // 20-digit integer is 86 characters) — so the
+                                // truncation would make the RUNTIME spelling
+                                // render LESS than the LITERAL spelling, and
+                                // the two spellings of one specifier must
+                                // render the same text (#7311).
+                                auto emitSnprintfStringExact =
+                                    [&](llvm::Value* fmtPtr,
+                                        llvm::ArrayRef<llvm::Value*> args) -> llvm::Value* {
+                                    auto* snpFn = module_->getFunction("snprintf");
+                                    if (!snpFn) {
+                                        auto* ft = llvm::FunctionType::get(
+                                            i32(), {ptrTy(), i64(), ptrTy()}, true);
+                                        snpFn = llvm::Function::Create(
+                                            ft, llvm::GlobalValue::ExternalLinkage,
+                                            "snprintf", module_.get());
+                                    }
+                                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                                    // The sizing call: the length the output
+                                    // WOULD have.
+                                    std::vector<llvm::Value*> sizeArgs = {
+                                        llvm::ConstantPointerNull::get(ptrTy()),
+                                        builder_.getInt64(0), fmtPtr};
+                                    for (llvm::Value* a : args) sizeArgs.push_back(a);
+                                    llvm::Value* wr = builder_.CreateCall(
+                                        snpFn, sizeArgs, "ts.xwr");
+                                    llvm::Value* l64 = builder_.CreateSExt(wr, i64());
+                                    llvm::Value* dSz =
+                                        builder_.CreateAdd(l64, builder_.getInt64(1));
+                                    llvm::Value* dc = builder_.CreateCall(
+                                        mallocFn, {dSz}, "ts.xdata");
+                                    // The rendering call: the whole text, into
+                                    // the exact buffer (snprintf writes the
+                                    // NUL too — the buffer is one byte longer
+                                    // than the text).
+                                    std::vector<llvm::Value*> renderArgs = {
+                                        dc, dSz, fmtPtr};
+                                    for (llvm::Value* a : args) renderArgs.push_back(a);
+                                    builder_.CreateCall(snpFn, renderArgs, "ts.xrender");
+                                    uint64_t strBytes = module_->getDataLayout()
+                                        .getTypeAllocSize(stringType());
+                                    llvm::Value* so = builder_.CreateCall(
+                                        mallocFn, {builder_.getInt64(strBytes)}, "ts.xobj");
+                                    builder_.CreateStore(
+                                        dc, builder_.CreateStructGEP(stringType(), so, 0));
+                                    builder_.CreateStore(
+                                        l64, builder_.CreateStructGEP(stringType(), so, 1));
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty, 1),
+                                        builder_.CreateStructGEP(stringType(), so, 2));
+                                    initStringRc(so);  // #422: producer's reference, rc := 1
+                                    return so;
+                                };
                                 // fix #7271 (spec §5.1 / §22.6, v0.344): the
                                 // `radix: int` parameter (stdlib §9.1) admits
                                 // the argument by IDENTITY, by the §5.1
@@ -3064,6 +3122,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         "§5.1)" + why);
                                     return nullptr;
                                 }
+                                // fix #7286 (stdlib §9.1 / §2.18, v0.344): the
+                                // OTHER one-argument overload —
+                                // `ToString(format: string)` — with a RUNTIME
+                                // format argument. stdlib §9.1 declares `public
+                                // pure method ToString(format: string): string;`
+                                // and a `string` argument binds to it EXACTLY
+                                // (§22.6: the radix overload's `int` parameter
+                                // admits no `string`). The overload's parameter
+                                // is a `string` — the VALUE, not the literal
+                                // text — so the rendering is a RUNTIME one: the
+                                // format is read at run time and the rendering
+                                // dispatched on it. The old path handled only a
+                                // string LITERAL, so a format held in a
+                                // variable fell through to the no-format
+                                // renderer and printed the DECIMAL text.
+                                //
                                 // fix #7336 (stdlib §2.18 / §18.5, v0.345): a
                                 // RUNTIME format on a receiver whose type has
                                 // NO vocabulary raises `FormatException`.
@@ -3094,30 +3168,59 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                      tt->primitive == P::Char ||
                                      tt->primitive == P::String))
                                     return emitAlwaysFormatException();
-                                // fix #7286 (stdlib §9.1 / §2.18, v0.344): the
-                                // OTHER one-argument overload —
-                                // `ToString(format: string)` — with a RUNTIME
-                                // format argument. stdlib §9.1 declares `public
-                                // pure method ToString(format: string): string;`
-                                // and a `string` argument binds to it EXACTLY
-                                // (§22.6: the radix overload's `int` parameter
-                                // admits no `string`). The overload's parameter
-                                // is a `string` — the VALUE, not the literal
-                                // text — so the rendering is a RUNTIME one: the
-                                // format is read at run time and the rendering
-                                // dispatched on it. The old path handled only a
-                                // string LITERAL, so a format held in a
-                                // variable fell through to the no-format
-                                // renderer and printed the DECIMAL text.
+                                // fix #7361 / #7303 (stdlib §2.18, v0.345; spec
+                                // §18.5, v0.345): the RUNTIME format spelling
+                                // renders the SAME table the LITERAL spelling
+                                // renders.
                                 //
-                                // The VOCABULARY is the one the LITERAL path
-                                // already implements (stdlib §2.18's integer
-                                // row as the house renders it: `D`/`Dn`
-                                // decimal, `X`/`Xn` hex), so the two spellings
-                                // of the same overload AGREE. §2.18's wider
-                                // vocabulary (`B`, the lower-case `x`) and its
-                                // FormatException for an unrecognized specifier
-                                // are a separate gap, in BOTH spellings.
+                                // The two spellings of one specifier are ONE
+                                // obligation: §18.5 puts the vocabulary in one
+                                // place for both — "A hole *with* a format spec
+                                // dispatches to `ToString(format: string)`: the
+                                // primitive and temporal types provide it
+                                // intrinsically (the specifier vocabulary and
+                                // its invariant-culture semantics are normative
+                                // in stdlib §2.18)" — and §2.18's table is about
+                                // the VALUE'S TYPE, not about the spelling of
+                                // the format argument. The LITERAL spelling
+                                // goes through the shared routine
+                                // (`emitWithFormatSpec`); this one dispatches at
+                                // RUN time, on the format's first code point.
+                                //
+                                // What this path renders, and what the shared
+                                // routine renders for the same specifier:
+                                //
+                                //  * `D`/`Dn` — the DECIMAL of the value the
+                                //    caller holds (sign-extended for a signed
+                                //    receiver, zero-extended for an unsigned
+                                //    one), zero-padded to n digits;
+                                //  * `X`/`x` — the receiver's NATURAL-WIDTH BIT
+                                //    PATTERN, zero-extended to 64 bits (a
+                                //    `sbyte` -5 is "FB", not "FFFFFFFB"), in
+                                //    the case the LETTER asks for;
+                                //  * `B`/`Bn` — the same bit pattern in binary
+                                //    digits, zero-padded to n digits;
+                                //  * `F`/`Fn`, `E`/`En`, `G`/`Gn`, `P`/`Pn` —
+                                //    the value as a real number (the shared
+                                //    routine applies the floating specifiers to
+                                //    an integer operand too), with the shared
+                                //    routine's defaults (two decimals for `F`
+                                //    and `P`, six for `E` and `G`), `P`'s ×100
+                                //    scale and its '%' suffix;
+                                //  * a specifier OUTSIDE the vocabulary — the
+                                //    strict fault: `FormatException`;
+                                //  * an EMPTY format — no specifier at all, so
+                                //    the no-format rendering.
+                                //
+                                // The two answers that were WRONG before this
+                                // change are #7361's: the runtime path widened
+                                // its receiver to 32 bits and read the HEX
+                                // digits off that pattern ("FFFFFFFB" for a
+                                // `sbyte` -5, where the literal spelling says
+                                // "FB"), and it case-folded the letter ("x"
+                                // printed "FF"). And #7303's: a specifier
+                                // outside the vocabulary rendered the plain
+                                // text instead of faulting.
                                 if (isIntRecv && radixIsString) {
                                     llvm::Value* fmtArg =
                                         lowerExpr(*call->args[0].value);
@@ -3136,20 +3239,33 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         i8Ty, cf, {builder_.getInt64(0)}, "fmt.c0p");
                                     llvm::Value* c0 = builder_.CreateLoad(
                                         i8Ty, c0p, "fmt.c0");
+                                    auto eqChar = [&](char ch) -> llvm::Value* {
+                                        return builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, ch));
+                                    };
+                                    // The specifier's LETTER. The CASE of the
+                                    // letter is the CASE of the rendering for
+                                    // `x`/`X` and `e`/`E`, `g`/`G` (§2.18's
+                                    // "`X`/`x` hex (upper/lower)").
                                     llvm::Value* isD = builder_.CreateOr(
-                                        builder_.CreateICmpEQ(
-                                            c0, llvm::ConstantInt::get(i8Ty, 'D')),
-                                        builder_.CreateICmpEQ(
-                                            c0, llvm::ConstantInt::get(i8Ty, 'd')),
-                                        "fmt.isD");
+                                        eqChar('D'), eqChar('d'), "fmt.isD");
+                                    llvm::Value* isXup = eqChar('X');
                                     llvm::Value* isX = builder_.CreateOr(
-                                        builder_.CreateICmpEQ(
-                                            c0, llvm::ConstantInt::get(i8Ty, 'X')),
-                                        builder_.CreateICmpEQ(
-                                            c0, llvm::ConstantInt::get(i8Ty, 'x')),
-                                        "fmt.isX");
-                                    // The digit suffix: the minimum digit
-                                    // count (stdlib §2.18's `Dn` / `Xn`).
+                                        isXup, eqChar('x'), "fmt.isX");
+                                    llvm::Value* isB = builder_.CreateOr(
+                                        eqChar('B'), eqChar('b'), "fmt.isB");
+                                    llvm::Value* isF = builder_.CreateOr(
+                                        eqChar('F'), eqChar('f'), "fmt.isF");
+                                    llvm::Value* isEup = eqChar('E');
+                                    llvm::Value* isE = builder_.CreateOr(
+                                        isEup, eqChar('e'), "fmt.isE");
+                                    llvm::Value* isGup = eqChar('G');
+                                    llvm::Value* isG = builder_.CreateOr(
+                                        isGup, eqChar('g'), "fmt.isG");
+                                    llvm::Value* isP = builder_.CreateOr(
+                                        eqChar('P'), eqChar('p'), "fmt.isP");
+                                    // The digit suffix: the count (stdlib
+                                    // §2.18's `Dn` / `Xn` / `Bn` / `Fn`).
                                     //
                                     // fix #7286 fix-forward: the utf8 buffer is
                                     // `n*4+1` bytes (the runtime's own
@@ -3193,7 +3309,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     llvm::Value* tailOk = builder_.CreateICmpEQ(
                                         tailc, llvm::ConstantInt::get(i8Ty, 0),
                                         "fmt.tailok");
-                                    // The width: the digits' value.
+                                    // The count: the digits' value.
                                     auto* strtolFn = declareC(
                                         "strtol", i64(), {ptrTy(), ptrTy(), i32()});
                                     llvm::Value* width64 = builder_.CreateCall(
@@ -3216,85 +3332,190 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         "fmt.wbnd");
                                     llvm::Value* width = builder_.CreateTrunc(
                                         widthBounded, i32(), "fmt.w32");
+                                    // Is there a count at all? (A specifier
+                                    // with no digit run takes its DEFAULT.)
+                                    llvm::Value* hasCount = builder_.CreateICmpUGT(
+                                        dlen, builder_.getInt64(0), "fmt.hascnt");
                                     // The buffer is the runtime's own; release
                                     // it (every read above precedes this).
                                     auto* freeFn = declareC(
                                         "free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
                                     builder_.CreateCall(freeFn, {cf});
-                                    // The recognized form: the specifier this
-                                    // path renders, with a digit suffix that is
+                                    // The recognized form: a specifier in the
+                                    // vocabulary, with a digit suffix that is
                                     // exactly digits.
                                     llvm::Value* recognized = builder_.CreateAnd(
-                                        builder_.CreateOr(isD, isX), tailOk,
+                                        builder_.CreateOr(
+                                            builder_.CreateOr(
+                                                builder_.CreateOr(isD, isX), isB),
+                                            builder_.CreateOr(
+                                                builder_.CreateOr(isF, isE),
+                                                builder_.CreateOr(isG, isP))),
+                                        tailOk,
                                         "fmt.rec");
-                                    auto* fmtBB = llvm::BasicBlock::Create(
-                                        llvm_, "ts.fmt", currentFn_);
+                                    // The VALUE, in the forms the renderings
+                                    // need. The SIGNEDNESS is the receiver's
+                                    // own TYPE's (the house predicate
+                                    // `isUnsignedTargetExpr`) — never the bit
+                                    // width's: `int` and `uint` are both 32
+                                    // bits and `long` and `ulong` are both 64.
+                                    const bool recvUnsigned =
+                                        isUnsignedTargetExpr(*ma->target);
+                                    // `D`: the DECIMAL of the value the caller
+                                    // holds — sign-extended for a signed
+                                    // receiver, zero-extended for an unsigned
+                                    // one (the shared routine's own rule).
+                                    llvm::Value* valD = recv;
+                                    if (!valD->getType()->isIntegerTy(64)) {
+                                        valD = recvUnsigned
+                                            ? builder_.CreateZExt(valD, i64(), "ts.zx")
+                                            : builder_.CreateSExt(valD, i64(), "ts.sx");
+                                    }
+                                    // `X`/`x`/`B`: the receiver's NATURAL-WIDTH
+                                    // BIT PATTERN, zero-extended to 64 bits (a
+                                    // `sbyte` -5 is "FB", not "FFFFFFFB") —
+                                    // the shared routine's own rule for `X`.
+                                    llvm::Value* valBits = recv;
+                                    if (!valBits->getType()->isIntegerTy(64))
+                                        valBits = builder_.CreateZExt(
+                                            valBits, i64(), "ts.zxb");
+                                    // `F`/`E`/`G`/`P`: the value as a real
+                                    // number (the shared routine applies the
+                                    // floating specifiers to an integer
+                                    // operand too).
+                                    llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
+                                    llvm::Value* dval = recvUnsigned
+                                        ? builder_.CreateUIToFP(recv, dblTy)
+                                        : builder_.CreateSIToFP(recv, dblTy);
+                                    // The counts: §2.18 fixes the default only
+                                    // for `F` ("n decimals, default 2"); the
+                                    // shared routine's defaults are two for
+                                    // `F` and `P` and six for `E` and `G`.
+                                    llvm::Value* cntF = builder_.CreateSelect(
+                                        hasCount, width, builder_.getInt32(2),
+                                        "ts.cntF");
+                                    llvm::Value* cntE = builder_.CreateSelect(
+                                        hasCount, width, builder_.getInt32(6),
+                                        "ts.cntE");
+                                    llvm::Value* cntP = builder_.CreateSelect(
+                                        hasCount, width, builder_.getInt32(2),
+                                        "ts.cntP");
+                                    // The conversions. The `ll` length modifier
+                                    // is load-bearing: the value is widened to
+                                    // 64 bits, and a bare `%d`/`%X` reads only
+                                    // 32 of them.
+                                    llvm::Value* decFmt = globalCString(
+                                        recvUnsigned ? "%0*llu" : "%0*lld");
+                                    llvm::Value* hexFmt = builder_.CreateSelect(
+                                        isXup, globalCString("%0*llX"),
+                                        globalCString("%0*llx"), "ts.hexfmt");
+                                    llvm::Value* eFmt = builder_.CreateSelect(
+                                        isEup, globalCString("%.*E"),
+                                        globalCString("%.*e"), "ts.efmt");
+                                    llvm::Value* gFmt = builder_.CreateSelect(
+                                        isGup, globalCString("%.*G"),
+                                        globalCString("%.*g"), "ts.gfmt");
+                                    // The floating arm: the format pointer and
+                                    // the count are selected at RUN time (the
+                                    // specifier is only known at run time
+                                    // here).
+                                    llvm::Value* flFmt = builder_.CreateSelect(
+                                        isF, globalCString("%.*f"),
+                                        builder_.CreateSelect(
+                                            isE, eFmt,
+                                            builder_.CreateSelect(
+                                                isG, gFmt, globalCString("%.*f%%"),
+                                                "ts.fmt3"),
+                                            "ts.fmt2"),
+                                        "ts.fmt1");
+                                    llvm::Value* flCnt = builder_.CreateSelect(
+                                        isF, cntF,
+                                        builder_.CreateSelect(
+                                            isE, cntE,
+                                            builder_.CreateSelect(isG, cntE, cntP,
+                                                                 "ts.cnt3"),
+                                            "ts.cnt2"),
+                                        "ts.cnt1");
+                                    // `P` scales the value by 100 (§2.18's
+                                    // percent row: "`P`/`Pn` percent (×100,
+                                    // `%` suffix)").
+                                    llvm::Value* flVal = builder_.CreateSelect(
+                                        isP,
+                                        builder_.CreateFMul(
+                                            dval,
+                                            llvm::ConstantFP::get(dblTy, 100.0)),
+                                        dval, "ts.flval");
+                                    // The dispatch: a recognized specifier
+                                    // renders, an unrecognized one faults, and
+                                    // an EMPTY format (no specifier at all)
+                                    // renders the no-format text.
+                                    auto* specBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.spec", currentFn_);
                                     auto* plainBB = llvm::BasicBlock::Create(
                                         llvm_, "ts.plain", currentFn_);
                                     auto* mrgBB = llvm::BasicBlock::Create(
                                         llvm_, "ts.mrg", currentFn_);
-                                    builder_.CreateCondBr(recognized, fmtBB, plainBB);
-                                    builder_.SetInsertPoint(fmtBB);
-                                    // The value: the receiver's OWN (the
-                                    // literal format path's value), widened to
-                                    // the format's own width.
-                                    const bool recvIs64 =
-                                        recv->getType()->isIntegerTy(64);
-                                    // fix #7286 fix-forward: the SIGNEDNESS is
-                                    // the receiver's own TYPE's (the house
-                                    // predicate `isUnsignedTargetExpr`) —
-                                    // never the bit width's: `int` and `uint`
-                                    // are both 32 bits and `long` and `ulong`
-                                    // are both 64 bits.
-                                    const bool recvUnsigned =
-                                        isUnsignedTargetExpr(*ma->target);
-                                    llvm::Value* val = recv;
-                                    if (!recvIs64) {
-                                        val = recvUnsigned
-                                            ? builder_.CreateZExt(recv, i32(), "ts.zx")
-                                            : builder_.CreateSExt(recv, i32(), "ts.sx");
-                                    }
-                                    // fix #7286 fix-forward: the DECIMAL
-                                    // conversion must match the value's
-                                    // SIGNEDNESS: a SIGNED printf conversion
-                                    // renders a `uint` of 4000000000 as
-                                    // "-294967296" and a `ulong` of
-                                    // 18446744073709551615 as "-1", where the
-                                    // no-format rendering of the same value
-                                    // (stdlib §9.1: "The no-format `ToString()`
-                                    // ... emits the text `ToString(10)` emits")
-                                    // gives "4000000000" and
-                                    // "18446744073709551615". The widening
-                                    // above is right; feeding the result to a
-                                    // signed conversion was not.
-                                    //
-                                    // The HEX conversion needs no signedness
-                                    // arm: the `X` conversion renders the
-                                    // argument's BITS, so the same length
-                                    // modifier serves both.
-                                    llvm::Value* decFmt = globalCString(
-                                        recvIs64 ? (recvUnsigned ? "%0*llu" : "%0*ld")
-                                                 : (recvUnsigned ? "%0*u" : "%0*d"));
-                                    llvm::Value* hexFmt = globalCString(
-                                        recvIs64 ? "%0*lX" : "%0*X");
-                                    llvm::Value* fptr = builder_.CreateSelect(
-                                        isX, hexFmt, decFmt, "ts.fptr");
-                                    llvm::Value* sval =
-                                        emitSnprintfString(fptr, {width, val});
-                                    auto* fmtEnd = builder_.GetInsertBlock();
+                                    builder_.CreateCondBr(hasSpec, specBB, plainBB);
+                                    builder_.SetInsertPoint(specBB);
+                                    // The unrecognized form: the §2.18
+                                    // strict-fault — `FormatException`. The
+                                    // guard throws; its continuation (the
+                                    // rendering below) is reached only for a
+                                    // recognized specifier.
+                                    emitGuardThrow(
+                                        builder_.CreateNot(recognized),
+                                        "FormatException");
+                                    // The arms.
+                                    auto* dBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.d", currentFn_);
+                                    auto* xTestBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.xtest", currentFn_);
+                                    auto* hexBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.hex", currentFn_);
+                                    auto* bTestBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.btest", currentFn_);
+                                    auto* binBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.bin", currentFn_);
+                                    auto* flBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.fl", currentFn_);
+                                    builder_.CreateCondBr(isD, dBB, xTestBB);
+                                    builder_.SetInsertPoint(dBB);
+                                    llvm::Value* sD =
+                                        emitSnprintfString(decFmt, {width, valD});
                                     builder_.CreateBr(mrgBB);
-                                    // The unrecognized form: the no-format
-                                    // rendering (the literal path's own
-                                    // fallback for a specifier it does not
-                                    // render).
+                                    builder_.SetInsertPoint(xTestBB);
+                                    builder_.CreateCondBr(isX, hexBB, bTestBB);
+                                    builder_.SetInsertPoint(hexBB);
+                                    llvm::Value* sX =
+                                        emitSnprintfString(hexFmt, {width, valBits});
+                                    builder_.CreateBr(mrgBB);
+                                    builder_.SetInsertPoint(bTestBB);
+                                    builder_.CreateCondBr(isB, binBB, flBB);
+                                    builder_.SetInsertPoint(binBB);
+                                    // The binary rendering: the runtime's own
+                                    // (§2.18's `B`/`Bn`), on the same
+                                    // natural-width bit pattern.
+                                    auto* binFn = declareC(
+                                        "bz_ulong_to_binary", ptrTy(), {i64(), i32()});
+                                    llvm::Value* sB = builder_.CreateCall(
+                                        binFn, {valBits, width}, "int.bin");
+                                    builder_.CreateBr(mrgBB);
+                                    builder_.SetInsertPoint(flBB);
+                                    llvm::Value* sF = emitSnprintfStringExact(
+                                        flFmt, {flCnt, flVal});
+                                    builder_.CreateBr(mrgBB);
+                                    // The empty form: the no-format rendering.
                                     builder_.SetInsertPoint(plainBB);
                                     llvm::Value* pval =
                                         emitPrimitiveToString(recv, tt->primitive);
                                     auto* plainEnd = builder_.GetInsertBlock();
                                     builder_.CreateBr(mrgBB);
                                     builder_.SetInsertPoint(mrgBB);
-                                    auto* phi = builder_.CreatePHI(ptrTy(), 2, "ts.str");
-                                    phi->addIncoming(sval, fmtEnd);
+                                    auto* phi = builder_.CreatePHI(ptrTy(), 5, "ts.str");
+                                    phi->addIncoming(sD, dBB);
+                                    phi->addIncoming(sX, hexBB);
+                                    phi->addIncoming(sB, binBB);
+                                    phi->addIncoming(sF, flBB);
                                     phi->addIncoming(pval, plainEnd);
                                     return phi;
                                 }
