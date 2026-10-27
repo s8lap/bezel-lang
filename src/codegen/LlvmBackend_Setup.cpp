@@ -24733,15 +24733,53 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // See the LOCALDECL-ONLY marker at the cast.
     if (v.isUsing) {
         if (!allowUsingVar) return nullptr;
-        const ast::LocalDecl* uld =
-            // LOCALDECL-ONLY: a §21.1 `const` local CANNOT reach this cast:
-            // the `v.isUsing` gate above is read through the shared
-            // `Emitter::localDeclInitView`, which reports isUsing FALSE for
-            // every `const` local - a runtime `const` is an
-            // `ast::LocalConstDecl` (no `isUsing` member at all), so it can
-            // never be a `using` binding.
-            dynamic_cast<const ast::LocalDecl*>(ldNode);
-        if (uld && uld->isAwaitUsing) return nullptr;  // #7306
+        // fix #7374 / §28.12 (v0.345): the `await using var` SPELLING is
+        // ADMITTED here, like its `using var` twin.
+        //
+        // §28.12 (v0.345): "`await using var` takes §28.10's admission
+        // unchanged ... Over an owned right-hand side with no `DisposeAsync` to
+        // await - a value-type, runtime-managed or move-only right-hand side
+        // ... scope exit takes the synchronous disposal (or the no-op) and
+        // likewise awaits nothing." A VALUE-LIKE CHOICE is a value type
+        // (§35.4), so its scope exit is the NO-OP — and §28.10's no-op "is the
+        // reassignability restriction" and NOTHING ELSE, so the awaited
+        // spelling's RUNTIME LIFETIME is the plain-`var` twin's. §28.12 also
+        // says the awaited spelling "takes §28.10's admission UNCHANGED" —
+        // the admission and the runtime lifetime together.
+        //
+        // The refusal this replaces (`isAwaitUsing` -> null, #7306) was the
+        // AWAIT-SPELLING copy path's twin of #7316's `v.isUsing` refusal: it
+        // kept the `await using var` copy of a value-like choice local out of
+        // the armed set, so the copy took no reference at bind and, because
+        // it took no reference, the escape walk's `choiceOwnerAliases`
+        // relaxation did not fire for it — so the SOURCE was classified as
+        // escaping and dropped from the armed set too. The SOURCE's +1 was
+        // then never discharged: the leak.
+        //
+        // MEASURED on this tree's base (e4a55c95), bezelc --sanitize=address
+        // (LSan), 101 iterations:
+        //
+        //   var a := Msg.Note("a" + "b"); await using var b := a;
+        //     -> 3535 byte(s) leaked in 202 allocation(s)
+        //
+        // and the relocation table for that shape is 1x release / 0x retain:
+        // the copy is never ARMED, so the source's +1 is never discharged.
+        //
+        // THE AWAIT SPELLING IS NOT THE ASYNC DISPOSAL MACHINERY'S ANY MORE.
+        // A value-typed right-hand side has no class, so §28.12 gives its
+        // scope exit the no-op — the async machinery claims no value-typed or
+        // runtime-managed right-hand side at all (the same correction #7322
+        // made for the runtime-managed `await using var` producer). What
+        // remains is the RUNTIME'S OWN REFERENCE, which is not a disposal
+        // obligation and never was: §28.9's exemption is from MANUAL
+        // disposal.
+        //
+        // The `uld` local is now unused, so the LOCALDECL-ONLY cast is gone
+        // with it — the `await using var` spelling is reached here through the
+        // SAME `v.isUsing` gate as the `using var` spelling, and a §21.1
+        // `const` local still reports isUsing FALSE through the shared
+        // `Emitter::localDeclInitView` (a runtime `const` is an
+        // `ast::LocalConstDecl`, which has no `isUsing` member at all).
     }
     // Resolve the choice type (the declared annotation wins; else the
     // initializer's inferred type), through the active substitution so a
@@ -37074,14 +37112,6 @@ void Emitter::collectStringReleaseEligible(
             // See the LOCALDECL-ONLY marker at the cast.
             const bool plusOneProducer =
                 v.init && isPlusOneStringProducer(v.init);
-            const ast::LocalDecl* usingLd =
-                // LOCALDECL-ONLY: a §21.1 `const` local CANNOT reach this
-                // cast: the ternary evaluates it only when `v.isUsing` is
-                // true, and `v.isUsing` (shared `Emitter::localDeclInitView`)
-                // is FALSE for every `const` local - a runtime `const` is an
-                // `ast::LocalConstDecl` (no `isUsing` member at all), so it
-                // can never be a `using` binding.
-                v.isUsing ? dynamic_cast<const ast::LocalDecl*>(s) : nullptr;
             const bool usingVarProducer =
                 plusOneProducer && v.isUsing;
             // fix #7322 (§28.9 / §28.10 / §28.12, v0.344): the `await using
@@ -37108,9 +37138,15 @@ void Emitter::collectStringReleaseEligible(
             // this the `await using var t := o.ToString();` producer's +1
             // leaked (the string itself, not just the reference).
             //
-            // `usingLd` is still needed below: it distinguishes a §21.1
-            // `const` local from a `var` one, and it is the LOCALDECL-ONLY
-            // marker for the cast.
+            // `usingLd` is gone: fix #7374 (§28.12, v0.345) admits the
+            // `await using var` spelling to the value-like-choice arm below,
+            // and the LOCALDECL-ONLY cast that produced it existed only to
+            // tell a §21.1 `const` local from a `var` one. A §21.1 `const`
+            // local still reports `isUsing` FALSE through the shared
+            // `Emitter::localDeclInitView` (a runtime `const` is an
+            // `ast::LocalConstDecl`, which has no `isUsing` member at all), so
+            // it can never be a `using` binding and the distinction is now
+            // carried by the shared view.
             // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a
             // VALUE-LIKE CHOICE local. The choice-payload constructor is not a
             // STRING producer, so `plusOneProducer` is false and
@@ -37137,9 +37173,26 @@ void Emitter::collectStringReleaseEligible(
                              s, /*retainedArgs=*/nullptr,
                              /*allowUsingVar=*/true)
                        : nullptr;
-            const bool usingVarChoice =
-                v.isUsing && !(usingLd && usingLd->isAwaitUsing) &&
-                choicePayloadTy != nullptr;
+            // fix #7374 / §28.12 (v0.345): the `await using var` SPELLING of a
+            // value-like choice local is admitted to the SAME arm as its
+            // `using var` twin. §28.12: "`await using var` takes §28.10's
+            // admission unchanged", and §28.10's admission of a value-typed
+            // right-hand side is a NO-OP at scope end whose only effect is the
+            // reassignability restriction — so the awaited spelling has the
+            // plain-`var` twin's RUNTIME LIFETIME. The exclusion this
+            // replaces (`!(usingLd && usingLd->isAwaitUsing)`) is the
+            // AWAIT-SPELLING twin of #7316's `v.isUsing` refusal, and it is
+            // what kept the awaited copy out of the armed set — so the copy
+            // took no reference at bind AND the escape walk's
+            // `choiceOwnerAliases` relaxation did not fire for it, which
+            // dropped the SOURCE from the armed set too. The source's +1 was
+            // then never discharged (measured: 3535 B / 202 allocations over
+            // 101 iterations).
+            //
+            // The `usingLd` local is now unused by this predicate; the
+            // `await using var` spelling reaches this arm through the same
+            // `v.isUsing` gate as the `using var` spelling.
+            const bool usingVarChoice = v.isUsing && choicePayloadTy != nullptr;
             // fix #7388 / §28.9 / §28.10 (v0.345): the `using var` SPELLING of
             // a BORROW-initialized string local — the COPY of a string local.
             //
