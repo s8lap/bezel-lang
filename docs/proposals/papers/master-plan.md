@@ -179,8 +179,8 @@ builtin arms, nullable, generics, cross-module): `ExprTypecheck*.cpp`, `TypeReso
 | # | campaign (track) | open (S/C/L) | why here | depends on |
 |---|---|---|---|---|
 | 0 | **Enablers** (standing, ≤1 lane) | 166 total; worked only as DONE-instrument needs | measurement must not lie before anything is declared fixed | owner: #2924/#7145 policy |
-| 1 | **`using var` / `await using` over every head kind** (ownership) | 24 (7/3/5) | heap-buffer-overflow and SEGV measured today on a two-line program; bounded; the pilot that proves the mechanics | ruling #3493 for half the members |
-| 2 | **Built-in call admission: typed arms for the stdlib surface** (sema) | 189 (33/53/0) | 53 compiler aborts and 33 wrong-value/soundness; the largest intake stream (159 filed in 30 d) is being fixed one arm at a time right now | none hard |
+| 1 | **`using var` / `await using` over every head kind** (ownership) | 24 (7/3/5) | heap-buffer-overflow and SEGV measured today on a two-line program; bounded; the pilot that proves the mechanics | ruling #3493 for half the members — **RULED 2026-10-27 (option 2, the `DisposeAsync` dispatch-table slot); the entry check found §3's U1 SPLITS into U1a/U1c/U1d and U2 into U2a–U2e, so the pilot's scope is three sub-families, not three** |
+| 2 | **Built-in call admission: typed arms for the stdlib surface** (sema) | 189 (33/53/0) | 53 compiler aborts and 33 wrong-value/soundness; the largest intake stream (159 filed in 30 d) is being fixed one arm at a time right now | none hard — **the entry check measured a LIVE SCOPE of 98 (92 reproduces + 6 moved) and re-labelled 77 of the 189 to other campaigns; the B0 leverage is at most 52/189 (27.5 %), or at most 45/98 (45.9 %) of the live members — BELOW ONE HALF, so the plan's own falsification rule forces B0 to SPLIT** |
 | 3 | **Enumerable heads and iterator frames: one bridge per face** (ownership) | 125 (43/9/27) | highest soundness density (wild jumps, UAF); September's G family untouched (19/21); grid instrument already sketched | campaign 1 (shares `registerUsingDisposal`) |
 | 4 | **Producer temporaries and boxes: one discharge authority** (ownership) | 148 (14/7/98) | the largest leak family and the loop's main engine (116 filed in 30 d); contains the UAFs #6393, #6983, #6409 | campaign 3 (shares the minting gate) |
 | 5 | **Nullable carrier unwrap at every value consumer** (sema/codegen) | 54 (14/0/0) + the builtin-position subset handled in 2 | tagged carrier read as a value: garbage, malformed IR; one unwrap authority | campaign 2 |
@@ -258,10 +258,16 @@ Each lane: `runAotChecked` rows, loop-amplified, with the **double-free control 
 never trade a leak for a UAF). Expected duration: two sessions. While U-lanes are serialised, the pool's
 other slots run **Campaign 2** (the other track).
 
-**DONE.** §2.3 with: the grid green under ASan; `s28_10_*`/`s28_12_*` fail rows re-banked (baseline
-has 2 under §28.10 and 5 under §28.12 today); U2 either closed or every member re-scoped *blocked on
+**DONE.** §2.3 with: the grid green under ASan; `s28_10_*`/`s28_12_*` fail rows re-banked (**the
+coordinator measured 4 banked fail under §28.10 and 6 under §28.12, plus 3 UNBANKED failures under
+§28.12 (`s28_12_0013`, `s28_12_0020`, `s28_12_0021`) — the plan's "2 and 5" was STALE, and the true
+in-scope divergence count is 4 and 9**); U2 either closed or every member re-scoped *blocked on
 #3493* if the ruling has not arrived — in which case the campaign exits `RE-SCOPED`, with U1 and U3 DONE
-and U2 re-queued behind the ruling.
+and U2 re-queued behind the ruling. **=> THE ENTRY CHECK (2026-10-28) SPLIT U1 AND U2, SO THE
+"THREE LANES" SPLIT BELOW IS SUPERSEDED BY THE RECORD'S OWN SUB-FAMILIES: U1a/U1b/U1c/U1d,
+U2a/U2b/U2c/U2d/U2e, U3a/U3b/U3c, U0. THE ANCHOR'S SITE IS FOUR PLACES, NOT ONE (a shared predicate
+in `src/common/`, `Emitter::registerUsingDisposal`, `MethodOwnership::handleLocalDecl`, and
+`Emitter::emitAsyncDisposeAwaitAndFree`).**
 
 ### Campaign 2 — Built-in call admission: typed arms for the stdlib surface (sema/stdlib track)
 
@@ -317,8 +323,16 @@ null admission), B4 (Opus; `StringBuilder`/string, touches `LlvmBackend_String.c
 (lane-contract 19b) — this campaign flips many permissive-acceptance pins, each named in the commit body.
 
 **DONE.** §2.3 with: generator green (0 compiler aborts, 0 `IR verification failed`, every wrong-shape
-cell rejected by §22.6); members closed or re-scoped; the stdlib §2/§3/§9 corpus fail rows (25 + 3 + 6
-today) re-banked; the `permissive-acceptance` warning count in `src/` for builtin heads banked lower.
+cell rejected by §22.6); members closed or re-scoped; the stdlib §2/§3/§9 corpus fail rows (**the
+coordinator measured 31 + 2 + 8 = 41 today — the plan's "25 + 3 + 6 = 34" was STALE**) re-banked; the
+`permissive-acceptance` warning count in `src/` for builtin heads banked lower. **=> THE ENTRY CHECK
+(2026-10-28) FOUND THE B0 ANCHOR DOES NOT SURVIVE THE FALSIFICATION RULE AND SPLITS** (at most
+52/189 = 27.5 %, at most 45/98 = 45.9 % of the live members — below one half), **AND THAT THE
+DONE INSTRUMENT NEEDS ONE MORE THING BEFORE IT IS THE DONE INSTRUMENT: 39 of its 60 reject needles
+PREDICT a diagnostic the compiler does not produce today, while the compiler has at least three
+families for a missing member — so a CORRECT fix could leave the grid red. THE CLASSIFIER ALREADY
+TAKES A LIST OF NEEDLES; NO CELL USES ONE.** **=> THE GRID IS THE CAMPAIGN'S BASELINE, NOT YET ITS
+DONE INSTRUMENT.**
 
 ### Campaign 3 — Enumerable heads and iterator frames: one bridge per face (ownership track)
 
@@ -565,8 +579,8 @@ from the label query and the corpus runner. Status ∈ QUEUED · ENTRY · ACTIVE
 | # | campaign | track | status | entry date | members at entry (S/C/L/other) | closed | re-scoped | in-scope siblings filed / triaged | corpus fails in scope (entry → now) | grid cells wrong (entry → now) | blocked on | last session | next action |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 0 | enablers | — | standing | — | — | — | — | — | — | — | — | — | #2924/#7145 errors; #4602 bounded retention, then default flip (ruled 2026-10-27) |
-| 1 | using-heads | ownership | QUEUED | — | 24 (7/3/5/9) | 0 | 0 | 0 / 0 | §28.10: 2, §28.12: 5 → — | — | — | — | ENTRY: re-measure 24, build the head × form grid |
-| 2 | builtin-call-admission | sema | QUEUED | — | 189 (33/53/0/103) | 0 | 0 | 0 / 0 | stdlib §2: 25, §3: 3, §9: 6 → — | — | — | — | ENTRY after 1's entry lane is dispatched (other track) |
+| 1 | using-heads | ownership | ENTRY | 2026-10-28 | 24 (7/3/5/9) | 0 | 0 | 0 / 0 | §28.10: 4, §28.12: 6 (+3 unbanked) → — | 41 wrong + 5 known-red (153 cells) | — | R36 | ENTRY LANDED (record + grid on `r36-c1-entry` @ `2381f534`, under review); U1 SPLITS into U1a/U1c/U1d — dispatch the U1c anchor lane |
+| 2 | builtin-call-admission | sema | ENTRY | 2026-10-28 | 189 (33/53/0/103) | 0 | 0 | 0 / 0 | stdlib §2: 31, §3: 2, §9: 8 → — | 48 wrong (110 cells) | — | R36 | ENTRY LANDED (record + grid on `r36-c2-entry` @ `8a356f9c` + `87c1e94f`, under review); the grid's 39 PREDICTED reject needles block the DONE line (N1) |
 | 3 | enumerable-heads | ownership | QUEUED | — | 125 (43/9/27/46) | 0 | 0 | 0 / 0 | §29: 7, stdlib §5: 1 → — | — | campaign 1 | — | — |
 | 4 | producer-temporaries | ownership | QUEUED | — | 148 (14/7/98/29) | 0 | 0 | 0 / 0 | §28.3/§28.9 subset → — | — | campaign 3 | — | — |
 | 5 | nullable-carrier | sema | QUEUED | — | 54 (14/0/0/40) | 0 | 0 | 0 / 0 | §7: tbd | — | campaign 2 | — | — |
@@ -582,6 +596,17 @@ from the label query and the corpus runner. Status ∈ QUEUED · ENTRY · ACTIVE
 **Session handback format** (three lines under the table): *Landed:* `fix #…` × n, members closed n,
 grid cells cleared n. *Blocked:* rulings awaited, with dates asked. *Asked:* new spec questions filed
 (numbers), labels added (count).
+
+**R36 session handback (2026-10-28, in progress — the run ends 2026-10-30 02:00 NZDT).**
+*Landed:* `narrow #7316` and `narrow #7333` picked onto staging (2 fix issues; UNATTRIBUTED 0);
+#1792 and #7108 closed as fixed (each with a coordinator measurement; #7108's mechanism was already
+closed under #7168). *Blocked:* the two campaign grids are not yet their campaigns' DONE instruments
+— campaign 2's 39 PREDICTED reject needles (a correct fix could leave the grid red), campaign 1's
+`Task` cells hang on one build and not on another; both entry commits are under review. *Asked:* 8
+spec questions filed from the certain-faults research (#7378–#7384) + 11 campaign-1 defects
+(#7387–#7397) + 2 codegen discriminators (#7385, #7386) + the 23 campaign-2 measurement comments;
+labels applied by the Appendix B sweep. **=> THE GATE CADENCE (owner directive 2026-10-28): ONE GATE
+CARRIES 60–100 ISSUE CLOSURES, NOT 5. => THE HAUL IS ACCUMULATED; DO NOT GATE A SMALL ONE.**
 
 ---
 
