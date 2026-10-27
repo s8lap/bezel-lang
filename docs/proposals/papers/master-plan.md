@@ -202,7 +202,15 @@ is the anchor; the *pointer-degrade* sites flip to Error — **owner decision**,
 `CHECK-NOT` ordering vacuity (#7065, #7069, #7070, #7071) — a plan-wide oracle hole; **(c)** the
 uninstrumented hand-rolled emit runners (#3917) and the leak census blind spot (#7335); **(d)** the
 checked-disposal default (#4602, **owner decision**); **(e)** promote `docs/proposals/papers/master-plan/work/*.py`
-to `scripts/tracker/` so §6's numbers are reproducible from the repo (a coordinator decision).
+to `scripts/tracker/` so §6's numbers are reproducible from the repo (a coordinator decision). **(f)** kernel pins for
+the ownership corpus (from the soundness research, `docs/research/soundness/pinmap/`): a `kernel:`
+header naming the K/A clauses on each of the 435 §28/§30.5 rule-corpus cases, a verbatim `rule:` quote
+for those cases (242 paraphrase today), and a ratchet that no live kernel clause has zero executable
+pins (six have none: K1.2, K1.4, K3.6, K4, K5.4, K5.8; 44 of 80 are pinned only by matrix cells). It
+needs no spec change. Required before campaign 9's entry, and wanted by any campaign whose DONE grid
+cites kernel clauses. **(g)** the model-vs-compiler differential (soundness research Stage 0, the
+`bzcore` model and its `.bzl` printer): its findings are matched against open issues and get a
+campaign label at intake; they are worked only inside the owning campaign (§1.4).
 
 ### Campaign 1 — `using var` / `await using` over every head kind (ownership track; the pilot)
 
