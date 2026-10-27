@@ -357,6 +357,10 @@ the ASan regression matrix; surviving mutants become corpus cases.
   README carries the re-run mutation table, the K5.3 a/b/c numbers used by proposals 0205/0206, the
   #4602 free-at-`Dispose()` measurement, four findings and the printer interface for the
   model-vs-compiler differential.
+- `bzdiff/` (added 2026-10-27): the model-vs-compiler differential (0047 §5.3): a printer from
+  model programs to real `.bzl` modules and a harness comparing verdict, rule family and disposal
+  trace with `bezelc`. 24,036 programs compared on release r35; 13 deduplicated findings filed as
+  #7402–#7414 with campaign labels (`FINDINGS.md`), the rest matched to open issues.
 - `data/soundness_issues.tsv`: the 475 `soundness` issues with labels, the source of §2.5's
   split.
 
