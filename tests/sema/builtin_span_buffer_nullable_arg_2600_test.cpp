@@ -19,7 +19,7 @@
 // `IndexOf(value: T?)` / `Contains(value: T?)` — NULLABLE — so an un-narrowed
 // `T?` is admissible there (the fix's spanBufferSkipClassT branch suppresses
 // the check for that case). ArraySpan<T>/ReadOnlyArraySpan<T> declare
-// `value: T` for ALL T (§4.15 line 2881 — Array<T> slots do not wrap class T
+// `value: T` for ALL T (§4.15 — Array<T> slots do not wrap class T
 // in T?), so they are covered unconditionally even for class T. The negative
 // control `NegClassArraySpan` below confirms the class-T skip is scoped to
 // Span/ReadOnlySpan and does NOT leak onto the ArraySpan family.
@@ -249,7 +249,7 @@ BEZEL_TEST(sema_span_buffer_nullable_arg_2600,
     }
 }
 
-// #2600 / §4.14 line 2463/2611: a CLASS-T `Span<T>` / `ReadOnlySpan<T>`
+// #2600 / stdlib §4.14: a CLASS-T `Span<T>` / `ReadOnlySpan<T>`
 // declares `IndexOf(value: T?)` / `Contains(value: T?)` — NULLABLE — so an
 // un-narrowed `K?` is admissible. The fix's spanBufferSkipClassT branch
 // suppresses the §7 check for class-T owning spans. Guards against a
@@ -272,7 +272,7 @@ BEZEL_TEST(sema_span_buffer_nullable_arg_2600,
     }
 }
 
-// #2600 / §4.15 line 2881: the class-T skip is scoped to Span/ReadOnlySpan
+// #2600 / §4.15: the class-T skip is scoped to Span/ReadOnlySpan
 // ONLY. ArraySpan<T>/ReadOnlyArraySpan<T> declare `value: T` for ALL T (Array
 // slots do not wrap class T in T?), so a class-T ArraySpan<K>.IndexOf(K?)
 // MUST reject — confirming the skip does not leak onto the ArraySpan family.

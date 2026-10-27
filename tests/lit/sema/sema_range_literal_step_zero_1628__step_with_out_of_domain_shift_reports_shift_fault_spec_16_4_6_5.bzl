@@ -13,5 +13,9 @@
 
 module M; class C public static method Main(): int for var i in 0..10 step (1 << 64) do end; return 0; end Main; end C;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: a range step of zero
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: shift count 64 is outside the domain `0..31`
 // CHECK-NOT: a range step of zero

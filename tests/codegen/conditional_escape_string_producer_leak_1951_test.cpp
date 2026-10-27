@@ -46,12 +46,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // (A) #1951 repro — the NON-escaping path. Pick(2) takes `_ => "other"`, so the
 // producer local `s` ("xy") is never read on that path; pre-fix its suppressed
@@ -130,7 +128,6 @@ const char* kMixedProducerBorrowLiteralArms =
 BEZEL_TEST(conditional_escape_string_producer_leak_1951,
            case_non_escaping_path_loop_lsan_clean_spec_28_3) {
     JitResult r = runAotChecked(kCaseNonEscapingPathLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // 5 producer locals each freed once
     BEZEL_EXPECT_EQ(r.exitCode, 25);   // 5 * "other".Length
 }
@@ -141,7 +138,6 @@ BEZEL_TEST(conditional_escape_string_producer_leak_1951,
 BEZEL_TEST(conditional_escape_string_producer_leak_1951,
            case_escaping_path_loop_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kCaseEscapingPathLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 10);   // 5 * "xy".Length
 }
@@ -152,7 +148,6 @@ BEZEL_TEST(conditional_escape_string_producer_leak_1951,
 BEZEL_TEST(conditional_escape_string_producer_leak_1951,
            if_expr_non_escaping_path_loop_lsan_clean_spec_20) {
     JitResult r = runAotChecked(kIfExprNonEscapingPathLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 25);
 }
@@ -164,7 +159,6 @@ BEZEL_TEST(conditional_escape_string_producer_leak_1951,
 BEZEL_TEST(conditional_escape_string_producer_leak_1951,
            mixed_producer_borrow_literal_arms_no_uaf_spec_28_3) {
     JitResult r = runAotChecked(kMixedProducerBorrowLiteralArms);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 15);   // "xy"(2) + "borrowed"(8) + "other"(5)
 }

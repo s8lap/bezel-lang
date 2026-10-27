@@ -1037,6 +1037,18 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
         !rt->declaration && rt->astNode && rt->astNode->name &&
         rt->astNode->name->parts.size() == 1 &&
         !isBuiltinTypeRefName(rt->headName())) {
+        // fix #6870 (§14.2 / §11.8, v0.343): a type parameter whose
+        // constraints make it a REFERENCE (§14.2's `class` arm, or a
+        // class-type bound) is erased to a `ptr` in the ERASED TEMPLATE, not
+        // to the `int` placeholder — so its nullable companion `T?` is a
+        // nullable REFERENCE, i.e. a plain pointer (§7.1), not the
+        // `{i8, i32}` tagged value struct. Read the same predicate the
+        // non-nullable arm reads (typeParamErasedAsReference), and only
+        // where no active substitution binds the name — every specialization
+        // resolves the name through `genericSubst_` first.
+        if (genericSubst_.find(rt->headName()) == genericSubst_.end() &&
+            typeParamErasedAsReference(rt->headName()))
+            return ptrTy();
         if (!genericSubstSemaTy_.empty()) {
             sema::TypeRef nv;
             if (nullableTypeParamConcrete(rt, nv)) {
@@ -1056,8 +1068,22 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 // (IR-verify failure, `bezelc -c` exit 1). The same placeholder
                 // struct the template `bz$M.Inner$Head` already uses keeps the
                 // signature and every return in that body consistent.
-                if (isBareTypeParamRef(&nv))
+                if (isBareTypeParamRef(&nv)) {
+                    // fix #6870 (§14.2 / §11.8, v0.343): the
+                    // substitution may map this parameter onto ANOTHER, still-
+                    // unbound type parameter (`T → U`) — the pseudo-
+                    // specialization of an inner generic built from inside an
+                    // OUTER generic's body. When THAT parameter is itself
+                    // reference-constrained (`where U: class`), the nullable
+                    // form is a nullable REFERENCE (§7.1) — a plain pointer —
+                    // not the `{i8, i32}` tagged value struct the placeholder
+                    // arm below returns. The two must agree: the erased body
+                    // reads the value as the pointer the pseudo-
+                    // specialization's signature declares.
+                    if (typeParamErasedAsReference(nv.headName()))
+                        return ptrTy();
                     return nullablePrimStructTy(sema::PrimitiveType::Int);
+                }
                 // resolved to a reference type → plain ptr `?` lowering.
             } else {
                 // a type param with no active binding — fall to template rule.
@@ -1607,6 +1633,41 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                         "fallback and a pointer-sized type is truncated to "
                         "32 bits (#3577, residue of #3540).");
             }
+            // fix #6870 (§14.2 / §11.8, v0.343): a bare
+            // type parameter whose constraints make it a REFERENCE (§14.2's
+            // `class` arm, or a class-type bound) is erased to a `ptr` in the
+            // ERASED TEMPLATE, not to the `int` (i32) placeholder.
+            //
+            // WHY the placeholder was wrong here. The erased template is the
+            // body a caller runs when it instantiates the declaration at `int`;
+            // the placeholder therefore has to be able to hold what the
+            // substitution holds. For `where T: class` / `where T: SomeClass`
+            // `int` is NOT a legal substitution at all (§14.2's table) — so the
+            // placeholder is not a conservative stand-in for the parameter, it
+            // is a representation the parameter can never hold.
+            //
+            // An INTERFACE bound (`where T: IFoo`) is deliberately NOT covered
+            // here: §14.2 admits a RECORD for it as well as a class, and a
+            // record arrives BY VALUE where a class arrives as a pointer, so
+            // there is no single uniform erased representation and erasing
+            // the parameter as a pointer would be unsound. That shape is the
+            // remaining part of #6870.
+            //
+            // The erasure was observable: with `T` at i32, a `T`-typed
+            // receiver is an i32, so the interface/vtable dispatch has nothing
+            // to dispatch on (issue #484's non-pointer-receiver guard) and the
+            // member call did not lower at all — the compile stopped on the
+            // internal "#1386" diagnostic. With the reference erasure the
+            // receiver is a `ptr` and the member call dispatches through the
+            // runtime itable (`bz_itable_lookup`), exactly as the
+            // per-instantiation specialization does.
+            //
+            // ONLY the erased template is affected: a specialization resolves
+            // the name through `genericSubst_` (the arm above) before reaching
+            // this fallback, so its concrete type is untouched.
+            if (genericSubst_.find(rt->headName()) == genericSubst_.end() &&
+                typeParamErasedAsReference(rt->headName()))
+                return ptrTy();
             return i32();  // value-kind named — int
         case sema::TypeRef::Kind::InlineArray: {
             // §15.1: [N]T is an LLVM fixed-size array [N x elemType].
@@ -2319,6 +2380,20 @@ void Emitter::patchConcreteDerivedGenericBaseVtableAccessors() {
 
 
 llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
+    // fix #6870 (§14.2 / §11.8, v0.343): the ERASED layout of a
+    // generic class must use the SAME representation of a reference-constrained
+    // type parameter as the erased template's body and signature (a `ptr`, not
+    // the `int` placeholder) — otherwise the erased body's field read is typed
+    // differently from the erased layout's slot (an i32 load where the caller
+    // passes a pointer). Scoped to this computation; a specialized layout
+    // resolves the name through `genericSubst_` first and is unaffected.
+    struct ErasedRefParamsGuard {
+        Emitter& e;
+        ErasedRefParamsGuard(Emitter& em, const sema::TypeSymbol* ts) : e(em) {
+            e.pushErasedRefScopeForType(ts);
+        }
+        ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+    } erasedRefGuard(*this, t);
     // CG29: a record has no vtable header; route to recordStruct so every
     // classStruct caller (field access, etc.) gets the right layout.
     if (t->kind == ast::TypeDeclKind::Record) return recordStruct(t);
@@ -2624,6 +2699,17 @@ withRecordFootprint(llvm::LLVMContext& ctx,
 }
 
 llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
+    // fix #6870 (§14.2 / §11.8, v0.343): the ERASED layout of a
+    // generic record must use the same representation of a
+    // reference-constrained type parameter as the erased template's body and
+    // signature (a `ptr`, not the `int` placeholder) — the classStruct twin.
+    struct ErasedRefParamsGuard {
+        Emitter& e;
+        ErasedRefParamsGuard(Emitter& em, const sema::TypeSymbol* ts) : e(em) {
+            e.pushErasedRefScopeForType(ts);
+        }
+        ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+    } erasedRefGuard(*this, t);
     // §9.1 / §9.2: storage = non-static FieldSymbols (positional + body
     // fields) and body auto-properties (PropertySymbol), in declaration order.
     std::vector<const sema::Symbol*> storage;
@@ -6683,6 +6769,18 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // #4602 (§28.2, v0.338): a bound method reference retains its receiver
     // in the closure env past this frame.
     if (receiverVal) emitCdMarkEscaped(receiverVal);
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.340): an ordinary §27.6 method
+    // reference CAPTURES its receiver ("the instance is captured at formation
+    // — by reference for class- or interface-typed receivers"), so the
+    // receiver's block must stay live across the receiver's logical disposal
+    // — §28.2: an explicit `Dispose()` "does not reclaim its receiver: the
+    // receiver's block stays live until the holder's release point". The
+    // stamp is the same one the compiler-generated `Dispose` group records,
+    // so the explicit-`Dispose()` call site treats every method group alike.
+    if (refExpr)
+        if (const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(refExpr))
+            noteMethodGroupBorrow(ma->target.get());
     // per §27.6 (v0.338; #5814): a reference over a generic method forms the
     // method at the type arguments it names, never the erased template.
     if (!ms->genericParams.empty() && refExpr)
@@ -9702,19 +9800,29 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         bool nullableRecordTarget = false;
         if (sema::TypeRef* tt = ctx_.exprType(*ma.target))
             nullableRecordTarget = isNullableRecordTy(tt);
+        // The TAGGED nullable-record carrier layout for this record: {i8
+        // hasValue; <record payload>} (§7.2 / #416). It is a LITERAL struct,
+        // while a record's OWN layout is an IDENTIFIED one (`%record.P`) — so
+        // the carrier and a bare record can never be the same LLVM type, even
+        // when their element lists coincide (a record whose first field is a
+        // byte and whose second is another record has the same SHAPE as a
+        // carrier, but not the same type).
+        llvm::StructType* carrier =
+            llvm::StructType::get(llvm_, {nullablePrimHasValTy(), st});
         // CG29: prefer lvalue address so writes go to the original
         // memory (e.g. grid[2].Cells[x] := v must update grid[2],
         // not a stack copy). Fall back to lowerExpr for temporaries
         // (e.g. a freshly returned record value).
         llvm::Value* base = nullptr;
         llvm::Type* baseTy = nullptr;
+        // The STORAGE type at `base` — the type of the value that lives there,
+        // not of the pointer. It is what tells a TAGGED carrier slot from a
+        // bare-record slot (see the §12.7 arm below).
+        llvm::Type* storageTy = nullptr;
         // The struct the base pointer points at: the bare record struct, or the
         // tagged nullable-record struct when the target is a `record?`.
         llvm::StructType* baseStruct =
-            nullableRecordTarget
-                ? llvm::StructType::get(llvm_,
-                      {nullablePrimHasValTy(), st})
-                : st;
+            nullableRecordTarget ? carrier : st;
         // fix #3090 (§12.7 / §8.6, v0.252): `o.X` where `o: Object` is
         // §12.7-narrowed to this record reads the BOXED record, whose storage is
         // the box payload two words into the wrapper. Checked ahead of the
@@ -9726,12 +9834,15 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         llvm::Type* narrowedTy = nullptr;
         if (llvm::Value* np = narrowedBoxPayloadAddr(*ma.target, narrowedTy)) {
             base = np;
+            storageTy = narrowedTy;
         } else if (llvm::AllocaInst* slot = localSlot(*ma.target)) {
             // §27.5: a captured record local lives in its shared cell.
             llvm::Type* ety = nullptr;
             base = boxedStorage(slot, ety);
+            storageTy = ety;
         } else {
             base = lvalueAddr(*ma.target, baseTy);
+            storageTy = baseTy;
             if (!base) {
                 llvm::Value* obj = lowerThisAddrOr(*ma.target);
                 if (!obj) return nullptr;
@@ -9743,6 +9854,41 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                     base = tmp;
                 }
             }
+        }
+        if (!nullableRecordTarget && storageTy == carrier) {
+            // fix #7088 (§12.7 / §7.4, v0.340): a §12.7-TYPE-NARROWED carrier.
+            //
+            // §12.7 (v0.340) flow-narrows the carrier of a successful `is T`
+            // test to `T` inside the controlled block, and §7.4 (v0.340) places
+            // that narrowing there. The narrowing retypes the READ, not the
+            // STORAGE: `c`'s slot is still the tagged {i8, P} carrier, because
+            // the carrier's DECLARED type is `P?`. The sema type of the target
+            // is therefore the BARE record `P` — so `isNullableRecordTy` above
+            // answers NO and the payload GEP was skipped, leaving the member
+            // path to address the carrier's slot as if it held a bare record:
+            // the field GEP then lands on the carrier's OWN layout, so
+            // `c.Stock` read the `Sku` pointer's low half (measured: 2373392
+            // where 5 was expected) and `c.Sku` read the tag byte as a string
+            // pointer (malformed IR — "GEP base pointer is not a vector or a
+            // vector of pointers" — and a SIGSEGV in the generated program).
+            //
+            // §12.7 "a narrowing converts nothing": a narrowing retypes the
+            // carrier and converts no value, so the value still sitting in the
+            // slot is the TAGGED carrier and the member read must take its
+            // PAYLOAD. The same unwrap #7044 performs at the `with` site.
+            //
+            // The discriminator is the STORAGE, not the spelling: the address
+            // this access resolves to really holds a tagged carrier (its LLVM
+            // type is pointer-equal to `{i8, <this record>}`), so the payload
+            // is where the record's fields live. A plain non-nullable record
+            // source is NOT affected — its own layout is an IDENTIFIED struct
+            // (`%record.P`), and the carrier is a LITERAL one, so the pointer
+            // equality above can never hold for it (measured: a record whose
+            // layout coincidentally IS `{i8, T}` — `record Outer(Flag: byte,
+            // Value: Inner)` — keeps working unchanged). An UN-narrowed
+            // `record?` target keeps the §7.4 path above, untouched.
+            nullableRecordTarget = true;
+            baseStruct = carrier;
         }
         if (nullableRecordTarget) {
             // Step into the payload (tag-struct index 1) to reach the bare

@@ -9,7 +9,9 @@
 // not a seam gap, per the #3610 issue body ("the imported half of it would
 // otherwise be misfiled under the imported-symbol umbrella").
 //
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error
 module App3610X;
 import OpLib3610;
 

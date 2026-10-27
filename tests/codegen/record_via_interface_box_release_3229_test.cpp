@@ -75,13 +75,10 @@ using bezel::test::runAot;
 
 namespace {
 
-// ASan toolchain skip-guard.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // T1 — THE PIN. The issue's exact repro. LSan flags a 24-byte Direct leak
 // per run pre-fix; the fix routes the box through the scope-end
@@ -208,7 +205,6 @@ BEZEL_TEST(codegen_record_via_interface_box_release_3229,
     // because the dispatch path of a property getter is a call-bounded
     // borrow (the same reason the CallExpr arm admits `face.Method()`).
     JitResult r = runAotChecked(kRecordViaInterfaceBoxRelease);
-    if (wasSkipped(r)) return;
     // LSan-clean (the #3229 leak would flip this).
     BEZEL_EXPECT_TRUE(r.ran);
     // The program's observable value is 42 (the `Name` field of the
@@ -224,7 +220,6 @@ BEZEL_TEST(codegen_record_via_interface_box_release_3229,
 BEZEL_TEST(codegen_record_via_interface_box_release_3229,
            record_via_interface_box_release_loop_amplified_spec_28_3_28_9_8_6) {
     JitResult r = runAotChecked(kRecordViaInterfaceBoxReleaseLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -237,7 +232,6 @@ BEZEL_TEST(codegen_record_via_interface_box_release_3229,
 BEZEL_TEST(codegen_record_via_interface_box_release_3229,
            record_via_interface_nullcond_box_release_spec_28_3_28_9_8_6) {
     JitResult r = runAotChecked(kRecordViaInterfaceNullCond);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
@@ -254,6 +248,5 @@ BEZEL_TEST(codegen_record_via_interface_box_release_3229,
 BEZEL_TEST(codegen_record_via_interface_box_release_3229,
            record_via_interface_method_group_ref_stays_escaped_spec_27_6) {
     JitResult r = runAotChecked(kRecordViaInterfaceMethodGroupRef);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
 }

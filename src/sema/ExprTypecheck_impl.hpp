@@ -636,8 +636,48 @@ private:
     // §11.8: enumerate the `type`-kind constraint bounds declared for
     // `paramName` (method constraints first, then the enclosing type's),
     // invoking `fn` with each resolved bound TypeRef until it returns true.
+    //
+    // fix #7086 (§14.2, v0.340): `includeDeclarationless` widens the walk to
+    // the bounds that carry NO declaration — the eight builtin COLLECTION
+    // interface heads (stdlib §4.1, §4.2, §4.12, §4.13), which have no
+    // TypeSymbol and therefore no member table. The DEFAULT walk skips them
+    // because every one of its callers reads `ctr->declaration`; the widened
+    // walk is for the caller that asks a NAME question over the stdlib's
+    // documented collection surface instead (see `constraintCollectionView`).
     bool forEachConstraintBound(std::string_view paramName,
-                                const std::function<bool(TypeRef*)>& fn);
+                                const std::function<bool(TypeRef*)>& fn,
+                                bool includeDeclarationless = false);
+    // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the
+    // constraint-derived BUILTIN COLLECTION view of the bare type parameter
+    // `paramName` — the declaration-less TypeRef of the builtin collection
+    // interface head the parameter is constrained to (`IList<int>` for
+    // `where T: IList<int>`), when that head's DOCUMENTED surface declares
+    // `member`. Null when there is no such bound, or when the bound's head
+    // does not declare that name.
+    //
+    // The eight builtin collection heads carry NO declaration, so the
+    // ordinary constraint walk cannot see them and §14.2's "inside the
+    // generic body, T's surface includes IFoo's members" reaches them
+    // nowhere. This asks the same question over the DECLARATION-LESS bounds
+    // and over a USER interface's declaration-less ancestors (stdlib §4.1's
+    // `interface MyI: IList<int>`), and answers it with the stdlib's own
+    // documented surface.
+    TypeRef* constraintCollectionView(std::string_view paramName,
+                                      std::string_view member);
+
+    // fix #7086 (§14.2, §22.3, §22.5, §5.1, v0.340; stdlib §4.1, §4.2,
+    // §4.12, §4.13): type a call to a documented builtin-collection member
+    // reached through a type parameter's constraint AGAINST THE MEMBER'S
+    // REAL SIGNATURE — its arity, its argument types, and (on the owning
+    // heads) its `owned` parameter slot — or REFUSE it loudly.
+    //
+    // `view` is the constraint-derived head (the declaration-less TypeRef of
+    // `IList<int>` for `where T: IList<int>`), and `member` the name the
+    // head declares. Returns true when the call is admitted; false when a
+    // diagnostic has been reported (the caller then reports nothing more).
+    bool builtinCollectionConstraintCallChecked(const ast::CallExpr& ce,
+                                                TypeRef* view,
+                                                std::string_view member);
 
     // Slice S6: in-progress method static-ness, so visitExpr's
     // IdentifierExpr handling can diagnose `this`/`base` in static
@@ -1434,6 +1474,31 @@ private:
                                         std::string_view param, TypeRef* arg,
                                         std::string argName,
                                         SourceLocation loc);
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the owner key a
+    // CLASS-level generic parameter's site and use are keyed on.
+    //
+    // A LOCAL class keys both on its `ast::TypeDecl`. An IMPORTED class has
+    // no `ast::TypeDecl` at all (#3141: ModuleLoader never assigns
+    // `Symbol::decl` for a type across the boundary), so the `TypeSymbol` is
+    // the one key the site and the use can agree on across the boundary —
+    // and it is the key the loader publishes the imported class's §17.11
+    // obligation on.
+    const void* classParamOwner(const TypeSymbol* ts) const;
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): record the §17.11
+    // obligation an IMPORTED generic CLASS carries — its class-level type
+    // parameter's substitution must have a well-defined `default` value —
+    // so the end-of-pass join can judge an instantiation site of that class
+    // exactly as the same-module typechecker judges it.
+    void recordImportedClassDefaultObligation(const TypeSymbol* ts,
+                                               SourceLocation loc);
+    // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): record the §17.11
+    // obligation an IMPORTED generic METHOD carries, at the call site, for
+    // the case the importer's own replay does not reach — an imported method
+    // whose body could not be reconstructed has no `ast::MethodDecl`, so the
+    // replay (keyed on that decl) records neither the use nor the site.
+    // The owner is the imported MethodSymbol, the key the loader published
+    // the obligation on.
+    void recordImportedMethodDefaultObligation(const ast::CallExpr& ce);
     // fix #5210 residual (§12.7 v0.313, §3.6 rule 2): annotation-only
     // instantiation sites — `var g: G<int>` and `class D : G<int>` — are not
     // recorded by recordDefaultObligationsForConstruction (only `new` calls
@@ -4599,6 +4664,64 @@ private:
     // covers the INSTANCE-receiver path only) — its former sibling
     // `IsNullOrEmpty` was retired entirely (fix #3854, stdlib §9.6, v0.290).
     void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
+    // fix #7207 (stdlib §3.1, v0.343): the DECLARED SURFACE of the built-in
+    // `StringBuilder` — the ARITY and the ARGUMENT TYPES of a member call.
+    //
+    // `StringBuilder` has no user declaration, so its member surface is
+    // EXACTLY what stdlib §3.1 documents for it (the #2457 diagnostic says
+    // so, where it rejects a member that is not on that surface). But nothing
+    // checked a call against that surface: the built-in members have no
+    // MethodSymbol, so §22.5's argument-count check (`checkCallArity`) never
+    // ran for them and `resolveMemberAccess` typed the member by NAME alone.
+    // A call at an arity §3.1 declares no form for was therefore a SILENT
+    // NO-OP (the call did nothing and the program printed a plausible wrong
+    // value), and an argument of a type the declared parameter does not take
+    // reached codegen as MALFORMED IR.
+    //
+    // The check is a TABLE of §3.1's declared forms (the same shape as
+    // #7140's `string` arity table): a call that matches no declared form is
+    // a compile error (§22.5/§22.6 — "a call that matches no declared form
+    // is a compile error"), and an argument that does not convert to its
+    // declared parameter is a compile error (§5.1).
+    //
+    // A user-declared class named `StringBuilder` is NOT this surface: it
+    // has a declaration, and its own members are checked by the ordinary
+    // user-method machinery.
+    void checkBuiltinStringBuilderCall(const ast::CallExpr& ce);
+    // fix #7218 (stdlib §2.2, stdlib §2.3, §5.1, §22.6, v0.343): the
+    // ARGUMENT TYPES of a `Math` / `Convert` static member call.
+    //
+    // `Math` and `Convert` are compiler built-ins with no user declaration,
+    // so their members have no MethodSymbol: §22.5's per-argument
+    // assignability check (`checkCallArity` → `checkArgsAgainstParams`) never
+    // ran for them, and `resolveMemberAccess` typed the member by NAME alone.
+    // An argument of a type the declared parameter does not take therefore
+    // reached codegen unchecked — and reached it as MALFORMED IR (the
+    // compiler ABORTED inside the LLVM verifier, with no diagnostic and no
+    // source location) or, for a `bool` argument, as a SILENT WRONG ANSWER.
+    //
+    // §5.1 (v0.343) applies the implicit conversions at every position
+    // whose target type is DECLARED, and a built-in member's parameter type
+    // IS declared (stdlib §2.2 declares `Math.Pow(x: double, y: double):
+    // double`; stdlib §2.3 declares the `Convert` family). §22.6's stage 3
+    // (v0.343) is that applicability test — "Applicability over the
+    // (substituted) signatures: parameter types under the implicit
+    // conversions (§5.1)" — and §5.1's constant-narrowing paragraph
+    // (v0.343) puts a call argument among the positions the conversions
+    // apply at: "Constant narrowing applies at every position where this
+    // section's implicit conversions apply — there is no position carve-out:
+    // … call arguments (`Set(3)`) …". So the argument must be checked
+    // against the declared parameter type and a call that matches NO
+    // declared form is an error (§22.6).
+    //
+    // The check is the shape #7207 established for `StringBuilder`: a TABLE
+    // of the declared forms, a §5.1 test per argument, and a diagnostic
+    // naming the offending argument and the expected type.
+    //
+    // A user-declared class named `Math` or `Convert` is NOT this surface:
+    // it has a declaration, and its own members are checked by the ordinary
+    // user-method machinery.
+    void checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce);
     // fix #6782 (§7, §7.3, v0.340): the member and static twin of the check
     // above, for the built-in receivers and type names it does not claim. A
     // resolved `calleeSym` (user or imported method) is left to checkCallArity.
@@ -4729,6 +4852,42 @@ private:
     // ExprTypecheck_Exprs.cpp for why it cannot false-reject.
     void checkIndexArgNullability(const ast::IndexExpr& ix, const ast::Expr& e,
                                   TypeRef* recvTy);
+
+    // fix #7064 (§23.4 / §5.1 / stdlib §4.4, v0.343): the INDEX-ARGUMENT TYPE
+    // twin of the §7 nullability check above — the question
+    // `checkIndexArgNullability`'s own header declines to open ("a type
+    // MISMATCH between an index argument and a declared parameter is a
+    // different question this fix does not open").
+    //
+    // §23.4: "An indexer is a property whose name is replaced by
+    // `[parameters]`" — an index argument is therefore a PARAMETER PASS, and
+    // §5.1 governs the conversion at that pass exactly as it governs
+    // `Add(key: K, …)`. stdlib §4.4 declares `Array<T>`'s indexer as
+    // `public property [i: int]: T`, and every other int-indexed builtin
+    // (the list interfaces §4.1/§4.2, `OwningArray<T>` §4.5, the buffer and
+    // span families §4.14, the array-backed spans §4.15, `FrozenArray<T>`
+    // §4.19, `ReadOnlyStringSpan` §3.3) declares the same `int` parameter.
+    //
+    // Before this check the index argument's type was never consulted at the
+    // index position: a `double`, `string`, record or class index compiled and
+    // reached codegen, where it produced malformed IR ("SExt only operates on
+    // integer"), and a `long` or `bool` index compiled and ran. Called once
+    // per IndexExpr, right after `checkIndexArgNullability`, so both checks
+    // see the same receiver typing and the same resolved indexer symbol.
+    void checkIndexArgTypes(const ast::IndexExpr& ix, const ast::Expr& e,
+                             TypeRef* recvTy);
+
+    // fix #7064 (§23.4, v0.343): the DECLARED index-parameter type of a
+    // resolved indexer PropertySymbol — the k-th parameter's declared type,
+    // substituted against the receiver's concrete generic arguments (§14.1 /
+    // §14.2). Reads a LOCAL indexer through its `ast::PropertyDecl` and an
+    // IMPORTED one through the reconstructed `ParameterSymbol`s (#2414's dual
+    // read), exactly as `checkIndexArgNullability` did; factored out so the
+    // §7 nullability check and the §5.1 type check cannot disagree about
+    // what an indexer declares. Returns null when the parameter type is not
+    // knowable (no indexer, no such parameter, an unresolved declaration).
+    TypeRef* declaredIndexerParamType(PropertySymbol* ps, std::size_t k,
+                                      const ast::Expr* target);
 
     // fix #2758 (§23.5, v0.241): "Index arguments are **positional-only**. The
     // named-argument form (`Identifier :=`, §22.5) is not admitted at an index

@@ -1230,6 +1230,7 @@ private:
         unsigned methodThunk = 0;    // thunk$N
         unsigned objThunk = 0;       // objthunk$<member>$N
         unsigned primThunk = 0;      // primthunk$<recv>$<member>$N
+        unsigned listThunk = 0;      // listthunk$<member>$N (#7014)
         unsigned propThunk = 0;      // pthunk$N
         unsigned raiseAsyncShim = 0; // __bz_raiseasync_shim_N
         unsigned spawnLambda = 0;    // spawn.lam$N
@@ -3711,6 +3712,90 @@ private:
     // well-formed never-match (the template verifies but is never called), while
     // a genuinely-unsupported name still reaches the #1847 diagnostic.
     std::unordered_set<std::string_view> templateGenericParamNames_;
+
+    // fix #6870 (§14.2 / §11.8, v0.343): the ERASED
+    // TEMPLATE's representation of a type parameter the `int` (i32) placeholder
+    // cannot stand for.
+    //
+    // Every generic declaration is also emitted once as an unspecialized
+    // TEMPLATE, whose type parameters are erased to the `int` placeholder.
+    // §11.8 leaves the realization strategy open — "An implementation may
+    // realize this by per-instantiation specialization or by shared code
+    // carrying a per-instantiation dispatch table … so long as the observable
+    // binding is the conforming type's member" — so the erased template is an
+    // implementation choice, and its erasure is only correct when `int` is a
+    // LEGAL substitution for the parameter: the placeholder must be able to
+    // hold whatever the substitution holds.
+    //
+    // §14.2's constraint table decides that. `where T: class` admits reference
+    // types only; `where T: SomeClass` admits that class and its descendants.
+    // For both bounds `int` is NOT a legal substitution, so the template's `T`
+    // is a REFERENCE, and erasing it to the i32 placeholder is not a
+    // conservative stand-in: it is a REPRESENTATION the parameter can never
+    // hold.
+    //
+    // An INTERFACE bound (`where T: IFoo`) is deliberately NOT covered:
+    // §14.2 admits a RECORD for it as well as a class, and a record arrives
+    // BY VALUE where a class arrives as a pointer, so there is no single
+    // uniform erased representation and erasing the parameter as a pointer
+    // would be UNSOUND. That shape is the remaining part of #6870.
+    //
+    // A TYPE-PARAMETER bound (`where T: U`) is not covered either — §14.2
+    // gives it subtype semantics and it admits value types ("at `U := long`
+    // it admits `long` alone"). The discriminator for it is the SCOPE (is the
+    // bound's spelling a declared type parameter of the enclosing scope?), not
+    // the NAME: a user's type parameter named after a builtin shadows it
+    // (§2.3) and its bound resolves IDENTICALLY to the builtin class's.
+    //
+    // The erasure was observable: inside the template, a `T`-typed receiver is
+    // an i32, so the interface/vtable dispatch has nothing to dispatch on
+    // (issue #484's non-pointer-receiver guard) and the member call does not
+    // lower at all — the compile stopped on the internal "#1386" diagnostic.
+    // With the reference erasure the receiver is a `ptr` and the member call
+    // dispatches through the runtime itable (`bz_itable_lookup`), exactly as
+    // the per-instantiation specialization does.
+    //
+    // The scopes hold, for every type parameter in scope, whether its
+    // constraints make it a REFERENCE (true) or admit a value type (false).
+    // It is consulted ONLY where no active substitution binds the name — i.e.
+    // only in the erased template; every specialization resolves the name
+    // through `genericSubst_` first and is unaffected.
+    //
+    // The scopes form a STACK, not a flat set, because the erased
+    // representation of a type parameter has to be read in the scope where the
+    // name is WRITTEN, while a substitution may carry it into a scope where
+    // the name is not declared at all: the pseudo-specialization `Inner$Head`
+    // of `Inner<T>` built from inside `Outer<U>`'s erased template substitutes
+    // `T → U`, so `Inner`'s field `T?` is really `U?` and `U` is declared by
+    // `Outer` — one scope out. The innermost scope that DECLARES the name
+    // wins, so a nested generic that reuses a name with different constraints
+    // still reads its own constraint, and a name that no inner scope declares
+    // falls back to the scope that does.
+    std::vector<std::unordered_map<std::string_view, bool>> erasedRefScopes_;
+
+    // fix #6870: push a scope for `ms` (its own type parameters plus its
+    // declaring type's). Defined in LlvmBackend_Calls2.cpp.
+    void pushErasedRefScope(const sema::MethodSymbol* ms);
+
+    // fix #6870: the same, for a declaring type alone (its own type
+    // parameters) — used where a type's ERASED layout is computed.
+    void pushErasedRefScopeForType(const sema::TypeSymbol* ts);
+
+    // fix #6870: pop the innermost scope.
+    void popErasedRefScope() {
+        if (!erasedRefScopes_.empty()) erasedRefScopes_.pop_back();
+    }
+
+    // fix #6870: is `name` a type parameter that erases as a reference in the
+    // current erased template? The innermost scope that DECLARES the name
+    // decides; a name no scope declares is not a type parameter in scope.
+    bool typeParamErasedAsReference(std::string_view name) const {
+        for (auto it = erasedRefScopes_.rbegin(); it != erasedRefScopes_.rend(); ++it) {
+            auto f = it->find(name);
+            if (f != it->end()) return f->second;
+        }
+        return false;
+    }
 
     // #383 / §28.8.1: true while emitting a class's compiler-generated Dispose
     // (a destructor body). A `using var u := move this._f;` inside a destructor
@@ -11814,6 +11899,168 @@ private:
     // CG22: if `cond` (i1, true = error) holds, throw `name`; otherwise
     // continue. Splits the current block.
     void emitGuardThrow(llvm::Value* cond, const char* name);
+
+    // fix #7159 / #6979 idiom (§28.9 / §31.4, v0.343): a guard that RAISES
+    // must release the CALLER-OWNED +1 reference to the string producer it
+    // holds, ON THE THROW EDGE.
+    //
+    // §28.9 (v0.343): a fresh runtime-managed string hands its consumer a +1
+    // reference that the consumer must release EXACTLY ONCE. The consumer of a
+    // +1 producer RECEIVER in a member call is the CALLER, which releases it
+    // AFTER the call returns (src/codegen/LlvmBackend_Exprs.cpp's
+    // `tryLowerStringMethod` call site). A raise branches to the unwind block,
+    // so that post-call release is UNREACHABLE, and the producer's reference
+    // leaks; §31.4's built-in exceptions are trivial-dispose, so nothing else
+    // releases it either.
+    //
+    // `ownedReceiver` is the caller's +1 reference — null when the receiver is
+    // NOT a caller-owned producer (a named local, a literal, a sentinel), in
+    // which case this is exactly `emitGuardThrow`.
+    //
+    // ⚠ This is the SINGLE funnel for the throw edge: every raise inside
+    // `tryLowerStringMethod` must go through it, so a §9.6 member added later
+    // cannot forget the release (the #7120 lane's per-arm fix was the shape
+    // that let the other arms leak; this is the shape that cannot).
+    //
+    // fix #7169 (§9.6, v0.343): `ownedProducers` is the LIST of the
+    // caller-owned +1 string producers the CALL holds: the receiver's
+    // producer for a member call, a `string` argument's producer for a static
+    // call, and one entry for each when a call holds both. Every non-null
+    // entry is released on the throw edge; an empty list is exactly
+    // `emitGuardThrow`. The list is what lets ONE guard shape serve the
+    // member arms (receiver) and the static arms (argument) alike.
+    void emitGuardThrowReleasingString(llvm::Value* cond, const char* name,
+                                       llvm::ArrayRef<llvm::Value*> ownedProducers);
+
+    // fix #6639 (§5.1, v0.343): widen an `int`-typed PARAMETER to i64 the way
+    // its SOURCE type's signedness requires, instead of always sign-extending.
+    //
+    // §5.1 (v0.343): "a value converts implicitly … when no programmer-visible
+    // information is lost", and "widening from unsigned to a strictly larger
+    // signed type (e.g. `byte → short`, `ushort → int`) is permitted because
+    // no value is lost". So a `byte` 200 is the `int` 200 — the widening is
+    // LOSSLESS and must preserve the value. A bare `CreateSExt` read the
+    // unsigned source's high bit as a sign bit, so a `byte` startIndex of 200
+    // arrived as -56: the char-needle arm then raised IndexOutOfRangeException
+    // and the string-needle arm silently searched from 0.
+    //
+    // The signedness is the SOURCE's, read from the sema type of the argument
+    // expression (`typeRefIsUnsigned` → `isUnsignedPrim`, the same predicate
+    // the §18.5 format path uses for a `byte` operand). An UNSIGNED source
+    // zero-extends; a SIGNED one sign-extends. A nullable source (`int?`,
+    // narrowed per §7.4) keeps the payload's signedness — the payload of an
+    // `int?` is an `int`.
+    //
+    // ⚠ The value must be widened BY ITS OWN SIGNEDNESS, not by the width of
+    // the parameter. Widening to the parameter's declared `int` width first
+    // would sign-extend a `byte` 200 to the int -56 before the zero-extension
+    // could see it.
+    //
+    // fix #7169 (§9.6, v0.343): this helper is EMITTER-SCOPE (it used to be a
+    // local lambda inside `tryLowerStringMethod`), because stdlib §9.6's
+    // range contracts are enforced in TWO files — the instance arms lower in
+    // `LlvmBackend_String.cpp`, the static `Repeat(c: char, count: int)` arm
+    // lowers in `LlvmBackend_Calls2.cpp` — and a file-local helper is not
+    // reachable from the second file. The static arm used to re-implement the
+    // rule inline, and the pair drifted (#7104 fixed the instance arm, #7117
+    // filed the static arm's, #7120 had to repair the static widening AGAIN
+    // to make its own new guard correct). One definition, one rule.
+    llvm::Value* widenIntParam(const ast::Expr* arg, llvm::Value* v,
+                                const char* signedName, const char* unsignedName) {
+        if (!v) return v;
+        if (v->getType()->isIntegerTy(64)) return v;
+        return typeRefIsUnsigned(ctx_.exprType(*arg))
+            ? builder_.CreateZExt(v, i64(), unsignedName)
+            : builder_.CreateSExt(v, i64(), signedName);
+    }
+
+    // fix #7106 (§5.1, v0.343): fit an `int`-typed PARAMETER that must land in
+    // an i32 SLOT (the span struct's Start/Length are i32 fields) to that slot
+    // BY THE SOURCE'S SIGNEDNESS.
+    //
+    // ⚠ This is NOT `widenIntParam`: that helper widens to i64 — the width the
+    // runtime helpers take — while the span's Start/Length are i32. Copying the
+    // #7102 fix here would emit an i64 into an i32 struct field.
+    //
+    // The pre-existing code did `CreateTrunc(v, i32())` for every value that
+    // was not already i32. A `trunc` to a WIDER type is malformed IR, so a
+    // `byte` start (i8) aborted the compiler:
+    //
+    //     DestTy too big for Trunc
+    //       %4 = trunc i8 %3 to i32
+    //     bezelc: codegen error: IR verification failed (malformed IR emitted)
+    //
+    // ⇒ an ICE on a program §5.1 admits.
+    //
+    // §5.1 (v0.343): a `byte` above the signed midpoint is the `int` 200, not
+    // -56 ("A value of one type implicitly converts to another when no
+    // programmer-visible information is lost"; the table row
+    // `| byte | short, ushort, int, uint, long, ulong, float, double, decimal |`).
+    // ⇒ an UNSIGNED source (`byte`, `ushort`, `uint`, `ulong`, `char`) ZERO-
+    // extends; a SIGNED one (`sbyte`, `short`, `int`) SIGN-extends. A value
+    // already i32 is used as is. A WIDER one (i64) keeps the pre-existing
+    // trunc — `long → int` is never implicit (§5.1's never-implicit list), so
+    // that arm is unreachable for a well-typed program and is kept only so the
+    // helper never hands a non-i32 value to an i32 slot.
+    //
+    // fix #7169 (§9.6, v0.343): emitter-scope, for the same reason as
+    // `widenIntParam` above — the §5.1 widening rules are ONE set.
+    llvm::Value* fitToI32(const ast::Expr* arg, llvm::Value* v) {
+        if (!v || !v->getType()->isIntegerTy()) return v;
+        unsigned w = v->getType()->getIntegerBitWidth();
+        if (w == 32) return v;
+        if (w < 32) {
+            return typeRefIsUnsigned(ctx_.exprType(*arg))
+                ? builder_.CreateZExt(v, i32(), "fit32.z")
+                : builder_.CreateSExt(v, i32(), "fit32.s");
+        }
+        return builder_.CreateTrunc(v, i32(), "fit32.t");
+    }
+
+    // fix #7169 (§9.6, §5.1, §28.9, §31.4, v0.343): the ONE place stdlib
+    // §9.6's "a negative count/width raises ArgumentOutOfRangeException"
+    // contract is enforced — the `Pad*` width and the `Repeat` count.
+    //
+    // stdlib §9.6 (v0.343) declares the count contract on the static
+    // `Repeat(c: char, count: int)` — "count < 0 raises
+    // ArgumentOutOfRangeException; count = 0 is \"\"" — and, by "same count
+    // contract", on `Repeat(unit: string, count: int)`; and the Pad contract
+    // on all three Pad members — "totalWidth <= Length returns the original
+    // string unchanged; totalWidth < 0 raises ArgumentOutOfRangeException".
+    //
+    // ⚠ The WIDENING is a PREREQUISITE of the guard, not an extra: the guard
+    // must test the count's §5.1 value, and §5.1 admits `byte → int` as a
+    // LOSSLESS conversion — an unsigned source must therefore ZERO-extend (a
+    // `byte` 200 is the int 200, never -56). The count is widened ONCE, and
+    // the SAME value is tested by the guard and used as the length/width.
+    //
+    // `ownedOnThrow` is the LIST of the caller-owned +1 string producers the
+    // call holds — the receiver's producer for a member call, the `string`
+    // argument's producer for a static call — and they are RELEASED on the
+    // throw edge (§28.9: the exception unwinds past the caller's post-call
+    // release; §31.4: the built-in exceptions are trivial-dispose, so nothing
+    // else releases it). This is the #7159 shape, and it is a PARAMETER of
+    // the contract function rather than a step each arm remembers: the
+    // future `Repeat(unit: string, count: int)` overload (#7129/#7131) passes
+    // the `unit` argument's producer here, so its guard releases it by
+    // construction instead of by remembering.
+    //
+    // Returns the widened count, so the caller uses the SAME value the guard
+    // tested.
+    llvm::Value* emitSection96CountContract(
+            const ast::Expr* countArg, llvm::Value* countRaw,
+            llvm::ArrayRef<llvm::Value*> ownedOnThrow,
+            const char* signedName, const char* unsignedName,
+            const char* compareName) {
+        llvm::Value* count64 = widenIntParam(countArg, countRaw, signedName,
+                                             unsignedName);
+        llvm::Value* neg = builder_.CreateICmpSLT(count64,
+                                                  builder_.getInt64(0),
+                                                  compareName);
+        emitGuardThrowReleasingString(neg, "ArgumentOutOfRangeException",
+                                      ownedOnThrow);
+        return count64;
+    }
 
     // §6.5 / §31.4 (v0.242, #3045): guard a shift's COUNT against its domain
     // `0 .. bitwidth(l)−1` — the width of the LEFT (shifted) operand, since
@@ -20134,9 +20381,17 @@ private:
     // construction lowering retains each of them for an eligible local, so the
     // slot owns +1 on every active-case string either way.
     bool valueLikeChoiceLocalIsCopy(const ast::Node* ldNode) const;
+    // fix #7305 / §28.10 (v0.344): `allowUsingVar` admits the `using var`
+    // SPELLING of a value-like choice local — §28.10 says of it that "the only
+    // effect is the reassignability restriction", so the `using var` spelling
+    // must have the SAME runtime lifetime as the plain-`var` spelling. False
+    // (the default) keeps the pre-#7305 answer: "not a candidate". The
+    // `await using var` spelling is refused EITHER WAY — the async disposal
+    // machinery owns that spelling (#7306).
     const sema::TypeRef* valueLikeChoiceLocalMintsStringPayload(
         const ast::Node* ldNode,
-        std::vector<const ast::Expr*>* retainedArgs = nullptr) const;
+        std::vector<const ast::Expr*>* retainedArgs = nullptr,
+        bool allowUsingVar = false) const;
     // fix #2115: register (if eligible) the scope-end managed-payload release of
     // a value-like choice local. Called from lowerLocalDecl after the slot store;
     // gated on valueLikeChoiceStrReleaseEligible_ (the escape walk's verdict) so
@@ -22427,6 +22682,123 @@ private:
     // also catches sites that bypassed CG60 by accident).
     bool isObjectMemberMethodRef(const ast::Expr* e) const;
 
+    // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): recognize the bare
+    // method-group REFERENCE shape over a CLASS's own compiler-generated
+    // `Dispose` — `var f := d.Dispose;` where `d: D` and `D` is a class.
+    //
+    // §8.7: "The compiler generates `IDisposable` on every non-static class."
+    // The generated `Dispose` has NO MethodDecl and NO MethodSymbol (§28.2:
+    // the name is the compiler's — "Declaring a member named `Dispose` on a
+    // class or a record is a compile error"), so sema leaves the member
+    // access expression symbol-less and codegen's §27.6 method-reference
+    // path (CG60, LlvmBackend_Exprs.cpp) fell through to `ret nullptr`: the
+    // local degraded to a zero-initialized value (the #2434 warning) and the
+    // CALL was a silent no-op — or, with a `() -> ()` annotation, a SIGSEGV.
+    //
+    // The producer guards are: a MemberAccessExpr naming `Dispose` whose
+    // `exprSymbol` is null (the generated member binds no symbol) and whose
+    // RECEIVER's type is a user CLASS (§8.7 gives `IDisposable` to every
+    // non-static class; a record / enum / choice / primitive does not
+    // implement it, and an INTERFACE receiver is a different shape — its
+    // runtime value may be a builtin collection with no vtable at all).
+    // Shared by the CG60 value-lowering gate and isPlusOneClosureProducer
+    // (so a bound local releases the cell at scope end) — one predicate keeps
+    // the producer and the consumer recognizing exactly the same set.
+    bool isClassDisposeMethodRef(const ast::Expr* e) const;
+
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): record that a method-group
+    // REFERENCE over `recvExpr`'s value has been formed — §27.6: "the instance
+    // is captured at formation — by reference for class- or interface-typed
+    // receivers". The capture is a BORROW of the receiver's block (§28.3: the
+    // closure cell does not own it), so the block must stay LIVE across the
+    // receiver's LOGICAL disposal — §28.2: "An explicit `Dispose()` or direct
+    // `DisposeAsync()` performs **logical disposal only** … and does not
+    // reclaim its receiver: the receiver's block stays live until the holder's
+    // release point".
+    //
+    // The fact is stamped on the receiver's symbol
+    // (`borrowedByMethodGroup`, on the BASE `sema::Symbol`) because it must
+    // survive from the group's FORMATION to the explicit-`Dispose()` CALL
+    // SITE, which is a different statement (the #2781 arm's `declType` patch
+    // is the same pattern: codegen writing a fact sema could not). The BASE
+    // symbol, not `LocalSymbol`: an `owned` PARAMETER receiver is a SIBLING
+    // of `LocalSymbol`, not a subclass, so a `dynamic_cast<sema::LocalSymbol*>`
+    // never saw it. A receiver that is not a binding at all (`this`, a field,
+    // a temporary) carries no symbol and is not recorded.
+    void noteMethodGroupBorrow(const ast::Expr* recvExpr);
+
+    // fix #7025 (follow-up, §28.2, v0.343): true when a method group borrows
+    // the block `recvExpr` denotes — the explicit `Dispose()` call path must
+    // then perform the LOGICAL disposal only and leave the reclaim to the
+    // holder's release point (§28.2). It tracks "a group over this binding
+    // was formed in this method body", NOT "a live borrow exists here" — see
+    // the definition's own comment.
+    bool receiverIsGroupBorrowed(const ast::Expr& recvExpr) const;
+
+    // fix #7025 (follow-up, §28.2, v0.343): the `disposeStack_` INDEX of the
+    // scope that OWNS the receiver's BINDING — the scope whose end is the
+    // receiver's holder's release point (§28.2: "the receiver's block stays
+    // live until the holder's release point").
+    //
+    // ⚠ IT IS NOT THE CALL SITE'S SCOPE. The rejected fix-forward registered
+    // the deferred reclaim on `disposeStack_.back()` — the innermost scope
+    // open at the DISPOSAL CALL SITE — and claimed that scope "is the
+    // receiver's holder scope whenever the disposal happens in the receiver's
+    // own scope (the ordinary shape)". That claim is FALSE for every shape
+    // where the explicit `Dispose()` sits in a NESTED scope of the receiver's
+    // binding (`do … end` block, `if` branch, …): the nested scope ends
+    // first, so the receiver's block was FREED while the holder was still
+    // live and the method group still pointed at it — measured on the
+    // rejected tip: ASan "heap-use-after-free … READ of size 8" in
+    // `disposethunk$Dispose` for `do d.Dispose(); end; f();`.
+    //
+    // A LOCAL's binding scope is the scope its declaration was lowered in, and
+    // that scope's depth is what `declScopeDisposeIndex` turns into an index
+    // (#4526's ONE sanctioned way to index `disposeStack_` with a recorded
+    // declaration depth). A PARAMETER is bound in the body's OUTERMEST scope
+    // by construction (#3403 — the scope the `owned` parameter's own
+    // auto-drop is registered in).
+    //
+    // THE CONTRACT OF THE FALSE BRANCH IS THE CONSERVATIVE ONE: REGISTER
+    // NOTHING (a bounded leak). `declScopeDisposeIndex`'s own documentation
+    // says so ("Every caller's false branch must be the conservative one
+    // (register nothing), which costs a bounded leak; the alternative reading
+    // is a use-after-free"). A receiver whose binding scope cannot be
+    // established is therefore NEVER registered on the call site's scope.
+    bool receiverBindingScopeIndex(const ast::Expr& recvExpr,
+                                   std::size_t& idxOut) const;
+
+    // fix #7025 (follow-up, §28.2, v0.343): register the holder's release
+    // point for a receiver whose explicit `Dispose()` performed the logical
+    // disposal only. The block is freed by a scope-end disposal registered on
+    // the RECEIVER'S OWN SLOT and on the scope that owns the receiver's
+    // BINDING (`scopeIdx`, from `receiverBindingScopeIndex` — NOT the call
+    // site's scope). Registering it on the receiver's own slot is what makes
+    // the OTHER reclaim paths for that block (`using var` scope end, the
+    // unwind-only path) mutually exclusive: they reload the same slot, and
+    // the scope-end null-guard lets exactly one of them reclaim the block.
+    void registerDeferredReclaim(llvm::AllocaInst* recvSlot,
+                                 std::size_t scopeIdx);
+
+    // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): back the bare reference to a
+    // class's own compiler-generated `Dispose` with a thunk closure — the
+    // shape `isClassDisposeMethodRef` recognizes.
+    //
+    // The thunk is `void (ptr env)`: it loads the captured receiver from the
+    // env and performs the receiver's LOGICAL DISPOSAL — §28.2: "An explicit
+    // `Dispose()` or direct `DisposeAsync()` performs logical disposal only
+    // — it sets the flag and runs the class's cleanup — and does not reclaim
+    // its receiver: the receiver's block stays live until the holder's
+    // release point." The vtable dispatch (slot 2) is exactly that operation
+    // (`emitDynamicDispose`); the holder's own release point performs the
+    // free, so the two agree on ONE disposal (§28.2's idempotent flag makes
+    // a second invocation a no-op).
+    //
+    // `ma` is the MemberAccessExpr node. Returns a fresh +1 closure cell —
+    // the cell holds a BORROW of the receiver (§27.6: the instance is
+    // captured at formation; §28.3: the cell does not own it).
+    llvm::Value* makeClassDisposeThunk(const ast::MemberAccessExpr& ma);
+
     // #1170: build a fresh closure cell { thunk, env, rc, envdtor, kind }
     // wrapping a (possibly cached) method thunk and the current receiver. Shared
     // by the cache-hit and cache-miss paths of makeMethodThunk. `kind` tags the
@@ -24211,6 +24583,94 @@ private:
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
+
+    // fix #7014 (stdlib §4.1 / §4.2, spec §27.6, v0.340): the bare
+    // method-group REFERENCE to a member a BUILTIN COLLECTION INTERFACE head
+    // declares (`co.Contains`, `ol.Insert`, …) must resolve exactly as the
+    // CALL form does (§27.6: "the member resolved on the value exactly as the
+    // call `v.Scaled()` is"). The call form of these members is rejected by the
+    // #853 fence in tryLowerCollectionInstanceCall (the interface erases the
+    // concrete backing, so no single bz_* call is sound); the reference form
+    // was ACCEPTED, degraded to a zero value (the #2434 warning) and SEGVed
+    // when the method group was called.
+    //
+    // `lowerBuiltinCollMemberRef` lowers a synthetic call through that SAME
+    // path, so the fence fires with the identical diagnostic and location —
+    // the reference form agrees with the call form and with the property form
+    // (which the matching fence in the MemberAccessExpr property arm already
+    // rejects). The array-backed BORROWING LIST interfaces (IReadOnlyList<T> /
+    // IList<T>) are NOT fenced — their call form lowers through the
+    // bz_array_* bridge — so their method-reference form must be EMITTED, not
+    // rejected; that needs a closure cell whose scope-end release is armed by
+    // the +1-producer scan in LlvmBackend_Setup.cpp, which is outside this
+    // lane's files (deferred, #7014).
+    //
+    // `isBuiltinCollMemberMethodRef` recognizes the shape the arm handles: a
+    // MemberAccessExpr over a collection-interface receiver with NO
+    // MethodSymbol (an interface head has no method declaration to bind).
+    bool isBuiltinCollMemberMethodRef(const ast::Expr* e) const;
+    llvm::Value* lowerBuiltinCollMemberRef(const ast::MemberAccessExpr& ma);
+
+    // fix #7014: owns the synthetic call trees built for the fenced
+    // method-reference forms, so the exprType entry set on their receiver
+    // placeholder never outlives its key (the same discipline
+    // primIntrinsicSynthCalls_ / nullCondCountSynth_ follow).
+    std::vector<std::unique_ptr<ast::CallExpr>> builtinCollMemberSynthCalls_;
+
+    // fix #7014 (stdlib §4.1, spec §27.6, v0.340): the method-group
+    // REFERENCE to a member of the array-backed BORROWING LIST interface
+    // `IList<T>` (`il.Contains`, `il.Add`, `il.Insert`, …).
+    //
+    // `IList<T>` is the ONE builtin collection interface whose members' CALL
+    // form LOWERS: the interface erases nothing that matters, because the only
+    // builtin implementing it is the array-backed `Array<T>` (stdlib §4.1 /
+    // §4.4), so `il.Contains(x)` lowers through the identical bz_array_*
+    // bridge the concrete `Array<T>` uses (the #853 bridge in
+    // tryLowerCollectionInstanceCall). The POLYMORPHIC interfaces
+    // (ICollection<T> / IOwningCollection<T> / IOwningList<T>) have no such
+    // bridge — their call form is fenced (#853) — and the reference form over
+    // them is rejected to match (isBuiltinCollMemberMethodRef).
+    //
+    // So §27.6 ("the member resolved on the value exactly as the call
+    // `v.Scaled()` is") requires the reference form here to behave EXACTLY as
+    // the call form does — which means EMITTING it, not rejecting it. It has
+    // NO MethodSymbol (an interface head has no method DECLARATION to bind),
+    // so the CG60 path fell through to `ret nullptr` and the local degraded to
+    // a zero value — the call was a SIGSEGV (measured: rc 139).
+    //
+    // `makeBuiltinListMemberThunk` mints the closure cell: a `ret (ptr env,
+    // params…)` thunk over the captured receiver whose body lowers a synthetic
+    // call through the SAME path the direct call uses.
+    bool isBuiltinListMemberMethodRef(const ast::Expr* e) const;
+    // The member's own signature read as a function type (§27.6: "the
+    // callee's own signature read as a function type — the receiver slot
+    // removed for a bound reference"), per stdlib §4.1's `IList<T>`.
+    sema::TypeRef* builtinListMemberFnType(const ast::MemberAccessExpr& ma);
+    llvm::Value* makeBuiltinListMemberThunk(const ast::MemberAccessExpr& ma,
+                                            sema::TypeRef* fnTy);
+
+    // The LOCAL a method-reference initializer binds to (the local whose
+    // initializer IS this expression), or null. §27.6's reference over a
+    // member with no MethodSymbol leaves sema unable to type the binding, so
+    // codegen restores the local's function type itself (the #2781
+    // Object-member arm's discipline).
+    sema::LocalSymbol* bindingLocalSymbol(const ast::Expr* init) const;
+
+    // fix #7014: owns the synthetic call trees built for the emitted
+    // borrowing-list method-reference forms, so the exprType entries set on
+    // their receiver placeholder and their arguments never outlive their keys
+    // (the same discipline primIntrinsicSynthCalls_ / builtinCollMemberSynthCalls_
+    // follow).
+    std::vector<std::unique_ptr<ast::CallExpr>> builtinListMemberSynthCalls_;
+
+    // fix #7014: the emitted thunks for the borrowing-list member references,
+    // keyed by (member, element type). §27.7.1 requires repeated evaluations
+    // of `il.Contains` over the SAME receiver to compare EQUAL, and the
+    // runtime's FVK_FN_PLUS_RECV rule compares the THUNK POINTERS (and then
+    // the receiver words) — so the thunk must be SHARED across evaluations
+    // (the cell + env are still fresh per evaluation, exactly as
+    // makeMethodThunk's cached thunks are).
+    std::map<std::string, llvm::Function*> builtinListMemberThunks_;
 
     // fix #2513 / spec §35.2 (v0.236): the stdlib §2.20 `Result<T, E>` carries
     // four compiler-provided per-instantiation combinators (Map / MapError /

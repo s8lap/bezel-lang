@@ -148,7 +148,7 @@ BEZEL_TEST(dict_first_last_elementat_3716, sorted_dictionary_class_value_first_4
 }
 
 // ---------------------------------------------------------------------------
-// stdlib §5 line 3594 — throwing contracts, over the sorted family
+// stdlib §5 — throwing contracts, over the sorted family
 // ---------------------------------------------------------------------------
 
 BEZEL_TEST(dict_first_last_elementat_3716, sorted_dictionary_first_empty_throws_5) {

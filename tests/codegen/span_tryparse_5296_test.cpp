@@ -1,7 +1,7 @@
 // Spec-derived regression tests for #5296 — the `Parse` / `TryParse` SPAN
 // overloads of stdlib §9.1 / §9.2 / §9.3 (v0.313, #1810).
 //
-// Authority — stdlib §9.1 (docs/Bezel_Standard_Library.md:5130):
+// Authority — stdlib §9.1 (the `span overloads (#1810)` paragraph):
 //
 //   "The span overloads (#1810) accept exactly the inputs the string forms
 //    accept — same FormatException/OverflowException contract, no whitespace
@@ -9,8 +9,8 @@
 //    substring; TryParse is shape (c) of the §1 Try convention."
 //
 //   public static method TryParse(s: ReadOnlyStringSpan, out result: int): bool;
-//   (§9.2 declares the `double` / `float` span forms at :5155-5156 / :5194-5195,
-//   §9.3 the `decimal` one at :5226-5227.)
+//   (§9.2 declares the `double` / `float` span forms and §9.3 the `decimal` one,
+//   each as `Parse(s: ReadOnlyStringSpan)` + its own `TryParse` overload.)
 //
 // Pre-fix, every one of these arms dispatched on the member name and arity
 // alone and then ran the operand through `loadStringData` — a
@@ -415,9 +415,9 @@ BEZEL_TEST(span_tryparse_5296, leak_out_discarded_path) {
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("100\n"));
 }
 
-// (d) Every one of the five declared span forms (stdlib §9.1:5130, §9.2:5155
-// (double) / :5194 (float), §9.3:5226 (decimal)), 100 iterations apiece, in
-// one program.
+// (d) Every one of the five span forms (stdlib §9.1 — `int`, and `long` by
+// §9.1's `the others have analogous shapes` rule; §9.2 — `double` / `float`;
+// §9.3 — `decimal`), 100 iterations apiece, in one program.
 BEZEL_TEST(span_tryparse_5296, leak_all_five_span_forms) {
     auto r = bezel::test::runAotChecked(
         "module M; class C public static method Main(): int "

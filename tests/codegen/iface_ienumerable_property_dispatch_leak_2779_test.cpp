@@ -156,13 +156,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Shared ISeq interface + Holder implementer for the IEnumerable<int> tests
 // — mirrors the issue's repro shape (`s: ISeq` interface-typed receiver,
@@ -366,7 +363,6 @@ BEZEL_TEST(codegen_iface_ienumerable_property_dispatch_leak_2779,
     std::string src = std::string("module M; ") + kISeqIEnumerableInt +
                       kBoundPlainVar;
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 25);
 }
@@ -382,7 +378,6 @@ BEZEL_TEST(codegen_iface_ienumerable_property_dispatch_leak_2779,
     std::string src = std::string("module M; ") + kISeqIEnumerableInt +
                       kDirectForIn;
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 25);
 }
@@ -399,7 +394,6 @@ BEZEL_TEST(codegen_iface_ienumerable_property_dispatch_leak_2779,
     std::string src = std::string("module M; ") + kISeqIEnumerableInt +
                       kUsingVarInterfaceGetter;
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 25);
 }
@@ -417,7 +411,6 @@ BEZEL_TEST(codegen_iface_ienumerable_property_dispatch_leak_2779,
 BEZEL_TEST(codegen_iface_ienumerable_property_dispatch_leak_2779,
            class_typed_interface_property_borrow_pin_still_pins_spec_28_10) {
     JitResult r = runAotChecked(kWidgetBorrowPinStillPins);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // Widget.live == 0 after Run()
 }
@@ -436,7 +429,6 @@ BEZEL_TEST(codegen_iface_ienumerable_property_dispatch_leak_2779,
 BEZEL_TEST(codegen_iface_ienumerable_property_dispatch_leak_2779,
            concrete_receiver_bound_var_remains_clean_per_2769_control) {
     JitResult r = runAotChecked(kConcreteReceiverControl);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 25);
 }

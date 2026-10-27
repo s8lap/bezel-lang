@@ -754,6 +754,38 @@ class TestNamesIndexGaps(unittest.TestCase):
                 "end Box;\n")
         self.assertEqual(self.types(body), (["TWidget"], []))
 
+    def test_a_nested_generic_method_call_is_not_an_invented_type(self):
+        # `F<Array<int>>(a)` is a generic METHOD call whose type argument is
+        # itself generic. The old spelling test stopped at the first `>`, so it
+        # could not see the `(` that makes the shape a call, and it reported the
+        # method's OWN name as an invented type — case s14_1_0010.
+        body = ("module Conf;\n\n"
+                "public class Program\n"
+                "  public static method Main()\n"
+                "    var a: Array<int> := [1];\n"
+                "    var v: int := F<Array<int>>(a);\n"
+                "  end Main;\n\n"
+                "  public static method F<T>(x: T): int\n"
+                "    return 1;\n"
+                "  end F;\n"
+                "end Program;\n")
+        self.assertEqual(self.types(body), ([], []))
+
+    def test_the_nested_call_spelling_does_not_silence_a_real_finding(self):
+        # The anchor for the fix above: an invented type in a plain type
+        # position is still reported, and a generic type CONSTRUCTED with
+        # `new` is still reported (the `new` spelling is a type use, not a
+        # call), so the nested-call spelling cannot become a blanket
+        # suppression of PascalCase type names.
+        body = ("module Conf;\n\n"
+                "public class Program\n"
+                "  public static method Main()\n"
+                "    var x: TWidget;\n"
+                "    var y: TWidget<int> := new TWidget<int>();\n"
+                "  end Main;\n"
+                "end Program;\n")
+        self.assertEqual(self.types(body), (["TWidget"], []))
+
     def types(self, body):
         import names
         return names.check_source(body, names.build_index(

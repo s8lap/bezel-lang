@@ -4,8 +4,8 @@
 //! title: a static readonly field assigned in an instance constructor is rejected
 //! rule: a `static readonly` field is assignable only in its own static field
 //!   initializer or in the declaring type's **static** constructor body,
-//!   spelled as the bare name or `TypeName.F` — an instance constructor of
-//!   the declaring type is not an assignment site for it, so no `new C()`
+//!   spelled as the bare name or `TypeName.F` ... and an instance constructor
+//!   of the declaring type is not an assignment site for it, so no `new C()`
 //!   writes `C._s`.
 //! cites: 22.8, 7.4, 22.13
 //! expect: reject

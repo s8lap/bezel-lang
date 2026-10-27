@@ -7,6 +7,10 @@
 // `var b := move a;` in the same position (`other` below) -- both must
 // behave identically, which is what "the same K3.4 consume" requires.
 //
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: error
 // CHECK-DAG: warning: owned value in `a` is implicitly disposed
 // CHECK-DAG: warning: owned value in `other` is implicitly disposed
 // CHECK-NOT: error

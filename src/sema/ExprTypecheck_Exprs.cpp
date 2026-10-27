@@ -3,6 +3,7 @@
 #include "common/BuiltinRegistry.hpp"
 #include "common/OwnershipFacts.hpp"  // §35.7 (#2045): classifyChoiceType
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
+#include "sema/GenericParams.hpp"  // genericParamCount / genericParamNameAt — #3143
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
@@ -514,6 +515,32 @@ static const char* typeTest5146OperandKindLabel(const TypeRef* d) {
 // identifier `Message`" where the identical hierarchy declared in ONE module
 // resolved it.)
 
+// fix #7177 (§23.4 / §23.5, v0.344): does `t` — or a type it INHERITS an
+// indexer from — declare an indexer at all?  The question the §23.4
+// indexer gate asks of a VALUE receiver ("does this type declare an
+// indexer?"), reduced to the yes/no the type-name receiver gate asks.
+//
+// The walk mirrors the one the §23.4 indexer typing block does over the
+// receiver type and its base chain: a `PropertySymbol` with `isIndexer`
+// set.  A BUILT-IN class symbol (`isUserDeclaredTypeSym` false) carries no
+// member table at all, so the walk finds nothing for it — which is why the
+// caller asks the built-in question separately.
+bool typeDeclaresIndexer(const TypeSymbol* t) {
+    if (!t) return false;
+    std::vector<const TypeSymbol*> frontier{t};
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        const TypeSymbol* cur = frontier[i];
+        if (!cur) continue;
+        for (const Symbol* m : cur->members) {
+            const auto* ps = dynamic_cast<const PropertySymbol*>(m);
+            if (ps && ps->isIndexer) return true;
+        }
+        for (const TypeSymbol* b : cur->baseTypes)
+            if (b) frontier.push_back(b);
+    }
+    return false;
+}
+
 // §14.1 (#2006): REMOVED by fix #4229 — replaced by
 // `ExprTC::typeTestTargetMentionsTypeVariable`, a member that threads
 // `currentScopeGenericParamNames()` through `refOutParamTypeMentionsTypeParam`
@@ -932,18 +959,10 @@ void ExprTC::checkIndexArgNullability(const ast::IndexExpr& ix,
     }
     auto declaredIndexParam = [&](std::size_t k) -> TypeRef* {
         if (dictKey) return k == 0 ? dictKey : nullptr;
-        if (!ps) return nullptr;
-        TypeRef* p = nullptr;
-        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-            if (k < pd->indexerParams.size() && pd->indexerParams[k].type)
-                p = ctx_.resolvedType(*pd->indexerParams[k].type);
-        } else if (k < ps->indexerParams.size()) {
-            if (auto* prm =
-                    dynamic_cast<ParameterSymbol*>(ps->indexerParams[k]))
-                p = prm->resolvedDeclType;
-        }
-        if (!p) return nullptr;
-        return substituteMemberType(p, ix.target.get(), ps->parent);
+        // fix #7064 (v0.343): the DECLARED-parameter read is now shared with
+        // the §5.1 index-argument TYPE check (`checkIndexArgTypes`), so the
+        // two cannot disagree about what an indexer declares.
+        return declaredIndexerParamType(ps, k, ix.target.get());
     };
 
     // fix #4084 (§28.3 / §23.4 / §14.1, v0.294): cache the substituted
@@ -1011,6 +1030,398 @@ void ExprTC::checkIndexArgNullability(const ast::IndexExpr& ix,
         nonNull->nullable = false;
         checkAssignable(idxTy, nonNull, arg.value->span.begin, subject(k),
                         arg.value.get());
+    }
+}
+
+// fix #7064 (§23.4 / §5.1, v0.343) — the DECLARED index-parameter type of a
+// resolved indexer PropertySymbol.
+//
+// The k-th parameter's DECLARED type, substituted against the receiver's
+// concrete generic arguments (§14.1 / §14.2), so a `Box<int>`'s `[i: T]`
+// indexer reads as `int` while the same declaration inside `Box<T>`'s own
+// body stays the rigid `T` — which is exactly what a body in that class
+// sees. A LOCAL indexer is read through its `ast::PropertyDecl`; an
+// IMPORTED one has no AST node (ModuleLoader reconstructs only the
+// PropertySymbol and its ParameterSymbols, #2414), so it is read through
+// those. Factored out of `checkIndexArgNullability` (#2619) so the §7
+// nullability check and the §5.1 type check cannot disagree about what an
+// indexer declares.
+TypeRef* ExprTC::declaredIndexerParamType(PropertySymbol* ps, std::size_t k,
+                                          const ast::Expr* target) {
+    if (!ps) return nullptr;
+    TypeRef* p = nullptr;
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+        if (k < pd->indexerParams.size() && pd->indexerParams[k].type)
+            p = ctx_.resolvedType(*pd->indexerParams[k].type);
+    } else if (k < ps->indexerParams.size()) {
+        if (auto* prm = dynamic_cast<ParameterSymbol*>(ps->indexerParams[k]))
+            p = prm->resolvedDeclType;
+    }
+    if (!p) return nullptr;
+    return substituteMemberType(p, target, ps->parent);
+}
+
+// fix #7064 (§23.4, v0.343) — are a candidate's index-parameter type and the
+// argument's type THE SAME type?
+//
+// `typeRefEqual` compares a Named pair by DECLARATION and by generic
+// arguments, but (outside one class scope) it equates any two DECLARATION-
+// LESS Named refs whose generic arguments agree — so `Array<int>` and
+// `Foo<int>` would compare equal, and the candidate preference below could
+// bind the argument to a candidate whose parameter type is a DIFFERENT
+// builtin. The head NAME is the tie-breaker for that shape (the same
+// correction #6315's `typeRefEqualSameScope` makes inside one class scope).
+static bool sameIndexParamType(const TypeRef* p, const TypeRef* a) {
+    if (!typeRefEqual(p, a)) return false;
+    if (p->kind == TypeRef::Kind::Named && a->kind == TypeRef::Kind::Named &&
+        !p->declaration && !a->declaration &&
+        p->headName() != a->headName())
+        return false;
+    return true;
+}
+
+// fix #7064 (§14.1 / §14.2, v0.343) — does this type still carry an
+// UNSUBSTITUTED type parameter?
+//
+// A declared index-parameter type read off an INHERITED generic member can
+// still carry the DERIVED class's type parameter. MEASURED repro (#6319's
+// `indexer_vtable_dispatch_6319.ancestor_chain_substitutes_generic_key`):
+//
+//   public class Root<T>   { public virtual property [i: T]: string => "root"; }
+//   public class Mid<U>: Root<Array<U>> { }
+//   var m: Mid<int> := …;  m[a]        // a: Array<int>
+//
+// The base-chain substitution (`ancestorGenericSubst`, #1101-A) binds Root's
+// `T` to `Array<U>` — with `U` STILL the derived class's parameter, because
+// the walk binds a base's type argument by NAME and `Array<U>`'s inner `U`
+// is one level down. The DECLARATION's parameter type is therefore `Array<U>`,
+// not `Array<int>`, and the §5.1 verdict at the declaration is UNDECIDABLE:
+// §14.2 rule 2 reads the interior use at the instantiations the declaration
+// forms (`Mid<int>` fixes `U := int`, so the parameter is `Array<int>` there).
+//
+// So this predicate fails OPEN — the same rule #6500/#6527 apply to a bare
+// type parameter at the dictionary key slot, and the same rule this check
+// already applies to a bare `property [i: T]`. The RECURSION matters: the
+// bare parameter is EMBEDDED in a constructed type here, so a top-level-only
+// test would have read `Array<U>` as a concrete type and rejected `m[a]`.
+static bool containsUnsubstitutedTypeParam(const TypeRef* t) {
+    if (!t) return false;
+    if (t->kind == TypeRef::Kind::Named && !t->declaration &&
+        t->genericArgs.empty() &&
+        !common::isReservedBuiltinTypeName(t->headName()) &&
+        !common::isBuiltinExceptionName(t->headName()))
+        return true;
+    for (const TypeRef* ga : t->genericArgs)
+        if (containsUnsubstitutedTypeParam(ga)) return true;
+    if (containsUnsubstitutedTypeParam(t->arrayElement)) return true;
+    for (const TypeRef::FuncParam& fp : t->funcParams)
+        if (containsUnsubstitutedTypeParam(fp.type)) return true;
+    if (containsUnsubstitutedTypeParam(t->funcReturn)) return true;
+    return false;
+}
+
+// fix #7064 (§23.4 / §5.1 / stdlib §4.4, v0.343) — the INDEX-ARGUMENT TYPE.
+//
+// §23.4: "An indexer is a property whose name is replaced by `[parameters]`"
+// — an index argument is therefore a PARAMETER PASS, and §5.1 governs the
+// conversion at that pass, exactly as it governs `Add(key: K, …)` and
+// `ContainsKey(key: K)`. stdlib §4.4 declares `Array<T>`'s indexer as
+// `public property [i: int]: T`; the other int-indexed builtins declare the
+// same `int` parameter — the list interfaces `IReadOnlyList<T>` (§4.1),
+// `IList<T>` (§4.1) and `IOwningList<T>` (§4.2), `OwningArray<T>` (§4.5),
+// the buffer/span family (§4.14), the array-backed spans (§4.15),
+// `FrozenArray<T>` (§4.19) and `ReadOnlyStringSpan` (§3.3) — and a
+// user-declared indexer declares whatever its own parameter list says
+// (§23.4: "Indexers may be overloaded by parameter type list").
+//
+// #2619's `checkIndexArgNullability` is the §7 twin of this check and says
+// in its own header that it deliberately does NOT open the type question:
+// "a type MISMATCH between an index argument and a declared parameter is a
+// different question this fix does not open". This is that question.
+//
+// WHAT IT COST BEFORE. The index argument's type was never consulted at the
+// index position. MEASURED on the pre-fix base (c74fb5b6), over
+// `Array<int>`:
+//
+//   a[1.5]  (double)   -> "SExt only operates on integer" / `sext double`
+//   a[s]    (string)   -> "SExt only operates on integer" / `sext ptr`
+//   a[r]    (record)   -> "SExt only operates on integer" / `sext %record.X`
+//   a[o]    (class)    -> "SExt only operates on integer" / `sext ptr`
+//   a[j]    (long)     -> COMPILED AND RAN
+//   a[b]    (bool)     -> COMPILED AND RAN
+//
+// — an internal compiler error where §5.1 asks for a clean diagnostic, on
+// four of the six shapes; and the two that compiled are §5.1 errors too
+// (§5.1's table is closed and lists only numeric WIDENING rows, so `long`
+// does not convert to `int`, and "Between integers and `bool`" is never
+// implicit). The same hole was open on the span family (`sp[1.5]` compiled
+// and ran), on the list interfaces (`il[1.5]` -> the verifier abort), on
+// `OwningArray<T>` / `FrozenArray<T>` (the verifier abort), on `string`
+// (`s[1.5]` -> the verifier abort) and on inline arrays (`a[1.5]` -> the
+// verifier abort) — the issue's title names only the collection families,
+// but the index POSITION is the same one in all of them.
+//
+// It was open on a USER-declared indexer too, and there the outcome was
+// worse than a diagnostic: `property [i: int]: int => i * 2` indexed with a
+// `double` compiled and PRINTED GARBAGE (MEASURED: 972021523), because the
+// argument reached the accessor without a conversion.
+//
+// THE §5.1 DECISION, stated. The index parameter is declared `int`; which
+// conversions TO it are permitted is §5.1's business, and §5.1's answer is
+// that the table is closed and lists only numeric widening:
+//
+//   * `sbyte`/`byte`/`short`/`ushort`/`char` -> `int`  : a §5.1 table row,
+//     so `a[c]` at a `char` index stays ADMITTED;
+//   * `int` -> `int`                           : the identity row;
+//   * `uint`/`long`/`ulong`/`float`/`double`/`decimal`/`bool`/`string`/a
+//     record/a class/an enum -> `int`           : NO row, so a §5.1 error.
+//
+// `long` is the one the issue's own table calls out ("`a[<a long>]`" is a
+// §5.1 error), and `bool` likewise ("Between integers and `bool`" is never
+// implicit). Both therefore become REJECTIONS — a behaviour flip on programs
+// that compile and run today, and the spec asks for it. The alternative
+// reading — that a `long` index is a permitted widening — has no support in
+// §5.1: the table's row is `int` -> `long`, never the reverse, and §5.1's
+// constant-narrowing clause is the only way a wider integer reaches a
+// narrower declared type, and it applies to COMPILE-TIME CONSTANTS only
+// (so `const N: long := 3; a[N]` stays admitted, and `a[j]` at a
+// run-time `long` does not).
+//
+// WHY IT CANNOT FALSE-REJECT.
+//
+//   1. The check asks the same question §5.1 asks everywhere else, through
+//      the same `checkAssignable` the CALL-argument path uses, with the
+//      argument expression supplied so §5.1's constant-narrowing clause
+//      applies identically to both spellings.
+//   2. A NULLABLE argument is left to `checkIndexArgNullability`, which
+//      already owns the §7 question at the same position; running both would
+//      report the same program twice.
+//   3. A TYPE PARAMETER on either side that is still UNSUBSTITUTED — a bare
+//      one (`property [i: T]`) or one EMBEDDED in a constructed type
+//      (`Array<U>`, read off an inherited member) — is undecidable here: at
+//      `T := int` the index is admitted and at `T := string` it is not, and
+//      the decision belongs to the instantiation, not to this declaration
+//      (§14.2 rule 2). Fail OPEN, exactly as #6500/#6527 do for the
+//      dictionary key slot. `containsUnsubstitutedTypeParam` states the
+//      rule once, for both sides.
+//   4. The §15.6 RANGE slicing form (`arr[0..1]`, `arr[r]` at a
+//      `Range<int>` value, `s[r]`) is not an element index at all — it is a
+//      slice, admitted on `Array<T>` and `string` and rejected with its own
+//      §15.6 diagnostic on every other receiver family. Leaving it alone
+//      keeps that one diagnostic per program.
+//   5. A DICTIONARY receiver is not checked here: its index parameter is the
+//      key type `K`, not `int`, and #6527 already checks that slot (with
+//      the same `checkAssignable`).
+void ExprTC::checkIndexArgTypes(const ast::IndexExpr& ix, const ast::Expr& e,
+                               TypeRef* recvTy) {
+    if (!recvTy || ix.indices.empty()) return;
+
+    // The receiver's indexer, where one was resolved. #2530 attaches the
+    // OVERLOAD-RESOLVED PropertySymbol to the IndexExpr, so this is the
+    // indexer the access actually binds to.
+    PropertySymbol* ps = nullptr;
+    if (auto* sym = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(e)))
+        if (sym->isIndexer) ps = sym;
+
+    // The receiver's head name, for the diagnostic and for the builtin
+    // family table below.
+    std::string recvName;
+    std::string_view cn;
+    if (recvTy->kind == TypeRef::Kind::Named) {
+        recvName = std::string(recvTy->headName());
+        if (recvName.empty() && recvTy->declaration)
+            recvName = std::string(recvTy->declaration->name);
+        cn = recvTy->headName();
+    } else if (recvTy->kind == TypeRef::Kind::Primitive &&
+               recvTy->primitive == PrimitiveType::String) {
+        recvName = "string";
+    }
+
+    // The BUILTIN receiver families. Two shapes reach here and both are
+    // recognised by IDENTITY with the synthesized builtin symbol, never by
+    // name alone (so a USER class named `Array` is not the builtin):
+    //
+    //   * a DECLARATION-LESS Named TypeRef — `var a: Array<int> := …`
+    //     written out, or an IMPORTED builtin. It carries its head NAME and
+    //     no declaration, and a user type cannot be declaration-less, so
+    //     the name identifies it.
+    //   * a Named TypeRef whose declaration IS a builtin class symbol —
+    //     `FrozenArray<T>.From(…)` (stdlib §4.19, #3249) stamps the
+    //     synthesized `builtinClassSym("FrozenArray")` as its declaration
+    //     and carries no syntactic head at all.
+    //
+    // The KEY-indexed dictionaries are recognised here too, only to be
+    // handed back: their index parameter is the key type `K`, not `int`,
+    // and #6527 already checks that slot.
+    static const char* const kKeyIndexedHeads[] = {
+        "Dictionary", "OwningDictionary", "SortedDictionary"};
+    static const char* const kIntIndexedHeads[] = {
+        "Array", "OwningArray", "OwningBuffer", "FrozenArray",
+        "IReadOnlyList", "IList", "IOwningList",
+        "ArraySpan", "ReadOnlyArraySpan", "Span", "ReadOnlySpan",
+        "ReadOnlyStringSpan", "Buffer", "__Buffer"};
+    auto headIn = [](std::string_view n,
+                     const char* const* list, std::size_t n_) {
+        for (std::size_t i = 0; i < n_; ++i)
+            if (n == list[i]) return true;
+        return false;
+    };
+    bool builtinReceiver = false;
+    bool keyIndexed = false;
+    if (recvTy->kind == TypeRef::Kind::Named) {
+        if (!recvTy->declaration) {
+            builtinReceiver =
+                headIn(cn, kIntIndexedHeads,
+                       sizeof(kIntIndexedHeads) / sizeof(kIntIndexedHeads[0])) ||
+                headIn(cn, kKeyIndexedHeads,
+                       sizeof(kKeyIndexedHeads) / sizeof(kKeyIndexedHeads[0]));
+            keyIndexed =
+                headIn(cn, kKeyIndexedHeads,
+                       sizeof(kKeyIndexedHeads) / sizeof(kKeyIndexedHeads[0]));
+        } else {
+            for (const char* n : kKeyIndexedHeads) {
+                auto* bs = builtinClassSym(n);
+                if (bs && recvTy->declaration == bs) {
+                    builtinReceiver = true;
+                    keyIndexed = true;
+                    cn = n;
+                    recvName = n;
+                    break;
+                }
+            }
+            if (!builtinReceiver)
+                for (const char* n : kIntIndexedHeads) {
+                    auto* bs = builtinClassSym(n);
+                    if (bs && recvTy->declaration == bs) {
+                        builtinReceiver = true;
+                        cn = n;
+                        recvName = n;
+                        break;
+                    }
+                }
+        }
+    }
+    if (keyIndexed) return;  // #6527 owns the key slot — do not report it twice.
+
+    // The builtin int-indexed families. Every one of them DECLARES an
+    // `int` index parameter (stdlib §3.3 / §4.1 / §4.2 / §4.4 / §4.5 /
+    // §4.14 / §4.15 / §4.19), so the declared type is `int` for all of
+    // them — the check is a table of the heads, not a per-family rule.
+    bool intIndexed = false;
+    if (recvTy->kind == TypeRef::Kind::InlineArray) {
+        // §15.1: an inline array is indexed by position; the index is an
+        // integer one, as it is on every other collection.
+        intIndexed = true;
+    } else if (recvTy->kind == TypeRef::Kind::Primitive &&
+               recvTy->primitive == PrimitiveType::String) {
+        // §4.6: `s[i]` is the code-point position — an integer index.
+        intIndexed = true;
+    } else if (builtinReceiver) {
+        intIndexed = true;
+    }
+
+    // The diagnostic's subject — the same wording #6527's dictionary-key check
+    // uses at the same position ("the index argument to `Dictionary[key]`"),
+    // so the two read alike and the §5.1 message keeps its SHARED shape
+    // (`checkAssignable`'s one message, whose tail every §5.1 site pins).
+    const std::size_t nargs = ix.indices.size();
+    auto subject = [&](std::size_t k) {
+        std::string s;
+        if (nargs == 1) {
+            s = recvName.empty() ? std::string("index argument")
+                                  : ("index argument to `" + recvName + "[i]`");
+        } else {
+            s = "index argument " + std::to_string(k + 1);
+            if (!recvName.empty()) s += " to the `" + recvName + "` indexer";
+        }
+        return s;
+    };
+
+    // The receiver's OWN indexer candidates, so the check is applied to the
+    // candidate the argument actually binds to.
+    //
+    // §23.4 overloads indexers by their parameter TYPE LIST, and the
+    // overload resolution's own `allParamsMatch` compares a Named parameter
+    // type by DECLARATION ONLY — so two candidates whose parameter types
+    // differ only in their GENERIC ARGUMENTS (`[k: Array<int>]` vs
+    // `[k: Array<string>]`, #6074) are indistinguishable to it, and it takes
+    // the FIRST. Checking the argument against that first candidate would
+    // REJECT a program whose argument matches the OTHER candidate exactly
+    // (#6074's own rows, in tests/codegen/generic_argument_slot_key_6074_
+    // test.cpp and its module twin). So the check PREFERS the candidate whose
+    // parameter type EQUALS the argument's type — `typeRefEqual`, which does
+    // compare generic arguments — and falls back to the resolved symbol when
+    // no candidate matches exactly. The exactly-matching candidate is also the
+    // one codegen binds (#6074's slot key compares the generic arguments too),
+    // so the two agree.
+    std::vector<PropertySymbol*> candidates;
+    if (ps && recvTy->kind == TypeRef::Kind::Named && recvTy->declaration) {
+        std::vector<TypeSymbol*> frontier{recvTy->declaration};
+        for (std::size_t fi = 0; fi < frontier.size(); ++fi) {
+            TypeSymbol* t = frontier[fi];
+            for (Symbol* m : t->members) {
+                auto* cand = dynamic_cast<PropertySymbol*>(m);
+                if (cand && cand->isIndexer) candidates.push_back(cand);
+            }
+            for (TypeSymbol* b : t->baseTypes)
+                if (b) frontier.push_back(b);
+        }
+    }
+
+    for (std::size_t k = 0; k < nargs; ++k) {
+        const auto& arg = ix.indices[k];
+        // The same modifiers the §7 check skips (§22.3 / #2758: a named /
+        // `ref` / `out` / `owned` modifier or a `_` discard on an index
+        // argument is a separate question).
+        if (!arg.value || arg.isDiscard || !arg.modifier.empty()) continue;
+
+        TypeRef* idxTy = ctx_.exprType(*arg.value);
+        if (!idxTy) continue;
+
+        // The DECLARED index-parameter type at this position.
+        TypeRef* declared = nullptr;
+        if (ps) {
+            for (auto* cand : candidates) {
+                TypeRef* pt =
+                    declaredIndexerParamType(cand, k, ix.target.get());
+                if (pt && sameIndexParamType(pt, idxTy)) {
+                    declared = pt;
+                    break;
+                }
+            }
+            if (!declared)
+                declared = declaredIndexerParamType(ps, k, ix.target.get());
+        } else if (intIndexed) {
+            declared = ctx_.primitiveTypeRef(PrimitiveType::Int);
+        }
+        if (!declared) continue;
+
+        // A declared parameter type that still carries an UNSUBSTITUTED type
+        // parameter — a bare one (`property [i: T]` in a generic class) or one
+        // EMBEDDED in a constructed type — is undecidable at the declaration:
+        // §14.2 rule 2 reads the interior use at the instantiations the
+        // declaration forms. Fail OPEN, as #6500/#6527 do for the dictionary
+        // key slot.
+        if (containsUnsubstitutedTypeParam(declared)) continue;
+
+        // A NULLABLE argument is the §7 question, owned by
+        // `checkIndexArgNullability` at this same position.
+        if (idxTy->nullable) continue;
+        // The same fail-OPEN for an ARGUMENT whose type still carries an
+        // unsubstituted type parameter.
+        if (containsUnsubstitutedTypeParam(idxTy)) continue;
+        // The §15.6 RANGE slicing form — not an element index.
+        bool isRange =
+            dynamic_cast<const ast::RangeExpr*>(arg.value.get()) != nullptr;
+        if (!isRange && idxTy->kind == TypeRef::Kind::Named &&
+            idxTy->declaration == builtinClassSym("Range"))
+            isRange = true;
+        if (isRange) continue;
+
+        SourceLocation loc = arg.value->span.begin.line != 0
+                                 ? arg.value->span.begin
+                                 : e.span.begin;
+        checkAssignable(idxTy, declared, loc, subject(k), arg.value.get());
     }
 }
 
@@ -2374,10 +2785,22 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         Symbol* gp = ts->genericParams[i];
                         TypeRef* arg = instTy->genericArgs[i];
                         if (!gp || !arg) continue;
+                        // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the
+                        // owner key is the class's `ast::TypeDecl` for a LOCAL
+                        // class and the imported `TypeSymbol` for an IMPORTED
+                        // one (which has no decl at all — #3141). The imported
+                        // class's §17.11 obligation is published on that
+                        // TypeSymbol, so recording the site against it is what
+                        // lets the end-of-pass join reject `Box<string>` the
+                        // way the same-module typechecker rejects it.
                         recordGenericInstantiationSite(
-                            ts->decl, gp->name, arg,
+                            classParamOwner(ts), gp->name, arg,
                             argNameOf(arg), e.span.begin);
                     }
+                    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the
+                    // imported class's §17.11 obligation, recorded as the
+                    // `default(T)` use the join pairs with the site above.
+                    recordImportedClassDefaultObligation(ts, e.span.begin);
                     // Return early — no further local/param/field type
                     // attachment is needed; the exprType is now set.
                     return;
@@ -3635,6 +4058,111 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (ix->target) {
             TypeRef* tt = ctx_.exprType(*ix->target);
+            // fix #7177 (§23.4 / §23.5 / §2.7, v0.344): the receiver of an
+            // index must be a VALUE.  A type name is not a value — §23.4
+            // (v0.344): "An indexer is a property whose name is replaced by
+            // `[parameters]`", and §23.5 (v0.344): "Static indexers are not
+            // supported" — so a type name can never be indexed even when the
+            // type DECLARES an indexer (an indexer is an INSTANCE member).
+            // §2.7 (v0.344) is the name-resolution rule behind the parallel
+            // §7.5 rejection: its table's "Head continued by `?.` or postfix
+            // `!`" row reads "these operators demand a nullable *value*;
+            // static access is spelled with `.` alone".
+            //
+            // MEASURED on the pre-fix base (r30-c1 tip 40d1691f), for a
+            // non-generic class `Plain` that declares `property [i: int]:
+            // int`:
+            //   * `Console.WriteLine(Plain[0]);` — compiled, ran, exited 0
+            //     and printed NOTHING (one #3079 internal-degradation
+            //     warning);
+            //   * `var z: int := Plain[0];` — compiled, ran and printed `0`:
+            //     a WRONG VALUE, not merely an empty output;
+            //   * `Plain[0] := 5;` — compiled with NO diagnostic at all.
+            // The GENERIC spelling `Box<int>[0]` behaved IDENTICALLY on a
+            // `Box<T>` that declares an indexer, so the issue's contrast
+            // ("the generic spelling is rejected, the non-generic one is
+            // accepted") was an artefact of the two probes declaring
+            // DIFFERENT indexers, not of their genericity: the verdict
+            // tracked only whether the type declared an indexer at all.  A
+            // type that declares NONE drew the existing §23.4 message
+            // ("type `X` does not declare an indexer — `a[i]` requires an
+            // indexer (§23.4)") and was rejected; a type that declares one
+            // was accepted and silently did nothing.
+            //
+            // The rule this gate implements, and the two messages it draws:
+            //   * the type declares NO indexer → the EXISTING §23.4 wording,
+            //     byte for byte, so the generic spelling's diagnostic (which
+            //     the issue's reviewers pinned) is unchanged and the
+            //     non-generic spelling now draws the SAME text;
+            //   * the type DOES declare one — or is a BUILT-IN class, whose
+            //     member table the compiler does not carry — → a new message
+            //     naming the type-name receiver, because "does not declare an
+            //     indexer" would be a falsehood there.
+            //
+            // A type name in receiver position is not itself wrong: §22.12's
+            // static-member form spells it (`Registry<int>.Register()`).  Only
+            // the INDEX on it is.  The parallel §7.5 rejection (a `?.` on a
+            // type name, #5452) is the same rule for the null-conditional
+            // operator.
+            if (TypeSymbol* recvTypeName =
+                    dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*ix->target))) {
+                if (!isUserDeclaredTypeSym(recvTypeName) ||
+                    typeDeclaresIndexer(recvTypeName)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        "the index operator `[]` cannot be applied to a type "
+                        "name (`" + std::string(recvTypeName->name) +
+                        "`); `a[i]` requires an indexer on a value — an "
+                        "indexer is an instance member and static indexers "
+                        "are not supported (§23.4 / §23.5)");
+                } else {
+                    // The EXISTING §23.4 wording, spelled once here so the
+                    // generic and the non-generic spelling of the same shape
+                    // draw the SAME text.  The `?` fallback mirrors the
+                    // §23.4 indexer gate's own spelling for a nameless type.
+                    const std::string tn =
+                        recvTypeName->name.empty()
+                            ? std::string("?")
+                            : std::string(recvTypeName->name);
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        std::string("type `") + tn +
+                            "` does not declare an indexer — "
+                            "`a[i]` requires an indexer (§23.4)");
+                }
+                // The value-receiver machinery below does not apply: there is
+                // no receiver VALUE to read an indexer from.  Clearing `tt`
+                // skips the §23.4 typing block; the `this`/`base` synthesis
+                // that precedes it cannot match a type name (its keyword test
+                // admits only `this` and `base`), so it stays inert.
+                tt = nullptr;
+            }
+            // fix #7177 (§23.4 / §27.1 / §27.7, v0.344): the INDEX form of
+            // the member-access hole a §27.6 method-reference value opens. A
+            // FUNCTION-typed receiver declares no members at all, so it
+            // declares no indexer either: `h.Id<int>[0]` names nothing to
+            // read. §23.4 (v0.344): "An indexer is a property whose name is
+            // replaced by `[parameters]`" — an index expression names a
+            // DECLARED indexer, and a function type declares none.
+            //
+            // MEASURED on the pre-fix base (r30-c1 tip 40d1691f): both
+            // `h.Id<int>[0]` and `h?.Id<int>[0]` compiled, ran, exited 0 and
+            // printed NOTHING (one #3079 internal-degradation warning each).
+            // The member-access twins (`h.Id<int>.Get()` and
+            // `h.Id<int>?.Get()`) are closed by the §27.1 arm of
+            // `closedValueSurfaceMemberReason` (ExprTypecheck_Calls.cpp).
+            if (tt && tt->kind == TypeRef::Kind::Function) {
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    "no indexer on a function value: `a[i]` requires an "
+                    "indexer (\xC2\xA7""23.4), and a function type "
+                    "(\xC2\xA7""27.1) declares no indexer of its own — a "
+                    "function value is CALLED (`f(x)`), not indexed "
+                    "(\xC2\xA7""27.7); no \xC2\xA7""26.5 extension can "
+                    "provide one either (\xC2\xA7""26.3: an extension block "
+                    "may not declare an indexer)");
+                tt = nullptr;
+            }
             // fix #2795 (§23.4 / §7.1 / §7.4, v0.240): the receiver type of a
             // `this`-rooted index. §23.4: "Inside a member of a class with its
             // own indexer, `this[i]` is required (the brackets need a left-hand
@@ -3969,6 +4497,90 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     if (cn == "OwningStack" || cn == "OwningQueue" ||
                         cn == "OwningLinkedList" || cn == "OwningSet" ||
                         cn == "OwningSlotMap") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, e.span.begin,
+                            std::string("type `") +
+                                std::string(cn) +
+                                "<T>` does not declare an indexer — "
+                                "`a[i]` requires an indexer (§23.4)");
+                    }
+                    // fix #7114 (§23.4 / §4.6 / §4.10 / §4.11 / §4.18,
+                    // v0.343): the BORROWING half of the very same family —
+                    // `LinkedList<T>` (stdlib §4.6), `Set<T>` (§4.10),
+                    // `Stack<T>` and `Queue<T>` (§4.11), and `SortedSet<T>`
+                    // (§4.18) — declares NO indexer either, and #5588's arm
+                    // named only the `Owning…` half of each pair. The
+                    // omission is the defect this issue reports: an index
+                    // expression on such a receiver is an indexer access on a
+                    // type that declares no indexer, so there is no member to
+                    // read and §2.7's name-resolution rule (a reference that
+                    // names nothing does not resolve) applies. The IndexExpr
+                    // was left untyped, and codegen's lowerCollectionIndexerGet
+                    // picked the receiver up through the SAME
+                    // kArrayBackedCollections registration #5588's comment
+                    // names (that table exists for NON-indexer operations like
+                    // `.Count`, not for a positional read), so the program
+                    // compiled, ran and exited 0 with a wrong answer.
+                    //
+                    // MEASURED on the pre-fix base (r30-c1 tip 9c966ddf), for
+                    // `var v: int := x[0];` after one element was stored:
+                    //   * `LinkedList<int>` — the #2434 backstop degraded the
+                    //     read to a zero-initialised value: the program
+                    //     COMPILED, RAN, exited 0 and printed `0` where the
+                    //     list held `1` (the issue's own repro).
+                    //   * `Stack<int>` / `Queue<int>` — NO diagnostic at all;
+                    //     codegen read the collection's array backing store
+                    //     directly and printed `1`, a plausible-but-wrong
+                    //     answer (a Stack iterates top-to-bottom and a Queue
+                    //     front-to-back, and NEITHER declares a positional
+                    //     read at all).
+                    //   * `Set<int>` / `SortedSet<int>` — NO diagnostic; the
+                    //     hash-table backing store was read as if it were an
+                    //     array and the program printed a garbage value.
+                    // All five are one defect in one arm, so all five are
+                    // rejected here.
+                    //
+                    // A declared generic PARAMETER may carry one of these
+                    // head names (`method F<Set>(x: Set)`), and such a
+                    // receiver is the DECLARATION's own type parameter
+                    // (§14.2), not the builtin — MEASURED on the pre-fix
+                    // base, a parameter named `Set` reaches this very branch
+                    // (head "Set", no generic arguments), so the guard is
+                    // not hypothetical. The three lookups mirror the ones the
+                    // tryIndexerConstraint arm below uses for the same
+                    // question, except that the class's parameters are read
+                    // through `sema::genericParamNameAt` — the ONE accessor
+                    // for a type's declared parameter names (#3143) — because
+                    // `TypeSymbol::decl` is null for an IMPORTED class and
+                    // the AST-gated read is exactly the seam
+                    // scripts/check_imported_symbol_reads.py ratchets (#3152).
+                    bool cnIsDeclaredTypeParam = false;
+                    if (currentMethodDecl_)
+                        for (const auto& gp : currentMethodDecl_->genericParams)
+                            if (gp.name == cn) {
+                                cnIsDeclaredTypeParam = true;
+                                break;
+                            }
+                    if (!cnIsDeclaredTypeParam && currentType_) {
+                        const std::size_t n = genericParamCount(currentType_);
+                        for (std::size_t i = 0; i < n; ++i)
+                            if (genericParamNameAt(currentType_, i) == cn) {
+                                cnIsDeclaredTypeParam = true;
+                                break;
+                            }
+                    }
+                    if (!cnIsDeclaredTypeParam && currentExtension_ &&
+                        currentExtension_->decl)
+                        if (auto* ed =
+                                dynamic_cast<const ast::ExtensionDecl*>(
+                                    currentExtension_->decl))
+                            if (ed->targetType &&
+                                isExtensionTargetTypeParam(*ed->targetType, cn))
+                                cnIsDeclaredTypeParam = true;
+                    if (!cnIsDeclaredTypeParam &&
+                        (cn == "LinkedList" || cn == "Stack" ||
+                         cn == "Queue" || cn == "Set" ||
+                         cn == "SortedSet")) {
                         ctx_.diagnostics().report(
                             Severity::Error, e.span.begin,
                             std::string("type `") +
@@ -5107,6 +5719,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // branch, and a single site cannot be forgotten by the next
                 // receiver family added above.
                 checkIndexArgNullability(*ix, e, tt);
+                // fix #7064 (§23.4 / §5.1, v0.343): the §5.1 TYPE twin of the
+                // §7 check above, run at the same point and for the same
+                // reason — once per IndexExpr, after every receiver family
+                // has been typed, so a user-declared indexer's resolved
+                // PropertySymbol is attached and the builtin families' `int`
+                // index parameter is known. §23.4 makes an index argument a
+                // parameter pass, and §5.1 governs the conversion at that
+                // pass; before this check the argument's type was never
+                // consulted, so a `double`/`string`/record/class index
+                // reached codegen as malformed IR and a `long`/`bool` index
+                // compiled and ran.
+                checkIndexArgTypes(*ix, e, tt);
                 // fix #2832 (§12.3 / §12.5 / §23.4, v0.240): `base[i]` where
                 // the resolved base indexer is ABSTRACT has no implementation
                 // to reach — §12.3's whole contract is "calls the base class's
@@ -5235,7 +5859,20 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // non-null `ctx_.exprType(*ma->target)` made the
                     // instance-receiver rejection fire on a perfectly legal
                     // type-name access.
-                    dynamic_cast<sema::TypeAliasSymbol*>(recv) != nullptr;
+                    dynamic_cast<sema::TypeAliasSymbol*>(recv) != nullptr ||
+                    // fix #7135 (§11.6 / §22.12, v0.343): a NESTED TYPE
+                    // reached through a chain head that supplies the
+                    // enclosing type's arguments —
+                    // `Tree<int>.Node<int>.Create()` — is a type-name
+                    // receiver too: the static member is reached through the
+                    // nested TYPE, not through an instance. The nested type's
+                    // own explicit type arguments make the receiver's
+                    // exprType non-null (resolveMemberAccess's nested-type
+                    // branch publishes the instantiated TypeRef), which is
+                    // exactly the condition this check reads, so without this
+                    // arm the legal spelling would be rejected as an instance
+                    // access.
+                    dynamic_cast<sema::NestedTypeSymbol*>(recv) != nullptr;
                 bool recvIsPrim = false;
                 if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
                         ma->target.get()))
@@ -6547,6 +7184,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         typeCall(*ce);
         checkChoiceCaseConstruction(*ce);
+        // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): the §17.11
+        // obligation of an IMPORTED generic method whose body could not be
+        // reconstructed — the importer's own replay is keyed on the method's
+        // `ast::MethodDecl`, which such a method does not have. Recorded
+        // after the call is typed, so the callee's symbol is resolved.
+        recordImportedMethodDefaultObligation(*ce);
     }
 }
 

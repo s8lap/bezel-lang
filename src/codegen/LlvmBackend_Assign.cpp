@@ -300,6 +300,124 @@ bool isRangeSliceIndex(bool idxTypeIsRange, const ast::Expr& idxExpr) {
     return idxTypeIsRange ||
            dynamic_cast<const ast::RangeExpr*>(&idxExpr) != nullptr;
 }
+
+// fix #7203 (spec §3.6 rule 2 / §14.1 / §14.2 / §23.4 / stdlib §4.4,
+// v0.343): the receiver type a collection-indexer lowering must use.
+//
+// THE DEFECT. A generic method's type PARAMETER named `Set` (or `Stack`,
+// `Queue`, `SortedSet`) carries the head name of a stdlib collection, so the
+// collection-indexer path read the receiver as THAT collection: the element
+// size came from the head name (a bare name carries no generic arguments ⇒
+// `collectionElemSize`'s 8-byte fallback) while the element SLOT was sized
+// from the declared type (an `int` ⇒ 4 bytes) — an 8-byte `memcpy` into a
+// 4-byte slot. MEASURED on this lane's base, `bezelc --sanitize=address`:
+// "stack-buffer-overflow ... WRITE of size 8 ... in memcpy", the overflowing
+// frame being the specialization's own 4-byte `out` slot.
+//
+// THE FIX. A type PARAMETER is not the collection its name spells. Spec §3.6
+// rule 2 — "For a generic type or member, the property is evaluated at each
+// instantiation, after substituting the type arguments" — and §14.1's
+// *Instantiation and its site* ("the constructed type or constructed member
+// obtained by substituting type arguments for its type parameters") put the
+// BOUND, not the parameter's spelling, in charge of what a value of that type
+// may be used for, so the receiver's shape must be read from the bound the
+// ACTIVE MONOMORPHIZATION binds it to — the same substitution
+// `elementPolicyFor` resolves through (LlvmBackend_ElementPolicy.cpp:100).
+// The index expression stays legal: this changes only HOW THE SLOT IS SIZED,
+// never WHETHER the index is allowed (stdlib §4.4 gives `Array<T>` the
+// property `[i: int]: T`; §14.2's constraints decide which substitutions a
+// type parameter admits).
+//
+// `subst` is the active monomorphization's sema-type map (param name → the
+// concrete type it was bound to); `typeParamNames` is the scope's type-PARAMETER
+// names (`templateGenericParamNames_`); `erasedTemplateBody` marks the DEAD
+// template body, which has no binding of its own.
+//
+// A bare head is a type PARAMETER only when the name is one IN SCOPE: the
+// active substitution binds it (a monomorphized body), or — in the erased
+// template body, which has no substitution — the template's own scope lists
+// it. A bare head that names neither is a BARE BUILTIN (`ReadOnlyStringSpan`,
+// stdlib §3.3 — a non-generic builtin type), which is NOT a type parameter
+// and keeps its own lowering.
+//
+// Returns the type the caller must read the receiver's shape from, or null
+// when the shape is NOT decidable here (an unbound type parameter) — the
+// caller then declines the collection path, which is the pre-existing answer
+// for those shapes.
+const sema::TypeRef* collectionIndexerReceiverType(
+        const sema::TypeRef* recvTy,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>& subst,
+        const std::unordered_set<std::string_view>& typeParamNames,
+        bool erasedTemplateBody) {
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named) return recvTy;
+    if (recvTy->declaration) return recvTy;          // a resolved declaration
+    if (!recvTy->genericArgs.empty()) return recvTy;  // a CONSTRUCTED builtin
+    // #5241 (§2.2): a builtin spelled with an import QUALIFIER (`D.Stopwatch`)
+    // is never captured by a same-named type parameter — leave it alone.
+    if (recvTy->isAliasQualifiedBuiltin()) return recvTy;
+    std::string_view head = recvTy->headName();
+    if (head.empty()) return recvTy;
+    if (erasedTemplateBody) {
+        // The erased template body carries no binding of its own: the element
+        // type is not derivable there, so the collection path must decline —
+        // exactly as a type parameter named `T` already does.
+        if (typeParamNames.count(head) == 0) return recvTy;  // a bare BUILTIN
+        return nullptr;
+    }
+    auto first = subst.find(head);
+    if (first == subst.end()) return recvTy;  // not a type parameter in scope
+    // Follow the substitution to the CONCRETE bound. A bound may itself be a
+    // type parameter (a class type parameter bound to a method one), so the
+    // walk follows the chain — bounded, so a self-referential map cannot loop.
+    const sema::TypeRef* bound = nullptr;
+    for (int depth = 0; depth < 8; ++depth) {
+        auto it = subst.find(head);
+        if (it == subst.end() || !it->second) break;
+        bound = it->second;
+        if (bound->kind != sema::TypeRef::Kind::Named || bound->declaration ||
+            !bound->genericArgs.empty())
+            break;  // a CONCRETE type: done
+        std::string_view boundHead = bound->headName();
+        if (boundHead.empty() || boundHead == head) break;
+        head = boundHead;
+    }
+    // No binding: the head names no bound type parameter — an unbound type
+    // parameter (nothing to size a slot from). The collection path declines.
+    // The walk can also END on a type PARAMETER (a chain that never reaches a
+    // concrete type): the element type is still not derivable, so decline.
+    if (!bound) return nullptr;
+    if (bound->kind == sema::TypeRef::Kind::Named && !bound->declaration &&
+        bound->genericArgs.empty())
+        return nullptr;
+    // The Set FAMILY declares no indexer (stdlib §4.10 `Set<T>` /
+    // `OwningSet<T>`, stdlib §4.18 `SortedSet<T>` — neither lists a
+    // `property [i: int]`, where stdlib §4.4's `Array<T>` does), so an index
+    // expression on one has no indexer to dispatch to (spec §23.4 defines an
+    // indexer as "a property whose name is replaced by `[parameters]`"). Its
+    // runtime representation is a HASH TABLE (a `bz_dict_t*`), not the dense
+    // `bz_array_t*` the collection-indexer path reads — yet its head is in
+    // `kArrayBackedCollections` (src/common/BuiltinRegistry.cpp:205), whose
+    // own header note (src/common/BuiltinRegistry.hpp) says of that
+    // predicate: "That predicate answers \"is this `bz_array_t*`-backed\" and
+    // so also contains `Set`, `OwningSet`, `SortedSet` and `FrozenArray`."
+    // The concrete
+    // `Set<int>[0]` spelling is kept away by #7114's SEMA rejection, which
+    // does NOT fire for a receiver whose static type is a type PARAMETER ⇒
+    // `bz_array_get` would read a `bz_dict_t*` as a `bz_array_t*`, a wild
+    // read at the dictionary's first bucket. Decline the bound here: the read
+    // degrades the way a `T`-named parameter already degrades (the `#2434`
+    // path) instead of reading the wrong representation. The DISCRIMINATOR is
+    // the BOUND's runtime representation, never the parameter's name: an
+    // ARRAY-backed bound (Array/Stack/Queue) keeps its resolved bound and its
+    // correctly sized slot.
+    if (bound->kind == sema::TypeRef::Kind::Named && !bound->declaration) {
+        std::string_view boundHead = bound->headName();
+        if (boundHead == "Set" || boundHead == "OwningSet" ||
+            boundHead == "SortedSet")
+            return nullptr;
+    }
+    return bound;
+}
 }  // namespace
 
 // fix #682/#1079 / stdlib §4.4 / spec §16.3 (v0.182, #1579): Range-slice an
@@ -429,7 +547,15 @@ llvm::Value* Emitter::lowerArrayRangeSlice(llvm::Value* recv,
 llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
-    auto* recvTy = ctx_.exprType(*ix.target);
+    const sema::TypeRef* recvTy = ctx_.exprType(*ix.target);
+    // fix #7203 (spec §3.6 rule 2 / §14.1 / stdlib §4.4, v0.343): a receiver whose static type is a
+    // generic type PARAMETER is read through the bound the active
+    // monomorphization binds it to — never through the head name the
+    // parameter happens to spell (a parameter named `Set` is not the stdlib
+    // `Set<T>`). See collectionIndexerReceiverType above.
+    recvTy = collectionIndexerReceiverType(recvTy, genericSubstSemaTy_,
+                                           templateGenericParamNames_,
+                                           emittingGenericTemplateBody_);
 
     // §3.3 (#883): ReadOnlyStringSpan[i] → the (Start + i)-th CODE POINT of the
     // source string (a char), bounds-checked against the span's Length AND
@@ -992,7 +1118,14 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
 llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
-    auto* recvTy = ctx_.exprType(*ix.target);
+    const sema::TypeRef* recvTy = ctx_.exprType(*ix.target);
+    // fix #7203 (spec §3.6 rule 2 / §14.1 / stdlib §4.4, v0.343): resolve a generic type-PARAMETER
+    // receiver through the active monomorphization before its shape (and the
+    // element size derived from it) is read — see
+    // collectionIndexerReceiverType above.
+    recvTy = collectionIndexerReceiverType(recvTy, genericSubstSemaTy_,
+                                           templateGenericParamNames_,
+                                           emittingGenericTemplateBody_);
     // §15.3 / §28.11 (#747): `move a[i]` on a move-only OWNING inline array
     // ([N owned]T? / [N owned]T). Read the owned element out of the slot and
     // leave the slot NULL (moved-from), so the array's scope-end slot disposal
@@ -1327,7 +1460,14 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                                         bool valIsFreshPlusOneString) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value || !val)
         return false;
-    auto* recvTy = ctx_.exprType(*ix.target);
+    const sema::TypeRef* recvTy = ctx_.exprType(*ix.target);
+    // fix #7203 (spec §3.6 rule 2 / §14.1 / stdlib §4.4, v0.343): resolve a generic type-PARAMETER
+    // receiver through the active monomorphization before its shape (and the
+    // element size derived from it) is read — see
+    // collectionIndexerReceiverType above.
+    recvTy = collectionIndexerReceiverType(recvTy, genericSubstSemaTy_,
+                                           templateGenericParamNames_,
+                                           emittingGenericTemplateBody_);
 
     // §4.15 (#549): ArraySpan<T>[i] := value — borrowing-set; no disposal.
     // §4.14 (#779): the OWNING Span<T>[i] := value over an OwningBuffer DISPOSES
@@ -5066,7 +5206,14 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
     if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
         return false;
-    auto* recvTy = ctx_.exprType(*ix->target);
+    const sema::TypeRef* recvTy = ctx_.exprType(*ix->target);
+    // fix #7203 (spec §3.6 rule 2 / §14.1 / stdlib §4.4, v0.343): resolve a generic type-PARAMETER
+    // receiver through the active monomorphization before its shape (and the
+    // element size derived from it) is read — see
+    // collectionIndexerReceiverType above.
+    recvTy = collectionIndexerReceiverType(recvTy, genericSubstSemaTy_,
+                                           templateGenericParamNames_,
+                                           emittingGenericTemplateBody_);
     // Handle Array<T>/OwningArray<T> and list-interface receivers (§4.1-§4.3)
     // as before, and also Dictionary<K,V>/OwningDictionary<K,V> (fix #613 / §4.8).
     bool isArr  = isCollectionTypeName(recvTy) || isListInterfaceName(recvTy);
@@ -5500,7 +5647,14 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
     auto* ix = dynamic_cast<const ast::IndexExpr*>(inc.target.get());
     if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
         return false;
-    auto* recvTy = ctx_.exprType(*ix->target);
+    const sema::TypeRef* recvTy = ctx_.exprType(*ix->target);
+    // fix #7203 (spec §3.6 rule 2 / §14.1 / stdlib §4.4, v0.343): resolve a generic type-PARAMETER
+    // receiver through the active monomorphization before its shape (and the
+    // element size derived from it) is read — see
+    // collectionIndexerReceiverType above.
+    recvTy = collectionIndexerReceiverType(recvTy, genericSubstSemaTy_,
+                                           templateGenericParamNames_,
+                                           emittingGenericTemplateBody_);
     bool isArr  = isCollectionTypeName(recvTy) || isListInterfaceName(recvTy);
     bool isDict = isDictTypeName(recvTy);
     if (!isArr && !isDict) return false;
@@ -17661,6 +17815,67 @@ struct ParamEscapeWalker {
                t->primitive != P::String;
     }
 
+    // fix #6769 (§8.6 / §8.1 / §28.9, v0.344): is `e` of a non-nullable VALUE
+    // kind (record, enum, non-generic choice, numeric/bool/char primitive)?
+    // Such a receiver's `Equals(Object?)` and its `=` against an `Object`
+    // dispatch through the compiler-generated box-equals thunk, which only
+    // READS `other` (the same premise `lowerValueSemUniversalEquals` and
+    // #3480 rest on). Two spec facts make that thunk the ONLY reachable
+    // member, and both were CHECKED against the v0.344 text and against the
+    // compiler, not assumed:
+    //   - no value kind declares an `Equals` at `Object?`/`Object` (§9.2's
+    //     dispatch-modifier rule for records, §10.5 for enums, §35.2 for
+    //     choices): the compiler rejects it at the declaration ("a record
+    //     member `Equals` may not take `Object?`", MEASURED);
+    //   - a value kind's own-typed `Equals(other: T)` does not accept an
+    //     `Object` argument at all ("the argument `other` to call to `Equals`
+    //     has type `Object` which has no implicit conversion to the value
+    //     type", MEASURED) — so where the call compiles, the member reached is
+    //     the generated one.
+    // A `=`/`<>` the value kind OVERLOADS is a different member (§25.2: "the
+    // overloaded operators are invoked for `a = b` and `a <> b` directly ...
+    // they do not delegate to `Equals`"), and the `=`/`<>` arm below excludes
+    // it by the operator symbol sema resolved the expression to.
+    // A class or `Object` receiver is NOT in this set: a user `Equals`
+    // override may store its borrowed parameter (#3480's measured UAF).
+    bool isValueKindExpr(const ast::Expr* e) {
+        // Not inside a lambda: the closure captures the parameter's box and
+        // may outlive the call (same guard as `isUnboxedRead`).
+        if (!e || lambdaDepth != 0 || isTarget(e)) return false;
+        const sema::TypeRef* t = ctx.exprType(*e);
+        if (!t || t->nullable) return false;
+        using K = sema::TypeRef::Kind;
+        using P = sema::PrimitiveType;
+        if (t->kind == K::Primitive)
+            return t->primitive != P::None && t->primitive != P::Object &&
+                   t->primitive != P::String;
+        if (t->kind == K::Named && t->declaration && t->genericArgs.empty()) {
+            auto k = t->declaration->kind;
+            return k == ast::TypeDeclKind::Record ||
+                   k == ast::TypeDeclKind::Enum ||
+                   k == ast::TypeDeclKind::Choice;
+        }
+        return false;
+    }
+
+    // The bare type name `Console` — the auto-imported `System.Console`, and
+    // NOT a local, a parameter, or a USER type that shadows it (§2.3's
+    // always-available names are shadowable except §3.4's reserved row;
+    // §2.7's resolution order). stdlib §2.1: "The `Object` overloads invoke
+    // `ToString()`" — the stdlib's `Write`/`WriteLine` render the argument and
+    // keep nothing, so a call through them is a READ of the parameter's box.
+    // A user type named `Console` is NOT that class: its `Write`/`WriteLine`
+    // are the author's own members, whose bodies may STORE the argument.
+    bool isConsoleType(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id || id->name != "Console") return false;
+        auto* sym = ctx.exprSymbol(*id);
+        if (dynamic_cast<sema::LocalSymbol*>(sym) ||
+            dynamic_cast<sema::ParameterSymbol*>(sym))
+            return false;
+        return !sema::isUserDeclaredTypeSym(sym);
+    }
+
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
@@ -17679,10 +17894,36 @@ struct ParamEscapeWalker {
                                  b->left.get()) != nullptr;
                 bool rNull = dynamic_cast<const ast::NullLiteralExpr*>(
                                  b->right.get()) != nullptr;
-                expr(b->left.get(), /*safeRead=*/rNull || isUnboxedRead(
-                                                     b->left.get()));
-                expr(b->right.get(), /*safeRead=*/lNull || isUnboxedRead(
-                                                      b->right.get()));
+                // fix #6769 (§8.4 / §8.6, v0.344): `valueKind = param` /
+                // `param = valueKind` boxes the value side and compares
+                // through the box-equals thunk, which only READS the
+                // parameter's box.
+                //
+                // EXCEPT when the value kind OVERLOADS `=`/`<>`: §25.2
+                // ("the overloaded operators are invoked for `a = b` and
+                // `a <> b` directly ... they do not delegate to `Equals`")
+                // hands the comparison to the author's operator, whose body
+                // may STORE the parameter's box — §28.3's field-store
+                // residual admits an `Object` parameter into a field — and
+                // the caller's post-call release would then leave a DANGLING
+                // reference. MEASURED on this lane: the pre-fix arm kept the
+                // stored box alive and read it back as `V`; the arm without
+                // this guard released it and the stored value read back as
+                // NOT-`V` (a record and an enum, both with a heterogeneous
+                // `operator =`/`operator <>` pair). The DISCRIMINATOR is the
+                // member sema resolved the expression to (§25.2's resolution):
+                // a built-in comparison binds none ("Built-in primitive
+                // operators do not reach here", sema's own note).
+                bool userOperator = false;
+                if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                        ctx.exprSymbol(*b)))
+                    userOperator = ms->isOperator;
+                bool lVal = !userOperator && isValueKindExpr(b->left.get());
+                bool rVal = !userOperator && isValueKindExpr(b->right.get());
+                expr(b->left.get(), /*safeRead=*/rNull || rVal ||
+                                        isUnboxedRead(b->left.get()));
+                expr(b->right.get(), /*safeRead=*/lNull || lVal ||
+                                         isUnboxedRead(b->right.get()));
                 return;
             }
             expr(b->left.get(), /*safeRead=*/isUnboxedRead(b->left.get()));
@@ -17699,7 +17940,23 @@ struct ParamEscapeWalker {
                     return;
                 }
                 expr(mem->target.get(), false);
-                for (auto& a : c->args) expr(a.value.get(), false);
+                // fix #6769 (§8.1 / §8.3 / §8.6, v0.344):
+                // `valueKind.Equals(param)` hands the parameter's box to the
+                // compiler-generated box-equals thunk, which only READS it
+                // (`isValueKindExpr`'s note gives the two spec facts that
+                // make the generated member the only reachable one).
+                // `Console.Write(param)` / `Console.WriteLine(param)`: the
+                // runtime renders the box and keeps nothing (stdlib §2.1:
+                // "The `Object` overloads invoke `ToString()`"); `isConsoleType`
+                // keeps a USER type named `Console` out of this set.
+                bool eqRead = (mem->member == "Equals" &&
+                               c->args.size() == 1 &&
+                               isValueKindExpr(mem->target.get())) ||
+                              (isConsoleType(mem->target.get()) &&
+                               (mem->member == "Write" ||
+                                mem->member == "WriteLine") &&
+                               c->args.size() == 1 && lambdaDepth == 0);
+                for (auto& a : c->args) expr(a.value.get(), eqRead);
                 return;
             }
             if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(

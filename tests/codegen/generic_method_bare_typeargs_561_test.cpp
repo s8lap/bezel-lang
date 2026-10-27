@@ -18,7 +18,7 @@
 //
 // After fix (parser + sema + codegen):
 //   - The parser's parsePostfix loop now recognises `Identifier < TypeArgList > (`
-//     (disambiguated via tokensLookLikeMethodTypeArgs) and stores the type args
+//     (disambiguated via tokensLookLikeGenericArgs) and stores the type args
 //     on the IdentifierExpr, continuing the postfix chain so `(...)` forms a
 //     normal CallExpr.
 //   - sema's typeCall reads typeArgs from both MemberAccessExpr and IdentifierExpr

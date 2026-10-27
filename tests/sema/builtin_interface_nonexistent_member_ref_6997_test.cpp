@@ -9,7 +9,9 @@
 //
 // The reference was left untyped, so codegen degraded `g` to a warning and the
 // call crashed. The CALL form `il.Nope(5)` was already rejected by the #2457
-// backstop, so the two spellings of one undeclared name disagreed.
+// backstop, so the two spellings of one undeclared name disagreed. (fix #7015
+// later moved that CALL form to the type level as well, with this same
+// wording -- see ROW 12 below.)
 //
 // THE RULE. A method reference is a use of the member, resolved on the receiver
 // exactly as the call is: "the member resolved on the value exactly as the call
@@ -187,14 +189,18 @@ BEZEL_TEST(builtin_interface_nonexistent_member_ref_6997,
         "no member `Nope` on `IList`");
 }
 
-// ROW 12 — the CALL form is untouched: it stays rejected by the #2457 codegen
-// backstop, with its own wording, and this fix does not change that message.
+// ROW 12 — the CALL form of the same undeclared name. #6997 left it to the
+// #2457 codegen backstop; fix #7015 rejects it at the TYPE level, with the
+// same "no member" wording as the bare form above (the two spellings of one
+// undeclared name must agree, language spec §27.6). This row's expectation
+// is therefore FLIPPED by #7015: the needle is the "no member" wording, not
+// the #2457 backstop's.
 BEZEL_TEST(builtin_interface_nonexistent_member_ref_6997,
-           ilist_call_nope_stays_rejected_by_2457_backstop) {
+           ilist_call_nope_is_rejected_by_the_type_level_reject) {
     expectRejected(
         mainWith("var il: IList<int> := a; ",
                  "Console.WriteLine(il.Nope(5)); "),
-        "`Nope` on built-in type `IList` produced no value");
+        "no member `Nope` on `IList`");
 }
 
 // ===========================================================================

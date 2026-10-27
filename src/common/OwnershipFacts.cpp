@@ -40,6 +40,60 @@ bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs) {
            fs->posParam->modifier == "owned" && !fs->posParamInitRef;
 }
 
+// fix #7025 (follow-up, §8.7 / §27.6 / §28.2, v0.340): the ONE authority for
+// "this expression is a method-group reference to a class's own
+// compiler-generated `Dispose`". See the header declaration for the spec
+// citations and the reason the shape needs its own recognizer (the generated
+// member has no MethodDecl and no MethodSymbol, so sema binds nothing).
+bool isGeneratedDisposeMethodRef(const ast::Expr* e, sema::SemaContext& ctx) {
+    const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || !ma->target) return false;
+    if (ma->member != "Dispose") return false;
+    // A real MethodSymbol (a user interface's declared `Dispose`, reached
+    // through a user interface) is the ORDINARY §27.6 reference and keeps its
+    // own thunk and its own capture bookkeeping.
+    if (ctx.exprSymbol(*e)) return false;
+    const sema::TypeRef* recvTy = ctx.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named) return false;
+    const sema::TypeSymbol* ts = recvTy->declaration;
+    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
+    // §8.7: "Static classes, records, enums, choices, primitives, and inline
+    // arrays do not implement `IDisposable`." A static class has no instance,
+    // so no value of that type can reach here — but the check keeps the
+    // predicate honest for the imported case, where the modifier list is not
+    // carried over the module boundary.
+    for (std::string_view mod : ts->modifiers)
+        if (mod == "static") return false;
+    return true;
+}
+
+// fix #7025 (follow-up, §27.6 / §28.2 / §28.6, v0.343): the STORAGE a
+// method-group receiver denotes. See the header declaration for the contract.
+//
+// The FIXTURE: the explicit spelling `this.d` and the bare spelling `d` are
+// the SAME storage — sema binds the SAME FieldSymbol to both — so the §28.2
+// borrow fact must land on it for both. Before this, only the bare spelling
+// was recorded (the receiver had to be an `IdentifierExpr`), and the explicit
+// spelling took the eager-reclaim path at the explicit `Dispose()` — the
+// measured heap-use-after-free: the group's capture (§27.6) pointed at a
+// block the explicit dispose had already freed, and §28.2's "the receiver's
+// block stays live until the holder's release point" did not hold.
+sema::Symbol* methodGroupReceiverStorage(sema::SemaContext& ctx,
+                                         const ast::Expr* recv) {
+    if (!recv) return nullptr;
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv))
+        return ctx.exprSymbol(*id);
+    if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(recv)) {
+        // `this.d` — the EXPLICIT spelling of the bare field read `d`. Sema
+        // attaches the member's FieldSymbol to the MemberAccessExpr
+        // (ExprTypecheck), which is the SAME symbol the bare spelling
+        // resolves to — so the two spellings share one storage, and one fact.
+        if (auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*ma)))
+            return fs;
+    }
+    return nullptr;
+}
+
 // §28.9 "Trivial-dispose classes" (v0.286) — see the header. This is the
 // pre-#3632 (TypeSymbol-only) entry point. It cannot read a field's RESOLVED
 // TypeRef without a `SemaContext`, so its `owned`-field arm is the

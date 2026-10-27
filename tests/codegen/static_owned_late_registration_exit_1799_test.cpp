@@ -40,16 +40,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "runAotChecked: SKIP" diagnostic. clang
-// is required to build this repo, so a skip is not expected here — guard anyway so
-// a toolchain-less environment does not turn into a spurious failure.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Count non-overlapping occurrences of `needle` in `hay`.
 int countOccurrences(const std::string& hay, const std::string& needle) {
@@ -126,7 +120,6 @@ BEZEL_TEST(codegen_static_owned_late_registration_1799,
     // recorded order, and the pass drains until it is disposed. Without the fix the
     // late field is stranded undisposed — "LATE-DISPOSED" never appears.
     JitResult r = runAotChecked(kLateRegistrationDuringExit);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
 
     // Clean run (Main returns Early.tag = 7); the drain introduced no double-free /
     // use-after-free (ASan/LSan net rides on r.ran).
@@ -160,7 +153,6 @@ BEZEL_TEST(codegen_static_owned_late_registration_1799,
     // declaration order. The LIFO drain must preserve this for pre-exit entries:
     // r2 (ResB) disposes before r1 (ResA).
     JitResult r = runAotChecked(kOrdinaryReverseOrder);
-    if (wasSkipped(r)) return;
 
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 5);

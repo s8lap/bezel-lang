@@ -96,13 +96,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 std::string sanitizerText(const JitResult& r) {
     std::string all;
@@ -202,7 +199,6 @@ const char* kSpecBuiltMidOuterBodyWithClosure =
 BEZEL_TEST(codegen_generic_spec_lambda_local_closure_cell_release_2854,
            generic_spec_lambda_local_releases_closure_cell_spec_28_9) {
     JitResult r = runAotChecked(kGenericSpecLambdaLocal);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);            // 400 B / 10 allocations pre-fix
     BEZEL_EXPECT_EQ(r.exitCode, kIssueReproValue);
 }
@@ -230,7 +226,6 @@ BEZEL_TEST(codegen_generic_spec_lambda_local_closure_cell_release_2854,
 BEZEL_TEST(codegen_generic_spec_lambda_local_closure_cell_release_2854,
            outer_body_keeps_its_own_closure_release_state_spec_14_1) {
     JitResult r = runAotChecked(kSpecBuiltMidOuterBodyWithClosure);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 175);
 }

@@ -50,12 +50,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // ===========================================================================
 // T1 (row A) — plain `var c := CString.From("abc")` in a 20-iteration loop.
@@ -147,7 +145,6 @@ BEZEL_TEST(codegen_ffi_local_cstring_wstring_leak_2824,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(kPlainCStringFrom);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-fix: 1 (LSan reports 260 B / 20)
 }
@@ -161,7 +158,6 @@ BEZEL_TEST(codegen_ffi_local_cstring_wstring_leak_2824,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(kPlainCStringToBytes);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-fix: 1 (LSan reports ~1040 B / 40)
 }
@@ -175,7 +171,6 @@ BEZEL_TEST(codegen_ffi_local_cstring_wstring_leak_2824,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 0);
     JitResult r = runAotChecked(kPlainWStringFrom);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);   // pre-fix: 1
 }
@@ -191,7 +186,6 @@ BEZEL_TEST(codegen_ffi_local_cstring_wstring_leak_2824,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 26);   // 5+6+7+8 = 26
     JitResult r = runAotChecked(kRawBytesCopyTo);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 26);   // pre-fix: 1 (LSan reports 72 B / 2)
 }

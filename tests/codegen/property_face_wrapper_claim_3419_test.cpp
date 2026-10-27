@@ -77,14 +77,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // The two programs differ ONLY in the owning collection head and the method
 // that inserts into it. Everything else -- the stored-view property, the 60
@@ -141,7 +137,6 @@ std::string program(const char* head, const char* insert) {
 BEZEL_TEST(property_face_wrapper_claim_3419,
            owninglinkedlist_stored_view_read_claims_wrapper_frame_28_6) {
     JitResult r = runAotChecked(program("OwningLinkedList", "AddLast"));
-    if (wasSkipped(r)) return;
     // Pre-fix on 0c5ecd1: LeakSanitizer reports 1920 bytes in 60 allocations
     // and the process exits 1.
     BEZEL_EXPECT_TRUE(r.ran);
@@ -165,7 +160,6 @@ BEZEL_TEST(property_face_wrapper_claim_3419,
 BEZEL_TEST(property_face_wrapper_claim_3419,
            owningstack_stored_view_read_control_stays_claimed_28_6) {
     JitResult r = runAotChecked(program("OwningStack", "Push"));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // stdlib §4.11 "Iteration order" is pop order, so the sum is order-
     // independent by construction: 3 + 4 == 7 either way, and the assertion is
@@ -228,7 +222,6 @@ BEZEL_TEST(property_face_wrapper_claim_3419,
         "    return 7; "
         "  end Main; "
         "end Main;");
-    if (wasSkipped(r)) return;
     // `r.ran` is the load-bearing assertion: pre-fix the process died on a wild
     // jump, so it is false there. The exit code then pins that the five reads
     // completed rather than the program merely surviving.

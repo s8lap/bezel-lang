@@ -1,14 +1,13 @@
 // Spec-derived regression test for issue #3399.
 //
 // AUTHORITY. spec §7 (nullable -> non-nullable) and stdlib §4.17
-// `SortedDictionary<K, V>` (v0.283), which declares, verbatim at
-// Bezel_Standard_Library.md:3322-3326:
+// `SortedDictionary<K, V>` (v0.283), which declares:
 //
-//     public method Add(key: K, value: V);          // v0.282: ArgumentException if the key is present …
-//     public method TryAdd(key: K, value: V): bool; // v0.282 (§1 shape (d)): false and no mutation if present
+//     public method Add(key: K, value: V);          // ArgumentException if the key is present —
+//     public method TryAdd(key: K, value: V): bool; // (§1 shape (d)): false and no mutation if present
 //
 // Both slots of `Add` are non-nullable, exactly as on the `Dictionary<K, V>`
-// twin (§4.8 line 1962).
+// twin (§4.8).
 //
 // THE DEFECT. `checkBuiltinCollectionCallArgs` carries two positive name lists —
 // the pos-0 key gate inside `isItemPosition` and the pos-1 `isDictValuePosition`
@@ -56,7 +55,7 @@
 // run time" sends the next reader hunting a fault one of them never produces.
 //
 // WHY IT WAS MISSED. #2582's own comment in this file asserted, of the pos-1
-// gate, that "`SortedDictionary<K, V>` (§4.17 line 2999-3017) declares NO
+// gate, that "`SortedDictionary<K, V>` (§4.17) declares NO
 // `Add(key, value)` at all — its write surface is the indexer-set". That was
 // TRUE when written and became false at v0.282, when proposal 0119 restored the
 // throwing `Add` to the sorted map. #3372 then added the sibling `TryAdd` to

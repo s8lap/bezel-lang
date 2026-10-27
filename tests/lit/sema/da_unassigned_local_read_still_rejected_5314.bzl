@@ -10,5 +10,9 @@
 
 module M; class C public static method F(v: int): int var u: string; var s := 0; for var i in 0..<2 do var v := i; s := s + v; end; if s = 1 then u := "a"; end; return u.Length + v; end F; public static method Main(): int return C.F(3); end Main; end C;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: read of unassigned local `v`
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: read of unassigned local `u`
 // CHECK-NOT: read of unassigned local `v`

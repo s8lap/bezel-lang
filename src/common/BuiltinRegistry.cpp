@@ -1794,6 +1794,19 @@ constexpr BuiltinNonNullableParamRow kBuiltinNonNullableParams[] = {
     {"Int32", "ToString", 1, 0},        {"Int32", "Parse", 1, 0},
     {"Int32", "TryParse", 2, 0},        {"Int32", "ParseOrNull", 1, 0},
     {"Int32", "Parse", 2, 0},           {"Int32", "TryParse", 3, 0},
+    // fix #7296 (§9.1, v0.344): the OTHER integer receivers. stdlib §9.1
+    // declares "SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64",
+    // and every one of them carries §9.1's `ToString(format: string)` /
+    // `ToString(radix: int)` pair — so the §7 nullability gate must own
+    // that argument position at these receivers as well, exactly as it owns
+    // `Int32`'s. Without these rows the gate did not reach them: a NARROWED
+    // nullable radix was over-rejected there (the primitive site's own
+    // rejection owned the position) while the POSITIONAL and the MIRROR
+    // spellings admitted it.
+    {"Byte", "ToString", 1, 0},         {"SByte", "ToString", 1, 0},
+    {"Int16", "ToString", 1, 0},        {"UInt16", "ToString", 1, 0},
+    {"UInt32", "ToString", 1, 0},       {"Int64", "ToString", 1, 0},
+    {"UInt64", "ToString", 1, 0},
     // §9.2 `Double` and `Float`.
     {"Double", "ToString", 1, 0},       {"Double", "Parse", 1, 0},
     {"Double", "TryParse", 2, 0},       {"Double", "ParseOrNull", 1, 0},
@@ -1841,6 +1854,17 @@ bool builtinParamIsNonNullable(std::string_view typeHead,
     else if (head == "double") head = "Double";
     else if (head == "float") head = "Float";
     else if (head == "decimal") head = "Decimal";
+    // fix #7296 (§9.1, v0.344): the other integer keywords name the same
+    // stdlib types §9.1 declares — "SByte, Byte, Int16, UInt16, Int32,
+    // UInt32, Int64, UInt64" — so the keyword spelling and the declared head
+    // reach the same rows.
+    else if (head == "byte") head = "Byte";
+    else if (head == "sbyte") head = "SByte";
+    else if (head == "short") head = "Int16";
+    else if (head == "ushort") head = "UInt16";
+    else if (head == "uint") head = "UInt32";
+    else if (head == "long") head = "Int64";
+    else if (head == "ulong") head = "UInt64";
     for (const auto& r : kBuiltinNonNullableParams)
         if (r.head == head && r.member == member && r.argCount == argCount &&
             r.position == position)

@@ -331,13 +331,32 @@ void ExprTC::run(const ast::SourceFile& src) {
     // fix #3044 (§17.11 / §3.6 rule 2, v0.242): every `default(T)` obligation
     // and every generic-method instantiation has now been seen, in whatever
     // source order they appeared. Join them.
+    checkDeferredDefaultInstantiations();
     // fix #6947 (§17.11, v0.340): publish the unconstrained `default(T)` uses
     // so ModuleLoader can carry them onto an imported method re-parsed from
     // shipped body text.
+    //
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the publication now runs
+    // AFTER the join, not before it. `checkDeferredDefaultInstantiations` calls
+    // `propagateDefaultTypeParamChains`, which DERIVES the chain uses — a
+    // generic whose own type parameter is passed on to a generic whose chain
+    // ends in a `default(T)` takes `default` of that parameter too (#5962).
+    // §17.11 reads such a chain as an obligation on the OWNER's parameter
+    // ("the rule below rejects at the instantiation site every substitution
+    // that is not defaultable ... read through any chain of user
+    // declarations"), so the derived uses are §17.11 obligations exactly like
+    // the direct ones and must be published: the exporter ships them in the
+    // metadata (`MetaGenericParam::requiresWellDefinedDefault`) and the
+    // importer replays them, which is what makes an external instantiation
+    // behave identically to a same-module one (§2.8.2 clause 2). Publishing
+    // BEFORE the join meant the derived uses — computed inside it — never
+    // reached the publication at all, so a class-level chain
+    // (`Box<T>.WrapC()` passing the class's own `T` to `Box<T>.DefB<T2>()`,
+    // whose body takes `default(T2)`) shipped no obligation and the importer
+    // accepted `Box<string>.WrapC()` where the same-module call is rejected.
     for (const auto& u : defaultTypeParamUses_)
         if (u.unconstrained)
             ctx_.noteUnconstrainedDefaultParam(u.owner, u.param);
-    checkDeferredDefaultInstantiations();
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): the same join for
     // `x as T`, over the same instantiation records.
     checkDeferredAsTargetInstantiations();
@@ -351,6 +370,198 @@ void ExprTC::run(const ast::SourceFile& src) {
     checkDeferredAsOperandInstantiations();
 }
 
+
+// fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the owner key a
+// CLASS-level generic parameter's site and use are keyed on.
+//
+// A LOCAL class keys both on its `ast::TypeDecl` — that is what every
+// class-level `default(T)` use in a class body is recorded against (see
+// ExprTypecheck_Exprs.cpp's `recordDefaultTypeParamUse(classDecl, ...)`) and
+// what every class-level instantiation site is recorded against.
+//
+// An IMPORTED class has no `ast::TypeDecl` (#3141: ModuleLoader never
+// assigns `Symbol::decl` for a type across the boundary), so the decl-keyed
+// site no-ops and the join has nothing to fire on. The `TypeSymbol` is the
+// one key the site and the use can agree on across the boundary — and it is
+// the key ModuleLoader publishes the imported class's §17.11 obligation on
+// (`SemaContext::setImportedUnconstrainedDefaultParams`).
+const void* ExprTC::classParamOwner(const TypeSymbol* ts) const {
+    if (!ts) return nullptr;
+    return ts->decl ? static_cast<const void*>(ts->decl)
+                    : static_cast<const void*>(ts);
+}
+
+// fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): record the §17.11
+// obligation an IMPORTED generic CLASS carries, so the end-of-pass join
+// (`checkDeferredDefaultInstantiations`) judges an instantiation site of that
+// class exactly as the same-module typechecker judges it.
+//
+// §17.11 makes the obligation a property of the class's BODY: a body that
+// takes `default(T)` (directly, or through a chain that ends in a
+// `default(T)`) is rejected at every non-defaultable substitution of the
+// class's type parameter T. The exporting module computed that obligation
+// and shipped it in the metadata; ModuleLoader published it on the imported
+// TypeSymbol; here the IMPORTING pass records the matching `default(T)` use
+// against the same owner key the site is recorded on, so the join can pair
+// them.
+//
+// A LOCAL class's obligation is recorded by its own body (the class-level
+// `recordDefaultTypeParamUse(classDecl, ...)`), so this is a no-op there.
+void ExprTC::recordImportedClassDefaultObligation(const TypeSymbol* ts,
+                                                   SourceLocation loc) {
+    if (!ts || ts->decl) return;  // a LOCAL class records its own
+    const std::vector<std::string>* req =
+        ctx_.importedUnconstrainedDefaultParams(ts);
+    if (!req) return;
+    for (const std::string& r : *req)
+        recordDefaultTypeParamUse(ts, r, loc, /*unconstrained=*/true);
+}
+
+// fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): record the §17.11
+// obligation an IMPORTED generic METHOD carries, at the call site, for the
+// case the importer's own replay does not reach.
+//
+// The #6947 replay (ExprTypecheck_Calls.cpp's `checkMethodGenericConstraints`)
+// records the imported method's `default(T)` uses against the method's
+// `ast::MethodDecl` and the call site's instantiation site against that same
+// key. Both need the decl. An imported method whose body could NOT be
+// reconstructed has NO `ast::MethodDecl` at all: the loader's re-parse of a
+// body that calls a generic in ANOTHER type of the exporting module fails
+// (that type is not in the re-parsed synthetic class), so the body is not
+// attached — and then the replay records nothing, the site no-ops, and the
+// join has nothing to fire on. That is the shape of #7095: the importer
+// accepts `U.Wrap<string>()`, where the same-module typechecker rejects it.
+//
+// The obligation is still known: the exporting module computed it (it can
+// see the whole chain, including across a type boundary) and shipped it in
+// the metadata, and the loader published it on the imported MethodSymbol.
+// Here the importing pass records the matching `default(T)` use against that
+// MethodSymbol — the key the obligation was published on — and the matching
+// instantiation site against the same key, so the join reaches the same
+// verdict the same-module typechecker reaches.
+//
+// The substitution is the call's own: an explicit type-argument list binds
+// the method's declared type parameters in declaration order (§14.5);
+// otherwise §14.5's argument-driven inference applies.
+void ExprTC::recordImportedMethodDefaultObligation(const ast::CallExpr& ce) {
+    auto* ms = dynamic_cast<MethodSymbol*>(ctx_.exprSymbol(*ce.callee));
+    if (!ms) return;
+    // The importer's own replay covers the method whose body WAS attached.
+    if (ms->decl) return;
+    const std::vector<std::string>* req =
+        ctx_.importedUnconstrainedDefaultParams(ms);
+    if (!req || req->empty()) return;
+
+    std::unordered_map<std::string_view, TypeRef*> subst;
+    const std::vector<std::unique_ptr<ast::Type>>* callTypeArgs = nullptr;
+    if (auto* cma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+        callTypeArgs = &cma->typeArgs;
+    else if (auto* cncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                             ce.callee.get()))
+        callTypeArgs = &cncm->typeArgs;
+    else if (auto* cid = dynamic_cast<const ast::IdentifierExpr*>(
+                             ce.callee.get()))
+        callTypeArgs = &cid->typeArgs;
+    if (callTypeArgs && !callTypeArgs->empty()) {
+        // §14.5: "an explicit type-argument list binds the method's declared
+        // type parameters in declaration order".
+        for (std::size_t gi = 0;
+             gi < ms->genericParams.size() && gi < callTypeArgs->size(); ++gi) {
+            const Symbol* gp = ms->genericParams[gi];
+            if (!gp) continue;
+            const ast::Type* ta = (*callTypeArgs)[gi].get();
+            if (!ta) continue;
+            TypeRef* resolved = ctx_.resolvedType(*ta);
+            if (resolved) subst[gp->name] = resolved;
+        }
+    } else {
+        // §14.5's argument-driven inference: unify each argument's type
+        // against the formal parameter's, binding the method's type
+        // parameters. A conflicting binding clears the whole substitution
+        // (nothing is then judged — the safe direction: the call is left to
+        // the overload resolution that already ran).
+        std::unordered_set<std::string_view> paramNames;
+        for (const Symbol* gp : ms->genericParams)
+            if (gp && !gp->name.empty()) paramNames.insert(gp->name);
+        bool consistent = true;
+        for (std::size_t pi = 0; pi < ce.args.size() && consistent; ++pi) {
+            if (!ce.args[pi].value) continue;
+            std::string_view amod = ce.args[pi].modifier;
+            if (amod == "out var" || amod == "out using var" ||
+                amod == "out owned var")
+                continue;  // §22.4: an inline out-var binds the parameter
+            const TypeRef* pt = sema::formalParamResolvedType(*ms, pi);
+            if (!pt) continue;
+            TypeRef* argTy = ctx_.exprType(*ce.args[pi].value);
+            if (!argTy) continue;
+            if (argTy->kind == TypeRef::Kind::Primitive &&
+                argTy->primitive == PrimitiveType::Object && argTy->nullable)
+                continue;  // §14.5: a bare `null` contributes no binding
+            if (!unifyReturnAgainstTarget(pt, argTy, paramNames, subst))
+                consistent = false;
+        }
+        if (!consistent) subst.clear();
+    }
+    if (subst.empty()) return;
+
+    // Name the offending type argument the way the §14.2 diagnostics do
+    // (mirroring ExprTypecheck_Calls.cpp's §14.2 `argNameOf` lambda).
+    //
+    // fix #5282's shape matters here: an ARGUMENT-INFERRED substitution is
+    // built from the argument's sema TypeRef, which for a PRIMITIVE carries
+    // neither `declaration` nor a name-bearing `astNode` — so a lambda that
+    // stops at "the type argument" would name nothing in the diagnostic
+    // ("type argument `the type argument` is not defaultable"). The
+    // explicitly-spelled `Wrap<string>()` path never hit this, because its
+    // TypeRef is resolved from a written ast::Type and keeps its name head.
+    auto argNameOf = [](const TypeRef* a) -> std::string {
+        std::string base;
+        if (a && a->declaration) base = std::string(a->declaration->name);
+        else if (a && a->astNode && a->astNode->name &&
+                 !a->astNode->name->parts.empty())
+            base = std::string(a->astNode->name->parts.back());
+        else if (a && a->kind == TypeRef::Kind::Primitive) {
+            using P = PrimitiveType;
+            switch (a->primitive) {
+                case P::Bool:    base = "bool";    break;
+                case P::Char:    base = "char";    break;
+                case P::String:  base = "string";  break;
+                case P::Byte:    base = "byte";    break;
+                case P::SByte:   base = "sbyte";   break;
+                case P::Short:   base = "short";   break;
+                case P::UShort:  base = "ushort";  break;
+                case P::Int:     base = "int";     break;
+                case P::UInt:    base = "uint";    break;
+                case P::Long:    base = "long";    break;
+                case P::ULong:   base = "ulong";   break;
+                case P::Float:   base = "float";   break;
+                case P::Double:  base = "double";  break;
+                case P::Decimal: base = "decimal"; break;
+                case P::Object:  base = "Object";  break;
+                default:         return "the type argument";
+            }
+        }
+        else return "the type argument";
+        // §7.1 (#741/f13): a nullable type argument displays with its `?`.
+        if (a->nullable) base += "?";
+        return base;
+    };
+
+    for (const auto& sb : subst) {
+        if (!sb.second) continue;
+        bool required = false;
+        for (const std::string& r : *req)
+            if (r == sb.first) { required = true; break; }
+        if (!required) continue;
+        // The owner is the imported MethodSymbol — the key the obligation was
+        // published on, and the key no other join's use is recorded against.
+        recordDefaultTypeParamUse(ms, sb.first, ce.span.begin,
+                                  /*unconstrained=*/true);
+        recordGenericInstantiationSite(ms, sb.first, sb.second,
+                                       argNameOf(sb.second), ce.span.begin);
+    }
+}
 
 // fix #3044 (§17.11 / §3.6 rule 2, v0.242): see the declarations in
 // ExprTypecheck_impl.hpp.
@@ -419,9 +630,16 @@ void ExprTC::recordAnnotationInstantiationSites(TypeRef* rt,
         if (arg->nullable) argName += "?";
         // Use the TypeDecl as the owner key — matches what recordAsOperandTypeParamUse
         // does for the type-level carrier (currentType_->decl, not currentType_).
-        recordGenericInstantiationSite(ts->decl, gp->name, arg,
+        // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): for an IMPORTED class
+        // there is no decl (#3141), so the owner is the imported TypeSymbol —
+        // the key its §17.11 obligation is published on.
+        recordGenericInstantiationSite(classParamOwner(ts), gp->name, arg,
                                      std::move(argName), loc);
     }
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the imported class's
+    // §17.11 obligation, recorded as the `default(T)` use the join pairs
+    // with the site above.
+    recordImportedClassDefaultObligation(ts, loc);
 }
 
 void ExprTC::recordGenericInstantiationSite(const void* owner,
@@ -673,14 +891,25 @@ void ExprTC::recordDefaultObligationsForConstruction(const ast::NewExpr& ne,
     // boundary, #3141) — recordGenericInstantiationSite no-ops on a null
     // owner, and there is no LOCAL `defaultTypeParamUses_` entry keyed by an
     // imported decl pointer to join against regardless.
+    //
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): for an IMPORTED class the
+    // owner is the imported TypeSymbol — the key the loader publishes the
+    // class's §17.11 obligation on, and the key the importing pass records
+    // the matching `default(T)` use against. Without it the site no-ops and
+    // `new Box<string>()` (and the static-receiver `Box<string>.Get()`) is
+    // accepted where the same-module program is rejected.
     for (std::size_t i = 0; i < t->genericParams.size(); ++i) {
         Symbol* gp = t->genericParams[i];
         if (!gp) continue;
         TypeRef* arg = rt->genericArgs[i];
         if (!arg) continue;
-        recordGenericInstantiationSite(t->decl, gp->name, arg,
+        recordGenericInstantiationSite(classParamOwner(t), gp->name, arg,
                                        argNameOf(arg), ne.span.begin);
     }
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the imported class's
+    // §17.11 obligation, recorded as the `default(T)` use the join pairs
+    // with the site above.
+    recordImportedClassDefaultObligation(t, ne.span.begin);
     // fix #5641 (§15.1 / §3.6 rule 2, v0.327): a type parameter `T` used in
     // a nullable position (`T?`, a field/local/param typed `T?`) is a
     // compile error when `T` is substituted by an inline array at the
@@ -11189,6 +11418,19 @@ static bool extensionTargetMatchesReceiver(
                     ta->declaration == nullptr && ta->astNode &&
                     ta->astNode->name && !ta->astNode->name->parts.empty() &&
                     freeVars.count(ta->astNode->name->parts.back());
+                // fix #6966 (§26.4 / §2.8.2, v0.343): an IMPORTED block's
+                // head is RECONSTRUCTED from the artifact interface, so its
+                // free type variable carries no AST node — the name rides in
+                // `importedName` instead (the same two-source read
+                // `collectFreeVarBinding` and the §26.5 candidate scan
+                // already use). Without this arm the reconstructed free
+                // variable was read as a CONCRETE type argument, so the
+                // reconstructed head never matched ANY receiver: the block
+                // was invisible to §26.5's search instead of being the
+                // candidate the importer must refuse and name (§2.8.2).
+                if (!taFree && ta->kind == TypeRef::Kind::Named &&
+                    ta->declaration == nullptr && !ta->importedName.empty())
+                    taFree = freeVars.count(ta->importedName) != 0;
                 if (taFree) continue;  // free var unifies with the receiver arg
                 if (!extensionTargetMatchesReceiver(ta, ra, freeVars))
                     return false;  // concrete arg must match exactly
@@ -13048,8 +13290,34 @@ static const TypeRef* extensionFindMatchingAncestor(
                 case P::ULong: case P::Float: case P::Double: case P::Decimal:
                 case P::Char:
                     return target;
-                default: break;  // String/Object/Unit/Function — fall through
+                default: break;  // String/Object/Unit — fall through
             }
+        } else if (recv->kind == TypeRef::Kind::Function) {
+            // fix #7177 (§26.5 rule 2 / §8.1, v0.344): a FUNCTION type
+            // reaches `Object` "via their reference-type heap representation"
+            // (§8.1), so `Object` IS a base type of a function type, and
+            // §26.5 rule 2 searches the extension blocks "on `x`'s type,
+            // base types, or implemented interfaces". An `extension Object`
+            // block is therefore a CANDIDATE for a function-typed receiver.
+            //
+            // MEASURED on the pre-fix base (r30-c1 tip 40d1691f): with
+            // `extension Object { public method Leak(k: Keeper) => ... }`,
+            // `f.Leak(k)` over `var f: () -> int` COMPILED and did NOTHING —
+            // the extension never matched, the member access stayed untyped,
+            // and the call degraded to nothing (one #3079 internal-
+            // degradation warning). The corpus case `s28_3_0119` banks that
+            // program as ADMITTED (§28.3: "a capture-free one is admitted"),
+            // so the extension must REACH the function receiver.
+            //
+            // The receiver position of an extension whose head is `Object` is
+            // a SET-ERASING position (§28.3's closure bullet, §9.7: "the
+            // receiver position is borrow-erasing like a parameter of that
+            // type"), so §28.3's rule applies there: a function value with a
+            // non-empty source set is rejected and a CAPTURE-FREE one is
+            // admitted. The capture-bearing rejection is #5514's job and is
+            // NOT part of this change; what this arm restores is only that
+            // the extension REACHES the receiver at all.
+            return target;
         }
     }
     // Walk user-declared receiver's base type chain.
@@ -13362,6 +13630,79 @@ bool ExprTC::extConstraintItemProvablyViolated(
     return false;
 }
 
+// fix #6966 (§26.4 / §2.8.2, v0.343): resolve the BOUND of an IMPORTED
+// extension block's `where` clause.
+//
+// WHY. The artifact interface carries a block's `where` clause as TEXT (the
+// §26.5 rule 4 diagnostic needs the source-like spelling), and the importer
+// re-parses that text into a throwaway AST the type resolver never sees
+// (module/ModuleLoader.cpp's extension reconstruction). So
+// `ctx.resolvedType(bound)` is null for an imported block's constraint — and
+// §26.5.1's APPLICABILITY FILTER ("a `where` clause is an applicability
+// filter, never a ranking signal") could not be evaluated at all: the block
+// would apply to EVERY receiver, and the importer would refuse (naming the
+// shape) a call the same-module program resolves through another block.
+//
+// WHAT THIS DOES. It resolves the bound's HEAD — the only part the §14.2
+// type-bound check reads (`groundSatisfiesTypeBound` compares declarations
+// and ignores generic args) — to a TypeRef in THIS context:
+//
+//   * a type the block's DEFINING module exports (looked up by its qualified
+//     name, then by its simple name, in that module's exported types only —
+//     never another imported module's same-named type, which would make the
+//     verdict depend on import order); then
+//   * a compiler-synthesized builtin interface (`IComparable`, `IEquatable`,
+//     `IEqualityComparer`, `IReadOnlySpan`, `INumber`, `ISteppable`,
+//     `IParsable` — stdlib §2.19).
+//
+// A bound that resolves to NOTHING stays unresolved: §26.5.1's filter then
+// keeps the candidate (the sound direction — a candidate that MIGHT apply is
+// never dropped), and the call is refused with the shape-naming diagnostic
+// rather than answered by a different block.
+//
+// A LOCAL block's bound is already resolved by the type resolver, so this
+// never runs for one: the local path is unchanged.
+static TypeRef* resolveImportedExtensionBound(
+    SemaContext& ctx, const ast::ExtensionDecl& decl, const ast::Type& bound) {
+    if (TypeRef* already = ctx.resolvedType(bound)) return already;
+    if (bound.kind != ast::TypeKind::Named) return nullptr;
+    if (!bound.name || bound.name->parts.empty()) return nullptr;
+    // §26.5 rule 4: the candidate is identified by what it HAS — its
+    // DEFINING MODULE among them. The ExtensionSymbol carries it (§2.8.3
+    // rule 3 / #2335).
+    const ExtensionSymbol* extSym = ctx.extensionSymbolOf(&decl);
+    if (extSym == nullptr) return nullptr;
+    std::string qualified;
+    for (std::size_t i = 0; i < bound.name->parts.size(); ++i) {
+        if (i) qualified += '.';
+        qualified += std::string(bound.name->parts[i]);
+    }
+    const std::string_view simple = bound.name->parts.back();
+    TypeSymbol* sym = nullptr;
+    if (const std::vector<TypeSymbol*>* types =
+            ctx.importedTypesOf(extSym->moduleName)) {
+        for (TypeSymbol* t : *types) {
+            if (t && t->qualifiedTypeName() == qualified) { sym = t; break; }
+        }
+        if (!sym) {
+            for (TypeSymbol* t : *types) {
+                if (t && t->qualifiedTypeName() == simple) { sym = t; break; }
+            }
+        }
+    }
+    if (!sym) sym = ctx.builtinInterfaceSym(simple);
+    if (!sym) return nullptr;  // unresolvable → keep the candidate (see above)
+    TypeRef* ref = ctx.makeTypeRef();
+    ref->kind = TypeRef::Kind::Named;
+    ref->declaration = sym;
+    ref->nullable = bound.nullable;
+    // The bound's type ARGUMENTS are deliberately NOT resolved: §14.2's
+    // type-bound check compares declarations and ignores generic args (a
+    // wrong-generic-arg conformer reads as SATISFYING — the sound direction).
+    ctx.setResolvedType(&bound, ref);
+    return ref;
+}
+
 // §26.4 (v0.277, #3336): per-extension-block applicability test. Walks every
 // `where T: c1, c2` clause, looks up T's substitution in `binding` (built from
 // the matched ancestor's generic args by collectFreeVarBinding), and asks
@@ -13386,6 +13727,15 @@ bool ExprTC::extWhereClauseProvablyViolated(
             if (kv.first == gc.typeParam) { arg = kv.second; break; }
         }
         if (!arg) continue;  // unbound — keep (see header note)
+        // fix #6966 (§26.4 / §2.8.2, v0.343): an IMPORTED block's `where`
+        // clause arrived as TEXT and was never resolved in this context, so
+        // resolve its bound before the item test reads it (the item test
+        // reads `ctx.resolvedType(item.typeArg)`).
+        for (const auto& item : gc.items) {
+            if (item.kind != "type" || !item.typeArg) continue;
+            if (ctx_.resolvedType(*item.typeArg)) continue;
+            resolveImportedExtensionBound(ctx_, decl, *item.typeArg);
+        }
         for (const auto& item : gc.items) {
             if (extConstraintItemProvablyViolated(item, arg))
                 return true;
@@ -13498,6 +13848,168 @@ Symbol* ExprTC::lookupExtensionMember(
         bool isStandardLibraryLinq = false;
         std::string stdHead;       // e.g. "IEnumerable<T>"
         std::string stdWhere;      // e.g. "where T: hashable" — usually empty
+        // fix #6966 (§26.4 / §2.8.2, v0.343): this candidate's block is an
+        // IMPORTED block whose cross-module dispatch is not the exported
+        // `bz$ext$<T>$<M>` symbol — a free-variable head (`extension Box<T>`)
+        // or a `where` clause. The block's SHAPE rides in the artifact
+        // interface so the importer can see it, but the importer CANNOT
+        // dispatch it: the exported symbol was compiled against the
+        // exporter's placeholder layout, and dispatching it importer-side
+        // needs the #783 monomorphization machinery, which does not exist for
+        // extension blocks yet. So when such a block WINS §26.5.1's
+        // specificity order, the call is REFUSED with a diagnostic naming
+        // the shape (§2.8.2) instead of binding some less specific block's
+        // member and silently answering a different question.
+        bool shapeOnly = false;
+        // fix #7280 (§26.4 / §2.8.2, v0.344): this candidate's MEMBER is a
+        // GENERIC one (it declares type parameters of its own, §26.4) in an
+        // IMPORTED, otherwise DISPATCHABLE block. The block itself is
+        // dispatchable — its ordinary members cross the boundary with a
+        // concrete layout — but this member does not: there is no
+        // importer-side monomorphization for an extension block, and the
+        // exporter's one symbol per member name is compiled against the
+        // placeholder layout. So the refusal is PER MEMBER: the block's
+        // ordinary members keep dispatching, and only this one is refused
+        // (§2.8.2).
+        bool genericMember = false;
+    };
+    // fix #6966 (§26.4 / §2.8.2, v0.343): the diagnostic §2.8.2 requires when
+    // the block §26.5.1 selects is one the artifact interface can only carry
+    // as a SHAPE. §2.8.2: "An implementation unable to carry some body shape
+    // in its interface format must reject the export, or the import, with a
+    // diagnostic naming the shape; it must not alter the instantiation's
+    // semantics." The shape is named here as §26.5 rule 4 names a candidate:
+    // its defining module, its declared head including any `where` clause,
+    // and its declaration site.
+    //
+    // The lookup is SILENT on a no-match (the caller decides the "no member"
+    // wording), so this diagnostic is emitted only where the lookup is asked
+    // to report (`reportAmbiguity`) — the probe call sites (which only ask
+    // "does an extension with this name exist") stay silent.
+    auto reportShapeOnlyCandidate = [&](const ExtCandidate& c) {
+        if (!reportAmbiguity) return;
+        std::string moduleName;
+        if (auto it = importedExtensionModule_.find(c.ext);
+            it != importedExtensionModule_.end())
+            moduleName = it->second;
+        std::string head =
+            "extension " + spellExtHeadTypeRef(c.declaredHead);
+        const std::string where =
+            c.decl ? spellExtWhereClause(c.decl->genericConstraints)
+                   : std::string();
+        if (!where.empty()) head += " " + where;
+        std::string site;
+        if (c.decl && c.decl->span.begin.line != 0) {
+            site = "declared at ";
+            if (!c.decl->sourceFile.empty())
+                site += c.decl->sourceFile + ":";
+            else
+                site += "line ";
+            site += std::to_string(c.decl->span.begin.line);
+            if (!c.decl->sourceFile.empty())
+                site += ":" + std::to_string(c.decl->span.begin.column);
+            else
+                site += ", column " + std::to_string(c.decl->span.begin.column);
+        } else {
+            site = "declaration site not tracked across module imports";
+        }
+        std::string recvName(namedTypeSimpleName(receiver));
+        if (recvName.empty()) recvName = "?";
+        // The two reasons a block is resolution-only (§26.4): a free-variable
+        // head, and a `where` clause. Name the one that applies.
+        const std::string why =
+            where.empty()
+                ? "its head binds a free type variable, so the exported "
+                  "symbol was compiled against the exporting module's "
+                  "placeholder layout and dispatching it here would need "
+                  "importer-side monomorphization (§26.4)"
+                : "its `where` clause is an applicability filter (§26.5.1) "
+                  "that the exported symbol cannot express, so the block "
+                  "applies to some receivers and not others (§26.4)";
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "no member `" + std::string(name) + "` on type `" + recvName +
+                "`: the extension block `" + head + "` in module `" +
+                moduleName + "` (" + site + ") declares `" +
+                std::string(name) +
+                "`, and §26.5.1 selects that block for this receiver — but "
+                "the artifact interface cannot carry that block's shape: " +
+                why +
+                ". The importer therefore has no `" + std::string(name) +
+                "` to bind here; §2.8.2 requires this reject rather than a "
+                "silent binding of some other block's member");
+    };
+    // fix #7280 (§26.4 / §2.8.2 / §26.5.1, v0.344): the SECOND refusal
+    // reason, and it is PER MEMBER rather than per block. The block-level
+    // reason above covers a RESOLUTION-ONLY block (a free-variable head or a
+    // `where` clause): every one of its members is un-dispatchable, so the
+    // block as a whole is refused. A DISPATCHABLE block (a ground head) is a
+    // different case: its ORDINARY members cross the boundary with a
+    // CONCRETE layout and are dispatchable, so they must keep working — but
+    // a GENERIC member of that same block (§26.4's "a generic method that
+    // declares the block's parameters before its own") has no importer-side
+    // monomorphization, and the exporter emits ONE symbol per extension
+    // member NAME (`bz$ext$<module>.<Target>$<M>`) compiled against the
+    // exporting module's PLACEHOLDER layout. Dispatching it here would call
+    // it with the wrong layout: MEASURED by carrying it anyway, an int-typed
+    // type argument "works" only by ABI luck (printed 7) and a record-typed
+    // one fails the LLVM verifier ("Call parameter type does not match
+    // function signature!"). So the member is refused — §2.8.2: "An
+    // implementation unable to carry some body shape in its interface format
+    // must reject the export, or the import, with a diagnostic naming the
+    // shape; it must not alter the instantiation's semantics."
+    auto reportGenericMemberCandidate = [&](const ExtCandidate& c) {
+        if (!reportAmbiguity) return;
+        std::string moduleName;
+        if (auto it = importedExtensionModule_.find(c.ext);
+            it != importedExtensionModule_.end())
+            moduleName = it->second;
+        const std::string head =
+            "extension " + spellExtHeadTypeRef(c.declaredHead);
+        std::string site;
+        if (c.decl && c.decl->span.begin.line != 0) {
+            site = "declared at ";
+            if (!c.decl->sourceFile.empty())
+                site += c.decl->sourceFile + ":";
+            else
+                site += "line ";
+            site += std::to_string(c.decl->span.begin.line);
+            if (!c.decl->sourceFile.empty())
+                site += ":" + std::to_string(c.decl->span.begin.column);
+            else
+                site += ", column " + std::to_string(c.decl->span.begin.column);
+        } else {
+            site = "declaration site not tracked across module imports";
+        }
+        std::string recvName(namedTypeSimpleName(receiver));
+        if (recvName.empty()) recvName = "?";
+        // The member's own type parameters — the shape that cannot cross.
+        std::string tpNames;
+        if (auto* ms = dynamic_cast<MethodSymbol*>(c.member)) {
+            for (Symbol* gp : ms->genericParams) {
+                if (!tpNames.empty()) tpNames += ", ";
+                if (gp) tpNames += "`" + std::string(gp->name) + "`";
+            }
+        }
+        if (tpNames.empty()) tpNames = "a type parameter";
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "no member `" + std::string(name) + "` on type `" + recvName +
+                "`: the extension block `" + head + "` in module `" +
+                moduleName + "` (" + site + ") declares `" +
+                std::string(name) +
+                "` as a GENERIC method (type parameters: " + tpNames +
+                "), and §26.5.1 selects that block for this receiver — but "
+                "the artifact interface cannot carry that member's shape: a "
+                "generic extension method has no importer-side "
+                "monomorphization (§26.4), and the exporter emits ONE symbol "
+                "per extension member NAME, compiled against the exporting "
+                "module's placeholder layout, so dispatching it here would "
+                "call it with the wrong layout. The importer therefore "
+                "refuses to bind `" +
+                std::string(name) +
+                "` here; §2.8.2 requires this reject rather than a silent "
+                "binding of some other block's member");
     };
     std::vector<ExtCandidate> found;
     std::vector<std::unique_ptr<TypeRef>> ownedAncs;
@@ -13505,6 +14017,25 @@ Symbol* ExprTC::lookupExtensionMember(
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
         const TypeRef* target = ctx_.resolvedType(*decl->targetType);
+        // fix #6966 (§26.4 / §2.8.2, v0.343): is this block one the artifact
+        // interface can only carry as a SHAPE — an IMPORTED block whose head
+        // binds a free type variable (`extension Box<T>`) or that carries a
+        // `where` clause? Such a block's exported symbol was compiled against
+        // the exporter's placeholder layout, so the importer cannot dispatch
+        // it; when it WINS §26.5.1's specificity order the call must be
+        // refused with a diagnostic naming the shape, never answered by some
+        // less specific block's member.
+        //
+        // The predicate is the exporter's own (module/ModuleMetadataBuilder.cpp
+        // `convertExtension`), via the shared
+        // `sema::typeRefBindsFreeTypeVariable` — the two sides must classify
+        // a carried block identically, or the importer would dispatch a
+        // non-dispatchable block (a silent wrong answer) or refuse a
+        // dispatchable one (a false rejection).
+        const bool shapeOnlyBlock =
+            importedExtensionModule_.count(ext) != 0 &&
+            (!decl->genericConstraints.empty() ||
+             typeRefBindsFreeTypeVariable(target));
         // §26.5 (#773/#714): the extension's free type variables are EITHER
         // named in a `where T: …` constraint (`extension Bag<T> where T: class`)
         // OR introduced implicitly as the generic-arg placeholder name in the
@@ -13646,10 +14177,25 @@ Symbol* ExprTC::lookupExtensionMember(
             // defers (the pre-#2328 comment in this slot). Adding a per-block
             // arity/argument-type tie-break here would be out of scope for the
             // fix; the call site can still surface an ambiguity in step 2.
+            // fix #7280 (§26.4 / §2.8.2, v0.344): is this the member the
+            // importer must refuse? Only an IMPORTED block's member can be
+            // refused (a same-module block monomorphizes its generic member
+            // locally and answers correctly), and only when the block is
+            // otherwise DISPATCHABLE — a resolution-only block is refused as
+            // a whole by the `shapeOnly` reason above, and reporting both
+            // would name the same defect twice.
+            bool genericMember = false;
+            if (!shapeOnlyBlock &&
+                importedExtensionModule_.count(ext) != 0) {
+                if (auto* msym = dynamic_cast<MethodSymbol*>(m))
+                    genericMember = !msym->genericParams.empty();
+            }
             found.push_back({m, matchedAnc, target, ext, decl, std::move(binding),
                                  /*isStandardLibraryLinq=*/false,
                                  /*stdHead=*/std::string(),
-                                 /*stdWhere=*/std::string()});
+                                 /*stdWhere=*/std::string(),
+                                 /*shapeOnly=*/shapeOnlyBlock,
+                                 /*genericMember=*/genericMember});
             break;
         }
     }
@@ -13747,6 +14293,9 @@ Symbol* ExprTC::lookupExtensionMember(
         return nullptr;
     }
     if (found.size() == 1) {
+        if (found[0].shapeOnly) reportShapeOnlyCandidate(found[0]);
+        else if (found[0].genericMember)
+            reportGenericMemberCandidate(found[0]);
         if (outBinding) *outBinding = found[0].binding;
         return found[0].member;
     }
@@ -13784,6 +14333,8 @@ Symbol* ExprTC::lookupExtensionMember(
     }
     if (maximal.size() == 1) {
         const ExtCandidate& winner = found[maximal[0]];
+        if (winner.shapeOnly) reportShapeOnlyCandidate(winner);
+        else if (winner.genericMember) reportGenericMemberCandidate(winner);
         if (outBinding) *outBinding = winner.binding;
         return winner.member;
     }
@@ -14036,7 +14587,8 @@ GenericParamSymbol* ExprTC::typeParamMarker(std::string_view name) {
 // T1/T2 repro pair fully round-trip. With BOTH arms added, `T.Zero()`
 // resolves and returns identically local vs. imported.
 bool ExprTC::forEachConstraintBound(
-    std::string_view paramName, const std::function<bool(TypeRef*)>& fn) {
+    std::string_view paramName, const std::function<bool(TypeRef*)>& fn,
+    bool includeDeclarationless) {
     // §14.2 type-parameter bounds: a constraint bound may itself be another type
     // parameter (`where T: U`). In that case `T` inherits `U`'s constraint-
     // derived member surface ("T conforms to every interface that U's own
@@ -14105,6 +14657,15 @@ bool ExprTC::forEachConstraintBound(
             TypeRef* ctr = ctx_.resolvedType(*item.typeArg);
             if (!ctr || ctr->kind != TypeRef::Kind::Named) return false;
             if (ctr->declaration) return fn(ctr);  // concrete class/iface bound
+            // fix #7086 (§14.2, v0.340): a bound with NO declaration is one of
+            // the eight builtin COLLECTION interface heads (stdlib §4.1, §4.2,
+            // §4.12, §4.13) — they carry no TypeSymbol and therefore no member
+            // table, which is why the ordinary walk skips them. The widened
+            // walk hands them to the caller that asks the NAME question over
+            // the stdlib's documented collection surface
+            // (`constraintCollectionView`); every other caller reads
+            // `ctr->declaration` and must not see them.
+            if (includeDeclarationless && fn(ctr)) return true;
             // A bound with no declaration whose single-part name is another
             // in-scope type parameter is a `where nm: <param>` bound — enqueue
             // that parameter so its own constraint surface is searched too.

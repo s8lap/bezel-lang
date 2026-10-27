@@ -12,6 +12,10 @@
 
 module M; class C public static method Foo(): int var n := 0; try n := n + 1; finally var f := lambda() => do try var x := 1; finally return x; end; end; n := n + f(); end; return n; end Foo; end C;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: is not defined for a unit
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: `return` inside a `finally` block is a compile error
 // CHECK-SAME: (§31.2)
 // fix #6190: the unresolved `x` operand of the value `return` must not turn the

@@ -104,13 +104,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // 20 disposals, each adds `tag + 1` (the lambda's tag is `i`, so the
 // contribution is `i + 1` per iteration). Sigma_{i=1..20} (i+1) = 230.
@@ -189,7 +186,6 @@ const char* kDestructorBodyCapturesCell =
 BEZEL_TEST(codegen_destructor_lambda_closure_cell_release_2887,
            destructor_body_closure_local_releases_cell_spec_27_5) {
     JitResult r = runAotChecked(kDestructorBodyLambdaReleases);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kSum20);
 }
@@ -216,7 +212,6 @@ BEZEL_TEST(codegen_destructor_lambda_closure_cell_release_2887,
 BEZEL_TEST(codegen_destructor_lambda_closure_cell_release_2887,
            destructor_body_captured_cell_is_freed_spec_27_5) {
     JitResult r = runAotChecked(kDestructorBodyCapturesCell);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kCount20);
 }

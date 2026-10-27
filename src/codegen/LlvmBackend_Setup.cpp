@@ -2380,6 +2380,20 @@ void Emitter::declareFunctions() {
             ci.bodyKind == ast::MethodBodyKind::Abstract)
             continue;
 
+        // fix #6870 (§14.2 / §11.8, v0.343): the ERASED TEMPLATE's
+        // signature must use the SAME representation of a reference-constrained
+        // type parameter as its body (see lowerTypeRef's erased-template
+        // fallback and pushErasedRefScope). The scope is pushed for this
+        // method and popped afterwards, so a nested computation cannot see a
+        // stale one.
+        struct ErasedRefParamsGuard {
+            Emitter& e;
+            ErasedRefParamsGuard(Emitter& em, const sema::MethodSymbol* m) : e(em) {
+                e.pushErasedRefScope(m);
+            }
+            ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+        } erasedRefGuard(*this, ms);
+
         llvm::Type* retTy = isMain(ms) ? i32()
                                        : lowerType(ci.returnType);
         std::vector<llvm::Type*> paramTys;
@@ -2733,6 +2747,79 @@ void Emitter::declareFunctions() {
     }
 }
 
+// fix #7055 (§14.1 / §2.8.2, v0.340): the generic parameters whose NAMES are
+// in scope for an IMPORTED declaration — the member's own §14.1 parameters and
+// the ones its declaring type contributes. An imported type-parameter
+// reference has no `ast::Type` node (there is no AST in the importer), so the
+// name is carried in `TypeRef::importedName` (ModuleLoader's `convert`).
+static void collectImportedTemplateParamNames(
+    const sema::MethodSymbol* ms,
+    std::vector<std::string_view>& out) {
+    auto add = [&out](const std::vector<sema::Symbol*>& ps) {
+        for (sema::Symbol* p : ps) {
+            auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(p);
+            if (gp) out.push_back(gp->name);
+        }
+    };
+    if (ms) {
+        add(ms->genericParams);
+        if (ms->parent) add(ms->parent->genericParams);
+    }
+}
+
+// fix #7055 (§14.1 / §2.8.2, v0.340): true when `rt` is a reference to one of
+// the generic type parameters in `params` — the erased-placeholder shape an
+// imported generic declaration's signature carries. `headOut` receives the
+// matched name.
+//
+// An imported generic method is called through the DEFINING module's
+// erased-placeholder template (§2.8.2 clause 2: "An external instantiation
+// behaves identically to a same-module instantiation"), so the importer's
+// declaration of it must be the TEMPLATE's signature. The template lowers a
+// type-parameter reference to the i32 placeholder, and its NULLABLE form to
+// the placeholder nullable struct {i8 hasValue; i32 value} — the rule
+// `lowerTypeRef` states for an unspecialized template body. `lowerTypeRef`
+// applies that rule to a LOCAL type-parameter reference (which carries an
+// `ast::Type` node); an IMPORTED one carries no AST, so the nullable branch
+// cannot fire and the nullability was DROPPED: the importer declared `T?` as
+// a bare i32 against the exporter's {i8, i32}.
+//
+// ⚠ THE NAME ALONE IS NOT THE TEST, and the caller must check it. A type
+// parameter may be spelled like a reserved built-in — §14.1 "Type-parameter
+// names" admits a type parameter named like an ordinary type, and §2.7 rule 1
+// finds the type parameter first — so `M<IntPtr>(x: IntPtr): IntPtr?` declares
+// a type parameter named `IntPtr`. The defining module's template lowers that
+// reference to the BUILT-IN's own layout (lowerTypeRef's built-in arms answer
+// before the type-parameter fallback reaches the i32 placeholder), and the
+// importer's declaration must lower it the SAME way, or the two modules
+// disagree on the ABI of one symbol: the importer declared {i8, i32} against
+// the exporter's {i8, i64}, and the call read the exporter's result as a
+// different struct — a SILENT wrong value (0 instead of 14), which §2.8.2
+// clause 2 forbids ("An external instantiation behaves identically to a
+// same-module instantiation of the same generic at the same arguments").
+// The caller therefore applies `isBuiltinTypeRefName` to `headOut` and leaves
+// such a reference to `lowerTypeRef`, which is the path that produced the
+// exporter's own layout.
+static bool importedTypeNamesGenericParam(
+    const sema::TypeRef* rt,
+    const std::vector<std::string_view>& params,
+    std::string_view& headOut) {
+    headOut = {};
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->declaration) return false;
+    std::string_view head = rt->importedName;
+    if (head.empty() && rt->astNode && rt->astNode->name &&
+        !rt->astNode->name->parts.empty())
+        head = rt->astNode->name->parts[0];
+    if (head.empty()) return false;
+    for (std::string_view n : params)
+        if (n == head) {
+            headOut = head;
+            return true;
+        }
+    return false;
+}
+
 // §2.5 (issue #328 inc 3): see the call site in declareFunctions(). One external
 // `llvm::Function` per imported method, registered in methodFns_ so the call
 // path (directCall) finds it. The body-emit loop iterates methodFns_ but
@@ -2748,6 +2835,29 @@ void Emitter::declareImportedFunctions() {
         sema::TypeRef* retRef = ctx_.importedReturnType(ms);
         llvm::Type* retTy = retRef ? lowerTypeRef(retRef)
                                    : llvm::Type::getVoidTy(llvm_);
+        // fix #7055 (§14.1 / §2.8.2, v0.340): the imported method's ABI is
+        // the defining module's erased-placeholder template, whose NULLABLE
+        // type-parameter form is the placeholder nullable struct
+        // {i8 hasValue; i32 value} — the same struct `lowerTypeRef` builds for
+        // a local template body. Declaring it as a bare i32 (what the
+        // nullability-dropping imported path answered) made the importer's
+        // call read the exporter's {i8, i32} result as an int: the first word
+        // of the struct, i.e. the hasValue tag plus padding — a garbage
+        // value — while the SEMANTIC type of the expression stayed `int?`, so
+        // the `??` path extracted field 0 of an i32 and crashed bezelc
+        // (SIGSEGV in llvm::Value::setName, from an extractvalue with a null
+        // result type).
+        std::vector<std::string_view> tmplParams;
+        collectImportedTemplateParamNames(ms, tmplParams);
+        // fix #7055 (§14.1 / §2.8.2, v0.340): the placeholder applies to a
+        // type parameter whose name is NOT a reserved built-in — a parameter
+        // named like a built-in (`M<IntPtr>`) is lowered by the DEFINING
+        // module's template to the built-in's own layout, so the importer
+        // declares it the same way (see the recognizer's comment).
+        std::string_view retHead;
+        if (importedTypeNamesGenericParam(retRef, tmplParams, retHead) &&
+            retRef->nullable && !isBuiltinTypeRefName(retHead))
+            retTy = nullablePrimStructTy(sema::PrimitiveType::Int);
         std::vector<llvm::Type*> paramTys;
         // #735: an imported ENUM instance method's `this` is the enum's
         // underlying integer (i32), passed BY VALUE — matching the exporter's
@@ -2777,9 +2887,19 @@ void Emitter::declareImportedFunctions() {
             sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
             // fix #3095 / §4.7: lowerParamTypeRef — the imported face of the
             // same `()`-parameter substitution declareFunctions makes.
+            llvm::Type* pTy = pt ? lowerParamTypeRef(pt) : i32();
+            // fix #7055 (§14.1 / §2.8.2, v0.340): the parameter side of the
+            // erased-placeholder ABI — see the return type above. The
+            // exporter's template takes a nullable type parameter as
+            // {i8 hasValue; i32 value}; declaring it as a bare i32 made the
+            // importer pass a raw int where the callee read a tagged struct.
+            std::string_view paramHead;
+            if (importedTypeNamesGenericParam(pt, tmplParams, paramHead) &&
+                pt->nullable && !isBuiltinTypeRefName(paramHead))
+                pTy = nullablePrimStructTy(sema::PrimitiveType::Int);
             paramTys.push_back(isByRefMod(ps ? ps->modifier : std::string_view())
                                    ? ptrTy()
-                                   : (pt ? lowerParamTypeRef(pt) : i32()));
+                                   : pTy);
         }
         auto* fnType = llvm::FunctionType::get(retTy, paramTys,
                                                /*isVarArg=*/false);
@@ -10968,6 +11088,18 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         ~CurrentMethodGuard() { slot = prev; }
     };
     CurrentMethodGuard methodGuard{currentMethod_, ms};
+    // fix #6870 (§14.2 / §11.8, v0.343): the ERASED TEMPLATE's body
+    // reads a reference-constrained type parameter as a `ptr` (not as the `int`
+    // placeholder) — the same representation declareFunctions gave this
+    // method's erased signature. The scope is pushed for this body and popped
+    // afterwards, so a nested emission cannot see a stale one.
+    struct ErasedRefParamsGuard {
+        Emitter& e;
+        ErasedRefParamsGuard(Emitter& em, const sema::MethodSymbol* m) : e(em) {
+            e.pushErasedRefScope(m);
+        }
+        ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+    } erasedRefGuard(*this, ms);
     // #4602: a record/enum/choice method's `this` is a value receiver.
     if (ms && !isStaticMethod(ms)) noteCdNonClassThisFn(ms->parent, fn);
     // §2.5 / §14.1 / #783: an IMPORTED method's `methodFns_` entry is an EXTERNAL
@@ -19504,7 +19636,48 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 Severity::Error, init->span.begin,
                 unconstructedBuiltinNewNote(builtinNewName,
                                             "initialize this local"));
-        } else if (init && !ctx_.diagnostics().hasErrors()) {
+        } else if (init && !ctx_.diagnostics().hasErrors() &&
+                   // fix #7257 (§14.1, §3.6 rule 2, v0.344): in the
+                   // UNSPECIALIZED generic TEMPLATE body the initializer is
+                   // written against the ABSTRACT type parameter, whose
+                   // member surface is not known here — `x[0]` on a bare `T`
+                   // has no indexer to lower to, `x.ToString()` on a bare `T`
+                   // has no method to dispatch to. The template body is not
+                   // an instantiation: §3.6 rule 2 evaluates every generic
+                   // requirement PER INSTANTIATION, at the instantiation
+                   // site (§14.1 *Instantiation and its site*), and the
+                   // instantiation is what the LIVE call binds — the
+                   // specialization (`buildSpecializedMethodFn`, which
+                   // CLEARS this flag) or the inlined instantiation with the
+                   // substitution bound. What the ABSTRACT body fails to
+                   // lower says nothing about any instantiation's result, so
+                   // #2434's diagnostic — whose stated purpose is to expose a
+                   // lowering failure that CAN MATTER — has nothing to expose
+                   // here. The established precedent is #6757's gate in
+                   // LlvmBackend_Exprs.cpp, which lowers the dead template's
+                   // value SILENTLY on the same flag.
+                   //
+                   // THE ZERO-INITIALISED SLOT IS UNCHANGED: the store below
+                   // is outside this branch, so the template's local is still
+                   // deterministically zero-initialized. Only the REPORT is
+                   // suppressed, and only in the template body — every other
+                   // lowering failure (including the LIVE specialization's
+                   // own degrade, which is reported from the specialization
+                   // where the flag is clear) keeps #2434's warning.
+                   //
+                   // ⚠ THE ONE EXCEPTION, measured rather than assumed: an
+                   // IMPORTED generic method of a non-generic class is NOT
+                   // dead across a module boundary — the importer binds the
+                   // erased template itself (#6907), so the template body IS
+                   // the live code there. The flag cannot distinguish that
+                   // case (it is a fact about the IMPORTING module, not about
+                   // the body being emitted), so this suppression also silences
+                   // the template's warning in that one shape. The wrong
+                   // answer that shape can produce is a PRE-EXISTING defect
+                   // of the erased-template dispatch path (reported by the
+                   // more specific #2477), NOT of this site; `narrow #7257`
+                   // records it.
+                   !emittingGenericTemplateBody_) {
             ctx_.diagnostics().report(
                 Severity::Warning, init->span.begin,
                 "internal: lowerLocalDecl's initializer expression failed "
@@ -21817,6 +21990,182 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // method is not in methodFns_ yet, leave disposeAsyncFn null — emitDisposals
     // will use the sync fallback.
     if (ld->isAwaitUsing) {
+        // fix #7322 (§28.9 / §28.12, v0.344): CAN THIS BINDING'S SLOT HOLD A
+        // CLASS OBJECT AT ALL? The generic async-disposal arm below assumes it
+        // can: `d.asyncDispose = true` makes `emitDisposals` call
+        // `emitAsyncDisposeAwaitAndFree`, whose null-`disposeAsyncFn` fallback
+        // is `emitDisposeAndReclaim` -> `emitDynamicDispose` -> *load word 0,
+        // call vtable slot 2*. That fallback is only sound when word 0 IS a
+        // class vtable. For a VALUE-typed or RUNTIME-MANAGED right-hand side
+        // it is not, and the read is an out-of-bounds access:
+        //
+        //   await using var t := o.ToString();   word 0 of a bz.string is its
+        //                                          DATA pointer, so slot 2 is
+        //                                          read at data+16 — 14 bytes
+        //                                          past the end of the 2-byte
+        //                                          payload (ASan:
+        //                                          heap-buffer-overflow, READ
+        //                                          of size 8).
+        //   await using var x := 5;               the slot holds an i64; the
+        //                                          load reads past it (ASan:
+        //                                          stack-buffer-overflow).
+        //   await using var x := "hi";            slot 2 is a null pointer
+        //                                          (ASan: SEGV at 0x0).
+        //
+        // §28.12 (spec:7488) settles the shape: "`await using var` takes
+        // §28.10's admission unchanged — ... the value-type, runtime-managed
+        // and move-only right-hand sides ... Over an owned right-hand side
+        // with no `DisposeAsync` to await — a value-type, runtime-managed or
+        // move-only right-hand side, or an object whose class does not
+        // implement `IAsyncDisposable` — scope exit takes the synchronous
+        // disposal (or the no-op) and likewise awaits nothing." A value type
+        // and a runtime-managed value have NO CLASS, so their scope exit is
+        // the no-op; §28.12 (spec:7490) then reads "The `DisposeAsync` awaited
+        // is the run-time object's. `await using` selects the logical-disposal
+        // path by the class of the object the binding holds ... never by the
+        // binding's static type" — with no class there is no path to select.
+        //
+        // So the spelling must take §28.10's ARMS unchanged, which is what
+        // falling through to the plain chain below does (the #3449 precedent
+        // for the vtable-less builtin heads: "the SPELLING was deciding the
+        // disposal while the REPRESENTATION did not").
+        //
+        // WHY AN INTERFACE- OR `Object`-TYPED RIGHT-HAND SIDE IS NEVER
+        // MISCLASSIFIED AS VALUE-LIKE. Such a slot MAY hold a class instance
+        // (the static type only says what the holder promises), so it must
+        // keep the async path — and it does: the predicate below answers
+        // "may hold a class" for every class, interface, `Object`, type-
+        // parameter and declaration-less head, and "may NOT" only for the
+        // kinds §28.9 exhausts as carrying no obligation (the value types and
+        // the runtime-managed values). The predicate reads the slot's OWN
+        // REPRESENTATION (the effective type: the declared type when there is
+        // one, else the initializer's), which is what the disposal would read
+        // — not the runtime class of some object, which the compiler cannot
+        // know and §28.12 forbids it from using anyway.
+        //
+        // fix #7337 / #7327 (§28.12, §28.9, §28.10, v0.344): THE DECLARED
+        // TYPE ALONE IS NOT THE SLOT'S REPRESENTATION. #7322's predicate read
+        // the DECLARED type when the binding had one, so a binding whose
+        // declared type is `Object` (or any interface) answered "may hold a
+        // class" for EVERY right-hand side — including a right-hand side that
+        // is a RUNTIME-MANAGED value, whose word 0 is a DATA pointer and not
+        // a vtable:
+        //
+        //   await using var x: Object := o.ToString();  -> the string's
+        //       payload pointer is read as a vtable, so slot 2 is read at
+        //       payload+16 — 14 bytes past the end of the 2-byte payload
+        //       (ASan: heap-buffer-overflow, READ of size 8).
+        //   await using var x: Object := "hi";           -> the literal's
+        //       slot 2 is a null pointer (ASan: SEGV at 0x0).
+        //
+        // and a FUNCTION-TYPED right-hand side was never named by the
+        // predicate's switch at all (`sema::TypeRef::Kind::Function`), so it
+        // fell through to the conservative "may hold a class" answer and the
+        // closure's word 0 was read as a vtable (ASan: SEGV):
+        //
+        //   await using var f := lambda() => 1;          -> SEGV.
+        //
+        // §28.12:7490 decides the shape: "`await using` selects the
+        // logical-disposal path by the class of the object the binding HOLDS
+        // ... never by the binding's static type", and it names the
+        // `Object`-typed and interface-typed bindings as the ones that
+        // dispatch on the RUNTIME class ("through `Object`, and through any
+        // interface"). So the static type is not the answer — the object the
+        // binding holds is. What the COMPILER can know about that object is
+        // the RIGHT-HAND SIDE's own type, so the predicate now reads it too
+        // and takes the NARROWER answer for the RUNTIME-MANAGED values
+        // (§28.9 — a `string`, a function value): they have NO class, so
+        // §28.12:7488's "scope exit takes the synchronous disposal (or the
+        // no-op) and likewise awaits nothing" is the whole of it.
+        //
+        // THE MIRROR, MEASURED: a CLASS right-hand side keeps the async path.
+        // `await using var u: Object := new Solo();` still awaits Solo's
+        // DisposeAsync (the initializer's type is the class Solo), so the
+        // narrowing does not cost a class its asynchronous disposal — §28.12:7490's
+        // "through `Object`" case is exactly this one.
+        //
+        // The narrowed shapes take the PLAIN chain's arms — the same arms the
+        // plain `using var` spelling reaches, which is what §28.12 means by
+        // "takes §28.10's admission unchanged" (§28.10:7260 — "the disposal at
+        // scope end is a no-op ... and the only effect is the reassignability
+        // restriction") — so the two twins agree again.
+        // per §28.12, §28.9, §28.10, fix #7337, fix #7327
+        auto typeMayHoldClass = [](const sema::TypeRef* t) -> int {
+            // 1 = may hold a class object, 0 = may NOT, -1 = unclassifiable.
+            if (!t) return -1;
+            switch (t->kind) {
+            case sema::TypeRef::Kind::Primitive:
+                // `Object` is the ONE primitive that can hold a class
+                // instance (or a boxed value); every other primitive is a
+                // value type or a runtime-managed value (§28.9) — no class,
+                // no disposal obligation.
+                return t->primitive == sema::PrimitiveType::Object ? 1 : 0;
+            case sema::TypeRef::Kind::Named:
+                // A declaration-less head (a type parameter, or a builtin
+                // class the #3449 gate did not claim) MAY be a class: keep
+                // the pre-existing path.
+                if (!t->declaration) return 1;
+                // Class / interface: may hold a class instance.
+                if (t->declaration->kind == ast::TypeDeclKind::Class ||
+                    t->declaration->kind == ast::TypeDeclKind::Interface)
+                    return 1;
+                // Record / enum / choice: a VALUE TYPE (§9 / §10 / §35.4) —
+                // no class, no disposal obligation.
+                return 0;
+            case sema::TypeRef::Kind::Function:
+                // §28.9: a FUNCTION-TYPED value is runtime-managed — it
+                // "carries no disposal obligation", and "a `using var` local
+                // of function type is nonetheless permitted (disposal at
+                // scope end is a no-op)". A function value is not a class,
+                // so there is no vtable to dispatch on: its word 0 is not
+                // one, and reading it as one is the out-of-bounds read this
+                // arm removes (#7327).
+                return 0;
+            default:
+                // The unit type, an inline array, an error type: not
+                // classifiable here — keep the pre-existing path.
+                return -1;
+            }
+        };
+        auto awaitUsingSlotMayHoldClass = [&]() -> bool {
+            const sema::TypeRef* initTy =
+                ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr;
+            // The EFFECTIVE type: the declared type when there is one, else
+            // the initializer's (as #7322 read it).
+            const sema::TypeRef* declTy =
+                ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+            if (!declTy) declTy = initTy;
+            int declAns = typeMayHoldClass(declTy);
+            // Unclassifiable (-1): keep the pre-existing path (may hold a
+            // class) — no new behaviour.
+            bool mayHold = (declAns != 0);
+            // fix #7337: the RIGHT-HAND SIDE's own kind is the axis
+            // (§28.12:7490 — "never by the binding's static type"). A
+            // RUNTIME-MANAGED value (§28.9 — a `string`, a function value)
+            // has NO class: word 0 of one is a data pointer, not a vtable,
+            // so the class disposal over it is the out-of-bounds read this
+            // arm removes. An `Object`-declared (or interface-declared)
+            // binding over such a right-hand side therefore takes the
+            // NO-OP path, whatever the declaration says.
+            //
+            // WHY ONLY THE RUNTIME-MANAGED VALUES NARROW, AND NOT THE VALUE
+            // TYPES. A value-typed right-hand side stored into an `Object`
+            // slot is BOXED (§8.6) into a runtime box — a heap object whose
+            // word 0 IS a vtable, so the class path is sound for it (and it
+            // is what reclaims the box today). The runtime-managed values
+            // are the ones whose word 0 is NOT a vtable, and they are the
+            // ones §28.9 exempts from manual disposal outright. A
+            // FUNCTION-typed right-hand side is runtime-managed too (§28.9)
+            // and is the second hole the predicate had (#7327).
+            if (initTy) {
+                bool initIsRuntimeManaged =
+                    (initTy->kind == sema::TypeRef::Kind::Primitive &&
+                     initTy->primitive == sema::PrimitiveType::String) ||
+                    initTy->kind == sema::TypeRef::Kind::Function;
+                if (initIsRuntimeManaged) mayHold = false;
+            }
+            return mayHold;
+        };
         // fix #2739 (§30.5/§30.6, v0.240): an `await using var` bound to a
         // borrowing BUILTIN collection literal (`await using var xs: Array<int> :=
         // [k, k, k]`) MUST NOT route through the generic asyncDispose path below
@@ -22181,7 +22530,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // one side, a wild jump on the other. Filed separately by the
                 // #3449 review as its own shape; do not read the sentence above
                 // as covering it.
-            } else {
+            } else if (awaitUsingSlotMayHoldClass()) {
                 Disposal d{it->second, nullptr};
                 d.asyncDispose = true;
                 // Attempt to resolve the direct DisposeAsync function pointer.
@@ -22241,6 +22590,34 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // handles it).
                 disposeStack_.back().push_back(d);
                 return;
+            } else {
+                // fix #7322 (§28.9 / §28.12, v0.344): the right-hand side is
+                // VALUE-typed or RUNTIME-MANAGED — it has no class, so the
+                // scope exit is the NO-OP (§28.12:7488: "scope exit takes the
+                // synchronous disposal (or the no-op) and likewise awaits
+                // nothing"). Registering the async/class disposal here is
+                // what produced the out-of-bounds read (see
+                // `awaitUsingSlotMayHoldClass` above), so register NOTHING and
+                // FALL THROUGH to the plain chain below — the same arms the
+                // plain `using var` spelling reaches, which is what §28.12
+                // means by "takes §28.10's admission unchanged" (§28.10:7260:
+                // "the disposal at scope end is a no-op ... and the only effect
+                // is the reassignability restriction").
+                //
+                // The runtime-managed value's OWN reference is not affected by
+                // this: it is discharged by the string/closure machinery, which
+                // arms the scope-end release for the `using var` spelling and
+                // (with #7322) for this one too — §28.10's "the only effect
+                // is the reassignability restriction" means the two spellings
+                // have the SAME runtime lifetime.
+                //
+                // fix #7337 / #7327 (v0.344): this arm is now also reached by
+                // a DECLARED-type binding whose right-hand side is
+                // runtime-managed or function-typed (`await using var x:
+                // Object := o.ToString();`, `await using var f := lambda() =>
+                // 1;`) — the declared type alone did not decide the
+                // representation, and the class disposal read the value's
+                // word 0 as a vtable. See `awaitUsingSlotMayHoldClass` above.
             }
         }
     }
@@ -24140,7 +24517,8 @@ bool Emitter::valueLikeChoiceLocalIsCopy(const ast::Node* ldNode) const {
 
 const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
         const ast::Node* ldNode,
-        std::vector<const ast::Expr*>* retainedArgs) const {
+        std::vector<const ast::Expr*>* retainedArgs,
+        bool allowUsingVar) const {
     // fix #2115 / §28.9 / §35.4: classify a `var` choice local for scope-end
     // managed-payload release. The value-like choice struct is a value-typed
     // stack slot; a +1 producer string stored into a case payload
@@ -24163,7 +24541,38 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // all-null view (any other node kind) answers "not a candidate" through the
     // `!v.init` test — the same answer the old `!ld` test gave.
     LocalDeclInitView v = localDeclInitView(ldNode);
-    if (!v.init || v.isUsing) return nullptr;
+    if (!v.init) return nullptr;
+    // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a value-like
+    // choice local. §28.10 (spec §28.10, line 7260) says of a value-typed
+    // right-hand side that "the disposal at scope end is a no-op (these types
+    // do not require disposal per §28.9), and the only effect is the
+    // reassignability restriction" — so the `using var` spelling must have the
+    // SAME RUNTIME LIFETIME as the plain-`var` spelling, which owns the
+    // construction's +1 payload and releases it at scope end. The plain-`var`
+    // twin is classified here and the `using var` twin was not: the
+    // `v.isUsing` term here refused it, so a `using var` value-like choice
+    // local was never a candidate and never got a scope-end release — the
+    // payload leaked. `allowUsingVar` (the caller's opt-in) admits that
+    // spelling; `await using var` stays refused EITHER WAY, because the async
+    // disposal machinery owns that spelling (#7306).
+    // A §21.1 `const` local never reaches the `isAwaitUsing` test below: it is
+    // not a `using` binding at all (§21.1 - a `const` binding never takes a
+    // disposal obligation; §28.10 - `using var` is that spelling), so the
+    // refusal has nothing to refuse for it. The `using`/`await using` spelling
+    // is admitted by the parser only on a `var` binding (see Parser_Stmts.cpp).
+    // See the LOCALDECL-ONLY marker at the cast.
+    if (v.isUsing) {
+        if (!allowUsingVar) return nullptr;
+        const ast::LocalDecl* uld =
+            // LOCALDECL-ONLY: a §21.1 `const` local CANNOT reach this cast:
+            // the `v.isUsing` gate above is read through the shared
+            // `Emitter::localDeclInitView`, which reports isUsing FALSE for
+            // every `const` local - a runtime `const` is an
+            // `ast::LocalConstDecl` (no `isUsing` member at all), so it can
+            // never be a `using` binding.
+            dynamic_cast<const ast::LocalDecl*>(ldNode);
+        if (uld && uld->isAwaitUsing) return nullptr;  // #7306
+    }
     // Resolve the choice type (the declared annotation wins; else the
     // initializer's inferred type), through the active substitution so a
     // generic choice at a concrete instantiation resolves to its specialized
@@ -26216,12 +26625,38 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // `var sub := s[a..b]` local owns the producer reference and must release it
     // at scope end. Recognize it by the IndexExpr's target being a string and
     // the index being a RangeExpr (the same shape codegen lowers to a slice).
+    //
+    // fix #7119 / §4.6 / stdlib §9.6 (v0.343): the same slice has a SECOND
+    // spelling — `s[r]` where `r` is a Range-typed VALUE (a variable, a call
+    // result) rather than a RangeExpr literal. The indexer lowering
+    // (LlvmBackend_Exprs.cpp) recognizes both spellings and funnels them
+    // through emitStringSliceBytes, which mints the same rc := 1 production
+    // (LlvmBackend_String.cpp), but the recognizer matched only the literal ⇒
+    // the consumer treated the slice as a BORROW, retained on top of the
+    // producer's +1, and the producer's reference was never dropped (MEASURED:
+    // 36 B in 2 allocations for one slice). §4.6: "`s[r]` for a `Range<int>`
+    // value `r` returns the substring spanning `r` ... The result is a fresh
+    // `string`" — the property stdlib §9.6 declares as
+    // `public pure readonly property [r: Range<int>]: string;`.
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(init)) {
-        if (ix->target && !ix->indices.empty() && ix->indices[0].value &&
-            dynamic_cast<const ast::RangeExpr*>(ix->indices[0].value.get())) {
-            auto* tt = ctx_.exprType(*ix->target);
-            return tt && tt->kind == sema::TypeRef::Kind::Primitive &&
-                   tt->primitive == sema::PrimitiveType::String;
+        if (ix->target && !ix->indices.empty() && ix->indices[0].value) {
+            // The index is a range in one of two spellings: a RangeExpr
+            // literal (`s[0..2]`) or a Range-typed value (`s[r]`) — exactly
+            // the two shapes the indexer lowering recognizes, and both mint
+            // the same rc := 1 production.
+            bool isRangeIndex =
+                dynamic_cast<const ast::RangeExpr*>(ix->indices[0].value.get())
+                    != nullptr;
+            if (!isRangeIndex) {
+                if (const sema::TypeRef* idxTy =
+                        ctx_.exprType(*ix->indices[0].value))
+                    isRangeIndex = isRangeType(idxTy);
+            }
+            if (isRangeIndex) {
+                auto* tt = ctx_.exprType(*ix->target);
+                return tt && tt->kind == sema::TypeRef::Kind::Primitive &&
+                       tt->primitive == sema::PrimitiveType::String;
+            }
         }
     }
     // #429 (OPERATOR-OPERAND category) / §4.6 / §28.9: a CALL to the inline
@@ -26265,7 +26700,14 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 }
             }
         }
-        if (call->args.empty() && call->callee) {
+        // fix #7312 (stdlib §9.1 / §2.18, v0.344): the ONE-ARGUMENT `ToString`
+        // OVERLOADS — `ToString(format: string)` and `ToString(radix: int)` —
+        // are recognized by the SAME receiver-type test as the no-argument
+        // spelling, so the primitive ToString family has ONE recognition site
+        // (the `check_nullable_string_producer_guard` ratchet counts them).
+        // The gate is therefore `args.size() <= 1`, not `args.empty()`, and
+        // each arity is decided INSIDE the one receiver-type test.
+        if (call->args.size() <= 1 && call->callee) {
             if (auto* ma =
                     dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
                 if (ma->member == "ToString" && ma->target) {
@@ -26278,7 +26720,64 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             case P::ULong: case P::UShort:
                             case P::Float: case P::Double: case P::Decimal:
                             case P::Char:
-                                return true;  // emitPrimitiveToString → rc=1 heap string
+                                // The NO-ARGUMENT spelling: emitPrimitiveToString
+                                // → rc=1 heap string.
+                                if (call->args.empty())
+                                    return true;
+                                // fix #7312 (stdlib §9.1 / §2.18, v0.344): the
+                                // ONE-ARGUMENT overloads mint a fresh +1 string
+                                // exactly as the no-argument one does. The
+                                // member-call arm that lowers them
+                                // (LlvmBackend_Exprs.cpp) builds the result the
+                                // same way: an inline `malloc` +
+                                // `initStringRc` (rc := 1) for the
+                                // literal-format path, the runtime's
+                                // `bz_double_to_string_r` /
+                                // `bz_decimal_to_string_fmt` /
+                                // `bz_char_to_string` (each a header at rc := 1)
+                                // for the rest, and `emitPrimitiveToString`
+                                // (rc := 1) for a specifier the arm does not
+                                // render itself.
+                                //
+                                // WHY THIS WAS NEEDED. With the one-argument
+                                // shape unclassified, every consumer of the
+                                // result treated it as a BORROW: a local bind
+                                // retained it ON TOP of the producer's own +1
+                                // and released only its own retain at scope
+                                // end, and the other consumers (a call
+                                // argument, a field store, a `return`, a concat
+                                // operand, an interpolation hole) released
+                                // nothing at all. The producer's +1 was
+                                // stranded and the string was never reclaimed.
+                                // MEASURED (#7312): 39 bytes in 2 allocations per
+                                // call, unbounded in a loop (200 iterations:
+                                // 7800 bytes in 400 allocations — one
+                                // allocation pair per call).
+                                //
+                                // THE CALLEE MUST NOT BE A SEMA-RESOLVED USER
+                                // METHOD. A primitive receiver cannot carry a
+                                // user member — but the gate keeps the
+                                // classification to the BUILTIN overloads, the
+                                // same `calleeResolvedBySema` test the `?.` arm
+                                // above uses, and keeps this arm DISJOINT from
+                                // `isUserMethodStringReturnCall` (which admits a
+                                // user method's `string` return and would
+                                // otherwise release the same reference a second
+                                // time).
+                                //
+                                // THE RECEIVER'S NULLABILITY IS NOT CONSULTED,
+                                // and must not be: §7.4 (v0.343) rejects every
+                                // member access on an un-narrowed nullable
+                                // receiver, so a nullable receiver that reaches
+                                // codegen has been narrowed, and §7.11
+                                // (v0.343) says a narrowed operand IS a
+                                // non-nullable operand. This is #7139's
+                                // invariant, and it is why the ratchet
+                                // `check_nullable_string_producer_guard` counts
+                                // the receiver-type tests here.
+                                if (!calleeResolvedBySema(*call, ctx_))
+                                    return true;
+                                break;
                             case P::Object:
                                 // fix #2846 (§8.5 "ToString" / §8.6 "Boxing" /
                                 // §28.9, v0.240): `o.ToString()` on an
@@ -26349,7 +26848,8 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                                 // call is an ordinary method call and
                                 // `isUserMethodStringReturnCall` (below) is the
                                 // arm that decides.
-                                if (!dynamic_cast<sema::MethodSymbol*>(
+                                if (call->args.empty() &&
+                                    !dynamic_cast<sema::MethodSymbol*>(
                                         ctx_.exprSymbol(*call->callee)))
                                     return true;
                                 break;
@@ -26357,6 +26857,12 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                                 break;  // Bool → sentinel; String → identity
                         }
                     }
+                    // fix #7312 (stdlib §9.1 / §2.18, v0.344): the Named and
+                    // builtin-exception spellings below are the NO-ARGUMENT
+                    // `ToString()` shape's. stdlib §9.1 declares a
+                    // one-argument `ToString` only on the numeric and char
+                    // primitives, so a one-argument call on a class, an
+                    // interface or a builtin exception is not that overload.
                     // fix #2846 (§8.5 / §8.6 / §28.9, v0.240) — the NAMED
                     // spellings of the same `lowerObjectToString` shape the
                     // `P::Object` case above covers. `Object` is not always the
@@ -26378,7 +26884,8 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // This mirrors LlvmBackend_Calls2.cpp's own gate
                     // (`isIfaceRecv || isNamedClassRecv`) rather than
                     // re-deriving it.
-                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                    if (call->args.empty() &&
+                        tt && tt->kind == sema::TypeRef::Kind::Named &&
                         tt->declaration &&
                         (tt->declaration->kind == ast::TypeDeclKind::Interface ||
                          tt->declaration->kind == ast::TypeDeclKind::Class) &&
@@ -26416,7 +26923,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     //     exception object's word 0 is one of the vtables
                     //     `bz_obj_is_string` scans, so it answers "not a
                     //     string") and are +1-or-sentinel regardless.
-                    if (isBuiltinExceptionTypeRef(tt) &&
+                    if (call->args.empty() && isBuiltinExceptionTypeRef(tt) &&
                         !dynamic_cast<sema::MethodSymbol*>(
                             ctx_.exprSymbol(*call->callee)))
                         return true;
@@ -26982,22 +27489,74 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // by the escape walk (its +1 then leaks — the safe direction); the consumer
     // TRANSFERS the single reference (no extra retain is emitted), so the release
     // drops it exactly once. No double-free. The property getters (`Length`,
-    // `IsAscii`, `[i: int]`, `[r: Range<int>]: string`) and the bool/int methods
+    // `IsAscii`, `[i: int]`) and the bool/int methods
     // (`Equals`, `CompareTo`, `StartsWith`, `EndsWith`, `Contains`, `IndexOf`,
     // `LastIndexOf`, `GetHashCode`, `ToInt32`, `ToInt64`, `ToDouble`, `ToFloat`,
-    // `ToBoolean`, `GetField`, `CountOf`, `Split`, `ToCharArray`, `GetEnumerator`,
+    // `ToBoolean`, `CountOf`, `Split`, `ToCharArray`, `GetEnumerator`,
     // `AsSpan`) are NOT covered here because they either don't return `string` or
     // don't go through tryLowerStringMethod's rc=1 path; they keep the existing
-    // non-producer classification (the borrowed/identity reads).
+    // non-producer classification (the borrowed/identity reads). The slicing
+    // property `[r: Range<int>]: string` is not an instance METHOD — it is
+    // covered by the IndexExpr arm above, in both of its spellings since
+    // #7119.
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->callee) {
             if (auto* ma =
                     dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
                 if (ma->target) {
                     auto* tt = ctx_.exprType(*ma->target);
+                    // fix #7139 / §7.4 / §7.11 / §9.6 / §28.9 (v0.343): the
+                    // receiver's DECLARED nullability is NOT part of the
+                    // producer contract, and reading it here is what made
+                    // EVERY string-producing §9.6 instance method leak its
+                    // producer's reference on a §7.4-narrowed `string?`
+                    // receiver.
+                    //
+                    // §7.4 (v0.343): "Member access, method calls, and
+                    // indexing on a nullable value are compile errors unless
+                    // the compiler has narrowed it to non-null". Sema
+                    // enforces that in ONE gate (ExprTC::resolveMemberAccess),
+                    // and the gate rejects EVERY nullable receiver that is not
+                    // narrowed: a simple local / parameter whose §7.4 flow
+                    // fact does not hold, a field or property that is not a
+                    // narrowed `readonly` path, an index result, and every
+                    // other expression shape (a call result, a conditional, a
+                    // `??` result, …). ⇒ a member access whose receiver's
+                    // static type is still `string?` at THIS point is a
+                    // receiver §7.4 has narrowed non-null — the program would
+                    // not have compiled otherwise. The narrowing is a FLOW
+                    // fact, so the receiver's DECLARED type stays `string?`
+                    // and `ctx_.exprType` still reports it as nullable.
+                    //
+                    // §7.11 (v0.343): "The rule reads the operand's static
+                    // type, so an operand that §7.4 has narrowed non-null is a
+                    // non-nullable operand and the ordinary operator applies
+                    // to it unchanged." ⇒ after the narrowing the receiver IS a
+                    // non-nullable operand, and the ordinary (non-nullable)
+                    // path is the one that runs.
+                    //
+                    // The LOWERING agrees, so the two stay in lockstep:
+                    // tryLowerStringMethod does not branch on the receiver's
+                    // nullability — `string?` is a BARE nullable pointer
+                    // (isNullableRefTy: "Covers `string?`, `Object?`, and
+                    // nullable class/interface fields"), so `self` is the
+                    // same `bz_string*` in both cases — and it mints the fresh
+                    // string at rc := 1 either way. Reading the DECLARED
+                    // nullability here made the recognizer and the lowering
+                    // DISAGREE about the receiver: the consumer then retained
+                    // on top of the producer's +1 and the producer's original
+                    // +1 never died. MEASURED before this fix: 3269 byte(s)
+                    // in 79 allocation(s) for a 40-iteration loop of
+                    // `var s: string? := "x"; var t: string := s.Repeat(50);`
+                    // (83 B per iteration: the 32-byte `bz_string` header plus
+                    // the 51-byte data buffer).
+                    //
+                    // The `?.` spelling is a DIFFERENT AST node
+                    // (ast::NullCondMemberExpr) and never reaches this arm —
+                    // it keeps its own classification, and its own codegen gap
+                    // is tracked separately (#7130).
                     if (tt && tt->kind == sema::TypeRef::Kind::Primitive &&
-                        tt->primitive == sema::PrimitiveType::String &&
-                        !tt->nullable) {
+                        tt->primitive == sema::PrimitiveType::String) {
                         std::string_view m = ma->member;
                         std::size_t argc = call->args.size();
                         // §9.6 ToUpper/ToLower: no args. Inline malloc + initStringRc.
@@ -27019,7 +27578,19 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             return true;
                         // §9.6 PadLeft/PadRight(totalWidth[, paddingChar]) →
                         // bz_str_pad.
-                        if ((m == "PadLeft" || m == "PadRight") &&
+                        // fix #7133 / §9.6 / §28.9 (v0.343): `PadCenter` is the
+                        // THIRD member of the same Pad family and mints through
+                        // the SAME helper (bz_str_pad, whose `align` byte
+                        // selects the centered layout) — the runtime ends it in
+                        // `bz_string_init_rc`, so it hands the consumer a fresh
+                        // +1 producer exactly like its two siblings. Without
+                        // this arm a consumer (a bound local, a WriteLine
+                        // argument, a `+` operand, …) would classify the result
+                        // as a BORROW, RETAIN it on top of the producer's +1,
+                        // and the producer's reference would never be dropped —
+                        // the same leak #7119 measured for Repeat/GetField.
+                        if ((m == "PadLeft" || m == "PadRight" ||
+                             m == "PadCenter") &&
                             (argc == 1 || argc == 2))
                             return true;
                         // §9.6 Insert(startIndex, value) → inline mint.
@@ -27027,6 +27598,34 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             return true;
                         // §9.6 Remove(startIndex[, count]) → inline mint.
                         if (m == "Remove" && (argc == 1 || argc == 2))
+                            return true;
+                        // fix #7119 / §9.6 / §28.9 (v0.343): the INSTANCE
+                        // `Repeat(count)` — the 1-arg spelling, `"x".Repeat(n)`
+                        // — repeats SELF n times. The 2-arg STATIC spelling
+                        // `string.Repeat(char, count)` is recognized in the
+                        // static-factory arm above; this is the sibling form
+                        // that arm never covered. tryLowerStringMethod's
+                        // `method == "Repeat" && call.args.size() == 1` arm
+                        // mints an inline malloc + initStringRc (rc := 1) ⇒ a
+                        // fresh +1 producer, and the consumer must TRANSFER
+                        // that reference instead of retaining on top of it
+                        // (MEASURED before this fix: 233 B in 2 allocations for
+                        // `"x".Repeat(200)`, 283 B for the shipped #6641
+                        // receiver `"c" + "x".Repeat(250) + "c"`).
+                        if (m == "Repeat" && argc == 1)
+                            return true;
+                        // fix #7119 / §9.6-ext / §28.9 (v0.343): `GetField(
+                        // delim, n)` — the §9.6-ext member that returns the
+                        // n-th 0-indexed field of SELF split by `delim` — also
+                        // mints a fresh +1 string (tryLowerStringMethod's
+                        // `method == "GetField" && call.args.size() == 2` arm
+                        // ends in the same initStringRc). MEASURED before this
+                        // fix: 34 B in 2 allocations. The comment above used to
+                        // list `GetField` among the members that "don't go
+                        // through tryLowerStringMethod's rc=1 path"; that was
+                        // false — GetField does return a `string` and does mint
+                        // at rc := 1, so it belonged here.
+                        if (m == "GetField" && argc == 2)
                             return true;
                     }
                     // stdlib §3.3 / #971: `span.ToString()` on a
@@ -28930,7 +29529,14 @@ void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
     if (emittingDisposerBody_) return;  // a disposer walks fields directly
     if (currentFn_ != stringReleaseEligibleFn_) return;
     if (!valueLikeChoiceStrReleaseEligible_.count(declNode)) return;
-    const sema::TypeRef* rt = valueLikeChoiceLocalMintsStringPayload(ld);
+    // fix #7305 / §28.10 (v0.344): `allowUsingVar` — the `using var` SPELLING
+    // of a value-like choice local is armed here exactly as its plain-`var`
+    // twin is (§28.10: "the only effect is the reassignability restriction" —
+    // the runtime lifetime must be the same). The membership gate above is
+    // what admits the spelling: a `using var` local that the escape walk did
+    // not clear never reaches this line.
+    const sema::TypeRef* rt = valueLikeChoiceLocalMintsStringPayload(
+        ld, /*retainedArgs=*/nullptr, /*allowUsingVar=*/true);
     if (!rt || !rt->declaration) return;  // defensive — eligibility is stale
     Disposal d{slot, nullptr};
     d.valueLikeChoiceStrRelease = true;
@@ -29190,6 +29796,160 @@ bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i) {
             return iid->name == "Console";
     }
     return false;
+}
+
+// fix #7127 / #6889 (§22.3 / §28.3 / §28.9, v0.343): is argument `i` of a call
+// whose callee is `callee` a COLLECTION-typed argument of a BUILT-IN member
+// whose lowering READS the argument and never STORES it?
+//
+// THE DEFECT THIS CLOSES. A named `Array<T>` local that is passed to a
+// BUILT-IN member (stdlib §9.6's `string.Join` / `string.From` /
+// `string.Trim`, stdlib §2.1's `Console.Write` / `Console.WriteLine`) is
+// NEVER DISPOSED: the compiler-inserted scope-end free of the array does not
+// run, and the callee does not dispose it either.
+//
+// WHY THE SCOPE-END FREE WAS SUPPRESSED. The array local's scope-end free is
+// armed only for a local the escape walk proves never ESCAPES
+// (`collectBorrowingArrayFreeEligible` → `borrowingArrayFreeEligible_`).
+// The walk's #1430 relaxation admits a bare-identifier argument in a PLAIN
+// (no-modifier) formal position of a RESOLVED user/imported method as a
+// CALL-BOUNDED borrow — but a BUILT-IN callee has no resolved MethodSymbol
+// (`ctx.exprSymbol` on `string.Join` / `Console.WriteLine` is null — the
+// members are matched structurally by the lowerings), so the `ms` path never
+// fires and every builtin argument fell through to the walk's conservative
+// ESCAPE ⇒ the local was excluded from the free-eligible set ⇒ §28.9's
+// "the backing storage is released with it by the compiler-inserted free at
+// the array's owner's release point" (stdlib §4.4) never ran.
+//
+// MEASURED on the base tree (`bezelc --sanitize=address`, LSan):
+//   `var a: Array<string> := ["x","y"]; string.Join(",", a);`
+//       → 208 B / 2 allocations leaked (the `bz_array_alloc` header at
+//         collections.cpp:252 and its backing store at :257);
+//   `var a: Array<string> := ["x","y"]; Console.WriteLine(a);`
+//       → the SAME 208 B / 2 allocations — the two are ONE site (#6889);
+//   `var b: Array<char> := ['a','b','c']; string.From(b, 0, 3);`
+//       → 144 B / 2 allocations;
+//   `var cs: Array<char> := [' ']; "abc".Trim(cs);`
+//       → 144 B / 2 allocations.
+// The CONTROLS are clean on the base tree: the same array never passed is
+// disposed, and the same array passed to a USER method (a concrete
+// `Array<char>` formal, or an `IEnumerable<char>` one) is disposed — the
+// user-method path is the `ms` relaxation, and it works.
+//
+// ⇒ ⇒ ⇒ THIS IS A LEAK, NOT A TRANSFER. The local is NOT consumed: after
+// `string.Join(",", a)` the program still reads `a.Count` and gets the right
+// value (MEASURED: prints `2`), so no ownership moved and no use-after-move
+// is diagnosed. The scope-end release was suppressed WITHOUT any ownership
+// transfer ⇒ the array's owner released nothing ⇒ §28.9's "released exactly
+// once" is violated. The fix restores the scope-end release; it must NOT
+// introduce a double free (see the exclusions below).
+//
+// WHY THE CALL-BOUNDED-BORROW READING IS THE SPEC'S (§22.3, v0.343). A PLAIN
+// (non-`owned`) formal is a BORROW: "the `owned` modifier is what transfers
+// ownership". stdlib §9.6 declares `Join(separator: string, items:
+// IEnumerable<string>)`, `From(buffer: Array<char>, start: length)` and
+// `Trim(chars: IEnumerable<char>)` with NO `owned` marker, and stdlib §2.1
+// declares `Console.Write(value: …)` / `Console.WriteLine(value: …)` the same
+// way ⇒ every one of those positions is a BORROW, and the CALLER keeps the
+// obligation ⇒ the scope-end free must run. (stdlib §3.1 states the same
+// fact for the `StringBuilder` family's own `args: Array<Object>` parameter:
+// "`AppendFormat`'s `args` is a call-bounded borrow".)
+//
+// THE EXCLUSIONS — WHY THIS IS NOT "EVERY BUILTIN CALLEE". The relaxation is
+// NOT the blanket rule "a builtin callee borrows its argument", because a
+// builtin CAN store its argument:
+//
+//   * a COLLECTION member stores its argument into an element slot
+//     (`Array<T>.Add(item: T)` — stdlib §4.4 — and its siblings). MEASURED on
+//     the base tree: `var l: Array<Array<int>> := []; do var a: Array<int> :=
+//     [1,2]; l.Add(a); end do; Console.WriteLine(l[0][0]);` COMPILES and
+//     LEAKS 144 B — the borrow escapes the inner scope into the outer
+//     container, and the compiler does not reject it. Freeing `a` at its
+//     scope end there would turn that leak into a heap-use-after-free. (The
+//     `using var` spelling of the same program is ALREADY a heap-use-after-free
+//     on the base tree — MEASURED — so this is a pre-existing borrow-escape
+//     hole in the ownership layer, not one this relaxation creates; it is
+//     REPORTED to the coordinator, not fixed here.)
+//   * an OWNING collection's element slot requires `owned` (stdlib §4.5's
+//     `OwningArray<T>.Add(owned item: T)`), so the compiler REJECTS a plain
+//     argument there ("a borrow cannot be passed where an `owned` value is
+//     required") — MEASURED — and the call-site `owned`/`move` spelling is
+//     excluded by the `a.modifier.empty()` gate at the call site.
+//
+// ⇒ ⇒ the relaxation is therefore admitted ONLY for the builtins whose
+// lowering READS the argument and provably never stores it — and it is keyed
+// on the SAME structural shapes the lowerings key on, so the escape decision
+// and the lowering stay in lockstep (the `isConsoleNonRetainingArg`
+// discipline). Every other builtin argument keeps the conservative ESCAPE —
+// leak-over-UAF, the safe direction.
+//
+// RECOGNIZED SHAPES (the stdlib's own parameter positions):
+//   * stdlib §9.6 `string.Join(separator, items)`  — `items` is parameter 1;
+//   * stdlib §9.6 `string.From(buffer, start, length)` — `buffer` is parameter 0;
+//   * stdlib §9.6 `string.Trim(chars)` / `TrimStart(chars)` / `TrimEnd(chars)`
+//     — `chars` is parameter 0;
+//   * stdlib §2.1 `Console.Write(value)` / `Console.WriteLine(value)` — the
+//     value is parameter 0.
+//
+// The argument must ALSO be a COLLECTION-typed value: that is the case this
+// relaxation exists for, and it keeps the other `string.From` overloads
+// (stdlib §9.6's `From(value: char)` and `From(value: CString)`) and the
+// `Console.Write` string overload out of the relaxation.
+static bool isBuiltinReaderCollectionArg(const ast::Expr* callee, size_t i,
+                                         const ast::Expr* arg,
+                                         const sema::SemaContext& ctx) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target || !arg) return false;
+
+    // ---- the OWNER: the static type the builtin member is accessed on ----
+    std::string_view owner;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+        // The static-qualifier spelling (`string.Join`, `Console.WriteLine`):
+        // the qualifier is a TYPE name, and the sema layer resolves NO type
+        // for it (MEASURED: `ctx.exprType` on the `string` / `Console`
+        // identifier is null), so the owner is read off the NAME — the same
+        // spelling the lowerings key on (`cls == "string" || cls == "String"`
+        // for `Join` in LlvmBackend_Calls.cpp; the identifier "Console" for
+        // the console lowering).
+        if (id->name == "string" || id->name == "String") owner = "string";
+        else if (id->name == "Console") owner = "Console";
+        else return false;
+    } else {
+        // The instance spelling (`"abc".Trim(cs)`): the receiver is a VALUE.
+        const sema::TypeRef* rt = ctx.exprType(*ma->target);
+        if (!rt) return false;
+        if (rt->kind == sema::TypeRef::Kind::Primitive &&
+            rt->primitive == sema::PrimitiveType::String) {
+            owner = "string";
+        } else {
+            return false;
+        }
+    }
+
+    // ---- the READER POSITION (the stdlib's own parameter positions) ----
+    bool readerPos = false;
+    if (owner == "string") {
+        readerPos = (ma->member == "Join" && i == 1) ||
+                    (ma->member == "From" && i == 0) ||
+                    ((ma->member == "Trim" || ma->member == "TrimStart" ||
+                      ma->member == "TrimEnd") && i == 0);
+    } else if (owner == "Console") {
+        readerPos = (ma->member == "Write" || ma->member == "WriteLine") &&
+                    i == 0;
+    }
+    if (!readerPos) return false;
+
+    // ---- the ARGUMENT must be a BORROWING COLLECTION value ----
+    const sema::TypeRef* at = ctx.exprType(*arg);
+    if (!at || at->kind != sema::TypeRef::Kind::Named) return false;
+    std::string_view head = at->headName();
+    if (head.empty() && at->declaration) head = at->declaration->name;
+    // §4.4–§4.11's borrowing collection family; the OWNING family is
+    // excluded (its element slots consume, and its `owned` parameters make a
+    // plain argument a compile error anyway).
+    if (!common::isBareCollectionTypeName(head)) return false;
+    if (common::isOwningPrefixedName(head)) return false;
+    return true;
 }
 
 // fix #3874 (§4.14/§4.15/§4.16/§8.6/§28.9, v0.294): is argument `i` of a call
@@ -30331,6 +31091,32 @@ struct StringEscapeWalker {
                         }
                     }
                 }
+            }
+            // fix #7127 / #6889 (§22.3 / §28.3 / §28.9, v0.343): a
+            // COLLECTION-typed argument of a BUILT-IN member that READS it
+            // (`string.Join` / `string.From` / `string.Trim` — stdlib §9.6;
+            // `Console.Write` / `Console.WriteLine` — stdlib §2.1) is a
+            // CALL-BOUNDED BORROW: the callee never stores it, so the
+            // caller's scope-end release of the array stays armed and
+            // §28.9's "the backing storage is released with it by the
+            // compiler-inserted free at the array's owner's release point"
+            // (stdlib §4.4) runs. WITHOUT this arm the builtin argument fell
+            // through to the walk's conservative ESCAPE (a builtin callee has
+            // no resolved MethodSymbol, so the #1430 `ms` path never fired),
+            // the local was excluded from `borrowingArrayFreeEligible_`, and
+            // the array's backing storage LEAKED (MEASURED: 208 B / 2
+            // allocations for `Array<string>`; 144 B / 2 for `Array<char>`).
+            // Gated on `borrowingArrayMode` for the same reason as the #2824
+            // FFI-buffer arm above: the dict-materializer / grouping /
+//            record-call-result walks have no release-old-on-reassign
+            // counterpart and keep their conservative ESCAPE. The
+            // non-retaining builtins are recognized structurally, keyed on
+            // the same callee shapes their lowerings key on, so the escape
+            // decision and the lowering stay in lockstep.
+            if (!safeArg && borrowingArrayMode && a.modifier.empty() &&
+                a.name.empty() && isTargetIdent(a.value.get()) &&
+                isBuiltinReaderCollectionArg(callee, i, a.value.get(), ctx)) {
+                safeArg = true;
             }
             // fix #2222 residue: a string local passed in a plain
             // (no-modifier, no-name) parameter position of an EXTERN
@@ -32383,6 +33169,33 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // Function with no MethodSymbol and an Object-typed receiver — so the
     // local's scope-end release picks it up.
     if (isObjectMemberMethodRef(init)) return true;
+    // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): a bare reference to a CLASS's
+    // own compiler-generated `Dispose` (`var f := d.Dispose;` where `d: D` and
+    // `D` is a class) lowers to a fresh +1 closure cell via
+    // makeClassDisposeThunk (the CG60 path, LlvmBackend_Exprs.cpp). The
+    // generated `Dispose` has no MethodDecl and no MethodSymbol (§28.2: the
+    // name is the compiler's — "Declaring a member named `Dispose` on a class
+    // or a record is a compile error at that declaration"), so the
+    // MethodSymbol branch above misses it and the 40-byte cell + its 8-byte
+    // env leaked on every reference. Match the CG60 gate that produced the
+    // cell — a class-typed receiver naming `Dispose`, with no bound symbol —
+    // so the local's scope-end release picks it up. The predicate is the same
+    // one the producer gate uses, so the producer and this consumer can never
+    // disagree about the set.
+    if (isClassDisposeMethodRef(init)) return true;
+    // fix #7014 (stdlib §4.1, spec §27.6 / §28.9, v0.340): a bare reference
+    // to a member of the array-backed BORROWING LIST interface `IList<T>`
+    // (`var f := il.Contains;`) lowers to a fresh +1 closure cell via
+    // makeBuiltinListMemberThunk (the CG60 path, LlvmBackend_Exprs.cpp). The
+    // member has no MethodSymbol (an interface head has no method DECLARATION
+    // to bind), so the MethodSymbol branch above misses it and the 40-byte
+    // cell + its 8-byte env leaked on every reference. Match the CG60 gate
+    // that produced the cell — an `IList<T>`-typed receiver naming one of the
+    // head's METHOD members, with no bound symbol — so the local's scope-end
+    // release picks it up (§28.9). The predicate is the same one the producer
+    // gate uses, so the producer and this consumer can never disagree about
+    // the set.
+    if (isBuiltinListMemberMethodRef(init)) return true;
     return false;
 }
 
@@ -35446,16 +36259,60 @@ void Emitter::collectClosureReleaseEligible(
                     ? ctx_.resolvedType(*currentReturnTypeNode_)
                     : currentLambdaReturnSemaTy_) &&
         !isFnTy(asyncResultSemaType_);
-    // Find every `var` (non-using) closure LocalDecl whose initializer is a
-    // +1 closure producer: either a codegen-internal producer (a lambda /
-    // method reference — isPlusOneClosureProducer) or a call to a
-    // user-defined, locally-compiled method whose declared return type is a
-    // function type (#429 RETURN category — isUserMethodClosureReturnCall;
-    // the callee mints exactly +1 on return, so the caller's local transfers
-    // that single reference and must release it at scope end iff non-escaping).
-    // The escape walk decides which candidates are non-escaping. (Function-typed
-    // locals never appear in `using var` — §28.9 — but the isUsing guard
-    // mirrors the string path defensively.)
+    // Find every closure LocalDecl whose initializer is a +1 closure producer:
+    // either a codegen-internal producer (a lambda / method reference —
+    // isPlusOneClosureProducer) or a call to a user-defined, locally-compiled
+    // method whose declared return type is a function type (#429 RETURN
+    // category — isUserMethodClosureReturnCall; the callee mints exactly +1
+    // on return, so the caller's local transfers that single reference and
+    // must release it at scope end iff non-escaping). The escape walk decides
+    // which candidates are non-escaping.
+    //
+    // fix #7269 (§28.9, v0.344): the walk admits the `using var` SPELLING of
+    // a function-typed local as well as `var` / `const`. The old `!v.isUsing`
+    // guard rested on the OPPOSITE premise — this header used to claim
+    // "Function-typed locals never appear in `using var` — §28.9" — and so
+    // excluded EVERY `using var` local from the candidate walk: the
+    // producer's +1 on the closure cell was never released and the cell
+    // leaked. §28.9 (v0.344) says the opposite, verbatim: "Function-typed
+    // fields, parameters, and locals are not subject to `owned` annotations
+    // and carry no disposal obligation; a `using var` local of function type
+    // is nonetheless permitted (disposal at scope end is a no-op) and serves
+    // only the non-reassignability role (§28.10) — a plain `var` of function
+    // type scopes its captures identically (§28.3's closure bullet)."
+    //
+    // MEASURED on the parent commit (`bezelc --sanitize=address`, LSan):
+    //
+    //   using var c := lambda(): int => 42;  ->  64 byte(s) leaked in 1 alloc
+    //   var c := lambda(): int => 42;         ->  clean
+    //   const c := lambda(): int => 42;       ->  clean
+    //
+    // ⇒ THE THREE-SPELLING MATRIX, with the `using var` arm the odd one out
+    // — a direct contradiction of §28.9's own last clause ("a plain `var` of
+    // function type scopes its captures identically"). The same shape leaks
+    // through the #429 RETURN category (`using var g := MakeFn();`, 64 B / 1
+    // allocation, where the `var` twin is clean), because the arm below is
+    // shared by all four producer predicates.
+    //
+    // The exclusion is now scoped to what §28.9 actually excludes: a `using
+    // var` local that CARRIES A DISPOSAL OBLIGATION (a class-typed binding).
+    // Every producer predicate below mints a CLOSURE CELL, so every local
+    // this arm sees is function-typed — and §28.9 puts function-typed values
+    // on the runtime-managed tier, which "carries no disposal obligation" at
+    // all. ⇒ No `using var` local that reaches this arm is excluded by the
+    // obligation rule, so the `using var` spelling is admitted. The
+    // §28.9 no-op clause is about the DISPOSAL OBLIGATION (a function value
+    // is not a class, §8.7 — it has no `Dispose()` to call); it is NOT a
+    // licence to skip releasing the closure CELL, which is a heap object
+    // backing the value and is released by the plain-`var` spelling.
+    //
+    // WHAT IS *NOT* ADMITTED: the BORROW arm below (the `else` branch) still
+    // excludes `using var`. A borrow-initialized function-typed local's slot
+    // owns NOTHING at bind (the +1 belongs to the SOURCE), and admitting it
+    // would widen `returnedClosureLocalOwnsPlusOne`'s reach — a different
+    // defect, measured separately (both spellings are LSan-clean on that
+    // shape). The producer arm is the one that mints a reference the slot
+    // must release.
     //
     // fix #3402 (§21.1 / §27.5 / §28.9, v0.283): the scan covers a §21.1
     // runtime `const` local (ast::LocalConstDecl) as well as a plain `var`
@@ -35508,43 +36365,61 @@ void Emitter::collectClosureReleaseEligible(
         if (!s) return;
         {
             LocalDeclInitView v = localDeclInitView(s);
-            if (v.init && !v.isUsing) {
-                if (isPlusOneClosureProducer(v.init) ||
-                    isUserMethodClosureReturnCall(v.init) ||
-                    isLambdaClosureReturnCall(v.init) ||
-                    isAwaitedClosureReturnCall(v.init)) {
-                    candidates.push_back(s);
-                    // fix #3757 follow-up: this decl belongs to the body being
-                    // analyzed — see closureLocalCandidates_'s declaration.
+            // fix #7269 (§28.9, v0.344): the PRODUCER arm is admitted for the
+            // `using var` spelling of a function-typed local as well as for
+            // `var` / `const` — see the header comment above for the spec
+            // sentence, the measured three-spelling matrix, and why the
+            // exclusion is now scoped to a `using var` local that CARRIES A
+            // DISPOSAL OBLIGATION (a class-typed binding — every producer
+            // predicate below mints a closure CELL, so the locals this arm
+            // sees are function-typed, and §28.9's runtime-managed tier
+            // carries no obligation at all).
+            const bool closureProducer =
+                v.init && (isPlusOneClosureProducer(v.init) ||
+                           isUserMethodClosureReturnCall(v.init) ||
+                           isLambdaClosureReturnCall(v.init) ||
+                           isAwaitedClosureReturnCall(v.init));
+            if (closureProducer) {
+                candidates.push_back(s);
+                // fix #3757 follow-up: this decl belongs to the body being
+                // analyzed — see closureLocalCandidates_'s declaration.
+                closureLocalCandidates_.insert(
+                    static_cast<const void*>(s));
+            } else if (v.init && !v.isUsing) {
+                // fix #2714: BORROW-initialized closure-typed local.
+                // Gate on the LOCAL's resolved type being a non-nullable
+                // function type — the same gate `collectStringReleaseEligible`
+                // uses for its borrowCandidates arm (a `string?` borrow is
+                // also left alone there for the same reason: null/sentinel
+                // handling is unchanged and the retain/release are
+                // null-safe, but the conservative scope to non-nullable
+                // borrows is kept for this increment). Reads the type from
+                // the declared annotation, or — for an inferred
+                // `var g := f()` — from the initializer's exprType.
+                //
+                // fix #7269 (§28.9, v0.344): this arm still EXCLUDES the
+                // `using var` spelling — see the header comment above ("WHAT
+                // IS *NOT* ADMITTED"). A borrow-initialized function-typed
+                // local's slot owns nothing at bind (the +1 belongs to the
+                // SOURCE), and admitting it would widen
+                // `returnedClosureLocalOwnsPlusOne`'s reach — a different
+                // defect, measured separately (both spellings are LSan-clean
+                // on that shape).
+                const sema::TypeRef* lt = nullptr;
+                if (v.type) lt = ctx_.resolvedType(*v.type);
+                if (!lt) lt = ctx_.exprType(*v.init);
+                if (lt && !lt->nullable &&
+                    lt->kind == sema::TypeRef::Kind::Function) {
+                    borrowCandidates.push_back(s);
+                    closureBorrowAll_.insert(static_cast<const void*>(s));
+                    // fix #2714 follow-up: a borrow-initialized closure
+                    // local also belongs to THIS body — extend
+                    // closureLocalCandidates_ so returnedClosureLocalOwnsPlusOne
+                    // recognizes the borrow side the same way it recognizes
+                    // the producer side (mirrors #2817's parallel extension
+                    // of stringLocalCandidates_ to stringBorrowAll_).
                     closureLocalCandidates_.insert(
                         static_cast<const void*>(s));
-                } else {
-                    // fix #2714: BORROW-initialized closure-typed local.
-                    // Gate on the LOCAL's resolved type being a non-nullable
-                    // function type — the same gate `collectStringReleaseEligible`
-                    // uses for its borrowCandidates arm (a `string?` borrow is
-                    // also left alone there for the same reason: null/sentinel
-                    // handling is unchanged and the retain/release are
-                    // null-safe, but the conservative scope to non-nullable
-                    // borrows is kept for this increment). Reads the type from
-                    // the declared annotation, or — for an inferred
-                    // `var g := f()` — from the initializer's exprType.
-                    const sema::TypeRef* lt = nullptr;
-                    if (v.type) lt = ctx_.resolvedType(*v.type);
-                    if (!lt) lt = ctx_.exprType(*v.init);
-                    if (lt && !lt->nullable &&
-                        lt->kind == sema::TypeRef::Kind::Function) {
-                        borrowCandidates.push_back(s);
-                        closureBorrowAll_.insert(static_cast<const void*>(s));
-                        // fix #2714 follow-up: a borrow-initialized closure
-                        // local also belongs to THIS body — extend
-                        // closureLocalCandidates_ so returnedClosureLocalOwnsPlusOne
-                        // recognizes the borrow side the same way it recognizes
-                        // the producer side (mirrors #2817's parallel extension
-                        // of stringLocalCandidates_ to stringBorrowAll_).
-                        closureLocalCandidates_.insert(
-                            static_cast<const void*>(s));
-                    }
                 }
             } else if (!v.init && !v.isUsing && v.type) {
                 // fix #2107-follow-up (§27.5 / §28.9, v0.298): the no-init
@@ -35925,12 +36800,148 @@ void Emitter::collectStringReleaseEligible(
         {
             // fix #3416: LocalDecl OR §21.1 LocalConstDecl, decoded once.
             LocalDeclInitView v = localDeclInitView(s);
-            if (v.init && !v.isUsing) {
-                if (isPlusOneStringProducer(v.init)) {
+            // fix #7272 (narrow) / §28.10 (v0.344): the `using var` SPELLING
+            // of a +1 string producer is admitted to the PRODUCER arm below.
+            //
+            // WHAT WAS SUPPOSED TO RELEASE IT. The scope-end release of a
+            // string local is THIS function's producer arm
+            // (`stringReleaseEligible_`) armed by `armStringLocalRefcount`
+            // (:28551) as a `Disposal{stringRelease}` on the local's slot. The
+            // `using var` spelling was excluded from the candidate walk by the
+            // `!v.isUsing` term, so the local never entered
+            // `stringReleaseEligible_`, no scope-end release was armed, and the
+            // producer's +1 was never discharged — the leak this fixes.
+            // MEASURED (the base arm, `bezelc --sanitize=address`, LSan):
+            //
+            //   using var t := o.ToString();   ->  34 byte(s) in 2 allocations
+            //   var         t := o.ToString();  ->  clean
+            //   using var t := sb.ToString();  ->  34 byte(s) in 2 allocations
+            //   var         t := sb.ToString(); ->  clean
+            //   using var t := "a" + "b";      ->  35 byte(s) in 2 allocations
+            //   var         t := "a" + "b";     ->  clean
+            //
+            // and the object code agrees: the plain-`var` twin carries ONE
+            // extra `bz_string_release` (the scope-end release of its slot) that
+            // the `using var` twin does not.
+            //
+            // WHY THIS IS NOT A DOUBLE RELEASE. There is NO second path that
+            // could discharge the same reference. The `using var` declaration's
+            // OWN disposal path is `registerUsingDisposal` (:21334), and a
+            // `string` is a RUNTIME-MANAGED type (§28.9): it is not a class, so
+            // `classOfLocal` cannot classify it, and §28.10 says of it that
+            // "the disposal at scope end is a no-op (these types do not require
+            // disposal per §28.9)". The compiler's own §28.10 lint says the
+            // same — "`using var` `t` is vacuous — the RHS is a
+            // value-typed/runtime-managed value with no disposal obligation
+            // (§28.9)" — and that lint is CORRECT about the OBLIGATION and is
+            // kept. "No disposal obligation" is not a licence to skip
+            // releasing the runtime's own reference: §28.10's next words are
+            // "and the only effect is the reassignability restriction", so the
+            // `using var` spelling of a runtime-managed value must have the
+            // SAME runtime lifetime as the plain-`var` spelling. This is the
+            // same reading #7269 applied to the closure cell (whose own §28.9
+            // sentence is even more explicit: "a plain `var` of function type
+            // scopes its captures identically").
+            //
+            // WHY ONLY THE PRODUCER ARM. The producer arm is where the slot
+            // takes ownership of a reference the PRODUCER minted (+1), so the
+            // scope-end release discharges exactly that one reference. The
+            // BORROW arm below is deliberately NOT extended to the `using var`
+            // spelling: a borrow-initialized local's slot owns nothing at bind
+            // (the reference belongs to the SOURCE), admitting it would widen
+            // `returnedStringLocalOwnsPlusOne`'s reach (which answers "does
+            // this local own a +1 that a RETURN may transfer?"), and the
+            // borrow side of the `using var` spelling is measured CLEAN on its
+            // own (a literal, a field read, an alias of another local) — a
+            // different concern, not this defect. Same split #7269 made for
+            // the closure arm.
+            //
+            // `await using var` was EXCLUDED here (as the async disposal
+            // machinery "owned" that spelling, #7306); fix #7322 admits it,
+            // because the async machinery no longer claims a value-typed or
+            // runtime-managed right-hand side at all — see
+            // `usingVarProducer` below.
+            // A §21.1 `const` local is never a `using` binding (§21.1 - a
+            // `const` binding never takes a disposal obligation; §28.10 -
+            // `using var` is that spelling), so it is never `await using`
+            // either, and the `isAwaitUsing` exclusion below has nothing to
+            // exclude for it. The `using`/`await using` spelling is admitted
+            // by the parser only on a `var` binding (see Parser_Stmts.cpp).
+            // See the LOCALDECL-ONLY marker at the cast.
+            const bool plusOneProducer =
+                v.init && isPlusOneStringProducer(v.init);
+            const ast::LocalDecl* usingLd =
+                // LOCALDECL-ONLY: a §21.1 `const` local CANNOT reach this
+                // cast: the ternary evaluates it only when `v.isUsing` is
+                // true, and `v.isUsing` (shared `Emitter::localDeclInitView`)
+                // is FALSE for every `const` local - a runtime `const` is an
+                // `ast::LocalConstDecl` (no `isUsing` member at all), so it
+                // can never be a `using` binding.
+                v.isUsing ? dynamic_cast<const ast::LocalDecl*>(s) : nullptr;
+            const bool usingVarProducer =
+                plusOneProducer && v.isUsing;
+            // fix #7322 (§28.9 / §28.10 / §28.12, v0.344): the `await using
+            // var` spelling is ADMITTED to the producer arm beside the plain
+            // `using var` one. The exclusion this term used to carry rested on
+            // "the async disposal machinery owns that spelling" (#7306) — and
+            // with #7322 it no longer does: a value-typed or runtime-managed
+            // right-hand side has no class, so §28.12:7488 gives its scope exit
+            // the NO-OP ("scope exit takes the synchronous disposal (or the
+            // no-op) and likewise awaits nothing"). The async machinery's only
+            // remaining share of this spelling is the class-typed one, whose
+            // reference is not the runtime-managed value's.
+            //
+            // §28.10:7260 is the reason the admission is REQUIRED, not merely
+            // permitted: "`using var` accepts a value-type or runtime-managed
+            // right-hand side. For ordinary value types and runtime-managed
+            // types, the disposal at scope end is a no-op (these types do not
+            // require disposal per §28.9), and the only effect is the
+            // reassignability restriction." "No disposal obligation" is not a
+            // licence to skip releasing the runtime's OWN reference — the
+            // #7272 argument, verbatim — so the `await using` spelling must
+            // have the SAME runtime lifetime as the plain-`var` one, which
+            // owns the producer's +1 and releases it at scope end. Without
+            // this the `await using var t := o.ToString();` producer's +1
+            // leaked (the string itself, not just the reference).
+            //
+            // `usingLd` is still needed below: it distinguishes a §21.1
+            // `const` local from a `var` one, and it is the LOCALDECL-ONLY
+            // marker for the cast.
+            // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a
+            // VALUE-LIKE CHOICE local. The choice-payload constructor is not a
+            // STRING producer, so `plusOneProducer` is false and
+            // `usingVarProducer` is false — the outer gate below was therefore
+            // FALSE for a `using var` choice local, so the decl was never
+            // classified at all and never armed for a scope-end release. Its
+            // plain-`var` twin takes the `valueLikeChoiceLocalMintsStringPayload`
+            // arm below and IS clean, and §28.10 requires the two spellings to
+            // have the SAME runtime lifetime ("the only effect is the
+            // reassignability restriction", spec §28.10, line 7260).
+            //
+            // WHY THIS IS NOT "WIDEN THE `using var` GATE". The gate stays
+            // exactly as #7272 left it: the BORROW arm below is still NOT
+            // reached for a `using var` local, and the PRODUCER arm still
+            // admits only a `using var` whose initializer is a +1 producer.
+            // The `using var` VALUE-LIKE CHOICE local gets its OWN arm (the
+            // `else if` after the gate), so nothing else about the `using var`
+            // spelling changes.
+            //
+            // `await using var` is EXCLUDED here exactly as it is excluded
+            // above: the async disposal machinery owns that spelling (#7306).
+            const sema::TypeRef* choicePayloadTy =
+                v.init ? valueLikeChoiceLocalMintsStringPayload(
+                             s, /*retainedArgs=*/nullptr,
+                             /*allowUsingVar=*/true)
+                       : nullptr;
+            const bool usingVarChoice =
+                v.isUsing && !(usingLd && usingLd->isAwaitUsing) &&
+                choicePayloadTy != nullptr;
+            if (v.init && (!v.isUsing || usingVarProducer)) {
+                if (plusOneProducer) {
                     producerCandidates.push_back(s);
                     // fix #2817: this decl belongs to the body being analyzed.
                     stringLocalCandidates_.insert(static_cast<const void*>(s));
-                } else if (valueLikeChoiceLocalMintsStringPayload(s)) {
+                } else if (choicePayloadTy) {
                     // fix #2115: a value-like choice local whose construction
                     // mints +1 string payload(s) — released at scope end iff
                     // non-escaping (the walk below).
@@ -35965,6 +36976,19 @@ void Emitter::collectStringReleaseEligible(
                             static_cast<const void*>(s));
                     }
                 }
+            } else if (usingVarChoice) {
+                // fix #7305 / §28.10 (v0.344): the `using var` SPELLING of a
+                // VALUE-LIKE CHOICE local — the arm the plain-`var` twin takes
+                // above, reached here because the outer gate is false for it.
+                // §28.10 (line 7260): "the only effect is the reassignability
+                // restriction" — so the runtime lifetime is the plain-`var`
+                // twin's, which owns the construction's +1 payload and releases
+                // it at scope end. Classified here, armed by
+                // armValueLikeChoiceStrRelease, released by the same
+                // tag-switched walk the `var` twin uses.
+                valueLikeChoiceCandidates.push_back(s);
+                // fix #2817: see the producer branch above.
+                stringLocalCandidates_.insert(static_cast<const void*>(s));
             } else if (!v.init && !v.isUsing && v.type &&
                        // LOCALDECL-ONLY: a `const` local always has an initializer (§21.1), so it never reaches this no-initializer arm
                        dynamic_cast<const ast::LocalDecl*>(s)) {
@@ -36068,7 +37092,18 @@ void Emitter::collectStringReleaseEligible(
                 static_cast<const void*>(ld)))
             continue;
         std::vector<const ast::Expr*> borrowArgs;
-        if (!valueLikeChoiceLocalMintsStringPayload(ld, &borrowArgs)) continue;
+        // fix #7305 / §28.10 (v0.344): `allowUsingVar` — the `using var`
+        // SPELLING of a value-like choice local is armed here exactly as its
+        // plain-`var` twin is. THIS IS LOAD-BEARING: the borrow-arg retain at
+        // the §35.3 construction site is gated on the argument node being in
+        // `valueLikeChoiceStrReleaseEligible_` (LlvmBackend_Calls2.cpp), and
+        // the scope-end release of the local releases those same strings. A
+        // release without the matching retain would drive the refcount
+        // negative — the runtime's over-release guard aborts the process — so
+        // the two must be admitted together.
+        if (!valueLikeChoiceLocalMintsStringPayload(ld, &borrowArgs,
+                                                     /*allowUsingVar=*/true))
+            continue;
         for (const ast::Expr* a : borrowArgs)
             retainedCtorArgs.insert(static_cast<const void*>(a));
     }
@@ -43700,7 +44735,23 @@ void Emitter::collectCellFreeEligible(
             // the lambda is in "non-escaping" top-level position.
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                 ownFrameBindings.insert(static_cast<const void*>(ld));  // #4524
-                bool nonEsc = !ld->isUsing &&
+                // fix #7269 (§28.9, v0.344): the `using var` spelling of a
+                // FUNCTION-typed local scopes its captures IDENTICALLY to the
+                // plain-`var` spelling (§28.9's last clause: "a plain `var` of
+                // function type scopes its captures identically"), so the
+                // escape verdict that decides whether the CAPTURE CELL may be
+                // freed at scope end must not exclude it. The membership test
+                // IS the gate: a `using var` local is in
+                // `closureReleaseEligible_` only if the closure-release walk
+                // (collectClosureReleaseEligible, above) proved it
+                // non-escaping — the same proof the plain-`var` spelling is
+                // admitted on. Before this change the `!ld->isUsing` term made
+                // the capture cell of a `using var` closure leak where the
+                // plain-`var` twin's cell was reclaimed (MEASURED on the
+                // parent commit: `var k: int := 7; using var c := lambda():
+                // int => k;` leaked 76 byte(s) in 3 allocations; the `var`
+                // and `const` twins were clean).
+                bool nonEsc =
                     closureNonEscaping.count(static_cast<const void*>(ld));
                 // fix #2334: anchor `using var` initializers that are CallExpr
                 // (form 2 of §28.14) so the CallExpr handling in expr() can
@@ -47861,6 +48912,26 @@ static const char* valueBuiltinBoxNameStr(std::string_view n) {
     return nullptr;
 }
 
+// fix #7055 (§32.7 / stdlib §10.0, v0.340): the FFI pointer-sized INTEGER
+// value types. `IntPtr`/`UIntPtr` are VALUE types — a machine-word integer,
+// i64 on the host — so their NULLABLE form is a nullable value type (§7.2):
+// the tagged {i8 hasValue; i64 value} struct, exactly like `DateTime?`.
+// They were absent from the nullable-value-builtin family, so `IntPtr?` fell
+// through to the BARE i64 lowering and its NULLABILITY WAS DROPPED — `null`
+// had no representation, and a cross-module generic method whose type
+// parameter is named `IntPtr` published an `i64` return that the importer
+// read as a nullable struct: the two modules disagreed on the ABI of one
+// symbol, and the call returned a SILENT wrong value.
+//
+// They are NOT among the boxable value builtins (§8.6: the boxed value
+// builtins are the DateTime/TimeSpan/DateOnly/TimeOnly/Guid shapes), so the
+// box-key set is left exactly as it was.
+static const char* ffiIntegerValueBuiltinName(std::string_view n) {
+    if (n == "IntPtr")  return "IntPtr";
+    if (n == "UIntPtr") return "UIntPtr";
+    return nullptr;
+}
+
 
 // §2.5–§2.6 (#1945/#1954): the value-builtin name (DateTime/TimeSpan/DateOnly/
 // TimeOnly/Guid) a TypeRef denotes, resolved across the three shapes value-builtins
@@ -47873,15 +48944,24 @@ const char* Emitter::valueBuiltinName(const sema::TypeRef* rt) {
     using K = sema::TypeRef::Kind;
     if (!rt || rt->kind != K::Named) return nullptr;
     // (a) builtinClassSym form: a compiler-intrinsic TypeSymbol (decl==nullptr).
-    if (rt->declaration)
-        return rt->declaration->decl ? nullptr
-                                     : valueBuiltinBoxNameStr(rt->declaration->name);
+    if (rt->declaration) {
+        if (rt->declaration->decl) return nullptr;
+        if (const char* ffi = ffiIntegerValueBuiltinName(rt->declaration->name))
+            return ffi;
+        return valueBuiltinBoxNameStr(rt->declaration->name);
+    }
     // (b) annotation form: declaration null, name via astNode headName.
-    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty()) {
+        if (const char* ffi = ffiIntegerValueBuiltinName(rt->headName()))
+            return ffi;
         return valueBuiltinBoxNameStr(rt->headName());
+    }
     // (c) imported form: declaration null, no astNode, importedName set.
-    if (!rt->importedName.empty())
+    if (!rt->importedName.empty()) {
+        if (const char* ffi = ffiIntegerValueBuiltinName(rt->importedName))
+            return ffi;
         return valueBuiltinBoxNameStr(rt->importedName);
+    }
     return nullptr;
 }
 
@@ -47891,7 +48971,9 @@ const char* Emitter::valueBuiltinName(const sema::TypeRef* rt) {
 // value-builtin's tagged-struct layout is keyed by isNullableValueBuiltinTy instead.
 const char* Emitter::valueBuiltinBoxName(const sema::TypeRef* rt) {
     if (!rt || rt->nullable) return nullptr;
-    return valueBuiltinName(rt);
+    const char* n = valueBuiltinName(rt);
+    if (n && ffiIntegerValueBuiltinName(n)) return nullptr;
+    return n;
 }
 
 

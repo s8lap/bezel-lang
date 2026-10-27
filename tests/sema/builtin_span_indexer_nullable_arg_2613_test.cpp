@@ -1,7 +1,7 @@
 // Spec-derived regression test for issue #2613.
 //
 // §7 (Nullability) / stdlib §3.3 (`ReadOnlyStringSpan`), v0.236: stdlib §3.3
-// (line 1321) declares the span's indexer
+// declares the span's indexer
 //
 //     public property [i: int]: char
 //

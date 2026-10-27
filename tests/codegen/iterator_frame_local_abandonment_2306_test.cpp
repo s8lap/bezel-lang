@@ -18,6 +18,7 @@
 #include <string>
 
 #include "support/aot_support.hpp"
+#include "support/aot_result_asserts.hpp"   // bezel::test::checkedToolchainSkipped
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
@@ -25,12 +26,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 int countOccurrences(const std::string& hay, const std::string& needle) {
     int n = 0;
@@ -89,7 +88,6 @@ BEZEL_TEST(iterator_frame_local_abandonment_2306,
         "        using var u := en.TakeCurrent(); "
         "        break; "
         "      end; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "dispose 1"), 1);
@@ -108,7 +106,6 @@ BEZEL_TEST(iterator_frame_local_abandonment_2306,
         "      while en.MoveNext() do "
         "        using var u := en.TakeCurrent(); "
         "      end; "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "dispose 1"), 1);
@@ -123,7 +120,6 @@ BEZEL_TEST(iterator_frame_local_abandonment_2306,
 BEZEL_TEST(iterator_frame_local_abandonment_2306,
            never_started_does_not_dispose_unestablished_local_29_7) {
     JitResult r = runAotChecked(program(""));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "dispose 1"), 0);
@@ -167,7 +163,6 @@ BEZEL_TEST(iterator_frame_local_abandonment_2306,
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(countOccurrences(r.stdoutText, "dispose 10"), 1);  // a, via iterator dispose
@@ -230,7 +225,6 @@ BEZEL_TEST(iterator_frame_local_abandonment_2306,
       for (const auto& d : r.diagnostics.diagnostics())
         fprintf(stderr, "DIAG: %s\n", d.message.c_str());
     }
-    if (wasSkipped(r)) return;
     // The nested-iter case surfaces a pre-existing leak in the inner
     // Gen2 frame when its MoveNext has run but the inner's enumerator's
     // own Dispose never reaches the inner's plain-owned-local path
@@ -246,6 +240,15 @@ BEZEL_TEST(iterator_frame_local_abandonment_2306,
     // double-dispose would print it twice. (Across both the buggy and
     // fixed paths the outer leak remains; that surface is for #1897 or a
     // follow-up, not #2306.)
+    //
+    // A toolchain-less box must FAIL this row loudly rather than fall into
+    // the `else` branch below (which exists for a genuine LSan report and
+    // would otherwise turn a skipped run into a vacuous PASS). The
+    // toolchain-SKIP diagnostic is the harness's own, so the run did NOT
+    // happen at all — there is nothing to count. (fix #3733's toolchain-SKIP
+    // burn-down: the guard that used to `return` on the "SKIP" literal is
+    // gone; this assertion is what makes the absence loud instead.)
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     if (r.ran) {
       int dispose100 = countOccurrences(r.stdoutText, "dispose 100");
       BEZEL_EXPECT_TRUE(dispose100 <= 1);

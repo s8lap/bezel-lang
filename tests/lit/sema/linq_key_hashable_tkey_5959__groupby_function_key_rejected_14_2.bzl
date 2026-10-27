@@ -6,7 +6,7 @@
 //
 // §14.2 + §3.6 hashable row clause (e) (v0.338): stdlib §5 declares
 // `GroupBy<TKey>(key: (T) -> TKey): IEnumerable<IGrouping<TKey, T>> where
-// TKey: hashable` (Bezel_Standard_Library.md:3697) — the same ordinary
+// TKey: hashable` (stdlib §5) — the same ordinary
 // member-level form as ToDictionary's, on the member's own type parameter.
 // Pre-fix the GroupBy typing arm consulted no gate, so a function-typed key
 // compiled silently. GroupBy is spelled here on the concrete-collection

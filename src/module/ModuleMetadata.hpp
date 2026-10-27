@@ -330,7 +330,16 @@ inline constexpr std::uint32_t kSchemaVersion = 7;
 // the importer-visible codegen ABI. An artifact stamped with another revision
 // is refused at import with the existing diagnostic (rc 1, "built by a
 // compiler with a different metadata content revision"), and must be rebuilt.
-inline constexpr std::uint32_t kProducerContentRevision = 3;
+// fix #7094 / #7095 (§17.11 / §2.8.2, v0.343) bumped 3 -> 4: the exporting
+// module now ships the §17.11 `default(T)` obligation of a generic's BODY
+// (`MetaGenericParam::requiresWellDefinedDefault`, a 3rd scalar of
+// GENERIC_BLOCK's REC_SCALARS) and folds it into the semantic hash — a NEW
+// METADATA FIELD and a NEW FOLD, the two changes this stamp exists to police.
+// Without the bump a compiler reading an artifact written before #7094 sees
+// the SAME stamp and LOADS IT SILENTLY: the obligation's fold is missing, the
+// importer judges the instantiation against an empty obligation set, ACCEPTS
+// it, and the program SEGFAULTS (exit 139) instead of being rejected.
+inline constexpr std::uint32_t kProducerContentRevision = 4;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
@@ -435,6 +444,31 @@ struct MetaGenericParam {
     std::string variance; // "", "in", "out"
     std::vector<MetaType> constraintTypes;       // §14.2 type constraints
     std::vector<std::string> specialConstraints; // "class", "value", "new", ...
+
+    // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): this type
+    // parameter's substitution MUST have a well-defined `default` value.
+    //
+    // §17.11 makes the obligation a property of the GENERIC BODY, not of the
+    // type argument list: a body that takes `default(T)` (directly, or through
+    // a chain that ends in a `default(T)`) is rejected at every non-defaultable
+    // substitution of T. The same-module typechecker discharges that obligation
+    // by joining the body's use of `default(T)` against the instantiation site
+    // (§17.11's closing rule). Across a module boundary the importer has no
+    // body to join against, so the exporter ships the obligation itself: this
+    // flag says "substituting this parameter requires a defaultable type".
+    //
+    // It is deliberately NOT a `where` constraint — it is not part of the
+    // declared signature, and it is not something the source says. It is the
+    // §17.11 obligation, carried, so §2.8.2 clause 2 ("an external
+    // instantiation behaves identically to a same-module instantiation of the
+    // same generic at the same arguments") can hold.
+    //
+    // WIRE: a 3rd scalar in GENERIC_BLOCK's REC_SCALARS, additive within the
+    // current schema version (the #2392 `outNullWhen` precedent): a reader
+    // predating this field never looks past index 1, and a current reader
+    // given a predating blob reads the missing 3rd scalar as false — the
+    // value every blob had before this field existed.
+    bool requiresWellDefinedDefault = false;
 
     bool operator==(const MetaGenericParam&) const;
 };

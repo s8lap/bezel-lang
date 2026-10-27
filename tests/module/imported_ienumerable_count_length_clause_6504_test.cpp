@@ -45,7 +45,7 @@
 //   * BARE `.Count` on `IEnumerable<T>` is NOT a legal program, so rejecting
 //     it is not a false reject. stdlib §4.12 declares `IEnumerable<out T>` with
 //     exactly one member, `GetEnumerator`; `Count` is §5's `method Count(): int`
-//     (Bezel_Standard_Library.md:3643) — a METHOD, spelled with parentheses.
+//     (stdlib §5) — a METHOD, spelled with parentheses.
 //     #6389's `no member `Count` on `IEnumerable<T>`` message is the CORRECT
 //     verdict for that read.
 //

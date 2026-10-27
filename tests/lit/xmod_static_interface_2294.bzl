@@ -17,7 +17,11 @@
 // sections — not merely that compilation failed: the gtest harness maps a
 // compiler CRASH to the same signal as a clean reject (issue #2254), so a
 // content match is what distinguishes a real §11.2/§11.8 diagnostic from an
-// internal-compiler-error escape. `CHECK-NOT: internal:` pins that too.
+// internal-compiler-error escape. The escape guard below pins that too.
+// (#6620: that guard used to name the codegen-only `internal:` marker —
+// codegen is gated on a clean front end, so on a row that rejects in the front
+// end it named a needle that could never fire; it now names the front end's
+// own ICE marker.)
 module SiApp;
 import SiLib2294;
 
@@ -31,6 +35,12 @@ end C;
 
 // bezelc emits diagnostics as `file:line:col: message` with no "error:"
 // severity word, so anchor on the `:line:col:` shape and the rule text.
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// #7069: the front end's ICE marker is printed BEFORE any user-facing
+// diagnostic, and a negative directive scans only the region between the
+// surrounding matches — below the positive match this needle could never
+// fire, so it is written above it, where it can.
+// CHECK-NOT: internal compiler error
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: class `Bad` implements static interface member `Ping` of `IPing` with a different signature
 // CHECK-SAME: (§11.2 / §11.8)
-// CHECK-NOT: internal:

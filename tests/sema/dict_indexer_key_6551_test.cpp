@@ -492,52 +492,74 @@ BEZEL_TEST(dict_indexer_key_6551,
             "end Helper;\n"));
 }
 
-// ── The NON-dictionary indexer families are deliberately untouched ─────────
+// ── The NON-dictionary indexer families — NOW GATED (#7064) ────────────────
 //
-// This fix is scoped to the dictionary key slot, and these rows pin the scope
-// boundary: `Array<T>[j]` at a `long j` is ALSO a §5.1 error (`long → int` is
-// a narrowing, and §5.1's table has no such row), but `Array<T>`'s indexer
-// declares `[i: int]` — a different declared parameter type, on a different
-// receiver family, and #6527 declined it for the same reason. The same for
-// `string`'s `[i: int]`. Widening the gate to those is a separate call; these
-// rows make the boundary visible so widening it is a conscious act.
+// These three rows were CONTROLS when this file was written: they pinned the
+// scope boundary of #6551, which was scoped to the dictionary key slot, and
+// they asserted that `Array<T>[j]` at a `long j`, `string[j]` at a `long j`
+// and a user-declared `property [i: int]` at a `long j` all COMPILED AND RAN
+// (exit 0).
 //
-// MEASURED: both compile, at exit 0, on the pre-fix base and on this tip.
+// #7064 is that separate call, and it CLOSES the boundary: §23.4 makes an
+// index argument a parameter pass, and §5.1 governs the conversion at that
+// pass. `Array<T>`'s indexer declares `[i: int]` (stdlib §4.4), `string`'s
+// is the same `[i: int]` position (spec §4.6), and a user-declared
+// `property [i: int]` declares its own `int` — so a `long` argument has no
+// §5.1 row at any of them (§5.1's table row is `int` -> `long`, never the
+// reverse, and §5.1's constant-narrowing clause — the only way a wider
+// integer reaches a narrower declared type — applies to COMPILE-TIME
+// CONSTANTS only). The comment above the old rows said exactly this: "`Array
+// <T>[j]` at a `long j` is ALSO a §5.1 error (`long -> int` is a narrowing,
+// and §5.1's table has no such row)".
+//
+// BEHAVIOUR FLIP: these three rows changed from "compiles and runs" to
+// "rejected with the §5.1 wording". The pre-#7064 expectation is not
+// preserved anywhere: the §5.1 error they pinned was never a §5.1-legal
+// program.
 
 BEZEL_TEST(dict_indexer_key_6551,
-           control_array_indexer_is_not_gated_by_this_fix_spec_15_1) {
-    BEZEL_EXPECT_EQ(std::string("2\n"),
-                    out("    var a: Array<int> := [1, 2, 3];\n"
-                        "    var j: long := 1;\n"
-                        "    Console.WriteLine(a[j].ToString());\n"
-                        "    return 0;\n"));
+           array_indexer_long_index_is_rejected_spec_5_1) {
+    auto r = runAot(prog("    var a: Array<int> := [1, 2, 3];\n"
+                         "    var j: long := 1;\n"
+                         "    Console.WriteLine(a[j].ToString());\n"
+                         "    return 0;\n"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        r, "the index argument to `Array[i]` has a type that is not "
+           "implicitly convertible to the target type (§5.1)"));
 }
 
 BEZEL_TEST(dict_indexer_key_6551,
-           control_string_indexer_is_not_gated_by_this_fix_stdlib_1) {
-    BEZEL_EXPECT_EQ(std::string("b\n"),
-                    out("    var s := \"abc\";\n"
-                        "    var j: long := 1;\n"
-                        "    Console.WriteLine(s[j].ToString());\n"
-                        "    return 0;\n"));
+           string_indexer_long_index_is_rejected_spec_5_1) {
+    auto r = runAot(prog("    var s := \"abc\";\n"
+                         "    var j: long := 1;\n"
+                         "    Console.WriteLine(s[j].ToString());\n"
+                         "    return 0;\n"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        r, "the index argument to `string[i]` has a type that is not "
+           "implicitly convertible to the target type (§5.1)"));
 }
 
 // A USER-declared indexer (`property [i: int]`, §23.4) reaches the same
-// unconverted position and is likewise not this fix's scope: the dictionary
-// gate is written against `genericArgs[0]` on the three keyed families. Pinned
-// for the same reason as the two rows above.
+// position and is gated by the same §5.1 rule: the parameter type is the
+// indexer's OWN declaration, and §5.1 decides whether the argument is
+// admitted at it.
 BEZEL_TEST(dict_indexer_key_6551,
-           control_user_indexer_is_not_gated_by_this_fix_spec_23_4) {
-    BEZEL_EXPECT_EQ(std::string("2\n"),
-                    out("    using var b := new R6551Box();\n"
-                        "    var j: long := 1;\n"
-                        "    Console.WriteLine(b[j].ToString());\n"
-                        "    return 0;\n",
-                        "public class R6551Box\n"
-                        "  private _v: Array<int> := [1, 2, 3];\n"
-                        "  public property [i: int]: int\n"
-                        "    get => _v[i];\n"
-                        "    set => do _v[i] := value; end;\n"
-                        "  end;\n"
-                        "end R6551Box;\n"));
+           user_indexer_long_index_is_rejected_spec_5_1) {
+    auto r = runAot(prog("    using var b := new R6551Box();\n"
+                         "    var j: long := 1;\n"
+                         "    Console.WriteLine(b[j].ToString());\n"
+                         "    return 0;\n",
+                         "public class R6551Box\n"
+                         "  private _v: Array<int> := [1, 2, 3];\n"
+                         "  public property [i: int]: int\n"
+                         "    get => _v[i];\n"
+                         "    set => do _v[i] := value; end;\n"
+                         "  end;\n"
+                         "end R6551Box;\n"));
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        r, "the index argument to `R6551Box[i]` has a type that is not "
+           "implicitly convertible to the target type (§5.1)"));
 }

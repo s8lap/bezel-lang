@@ -8,7 +8,9 @@
 // path does (setExprSymbol), so `checkOperatorOverloadPurity` reaches it via
 // the same `callTargetIsPure` authority — no separate predicate.
 //
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error
 
 module M;
 public record R(V: int)

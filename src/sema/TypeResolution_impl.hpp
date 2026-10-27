@@ -223,7 +223,16 @@ private:
                    (std::hash<std::size_t>{}(p.second) * 0x9e3779b9);
         }
     };
-    std::unordered_set<std::pair<std::string, std::size_t>, PairHash>
+    // fix #7096 (§2.2, v0.343): the collision table is a MAP now, from the
+    // (name, arity) key to the ORIGIN MODULES that export it — §2.2 requires
+    // the diagnostic to cite both origins ("a compile error citing both
+    // origins"), and the origin modules are known only HERE, in the import
+    // loop that populates the table (TypeResolution.cpp). The value is
+    // SORTED and DEDUPED, so the diagnostic's text does not depend on the
+    // order the imports were visited in — the same guarantee the chain-head
+    // collision site gives (#7083).
+    std::unordered_map<std::pair<std::string, std::size_t>,
+                       std::vector<std::string>, PairHash>
         ambiguousImportNames_;
 
     // fix #5172 (§2.2, v0.310): every imported type is recorded here by
@@ -832,6 +841,19 @@ private:
     // constraint check lives, #3160/#4465) could never be.
     void recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
                                            Scope* scope);
+
+    // fix #7164 (§14.1 / §2.2 / §2.3 / Appendix C.1, v0.343): the §14.1
+    // arity rule at an EXPRESSION-position type reference. The TYPE
+    // position enforces it (resolveNamed's "Generic-arity check"); the
+    // expression position never reached that check, because an
+    // IdentifierExpr carrying type arguments (`Box<int>.Make(…)`,
+    // `var v := Box<int>;`) is not an `ast::Type` node — so `resolveNamed`
+    // was never called for it. Method, not free function, because the
+    // §2.2 arity SELECTION it consults reads this Resolver's
+    // `importedByArity_` table and its `builtinTypeArity` table — the same
+    // two tables `resolveNamed` applies the selection with, so the two
+    // positions cannot disagree about the same reference.
+    void checkExprTypeRefArity(const ast::IdentifierExpr& id, Scope* scope);
 
     // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): Pass 2 for the
     // degenerate-`as`-target rule at a TYPE-level generic parameter. The

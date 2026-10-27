@@ -65,16 +65,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic (mirrors #1934/#1968/
-// #1957/#1990). clang is required to build this repo, so a skip is not expected
-// — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // T1 — exact repro for the owned LOCAL case (#2000): a `var s := new Shared<X>(...)`
 // declared in the try-block scope is transferred via `owned s` to a Sink; a LATER
@@ -210,7 +204,6 @@ const char* kTwoSharedLocalSuccessful =
 BEZEL_TEST(builtin_owned_handle_try_catch_unwind_2000,
            shared_local_caught_method_call_released_once_spec_28_4_28_6_28_13) {
     JitResult r = runAotChecked(kSharedLocalCaughtMethodCall);
-    if (wasSkipped(r)) return;                         // ASan toolchain absent — skip
     BEZEL_EXPECT_TRUE(r.ran);                          // LSan-clean: s released, no leak
     BEZEL_EXPECT_EQ(r.exitCode, 0);                    // caught AND X._n == 1 (witness)
 }
@@ -219,7 +212,6 @@ BEZEL_TEST(builtin_owned_handle_try_catch_unwind_2000,
 BEZEL_TEST(builtin_owned_handle_try_catch_unwind_2000,
            shared_local_caught_ctor_arg_released_once_spec_28_4_28_6_28_13) {
     JitResult r = runAotChecked(kSharedLocalCaughtCtor);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);                          // LSan-clean: ctor arg path
     BEZEL_EXPECT_EQ(r.exitCode, 0);                    // caught AND X._n == 1
 }
@@ -228,7 +220,6 @@ BEZEL_TEST(builtin_owned_handle_try_catch_unwind_2000,
 BEZEL_TEST(builtin_owned_handle_try_catch_unwind_2000,
            two_shared_locals_caught_both_released_once_spec_28_4_28_6_28_13) {
     JitResult r = runAotChecked(kTwoSharedLocalCaught);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);                          // LSan-clean: both released, no leak
     BEZEL_EXPECT_EQ(r.exitCode, 0);                    // caught AND X._n == 2
 }
@@ -237,7 +228,6 @@ BEZEL_TEST(builtin_owned_handle_try_catch_unwind_2000,
 BEZEL_TEST(builtin_owned_handle_try_catch_unwind_2000,
            shared_local_successful_transfer_no_double_release_spec_28_4_28_6_28_13) {
     JitResult r = runAotChecked(kTwoSharedLocalSuccessful);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);                          // LSan-clean: disposed once via Sink
     BEZEL_EXPECT_EQ(r.exitCode, 0);                    // X._n == 2 after both released
 }

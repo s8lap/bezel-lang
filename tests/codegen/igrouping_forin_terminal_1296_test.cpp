@@ -56,15 +56,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // The exact #1296 repro shape (g.Sum() over a for-in IGrouping variable):
 // xs = [4, 5], key = 0 → one group holding {4, 5} → g.Sum() = 9.
@@ -108,8 +103,8 @@ const char* kForInGroupBySumViaTemp =
 // CORRECTED for #755/#2265 item 2. This source used to include `g.Single()`
 // and expect 29 — i.e. it asserted that `Single()` on a TWO-element group
 // yields its first element. That is not what the standard library says:
-// stdlib §5:3020 declares `Single(): T; // throws if not exactly one` and
-// §5:3089 names `InvalidOperationException`. The #1296 lowering had no arity
+// stdlib §5 declares `Single(): T; // throws if not exactly one` and names
+// `InvalidOperationException`. The #1296 lowering had no arity
 // check (it emitted a bare `arr[0]`), and the expectation encoded that missing
 // fault as correct. The `Single()` contract now has its own tests below (one
 // pinning the value on a genuine one-element group, one pinning the fault on a
@@ -164,7 +159,6 @@ const char* kForInGroupByMultipleGroupsSum =
 BEZEL_TEST(igrouping_forin_terminal_1296,
            forin_bare_groupby_sum_correct_value_spec_5) {
     JitResult r = runAotChecked(kForInGroupBySum);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);        // compiled + LSan-clean
     BEZEL_EXPECT_EQ(r.exitCode, 9);  // one group {4, 5} → 4 + 5 = 9
 }
@@ -172,7 +166,6 @@ BEZEL_TEST(igrouping_forin_terminal_1296,
 BEZEL_TEST(igrouping_forin_terminal_1296,
            forin_bare_groupby_sum_via_temp_correct_value_spec_5) {
     JitResult r = runAotChecked(kForInGroupBySumViaTemp);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 9);
 }
@@ -180,7 +173,6 @@ BEZEL_TEST(igrouping_forin_terminal_1296,
 BEZEL_TEST(igrouping_forin_terminal_1296,
            forin_bare_groupby_all_terminals_correct_value_spec_5) {
     JitResult r = runAotChecked(kForInGroupByAllTerminals);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // Sum (9) + First (4) + Last (5) + ElementAt(1) (5) + Count (2)
     // (`Single()` moved to its own pair of cases — see #755/#2265 item 2.)
@@ -190,7 +182,6 @@ BEZEL_TEST(igrouping_forin_terminal_1296,
 BEZEL_TEST(igrouping_forin_terminal_1296,
            forin_bare_groupby_multi_groups_sum_correct_value_spec_5) {
     JitResult r = runAotChecked(kForInGroupByMultipleGroupsSum);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // odd {1, 3} sum 4 + even {2, 4, 6} sum 12 → 16
     BEZEL_EXPECT_EQ(r.exitCode, 16);

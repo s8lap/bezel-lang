@@ -9,5 +9,9 @@
 
 module M; import System; class R private v: int := 5; public method V(): int return this.v; end V; destructor end destructor; end R; class C public static method Consume(x: owned R): () -> int x.Dispose(); return lambda(): int => 99; end Consume; public static method Run(flag: bool): int var p := new R(); var f: () -> int := (case flag of true => Consume(move p), _ => lambda(): int => p.V()); return f(); end Run; public static method Main(): int Console.WriteLine(Run(false).ToString()); return 0; end Main; end C;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: closure captures
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: owned value in `p` would be dropped here without disposal (§28.3 — consider `using var`, explicit `.Dispose()`, `move`, or `return`)
 // CHECK-NOT: closure captures

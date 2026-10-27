@@ -60,12 +60,10 @@ using bezel::test::runAotOut;
 
 namespace {
 
-bool aotWasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string_view::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // §4.14 source: `OwningBuffer<int>` -> Span<T> / ReadOnlySpan<T>.
 std::string buf3(const std::string& body) {
@@ -414,7 +412,6 @@ BEZEL_TEST(span_range_tostring_2661, span_and_range_renders_are_leak_free) {
         "    if v.Length < 80 then return 10; end; "
         "  end while; "
         "  return 0; "));
-    if (aotWasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
@@ -512,7 +509,6 @@ BEZEL_TEST(span_range_tostring_2661, control_documented_span_surface_still_works
         "  if has = false then return 4; end; "
         "  if slLen <> 2 then return 5; end; "
         "  return 33; "));
-    if (aotWasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 33);
 }
@@ -538,7 +534,6 @@ BEZEL_TEST(span_range_tostring_2661, control_ireadonlyspan_surface_still_works) 
         "    return F(sp); "
         "  end Main; "
         "end C;");
-    if (aotWasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 44);
 }
@@ -656,7 +651,6 @@ BEZEL_TEST(span_range_tostring_2661, boxed_range_renders_are_leak_free) {
         "    if s.Length < 1 then return 7; end; "
         "  end while; "
         "  return 0; "));
-    if (aotWasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

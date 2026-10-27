@@ -30,11 +30,17 @@
 // user-declared one, which reaches the predicate by a different branch. The
 // two diagnostics below are character-identical apart from the type name.
 //
-// The `IMPORTED` prefix additionally carries `CHECK-NOT: cannot target the
-// imported parameter type here` — pre-fix, the imported leg was left to
+// The `IMPORTED` prefix additionally forbids the "cannot target the imported
+// parameter type here" wording — pre-fix, the imported leg was left to
 // codegen's `lowerCallDispatch` arm and produced THAT string at this same
-// location, so this is the line that makes the row a pin rather than a
-// control.
+// location, so these are the lines that make the row a pin rather than a
+// control. #7070: that prohibition is a claim about the WHOLE output, so it
+// is written on BOTH sides of the positive match — a negative directive
+// scans only the region between the surrounding matches, and the copy below
+// the match alone let a wrong diagnostic emitted FIRST through. The wording
+// is quoted here WITHOUT a directive prefix on purpose: FileCheck scans a
+// check file for directive names anywhere on a line, so a prose block that
+// quoted one would mint a live directive.
 module FRP4;
 
 import FR5328Lib;
@@ -65,13 +71,26 @@ end ProgramLocal;
 
 // bezelc emits diagnostics as `file:line:col: message` with no "error:"
 // severity word, so anchor on the `:line:col:` shape and the rule text.
+//
+// #7070: the pre-positive copy of the "cannot target the imported parameter
+// type here" prohibition. A negative directive scans only the region between
+// the surrounding matches, so the copy that follows the positive match
+// excluded the codegen wording only from the text AFTER the expected
+// diagnostic — a wrong diagnostic emitted FIRST still passed the row.
+// IMPORTED-NOT: cannot target the imported parameter type here
+// #7069: this row rejects in SEMA in both legs, so codegen never runs on it
+// and the codegen-only `internal:` marker could never occur here — the
+// front end's own ICE marker is the reachable one. It is printed BEFORE any
+// user-facing diagnostic, and a negative directive scans only the region
+// between the surrounding matches, so it is written above the positive
+// match, where it can fire.
+// IMPORTED-NOT: internal compiler error
 // IMPORTED: :{{[0-9]+}}:{{[0-9]+}}: a collection literal `[...]` cannot target the interface type `IShape`
 // IMPORTED-SAME: §15.4 admits only a concrete collection target
 // IMPORTED-SAME: (§15.4)
 // IMPORTED-NOT: cannot target the imported parameter type here
-// IMPORTED-NOT: internal:
 
+// LOCAL-NOT: internal compiler error
 // LOCAL: :{{[0-9]+}}:{{[0-9]+}}: a collection literal `[...]` cannot target the interface type `IShapeLocal`
 // LOCAL-SAME: §15.4 admits only a concrete collection target
 // LOCAL-SAME: (§15.4)
-// LOCAL-NOT: internal:

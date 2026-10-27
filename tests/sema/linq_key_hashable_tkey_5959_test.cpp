@@ -17,9 +17,9 @@
 //   §3.6 rule 4 (line 497): the diagnostic names the property in the words
 //     of the table above.
 // Stdlib §5 (docs/Bezel_Standard_Library.md, v0.338):
-//   line 3697 `GroupBy<TKey>(key: (T) -> TKey): … where TKey: hashable;`
-//   lines 3701-3702 both `ToDictionary` overloads, same `where TKey: hashable`.
-//   line 3742 "Key and equality contracts": these three "state the same
+//   `GroupBy<TKey>(key: (T) -> TKey): … where TKey: hashable;`
+//   both `ToDictionary` overloads, same `where TKey: hashable`.
+//   "Key and equality contracts": these three "state the same
 //     requirement on `TKey` with an ordinary member-level `where` clause …
 //     Both are the ordinary constraint form of language spec §14.2 — on a
 //     §26.4 extension block in the first case, on the member's own type

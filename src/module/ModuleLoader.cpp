@@ -83,6 +83,43 @@ std::optional<std::vector<std::uint8_t>> readMetadataSection(
 
 namespace {
 
+// fix #7094 / #7095 (§17.11 / §2.8.2 clause 2, v0.343): publish an imported
+// symbol's §17.11 obligation WITHOUT dropping what is already published for
+// it.
+//
+// The obligation an imported symbol carries can arrive from TWO independent
+// sources, and neither is a subset of the other:
+//   - the EXPORTED requirement set (`MetaGenericParam::
+//     requiresWellDefinedDefault`), which carries both the direct
+//     `default(T)` uses and the DERIVED chain uses; and
+//   - the RE-PARSED body's own `default(T)` uses, published after the body
+//     re-parse (the #6947 publication below).
+// `SemaContext::setImportedUnconstrainedDefaultParams` REPLACES, so
+// publishing one source after the other would silently drop the first — e.g.
+// the exported DERIVED requirement of `U.Wrap<T>` (whose chain ends in
+// another type's `default(T)`) would be lost to the re-parsed body's (empty)
+// direct set. This helper unions instead.
+//
+// `SemaContext::setImportedUnconstrainedDefaultParams` is not touched: the
+// merge is a property of the LOADER's publication sites, not of the setter.
+static void publishImportedDefaultRequirement(sema::SemaContext& ctx,
+                                              const sema::Symbol* sym,
+                                              const std::vector<std::string>& names) {
+    if (!sym || names.empty()) return;
+    // Copy first: `setImportedUnconstrainedDefaultParams` may rehash the map
+    // and invalidate a pointer into it.
+    std::vector<std::string> merged;
+    if (const auto* cur = ctx.importedUnconstrainedDefaultParams(sym))
+        merged = *cur;
+    for (const std::string& n : names) {
+        bool seen = false;
+        for (const std::string& e : merged)
+            if (e == n) { seen = true; break; }
+        if (!seen) merged.push_back(n);
+    }
+    ctx.setImportedUnconstrainedDefaultParams(sym, merged);
+}
+
 // --- MetaType → TypeRef reconstruction --------------------------------------
 
 sema::PrimitiveType fromPrimitiveKind(PrimitiveKind p) {
@@ -951,6 +988,26 @@ struct Loader {
                 m->isOperator = mm.isOperator;
                 if (mm.isOperator) m->operatorToken = ctx.internString(mm.name);
                 m->genericParams = convertGenericParams(mm.genericParams, scope);
+                // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): the
+                // METHOD-level §17.11 obligation — a method-level type
+                // parameter whose substitution must have a well-defined
+                // `default` value, because the method's body takes
+                // `default(T)` (directly, or through a chain that ends in a
+                // `default(T)` — possibly in ANOTHER type of the exporting
+                // module, which the importer's re-parse of this body cannot
+                // see). The exporting module computed the obligation and
+                // shipped it in the metadata; publish it on the imported
+                // METHOD symbol so the importing pass can judge
+                // `U.Wrap<string>()` exactly as the same-module typechecker
+                // judges it.
+                {
+                    std::vector<std::string> reqDefault;
+                    for (const MetaGenericParam& mg : mm.genericParams)
+                        if (mg.requiresWellDefinedDefault)
+                            reqDefault.push_back(mg.name);
+                    if (!reqDefault.empty())
+                        publishImportedDefaultRequirement(ctx, m, reqDefault);
+                }
                 m->params = convertParams(mm.params, scope);
                 // The method's resolved return type rides on a side table keyed
                 // by ast::Type — but an imported method has no ast::Type node.
@@ -3919,6 +3976,28 @@ static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
     return src;
 }
 
+// fix #7008 (§17.11 / §2.8.2 clause 2, v0.340): one edge of a cross-module
+// `default(T)` CHAIN. The body of `owner` passes its own type parameter
+// `ownerParam` as the type argument at `calleeParam`'s position of a call to
+// `callee`; `callee`'s own body takes an unconstrained `default(calleeParam)`.
+// §17.11 reads such a chain as "the generic body passes `T` on to a generic
+// whose chain ends in a `default(T)`", so the OWNER's type parameter takes a
+// `default(T)` obligation too and every instantiation of the owner is
+// rejected when that parameter is substituted by a non-defaultable type.
+//
+// The edge is collected by the importer while it re-parses the owner's body
+// (the callee is a SIBLING method of the same reconstructed type, so the
+// callee's own requirement is known from its own re-parse — the #6947
+// publication). The chain is closed by a fixpoint over all the edges after
+// every body of the module has been attached, so the order in which the
+// methods are declared does not decide the verdict.
+struct DefaultChainEdge {
+    sema::MethodSymbol* owner = nullptr;
+    sema::MethodSymbol* callee = nullptr;
+    std::string calleeParam;  // the callee's own type-parameter name
+    std::string ownerParam;   // the owner's own type-parameter name
+};
+
 // fix #5009 fix-forward 3: the loader-side twin of ModuleMetadataBuilder's
 // `astTypeMentionsNames` (#4600): does AST type `t` name one of `names` as a
 // bare type-parameter reference, at any nesting depth?
@@ -4007,7 +4086,8 @@ static bool parseAndAttachMethodBody(
     const sema::TypeSymbol& importedType,
     sema::SemaContext& mainCtx,
     bool nonGenericRecordFactoryPath,
-    const std::string& moduleName) {
+    const std::string& moduleName,
+    std::vector<DefaultChainEdge>& chainEdges) {
     // fix #4553 (§2.8.2 / §14.2, v0.306): decide whether the class header's
     // `where` clauses can be reproduced, and collect the exporting module's
     // sibling types they name so they can be registered below.
@@ -4652,8 +4732,87 @@ static bool parseAndAttachMethodBody(
     importedMs->decl = parsedMdBase;
     // fix #6947 (§17.11 / §2.8.2 clause 1, v0.340): carry the body's
     // unconstrained `default(T)` uses to the importer (see SemaContext).
+    //
+    // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): this publishes by UNION,
+    // not by replacement. `Loader::convertMember` has already published the
+    // EXPORTED requirement set for this method — the direct `default(T)`
+    // uses and the DERIVED chain uses alike — and that set is NOT a subset
+    // of the re-parsed body's own (direct) uses: the chain's obligation lives
+    // in the CALLEE's body, in another type of the exporting module, which
+    // this re-parse cannot see. Replacing would silently drop it, and the
+    // importer would judge `U.Wrap<string>()` against an empty obligation
+    // set — accepting a program the same-module typechecker rejects.
     if (const auto* names = freshCtx.unconstrainedDefaultParamsOfOwner(parsedMdBase))
-        mainCtx.setImportedUnconstrainedDefaultParams(importedMs, *names);
+        publishImportedDefaultRequirement(mainCtx, importedMs, *names);
+    // fix #7008 (§17.11 / §2.8.2 clause 2, v0.340): collect the CHAIN edges of
+    // this body — the calls it makes to a sibling method with one of the type
+    // parameters in scope as the type argument. The sibling's own body is
+    // re-parsed by its own attach (the #6947 publication above), so its
+    // requirement is known there; the edge is closed by the fixpoint in
+    // loadMetadataPass2 after every body of the module is attached.
+    //
+    // `Wrap<T>(): string => DefB<T>();` is the shape: `DefB<T>` takes an
+    // unconstrained `default(T)`, so `Wrap`'s own `T` takes one too, and
+    // `Wrap<string>()` is rejected same-module. The #6947 replay set holds
+    // only the DIRECT uses, so cross-module the importer saw an empty set for
+    // `Wrap` and ACCEPTED `Wrap<string>()` — then ran the template and
+    // segfaulted. §2.8.2 clause 2: an external instantiation behaves
+    // identically to a same-module instantiation of the same generic at the
+    // same arguments.
+    {
+        // The type parameters in scope in the body: the method's own, plus the
+        // reconstructed type's (a generic class's parameter is in scope in
+        // every one of its members).
+        std::unordered_set<std::string_view> scopeParams;
+        for (sema::Symbol* g : freshMs->genericParams)
+            if (g && !g->name.empty()) scopeParams.insert(g->name);
+        for (sema::Symbol* g : freshType->genericParams)
+            if (g && !g->name.empty()) scopeParams.insert(g->name);
+        if (!scopeParams.empty()) {
+            for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+                // Only a call IN THIS BODY is an edge of this body's chain
+                // (the synthetic class also carries the sibling methods as
+                // stubs and the type's const initializers).
+                if (!expr || expr->span.begin.offset < bodyBegin ||
+                    expr->span.begin.offset >= bodyEnd)
+                    continue;
+                auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym);
+                if (!fms) continue;
+                // The sibling method this call names, as the importer knows it
+                // (the same map the exprSymbol remap above uses).
+                auto it = importedMethods.find(freshMethodSigKey(fms));
+                if (it == importedMethods.end()) continue;
+                auto* calleeMs = dynamic_cast<sema::MethodSymbol*>(it->second);
+                if (!calleeMs) continue;
+                // The call's explicit type arguments, positionally aligned with
+                // the callee's own type parameters (§14.5).
+                const std::vector<std::unique_ptr<ast::Type>>* targs = nullptr;
+                if (auto* ma =
+                        dynamic_cast<const ast::MemberAccessExpr*>(expr))
+                    targs = &ma->typeArgs;
+                else if (auto* id =
+                             dynamic_cast<const ast::IdentifierExpr*>(expr))
+                    targs = &id->typeArgs;
+                if (!targs || targs->empty()) continue;
+                const std::size_t n = std::min(targs->size(),
+                                               calleeMs->genericParams.size());
+                for (std::size_t i = 0; i < n; ++i) {
+                    const sema::Symbol* gp = calleeMs->genericParams[i];
+                    if (!gp || gp->name.empty()) continue;
+                    const ast::Type* at = (*targs)[i].get();
+                    if (!at || at->kind != ast::TypeKind::Named || !at->name ||
+                        at->name->parts.size() != 1 || !at->genericArgs.empty())
+                        continue;
+                    const std::string_view ownerParam =
+                        at->name->parts.back();
+                    if (!scopeParams.count(ownerParam)) continue;
+                    chainEdges.push_back(
+                        {importedMs, calleeMs, std::string(gp->name),
+                         std::string(ownerParam)});
+                }
+            }
+        }
+    }
     // fix #5009: binding is proven above; LOWERING is not. Mark the body so
     // codegen escalates an INTERNAL lowering degrade inside it to the #1943
     // reject (emitInlineGenericMethod).
@@ -6360,11 +6519,33 @@ static void loadMetadataPass2(
     const std::vector<sema::TypeSymbol*>& created) {
     Loader loader{ctx, localTypes};
 
+    // fix #7008 (§17.11 / §2.8.2 clause 2, v0.340): the cross-module
+    // `default(T)` CHAIN edges collected while the bodies were attached. The
+    // fixpoint below runs after every body of the module has been attached, so
+    // the order in which the methods are declared does not decide the verdict.
+    std::vector<DefaultChainEdge> chainEdges;
+
     for (std::size_t i = 0; i < md.types.size(); ++i) {
         const MetaTypeDecl& td = md.types[i];
         sema::TypeSymbol* t = created[i];
         t->genericParams =
             loader.convertGenericParams(td.genericParams, t->memberScope);
+        // fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): the CLASS-level
+        // §17.11 obligation — a class-level type parameter whose substitution
+        // must have a well-defined `default` value, because the class's body
+        // takes `default(T)` (directly, or through a chain that ends in a
+        // `default(T)`). The exporting module computed it and shipped it in
+        // the metadata; publish it on the imported TYPE symbol so the
+        // importing pass can judge a `Box<string>` instantiation site exactly
+        // as the same-module typechecker judges it.
+        {
+            std::vector<std::string> reqDefault;
+            for (const MetaGenericParam& mg : td.genericParams)
+                if (mg.requiresWellDefinedDefault)
+                    reqDefault.push_back(mg.name);
+            if (!reqDefault.empty())
+                publishImportedDefaultRequirement(ctx, t, reqDefault);
+        }
         // fix #3151 (§2.8.3 rule 4, v0.252): mirror the local rule from
         // reconstructTypeSymbol above — push to `baseTypeRefs` and
         // `baseTypes` under ONE guard (`kind == Named && declaration`) so
@@ -6548,7 +6729,7 @@ static void loadMetadataPass2(
                 parseAndAttachMethodBody(td, mm, importedMs, *t, ctx,
                     (t->kind == ast::TypeDeclKind::Class &&
                      td.genericParams.empty()),
-                    md.moduleName);
+                    md.moduleName, chainEdges);
         }
 
         // §14.1 / §23 / §2.8.2 / §2.8.3 rule 4 (fix #2893): property bodies —
@@ -6952,6 +7133,23 @@ static void loadMetadataPass2(
                 // with `extensionDecl`.
                 ms->parent = nullptr;
                 ms->scope = scope;
+                // fix #7280 (§26.4 / §2.8.2, v0.344): an extension member's
+                // OWN type parameters ride `MetaMember::genericParams` (the
+                // channel #7095 already ships for a method's type parameters),
+                // and the importer must set them: §26.4 reads an extension
+                // member as "a generic method that declares the block's
+                // parameters before its own", so a member that declares its
+                // own type parameters IS a generic method. The importer left
+                // the field empty, so it could not tell a GENERIC extension
+                // member from an ordinary one — and the §2.8.2 refusal
+                // (sema/ExprTypecheck.cpp's `lookupExtensionMember`) needs
+                // exactly that distinction: a generic extension member has no
+                // importer-side monomorphization, so it must be REFUSED
+                // rather than dispatched (the exporter's one symbol per
+                // extension member name is compiled against the exporting
+                // module's placeholder layout).
+                ms->genericParams =
+                    loader.convertGenericParams(mm.genericParams, scope);
                 ms->params = loader.convertParams(mm.params, scope);
                 ms->extensionDecl = decl.get();
                 ms->isPure = mm.isPure;
@@ -7037,6 +7235,54 @@ static void loadMetadataPass2(
     // codegen can fold an imported `const` read without a storage symbol.
     for (auto& [m, val] : loader.constValues_)
         ctx.setImportedConstValue(m, val);
+
+    // fix #7008 (§17.11 / §2.8.2 clause 2, v0.340): close the cross-module
+    // `default(T)` CHAINS. §17.11 reads a chain as "the generic body passes
+    // `T` on to a generic whose chain ends in a `default(T)`": a method whose
+    // body passes its own type parameter to a sibling whose body takes an
+    // unconstrained `default(T)` takes a `default(T)` obligation itself, and
+    // every instantiation of it is rejected when that parameter is substituted
+    // by a non-defaultable type. The #6947 replay set holds only the DIRECT
+    // uses, so the chain was invisible to the importer: `U.Wrap<string>()`
+    // (body `DefB<T>()`, `DefB<T>` body `$"{default(T)}"`) was ACCEPTED
+    // cross-module where the same-module call is rejected — and then ran the
+    // template and segfaulted. §2.8.2 clause 2: an external instantiation
+    // behaves identically to a same-module instantiation of the same generic
+    // at the same arguments.
+    //
+    // The fixpoint is over a finite set of (owner, owner-parameter) pairs, so
+    // it terminates even for a mutual recursion (`A<S>` -> `B<S>` -> `A<S>`).
+    // The names are added to the SAME set the #6947 publication fills, so the
+    // importer's existing replay (sema/ExprTypecheck_Calls.cpp) judges the
+    // binding exactly as it judges a same-module one.
+    {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const DefaultChainEdge& e : chainEdges) {
+                if (!e.owner || !e.callee) continue;
+                // Copy: setImportedUnconstrainedDefaultParams may rehash the
+                // map the read pointer points into.
+                std::vector<std::string> calleeNames;
+                if (const auto* cn =
+                        ctx.importedUnconstrainedDefaultParams(e.callee))
+                    calleeNames = *cn;
+                if (std::find(calleeNames.begin(), calleeNames.end(),
+                              e.calleeParam) == calleeNames.end())
+                    continue;
+                std::vector<std::string> ownerNames;
+                if (const auto* on =
+                        ctx.importedUnconstrainedDefaultParams(e.owner))
+                    ownerNames = *on;
+                if (std::find(ownerNames.begin(), ownerNames.end(),
+                              e.ownerParam) != ownerNames.end())
+                    continue;
+                ownerNames.push_back(e.ownerParam);
+                ctx.setImportedUnconstrainedDefaultParams(e.owner, ownerNames);
+                changed = true;
+            }
+        }
+    }
 }
 
 bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx) {

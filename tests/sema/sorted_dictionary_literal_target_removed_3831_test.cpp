@@ -11,7 +11,8 @@
 //
 // `SortedDictionary<K, V>` is not one of the two names, and it is not a
 // §15.4.1 sequence-literal-protocol conformer either (its `Contains`/
-// `ContainsKey` surface is the .NET-familiarity alias of stdlib line 76,
+// `ContainsKey` surface is the .NET-familiarity alias of stdlib §1's
+// "Key membership is `Contains(key)`" conventions row,
 // unrelated to `ICollectionLiteralTarget`/`IOwningCollectionLiteralTarget`),
 // so no literal FORM targets it at all. The ruling on #3517 confirms the
 // closed list stands and that widening it is an undecided proposal question

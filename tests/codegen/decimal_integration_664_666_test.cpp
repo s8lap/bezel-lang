@@ -248,7 +248,7 @@ BEZEL_TEST(codegen_666_linq_decimal, max_returns_largest_stdlib_5_1) {
 }
 
 // stdlib §5: Average(selector: (decimal)->decimal): decimal.
-// Per stdlib §5 line 2589: "public method Average(selector: (T) -> decimal): decimal;"
+// Per stdlib §5: "public method Average(selector: (T) -> decimal): decimal;"
 // Average of {1.0, 2.0, 3.0} = 2.0.
 BEZEL_TEST(codegen_666_linq_decimal, average_selector_decimal_stdlib_5) {
     BEZEL_EXPECT_EQ(run(prog(

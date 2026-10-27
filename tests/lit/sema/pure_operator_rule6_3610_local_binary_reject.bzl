@@ -13,7 +13,9 @@
 // (c7-b13, R12 cycle 4): the reject already fires; this file pins it against
 // regression at the diagnostic-track layer, which had no #3610 coverage.
 //
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error
 
 module M;
 public class Vec

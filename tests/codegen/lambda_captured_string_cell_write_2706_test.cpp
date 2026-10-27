@@ -63,14 +63,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // =====================================================================
 // (A) The issue's repro B: a captured LOCAL, written after TWO captures. NO
@@ -303,7 +299,6 @@ BEZEL_TEST(codegen_lambda_captured_string_cell_write_2706,
 BEZEL_TEST(codegen_lambda_captured_string_cell_write_2706,
            displaced_value_not_over_retained_by_capture_spec_28_9) {
     JitResult r = runAotChecked(kWriteLiteralAfterTwoCaptures);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
     BEZEL_EXPECT_TRUE(r.ran);          // no leak of the displaced string
     BEZEL_EXPECT_EQ(r.exitCode, 81);
 }
@@ -326,7 +321,6 @@ BEZEL_TEST(codegen_lambda_captured_string_cell_write_2706,
 BEZEL_TEST(codegen_lambda_captured_string_cell_write_2706,
            never_written_capture_keeps_transfer_model_spec_27_5) {
     JitResult r = runAotChecked(kTwoCapturesNeverWritten);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // no leak from an over-broad suppression
     BEZEL_EXPECT_EQ(r.exitCode, 54);
 }
@@ -338,7 +332,6 @@ BEZEL_TEST(codegen_lambda_captured_string_cell_write_2706,
 BEZEL_TEST(codegen_lambda_captured_string_cell_write_2706,
            sole_non_loop_capture_of_written_local_stays_balanced_spec_28_9) {
     JitResult r = runAotChecked(kWriteAfterSingleCaptureNoLoop);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // must stay leak-free
     BEZEL_EXPECT_EQ(r.exitCode, 108);
 }

@@ -55,15 +55,23 @@ BEZEL_TEST(codegen_sb_insert_spec_3_1, insert_at_end) {
         "end Main; end C;"), 1);
 }
 
-BEZEL_TEST(codegen_sb_insert_spec_3_1, insert_out_of_range_is_noop) {
-    // index > length: no-op (the builder is left unchanged).
+BEZEL_TEST(codegen_sb_insert_spec_3_1, insert_out_of_range_raises_index_out_of_range) {
+    // fix #7221 (stdlib §3.1, v0.343): an index PAST the content's Length is
+    // outside `0..Length`, so §3.1's sentence decides it — "`Insert` and
+    // `Remove` raise `IndexOutOfRangeException` when the index or the
+    // `(startIndex, length)` window falls outside `0..Length`". The row
+    // pinned the opposite (a silent no-op with the text unchanged) before the
+    // fix; it now pins the RAISE, observed through the catch arm's exit code.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var sb := new StringBuilder(); "
         "  sb.Append(\"ab\"); "
-        "  sb.Insert(99, \"X\"); "
-        "  return (if sb.ToString() = \"ab\" then 1 else 0); "
-        "end Main; end C;"), 1);
+        "  try "
+        "    sb.Insert(99, \"X\"); "
+        "  catch IndexOutOfRangeException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
 }
 
 // -------------------------------------------------------------------------
@@ -100,15 +108,24 @@ BEZEL_TEST(codegen_sb_remove_spec_3_1, remove_all) {
         "end Main; end C;"), 0);
 }
 
-BEZEL_TEST(codegen_sb_remove_spec_3_1, remove_out_of_range_is_noop) {
-    // start+length > content length: no-op.
+BEZEL_TEST(codegen_sb_remove_spec_3_1, remove_out_of_range_raises_index_out_of_range) {
+    // fix #7221 (stdlib §3.1, v0.343): a `(startIndex, length)` window that
+    // ends PAST the content's Length falls outside `0..Length`, so §3.1's
+    // sentence decides it — "`Insert` and `Remove` raise
+    // `IndexOutOfRangeException` when the index or the `(startIndex, length)`
+    // window falls outside `0..Length`". The row pinned the opposite (a
+    // silent no-op with the text unchanged) before the fix; it now pins the
+    // RAISE, observed through the catch arm's exit code.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var sb := new StringBuilder(); "
         "  sb.Append(\"abc\"); "
-        "  sb.Remove(1, 99); "
-        "  return (if sb.ToString() = \"abc\" then 1 else 0); "
-        "end Main; end C;"), 1);
+        "  try "
+        "    sb.Remove(1, 99); "
+        "  catch IndexOutOfRangeException => return 42; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;"), 42);
 }
 
 // -------------------------------------------------------------------------

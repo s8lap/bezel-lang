@@ -1178,10 +1178,20 @@ void fillParamDefaults(std::vector<MetaParam>& out,
 
 // Convert a method/type's generic parameters. Variance comes from the symbol;
 // constraints (§14.2) come from the declaring AST node's GenericConstraints.
+//
+// fix #7094 (§17.11 / §2.8.2 clause 2, v0.343): `requiresDefault`
+// is the OWNING generic's set of type parameters whose substitution must have
+// a well-defined `default` value — the §17.11 obligation the owning body
+// creates (directly, by taking `default(T)`, or through a chain that ends in
+// a `default(T)`). The set comes from the owning module's own typecheck
+// (`SemaContext::unconstrainedDefaultParamsOfOwner`, keyed by the owning
+// declaration). It is shipped so the importer can reach the SAME verdict the
+// same-module typechecker reaches at the instantiation site.
 std::vector<MetaGenericParam> convertGenericParams(
     const std::vector<sema::Symbol*>& gps,
     const std::vector<ast::GenericConstraint>& constraints,
-    sema::SemaContext& ctx) {
+    sema::SemaContext& ctx,
+    const std::vector<std::string>* requiresDefault = nullptr) {
     std::vector<MetaGenericParam> out;
     out.reserve(gps.size());
     for (sema::Symbol* s : gps) {
@@ -1190,6 +1200,14 @@ std::vector<MetaGenericParam> convertGenericParams(
         MetaGenericParam mg;
         mg.name = std::string(gp->name);
         mg.variance = std::string(gp->variance);  // "", "in", "out"
+        // fix #7094 (§17.11, v0.343): the §17.11 obligation rides
+        // the parameter it constrains.
+        if (requiresDefault)
+            for (const std::string& r : *requiresDefault)
+                if (r == mg.name) {
+                    mg.requiresWellDefinedDefault = true;
+                    break;
+                }
         // §14.2: gather constraints whose `where T:` parameter matches.
         bool hasAstConstraint = false;
         for (const ast::GenericConstraint& gc : constraints) {
@@ -1500,7 +1518,14 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             out.type = convertAstType(md->returnType.get(), ctx);
             out.returnOwned = md->returnOwned;
             out.genericParams = convertGenericParams(
-                meth->genericParams, md->genericConstraints, ctx);
+                meth->genericParams, md->genericConstraints, ctx,
+                // fix #7095 (§17.11 / §2.8.2 clause 2, v0.343): the §17.11
+                // obligation this method's OWN body creates for its own type
+                // parameters — the direct `default(T)` uses and the DERIVED
+                // chain uses alike. The owner key is the method's
+                // `ast::MethodDecl`, the key the exporting module's
+                // typecheck records both against.
+                ctx.unconstrainedDefaultParamsOfOwner(md));
             out.params = convertParams(meth->params, ctx);
             fillParamDefaults(out.params, md->params, &ctx);
             std::vector<sema::Symbol*> contractGenerics;
@@ -2202,7 +2227,12 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // §14 generic params + their §14.2 constraints (from the TypeDecl AST).
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl)) {
         out.genericParams =
-            convertGenericParams(t.genericParams, td->genericConstraints, ctx);
+            convertGenericParams(t.genericParams, td->genericConstraints, ctx,
+                                 // fix #7094 (§17.11, v0.343): the
+                                 // §17.11 obligation the class's OWN body
+                                 // creates for its class-level type
+                                 // parameters.
+                                 ctx.unconstrainedDefaultParamsOfOwner(td));
     }
 
     // §12 base class + interfaces (resolved TypeRefs, parallel to baseTypes).
@@ -2803,10 +2833,13 @@ static std::vector<std::string> extensionConstraintTexts(
 }
 
 // §26 / §2.5 (#735): convert one `public extension T` block into its wire form,
-// or return false to skip it (a shape whose cross-module dispatch is not exactly
-// the exported `bz$ext$<T>$<M>` symbol — see MetaExtension's header note).
+// or return false to skip it. `outShapeOnly` reports the RESOLUTION-ONLY
+// shapes: a block whose cross-module dispatch is not exactly the exported
+// `bz$ext$<T>$<M>` symbol, but whose SHAPE (head, `where` clause, member
+// names) the importer must still see — see the fix #6966 note below.
 static bool convertExtension(const sema::ExtensionSymbol& ext,
                              sema::SemaContext& ctx, MetaExtension& out,
+                             bool& outShapeOnly,
                              std::string_view source,
                              std::string_view sourceFile) {
     const auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext.decl);
@@ -2821,42 +2854,44 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
     out.sourceSpan.endLine = decl->span.end.line;
     out.sourceSpan.endColumn = decl->span.end.column;
     out.genericConstraints = extensionConstraintTexts(decl->genericConstraints);
-    // §26.4: a block with `where` constraints, or a target carrying type
-    // arguments, binds block-level type parameters — the exported symbol was
-    // compiled against the exporter's placeholder layout, so dispatching it
-    // importer-side needs the #783 monomorphization machinery. Not exported.
-    if (!decl->genericConstraints.empty()) return false;
     const sema::TypeRef* target = ctx.resolvedType(*decl->targetType);
     if (target == nullptr) return false;
-    // fix #6898 (§26.4 / §2.8.2 clause 2, v0.340): a target with type arguments
-    // binds a block-level type parameter only when an argument is a FREE
-    // variable (a Named ref with no declaration and no arguments of its own,
-    // the shape TypeResolution leaves a bare identifier in). A GROUND head such
-    // as `extension IList<int>` binds nothing, so its member is the exact
-    // exported `bz$ext$IList$M` symbol and dispatches like any other extension;
-    // before this it was dropped from the metadata, so an importer's `il.Foo`
-    // found no extension and a bare reference degraded to a zero value.
-    if (!decl->targetType->genericArgs.empty()) {
-        std::function<bool(const sema::TypeRef*)> hasFreeVar =
-            [&](const sema::TypeRef* t) -> bool {
-            if (!t) return true;
-            if (t->kind == sema::TypeRef::Kind::Named && !t->declaration &&
-                t->genericArgs.empty())
-                return true;
-            for (const sema::TypeRef* ga : t->genericArgs)
-                if (hasFreeVar(ga)) return true;
-            return false;
-        };
-        for (const sema::TypeRef* ga : target->genericArgs)
-            if (hasFreeVar(ga)) return false;
-    }
-    // §26.4: a bare single-segment identifier in the head introduces a fresh
-    // block-level type parameter; TypeResolution leaves such a head as a
-    // null-declaration Named ref. Only a resolved type (or a primitive, §26.2)
-    // has a stable cross-module identity to dispatch against.
-    if (target->kind == sema::TypeRef::Kind::Named &&
-        target->declaration == nullptr && target->genericArgs.empty())
-        return false;
+    // fix #6966 (§26.4 / §2.8.2, v0.343): a block with `where` constraints, or
+    // a head that binds a FREE type variable (`extension Box<T>`, or a head that
+    // names no resolvable type at all), is NOT dispatchable across a module
+    // boundary: the exported symbol was compiled against the exporter's
+    // placeholder layout, so dispatching it importer-side needs the #783
+    // monomorphization machinery, which does not exist for extension blocks
+    // yet.
+    //
+    // Such a block used to be DROPPED here. Dropping it is what let #6966's
+    // silent wrong answer through: the importer then saw only the exporting
+    // module's OTHER, less specific block (`extension Object`) and bound THAT
+    // one, printing its value, where the same-module program binds the
+    // dropped block's member (§26.5.1's specificity order). §2.8.2 requires
+    // the implementation to "reject the export, or the import, with a
+    // diagnostic naming the shape" — it must never alter the instantiation's
+    // semantics. So the shape is CARRIED (its head, its `where` clause and its
+    // member names), and the importer refuses to dispatch it, naming it.
+    //
+    // The predicate is `sema::typeRefBindsFreeTypeVariable` — SHARED with the
+    // importer (sema/ExprTypecheck.cpp), which must classify a carried block
+    // the same way or it would dispatch a non-dispatchable block (a silent
+    // wrong answer) or refuse a dispatchable one (a false rejection).
+    //
+    // The `where`-clause half is the OTHER shape §26.4 names: the clause's
+    // constraint is read at the receiver's instantiation, so the block applies
+    // to some receivers and not others — an APPLICABILITY FILTER (§26.5.1),
+    // never a ranking signal — and the exported symbol cannot express it.
+    outShapeOnly = !decl->genericConstraints.empty() ||
+                   sema::typeRefBindsFreeTypeVariable(target);
+    // fix #6898 (§26.4 / §2.8.2 clause 2, v0.340): a GROUND head such as
+    // `extension IList<int>` binds nothing, so its member is the exact
+    // exported `bz$ext$IList$M` symbol and dispatches like any other
+    // extension; before #6898 it was dropped from the metadata, so an
+    // importer's `il.Foo` found no extension and a bare reference degraded to
+    // a zero value. The ground head is exactly the shape the predicate above
+    // does NOT flag.
     out.target = convertType(target);
     out.visibility = toMetaVisibility(decl->visibility, /*inInterface=*/false);
     for (sema::Symbol* m : ext.members) {
@@ -2907,9 +2942,16 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
             // the source span. The importer mirrors `parseAndAttachProperty
             // Body`'s class-side machinery for the extension side
             // (ModuleLoader.cpp parseAndAttachExtensionPropertyBody).
+            //
+            // fix #6966 (§26.4 / §2.8.2, v0.343): a RESOLUTION-ONLY block
+            // (a free-variable head or a `where` clause) carries NO property
+            // body: the importer re-parses that body in ITS OWN context, and
+            // a body written against the exporter's block-level type
+            // parameter does not resolve there. The block's shape is enough
+            // for the importer to refuse the call and name the shape.
             if (convertMember(*prop, /*inInterface=*/false, ctx, mm,
                               /*isGenericType=*/false, source,
-                              /*wantPropertyBodyText=*/true)) {
+                              /*wantPropertyBodyText=*/!outShapeOnly)) {
                 // §26.3: extension properties have no setter — the spec read
                 // "computed read-only properties" is the only form. Force the
                 // wire shape to match even if the exporter-derived conversion
@@ -2924,14 +2966,81 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
         // A property has no exported accessor symbol (it is inlined at the use
         // site), so only methods cross; a generic extension method would need
         // importer-side monomorphization (as above).
+        //
+        // fix #6966 (§26.4 / §2.8.2, v0.343): in a RESOLUTION-ONLY block the
+        // member's NAME and ARITY are what the importer needs (to rank the
+        // block against the exporting module's dispatchable blocks and to
+        // refuse the call naming the shape); the member is never dispatched,
+        // so its signature is carried for resolution alone.
         if (meth == nullptr || meth->isOperator) continue;
-        if (!meth->genericParams.empty()) continue;
+        //
+        // fix #7223 (§26.4 / §2.8.2 / §26.5.1, v0.344): a GENERIC method
+        // cannot be carried WITH A BODY — the importer has no
+        // monomorphization machinery for an extension block's generic member
+        // — so the method branch used to skip it outright. In a
+        // RESOLUTION-ONLY block (a free-variable head or a `where` clause)
+        // that skip emptied `out.members`, and the `!out.members.empty()`
+        // rule below then DROPPED the whole block: the importer never saw
+        // the more specific block, bound the exporting module's LESS
+        // SPECIFIC one, and answered with its value (measured: same-module
+        // printed 2, cross-module printed 1, exit 0 — a silent wrong
+        // answer, the #6966 failure mode).
+        //
+        // §2.8.2: "An implementation unable to carry some body shape in its
+        // interface format must reject the export, or the import, with a
+        // diagnostic naming the shape; it must not alter the
+        // instantiation's semantics." Carrying the SHAPE (the member's name
+        // and arity — the two things the importer needs to rank the block
+        // and to refuse the call naming the shape) is the same carriage
+        // #6966 established for a resolution-only block's ordinary members:
+        // the member is never dispatched, so its signature rides the wire
+        // for resolution alone.
+        //
+        // A DISPATCHABLE block (a ground head) skipped its generic members:
+        // there the importer WOULD dispatch the carried member, and the
+        // exporter emits ONE symbol for an extension block's generic member
+        // (`bz$ext$<module>.<Target>$<M>`) compiled against the PLACEHOLDER
+        // layout — the importer would call it with the concrete layout.
+        // MEASURED by carrying it anyway: an int-typed type argument "works"
+        // only by ABI luck, and a value-typed one fails the LLVM verifier
+        // ("Call parameter type does not match function signature" — the
+        // placeholder pointer against the concrete `%record`). That is the
+        // #2884 unsoundness class, so the DISPATCH is not an option.
+        //
+        // fix #7280 (§26.4 / §2.8.2 / §26.5.1, v0.344): the DISPATCH is not
+        // an option, but the CARRY is — and the carry is what the refusal
+        // needs. Skipping the member emptied `out.members`, and the
+        // `!out.members.empty()` rule below then DROPPED the whole block: the
+        // importer never saw the MORE SPECIFIC block, bound the exporting
+        // module's LESS SPECIFIC one, and answered with its value (measured:
+        // same-module printed 2, cross-module printed 1, exit 0 — the silent
+        // wrong answer #6966 fixed for the resolution-only spelling). So the
+        // generic member of a DISPATCHABLE block rides the wire as a SHAPE
+        // (its name, arity and type parameters — the three things the
+        // importer needs to RANK the block and to REFUSE the call naming the
+        // shape), exactly as #6966's resolution-only carriage carries a
+        // resolution-only block's ordinary members.
+        //
+        // The importer refuses that member (§2.8.2, implemented in
+        // sema/ExprTypecheck.cpp's `lookupExtensionMember`) instead of
+        // dispatching it; the refusal is PER MEMBER, so the block's ORDINARY
+        // members — whose exported symbols carry the CONCRETE layout and are
+        // dispatchable — keep working.
         if (!isExportedMember(meth->visibility, /*inInterface=*/false)) continue;
         if (dynamic_cast<const ast::MethodDecl*>(meth->decl) == nullptr) continue;
         MetaMember mm;
         if (convertMember(*meth, /*inInterface=*/false, ctx, mm,
-                          /*isGenericType=*/false, source))
+                          /*isGenericType=*/false, source)) {
+            // fix #7280: the SHAPE rides ALONE — a body must not cross for a
+            // member the importer may never dispatch (the exporter's one
+            // symbol per member name is compiled against the placeholder
+            // layout, so a body would advertise a dispatch that §2.8.2
+            // forbids). A RESOLUTION-ONLY block's member keeps its body
+            // (the #6966/#7223 carriage is unchanged).
+            if (!outShapeOnly && !meth->genericParams.empty())
+                mm.methodBodyText.clear();
             out.members.push_back(std::move(mm));
+        }
     }
     return !out.members.empty();
 }
@@ -2980,14 +3089,36 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
         // imported modules" for extension blocks on the receiver's type.
         if (auto* ext = dynamic_cast<const sema::ExtensionSymbol*>(child)) {
             MetaExtension me;
-            bool converted = convertExtension(*ext, ctx, me, source, sourceFile);
+            bool shapeOnly = false;
+            bool converted = convertExtension(*ext, ctx, me, shapeOnly, source,
+                                               sourceFile);
             const auto* edecl =
                 dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
             if (edecl && edecl->visibility == ast::Visibility::Public) {
                 std::unordered_set<std::string> exportedNames;
-                if (converted)
+                // fix #6966 (§26.4 / §2.8.2, v0.343): a RESOLUTION-ONLY
+                // block's members are NOT exported — the importer cannot
+                // dispatch them — so their names stay in the
+                // "visible but not exported" set below, and a ground generic
+                // block's same-named member is still withheld (the #6898
+                // rule). What the shape adds is that the IMPORTER now SEES
+                // the block, so it can refuse the call and NAME the shape
+                // instead of silently binding a less specific block.
+                if (converted && !shapeOnly)
                     for (const MetaMember& mm : me.members)
-                        exportedNames.insert(mm.name);
+                        // fix #7280 (§26.4 / §2.8.2, v0.344): a GENERIC
+                        // member of a DISPATCHABLE block rides the wire as a
+                        // SHAPE (§26.4's generic method cannot be carried
+                        // WITH a body, and the importer must not dispatch
+                        // it), so — exactly like a resolution-only block's
+                        // members above — its NAME stays in the "visible
+                        // but not exported" set: a ground generic block's
+                        // same-named member is still withheld (the #6898
+                        // rule), because the importer could otherwise bind
+                        // that member where the same-module program binds
+                        // the generic one.
+                        if (mm.genericParams.empty())
+                            exportedNames.insert(mm.name);
                 for (sema::Symbol* m : ext->members) {
                     bool visible = false;
                     if (auto* p = dynamic_cast<const sema::PropertySymbol*>(m))
@@ -3000,7 +3131,11 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
                 }
             }
             if (converted) {
-                if (edecl && edecl->targetType &&
+                // fix #6966 (§26.4 / §2.8.2, v0.343): only a DISPATCHABLE
+                // block with a ground generic head is a candidate for the
+                // #6898 withhold below; a resolution-only block is not
+                // withholdable (it carries no dispatchable member at all).
+                if (!shapeOnly && edecl && edecl->targetType &&
                     !edecl->targetType->genericArgs.empty())
                     groundGenericExtIdx.push_back(md.extensions.size());
                 md.extensions.push_back(std::move(me));

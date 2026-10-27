@@ -2417,6 +2417,50 @@ private:
     // value-typed projection by member name (still a copy, never a borrow).
     bool returnedExprMayBorrow(const ast::Expr& e) const;
 
+    // fix #7103 (§28.3 *Producers* "Local-variable read `x` where `x` is
+    // owned", §28.3 K1.5, §28.7 *Overwrite while borrowed*, v0.343): the
+    // borrow source of an `Object`-typed read of an OWNED local.
+    //
+    // Returns the root symbol when the read is a BORROW that the
+    // borrow-vs-copy gate (`returnedExprMayBorrow` -> `isBorrowableType`)
+    // cannot see, and nullptr otherwise.
+    //
+    // WHY THE GATE MISSES IT. `isBorrowableType` reads the `Object`
+    // PRIMITIVE kind as a value type — the compiler's OWN comment there
+    // calls `string` and `Object` "runtime-managed reference types whose
+    // lifetime is not tied to any single owner" (that sentence is the
+    // compiler's, not the spec's: §28.9's runtime-managed tier is `string`,
+    // `Type`, boxed value types and function-typed values, and `Object` is
+    // not on it) — so `returnedExprMayBorrow` answers FALSE for an
+    // `Object`-typed root and `borrowSourceForExpr`'s Shape 1 never records
+    // the borrow source. §28.3's *Producers* row for a local read of an OWNED
+    // local has NO carve-out for the reader's static type: "In a **borrowing
+    // position**, `x` retains ownership and the value is borrowed for the
+    // consuming operation." The STATE decides, not the static type.
+    //
+    // WHAT MAKES AN `Object`-typed ROOT DISCRIMINABLE. §28.3's *Ownership
+    // state of locals* makes the `unclassified` state the one that carries
+    // "no obligation and no source, so a read of it is no borrow" — and it
+    // applies to a local holding a RUNTIME-MANAGED value (a box, a `string`,
+    // a function value). The compiler has no `unclassified` state (that is
+    // issue #6609), so the OWNED state is the discriminator used here: a
+    // local in the OWNED state holds a CLASSIFIED value (a class instance, or
+    // an owning collection — §28.3's producers table), and per §28.3 K1.5
+    // "an unmarked read of an owned binding is a borrow of the binding" — a
+    // reference alias, never a copy. A local holding a box is never Owned,
+    // so it never reaches this predicate.
+    //
+    // SCOPE. Only the BARE-IDENTIFIER root of an `Object`-typed local is
+    // admitted. Per §28.3 K1.5, "Reads of named bindings lend unless the
+    // position consumes (K3): an unmarked read of an owned binding is a
+    // borrow of the binding", while "Reads of storage lend: a field,
+    // property, indexer, or slot read is a borrow whose source is the
+    // storage's holder" — so a member/index projection off an `Object`-typed
+    // value reads STORAGE, whose source is the storage's holder, and not the
+    // local binding this predicate is about. Only a bare identifier reads the
+    // binding.
+    sema::Symbol* objectTypedOwnedRootBorrowSource(const ast::Expr& rhs);
+
     // Walk the return value's expression and, for each path that ends
     // in a local-identifier root, verify the root isn't a `using var`.
     void checkBorrowEscapesOnReturn(const ast::Expr& e);
@@ -2677,6 +2721,32 @@ private:
     void checkTransitiveCapturesDisposed(
         const ast::LambdaExpr& lam,
         std::set<const ast::LambdaExpr*>& visited);
+    // fix #7025 (follow-up, §28.2, v0.340): the METHOD-GROUP twin of
+    // checkTransitiveCapturesDisposed. A method-group reference over a class's
+    // own compiler-generated `Dispose` CAPTURES its receiver (§27.6: "the
+    // instance is captured at formation — by reference for class- or
+    // interface-typed receivers"), and the group's INVOCATION reads that
+    // captured borrow — so a receiver disposed before the invocation is the
+    // §28.2 use-after-dispose case the warning regime covers ("the compiler
+    // must emit a compile-time warning when a local variable is used (read,
+    // borrowed from, or consumed) after an explicit `Dispose()` … on the same
+    // variable that dominates the use site on every path").
+    void checkGeneratedDisposeReceiverDisposed(
+        const ast::MemberAccessExpr& ma);
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): stamp the BORROW fact
+    // on the RECEIVER of a method-group reference — §27.6: "the instance is
+    // captured at formation — by reference for class- or interface-typed
+    // receivers". Called from the pre-scan, so the fact is a WHOLE-BODY fact
+    // (a group formed later in the body is seen by an earlier explicit
+    // `Dispose()`), and stamped on the BASE symbol so an `owned` PARAMETER
+    // receiver — whose symbol is a SIBLING of `LocalSymbol`, not a subclass —
+    // carries it too.
+    void noteMethodGroupBorrow(const ast::Expr& e);
+    // fix #7025 (follow-up, §27.6 / §28.6, v0.343): §28.6's receiver-
+    // ownership rule, read at a §27.6 FORMATION of `Dispose` /
+    // `DisposeAsync` (the call spelling's own check lives in
+    // `handleDischarge`). See the definition's comment.
+    void checkDisposeReceiverOwnershipAtFormation(const ast::MemberAccessExpr& ma);
     void collectIdentifiersIn(
         const ast::Expr& e,
         std::vector<const ast::IdentifierExpr*>& out) const;
@@ -3195,6 +3265,20 @@ private:
     // `EscapeScope::Method` and `EscapeScope::LambdaBody` (it consults no
     // `states_` / `localDepth_` entry, mirroring the §9.7 record/span/choice
     // leg). Returns the local's symbol, or null.
+    //
+    // fix #7209 (§28.11 *Borrowing collections* → *Storing a borrow*,
+    // clause 2; v0.343): the SAME recognizer now also serves the §28.11
+    // COLLECTION-store sink (`checkCollectionBorrowStoreEscape`), where the
+    // same shape escaped the same way — the element store of a
+    // collection-literal local into a longer-lived collection was accepted,
+    // and the `using var` spelling then read freed memory (ASan
+    // heap-use-after-free) while the plain-`var` spelling leaked. The
+    // recognizer is deliberately SHARED so the two sinks cannot drift: the
+    // field store and the collection store decide the same question ("is
+    // this a bare read of a local whose backing is reclaimed at its own
+    // scope end?") and must answer it identically. Its name keeps the
+    // #3706 origin for the history; the .cpp carries the current contract.
+    // per §28.3, §28.9, §28.11
     sema::LocalSymbol* borrowingArrayLiteralLocalFieldStoreSource(
         const ast::Expr& e) const;
 
@@ -5055,6 +5139,28 @@ private:
     // scannable body and are not recognized (adoption, as before). // per
     // §28.10, §28.3, §28.6, #2137
     bool propertyGetterIsRecognizedBorrow(const ast::PropertyDecl& pd) const;
+    // §28.6 / §28.3 / §28.10 (v0.343): true when `read` is a PROPERTY (getter)
+    // read whose RESULT is a BORROW — §28.3's producers table ("Property
+    // access `obj.P` (instance getter) | Borrowed (source: `obj`)", "Static
+    // property access `T.P` (class-typed result) | Borrowed (source: the
+    // declaring type's static storage)") and §28.6's borrow-receiver list
+    // ("a getter or other non-`owned` call result"). The borrow-ness is read
+    // by the SAME predicate §28.10's borrow-pin uses
+    // (`propertyGetterIsRecognizedBorrow`), so the two rules cannot disagree
+    // about what a getter hands back:
+    //   - a resolved USER getter whose own declared type is not
+    //     mint-announcing ALWAYS lends (§28.6's A4 bullet: "properties and
+    //     indexers do not carry `owned` ... so its return is always a
+    //     borrow");
+    //   - a getter declared at a mint-announcing type (Task-family /
+    //     iterable-family) is body-scanned (#6404): a mint-source body hands
+    //     the caller an owned frame, a borrow-source body lends;
+    //   - a read with no resolved body lends when it is interface- or
+    //     virtual-dispatched (#2174's signature-level guarantee) and does NOT
+    //     for a BUILTIN property (not a user-declared getter, so §28.6's A4
+    //     guarantee does not bind it) — the pre-#2174 adoption for that
+    //     face, unchanged.
+    bool propertyReadIsRecognizedBorrow(const ast::Expr& read) const;
     // §28.10 / §28.3 / §28.6 / #2137-residual: body-level predicate called
     // from propertyGetterIsRecognizedBorrow ONLY for the Task-family return
     // carve. A Task-family getter's body determines whether it MINTS a fresh
@@ -5648,13 +5754,35 @@ private:
     // deferred-activation walk visits (position-independent). // per §28.3 /
     // stdlib §5 (#1915)
     void checkMinMaxMintingSelector(const ast::CallExpr& ce);
+    // §28.3 / stdlib §5 (#7201): a lazy LINQ `Zip<U,R>(other, combine)` whose
+    // combiner MINTS a fresh cleanup-bearing value per PAIR — an inline lambda
+    // combiner (`lambda(a, b) => a + b`) or a METHOD-REFERENCE combiner whose
+    // own body mints (`Cat(a, b) => a + b`) — launders that value out through
+    // the zipped sequence's receiver-sourced-borrow classification (stdlib §5
+    // "Ownership at class-typed substitutions", the same rule the `Select`
+    // projection (#1917) and the `Min`/`Max` projection (#1915) follow): the
+    // lazy pipeline takes NO disposal obligation on the combined elements, so
+    // every minted combination leaks and no consumer reclaims it (`ToArray`
+    // owns only the CONTAINER, borrowing elements). Same §28.3 laundering
+    // class as the `Aggregate` minted-seed rejection; reject the launder at
+    // the combiner. Called for every CallExpr the deferred-activation walk
+    // visits (position-independent). // per §28.3 / stdlib §5 (#7201)
+    void checkLazyZipMintingCombiner(const ast::CallExpr& ce);
     // The first return-path expression of `lam` (an inline lambda selector) that
     // MINTS a fresh cleanup-bearing value (lazySelectSelectorReturnMints), or
     // nullptr if none does. Scans the `=> E` body or the block body's `return`
     // statements, never crossing a nested lambda (its returns belong to it) —
-    // mirrors the SB01-B return walk. Shared by the `Select` (#1917) and `Min`/
-    // `Max` (#1915) minting-selector rejects. // per §28.3 / stdlib §5
+    // mirrors the SB01-B return walk. Shared by the `Select` (#1917), `Min`/
+    // `Max` (#1915) and `Zip` (#7201) minting-callback rejects. // per §28.3 /
+    // stdlib §5
     const ast::Expr* selectorLambdaMintingReturn(const ast::LambdaExpr& lam);
+    // The first return-path expression of a METHOD-REFERENCE callback — the
+    // callee's OWN body — that MINTS a fresh cleanup-bearing value, or nullptr
+    // if none does. The same return-path walk as selectorLambdaMintingReturn,
+    // over the method's `=> E` body or its block body's `return` statements. An
+    // `async` method projects a Task frame (a different ownership contract) and
+    // is never a mint. // per §28.3 / stdlib §5 (#7201)
+    const ast::Expr* callbackMethodMintingReturn(const ast::MethodDecl& decl);
     // True when `retExpr` — a lazy `Select` selector's return value — mints a
     // fresh owned/heap value with no borrow source: an owned-class producer
     // (producerState == Owned), a fresh string (a `+` concatenation, an
@@ -6048,6 +6176,22 @@ private:
     // in the same LocalDecl pass as scopedLambdaLocalInit_. // per §28.3 v0.196
     std::unordered_map<sema::Symbol*, const ast::Expr*>
         deferredMethodRefLocalInit_;
+    // fix #7025 (follow-up, §21.1 / §27.6 / §28.2, v0.340): a local bound to
+    // a method-group REFERENCE over a CLASS's own compiler-generated `Dispose`
+    // (`var f := d.Dispose;` / `const f := d.Dispose;`) — the shape the
+    // generated member leaves SYMBOL-less (§28.2: "the name is the
+    // compiler's"), so `deferredMethodRefLocalInit_`'s MethodSymbol test
+    // misses it and the §28.2 use-after-dispose machinery never saw the
+    // group's CAPTURE of the receiver (§27.6: "the instance is captured at
+    // formation — by reference for class- or interface-typed receivers").
+    //
+    // Keyed on the local's DECLARATION NODE (not its LocalSymbol) so the §21.1
+    // `const` spelling — whose declaration is an `ast::LocalConstDecl`, a
+    // different node — is found by the same lookup. Recorded by
+    // scopedPreScanStmt; consulted at the group's INVOCATION site, where the
+    // captured borrow is read (§28.2's use-after-dispose warning regime).
+    std::unordered_map<const void*, const ast::MemberAccessExpr*>
+        deferredGeneratedDisposeRefDecl_;
     // Every symbol that is an assignment target anywhere in the body
     // (including through an `out`/`ref` call argument). A lambda-literal
     // local among them is NOT verifiable (the binding may have been swapped
@@ -6098,6 +6242,21 @@ private:
     void scopedPreScan(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void scopedPreScanStmt(const ast::Stmt& s);
     void scopedPreScanExpr(const ast::Expr& e);
+
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): TRUE while the pre-scan
+    // is visiting a CALL's CALLEE.
+    //
+    // A callee member access (`d.Dispose()`, `d.Ping()`) is a CALL to the
+    // member, NOT a method-group FORMATION (§27.6 forms the group only when
+    // the member access is used as a VALUE). So the callee must NOT stamp the
+    // receiver's §27.6 borrow fact: stamping it would make EVERY explicit
+    // `Dispose()` defer its reclaim — a wholesale change of the disposal
+    // lowering, far beyond the shape this fix is about.
+    //
+    // Everything else that reaches a member access — a call ARGUMENT, a
+    // `return` value, a discarded expression statement, a lambda body, a
+    // collection literal element — IS a formation site and does stamp.
+    bool preScanInCallCallee_ = false;
 
     // True when the call's formal at `argPos` is `scoped`. Resolves user
     // methods/ctors via sema symbols, builtin TaskScope.Spawn by receiver

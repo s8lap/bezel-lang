@@ -107,15 +107,10 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// the helper returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // The VALUE printed is the oracle for the rows whose programs still carry an
 // unrelated, still-open leak (the async-iterator arm capture, and the guarded
@@ -267,7 +262,6 @@ BEZEL_TEST(catch_binding_capture_across_await_3503,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "3\n6\n");
 }
@@ -311,7 +305,6 @@ BEZEL_TEST(catch_binding_capture_across_await_3503,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "16500\n");
 }
@@ -362,7 +355,6 @@ BEZEL_TEST(catch_binding_capture_across_await_3503,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "21000\n");
 }
@@ -409,7 +401,6 @@ BEZEL_TEST(catch_binding_capture_across_await_3503,
         "    return 0; "
         "  end Main; "
         "end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "6\n");
 }

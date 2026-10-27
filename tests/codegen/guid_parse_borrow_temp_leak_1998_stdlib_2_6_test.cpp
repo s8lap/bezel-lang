@@ -69,16 +69,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required
-// to build this repo, so a skip is not expected — guard anyway (mirrors #1982 /
-// #1989 / #2199).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // The exact #1998 repro: `Guid.Parse(g.ToString())` — the no-arg ToString
 // producer (rc=1 heap string, #1982) passed as a BORROW to Parse, in a loop so
@@ -171,7 +165,6 @@ const char* kParseLiteralControl =
 BEZEL_TEST(guid_parse_borrow_temp_leak_1998,
            parse_noarg_tostring_lsan_clean_stdlib_2_6) {
     JitResult r = runAotChecked(kParseNoArgToString);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
     BEZEL_EXPECT_TRUE(r.ran);         // compiled + LSan-clean (temp freed once)
     BEZEL_EXPECT_EQ(r.exitCode, 40);  // every "D" render round-tripped
 }
@@ -183,7 +176,6 @@ BEZEL_TEST(guid_parse_borrow_temp_leak_1998,
 BEZEL_TEST(guid_parse_borrow_temp_leak_1998,
            parse_format_tostring_lsan_clean_stdlib_2_6) {
     JitResult r = runAotChecked(kParseFormatToString);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);  // every "N" render round-tripped
 }
@@ -195,7 +187,6 @@ BEZEL_TEST(guid_parse_borrow_temp_leak_1998,
 BEZEL_TEST(guid_parse_borrow_temp_leak_1998,
            tryparse_noarg_tostring_lsan_clean_stdlib_2_6) {
     JitResult r = runAotChecked(kTryParseNoArgToString);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);  // every TryParse succeeded + round-tripped
 }
@@ -207,7 +198,6 @@ BEZEL_TEST(guid_parse_borrow_temp_leak_1998,
 BEZEL_TEST(guid_parse_borrow_temp_leak_1998,
            parse_literal_control_lsan_clean_stdlib_2_6) {
     JitResult r = runAotChecked(kParseLiteralControl);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);  // round-trips, no double-free of the literal
 }

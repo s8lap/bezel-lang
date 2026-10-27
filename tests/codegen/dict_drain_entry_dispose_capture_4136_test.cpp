@@ -117,12 +117,10 @@ using bezel::test::runAotCheckedLenient;
 
 namespace {
 
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 bool has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
@@ -259,7 +257,6 @@ std::string stringKeyProgram() {
 BEZEL_TEST(dict_drain_entry_dispose_capture_4136,
            int_key_captured_loop_var_explicit_dispose_no_stack_overflow) {
     JitResult r = runAotCheckedLenient(intKeyProgram());
-    if (wasSkipped(r)) return;
     // Pre-fix: a genuine AddressSanitizer stack-buffer-overflow at the
     // `entry.Dispose()` call site itself (r.ran=false), matching #4136's own
     // measured "[32, 40) ... offset 40 overflows this variable" report.
@@ -270,7 +267,6 @@ BEZEL_TEST(dict_drain_entry_dispose_capture_4136,
 BEZEL_TEST(dict_drain_entry_dispose_capture_4136,
            string_key_captured_loop_var_explicit_dispose_no_stack_overflow) {
     JitResult r = runAotCheckedLenient(stringKeyProgram());
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     // 9: `entry.Value.N`, read before the explicit Dispose() under test.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "result=9"));
@@ -310,7 +306,6 @@ BEZEL_TEST(dict_drain_entry_dispose_capture_4136,
         "  end Main; "
         "end C;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "result=9"));
 }

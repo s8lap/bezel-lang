@@ -8,7 +8,7 @@
 //      in ascending order."
 //   and its declaration:
 //     "public class SortedSet<T>: IReadOnlyCollection<T> where T: IComparable<T>"
-//   stdlib line 1467:
+//   stdlib §4.1:
 //     "public interface IReadOnlyCollection<out T>: IEnumerable<T>"
 //   stdlib §5 `System.Collections.Linq`, the `public extension IEnumerable<T>`
 //   block, declares `Where(predicate: (T) -> bool)`, `Select<U>(selector)`,

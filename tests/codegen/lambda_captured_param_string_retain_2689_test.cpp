@@ -59,14 +59,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // (A) The #2689 repro verbatim: TWO lambdas capturing one borrowed `string`
 // parameter. Pre-fix each env destructor released the caller's string, so the
@@ -173,7 +169,6 @@ const char* kTwoLambdasCaptureClosureParam =
 BEZEL_TEST(codegen_lambda_captured_param_string_retain_2689,
            two_lambdas_capturing_string_param_no_use_after_free_spec_28_1) {
     JitResult r = runAotChecked(kTwoLambdasCaptureStringParam);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
     BEZEL_EXPECT_TRUE(r.ran);          // no over-release (bug) and no leak
     BEZEL_EXPECT_EQ(r.exitCode, 142);  // both captures still read back
 }
@@ -185,7 +180,6 @@ BEZEL_TEST(codegen_lambda_captured_param_string_retain_2689,
 BEZEL_TEST(codegen_lambda_captured_param_string_retain_2689,
            one_lambda_capturing_string_param_no_use_after_free_spec_28_9) {
     JitResult r = runAotChecked(kOneLambdaCapturesStringParam);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 71);
 }
@@ -197,7 +191,6 @@ BEZEL_TEST(codegen_lambda_captured_param_string_retain_2689,
 BEZEL_TEST(codegen_lambda_captured_param_string_retain_2689,
            two_lambdas_capturing_string_local_still_balanced_spec_27_5) {
     JitResult r = runAotChecked(kTwoLambdasCaptureStringLocal);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);         // no leak from an over-broad retain
     BEZEL_EXPECT_EQ(r.exitCode, 142);
 }

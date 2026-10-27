@@ -390,6 +390,130 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
                "`GetHashCode`/`GetType` (\xC2\xA7""8.1); no user member or "
                "\xC2\xA7""26.5 extension provides `" + m + "`";
     }
+    // fix #7177 (§27.1 / §27.6 / §27.7 / §26.5, v0.344): a FUNCTION-typed
+    // receiver is the third value shape with no user `TypeSymbol` — the
+    // primitive and the unit type are the other two, and both are answered
+    // above. A function value (a method reference, §27.6, or a lambda, §27.5)
+    // has NO member table: §26.5 resolves `x.Foo` against the receiver's
+    // DECLARED type and its bases, and a function type declares neither, so
+    // the name resolves to nothing (§2.7). Without this arm the access was
+    // left untyped and unreported, and codegen degraded it to nothing.
+    //
+    // MEASURED on the pre-fix base (r30-c1 tip 40d1691f): `h.Id<int>.Get()`
+    // — a method reference over a generic method, §27.6 — compiled, ran,
+    // exited 0 and printed NOTHING (one #3079 internal-degradation
+    // warning); so did `h.Id<int>?.Get()`, `h?.Id<int>.Get()` and
+    // `h?.Id<int>?.Get()`. The same shape with a NON-EXISTENT member name
+    // (`h.Id<int>.Bogus()`) was equally silent, so the receiver was not
+    // rejected by any member-existence rule at all.
+    //
+    // The universal members stay admissible: the exemption at the top of
+    // this predicate already exempts them, and they ARE members of a function
+    // value — `h.Id<int>.ToString()` prints the function's signature
+    // ("(int) -> int"), MEASURED on the same base.
+    //
+    // fix #7177 rework (§8.1 / §8.7 / §26.5 rule 2 / §28.2 / §28.9,
+    // v0.344): TWO carve-outs.
+    //
+    // (1) `Dispose` is NOT a member of a function value, and the compiler
+    // ALREADY answers that exact question for the closest sibling IN THIS
+    // VERY PREDICATE: the `Object` arm above rejects `o.Dispose()` on the
+    // class-only rule (§8.7 / §28.2).  A function type is not a class
+    // either, so the two answers must agree — and they now do (#7260).
+    //
+    //     §28.9 (v0.344), the section's OPENING SENTENCE: "Their
+    //     `Dispose()` is a no-op (or, for types that are not classes and
+    //     therefore have no `Dispose()` at all, the type's lifetime is
+    //     managed by the runtime without user involvement)."
+    //
+    //     §28.9 (v0.344), the FUNCTION-TYPED bullet: "Function-typed
+    //     values — values of any function type `(T1, ..., Tn) -> R`,
+    //     regardless of whether they capture. … Function-typed fields,
+    //     parameters, and locals are not subject to `owned` annotations
+    //     and carry no disposal obligation; a `using var` local of
+    //     function type is nonetheless permitted (disposal at scope end is
+    //     a no-op) …"
+    //
+    //     §8.7 (v0.344): "`Dispose()` is class-only.  The compiler generates
+    //     `IDisposable` on every non-static class."  A function type is
+    //     not a class, so it has no `Dispose()` AT ALL — which is the
+    //     parenthetical §28.9's opening sentence spells out.
+    //
+    //     §28.2 (v0.344): "`Dispose()` is not on `Object`; it is
+    //     class-only."
+    //
+    // WHY THIS IS NOT A "NO-OP" BUT A REJECTION.  §28.9's parenthetical
+    // offers two behaviours — a no-op, or no `Dispose()` at all — and the
+    // SECOND one is the one that applies to a function type, because a
+    // function type is not a class.  The compiler already picked the
+    // second one for the closest sibling (`Object`, the `Primitive` arm
+    // above), with the class-only reason and the §8.7 / §28.2 citations,
+    // and the compiler must answer the same question the same way for the
+    // closest sibling.  A "no-op" reading would also be a behaviour
+    // CHANGE, not a status quo: the compiler has always implemented the
+    // spelling as a REAL dispose on a closure cell (§28.2's
+    // checked-disposal guard; the `bz_closure_mark_disposed` helper,
+    // #4475), so a "no-op" would have to become a new no-op — and a
+    // no-op `Dispose()` on a heap-allocated closure cell would still leave
+    // the reader asking what the cell's own lifetime is.
+    //
+    // The #7177 lane first REJECTED this spelling, and the review blocked
+    // it because two BANKED rows (`closure_dispose_then_invoke_4475`) pinned
+    // the compiler's real dispose — a `DisposedAccessException` in checked
+    // mode and a SIGSEGV in unchecked mode.  A banked row is evidence of
+    // the CURRENT behaviour, not of the CORRECT behaviour, and §28.9 is
+    // not ambiguous on this point.  So the spelling is REJECTED (#7260),
+    // and the two banked rows are re-pinned as rejection rows — which is
+    // STRICTLY STRONGER: the old rows asserted a runtime behaviour, the
+    // new rows assert a compile-time refusal.
+    //
+    // The message is the sibling `Object` rule's message — the same shape
+    // and the same citations (§8.7's class-only rule, §28.2, and §28.9's
+    // runtime-managed list), because the compiler must answer the same
+    // question the same way for the closest sibling.
+    //
+    // (2) A member an `extension Object` provides is NOT nameless and must
+    // not be rejected here.  §8.1 (v0.344): "function types reaching
+    // `Object` similarly via their reference-type heap representation" ⇒
+    // `Object` IS a base type of a function type, and §26.5 rule 2 searches
+    // the extension blocks "on `x`'s type, base types, or implemented
+    // interfaces".  The extension lookup itself now REACHES that base
+    // (`extensionFindMatchingAncestor`, ExprTypecheck.cpp), so a member an
+    // `extension Object` provides RESOLVES and this arm is never asked
+    // about it.  The message below is therefore drawn only for a name that
+    // NO reachable extension declares, and it says so.
+    if (recvTy->kind == TypeRef::Kind::Function) {
+        // `ReferenceEquals` IS a member of `Object` (§8.1 declares it
+        // `static ReferenceEquals(a: Object?, b: Object?): bool`), and §8.1
+        // puts `Object` in a function type's base chain, so a function value
+        // HAS it — dropping this carve-out would be an OVER-rejection, a
+        // member §8.1 admits becoming unreachable.  (Its permissive-static
+        // hole — `f.ReferenceEquals(c, c)` compiles and prints NOTHING — is a
+        // SEPARATE defect with its own fail-without; it is REPORTED, not
+        // fixed here.)
+        if (m == "ReferenceEquals") return {};
+        // `Dispose` is class-only (§8.7) and a function type is not a class
+        // (§28.2, §28.9) — the same ground, and the same answer, as the
+        // sibling `Object` rule above.  See the long comment above.
+        if (m == "Dispose") {
+            return "no member `Dispose` on a function value: `Dispose()` is "
+                   "class-only (\xC2\xA7""8.7, v0.340), and a function type is "
+                   "not a class, so `Dispose` is not one of its members "
+                   "(\xC2\xA7""28.2). A function-typed value's lifetime is "
+                   "managed by the runtime without user involvement "
+                   "(\xC2\xA7""28.9, v0.344); the values it captures keep "
+                   "their own disposal obligations (\xC2\xA7""28.9, "
+                   "\xC2\xA7""28.3).";
+        }
+        return "no member `" + m +
+               "` on a function value: a function type (\xC2\xA7""27.1) "
+               "declares no members of its own — a function value is CALLED "
+               "(`f(x)`), not queried for members (\xC2\xA7""27.7); the "
+               "members reachable on one are the \xC2\xA7""8.1 universal "
+               "instance members and the \xC2\xA7""26.5 extension members of "
+               "its `Object` base (\xC2\xA7""8.1) — and none of those "
+               "declares `" + m + "`";
+    }
     return {};
 }
 
@@ -2925,7 +3049,7 @@ std::string ExprTC::refOutNarrowedCopyOutHint(const ast::Expr& operand,
 
 // Defined with `substituteMemberType`, below.
 static bool ancestorGenericSubst(
-    const TypeRef* recvTy, const TypeSymbol* derived,
+    SemaContext& ctx, const TypeRef* recvTy, const TypeSymbol* derived,
     const TypeSymbol* parent, bool throughInterfaces,
     std::unordered_map<std::string_view, TypeRef*>& out,
     const std::unordered_set<std::string_view>* excludeNames);
@@ -3009,7 +3133,7 @@ void ExprTC::collectHierarchyOverloads(TypeSymbol* start, std::string_view name,
                 for (Symbol* gp : b->genericParams)
                     if (gp) own.insert(gp->name);
                 std::unordered_map<std::string_view, TypeRef*> sub;
-                if (ancestorGenericSubst(nullptr, d->parent, b->parent,
+                if (ancestorGenericSubst(ctx_, nullptr, d->parent, b->parent,
                                          /*throughInterfaces=*/false, sub,
                                          &own) &&
                     !sub.empty())
@@ -3200,7 +3324,7 @@ const TypeRef* ExprTC::formalTypeAtReceiver(const TypeRef* pt,
         const TypeRef* rt = ctx_.exprType(*recvTarget);
         if (rt && rt->declaration && rt->declaration != par &&
             rt->declaration->kind == ast::TypeDeclKind::Interface &&
-            !ancestorGenericSubst(rt, rt->declaration, par,
+            !ancestorGenericSubst(ctx_, rt, rt->declaration, par,
                                   /*throughInterfaces=*/true, cs,
                                   &ownGenerics))
             cs.clear();
@@ -5769,6 +5893,24 @@ ExprTC::foldNumConstExprTC(const ast::Expr& e, int depth) {
 
 // Slice 3h: resolve a CallExpr's return type from the callee's
 // resolved MethodSymbol.
+// fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: forward
+// declarations of the builtin-collection constraint helpers. Their
+// definitions sit beside the stdlib surface tables they read (below), but
+// `typeCall` — which is earlier in this file — uses one of them.
+static TypeRef* builtinCollectionConstraintCallType(SemaContext& ctx,
+                                                    const TypeRef* view,
+                                                    std::string_view member);
+static bool builtinCollectionConstraintPropertyAdmitted(
+    std::string_view head, std::string_view member);
+static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
+                                                        const TypeRef* view,
+                                                        std::string_view member);
+// fix #7140 (stdlib §9.6, v0.343): the built-in `string` members' ARITY
+// gate. Its definition sits beside the other stdlib §9.6 string-member
+// helper (below), but `typeCall` — which is earlier in this file — uses it.
+static void checkBuiltinStringCallArity(SemaContext& ctx,
+                                         const ast::CallExpr& ce);
+
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
     // §22.16 (v0.250, #3038): `old(E)` — the callee is the contextual
@@ -6084,10 +6226,156 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     "' requires a `char` " + what + " (stdlib §9.5/§9.6)");
             };
             // §9.6: string.Repeat(c: char, count: int).
+            //
+            // fix #7132 (§5.1, §9.6, v0.343): `requireIntLike` only asks
+            // "is this argument integer-LIKE?" — a `uint` / `long` / `ulong`
+            // count passes it, so the STATIC spelling's `count: int` was
+            // admitted with a type §5.1's "never implicit" bullet forbids
+            // (`uint` → `int` is the bullet's own example). The count is
+            // therefore put on the SAME implicitly-convertible check the
+            // PAD/SPAN parameters use — `checkAssignable` against `int` — so
+            // the static and the instance spelling report the SAME §5.1
+            // diagnostic, and §5.1's constant-narrowing clause still admits a
+            // `long` CONSTANT whose value fits `int`'s range
+            // (`const N: long := 3L`), because `checkAssignable` runs
+            // `narrowIntConstantToTarget` first.
+            //
+            // The gate is applied only to an INTEGER-LIKE count: a
+            // non-integer-like one is already rejected by `requireIntLike`
+            // above with the "requires a `char` (int) count" wording, and
+            // running both on the same argument would report one program
+            // twice for one mistake.
             if (recvPt == PrimitiveType::String && mm == "Repeat" &&
                 ce.args.size() == 2) {
                 requireIntLike(0, "first argument");
                 requireIntLike(1, "(int) count");
+                const auto& cntArg = ce.args[1];
+                if (cntArg.value && !cntArg.isDiscard) {
+                    TypeRef* cntTy = ctx_.exprType(*cntArg.value);
+                    if (cntTy && cntTy->kind == TypeRef::Kind::Primitive &&
+                        isIntegerLike(cntTy->primitive)) {
+                        checkAssignable(
+                            cntTy,
+                            ctx_.primitiveTypeRef(PrimitiveType::Int),
+                            cntArg.value->span.begin,
+                            "argument to `string.Repeat`",
+                            cntArg.value.get());  // §5.1 / §7.4
+                    }
+                }
+            }
+            // fix #7150 (stdlib §9.6, §5.1, §4.6, v0.343): `string.Join`'s
+            // SEPARATOR.
+            //
+            // stdlib §9.6 declares
+            //   public static method Join(separator: string, items: IEnumerable<string>): string;
+            // — the separator is a `string`, and there is NO `char` separator
+            // overload. §5.1's implicit-conversion table has no row into
+            // `string` at all: its `char` row widens to `int`/`uint`/`long`/
+            // `ulong`/`float`/`double`/`decimal` and never to `string`, and
+            // §4.6 says it outright — "The compiler does not implicitly
+            // convert other types to `string`". So the only admissible
+            // separator is a `string` — a `string?` that §7.4 has narrowed
+            // non-null included, since the narrowed read HAS type `string`.
+            //
+            // THE DEFECT. A built-in `string` member is a compiler intrinsic:
+            // it has no MethodSymbol, so §22.5's per-argument assignability
+            // check never ran for this call, and the codegen lowering
+            // (`LlvmBackend_Calls.cpp`'s static `Join` arm) lowered
+            // `call.args[0]` — the separator — as a `bz_string*` whatever its
+            // type. MEASURED pre-fix on this tree:
+            //
+            //   `string.Join(',', parts)`   → the compiler emits MALFORMED IR:
+            //     "Load operand must be a pointer." x3, then "codegen error:
+            //     IR verification failed (malformed IR emitted)" — the
+            //     COMPILER'S OWN IR verifier rejects the module, because the
+            //     `char` arrives as an `i32` where a pointer is expected;
+            //   `string.Join(5, parts)` and `string.Join(sep, parts)` over a
+            //     `char`/`double` variable → the same malformed IR
+            //     ("GEP base pointer is not a vector or a vector of
+            //     pointers" + "Load operand must be a pointer.");
+            //   `String.Join(',', parts)` → the same malformed IR (the
+            //     PascalCase alias of the same type keyword);
+            //   `string.Join(null, parts)` → compiled CLEANLY and then
+            //     SEGFAULTED at run time (the lowering reads the length and
+            //     the data pointer out of a null string header).
+            //
+            // ⇒ Every one of those is a program the document does not define,
+            // and each was a COMPILER defect rather than a diagnostic. The
+            // gate below rejects them at the front end, so the lowering never
+            // sees an argument it has no lowering for.
+            //
+            // WHERE THE REJECTION BELONGS. In SEMA, not in codegen: the
+            // document says the call is not well-formed (§9.6 declares a
+            // `string` separator; §4.6/§5.1 convert nothing else into one),
+            // so the rejection belongs where the call is CHECKED. Codegen is
+            // unreachable for a rejected program (`Driver::compileFile` runs
+            // it only when `!diagnostics.hasErrors()`), so the +1 producer
+            // recognizer in `LlvmBackend_Setup.cpp` — which claims
+            // `string.Join` as an `rc := 1` heap-string producer — stays
+            // CONSISTENT with the rejection by construction: a rejected call
+            // is never classified.
+            //
+            // fix #7191 (§22.5, stdlib §9.6, v0.343): the SEPARATOR is the
+            // PARAMETER named `separator`, and §22.5 binds a named argument to
+            // the parameter it NAMES, never to the position it occupies:
+            // "named arguments may appear in any order after positional
+            // arguments. Each supplied argument binds exactly one parameter".
+            // This gate read `ce.args[0]` POSITIONALLY, so
+            // `string.Join(items := parts, separator := ",")` was checked
+            // against the ITEMS argument and REJECTED — naming the WRONG
+            // parameter — while the very same call spelled in declaration
+            // order was accepted. The two spellings name the same parameters
+            // and supply the same arguments; they are the same call.
+            //
+            // WHERE THE BINDING COMES FROM. The published §22.5 binding
+            // (`ctx_.builtinCallBinding`) is NOT available here: this gate runs
+            // early in `typeCall`, and the publication (`checkBuiltinNamedArgs`
+            // -> `ctx_.setBuiltinCallBinding`) happens at the END of it. So the
+            // binding is established LOCALLY, with the SHARED §22.5 binder
+            // (`bindArgsToParams` — the same one `checkBuiltinNamedArgs`
+            // runs) over the REGISTRY's declared names
+            // (`common::builtinParamNameCandidates`, whose `string.Join`/2 row
+            // carries {"separator", "items"}), so NO second name table is
+            // introduced here.
+            //
+            // A call that does not bind at all (an unknown name, a double
+            // bind, a positional argument after a named one) keeps the
+            // POSITIONAL read: `checkBuiltinNamedArgs` reports the §22.5
+            // violation later, and the separator must still be type-checked
+            // here, so that a non-`string` separator is rejected rather than
+            // lowered.
+            if (recvPt == PrimitiveType::String && mm == "Join" &&
+                ce.args.size() == 2) {
+                std::size_t sepArgIdx = 0;  // parameter 0 is `separator`
+                for (const auto& f : common::builtinParamNameCandidates(
+                         tid->name, "Join", ce.args.size())) {
+                    BindResult br = bindArgsToParams(
+                        sema::FormalsView::ofNames(f.names, f.required), ce.args,
+                        ce.span.begin, "call to built-in `string.Join`",
+                        /*emit=*/false);
+                    if (!br.ok) continue;  // not this overload's binding
+                    for (std::size_t p = 0; p < f.names.size(); ++p) {
+                        if (f.names[p] != "separator") continue;
+                        const int src = br.paramToArg[p];
+                        if (src >= 0 &&
+                            static_cast<std::size_t>(src) < ce.args.size())
+                            sepArgIdx = static_cast<std::size_t>(src);
+                    }
+                    break;
+                }
+                const auto& sepArg = ce.args[sepArgIdx];
+                if (sepArg.value && !sepArg.isDiscard) {
+                    TypeRef* sepTy = ctx_.exprType(*sepArg.value);
+                    if (sepTy) {
+                        checkAssignable(
+                            sepTy,
+                            ctx_.primitiveTypeRef(PrimitiveType::String,
+                                                  /*nullable=*/false),
+                            sepArg.value->span.begin,
+                            "separator argument to `string.Join`",
+                            sepArg.value.get());  // §5.1 / §7.4
+                    }
+                }
             }
             // fix #3853 (stdlib §9.6, v0.290; proposal 0123 R6): the static
             // `string.Compare(a, b[, ignoreCase])` this #2581 protection used
@@ -6112,6 +6400,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             }
         }
     }
+    // fix #7140 (stdlib §9.6, v0.343): the ARITY gate for the built-in
+    // `string` members. A built-in `string` member has no MethodSymbol, so
+    // §22.5's argument-count check (`checkCallArity`) never ran for it, and
+    // `resolveMemberAccess` typed the member by NAME alone — the argument
+    // count was never inspected. The lowerings (`Emitter::tryLowerStringMethod`
+    // and the static-factory arms) key on name AND arity, so a call at an
+    // arity no stdlib §9.6 overload declares matched NO lowering: the #2477
+    // permissive-acceptance path degraded the slot to a zero-initialized value
+    // and the program's first read of it faulted (SIGSEGV at 0x8), or — where
+    // the lowering ignores the surplus arguments — the call silently DROPPED
+    // them and printed a plausible wrong value. Both are closed here, by
+    // REJECTING the call: the diagnostic names the arity stdlib §9.6
+    // declares.
+    checkBuiltinStringCallArity(ctx_, ce);
     // per §15.4 (#1174): the builtin string methods whose parameter is an
     // `IEnumerable<T>` — `string.Trim(chars: IEnumerable<char>)` (stdlib §9.6)
     // and `string.Join(sep: string, items: IEnumerable<string>)` (stdlib §3.4)
@@ -6973,21 +7275,56 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         else if (auto* cid =
                      dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get()))
             callTypeArgs = &cid->typeArgs;
-        if (declaredArity > 0) {
-            if (callTypeArgs && !callTypeArgs->empty() &&
-                callTypeArgs->size() != declaredArity) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ce.span.begin,
-                    "call to `" + std::string(ms->name) +
-                    "` supplies " + std::to_string(callTypeArgs->size()) +
-                    " explicit type argument(s), but `" +
-                    std::string(ms->name) + "` declares " +
-                    std::to_string(declaredArity) +
-                    " type parameter(s) — an explicit type-argument list "
-                    "must supply exactly as many arguments as the method "
-                    "declares type parameters; there are no partial lists "
-                    "(§14.5)");
-            }
+        // fix #7162 (§22.12 / §14.1 / §14.5, v0.343): §14.5's all-or-nothing
+        // rule fixes an explicit type-argument list against the method's
+        // DECLARED count, and the declared count may be ZERO. The old
+        // `declaredArity > 0` gate therefore exempted exactly the case
+        // §22.12 names — "a name that resolves to a non-generic entity after
+        // a syntactically-successful generic reading is an ordinary error at
+        // that name" — and the compiler SILENTLY DROPPED the list: a call
+        // `o.Plain<int>()` on a method that declares no type parameters ran
+        // as `o.Plain()`, and the bare callee `Make<int>(7)` as `Make(7)`.
+        //
+        // The gate is REMOVED, not narrowed: the inner condition already
+        // requires a NON-EMPTY list, so the check fires exactly where a list
+        // is present and its length differs from the declared count (zero
+        // included) — never on a call without a list, and never on a list
+        // that matches the declared count.
+        //
+        // §22.6's overload selection, read with §14.5's participation rule
+        // ("with a list, only candidates declaring that many type parameters
+        // of their own take part"), makes this safe for an OVERLOADED name:
+        // `resolveMethodOverload` narrows the candidate set to the
+        // candidates declaring the list's length, so the selected overload
+        // declares that length whenever ANY candidate does. The check
+        // therefore fires only where NO candidate admits the list: a list
+        // that spells nothing at that name (§22.12), and a wrong arity
+        // (§14.1: "Every such reference supplies exactly the declared number
+        // of type arguments"). The one place the selection does NOT narrow
+        // is where the call's ARGUMENTS bind no candidate at all — the
+        // selection then falls back to a candidate of its own choosing, in a
+        // program that is already erroneous for its arguments; there the
+        // message names the candidate the fallback chose, as it always has.
+        //
+        // The message is UNCHANGED, so the diagnostics the lit track and the
+        // #4589/#6312 gtests pin for the declaredArity > 0 shapes are
+        // byte-identical; the zero case reuses the same sentence, which
+        // already reads correctly for a declared count of zero ("supplies 1
+        // explicit type argument(s), but `Plain` declares 0 type
+        // parameter(s)").
+        if (callTypeArgs && !callTypeArgs->empty() &&
+            callTypeArgs->size() != declaredArity) {
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "call to `" + std::string(ms->name) +
+                "` supplies " + std::to_string(callTypeArgs->size()) +
+                " explicit type argument(s), but `" +
+                std::string(ms->name) + "` declares " +
+                std::to_string(declaredArity) +
+                " type parameter(s) — an explicit type-argument list "
+                "must supply exactly as many arguments as the method "
+                "declares type parameters; there are no partial lists "
+                "(§14.5)");
         }
         // §14.2 (v0.327, #5640): a dispatched generic method's call rejects a
         // move-only value type (§15.3) and an inline array of any form (§15.1)
@@ -10035,6 +10372,42 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                         }
                         if (isDeclaredParam) {
+                            // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2,
+                            // §4.12, §4.13: a `where T: IList<int>` bound DOES
+                            // provide this member — §14.2: "Inside the generic
+                            // body, T's surface includes IFoo's members". The
+                            // eight builtin collection heads carry no
+                            // declaration, which is why the constraint walk
+                            // cannot see them; the stdlib's documented surface
+                            // says the member IS there, so the call is admitted
+                            // and typed from that surface.
+                            //
+                            // The call is typed against the member's REAL
+                            // SIGNATURE — its arity (§22.5), its argument
+                            // types (§5.1) and, on the owning heads, its
+                            // `owned` parameter slot (§22.3) — or REFUSED
+                            // loudly with a diagnostic of its own. Admitting
+                            // a member BY NAME without typing the call
+                            // against its signature is what made the owning
+                            // heads' `Add` double-dispose its element and
+                            // made a wrong element type reach the
+                            // malformed-IR lowering.
+                            //
+                            // The control side is unchanged: a name the head
+                            // does NOT declare falls through to the reject
+                            // below, exactly as it does for a head with no
+                            // collection constraint at all.
+                            if (TypeRef* view =
+                                    constraintCollectionView(paramName, mbr)) {
+                                if (!builtinCollectionConstraintCallChecked(
+                                        ce, view, mbr))
+                                    return;
+                                if (TypeRef* rt =
+                                        builtinCollectionConstraintCallType(
+                                            ctx_, view, mbr))
+                                    ctx_.setExprType(&ce, rt);
+                                return;
+                            }
                             ctx_.diagnostics().report(
                                 Severity::Error, ce.span.begin,
                                 "no member `" + std::string(mbr) +
@@ -18140,10 +18513,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // `string?` argument is rejected instead of silently accepted.
     checkBuiltinStringCallArgs(ce);
 
+    // fix #7207 (stdlib §3.1, v0.343): the built-in `StringBuilder` has no
+    // user declaration, so its member surface is EXACTLY §3.1's listing —
+    // and nothing checked a call against it (no MethodSymbol ⇒ no
+    // `checkCallArity`; the member was typed by NAME alone). The same
+    // per-argument assignability the user-method path runs is run here,
+    // against §3.1's declared parameter types, and a call at an arity §3.1
+    // declares no form for is rejected rather than silently ignored.
+    checkBuiltinStringBuilderCall(ce);
+
     // fix #6782 (§7, §7.3, v0.340): the same §7 null check for the built-in
     // members and statics the string-receiver check above does not reach,
     // against the declared non-nullable positions in the registry.
     checkBuiltinNullableArgs(ce, calleeSym);
+
+    // fix #7218 (stdlib §2.2, stdlib §2.3, §5.1, §22.6, v0.343): the same
+    // per-argument TYPE check for the built-in `Math` / `Convert` statics.
+    // Those classes have no user declaration, so their members have no
+    // MethodSymbol and no declared parameter type was ever checked against
+    // the argument: a wrongly-typed argument reached codegen and the
+    // compiler ABORTED inside the LLVM verifier (or, for a `bool`, silently
+    // produced a wrong value). §5.1's conversions apply "where the target
+    // type is known", and stdlib §2.2 / §2.3 declare it.
+    checkBuiltinMathConvertCallArgs(ce);
 
     // §22.5 (v0.283, #3398): the BINDING twin of the three per-argument
     // builtin checks around it. Those answer "is this argument's TYPE
@@ -20485,10 +20877,39 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         // `AsSpan(r: Range<int>)` passes a Named (non-primitive) argument and
         // is skipped by the Primitive guard in the loop below, so admitting
         // AsSpan here cannot false-reject the Range form.
+        //
+        // fix #7132 (§5.1, §9.6, v0.343): the INSTANCE `Repeat(count)`
+        // takes its count as an `int` — the same declared type stdlib §9.6
+        // gives the STATIC `Repeat(c: char, count: int)` — and its count was
+        // NOT in this set, so the count argument was never type-checked at
+        // all. A `uint` count (which §5.1's "never implicit" bullet forbids:
+        // "between signed and unsigned types of the same or narrower width")
+        // was admitted, and after the #7104 byte-widening fix it produced a
+        // SILENT WRONG VALUE where it used to crash loudly: `"x".Repeat(b)`
+        // with `b: uint := 4000000000` compiled and printed `-294967296`.
+        // Adding `Repeat` here puts its count on the SAME
+        // implicitly-convertible check the PAD/SPAN parameters already use
+        // (the `checkAssignable` call in the loop below), so the `uint` count
+        // is rejected at the sibling site with the same §5.1 diagnostic —
+        // and §5.1's constant-narrowing clause still admits a `long`
+        // CONSTANT whose value fits `int`'s range (`const N: long := 3L`),
+        // because `checkAssignable` runs `narrowIntConstantToTarget` first.
+        // (Whether the INSTANCE spelling belongs on stdlib §9.6's `String`
+        // listing at all is a SEPARATE, open question — issue #7131 records
+        // that §9.6 declares only the two STATIC `Repeat` forms; this fix
+        // gates the count of the spelling the compiler implements, and does
+        // not rule on the member's existence.)
+        // NOTE the position: the instance spelling puts the count at
+        // position 0; the STATIC `string.Repeat(c, count)` puts it at
+        // position 1 and is gated at its own site (the static-primitive
+        // argument check in `typeCall`), because the static callee's target
+        // is the TYPE NAME `string` — which carries no value exprType — and
+        // the receiver guard above therefore excludes it by construction.
         bool intPos =
             (pos == 0 && (m == "Substring" || m == "Remove" || m == "Insert" ||
                           m == "PadLeft" || m == "PadRight" ||
-                          m == "PadCenter" || m == "AsSpan")) ||
+                          m == "PadCenter" || m == "AsSpan" ||
+                          m == "Repeat")) ||
             (pos == 1 && (m == "Substring" || m == "Remove" ||
                           m == "IndexOf" || m == "AsSpan"));
         if (intPos) return PT::Int;
@@ -20550,6 +20971,1344 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     }
 }
 
+// fix #7207 (stdlib §3.1, v0.343): the DECLARED SURFACE of the built-in
+// `StringBuilder` — the ARITY and the ARGUMENT TYPES of a member call.
+//
+// THE DEFECT. `StringBuilder` has no user declaration, so its member surface
+// is EXACTLY what stdlib §3.1 documents for it (the #2457 diagnostic says so
+// where it rejects a member that is not on that surface). But nothing checked
+// a call against that surface: the built-in members have no MethodSymbol, so
+// §22.5's argument-count check (`checkCallArity`) never ran for them, and
+// `resolveMemberAccess` typed the member by NAME alone.
+//
+// MEASURED pre-fix (on 7f30a995), each row = the call, the observed
+// behaviour:
+//
+//   sb.Replace()              -> compiles, runs, prints "hello"  (a SILENT
+//                                no-op: the declared form replaced nothing)
+//   sb.Replace("l")           -> the same silent no-op
+//   sb.Replace("l","L","x")   -> the surplus argument is DROPPED ("hello")
+//   sb.Replace('l','L')       -> MALFORMED IR ("Call parameter type does
+//                                not match function signature!")
+//   sb.Replace(3,4)           -> the same malformed IR
+//   sb?.Replace()             -> the same silent no-op (the null-conditional
+//                                spelling)
+//   sb.Append()               -> the same silent no-op
+//   sb.Append("a","b")        -> the surplus argument is DROPPED ("helloa")
+//   sb.AppendLine("a","b")    -> the same
+//   sb.AppendFormat("x")      -> the same
+//   sb.AppendFormat("x",[1],2)-> the same
+//   sb.Insert(0)              -> the same
+//   sb.Remove(0)              -> the same
+//   sb.Remove(0,1,2)          -> the same
+//   sb.Clear(1)               -> the same (the builder is NOT cleared)
+//   sb.Insert("x","y")        -> MALFORMED IR ("SExt only operates on
+//                                integer")
+//   sb.Remove("x","y")        -> the same
+//   sb.AppendFormat("x",3)    -> the same
+//
+// A silent no-op that prints a plausible wrong value is the top defect class
+// in this repository, and the malformed IR is an internal compiler error on
+// a program the spec rejects.
+//
+// THE FIX. A TABLE of §3.1's declared forms (the same shape as #7140's
+// `string` arity table): a call that matches no declared form is a compile
+// error (§22.5/§22.6), and an argument that does not convert to its declared
+// parameter is a compile error (§5.1). The check REJECTS; it adds no lowering.
+//
+// WHAT THE TABLE DOES NOT TYPE-CHECK, and why:
+//
+//   * `Append`'s and `AppendLine`'s VALUE parameter. §3.1 declares
+//     `Append(value: Object)` (plus the per-type overloads of #1355) and
+//     `AppendLine(value: string)`, but the compiler SHIPS the value-kind
+//     rendering for both — #6781 ("stdlib §3.1: Append(value) =
+//     Append(value.ToString())", cited to §3.1) — and a green test pins it
+//     (`codegen_stringbuilder_append_value_builtin_6781`). §5.1's "any type
+//     to `Object`" admits every type anyway, so a type check there could
+//     only ever REJECT an argument the shipped surface accepts.
+//
+//   * `Insert`'s VALUE parameter: #6807 already rejects a non-`string` value
+//     with its own located diagnostic, and two diagnostics for one argument
+//     would be noise.
+//
+//   * `ToString`: §8.1's universal `Object.ToString` arity check already
+//     rejects a call with arguments, the built-in `StringBuilder` receiver
+//     included.
+//
+//   * `Length` and `Capacity`: §3.1 declares them as PROPERTIES, so their
+//     call spelling (`sb.Length()`) is a call to a member §3.1 does not
+//     declare. The call spelling is left alone here: the property READ is
+//     the declared form and the compiler's own `Length`/`Count` lowering
+//     answers the call spelling with the length. A separate question from
+//     this one (and one this check does not open).
+namespace {
+
+// The declared parameter kind at one position of a §3.1 form.
+enum class StringBuilderParamKind {
+    Unchecked,    // §3.1's declared type admits the argument as it stands
+    String,       // §3.1 declares `string`
+    Int,          // §3.1 declares `int`
+    ObjectArray,  // §3.1 declares `Array<Object>`
+};
+
+// One declared form of one §3.1 member: the member, the arity that form
+// takes, the declared parameter kind at each of its (at most two) positions,
+// and the declared signature, quoted in the diagnostic.
+struct BuiltinStringBuilderSurfaceRow {
+    std::string_view member;
+    unsigned arity;
+    StringBuilderParamKind param0;
+    StringBuilderParamKind param1;
+    std::string_view decl;
+};
+
+// §3.1's listing, transcribed. The rows are the DECLARED forms, one per
+// arity per member (a member with two declared arities — `AppendLine` —
+// carries two rows).
+const std::vector<BuiltinStringBuilderSurfaceRow>& builtinStringBuilderSurface() {
+    static const std::vector<BuiltinStringBuilderSurfaceRow> kRows = {
+        {"Append", 1, StringBuilderParamKind::Unchecked,
+         StringBuilderParamKind::Unchecked,
+         "`Append(value: string): StringBuilder` and its per-type overloads"},
+        {"AppendLine", 0, StringBuilderParamKind::Unchecked,
+         StringBuilderParamKind::Unchecked, "`AppendLine(): StringBuilder`"},
+        {"AppendLine", 1, StringBuilderParamKind::Unchecked,
+         StringBuilderParamKind::Unchecked,
+         "`AppendLine(value: string): StringBuilder`"},
+        {"AppendFormat", 2, StringBuilderParamKind::String,
+         StringBuilderParamKind::ObjectArray,
+         "`AppendFormat(format: string, args: Array<Object>): StringBuilder`"},
+        {"Insert", 2, StringBuilderParamKind::Int,
+         StringBuilderParamKind::Unchecked,
+         "`Insert(index: int, value: string): StringBuilder`"},
+        {"Remove", 2, StringBuilderParamKind::Int, StringBuilderParamKind::Int,
+         "`Remove(startIndex: int, length: int): StringBuilder`"},
+        {"Replace", 2, StringBuilderParamKind::String,
+         StringBuilderParamKind::String,
+         "`Replace(oldValue: string, newValue: string): StringBuilder`"},
+        {"Clear", 0, StringBuilderParamKind::Unchecked,
+         StringBuilderParamKind::Unchecked, "`Clear(): StringBuilder`"},
+    };
+    return kRows;
+}
+
+}  // namespace
+
+void ExprTC::checkBuiltinStringBuilderCall(const ast::CallExpr& ce) {
+    // #2581 / #2594: a built-in instance callee is EITHER a MemberAccessExpr
+    // (`recv.M(..)`) OR a NullCondMemberExpr (`recv?.M(..)`); the two are
+    // separate Expr kinds but share identical `target`/`member` fields, and
+    // the null-conditional form is the same hole on a separate path.
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+    TypeRef* recvTy = ctx_.exprType(*tgt);
+    // The BUILT-IN `StringBuilder` only: it has no user declaration, so its
+    // surface is §3.1's listing. A user-declared class named `StringBuilder`
+    // HAS a declaration (`recvTy->declaration`), and its own members are
+    // checked by the ordinary user-method machinery — this check must not
+    // claim them.
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return;
+    if (recvTy->headName() != "StringBuilder") return;
+    // The member must be ON the declared surface; a member that is not is
+    // the #2457 backstop's business (it rejects it, at codegen, with the
+    // diagnostic that names the rule).
+    const auto& surface = builtinStringBuilderSurface();
+    std::vector<const BuiltinStringBuilderSurfaceRow*> forms;
+    for (const auto& row : surface)
+        if (row.member == member) forms.push_back(&row);
+    if (forms.empty()) return;
+    // §22.5 / §22.6: a call that matches NO declared form is a compile
+    // error. The diagnostic names the arity §3.1 declares.
+    const BuiltinStringBuilderSurfaceRow* form = nullptr;
+    for (const auto* f : forms)
+        if (f->arity == ce.args.size()) { form = f; break; }
+    if (!form) {
+        std::string decls;
+        std::string expectation;
+        for (const auto* f : forms) {
+            if (!decls.empty()) decls += " / ";
+            decls += std::string(f->decl);
+            if (!expectation.empty()) expectation += " or ";
+            expectation += std::to_string(f->arity);
+        }
+        if (forms.size() == 1) expectation = "exactly " + expectation;
+        expectation += " argument(s)";
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "the call to `StringBuilder." + std::string(member) +
+            "` supplies " + std::to_string(ce.args.size()) +
+            " argument(s) but stdlib §3.1 declares " + decls + " — " +
+            expectation + " (§22.5/§22.6; stdlib §3.1)");
+        return;
+    }
+    // The §22.5 BINDING: a named argument binds to the parameter it NAMES
+    // ("named arguments may appear in any order after positional arguments.
+    // Each supplied argument binds exactly one parameter"), so the parameter
+    // an argument supplies is read through the binder, not by position.
+    // The published binding (`ctx_.builtinCallBinding`) is NOT available
+    // here — it is published at the END of `typeCall` — so the binding is
+    // established LOCALLY, with the SHARED §22.5 binder over the REGISTRY's
+    // declared names (the same construction #7191 uses), so no second name
+    // table is introduced.
+    std::vector<int> paramToArg;
+    std::vector<std::string_view> paramNames;
+    for (const auto& cand : common::builtinParamNameCandidates(
+             "StringBuilder", member, ce.args.size())) {
+        BindResult br = bindArgsToParams(
+            sema::FormalsView::ofNames(cand.names, cand.required), ce.args,
+            ce.span.begin,
+            "call to built-in `StringBuilder." + std::string(member) + "`",
+            /*emit=*/false);
+        if (!br.ok) continue;  // not this overload's binding
+        paramToArg = br.paramToArg;
+        paramNames = cand.names;
+        break;
+    }
+    // A call that binds no candidate (an unknown name, a double bind, a
+    // positional argument after a named one) keeps the POSITIONAL reading:
+    // `checkBuiltinNamedArgs` reports the §22.5 violation later, and the
+    // arguments must still be type-checked here.
+    if (paramToArg.empty()) {
+        for (std::size_t i = 0; i < ce.args.size(); ++i)
+            paramToArg.push_back(static_cast<int>(i));
+    }
+    const StringBuilderParamKind kinds[2] = {form->param0, form->param1};
+    for (std::size_t p = 0; p < 2; ++p) {
+        if (kinds[p] == StringBuilderParamKind::Unchecked) continue;
+        if (p >= paramToArg.size()) continue;
+        const int ai = paramToArg[p];
+        if (ai < 0 || static_cast<std::size_t>(ai) >= ce.args.size()) continue;
+        const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+        if (!arg.value || arg.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule; skip.
+        if (!arg.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*arg.value);
+        if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+        const std::string paramName =
+            p < paramNames.size() ? std::string(paramNames[p]) : std::string();
+        const std::string what =
+            paramName.empty()
+                ? std::string("argument to `StringBuilder.") + std::string(member) + "`"
+                : std::string("argument `") + paramName + "` to `StringBuilder." +
+                      std::string(member) + "`";
+        if (kinds[p] == StringBuilderParamKind::ObjectArray) {
+            // §3.1 declares `args: Array<Object>` — an array of objects, and
+            // only that: a class type is INVARIANT (§12.9), so `Array<int>` is
+            // not an `Array<Object>`. Anything else (an `Object`, an `int`)
+            // is not an array at all, and the runtime helper reads it as one.
+            const bool isObjectArray =
+                argTy->kind == TypeRef::Kind::Named &&
+                argTy->headName() == "Array" && !argTy->nullable &&
+                argTy->genericArgs.size() == 1 && argTy->genericArgs[0] &&
+                argTy->genericArgs[0]->kind == TypeRef::Kind::Primitive &&
+                argTy->genericArgs[0]->primitive == PrimitiveType::Object &&
+                !argTy->genericArgs[0]->nullable;
+            if (!isObjectArray) {
+                ctx_.diagnostics().report(
+                    Severity::Error, arg.value->span.begin,
+                    "no matching overload of `StringBuilder.AppendFormat` — "
+                    "stdlib §3.1 declares `AppendFormat(format: string, args: "
+                    "Array<Object>): StringBuilder`, so the `args` argument "
+                    "must be an `Array<Object>` (stdlib §3.1; §5.1)");
+            }
+            continue;
+        }
+        // §7: the nullability gate (#6782) owns a NULLABLE argument at a
+        // non-nullable parameter — `builtinParamIsNonNullable` says whether
+        // it applies at this position — so this check does not report it a
+        // second time.
+        if (argTy->nullable &&
+            common::builtinParamIsNonNullable("StringBuilder", member,
+                                               ce.args.size(),
+                                               static_cast<int>(p)))
+            continue;
+        const PrimitiveType declared =
+            kinds[p] == StringBuilderParamKind::String ? PrimitiveType::String
+                                                        : PrimitiveType::Int;
+        checkAssignable(
+            argTy, ctx_.primitiveTypeRef(declared, /*nullable=*/false),
+            arg.value->span.begin,
+            what + " (stdlib §3.1 declares " + std::string(form->decl) + ")",
+            arg.value.get());  // §5.1 / §7.4 (#1191) — narrowing-aware
+    }
+}
+
+// fix #7218 (stdlib §2.2, stdlib §2.3, §5.1, §22.6, v0.343): the ARGUMENT
+// TYPES of a `Math` / `Convert` static member call.
+//
+// THE DEFECT. `Math` and `Convert` are compiler built-ins: they have no user
+// declaration and their members have no MethodSymbol, so §22.5's
+// per-argument assignability check (`checkCallArity` →
+// `checkArgsAgainstParams`) never ran for them, and `resolveMemberAccess`
+// typed the member by NAME alone. An argument of a type the declared
+// parameter does not take therefore reached codegen unchecked.
+//
+// MEASURED pre-fix on 94d0b7fd (one-line programs through `bezelc`):
+//   Math.Pow("not a double", 3)  -> "SIToFP source must be integer or
+//                                    integer vector" + "IR verification
+//                                    failed" — a COMPILER ABORT, with NO
+//                                    diagnostic and NO source location;
+//   Math.Abs("x")                -> "Both operands to ICmp instruction are
+//                                    not of the same type!" (the same abort);
+//   Convert.ToInt32(7.5)         -> "Load operand must be a pointer.";
+//   Math.Abs(true)               -> COMPILES and prints 1 — a SILENT WRONG
+//                                    ANSWER, because §5.1 lists "between
+//                                    integers and bool" as never implicit.
+//
+// §5.1 (v0.343) applies the implicit conversions at every position whose
+// target type is DECLARED, and a built-in member's parameter type IS
+// declared: stdlib §2.2 declares `Math.Pow(x: double, y: double): double`
+// and stdlib §2.3 declares the `Convert` family. §22.6's stage 3 (v0.343)
+// makes that the APPLICABILITY test of a call — "Applicability over the
+// (substituted) signatures: parameter types under the implicit conversions
+// (§5.1)" — and §5.1's constant-narrowing paragraph (v0.343) puts a call
+// argument among the positions the conversions apply at: "Constant
+// narrowing applies at every position where this section's implicit
+// conversions apply — there is no position carve-out: … call arguments
+// (`Set(3)`) …". So the argument must be checked against the declared
+// parameter type, and a call that matches NO declared form is an error
+// (§22.6). The check is the shape #7207 established for `StringBuilder`: a
+// TABLE of the declared forms, a §5.1 test per argument, and a diagnostic
+// naming the offending argument and the expected type.
+//
+// NOT CHECKED HERE, each for a stated reason:
+//   * the ARITY — a call at an arity no declared form has is a separate
+//     question (§22.5's arity rule; #7140's family for `string`, #7207's for
+//     `StringBuilder`);
+//   * `Math.Min` / `Max` / `Clamp` / `Sign` — their declared parameter type
+//     is the TYPE PARAMETER `T` (`where T: IComparable<T>` / `where T:
+//     INumber<T>`), so §22.6's stage-3 applicability has no concrete
+//     parameter type to apply §5.1's table to, and the CONSTRAINT, not
+//     §5.1, governs the argument;
+//   * `Math.DivRem` — its first two arguments are already rejected AT THE
+//     SOURCE LOCATION by an existing stdlib-§2.2-citing diagnostic, so this
+//     check would only duplicate that one;
+//   * a NULLABLE argument — the nullability dimension is §7's, and this
+//     check judges the argument's TYPE. The §7 gate's registry rows (#6782)
+//     cover the `Convert` positions but not `Math`'s, so a nullable
+//     argument at a `Math` position is left exactly as it was.
+namespace {
+
+// The DECLARED parameter type at one position of one §2.2/§2.3 form.
+enum class MathConvertParamKind {
+    Unchecked,  // the declared type is a TYPE PARAMETER (`T`) or an `out`
+                // slot the out-variable machinery types: §5.1's table has no
+                // concrete target type to apply to at such a position
+    Bool,
+    Int,
+    Long,
+    Float,
+    Double,
+    Decimal,
+    String,
+};
+
+// One DECLARED FORM of one §2.2/§2.3 member: the class, the member, the
+// arity the form takes, the declared parameter kind at each of its (at most
+// two) positions, and the declared signature, quoted in the diagnostic.
+struct MathConvertSurfaceRow {
+    std::string_view head;
+    std::string_view member;
+    unsigned arity;
+    MathConvertParamKind param0;
+    MathConvertParamKind param1;
+    std::string_view decl;
+};
+
+// §2.2's and §2.3's listings, transcribed. One row per DECLARED FORM: a
+// member with two declared parameter types (`Abs`) or two declared arities
+// (`Round`) carries one row per form, and a member with neither carries one.
+const std::vector<MathConvertSurfaceRow>& builtinMathConvertSurface() {
+    static const std::vector<MathConvertSurfaceRow> kRows = {
+        // stdlib §2.2 `Math`.
+        {"Math", "Abs", 1, MathConvertParamKind::Int,
+         MathConvertParamKind::Unchecked, "`Abs(x: int): int`"},
+        {"Math", "Abs", 1, MathConvertParamKind::Long,
+         MathConvertParamKind::Unchecked, "`Abs(x: long): long`"},
+        {"Math", "Abs", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Abs(x: double): double`"},
+        {"Math", "Abs", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`Abs(x: decimal): decimal`"},
+        {"Math", "Sqrt", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Sqrt(x: double): double`"},
+        {"Math", "Pow", 2, MathConvertParamKind::Double,
+         MathConvertParamKind::Double, "`Pow(x: double, y: double): double`"},
+        {"Math", "Floor", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Floor(x: double): double`"},
+        {"Math", "Floor", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`Floor(x: decimal): decimal`"},
+        {"Math", "Ceiling", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Ceiling(x: double): double`"},
+        {"Math", "Ceiling", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`Ceiling(x: decimal): decimal`"},
+        {"Math", "Truncate", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`Truncate(x: double): double`"},
+        {"Math", "Truncate", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`Truncate(x: decimal): decimal`"},
+        {"Math", "Round", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked,
+         "`Round(x: double, digits: int := 0): double`"},
+        {"Math", "Round", 2, MathConvertParamKind::Double,
+         MathConvertParamKind::Int, "`Round(x: double, digits: int := 0): double`"},
+        {"Math", "Fmod", 2, MathConvertParamKind::Double,
+         MathConvertParamKind::Double, "`Fmod(x: double, y: double): double`"},
+        {"Math", "IEEERemainder", 2, MathConvertParamKind::Double,
+         MathConvertParamKind::Double,
+         "`IEEERemainder(x: double, y: double): double`"},
+        // stdlib §2.3 `Convert`. The `Try*` forms' SECOND parameter is an
+        // `out` slot, whose type the out-variable machinery owns (§22.3).
+        {"Convert", "ToInt32", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToInt32(value: string): int`"},
+        {"Convert", "ToInt64", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToInt64(value: string): long`"},
+        {"Convert", "ToDouble", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToDouble(value: string): double`"},
+        {"Convert", "ToDecimal", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToDecimal(value: string): decimal`"},
+        {"Convert", "ToBoolean", 1, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked, "`ToBoolean(value: string): bool`"},
+        {"Convert", "TryToInt32", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToInt32(value: string, out result: int): bool`"},
+        {"Convert", "TryToInt64", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToInt64(value: string, out result: long): bool`"},
+        {"Convert", "TryToDouble", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToDouble(value: string, out result: double): bool`"},
+        {"Convert", "TryToDecimal", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToDecimal(value: string, out result: decimal): bool`"},
+        {"Convert", "TryToBoolean", 2, MathConvertParamKind::String,
+         MathConvertParamKind::Unchecked,
+         "`TryToBoolean(value: string, out result: bool): bool`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Int,
+         MathConvertParamKind::Unchecked, "`ToString(value: int): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Long,
+         MathConvertParamKind::Unchecked, "`ToString(value: long): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Float,
+         MathConvertParamKind::Unchecked, "`ToString(value: float): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Double,
+         MathConvertParamKind::Unchecked, "`ToString(value: double): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Decimal,
+         MathConvertParamKind::Unchecked, "`ToString(value: decimal): string`"},
+        {"Convert", "ToString", 1, MathConvertParamKind::Bool,
+         MathConvertParamKind::Unchecked, "`ToString(value: bool): string`"},
+        {"Convert", "ToString", 2, MathConvertParamKind::Int,
+         MathConvertParamKind::Int, "`ToString(value: int, toBase: int): string`"},
+        {"Convert", "ToString", 2, MathConvertParamKind::Long,
+         MathConvertParamKind::Int, "`ToString(value: long, toBase: int): string`"},
+    };
+    return kRows;
+}
+
+// The §5.1 target type of one kind, spelled for the diagnostic.
+std::string_view mathConvertTypeName(MathConvertParamKind k) {
+    switch (k) {
+        case MathConvertParamKind::Bool: return "bool";
+        case MathConvertParamKind::Int: return "int";
+        case MathConvertParamKind::Long: return "long";
+        case MathConvertParamKind::Float: return "float";
+        case MathConvertParamKind::Double: return "double";
+        case MathConvertParamKind::Decimal: return "decimal";
+        case MathConvertParamKind::String: return "string";
+        case MathConvertParamKind::Unchecked: break;
+    }
+    return {};
+}
+
+// The §5.1 target type of one kind, as the primitive it names.
+PrimitiveType mathConvertPrimitiveOf(MathConvertParamKind k) {
+    switch (k) {
+        case MathConvertParamKind::Bool: return PrimitiveType::Bool;
+        case MathConvertParamKind::Int: return PrimitiveType::Int;
+        case MathConvertParamKind::Long: return PrimitiveType::Long;
+        case MathConvertParamKind::Float: return PrimitiveType::Float;
+        case MathConvertParamKind::Double: return PrimitiveType::Double;
+        case MathConvertParamKind::Decimal: return PrimitiveType::Decimal;
+        case MathConvertParamKind::String: return PrimitiveType::String;
+        case MathConvertParamKind::Unchecked: break;
+    }
+    return PrimitiveType::None;
+}
+
+// "an `int`", "a `long`", … — one kind's phrase, with its article.
+std::string mathConvertTypePhrase(MathConvertParamKind k) {
+    const std::string_view name = mathConvertTypeName(k);
+    if (name.empty()) return {};
+    const char* article = k == MathConvertParamKind::Int ? "an " : "a ";
+    return std::string(article) + "`" + std::string(name) + "`";
+}
+
+// "an `int`, a `long` or a `double`" — the kinds a position admits.
+std::string mathConvertTypeList(const std::vector<MathConvertParamKind>& kinds) {
+    std::string out;
+    for (std::size_t i = 0; i < kinds.size(); ++i) {
+        if (!out.empty()) out += (i + 1 == kinds.size()) ? " or " : ", ";
+        out += mathConvertTypePhrase(kinds[i]);
+    }
+    return out;
+}
+
+}  // namespace
+
+void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+    // The BUILT-IN `Math` / `Convert` only: they have no user declaration
+    // (`ts->decl == nullptr`), so their surface is EXACTLY §2.2's / §2.3's
+    // listing. A user-declared class named `Math` or `Convert` HAS a
+    // declaration, and its own members are checked by the ordinary
+    // user-method machinery — this check must not claim them.
+    auto* ts = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tgt));
+    if (!ts || ts->decl != nullptr) return;
+    const std::string_view head = ts->name;
+    if (head != "Math" && head != "Convert") return;
+    // The DECLARED FORMS of this member at this arity. A call at an arity no
+    // declared form has is NOT this check's question (the ARITY rule and
+    // #7140's family own it), so the check stands down.
+    std::vector<const MathConvertSurfaceRow*> forms;
+    for (const auto& row : builtinMathConvertSurface())
+        if (row.head == head && row.member == member &&
+            row.arity == ce.args.size())
+            forms.push_back(&row);
+    if (forms.empty()) return;
+    // The §22.5 BINDING: a named argument binds to the parameter it NAMES
+    // ("named arguments may appear in any order after positional arguments.
+    // Each supplied argument binds exactly one parameter"), so the parameter
+    // an argument supplies is read through the binder, not by position. The
+    // published binding (`ctx_.builtinCallBinding`) is NOT available here —
+    // it is published at the END of `typeCall` — so the binding is
+    // established LOCALLY, over the REGISTRY's declared names, exactly as
+    // #7207 does for `StringBuilder`; no second name table is introduced.
+    std::vector<int> paramToArg;
+    std::vector<std::string_view> paramNames;
+    for (const auto& cand : common::builtinParamNameCandidates(
+             head, member, ce.args.size())) {
+        BindResult br = bindArgsToParams(
+            sema::FormalsView::ofNames(cand.names, cand.required), ce.args,
+            ce.span.begin,
+            "call to built-in `" + std::string(head) + "." +
+                std::string(member) + "`",
+            /*emit=*/false);
+        if (!br.ok) continue;  // not this overload's binding
+        paramToArg = br.paramToArg;
+        paramNames = cand.names;
+        break;
+    }
+    // A call that binds no candidate (an unknown name, a double bind, a
+    // positional argument after a named one) keeps the POSITIONAL reading:
+    // `checkBuiltinNamedArgs` reports the §22.5 violation, and the arguments
+    // must still be type-checked here.
+    if (paramToArg.empty()) {
+        for (std::size_t i = 0; i < ce.args.size(); ++i)
+            paramToArg.push_back(static_cast<int>(i));
+    }
+    // §5.1: does this argument convert to the declared parameter type?
+    //
+    // The probe is TWO-PASS and it NEVER WRITES the argument's recorded type.
+    // The write is the whole point of the two passes:
+    //
+    //   * PASS 1 asks the IDENTITY and the §5.1 widening table of EVERY
+    //     declared kind at this position, in declaration order.
+    //     `primitiveOperandMatchesParam` with `allowConstantNarrowing=false`
+    //     is that test, and it writes nothing.
+    //   * PASS 2 asks §5.1's constant narrowing, and only if PASS 1
+    //     admitted nothing.
+    //
+    // WHY NOT ONE PASS. `narrowIntConstantToTarget` — the ONE §5.1
+    // constant-narrowing implementation — RE-TYPES the argument expression
+    // (`ctx_.setExprType`), and these built-ins pick their overload FROM
+    // THE ARGUMENT'S OWN TYPE (there is no overload resolution for them:
+    // `Math.Abs` has four declared forms and no MethodSymbol). A single
+    // pass that tried the declared kinds in table order therefore re-typed
+    // a `long` constant to `int` — `int` is reachable only by the
+    // narrowing — before the identity match on `long` was tried, and the
+    // `int` form then looked like the EXACT match. §22.6's stage 4 ranks
+    // EXACT matches, and §5.1 grades a narrowed candidate "as any other
+    // conversion is, never as an exact match" (v0.343) — so the
+    // mis-selected form changed the call's RESULT type:
+    // `Math.Abs(-2147483648L)` became `Abs(int)` and raised
+    // OverflowException on `int.MinValue`, and
+    // `Math.Abs(2000000000L) + 2000000000` overflowed at the `int + int`.
+    // MEASURED: base `94d0b7fd` prints 2147483648 and 4000000000; the
+    // one-pass probe printed an OverflowException for both.
+    //
+    // The narrowing is an APPLICABILITY fact here (§5.1: "Constant
+    // narrowing applies at every position where this section's implicit
+    // conversions apply — there is no position carve-out: … call arguments
+    // (`Set(3)`) …", v0.343), and the REWRITE that records it belongs to the
+    // overload-resolution machinery (`checkAssignable`), not to a probe.
+    // So PASS 2 asks the same question WITHOUT the rewrite: the same gates
+    // `narrowIntConstantToTarget` applies (an integer source, an integer
+    // target the ordinary widening table does not already admit) and the
+    // same range test (`fitsInIntType`, the shared one), over the same
+    // constant fold (`foldIntConstExprTC`).
+    //
+    // A `string`/`bool` parameter takes only its own type — §5.1's table
+    // has no conversion TO `string`, and lists "between integers and bool"
+    // as never implicit.
+    auto admitsByIdentityOrWidening = [&](TypeRef* argTy,
+                                           MathConvertParamKind k) -> bool {
+        switch (k) {
+            case MathConvertParamKind::Unchecked: return true;
+            case MathConvertParamKind::String:
+                return argTy->kind == TypeRef::Kind::Primitive &&
+                       argTy->primitive == PrimitiveType::String;
+            case MathConvertParamKind::Bool:
+                return argTy->kind == TypeRef::Kind::Primitive &&
+                       argTy->primitive == PrimitiveType::Bool;
+            default: break;
+        }
+        return primitiveOperandMatchesParam(
+            /*operandExpr=*/nullptr,  // no expression ⇒ the narrowing
+                                      // branch is unreachable, so this
+                                      // pass CANNOT write
+            argTy,
+            ctx_.primitiveTypeRef(mathConvertPrimitiveOf(k),
+                                  /*nullable=*/false),
+            /*allowConstantNarrowing=*/false);
+    };
+    auto admitsByConstantNarrowing = [&](const ast::Expr* argExpr,
+                                         TypeRef* argTy,
+                                         MathConvertParamKind k) -> bool {
+        if (k != MathConvertParamKind::Int && k != MathConvertParamKind::Long)
+            return false;
+        if (!argExpr || !argTy) return false;
+        if (argTy->kind != TypeRef::Kind::Primitive || argTy->nullable)
+            return false;
+        if (!isIntegerPrimitiveTypeForOverload(argTy->primitive)) return false;
+        const PrimitiveType pt = mathConvertPrimitiveOf(k);
+        if (!isIntegerPrimitiveTypeForOverload(pt)) return false;
+        if (pt == argTy->primitive) return false;              // identity
+        if (primitiveWidens(argTy->primitive, pt)) return false;  // the widening
+        auto cv = foldIntConstExprTC(*argExpr);
+        if (!cv) return false;
+        return fitsInIntType(*cv, pt);
+    };
+    const std::string stdlibCite =
+        head == "Math" ? "stdlib §2.2" : "stdlib §2.3";
+    // The DECLARED signatures at this arity, quoted in the diagnostics below.
+    std::string decls;
+    for (const auto* f : forms) {
+        if (!decls.empty()) decls += " / ";
+        decls += std::string(f->decl);
+    }
+    // fix #7286 (§22.6, v0.344): the STATIC TYPE of an argument at a call —
+    // "The argument's static type is its type at the call: a read of a binding
+    // §7.4 has narrowed non-null is of its non-nullable type … so a narrowed
+    // `d: Dog?` is exact at a `Dog` parameter". Sema keeps a narrowed read's
+    // exprType at the DECLARED `T?` (SemaContext.hpp:535-541 — "Sema keeps
+    // the read's exprType at the declared `T?` … so the narrowing must reach
+    // codegen through this table"), so the narrowing is read here, from the
+    // §7.4 facts, and the read's type is its non-nullable one.
+    auto effectiveArgType = [&](const ast::Expr* e) -> TypeRef* {
+        TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+        if (!t || !t->nullable) return t;
+        if (!isNarrowedNonNullRead(e)) return t;
+        return operandStaticTypeAt(e, t);
+    };
+    for (std::size_t p = 0; p < forms.front()->arity; ++p) {
+        // The declared kinds at this position, across the declared forms.
+        std::vector<MathConvertParamKind> admitted;
+        for (const auto* f : forms) {
+            const MathConvertParamKind k = p == 0 ? f->param0 : f->param1;
+            if (k == MathConvertParamKind::Unchecked) continue;
+            if (std::find(admitted.begin(), admitted.end(), k) == admitted.end())
+                admitted.push_back(k);
+        }
+        if (admitted.empty()) continue;  // no declared type to check against
+        if (p >= paramToArg.size()) continue;
+        const int ai = paramToArg[p];
+        if (ai < 0) continue;  // the parameter takes its default
+        if (static_cast<std::size_t>(ai) >= ce.args.size()) continue;
+        const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+        if (!arg.value || arg.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule; skip.
+        if (!arg.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*arg.value);
+        if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+        // §7: the nullability gate (#6782) owns a NULLABLE argument at a
+        // non-nullable parameter — this check is about the argument's TYPE,
+        // so a nullable argument is left to that gate (whose registry rows
+        // cover the `Convert.To*` positions but not `Math`'s, and not
+        // `Convert.ToString` — see below).
+        if (argTy->nullable) {
+            // fix #7286 (§5.1 / §7.4 / §22.6, v0.344): the `toBase` parameter
+            // of `Convert.ToString(value, toBase)` is declared `int`
+            // (stdlib §2.3), and the §7 gate's registry has NO row for it —
+            // `common::builtinParamIsNonNullable` carries rows for the
+            // `Convert.To*` / `TryTo*` members at position 0 and for
+            // `Int32.Parse` / `TryParse`, but NONE for `Convert.ToString` —
+            // so the gate never claims this position, and a nullable radix
+            // reached codegen unchecked.
+            //
+            // MEASURED on the base arm: `Convert.ToString(255, r)` over
+            // `var r: int? := 16` COMPILED and printed "255" — the DECIMAL
+            // text of the value, not its radix-16 text "ff". A silently wrong
+            // answer in a program that compiles.
+            //
+            // THE RULE. §5.1's nullable lifting is ONE-WAY — "For any type
+            // `T`, `T` implicitly converts to `T?`" and "Each implicit
+            // conversion of this section also lifts to the nullable forms" —
+            // so an `int?` converts to NO non-nullable `int` parameter, and
+            // §22.6 makes that a compile error ("If no candidate is applicable
+            // at all — no candidate is reachable: a conversion §5.1 does not
+            // admit as implicit, … the call is a compile error with no
+            // candidates cited"). §7.4's narrowing is the ONE way a nullable
+            // reaches the parameter: §22.6 reads "a read of a binding §7.4
+            // has narrowed non-null is of its non-nullable type".
+            //
+            // The position is the `toBase` one only: every other position of
+            // this probe stays as it was (§7's gate owns it).
+            const bool isToBasePosition =
+                head == "Convert" && member == "ToString" &&
+                ce.args.size() == 2 && p == 1;
+            if (!isToBasePosition) continue;
+            if (!isNarrowedNonNullRead(arg.value.get())) {
+                const std::string paramName =
+                    p < paramNames.size() ? std::string(paramNames[p])
+                                          : std::string();
+                const std::string what =
+                    paramName.empty()
+                        ? "the argument at position " + std::to_string(p + 1)
+                        : "the `" + paramName + "` argument";
+                ctx_.diagnostics().report(
+                    Severity::Error, arg.value->span.begin,
+                    "no matching overload of `" + std::string(head) + "." +
+                        std::string(member) + "` — " + stdlibCite +
+                        " declares " + decls + ", so " + what + " must be " +
+                        mathConvertTypeList(admitted) + " (" + stdlibCite +
+                        "; §5.1): a `" + spellTypeRefForDiag(argTy) +
+                        "` is never implicitly convertible to an `" +
+                        std::string(mathConvertTypeName(admitted.front())) +
+                        "` (§5.1's nullable lifting converts a `T` to a `T?`, "
+                        "never the other way) — narrow it to non-null first "
+                        "(§7.4)");
+                return;  // ONE diagnostic per call
+            }
+            // A NARROWED read: the argument is read at its non-nullable type
+            // (§22.6), so the probe below sees the `int` it denotes. Publish
+            // the read, so codegen extracts the payload of the
+            // `{i8 hasValue; int}` carrier the read still loads
+            // (`SemaContext::markNarrowedValueRead`; the codegen half is
+            // LlvmBackend_Calls.cpp's `Convert.ToString`).
+            argTy = operandStaticTypeAt(arg.value.get(), argTy);
+            ctx_.markNarrowedValueRead(arg.value.get());
+        }
+        bool ok = false;
+        for (MathConvertParamKind k : admitted)
+            if (admitsByIdentityOrWidening(argTy, k)) { ok = true; break; }
+        if (!ok)
+            for (MathConvertParamKind k : admitted)
+                if (admitsByConstantNarrowing(arg.value.get(), argTy, k)) {
+                    ok = true;
+                    break;
+                }
+        if (ok) continue;
+        // The rejection: a located, spec-cited diagnostic naming the
+        // offending argument and the type §2.2 / §2.3 declares there — the
+        // shape #7207 established for `StringBuilder`.
+        const std::string paramName =
+            p < paramNames.size() ? std::string(paramNames[p]) : std::string();
+        const std::string what =
+            paramName.empty()
+                ? "the argument at position " + std::to_string(p + 1)
+                : "the `" + paramName + "` argument";
+        ctx_.diagnostics().report(
+            Severity::Error, arg.value->span.begin,
+            "no matching overload of `" + std::string(head) + "." +
+                std::string(member) + "` — " + stdlibCite + " declares " +
+                decls + ", so " + what + " must be " +
+                mathConvertTypeList(admitted) + " (" + stdlibCite + "; §5.1)");
+        return;  // ONE diagnostic per call
+    }
+
+    // fix #7266 (stdlib §2.3, v0.344; §22.6, v0.344): §22.6's RANKING step
+    // (stage 4) and its last step (the AMBIGUITY error), over the SAME
+    // declared forms the probe above collects.
+    //
+    // THE DEFECT. §2.3's `ToString` overload set declares one form per
+    // parameter type — `ToString(value: int)`, `ToString(value: long)`,
+    // `ToString(value: float)`, `ToString(value: double)`,
+    // `ToString(value: decimal)`, `ToString(value: bool)`, and the
+    // two-argument `ToString(value: int, toBase: int)` /
+    // `ToString(value: long, toBase: int)` — and §2.3 states the rule for
+    // them verbatim: "A `char` and the integer types other than `int` and
+    // `long` each convert to two or more of these parameter types and match
+    // none exactly, so the call is ambiguous and a compile error (§22.6)".
+    //
+    // The probe above answers §22.6's stage 3 (APPLICABILITY) and nothing
+    // more: it asks whether the argument converts to AT LEAST ONE of the
+    // declared kinds at the position, and it never asks §22.6's stage 4
+    // (RANKING). A `byte` converts to BOTH `int` and `long` and matches
+    // neither exactly, so the probe admitted it — `Convert.ToString(b, 10)`
+    // compiled and printed 200 — while the very same probe rejected a
+    // `ulong` (which converts to NEITHER `int` nor `long`, so NO candidate
+    // is applicable) with a "no matching overload" diagnostic. The same
+    // rule, the same call, opposite verdicts by argument type.
+    //
+    // THIS STEP IS THAT RULE'S NEXT STEP, NOT A SECOND RULE BESIDE IT. It
+    // ranks the candidates the probe already collected: §22.6 ranks an EXACT
+    // match above a conversion and leaves two conversions EQUAL ("two
+    // candidates that both require an implicit conversion at the same
+    // position are equally ranked there"), so a position where two or more
+    // applicable candidates CONVERT and none matches EXACTLY is a tie, and
+    // §22.6's last step reports the tie as "ambiguous" — a compile error.
+    // There is no type list here: the verdict follows from the declared
+    // forms and §5.1's table, so the next type to reach the position is
+    // judged by the same rule.
+    //
+    // THE `ulong` REJECTION IS NOT WEAKENED. `ulong` converts to neither
+    // `int` nor `long`, so no candidate is applicable, the probe's "no
+    // matching overload" diagnostic still fires first, and this step has no
+    // applicable candidate to rank.
+    //
+    // fix #7289 (stdlib §2.2, v0.344; §22.6, v0.344): THE SAME STEP NOW
+    // REACHES THE `Math` CLASS.
+    //
+    // WHY IT REACHES `Math` — THE HOUSE REASONING RE-EXAMINED. #7266 scoped
+    // its step to the `Convert` class because "§2.3 is the only section that
+    // states the ambiguity rule". That reason is a statement about where the
+    // rule is SPELLED OUT, not about where it APPLIES: §22.6's ranking step is
+    // general ("two candidates that both require an implicit conversion at the
+    // same position are equally ranked there", and "If no candidate is
+    // unambiguously better ... the call is ambiguous and is a compile error"),
+    // and stdlib §2.2 declares the very same SHAPE for three more members:
+    // `Floor(x: double): double` beside `Floor(x: decimal): decimal`, and the
+    // same pair for `Ceiling` and `Truncate`.
+    //
+    // THE DECISIVE ANCHOR IS THE RECORD OF THE RULE'S OWN LANDING. The
+    // decimal forms were added at v0.228 ("Math decimal symmetry", stdlib
+    // §2.2), and that revision's migration note in `docs/Bezel_Changelog.md`
+    // states the consequence in terms: "Newly rejected: a `Math.Floor`/
+    // `Ceiling`/`Truncate` call whose argument is an integer type or `char` —
+    // previously legal via the sole `double` overload's implicit conversion,
+    // now ambiguous under §22.6's equal-ranking rule (the `double` and
+    // `decimal` candidates tie); the remedy is an explicit conversion
+    // (`Math.Floor(double(n))`) — or reconsidering the call, since floor/
+    // ceiling of an already-integral value is a no-op (`Abs`/`Sign` are
+    // unaffected: their `int` overloads give exact matches)". => THE CLASS IS
+    // "AN INTEGER TYPE OR `char`" — `int` AND `long` INCLUDED, NOT ONLY THE
+    // NARROW TYPES: `Abs` is unaffected because it DECLARES an `int` overload
+    // (an exact match), and `Floor`/`Ceiling`/`Truncate` declare none, so
+    // every integer argument converts to BOTH `double` and `decimal` and
+    // matches NEITHER exactly.
+    //
+    // THE DECLARATIONS ARE NOT THE PROBLEM. The `double`/`decimal` pair is
+    // deliberate (stdlib §2.2, v0.228) and its consequence was accepted and
+    // recorded then; the compiler simply stopped ENFORCING it when `Math`
+    // became a built-in surface with no `MethodSymbol` to resolve against.
+    // So the remedy is this step, not a change to the normative document.
+    //
+    // `Math.Abs` IS NOT DOUBLE-REPORTED. Its four declared forms make the
+    // same tie for the same narrow types, but #6955's dedicated §22.6 check
+    // owns that member and RETURNS from `typeCall` before this probe runs, so
+    // the two never meet; and for the argument types the dedicated check does
+    // NOT refuse (`int`, `long`, `double`, `decimal` are exact matches, and
+    // `float` reaches only the `double` form) there is no tie here either.
+    // MEASURED, both arms: `Math.Abs` produces exactly ONE diagnostic.
+    //
+    // THE EXPLICIT TYPE-ARGUMENT LIST STANDS THE STEP DOWN (for the `Math`
+    // class). §14.5's all-or-nothing rule owns a call that carries one — no
+    // member of §2.2's `Math` declares a type parameter except the generic
+    // `Min`/`Max`/`Clamp`/`Sign`, which are not in this surface — and it
+    // REPORTS ("`Math.Floor` is given 1 explicit type argument(s), but it
+    // declares no type parameters"). Without this stand-down the same call
+    // would carry that diagnostic AND this one. MEASURED on the fix arm:
+    // `Math.Floor<int>(b)` reported TWO diagnostics before the stand-down and
+    // ONE after.
+    if (head == "Math") {
+        if (auto* macc =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            if (!macc->typeArgs.empty()) return;
+    }
+    if ((head == "Convert" || head == "Math") && forms.size() > 1) {
+        // The §22.6 grid: one entry per (declared form, argument position).
+        enum class Grade { Exact, Convert, NotApplicable };
+        const std::size_t arity = forms.front()->arity;
+        std::vector<std::vector<Grade>> grid(
+            forms.size(), std::vector<Grade>(arity, Grade::NotApplicable));
+        // The step stands down where another rule owns the call: a
+        // parameter that takes its DEFAULT is §22.6's defaulted-arity
+        // tie-break's business (this step does not model it), a §22.3
+        // modifier aliases the caller's slot, a §7 NULLABLE argument is
+        // §7's nullability gate's, and a discard or an unresolved type is
+        // not this step's question.
+        bool rankable = paramNames.size() >= arity && paramToArg.size() >= arity;
+        for (std::size_t p = 0; p < arity && rankable; ++p) {
+            const int ai = paramToArg[p];
+            if (ai < 0 || static_cast<std::size_t>(ai) >= ce.args.size()) {
+                rankable = false;
+                break;
+            }
+            const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+            if (!arg.value || arg.isDiscard || !arg.modifier.empty()) {
+                rankable = false;
+                break;
+            }
+            // fix #7286 (§22.6, v0.344): the grid reads the argument's STATIC
+            // TYPE at the call — "a read of a binding §7.4 has narrowed
+            // non-null is of its non-nullable type" — so a NARROWED nullable
+            // is ranked at its non-nullable type. An UN-narrowed nullable is
+            // refused by the probe above (at the `toBase` position) or left
+            // to §7's gate (elsewhere), and stands the grid down here, as
+            // before.
+            TypeRef* argTy = effectiveArgType(arg.value.get());
+            if (!argTy || argTy->kind == TypeRef::Kind::Error || argTy->nullable) {
+                rankable = false;
+                break;
+            }
+            for (std::size_t c = 0; c < forms.size() && rankable; ++c) {
+                const MathConvertParamKind k =
+                    p == 0 ? forms[c]->param0 : forms[c]->param1;
+                if (k == MathConvertParamKind::Unchecked) {
+                    rankable = false;
+                    break;
+                }
+                if (argTy->kind != TypeRef::Kind::Primitive) continue;
+                if (argTy->primitive == mathConvertPrimitiveOf(k)) {
+                    grid[c][p] = Grade::Exact;
+                } else if (admitsByIdentityOrWidening(argTy, k) ||
+                           admitsByConstantNarrowing(arg.value.get(), argTy, k)) {
+                    // §5.1's constant narrowing reaches a candidate only as
+                    // a CONVERSION ("graded as any other conversion is,
+                    // never as an exact match", v0.343) — so it never
+                    // separates two candidates.
+                    grid[c][p] = Grade::Convert;
+                }
+            }
+        }
+        if (rankable) {
+            // The APPLICABLE candidates: those with no inapplicable
+            // position.
+            std::vector<std::size_t> appl;
+            for (std::size_t c = 0; c < forms.size(); ++c) {
+                bool ok = true;
+                for (std::size_t p = 0; p < arity; ++p)
+                    if (grid[c][p] == Grade::NotApplicable) {
+                        ok = false;
+                        break;
+                    }
+                if (ok) appl.push_back(c);
+            }
+            // §22.6's stage 4: a candidate is better than another at a
+            // position iff it is EXACT there and the other CONVERTS; two
+            // conversions are equally ranked. A candidate is "unambiguously
+            // better" iff it is better-or-equal at EVERY position and
+            // strictly better at at least one.
+            auto betterOrEqualAt = [](Grade x, Grade y) {
+                return !(x == Grade::Convert && y == Grade::Exact);
+            };
+            auto strictlyBetterAt = [](Grade x, Grade y) {
+                return x == Grade::Exact && y == Grade::Convert;
+            };
+            bool decided = false;
+            for (std::size_t xi = 0; xi < appl.size() && !decided; ++xi) {
+                const std::size_t x = appl[xi];
+                bool dominates = true;
+                for (std::size_t yi = 0; yi < appl.size() && dominates; ++yi) {
+                    if (xi == yi) continue;
+                    const std::size_t y = appl[yi];
+                    bool betterOrEqual = true;
+                    bool anyStrict = false;
+                    for (std::size_t p = 0; p < arity; ++p) {
+                        if (!betterOrEqualAt(grid[x][p], grid[y][p])) {
+                            betterOrEqual = false;
+                            break;
+                        }
+                        if (strictlyBetterAt(grid[x][p], grid[y][p])) anyStrict = true;
+                    }
+                    if (!betterOrEqual || !anyStrict) dominates = false;
+                }
+                if (dominates) decided = true;
+            }
+            if (!decided && appl.size() > 1) {
+                // The tie: report it at the position where it happens — the
+                // position two or more applicable candidates convert at and
+                // none matches exactly.
+                std::size_t tiePos = arity;
+                for (std::size_t p = 0; p < arity && tiePos == arity; ++p) {
+                    int converts = 0;
+                    int exacts = 0;
+                    for (std::size_t c : appl) {
+                        if (grid[c][p] == Grade::Convert) ++converts;
+                        else if (grid[c][p] == Grade::Exact) ++exacts;
+                    }
+                    if (converts >= 2 && exacts == 0) tiePos = p;
+                }
+                if (tiePos < arity) {
+                    const auto& arg =
+                        ce.args[static_cast<std::size_t>(paramToArg[tiePos])];
+                    std::vector<std::string> candNames;
+                    std::vector<bool> fillsDefault(forms.size(), false);
+                    for (const auto* f : forms) {
+                        std::string n = std::string(member) + "(";
+                        n += std::string(paramNames[0]) + ": " +
+                             std::string(mathConvertTypeName(f->param0));
+                        if (f->arity > 1)
+                            n += ", " + std::string(paramNames[1]) + ": " +
+                                 std::string(mathConvertTypeName(f->param1));
+                        n += ")";
+                        candNames.push_back(n);
+                    }
+                    // The remedy note names the section that states the rule
+                    // for THIS class's declared forms — §2.3 for `Convert`,
+                    // §2.2 for `Math` — and the remedy that section's own
+                    // record gives (the v0.228 migration note for `Math`:
+                    // "the remedy is an explicit conversion
+                    // (`Math.Floor(double(n))`) — or reconsidering the call,
+                    // since floor/ceiling of an already-integral value is a
+                    // no-op").
+                    const std::string extraNote =
+                        head == "Math"
+                            ? "\nstdlib §2.2: an argument that converts to two "
+                              "or more of these parameter types and matches "
+                              "none exactly is ambiguous and a compile error "
+                              "(§22.6) — the remedy is an explicit conversion "
+                              "to one parameter type (`Math." +
+                                  std::string(member) + "(double(n))`) — or "
+                                  "reconsidering the call: the rounding of an "
+                                  "already-integral value is a no-op"
+                            : "\nstdlib §2.3: an argument that converts to two "
+                              "or more of these parameter types and matches "
+                              "none exactly is ambiguous and a compile error "
+                              "(§22.6) — the remedy is an explicit cast to one "
+                              "parameter type, or the value's own `ToString()`";
+                    ctx_.diagnostics().report(
+                        Severity::Error, arg.value->span.begin,
+                        overloadAmbiguityMessage(
+                            "`" + std::string(head) + "." + std::string(member) +
+                                "`",
+                            candNames, appl, fillsDefault, extraNote));
+                }
+            }
+        }
+    }
+}
+
+// fix #7140 (stdlib §9.6, v0.343): the ARITY of a built-in `string` member
+// call.
+//
+// THE DEFECT. A built-in `string` member is a compiler intrinsic: it has no
+// MethodSymbol, so §22.5's argument-count check (`checkCallArity`) never ran
+// for it, and `resolveMemberAccess` typed the member by NAME alone — the
+// argument count was never inspected (the CG27f arms key on `ma.member` and
+// nothing else). The lowerings are the arity-discriminating half:
+// `Emitter::tryLowerStringMethod` (LlvmBackend_String.cpp) keys on the member
+// name AND the argument count, and the static-factory arms
+// (LlvmBackend_Setup.cpp) key on the argument count alone. A call at an arity
+// no stdlib §9.6 overload declares therefore matched NO lowering: codegen
+// found no dispatch, the #2477 permissive-acceptance path degraded the slot
+// to a zero-initialized value, and the program's first read of it faulted —
+// MEASURED pre-fix: SIGSEGV (rc 139) at fault address 0x8, the string
+// header's length field read off a null pointer.
+//
+// MEASURED pre-fix, the whole §9.6-declared instance surface at a wrong
+// arity (each row = the member, its declared arities, the observed
+// behaviour):
+//
+//   member        declared   wrong arity observed
+//   Substring     1 or 2     0 -> SIGSEGV;  3, 4 -> the surplus arguments
+//                               are DROPPED and "bc" is printed (a silent
+//                               wrong value)
+//   Trim          0 or 1     2, 3 -> SIGSEGV
+//   TrimStart     0          1 -> SIGSEGV
+//   TrimEnd       0          1 -> SIGSEGV
+//   ToUpper       0          1, 2 -> SIGSEGV
+//   ToLower       0          1 -> SIGSEGV
+//   Replace       2          0, 1, 3 -> SIGSEGV
+//   PadLeft       1 or 2     0 -> SIGSEGV;  3 -> the surplus argument is
+//                               DROPPED ("--ab" is printed)
+//   PadRight      1 or 2     0 -> SIGSEGV;  3 -> DROPPED ("ab--")
+//   Insert        2          0, 1, 3 -> SIGSEGV
+//   Remove        1 or 2     0 -> SIGSEGV;  3 -> DROPPED ("adef")
+//   Contains      1          0 -> the slot degrades to `false`;  2, 3 -> the
+//                               surplus arguments are DROPPED
+//   StartsWith    1          2 -> DROPPED
+//   EndsWith      1          2 -> DROPPED
+//   Equals        1 or 2     0 -> the slot degrades to `false`;  3 -> DROPPED
+//   IndexOf       1 or 2     0 -> the slot degrades to 0;  3 -> DROPPED
+//   LastIndexOf   1          0 -> the slot degrades to 0;  2 -> DROPPED
+//   CompareTo     1 or 2     0 -> the slot degrades to 0;  3 -> DROPPED
+//   GetHashCode   0          1 -> the slot degrades to 0
+//
+// and the STATIC surface:
+//
+//   string.Repeat             2   0, 1, 3 -> SIGSEGV
+//   string.From               1/3 2, 4 -> SIGSEGV
+//   string.Join               2   1, 3 -> SIGSEGV
+//   string.IsNullOrWhiteSpace 1   0, 2 -> the slot degrades to `false`
+//
+// ⇒ ⇒ Both halves of the failure are ACCEPTANCE INVERSIONS, and the fix must
+// REJECT: dropping the surplus argument, or coercing it, would compile a
+// call the document does not define and print a plausible value for it.
+//
+// THE GATE. Keyed on the ARITIES stdlib §9.6 declares — the rows below are
+// transcribed from `docs/Bezel_Standard_Library.md` §9.6's `String` listing,
+// which is the same set of declarations `common::builtinParamNameCandidates`'
+// `kStringParamNames` rows carry (that table omits the nullary members,
+// because a member that takes no parameter can take no named argument).
+//
+// THE THREE MEMBERS §9.6 DOES NOT DECLARE. The INSTANCE `Repeat(count)`,
+// `GetField(delim, n)` and `CountOf(sub)` are implemented by the compiler but
+// are NOT declared in stdlib §9.6 — issue #7131 records that gap and asks
+// whether they belong in the document and at which arity, and a document
+// amendment is a coordinator decision, not this lane's. They are therefore
+// NOT deleted here (deleting a member the compiler has shipped is a
+// behaviour flip this lane does not own), but they are not left crashing
+// either: their arity is pinned to the arity the compiler LOWERS them at, so
+// a call the lowering cannot dispatch is rejected with a diagnostic that says
+// so and points at #7131.
+//
+// THE SCOPE. The rows cover the members the four built-in `string` arms in
+// `resolveMemberAccess` accept (the `string`-returning, `bool`-returning,
+// `int`-returning and `double`/`long`/`float`-returning arms). The numeric
+// conversion members (`ToInt32` / `ToUInt32` / `ToInt64` / `ToDouble` /
+// `ToFloat` / `ToBoolean`) are NOT in the table: stdlib §9.6 declares no such
+// member either, so pinning their arity is #7131's question too (they are
+// reported, not changed).
+struct BuiltinStringArityRow {
+    std::string_view member;
+    // The declared arities. A LIST, not a range: `string.From` declares a
+    // one-argument form AND a three-argument form, and the two-argument
+    // shape is not one of them.
+    std::vector<unsigned> arities;
+    // The stdlib §9.6 declaration(s), quoted so the diagnostic names the
+    // surface the programmer must match.
+    std::string_view decl;
+};
+
+// The INSTANCE members stdlib §9.6 declares, with their declared arities.
+static const std::vector<BuiltinStringArityRow>& builtinStringInstanceArities() {
+    static const std::vector<BuiltinStringArityRow> kRows = {
+        // §9.6's Inspection group.
+        {"Contains", {1},
+         "`Contains(value: string): bool` / `Contains(value: char): bool`"},
+        {"StartsWith", {1}, "`StartsWith(value: string): bool`"},
+        {"EndsWith", {1}, "`EndsWith(value: string): bool`"},
+        {"IndexOf", {1, 2},
+         "`IndexOf(value: char, startIndex: int := 0): int` / "
+         "`IndexOf(value: string, startIndex: int := 0): int`"},
+        {"LastIndexOf", {1},
+         "`LastIndexOf(value: char): int` / `LastIndexOf(value: string): int`"},
+        // §9.6's Comparison and equality group.
+        {"CompareTo", {1, 2},
+         "`CompareTo(other: string): int` / "
+         "`CompareTo(other: string, ignoreCase: bool): int`"},
+        {"Equals", {1, 2},
+         "`Equals(other: string): bool` / "
+         "`Equals(other: string?, ignoreCase: bool): bool`"},
+        // §9.6's Substring group.
+        {"Substring", {1, 2},
+         "`Substring(startIndex: int): string` / "
+         "`Substring(startIndex: int, length: int): string`"},
+        // §9.6's Span views group. `AsSpan(r: Range<int>)` is the one-argument
+        // form beside `AsSpan(start: int)`, so the range is admitted at the
+        // one-argument arity.
+        {"AsSpan", {0, 1, 2},
+         "`AsSpan(): ReadOnlyStringSpan` / `AsSpan(start: int): ReadOnlyStringSpan`"
+         " / `AsSpan(start: int, length: int): ReadOnlyStringSpan` / "
+         "`AsSpan(r: Range<int>): ReadOnlyStringSpan`"},
+        // §9.6's Modification group.
+        {"Trim", {0, 1},
+         "`Trim(): string` / `Trim(chars: IEnumerable<char>): string`"},
+        {"TrimStart", {0}, "`TrimStart(): string`"},
+        {"TrimEnd", {0}, "`TrimEnd(): string`"},
+        {"ToUpper", {0}, "`ToUpper(): string`"},
+        {"ToLower", {0}, "`ToLower(): string`"},
+        {"Replace", {2},
+         "`Replace(oldChar: char, newChar: char): string` / "
+         "`Replace(oldValue: string, newValue: string): string`"},
+        {"PadLeft", {1, 2},
+         "`PadLeft(totalWidth: int, paddingChar: char := ' '): string`"},
+        {"PadRight", {1, 2},
+         "`PadRight(totalWidth: int, paddingChar: char := ' '): string`"},
+        // fix #7153 (stdlib §9.6, v0.343): `PadCenter` was MISSING here — the
+        // table was built from the §9.6 listing and the member was omitted, so
+        // a call at an arity §9.6 does not declare was ACCEPTED (the surplus
+        // argument silently DROPPED, and the zero-argument form degraded to a
+        // zero-initialised slot that faulted at 0x8 on the first read). §9.6
+        // declares it exactly like its two siblings — one required parameter
+        // and one DEFAULTED one ⇒ arities {1, 2}, not {2}.
+        {"PadCenter", {1, 2},
+         "`PadCenter(totalWidth: int, paddingChar: char := ' '): string`"},
+        {"Insert", {2}, "`Insert(startIndex: int, value: string): string`"},
+        {"Remove", {1, 2},
+         "`Remove(startIndex: int): string` / "
+         "`Remove(startIndex: int, length: int): string`"},
+        // §9.6's Object overrides.
+        {"GetHashCode", {0}, "`GetHashCode(): int`"},
+        // fix #7153 (stdlib §9.6, v0.343): `ToString` was MISSING here too —
+        // it is declared in §9.6's *Object overrides* group, which the widening
+        // pass over the member list did not reach, so a call at the wrong
+        // arity was ACCEPTED and the surplus argument silently DROPPED. §9.6
+        // declares `public pure override method ToString(): string;` — the
+        // `Object`-override spelling, at arity {0}. The gate is on the ARITY:
+        // the member itself keeps working (`"ab".ToString()` is the §9.6
+        // contract, "returns this").
+        {"ToString", {0}, "`ToString(): string`"},
+        // §9.6's Splitting and Conversion groups.
+        {"Split", {1},
+         "`Split(separator: char): owned Array<string>` / "
+         "`Split(separator: string): owned Array<string>` / "
+         "`Split(separators: Array<char>): owned Array<string>`"},
+        {"ToCharArray", {0}, "`ToCharArray(): owned Array<char>`"},
+    };
+    return kRows;
+}
+
+// The STATIC members stdlib §9.6 declares, with their declared arities.
+// The head is the TYPE NAME `string` (no value exprType), which is how the
+// static spelling is told from the instance one.
+static const std::vector<BuiltinStringArityRow>& builtinStringStaticArities() {
+    static const std::vector<BuiltinStringArityRow> kRows = {
+        // §9.6 declares `From` at ONE argument (the `char` / `CString` /
+        // `WString` forms) and at THREE (the char-array window form) — the
+        // two-argument shape is not one of them.
+        {"From", {1, 3},
+         "`From(value: char): string` / "
+         "`From(buffer: Array<char>, start: int, length: int): string` / "
+         "the `CString` and `WString` forms (one argument each)"},
+        // `FromCStringPointer` / `FromWStringPointer` are NOT listed here:
+        // the static-primitive path already rejects their wrong arity with
+        // "no matching overload of `String.FromCStringPointer` — it takes
+        // exactly one `IntPtr`", and a second diagnostic would report one
+        // mistake twice.
+        {"Join", {2},
+         "`Join(separator: string, items: IEnumerable<string>): string`"},
+        {"Repeat", {2},
+         "`Repeat(c: char, count: int): string` / "
+         "`Repeat(unit: string, count: int): string`"},
+        {"IsNullOrWhiteSpace", {1},
+         "`IsNullOrWhiteSpace(value: string?): bool`"},
+    };
+    return kRows;
+}
+
+// The three built-in `string` members stdlib §9.6 does NOT declare (issue
+// #7131): the INSTANCE `Repeat(count)`, `GetField(delim, n)` and
+// `CountOf(sub)`. The arity below is the one the compiler LOWERS them at, not
+// a declared one — the diagnostic says so, so the reader is never told a
+// declaration that does not exist.
+static const std::vector<BuiltinStringArityRow>&
+builtinStringUndeclaredArities() {
+    static const std::vector<BuiltinStringArityRow> kRows = {
+        {"Repeat", {1}, "`Repeat(count: int): string` (the INSTANCE spelling)"},
+        {"GetField", {2}, "`GetField(delimiter: char, n: int): string`"},
+        {"CountOf", {1}, "`CountOf(substring: string): int`"},
+    };
+    return kRows;
+}
+
+static const BuiltinStringArityRow* findBuiltinStringArity(
+    const std::vector<BuiltinStringArityRow>& rows, std::string_view member) {
+    for (const auto& r : rows)
+        if (r.member == member) return &r;
+    return nullptr;
+}
+
+// "exactly 2 argument(s)" / "0 or 1 argument(s)" / "1 or 3 argument(s)" — how
+// the declared arity is spelled in the diagnostic.
+static std::string builtinStringArityExpectation(const BuiltinStringArityRow& r) {
+    if (r.arities.size() == 1)
+        return "exactly " + std::to_string(r.arities.front()) + " argument(s)";
+    std::string out;
+    for (std::size_t i = 0; i < r.arities.size(); ++i) {
+        if (i) out += (i + 1 == r.arities.size()) ? " or " : ", ";
+        out += std::to_string(r.arities[i]);
+    }
+    return out + " argument(s)";
+}
+
+static void checkBuiltinStringCallArity(SemaContext& ctx,
+                                         const ast::CallExpr& ce) {
+    const ast::Expr* target = nullptr;
+    std::string_view member;
+    bool nullCond = false;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        target = ma->target.get();
+        member = ma->member;
+    } else if (auto* ncm =
+                   dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
+        target = ncm->target.get();
+        member = ncm->member;
+        nullCond = true;
+    } else {
+        return;
+    }
+    if (!target) return;
+    const BuiltinStringArityRow* spec = nullptr;
+    bool declared = true;   // does stdlib §9.6 declare this member at all?
+    bool isStatic = false;
+    // The STATIC spelling: the callee's target is the TYPE NAME `string`,
+    // which carries no value exprType. This is the same shape
+    // `resolveMemberAccess`'s primitive-qualifier branch recognises (the
+    // bare-keyword head), so a local that happens to be named `string` is
+    // read the same way the rest of the compiler reads it.
+    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+        if (tid->name == "string" || tid->name == "String") {
+            isStatic = true;
+            spec = findBuiltinStringArity(builtinStringStaticArities(), member);
+            if (!spec) return;   // not a stdlib §9.6 static member at all
+        }
+    }
+    if (!spec) {
+        // The INSTANCE spelling: the receiver is a VALUE of type `string`.
+        const TypeRef* recv = ctx.exprType(*target);
+        if (!recv || recv->kind != TypeRef::Kind::Primitive ||
+            recv->primitive != PrimitiveType::String)
+            return;
+        spec = findBuiltinStringArity(builtinStringInstanceArities(), member);
+        if (!spec) {
+            spec = findBuiltinStringArity(builtinStringUndeclaredArities(),
+                                          member);
+            declared = false;
+        }
+        if (!spec) return;
+        // The null-conditional spelling `s?.M(..)`: the `?.` mirror of the
+        // string-member gate REJECTS every built-in `string` member it cannot
+        // lower ("string member `?.M` is not yet supported in codegen"), so
+        // gating one of those here would report the SAME mistake twice. Only
+        // the two §9.6 members the `?.` path DOES admit are gated.
+        if (nullCond && member != "Split" && member != "ToCharArray")
+            return;
+    }
+    const unsigned argc = static_cast<unsigned>(ce.args.size());
+    bool admitted = false;
+    for (unsigned a : spec->arities)
+        if (a == argc) { admitted = true; break; }
+    if (admitted) return;
+    // How the callee is named in the diagnostic: the static spelling is
+    // `string.M`, the instance spelling `M` on `string`.
+    const std::string callee =
+        isStatic ? ("`string." + std::string(member) + "`")
+                 : ("`" + std::string(member) + "` on `string`");
+    const std::string expectation = builtinStringArityExpectation(*spec);
+    if (declared) {
+        ctx.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "the call to " + callee + " supplies " + std::to_string(argc) +
+                " argument(s) but stdlib §9.6 declares " +
+                std::string(spec->decl) + " — " + expectation +
+                " (§22.5; §9.6)");
+        return;
+    }
+    // A member stdlib §9.6 does not declare: the arity below is the one the
+    // compiler LOWERS it at, so name that, and point at the issue that
+    // records the gap in the document.
+    ctx.diagnostics().report(
+        Severity::Error, ce.span.begin,
+        "the call to " + callee + " supplies " + std::to_string(argc) +
+            " argument(s) but the compiler lowers `" + std::string(member) +
+            "` only at " + expectation +
+            "; stdlib §9.6 declares no such member at all (issue #7131 asks "
+            "whether the member belongs in §9.6 and at which arity)");
+}
+
 // fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
 // non-nullable target", v0.340): the MEMBER and STATIC twin of
 // `checkBuiltinStringCallArgs`, for the built-in receivers and type names that
@@ -20568,6 +22327,19 @@ static std::string_view primitiveKeywordHead(PrimitiveType p) {
         case PrimitiveType::Decimal: return "decimal";
         case PrimitiveType::Bool:    return "bool";
         case PrimitiveType::Char:    return "char";
+        // fix #7296 (§9.1, v0.344): the OTHER integer receivers. stdlib §9.1
+        // declares "SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64"
+        // and every one of them carries §9.1's `ToString(format: string)` /
+        // `ToString(radix: int)` pair, so the §7 nullability gate must reach
+        // their argument position too — the registry's rows for those heads
+        // are the other half of this (src/common/BuiltinRegistry.cpp).
+        case PrimitiveType::Byte:    return "byte";
+        case PrimitiveType::SByte:   return "sbyte";
+        case PrimitiveType::Short:   return "short";
+        case PrimitiveType::UShort:  return "ushort";
+        case PrimitiveType::UInt:    return "uint";
+        case PrimitiveType::Long:    return "long";
+        case PrimitiveType::ULong:   return "ulong";
         default:                     return {};  // `string` has its own check
     }
 }
@@ -20597,6 +22369,87 @@ void ExprTC::reportBuiltinArgIfNullable(const ast::Expr* arg,
             " is nullable but the target type is non-nullable (\xC2\xA7""7)");
 }
 
+// fix #7296 (§7 / §22.5, v0.344): the receiver head of a built-in call, and
+// whether the compiler HONOURS a parameter NAME there.
+//
+// This is `checkBuiltinNamedArgs`'s ONE claim decision, shared with the §7
+// nullability gate. The named-argument binder (#3398) is the only thing that
+// binds a NAME to a parameter: where it claims a call, the name carries the
+// POSITION and the argument's index is not its position; where it does NOT
+// claim the call, the name is neither matched nor rejected and the argument
+// binds POSITIONALLY — codegen lowers a built-in call by position (§22.5,
+// #3423), so the index IS the position.
+//
+// The §7 nullability gate reads a POSITION per argument, so it may trust that
+// read exactly where the name is NOT honoured. `honoured` is true for every
+// shape the binder claims, INCLUDING the shapes it rejects outright (its
+// Limitation 1, below): a rejected call never reaches codegen, so the gate's
+// position read is moot there — and the gate staying out of the way keeps one
+// diagnostic per call.
+static std::string_view builtinCallHeadHonouringArgNames(
+    SemaContext& ctx, const ast::CallExpr& ce, bool* honoured) {
+    *honoured = false;
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return {};
+    std::string_view head;
+    if (TypeRef* recvTy = ctx.exprType(*tgt)) {
+        if (recvTy->kind == TypeRef::Kind::Primitive) {
+            // Only `string` has a documented parameter-name surface here
+            // (stdlib §9.6); the other primitives are left unclaimed — so a
+            // name written there is NOT honoured and the argument binds
+            // positionally.
+            if (recvTy->primitive != PrimitiveType::String) return {};
+            head = "string";
+        } else if (recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration) {
+            // `headName()` is the alias-transparent read (#1462) and already
+            // falls back to the metadata `importedName` for a cross-module
+            // TypeRef with no astNode.
+            head = recvTy->headName();
+            if (head.empty()) return {};  // the §5 lazy sentinel, and kin
+            if (!common::isReservedBuiltinTypeName(head) &&
+                !common::isBuiltinExceptionName(head) &&
+                !common::isBuiltinNamedArgTableHead(head))
+                return {};
+        } else if (recvTy->kind == TypeRef::Kind::Named &&
+                   !recvTy->declaration->decl &&
+                   common::isBuiltinNamedArgTableHead(
+                       recvTy->declaration->name)) {
+            // Some built-in receivers DO carry a declaration: a
+            // `SemaContext::builtinClassSym` — a compiler-intrinsic
+            // `TypeSymbol` with `decl == nullptr`. `Encoding.UTF8` is one
+            // (ExprTypecheck_Calls.cpp stamps `builtinClassSym("Encoding")`
+            // on the singleton's TypeRef), so the declaration-less branch
+            // above never sees it and the whole §3.2 surface would be
+            // unclaimed.
+            //
+            // `decl == nullptr` alone does NOT mean "built-in" — an IMPORTED
+            // user `TypeSymbol` has no AST either — so the test is ANDed with
+            // the registry's own head set. A user class that happened to be
+            // named `Encoding` would resolve its member to a real
+            // `MethodSymbol` and be excluded by the `calleeSym` gate.
+            // Other `builtinClassSym` heads (DateTime, TimeSpan, Guid, Range,
+            // …) stay unclaimed: the registry carries no rows for them, and an
+            // unclaimed built-in costs a rejection that does not fire, never a
+            // false one.
+            head = recvTy->declaration->name;
+        } else {
+            return {};  // a user type: checkCallArity bound the call already
+        }
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+        // A static call `Head.M(...)`: the target is a bare type name with no
+        // value type. Nothing at that shape distinguishes a built-in static
+        // class from a user one, so only the heads
+        // `isBuiltinNamedArgTableHead` names are claimed — a user static call
+        // is bound by `checkCallArity` and never reaches here.
+        if (!common::isBuiltinNamedArgTableHead(id->name)) return {};
+        head = id->name;
+    } else {
+        return {};
+    }
+    *honoured = true;
+    return head;
+}
+
 void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
                                       Symbol* calleeSym) {
     // A resolved callee is a user or imported method, whose arguments
@@ -20624,13 +22477,44 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
         head = id->name;
     }
     if (head.empty()) return;
+    // fix #7296 (§7 / §22.5, v0.344): does the compiler HONOUR the NAME
+    // written on an argument at this call? `checkBuiltinNamedArgs` (#3398) is
+    // the only binder of a name to a parameter, and it claims the primitive
+    // receivers NOT AT ALL ("Only `string` has a documented parameter-name
+    // surface here (stdlib §9.6); the other primitives are left unclaimed").
+    // Where it does not claim the call, the name is neither matched nor
+    // rejected and the argument binds POSITIONALLY (codegen lowers a
+    // built-in call by position — §22.5, #3423) — so the argument's INDEX is
+    // its POSITION and this gate may check it.
+    //
+    // This is what closes the NAMED spelling of stdlib §9.1's
+    // `ToString(radix: int)` / `ToString(format: string)`: before it, the
+    // gate skipped every NAMED argument, so an un-narrowed `int?` written as
+    // `ToString(radix := r)` reached codegen un-owned and the call was
+    // SILENTLY ACCEPTED, while the positional spelling was refused and the
+    // mirror spelling (`Convert.ToString(value, toBase)`, stdlib §2.3) was
+    // refused too — two spellings of one overload disagreeing in ADMISSION.
+    bool anyNamed = false;
+    for (const auto& a : ce.args)
+        if (!a.name.empty()) { anyNamed = true; break; }
+    bool namesHonoured = false;
+    if (anyNamed) {
+        bool honoured = false;
+        (void)builtinCallHeadHonouringArgNames(ctx_, ce, &honoured);
+        namesHonoured = honoured;
+    }
     const std::string what = "argument to `" + std::string(head) + "." +
                              std::string(member) + "`";
     for (std::size_t i = 0; i < ce.args.size(); ++i) {
         const auto& a = ce.args[i];
-        // A named argument binds by name, not position: left to
-        // `checkBuiltinNamedArgs`, so the position read here is not trusted.
-        if (!a.value || a.isDiscard || !a.modifier.empty() || !a.name.empty())
+        // A named argument binds by name, not position, WHERE THE COMPILER
+        // HONOURS NAMES THERE: left to `checkBuiltinNamedArgs`, so the
+        // position read here is not trusted. Where the name is not honoured
+        // (fix #7296) the argument binds positionally and the index IS its
+        // position.
+        if (!a.value || a.isDiscard || !a.modifier.empty())
+            continue;
+        if (!a.name.empty() && namesHonoured)
             continue;
         if (!common::builtinParamIsNonNullable(head, member, ce.args.size(),
                                                i))
@@ -20739,54 +22623,14 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
     auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
     if (!tgt) return;
 
-    std::string_view head;
-    if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
-        if (recvTy->kind == TypeRef::Kind::Primitive) {
-            // Only `string` has a documented parameter-name surface here
-            // (stdlib §9.6); the other primitives are left unclaimed.
-            if (recvTy->primitive != PrimitiveType::String) return;
-            head = "string";
-        } else if (recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration) {
-            // `headName()` is the alias-transparent read (#1462) and already
-            // falls back to the metadata `importedName` for a cross-module
-            // TypeRef with no astNode.
-            head = recvTy->headName();
-            if (head.empty()) return;  // the §5 lazy sentinel, and kin
-            if (!common::isReservedBuiltinTypeName(head) &&
-                !common::isBuiltinExceptionName(head) &&
-                !common::isBuiltinNamedArgTableHead(head))
-                return;
-        } else if (recvTy->kind == TypeRef::Kind::Named &&
-                   !recvTy->declaration->decl &&
-                   common::isBuiltinNamedArgTableHead(
-                       recvTy->declaration->name)) {
-            // Some built-in receivers DO carry a declaration: a
-            // `SemaContext::builtinClassSym` — a compiler-intrinsic
-            // `TypeSymbol` with `decl == nullptr`. `Encoding.UTF8` is one
-            // (ExprTypecheck_Calls.cpp stamps `builtinClassSym("Encoding")`
-            // on the singleton's TypeRef), so the declaration-less branch
-            // above never sees it and the whole §3.2 surface would be
-            // unclaimed.
-            //
-            // `decl == nullptr` alone does NOT mean "built-in" — an IMPORTED
-            // user `TypeSymbol` has no AST either — so the test is ANDed with
-            // the registry's own head set. A user class that happened to be
-            // named `Encoding` would resolve its member to a real
-            // `MethodSymbol` and be excluded by the `calleeSym` gate above.
-            // Other `builtinClassSym` heads (DateTime, TimeSpan, Guid, Range,
-            // …) stay unclaimed: the registry carries no rows for them, and an
-            // unclaimed built-in costs a rejection that does not fire, never a
-            // false one.
-            head = recvTy->declaration->name;
-        } else {
-            return;  // a user type: checkCallArity bound the call already
-        }
-    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
-        if (!common::isBuiltinNamedArgTableHead(id->name)) return;
-        head = id->name;
-    } else {
-        return;
-    }
+    // fix #7296 (§7 / §22.5, v0.344): the CLAIM decision is ONE helper,
+    // shared with the §7 nullability gate — the gate may only read an
+    // argument's position where the compiler does NOT honour the name, and
+    // that is exactly what this helper answers.
+    bool honoured = false;
+    std::string_view head =
+        builtinCallHeadHonouringArgNames(ctx_, ce, &honoured);
+    if (!honoured) return;
 
     const std::string desc = std::string("call to built-in `") +
                              std::string(head) + "." + std::string(member) +
@@ -21590,7 +23434,7 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
 // a concrete receiver's class-level arguments reach an inherited member through
 // its base CLASS — so the walk itself must not be a second copy.
 static bool ancestorGenericSubst(
-    const TypeRef* recvTy, const TypeSymbol* derived,
+    SemaContext& ctx, const TypeRef* recvTy, const TypeSymbol* derived,
     const TypeSymbol* parent, bool throughInterfaces,
     std::unordered_map<std::string_view, TypeRef*>& out,
     const std::unordered_set<std::string_view>* excludeNames = nullptr);
@@ -21743,7 +23587,7 @@ ExprTC::constraintReceiverSubst(const ast::Expr* receiver,
             // the next bound, and if none supplies anything the caller sees the
             // empty map and runs the pre-existing check unchanged.
             return ancestorGenericSubst(
-                bound, bound->declaration, memberParent,
+                ctx_, bound, bound->declaration, memberParent,
                 /*throughInterfaces=*/true, out);
         });
     if (!found) out.clear();
@@ -24495,7 +26339,7 @@ bool ExprTC::checkMemberVisibility(const MemberSymbol* msym,
 // answer in both directions — when `parent` is not on the chain, or when a
 // generic link is unresolvable (`Base<U>` with no `U` in scope to bind it).
 static bool ancestorGenericSubst(
-    const TypeRef* recvTy, const TypeSymbol* derived,
+    SemaContext& ctx, const TypeRef* recvTy, const TypeSymbol* derived,
     const TypeSymbol* parent, bool throughInterfaces,
     std::unordered_map<std::string_view, TypeRef*>& out,
     const std::unordered_set<std::string_view>* excludeNames) {
@@ -24547,16 +26391,52 @@ static bool ancestorGenericSubst(
                 for (std::size_t gi = 0; gi < base->genericParams.size();
                      ++gi) {
                     TypeRef* arg = baseRef->genericArgs[gi];
-                    // Resolve a bare generic-param ref (`T`, no declaration)
-                    // through this level's bindings; a concrete arg passes
-                    // through unchanged.
-                    if (arg && arg->kind == TypeRef::Kind::Named &&
-                        !arg->declaration && arg->astNode &&
-                        arg->astNode->name &&
-                        arg->astNode->name->parts.size() == 1) {
-                        auto it = curArgsAt.find(arg->headName());
-                        if (it != curArgsAt.end()) arg = it->second;
-                    }
+                    // §14.1 / §3.6 rule 2 (v0.343): the base clause is an
+                    // INSTANTIATION SITE of the base's generic declaration, so
+                    // the argument it writes is read at the INSTANTIATION
+                    // (§3.6 rule 2 *Per-instantiation evaluation for
+                    // generics*: "the property is evaluated at each
+                    // instantiation, after substituting the type arguments"),
+                    // not at the declaration. The binding is therefore by
+                    // BINDING, not by NAME: this level's own bindings must be
+                    // substituted through the WHOLE argument, including a
+                    // CONSTRUCTED one (`Root<Array<U>>` binds Root's `T` to
+                    // `Array<U>`, whose inner `U` is THIS level's parameter
+                    // and must be substituted too).
+                    //
+                    // The pre-fix walk looked a BARE single-part name up in
+                    // this level's bindings and left every other shape —
+                    // a constructed argument above all — untouched, so
+                    // `Array<U>` stayed `Array<U>` and the inner parameter
+                    // was never substituted. That is the "bind by NAME only"
+                    // defect (#7115): the inherited member's type kept the
+                    // DERIVED class's parameter, which made the §5.1 question
+                    // at the index position undecidable and forced
+                    // #7064's check to fail OPEN over a whole class of index
+                    // arguments.
+                    //
+                    // The walker used here is `sema::substituteGenericArgs`
+                    // — the DECLARED SINGLE AUTHORITY for eager generic
+                    // substitution (src/sema/SubstArgs.hpp), which recurses
+                    // into Named-with-genericArgs, InlineArray element and
+                    // Function parameter/return. It is the SAME authority
+                    // `Resolver::applyGenericSubst` uses, so the two
+                    // base-chain walks (this one and
+                    // `Resolver::buildBaseClassGenericSubst`) now agree:
+                    // the override-matching walk already recursed, this one
+                    // did not.
+                    //
+                    // A parameter this level does NOT bind stays a bare
+                    // parameter reference (the walker leaves it alone), so
+                    // the map still carries an unsubstituted reference for
+                    // the genuinely-undecidable case — the conservative
+                    // direction #7064's fail-open relies on.
+                    if (arg)
+                        arg = sema::substituteGenericArgs(
+                            arg, sema::SubstArgs{ctx, curArgsAt, {},
+                                                 /*validateNestedInlineArrays=*/
+                                                 false,
+                                                 /*aliasChainParams=*/true});
                     if (base->genericParams[gi])
                         if (!excludeNames ||
                             !excludeNames->count(base->genericParams[gi]->name))
@@ -24695,7 +26575,7 @@ TypeRef* ExprTC::substituteMemberType(TypeRef* declared,
         // which reproduces the inline loop it replaces EXACTLY — only a Class
         // base is traversable, and a class has at most one — so no program that
         // compiled through this arm before compiles differently now.
-        if (!ancestorGenericSubst(recvTy, derived, parent,
+        if (!ancestorGenericSubst(ctx_, recvTy, derived, parent,
                                   /*throughInterfaces=*/false, classSubst,
                                   excludeNames))
             return declared;  // ancestor not reached / unresolvable generic link
@@ -26336,16 +28216,580 @@ static bool isDocumentedBuiltinCollectionMember(std::string_view head,
     return false;
 }
 
-// The "no member" diagnostic for the bare reference, or "" when no rejection
-// applies: `t` is not one of the heads above, or `name` is documented there,
-// is a universal Object member (§8.1), or is in the §5 collection table, whose
-// bare form #6784's bareStructuralOperatorReject rejects before this runs. A
-// §5 name outside that table gets this wording, which names §5 as one of its
-// possible reasons. The caller decides the
-// remaining exemption, a user extension that applies to the receiver (§26.5),
-// because it needs the extension table.
-static std::string bareBuiltinCollectionMemberReject(const TypeRef* t,
-                                                     std::string_view name) {
+// fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the SHAPE of a
+// documented builtin-collection member.
+//
+// `isDocumentedBuiltinCollectionMember` is the single authority for WHICH
+// NAMES a head declares; this table adds the SIGNATURE each one carries,
+// which the §14.2 constraint walk needs to type a member reached through a
+// bare type parameter (`where T: IList<int>` → `x.Add(1)`, `x.Count`). The
+// declared shapes, verbatim from the stdlib:
+//
+//   §4.1  `pure readonly property Count: int`
+//         `readonly property IsReadOnly: bool`
+//         `method Add(item: T)` · `method Clear()`
+//         `method Contains(item: T): bool` · `method Remove(item: T): bool`
+//         `method Insert(index: int, item: T)`
+//   §4.2  the same surface, with `owned item: T` on the owning pair
+//   §4.12 `method GetEnumerator(): owned IEnumerator<T>`
+//   §4.13 `method GetOwningEnumerator(): owned IOwningEnumerator<T>`
+//
+// The head→name mapping is NOT repeated here — it stays in
+// `isDocumentedBuiltinCollectionMember`, so the two cannot drift apart.
+enum class BuiltinCollectionMemberShape {
+    None,
+    IntProperty,         // `Count`
+    BoolProperty,        // `IsReadOnly`
+    UnitMethod,          // `Add` / `Clear` / `Insert`
+    BoolMethod,          // `Contains` / `Remove`
+    BorrowingEnumerator,  // `GetEnumerator`
+    OwningEnumerator,     // `GetOwningEnumerator`
+    DisposeMethod,        // `Dispose`
+};
+
+struct BuiltinCollectionMemberSig {
+    BuiltinCollectionMemberShape shape = BuiltinCollectionMemberShape::None;
+    int arity = 0;              // the declared parameter count of a METHOD
+    int elementParam = -1;      // the ELEMENT-typed parameter's index (-1: none)
+    int indexParam = -1;        // the `index: int` parameter's index (-1: none)
+    bool elementOwned = false;  // the element parameter takes an `owned` value
+};
+
+// fix #7086 (stdlib §4.1 / §4.2, v0.340): the OWNING heads — the two whose
+// `Add`/`Insert` take an `owned` element (stdlib §4.2: "The mutating methods
+// take `owned` parameters where appropriate: `Add` and `Insert` take ownership
+// of the new element"). The owning-ness is a property of the HEAD, not of the
+// member name: `ICollection<T>.Add(item: T)` borrows and
+// `IOwningCollection<T>.Add(owned item: T)` transfers.
+static bool builtinCollectionHeadIsOwning(std::string_view head) {
+    return head == "IOwningCollection" || head == "IOwningList" ||
+           head == "IOwningEnumerable";
+}
+
+// fix #7086 (stdlib §4.1 / §4.2 / §4.12 / §4.13, v0.340): the SIGNATURE a
+// documented builtin-collection member carries, PER HEAD. The declared shapes,
+// verbatim from the stdlib:
+//
+//   §4.1  `method Add(item: T)` · `method Insert(index: int, item: T)`
+//   §4.2  `method Add(owned item: T)` · `method Insert(index: int, owned item: T)`
+//   §4.12 `method GetEnumerator(): owned IEnumerator<T>`
+//   §4.13 `method GetOwningEnumerator(): owned IOwningEnumerator<T>`
+//
+// The `elementOwned` flag is the head's: §4.1's `Add` borrows the element and
+// §4.2's transfers it.
+static BuiltinCollectionMemberSig builtinCollectionMemberSig(
+    std::string_view head, std::string_view m) {
+    const bool owning = builtinCollectionHeadIsOwning(head);
+    if (m == "Count")
+        return {BuiltinCollectionMemberShape::IntProperty, 0, -1, -1, false};
+    if (m == "IsReadOnly")
+        return {BuiltinCollectionMemberShape::BoolProperty, 0, -1, -1, false};
+    if (m == "Add")
+        return {BuiltinCollectionMemberShape::UnitMethod, 1, 0, -1, owning};
+    if (m == "Clear")
+        return {BuiltinCollectionMemberShape::UnitMethod, 0, -1, -1, false};
+    if (m == "Contains" || m == "Remove")
+        return {BuiltinCollectionMemberShape::BoolMethod, 1, 0, -1, false};
+    if (m == "Insert")
+        return {BuiltinCollectionMemberShape::UnitMethod, 2, 1, 0, owning};
+    if (m == "GetEnumerator")
+        return {BuiltinCollectionMemberShape::BorrowingEnumerator, 0, -1, -1,
+                false};
+    if (m == "GetOwningEnumerator")
+        return {BuiltinCollectionMemberShape::OwningEnumerator, 0, -1, -1, false};
+    if (m == "Dispose")
+        return {BuiltinCollectionMemberShape::DisposeMethod, 0, -1, -1, false};
+    return {};
+}
+
+// fix #7086 (§14.2, v0.340): the documented collection members this fix
+// ADMITS through a type parameter's constraint.
+//
+// The admission is limited to the members whose CODEGEN path resolves a bare
+// type parameter's substitution:
+//
+//   * the two PROPERTY reads (`Count` / `IsReadOnly`) — the property-read
+//     path resolves the receiver through the active substitution
+//     (LlvmBackend_Exprs.cpp's `resolveTypeParamRef`), so the read answers
+//     the member's real value;
+//   * the five INSTANCE CALLS (`Add` / `Clear` / `Contains` / `Remove` /
+//     `Insert`) — the collection-call path dispatches on the receiver's
+//     SEM type, so the concrete type is restated for the duration of the
+//     call's lowering (LlvmBackend_Exprs.cpp, #7086);
+//   * `GetEnumerator` (stdlib §4.12) — the enumeration path reads the
+//     receiver's type the same way, and the concrete type is restated the
+//     same way. The restatement is REFUSED for a receiver that is not a
+//     concrete array-backed collection (the collection-interface heads erase
+//     the concrete backing), and the refusal is a compile-time ERROR: the
+//     non-generic spelling of the same shape is rejected the same way
+//     (#2457), and admitting it SEGFAULTED (MEASURED: exit 139).
+//
+// The two shapes NOT admitted are measured SEGFAULTS, and a program that
+// compiles and then crashes is worse than a false rejection:
+//
+//   * `GetOwningEnumerator` (stdlib §4.13) — the owning enumeration path
+//     emits an enumerator over a value it cannot enumerate, and the program
+//     SEGFAULTs at the first `MoveNext()` (MEASURED: exit 139);
+//   * the METHOD-REFERENCE form (`var g: (int) -> bool := x.Contains;`,
+//     §27.6) — the method-reference lowering does not resolve the receiver
+//     either, so the bound function value degrades to a zero and calling it
+//     SEGFAULTs. (The ORDINARY receiver has the same gap — #7014 owns it,
+//     and #7014's ruling is that the reference form over a collection head
+//     is REJECTED, not emitted.)
+//
+// Both are reported with their measurements; neither is silently admitted.
+static bool builtinCollectionConstraintPropertyAdmitted(
+    std::string_view head, std::string_view member) {
+    const BuiltinCollectionMemberShape shape =
+        builtinCollectionMemberSig(head, member).shape;
+    return shape == BuiltinCollectionMemberShape::IntProperty ||
+           shape == BuiltinCollectionMemberShape::BoolProperty;
+}
+
+// fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the
+// constraint-derived BUILTIN COLLECTION view of a bare type parameter.
+//
+// §14.2 (v0.340) decides the case: "Inside the generic body, T's surface
+// includes IFoo's members, regardless of which conformance category T
+// belongs to." The compiler already does this for the seven builtin
+// interfaces that carry a REAL synthesized Interface TypeSymbol
+// (`SemaContext::isSynthesizedBuiltinInterfaceName` — IComparable,
+// IEquatable, …): `where T: IComparable<int>` + `x.CompareTo(o)` resolves.
+// The eight builtin COLLECTION interfaces carry NO declaration and therefore
+// no member table, so the ordinary constraint walk
+// (`ExprTC::forEachConstraintBound`) cannot see them at all and §14.2's
+// sentence reaches them nowhere.
+//
+// This asks the same question over the DECLARATION-LESS bounds and over a
+// USER interface's declaration-less ancestors (stdlib §4.1's
+// `interface MyI: IList<int>` — `Add` is inherited by MyI from IList<int>),
+// and answers it with the stdlib's own documented surface.
+//
+// The answer is the DECLARATION-LESS TypeRef of the head — the very shape an
+// ordinary `IList<int>` receiver carries — so every downstream consumer
+// (sema's collection typing, codegen's collection dispatch) sees the same
+// thing it sees for a non-generic receiver.
+TypeRef* ExprTC::constraintCollectionView(std::string_view paramName,
+                                          std::string_view member) {
+    TypeRef* found = nullptr;
+    forEachConstraintBound(
+        paramName,
+        [&](TypeRef* ctr) -> bool {
+            // (a) The bound IS one of the eight builtin collection heads.
+            if (!ctr->declaration) {
+                const char* section = nullptr;
+                const char* surface = nullptr;
+                if (!builtinCollectionInterfaceSurface(ctr->headName(), section,
+                                                       surface))
+                    return false;
+                if (!isDocumentedBuiltinCollectionMember(ctr->headName(),
+                                                         member))
+                    return false;
+                found = ctr;
+                return true;
+            }
+            // (b) The bound is a USER interface (or class): the member may be
+            // INHERITED from a declaration-less builtin collection head
+            // (`interface MyI: IList<int>` — stdlib §4.1). The declared bases
+            // that carry no user TypeSymbol live in `nonSymbolBaseRefs`
+            // (TypeResolution_Names.cpp), and the interface's own symbolic
+            // bases are walked in the same closure.
+            std::vector<TypeSymbol*> frontier{ctr->declaration};
+            std::unordered_set<TypeSymbol*> visited;
+            std::size_t i = 0;
+            while (i < frontier.size()) {
+                TypeSymbol* sym = frontier[i++];
+                if (!sym || !visited.insert(sym).second) continue;
+                for (const TypeRef* br : nonSymbolBaseRefsOf(sym)) {
+                    if (!br || br->kind != TypeRef::Kind::Named ||
+                        br->declaration)
+                        continue;
+                    const char* section = nullptr;
+                    const char* surface = nullptr;
+                    if (!builtinCollectionInterfaceSurface(br->headName(),
+                                                           section, surface))
+                        continue;
+                    if (!isDocumentedBuiltinCollectionMember(br->headName(),
+                                                             member))
+                        continue;
+                    found = const_cast<TypeRef*>(br);
+                    return true;
+                }
+                for (TypeSymbol* b : sym->baseTypes)
+                    if (b) frontier.push_back(b);
+            }
+            return false;
+        },
+        /*includeDeclarationless=*/true);
+    return found;
+}
+
+// fix #7086 (§14.2, v0.340): the ELEMENT type of a collection view — the
+// view's own type argument (stdlib §4.1: `IList<T>`'s `T`).
+static TypeRef* builtinCollectionViewElement(const TypeRef* view) {
+    if (!view || view->genericArgs.empty()) return nullptr;
+    return view->genericArgs[0];
+}
+
+// fix #7086 (§14.2, v0.340) + stdlib §4.12, §4.13: the `owned IEnumerator<T>`
+// / `owned IOwningEnumerator<T>` result of the two enumeration members. The
+// same declaration-less Named-ref shape the ordinary `Array<T>.GetEnumerator()`
+// uses (ExprTypecheck_Calls.cpp's #1002 arm), so codegen's manual-protocol
+// typing fires on it exactly as it does there.
+static TypeRef* builtinCollectionEnumeratorType(SemaContext& ctx,
+                                                TypeRef* elem,
+                                                bool owning) {
+    if (!elem) return nullptr;
+    static const ast::Type* kBorrowingNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("IEnumerator");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    static const ast::Type* kOwningNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("IOwningEnumerator");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    TypeRef* tr = ctx.makeTypeRef();
+    tr->kind = TypeRef::Kind::Named;
+    tr->declaration = nullptr;
+    tr->astNode = owning ? kOwningNode : kBorrowingNode;
+    tr->genericArgs.push_back(elem);
+    return tr;
+}
+
+// fix #7086 (§14.2, v0.340): the RESULT TYPE of a call to a documented
+// builtin-collection member reached through a type parameter's constraint.
+// The declared shapes are stdlib §4.1, §4.2, §4.12, §4.13.
+static TypeRef* builtinCollectionConstraintCallType(SemaContext& ctx,
+                                                    const TypeRef* view,
+                                                    std::string_view member) {
+    const BuiltinCollectionMemberSig sig =
+        builtinCollectionMemberSig(view ? view->headName()
+                                        : std::string_view("IList"),
+                                    member);
+    TypeRef* elem = builtinCollectionViewElement(view);
+    switch (sig.shape) {
+        case BuiltinCollectionMemberShape::UnitMethod:
+        case BuiltinCollectionMemberShape::DisposeMethod: {
+            TypeRef* u = ctx.makeTypeRef();
+            u->kind = TypeRef::Kind::Unit;
+            return u;
+        }
+        case BuiltinCollectionMemberShape::BoolMethod:
+            return ctx.primitiveTypeRef(PrimitiveType::Bool);
+        case BuiltinCollectionMemberShape::BorrowingEnumerator:
+            return builtinCollectionEnumeratorType(ctx, elem, /*owning=*/false);
+        case BuiltinCollectionMemberShape::OwningEnumerator:
+            return builtinCollectionEnumeratorType(ctx, elem, /*owning=*/true);
+        default:
+            return nullptr;
+    }
+}
+
+// fix #7086 (§14.2, v0.340): the type of a PROPERTY read of a documented
+// builtin-collection member reached through a type parameter's constraint
+// (`x.Count` → `int`, `x.IsReadOnly` → `bool`; stdlib §4.1, §4.2). Null
+// when the member is not a property.
+static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
+                                                        const TypeRef* view,
+                                                        std::string_view member) {
+    (void)view;  // the property shapes carry no element type
+    const BuiltinCollectionMemberSig sig =
+        builtinCollectionMemberSig(view ? view->headName()
+                                        : std::string_view("IList"),
+                                    member);
+    switch (sig.shape) {
+        case BuiltinCollectionMemberShape::IntProperty:
+            return ctx.primitiveTypeRef(PrimitiveType::Int);
+        case BuiltinCollectionMemberShape::BoolProperty:
+            return ctx.primitiveTypeRef(PrimitiveType::Bool);
+        default:
+            return nullptr;
+    }
+}
+
+// fix #7086 (§14.2, §22.3, §22.5, §5.1, v0.340; stdlib §4.1, §4.2, §4.12,
+// §4.13): type a call to a documented builtin-collection member reached
+// through a type parameter's constraint AGAINST THE MEMBER'S REAL SIGNATURE.
+//
+// §14.2 (v0.340) puts the head's members — WITH their signatures — into T's
+// surface inside the generic body: "Inside the generic body, T's surface
+// includes IFoo's members". A call to one of them must therefore be typed
+// like a call to that member: the right ARITY (§22.5), the right ARGUMENT
+// TYPES (§5.1), and the right PARAMETER MODIFIERS (§22.3's `owned`
+// call-site transfer marker).
+//
+// The commit this fixes admitted these members BY NAME — the stdlib's
+// documented surface table — and never typed the CALL against the member's
+// signature, so the table's `arity` / element / index fields were read
+// NOWHERE. Three consequences, all MEASURED: the owning heads' `owned`
+// parameter slot was not modelled at all (a program the base REJECTED became
+// ACCEPTED and double-disposed its element — ASan heap-use-after-free); a
+// wrong element type produced MALFORMED IR and a compiler ICE; and a wrong
+// arity was admitted outright.
+//
+// The refusals below are the shapes this compiler cannot type yet. Each is a
+// LOUD refusal — a compile-time ERROR with a real location — because the
+// alternative (admitting the call) is either memory-unsafe or a wrong-answer
+// path. A refusal is a NARROWER behaviour than the base (which rejected these
+// shapes too, with a different message); an unsafe acceptance is not.
+//
+// Returns true when the call is admitted; false when a diagnostic has been
+// reported.
+bool ExprTC::builtinCollectionConstraintCallChecked(const ast::CallExpr& ce,
+                                                    TypeRef* view,
+                                                    std::string_view member) {
+    const std::string_view head = view->headName();
+    const BuiltinCollectionMemberSig sig =
+        builtinCollectionMemberSig(head, member);
+    const SourceLocation loc = ce.span.begin;
+
+    // (1) The OWNING heads' `Add`/`Insert` — stdlib §4.2 declares
+    //     `method Add(owned item: T)` on `IOwningCollection<T>` and
+    //     `method Insert(index: int, owned item: T)` on `IOwningList<T>`:
+    //     "The mutating methods take `owned` parameters where appropriate:
+    //     `Add` and `Insert` take ownership of the new element". §22.3
+    //     (v0.340), *Parameter modifiers*: "when the argument is a **named
+    //     owned binding** … the caller writes the transfer marker at the call
+    //     site: `M(move x)` … Omitting the marker on a named owned binding is
+    //     a compile error naming the fix."
+    //
+    //     The constraint head carries NO declaration and therefore no member
+    //     symbol, so nothing downstream of sema knows that this parameter is
+    //     `owned`: the ownership pass cannot see the sink, the transfer
+    //     marker is not required, and the element is disposed TWICE — once
+    //     by the collection that took it and once by the binding that still
+    //     owns it (MEASURED: ASan `heap-use-after-free` in `bz$elemDispose`).
+    //     The `owned` slot is modelled in the SIGNATURE TABLE above, but the
+    //     CALL-SITE marker cannot be enforced through a constraint, so the
+    //     shape is REFUSED until it can be. This is a sound interim, not a
+    //     completion. // per §22.3, v0.340
+    if (sig.elementOwned) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`" + std::string(member) + "` through a type parameter "
+            "constrained to `" + std::string(head) + "` is not supported: "
+            "the member takes an `owned` parameter (stdlib §4.2), and "
+            "§22.3's call-site transfer marker (`M(move x)`) is not checked "
+            "at a call through a type parameter — the constraint head "
+            "carries no declaration and therefore no member symbol, so the "
+            "compiler cannot see that the argument is consumed, and the "
+            "element would be disposed twice. Call the member on a concrete "
+            "receiver");
+        return false;
+    }
+
+    // (1b) The owning family's `Clear` — stdlib §4.2 declares
+    //      `method Clear();  // disposes every element` on
+    //      `IOwningCollection<T>`. The owning family's element DISPOSAL is
+    //      an ownership effect, and the constraint path cannot reproduce it
+    //      for a receiver reached through a type parameter: MEASURED under
+    //      ASan, `x.Clear()` on an `OwningArray<Item>` reached through
+    //      `where T: IOwningCollection<Item>` leaves the COLLECTION
+    //      undisposed and it LEAKS (the elements are disposed, the
+    //      collection's own storage is not freed), while the same call on a
+    //      concrete receiver — and on a concrete receiver passed as a
+    //      PARAMETER — is ASan-clean. The shape is REFUSED until the
+    //      owning semantics are reproduced. (The BORROWING family's `Clear`
+    //      disposes nothing — stdlib §4.1 — and is admitted: it measures
+    //      identical to the direct path.) // per §14.2, v0.340
+    if (builtinCollectionHeadIsOwning(head) && member == "Clear") {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`Clear` through a type parameter constrained to `" +
+                std::string(head) + "` is not supported: the owning family's "
+                "`Clear` disposes every element it holds (stdlib §4.2), and "
+                "the compiler cannot reproduce that ownership effect for a "
+                "receiver reached through a type parameter — MEASURED under "
+                "ASan, the collection is left undisposed and leaks. Call the "
+                "member on a concrete receiver");
+        return false;
+    }
+
+    // (2) `Dispose` on the owning heads — stdlib §4.2 declares
+    //     `IOwningCollection<T>: IReadOnlyCollection<T>, IDisposable`, so
+    //     the constraint DOES establish the member (§14.2). It is refused
+    //     here because the collection dispatch has no `Dispose` arm for a
+    //     receiver reached through a type parameter: the call would be
+    //     dropped and the elements would never be disposed. The refusal
+    //     NAMES the member and the head — the earlier "no member `Dispose`
+    //     on unconstrained type parameter `T`" was false on both counts
+    //     (the parameter IS constrained, and the head DOES declare the
+    //     member). // per §14.2, v0.340
+    if (sig.shape == BuiltinCollectionMemberShape::DisposeMethod) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`Dispose` through a type parameter constrained to `" +
+                std::string(head) + "` is not supported: the constraint "
+                "establishes the member (stdlib §4.2), but the compiler "
+                "cannot dispatch `Dispose` on a receiver reached through a "
+                "type parameter — the call would be dropped and the "
+                "collection's elements would never be disposed. Call it on "
+                "a concrete receiver");
+        return false;
+    }
+
+    // (3) The OWNING enumerator — stdlib §4.13 declares
+    //     `method GetOwningEnumerator(): owned IOwningEnumerator<T>` on
+    //     `IOwningEnumerable<T>`, so the constraint establishes the member
+    //     (§14.2). Admitting the CALL SEGFAULTs (MEASURED: exit 139 — the
+    //     owning enumeration path emits an enumerator over a value it
+    //     cannot enumerate), and a program that compiles and then crashes
+    //     is worse than a false rejection. // per §14.2, v0.340
+    if (sig.shape == BuiltinCollectionMemberShape::OwningEnumerator) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`GetOwningEnumerator` through a type parameter constrained to `" +
+                std::string(head) + "` is not supported: the constraint "
+                "establishes the member (stdlib §4.13), but a call to it "
+                "through a type parameter SEGFAULTs (MEASURED: exit 139). "
+                "Call it on a concrete receiver");
+        return false;
+    }
+
+    // (4) A PROPERTY called as a method (`x.Count()`) — the property shapes
+    //     carry no parameter list, so there is no call to type. // per §14.2
+    if (sig.shape == BuiltinCollectionMemberShape::IntProperty ||
+        sig.shape == BuiltinCollectionMemberShape::BoolProperty) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`" + std::string(member) + "` is a property of `" +
+                std::string(head) + "`, not a method — it cannot be "
+                "called (stdlib §4.1; §14.2, v0.340)");
+        return false;
+    }
+
+    // (5) The ARITY — §22.5's rule that a call supplies exactly the
+    //     parameters the callee declares. The non-generic spelling of the
+    //     same shape is rejected by the collection dispatch's own arity
+    //     check (§4.1's `Add(item: T)` / `Insert(index: int, item: T)`).
+    if (static_cast<int>(ce.args.size()) != sig.arity) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "the call to `" + std::string(member) + "` supplies " +
+                std::to_string(ce.args.size()) +
+                " argument(s) but `" + std::string(head) + "` declares " +
+                std::to_string(sig.arity) + " (§22.5, v0.340; stdlib "
+                "§4.1)");
+        return false;
+    }
+
+    // (6) The INDEX parameter — stdlib §4.1 declares
+    //     `method Insert(index: int, item: T)`, so the first parameter is
+    //     an `int`. The non-generic spelling of a wrong index type is NOT
+    //     rejected today (it reaches the malformed-IR lowering — a
+    //     PRE-EXISTING defect, reported separately), so this check is
+    //     what keeps the same shape from reaching that lowering through a
+    //     constraint. // per §5.1, v0.340
+    if (sig.indexParam >= 0 &&
+        static_cast<std::size_t>(sig.indexParam) < ce.args.size() &&
+        ce.args[sig.indexParam].value) {
+        TypeRef* argTy = ctx_.exprType(*ce.args[sig.indexParam].value);
+        checkAssignable(argTy, ctx_.primitiveTypeRef(PrimitiveType::Int),
+                        ce.args[sig.indexParam].value->span.begin,
+                        "`index` argument to `" + std::string(head) +
+                            "." + std::string(member) + "`",
+                        ce.args[sig.indexParam].value.get());
+    }
+
+    // (7) The ELEMENT parameter — stdlib §4.1 declares `method Add(item:
+    //     T)`, `method Contains(item: T): bool`, `method Remove(item: T):
+    //     bool` and `method Insert(index: int, item: T)`, so the argument
+    //     must convert to the head's element type (§5.1). The non-generic
+    //     spelling of a wrong element type is rejected with exactly this
+    //     diagnostic. // per §5.1, v0.340
+    if (sig.elementParam >= 0 &&
+        static_cast<std::size_t>(sig.elementParam) < ce.args.size() &&
+        ce.args[sig.elementParam].value) {
+        TypeRef* elemTy = builtinCollectionViewElement(view);
+        TypeRef* argTy = ctx_.exprType(*ce.args[sig.elementParam].value);
+        checkAssignable(argTy, elemTy,
+                        ce.args[sig.elementParam].value->span.begin,
+                        "argument to `" + std::string(head) + "." +
+                            std::string(member) + "`",
+                        ce.args[sig.elementParam].value.get());
+    }
+    return true;
+}
+
+
+// fix #7015 (stdlib §5, v0.340): EVERY operator name stdlib §5 documents.
+// `kStdlibLinqOverloads` (src/sema/LinqStdlibOverloads.hpp) is the §5 listing
+// the compiler already reads for the arity gate (#3726); the set of names it
+// holds is the documented stdlib §5 name set. The shared 38-name table
+// (`kBuiltinCollectionLinqOperatorNames`, src/common/BuiltinRegistry.cpp) is a
+// SUBSET of it: it misses `ElementAtOrNull` and `Reverse` (and it answers a
+// narrower question — "is this name a builtin-collection LINQ operator the
+// compiler dispatches structurally" — not "is this name documented in §5").
+static bool isDocumentedStdlibLinqOperatorName(std::string_view n) {
+    return bezel::sema::stdlibLinqLookup(n, /*arity=*/-1) != nullptr;
+}
+
+// fix #7015 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2, §4.12,
+// §4.13) + fix #7027 (language spec §27.6, v0.340; stdlib §4.1, §4.2): the
+// builtin collection interface heads whose CALL form this reject covers —
+// ALL EIGHT of them, the same set builtinCollectionInterfaceSurface names.
+//
+// The eight heads split in two by what the #853 codegen backstop does with an
+// undeclared name on them:
+//   * the four it does NOT reach — IReadOnlyList<T> / IList<T> (§4.1),
+//     IEnumerable<T> (§4.12), IOwningEnumerable<T> (§4.13). These are the
+//     array-backed / borrowed heads, where codegen's structural dispatch
+//     accepted the undeclared name and the call compiled with NO diagnostic
+//     at all: `ro.Add(1)` (a READ-ONLY list) and `il.IndexOf(2)` both ran.
+//     This is the half fix #7015 reports.
+//   * the four it REJECTS with its own "not yet supported in codegen"
+//     message — IReadOnlyCollection<T> / ICollection<T> /
+//     IOwningCollection<T> / IOwningList<T> (the polymorphic collection
+//     interfaces plus the owning list). On those heads the call was already
+//     refused, but #853's wording says the member EXISTS and is missing only
+//     from codegen — false for a name the head does not declare: `co.Insert(0,
+//     1)` on an `ICollection<T>` (stdlib §4.1: `Insert` is declared on
+//     `IList<T>` only) got the #853 message. This is fix #7027's half.
+//
+// So the type-level reject now covers every head, and the two spellings of one
+// undeclared name agree on all of them (language spec §27.6: the member is
+// resolved "on the value exactly as the call `v.Scaled()` is"). A DECLARED
+// member on a polymorphic head keeps #853's message — that one is true: the
+// member exists and only codegen's lowering is missing.
+
+// The "no member" diagnostic for a member a builtin collection interface does
+// not declare, or "" when no rejection applies: `t` is not one of the heads
+// above, or `name` is documented there, is a universal Object member (§8.1),
+// or is a stdlib §5 operator name.
+//
+// The two spellings differ in ONE respect, and it is deliberate:
+//   * the BARE reference exempts every name the #6784 arm
+//     (bareStructuralOperatorReject) rejects with its own "not yet
+//     supported" wording -- the shared 38-name table AND the whole documented
+//     §5 name set (fix #7019 added `ElementAtOrNull` and the lazy `Reverse`)
+//     -- so the two arms cannot both fire on one name, and the DESIGNED
+//     wording is the one the user sees. A name outside both sets is not
+//     exempted here: it is not a §5 member, so the "no member" wording is the
+//     right one.
+//   * the CALL form exempts the WHOLE documented §5 name set, because the
+//     call is typed by the LINQ typing for every §5 name (not only the 38
+//     the table lists), so `il.ElementAtOrNull(1)` and `ro.Contains(3)` are
+//     legitimate calls (§5) and must not be taken for undeclared members (the
+//     exemption is about the member surface: `il.ElementAtOrNull(1)` is
+//     typed, and codegen's #2457 backstop is what refuses it).
+//
+// `callForm` selects the CALL form's exemptions (the whole documented §5 name
+// set, and `Dispose`); the head set is the same for both spellings, so the
+// two agree on every head (fix #7015, fix #7027).
+//
+// The caller decides the remaining exemption, a user extension that applies
+// to the receiver (§26.5), because it needs the extension table.
+static std::string builtinCollectionMemberReject(const TypeRef* t,
+                                                 std::string_view name,
+                                                 bool callForm) {
     if (!t || t->kind != TypeRef::Kind::Named || t->declaration) return "";
     const std::string_view head = t->headName();
     const char* section = nullptr;
@@ -26354,7 +28798,44 @@ static std::string bareBuiltinCollectionMemberReject(const TypeRef* t,
     if (name == "ToString" || name == "Equals" || name == "GetHashCode" ||
         name == "GetType" || name == "ReferenceEquals")
         return "";
-    if (common::isBuiltinCollectionLinqOperatorName(name)) return "";
+    // fix #7015 (language spec §8.7, §28.6, v0.340; stdlib §4.1, §4.2, §4.12,
+    // §4.13): `Dispose` is EXEMPTED in the CALL form, and only there.
+    //
+    // The compiler has always routed `il.Dispose()` on a borrowing collection
+    // interface head to the concrete collection's disposal, and ten shipped
+    // rows pin that: `codegen_iface_head_dispose_2970` (4), `codegen_iface_head_
+    // dispose_3026`, `codegen_iface_head_raw_user_class_2975`,
+    // `codegen_nullcond_dispose_collections_4221`,
+    // `iowningenumerable_explicit_dispose_6553` and
+    // `named_local_property_read_source_abandonment_3605` (2) each ship a
+    // deliberate fix on it (#2970's wild jump, #3026, #4221's `?.` path, #6553,
+    // #3605) and assert the program COMPILES and runs. Rejecting the call
+    // would delete the premise of six test files.
+    //
+    // The SPEC does not settle the question, so this hunk is held, not decided:
+    // stdlib §4.1 declares no `Dispose` on the borrowing heads (they do not
+    // extend `IDisposable`), while language spec §8.7 makes `Dispose()` a
+    // member of every non-static class and §28.6's receiver rule reads the
+    // receiver's OWNERSHIP classification, not the interface's member set. The
+    // two readings disagree, and the compiler's shipped behavior follows the
+    // second. Filed as a spec-question; the BARE form's #6997 rejection
+    // ("no member `Dispose` on `IList`", the #6997 ROW 4) is left exactly as
+    // it shipped, so the two spellings of `Dispose` still disagree -- the
+    // pre-existing disagreement this fix does not widen.
+    if (callForm && name == "Dispose") return "";
+    // fix #7019 (language spec §27.6, v0.340; stdlib §5): the BARE form
+    // exempts the 38-name table AND the whole documented §5 set -- the same
+    // names the #6784 arm rejects with its own "not yet supported" wording.
+    // The #6784 arm is reached FIRST on both the `.` and the `?.` spelling,
+    // under the same guard as this one, and it reports and returns as soon as
+    // it has a message -- so this arm is not reached for those names at all.
+    // The widened exemption is therefore an INVARIANT, not a behavioural fix:
+    // it keeps the two arms provably unable to both fire on one name, and it
+    // is NOT a claim about which arm runs first.
+    if (callForm ? isDocumentedStdlibLinqOperatorName(name)
+                 : (common::isBuiltinCollectionLinqOperatorName(name) ||
+                    isDocumentedStdlibLinqOperatorName(name)))
+        return "";
     if (isDocumentedBuiltinCollectionMember(head, name)) return "";
     return "no member `" + std::string(name) + "` on `" + std::string(head) +
            "` (stdlib " + std::string(section) + ") -- it is not part of this "
@@ -26380,9 +28861,50 @@ std::string ExprTC::bareStructuralOperatorReject(const TypeRef* receiver,
                                                  bool nullCond,
                                                  SourceLocation loc) {
     if (!receiver) return "";
-    bool isOp = receiver->kind == TypeRef::Kind::Primitive
-                    ? common::isStringLinqOperatorMemberName(name)
-                    : common::isBuiltinCollectionLinqOperatorName(name);
+    // fix #7019 (language spec §27.6, v0.340; stdlib §5): the name test is
+    // stdlib §5's OWN list, not the shared 38-name table. The table
+    // (`kBuiltinCollectionLinqOperatorNames`, src/common/BuiltinRegistry.cpp)
+    // answers a narrower question -- "is this name a builtin-collection LINQ
+    // operator the compiler dispatches structurally" -- and it MISSES two
+    // names stdlib §5 documents: `ElementAtOrNull` and the lazy `Reverse`.
+    // A bare reference to those two was left untyped, codegen degraded the
+    // local to a zero function value (#2434), and calling it SEGV'd -- the
+    // crash #6784 was filed for. They must get the #6784 wording, like every
+    // other documented §5 name.
+    //
+    // The §5 list is read from `kStdlibLinqOverloads`
+    // (src/sema/LinqStdlibOverloads.hpp) -- the same table the arity gate
+    // (#3726) reads -- so the name set cannot drift from the stdlib again.
+    //
+    // The extension applies to the EIGHT builtin collection INTERFACE heads,
+    // the ones whose declared surface sema knows
+    // (isDocumentedBuiltinCollectionMember). A name the head DECLARES keeps
+    // its own resolution (language spec §26.5 rule 1: instance resolution is
+    // committed): `il.Count` is the `Count` property of stdlib §4.1 and
+    // `il.Contains` is `ICollection<T>.Contains` -- neither is a §5-only
+    // name, so neither takes the §5 wording. The concrete and span families
+    // keep the table's set: their declared surface is not sema's to read, and
+    // their own per-family arms (fix #2470/#2492/#2537) answer the bare
+    // reference there.
+    bool isOp;
+    if (receiver->kind == TypeRef::Kind::Primitive) {
+        isOp = common::isStringLinqOperatorMemberName(name);
+    } else {
+        isOp = common::isBuiltinCollectionLinqOperatorName(name);
+        if (!isOp) {
+            const std::string_view h = receiver->headName();
+            const char* section = nullptr;
+            const char* surface = nullptr;
+            // builtinCollectionInterfaceSurface IS the list of the eight
+            // builtin collection INTERFACE heads, so there is one list here,
+            // not two.
+            const bool isCollectionInterfaceHead =
+                builtinCollectionInterfaceSurface(h, section, surface);
+            isOp = isCollectionInterfaceHead &&
+                   isDocumentedStdlibLinqOperatorName(name) &&
+                   !isDocumentedBuiltinCollectionMember(h, name);
+        }
+    }
     if (!isOp) return "";
     std::string recv = structuralLinqReceiverName(receiver, nullCond, name);
     if (recv.empty()) return "";
@@ -27406,7 +29928,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                     // #1034: `string.Format` and `string.Concat` are NOT provided
-                    // by the stdlib (§9.6 lists Join/From/Empty/Repeat; composite
+                    // by the stdlib (§9.6 lists Join/From/Repeat; composite
                     // formatting is done with string interpolation `$"{...}"`).
                     // They were typed `string` here but have no codegen lowering,
                     // so `string.Format(...)` compiled and CRASHED (SIGSEGV) and
@@ -27423,7 +29945,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // `getenv` example) was rejected outright as an unknown
                     // static. Both return `string`; codegen lowers them in
                     // tryLowerPrimitiveStaticCall.
-                    if (mbr == "Join" || mbr == "Empty" ||
+                    //
+                    // fix #7128 (stdlib §9.6, v0.343): `string.Empty` is NOT a
+                    // stdlib §9.6 member — the `String` listing declares
+                    // `Length` / `IsEmpty` / `IsAscii` and the construction
+                    // methods (`From` / `FromCStringPointer` /
+                    // `FromWStringPointer` / `Repeat` / `Join`) and NO `Empty`,
+                    // as a property or as a method;
+                    // `Bezel_For_Code_Generation.md` §5 lists `String.Empty`
+                    // among the APIs that do NOT exist, with the replacement
+                    // "use `""`". It was nonetheless in this accept set, so
+                    // sema typed BOTH spellings — the member READ
+                    // `string.Empty` and the CALL `string.Empty()` — as a
+                    // `string`. The READ spelling has no codegen lowering, so
+                    // the local it initialised was left zero-initialized (a
+                    // NULL bz.string) and the program's first read of it
+                    // (`.Length`) dereferenced NULL at offset 0x8 — the
+                    // string header's length field — and the generated program
+                    // died with SIGSEGV. The remedy is the REJECTION, not an
+                    // addition: dropping `Empty` from this set makes both
+                    // spellings fall through to the clean §3.4 "type 'string'
+                    // has no static method or property 'Empty'" reject, exactly
+                    // as any other unknown static (`string.Bogus()`) and
+                    // exactly as the `Format`/`Concat` removal above does.
+                    if (mbr == "Join" ||
                         mbr == "From" || mbr == "Repeat" ||
                         mbr == "FromCStringPointer" ||
                         mbr == "FromWStringPointer") {
@@ -28218,6 +30763,57 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "GetHashCode" || ma.member == "GetType" ||
                         ma.member == "ReferenceEquals" || ma.member == "Dispose";
                     if (!isUniversalObjMember) {
+                        // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12,
+                        // §4.13: a `where T: IList<int>` bound establishes
+                        // IList's DOCUMENTED member surface inside the generic
+                        // body. §14.2: "Inside the generic body, T's surface
+                        // includes IFoo's members, regardless of which
+                        // conformance category T belongs to." The eight
+                        // builtin collection heads carry NO declaration and
+                        // therefore no member table, which is why the
+                        // constraint walk above cannot see them at all.
+                        //
+                        // The control side is unchanged: a name the head does
+                        // NOT declare still falls through to the reject below,
+                        // and a name on a head with no collection bound at all
+                        // is unaffected.
+                        if (TypeRef* view =
+                                constraintCollectionView(paramName, ma.member)) {
+                            // A PROPERTY read (`x.Count`, `x.IsReadOnly`) is
+                            // typed here. An INSTANCE CALL is typed by
+                            // typeCall, which owns the call's result type
+                            // AND the call's own checks (its arity, its
+                            // argument types, and the `owned` marker on the
+                            // owning heads' members).
+                            if (&ma != calleeOfCallCtx_) {
+                                if (builtinCollectionConstraintPropertyAdmitted(
+                                        view->headName(), ma.member)) {
+                                    if (TypeRef* pt =
+                                            builtinCollectionConstraintPropertyType(
+                                                ctx_, view, ma.member)) {
+                                        ctx_.setExprType(&ma, pt);
+                                        return;
+                                    }
+                                }
+                                // The METHOD-REFERENCE form (§27.6) of a
+                                // collection member stays refused: #7014
+                                // ruled that the reference form over a
+                                // collection head is not emitted, and its
+                                // call form is fenced, so the two must
+                                // agree. The refusal is unchanged by this
+                                // fix — it falls through to the reject below.
+                            } else {
+                                // The CALLEE position: typeCall owns the
+                                // call's typing and its refusals, so the
+                                // callee is left untyped here and ONE
+                                // diagnostic comes from typeCall. The
+                                // "no member ... on bare type parameter" text
+                                // below is FALSE for a member the head DOES
+                                // declare (§14.2), so it must not fire for
+                                // one.
+                                return;
+                            }
+                        }
                         // #6757 (§3.6 rule 2 / §14.2, the #5449 ruling): a class
                         // bound that derives from a built-in exception brings §31.4's
                         // surface with it (`Message` / `StackTrace` / `CauseChain` on
@@ -30102,6 +32698,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "TrimEnd" || ma.member == "ToLower" ||
                         ma.member == "ToUpper" || ma.member == "Replace" ||
                         ma.member == "PadLeft" || ma.member == "PadRight" ||
+                        ma.member == "PadCenter" ||
                         ma.member == "Repeat" || ma.member == "Remove" ||
                         ma.member == "Insert" ||
                         ma.member == "GetField") {
@@ -31260,7 +33857,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
         // fix #6997 (language spec §27.6, v0.340; stdlib §4.1, §4.2, §4.12,
         // §4.13): the bare reference to a name the builtin collection
-        // interface does not declare -- see bareBuiltinCollectionMemberReject.
+        // interface does not declare -- see builtinCollectionMemberReject.
         // The CALL form is exempt (calleeOfCallCtx_). A same-named user
         // extension that applies to the receiver (§26.5) is what the reference
         // resolves to, so it is not rejected.
@@ -31270,7 +33867,44 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 if (loc.line == 0 && ma.target)
                     loc = ma.target->span.begin;
                 std::string msg =
-                    bareBuiltinCollectionMemberReject(tt, ma.member);
+                    builtinCollectionMemberReject(tt, ma.member,
+                                                  /*callForm=*/false);
+                if (!msg.empty() &&
+                    !lookupExtensionMember(tt, ma.member, nullptr, loc,
+                                           /*reportAmbiguity=*/false)) {
+                    ctx_.diagnostics().report(Severity::Error, loc, msg);
+                    return;
+                }
+            }
+        }
+        // fix #7015 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2,
+        // §4.12, §4.13): the CALL form of a name the builtin collection
+        // interface does not declare. §27.6 resolves a receiver-qualified
+        // reference "on the value exactly as the call `v.Scaled()` is", so
+        // the two spellings of one undeclared name must agree — and after
+        // #6997 they did NOT: the bare form was rejected and the call form
+        // was not. On the heads codegen's structural dispatch reaches (the
+        // array-backed list interfaces) the call compiled with NO diagnostic
+        // at all: `ro.Add(1)` (a READ-ONLY list) mutated the array behind
+        // it and `il.IndexOf(2)` printed a value, for names no head declares
+        // (stdlib §4.1 declares `IReadOnlyList<T>` as the indexer plus
+        // `Count` and `GetEnumerator`, and `IList<T>` as the indexer plus
+        // `Insert` inheriting the `ICollection<T>` members).
+        //
+        // The callee slot decides which form this is; the heads the #853
+        // codegen backstop already rejects are #7027's own fix, and the
+        // §5 operator names are exempted above (a §5 call is typed by the
+        // LINQ typing). A same-named user extension that applies to the
+        // receiver (§26.5) is what the call resolves to, so it is not
+        // rejected.
+        if (ma.target && &ma == calleeOfCallCtx_ && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target)
+                    loc = ma.target->span.begin;
+                std::string msg =
+                    builtinCollectionMemberReject(tt, ma.member,
+                                                  /*callForm=*/true);
                 if (!msg.empty() &&
                     !lookupExtensionMember(tt, ma.member, nullptr, loc,
                                            /*reportAmbiguity=*/false)) {
@@ -32707,6 +35341,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             extensionNameBlockedNote(
                 ma.target ? ctx_.exprType(*ma.target) : nullptr,
                 ma.member));
+        return;
+    }
+    // fix #7135 (§22.12 / §14.1 / §11.6 / A.7, v0.343): explicit type
+    // arguments are meaningful on exactly two kinds of member — a generic
+    // METHOD (the §14.1 / §27.6 spelling `obj.Method<int>(args)`, whose list
+    // the method-reference and call paths validate) and a generic NESTED TYPE
+    // (the §11.6 spelling `Tree<int>.Node<int>`, whose list the nested-type
+    // branch below applies). §22.12 states the rule for every other name:
+    // "a name that resolves to a non-generic entity after a
+    // syntactically-successful generic reading is an ordinary error at that
+    // name". A field, a property, a const, an enum constant or a choice case
+    // reached with a type-argument list is such a name — the list spells
+    // nothing there, and silently ignoring it is how `o.F<int>.Length` would
+    // come to compile as if it were `o.F.Length`.
+    if (!ma.typeArgs.empty() && member &&
+        !dynamic_cast<MethodSymbol*>(member) &&
+        !dynamic_cast<NestedTypeSymbol*>(member)) {
+        ctx_.diagnostics().report(
+            Severity::Error, ma.span.begin,
+            "`" + std::string(ma.member) +
+                "` names no type parameters: a type-argument list is spelled "
+                "on a generic method (`obj.Method<int>(…)`, §14.1 / §27.6) or "
+                "on a nested type (`Tree<int>.Node<int>`, §11.6), and this "
+                "member is neither — a name that resolves to a non-generic "
+                "entity after a syntactically-successful generic reading is "
+                "an ordinary error at that name (§22.12)");
         return;
     }
     if (!member) {
@@ -34235,6 +36895,68 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             tgt && tgt->declaration == targetType && !tgt->genericArgs.empty())
             ct->genericArgs = tgt->genericArgs;
         ctx_.setExprType(&ma, ct);
+    } else if (auto* nts = dynamic_cast<NestedTypeSymbol*>(member)) {
+        // fix #7135 (§11.6 / §14.1 / Appendix C.1, v0.343): a nested type
+        // reached through a chain head that supplies the enclosing type's
+        // arguments, carrying EXPLICIT type arguments of its own — §11.6's
+        // worked example `Tree<int>.Node<int>.Create()` — is an
+        // INSTANTIATION of that nested type.  Build the instantiated TypeRef
+        // and attach it, so the members reached THROUGH it substitute the
+        // nested type's own type parameters (`U := int` in the example):
+        // the call's return type is substituted by
+        // `substituteMemberType(rt, ma->target.get(), ms->parent)`, which
+        // reads the receiver's TypeRef — the one this branch publishes.
+        //
+        // The BARE form (`Tree<int>.Node`, no type arguments) is NOT TYPED
+        // here: it is a different spelling, and typing it here would change
+        // the verdict of programs that compile today.  Its ARITY, though, is
+        // checked below.
+        //
+        // fix #7164 (§14.1 / §2.2 / Appendix C.1, v0.343): the BARE form's
+        // arity rule is §14.1's own — "every such reference supplies exactly
+        // the declared number of type arguments … there, too, the bare `Box`
+        // fixes arity 0".  The nested type's OWN parameter count is the
+        // declared count, so a bare reference to a nested type that declares
+        // parameters supplies ZERO and is a wrong-arity reference: it left
+        // the nested type's parameter unbound and the program ran.  The type
+        // position already says so for the same shape (`var v: Outer.Inner;`
+        // at a `class Inner<V>` is rejected with this same text), so the
+        // two positions now agree.  §11.6's
+        // "a bare enclosing segment fixes arity 0"
+        // is the ENCLOSING segment's rule (the chain head
+        // `Tree<int>`), not a licence for the nested segment to be bare.
+        if (nts->type) {
+            if (ma.typeArgs.size() != nts->type->genericParams.size()) {
+                // §14.1 / Appendix C.1: every type reference supplies exactly
+                // the declared number of type arguments. The wording is the
+                // type resolver's (§14.1's arity rule), so one rule has one
+                // message.
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    "generic-argument count does not match type's "
+                    "generic-parameter count");
+                return;
+            }
+            if (!ma.typeArgs.empty()) {
+                auto* instTy = ctx_.makeTypeRef();
+                instTy->kind = TypeRef::Kind::Named;
+                instTy->declaration = nts->type;
+                std::vector<const ast::Type*> argAsts;
+                argAsts.reserve(ma.typeArgs.size());
+                for (const auto& ta : ma.typeArgs) {
+                    instTy->genericArgs.push_back(ta ? ctx_.resolvedType(*ta)
+                                                    : nullptr);
+                    argAsts.push_back(ta.get());
+                }
+                ctx_.setExprType(&ma, instTy);
+                // §14.2 constraint check at this instantiation site — the same
+                // dispatch the chain-head receiver (`Registry<int>.Make()`) runs
+                // through `checkGenericConstraintsAtExpr` (fix #3160), so a
+                // nested type's own `where` clause is enforced here too.
+                checkGenericConstraintsAtExpr(ctx_, ma.span.begin, argAsts,
+                                               instTy->genericArgs, nts->type);
+            }
+        }
     } else if (auto* ms = dynamic_cast<MethodSymbol*>(member)) {
         // §27.6 (issue #436): a bare `obj.Method` in value position (not the
         // callee of a CallExpr) is a method reference — a function value of
@@ -34779,7 +37501,30 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         SourceLocation loc = nm.span.begin;
         if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
         std::string msg =
-            bareBuiltinCollectionMemberReject(recvTyForDiag, nm.member);
+            builtinCollectionMemberReject(recvTyForDiag, nm.member,
+                                          /*callForm=*/false);
+        if (!msg.empty() &&
+            !lookupExtensionMember(recvTyForDiag, nm.member, nullptr, loc,
+                                   /*reportAmbiguity=*/false)) {
+            ctx_.diagnostics().report(Severity::Error, loc, msg);
+            return;
+        }
+    }
+    // fix #7015 (language spec §27.6, §8.1, v0.340; stdlib §4.1, §4.2, §4.12,
+    // §4.13): the `?.` CALL form of a name the builtin collection interface
+    // does not declare — the `?.` twin of the `.` call-form arm in
+    // resolveMemberAccess. The `?.` call's typing goes through the SPECULATIVE
+    // twin in typeCall (the member-access typing is keyed on the `.` callee),
+    // and that twin DISCARDS anything it reports — so a reject raised only
+    // there would be rolled back and the call would still compile. This arm
+    // reports it here, where it survives: the twin's own copy of the same
+    // reject is inside the rolled-back region.
+    if (!member && &nm == calleeOfCallCtx_ && recvTyForDiag) {
+        SourceLocation loc = nm.span.begin;
+        if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+        std::string msg =
+            builtinCollectionMemberReject(recvTyForDiag, nm.member,
+                                          /*callForm=*/true);
         if (!msg.empty() &&
             !lookupExtensionMember(recvTyForDiag, nm.member, nullptr, loc,
                                    /*reportAmbiguity=*/false)) {

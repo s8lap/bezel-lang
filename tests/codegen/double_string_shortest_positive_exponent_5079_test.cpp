@@ -115,7 +115,13 @@ end Main; end C;
 
 // ── Zero, negative zero, NaN, and the infinities are unaffected (all bypass
 // the shortest-string search: NaN/Infinity are special-cased; +/-0.0 pick the
-// fixed candidate "0"/"-0" as strictly shorter than any scientific form). ───
+// fixed candidate "0"/"-0" as strictly shorter than any scientific form).
+//
+// The three NON-FINITE spellings are the §2.18 ones as of #7301 (stdlib
+// §2.18, v0.344): "NaN", "Infinity" and "-Infinity" — the names of the §9.2
+// constants. This row pinned C's "%g" spellings ("nan", "inf", "-inf")
+// before #7301; the flip is the DOCUMENT's spelling, and the zero /
+// negative-zero arms are unchanged. ─────────────────────────────────────────
 BEZEL_TEST(double_string_shortest_5079, zero_nan_infinity_unaffected) {
     BEZEL_EXPECT_EQ(run(R"BZ(
 module M; class C public static method Main(): int
@@ -125,11 +131,11 @@ module M; class C public static method Main(): int
   var nz: double := -0.0;
   if $"{nz}" = "-0" then ok := ok + 2; end;
   var n: double := double.NaN;
-  if $"{n}" = "nan" then ok := ok + 4; end;
+  if $"{n}" = "NaN" then ok := ok + 4; end;
   var pi: double := double.PositiveInfinity;
-  if $"{pi}" = "inf" then ok := ok + 8; end;
+  if $"{pi}" = "Infinity" then ok := ok + 8; end;
   var ni: double := double.NegativeInfinity;
-  if $"{ni}" = "-inf" then ok := ok + 16; end;
+  if $"{ni}" = "-Infinity" then ok := ok + 16; end;
   return ok;
 end Main; end C;
 )BZ"), 31);

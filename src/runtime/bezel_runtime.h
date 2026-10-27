@@ -135,6 +135,14 @@ void bz_array_free_owning_wrap(void* arr, void (*fallback)(void*),
 // NOT free the header block — mirrors class-instance quarantine in the codegen.
 void bz_array_mark_disposed(void* arr, void (*dispose_elem)(void*));
 
+// fix #7045 (§28.2 / §28.3, v0.340): the checked-disposal twin of
+// bz_array_free_dynamic — the static collection head is erased, so the
+// backing's element ownership is taken from the header's recorded disposer,
+// and the block is QUARANTINED (header kept, disposed=1) instead of
+// reclaimed, so a borrow that survives the release can still have its
+// disposed flag read by the §28.2 backstop.
+void bz_array_mark_disposed_dynamic(void* arr);
+
 // §28.2 v0.135 / issue #621: return non-zero if the array has been disposed
 // via bz_array_mark_disposed (checked mode only).
 int8_t bz_array_is_disposed(void* arr);
@@ -1713,11 +1721,14 @@ int32_t bz_char_is_control(int32_t cp);
 int32_t bz_char_is_punctuation(int32_t cp);
 int32_t bz_char_to_upper(int32_t cp);
 int32_t bz_char_to_lower(int32_t cp);
-// §9.6 / #1295: PadLeft/PadRight — width-aware padding to `totalWidth` code
-// points with `padChar` (leftAlign=1 for PadRight, self-then-pad; 0 for PadLeft,
-// pad-then-self). Preserves code points > U+00FF (fixed-width storage, §4.6).
+// §9.6 / #1295: PadLeft/PadRight/PadCenter — width-aware padding to
+// `totalWidth` code points with `padChar` (align=1 for PadRight,
+// self-then-pad; 0 for PadLeft, pad-then-self; 2 for PadCenter, the padding
+// split evenly with the odd extra character on the RIGHT — §9.6:
+// "ab".PadCenter(5) = " ab  "). Preserves code points > U+00FF (fixed-width
+// storage, §4.6).
 void*   bz_str_pad(const void* self, int64_t totalWidth,
-                   int32_t padChar, int8_t leftAlign);
+                   int32_t padChar, int8_t align);
 // Replace(old, new): fresh string with all occurrences of `old` replaced.
 void*   bz_str_replace(const void* self, const void* old_str, const void* new_str);
 // Split(sep: char): fresh Array<string> split at every code point equal to sep.
@@ -1727,23 +1738,49 @@ void*   bz_str_split_str(const void* self, const void* sep);
 // §9.6 / issue #654: ToCharArray(): owned Array<char> (elem_size=4, i32 code points).
 void*   bz_str_to_char_array(const void* self);
 
-// StringBuilder helper — concatenates an array of bz.string pointers.
-// Caller must free *out_data with free() after use.
+// StringBuilder helper — the `Object`-vtable renderer.
 // ---------------------------------------------------------------------------
-void bz_strbuilder_to_string(void* parts_arr,  // bz_array_t* of bz.string ptrs
-                              char** out_data,
-                              int64_t* out_len);
+// fix #7243 (spec §4.6 / stdlib §3.1, v0.344): render the builder's parts
+// (a bz_array_t* of bz.string ptrs) as ONE fresh +1 `bz.string` holding the
+// content's CODE POINTS at the narrowest width that fits the largest code
+// point in the value (§4.6's own rule — and the rule stdlib §9.6's `IsAscii`,
+// which answers the width in O(1), makes observable).
+//
+// This is the runtime twin of the codegen's `emitStringBuilderToString`
+// (src/codegen/LlvmBackend_String.cpp), which does the same thing through
+// bz_strbuilder_flatten: the builder's own `ToString()` and the `Object`
+// vtable's ToString slot are the SAME operation (§8.5), so they must render
+// the same text.
+//
+// It REPLACES the legacy byte-level `bz_strbuilder_to_string`, which had this
+// one caller and concatenated the parts' RAW BYTES — a byte blob is not a
+// code-point sequence (§4.6), so a wide content came back mangled.
+void* bz_strbuilder_to_string_obj(void* parts_arr);
+
+// fix #7229 (spec §4.6 / stdlib §3.1, v0.344): flatten the builder's parts
+// into ONE packed buffer of CODE POINTS. Returns the content's code-point
+// count (§4.6's length) and fills *out_data with a malloc'd buffer holding
+// the content's code points at *out_width bytes each; the caller owns that
+// buffer (it becomes the `string`'s data buffer). The width is the NARROWEST
+// that fits the largest code point in the value (§4.6) — stdlib §9.6's
+// `IsAscii` answers from the width in O(1), so the width must follow the
+// value.
+int64_t bz_strbuilder_flatten(void* parts_arr,  // bz_array_t* of bz.string ptrs
+                               char** out_data,
+                               int8_t* out_width);
 
 // ---------------------------------------------------------------------------
 // StringBuilder mutators (§3.1). A StringBuilder is a bz_array_t* of bz.string*
-// parts; its logical content is the concatenation of those parts. Each mutator
-// flattens the current parts to one buffer, applies the operation, and resets
-// the parts array to a single fresh +1 string part. The old part pointers are
+// parts; its logical content is the concatenation of those parts' CODE POINTS
+// (§4.6 — each part stores its code points at its own per-string width, so
+// the parts are not byte-concatenable). Each mutator flattens the current
+// parts to one code-point sequence, applies the operation, and resets the
+// parts array to a single fresh +1 string part. The old part pointers are
 // left as-is (the builder does not retain/own its parts — matching Append and
 // Clear, which never release them; a leak is tolerated, a double-free is not).
 // Each is a no-op on out-of-range arguments that would read out of bounds; the
 // index/length conventions match the §9.6 String forms.
-//   Insert(index, value): insert `value` (as bytes) at code-point `index`.
+//   Insert(index, value): insert `value`'s code points at code-point `index`.
 //   Remove(startIndex, length): delete `length` code points from `startIndex`.
 //   Replace(oldValue, newValue): replace every occurrence of `oldValue`.
 // `value`/`oldValue`/`newValue` are bz.string* (may be a literal/global).

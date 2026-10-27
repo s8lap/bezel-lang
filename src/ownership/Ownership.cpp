@@ -3621,6 +3621,240 @@ bool MethodOwnership::iterableIsOwningEnumerable(const ast::ForStmt& fs) {
            common::isOwningIterableInterfaceHead(head);
 }
 
+// fix #7073 (§28.3 "Ownership state of locals" / §15.4 "Collection literals",
+// §28.6 "Who may call Dispose()", v0.340): is `sym` a local bound to a
+// COLLECTION LITERAL — a FRESH OWNED production per language spec §28.3's
+// *Producers* table, which names the row by name:
+//
+//   | Collection literal (`[1, 2, 3]`) targeting a reference type
+//     (`Array<T>`, `OwningArray<T>`, `Set<T>`, `Dictionary<K, V>`, etc.)
+//     | Owned |
+//
+// The ownership pass CANNOT see that row, and the reason is §15.4's
+// context-typing: "A collection literal has no standalone type. It is
+// well-typed only in a context that provides the target type" — so sema
+// records NO `exprType` for the literal node. MEASURED on this lane (a
+// temporary `BEZEL_DEBUG_OWN` instrumentation of `producerState` and of the
+// `disposeAliasSource` populate): `ctx_.exprType(*ld.initializer)` is NULL
+// for a `CollectionLiteralExpr`, so `producerState`'s collection-literal arm
+// (fix #4338's) never fires and the local is classified **Borrowed**.
+//
+// The consequence is a §28.6 HOLE, not a cosmetic mislabel.
+// `disposeAliasSource` (OwnershipState.hpp) — the dedicated field
+// `checkDisposeReceiverOwnership` reads — is populated only from
+// `isOwnedTrackedLocal`, i.e. from a source the pass classifies as OWNED. An
+// alias of a literal-initialized collection local is therefore invisible to
+// the §28.6 borrow-receiver check.
+//
+// MEASURED (issue #7073, the AOT path):
+//
+//   var a: Array<int> := [1,2,3];
+//   var il: IList<int> := a;
+//   il.Dispose();
+//
+// compiled with NO diagnostic, printed "survived", and then aborted with
+// "free(): double free detected in tcache 2" (rc 134). The IR (BEZEL_DUMP_IR)
+// shows why: `il.Dispose()` takes the interface arm of the explicit-Dispose
+// chain and calls `bz_array_free` on the array — RECLAIMING it — while `a`'s
+// own scope-end pass reclaims the SAME array through `a`'s slot (the two
+// slots hold the same pointer, so nulling `il`'s slot does not stop `a`'s
+// pass). The `new`-source twin of the same program
+// (`var a: Array<int> := new Array<int>(2);`) is REJECTED today by fix
+// #4236's `disposeAliasSource` arm — the ONLY difference is the source's
+// initializer form, i.e. exactly this blind spot.
+//
+// This helper is the missing half of §28.3's producers row: it recognizes the
+// literal-initialized local as the OWNER the spec says it is, so that an
+// alias of it is the BORROW §28.6 names ("`Dispose()` or a direct
+// `DisposeAsync()` call through a **borrow** is a compile error. The borrow
+// receivers: a borrowed local or parameter ...") and the §28.6 check rejects
+// the dispose-through-alias.
+//
+// The TARGET type decides the row, exactly as §28.3's table does: a literal
+// targeting an INLINE-ARRAY type produces a VALUE ("Collection literal ...
+// targeting an inline-array type (`[N]T`, including `[N owned]T?`) | Not
+// applicable — produces a value"), so only a reference-type target is the
+// Owned row. The local's DECLARED type is the context §15.4 says types the
+// literal, and it is also the type `producerState`'s collection-literal arm
+// WOULD have read had the literal carried one — so the two agree by
+// construction (the same `common::isPatternAResultCollectionHead` authority).
+// fix #7073 follow-up (§21.1, §28.3, §28.6, v0.340): the candidate is
+// widened from `const ast::LocalDecl*` to `const ast::Node*` so that a §21.1
+// RUNTIME `const` local — a DIFFERENT AST node (`ast::LocalConstDecl`, with
+// its own `value` field) — is admitted beside the `var` form
+// (`ast::LocalDecl`, with its `initializer`). This is the canonical
+// LocalDecl/LocalConstDecl split (#3591's ratchet, whose recorded fix shape
+// is `LlvmBackend_Setup.cpp:24776` — "widen the candidate ... to
+// `const ast::Node*`"; the same split is read the same way at
+// `Ownership.cpp`'s own `checkReturnGetEnumeratorFromScopeBoundReceiver`,
+// which reads `ld->type.get()` / `lc->type.get()` off whichever node kind
+// `ls->decl` actually is).
+//
+// MEASURED, and the reason this is not optional: the previous, `LocalDecl`-
+// only spelling made a `const` SOURCE invisible to this predicate, so
+//
+//   const a: Array<int> := [1,2,3];
+//   var il: IList<int> := a;
+//   il.Dispose();
+//
+// compiled with NO diagnostic and DOUBLE-FREED (ASan: two `bz_array_free`
+// calls on the same 64-byte region — one from the explicit dispose through
+// the alias, one from the compiler-inserted scope-end free of the `const`
+// literal owner). The `var`-source twin of the very same program IS rejected
+// (the `const_alias_of_literal_owner_dot_dispose_rejected_28_6` row), so the
+// difference between the two verdicts was the binding KEYWORD alone — the
+// §28.3 producers row does not care whether the owner is spelled `var` or
+// `const`.
+//
+// §21.1 does not make the `const` spelling a way OUT: a runtime `const`'s
+// initializer must not be an owned production (§28.3), and a collection
+// literal targeting a reference type IS one — so `const a: Array<int> :=
+// [1,2,3];` is itself a §21.1 compile error the compiler does not enforce
+// today (fix #7092's territory, deferred). The §28.6 verdict on the dispose
+// is what this predicate decides, and it is unchanged by the binding kind:
+// `a` owns the array (§28.3's producers table), `il` is a borrow of it
+// (§28.3's *Consuming positions*), and "`Dispose()` or a direct
+// `DisposeAsync()` call through a **borrow** is a compile error" (§28.6).
+//
+// The widening is safe by construction: the candidate is READ here (the
+// initializer/collection-literal test and the declared type), never
+// compared by pointer identity, so admitting a second node kind changes
+// nothing downstream.
+// // per §21.1, §28.3, §15.4, §28.6, v0.340, #7073
+static bool isOwnedCollectionLiteralLocal(sema::Symbol* sym) {
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || !ls->decl) return false;
+    const ast::Expr* init = nullptr;
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl))
+        init = ld->initializer.get();
+    else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(ls->decl))
+        init = lc->value.get();
+    if (!init) return false;
+    if (!dynamic_cast<const ast::CollectionLiteralExpr*>(init))
+        return false;
+    const sema::TypeRef* t = ls->declType;
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    return common::isPatternAResultCollectionHead(t->headName());
+}
+
+// fix #7092 (§28.3 "Ownership state of locals" / §15.4 / §28.6, v0.340): does
+// this assignment install an OWNED collection LITERAL into `sym`?
+//
+// The DECLARATION spelling of the same producers row is
+// `isOwnedCollectionLiteralLocal` above (fix #7073's): the local's DECLARED
+// type is the context §15.4 says types the literal. The ASSIGNMENT spelling
+// has the same context — the LHS's declared type — and no helper, because
+// the fact is about the local's CURRENT VALUE, not about its declaration:
+// `a := [1,2,3];` installs the literal into `a` whatever `a`'s initializer
+// was.
+//
+// The predicate is the SAME authority the declaration helper uses
+// (`common::isPatternAResultCollectionHead` over the DECLARED type), so the
+// two spellings of §28.3's producers row cannot skew: a literal targeting a
+// heap-collection type is Owned in both, and a literal targeting anything
+// else (an inline-array type, which produces a VALUE — §28.3's producers
+// row's second literal row) is Owned in neither.
+//
+// per §28.3, §15.4, §28.6, v0.340, #7092
+static bool assignmentInstallsOwnedCollectionLiteral(sema::Symbol* sym,
+                                                      const ast::Expr* value) {
+    if (!value) return false;
+    if (!dynamic_cast<const ast::CollectionLiteralExpr*>(value)) return false;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!ls || !ls->declType) return false;
+    if (ls->declType->kind != sema::TypeRef::Kind::Named) return false;
+    return common::isPatternAResultCollectionHead(ls->declType->headName());
+}
+
+// fix #7092 (§28.3, §28.6, v0.340): does this local currently hold an OWNED
+// collection literal? The mirror of `disposeAliasChainRoot`'s shape — a
+// file-local static over the same `states_` map every caller has.
+//
+// The local's ownership STATE is deliberately NOT consulted: the §28.3
+// producers row is about the VALUE (a collection literal targeting a
+// reference type is Owned), and the state of a literal-carrying local is
+// mis-classified as Borrowed precisely because the literal is
+// context-typed (§15.4) and carries no `exprType` — that mis-classification
+// is the blind spot this fact compensates for, without changing any state.
+// per §28.3, §15.4, §28.6, v0.340, #7092
+static bool holdsOwnedCollectionLiteral(
+    sema::Symbol* sym,
+    const std::unordered_map<sema::Symbol*, LocalOwnership>& states) {
+    if (!sym) return false;
+    auto it = states.find(sym);
+    return it != states.end() && it->second.ownsCollectionLiteral;
+}
+
+// fix #7091 (§28.3 "Ownership state of locals" / §28.6 "Who may call
+// Dispose()", v0.340): the ROOT owner of an ALIAS CHAIN.
+//
+// `disposeAliasSource` (OwnershipState.hpp) records, for a local bound to a
+// bare identifier read of an owner, the source of that read. The §28.6
+// receiver check consults that field ONCE, so it recognizes a ONE-HOP alias
+// (`var b := a;` — `b`'s recorded source is the owned local `a`) and misses a
+// TWO-HOP chain: `b` is itself a BORROW, so a local bound to `b` records `b`
+// — not an owner — and nothing is recorded for it.
+//
+// §28.3, *Consuming positions for an owned-local read* (v0.340): "an
+// **unmarked** local binding or assignment RHS over a **class- or
+// interface-typed** binding — `var y := x;`, `y := x;`: a plain alias binding
+// is a borrow of `x`, source `x` itself". So in
+//
+//   var a: Array<int> := new Array<int>(2);
+//   var b: Array<int> := a;
+//   var il: IList<int> := b;
+//   il.Dispose();
+//
+// `b` is a borrow of `a` and `il` is a borrow of that borrow; `a` is the
+// owner. §28.6 (v0.340): "`Dispose()` or a direct `DisposeAsync()` call
+// through a **borrow** is a compile error. The borrow receivers: a borrowed
+// local or parameter ...". So the call is a compile error and the program must
+// not run.
+//
+// MEASURED (issue #7091, on this branch's base 9f1d7603, generated-code
+// AddressSanitizer): the two-hop chain compiled with NO diagnostic and
+// double-freed — "ERROR: AddressSanitizer: attempting double-free on
+// 0x7b70373e0010 in thread T0: #1 bz_array_free
+// src/runtime/bezel_runtime_collections.cpp:741:5 #2 main" — the explicit
+// `il.Dispose()` (the interface arm of the explicit-dispose chain) and `a`'s
+// scope-end pass, on the same 8-byte region. The one-hop twin
+// (`var il: IList<int> := a; il.Dispose();`) IS rejected today, so the number
+// of hops was the whole difference between "compile error" and "double free
+// at run time".
+//
+// WHY THE ROOT, AND WHY THE DIAGNOSTIC NAMES IT. The chain is followed to its
+// TERMINAL element — the last symbol that still carries a recorded source.
+// Every link is created by a populate site whose source is an owner (an owned
+// tracked local, a collection-literal owner per #7073, or an `owned` field
+// per #4283), so the terminal IS the owner the chain roots at. Naming it
+// keeps the existing §28.6 wording TRUE: "it is a borrow (an alias) of `X`,
+// which still owns it" is true of the root owner and FALSE of an intermediate
+// alias (`b` does not own the array `il` borrows — `a` does), so the field
+// records the ROOT rather than the direct source. The diagnostic text is
+// therefore UNCHANGED by this fix — the one-hop case's message is
+// byte-identical, and the multi-hop case reuses it verbatim with the root's
+// name in the slot the direct source used to occupy.
+//
+// The helper is a file-local STATIC (no header edit): it reads only the
+// `states_` map, which every caller has. The chain is a DAG over declaration
+// order (a link always points at an EARLIER declaration), so the walk
+// terminates; the depth bound is a belt-and-braces guard against a malformed
+// cycle.
+static sema::Symbol* disposeAliasChainRoot(
+        sema::Symbol* sym,
+        const std::unordered_map<sema::Symbol*, LocalOwnership>& states) {
+    if (!sym) return nullptr;
+    auto it = states.find(sym);
+    if (it == states.end() || !it->second.disposeAliasSource) return nullptr;
+    sema::Symbol* cur = it->second.disposeAliasSource;
+    for (int depth = 0; depth < 64; ++depth) {
+        auto it2 = states.find(cur);
+        if (it2 == states.end() || !it2->second.disposeAliasSource) break;
+        cur = it2->second.disposeAliasSource;
+    }
+    return cur;
+}
+
 // §29.2 (#834): find the LocalSymbol ExprTypecheck created for `fs`'s
 // iteration variable. Sema anchors that symbol on the ForStmt
 // (`lsym->decl = fs`), so it is the LocalSymbol whose `decl` is `&fs`.
@@ -4025,7 +4259,29 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             if (auto* rid =
                     dynamic_cast<const ast::IdentifierExpr*>(lc->value.get())) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+                // fix #7073 (§28.3, §28.6, v0.340): the source is also an
+                // owner when it is a collection-LITERAL local (§28.3's
+                // producers table: a collection literal targeting a reference
+                // type is Owned) — the ownership pass cannot see that row
+                // because the literal is CONTEXT-TYPED (§15.4) and carries no
+                // exprType, so `isOwnedTrackedLocal` answers false for it.
+                if (isOwnedTrackedLocal(rsym) ||
+                    isOwnedCollectionLiteralLocal(rsym) ||
+                    // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source
+                    // holds an OWNED collection LITERAL — §28.3's producers
+                    // row — whose ownership state the pass cannot see (the
+                    // literal is CONTEXT-TYPED, §15.4). See
+                    // `holdsOwnedCollectionLiteral`'s own comment.
+                    holdsOwnedCollectionLiteral(rsym, states_))
+                    aliasSrc = rsym;
+                // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain
+                // — the source is itself a borrow of an owner, so record the
+                // chain's ROOT owner instead of the intermediate alias (the
+                // §28.6 wording names the root, which is the one that still
+                // owns the value). See `disposeAliasChainRoot`'s comment.
+                else if (sema::Symbol* root =
+                             disposeAliasChainRoot(rsym, states_))
+                    aliasSrc = root;
             }
             // fix #4283 (§28.3/§28.6, v0.298): mirrors `handleLocalDecl`'s own
             // #4283 widening one arm above — see that site's comment for the
@@ -6951,6 +7207,100 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     return true;
 }
 
+// §28.6 / §28.3 / §28.10 (v0.343): true when `read` is a PROPERTY (getter)
+// read whose RESULT is a BORROW.
+//
+// §28.3's producers table: "Property access `obj.P` (instance getter) |
+// Borrowed (source: `obj`)" and "Static property access `T.P` (class-typed
+// result) | Borrowed (source: the declaring type's static storage)". §28.6's
+// borrow-receiver list names "a getter or other non-`owned` call result" — so
+// a getter result is a receiver on which `Dispose()` is a compile error.
+//
+// The borrow-ness is decided by the SAME predicate §28.10's borrow-pin uses
+// (`propertyGetterIsRecognizedBorrow`), so §28.10's borrow-pin and §28.6's
+// dispose-receiver rule cannot disagree about what a getter hands back:
+//
+//   * a resolved USER getter whose own declared type is NOT mint-announcing
+//     ALWAYS lends — §28.6's A4 bullet: "properties and indexers do not carry
+//     `owned` ... so its return is always a borrow";
+//   * a getter declared at a mint-announcing type (Task-family /
+//     iterable-family) is body-scanned (#6404): a mint-source body hands the
+//     caller an owned frame, a borrow-source body lends;
+//   * a read with no resolved body lends when it is interface- or
+//     virtual-dispatched (#2174's signature-level guarantee for any
+//     user-declared getter) and does NOT for a BUILTIN property (not a
+//     user-declared getter, so §28.6's A4 guarantee does not bind it) — the
+//     pre-#2174 adoption for that face, unchanged.
+//
+// Extracted from `usingVarInitIsRecognizedBorrow`'s PropertySymbol branch
+// (whose logic is carried over verbatim) so the two rules read ONE fact. //
+// per §28.6, §28.3, §28.10, #2137, #2174
+bool MethodOwnership::propertyReadIsRecognizedBorrow(
+        const ast::Expr& read) const {
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(read));
+    if (!ps) return false;
+    // An indexer read is an IndexExpr, never a MemberAccessExpr — the
+    // PropertySymbol arm never sees one. // per §28.11
+    if (ps->isIndexer) return false;
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+        return propertyGetterIsRecognizedBorrow(*pd);
+    // No resolved body (an interface-dispatched or virtual read, or a builtin
+    // property). The condition is narrow:
+    //   1. the read is a `MemberAccessExpr` (the dispatch form);
+    //   2. the PropertySymbol's `parent` is an INTERFACE (interface-dispatched)
+    //      or a CLASS that contributes a virtual/override (the inherited
+    //      member case — same dispatch path);
+    //   3. the receiver's static type is the interface or the base class (so
+    //      the read is NOT a direct dispatch on a concrete class — the
+    //      concrete class's getter would have resolved to its own
+    //      PropertyDecl and taken the resolved branch above).
+    // Anything else with null decl (a builtin property like `tcs.Task`
+    // registered through some other pathway) keeps adoption, matching the
+    // pre-#2174 behavior for those shapes. // per §28.10, §28.3, §28.6,
+    // #2137, #2174
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&read);
+    if (!ma || !ma->target || !ps->parent) return false;
+    // Match either: (a) parent is an interface (declaration site) or (b) the
+    // read goes through an interface-typed receiver. The "parent is a class
+    // with a virtual/override member" branch is already covered by the
+    // resolved case (the inheriting class's PropertySymbol carries the
+    // concrete PropertyDecl, ps->decl is set).
+    const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+    bool interfaceDispatched = false;
+    if (rt) {
+        // Receiver's static type is an interface head.
+        if (rt->declaration &&
+            rt->declaration->kind == ast::TypeDeclKind::Interface) {
+            interfaceDispatched = true;
+        } else if (!rt->declaration && rt->astNode && rt->astNode->name) {
+            // A null-declaration Named with a head name (e.g. IHas for an
+            // interface alias) — also interface-dispatched.
+            std::string_view head = rt->headName();
+            if (head.size() > 0 && head.front() == 'I' &&
+                head[1] >= 'A' && head[1] <= 'Z') {
+                // Conservative: only call it an interface if the head starts
+                // with an uppercase letter after `I`. (Real interface names
+                // start with `I` followed by uppercase.)
+                interfaceDispatched = true;
+            }
+        }
+    }
+    // Also: an inherited (virtual/override) member resolved to a parent-class
+    // PropertySymbol with no decl — the inherited shape. We need the parent
+    // to be a CLASS (not interface) with a virtual/override member. This is
+    // rare (the inheriting class usually carries its own PropertyDecl) and
+    // conservative: only fire when the member carries a virtual/override
+    // modifier on the symbol.
+    bool inheritedVirtual = false;
+    if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Class) {
+        for (auto m : ps->modifiers)
+            if (m == "virtual" || m == "override") {
+                inheritedVirtual = true; break;
+            }
+    }
+    return interfaceDispatched || inheritedVirtual;
+}
+
 // §28.10 "using var initialized from a borrow" (v0.180+, #2128). See the header
 // for the full contract: the borrow shapes a `using var` initializer can take —
 // beyond the bare-id / arm-meet / bind-atom / bare-T-call shapes handled inline
@@ -6984,97 +7334,11 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
         // surfaces with no PropertyDecl) keep adoption. Indexer
         // PropertySymbols never arrive here (an indexer read is an IndexExpr,
         // recognized below). // per §28.10, §28.3, §28.6, #2137
-        if (auto* ps =
-                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(init))) {
-            if (!ps->isIndexer) {
-                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-                    if (propertyGetterIsRecognizedBorrow(*pd)) return true;
-                } else if (auto* ma =
-                               dynamic_cast<const ast::MemberAccessExpr*>(&init)) {
-                    // #2174: an INTERFACE- or virtual-DISPATCHED read — the
-                    // PropertySymbol has no resolved PropertyDecl (the
-                    // PropertySymbol is the interface's auto-property or
-                    // a virtual override, with no body to body-scan). §28.6's
-                    // "a property or indexer getter may not return a
-                    // freshly-produced owned value" is a SIGNATURE-LEVEL
-                    // guarantee for any user-declared getter — the same
-                    // guarantee #2137(b) relied on for the resolved case.
-                    // Pin it: the typed `using var` over `i.P` would
-                    // otherwise reach codegen's classOfLocal dispose path
-                    // and double-free the borrow (heap-use-after-free under
-                    // ASan, the #2137 family). The condition is narrow:
-                    //   1. init is a `MemberAccessExpr` (the dispatch form);
-                    //   2. the PropertySymbol's `parent` is an INTERFACE
-                    //      (interface-dispatched) or a CLASS that
-                    //      contributes a virtual/override (the inherited
-                    //      member case — same dispatch path);
-                    //   3. the receiver's static type is the interface
-                    //      or the base class (so the read is NOT a
-                    //      direct dispatch on a concrete class — the
-                    //      concrete class's getter would have resolved to
-                    //      its own PropertyDecl and taken the resolved
-                    //      branch above).
-                    // Anything else with null decl (a builtin property
-                    // like `tcs.Task` registered through some other
-                    // pathway) keeps adoption, matching the pre-#2174
-                    // behavior for those shapes.
-                    // // per §28.10, §28.3, §28.6, #2137, #2174
-                    if (ma->target && ps->parent) {
-                        // Match either: (a) parent is an interface
-                        // (declaration site) or (b) the read goes through
-                        // an interface-typed receiver. The "parent is a
-                        // class with a virtual/override member" branch is
-                        // already covered by the resolved case (the
-                        // inheriting class's PropertySymbol carries the
-                        // concrete PropertyDecl, ps->decl is set).
-                        const sema::TypeRef* rt =
-                            ctx_.exprType(*ma->target);
-                        bool interfaceDispatched = false;
-                        if (rt) {
-                            // Receiver's static type is an interface head.
-                            if (rt->declaration &&
-                                rt->declaration->kind ==
-                                    ast::TypeDeclKind::Interface) {
-                                interfaceDispatched = true;
-                            } else if (!rt->declaration &&
-                                       rt->astNode && rt->astNode->name) {
-                                // A null-declaration Named with a head
-                                // name (e.g. IHas for an interface alias)
-                                // — also interface-dispatched.
-                                std::string_view head = rt->headName();
-                                if (head.size() > 0 && head.front() == 'I' &&
-                                    head[1] >= 'A' && head[1] <= 'Z') {
-                                    // Conservative: only call it an
-                                    // interface if the head starts with
-                                    // an uppercase letter after `I`.
-                                    // (Real interface names start with
-                                    // `I` followed by uppercase.)
-                                    interfaceDispatched = true;
-                                }
-                            }
-                        }
-                        // Also: an inherited (virtual/override) member
-                        // resolved to a parent-class PropertySymbol with
-                        // no decl — the inherited shape. We need the
-                        // parent to be a CLASS (not interface) with a
-                        // virtual/override member. This is rare (the
-                        // inheriting class usually carries its own
-                        // PropertyDecl) and conservative: only fire
-                        // when the member carries a virtual/override
-                        // modifier on the symbol.
-                        bool inheritedVirtual = false;
-                        if (ps->parent &&
-                            ps->parent->kind == ast::TypeDeclKind::Class) {
-                            for (auto m : ps->modifiers)
-                                if (m == "virtual" || m == "override") {
-                                    inheritedVirtual = true; break;
-                                }
-                        }
-                        if (interfaceDispatched || inheritedVirtual) return true;
-                    }
-                }
-            }
-        }
+        //
+        // The recognition itself now lives in `propertyReadIsRecognizedBorrow`
+        // — SHARED with §28.6's dispose-receiver rule, which reads the same
+        // borrow-ness fact — so the two rules cannot drift apart.
+        if (propertyReadIsRecognizedBorrow(init)) return true;
     }
     // An INDEXER access — a bare `coll[i]` / `arr[i]` (single-element read, NOT
     // the range-slice `arr[r]`; see the carve-out below). The element-slot table
@@ -7705,7 +7969,19 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                     dynamic_cast<const ast::IdentifierExpr*>(
                         ld.initializer.get())) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                if (isOwnedTrackedLocal(rsym)) {
+                // fix #7073 (§28.3, §28.6, v0.340): a collection-LITERAL
+                // local is an OWNER per §28.3's producers table even though
+                // the ownership pass cannot classify it (the literal is
+                // CONTEXT-TYPED — §15.4 — and carries no exprType), so the
+                // alias of one is the BORROW §28.6 rejects a dispose through.
+                if (isOwnedTrackedLocal(rsym) ||
+                    isOwnedCollectionLiteralLocal(rsym) ||
+                    // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source
+                    // holds an OWNED collection LITERAL — §28.3's producers
+                    // row — whose ownership state the pass cannot see (the
+                    // literal is CONTEXT-TYPED, §15.4). See
+                    // `holdsOwnedCollectionLiteral`'s own comment.
+                    holdsOwnedCollectionLiteral(rsym, states_)) {
                     states_[lsym].disposeAliasSource = rsym;
                 } else if (fromLambdaBody &&
                            (isOwnedTrackedLocalInEnclosingFrame(rsym) ||
@@ -7766,6 +8042,17 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                     // tracking comment for the follow-up.
                     states_[lsym].disposeAliasSource = rsym;
                 }
+                // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain
+                // — the source is itself a borrow of an owner, so record the
+                // chain's ROOT owner instead of the intermediate alias. The
+                // §28.6 wording the receiver check emits names the root
+                // ("... of `X`, which still owns it"), and only the root
+                // still owns the value: an intermediate alias does not. See
+                // `disposeAliasChainRoot`'s own comment for the measurement
+                // and the full rationale.
+                else if (sema::Symbol* root =
+                             disposeAliasChainRoot(rsym, states_))
+                    states_[lsym].disposeAliasSource = root;
             }
             // fix #4283 (§28.3 "Ownership state of locals" / §28.6 "Who may
             // call Dispose()", v0.298): the IdentifierExpr check above can
@@ -8876,7 +9163,27 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
         sema::Symbol* aliasSrc = nullptr;
         if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(as.value.get())) {
             sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-            if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+            // fix #7073 (§28.3, §28.6, v0.340): the collection-LITERAL local
+            // is an owner too (§28.3's producers table) — see the helper's
+            // own comment for why the ownership pass cannot classify it.
+            if (isOwnedTrackedLocal(rsym) ||
+                isOwnedCollectionLiteralLocal(rsym) ||
+                // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source holds
+                // an OWNED collection LITERAL — §28.3's producers row — whose
+                // ownership state the pass cannot see (the literal is
+                // CONTEXT-TYPED, §15.4). See `holdsOwnedCollectionLiteral`'s
+                // own comment.
+                holdsOwnedCollectionLiteral(rsym, states_))
+                aliasSrc = rsym;
+            // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain — the
+            // RHS names a borrow of an owner (`b := a;` where `a` is owned and
+            // `b` is its borrow), so record the chain's ROOT owner. The §28.6
+            // wording the receiver check emits names the root ("... of `X`,
+            // which still owns it"), and only the root still owns the value.
+            // See `disposeAliasChainRoot`'s own comment.
+            else if (sema::Symbol* root =
+                         disposeAliasChainRoot(rsym, states_))
+                aliasSrc = root;
         }
         for (auto& [sym, st] : states_) {
             if (!refersTo(sym, *id)) continue;
@@ -8979,6 +9286,129 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // silently killed).
             if (st.state == OwnershipState::Owned)
                 checkConsumeFreeze(id->name, as.target->span.begin, ctx_.exprSymbol(*id));
+            // fix #6609 (§28.3 bullet 1, v0.339): a SELF-ASSIGNMENT into an
+            // OWNED-STATE local. v0.339 added, verbatim: "A self-assignment is
+            // no exception: for an owned-state class-typed local `t`, `t := t;`
+            // stores the unmarked read `t`, a borrow, into an owned-state LHS
+            // and is rejected at the assignment by this rule, not a §28.7
+            // discharge."
+            //
+            // WHY IT IS HERE AND NOT IN SEMANTIC ANALYSIS. The sentence names
+            // this as the *state-match* rule of §28.3's reassignment bullet
+            // rejecting — "an owned-state LHS requires an owned RHS … a
+            // borrowed-state LHS requires a borrow (or `null`) RHS" — and the
+            // state-match question is answered only by this pass's dataflow
+            // (`st.state`, read here BEFORE `st.state = producerState(...)`
+            // below overwrites it). Sema cannot see it. And the reject must
+            // land on the same LHS-state arm the rule is written about, next
+            // to the two neighbours that already read `st.state` for a
+            // reassignment (the #3967 maybe-consumed arm above and §28.7's
+            // consume-site freeze immediately above), so no third reader of
+            // `st.state` is introduced.
+            //
+            // MEASURED on the parent (`3992d898`): the issue's repro — a
+            // class-typed owned local `var t := new Res(); t := t;` —
+            // COMPILES CLEAN, rc=0, the only diagnostic being the pre-existing
+            // §28.3 auto-drop *warning*. The control arm (the same file with
+            // `t := t;` removed) is rc=0 with the same warning, so the probe
+            // parses and the shape is real.
+            //
+            // WHAT MAKES THIS A §28.3 VIOLATION — the predicate, derived here
+            // and not taken from the issue. The spec sentence has three
+            // conjuncts and each is load-bearing:
+            //   (1) an OWNED-STATE LHS — `st.state == Owned`, the state this
+            //       pass has already computed for the tracked local at this
+            //       point. A Borrowed-state local self-assigning is FINE: the
+            //       rule's second half ("a borrowed-state LHS requires a
+            //       borrow … RHS") is satisfied by the unmarked read.
+            //   (2) the RHS IS the unmarked read of that SAME binding. Symbol
+            //       identity, not spelling: `ctx_.exprSymbol` on both sides, so
+            //       two locals sharing a name across bodies cannot alias, and
+            //       `t := u` (two distinct owned locals) is untouched.
+            //   (3) NOT a marked transfer. `t := move t` is the §28.3 /
+            //       §22.3 explicit-transfer spelling and is the sanctioned way
+            //       to express the same intent; `recordMovesIn` has already
+            //       consumed the source by this point, and the
+            //       `valueHasOwnedMarker` form diverted into
+            //       `handleMarkedOwnedAssignment` above. Both are excluded by
+            //       requiring a bare `IdentifierExpr` RHS with no marker.
+            //
+            // SCOPE — every exclusion below is MEASURED, not assumed, because
+            // `t := t` is an extremely common idiom and an over-broad arm
+            // breaks ordinary code:
+            //   * A MOVE-ONLY VALUE TYPE keeps its §15.3 no-op. §15.3
+            //     *Whole-value reassignment* states the no-op for whole-value
+            //     reassignment of "a move-only local or instance field" —
+            //     self-assignment `arr := arr;` — and `arr` there is exactly
+            //     the owning inline array. `isMoveOnlyValueType` is the one
+            //     authority for that property (it is what #3575 made ride on
+            //     the VALUE TYPE rather than on the spelling), so it is asked
+            //     about the TARGET's declared type. MEASURED
+            //     `var arr: [3 owned]Res := [...]; arr := arr;` rc=0 on the
+            //     parent and must stay rc=0 here — §15.3's own no-op, and the
+            //     pinned ROW 5 control.
+            //   * A PRIMITIVE or STRING local has no disposal obligation, so
+            //     `st.state` is not `Owned` and the arm never fires. MEASURED
+            //     `var i := 1; i := i;` and `var s := "a"; s := s;` are both
+            //     rc=0 on the parent and stay rc=0 (a self-assignment there is
+            //     the §28.3 adoption/poly-null region's ordinary code).
+            //   * A BORROW-STATE local — `var b := r; b := b;` — is the
+            //     borrowed-state half of the rule and is accepted. MEASURED
+            //     rc=0 on the parent, pinned as ROW 3.
+            //   * An `owned` FIELD self-assignment (`this.f := this.f;`) is
+            //     ALREADY rejected by `handleOwnedFieldAssignment` above with
+            //     the §28.3/§28.5 "a borrow cannot be stored into an `owned`
+            //     field" diagnostic. MEASURED rc=1 on the parent, unchanged
+            //     here — this arm is local-only, so it neither steals nor
+            //     duplicates that message. Pinned as ROW 4.
+            //
+            // NOT FIXED HERE, REPORTED: §28.3's state-match bullet is GENERAL —
+            // "Assigning a borrow to an owned-state LHS … is rejected" — and
+            // the self-assignment is the instance v0.339 named, not the only
+            // one. MEASURED on the parent, `var t := new Res(); t := r;` with
+            // `r` a `Res` PARAMETER is also accepted rc=0: the same violation
+            // through a different spelling. This arm is deliberately scoped to
+            // the named case; widening it to every borrow RHS is an
+            // expression-shape widening with its own blast radius (it would
+            // reject every `t := someBorrowingCall()` shape), which is exactly
+            // the scope creep CLAUDE.md forbids and which needs its own census.
+            // Filed as a follow-up.
+            if (st.state == OwnershipState::Owned && !as.valueHasOwnedMarker) {
+                // (2) the RHS is the unmarked read of THIS binding. Peel a
+                // force-unwrap (`t := t!` reads the same slot) exactly as
+                // `scanGetterReturns`'s own `isSelfAssignment` does; compare by
+                // SYMBOL identity, not by name.
+                const ast::Expr* rhs = lookThroughForceUnwrap(as.value.get());
+                const auto* rid =
+                    dynamic_cast<const ast::IdentifierExpr*>(rhs);
+                bool selfRead = false;
+                if (rid) {
+                    sema::Symbol* rsym = ctx_.exprSymbol(*rid);
+                    sema::Symbol* tsym = ctx_.exprSymbol(*id);
+                    selfRead = rsym && tsym && rsym == tsym;
+                }
+                // (3-exclusion) a move-only VALUE type keeps §15.3's no-op.
+                const char* moKind = nullptr;
+                bool moveOnlyTarget =
+                    common::isMoveOnlyValueType(ctx_.exprType(*as.target), ctx_,
+                                                moKind);
+                if (selfRead && !moveOnlyTarget)
+                    report(Severity::Error, as.target->span.begin,
+                           std::string("cannot self-assign `") +
+                               std::string(id->name) +
+                               "`: the right-hand side is an unmarked read of "
+                               "`" + std::string(id->name) +
+                               "`, which is a BORROW, and `" +
+                               std::string(id->name) +
+                               "` is in the OWNED state — §28.3's state match "
+                               "requires an owned-state LHS to receive an "
+                               "owned value (a fresh producer, or a named owned "
+                               "binding under the explicit transfer marker `x "
+                               ":= move y`). A self-assignment is no exception: "
+                               "it is not a §28.7 drop-and-replace discharge. "
+                               "Delete the statement, or spell the transfer "
+                               "explicitly with `move`");
+            }
             // fix #4329 (§28.3 / §28.7 / O4 silent-poison design, v0.298): at a
             // non-loop `if … then` / no-else merge, `joinInto`'s catch-all sets
             // the local's state to Poisoned while preserving its `obligationOrigin`
@@ -9187,6 +9617,19 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // fix #4236: mirror the reset/set above for disposeAliasSource.
             st.disposeAliasSource =
                 (aliasSrc && aliasSrc != sym) ? aliasSrc : nullptr;
+            // fix #7092 (§28.3, §15.4, §28.6, v0.340): re-derive the
+            // "this local's current value is an OWNED collection LITERAL"
+            // fact on every reassignment — SET when the RHS is a collection
+            // literal targeting a reference type (§28.3's producers row), and
+            // CLEARED otherwise, so a rebind away from the literal
+            // (`a := new Array<int>(3);`) does not leave a stale owner fact
+            // behind. The local's ownership STATE is untouched by this (the
+            // literal's producers row is a fact about the VALUE, and the
+            // state-match rule and the must-use lint must not see a change
+            // from this fix). See `assignmentInstallsOwnedCollectionLiteral`'s
+            // own comment.
+            st.ownsCollectionLiteral =
+                assignmentInstallsOwnedCollectionLiteral(sym, as.value.get());
             return;
         }
         // §28.8.1 / #825: name not found in local states — this bare identifier
@@ -10257,8 +10700,8 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
     // A field read (`obj.f`, or a bare `f` implicit-`this`), resolving to a
     // FieldSymbol. `this.<owned field>` is the admitted §28.7 dispose-then-
     // assign / #1230 destructor idiom; every other field read is a borrow the
-    // caller does not own. A property/indexer getter is NOT a FieldSymbol, so
-    // it is left to the conservative default (unenforced) — see the gap note.
+    // caller does not own. A property/indexer getter is NOT a FieldSymbol — it
+    // is read by the getter arm below.
     if (dynamic_cast<const ast::IdentifierExpr*>(&recv) ||
         dynamic_cast<const ast::MemberAccessExpr*>(&recv)) {
         if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(recv))) {
@@ -10270,6 +10713,34 @@ void MethodOwnership::checkDisposeReceiverOwnership(const ast::Expr& recv,
                 "borrow, and an `owned` field is disposable only through "
                 "`this` (code of its declaring type); the field's actual "
                 "owner disposes it");
+            return;
+        }
+        // A GETTER's result — a property read (`obj.P`, or the bare `P`
+        // form) resolving to a PropertySymbol. §28.3's producers table:
+        // "Property access `obj.P` (instance getter) | Borrowed (source:
+        // `obj`)" and "Static property access `T.P` (class-typed result) |
+        // Borrowed (source: the declaring type's static storage)"; §28.6's
+        // borrow-receiver list names "a getter or other non-`owned` call
+        // result" among the receivers on which `Dispose()` is a compile
+        // error. A getter is a borrow-producing position (§28.6's A4 bullet:
+        // "properties and indexers do not carry `owned` ... so its return is
+        // always a borrow"), so the caller does not own the result and may
+        // not dispose it — the object that owns it does. The borrow-ness is
+        // read by the SAME predicate §28.10's borrow-pin uses
+        // (`propertyReadIsRecognizedBorrow`), so the two rules cannot
+        // disagree about what a getter hands back; a getter whose own
+        // declared type is mint-announcing (Task-family / iterable-family)
+        // hands the caller an owned frame instead and is admitted.
+        // // per §28.6, §28.3, §28.10
+        if (propertyReadIsRecognizedBorrow(recv)) {
+            report(
+                Severity::Error, loc,
+                "cannot call `Dispose()` on a getter result (§28.6 \"Who may "
+                "call Dispose()\", §28.3 *Producers*) — a property or indexer "
+                "getter is a borrow-producing position, so its result is a "
+                "borrow of the receiver and the caller does not own it; the "
+                "object that owns the value disposes it (expose a factory as "
+                "a method returning `owned T` instead)");
             return;
         }
     }
@@ -12189,7 +12660,17 @@ void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
         if (auto* rid =
                 dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
             sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-            if (isOwnedTrackedLocal(rsym)) {
+            // fix #7073 (§28.3, §28.6, v0.340): the collection-LITERAL local
+            // is an owner too (§28.3's producers table) — see the helper's
+            // own comment for why the ownership pass cannot classify it.
+            if (isOwnedTrackedLocal(rsym) ||
+                isOwnedCollectionLiteralLocal(rsym) ||
+                // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source holds
+                // an OWNED collection LITERAL — §28.3's producers row — whose
+                // ownership state the pass cannot see (the literal is
+                // CONTEXT-TYPED, §15.4). See `holdsOwnedCollectionLiteral`'s
+                // own comment.
+                holdsOwnedCollectionLiteral(rsym, states_)) {
                 aliasSrc = rsym;
             } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
                 aliasSrc = rsym;
@@ -12198,6 +12679,13 @@ void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
             } else if (isOwnedParameterInEnclosingFrame(rsym)) {
                 aliasSrc = rsym;
             }
+            // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain — the
+            // source is itself a borrow of an owner, so record the chain's
+            // ROOT owner instead of the intermediate alias. See
+            // `disposeAliasChainRoot`'s own comment.
+            else if (sema::Symbol* root =
+                         disposeAliasChainRoot(rsym, states_))
+                aliasSrc = root;
         }
         if (!aliasSrc && exprIsOwnedFieldRead(*ld->initializer))
             aliasSrc = ctx_.exprSymbol(*ld->initializer);
@@ -12341,7 +12829,17 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
             if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
                     lc->value.get())) {
                 sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                if (isOwnedTrackedLocal(rsym)) {
+                // fix #7073 (§28.3, §28.6, v0.340): the collection-LITERAL
+                // local is an owner too (§28.3's producers table) — see the
+                // helper's own comment.
+                if (isOwnedTrackedLocal(rsym) ||
+                    isOwnedCollectionLiteralLocal(rsym) ||
+                    // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source
+                    // holds an OWNED collection LITERAL — §28.3's producers
+                    // row — whose ownership state the pass cannot see (the
+                    // literal is CONTEXT-TYPED, §15.4). See
+                    // `holdsOwnedCollectionLiteral`'s own comment.
+                    holdsOwnedCollectionLiteral(rsym, states_)) {
                     aliasSrc = rsym;
                 } else if (isOwnedTrackedLocalInEnclosingFrame(rsym)) {
                     // fix #4286: `isOwnedTrackedLocalInEnclosingFrame`, NOT
@@ -12363,6 +12861,13 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     // (Ownership_impl.hpp) for the full rationale.
                     aliasSrc = rsym;
                 }
+                // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias chain —
+                // the source is itself a borrow of an owner, so record the
+                // chain's ROOT owner instead of the intermediate alias. See
+                // `disposeAliasChainRoot`'s own comment.
+                else if (sema::Symbol* root =
+                             disposeAliasChainRoot(rsym, states_))
+                    aliasSrc = root;
             }
             if (!aliasSrc && exprIsOwnedFieldRead(*lc->value))
                 aliasSrc = ctx_.exprSymbol(*lc->value);
@@ -12566,7 +13071,25 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                 if (auto* rid = dynamic_cast<const ast::IdentifierExpr*>(
                         as->value.get())) {
                     sema::Symbol* rsym = ctx_.exprSymbol(*rid);
-                    if (isOwnedTrackedLocal(rsym)) aliasSrc = rsym;
+                    // fix #7073 (§28.3, §28.6, v0.340): the collection-LITERAL
+                    // local is an owner too (§28.3's producers table) — see
+                    // the helper's own comment.
+                    if (isOwnedTrackedLocal(rsym) ||
+                        isOwnedCollectionLiteralLocal(rsym) ||
+                        // fix #7092 (§28.3, §15.4, §28.6, v0.340): the source
+                        // holds an OWNED collection LITERAL — §28.3's
+                        // producers row — whose ownership state the pass
+                        // cannot see (the literal is CONTEXT-TYPED, §15.4).
+                        // See `holdsOwnedCollectionLiteral`'s own comment.
+                        holdsOwnedCollectionLiteral(rsym, states_))
+                        aliasSrc = rsym;
+                    // fix #7091 (§28.3, §28.6, v0.340): a MULTI-HOP alias
+                    // chain — the RHS names a borrow of an owner, so record
+                    // the chain's ROOT owner. See
+                    // `disposeAliasChainRoot`'s own comment.
+                    else if (sema::Symbol* root =
+                                 disposeAliasChainRoot(rsym, states_))
+                        aliasSrc = root;
                 }
                 for (auto& [sym, st] : states_) {
                     if (!refersTo(sym, *tid)) continue;
@@ -12675,6 +13198,16 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaStmt(const ast::Stmt& s) {
                     // above (~line 9364) for why this line was missing.
                     st.disposeAliasSource =
                         (aliasSrc && aliasSrc != sym) ? aliasSrc : nullptr;
+                    // fix #7092 (§28.3, §15.4, §28.6, v0.340): the same
+                    // re-derivation for the "this local's current value is an
+                    // OWNED collection LITERAL" fact — SET when the RHS is a
+                    // collection literal targeting a reference type (§28.3's
+                    // producers row), CLEARED otherwise. The lambda-body arm
+                    // mirrors the method-scope arm exactly (as #4269's
+                    // comment above demands of this arm).
+                    st.ownsCollectionLiteral =
+                        assignmentInstallsOwnedCollectionLiteral(
+                            sym, as->value.get());
                     break;
                 }
             }

@@ -5199,6 +5199,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 : builder_.CreateSExt(v, iterElemTy_);
                         }
                     }
+                    // fix #7054 (§29.3 / §14.1 / §2.8.2, v0.340): the yielded
+                    // value's LLVM type can differ NOMINALLY from the iterator's
+                    // element type while being LAYOUT-IDENTICAL — the erased-
+                    // template type-name mismatch fix #7049 fixed at the `return`
+                    // site. In a generic template body, `Opt<T>.Some(x)` builds
+                    // the SPECIALIZED `choice.Opt$spec0` (the payload-carrying
+                    // case construction installs the instantiation substitution,
+                    // LlvmBackend_Calls2.cpp's `choiceCtorSubst`) while the
+                    // element type is the UNSPECIALIZED `choice.Opt`. The store
+                    // below is conditional on an exact type match, so the value
+                    // was DROPPED on the floor: the consumer read the
+                    // calloc-zeroed current_val slot and every payload read 0
+                    // (MEASURED on the base: an imported generic iterator
+                    // yielding `Opt<T>.Some(x)` at T = int printed 0 for 15; the
+                    // same-module instantiation printed 15).
+                    //
+                    // §14.1 / §2.8.2 clause 2: the external instantiation must
+                    // behave identically to the same-module one, so the value
+                    // must cross. Reinterpret it through the SAME alloca
+                    // round-trip `emitReturn` uses for the return site (fix
+                    // #7049) — the two structs are layout-identical, so this is
+                    // the same bits under another struct name. A genuinely
+                    // irreconcilable layout is left alone, and the store stays
+                    // skipped (the pre-existing conservative behaviour).
+                    if (v->getType() != iterElemTy_)
+                        v = reinterpretToType(v, iterElemTy_);
                     if (v->getType() == iterElemTy_) {
                         llvm::Value* cvField = builder_.CreateStructGEP(
                             smStateStruct_, smSelf_, iterCurrentValField_);
@@ -6788,6 +6814,16 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         llvm::AllocaInst* myAsyncReturnSlot =
             finallyStack_.back().asyncReturnSlotRouted
                 ? asyncReturnSlotHere() : nullptr;
+        // fix #6847: the loopStack_ depth at THIS try's entry. The target loop
+        // of an unlabeled break/continue routed through this finally has index
+        // `myLoopDepthAtEntry - 1` (the innermost loop open when the finally
+        // was entered — see lowerLoopJump, which routes the jump here exactly
+        // when the finally's entry depth exceeds the target's index). The
+        // mode-2/3 dispatch below needs it to decide whether the ENCLOSING
+        // finally lies inside that target loop. Read before the pop, like the
+        // flags above.
+        const std::size_t myLoopDepthAtEntry =
+            finallyStack_.back().loopDepthAtEntry;
         // Pop the frame — outer frames (if any) are now at back().
         finallyStack_.pop_back();
         if (!finallyBodyStack_.empty()) finallyBodyStack_.pop_back();
@@ -6873,7 +6909,29 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             auto* brkDispBB = llvm::BasicBlock::Create(llvm_,"finally.brk",currentFn_);
             sw->addCase(builder_.getInt32(2), brkDispBB);
             builder_.SetInsertPoint(brkDispBB);
-            if (outerFr) {
+            // fix #6847 (§21.5, v0.340): the break's target is the loop this
+            // finally captured at entry (index myLoopDepthAtEntry - 1). The
+            // jump exits every INTERVENING scope; the ENCLOSING finally is one
+            // only when it lies inside that target loop. It does exactly when
+            // its own entry depth is at or below this finally's — the same
+            // test the labeled-route chain below applies as
+            // `outerFr->loopDepthAtEntry > route.targetLoopIdx`. When the
+            // enclosing finally lies OUTSIDE the target loop, the break leaves
+            // the target loop but stays inside the enclosing finally's
+            // protected block: the enclosing finally runs LATER, when that
+            // block completes normally, and the break must land on the target
+            // loop's exit block.
+            //
+            // The pre-fix code chained to the enclosing finally
+            // UNCONDITIONALLY, which lost the target: an enclosing finally
+            // with no loop of its own (entered before any loop was open)
+            // has no loopBreakBB, so its mode-2 case did not exist and the
+            // switch default skipped the code after the loop. #6847: a
+            // `break` inside a try/finally nested in a `while` skipped the
+            // statement after the loop.
+            const bool outerInsideTarget =
+                outerFr && outerFr->loopDepthAtEntry >= myLoopDepthAtEntry;
+            if (outerInsideTarget) {
                 // fix #1598 / §29.7/§28.10 (v0.182): dispose the scopes
                 // established between this finally and the next-outer finally
                 // (reverse establishment) before routing onward — the mode-2
@@ -6882,13 +6940,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 builder_.CreateStore(builder_.getInt32(2), outerFr->exitModSlot);
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
-                // fix #1598 / §29.7/§28.10 (v0.182): no further outer finally —
-                // dispose every remaining scope down to the loop's own scope
-                // depth (an enclosing `using var` established before this try
-                // but inside the loop) AFTER the finally body, then jump to the
-                // break target. The pre-v0.182 code disposed nothing here,
-                // leaving that range disposed too early (at the break site,
-                // before the finally) instead — a use-after-dispose.
+                // fix #1598 / §29.7/§28.10 (v0.182): no further outer finally
+                // to cross — dispose every remaining scope down to the loop's
+                // own scope depth (an enclosing `using var` established before
+                // this try but inside the loop) AFTER the finally body, then
+                // jump to the break target. The pre-v0.182 code disposed
+                // nothing here, leaving that range disposed too early (at the
+                // break site, before the finally) instead — a use-after-dispose.
                 emitDisposalsInRange(loopScopeDepth, bodyScopeIdx);
                 builder_.CreateBr(loopBreakBB);
             }
@@ -6899,7 +6957,12 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             auto* cntDispBB = llvm::BasicBlock::Create(llvm_,"finally.cnt",currentFn_);
             sw->addCase(builder_.getInt32(3), cntDispBB);
             builder_.SetInsertPoint(cntDispBB);
-            if (outerFr) {
+            // fix #6847 (§21.5, v0.340): the mode-3 twin of the mode-2 test
+            // above — the continue's target is the same captured loop, and the
+            // enclosing finally is crossed only when it lies inside it.
+            const bool outerInsideTarget =
+                outerFr && outerFr->loopDepthAtEntry >= myLoopDepthAtEntry;
+            if (outerInsideTarget) {
                 // fix #1598 / §29.7/§28.10 (v0.182): mode-3 twin of mode-2 above.
                 emitDisposalsInRange(outerFr->disposeDepthAtEntry, bodyScopeIdx);
                 builder_.CreateStore(builder_.getInt32(3), outerFr->exitModSlot);
@@ -8369,6 +8432,37 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             bool isStackFamily = iterTy &&
                 (iterTy->headName() == "Stack" ||
                  iterTy->headName() == "OwningStack");
+            // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL
+            // backstop for the enumeration. §28.3's store-rule residual admits
+            // a call that stores a borrow of a plain (non-`owned`) argument
+            // into a field; the temporary is NOT lifetime-extended, so it is
+            // disposed at its boundary while the stored borrow may still be
+            // read afterwards. The read must then raise
+            // DisposedAccessException (§28.2 K4.1) — the owner's ruling for
+            // #7045 spells out that "`for var x in _xs` enumerates the array,
+            // so it is such an access".
+            //
+            // The guard reads the SAME disposed byte the indexer / Count /
+            // collection-method guards read (Exprs.cpp, Assign.cpp, Calls.cpp)
+            // — bz_array_is_disposed on the bz_array_t header — and throws
+            // through the same emitGuardThrow helper. It is emitted ONLY in
+            // checked mode: in unchecked mode use-after-dispose is undefined
+            // (§28.2's checked/unchecked split), and the release reclaims the
+            // block there, so the byte is not even readable.
+            //
+            // The guard must precede EVERY read of the array below — the mod
+            // epoch capture, the length, and the element readback — because
+            // the quarantined header's data buffer is already freed
+            // (bz_array_mark_disposed) and its count is zero.
+            if (checkedDisposal_) {
+                llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+                llvm::Value* flag =
+                    builder_.CreateCall(isFn, {arrObj}, "cd.arrdis");
+                llvm::Value* disposed = builder_.CreateICmpNE(
+                    flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                emitGuardThrow(disposed, "DisposedAccessException");
+            }
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             // §29.12 / #1232: capture mod epoch before the loop starts.
@@ -10301,6 +10395,22 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         else if (elemTy->isIntegerTy(16)) esz = 2;
         else if (elemTy->isStructTy())
             esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
+        // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL backstop for
+        // the enumeration — the sibling of the guard in lowerArrayFor, for the
+        // IEnumerable-protocol lowering of the same shape. A member access
+        // through a stored borrow of a logically disposed collection raises
+        // DisposedAccessException (§28.2 K4.1); the enumeration is such an
+        // access. Emitted only in checked mode, and it precedes every read of
+        // the array below (the length and the element readback).
+        if (checkedDisposal_) {
+            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* isFn = declareC("bz_array_is_disposed", i8Ty, {ptrTy()});
+            llvm::Value* flag =
+                builder_.CreateCall(isFn, {enumObj}, "cd.arrdis");
+            llvm::Value* disposed = builder_.CreateICmpNE(
+                flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+            emitGuardThrow(disposed, "DisposedAccessException");
+        }
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
         auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
         llvm::Value* len = builder_.CreateCall(lenFn, {enumObj});

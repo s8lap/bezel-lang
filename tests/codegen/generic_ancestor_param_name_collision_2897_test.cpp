@@ -44,14 +44,6 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
-
 // A `Cell` whose live count is the exactly-once disposal oracle.
 const char* kCountedCell =
     "class Cell "
@@ -90,7 +82,8 @@ BEZEL_TEST(generic_ancestor_param_collision_2897, base_reuses_derived_param_name
         "  c.dv := 9; "
         "  return c.ba + c.cell.tag + c.da + c.bv.Length + c.dv; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 + 6 + 4 + 9
     BEZEL_EXPECT_EQ(r.exitCode, 63);
@@ -120,7 +113,8 @@ BEZEL_TEST(generic_ancestor_param_collision_2897, explicit_base_ctor_over_collis
         "  c.dv := 9; "
         "  return c.ba + c.cell.tag + c.da + c.bv.Length + c.dv; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 + 6 + 4 + 9
     BEZEL_EXPECT_EQ(r.exitCode, 63);
@@ -159,7 +153,8 @@ BEZEL_TEST(generic_ancestor_param_collision_2897, three_levels_one_name_spec_14_
         "  if c.rv <> 100L then return 91; end; "
         "  return c.ra + c.rc.tag + c.ma + c.mc.tag + c.la + c.mv.Length + c.lv; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 41 + 3 + 6 + 3 + 2 + 4 + 9
     BEZEL_EXPECT_EQ(r.exitCode, 68);
@@ -194,7 +189,8 @@ BEZEL_TEST(generic_ancestor_param_collision_2897, exactly_once_disposal_loop_spe
         "  end; "
         "  return (acc - 792) + Cell.live * 100 + (Cell.made - 24); "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // per iteration 41 + 3 + 3 + 6 + 4 + 9 = 66; 12 iterations = 792;
     // 24 cells made, 0 live.
@@ -234,7 +230,8 @@ BEZEL_TEST(generic_ancestor_param_collision_2897, control_renamed_and_same_argum
         "  end; "
         "  return n - 111; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
+    // #3733: the toolchain-SKIP guard is GONE — a SKIP (ran=false) now
+    // FAILS the r.ran assertion below instead of passing silently.
     BEZEL_EXPECT_TRUE(r.ran);
     // 41+3+6+4+9 = 63 and 41+3+2+2 = 48 => 111
     BEZEL_EXPECT_EQ(r.exitCode, 0);

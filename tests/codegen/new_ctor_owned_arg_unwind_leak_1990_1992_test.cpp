@@ -50,14 +50,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic (mirrors #1934/#1968).
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // T1 — #1990 exact repro: a single bare owned local `x` transferred into
 // `new Pair(move x, <throws>)`, the throw CAUGHT in-method, with a post-catch
@@ -231,7 +227,6 @@ const char* kMethodCallTwoOwnedCaught =
 BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
            single_owned_caught_post_catch_return_disposed_once_spec_28_3) {
     JitResult r = runAotChecked(kSingleOwnedCaughtPostCatchReturn);
-    if (wasSkipped(r)) return;   // ASan toolchain unavailable — skip, not a fail
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean: owned x disposed once, not leaked
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // caught AND X._n==1 (witness)
 }
@@ -240,7 +235,6 @@ BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
 BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
            two_owned_same_type_caught_both_disposed_once_spec_28_3) {
     JitResult r = runAotChecked(kTwoOwnedSameTypeCaught);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean: neither owned arg leaks/double-frees
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // caught AND X._n==2 (witness)
 }
@@ -249,7 +243,6 @@ BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
 BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
            two_owned_distinct_types_caught_each_disposed_once_spec_28_3) {
     JitResult r = runAotChecked(kTwoOwnedDistinctTypesCaught);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean on both distinct owned args
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // caught AND X._n==1 AND Y._n==1 (witness)
 }
@@ -258,7 +251,6 @@ BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
 BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
            successful_two_owned_no_double_free_spec_28_3) {
     JitResult r = runAotChecked(kSuccessfulTwoOwned);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean: constructed + disposed once each
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // X._n==2 at t's scope end (witness)
 }
@@ -267,7 +259,6 @@ BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
 BEZEL_TEST(new_ctor_owned_arg_unwind_leak_1990_1992,
            method_call_two_owned_caught_both_disposed_once_spec_28_3) {
     JitResult r = runAotChecked(kMethodCallTwoOwnedCaught);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean on the method-call path
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // caught AND X._n==2 (witness)
 }

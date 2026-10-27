@@ -1,0 +1,1686 @@
+# Campaign assignment of the 1613 open issues (as of 2026-10-27; exclusive, first match wins)
+
+| campaign | open | soundness | crash | leak | spec-trk | opened 30d | closed 30d | closed ever | seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| infra-oracles | 166 | 11 | 8 | 7 | 13 | 71 | 86 | 392 | 14 |
+| using-heads | 24 | 7 | 3 | 5 | 2 | 14 | 8 | 25 | 19 |
+| enumerable-heads | 125 | 43 | 9 | 27 | 3 | 81 | 117 | 496 | 68 |
+| producer-temporaries | 148 | 14 | 7 | 98 | 0 | 116 | 140 | 678 | 53 |
+| builtin-call-admission | 189 | 33 | 53 | 0 | 0 | 159 | 231 | 649 | 50 |
+| closures-cells | 111 | 24 | 3 | 49 | 0 | 67 | 84 | 299 | 71 |
+| collection-elements | 77 | 13 | 1 | 30 | 1 | 67 | 54 | 204 | 44 |
+| nullable-carrier | 54 | 14 | 0 | 0 | 9 | 42 | 96 | 312 | 14 |
+| generic-boundaries | 88 | 17 | 13 | 3 | 0 | 49 | 160 | 423 | 43 |
+| borrow-provenance | 96 | 30 | 1 | 17 | 0 | 39 | 99 | 313 | 57 |
+| choice-payloads | 30 | 10 | 6 | 10 | 0 | 22 | 6 | 19 | 25 |
+| async-frames | 32 | 16 | 1 | 7 | 8 | 23 | 13 | 81 | 23 |
+| cross-module | 25 | 9 | 2 | 4 | 1 | 19 | 20 | 164 | 15 |
+| records-statics-misc | 49 | 9 | 0 | 1 | 0 | 36 | 78 | 387 | 10 |
+| spec-trains | 222 | 48 | 3 | 1 | 222 | 177 | 59 | 60 | 0 |
+| features-proposals | 99 | 0 | 1 | 1 | 0 | 10 | 5 | 180 | 0 |
+| unassigned | 78 | 15 | 1 | 1 | 0 | 59 | 168 | 657 | 0 |
+
+
+## infra-oracles — Enablers: oracles, ratchets, gate and silent degrade (166 open; tests/README, §22.3 internal:)
+
+- #2271 [sound]   (91d) [codegen] residual findings from the 2026-07-26..28 window: #1840 double-free, #2154p2 disposal gate, #1838 precedence bug
+- #2649 [sound]   (84d) [codegen] #2634 residuals: the unwrap gate is not the sema gate (Atomic<int?> slips it), and the signedness key is enum/generic-blind
+- #2924 [sound] S (82d) [test-infra, MEDIUM] 12 of 52 `internal:` codegen degrades are WARNINGS that ship a binary — no per-site record of which can degrade to an unsafe POIN
+- #3882 [sound]   (52d) sema/codegen: a Stopwatch.StartNew()-produced local silently degrades (exit 0 + internal permissive-acceptance warning) on an undispatched instance me
+- #4244 [sound]   (46d) extension: fix #4233 widens exposure to pre-existing #605/#2547 permissive generic-member-access silent-degrade (not a #4233 defect; general gap)
+- #4704 [sound]   (34d) conformance l4_3 / l4_4 / l2_4: 10 rows KNOWN — codegen/lowerer defects (#3079-class) + #853 polymorphic interface dispatch
+- #4849 [sound]   (33d) codegen (#4812 candidate): poison narrowed read reaches executed code — `v is not string` on a value-typed T carrier fails to lower, degrades to false
+- #5875 [sound]   (15d) ratchet RED: #5811 added a bare LocalDecl-only walker at ExprTypecheck.cpp:8783 (check_localdecl_only_walkers)
+- #5876 [sound]   (15d) ratchet RED: #5870 added an unmarked class3 AST-gated symbol read at ExprTypecheck.cpp:25501 (check_imported_symbol_reads)
+- #6364 [sound] S (10d) [sema][soundness] the import-blind-cast family is UNBOUNDED: check_imported_symbol_reads is baselined at 31, not zero, and ExprTypecheck_Calls.cpp alo
+- #7145 [sound] S (3d) [codegen][soundness] the compiler emits an 'internal:' note when it cannot lower a site, then CARRIES ON and ships a program that dies with a NULL der
+- #1907 [crash]   (104d) Opt-level knob: O2's new IR pipeline changes the ASan/LSan test oracle (runAotChecked #1837 fails) — blocks landing
+- #2117 [crash]   (97d) gate: conditional 're-verdict' mode — skip re-running unchanged tests after a fail whose fix is tests-only (same compiler identity)
+- #2252 [crash]   (91d) #2227 residuals: struct-vs-scalar ConstantPattern still aborts the backend; diagnostic is position-dependent; tests are vacuous
+- #3454 [crash]   (61d) test-coverage: pin `fix #3422`'s lambda-body improvement — `u.Equals(())` in a lambda went from SIGSEGV to correct, and nothing defends it
+- #4507 [crash]   (37d) codegen: inline-array collection-literal initializer on a record field does not lower (internal: lowerExpr returned null — #1386), single-module and c
+- #7069 [crash] S (4d) lit: on 12 of the 17 rows repaired by #6620 the front-end ICE needle sits AFTER the positive CHECK, so it can never fire
+- #7071 [crash] S (4d) lit: on imported_literal_target_false_reject_5328rv__p5 the ICE-escape guard was swapped from a REACHABLE codegen marker to an INERT front-end one (co
+- #7200 [crash]   (3d) [sema] string.From(buffer, start, length) has NO §5.1 argument gate: long/ulong/uint silently accepted for the int start/length; double/string emit MA
+- #1630 [other]   (110d) [tests] codegen_json_675 deflake attempt regressed graph_json_cycle_raises (runJit->subprocess broke the cycle-raise assertion)
+- #1632 [other]   (110d) [tests] shared runJit skips ownership::checkOwnership — ownership/disposal tests using it don't exercise the ownership pass
+- #1705 [other]   (108d) impl: `Ptr<T>` intrinsic family + `System.Interop` module + FFI-pointee instantiation gate
+- #1709 [other]   (108d) impl: `Interop.CodeAddress<F>` + static-admission check + F instantiation gate
+- #1725 [other]   (108d) [design-gate] Stage 2 fork-join: designed-and-recorded (rationale §12.9, v0.186) — not normative
+- #1737 [other]   (108d) conformance: stage the move-only value-type surface as Extended (Appendix D.2 row — proposal 0036 graduation)
+- #1763 [other]   (107d) test-infra: migrate test harness JIT→AOT + per-program sanitizers (tracking)
+- #1773 [other]   (106d) json_550_test.cpp graph_json_cycle_raises_spec_2_15_v0139 encodes an ownership-invalid, possibly spec-obsolete scenario
+- #1903 [other]   (104d) Conformance corpus: spec_0242 fails compile under the v0.190 #1786 task-discard rule (stale example — needs regen/await)
+- #2100 [other]   (97d) Tiered gate: diff-selected canary tier (fail-fast) + BEZEL_TEST_LIST subset runs + k2 bincache compiler-lib identity
+- #2160 [other]   (96d) [diagnostics][§28.10] Vacuous-pin lint (#2073) misfires on using var over new Array<int>() — heap collection called 'value-typed/runtime-managed'
+- #2254 [other]   (91d) Test-quality sweep: several 2026-07-28 regression tests pass with their fix reverted
+- #2293 [other]   (90d) [build] agent_check/gate configure fresh worktrees with the default generator and empty CMAKE_BUILD_TYPE — defeats cross-worktree ccache reuse
+- #2323 [other]   (90d) gate.sh: the zero-builders preflight samples only at launch — a lane that starts building AFTER it passes silently contends the whole run
+- #2336 [other]   (90d) agent_check.sh --area: subprocess-bezelc tests can read a STALE bezelc binary (false negatives)
+- #2341 [other]   (90d) test: lit pin for §21.7 compound-statement totality (trailing try/catch accepted with no trailing return)
+- #2374 [other]   (89d) AUDIT: the `astNode`-only gate pattern has produced 5 confirmed cross-module bugs — systematically sweep the remaining ~80 sites
+- #2426 [other]   (89d) [build] incremental rebuild after editing LlvmBackend_impl.hpp is unreliable — produced THREE false test failures in one day (staleness, not a code de
+- #2441 [other]   (89d) [build] agent_check.sh/gate.sh reconfigure without --preset: 51/55 worktree build dirs are Unix-Makefiles/no-build-type, not the documented Ninja+Debu
+- #2552 [other]   (87d) [sema] #2542 deferred: legacy imported-property tests (#2401, #2387) authored under old buggy silent-skip behavior — re-derive test fixtures to match 
+- #2633 [other]   (84d) [build][gate] --full (ASan) masks defects the plain gate catches — both modes must run
+- #2683 [other]   (84d) [codegen] #2655 shape 1 reaches INTO lambda bodies (sema descends, the ownership pass does not) — sound but untested, and the commit claims the opposi
+- #2684 [other]   (84d) [test] #2658's entry-block store placement has no automated pin — a refactor moving it back into the loop body would fail nothing
+- #2707 [other]   (84d) [codegen] gate analysis for the #2696 family: the four originally-listed sites are INERT; the live ones are inlined ctors (fixed) and inlined indexer 
+- #2919 [other]   (82d) [infra, LOW-MEDIUM] gc_scratch.sh never reaps /mnt/fast/lane-builds — 54 dead lane build trees, 68 GiB, are pinning the fast volume at 90% full
+- #3001 [other]   (81d) The gate undercount banner is NOT a cache/timeout interaction: the close-out undercounted 3x with BEZEL_AOT_CACHE=0 and an 1800s ceiling — and per-att
+- #3222 [other]   (75d) gate: the per-shard timeout ceiling is oracle-blind — ASan needs ~1.9x plain, gets 1x, and dies at 95% with a misleading "shard-summary MISMATCH" head
+- #3303 [other]   (68d) [gate-perf] F15 measured: -fuse-ld=lld is worth ~25-33s/cycle and does not repay its one-time K2 cold — declining, with numbers
+- #3446 [other]   (61d) gate self-tests: two latent flake sources in test_gate_serialization.py helpers (exec-window read, shallow kill)
+- #3490 [other]   (61d) new SortedSet<int?>() still degrades to the #2974 "produced no value" message, and no one checks §4.18's where T: IComparable<T> for a builtin generic
+- #3555 [other]   (60d) Coverage: #3504's spill-order row pins only 2 of the 4 emit sites — the two yield-handler sites are untested
+- #3607 [other]   (59d) conformance+lit corpora: only 24 of 467 executable programs print anything, so the stdout channel of any runtime oracle is ~19x thinner than the execu
+- #3642 [other]   (58d) tests: MethodDA::runRecordConstructor's this(...)-chain readonly-seeding suppression is exercised by no test (fix #3624 follow-up) (§12.8 / §22.10 / §
+- #3673 [other]   (55d) [gate-perf] -shared-libasan for the ASan oracle: ≤138 s/pass upper bound, needs three measurement cycles — spec recorded, deferred
+- #3675 [other]   (55d) tests/CMakeLists.txt check-tidy comment still says gate.sh invokes check_tidy.sh (moved to gate_full_cycle.sh by #3666)
+- #3678 [other]   (55d) gate: /var/tmp/bezel-scratch/shard-logs/ is never reaped (249 kept runs, 217 with a [ FAIL ]) — a root-level scan would veto every ceiling-only retry 
+- #3681 [other]   (55d) tests/sema/trivial_dispose_recursive_clause_3632_test.cpp: destructor begin end destructor; is a parse error, silently tolerated by the light harness
+- #3691 [other]   (55d) gate.sh: the AOT_MISSES grep is unanchored — any future [aot-cache] field ending in 'misses=' is silently summed into the gate's miss total (measured:
+- #3698 [other]   (55d) AOT bincache (no-fsync mode): a failed size-sidecar write still installs the entry — neither durable nor verifiable; refuse the store instead (#3669/#
+- #3715 [other]   (54d) gate: fsync-free store evidence ([aot-cache] store_fsync_skipped / verify_rejects) is overwritten before it can be read — persist per pass and gate on
+- #3722 [other]   (54d) gate.sh header still tells operators to run check_tidy against the bare local `main` (stale base, cf. #3718)
+- #3734 [other]   (54d) gate: sum #3007's 'INFRA: N failure(s)' across shards in run_parallel.sh and fail the sharded run on a nonzero total (the #3626 floor, for the infra c
+- #3737 [other]   (54d) gate: coverage floor counts an arbitrated-FLAKY-then-ACCEPTED test as not run (20573/20575 → COVERAGE SHORT → full retry), and telemetry reports it as
+- #3739 [other]   (54d) gate speed proposal: order tests by risk (don't skip), diff-select the ASan pass with a nightly full ASan, predict-warm ceilings — measured against 'c
+- #3781 [other]   (54d) gate_trend R5 "coverage-floor-disabled" fires on every coverage-SHORT failure: the record says floor_enforced=false when the floor is what failed the 
+- #3807 [other]   (53d) spec-ahead-of-impl §2.3: the module import gate ("All other library modules require explicit `import`") has never been enforced for System.Collections
+- #3838 [other]   (52d) test v0.288: the overridden-base `DisposeAsync` case of §28.12's per-class supersession rule (ruled on #3492)
+- #3901 [other]   (51d) conformance corpus: only 193 of 668 cases run and only 2 execute as whole programs — the suite proves 'compiles', not 'behaves as specified'
+- #3917 [other] S (51d) tests: hand-rolled emitModule/emitObjectFile runners (record_string_field_call_release_1747_test.cpp) bypass forceSanitizeAddress() — --full never ins
+- #3934 [other]   (51d) agent_check.sh: single-dash flag typo (-area, -no-lit) still silently becomes a filter substring — same class as #3923
+- #3963 [other]   (51d) two R15 lanes were assigned the same worktree: silent src/ clobber and mid-run HEAD move produced ~2h of phantom test results
+- #3991 [other]   (51d) [tests][sema] migrate the remaining 120 ungated parseSemaAll-shaped helpers to the #3985 shared gate
+- #4131 [other]   (48d) wrong §-citation in async_lambda_exprbody_pattern_a_disposer_3960 test comment (§30.1 quoted for a §30.9 sentence)
+- #4248 [other]   (46d) extension method body on a free-var receiver: spurious #2491 "degraded to zero" Warning fires even though the returned value is CORRECT
+- #4327 [other]   (46d) sema: fix #4309's closed-set membership test proves anti-drift, not anti-omission — a 26th builtin interface added to builtinTypeArity would get zero 
+- #4361 [leak]   (43d) test-only narrow: add ASan LSan-floor regression for const_move_declless_builtin_3709 — 500x amplified leak test to pin runtime side
+- #4383 [other] S (42d) Run the rule corpus's first classification — 2,148 cases, 918 of them executable, zero divergence data
+- #4384 [other]   (42d) §2.8.1's "closed by compilation, not by name" describes a build model bezelc cannot express
+- #4418 [other]   (42d) Spec-ahead-of-impl (v0.299, §28.9): the trivial-dispose ceremony exemption now covers every holder form, not only a `new` expression
+- #4435 [leak]   (41d) REFUTE r18-c8-lane-40: lane-36 introduces no regression; spec_27_5_inside_a_sync_lambda_body passes at HEAD
+- #4452 [other] S (40d) Oracle repair: the suite passes for the wrong reasons in measured quantities — treat the five known holes as one programme
+- #4505 [other]   (37d) conformance: the committed corpus is a v0.278 extraction while the docs are v0.306 — 426 of 668 cases differ, so the gate phase executes stale spec te
+- #4539 [other]   (36d) seam: check_imported_symbol_reads ratchets the READS, not their CONSUMERS — #4480, #4508 and #4510 are the same defect at three different consumers, a
+- #4555 [other]   (36d) rule corpus: first classification banked — 1736 pass, 413 divergent; the spec-catch-up docket is now measured
+- #4602 [other] S (35d) §28.2 v0.307: flip bezelc's default to checked disposal mode; add --unchecked-disposal; keep --checked-disposal as a no-op
+- #4620 [leak]   (35d) [codegen] #4593 unmasks a pre-existing capture-cell leak: codegen_const_narrowing_capture_2597.loop_declared_const_captures_per_iteration_spec_27_5 fa
+- #4621 [other]   (35d) rule corpus: v0.307 left 3 REGRESSION + 35 UNCLASSIFIED rows unbanked (proposals 0127/0128/0129/0131 are spec-ahead-of-compiler)
+- #4630 [other]   (35d) typeof/Type reflection remains unimplemented, blocking s28_9_0034 (quiet tier) — spec question #4393/#487 now settled, implementation still pending
+- #4654 [other]   (34d) rule corpus: 328 reject-tier cases do not assert their own rule — 194 vacuous passes + 134 wrong-diagnostic fails across 50+ sections
+- #4666 [other]   (34d) [testing] ratchet the `parseAndCheck*`-only test shape — 2,137 rows (8.4%) assert nothing at runtime
+- #4668 [other]   (34d) [infra] gc_scratch.sh reaps a live lane worktree when the lane is doing read-only analysis
+- #4687 [other]   (34d) Builtins: expose abstract Stream per spec §7.1 (System.IO.Stream)
+- #4696 [other]   (34d) rule corpus: s9_8_0003's constructor parameter name does not match its own scenario (cardinal-sin-adjacent, but a source typo, not a compiler defect)
+- #4700 [other]   (34d) rule corpus: s22_12_0017 passes vacuously — rejects on unimplemented SharedEventSource.Subscribe (#2457), not the capture-free rule it means to pin
+- #4703 [other]   (34d) [seam-debt] #4618's §22.10 primary-ctor check reads `t->decl` — class-1 exception, caller is module-local
+- #4714 [other]   (34d) [seam-debt] #4702's §9.9 contract-clause check reads `cs->decl` — third reasoned exception this batch
+- #4716 [other]   (34d) [testing] "rejects AND mentions §N" oracles drift silently when an earlier check starts firing
+- #4769 [other]   (34d) [codegen] a correctly-annotated using-var over pool.Drain() still degrades to a zero-initialized slot (#2434 note) — the minted drain-view frame is no
+- #4842 [other]   (33d) [corpus] s28_3_0006 fixture has no borrow — expect:reject is unreachable (§28.3)
+- #4927 [other]   (32d) #4896 issue body: expected `<Green>` is wrong — stdlib §2.13/§8.5 v0.307 says enum ToString renders the qualified type name (`<Conf.Color>`)
+- #4991 [other]   (32d) Lane builds never share ccache entries: per-worktree absolute paths make every fresh lane a full cold build
+- #5029 [other]   (31d) [toolchain] enforce cold codegen builds via scripts/agent_check.sh; refuse bare 'cmake --build -j$(nproc)' (R21 cycle-26 build-discipline ratchet)
+- #5056 [other]   (31d) pick_stage/pick_ledger review notes: --continue without an in-progress pick; ambiguity after a mixed rewriteRef history
+- #5065 [other]   (30d) [test] add direct `s.Q := v` setter rows to direct_generic_iface_accessor_slot_5058 once #4947 and #5058 both land (§23, v0.307)
+- #5070 [other]   (30d) thin libbezel_core.a: needs thin-aware k2 identity (aot_support buildIdentity, record_core_identity.cmake, gate/identity.py)
+- #5102 [other]   (30d) fix #4838 follow-up: §22.6/§11.1 sema-level diagnostic oracle for primary vs body ctor exact-match
+- #5127 [other]   (28d) §28.14: adversarial test — method-own type-parameter arg captured into an escaping closure after #5116 call-bounded release
+- #5233 [other]   (26d) tests: remove 172 exact-duplicate gtest rows and consolidate repeated control rows (not during a bugfix run)
+- #5333 [other]   (24d) [infra][gate] pregate: label each failure NEW vs ALREADY RED at base, and print the remedy
+- #5419 [leak]   (22d) l5_0003 cannot fail: a bound query passed as IEnumerable<T> is materialized at the call site, so the callee's re-enumeration never raises (and the cas
+- #5420 [other]   (22d) #5118's fix is unlandable: lazy-query ?. -coalesce is degraded by #2434's zero-init fallback before the K7.3 arm is reached (and #2434's Warning masks
+- #5439 [other]   (21d) #5118 review REJECT: vacuous accept row + fabricated §14.2 cl 5 citation
+- #5454 [other]   (21d) Pre-existing: six §28.8.1 conformance cases pin a "not reassigned" needle the compiler stopped emitting at e2aa55d0
+- #5465 [leak]   (20d) leaksAtLeast is a LEAK oracle, not an ASan oracle — never use it as a row's sole assertion
+- #5476 [other]   (20d) [sema] 'override' on a non-virtual base member compiles silently (blocks rule-corpus row s20_0006)
+- #5477 [other]   (20d) [sema] §22.12 rule 2 mutable-static admission is inconsistent — either over-rejects or the spec admits no ordered-evaluation probe (blocks row s20_001
+- #5520 [other]   (19d) §14.2 register / stdlib §4 (v0.320): gate the standard library's equality search on §9.2's first kind at the call — #5491
+- #5545 [other]   (19d) §14.2 rule 2 (v0.321): `Array<T>.Sort()` in a generic body is decided by `T`'s constraints (probe the sorting gate) — #5527
+- #5547 [other]   (19d) §15.1.2 (v0.321): gate an inline array's `Contains` (and `in`) on §9.2's first kind — #5528
+- #5571 [other]   (19d) tests: port `event_raise_reentrant_dispose_908.handler_disposes_later_subscription` off the JIT oracle — its program is ill-formed (§27.5, §28.3; v0.3
+- #5585 [other]   (19d) check_docs.sh (v0.323): three recompute-and-compare checks — stdlib marker ↔ index issue numbers, §30 listing parity, sendability-statement roster
+- #5586 [other]   (19d) Comments (v0.323): orphaned `K3.10` citations and `Sendability.cpp`'s quotation of the removed §30.14 list; add a K-citation check
+- #5663 [other]   (19d) Rule corpus: s20_0013/s20_0014 move out of a `using var` (A5), so they test the wrong rule
+- #5857 [other]   (15d) [harness] runAot's fork-isolation supervisor SIGSYSes on a program that stores a cross-module Span&lt;int&gt; into a local; a program returning a comp
+- #5886 [other]   (14d) check_imported_symbol_reads misses class-1 reads passed as arguments — a live sibling in ExprTypecheck.cpp is invisible to it
+- #5937 [other]   (14d) check_docs.sh REGISTER (v0.338): the member-name regex splits names lazily, so direction A finds a "member" in almost any window and an unmapped condi
+- #5970 [other]   (14d) §27.7.1: GetHashCode() on a function value does not lower (initializer degrades to zero, #2434-style warning)
+- #6103 [other]   (14d) conformance s28_3_0193/0195/0197 (expect reject) are rejected ONLY by a §11.2 false mismatch; s28_3_0194/0196 (expect accept) are false-rejected by it
+- #6244 [other]   (13d) [test-infra] scratch matrix: two cells reported once as 'no executable produced', not reproducible (#6166 review)
+- #6262 [other]   (13d) test-gap #6146: bare case of a generic choice at an inline-array / [N owned]class instantiation unmeasured
+- #6363 [other]   (10d) [sema][docs] a justification comment at ExprTypecheck_Calls.cpp:3567 names `Box<out V>` — a program §12.9 forbids — as the motivating case for a gate 
+- #6384 [other] S (10d) [test-infra][gate] MANDATORY PRE-GATE STEP: bank check_toolchain_skip_surface immediately before the gate — every runAotChecked* commit raises the den
+- #6386 [other]   (10d) [test-infra] retire the module area's hand-rolled cross-module runners onto runAotModules (#6379 left them explicitly out of scope)
+- #6477 [other]   (8d) [ratchet] check_toolchain_skip_surface.py documents a positive-substring EXEMPTION it never implements — the burn-down floor is 3, not 0
+- #6510 [other]   (8d) check_toolchain_skip_surface: the polarity exemption over-exempt — !(find(X) != npos) and an unbalanced find( are both read as positive (latent, 0 liv
+- #6517 [other]   (8d) sema_extension.two_bare_identifiers_in_nested_args_still_both_bind_4448 is vacuous: its program is a parse error
+- #6524 [other]   (8d) [test-infra] check_vacuous_tests.py has no model for a row that asserts a diagnostic is ABSENT when its program fails an EARLIER compiler phase
+- #6525 [other]   (8d) [ratchet] check_src_citations.py resolves §-citations but has NO handling of file:line citations — 422 of them in src/ are ungated, and a decayed one 
+- #6561 [other]   (7d) #6554 fix-forward: the widened §5.1 target gate turns an ACCEPT into a malformed-IR rejection, order-dependent (short before byte)
+- #6569 [leak]   (7d) Three dictionary test headers state a false model of the leak oracle; runAotChecked hardcodes detect_leaks=1 and never reads BEZEL_AOT_DETECT_LEAKS
+- #6597 [other]   (7d) §8.5 (v0.339): a function value's `ToString()` renders its formed function type — tighten the `Length > 0` assertions to the exact text
+- #6606 [other]   (7d) #6546 follow-up: the skip-constant table is scope-blind and over-flags, violating its own 'never over-flagging' invariant
+- #6618 [other]   (7d) #6608 follow-up: string_local_reassign_leak_1997_test.cpp is the 5th wrapper instance and has no control-arm purchase (rows are loud, so nothing vacuo
+- #6619 [other]   (7d) lit: CHECK-NOT: error can never match (errors carry no 'error:' prefix) — 994 directives across 992 files, dead weight not broken rows
+- #6622 [other]   (7d) check_toolchain_skip_surface.py: docstring says 'absorbing_sites did not rise'; the code requires it to STRICTLY FALL (abs_m >= abs_b fires on flat)
+- #6649 [other]   (7d) Math.Abs as a (decimal) -> decimal method reference is still refused by the #5814 reference gate
+- #6662 [other]   (6d) string.IndexOf gate keys on textual argument position: reordered named args rejected; string extension IndexOf(int) misdiagnosed
+- #6719 [other]   (6d) `object_instance_reclaimed_5437_test.cpp:171` compares instead of assigning: `o = j;` where the row's comment says the `Object` slot is overwritten wi
+- #6762 [other]   (6d) Self-contained (static musl) link: dlopen of glibc's libc.so.6 returns NULL in two §32 FFI rows
+- #6855 [other]   (6d) A generic `x is StringBuilder` returns a degraded `False` for `T = StringBuilder` (§3.6, §14.1)
+- #7065 [other] S (4d) lit: a CHECK-NOT placed after the positive CHECK only excludes its text from the output AFTER the match, so a wrong diagnostic emitted FIRST still pas
+- #7070 [other] S (4d) lit: the two imported_literal_target_false_reject rows' wording guards are one-sided — and rewording p5's prose alone would make it weaker
+- #7072 [other]   (4d) codegen: a method-group reference to GetEnumerator over a builtin collection interface is accepted, degrades with the #2434 warning, and the call is a
+- #7114 [other]   (3d) [sema][silent-acceptance] an index expression on a type with NO indexer compiles and silently degrades to a zero value (LinkedList<T>[0] prints 0, not
+- #7122 [other]   (3d) [test-docs] a stale in-repo comment claims the ASan oracle is unavailable -- it reads an unconditional boilerplate parenthetical instead of the counte
+- #7151 [other]   (3d) [stdlib-contract][codegen] the compiler admits INSTANCE conversion members on a string (ToInt32/ToInt64/ToDouble/ToBoolean) that stdlib §2.3 declares 
+- #7158 [other]   (3d) [corpus][harness] names.py's reject-case exemption covers an unknown TYPE but not an unknown MEMBER, so a reject case about an undocumented member can
+- #7170 [other]   (3d) [spec-question][ownership] the spec has NO sentence that decides a lazy Select whose selector projects a fresh string — §28.3's 'the admission is vacu
+- #7176 [other]   (3d) [test-infra] a bare `cmake --build` on a NEVER-CONFIGURED build/ fails with "could not load cache" (CMAKE's message, NOT ccache's) — configure first; 
+- #7191 [other]   (3d) [sema] the #7150 string.Join separator gate reads ce.args[0] POSITIONALLY, so a reordered named-argument call is REJECTED naming the WRONG parameter w
+- #7194 [other]   (3d) [ownership][codegen] a future stdlib 9.6 PROPERTY that returns a fresh string would be neither RATCHETED nor REJECTED - the mint ratchet derives only 
+- #7236 [other] S (2d) [ratchet][infra] check_toolchain_skip_surface --update refuses a checked_calls rise when absorbing_sites is FLAT - every new test file with a runAotCh
+- #7241 [other]   (2d) [ownership][diagnostic] the §28.10 "vacuous `using var`" lint over-fires on a borrowing collection — it claims "no disposal obligation" where §28.9 ma
+- #7257 [other]   (1d) [codegen] the generic TEMPLATE body's dead local degrades SILENTLY-to-zero BUT emits an `internal:` diagnostic - the ratchet `check_internal_residual`
+- #7314 [other]   (0d) stdlib §2.5/§2.6 declare ParseOrNull for Guid/DateTime/DateOnly/TimeOnly but the compiler has no arm — a legal program silently degrades
+- #7332 [other]   (0d) `x?.ToString(format)` on a NULLABLE receiver DEGRADES to a zero-initialised local instead of formatting the value
+- #7335 [leak] S (0d) [infra] the leak census cannot see the deliberate-leak rows: one coverage line, not gate-wired, and blind to runAotChecked rows
+
+## using-heads — `using var` / `await using` over every head kind (24 open; §28.10, §28.12, §30.7, stdlib §2.10)
+
+- #3482 [sound] S (61d) await using / using var at a GENERIC TYPE PARAMETER head still reads word 0 as a vtable — usingVarBuiltinHeadName cannot name a monomorphized head (§2
+- #3483 [sound] S (61d) await using on an IAsyncDisposable-typed head runs the DESTRUCTOR instead of awaiting DisposeAsync (§28.12 step 1) — plus: `owned IAsyncDisposable` re
+- #3493 [sound] S (61d) `await using` resolves DisposeAsync (and now physical reclamation) from the DECLARED type — a derived runtime type gets the base's cleanup (§28.12 ste
+- #3516 [sound] S (60d) `await using` on an ABSTRACT-class head with an `abstract DisposeAsync` runs the DESTRUCTOR instead of awaiting DisposeAsync (§28.12 step 1)
+- #5653 [sound] S (19d) §28.12 (v0.328): `await using` over a static type without `DisposeAsync` must await the run-time object's
+- #7306 [sound] S (1d) `await using var` of a string is a heap-buffer-overflow - a pre-existing memory-safety defect, excluded from the #7272 fix on purpose
+- #7322 [sound] S (0d) `await using` over a right-hand side with NO disposal obligation reads 8 bytes past a 2-byte payload — a heap-buffer-overflow in the async resume path
+- #6194 [crash] S (13d) Codegen HANG: `using var t := tcs.Task` then `await t` deadlocks under AOT (variant of #1771)
+- #7283 [crash] S (1d) await using var of a lambda SEGFAULTS the async resume path (pre-existing, measured on both arms)
+- #7327 [crash] S (0d) `await using` over a FUNCTION-TYPED right-hand side still reaches the class disposal and still SEGFAULTS — the residual of #7322's fix
+- #1531 [other] S (112d) [runtime] §28.12 (v0.179): direct DisposeAsync() physical reclamation, incl. fault edge
+- #1603 [other] S (111d) [runtime] §28.12: DisposeAsync() physical reclamation — abandoned task + dynamic/inherited receiver (follow-up to #1531)
+- #2623 [leak] S (84d) [codegen][leak] an `owned` field holding an async enumerator is not disposed when its owner is (64-byte frame leak, §28.5)
+- #2624 [leak] S (84d) [codegen][leak] explicit `.Dispose()` on an async enumerator plus its `await using var` scope-end leaks the pending per-advance Task (185 bytes)
+- #3471 [other] S (61d) registerUsingDisposal still carries TWO spellings of the builtin-collection disposal build (the isAwaitUsing branch's copy and the sync chain's) — the
+- #3515 [leak] S (60d) `await using`: §28.12 step 2 reclamation is keyed on the DECLARED class, so a derived level's owned fields are stranded behind a base-typed head (no o
+- #7316 [leak] S (0d) a `using var` COPY of a value-like choice local still leaks — #7305 fixed the construction path, the copy path is a different mechanism
+- #7326 [other]   (0d) `await using` outside an async method or async lambda is NOT rejected — the compiler compiles it
+- #7328 [other]   (0d) `await using` over an INTERFACE-typed or BASE-CLASS-typed right-hand side takes the SYNCHRONOUS disposal path instead of the asynchronous one
+- #7337 [other]   (0d) [codegen] an `await using` DECLARED Object but holding a runtime-managed value still reads out of bounds — the predicate keys on the static type, whic
+- #7338 [other]   (0d) [codegen] the `await using` slot predicate's runtime-managed set omits the `Type` token - sema and codegen disagree (spec §28.9, §28.12, v0.344)
+- #7339 [other]   (0d) [codegen] an `Object`-typed `await using` right-hand side holding a runtime STRING still takes the class disposal path (spec §28.9, §28.12, v0.344)
+- #7354 [other] S (0d) §28.12 / stdlib §2.10 (v0.345): `IAsyncDisposable` extends `IDisposable` — conformance, the `where T: IDisposable` bound, the `Dispose()` member, and 
+- #7357 [leak] S (0d) a COPY of a value-like choice local leaks 35 bytes when the SOURCE is a PARAMETER or a NULLABLE - and so does the plain `var` twin, so this one is sym
+
+## enumerable-heads — Enumerable heads and iterator frames: one bridge per face (125 open; §29.2, §29.11, §28.6, §21.4, §21.5, stdlib §5)
+
+- #2297 [sound] S (90d) [codegen][crash] `SortedSet<T>` passed as `IEnumerable<T>` -> SIGSEGV (excluded from #1069's Set fix because the snapshot is unordered)
+- #2307 [sound] S (90d) Single-use owning iterator return forms IOwningEnumerator<T> / IOwningAsyncEnumerator<T> are unimplemented: BAD_REJECT + double-free + vacuous-pin (§2
+- #2520 [sound] S (88d) [codegen] explicit .GetEnumerator() on SortedSet<T>/SortedDictionary<K,V> still non-functional (needs sorted snapshot)
+- #2628 [sound]   (84d) [codegen] iterElemIsOwnedClass_/iterElemSemaTy_ not saved-restored around nested generic specialization (silently disables the outer iterator's #1120 
+- #3370 [sound] S (63d) EXPRESSION-BODIED IOwningEnumerable<T> property getter over Array-family source produces 4-slot IEnumerable wrapper → for-in SEGV
+- #3469 [sound] S (61d) SIGSEGV: a lazy-LINQ-pipeline property getter at an `IEnumerable<T>` head is never drained — the §29.11 iterator protocol is driven on the 4-slot lazy
+- #3478 [sound] S (61d) Callee-owned RETURN at an IOwningEnumerable<T> head still installs the borrowing Current (§29.11 single-consumption; array and stack families)
+- #3479 [sound] S (61d) OwningBuffer<T> is admitted at an IOwningEnumerable<T> head, a conversion stdlib §4.14 does not declare (SEGV at the local-decl face)
+- #3519 [sound] S (60d) codegen: a callee-owned Dictionary returned as IEnumerable<DictionaryEntry<K,V>> SEGVs on first iteration (wild jump); in-place iteration is clean
+- #3522 [sound] S (60d) codegen: a user class implementing IEnumerable<T> is unlowerable in a direct 'for' (not yet implemented) and SEGVs through an IEnumerable<T> head
+- #3576 [sound]   (59d) stdlib §5 element-access terminals (First/Last/ElementAt) over a dictionary source lower to a SILENT zero-filled entry on the whole family
+- #4007 [sound] S (50d) #3993's IEnumerable/IAsyncEnumerable exemption: safety claim is false — same itmap$ wild-jump SEGV as the rejected heads, reachable through any call b
+- #4009 [sound] S (50d) #3993's checkOwnedReturnDirectBorrow misses a relayed call to a non-owned-returning instance method — same double-free, in scope
+- #4827 [sound] S (33d) Explicit Dispose() on an IOwningEnumerable-typed iterator frame dispatches class vtable slot 2 (MoveNext) — leak / wrong code
+- #4828 [sound] S (33d) owned IOwningEnumerable<T> parameter holding a yield frame: no leak-free discharge (auto-drop / using var leak; for-in over `move src` iterates nothin
+- #4885 [sound]   (33d) bz_obj_is_string misclassifies Array/lazy pipelines held in Object as string (widened by narrow #4858)
+- #4887 [sound] S (33d) o is IEnumerable<char> is dropped (#3079 warning) for an Object operand holding a string
+- #4888 [sound] S (33d) SIGSEGV: for var ch in e over an IEnumerable<char> local holding a string
+- #6138 [sound]   (14d) LINQ: Where + Distinct over an Array<Object> holding a function value in one expression frees the function value (use-after-free)
+- #6185 [sound] S (13d) [codegen][miscompile] §21.4 / §29.2 (v0.338): `for` over an inline array or inline literal loses its index across an `await` / `yield` in the body (lo
+- #6277 [sound] S (13d) codegen (§29.2/§28, v0.338): a temporary string argument to a lazy iterator is released while the iterator frame still borrows it (heap-use-after-free
+- #6280 [sound]   (13d) codegen (§29.2, v0.338): reassigning the source string inside a string for-loop body is a heap-use-after-free
+- #6356 [sound] S (11d) [sema/ownership][soundness] a class variant of #4931: an instance GetEnumerator() returning the enumerator of an OWNED LOCAL returns a dangling enumer
+- #6360 [sound] S (11d) [codegen][soundness] a delegating GetEnumerator on an IMPORTED enumerator class takes the unfixed lowering and use-after-frees (the $ad discriminator 
+- #6387 [sound] S (10d) [codegen][soundness] a wrapper over a computed IEnumerable<T> property FREES a field the holder owns (ownsSrc producer misses the getter path)
+- #6393 [sound] S (10d) A LINQ element-returning terminal over a string-element receiver hands back a bare slot pointer with no +1 — reclaiming the receiver is a use-after-fr
+- #6403 [sound] S (10d) [codegen][soundness] a `virtual` iterator-format property with an ARROW-bodied getter, read through a base-typed receiver, leaks its §29.2 wrapper fra
+- #6406 [sound] S (10d) [codegen][ownership][leak] a user class implementing IEnumerable<int> passed to an IEnumerable<int> formal leaks the wrapper block (9,632 B / 301 allo
+- #6407 [sound] S (10d) [codegen][soundness] a generic class with a virtual ARROW-bodied property read by `for x in b.E` SEGVs at pc 0x0 — PRE-EXISTING, and it blocks measuri
+- #6409 [sound] S (10d) [codegen][ownership][uaf] an unbound owned temporary user class at an IEnumerable<int> formal double-registers the 29.2 wrapper frame — heap-use-after
+- #6438 [sound]   (10d) [codegen][soundness] a block getter over an `owned Array<Item>` field still UAFs, and does so on a DIRECT `for x in h.E` with no binding — it never re
+- #6447 [sound] S (9d) [codegen][soundness] the for-in consumer's field-lend test stops at ONE hop — a getter that launders a field through a local still UAFs, on BOTH dispa
+- #6451 [sound] S (9d) an EXPRESSION-bodied iterable getter at a mint-announcing head SEGVs at the caller once accepted — §28.6's getter diagnostic is currently the only thi
+- #6487 [sound] S (8d) A `virtual` property's block-bodied getter UAFs — the face `propBlockGetterReturnKinds_` calls 'structurally unreachable', tracked by a STALE issue nu
+- #6489 [sound] S (8d) A getter that MATERIALIZES a deferred-activation frame (ToArray()) carries a live heap-use-after-free under ASan — §28.3's own prescribed remedy does 
+- #6490 [sound] S (8d) The `virtual`/itable getter face publishes no mint; publishing one flips `kPropGetterReturnMint`'s SECOND reader (`ownsSource`) and needs its own orac
+- #6493 [sound] S (8d) The laundered-METHOD twin of #6484 is open: bind-frame-and-return over a scope-bound local compiles clean and is a live heap-use-after-free — and reac
+- #6539 [sound] S (8d) [ownership][soundness] a getter returning a frame whose source is laundered through ONE extra local still UAFs — on BOTH the `var` and `const` alias s
+- #6783 [sound] S (6d) Extension members on IEnumerable<T> are not dispatched on IGrouping<TKey, T>, or as properties on Array<T> (§26.5, v0.340)
+- #6863 [sound] S (6d) `for var x in this` in an extension method on `IEnumerable<int>` throws OverflowException or prints garbage (§26.1, §29)
+- #7063 [sound] S (4d) [codegen] a USER class conforming to a builtin collection interface yields wrong values for every member read through the interface-typed receiver (Co
+- #7160 [sound] S (3d) [codegen][soundness] a lazy Select whose selector is a METHOD REFERENCE reads past the end of a heap allocation: ASan heap-buffer-overflow, READ of si
+- #7193 [sound]   (3d) [codegen][soundness] a GENERIC method whose selector indexes a generic array with a RANGE reads past the end of the heap allocation - ASan heap-buffer
+- #1839 [crash] S (105d) [codegen][crash] storing an Array<T> into an owned IEnumerable<T> field does not wrap it -> SIGSEGV at object disposal
+- #2643 [crash]   (84d) sema: LINQ Contains on an IGrouping<TKey,T> receiver still skips the §7 argument check (element is genericArgs[1]) — residual of #2593
+- #3544 [crash] S (60d) codegen: `lowerIEnumerableFor`'s USER-CLASS element type is still a raw `lowerTypeRef` — a hand-written `Current(): ()` reaches the same `void` alloca
+- #6242 [crash] S (13d) codegen (§29.11, v0.338): a second terminal operator on a spent lazy query inside a callee taking IEnumerable<T> SEGFAULTS instead of raising InvalidO
+- #6245 [crash] S (13d) [codegen] for over Set<T> / Dictionary<K,V> with an await in the body crashes (SEGV / spurious InvalidOperationException) — §21.4, §29.2
+- #6271 [crash]   (13d) codegen (§3.6, v0.338): Distinct/ToSet/ToDictionary over an inline-array element type fails IR verification
+- #6655 [crash]   (7d) codegen §25.2: user operator with a stdlib collection interface parameter segfaults when the body uses the operand (v + arr, operator +(V, IEnumerable
+- #6819 [crash] S (6d) A nullable IEnumerable<int>? local bound to an Array crashes (SIGSEGV) at scope exit after e?.First() (§7.5, §28, v0.340)
+- #6964 [crash] S (5d) iterator range-for: assigning the loop variable in the body changes the iteration (hidden counter not separated in state-machine path)
+- #2217 [other]   (93d) #2154 deeper analysis: source/clone state split blocks the per-yield mask approach
+- #2331 [other]   (90d) RULING NEEDED: §22.12 rule 2 names no form for a generic-parameter-typed mutable static (`static x: T?` in a generic class)
+- #2611 [other]   (85d) lowerLocalDecl fails to lower IOwningAsyncEnumerable<T>-producing call as a using var initializer (#2434 degradation, blocks #2591 manual-protocol tes
+- #2748 [other]   (84d) codegen: the 3 unguarded lazy emitters (#2731 item 1) — 2 are module-level-only, ensureExprGetterThunk is the reachable one and has a genericSubst_ cl
+- #3047 [other]   (77d) [proposal 0081] Statically-certain-abandonment lints: fresh Task into a borrowing slot; terminal accessors over minting pipelines
+- #3051 [other]   (77d) [proposal 0085] Pure-body for over concretely-typed Array/string: make the §29.2 elision normative
+- #3054 [other]   (77d) [proposal 0088] Concrete-typed static selectors: name the generify remedy; design the selector announcement
+- #3361 [other] S (64d) follow-up: #3358 Setup.cpp fix at 479331e is unverifiable — codegen path that mints bvt$spanbox never fires on stdlib Span
+- #3363 [other] S (63d) fix #3355 follow-up: structurally correct IOwningEnumerable getter wrap (new helper + Setup.cpp predicate widening)
+- #3374 [leak] S (63d) fix #3356 follow-up: registerIterableSourceDisposal does not claim IndexExpr-shaped IEnumerable<T> initializers — var it := obj[i]; of a wrapped index
+- #3390 [leak] S (61d) fix #3377 follow-up: a deferred-activation frame that ESCAPES its scope still leaks its fresh receiver — needs frame-level `this` ownership (§28.3/§29
+- #3406 [other] S (61d) Spec-catch-up: wrapArrayAsIOwningEnumerator + isOwningCollectionDrainAliasCall rest on the v0.195 'Drain() returns the receiver' premise, superseded a
+- #3475 [leak] S (61d) Stored-view property read in ARGUMENT position leaks its wrapper frame (24 B, family-independent)
+- #3476 [leak] S (61d) Callee-owned OwningX<T> RETURN coerced to a borrowing IEnumerable<T> head leaks its elements (32 B, array and stack families)
+- #3561 [other] S (59d) [codegen/ownership] async-iterator twin of #3554 is unreachable: `yield return <local>` in an IOwningAsyncEnumerator body is not credited as a transfe
+- #4010 [other] S (50d) #3993's IEnumerable/IAsyncEnumerable exemption is name-literal, not structural — a user-defined non-IDisposable interface extending IEnumerable<T> is 
+- #4492 [leak]   (37d) codegen: §29.7 abandonment teardown cannot host the §28.4 fault check (leaks the frame), and four disposer thunks reach user code uncounted
+- #4692 [other]   (34d) Guide 05 §5: bound-query re-enumeration through IEnumerable<T> param never raises InvalidOperationException (s9_8-adjacent, l5_0003)
+- #4694 [other]   (34d) GroupBy stored-in-a-variable is still permanently gated, not implemented — follow-up to closed #755 (l5_0011)
+- #4706 [other]   (34d) [codegen] isFreshGroupingTerminalLocal is the fifth name-keyed materializer recognizer — unfixed, needs a repro first
+- #4740 [other]   (34d) §29.12 v0.307: does an ArraySpan<T> mutation (Reverse/Fill/CopyFrom) invalidate an enumerator over the backing array? — spec silent, impl does nothing
+- #4886 [leak] S (33d) Leak: binding a non-literal string to an IEnumerable<char> local in a loop (~1.8 KB / 98 allocs per 50 iters)
+- #4978 [other]   (32d) §27.6 (v0.307): method references — no target-typed overload selection, no conversion adapter; event handler positions now reject both (#4968 spurious
+- #6025 [other]   (14d) sema §22.6 (v0.338): a null argument silently selects Handle(e: A?) over Handle(e: Object?) instead of reporting ambiguity
+- #6180 [other]   (13d) sema §11.2: property/indexer type mismatch against STDLIB generic interfaces (IEnumerator<int>.Current: string, IReadOnlyList<int> indexer: string) ne
+- #6186 [leak] S (13d) [codegen][leak] §21.5 (v0.338): `break` out of a `for` over a `Set<int>` leaks the key snapshot (bz_dict_keys_gen)
+- #6221 [other]   (13d) sema §22.6 (v0.338): an int literal among F(byte) / F(int) selects byte when byte is declared first (order-dependent; Example 1 says exact int)
+- #6246 [other]   (13d) sema (§29.11, v0.338): Contains / ElementAtOrNull on a bound lazy query are not treated as terminal operators by the single-consumption tracker
+- #6396 [leak] S (10d) Eager terminal arms that never call freeFreshInputTemp leak a whole unbound owned receiver per evaluation (12,120 B / 101 iterations, ASan)
+- #6412 [leak] S (10d) [codegen][ownership][leak] an unbound owned Array<int> TEMPORARY at the same IEnumerable<int> formal leaks 36,000 B / 600 allocs on BOTH legs — the Ar
+- #6453 [leak] S (9d) [codegen][leak] an ENUMERABLE-head argument is materialised into an unregistered-vtable wrapper the caller disposes — 30,000 B / 1,000 survives even w
+- #6455 [leak] S (9d) [codegen][leak] a BORROWED collection-interface-head parameter leaks the unbound owned temporary — 29,940 B / 998, byte-identical on base and on #6433
+- #6473 [other]   (8d) for-in DictionaryEntry over an escaping-capture loop variable never discharges the §28.11 value column
+- #6491 [leak] S (8d) Pre-existing: an unbound local holding a `virtual` block getter's §29.2 frame leaks (6368 B / 199 allocs, no loop) — and the alloc count is NONDETERMI
+- #6501 [other]   (8d) `ToDictionary` keyed by an inline array still aborts — a THIRD `CreateSExt` trampoline site (Calls3.cpp:1707, `buildLinqMapTrampoline` kind 2), not co
+- #6508 [other]   (8d) sema_extension.nested_bare_identifier_in_arg_position_still_binds_4448 fails on staging: the 26.4 bare-identifier diagnostic fires on `extension IEnum
+- #6515 [other]   (8d) Re-anchor the ~34 distinct `ModuleLoader.cpp:N` line citations; two had decayed into pointing at unrelated code
+- #6528 [other]   (8d) IGrouping: the ?. spelling of the OTHER stdlib §5 operators (g?.First(), g?.ToArray(), …) still types nothing and drops the store
+- #6545 [leak] S (8d) a for-loop that breaks early strands the undrained remainder of an owning enumerable (64 B, both the list and array twins)
+- #6556 [leak]   (7d) Select(e => e.Key).ToArray() on a string-keyed Dictionary leaks every rebuilt Key (68 B / 4 allocs)
+- #6559 [leak]   (7d) Dictionary&lt;string, class&gt; leaks both class instances (32 B / 2 allocs) — independent of ToArray
+- #6563 [leak] S (7d) LINQ/ToArray snapshot aliased into a second binding leaks the array header and data buffer (not a Key refcount)
+- #6567 [leak] S (7d) A LINQ ToArray() snapshot that is aliased by a second binding leaks the whole array header and data buffer
+- #6609 [other]   (7d) spec v0.339 §28.3: three unimplemented rules (self-assignment, the 'unclassified' state, ToArray at a class element type)
+- #6613 [leak] S (7d) ToArray() over a LINQ materializer, aliased into another local, leaks the snapshot backing — address-layout dependent; 12/30 one-shot, 20/20 with ASLR
+- #6626 [leak]   (7d) [codegen][leak] GroupBy over heap-string elements / fresh string keys leaks (grouping key_data never releases the stored string)
+- #6627 [other]   (7d) [sema] untyped lambda key selector over record elements: GroupBy(lambda(q) => q.name) types g.Key / for-in elements wrongly
+- #6661 [other]   (6d) ToDictionary key selector returning double/float/record is not implemented in codegen (stdlib §5)
+- #6671 [other]   (6d) [codegen] an OwningSet<T> sequence literal in a generic body (where T: class) never materialises: prints 0 (collectionElemIsClass reads the unresolved
+- #6687 [other]   (6d) sema §25.2 / §5.1 (v0.339): an operator parameter naming the operator's own type parameter keeps the declaration-pointer grade - Box<int> + Array<stri
+- #6688 [other]   (6d) sema §25.2 / §5.1 (v0.339): operator operand grade omits 'a type parameter to its bound' (T: IA into operator +(V, IA)), string into IEnumerable<char>
+- #6703 [other]   (6d) §22.6: user class implementing IEnumerable<int> rejected as 'no overload applicable' at an F(IEnumerable<string>)/F(IEnumerable<int>) pair
+- #6712 [leak]   (6d) codegen ownership (v0.339): a GroupBy(..).ToArray() local leaks bz_groupby_to_array storage when moved, reassigned, returned, passed owned or captured
+- #6759 [leak]   (6d) GroupBy then Select on a temporary leaks the materialized groups (stdlib §5, v0.339)
+- #6862 [other]   (6d) The spec's own §27.6 example `IEnumerable<int>.Count` fails: unresolved identifier `IEnumerable` (§27.6)
+- #6879 [other]   (6d) e.Last(5) with a user extension IEnumerable<int> Last(a: int) is reported ambiguous with §5's Last(predicate), which is not applicable to an int argum
+- #6890 [leak] S (6d) [codegen][leak] §28.3 (v0.340): an `Array<char>` local converted to an `IEnumerable<char>` local is never disposed at scope end (128 B / 2 allocations
+- #7029 [other]   (5d) Range<T> -> IEnumerable<T> at assignment / field / collection-element positions (deferred from #6998 review)
+- #7039 [other]   (5d) [codegen][xmod] imported constructor never wraps an IEnumerable<T> argument: Array<int> at an imported ctor's IEnumerable<int> formal SEGVs
+- #7079 [other]   (4d) [sema] §2.2 arity selection: a bare type reference and a static-member chain head still do not select an imported non-generic type beside a local gene
+- #7123 [other]   (3d) [sema] 2.7's chain-head warning never fires for an INHERITED nested type: the deferral walks the lexical scope chain, and a base type's body scope is 
+- #7178 [other]   (3d) [codegen][runtime] an exception raised inside a lazy Select selector does NOT propagate — it is swallowed and the null projection is then read (SEGV a
+- #7179 [leak] S (3d) [ownership][leak] a lazy Select whose selector projects a numeric ToString() is ACCEPTED and leaks 71 B — the minting gate is a NAME list over §9.6 me
+- #7182 [other]   (3d) [sema][soundness] a BARE method reference carries no Function TypeRef, so its formation-site arity check is SKIPPED (a wrong-arity selector is accepte
+- #7183 [leak] S (3d) [codegen][leak] an EAGER 5 terminal (Min/Max/Sum/Any/First) whose callback is a method reference leaks the 64 B closure cell - the lazy half is fixed 
+- #7184 [leak] S (3d) [ownership][leak] a lazy SelectMany whose selector MINTS a fresh owned value leaks 416 B in 4 allocations - and 1917s fix was written, reviewed and NE
+- #7186 [other]   (3d) [sema] a BARE method reference binds the FIRST-DECLARED overload, not the one 27.6 target-typed selection picks - so the WRONG function is called (the
+- #7195 [other]   (3d) [sema] the EXPRESSION position resolves a generic reference's head by BARE NAME, so §2.2's arity SELECTION never happens there - at a shadowing spelli
+- #7198 [other]   (3d) [sema] string.Join does NOT type-check its ITEMS argument against IEnumerable<string>, so a string or a two-string payload is ACCEPTED - the call is H
+- #7202 [other]   (3d) [sema][soundness] a §5 lazy operator's callback argument accepts a CALL EXPRESSION: xs.Select(Identity("x")) compiles clean and then SEGVs - stdlib §5
+- #7212 [leak] S (2d) [codegen][leak] a minting METHOD-REFERENCE Select selector still leaks 71 B / 4 allocs - the Select gate has no method-group arm (the Zip gate now doe
+- #7213 [leak] S (2d) [codegen][leak] the OrderBy / OrderByDescending / ThenBy / GroupBy key selectors have NO minting gate arm at all - a minting key selector is admitted 
+- #7268 [other]   (1d) stdlib 9.1's ArgumentException for an unadmitted radix is not implemented - an unadmitted radix silently renders in decimal (v0.344)
+
+## producer-temporaries — Producer temporaries and boxes: one discharge authority (148 open; §28.3 (K8, K8.2, producers row), §28.9, §8.6, §17.13)
+
+- #2123 [sound]   (97d) §17.15 binding atom: first-landing residuals — conditional consumes (K7.4 at the atom boundary), non-decidable owned clause forms, runtime-managed cla
+- #3357 [sound] S (64d) Cross-module boxed record "is Pt" discriminator gate (bvt$box$<RecordName> LinkOnceODR cascade; #2301 part 2)
+- #3881 [sound]   (52d) codegen: a bogus member chained directly off a fresh new T() (no intermediate local) still silently no-ops — #2935/#2966 residual
+- #3905 [sound] S (51d) codegen: generic choice (Result<T,E> et al.) still declines to box to Object/interface — needs a choice specializedBoxVtableFor (§35.8/§35.11)
+- #4490 [sound]   (37d) codegen: §28.4 fault propagation still missing at the drop-on-overwrite (§28.7) and unbound-owned-temporary (§28.3) disposal points
+- #4528 [sound]   (36d) codegen: the retired `event` member kind and stdlib §6.5s replacement classify escapes differently — §24 claims identical semantics, and #1727s 75-fil
+- #4858 [sound]   (33d) codegen: lowerTypeTest drops / mis-decides / SEGVs on concrete value and string operands — `i is Object` dropped, `p is IShape` false for record Pt: I
+- #5874 [sound]   (15d) ownership: an undischarged owned method parameter is never disposed (§28.3) — leaks every call
+- #6094 [sound] S (14d) [codegen][memory-safety] method reference to an Object member over a boxed record (`o.GetHashCode`) is a heap-use-after-free once the box local's scop
+- #6208 [sound]   (13d) [codegen] Range<T>? converted to Object? aborts with a box over-release at scope exit (§8.6)
+- #6437 [sound]   (10d) [codegen][soundness] the `using var e := h.Seq` twin carries the SAME syntactic claim at TWO sites — narrowing one turns the UAF into a silent LEAK
+- #6718 [sound]   (6d) sema §25.2/§5.1 (v0.339): a user operator taking Object is not applicable to a built-in class or a boxed value operand (silent wrong answer via the §8
+- #6832 [sound] S (6d) §28.9: iterator/async callee reads an Object-param box after the caller released it (use-after-free)
+- #7214 [sound]   (2d) [codegen][runtime] a method reference held in a LOCAL is MISCOMPILED - the callback's result is truncated to `i32`, so the GENERATED PROGRAM dies with
+- #2371 [crash] S (89d) impl: interface-to-generic-class downcast defects — `as Array&lt;string&gt;` behind IReadOnlyList returns null for a genuine Array; downcast probes se
+- #4834 [crash]   (33d) codegen: constructor-chain arguments are never §8.6-boxed — `base(n)`/`this(v := 1)`/inheritance clause `: B(n)` against an `IComparable<int>` formal 
+- #6150 [crash]   (14d) [codegen] Dictionary<I, V>.Add with a value temp boxed to the interface key crashes in bz_obj_is_string
+- #6172 [crash]   (14d) [codegen] expression lambda declared `: Object` with a value-typed body is not boxed at its return — malformed IR (`ret i32 7` in a ptr function)
+- #6415 [crash]   (10d) [codegen][ownership][leak] a SYNC owned PARAM `method Take(owned x: IList<int>)` passed a user class leaks 41,916 B / 1497 allocs, no crash — the #636
+- #6717 [crash]   (6d) codegen: a record operand converted to an interface operator parameter is not boxed (malformed IR, binary and compound) (§25.2, §5.1, §8.6)
+- #6846 [crash]   (6d) [codegen][xmod] an int argument to an imported method's Object? parameter is not boxed; the call emits malformed IR (§8.6)
+- #1655 [other]   (108d) [v0.184] compiler: reject fresh non-trivial-dispose producers as borrowing-family literal elements (spec §15.4, v0.184)
+- #1877 [leak]   (104d) §28.9 reclamation of plain-var trivial-dispose reference types is not wired up — heap-collection spines and closure transients leak their backing stor
+- #2222 [leak]   (92d) CString conversion of a Bezel string in the same scope as a string concat loop leaks 136 bytes (slot-B adversarial discovery)
+- #2224 [leak]   (92d) #1889 (deferred): Task-family element disposal in collections breaks async nested-Task returns
+- #2370 [other]   (89d) question: owning-wrapper branch admits fresh values through non-owned wrapper returns — recorded decision or divergence from Appendix C.3?
+- #3427 [leak]   (61d) fix #3402 follow-up: the LocalDecl-only sweep's 'not applicable' rationale is wrong for records, value-like choices and view aliases — three measured 
+- #3489 [other]   (61d) Implement SortedSet<T> for a reference element type (follow-up to #3428's rejection; also widen the two §15.4 fresh-store whitelists)
+- #3904 [leak] S (51d) tests: narrowed_value_unbox_3090's box-escape leak control is unreachable — §15.4 rejects the collection literal before any box exists
+- #3908 [other] S (51d) codegen: a non-auto-hashable RECORD's boxed .Equals/.GetHashCode bypasses the §9.2 use-site error (structural compare via a class field's reference id
+- #4482 [leak]   (37d) codegen: char.ToString(cp) static spelling and string.IsNullOrWhiteSpace(ownedLocal) leak, while their sibling spellings do not
+- #4713 [other]   (34d) rule-corpus s35_4_0007: an owning-choice local's undischarged must-use warning never fires (disposal itself is correct; only the K3.14 diagnostic is m
+- #4717 [leak]   (34d) [codegen] §8.6 box mints are never discharged — 24 B/call across the Array/LinkedList/Dictionary/Set Object family
+- #4781 [leak]   (33d) codegen: fresh string concat assigned into an Object local leaks (10.5 KB / 600 allocs per 300 iterations)
+- #4782 [leak] S (33d) codegen: narrowed self-assign `o := o` on an Object narrowed to int leaks ~2 boxes/iteration
+- #4786 [leak]   (33d) codegen: a fresh `new C(..)` used as a property-read receiver is never disposed — `new C(i).Tag` leaks one object per evaluation (§28.3)
+- #4840 [leak]   (33d) [ownership] owned parameter of a record body constructor is leaked when not stored (ASan: 16 bytes)
+- #4841 [leak] S (33d) codegen: a value argument §8.6-boxed into an Object/interface CONSTRUCTOR parameter at `new C(5)` is never released — one 24 B box leaked per construc
+- #4874 [leak]   (33d) [codegen][leak] collection-literal local in a generic method body is never disposed (184 B/2 allocs per call)
+- #4906 [leak]   (33d) Leak: string temporary passed as a ctor-chain argument (this(s := t + u)) is never released
+- #4960 [leak]   (32d) [codegen] conditional `return y;` of an owned plain local leaks `y` on the fall-through path (disposeStack_ erase is not edge-local) (§28.3)
+- #4969 [leak]   (32d) codegen: event Raise leaks an owned class payload temporary on SharedEventSource<T> and EventSource<T> (stdlib §6.5, v0.307)
+- #4970 [leak]   (32d) codegen: event Remove / -= leaks a 48 B closure record per call, even for a static handler (SharedEventSource<T> and EventSource<T>, stdlib §6.5, v0.3
+- #5051 [leak]   (31d) [codegen][leak] string leaks at constructor boundaries: #4981 base-slot retain over-counts mixed nullable arg; +1 local to primary ctor; this(...) pro
+- #5064 [leak]   (30d) [codegen][leak] fresh `new` assigned to a non-owned class-typed auto-property is accepted silently and never disposed (§28.6/§28.3, v0.307)
+- #5072 [leak]   (30d) [codegen][leak] owned loop-body local returned conditionally from inside the loop is never disposed on non-returning iterations (§28.3 K3.14, v0.307)
+- #5129 [leak]   (28d) [codegen][leak] function-typed arg passed to a method-own generic param U leaks 48 B/call (Object? field widening shape)
+- #5212 [leak]   (27d) [codegen][leak] set(owned) setter body that never consumes `value` leaks it — undischarged owned parameter not auto-dropped (§28.3/§23.3, v0.313)
+- #5223 [leak]   (26d) [codegen][leak] §28.11 runtime-managed element row not implemented for function values: Array<() -> int>.Add / dict values never retain-on-insert / re
+- #5229 [leak]   (26d) [codegen][leak] boxed argument at a function-value call site is never released (one 24-byte box per call) — follow-up to #5221
+- #5281 [leak]   (25d) [codegen][leak] the #5244/#5262 borrowed-string-argument pin is never dropped when the callee throws, and not at all on a bound method-reference call
+- #5294 [other]   (25d) [codegen] a fresh owned temporary passed to a borrow parameter is disposed at SCOPE end, not at the full expression's end (§28.3 Unbound owned tempora
+- #5325 [leak]   (24d) [codegen][leak] owned field of a vtable-less builtin class is not drop-on-overwrite: a second store leaks the displaced Stopwatch (§28.7)
+- #5350 [leak] S (24d) [codegen][leak] a never-transferred local from a builtin static factory (Stopwatch.StartNew, CancellationTokenSource, FrozenArray) leaks: producerStat
+- #5412 [leak]   (23d) [codegen][leak] Channel<T> record/choice element with an owned field leaks: no Dispose is emitted for user aggregates
+- #5457 [leak]   (21d) #5421 follow-up: drop-on-overwrite fix (137eb947) has no ASan row that can observe the reassignment leak
+- #5743 [other]   (18d) A discarded move-only owning-array return is never disposed (32 B, field-independent)
+- #5879 [other]   (14d) §35.4/§9.7: an Object-typed payload or field is not treated as borrow-carrying, so a borrow-bearing temporary is admitted
+- #5928 [other]   (14d) No machine enforcement that a fresh llvm::Function pins currentFn_ (silent cross-function IR regression)
+- #5948 [other]   (14d) §14.2 (v0.338): `Rel<Box<A>, Box<A>>` with `where T: U` inside a generic body is wrongly rejected (identical types)
+- #5951 [leak] S (14d) [codegen] a §8.6 box minted for an argument to a GENERIC callee's Object? parameter (or a Object? local in a generic body) is never released: 24 B per
+- #5967 [leak]   (14d) a method-reference function value copied from a local or stored into a collection leaks its 48 B function object (LSan), one per evaluation
+- #5968 [other]   (14d) §14.2 (v0.338): `where T: U` with a bare-parameter / derived-over-different-argument argument is accepted at the instantiation (`Rel<A,Box<A>>`, `Rel<
+- #5975 [other]   (14d) §28.5 *Generic class fields* (v0.338): the compiler accepts `owned _slot: T` instantiated at an owning inline array (`Box<[2 owned]Res>`); the spec re
+- #5980 [other]   (14d) Task<Object>/OwningTask<Object> result holding a user-class instance upcast to Object is never disposed or freed
+- #6003 [leak] S (14d) [ownership][leak] plain 'var' local of a built-in exception class from a factory call is never auto-dropped and draws no warning (§28.3, v0.338)
+- #6059 [other]   (14d) Operator arguments are not boxed: value kinds and primitives against an Object operator parameter (§25, §5.1, §8.6)
+- #6060 [leak]   (14d) sync body with more than one return: `return <owned local>` stops later exits from disposing that local (leak; sync twin of #6052)
+- #6085 [leak] S (14d) [codegen][leak] a §8.6 box in an Object local leaks 24 B: async-body local at scope end, and a box local returned from a sync or Task<Object> body
+- #6093 [leak] S (14d) [codegen][leak] method reference over a boxed-record local still leaks the 24 B box when the local is reassigned, aliased, or passed as an argument (r
+- #6105 [other]   (14d) [codegen][memory-safety] generic class constructor argument at T := Object is not converted: `new Box<Object>(5)` SEGVs (§8.6, v0.338)
+- #6117 [leak] S (14d) [codegen][leak] a fresh exception object produced by an `if`/`case` EXPRESSION arm and bound to a local is never disposed (LeakSanitizer)
+- #6135 [other]   (14d) a nullable function value at Console.WriteLine / in an interpolation hole is lowered as a string: prints nothing, SEGV when null
+- #6147 [other]   (14d) [codegen] §9.2 (v0.338): a boxed GENERIC record ignores its declared Equals/GetHashCode through the Object slot (follow-up to #5924 item 3)
+- #6148 [other]   (14d) [codegen] string stored in an Object? property is released as a box once another instance holds a boxed value: SEGV in bz_box_release (§8.6)
+- #6149 [leak] S (14d) [codegen][leak] Object box argument is never released: local Object passed to a call, and a temp boxed for an interface-dispatched call (§8.6)
+- #6177 [leak]   (14d) ownership: borrow-taking query temporary s.Remove(new R(..)) on OwningSet/OwningArray leaks the temporary (§28.3 rule 5), same on base
+- #6188 [other]   (13d) [codegen] §8.5/§8.6: ToString on a boxed generic record at string renders garbage fields (G<string> as Object prints G(V: 5851008, X: 0))
+- #6189 [other]   (13d) [codegen][xmod] §2 rule 4 / §9.2: boxed values of one record type compare unequal through Object.Equals when boxed in different modules (is S is true)
+- #6209 [leak] S (13d) [codegen][leak] x.Equals(<call returning Object>) never releases the returned box, for record, string and Object receivers (§8.6 / §28.9)
+- #6260 [leak]   (13d) codegen (§7.7, §28.2, v0.338): `return nn ?? throw` at an Object return leaks one function-value cell per call (follow-up to #6176)
+- #6275 [other]   (13d) sema: cross-module 'override Foo(x: Item)' in class AD: B<Box<int>> rejected 'does not match the base member's parameter types (§12.1)'
+- #6281 [leak]   (13d) codegen (§15.1, v0.338): an inline-array literal or call result of interpolated strings leaks every element
+- #6366 [leak] S (10d) [codegen][ownership][leak] an unbound owned collection temporary leaks on .Sum() and as a bare discarded call statement — ALL THREE families incl. Lin
+- #6374 [leak] S (10d) [codegen][ownership][leak] unbound owned OwningLinkedList<T> leaks on .Count/.Count()/for-in — 33,600 B / 600 allocs; the exclusion is STRUCTURAL (kPl
+- #6418 [leak] S (10d) [codegen][leak] an unbound owned Set/Dictionary ARGUMENT (not receiver) still leaks after #6394
+- #6420 [leak]   (10d) [codegen][leak] an Aggregate seed BOUND TO A LOCAL leaks 3,535 B / 202 allocs on both sides of #6395
+- #6421 [leak] S (10d) [codegen][leak] a discarded _ := expression leaks 3,532 B / 201 allocs — general to _ :=, NOT LINQ
+- #6444 [leak] S (9d) §17.13 (v0.338): discard of string concatenation leaks 32 B/iter — spec says cosmetic, asymmetry with var binding
+- #6454 [leak]   (9d) [codegen][leak] the three LIST heads still leak 29,940 B on staging — #6415's fix is committed on unpicked lane branches and BEZEL_TEST_FILTER=6415 ma
+- #6456 [leak]   (9d) [codegen][leak] a string-keyed Dictionary DECLINES the key-column release and leaves a per-key string leak standing — deliberately, with the reason re
+- #6457 [leak] S (9d) [codegen][leak] a bare `new <builtin collection>` argument at a BORROWED parameter is never disposed — every builtin type, parameter type irrelevant (
+- #6461 [leak]   (9d) [codegen][leak] a NESTED block-bodied string getter leaks 8000 B / 400 allocs on every read — byte-identical on base and on #6449, and absent from tha
+- #6481 [leak] S (8d) [codegen][leak] a `new` class passed as a plain argument to a borrowing `Dictionary.Add` is never discharged (1,616 B / 101 allocs over 101 iterations
+- #6520 [leak]   (8d) [codegen][ownership][leak] an `owned IOwningCollection<T>` / `IReadOnlyCollection<T>` FIELD gets NO disposal at all — generated DisposeCore is empty
+- #6558 [leak]   (7d) Dictionary&lt;string,V&gt;.Keys leaks every rebuilt key string (186 B / 11 allocs)
+- #6614 [leak]   (7d) the #6476 range-slice carve-out in LlvmBackend_Assign.cpp is still present and still covers a leak shape (P.MakeArr()[0..1]: 223 B / 4 allocs -> 301 B
+- #6621 [leak]   (7d) #6611's vacuity survives in the leaksAtLeast (floor-assertion) spelling: function_typed_autoprop_disposal_5389 reads 2/0 under the knob — the only lea
+- #6623 [other]   (7d) #6609 R1 (r32-selfassign @ d27ed21e): reviewed fix, +10 checked_calls with flat absorbing_sites — cannot be banked
+- #6632 [leak] S (7d) [codegen][leak] an unbound owned OwningArray call result as a member receiver (`C.Make(move zs).Count`) is never disposed — 22,400 B / 400 allocs over
+- #6633 [leak] S (7d) [sema][codegen][leak] a bare expression statement of an owned built-in owning collection (`C.Mk();`, `new OwningStack<Item>();`) is neither rejected (
+- #6670 [leak]   (6d) [codegen][leak] an owned built-in collection temporary argument leaks when a LATER argument throws; a class temporary is clean (§28.3, v0.339; #993 re
+- #6716 [leak]   (6d) codegen §28.3: a fresh 'new StringBuilder()' (decl-null builtin class) as an operand of '=' / '<>' is never disposed (leak; isFreshOwnedClassProducer 
+- #6733 [leak] S (6d) [codegen][leak] record = Object-local equality leaks the 24 B box made for the record operand (§8.4, §8.6)
+- #6736 [leak] S (6d) [codegen] §28.9 (v0.339): a string argument built at run time leaks through Array<string>.Contains, IndexOf and Remove
+- #6744 [leak] S (6d) §28.9 (v0.340): leak of the base(...) temp string when a this(...)-hop target's base(x + "!") binds a primary-ctor base's positional string (2 allocs 
+- #6769 [leak] S (6d) [codegen][leak] a record temporary passed to an Object parameter leaks the 24 B box, generic or not (§8.6)
+- #6771 [leak]   (6d) [ownership][leak] §28.3 (v0.340): an owned value in an Object local, read through the #6083 early-exit record as `var d: Dog := o`, leaks (16 B)
+- #6773 [other]   (6d) §22.6: co-equal conversions from a user generic source (Box<Dog> at IBox<Animal>/IBox<Dog>) are still silently resolved (residual of #6702)
+- #6775 [leak] S (6d) A temporary passed as an argument or used as a receiver is not disposed (LeakSanitizer; spec §28.3)
+- #6827 [leak] S (6d) [codegen][leak] a value boxed for an Object parameter that the callee returns or stores into a field leaks 24 B per call (§8.6, §28.9)
+- #6843 [other]   (6d) §8.5: boxed DateTime (Object) renders System.DateTime instead of its ToString
+- #6844 [leak]   (6d) §28: aligned interpolation hole of a call-result string leaks; temporary string arg to StringBuilder.Insert leaks
+- #6857 [leak] S (6d) A two-level exception subclass with a computed `base(...)` message leaks 35 bytes in 2 allocations (§28.3)
+- #6876 [other]   (6d) A ?. receiver-qualified extension method reference (b?.Foo over extension Box) lowers to a zero function value (§27.6, §7.5, v0.340)
+- #6889 [leak] S (6d) [codegen][leak] §28.3 (v0.340): an `Array<string>` local passed to the static `Console.WriteLine(a)` is never disposed (192 B / 2 allocations)
+- #6896 [leak] S (6d) [codegen] §28.3 (v0.340): the IReadOnlySpan<T> adapter box minted for a span argument at an interface-typed parameter is never released (32 B leak per
+- #6917 [leak]   (6d) Owned Mutex created in a loop and acquired without disposal leaks; using var o := move mx also leaks
+- #6926 [leak] S (6d) Leak: a record boxed into an Array<IFace> via Add(record) is never freed (top-level record)
+- #6929 [leak] S (6d) Leak: in a generic method, boxing the same top-level record twice (call arg to an interface param, then a var of the interface) leaks one box
+- #6930 [leak] S (6d) [codegen] §19.3 (v0.340): a boxed int passed to an Object parameter that is scrutinised by a case expression leaks the 24-byte box (LSan); binding and
+- #6938 [leak] S (5d) [codegen][leak] a string slice by a Range VALUE (local or call result) leaks its result, 35 B/iteration; the literal-range slice does not (spec §16.3,
+- #6941 [leak]   (5d) [codegen][leak] owned class result of a user unary operator bound by using var leaks 16 B
+- #6975 [leak]   (5d) [codegen][leak] (v0.340): a temporary class instance or array passed directly to an Object parameter leaks, with no pattern involved
+- #7005 [leak] S (5d) [codegen][leak] a case (stmt or expr) over an Object local holding a §8.6 box leaks the box (24 B) at scope end (§8.6, §28.9)
+- #7020 [leak]   (5d) Statement-form case: a float or string bound over an integer scrutinee leaks an LLVM ICmp verifier error instead of the §19 diagnostic
+- #7026 [leak]   (5d) [codegen][ownership][leak] _ := o; on an owned Object holding a Mutex leaks the mutex core; the same discard of a directly typed Mutex is clean (§17.1
+- #7037 [leak]   (5d) [codegen][leak] plain var of a class nested in a LOCAL record is never disposed (16 B) (§28.3, §21.10, v0.340)
+- #7099 [leak]   (4d) a fresh owned temporary passed to a function value leaks (16 B)
+- #7125 [other]   (3d) [codegen] 28.3 rule 1's unbound-owned-temporary boundary is implemented THREE ways: scope end (direct call), immediately after the call (borrowing-col
+- #7141 [other]   (3d) [sema] §15.4's fresh-store warning does not fire when the receiver's static type is the borrowing-family interface IList<T> (it fires on the concrete 
+- #7147 [other]   (3d) [ownership] §28.6's 'other non-owned call result' is unenforced: a call whose declared return is a plain class type is a BORROW (§28.3's producers tab
+- #7152 [leak] S (3d) A temporary passed to an interface- or Object-typed formal is NEVER discharged (a fourth arm of the §28.3 K8 rule, not a mis-timed one)
+- #7166 [leak]   (3d) The defect
+- #7171 [leak] S (3d) [codegen][leak] a string index/slice over a PRODUCER receiver never discharges that receiver (35-38 B, LSan) — the never-released class, not #7159's t
+- #7177 [other]   (3d) [codegen] an index on a NON-GENERIC type name (Plain[0]) is ACCEPTED and prints NOTHING, while the GENERIC spelling (Box<int>[0]) is rejected with §23
+- #7187 [leak] S (3d) [codegen][leak] a while CONDITION's unbound owned temporary accumulates across iterations - 200 000 of 200 001 evaluations still leak (§28.3 K8.2, v0.
+- #7188 [leak] S (3d) [codegen][leak] a STATIC BUILTIN call whose argument is a +1 string producer leaks that producer on the NORMAL path (17500-35000 B / 1000-2000 allocs 
+- #7190 [leak] S (3d) [codegen][leak] a var-declared array literal passed to string.Join escapes - 144 B in 2 allocations per call (8640 B / 120 allocations over 60 iterati
+- #7211 [leak] S (3d) [codegen][leak] a +1 producer string passed as an ARGUMENT to a 9.6 string INSTANCE method leaks 700 B / 40 allocs over 20 iterations (the instance-me
+- #7222 [leak] S (2d) [codegen][ownership] the §9.6 string-member family does NOT discharge the value argument's producer reference — it leaks
+- #7230 [leak] S (2d) [ownership][leak] a fresh new StringBuilder(...) used as a RECEIVER TEMP is never disposed - 12560 B / 80 allocs over 20 iterations under LSan
+- #7231 [leak] S (2d) [ownership][leak] a producer VALUE argument is neither retained nor released by the StringBuilder.Insert arm - 700 B / 40 allocs over 20 iterations on
+- #7267 [leak] S (1d) A radix-rendered string is allocated but never disposed - every ToString(radix) leaks 35 bytes in 2 allocations (28, v0.344)
+- #7272 [leak] S (1d) [ownership][leak] StringBuilder.AppendFormat calls the vtable renderer and never releases the +1 string it gets back - 35 B / 2 allocations, every cal
+- #7278 [leak] S (1d) [leak] `s.ToCharArray()` leaks the returned array - 112 B / 2 allocations (the array's own storage)
+- #7298 [leak] S (1d) an Array<Object> leaks the box it stores a value in, with no AppendFormat call at all
+- #7307 [leak]   (1d) a `using var` bound to a field store leaks 35 bytes - and so does the plain `var` twin, so this one is symmetric
+
+## builtin-call-admission — Built-in call admission: typed arms for the stdlib surface (189 open; §22.6, §5.1, §7.4, stdlib §2, §3, §9)
+
+- #1765 [sound]   (107d) [codegen][soundness] Ptr<T>.Load/Store/DangerousPointer is a codegen stub — silently returns default (no real dereference) (§32.12)
+- #2221 [sound]   (92d) array.Sort on class-typed Array<T> causes heap-use-after-free (ownership model silent miscompile)
+- #2620 [sound] S (84d) [codegen] TaskCompletionSource<T>.TrySetResult/SetResult with a NARROWED T? delivers the tag byte instead of the value (silent wrong result)
+- #2625 [sound] S (84d) [codegen] narrowed-nullable not unwrapped: residual builtin value-type-param lowering sites (audit; 3 reproduced, ~30 inferred) — family of #2605/#261
+- #2647 [sound]   (84d) [codegen] SortedSet<T> literal takes the bz_array_alloc path but SortedSet is documented as bz_dict_t-backed — representation mismatch (verify first)
+- #2730 [sound]   (84d) codegen: OwningArray<T>.AddRange may not drain its source (unverified), and SortedSet/SortedDictionary still silently drop a comparer argument
+- #4120 [sound]   (48d) CString/WString/RawBytes.ToString() silently return a wrong value (empty string / garbage) — same shape as #3907, uncovered by its fix
+- #4126 [sound]   (48d) CancellationToken/Range<T>/Guid.GetHashCode() silently wrong values; Stopwatch.ToString()/.GetHashCode() SIGSEGV — same defect class as #4120, not fix
+- #4481 [sound]   (37d) stdlib: char classification and case conversion are ASCII-only above the #4420 guard — needs UCD data or a doc'd ASCII contract
+- #4585 [sound]   (36d) codegen: Array<Guid?> stores a corrupted payload — the hasValue tag survives, the Guid bytes do not (§7.2/§15.1, v0.306)
+- #4790 [sound]   (33d) codegen: equal-arity ctor that binds by name but mismatches type shadows an applicable defaulted sibling (silent zero-fill / IR verifier failure) (§22
+- #5409 [sound]   (23d) §14.1 (v0.314): retire the #4847/#4862 name-keyed shadowing workarounds, now dead after #5393
+- #6636 [sound] S (7d) [sema][soundness] string.Split(int) is silently accepted with a permissive-acceptance warning and prints 0
+- #6637 [sound] S (7d) [codegen][soundness] Array<int>.IndexOf with a flow-narrowed int? argument returns -1 for a present element
+- #6648 [sound] S (7d) Math.Min/Max/Clamp over double, int or long have an untyped result, so any initializer target is accepted (silent wrong output)
+- #6751 [sound] S (6d) Mixed-type = with byte or ulong against double gives wrong answers (§6.2, v0.339)
+- #6782 [sound] S (6d) TimeSpan.ToString(null) and DateTime.ToString(null) compile for a non-nullable format parameter (stdlib §2.18, §7.1, v0.340)
+- #6823 [sound] S (6d) [codegen] a §7.4-narrowed nullable value at a built-in non-string overload passes the carrier: Append(int/double/char), int.ToString(radix), int.Parse
+- #6864 [sound] S (6d) `Math.Max(3u, 4000000000u)` prints 3: the generic `Max` orders `uint` wrongly (stdlib §2.2)
+- #6865 [sound] S (6d) `Math.Min('a', 'b')` prints 97, not `a`: the generic `Min` returns the character code (stdlib §2.2)
+- #6942 [sound] S (5d) [sema][soundness] Math.Sign as a non-callee reference is typed int: bare `var g := Math.Sign;` compiles and yields 0, and `Math.Sign<int>` as (int) ->
+- #6957 [sound] S (5d) [sema][soundness] Encoding.UTF8.GetString accepts a non-byte array (Array<int>, Array<char>) and prints a wrong string (stdlib §3.2)
+- #6983 [sound]   (5d) FrozenArray<string>.From frees a borrow returned through a function value or a builtin method (o.First()): heap-use-after-free
+- #7004 [sound] S (5d) §19.5: a typed binding var a: int over an int? destructuring slot binds the whole nullable carrier (reads a garbage value)
+- #7066 [sound] S (4d) [codegen] a same-module `var r: T? := x;` (T a type parameter) degrades to a zero-initialized local and the program prints the wrong value (§7.4, §14.
+- #7089 [sound] S (4d) [codegen][soundness] a §12.7-narrowed nullable RECORD carrier read as a VALUE hands the tagged carrier to a record consumer (malformed IR; record equa
+- #7098 [sound]   (4d) [codegen][soundness] a method group over a builtin collection member SILENTLY non-lowers on a signature mismatch and the call SEGVs (§27.6, v0.343)
+- #7108 [sound] S (3d) [codegen][soundness] string.Remove has no start-index bounds check: Remove(253) on a 252-char string reads past the end and returns a 253-length strin
+- #7189 [sound] S (3d) [codegen][soundness] a string.Join over an element WIDER than 8 bytes reads a TRUNCATED element - Array<[3]int> SIGSEGVs and Array<RS> prints a garbag
+- #7210 [sound] S (3d) [codegen][stdlib][soundness] StringBuilder.Insert SILENTLY NO-OPS an out-of-range index - stdlib 3.1 says it raises IndexOutOfRangeException (and a ru
+- #7229 [sound] S (2d) [stdlib][codegen] the StringBuilder runtime's mutators index the flattened BYTE content while Length counts CODE POINTS - an in-range multi-byte Inser
+- #7291 [sound] S (1d) Convert.ToString aborts the compiler when the VALUE argument is a nullable that is null at run time
+- #7294 [sound] S (1d) the one-argument int.Parse arm has no first-argument guard: a class instance is read as text from foreign memory
+- #2313 [crash]   (90d) IReadOnlySpan<char> parameter emits malformed IR (#971 item 4 residue; blocks §3.3 SequenceEqual(IReadOnlySpan<char>))
+- #2642 [crash] S (84d) codegen: LINQ Contains on IEnumerable<T> ICEs on a narrowed T? and on a nullable-element sequence (§7.4 / stdlib §5, v0.236)
+- #4255 [crash]   (46d) bezelc OOMs (~24.7GB RSS) compiling a legitimate 2000-level deep non-generic record nesting chain; pre-existing, not caused by #4237
+- #4805 [crash]   (33d) codegen: combined-form record ctor with ref parameter + literal call-site arg mis-lowers to internal #1386 ICE instead of clean §22.3 diagnostic
+- #5911 [crash]   (14d) §15.1: *OrNull tier unenforced — Dictionary<[3]int,[3]int>.GetOrNull admitted, then malformed IR
+- #5978 [crash]   (14d) A function value at Object is not recognised at run time: `o is string` is True and `o.ToString()` crashes
+- #6056 [crash]   (14d) §12.7 (v0.338) residuals of #5826: a case type pattern at a function type emits malformed IR; `is` against a function type does not narrow
+- #6084 [crash] S (14d) codegen §17.4 (v0.338): `o as <choice>` then `<> null` fails IR verification (icmp i32 vs i8 has-value flag)
+- #6100 [crash]   (14d) codegen: `return o ?? 5;` / case-expression mixing an Object local and an int under Task<Object> emits malformed IR (§30.5, v0.338)
+- #6116 [crash] S (14d) [codegen] `bq ?? b = b` (class `B?` coalesce compared by reference) fails IR verification: PHI node operands are not the same type as the result
+- #6126 [crash] S (14d) [codegen][crash] nullable function value in an interpolation hole SEGVs when null; `Console.WriteLine` of a nullable function value prints an empty li
+- #6254 [crash] S (13d) §14.5 (v0.338): single generic candidate bound only by a bare null — M<T>(x: T?) fails IR verification, M<T>(x: Array<T>?) runs with T unbound
+- #6255 [crash] S (13d) [codegen] §7.4-narrowed int? passed to a long parameter fails IR verification (missing unwrap before §5.1 widening)
+- #6295 [crash] S (13d) Math.Max<T> reference: false rejection under a constrained type parameter, and wrong type-argument count still crashes (rc139)
+- #6635 [crash] S (7d) [sema][compiler-crash] string.Contains / LastIndexOf / Replace accept an int search value at position 0 and ICE (siblings of #6562)
+- #6646 [crash]   (7d) [codegen] §35.3 (v0.338): a nullable-typed argument of a choice payload is stored without unwrapping and emits malformed IR (same store-side gap as #6
+- #6647 [crash]   (7d) Math.Round/Sqrt/Pow accept a decimal argument and Math.Abs accepts decimal? (undeclared overloads reach codegen as malformed IR)
+- #6659 [crash] S (6d) Set<T?> and Dictionary<K?,V> with a nullable key: IR verification abort (Dictionary) and TryAdd adds nothing (Set<double?>)
+- #6677 [crash] S (6d) [codegen][crash] `long? ?? int?` segfaults the compiler (rc 139) (§7.7, §5.1, v0.339)
+- #6689 [crash]   (6d) codegen: FileStream passed as a Stream argument to a user method/operator fails IR verification (Call parameter type does not match function signature
+- #6750 [crash] S (6d) in over Array<long?> with an int operand fails IR verification (§17.5, v0.339)
+- #6809 [crash] S (6d) [sema][compiler-crash] StringBuilder Insert/Remove/Replace accept wrong argument types and arities and emit malformed IR (a.Replace(1,2), a.Remove("a"
+- #6845 [crash] S (6d) user type/extension named StringBuilder with Insert dispatches to the builtin by name (IR verification failed)
+- #6854 [crash]   (6d) A `case` expression with a binding type pattern emits malformed IR and fails codegen (§19.3)
+- #6860 [crash]   (6d) Compiler segfaults (exit 139) on a `+` chain of 1500 or more terms; 1000 terms compile
+- #6873 [crash]   (6d) codegen emits malformed IR for null passed to a Type? parameter
+- #6884 [crash]   (6d) Math.Max/Min with mixed argument types (int,long / int,double) emit malformed IR (stdlib §2.2, §14.5)
+- #7030 [crash]   (5d) [codegen] a lambda whose expression body is `q.IsEmpty` / `q.IsOpenEnded` / `q.IsEndInclusive` / `q.Step` on a Range<T> fails IR verification (§27.5, 
+- #7118 [crash]   (3d) [codegen][compiler-crash] Array<T>.AsSpan(start) truncates a byte startIndex -> malformed IR aborts the compiler (§5.1)
+- #7154 [crash] S (3d) StringBuilder.Replace lowers to a malformed bz_sb_replace call: the LLVM module fails IR verification (pre-existing)
+- #7167 [crash]   (3d) The defect
+- #7180 [crash] S (3d) [compiler-crash] a reordered named-argument call to string.Equals hands an i1 to a ptr parameter: the compiler aborts with "IR verification failed"
+- #7217 [crash] S (2d) [codegen][compiler-crash] the codegen's isStrBld arm claims a USER-DECLARED class named StringBuilder by HEAD NAME - calling one of its OWN methods SE
+- #7218 [crash]   (2d) [sema][codegen] a Math/Convert built-in's argument is NEVER type-checked — the compiler ABORTS with malformed IR instead of a §5.1 diagnostic
+- #7232 [crash] S (2d) [compiler-crash][sema] a NULLABLE argument at a Math position is unchecked and ABORTS the compiler with malformed IR - 7's nullability registry covers
+- #7239 [crash] S (2d) [codegen][compiler-crash] a RUN-TIME `long` at Convert.ToString's `toBase` parameter makes the compiler emit MALFORMED IR - `Type too small for SExt /
+- #7244 [crash] S (1d) [compiler-crash][stdlib] StringBuilder.AppendFormat SEGFAULTS on a `string` argument (it reads the string's DATA pointer as a vtable)
+- #7246 [crash]   (1d) [compiler-crash][codegen] a LOCAL holding ANOTHER local (a method reference) still SEGFAULTS — the #7214 fix recovers the type only ONE level deep
+- #7252 [crash]   (1d) [codegen][compiler-crash] `DateTime.FromTicks(ticks: long)` makes the compiler emit MALFORMED IR for an unsigned argument - `IR verification failed` -
+- #7265 [crash] S (1d) The ToString(format: string) format-specifier path renders unsigned signed, ignores the binary specifier, and CRASHES the compiler for a long/uint rec
+- #7274 [crash] S (1d) [codegen][compiler-crash] a float operand and a double operand at Double.IeeeEquals/BitwiseEquals produce MALFORMED IR - the compiler aborts with "IR 
+- #7284 [crash] S (1d) decimal.ToString(radix) ABORTS THE COMPILER with an LLVM IR verification failure
+- #7285 [crash] S (1d) int.Parse / int.TryParse silently accept a uint/ulong radix and SEGFAULT on a bool/string radix
+- #7287 [crash]   (1d) the literal format overload aborts the compiler for every non-32-bit integer receiver (fptosi on an integer value)
+- #7290 [crash] S (1d) the two-argument int.TryParse aborts the compiler when the first argument is not a string
+- #7293 [crash] S (1d) double/float/decimal TryParse abort the compiler when the first argument is not a string
+- #7297 [crash] S (1d) a nullable floating-point argument to Math.Floor makes the compiler load the whole nullable box and abort with malformed IR
+- #7299 [crash] S (1d) four more compiler aborts: the bool and char receivers of Parse/TryParse with a non-string first argument
+- #7300 [crash] S (1d) the decimal Parse/TryParse arms are a second copy in a different file and still abort the compiler
+- #7319 [crash]   (0d) `ToString(format)` on a NULLABLE receiver formats the CARRIER instead of the payload — and on a `double?` receiver the compiler emits malformed IR and
+- #7329 [crash]   (0d) The literal `D`/`X` format on an integer receiver that is not 32 bits wide emits MALFORMED IR and ABORTS the compiler
+- #7331 [crash]   (0d) `Convert.ToString` on a NULLABLE operand renders the CARRIER's bytes, and `Convert.ToString(value, toBase)` on a nullable operand ABORTS the compiler
+- #7358 [crash] S (0d) a malformed format-specifier SUFFIX on a NARROW integer receiver emits INVALID IR (`trunc` where a WIDEN is required) - and on a 64-bit receiver it no
+- #1701 [other]   (108d) [v0.185] IParsable<T>.TryParse out-nullability bridge synthesis (constraint-vs-direct surface split)
+- #1792 [other]   (105d) impl: direct char.Parse/TryParse/ParseOrNull and bool.ParseOrNull unhandled in sema though codegen lowers char's pair (stdlib §9.5/§2.19, v0.222/v0.23
+- #2094 [other]   (98d) Counter<K> implementation deferred from #2093 — requires new intrinsic class machinery
+- #2253 [other]   (91d) decimal: banker's rounding now applies to ToString("Fn") but not to "Pn"/"En" — two spellings of the same rounding disagree
+- #2256 [other]   (91d) spec §22.15 × §35 choices: the closed pure-construction list omits choice construction, and the pure return restriction misses owning choices
+- #2651 [other]   (84d) sema: Dictionary entry-form Add/Contains/Remove(entry) is classified as the K slot (latent false reject, masked today) — stdlib §4.8, v0.237
+- #2662 [other]   (84d) span.Slice(r: Range<int>) is accepted but undeclared in stdlib §4.14/§4.15 — accepted-and-never-lowered, and two ownership tests depend on it
+- #2729 [other]   (84d) stdlib §4.9 sorted-dictionary comparer: implement the borrowing comparer field per the reference implementation (the needs-a-ruling claim was withdraw
+- #3396 [other]   (61d) fix #2765 follow-up: Object → a USER class's builtin IEquatable<Object> is now rejected with a stdlib-specific message that does not describe that pro
+- #3509 [other]   (60d) SortedDictionary<K, V> with a reference key is O(n) per point operation: the CompareTo identity pair uses a constant hash (follow-up to #3488; stdlib 
+- #3826 [other]   (53d) OwningBuffer/FrozenArray/Dictionary/SortedDictionary Reverse() does not match stdlib §5 (deferred from #3763)
+- #3896 [other]   (51d) Set/OwningSet/SortedSet/FrozenArray/Dictionary/OwningDictionary/LinkedList/OwningLinkedList still gated by closed-#2457 placeholder (residual slices a
+- #3943 [other]   (51d) codegen: record arm's #3922 non-struct guard doesn't consult viaNullCondWrapper — double diagnostic via ?. (inconsistent with choice arm's #3925)
+- #4797 [other]   (33d) [codegen] coll.Drain() passed directly as a call argument does not lower (internal #1386 compile failure)
+- #4890 [other]   (33d) [spec-question] double/float no-format ToString() renders NaN/Infinity as lowercase "nan"/"inf", while internal diagnostic code uses capitalized "NaN"
+- #5355 [other]   (24d) [codegen] pin #5313 site 5 (builtinHead unwind in registerUnwindOwnedParam) for the imported Channel/ChannelSender owned-parameter shape (§30.15, v0.3
+- #5486 [other]   (20d) spec-question: §35.3 / §28.3 (v0.316) — are function-typed choice payloads and inline-array elements fields for the closure bullet?
+- #5490 [other]   (20d) spec-question: stdlib §2.3 (v0.316) — Convert.ToString(double) states no relation to double.ToString()
+- #5854 [other]   (15d) [spec-question][10.5 vs 9.2] is override Equals(Object?) on an enum/choice admitted or rejected? The corpus says REJECT and banks the row fail; the co
+- #5961 [other]   (14d) §12.2 (v0.338): static `Equals`/`GetHashCode`/`ToString` at another signature (and a field/property of those names) accepted — only the own-signature 
+- #5998 [other]   (14d) Extension-head constraint check (#5549) residuals: type-bound items, Dictionary and other builtin heads, nested heads
+- #6007 [other]   (14d) default(X) accepts built-in classes (StringBuilder, Exception, Stream, Mutex, Channel, ...) that §17.11 says are non-defaultable
+- #6024 [other]   (14d) sema §7.5 (v0.338): ?. on a built-in collection/StringBuilder member (a?.Count, a?.Length) infers a NON-nullable type; null receiver yields 0, and `va
+- #6027 [other]   (14d) diagnostic §22.6 (v0.338): an ambiguous-call message lists Handle(IOException) twice for the pair Handle(IOException) / Handle(IOException?) (the null
+- #6029 [other]   (14d) diagnostic §12.1/§8.1 (v0.338): two misleading messages on a class Object-trio override: virtual ToString(fmt) base gives a parameter-count message; `
+- #6035 [other]   (14d) narrow #5962 residual: chain link through a composite record/choice over S not judged for default(T) (§17.11)
+- #6042 [other]   (14d) codegen: own-typed Equals call on a generic owning choice value fails LLVM verification
+- #6049 [other]   (14d) narrow #6032 residual: owning-at-every-instantiation generic choice with a constrained type parameter still falsely obliged GetHashCode (§8.3 L1103)
+- #6058 [other]   (14d) [codegen] a value at an Object-typed positional record component or choice payload is stored unboxed (SEGV on the first type test) — §8.1 / §8.3 (v0.3
+- #6070 [other]   (14d) sema §7.5 (v0.338): chain continuation after a nullable-chain value segment is rejected: `s?.Length.ToString()` / `a?.Count.ToString()`
+- #6078 [other]   (14d) override Equals(Object?) on a record/enum/choice accepted although §9.2 says value kinds do not override Object members (and its own-typed-Equals pair
+- #6106 [other]   (14d) sema §8.1/§27.7.1 (v0.338): Object members on a function-typed receiver are left untyped — `var t := f.ToString()`, chained members and `f?.ToString()
+- #6151 [other]   (14d) [codegen] direct GetHashCode() on a choice/enum that lists an interface declaring GetHashCode fails to lower (§9.2/§14.2, v0.338)
+- #6159 [other]   (14d) user extension named Count/Length on a built-in receiver compiles but the built-in intrinsic answers (StringBuilder, IList)
+- #6181 [other]   (13d) choiceHoldsBorrows reads an owning generic choice's payloads unsubstituted: W1<Own> rejected as borrow-bearing in a class field (§35.4, v0.338), and i
+- #6187 [other]   (13d) [codegen] §31: try/catch does not catch an exception thrown by Equals/GetHashCode/ToString called on an Object-typed receiver (unhandled; ToString SEG
+- #6228 [other]   (13d) Interface witness picks the wrong overload for generic-interface instantiations and method-own type parameters inside builtins (findInterfaceImplAt / 
+- #6235 [other]   (13d) Compile time: fan-out-2 generic choice chain is exponential (depth 12: ~20 s); 40 non-generic choices through one generic take 20 s
+- #6239 [other]   (13d) codegen: generic choice implementing a non-generic interface: property read through the interface prints 0 instead of 7
+- #6253 [other]   (13d) §22.6 (v0.338): nullable built-in exception overload pair E(Exception?)/E(ArgumentException?) is ambiguous for an ArgumentException? argument
+- #6307 [other]   (13d) Interface dispatch of a generic method runs the wrong body for generic implementers and a twice-instantiated interface (§11.2, §12.1)
+- #6530 [other]   (8d) #6500's range-index guard over-rejects a type parameter named after a reserved builtin
+- #6644 [other]   (7d) [sema] §7.4 (v0.339): a straight-line check-then-use of a mutably captured nullable local is rejected when the use is a call argument
+- #6697 [other]   (6d) sema: generic inference binds T := int? from a §7.4-narrowed read, rejecting const j: int := Id(i) (§22.6, v0.339)
+- #6742 [other]   (6d) stdlib §2.5 (v0.340): TimeSpan.MinValue / TimeSpan.MaxValue do not lower (zero-initialised local; Console.WriteLine of it emits nothing); ts.ToString(
+- #6753 [other]   (6d) A StringBuilder passed as Object prints bytes instead of its text (stdlib §2.1, v0.339)
+- #6755 [other]   (6d) is and as on an Object holding a StringBuilder or Random miss its runtime type (§17.4, §12.7, v0.339)
+- #6777 [other]   (6d) Interpolating a null StringBuilder? renders an empty string instead of null (spec §8.5)
+- #6780 [other]   (6d) Debug.WriteLine accepts a StringBuilder for its string parameter and writes an empty line (stdlib §8.2)
+- #6810 [other]   (6d) §22.5 (v0.340): a named argument bypasses the null check on builtin non-nullable string parameters (follow-up to #6782)
+- #6811 [other]   (6d) §7.3 (v0.340): builtin non-string reference parameters declared non-nullable accept null (follow-up to #6782)
+- #6812 [other]   (6d) §7.3 (v0.340): builtin non-nullable string parameters outside the #6782 table accept null (follow-up to #6782)
+- #6820 [other]   (6d) Object local holding a StringBuilder: a render before a later reassignment of the local still misdispatches and SEGVs (stdlib §2.1, §8.5, v0.340)
+- #6825 [other]   (6d) [sema] long.ToString(null) is accepted: the #6782 type map has no Int64 or other integer primitive heads (§7.3, stdlib §9.1, v0.340)
+- #6826 [other]   (6d) [sema] string.Contains/LastIndexOf/Replace/Split accept an Object argument (§5.1, stdlib §9.6, v0.340)
+- #6872 [other]   (6d) sema accepts a builtin Type value assigned to an int or string location (§5.1)
+- #6881 [other]   (6d) staging: #6806's stringbuilder_append_nullable row fails after #6782 (Append(DateTime?) now rejected as nullable-to-non-nullable)
+- #6892 [other]   (6d) [runtime] identity-hash side-table entries of the tagged built-ins (Array / StringBuilder / Mutex) are never forgotten at their free (residual of #677
+- #6933 [other]   (6d) unconstrained generic: x.ToString().Length as a call argument stops on #1386 — the live int-placeholder template cannot dispatch an Object member on T
+- #7016 [other]   (5d) [sema][codegen] ?. on a declared builtin-interface member emits nothing or zero-initializes (il?.Count, il?.Contains) (§7.5, stdlib §4.1, v0.340)
+- #7028 [other]   (5d) [codegen] Encoding.GetBytes/GetString through an Encoding-typed variable has no dispatch arm (stdlib §3.2)
+- #7061 [other]   (4d) stdlib §2.2: Math.Abs(float) is typed float and computed in float; the stdlib rationale says it resolves to Abs(double) and returns double
+- #7090 [other]   (4d) [codegen] a PROPERTY reference over a builtin collection interface head (var f: () -> int := il.Count;) is accepted, holds the property's VALUE, and t
+- #7093 [other]   (4d) [sema/codegen] a bare reference to a member a CONCRETE builtin collection declares is rejected, while the same reference over the INTERFACE head is ad
+- #7129 [other]   (3d) [stdlib-contract] stdlib 9.6's declared static Repeat(unit: string, count: int) overload is rejected by sema
+- #7130 [other]   (3d) [codegen] the ?. spelling of the string instance methods is rejected in codegen, though 7.5 defines it
+- #7146 [other]   (3d) [ownership] a BUILTIN property read is still accepted as a Dispose() receiver: tcs.Task.Dispose() compiles, though the stored-view property face lends
+- #7149 [other]   (3d) [docs] the #7085 measurement table in TypeResolution_Names.cpp says 'a parse error - A.5' for a row that reports 'expected expression' - A.5 is the ru
+- #7173 [other]   (3d) [sema] a BUILTIN member reached with an explicit type-argument list accepts ANY list and ignores it (Console.WriteLine<int>("x") -> rc 0; two args on 
+- #7219 [other]   (2d) [codegen] a Math/Convert member evaluates each argument TWICE — Math.Fmod/Math.IEEERemainder double-evaluate even a fully POSITIONAL call (§22.5, v0.3
+- #7221 [other]   (2d) [codegen] StringBuilder.Insert/Remove silently NO-OP out of range while stdlib §3.1 says they raise IndexOutOfRangeException
+- #7227 [other]   (2d) [sema][stdlib] Math.Sign's type-parameter CONSTRAINT is not enforced - Sign("x") aborts in LLVM and Sign(true) silently returns -1
+- #7228 [other]   (2d) [stdlib][codegen] StringBuilder.Replace with an EMPTY oldValue silently NO-OPS - stdlib 3.1 says it raises ArgumentException
+- #7234 [other]   (2d) [sema][stdlib] stdlib 2.3's ambiguity note is not implemented for Convert.ToString - ToString('A') and ToString(255U) are accepted where 2.3 says the 
+- #7242 [other]   (1d) [codegen][stdlib] an UNSIGNED operand at a Math built-in's double parameter is SIGN-EXTENDED - Math.Sqrt(4000000000u) prints -nan (spec 5.1, stdlib 2.
+- #7245 [other]   (1d) [stdlib][codegen] `String.IsAscii` keys on the STORAGE WIDTH, so a width>=2 string that holds no code point >= 256 answers FALSE (stdlib §9.6)
+- #7249 [other]   (1d) [codegen] an UNSIGNED operand at a `long` parameter is SIGN-EXTENDED - TimeSpan.FromTicks(4000000000u) prints -294967296 (spec 5.1, stdlib 2.5)
+- #7253 [other]   (1d) [codegen][stdlib] `ISteppable<T>.Step(value: T, by: long)` SIGN-EXTENDS an unsigned `by` - `Step(0.0, 4000000000u)` gives -294967296
+- #7254 [other]   (1d) [sema][stdlib] `Math.Abs(4000000000u)` is REJECTED as an ambiguous call, although §5.1 admits `uint` at both `long` and `double`
+- #7258 [other]   (1d) [codegen] an integer radix rendering (`ToString(radix)` / `Convert.ToString(n, radix)`) emits the WRONG TEXT for unsigned values AND for any value abo
+- #7271 [other]   (1d) [codegen] a uint RADIX is silently accepted and renders the DECIMAL text — the call is a no-op instead of an error (stdlib §9.1, §22.6, v0.344)
+- #7277 [other]   (1d) stdlib 9.6 declares `string.Repeat(unit: string, count: int)` but the compiler only implements the `char` overload
+- #7286 [other]   (1d) the radix class is not closed: a nullable radix, a foldable constant expression, a string-variable argument and a runtime int radix are still silently
+- #7292 [other]   (1d) the arguments of a named-argument call are evaluated twice
+- #7295 [other]   (1d) char.Parse(s, radix) is silently dropped with a warning instead of being a located compile error
+- #7296 [other]   (1d) the named-argument spelling of a primitive ToString radix is owned by no nullability check
+- #7303 [other]   (1d) an unrecognized format specifier is ignored instead of raising FormatException: (1.5).ToString("C") prints 1.5
+- #7304 [other]   (1d) this and base are still lowered as strings: int.TryParse(this, out v) reads the receiver's own bytes as text
+- #7308 [other]   (1d) the `TryParse` out-slot default is attributed to stdlib §9.3 in seven places, and §9.3 says nothing about the out slot - this is a CLASS, in src/ and 
+- #7309 [other]   (1d) stale stdlib line numbers in a test file - span_tryparse_5296_test.cpp cites :5155-5156 / :5194-5195 and "§9.3:5226-5227", and none of those lines poi
+- #7311 [other]   (1d) The `ToString(format)` MEMBER-CALL path renders the NO-FORM text for a finite value, where the
+- #7315 [other]   (0d) The parse-operand guard policy has three spellings, and the two radix arms disagree with the shared helper on the unknown-static-type case
+- #7320 [other]   (0d) `Guid.TryParse` does not assign `default(Guid)` to its out slot on the false path — stdlib §1 shape (c) names `Guid` explicitly
+- #7323 [other]   (0d) the parse-operand guards DROP the call where spec §22.6 says the call is A COMPILE ERROR — and the drop is SILENT, so it is a silent-acceptance invers
+- #7325 [other]   (0d) `double.Parse` accepts a signed bare point — `"+.5"` and `"-.5"` parse, while `".5"` correctly raises
+- #7333 [other]   (0d) `bool.ToString("F4")` and `char.ToString("F4")` COMPILE — stdlib §2.18 says a format spec on `bool` and `char` is a COMPILE ERROR
+- #7336 [other]   (0d) [sema] a runtime format string on a bool/char/string receiver prints the plain rendering instead of raising FormatException (stdlib §2.18, §18.5, v0.3
+- #7340 [other]   (0d) [stdlib] the JSON deserializer's number grammar accepts a bare point, a leading `+`, and non-numeric junk as a number, reading them as 0 (stdlib §2.15
+- #7341 [other]   (0d) [stdlib] a point with NO DIGITS AFTER IT, followed by an exponent, is still admitted by every floating Parse and Convert — "5.e3" reads as 5000 (stdli
+- #7342 [other]   (0d) [codegen] a NARROWED `Guid?` receiver overflows the stack — `x.ToString("D")` and `x.ToString()` write 20 bytes past a stack slot (spec §7.4, §22.6, v
+- #7359 [other]   (0d) the member spelling of the LOWER-CASE `x` hex specifier renders UPPER-CASE, where stdlib 2.18's integer row says `X`/`x` hex (upper/lower) - and the i
+- #7361 [other]   (0d) the RUNTIME-FORMAT spelling of `X` renders a NARROW signed receiver's 32-BIT PATTERN where the literal spelling renders its NATURAL-WIDTH pattern - th
+- #7362 [other]   (0d) `D` on a FLOATING receiver TRUNCATES instead of raising FormatException - `(3.5).ToString("D")` renders "3", and `(1.0/0.0).ToString("D")` renders "-2
+
+## closures-cells — Closures and capture cells, second pass (111 open; §27.5, §28.9, §28.14, §28.3 sink rule)
+
+- #1432 [sound]   (116d) §28.14 v1 subset: a lambda's own function-typed parameters are not scoped/call-bounded-verified (callee-side checks cover method/ctor formals only)
+- #2248 [sound] S (91d) #1921 follow-up: closure-arg release is a UAF when the callee returns a bare type parameter
+- #2249 [sound] S (91d) #996 follow-up: source-free closure release double-frees when the handler is not a fresh +1 producer
+- #2267 [sound]   (91d) [sema][miscompile] #2107 narrowing rests on an invariant the compiler does not honour — a target-typed block lambda's returns are checked against noth
+- #2715 [sound] S (84d) codegen: closure envdtor release is ungated while the second-capture retain excludes guarded locals — over-release (double-free direction)
+- #2719 [sound] S (84d) [codegen] UNVERIFIED: two write paths to a captured cell that #2706's assignment walk does not see (ref/out rebind; boxed-VALUE capture)
+- #3940 [sound] S (51d) CaptureReclaimSetScope omits closureBorrowAll_ / closureBorrowRetainEligible_, which the same collectClosureReleaseEligible call clears (all 5 constru
+- #4031 [sound] S (50d) fix #4004/#4005 commit 40053ed: collectLocalDeclDirectLambdaTargets has no LocalConstDecl arm — const-local lambda target double-frees, trips check_lo
+- #4033 [sound]   (50d) fix #4005 gap: owned-target lambda check never reaches a LocalDecl target nested inside ANOTHER lambda's body — measured heap-use-after-free
+- #4881 [sound]   (33d) [ownership] call-site scoped marker accepted on a non-scoped parameter; callee stores it — UAF (§28.14)
+- #5866 [sound] S (15d) heap-use-after-free: calling a closure element read back out of a borrowing collection releases it with no matching retain
+- #6127 [sound] S (14d) [codegen][crash] immediately invoking the function-typed result of a generic call (`G.Id<(int) -> int>(f)(3)`) aborts with refcount over-release (clos
+- #6137 [sound] S (14d) invoking the result of a generic identity call at a function type over-releases the closure (`Id<(int) -> int>(f)(3)`)
+- #6230 [sound] S (13d) codegen: `return nn ?? e;` over a function local at a function-typed return type over-releases when the result is invoked directly (`F(true)(1)`: refc
+- #6269 [sound] S (13d) codegen (§27.5, v0.338): an escaping lambda that calls a captured closure over a parameter over-releases the closure (use-after-free, exit 134)
+- #6293 [sound] S (13d) §28.2 (v0.338) checked mode: a lambda stored past its captured local's scope dereferences a null cell (SEGV) instead of raising DisposedAccessExceptio
+- #6634 [sound] S (7d) [sema][ownership] §28.3 sink rule: a lambda capturing value-receiver `this` is accepted when returned, and reads the dead receiver frame
+- #6651 [sound] S (7d) [ownership] §28.3 sink rule (v0.339): a lambda capturing a plain parameter is accepted when stored via `.Add`/`.Insert`/… or into a field from a const
+- #6652 [sound] S (7d) [ownership] §28.3 sink rule (v0.339): receiver-capture leg residuals — traced local, method reference over `this`, extension receiver, remaining holde
+- #6653 [sound] S (7d) [ownership] collectIdentifiersIn skips case/interpolation/with/collection-literal/range/bind, so captures inside them escape every closure-escape chec
+- #6696 [sound] S (6d) sema: an expression-bodied lambda returning T? is accepted at a () -> T target (silent wrong value / segfault) (§5.1, §7.4, v0.339)
+- #6710 [sound] S (6d) §28.3 Concrete-slot function bodies (v0.339): a lambda returning a fresh owned value at a concrete class-return slot is accepted and leaks every resul
+- #7038 [sound] S (5d) §28.3/§27.3 (v0.340): a block-body lambda returning an alias of its own owned local is accepted; heap-use-after-free at the caller
+- #7259 [sound] S (1d) [ownership][soundness] a CAPTURE-BEARING function value is ACCEPTED at the receiver of an extension call whose head is `Object` - the set-erasing posi
+- #3466 [crash] S (61d) [codegen] async: a lambda-captured PARAMETER's cell holder gets no frame field — null after a suspension (SIGSEGV on read, leak on free) (§27.5 / §30.
+- #6287 [crash] S (13d) codegen (§32.8, v0.338): invoking a plain extern function-typed callback (atexit/qsort with a lambda or static method ref) segfaults at runtime
+- #7260 [crash]   (1d) [ownership][spec] a function-typed value gets a REAL `Dispose()` (exception + SIGSEGV) but §28.9 says it has NO `Dispose()` at all - TWO BANKED ROWS p
+- #2225 [leak] S (92d) #1073 (deferred): closure-arg release at non-iterator call site — incomplete for captured-reference closures
+- #2372 [other]   (89d) [sema] §28.14 v0.179 task-abandonment check: lambda-body descent + non-statement-level invocation positions
+- #2383 [leak] S (89d) [codegen] widen the #2334 TaskScope.Spawn capture-cell fix to other §28.14 using-var-bounded scoped register positions
+- #2578 [leak] S (86d) [codegen] #2383 deferred: BLOCKING 1/2/spec-drift/misbinding source-level fixes need pre-existing regression repair first
+- #2622 [leak] S (84d) [codegen][leak] §27.5 shared capture cell of a lambda passed to an iterator is never freed (4 bytes, sync AND async)
+- #2626 [leak] S (84d) [codegen][leak] #2609 residual: expression-bodied async iterator gets the frame retain but no call-site closure release
+- #2632 [other]   (84d) sema: §7.4 narrowing diagnostic reported at 0:0 (lost span) when the access follows a lambda
+- #2640 [leak] S (84d) codegen: closure capture cell leaks 8 bytes when a const local's narrowing rides into a lambda body (#2597 follow-up, newly reachable)
+- #3236 [other]   (70d) [probe follow-up] M12 §22.12 rule 5 capture-free handler on imported STATIC event — not yet probed (#3232 lane D)
+- #3403 [leak] S (61d) [codegen] async: a `var` local captured by a lambda declared AFTER an `await` leaks its capture cell (§27.5 / §30.1)
+- #3459 [leak] S (61d) [codegen] capture-cell reclaim appears not to reach generic method bodies — the generic spelling of #3426 still leaks 2000 B/500 after fix #3426 (§27.
+- #3500 [leak] S (60d) [codegen] two capture-cell/closure reclaim gaps unmasked by #3484: a sync iterator (52 B / 3) and an if-EXPRESSION lambda arm (11600 B / 700) (§27.5 /
+- #3518 [leak] S (60d) [codegen] a closure produced by an if-EXPRESSION arm is reclaimed by nobody: neither its cell+env nor its capture cells (11600 B / 700 over 200 calls)
+- #3532 [leak] S (60d) [codegen] a captured local with no reads-through-cell disposal, declared shallower than its capture site and read afterwards, never reclaims its cell 
+- #3541 [leak] S (60d) [codegen] remove the #3500 four-kind exclusion from the sync-iterator abandonment snapshot now that #3531 is fixed — blocked on #3539 (§27.5 / §29.7 /
+- #3824 [leak] S (53d) #1135 widening leaves 8 B/cell leak when intermediate non-escaping lambda captures an inner symbol
+- #3928 [leak] S (51d) emitAsyncLambda loses the ancestor-proven sharedCellEnvdtorFreeOwner_ entry (surviving half of #3921) — merge written and verified, blocked from landi
+- #4130 [leak] S (48d) Lambda that reads an enclosing loop's mutated control variable leaks a 4-byte capture cell, independent of anything else in the lambda body
+- #4214 [leak] S (47d) closure capturing a capturing closure leaks one 8-byte cell per instance (no async, no ownership involved)
+- #4230 [leak] S (47d) captured local returned on only SOME branches leaks the not-taken branch's capture (fix 4198 follow-up)
+- #4431 [leak] S (41d) narrow #4422: reassigned closure-typed local's always-retain lacks scope-end release — leaks 1 ref per reassign
+- #4432 [leak] S (41d) field_store of escaping lambda inside loop leaks capture cell (pre-existing, not #4210/#3498)
+- #4438 [leak] S (41d) regression: cherry-pick of lane-36 onto r18-c7 (with #4210/#4165/#4254) re-introduces 4422/4227/4174/4226 leaks (lane-36 standalone branch fixes them)
+- #4474 [leak] S (38d) [codegen] adjacent: lambdaRef := y decl-init leaks 56 B / 3 allocs (separate from #4473)
+- #4476 [other]   (37d) citation sweep follow-up: 4 §28.9 / §31.1 [/ §27.5] multi-section fix-history tags in Ownership_impl.hpp
+- #4522 [leak] S (37d) [codegen] #4509 residuals: four capture-cell shapes the refcount deliberately declines (contents-managed, nested-widened, for-var/inline-array, parame
+- #4534 [leak] S (36d) [codegen] a lambda passed as a constructor argument to a GENERIC class leaks its 48 B closure (§28.9) — non-generic ctor and generic method are both c
+- #4535 [leak] S (36d) [codegen] a lambda-valued field initializer on a RECORD leaks its 48 B closure (§28.9) — the same initializer on a class is clean
+- #4542 [leak] S (36d) [codegen] capture cell leaks 4 B/call when the declaring frame calls an intermediate lambda more than once (#4524's residual)
+- #4723 [leak] S (34d) [ownership] owned Array<Exception> local never disposed when captured inside a lambda's for/case body (§28.3/§31.1, #4667 census)
+- #4860 [leak] S (33d) codegen: lambda capturing a local, passed as a method argument, leaks its captured cell/env (80 B, LSan) (§28)
+- #4928 [other]   (32d) [ownership] §28.14 bounding forms 2/3 on a static-factory `owned` return: `using var x := S.Create(scoped ...)` resolves `Create`'s `owned` return as 
+- #4938 [leak] S (32d) [codegen][leak] lambda passed to a generic method with a T-returning closure parameter (Make<T>(f: () -> T)) leaks its 48 B closure per call (§28.9, v
+- #5228 [leak] S (26d) [codegen] a lambda capturing a local int inside a method of a GENERIC class leaks the 4 B capture cell (§28.9) — non-generic class is clean
+- #5258 [leak] S (26d) [codegen][leak] lambda's own owned parameter conditionally stored into a captured field leaks on the throwing path (#5243 sibling; §28.3/§30, v0.313)
+- #5259 [leak] S (26d) [codegen][leak] owned parameter consumed by `Add(move v)` on one branch leaks on the throwing branch (#5243 sibling; §28.3/§30, v0.313)
+- #5377 [other]   (23d) spec-question: §9.7 / §28.3 (v0.314): is a record's function-typed component a field for the closure bullet?
+- #5378 [other]   (23d) spec-question: §22.10 / §28.14 (v0.314): is a primary constructor's capture of a plain function-typed parameter a store of a call-bounded parameter?
+- #5632 [other]   (19d) HYPOTHESIS (probe first): §28.3 (v0.326): a lambda at a borrow-bearing return slot, and the invocation of a function value of such a type — #5616
+- #5673 [other]   (19d) [sema][ownership] spec §28.3 clause 4 second limb unimplemented — a `where T: value` capture contributes nothing where the spec says it contributes th
+- #5850 [leak] S (15d) [codegen][leak] a closure passed to a CONSTRUCTOR's function-typed formal is never released under an ALIAS spelling — 17996 B / 899 allocs over 300 it
+- #5851 [leak] S (15d) [codegen][leak] a `scoped` callback argument is never released under an ALIAS spelling — 18000 B / 900 allocs over 300 iterations (#3195, §28.14, v0.3
+- #5885 [other]   (14d) A collection-literal static initializer on a generic class never runs — the cell stays null
+- #5927 [leak] S (14d) Lambda envdtor leaks when a DrainedEntry and a concatenated-string capture coexist
+- #5960 [other]   (14d) §27.7.1: Array<(int)->int>.Contains/IndexOf miss an equal method reference from a separate evaluation (f = g is true, a.Contains(g) false)
+- #5971 [other]   (14d) §11.2 (v0.338): interface conformance does not substitute inside function-typed parameter types (generic ISink<int> with Take(f: (int) -> ()) falsely 
+- #5976 [other]   (14d) Generic method references with a type-argument list: residual over-rejections after #5814 (where-clause methods, same-name arity overloads, non-record
+- #5986 [other]   (14d) §22.3 (v0.338): ref-at-move-only-type residuals of #5566 — lambda ref params, function-type ref slots in locals/fields/return types, generic ref x: T 
+- #6061 [leak] S (14d) owned local in a lambda block body that is never discharged leaks silently: no auto-drop, no warning, no rejection
+- #6104 [other]   (14d) [codegen][wrong-answer] function value returned through function-type return covariance to Object stays a bare closure cell (`var g: () -> Object := l
+- #6108 [leak] S (14d) [codegen][leak] capturing lambda temporary in an expression-bodied method, an `if` condition or an interpolation hole leaks its captured cell (§28.9, 
+- #6134 [other]   (14d) `=`/`<>` between an Object operand and a function-typed operand compares identity, not function value equality (§27.7.1)
+- #6141 [leak] S (14d) [ownership][leak] §28.3/§27.5 (v0.338): assigning `new` to a borrow-initialised local inside a capturing lambda is accepted and leaks; the straight-li
+- #6162 [other]   (14d) sema §28.3 (v0.330): non-capturing procedure lambda at an explicit function-typed type argument rejected as carrying captured borrows
+- #6212 [leak] S (13d) [codegen][leak] a closure stored in an `Array<(T) -> ()>` is never released when the array is disposed: 48 B per stored lambda (§28.9)
+- #6213 [leak] S (13d) [codegen][leak] a nullable function-typed local declared `null` and assigned a lambda later leaks the closure and its env at scope end (§27.2 / §28.9)
+- #6215 [other]   (13d) ownership §28.3 *Set-erasing positions* (v0.338): a receiver-borrowing method reference is accepted at an `Object` initializer, assignment, return and
+- #6226 [leak] S (13d) A function-typed local passed to an interface method leaks its closure (direct class call does not)
+- #6261 [other]   (13d) ownership §28.3 Set-erasing positions (v0.338): a method reference passed as a function value's Equals(Object) argument is not checked
+- #6279 [other]   (13d) codegen (§27.5, v0.338): a closure in a loop body loses writes to a captured outer local after an await
+- #6301 [other]   (13d) Generic-method override still dispatches to the base body for Array<X>/function-typed/interface-routed generic bases (§12.1)
+- #6306 [leak] S (13d) A closure passed to a virtual generic method leaks its cell (non-virtual does not)
+- #6479 [other]   (8d) Dangling identifier argument: missed by -Wdangling-capture, -Wdangling-gsl, bugprone-dangling-handle AND the #6469 text ratchet
+- #6480 [leak] S (8d) [codegen][leak] expression-bodied lambda: the §28.3 indexer-get receiver discharge has no scope to register into (45,955 B / 606 allocs)
+- #6628 [leak] S (7d) [codegen][leak] a string-capturing lambda passed to a constructor leaks an 8 B capture cell once Main declares any other local (§28.9, v0.339)
+- #6631 [other]   (7d) Generic method with type-parameter names swapped relative to the interface's dispatches to the wrong instantiation (name capture, §11.1)
+- #6642 [other]   (7d) sema (§22.6, v0.339): constructor overloads `() -> ()` / `() -> int` pick the first declared for a VALUE lambda (`new K(lambda() => 1)` runs the `-> (
+- #6643 [other]   (7d) sema (§27.3/§5.1, v0.339): an expression-bodied lambda whose body is `()` is accepted at a `() -> int` target and returns garbage
+- #6667 [other]   (6d) Generic extension block: procedure lambda into a `() -> T` slot compiles and returns garbage (formalTypeAtReceiver leaves T unsubstituted)
+- #6766 [leak] S (6d) [codegen][leak] a lambda-valued local in a constructor body (record or class) leaks its closure (§27.5, §28.9, v0.340)
+- #6767 [other]   (6d) §9.4 (v0.340): read a generic value kind's receiver-capture holds-borrows and owning counts per instantiation (Bx<Widget> closure over this is accepte
+- #6828 [other]   (6d) [codegen][cross-module] imported generic method bound through a function-typed or interface formal (ShowF(() => 'a'), ShowE(Array<char>)) runs the int
+- #6839 [leak] S (6d) §28: lambda capturing this plus a string local leaks the closure and the string
+- #6877 [other]   (6d) A receiver-qualified extension method reference on a string receiver (s.Foo over extension string) lowers to a zero function value and SEGVs (§27.6, v
+- #6953 [leak] S (5d) [codegen][leak] §27.5/§21.4 (v0.340): a lambda capturing a `for` loop variable inside an iterator leaks its capture cell on every iteration (4 B)
+- #6987 [other]   (5d) §22.8: a ctor lambda writing the own readonly inline-array element is accepted
+- #7000 [other]   (5d) [codegen][cross-module] `Contains` on an imported `Range<int>` value and a lambda capturing it are rejected with the #2457 text (stdlib §9.8)
+- #7031 [leak] S (5d) [ownership] `var f := lambda() => lambda() => k + 1; f()()` leaks a 4-byte capture cell under ASan (§27.5)
+- #7109 [other]   (3d) [ownership] §28.3's self-assignment rule is rejected in a method body but not in a lambda body, a getter body or as a loop body's first statement (§28
+- #7112 [leak] S (3d) [leak] a lambda whose body is a method reference leaks its capture cell: 64 B direct + 8 B indirect at lam/bin/bash (§28.9, v0.340)
+- #7124 [other]   (3d) [codegen] 22.3's move call-site marker is enforced on a direct call but NOT through a function value: the two spellings of one call disagree
+- #7247 [other]   (1d) [codegen][sema] an `extension Object` member is NEVER resolved on a FUNCTION-typed receiver - it compiles and prints NOTHING (the #3079 degradation)
+- #7270 [other]   (1d) c.ReferenceEquals(c, c) on a function value COMPILES and PRINTS NOTHING - the #3079 silent degradation (8.1, v0.344)
+- #7288 [leak] S (1d) a capture-bearing closure copied into a second local in a nested block leaks its capture cell - in every spelling
+
+## collection-elements — Owned collections: element lifetime in the runtime (77 open; §15.4, §28.11, §28.7, stdlib §4)
+
+- #2327 [sound] S (90d) Two unrelated bugs found while scoping #1065: owned Array<T> field from a fresh literal miscompiles to Count=0; [N]T? nullable-inline-array literal co
+- #2685 [sound] S (84d) Sema: four residual element-read escape paths left open by #2672 (literal-of-borrows, nested literals, non-indexer yields, alias/closure/return)
+- #5059 [sound]   (30d) [codegen][soundness] no runtime tag distinguishes Array/LinkedList/Dictionary/... from a bare string or each other behind an Object/interface erasure
+- #6314 [sound] S (13d) §28.2 (v0.338) checked disposal mode: 14 corpus cases fail under --checked-disposal (Set/SortedSet false DisposedAccessException, iterator double Disp
+- #6448 [sound] S (9d) [sema][leak][spec question] a class field holding a collection literal WITHOUT `owned` is accepted and never freed — reject, or retain?
+- #6467 [sound] S (9d) SIGSEGV (exit 139): §15.4.1 OWNING form FromCollectionLiteral double-frees — §28.3 owned-argument transfer never fires for a built-in callee
+- #6739 [sound]   (6d) [codegen] §31.2 (v0.339): a throwing Equals on an interface element is swallowed by Array<I>.Contains/IndexOf
+- #6936 [sound] S (5d) Stack<string>: Pop() on a using-var stack leaks the stack; TryPeek(out q) over-releases the peeked string (rc 134)
+- #7076 [sound] S (4d) §28.2 K4.1 (v0.340): a Set<T>'s .Count read is guarded with the ARRAY disposed check on a dict pointer, and the dict/Set enumeration has no disposed g
+- #7081 [sound] S (4d) four collection-receiver read paths still lack the §28.2 disposed guard: `in`, a list-interface method call, LinkedList<T>.Count, StringBuilder.Length
+- #7082 [sound] S (4d) the new list-interface disposed guard false-positives on a user class implementing IList<T> — a LIVE instance raises DisposedAccessException
+- #7092 [sound] S (4d) ownership: the §28.3 producers row for a collection literal is invisible to the ownership pass — an assignment-path alias dispose double-frees, a conc
+- #7240 [sound] S (2d) [ownership][soundness] a built-in collection local's scope-end free is invisible to the borrow-escape rules at four more sinks — ASan heap-use-after-f
+- #7059 [crash] S (4d) [codegen] FrozenArray<string>.From and Stack<string> Push/Pop abort 134 (SIGABRT), local and imported
+- #2645 [leak] S (84d) [codegen][leak] #2608/#2635 residual: new OwningBuffer<T>(n) allocates via bz_array_alloc_count_n and is never element-disposer-stamped
+- #2648 [leak] S (84d) [codegen][leak] owning-collection element-disposer stamp: imported literals never stamped, and lowerNew keys on a different head than the literal site
+- #2672 [other] S (84d) Sema: an element-read borrow of a scope-bound collection-literal local escapes the §28.11 store rule and the §28.3 borrowed-field store rule (blocks #
+- #2676 [leak] S (84d) Fresh trivial-dispose literal elements leak: var xs: Array<Box> := [new Box(), new Box()] frees the backing but not the elements (#2655 shape 3, defer
+- #2762 [leak] S (84d) codegen (leak): a collection-LITERAL initialiser on a borrowing `Array<T>` field is never disposed — 2 allocations leaked per construction
+- #3393 [other] S (61d) §15.4's own fresh-store archetype does not compile: a collection literal in a borrowing-collection STORE position never lowers
+- #3472 [other]   (61d) sema: §18.5's type-formattability check misses the UNIT type and INLINE ARRAYS — `$"{u:X}"` / `$"{a:X}"` are accepted and render garbage instead of th
+- #4891 [other]   (33d) Impl-ahead-of-spec: `Buffer<T>` is nameable from user source although §2.3's auto-import set does not include it — make it unreachable (or fault on a 
+- #5118 [other]   (29d) [ownership] checkCoalesceMeetMixed NullCondMemberExpr arm may false-positive K7.3 for interface-typed receivers (`d?.Keys ?? new Dictionary<K,V>()`) —
+- #6020 [other]   (14d) sema §27.8 (v0.338): `new D()` through an alias of a built-in generic (type D := Dictionary<int,int>) is rejected; as a call argument it ICEs
+- #6022 [other]   (14d) sema/module §11.2/§27.8 (v0.338): an alias declared in an imported module (type A := Array<int>) used as an interface parameter false-rejects its Arra
+- #6026 [other]   (14d) sema §26.4/§3.6 (v0.338): an extension block's where T: hashable is not checked against a function-type argument (Array<(int)->int> accepted)
+- #6090 [other]   (14d) Set<R?> / Dictionary<R?,V> over a record: wrong counts and stack-buffer-overflow in bz_dict_set_gen
+- #6095 [other]   (14d) [codegen][memory-safety] Dictionary<Object, V>.Add / ContainsKey with a non-Object argument: stack-buffer-overflow in bz$valkey$hash (method-argument 
+- #6145 [leak] S (14d) codegen [leak?]: Set<R> of records holding a string, 300 Add + Contains + Remove, leaks 10700 B / 600 allocs under ASan (pre-existing, non-generic too
+- #6178 [other]   (14d) [sema] a '?.' call on a nullable Set<int>?/LinkedList<int>? receiver (s?.Remove(1)) has no result type: fails to lower with #2434/#3079 warnings and e
+- #6184 [leak] S (13d) [codegen][leak] §15.4 (v0.338): fresh class elements of a `for`-source collection literal are never released (destructor not run)
+- #6237 [other]   (13d) [codegen] §15.4 (v0.338): a collection literal in a hash-container KEY position (`d[[4, 5, 6]] := v`, `d.Add([1, 2, 3], v)`) never lowers — the indexe
+- #6238 [leak] S (13d) [codegen][leak] §28.11 (v0.338): a generic-backed dictionary key with string components (record of strings, `[2]string`) never releases them — 3540 B 
+- #6259 [other]   (13d) codegen/sema (§15.4, v0.338): a CLASS field default of an inline array stores out of bounds (wrong-length literal) and stores nullable elements unwrap
+- #6282 [leak] S (13d) codegen (§28, v0.338): overwriting an owned Set<T> class field frees the old hash table with bz_array_free (leak)
+- #6333 [other]   (11d) sema: §7.4 narrowing not enforced on a nullable OwningArray<T> receiver (instance form and static-call sugar)
+- #6358 [leak] S (11d) [runtime][spec-question] should bz_dict_free release string keys, or does a Dictionary<string,V> co-ownership contract belong beside it?
+- #6365 [leak] S (10d) an unbound \`owned Dictionary<K,V>\` rebound as \`.Keys\` leaks the dict and its key snapshot (family of #6352/#1013)
+- #6488 [leak] S (8d) An `OwningDictionary` indexer-get receiver leaks the whole table (43,935 B / 505 allocs), pre-existing and excluded by #6476
+- #6499 [other]   (8d) §3.6: `Set<Range<T>>` is rejected although the hashable row admits it (pre-existing, left out of #6207 deliberately)
+- #6502 [other]   (8d) Array<T>.FromCollectionLiteral is rejected with a false §3.4 'no static method or property' — member-lookup bug, not a borrow-source bug (#6468 row 3)
+- #6507 [other]   (8d) Imported (cross-module) receivers bypass the 4.4 / 4.14 member arms: Array<T>.Length and OwningBuffer<T>.Count compile and return a value where the sa
+- #6514 [leak] S (8d) The Array<T>.Slice(r) result under a plain var binding is never reclaimed — the container leaks outright, and #6492's retain widens that leak 2→6 allo
+- #6516 [leak] S (8d) [codegen][leak] a plain `var` local over an `Array<string?>` is never reclaimed — backing + every element leak (§28.11, §28.9, v0.338)
+- #6543 [other]   (8d) bz_array_t: 9 element-disposer alloc sites but only 3 stamps — are the other 6 reachable owning constructions?
+- #6625 [other]   (7d) codegen: int in Set<long> / Set<long>.Contains(int) returns False for a present element (widening not applied)
+- #6645 [other]   (7d) sema (§26.5/§22.6, v0.339): members of a GENERIC extension block (or one over `Array<int>`) are still not ranked by argument type
+- #6660 [other]   (6d) A unit-returning call (Set<T>.Add) as an if condition passes sema and aborts codegen with a malformed branch
+- #6666 [other]   (6d) [codegen] ToDictionary does not implement aggregate keys (record, inline array, decimal, float, double, Guid): the key crosses the runtime as one int6
+- #6672 [leak] S (6d) [codegen][ownership][leak] a plain `var` local initialised by an owning-collection literal is never disposed, and gets no must-use warning; `using var
+- #6685 [leak] S (6d) var s := a?.ToSet() (plain local) leaks the set: the ?. spelling of the Set materializer local is not reclaimed (§7.5, stdlib §5)
+- #6690 [other]   (6d) ctor overloads differing inside a built-in generic argument (Array<string>/Array<int>) pick the first-declared ctor and accept an unrelated Array<Obje
+- #6691 [leak] S (6d) §28.3 (v0.339): OwningSet<Object> and OwningSet<built-in class> literals leak their elements
+- #6692 [other]   (6d) codegen §17.5 (v0.339): `x in SortedSet<int>` returns False for a present element at exit 0 (`.Contains(x)` returns True)
+- #6700 [other]   (6d) §12.2/§22.6: overriding one of two virtual Array<…> overloads drops the un-overridden base overload at the call
+- #6701 [other]   (6d) §12.1/§12.2: valid override of one of two virtual Array<…> overloads rejected as 'does not match the base member' (3-level and cross-module)
+- #6760 [leak] S (6d) A fresh Array<int> returned through a non-owned return type leaks when consumed (§28.3, v0.339)
+- #6815 [other]   (6d) A bare null-conditional read of a LinkedList / OwningLinkedList / SortedSet property (ll?.First) is dropped: the statement emits nothing (§7.5, stdlib
+- #6880 [other]   (6d) A bare reference to a user extension member is rejected on IGrouping (any name, #6740) and on Array/Stack/Queue/Set/Dictionary/LinkedList for a §5 ope
+- #6919 [other]   (6d) [ownership][over-reject] an int read from an IMPORTED Array<int>/OwningBuffer<int>/FrozenArray<int> indexer is treated as a borrow of the source (in-m
+- #6922 [other]   (6d) [codegen][cross-module] Array<T>.Reversed()/Sorted() on an IMPORTED Array<T> yields an unusable value (compile-fail / statement emits nothing)
+- #6937 [leak] S (5d) o.Dispose() through Object leaks the strings of Array/Stack/Queue<string> and the class slots of OwningBuffer<C> (header elem_disposer unset)
+- #6943 [leak] S (5d) [codegen][leak][cross-module] the drop of an IMPORTED OwningArray<Array<int>> never disposes its Array elements; the same-module drop does (stdlib §4.
+- #6945 [leak] S (5d) owned Dictionary<string,string>/SortedDictionary field leaks its strings; overwriting an owned Mutex/StringBuilder field leaks the displaced value
+- #6992 [leak] S (5d) [codegen][leak] reassigning an owned generic `Set<T>` field leaks its string elements at T=string (§28.7)
+- #6993 [leak] S (5d) [codegen][leak] a generic owned `Set<T>` parameter is not released by its callee at T=string (§28.3)
+- #6994 [leak] S (5d) [codegen][cross-module][leak] an imported `SortedDictionary<string,string>.FirstKey.Length` leaks a string per read (stdlib §4.17)
+- #6995 [leak] S (5d) [codegen][leak] `FrozenArray<int>.From` over a literal-initialized `Array<int>` leaks, also through an imported function (stdlib §4.19)
+- #7035 [other]   (5d) §19.3 (v0.340): the instantiation-site classifier omits choices, inline arrays, the unit type and DateTime
+- #7043 [leak] S (5d) codegen: owned call result passed to a PLAIN (non-owned) primary-constructor Array parameter leaks (§22.10, §28.3, v0.340)
+- #7051 [other]   (5d) Collection literal as default of an explicit-constructor parameter arrives empty (§22.5, §15.4)
+- #7052 [leak] S (5d) this([..]) chain with a collection literal argument leaks the literal under LSan (§22.8, §28.3)
+- #7053 [leak] S (5d) leak: a nested collection literal passed to a constructor parameter leaks its inner arrays (§28.3, §22.10, v0.340)
+- #7058 [leak] S (4d) [codegen][leak] Array<string> slice prints 0 and leaks (stdlib §9 collection views)
+- #7060 [leak] S (4d) [codegen][leak] Queue<string> leaks its string elements
+- #7216 [leak] S (2d) [ownership][leak] an Array<T> local that is ALIASED into another local, or REASSIGNED after a reader call, still leaks its backing storage (208 B / 41
+- #7264 [other]   (1d) An inline-array collection literal's element sign-extends an unsigned literal - the value is lost (5.1, v0.344)
+
+## nullable-carrier — Nullable carrier unwrap at every value consumer (54 open; §7.4, §7.5, §7.7, §7.10, §5.1, §12.7, §19.5)
+
+- #3040 [sound]   (77d) fix #2933 follow-up: isStringFallbackTarget positive list regresses `b?.value` on nullable generic records (§4.6 / stdlib §3.4, v0.240)
+- #3688 [sound]   (55d) narrow #3591 follow-up: collectCaseArmBorrowSourcesStmt's LocalDecl-bare site (case-arm provenance via a const-bound CaseExpr) is UNCLEAR, not triaged
+- #4838 [sound]   (33d) [sema/codegen] §22.6 exact-match ranking not applied between a record's primary ctor and a body ctor: new R(5) picks ctor(x: int?) over primary (X: in
+- #5522 [sound] S (19d) §7.4 / §12.7 (v0.320): a `ref` parameter is still flow-narrowed (null and type narrowing) — #5495
+- #5643 [sound]   (19d) HYPOTHESIS (probe first): §28.10 (v0.327): `using var y := p ?? q;` over borrow arms may dispose a value it does not own
+- #5903 [sound] S (14d) §12.7 *A narrowing converts nothing* (v0.335): a flow-narrowed carrier is read at its declared type at §9.7's borrow-erasing and §28.3's set-erasing p
+- #5952 [sound]   (14d) [codegen,soundness] §9.2: Second<K>(k, null) at a class with an own-typed Equals(K) passes null into the member body (SEGV)
+- #6072 [sound] S (14d) sema §5.1 (v0.338): four conversion positions are never checked — `??`, `for var t: T in`, target-typed lambda body, `yield return` accept a base-to-d
+- #6073 [sound] S (14d) sema §5.1 (v0.338): residual implicit conversions left accepted after #6023 — Object to built-in class / type parameter / int?, the checkAssignable ca
+- #6225 [sound] S (13d) spec-question: §5.1/§7 (v0.338): is T? -> Object an implicit conversion? An un-narrowed null Animal? is accepted at a non-nullable Object parameter
+- #6482 [sound] S (8d) [codegen, HIGH, pre-existing, memory-safety] the new() shorthand is ADMITTED at a typed assignment target (§17.7 forbids it), drops the store with onl
+- #6505 [sound] S (8d) hasObjectHeaderEquality(Range)==true is a load-bearing falsehood: narrowing it silently drops Set<Range<int>> declarations via the #559 guard
+- #6731 [sound] S (6d) §11.2 / §12.1 (v0.340): the `T`→`T?` parameter widening is admitted at a reference-typed `ref`/`out` parameter of an override or an implementation — a
+- #6859 [sound] S (6d) `GetType()` is rejected as a plain call but compiles to a zero-initialized value via `?.` and as a method reference (§8.2)
+- #2286 [other]   (91d) stdlib §7.1/§7.2/§7.5: FileStream error paths do not raise IOException/FileNotFoundException
+- #2741 [other]   (84d) sema: §5.1 constant narrowing is implemented only from an exact 'int' source and never to 'int' — the spec states the rule over any integer type pair
+- #3252 [other]   (70d) W4L1 #3040 refutation: positive-list isStringFallbackTarget (88ba07b) does NOT regress generic_record_nullable_462 at HEAD 575f8cc
+- #3379 [other]   (62d) Lane F #1877 REFUTE-at-intake — foundation (R1-R4 owner ruling); narrow sub-fixes already shipped
+- #3387 [other]   (61d) fix #3376 follow-up: hoist the `.`-form result-head authorities so `?.ToSet`/`?.ToDictionary`/`Set` receivers can be typed correctly (§7.5)
+- #3456 [other]   (61d) typeNameForDiag spells a nullable type `?string`, not `string?` (§7.1) — 21 diagnostic sites; the sibling helper 450 lines away gets it right
+- #3954 [other]   (51d) narrow test gap: #3939's own plain-`.` non-nullable struct-mismatch repro has no dedicated pinned test
+- #4658 [other]   (34d) [codegen] narrow the #4045 backstop to Severity::Error when the assignment TARGET has no symbol — plus: its source span is wrong for a re-parsed impor
+- #4889 [other]   (33d) Pattern-match scrutMayBeString guard lacks parity with narrow #4858 lowerTypeTest string decisions
+- #5478 [other]   (20d) spec-question: §22.3 / §7.4 (v0.316) — may a ref/out chain be rooted at a narrowed nullable value-type variable?
+- #5572 [other]   (19d) HYPOTHESIS (probe first): §9.7 / §22.12 (v0.322): the null-source recognizer rejects an inline-array literal argument (`new R([null, null])`)
+- #5633 [other]   (19d) [test gap] #5610: the new rejection of non-nullable `override Equals(Object)` has no regression row
+- #5953 [other]   (14d) [codegen] §9.2: a.GetHashCode() on a type parameter instantiated at int? is rejected as not implemented
+- #6012 [other]   (14d) sema §11.2 (v0.338): interface conformance false-rejects a candidate that widens a declaration-less parameter T -> T? (Mutex vs Mutex?)
+- #6063 [other]   (14d) default(G<W>) over-rejects a record whose field is T? when W is a non-nullable reference type (§17.11)
+- #6065 [other]   (14d) codegen §30.11 (v0.338): optional-chain TaskCompletionSource calls never complete: `tcs?.SetResult(5)` / `tcs?.SetResult()` leave IsCompleted False
+- #6071 [other]   (14d) sema (v0.338): `?.` forms on built-in collections skip the `.` path's member checks: `Set?.Length`, `Dictionary?.Length`, `string?.Count`, `a?.Count :
+- #6077 [other]   (14d) sema §30.11 (v0.338): TaskCompletionSource argument-count checks are incomplete: `t?.SetResult(1)` (non-generic, safe-call), `SetCancelled(1)`, `TaskC
+- #6152 [other]   (14d) codegen: generic-interface indexer element T? at T=int reads garbage through the interface (I<int> over int?)
+- #6175 [other]   (14d) sema §6.6 L818: compound assignment with a nullable right operand (v += int?) accepted; binary v + r rejects
+- #6201 [other]   (13d) #6163 follow-up: Remove on Stack/Queue is still accepted via null-conditional (s?.Remove(1)) and via IReadOnlyCollection<T> receivers
+- #6346 [other]   (11d) §7.4 — a local's narrowing survives a later assignment of null, for every collection family
+- #6629 [other]   (7d) codegen §7.7: `Object? ?? 5` (value-typed right operand into an Object? left) dies in the backend: PHI node operands are not the same type
+- #6663 [other]   (6d) a?.Drain() on an owning collection stays untyped (#2756): codegen drops the value, exit 0
+- #6678 [other]   (6d) [sema][soundness] `s ??= 5` on a `string?` is accepted and the binary dumps core: `??=` is not covered by #6214 (§7.7, §5.1, v0.339)
+- #6723 [other] S (6d) §12.1 (v0.340): an override matching one base member exactly and another by `T?` widening must fill the exact slot — the override walk takes the first
+- #6724 [other] S (6d) §27.1.1 (v0.340): a function value's nullable view at a `string` or generic-class slot is rejected as invariant, and a `ref`/`out` slot is compared co
+- #6772 [other] S (6d) §7.4 (v0.340): a fact established on the only break path out of `while true` is lost after the loop — the join still intersects with loop entry
+- #6803 [other]   (6d) [codegen][cross-module] the generic template's T -> Object conversion returns null: H.Id<int>(5) across modules prints null (§2.8.2, §14.1)
+- #6822 [other]   (6d) [sema] checkAssignable ignores §7.4 readonly-field narrowing: a guarded readonly field is rejected at a user-call parameter (§7.4, v0.340)
+- #6824 [other]   (6d) [sema] base(m) with a nullable m into a built-in exception's message: string is accepted (§7.3, §31.4, v0.340)
+- #6829 [other]   (6d) [codegen][cross-module] imported generic method with a T? formal at T = int: H.ShowN(5) prints an empty string, same-module prints 5 (§2.8.2, §5.1, v0
+- #6840 [other]   (6d) §16.3: Range<T>.End/Start in a generic body read an open side as 0, not null
+- #6883 [other]   (6d) [codegen] a TextWriter-typed local (var w: TextWriter := Console.Out) does not lower: w.WriteLine fails to compile (stdlib §2.1/§7.4, v0.340)
+- #6963 [other]   (5d) §5.1 named-constant operand narrowing residual (#6914): wider constant vs narrower operand, and compound assignment u += K
+- #7007 [other]   (5d) [codegen] §12.7 (v0.340): v is string / is not string over T = int? fails to lower (return-value expression failed, #2491 warning); both print False
+- #7033 [other]   (5d) §19.3 (v0.340): a value-typed case binding over a generic substitution never matches an identical record or nullable type
+- #7318 [other]   (0d) `int.ParseOrNull` / `double.ParseOrNull` / `float.ParseOrNull` / `decimal.ParseOrNull` are REJECTED by sema, but the stdlib declares them (stdlib §9.1
+- #7350 [other] S (0d) §12.7 (v0.345): `v is T?` over `v: T` at a nullable substitution answers `true` at `null` — a nullable target tests as its underlying type
+- #7353 [other] S (0d) §19.3 (v0.345): a typed pattern binding whose written type is nullable (`var s: string?`) keeps that type and enters its arm narrowed non-null
+
+## generic-boundaries — Generic instantiation boundaries (88 open; §14.1, §14.2, §14.5, §3.6, §12.9, §28.3 bare-type-parameter rules)
+
+- #2220 [sound] S (92d) bug: generic choice match-arm payload binding reads wrong (unspecialized) struct — class payloads return 0
+- #2289 [sound] S (90d) Generic inheritance: an INHERITED base field is laid out with the DERIVED class's name-keyed substitution — SEGV when the base names its type paramete
+- #2735 [sound] S (84d) sema: the #2713 owning-element per-instantiation sweep does not reach CROSS-MODULE instantiations of an imported generic
+- #2736 [sound] S (84d) sema: owning-element check misses generic-METHOD type params, and omits OwningTask<T> / the IOwning* interfaces that §14.4 names
+- #2861 [sound] S (83d) [codegen] #2841 residuals: a generic class's static AUTO-PROPERTY is not per-instantiation redirected, and an unreconstructed static body reaching a S
+- #3655 [sound] S (57d) codegen: per-instantiation descriptor td$<I>_<T> for specialized synthesized builtin iface uses SIMPLE type-arg name (sibling of #3543)
+- #3861 [sound]   (52d) sema §14.5 phase 1: `unifyArgSubst` unifies generic arguments by arity, not by implemented instantiation — non-unique instantiations bind instead of f
+- #4861 [sound] S (33d) [codegen] recv?.M() on a GENERIC-class receiver never installs the receiver's class substitution — silent wrong value (Box<string>?.Plain() prints 0) 
+- #4862 [sound] S (33d) [codegen] method type parameter shadowing its class's T: body reads of class-T members lower at the method T (name-keyed substitution) — silent wrong 
+- #6112 [sound] S (14d) [sema][soundness] §20 (v0.338): case/if arms of DIFFERENT instantiations of one generic class get a common type (Bx<B> vs Bx<A>) — heap-buffer-overflo
+- #6315 [sound] S (13d) typeRefEqual treats different type parameters as equal: nested-key overrides/implementations are falsely accepted (§12.1, §11.2)
+- #6443 [sound] S (9d) [codegen][leak] #6405's mint bit is keyed per PropertyDecl while the block getter is emitted per SPECIALISATION — a generic class that mints for one T
+- #6747 [sound] S (6d) §22.6/§14.5: a generic candidate with an inapplicable closed parameter is selected, and the program segfaults (exit 139)
+- #6866 [sound] S (6d) Inference from an `Array<char>` argument to `IEnumerable<T>` loses `char`: the same-module call prints 97 (§14.5)
+- #6927 [sound] S (6d) #6900 cross-module half: imported generic at explicit long/double with int-literal args runs the i32 placeholder (OverflowException / IR verify / wron
+- #6931 [sound] S (6d) generic CLASS method template is still the callee through a layout-equal specialized vtable slot and a method reference: silent wrong value at a class
+- #7062 [sound] S (4d) [cross-module] an imported generic body with an unmentioned T is not instantiation-checked (the same module rejects it)
+- #2291 [crash] S (90d) Cross-module generic base chain: three shapes abort in the IR verifier for a reference-type argument (imported concrete-derived; local primary-ctor ba
+- #2650 [crash] S (84d) codegen: imported class-T Span<R> across a module boundary fails IR verification (§2.5/§29.3, stdlib §4.14, v0.237)
+- #3378 [crash] S (62d) imported generic class typed ctor fails IR verification at T = non-trivial record
+- #3485 [crash] S (61d) codegen: `emitChainCall` applies NO argument coercion, so `base(7)` at a `long` formal and `base(null)` at a `()?`/`int?` formal all emit malformed IR
+- #3495 [crash] S (61d) codegen: every member call OTHER than zero-arg `ToString()` on a §7.4-narrowed nullable VALUE receiver still gets the tagged struct — malformed IR, an
+- #3524 [crash] S (60d) codegen: a §22.10 inheritance-clause base call into a CONCRETE GENERIC base calls the ERASED `T→i32` template — `class D(): B<string>("hello")` emits 
+- #6021 [crash] S (14d) codegen/sema §11.2 (v0.338): a method inherited through a generic interface chain returning Array<int> loses its value (WriteLine vanishes) and `var a
+- #6232 [crash] S (13d) Payload-free case of a generic choice (`InnerU<Own>.No`) is typed without its type arguments: ICE, leak, and rejection of a valid reassignment (§35.3,
+- #6257 [crash] S (13d) [module] imported generic class at G<string>: call to a T-typed method fails IR verification
+- #6792 [crash] S (6d) [codegen] a bare T passed to an Exception- or class-typed parameter fails IR verification in the unspecialized template body
+- #6932 [crash] S (6d) importer-reconstructed generic class method: an interface member called through T, used as a receiver (item.Mark().ToString()), does not lower: silent
+- #7021 [crash] S (5d) generic derived class over Box<int>: inherited Get() + 1 fails IR verification (add ptr, i32) (§14.1)
+- #7056 [crash] S (5d) ICE: generic-choice construction inside a generic body fails IR verification at lambda return, nested construction, case-expression PHI and async (§14
+- #710 [other] S (136d) Module export: generic class ctor body with an owned local / cross-type call is not exported (diagnosed, not constructable) — asymmetric with non-gene
+- #803 [other]   (130d) Generic static init: per-instantiation init-timing independence (needed only once T-dependent static initializers are supported)
+- #1743 [other]   (108d) [latent] bound method-reference env over a record: owned-field disposal + generic-record layout gaps (§27.6)
+- #2020 [other] S (102d) Latent: emitBaseDisposeChain assumes disposerCoreFns_[base] is the erased template, which may not hold for an IMPORTED generic base (currently harmles
+- #2554 [other]   (86d) [follow-up #2445] relax #1078's sema reject so CALL-form bare-T member access reaches codegen's deferred resolution
+- #2580 [other] S (86d) diagnostics: #1386 internal-error shape (out-of-shape operand reaches codegen) — sweep for other §22.3/§22.4 cases
+- #2737 [other]   (84d) diagnostics: ast::Type-anchored errors report file:0:0 (no location) — owning-element, §28.5 generic-owned-field, and the #2713 sweep
+- #3055 [other]   (77d) [proposal 0089] Retire the §19.6 generic-leaves determination rule? A study, post-choices
+- #3101 [other]   (76d) cleanup: rename the `EqualityBearing` sema identifiers to `Hashable` (§3.6, v0.242)
+- #3400 [other]   (61d) §14.6 (#3271) residual: generic-member edges with inferred type arguments, and mutual member cycles, are still accepted
+- #3457 [other]   (61d) issue-3440 interim under-approximates: the SOUND generic upcast `OfType<Base<int>>()` on `Der<int>` is now refused (isSubtype is argument-blind)
+- #3474 [other] S (61d) codegen: an interpolation hole holding a VOID BUILT-IN INTRINSIC still hard-ICEs `#1386` — `$"[{Console.Write("w")}]"` (§18.5 / §4.7 / §8.5, v0.283)
+- #3486 [other] S (61d) codegen: a unit-typed POSITIONAL parameter — `class B(u: ())` — lays the class out with a `void` field and fails the verifier with "GEP into unsized t
+- #3501 [other] S (60d) codegen: a unit-typed argument at a CLASS-generic formal monomorphized to `()` still hard-ICEs #1386 at every spelling — `new B<()>(C.Nothing())`, `ba
+- #3514 [other] S (60d) codegen: emitVirtualGenericDispatch has two `return nullptr`s AFTER it has begun emitting the dispatch — a caller that falls through then emits into a
+- #3525 [other] S (60d) codegen: `new B<()>(unitArg)` still hard-ICEs `#1386` when the ENCLOSING generic scope binds a type parameter of the same NAME (§4.7 / §7.10 / §14.1, 
+- #3526 [other] S (60d) sema: no argument check against a formal typed by an UNBOUND type parameter inside a generic template body — `this("x")` at `constructor(u: T?) where 
+- #3659 [other] S (56d) codegen follow-up: per-instantiation §11.6 nested type using enclosing generic parameter — option 2 spelling (#3584 partial)
+- #4241 [other]   (46d) extension: user-declared GENERIC extension member call never resolves correctly cross-module (misleading §28.3 diagnostic; pre-existing, not a #4233 r
+- #4333 [other]   (46d) groundSatisfiesNew: port DictionaryEntry/Span-family instantiation-dependent new() dispatch (follow-up to #4298)
+- #4567 [other] S (36d) codegen: the I1 substitution duplication is unconsolidated at the codegen layer — resolveTypeParamRef (shallow) beside substituteTypeRefLocal (recursi
+- #4789 [other]   (33d) [codegen] non-generic user-declared extension member call never resolves cross-module (s26_5_0016)
+- #4817 [other]   (33d) [codegen] Same<T>(a: Pair<T>, b: Pair<T>) => a.Equals(b) falsely rejected by #3918 mismatch guard in dead template pass (§9.1, v0.307)
+- #4980 [leak] S (32d) [codegen][leak] generic-body store into a bare-T field at T=string leaks the old value (retain-only policy of #4965; T locals take no +1) (§28.9/§14.1
+- #5257 [other]   (26d) [codegen][silent-wrong] generic subclass whose class type parameter shares the overridden virtual generic method's type-parameter name dispatches with
+- #5339 [other]   (24d) codegen: block-bodied indexer getter of a generic class is memoized per declaration, not per owner instantiation (§14.1/§23, v0.313)
+- #5386 [other]   (23d) spec-question: §11.6 / §2.8.3 / stdlib §2.13 (v0.314): how is a nested type of a generic type spelled outside its enclosing declaration, and how is it
+- #5417 [leak] S (22d) [codegen][leak] generic method returning 'owned T' is classified non-owning: 'using var' warned vacuous and 4776 B/199 allocs leak per call (§28.9, §2
+- #5488 [other]   (20d) spec-question: §9.8 / §14.2 (v0.316) — a derived class that inherits its base's synthesized serialization silently drops its own fields
+- #5962 [other]   (14d) §17.11 (v0.338): unconstrained default(T) — Task substitution, type-parameter chains and type-position-only instantiations still accepted (#5820 resid
+- #5988 [other]   (14d) Overloads naming different built-in INTERFACES / non-exception built-ins, or built-in exceptions nested in generic args, are still rejected as indisti
+- #6010 [other]   (14d) Open-bound check residuals (#5968): static receiver, method-level params, generic method bounds, constrained params, alias targets still accept
+- #6030 [other]   (14d) sema §14.2 (v0.338): interface conformance does not compare method constraint sets (where T: IEquatable<T> on the interface member, none on the implem
+- #6096 [other]   (14d) [codegen][wrong-answer] record through an interface view: `string` overload of an interface method returns garbage; generic record's interface method 
+- #6122 [other]   (14d) checkHidingAndOverride: abstract-class override with an own type parameter in the class-param slot is falsely ACCEPTED (A<S> P<T>(Pair<S,T>), K<T>: A<
+- #6203 [other]   (13d) [codegen] §14.2: a generic interface member Object-spelled only after substitution (IE<Object?>.Equals) is not witnessed by a value kind's Object slot
+- #6216 [other]   (13d) §19.6/§19.3: alias head with different type arguments than the scrutinee is not rejected (and, post-#6193, no longer warns); statement-position case w
+- #6240 [other]   (13d) sema §11.2: abstract generic class K<Z>: B<Z>, N (N.Value: int) accepted while the concrete form is rejected
+- #6248 [other]   (13d) [codegen] §22.16: invariant over a field of a generic middle class (Leaf: Mid<long>) raises a false ContractViolationException at construction
+- #6256 [other]   (13d) [module] cross-module link error: undefined reference to an imported generic class's overload-suffixed method (bz$LibT.G$L.4)
+- #6272 [other]   (13d) sema (§11.2, v0.338): a generic class B<T>: I<T> with Q(T) plus an extra Q(bool) overload is falsely rejected as not implementing I<T>.Q
+- #6298 [other]   (13d) Generic-method override called through a generic base type dispatches to the base body (§12.1)
+- #6304 [other]   (13d) Generic base indexer with a non-int element type dispatches wrongly through a base-typed reference (§12.1, §11.2)
+- #6312 [other]   (13d) Explicit type-argument list: a non-generic overload is picked, and a call matching no overload is accepted (§14.5, §22.6)
+- #6316 [other]   (13d) typeRefEqual residuals after #6315: abstract-indexer value twin, non-generic-interface property, two-key indexer overrides (§12.1)
+- #6359 [other]   (11d) [sema] applyBaseMemberSubst is now byte-equivalent to applyGenericSubst — a second copy-paste of the same substitution walker that will drift
+- #6392 [leak] S (10d) generic `owned` parameter adopted by `using var _ := owned e;` leaks — same body is clean when the parameter type is not a type parameter
+- #6585 [other]   (7d) §26.4 (v0.339): measure whether any non-extension generic position silently accepts an identifier that names nothing (the #6522 lead)
+- #6795 [other]   (6d) choiceHasUserDeclaredEquality requires a homogeneous =/<> overload; §3.6 hashable row says Equals(C)+GetHashCode suffices (v0.340)
+- #6816 [other]   (6d) [codegen][cross-module] an imported interface's generic method, implemented in the importer, gets an int-shaped value through interface dispatch (char
+- #6817 [other]   (6d) [sema][cross-module] §14.5 Agreement is not enforced for an imported generic method: Pair(5, short(3)) runs instead of rejecting (v0.340)
+- #6850 [other]   (6d) A `long` generic argument rejects an integer literal that fits `long`: `S.G<long>(1, 3_000_000_000)` (§4.2)
+- #7036 [other]   (5d) §19.3 (v0.340): the instantiation-site rejection of a reference-typed case binding does not follow a chain of generic calls
+- #7080 [other]   (4d) A type parameter that shadows a reserved built-in is lowered as the built-in, so an exported generic template's ABI depends on the parameter's NAME (§
+- #7101 [other]   (4d) a module-level generic declaration is not subject to §2.2's arity rule, so a bare reference of the always-available arity is rejected
+- #7196 [other]   (3d) [sema] the new expression-position arity check treats Task/TaskCompletionSource as available at arity 0 OR 1, so Task<int> at a user class Task is ACC
+- #7237 [other]   (2d) [codegen] a generic type parameter bounded ONLY BY AN INTERFACE (where T: IFoo) still dies on the #1386 internal diagnostic - the erased representatio
+- #7261 [other]   (1d) [codegen][cross-module] a CROSS-MODULE instantiation of a public generic method does NOT behave identically to the same-module one - the importer call
+
+## borrow-provenance — Borrow provenance and the sink rule: ownership-pass catch-up (96 open; §28.3 provenance/consume-site/freeze, §28.14, §9.7, §28.2, §28.6, §28.7, §30.5)
+
+- #2215 [sound] S (93d) [ownership] §28.8.1 WrongOrder (TransferToHelper) silently accepted — implicit exception edges from synchronous call argument-evaluation missing
+- #2551 [sound] S (87d) [codegen] #2548 deeper analysis: the indexer-set producer-RHS release fires on the ToString intermediate, not the concat result — BinaryExpr lowering 
+- #2636 [sound] S (84d) [codegen] erased IReadOnlyList owned-field free assumes an Array backing — EnumValues/CommandLineArgs would be read as a bz_array_t (verify reachabili
+- #3520 [sound] S (60d) Missing rejection: a closure capturing a catch-arm binding may ESCAPE the arm — compiles, then use-after-free (§31.1)
+- #3827 [sound] S (53d) Soundness gap in #3745 gap-1 record-call-result relaxation: callee field-store of record aliases string fields, scope-end release would UAF
+- #3873 [sound] S (52d) impl: §28.11's scope-bound-local-borrow REJECTION does not reach OwningDictionary's key (only the §15.4 warning does, after issue 3839)
+- #3959 [sound] S (51d) Four sibling arms still poison during the O3b suppressed phase: .Dispose()/move of a consumed local in a loop body is still a silently-accepted heap-u
+- #3967 [sound] S (51d) Reassigning a MAYBE-CONSUMED (conditionally moved-from) owned local still heap-use-after-frees — #3950's static gate cannot cover it
+- #3999 [sound] S (51d) pre-existing double-free: move-in-one-arm + capture-in-other-arm of a marker-free if/case expression (§28.3 K7.4, §338/#1626)
+- #4021 [sound]   (50d) fresh_receiver_property_2751.record_result_receiver_not_disposed fails on r15-c2-batch base 8aeb7a3 (pre-existing, unrelated to #4016)
+- #4094 [sound]   (48d) Pattern matching with type alias as pattern type silently fails (ResAlias(var t) in case arm)
+- #4102 [sound] S (48d) Loop-carried conditional Dispose() of a non-nullable owned local: silent SIGSEGV, zero diagnostics
+- #4122 [sound] S (48d) checkRead's IndexExpr indices loop poisons a Disposed move-source before recordMovesIn can report it (sibling of #3979/#4023)
+- #4124 [sound] S (48d) checkRead's ?./?() receiver guard (fix-forward 102d29f) leaves a bare (non-move) MovedFrom/Disposed read through a nested call/ctor receiver fully und
+- #4882 [sound]   (33d) [ownership] borrow of a using var stored into an outer local is accepted — UAF (plain owned local is rejected)
+- #4954 [sound]   (32d) [ownership] borrow of a using var escapes via if/case-expression return and via a call-result holder (UAF) — #4948 residuals
+- #5845 [sound] S (15d) §28.3 transfer window: `move x` into a user-method `owned` formal never nulls the caller slot, and the order-blind walker cannot satisfy both throw ed
+- #5972 [sound]   (14d) §28.3 *consume-site freeze* (v0.338): the compiler accepts `Sink(x, move x)` / `Sink(x.Child(), move x)`; the spec rejects it at the `move`
+- #5973 [sound] S (14d) §28.3 *borrow lifetime rules* (v0.338): the compiler accepts `p := it` to a plain parameter where `it` is a `using var` of a nested block; the spec re
+- #5974 [sound] S (14d) §28.3 *borrow lifetime rules* (v0.338): the compiler accepts `p := it; _k := p;` (a parameter assigned a local's borrow, then stored to a field); the 
+- #6136 [sound] S (14d) sema: a call-bounded function parameter escapes through `h ?? "s"` at an Object return (§28.14) — use-after-free
+- #6234 [sound]   (13d) Read of a move-only binding after an if-expression branch moved it is accepted (§20 Ownership, §28.3, v0.338)
+- #6288 [sound] S (13d) Record field released by the #4253/#4277 class disposer while a returned copy still reads it (heap-use-after-free)
+- #6708 [sound] S (6d) §9.7 (v0.339): the borrow-bearing-record classifier ignores auto-properties, so a body record holding a class in a property escapes every §9.7 bullet
+- #6737 [sound] S (6d) §9.7 (v0.340): the holds-borrows classifier treats a builtin-collection record field (`Array<int>`) as borrow-free — the spec's own `Bag` example esca
+- #6867 [sound] S (6d) A generic `a.Equals(b)` and `a.GetHashCode()` do not reach a record's own members: `False False 540`, not `True False 3` (§9.2)
+- #6886 [sound] S (6d) [ownership] a fresh temporary passed to a constructor's borrow parameter and stored in a non-owned field dangles when the holder outlives the loop bod
+- #7009 [sound] S (5d) record = between two function-returned record temporaries in a loop: heap-use-after-free under ASan (§8.4, §28.3)
+- #7097 [sound] S (4d) [ownership] an ALIAS of a non-`owned` field read can call `Dispose()` — accepted, then double-frees at run time (§28.6, v0.343)
+- #7107 [sound] S (3d) [ownership][soundness] an explicit Dispose() suppresses §28.3's borrow-lifetime rejection: a method group over the disposed local compiles and SEGVs (
+- #6616 [crash] S (7d) §28.3/§28.11: return of a ToArray() snapshot over a scope-bound local is ACCEPTED at a class/interface element type (v0.339 §28.3; §28.11 unchanged si
+- #1656 [other]   (108d) [v0.184] compiler: enforce §28.6 getter/owned-escape rules on extension members (§26.1 Words shape)
+- #1658 [other]   (108d) [v0.184] compiler: §28.8.1 restoration analysis must treat drop-on-overwrite stores as throwable (spec §28.8.1, v0.184)
+- #1662 [other]   (108d) [v0.184] compiler: set(owned) property/indexer assignment is an announced consume + freeze site (spec §28.3/§23.3, v0.184)
+- #1669 [other]   (108d) [v0.184] run-coordination: verify the two displaced TRAIN-OWN findings were not dropped (input JSON mispairing)
+- #1672 [other]   (108d) [v0.184] Pattern A: plain owned locals + admitted static Task fields as operands; borrowed-source chained slot (§30.5/§22.13(b); resolves #1533)
+- #1772 [other] S (106d) Async method bodies hard-reject plain-`var` owned locals instead of §28.3 warn+auto-drop
+- #1933 [leak] S (103d) GroupBy element-returning terminal: residual leaks after #1930 (unbound temp, escaping bound local, predicate/no-seed-Aggregate forms) (§5/§28.9)
+- #2124 [other]   (97d) §35.5 owning match: implement the consuming scrutinee `case owned x of` (marker now parses; lowering rejected as targeted)
+- #2171 [other]   (96d) [impl][§30.5] widen await-operand admission to plain task-typed borrow-field paths (direct + aliased) per the #2042 ruling
+- #2255 [other] S (91d) spec §30.5/§30.4: no producer row admits a move-only value task result (owning choices) — and the impl checks head names only, so Task&lt;Result&lt;C,
+- #2569 [leak] S (86d) [codegen] record indexer setter leaks (gated by #2548 but underlying leak surface elsewhere)
+- #2570 [other] S (86d) [codegen] lowerIndexerSet's emitProducerRelease: verify isObjectOrInterfaceTarget accepts IndexExpr
+- #2577 [leak] S (86d) [codegen] non-virtual RECORD PROPERTY setter on the local path leaks producer-RHS (#2568 pre-existing gap)
+- #2615 [leak] S (85d) [codegen][leak] owned ICollection<T>/IReadOnlyCollection<T>/IOwningCollection<T> field leaks backing (polymorphic-interface field disposal)
+- #2644 [other]   (84d) [sema/ownership] a collection-literal-initialised local is rejected as a borrow when stored into an owned field, while the new-initialised local is ac
+- #2671 [other] S (84d) [ownership] #2654 residual: the trivial-dispose warning exemption keys on the declaration's initializer, so a reassigned local can lose a genuinely-du
+- #2690 [leak] S (84d) [codegen/runtime] MEDIUM: LINQ ToDictionary over a string source never retains nor releases its values — bounded leak (split out of #2688)
+- #2705 [leak] S (84d) [codegen] LOW: an assigned-to `string` parameter's last value leaks (one per call) — the accepted residual of #2696
+- #2740 [other] S (84d) literal-tree interior reclaim: two iteration shapes still decline after #2711 (dictionary `kv.Value`, and iterating `root[k]`)
+- #2745 [other] S (84d) ownership: §21.1's move-only-value const rejection (§15.3) is unenforced — the vacuous-using-var lint's const remedy points into it
+- #2749 [leak] S (84d) ownership: §21.1 const rejection — residual owned-returning members, the arr[r] slice form, lambda bodies, and BindExpr depth (follow-up to #2709)
+- #3056 [other]   (77d) [proposal 0090] Transfer-marker unification study: move as the single consume action, owned purely declarative
+- #3124 [other]   (76d) Value-receiver `this` binding is unspecified: does a record method's receiver alias the receiver's storage or a copy?
+- #3388 [other]   (61d) Cosmetic: pure-body 'marker-free consume' diagnostic renders two section citations — '(§28.3) (§22.15)'
+- #3549 [other]   (60d) §28.11 collection-store rejection calls a catch-arm binding "an owned scope-bound local disposed at the end of its block" — right rejection, wrong rul
+- #3569 [other] S (59d) Narrow the §31.1 lambda-body catch-borrow rejection to lambdas whose own value escapes — it currently over-rejects a memory-safe arm-confined lambda
+- #3632 [other] S (58d) §28.9's recursive clause is unimplemented: an `owned` field of a TRIVIAL-dispose type wrongly disqualifies its holder (one predicate, three consumers,
+- #3709 [other] S (55d) sema §21.1: const y := move x compiles for a TRIVIAL-dispose class — the owned-production rejection keys on the type's dispose verdict, not on the mov
+- #3979 [other] S (51d) checkRead's CallExpr arm preempts markMovedByName: f(move x) after Dispose() is accepted with a warning instead of rejected, and SEGVs (#3941 at the c
+- #4053 [other] S (50d) ownedArgSourceIsBorrow's new #4042 carve-out is DIRECT-initializer-only — a further alias of a builtin-materializer-bound local still false-rejects
+- #4055 [other] S (50d) test-gap: #4023's checkRead CallExpr-arg fix untested on the await half at that one call site
+- #4231 [other] S (47d) Probe: can `checkAssignable`'s nullable-blind free-type-variable carve-out accept a program §14.5's Agreement rule forbids?
+- #4262 [other] S (46d) checkConsumeFreeze: the rebind false-reject survives for most realistic rebind shapes — fix #4225 narrowed to bare-identifier and `new` RHS only
+- #4274 [leak] S (46d) [codegen] imported string-element inline-array call result via `outer := <call>;` leaks 38 B post-#4265 (release-eligibility gap, sibling of #4266)
+- #4277 [leak] S (46d) [codegen] class-field record-string-field release (#4253) is narrow: non-sealed classes and constructor-body-assigned fields still leak
+- #4291 [other] S (46d) [codegen] #4253's sealed condition may be partly redundant now that #4276 is fixed (needs re-verification, not a rubber-stamp relaxation)
+- #4762 [other]   (34d) [ownership] second consume of an owning-match arm binding is memory-safe but undiagnosed (§28.8.1)
+- #4774 [leak] S (33d) [codegen/disposal] combined-form record body ctor assigning a string positional field leaks 2 allocations per construction
+- #4846 [other]   (33d) [ownership] §28.3 state match on reassignment not enforced: borrow assigned to owned-state local accepted (potential double-dispose)
+- #4929 [other]   (32d) [ownership] owning-match arm: `move w` as a branch of an if-expression arm result is rejected ("not an owned binding") while the bare `move w` arm is 
+- #4951 [other]   (32d) [ownership] K8.4 ordered walk: if/else merge keeps pre-branch taint, so a kill on every path is not recognised
+- #5154 [other]   (28d) ownership (HYPOTHESIS): the static-return rule exempts owning-collection heads (`isOwningTypeHead`, `Ownership.cpp:14678`) against §28.3's "same owned
+- #5387 [other]   (23d) spec-question: an owned/borrowed value assigned through a property is a field store under an auto-property but a plain-parameter call under a block-fo
+- #5487 [other]   (20d) spec-question: §28.3 / §22.12 (v0.316) — static property assignments of borrow-carrying values
+- #5625 [other]   (19d) HYPOTHESIS (probe first): §28.3 (v0.325): a `scoped`-parameter-sourced store into a `ref` or plain `out` location must be rejected at the callee — #56
+- #5855 [leak] S (15d) [codegen][leak] a record local holding a runtime-built string gets NO scope-end release once it is passed to a call — by-value pass leaks with no boxi
+- #5873 [other]   (15d) codegen: a borrowing-match payload binding still reads a snapshot copy after an intervening write (garbage pointer on a §19.3-admitted path)
+- #5877 [other]   (14d) [spec-question][29.11 vs 28.3] does 'a spent right' suppress the §28.3 hard reject inside a generator, or only the must-use warning?
+- #5880 [leak] S (14d) record local holding a runtime-built string never gets its scope-end release unless it is boxed into an interface
+- #6069 [other]   (14d) sema §19.3/§13 (v0.338): private field readable through an IMPORTED alias head in a named slot over Object (#6045 residual); imported alias heads also
+- #6123 [other]   (14d) Task<Object> never disposes a user-class instance result; a multi-return Object local holding one is destroyed by the frame and the result dangles (§3
+- #6124 [other]   (14d) Borrow escape through an Object-typed holder is accepted: var o: Object := d; keep := o; outlives d (§28.3, v0.338)
+- #6153 [leak] S (14d) ownership: a record temporary holding an owned string, passed by value as a call argument, is never released (LeakSanitizer 34 B / 2 allocs); Set<reco
+- #6339 [other]   (11d) [sema] a nested recursive alias drops a diagnostic count 2 -> 1, silently suppressing a FALSE 'type alias Id is recursive' report
+- #6612 [other]   (7d) _unescape docstring claims the & 0xFF mask 'can [not] promote an ill-formed spelling to the marker' — MEASURED false for two literals
+- #6848 [leak] S (6d) Overwriting an `Object` local through a `ref` argument leaks the displaced value (§28.7)
+- #6977 [leak] S (5d) [codegen][leak] §8.4 l1.Equals(l2) on two local fresh-constructed records leaks both locals' string fields (record local release eligibility)
+- #7075 [leak] S (4d) leak: a runtime-managed RHS displaces a classified Object-typed local without disposing it — the displaced instance is never freed (§28.3, §28.7, v0.3
+- #7087 [leak] S (4d) §28.3's state-match-on-reassignment rule is never exercised by the test that names it, and the corrected program leaks 800 bytes / 100 allocations
+- #7134 [other]   (3d) [ownership] a spurious §28.3 must-use / auto-drop warning fires on a trivial-dispose value — but only on an error path
+- #7138 [other]   (3d) [ownership] §28.6's receiver rule is not read at a §27.6 FORMATION for an alias of an owned binding: b.Dispose forms where b.Dispose() is rejected
+- #7155 [other]   (3d) A borrowed local bound from a getter read can call Dispose() - the alias source is populated only for an owned field read (§28.6)
+- #7235 [other]   (2d) [ownership] the CLASS-TYPED spelling of a collection alias is still accepted where 28.7 requires the rejection - the Object-typed spelling now gets it
+- #7238 [other]   (2d) `Object` is modelled as a primitive value type, so the class-typed ownership rules never fire on it (§3.1, §8.1, §28.1, §28.3, v0.343)
+- #7343 [other]   (0d) §2.7 / §2.2 (v0.345): an import alias at a chain head silently shadows a same-named enclosing member — the Warning row fires only when the head resolv
+
+## choice-payloads — Choice payload lifetime and layout (30 open; §35, §19.3, §15.3, §9.4)
+
+- #2571 [sound] S (86d) [sema/codegen] AndThen on Result<T,E> requires explicit Result<U,E> wrapping (spec §35.2)
+- #3939 [sound] S (51d) codegen: choice Equals(genericArg) struct-MISMATCH guard (fix #3913) has the SAME quiet zero-degrade via plain `.`/`!.` that #3925 just fixed for the 
+- #4816 [sound] S (33d) [codegen] choice arm of lowerValueSemMethodOn: type-parameter name shadowing gives silent False for Same<T>(Opt<int>) (§9.1, v0.307)
+- #4883 [sound] S (33d) [codegen/async] owning match with await inside the arm SEGVs at runtime
+- #5453 [sound] S (21d) Use-after-free: owning-match binding disposal reads freed payload (heap-buffer-overflow under ASan)
+- #5912 [sound] S (14d) Pre-existing heap-use-after-free: owning-choice payload read with no owned sink
+- #6167 [sound] S (14d) codegen: choice payload of a nullable owning choice (v: Own?) — dynamic-stack-buffer-overflow at construction (§35.4, v0.338)
+- #6168 [sound] S (14d) owning choice local passed by value: second pass accepted (SEGV), single pass never disposes, lambda capture stack-buffer-overflow (§35.4, §28.3, v0.3
+- #6233 [sound] S (13d) Plain read of a move-only (owning choice) field in a consuming position is accepted: heap-use-after-free (§15.3, §28.8.1, v0.338)
+- #6478 [sound] S (8d) [codegen][soundness] a generic choice reaching an Object/interface location is accepted with ZERO diagnostics, then `GetHashCode()` returns 0 and `is 
+- #6034 [crash] S (14d) segfault in Emitter::patternMatches on 'case this of' over declaring choice (choice_this_equality_operator_357 program)
+- #6043 [crash] S (14d) codegen §9/§2.8 (v0.338): an imported choice with an Array<int> payload segfaults when matched (rc 139); direct-spelled, no alias
+- #6164 [crash] S (14d) codegen: choice case construction does not apply the §5.1 widening to the payload (int -> long variable aborts IR verify; int literal -> double payloa
+- #6165 [crash] S (14d) sema §5.1: int source accepted for an inline-array ([3]int) parameter / choice payload; compiler crashes (rc 132) or fails IR verification
+- #6638 [crash] S (7d) [codegen] `case this` inside a lambda in a generic choice method emits malformed IR (lam$0 has no terminator)
+- #6640 [crash] S (7d) [codegen][async] `case this` inside an async lambda in a choice method emits malformed IR (bz$asynclam$N$Resume has no terminator)
+- #4634 [leak] S (35d) [codegen] a §35.5 pattern binding that is never adopted leaks its transferred payload (24 B) — no auto-drop, no must-use warning
+- #4684 [leak] S (34d) [codegen] owning match with a non-destructuring `var` arm leaks its payloads (§35.5)
+- #4804 [leak] S (33d) Residuals of #4634/#4684: owning-match whole-binding and payload leaks remain on consume/escape/throw/async arms
+- #4971 [leak]   (32d) codegen: SharedEventSource<T>.Raise with a type-parameter payload in G<T> — leaked 128 B under #4901 v2, spuriously rejected under v3 (stdlib §6.5, v0
+- #5153 [leak] S (28d) codegen probe (§35.5, v0.309, #4821): an owning match's unconsumed whole-value `var y => ()` arm may leak — the moved-from mark is set at arm selectio
+- #5979 [other]   (14d) async return of a value type under Task<Object>/OwningTask<Object> stores an unboxed payload (SEGV); blocks the OwningTask<Object> result disposer
+- #5992 [leak] S (14d) §28.3/§35.5 (v0.338): owning-choice scrutinee temporary `Outer.Got(Oc.Fetched(new W(), 200), 5)` in a `case` leaks 16 B per evaluation under --checked
+- #6014 [leak] S (14d) Owning match: positional transferred binding left unused in the arm never disposes its payload (leak, destructor not run)
+- #6036 [other]   (14d) codegen §19.3 (v0.338): a type-test pattern in a named slot over an Object-typed field matches the wrong arm (`Wrap(V = string)` matches an int payloa
+- #6170 [leak] S (14d) [codegen][leak] string payload of a value-like choice nested in a value-like choice is never released (§28.9, §35.4, v0.338)
+- #6486 [other]   (8d) #6459 follow-ups: the new test's red rows depend on the prelude's layout, and a new §35.7 emitter could re-drift
+- #6738 [leak] S (6d) §28 (v0.340): method call on a choice temporary with an interpolated-string payload leaks (Tag.A($"x{i}", i).Describe(), 400 allocs / 200 iters)
+- #7047 [leak] S (5d) §28 (v0.340): returning a choice construction with an interpolated-string payload from a method leaks the payload (return Result<int,string>.Error($"b
+- #7050 [other]   (5d) diag: #2354 follow-ups — duplicate arity error, ellipsis in the did-you-mean spelling, note at a default value (§35.3, v0.340)
+
+## async-frames — Async return slot and frame-carried locals (32 open; §30.5, §30.1, §30.9, §30.10, stdlib §6)
+
+- #1422 [sound] S (116d) TaskScope §6.10: the exception-edge disposal is a non-blocking zombie drain, not an awaited drain (awaiting-across-unwind deferral)
+- #5015 [sound] S (32d) [codegen][crash] generic async W<T>(x: T) at T := class with owned arg + using var Task<T> SIGSEGVs at runtime
+- #5280 [sound] S (25d) [codegen][uaf] the #5244/#5262 borrowed-string-argument pin is released before an async callee resumes — the parameter read after the suspension is a 
+- #5311 [sound] S (24d) [codegen][memory] async string / string? returns are not normalized to +1: await of a producer body leaks, Task<string>.Result of a borrow body over-r
+- #5657 [sound] S (19d) stdlib §6.10 (v0.328): `TaskScope` holder rule — the owning positions the compiler does not reject (proposal 0145)
+- #5699 [sound] S (19d) §30.5 (v0.331): reject `Task<T>` over a value type that holds borrows at every site forming the type — `TaskCompletionSource<Pair>`, `Task.FromResult(
+- #5704 [sound] S (19d) §30.5 *No fourth kind* (v0.331): reject a non-`await` borrow `return` in an `async` `Task<T>` body at a trivial-dispose class, an interface or `Object
+- #5719 [sound] S (19d) §30.1 (v0.332): a holds-borrows binding an `async` lambda captures is rejected when used after the lambda body's own suspension point (#5687)
+- #5722 [sound] S (19d) stdlib §6.5 (v0.332): reject `AsyncEventSource<T>` at a value type that holds borrows wherever the type is formed — proposal 0154
+- #5831 [sound] S (18d) §30.5 / §30.9 / §30.10 (v0.334): an unsettled task's disposal attaches the frame's discharge; a faulted task retains the task whose fault it carries —
+- #5900 [sound] S (14d) §29.7 / §30.7 (v0.335): disposing an async enumerator while a `MoveNextAsync()` is in flight defers the frame's disposal to the advance's settlement (
+- #5949 [sound] S (14d) §30.5 (v0.338): unbound `var r := await Make();` at `Task<Object>` (Pattern A, runtime-managed Object) is accepted and leaks (LSan) - taskResultArgIsC
+- #6051 [sound] S (14d) Task<Object>: `return <owned binding> as Object` leaves the task result dangling (heap-use-after-free when the caller reads it)
+- #6097 [sound] S (14d) async: a `finally` that reassigns the local already returned by `return o;` frees the task result (heap-use-after-free; §28.3 return slot, §30.5, v0.3
+- #6098 [sound] S (14d) async: `return (if c then o else q);` over two owned locals (unmarked) disposes both — Task<T> result dangles (heap-use-after-free; §30.5 kind 1, v0.3
+- #6211 [sound] S (13d) [codegen] a lambda capturing a `for` loop variable, then a suspension in the same iteration (await / yield): the loop never advances and the closure r
+- #6446 [crash] S (9d) async OwningTask<interface|Object> arrow body over Task.FromOwnedResult: accepted, then SIGSEGV
+- #1523 [other]   (112d) [compiler+runtime] §30.14 (v0.179): async Domain.Spawn entries (proposal 0032 Stage 0)
+- #1604 [other]   (111d) [runtime] §30.15 v0.179: Channel<T>.Receive() give-back race unfixed for value/string-T Task<T> form
+- #1676 [other]   (108d) [v0.184] TCS source-owns-task enforcement (§30.11)
+- #1698 [other]   (108d) [v0.185] Stream async methods must be async virtual with a blocking default (stdlib §7.1)
+- #2122 [other]   (97d) §17.15 binding atom: support `await` inside an atom in async bodies (lift the #2098 targeted rejection)
+- #2216 [leak]   (93d) fix #2173 #1889 partial: task-family field disposal plumbing added but test still leaks
+- #3048 [other]   (77d) [proposal 0082] Pattern A scoped await-bind: var x := await FreshAsync() desugars to the two-line form
+- #5276 [leak] S (25d) [codegen][leak] #5253 residual: escaping / async / iterator / ensures-bearing bodies with an assigned string param keep a per-call leak (§28.9, v0.313
+- #5410 [leak] S (23d) [codegen][leak] async continuation ($Resume thunk) leaks 32B per await — codegen_async_generic_string_local_release_2807, pre-existing on staging
+- #5856 [other]   (15d) coverage gap: the it->channel unwindOnly disposal arm has no vtable-observing test; finding the shape is blocked by unwind gating
+- #5981 [leak] S (14d) a named Object local that is returned leaks when a throw precedes the return (sync and async)
+- #5982 [leak] S (14d) Task<string> async result built by concatenation leaks two allocations per call
+- #6099 [leak] S (14d) async body with more than one `return` of a string local leaks the strings (Task<string>; multi-return twin of #3961/#6052; §30.5, v0.338)
+- #6173 [leak] S (14d) §30.5 No fourth kind (v0.338): a function value invoked through a member or array element (`h.mk()`, `this.mk()`, `fs[0]()`) is accepted under Task<Ob
+- #7321 [other]   (0d) The compiler accepts `Task.WhenAllOwned` — a member stdlib §6.7 says was RETIRED (the document's spelling is `Task.WhenAll(move tasks)`)
+
+## cross-module — Cross-module parity: retire AST-gated symbol reads (25 open; §2.5, §2.8, §22.10 (imported), check_imported_symbol_reads)
+
+- #3350 [sound] S (65d) fix #3346 follow-up: salvaged wire-side alone cannot close this — needs Option A (per-instantiation ABI stub on the EXPORTER side), per #3275 invarian
+- #3671 [sound] S (55d) dedup (census row 7): buildRecordValue folds-only imported field initializers while emitOwnFieldInit replays them — two spellings of one question
+- #5214 [sound] S (27d) [codegen][xmod] library's internal call of its own virtual generic method ignores an importer's override — silent base body (127 for 37) (§11/§14.2/§2
+- #6206 [sound] S (13d) [codegen] §22.16 residual of #4645: a subclass declared in an IMPORTING module — its clauses are not evaluated at an inherited imported method's bound
+- #6743 [sound] S (6d) §22.10 (v0.340) cross-module: IMPORTED explicit-ctor class chaining base(...) into a primary-ctor class SEGVs on 'new C(...)' (positional field never 
+- #6991 [sound] S (5d) [codegen][cross-module][soundness] a lambda reading `Count` of an imported `LinkedList<int>` prints nothing (exit 0)
+- #7008 [sound] S (5d) cross-module: a transitive default(T) chain (Wrap<T>() => DefB<T>()) is not replayed at an importer (follow-up to #6947, §17.11)
+- #7078 [sound] S (4d) #7055 fix: name-keyed type-param recognizer lacks the built-in-name guard -> silent wrong value cross-module
+- #7223 [sound] S (2d) [codegen][semantics] a free-variable extension block whose ONLY member is a GENERIC method is carried with NO members - cross-module silently binds th
+- #6833 [crash] S (6d) §8.6: cross-module call to an Object parameter passes the value unboxed (IR verification failed)
+- #7281 [crash] S (1d) spec: the producer-content stamp polices the HASH FOLD, not the interface shape - what should happen when an artifact predates an interface-shape chan
+- #1398 [other]   (117d) §2.5 SCC module compilation unimplemented: no build-driver module-graph infrastructure
+- #1425 [leak] S (116d) §11.8 v1 residues: inherited static-interface chains, cross-module statics, and disposal of class-typed constraint-static results
+- #4691 [other]   (34d) §2.2/§2.3: the auto-imported module dotted qualifier (System.Console, ...) never resolves — needs matching codegen (Console/Math dispatch is AST-struc
+- #4705 [other]   (34d) [codegen] cross-module auto-property ++/-- plausibly bypasses the §22.16 exported-setter checked face (mode-policy inconsistency vs := / OP=)
+- #6044 [other]   (14d) codegen §2.8 (v0.338): an imported method returning an array reports Count 0 to the importer (`U.S(U.Mk())` prints 0, expected 2)
+- #6160 [other]   (14d) extension Count()/Length() (user, imported, or on Object) on a built-in receiver is rejected by #6128; should dispatch to the extension (§26.5)
+- #6289 [leak] S (13d) Cross-module call passing a function value to an imported (Outer.Box)->int parameter leaks 64 bytes under ASan (plain run is clean)
+- #6504 [other]   (8d) The #6389 test file claims the importedName.empty() clause has a control row; it has none (coverage gap)
+- #6918 [leak] S (6d) using var sb := Lib.MkSb() with a cross-module owned StringBuilder return leaks 115200 bytes
+- #6944 [leak] S (5d) [sema][cross-module] typeCall's colName lambda is astNode-only: builtin METHOD calls on an imported collection are untyped (OwningBuffer.AsSpan does n
+- #7018 [other]   (5d) [codegen][xmod] Count on an unannotated IList<int> imported from another module emits nothing (#3079); the single-module read prints 3 (stdlib §4.1, v
+- #7224 [other]   (2d) [codegen][semantics] a free-variable extension block's PROPERTY is carried on the wire but the importer's shape-refusal path never fires for a propert
+- #7225 [other]   (2d) [semantics][over-rejection] #6966's fix makes cross-module MORE restrictive than same-module when the where bound names a type the defining module did
+- #7282 [other]   (1d) spec: an extension block whose only member is INTERNAL - does 26.5's ranking license the cross-module divergence, or does 2.8.2 forbid it?
+
+## records-statics-misc — Records, statics, contracts, exceptions and the remainder (49 open; §8.4, §9.x, §21, §22.8, §22.16, §31)
+
+- #2114 [sound] S (97d) [sema][narrowing][probe] Generic-type static readonly field narrowing may alias across instantiations if FieldSymbol is shared
+- #2295 [sound] S (90d) #803 verify-first: generic static init is a silent MISCOMPILE today, not a safe skip — T.Member() lowers to zero, and the initializer runs once per TY
+- #3966 [sound] S (51d) Record body-field default initializer is lost through synthesized Deserialize when the record has an explicit constructor (§9.2/§9.8, v0.294)
+- #4645 [sound] S (35d) [codegen] §22.16: emitInvariantCheck evaluates the STATIC class's conjunction, not the dynamic one — an inherited method skips every clause the subcla
+- #6204 [sound] S (13d) [codegen] §22.16: a GENERIC class's invariant is still never evaluated at construction exit or at a public method boundary (#4614(a) is closed but liv
+- #6497 [sound] S (8d) [codegen] §22.16: a generic class's public method boundary and requires prologue are never emitted (the method half of #6204)
+- #6498 [sound] S (8d) [codegen] §22.16: an interface-dispatched property store evaluates no invariant (residual of #6205)
+- #6856 [sound] S (6d) Writes to `readonly` `Exception.Message` are accepted and dropped, directly and through a bare type parameter (§23.1, §31.4)
+- #7057 [sound] S (4d) stdlib §7.3–§7.5: File.ReadAllText on a MISSING file returns "" silently — no FileNotFoundException
+- #1675 [other]   (108d) [v0.184] allocation failure aborts: fatal report, no unwind, no OutOfMemoryException (§31.4)
+- #1680 [other]   (108d) [v0.184] Compiler/runtime: static-init self-execution scoping + transitive within-type forward check (spec §22.13).
+- #1713 [other]   (108d) impl: callback-exception abort-with-diagnostic at the FFI boundary
+- #2272 [other]   (91d) [sema/ownership] residual findings from the 2026-07-26..28 window: #2219 record gap, #2155 value-blind exemption, #2169 over-rejection, #2137, #2213, 
+- #2317 [other]   (90d) ReadOnlyStringSpan: SequenceEqual(IReadOnlySpan<char>) and CopyTo(Span<char>) still deferred (§3.3 v0.108/v0.109)
+- #2364 [other]   (89d) Serialization (§9.8 v0.228): support inheritance in class synthesis (base fields currently rejected, not corrupted)
+- #3050 [other]   (77d) [proposal 0084] equality skip: per-member exclusion from record auto-equality, mirroring serialized skip
+- #3404 [other]   (61d) [codegen] collectSuspendLocals: the one-liner catch-arm branch still defaults its frame slot to i32, contradicting #461's pointer-width rule (§30.9 / 
+- #4017 [other]   (50d) Combined-form record: explicit secondary ctor of a different arity chaining to the primary ctor rejected at sema (found mapping #4013)
+- #5382 [other]   (23d) spec-question: §21.1 / §17.15 / §27.3 (v0.314): may a declaration reuse the name of a local or parameter of an enclosing scope?
+- #5489 [other]   (20d) spec-question: §9.8 (v0.316) — what is a "base-class-typed component" that needs a `polymorphic` registry?
+- #5498 [other]   (19d) spec-question: §9.8 / §12.2 (v0.317): may a derived class hand-write Serialize over a base whose Serialize is synthesized?
+- #5865 [other]   (15d) A record local with a runtime string gets no scope-end release once passed BY VALUE to any call
+- #6000 [other]   (14d) An implementation/override whose built-in-exception parameter differs from the interface/base member is accepted
+- #6017 [other]   (14d) sema/codegen §19.3 (v0.338): a named slot on a record's body auto-property never matches; case arm and _ arm are both silently skipped
+- #6033 [other]   (14d) value-kind Equals/GetHashCode: record with both Equals spellings and static GetHashCode accepted (§8.3)
+- #6046 [other]   (14d) codegen §19.3 (v0.338): `case i of Item(h = var v)` on a nested public record fails to lower (warning #3079, nothing printed)
+- #6251 [other]   (13d) [codegen] §22.16: ContractViolationException.Message lacks the clause source text (and the member, for invariants)
+- #6266 [other]   (13d) [codegen] --checked-contracts compile time and code size grow ~3.5x on deep invariant chains with the #4645 dynamic-invariant arms
+- #6571 [other]   (7d) The overload grid leaves a losing candidate's width in the shared ctx_ record on its early-exit paths (latent, benign today)
+- #6572 [other]   (7d) fix #6555: the new §21.9 unused-result warning fires alongside the hard error it replaces
+- #6615 [other]   (7d) two shipped commits carry a Co-Authored-By trailer naming a model the git author does not record (f7a74489 'Opus', dbd6eb18 'Sonnet') — reported, not 
+- #6658 [other]   (6d) release_static.sh: the embedded-build-dir guard (strings | grep -qF) silently passes under pipefail (SIGPIPE)
+- #6734 [other]   (6d) [codegen] §31.2 (v0.339): a record's Equals that throws inside Set.Contains or Array.IndexOf never reaches the catch arm
+- #6735 [other]   (6d) [sema] §9.2 (v0.339): an instance Equals at a non-own parameter list makes an auto-hashable record non-hashable
+- #6756 [other]   (6d) Function types are not variant over built-in exception classes (§12.9, v0.339)
+- #6793 [other]   (6d) [sema][codegen] io.Message() on a concrete IOException is accepted and the enclosing statement silently emits nothing (§31.4, v0.340)
+- #6794 [other]   (6d) Record plain Equals(other: R?) is told to declare GetHashCode although R? is not the Object slot (§9.2, §8.3, v0.340)
+- #6808 [other]   (6d) §4.2/§5.1: typed local const rejects a target-typed integer constant; constant expression under unary minus at an unsigned target throws at run time
+- #6813 [other]   (6d) §8.3 (v0.340): a static class's own static Equals(other: V) is rejected by the Object-slot GetHashCode pairing
+- #6858 [leak] S (6d) A generic `Box<T>` does not dispose its owned `T` field: an `IOException` leaks 40 bytes (§28.5)
+- #6885 [other]   (6d) §2.7 Through nesting / §21.10 (v0.340): a nested type's or local type's body cannot name an enclosing type's static member by bare name (unresolved id
+- #6961 [other]   (5d) §17.14: integer division / mod by a constant zero outside a const initializer is a run-time DivideByZeroException, not a compile error
+- #7022 [other]   (5d) [sema][soundness] Dispose() on a record or enum receiver is accepted; records and enums do not implement IDisposable (§8.7, v0.340)
+- #7023 [other]   (5d) [sema][soundness] U.Dispose() on a static class is accepted with no diagnostic; static classes do not implement IDisposable (§8.7, v0.340)
+- #7074 [other]   (4d) [codegen] a local bound to an untyped member read has no type, so a member CALL on it drops the statement (#3079 no-op) — IsReadOnly over an ICollecti
+- #7105 [other]   (3d) [codegen] string.PadLeft/PadRight/PadCenter sign-extend a byte totalWidth: byte 200 pads to 3, not 200 (§5.1, §9.6, v0.343)
+- #7137 [other]   (3d) [sema] the §2.7 chain-head warning's value-path remedy does not compile: it says 'qualify with `this.Status`' in a static body
+- #7185 [other]   (3d) [sema] a direct static FromCollectionLiteral call on a built-in collection is still rejected with a FALSE 3.4 diagnostic - and 6460s fix was written, 
+- #7324 [other]   (0d) the `Convert` float arms accept the spellings stdlib §9.2 forbids, and accept a signed bare point
+
+## spec-trains — Spec-tracking trackers not yet claimed by a campaign (triage at each train) (222 open; per tracker)
+
+- #3860 [sound]   (52d) impl catch-up v0.292: `DateTime.Add*`/`Add`/`Subtract(span)`/`DateTime.FromTicks` must raise `OverflowException` outside `MinValue..MaxValue` (no rang
+- #4147 [sound]   (47d) §14.5/§22.6 (v0.296): function-typed arguments at overloaded and generic callees — no unification through a function-typed parameter, no exact/convert
+- #5515 [sound]   (19d) §28.14 (v0.320): widen the method-reference formation bar to set-erasing callee parameters — #5375
+- #5516 [sound]   (19d) §28.3 (v0.320): a member with a type parameter in a nested parameter slot is inadmissible at a function-type substitution — #5375
+- #5517 [sound]   (19d) §28.3 (v0.320): a generic method returning a lambda that captures its plain bare-`T` parameter is accepted (proposal 0133 §5.4)
+- #5518 [sound]   (19d) §28.14 (v0.320): a call-bounded callback stored into a local collection or local function-typed inline array is accepted — #5499, #5486
+- #5523 [sound]   (19d) §22.3 / §15.3 (v0.320): a plain move-only parameter is admitted at a `ref`/`out` argument (proposal 0134 Q6)
+- #5524 [sound]   (19d) §22.3 (v0.320): `out` with a pre-declared recipient may alias the recipient's storage during the call (conformance probe)
+- #5536 [sound]   (19d) §9.4 (v0.321): fix the copyable receiver on the author-written setter and compound-assignment accessor paths — #5496
+- #5537 [sound]   (19d) §9.4 (v0.321): pass a move-only receiver's storage in place instead of the CG29 bitwise spill — #5496
+- #5539 [sound]   (19d) §19.3 (v0.321): a borrowing-match binding of a move-only payload may not be live at a write point — #5496
+- #5540 [sound]   (19d) §19.3 / §19.4 (v0.321): re-read the case tag per arm after a declined guard containing a write point — #5496
+- #5541 [sound]   (19d) §9.4 (v0.321): the disposed state for an owning choice emptied in place — #5496
+- #5542 [sound]   (19d) §19.3 / §35.5 (v0.321): payload bindings over an in-place scrutinee take their own copy or reference — #5496
+- #5543 [sound]   (19d) §8.6 (v0.321): keep a boxed receiver's payload alive for the member call (probe) — #5496
+- #5544 [sound]   (19d) §15.1 (v0.321): reject an inline array whose element type is move-only (`[N]C` over an owning choice)
+- #5551 [sound]   (19d) §22.3 (v0.321): reject a field of move-only type as a `ref`/`out` argument — #5533
+- #5552 [sound]   (19d) §27.5 (v0.321): bound a closure over a `ref`/`out` parameter by the call on every escape route — #5534
+- #5553 [sound]   (19d) §30.1 (v0.321): apply the async borrow-bearing ban to inline arrays — #5530
+- #5561 [sound]   (19d) §15.1.2 / §9.7 (v0.322): classify a record- or choice-element inline array (`[N]Pair`) as borrow-bearing and apply §9.7's bullets to it — #5555
+- #5562 [sound]   (19d) §30.1 (v0.322): the async borrow-bearing ban covers inline arrays of borrow-bearing records and holds-borrows choices — #5555
+- #5565 [sound]   (19d) §22.3 / §35.11 (v0.322): the `ref`/`out` owned-state bound at a `T`-dependent location, checked per instantiation — #5557
+- #5580 [sound]   (19d) stdlib §10.5 (v0.323): `Ptr<T>` `LoadAt`/`StoreAt`/`CopyFromArray`/`FromIntPtr` and `Load`/`Store` are documented but not implemented
+- #5623 [sound]   (19d) §28.3 (v0.325): attach the carried-borrow union to a bare-type-parameter result at a borrow-bearing value substitution, and run the callee check there
+- #5642 [sound]   (19d) §9.4 / §15.1.1 (v0.327): the disposed state for an owning inline array destroyed with its holder, tested on slot reads through a borrowing-match bindi
+- #5649 [sound]   (19d) §9.7 / §3.6 rule 2 (v0.328): read every §9.7 bullet at each instantiation where a generic body's value holds borrows — #5629
+- #5650 [sound]   (19d) §28.3 *Set-erasing positions* (v0.328): a field declared at a bare type parameter, written through a receiver instantiated at a function type
+- #5697 [sound]   (19d) §28.3 provenance clause 1 / §28.14 bound 1 (v0.331): a captured value that holds borrows contributes its carried sources — proposal 0148 (four tests f
+- #5698 [sound]   (19d) K5.5 / K5.9 (§28.3, v0.331): trace iterator-frame and lazy-query locals in the consume-site freeze, and freeze the site-announced kills under a live s
+- #5700 [sound]   (19d) stdlib §6.8 / §30.14 (v0.331): `Domain.Spawn`'s plain argument and result rows admit no class but `string` and `Type` — re-check through a user generi
+- #5702 [sound]   (19d) §28.3 *Static stores* (v0.331): a class- or interface-typed borrow reaches a static only from static storage — proposal 0151
+- #5718 [sound]   (19d) §28.3 provenance clause 1 / §27.5 (v0.332): a captured binding's source set is the union over every assignment to it — proposal 0152
+- #5720 [sound]   (19d) §28.2 (v0.332): a span read or write is flag-checked in checked disposal mode — guard the span paths and quarantine `OwningBuffer<T>`'s header (propos
+- #5721 [sound]   (19d) §9.7 / §28.11 (v0.332): the stdlib value-copy members (`ToArray`, `Sorted`, `AddRange`, `CopyTo`, …) carry the copied elements' sources and are checke
+- #5734 [sound]   (19d) §9.7 (v0.333): a store into a record value's own storage (`p.Item := e`) adds the stored value's sources to the record's one set and is checked at the
+- #5735 [sound]   (19d) §28.11 / §9.7 (v0.333 reading): a borrow stored into a local collection is checked against the collection's later fate in the body — `coll.Add(item); 
+- #5803 [sound]   (18d) §9.2 / §9.7 / §12.7 / stdlib §4.16 (v0.334): the holds-borrows posture's three declaration rules and the `ref`-argument rule — proposal 0159 (option b
+- #5809 [sound]   (18d) §28.3 *The return slot* / §28.10 / §30.1 (v0.334): an owned return value is held by a callee-local return slot until every return-edge cleanup complet
+- #5819 [sound]   (18d) §7.10 / §15.3 / §28.11 / stdlib §4.12 §6.5 (v0.334): a move-only substitution has no copy — proposal 0166
+- #5820 [sound]   (18d) §17.11 (v0.334): an unconstrained `default(T)` is rejected at every non-defaultable substitution, reference types included
+- #5824 [sound]   (18d) §29.3 / §29.8 / §29.11 (v0.334): an iterable minted over an `owned` or move-only parameter is single-consumption — proposal 0167
+- #5829 [sound]   (18d) §28.3 *Bare-type-parameter returns* / §12.9 (v0.334): function types over a type parameter at depth one; in-body function values; exported mint slots 
+- #5830 [sound]   (18d) §28.2 / §28.4 / §28.6 / §28.12 (v0.334): explicit disposal marks, the holder frees; the in-flight `DisposeAsync` window — proposal 0162 items 1–3
+- #5904 [sound]   (14d) §28.3 / §28.14 / §12.9 (v0.335): function-typed slots keep their keying through implementations, containers and `scoped` fields; a body's bare-`T` len
+- #5933 [sound]   (14d) §28.7 / §28.2 / §28.4 / K9.5 (v0.337): after an overwrite abandoned by the displaced value's throwing disposer the location keeps the logically dispos
+- #6732 [sound]   (6d) §27.6 (v0.340): method-reference formation bridges a §5.1 conversion at a `ref`/`out` slot — `var f: (ref Dog) -> () := Util.Touch;` over `Touch(ref a
+- #7344 [sound]   (0d) §27.6 (v0.345, proposal 0201): reject a method reference to `Dispose` or `DisposeAsync`, bound or type-qualified, at its formation on every receiver
+- #7349 [sound]   (0d) §22.8 (v0.345): a member store into a `readonly` field outside the window is rejected — `o.A[0] := 9` / `this.A[0] := 9` in a plain method, a `ref`/`o
+- #6604 [crash]   (7d) §2.7 / §12.9 (v0.339): a type position names a type — delete the type-position enclosing-member stop and its carve-out plumbing; 25 gtest rows change 
+- #7206 [crash]   (3d) [spec-question] stdlib 3.1 declares NO char overload of StringBuilder.Replace - the compiler lowers one anyway and the malformed IR kills the module i
+- #7215 [crash]   (2d) [spec-question] is REFUSING a minting callback with a RUNTIME-MANAGED result type right, or is it a 28.9 runtime-reclamation gap a runtime fix could c
+- #1727 [other]   (108d) [compiler] retire the event member kind (0035 graduation, spec v0.187): parser/sema/ownership/codegen + §17.2 desugaring on the three source types
+- #1728 [other]   (108d) [stdlib+runtime] SharedEventSource<T>/ISharedEvent<T>: synchronized subscriber list + capture-free admission at every subscribe position (spec v0.187 
+- #1806 [other]   (105d) Compiler catch-up: v0.195 stdlib contract statements
+- #2052 [other]   (100d) impl catch-up / v0.202: pure members (0042)
+- #2240 [other]   (91d) impl: verify/implement the stdlib surface declared by the v0.227 clarifications (Counter<K> conformance clause; DateOnly/TimeOnly/TimeSpan ToString(fo
+- #2242 [other]   (91d) impl: stdlib v0.228 — ergonomics batch II (0067): span-source encode, Math decimal, radix TryParse, Array IndexOf-from/LastIndexOf, TimeSpan operators
+- #2337 [other]   (90d) impl: SerializationException typed fault-location surface — Offset/Line/Column with the write-side-null pin (stdlib §2.15, v0.229)
+- #2347 [other]   (89d) impl: ParseOrNull/GetOrNull/ReadKeyOrNull — the *OrNull convenience tier (stdlib §1, §2.1, §2.5–§2.6, §4.8/§4.9/§4.17, §9.1–§9.5, v0.231)
+- #2348 [other]   (89d) impl: Environment.Get/Set/Variables renames (BREAKING) + String.IsEmpty + NewGuid v4 conformance test (stdlib §2.4, §9.6, §2.6, v0.231)
+- #2349 [other]   (89d) impl: stdlib §2.15 one-shot facades Json/Binary (v0.232)
+- #2355 [other]   (89d) impl: compiler-provided Result value-payload combinators — Map/AndThen/MapError/UnwrapOr (spec §35.2, stdlib §2.20, v0.233)
+- #2698 [other]   (84d) proposal 0077 stage 2: the Q1 targeted lint at fresh trivial-dispose Add arguments (owner-ruled option (i) with the lint on)
+- #2699 [leak]   (84d) proposal 0077 stage 2: complete the literal-tree aggregate — fresh-producer elements and arm-meet-owned conditional elements (#2660 shipped the nested
+- #2700 [other]   (84d) proposal 0077 stage 2: the §28.6 c1/c3 rejections at trivial-dispose types (c2 verified already correct)
+- #3257 [other]   (70d) Implement v0.258 iterable calls-mint unification (proposal 0096) — sema/codegen catch-up
+- #3261 [other]   (70d) Implement v0.259 (proposals 0097–0099): SupersededChain, stdlib surface program, ScopeGuard — compiler/stdlib catch-up
+- #3280 [other]   (68d) Implement the `CancellationTokenSource` fact grant and the published-source signal-only rule (v0.263)
+- #3283 [other]   (68d) Implement the stdlib bit tier: `BitReader`/`BitWriter` and the §4.15 mirror (v0.264)
+- #3301 [other]   (68d) Implement constructor-only records: the §3.6 property, non-defaultability, the `with` rejection, and §9.8's two new rules (v0.268, proposal 0107)
+- #3302 [other]   (68d) Implement the widened terminal-accessor warning (adopt-then-yield) and `Exception.ToString()` (v0.268, proposals 0112 and 0113)
+- #3373 [other]   (63d) Spec-ahead-of-impl (v0.282): window-parameter renames — String.From, String.Remove, Encoding.GetString
+- #3648 [other]   (57d) fix #3632 schema-bump follow-up: bump kSchemaVersion once §28.9 widening takes effect at ModuleMetadataBuilder exporter
+- #3819 [other]   (53d) stdlib §2.13 `Type`: the reflection lattice (`BaseType`, `IsClass`, `IsEnum`, `EnumValues`, `FullName`, `IsAssignableFrom`, `Implements`) is documente
+- #3834 [other]   (52d) impl catch-up v0.288: target-typed integer constants at every constant-narrowing position (spec §4.2 / §5.1, 0122 L5) — probe and implement the newly-
+- #3836 [other]   (52d) probe v0.288: the enum→integer cast at every integer target (spec §5.4, 0122 L9) — `long(p)` on a byte-backed enum, `short(s)` on a long-backed one
+- #3847 [other]   (52d) impl catch-up v0.290: default parameters on the nine built-in overload pairs; the array-span `ignoreUnknownFields` shapes; the Debug accept-list diagn
+- #3850 [other]   (52d) impl catch-up v0.290: `Math.Sign<T>(x: T): int where T: INumber<T>` replaces the four per-type overloads (stdlib §2.2, 0123 R4)
+- #3855 [other]   (52d) impl catch-up v0.290: the byte read tier is declared once on `IReadOnlySpan<byte>` — interface-typed receivers and user `extension IReadOnlySpan<byte>
+- #3858 [other]   (52d) impl catch-up v0.292: §14.5/§27.3 inference edge rulings — probes and one stale comment (#1695's implementation half)
+- #3862 [other]   (52d) impl catch-up v0.293: compiler-provided `E.FromNameOrNull` / `E.NameOf` on every enum (spec §10.4; stdlib §9.9; proposal 0124, #2244)
+- #3866 [other]   (52d) impl catch-up v0.294: the sequence-literal protocol is interface-based — `ICollectionLiteralTarget<TSelf, T>` / `IOwningCollectionLiteralTarget<TSelf,
+- #3867 [other]   (52d) spec-ahead-of-impl: the `owned Shared<C>` entry shape of a synthesized `Deserialize` (spec §9.8) is unimplemented — sema returns the declaring type, c
+- #4148 [other]   (47d) §30.6 (v0.296): an async lambda's wrapper — probe the closed-slot source; implement the free-slot inapplicability, the two-closed-candidates ambiguity
+- #4149 [other]   (47d) §17.7/§4.2/§14.5 (v0.296): the written-declared-type positions — the pre-existing implementation gaps, enumerated
+- #4152 [other]   (47d) §9.2/§10.5/§35.2 v0.297: reject virtual/abstract/sealed override and non-trio override on every value-kind member — records join enums and choices; pr
+- #4153 [other]   (47d) §9.8 v0.297: no serialized-name uniqueness check exists — records' components, enum constants, choice cases; a collision silently reads back as the fi
+- #4430 [other]   (41d) v0.301 spec-ahead-of-impl deltas: the smaller five
+- #4604 [other]   (35d) stdlib §4.21 v0.307: `OwningSlotMap<T>` and `SlotHandle` — compiler catch-up
+- #4669 [other]   (34d) ship ScopeGuard as a compiler-known stdlib type
+- #4672 [other]   (34d) [stdlib+runtime] Channel<T> Close/TryReceive/IsClosed + no-arg Raise overload on EventSource<()>
+- #4697 [other]   (34d) §15.4.1: ICollectionLiteralTarget<TSelf,T> / IOwningCollectionLiteralTarget<TSelf,T> are not resolvable type names — sequence-literal conformance is p
+- #4777 [other]   (33d) [corpus gap] stdlib §4.21 l4_21_* rows: OwningSlotMap<T> runtime not implemented
+- #4778 [other]   (33d) [corpus gap] stdlib §6.5 l6_5_* rows: EventSource/SharedEventSource runtime not implemented
+- #5191 [other]   (28d) Spec-ahead-of-impl (v0.311, §19.3/§12.7, #5170): a type parameter against a value type is decided per instantiation — pins and one probe
+- #5408 [other]   (23d) §14.2 (v0.314): imported/imported where-clause comparison drops type constraints (pre-existing gap)
+- #5519 [other]   (19d) §21.1 / §23.3 (v0.320): a setter-body declaration named `value` is accepted while the implicit `value` is in scope — #5484
+- #5521 [other]   (19d) §14.2 (v0.320): decide a declared constraint at a type-parameter argument at the naming, not at the outer instantiations — #5510
+- #5538 [other]   (19d) §9.4 / §35.11 (v0.321): reject an `async` or iterator member call on a move-only receiver — #5496
+- #5546 [other]   (19d) §14.2 rule 2 / §35.11 (v0.321): `Result<T, E>`'s combinators in a generic body are checked at the instantiations — #5527
+- #5548 [other]   (19d) §14.2 (v0.321): decide a declared constraint at a constructed or mixed type-parameter argument at the naming — #5529
+- #5549 [other]   (19d) §26.4 (v0.321): check a generic extension head against the extended type's declared constraints — #5531
+- #5550 [other]   (19d) §12.7 (v0.321): type-narrow a `readonly` field path by `is T` — #5532
+- #5563 [other]   (19d) §15.1 (v0.322): reject a nested inline array formed by substitution on the generic type and method path — #5555
+- #5564 [other]   (19d) §14.2 (v0.322): `new()` admits a nullable value type (`new T()` is `null`) and no nullable reference type — #5556
+- #5566 [other]   (19d) §22.3 (v0.322): reject a `ref` parameter declared at a move-only value type — #5560
+- #5567 [other]   (19d) §27.5 / §7.9 (v0.322): closure-body definite assignment starts from the lambda's formation — #5558
+- #5568 [other]   (19d) §28.14 (v0.322): a value-typed argument at an interface-typed `scoped` parameter — admit the non-borrow-bearing case, reject the borrow-bearing one wi
+- #5579 [other]   (19d) stdlib §2.4 (v0.323): `Environment.UserName` and `CommandLineArgs` are documented but not implemented
+- #5581 [other]   (19d) stdlib §10.6 (v0.323): `Interop` (`LastErrno()`, `CodeAddress<F>`) is documented but not implemented
+- #5582 [other]   (19d) §28.10 (v0.323): reject an unmarked `using var y := x;` over a named owned binding (proposal 0137, option B)
+- #5583 [other]   (19d) §18.8 (v0.323): remove the `\x` escape — lexer and codegen arms (proposal 0136 §1.1)
+- #5584 [other]   (19d) §23.3 / Appendix A.4 (v0.323): narrow `SetterParamSpec` to `(owned)` and delete the setter-parameter rename (proposal 0136 §1.2)
+- #5589 [other]   (19d) §15.1.2 / §28.3 (v0.323): one source set per borrow-bearing inline-array local — store scope check, escape check and freeze — #5573
+- #5596 [other]   (19d) Static-initialization cycle detection: function-value and virtual-dispatch routings, and cross-module cycles (spec §22.13 rule 1)
+- #5609 [other]   (19d) §28.3 (v0.324): count a function-typed argument's and a function-value receiver's source sets at a bare-type-parameter call (#5595)
+- #5636 [other]   (19d) §12.4 (v0.327): reject a base-type reference to a compiler-known class its text does not open — #5613 (proposal 0138)
+- #5639 [other]   (19d) §14.2 (v0.327): check every body of a dispatched generic method for requirements its constraint set does not establish — #5509 (proposal 0141)
+- #5644 [other]   (19d) §28.10 (v0.327): reject a `using var` over an `if`/`case`/`??` arm-meet whose every arm is an unmarked named owned binding — #5591 (proposal 0139)
+- #5654 [other]   (19d) §30.7 (v0.328): the across-`yield return` check — `Object` head admitted, static types the rule admits rejected, and the per-level fallback — proposal
+- #5655 [other]   (19d) §22.12 rule 4 (v0.328): the declaration-site warning at built-in reference heads, with `Type` in the suppression set
+- #5656 [other]   (19d) §14.2 rule 2 / §27.6 (v0.328): read a register member's condition at a method or property reference's formation — #5634
+- #5669 [other]   (19d) §12.2 (v0.330): reject a non-`override` class member at `Object`'s own signature as hiding (the check never walks `Object`), and resolve `Equals(T)` b
+- #5701 [other]   (19d) HYPOTHESIS (probe first): stdlib §6.8: every `Domain.Spawn` result is typed `OwningTask<R>` in sema, where the stdlib declares `owned Task<R>` for a n
+- #5703 [other]   (19d) K3.2 / §30.5 (v0.331): an `async` body's result `return` under `OwningTask<T>` or a class- or interface-typed `Task<T>` is marker-free — reject the re
+- #5724 [other]   (19d) §8.3 / §8.4 (v0.332): a class's non-`override` own-typed `Equals` obliges `override GetHashCode()`, and `=` on a class is the call `a.Equals(b)` — pro
+- #5736 [other]   (19d) §3.6 / §9.2 (v0.333): a class or interface type whose `Equals` is ambiguous at its own operands is not hashable — `Set<Point3>` rejected — proposal 01
+- #5804 [other]   (18d) §8.3 / §12.1 / §12.2 / §9.2 (v0.334): a class's own-typed `Equals` is the `Object` slot — proposal 0160
+- #5805 [other]   (18d) §14.2 / Appendix C.4 (v0.334): a type bound naming `Object` is a compile error at the declaration — proposal 0161 (A3)
+- #5806 [other]   (18d) §9.2 (v0.334): the second kind's `Equals` at an inline-array substitution compares a boxed array of the same type element-wise — probe first
+- #5807 [other]   (18d) §28.6 / §22.12 / K9.4 (v0.334): no explicit disposal of a `static owned` field; form (iv) retired; `static readonly` owning-array slots fixed — propos
+- #5808 [other]   (18d) §28.3 (v0.334): undischarged `owned` parameters of a synchronous body are disposed in reverse declaration order — probe first
+- #5810 [other]   (18d) §28.3 *State match on reassignment* / K1 (v0.334): a maybe-consumed owned local is reassignable, displacing per path — lift #3967's narrow rejection
+- #5812 [other]   (18d) §20 / §19.2 / §15.3 (v0.334): a move-only arm or `??` operand classifies by the position the construct occupies — probe the owning-choice path
+- #5813 [other]   (18d) impl-ahead-of-spec: K1 (v0.334): `new T(move n, n)`, a later argument reading a binding an earlier argument moved, is admitted
+- #5814 [other]   (18d) §27.6 / §14.1 / §22.12 / §26.4 (v0.334): generic method references name their type arguments; formations, receiver-position names and extension-block 
+- #5815 [other]   (18d) §14.6 (v0.334): the instantiation-request graph is re-checked over the program at assembly
+- #5816 [other]   (18d) §30.1 (v0.334): the `async` parameter rule is re-applied at each instantiation of the declaring declaration, and at a dispatched body
+- #5818 [other]   (18d) §28.3 *Factory methods* / §11.8 (v0.334): a static-interface witness of a bare-`T`-returning member takes row 5 — probe first
+- #5821 [other]   (18d) §14.2 register / stdlib §4.14 (v0.334): a generic body's use of a two-presentation type is read per instantiation; the one-argument constructor's defa
+- #5822 [other]   (18d) §28.9 / §28.4 (v0.334): a field of move-only value type, owning choices included, disqualifies trivial-dispose
+- #5823 [other]   (18d) §3.6 *Nullable forms* / §30.14 (v0.334): a nullable form has its underlying type's holds-borrows and sendable properties — probe first
+- #5825 [other]   (18d) §29.7 / §29.8 (v0.334): a body fault is an iterator frame's completion
+- #5899 [other]   (14d) §22.12 note (j) / §30.5 (v0.335): no static is declared at `OwningTask<T>`; a borrowed Pattern B award spends the task — proposal 0171
+- #5901 [other]   (14d) §33.3 / §22.13 (v0.335): `Environment.Exit` inside the exit pass ends the pass with its code — route it to a defined termination (#5841)
+- #5902 [other]   (14d) §29.8 / §29.11 / §15.3 / §30.1 (v0.335): a parameter typed by a type parameter is a move-only parameter at a move-only substitution (#5800)
+- #5905 [other]   (14d) §27.7.1 (v0.335): a function value's `GetHashCode` is kind-dispatched on the equality's key — proposal 0173
+- #5906 [other]   (14d) §14.2 *Type-parameter bounds* (v0.335): `where T: U` is satisfied by subtyping only — the checks defer at a non-user substitution (#5838)
+- #5907 [other]   (14d) §9.2 *Through a type parameter* (v0.335): the three kinds read at the instantiation, the second kind's §22.6 ambiguity included (#5837)
+- #5908 [other]   (14d) §22.7 / §22.13 (v0.335): a type's static initializer runs at its first use — an imported base's initializer is skipped at a derived construction (from
+- #5921 [other]   (14d) stdlib §4.14–§4.16 / §8.6 / §9.7 (v0.336): retire `IReadOnlySpan<TElement>`; the cross-backing `SequenceEqual` overloads and the second byte read tier
+- #5922 [other]   (14d) §28.11 (v0.336): the collection-store escape check rejects a store into a collection an `owned` parameter holds
+- #5923 [other]   (14d) §28.8.1 / §28.11 / K9 (v0.336): the replacing `move` — `move loc with e`; the restoration window retired — proposal 0174
+- #5924 [other]   (14d) §9.2 (v0.336): the own-typed `Equals` is the `Object` slot on every value kind; `Equals(Object?)` rejected on a record — proposal 0176
+- #5932 [other]   (14d) K9.3 / §28.8.1 / §28.6 (v0.337): a destructor takes its fields as any other body does; the bare take of a non-nullable field retired; #1230's diagnost
+- #5934 [other]   (14d) §3.6 / §35.7 / §14.2 (v0.337): declared equality is user equality on every value kind — proposal 0178
+- #5935 [other]   (14d) §27.6 / §27.7.1 (v0.337): `c.Ext = c.Ext` over an `extension Object` member at a class receiver compares unequal (#5918)
+- #5938 [other]   (14d) §19.3 / §35.5 (v0.338): the marked named slot `move N = var x` is retired — two diagnostics stop naming it; `move` at a named slot rejected naming the
+- #5944 [other]   (14d) §28.5 (v0.338): is `owned _s: T` at a value-classified choice substitution an instantiation-site error?
+- #5945 [other]   (14d) §28.1 clause 2 (v0.338): is `owned` on a value-classified choice at a parameter/return/lambda slot a compile error?
+- #5946 [other]   (14d) §22.6/§11.3 (v0.338): is a same-type owned/plain pair after class type-argument substitution (Box<Widget>.A(T) vs A(owned Widget)) a clash?
+- #5957 [other]   (14d) §22.6 (v0.338): which diagnostic for `Pick(null)` over two non-nullable built-in-class overloads — no-candidate or ambiguity?
+- #5958 [other]   (14d) spec-question: generic OwningTask<T> admitted at an inferred value-type instantiation, but §14.4 rejects value types at OwningTask<T> (and stdlib Doma
+- #5963 [other]   (14d) §17.11/§14.2 (v0.338): default(T) under where T: new() at a class, or notnull at a reference type — spec silent, compiles with a null
+- #5977 [other]   (14d) §28.3 K3.13 (v0.338): is `move (fresh producer)` stored into an `owned` field rejected as redundant, or admitted?
+- #5989 [other]   (14d) §12.4 (v0.338): closed compiler-known class as a base via an alias or as String / interface / record base — what does the rule cover?
+- #6006 [other]   (14d) Spec question: ref parameter at a generic choice instantiated over an owning payload (Opt<Bundle>) accepted (§22.3, §15.3, §35.4)
+- #6011 [other]   (14d) §12.1/§8.1 (v0.338): does an override of Object's ToString/GetHashCode/Equals at a NULLABLE return type (string?/int?/bool?) match the base member — r
+- #6047 [other]   (14d) §19.3 L3947 vs §13.1 (v0.338): is a named slot on a non-public explicit field an unconditional compile error, or admitted where §13 visibility allows 
+- #6068 [other]   (14d) Type arguments applied to a type parameter (`Array<int>` where `Array` is a type parameter): resolver folds them away, spec §3.6 unspecified (spec-que
+- #6131 [other]   (14d) §11.2/§23.4 (v0.338): are an INDEXER's PARAMETER types compared under the interface's substitution? generic-parameter indexer `readonly property [k: K
+- #6183 [other]   (13d) spec-question: §15.4 / §21.4 (v0.338) — is a collection literal with no target type a legal `for` source, and as what?
+- #6192 [other]   (13d) spec-question §12.5/§14.2: interface Equals(Object?) is unsatisfiable by a record/enum/choice (generated Equals not accepted as the implementation; ha
+- #6195 [other]   (13d) §27.3: is a lambda whose body only throws a procedure lambda ('exactly when no path executes a value-carrying return') or does 'the same totality rule
+- #6210 [other]   (13d) `=` between two different value types (record P = record Q, Range<int> = Range<long>) is accepted and answers True (§8.4 / §9.2)
+- #6241 [other]   (13d) spec-question §2.3 / stdlib §6.5: canonical module of the event types (IEvent, IAsyncEvent, ISharedEvent, EventSource...): System or System.Threading?
+- #6250 [other]   (13d) §9.2 / stdlib §9.8 (v0.338): is the intrinsic record Range<T> an admissible auto-hashable component?
+- #6290 [other]   (13d) spec (§32.8, v0.338): is an implicit receiver read (instance member or this) inside a plain extern callback lambda a capture that must be rejected?
+- #6294 [other]   (13d) §28.2 (v0.338) checked-disposal retention, layers 2-4: field/cascade/explicit-Dispose/escaped/collection releases still quarantine without bound (foll
+- #6331 [other]   (11d) spec-question: §22.6 — a coinciding SUBSET of generic candidates, with a third that does not coincide
+- #6338 [other]   (11d) sema: an arrow-body collection literal whose target type cannot admit it is silently accepted, not rejected (§15.4)
+- #6342 [other]   (11d) §14.5 — does argument-driven type-argument inference see through a §12 subtype step?
+- #6427 [other]   (10d) [spec-question] is `t := t` on an owning local a §28.7 discharge? (#6404 rejects on an interpretation)
+- #6428 [other]   (10d) [sema][28.6 ASYMMETRY] a getter's direct return rejects while the same value laundered through a local accepts
+- #6435 [other]   (10d) [sema][ownership] an IEnumerator<T> -> IList<T> conversion is accepted with NO diagnostic, so list-head ownership reclaims a vtable-backed wrapper as 
+- #6466 [other]   (9d) [spec-catch-up] §28.3 (v0.338) worked example not enforced: the spec's own transitive case compiles clean
+- #6483 [other]   (8d) #6431 measurement follow-up: the mint-announcing getter carve has TWO supported spec readings, and the blocker that stopped the last attempt is gone
+- #6531 [other]   (8d) spec-question: must a range-keyed dictionary index match the key's element type?
+- #6536 [other]   (8d) spec-question: does the §5.1 key-slot check reject or fail OPEN at a bare type parameter in a generic body?
+- #6566 [other]   (7d) An entry copied out of a ToArray() snapshot does not co-own its Key, so any array mutation that gives the Key back leaves the local dangling
+- #6573 [other]   (7d) spec-question: §28.11 (v0.339): the element-borrow use-after-removal warning (lint B, retired v0.338) is still emitted by the compiler — `s28_11_0008`
+- #6583 [other]   (7d) §29.11 (v0.339): `q.Equals(q)` spends nothing — the compiler reports the argument as a point-3 consumption (split from #6247 part 2)
+- #6587 [other]   (7d) §15.3 / §28.3 (v0.339): probe — `_arr := _arr;` and `_arr := f(_arr);` at a move-only instance field must be rejected (the self-assignment no-op is a 
+- #6588 [other]   (7d) §26.5 rule 2 (v0.339): an `extension Object` member called on a `string` receiver is rejected by codegen ("string member `.Hi` is not yet supported")
+- #6589 [other]   (7d) §11.3 (v0.339): an interface's inherited members join the clash check — `J: I` declaring `A(owned x: Widget)` over `I`'s `A(x: Widget)` is accepted
+- #6590 [other]   (7d) §26.4 / §14.2 (v0.339): an extension member's `where` constraining a block parameter is accepted — it is §14.2 rule 1's error
+- #6591 [other]   (7d) §14.2 (v0.339): a bound naming a primitive, `string`, a function type, an inline array or a nullable type is accepted — it is a compile error at the d
+- #6592 [other]   (7d) §12.9 (v0.339): a variant conversion accepts `T?` → `T` under `out` and `T` → `T?` under `in` — `Array<string?>` reaches `IEnumerable<string>`
+- #6593 [other]   (7d) §22.6 (v0.339): grade a narrowed argument at its non-nullable type, `null` as a non-separating argument, coinciding members of a generic type as ambig
+- #6594 [other]   (7d) §8.3 (v0.339): the `GetHashCode` pairing obligation is the `Object` slot's — an override of a user base's `Equals(a: int, b: int)` obliges nothing
+- #6595 [other]   (7d) §9.2 / §10.5 / §35.2 (v0.339): `Equals`, `GetHashCode` and `ToString` are reserved on every value kind — reject a static, field, property, `const`, en
+- #6596 [other]   (7d) §27.6 / §12.7 (v0.339): probe the formed type of an adapter-bridged method reference — a converting reference is an instance of its target type
+- #6598 [other]   (7d) §27.6 / §27.7.1 (v0.339): probe a bound method reference over a move-only receiver — a compile error at the formation; pin `string`, function-value an
+- #6599 [other]   (7d) §29.11 (v0.339): an explicit `GetEnumerator()` / `GetAsyncEnumerator()` call spends a bound lazy query — `var e := q.GetEnumerator(); for var x in q` 
+- #6600 [other]   (7d) §19.3 (v0.339): an unresolved destructuring pattern head is a compile error naming the name — the compiler accepts it and runs no arm
+- #6601 [other]   (7d) §12.1 (v0.339): an override matching two base virtual members at the base clause's substitution is accepted and overrides both — it is a compile error
+- #6602 [other]   (7d) §8.4 / §10.5 / §9.2 / §35.7 (v0.339): an enum declaring its own `Equals` has no `=` — sema rejection at `=`/`<>`; generated component comparisons by t
+- #6603 [other]   (7d) §7.4 / §12.7 / §19.1 (v0.339): a type fact flows like a null fact — retype the carrier after an exiting `is not T` and inside a type-pattern `case` ar
+- #6605 [other]   (7d) §2.7 *Through nesting* / §11.6 (v0.339): at name positions the enclosing-member stop reads "declared or inherited" and §11.6's access reaches every en
+- #6698 [other]   (6d) spec-question: is a §7.4-narrowed read's type inside an if-expression branch T or T? (§20, §22.6, v0.339)
+- #6895 [other]   (6d) §22.8 (v0.340): is a static readonly field's ref/out binding inside its own static field initializer admitted?
+- #6902 [other]   (6d) Spec question: `x op= e` with a constant that fits neither uint nor the result type: compile error or run-time OverflowException?
+- #7131 [other]   (3d) [stdlib-contract] the compiler implements string's instance Repeat(count), GetField(delim, n) and CountOf(sub) - none of which stdlib 9.6 declares
+- #7273 [other]   (1d) §8.7 / §28.9 (v0.345, proposal 0200): `Dispose()` on a `string`, a `Type` or an interface-typed receiver whose interface does not extend `IDisposable`
+- #7345 [other]   (0d) §28.2 / §28.6 (v0.345): the explicit `Dispose()` call path reclaims a class instance at the call; the spec says logical disposal only, reclamation at 
+- #7346 [other]   (0d) §2.7 rule 1 / §11.6 (v0.345): a qualified chain reaches a nested type the head type inherits — `K.N` names `B.N` for `class K: B`; a nested type of a 
+- #7347 [other]   (0d) §2.7 (v0.345, proposal 0202): the head of a qualified name in a type position is the bare-type-name row's — a nested type is found innermost at `C.N` 
+- #7348 [other]   (0d) §22.7 / §22.13 (v0.345): a generic instantiation's static constructor body may not run before its first use — `G<string>.S` reads `0` where the static
+- #7351 [other]   (0d) §19.3 (v0.345, proposal 0204): over a `char` scrutinee, nullable or not, reject an integer constant in a constant, relational or range pattern
+- #7352 [other]   (0d) §6.2 (v0.345): a constant operand across signedness — three corners of the compiler's constant search reject what the rule admits
+- #7355 [other]   (0d) §22.8 (v0.345): reject a `static readonly` write through another instantiation's name inside a generic type's static constructor (`G<string>.S := 1` i
+- #7356 [other]   (0d) §16.1 / §17.5 / §19.3 (v0.345, proposal 0203): type a range literal from its position or its endpoints' §6.2 common type; drop the interim clause A; r
+
+## features-proposals — Feature and proposal trackers (not defects) (99 open; docs/proposals)
+
+- #2223 [crash]   (92d) fix #1314 commit message: source changes also include #1830 work
+- #446 [other]   (143d) README + cross-platform build docs overhaul (Windows/macOS/other-Linux)
+- #545 [other]   (140d) Architecture: self-host stdlib collections in Bezel (unify element-finalization into one policy + a compiler-understood Buffer<T> primitive)
+- #547 [other]   (140d) Stdlib: add ordered (sorted) associative collections — SortedDictionary<K,V> / SortedSet<T> (implement self-hosted, with #545)
+- #718 [other]   (135d) Serialization: support recursive Shared<T> spines (linked lists, general/mutual cycles) via synthesized Serialize/Deserialize functions
+- #1376 [other]   (117d) PROPOSAL 0001: Networking and the fetch-inspired Http client (System.Net.Http) — design for review
+- #1394 [other]   (117d) Stream span Read/Write overloads + Count-window guards (§7.1 v0.165, #1375) unimplemented — blocked on #645
+- #1395 [other]   (117d) StringBuilder/Console/TextWriter per-type numeric overloads (§3.1/§2.1/§7.4 v0.165, #1355): observably satisfied via boxing; non-boxing overloads defe
+- #1402 [other]   (117d) Proposal 0002: the Http server — minimal-API routing over the fetch-symmetric 0001 vocabulary (draft for review)
+- #1410 [other]   (116d) Proposal 0004: Bezel MVU — Elm-style UI architecture (early draft for review)
+- #1414 [other]   (116d) Compiler structure refactor plan: test auto-registration, runtime split, builtin registry, shared ownership-facts, Emitter decomposition
+- #1433 [other]   (116d) Proposal 0006: concrete stream family (StreamReader/Writer, MemoryStream, CopyToAsync)
+- #1434 [other]   (116d) Proposal 0009: Base64 + hex encodings
+- #1435 [other]   (116d) Proposal 0010: serialization eligibility for Guid/DateTime/TimeSpan/DateOnly/TimeOnly + WriteBytes
+- #1436 [other]   (116d) Proposal 0007: System.Net substrate (sockets, Dns, TLS seam)
+- #1437 [other]   (116d) Proposal 0008: integer toolkit (wrapping/saturating ops, BitOperations, HashCode)
+- #1440 [other]   (116d) Proposal 0011: System.Diagnostics.Process (child processes)
+- #1441 [other]   (116d) Proposal 0013: Environment surface (CurrentDirectory, ProcessId, OperatingSystem.Is*)
+- #1442 [other]   (116d) Proposal 0014: signal hooks (SIGINT/SIGTERM → Channel)
+- #1443 [other]   (116d) Proposal 0015: PeriodicTimer
+- #1444 [other]   (116d) Proposal 0016: monotonic time (Instant / Stopwatch extensions / TimeSpan.FromNanoseconds)
+- #1445 [other]   (116d) Proposal 0012: DateTimeOffset + TimeZoneInfo
+- #1446 [other]   (116d) Proposal 0017: TempFile RAII + Path/Directory utility completions
+- #1447 [other]   (116d) Proposal 0018: async File family (ReadAllBytesAsync / ReadAllLinesAsync / WriteAllBytesAsync / WriteAllLinesAsync / AppendAllTextAsync)
+- #1449 [other]   (116d) Proposal 0020 (RFC): Regex — engine family + v1 surface
+- #1450 [other]   (116d) Proposal 0023: Task.WhenEach
+- #1451 [other]   (116d) Proposal 0024: PriorityQueue (borrowing form)
+- #1452 [other]   (116d) Proposal 0025: BitArray
+- #1453 [other]   (116d) Proposal 0022 (RFC): test framework — Assert library + discovery fork
+- #1454 [other]   (116d) Proposal 0029: checksums (CRC-32/xxHash)
+- #1455 [other]   (116d) Proposal 0030: Unicode normalization (explicit)
+- #1456 [other]   (116d) Proposal 0031: Verify/Unreachable/Debug
+- #1457 [other]   (116d) Proposal 0026: LINQ additions (indexed Select/Where, Chunk, MinBy/MaxBy)
+- #1458 [other]   (116d) Proposal 0027: SplitSpans — zero-alloc string tokenization
+- #1459 [other]   (116d) Proposal 0028: Random extensions (NextFloat, NextInt64 range overloads, Shuffle, NextBytes span)
+- #1460 [other]   (116d) Proposal 0021: structured logging (ILogger, LogEvent, cross-domain sink)
+- #1461 [other]   (115d) Proposal 0019: JSON DOM (JsonValue)
+- #1507 [other]   (112d) Tracking (§11.8 recorded follow-up): promote `IDeserializable.Deserialize` to a true static interface method
+- #1532 [other]   (112d) [conformance] §30.5 (v0.179): value-result await operand consumption scoped to unbound temporaries
+- #1565 [other]   (112d) [conformance] v0.181 declaration-surface conformance pack
+- #1683 [other]   (108d) [v0.184] Compiler: static-event alias advisory (should-level, spec §22.12 rule 5).
+- #1699 [other]   (108d) [v0.185] Migrate callback-taking lazy-operator signatures to scoped (extends #1509)
+- #1704 [other]   (108d) [enhancement, liftable] §28.14: transparent-getter hop for form 4 (0035 graduation, spec v0.187)
+- #1707 [other]   (108d) impl: `Interop.LastErrno()` intrinsic
+- #1708 [other]   (108d) impl: C-compatible records — §3.6 row, per-target layout engine, by-address marshalling, single-field direct admission
+- #1710 [other]   (108d) impl: `:= symbol "name"` alias clause + startup symbol resolution (failure before Main)
+- #1711 [other]   (108d) impl: `variadic(N)` emission (per-target variadic calling sequence) + promoted-type check
+- #1712 [other]   (108d) impl: the `env` clause — pairing well-formedness, env-stripped surface types, trampoline synthesis, checked-mode thread guard
+- #1714 [other]   (108d) impl/runtime: foreign-thread service surface (allocation available; sanctioned set; async-signal narrower)
+- #1716 [other]   (108d) impl: inline-array extern rules — lvalue-only by-address params, write-back, no returns, extended element set
+- #1717 [other]   (108d) impl: `RawBytes.FromForeign`, `CString.Pointer`, `WString.Pointer`, `OwningBuffer<T>.DangerousPointer()` + gates
+- #1731 [other]   (108d) compiler: metadata-time missing-closure diagnostic naming the module (spec §2.8.3 rule 1, v0.188)
+- #1734 [other]   (108d) compiler: entry-point search scope = root compilation; --main-class within root only (spec §33.1/§33.5/§2.8.4, v0.188)
+- #1746 [other]   (108d) [follow-up] #1621: add a mechanical pin for the builtin-exception hierarchy (sema BuiltinRegistry vs codegen)
+- #1904 [other]   (104d) [Ecosystem] Productive-programming track — what Bezel needs beyond the compiler+spec (internal-dogfooding order)
+- #1908 [other]   (104d) [Ecosystem pillar 1] Build system / project driver — tracking (proposal 0040)
+- #2034 [other]   (102d) Proposal 0047: mechanized core semantics (ownership + domains)
+- #2039 [other]   (102d) Proposal 0052: machine-grade diagnostics and a compiler query API
+- #2040 [other]   (102d) Proposal 0053: property-based specification (extends 0022)
+- #2041 [other]   (102d) Proposal 0054: traceability conventions — contract-to-code citations
+- #2092 [other]   (98d) tooling: canonical formatter (bezel fmt) — unrecorded ecosystem gap
+- #2275 [other]   (91d) [process] 2e43ae5 is mislabeled: it restores #2222 and #2209, not #2121 — reverting it would silently reopen both
+- #2340 [other]   (90d) citation cleanups unblocked by v0.230: ref/out diagnostic cites §22.3; bz_str_indexof comment cites §9.6's stated rule
+- #2352 [other]   (89d) stdlib §2.15: complete the (ReadOnlyArraySpan&lt;byte&gt;, ignoreUnknownFields) pair — agent constructor + Binary facade forms (0073 Q3 piggyback pin)
+- #2377 [other]   (89d) [codegen] async owned-param iterator: GetAsyncEnumerator claims ALL owned params on first call, even never-consumed ones (throughput follow-up to #235
+- #2393 [other]   (89d) [sema] lift #2345's remaining out/out-owned-through-?. restrictions: out owned callee params, accessor-mediated out targets
+- #2494 [other]   (88d) [docs/comment] #2457 slice 2's GetEnumerator-explicit-call comment miscites #2470, should be #2471
+- #2510 [other]   (88d) codegen: lowerIndexerCompound and the IncrementStmt indexer path duplicate the same get-then-set flow (refactor opportunity, not a bug)
+- #2920 [other]   (82d) [docs/comments, LOW] a THIRD §22.9 miscitation family: ~30 sites cite it for properties/indexers in general, where the section is §23
+- #3394 [other]   (61d) [codegen] #2752's mixed-operand ladder in the builtin-interface dispatch arm is dead code after #2765 — delete or re-label
+- #3397 [other]   (61d) fix #2765 follow-up: #2752's argument-side guard and CompareTo trap arm are left statically unreachable with zero coverage — delete or record
+- #3432 [other]   (61d) cleanup: retire the two now-unreachable `isVoidTy()` argument repairs left over from #2915/#3095/#3105 (§4.7, v0.283)
+- #3438 [other]   (61d) Six open issues carry Bezel repros that do not parse: comments written as (* ... *), which §1.5 does not define
+- #3646 [other]   (57d) citation defect: #3622 and fix 80fa3a7 cite §21.5 (break/continue) instead of §21.4 (for-statement)
+- #3822 [other]   (53d) Stale `K3.10` citations in four source/test comments after v0.287 merged consume-table rows K3.9/K3.10 (comments only; nothing fails)
+- #3859 [other]   (52d) text-only v0.292: `isValidRangeElementType` should state the rule §16.3 now states (no behavioural delta); holds the reading-(ii) lift path (#1508)
+- #4098 [other]   (48d) sema: two more comments in resolveMemberAccess repeat #3932's "NullCondMemberExpr is already non-nullable" inaccuracy
+- #4150 [leak]   (47d) currentEnumMethod_'s NestedBodyScope leak: original block-form rationale is stale (§10.5); residual soft-leak risk unmeasured (found while fixing #414
+- #4242 [other]   (46d) compile-time cost proportional to a single record's total field count survives the #4234 memoization fix (flat 729-field record: 24s)
+- #4299 [other]   (46d) Recommendation: consolidate the growing per-call-site null-declaration-builtin name lists (ExceptionInfo/Span-family/DictionaryEntry/IGrouping/...) in
+- #4436 [other]   (41d) bezelc: residual N^1.9 compile time on deep record chains after fix #4255 — LLVM pm.run, not bezelc IR
+- #4451 [other]   (40d) Pin a reproducible build toolchain: no authoring environment can build the compiler, so every spec-side claim is a source read
+- #4453 [other]   (40d) Triage by family, not by instance: 144 of 552 open issues are siblings, and the narrow-fix loop is what produces them
+- #4541 [other]   (36d) codegen: collapse the three hand-maintained lambda-reference walkers into one authority (follow-up to #4527)
+- #4581 [other]   (36d) codegen: S3's audited six undercounts — 7 more newSema[...] substitution sites found while fixing #4567
+- #4753 [other]   (34d) [sema] seam debt: clauseOnlyDifference is AST-gated, never fires for imported methods (#3152 class-3)
+- #4833 [other]   (33d) sema: #4766's Length/Count typing arm spells a builtin-name list (class-F grid spelling) — consolidate onto the builtin member table
+- #4912 [other]   (33d) Enumerable-grid debt from #4850: hasFreshStorage spells its own builtin-collection head list in LlvmBackend_Calls2.cpp (#3419)
+- #5042 [other]   (31d) Imported-symbol seam debt from R21 batch: AST decl reads in #5009-ff4 / #4996 / #4968 should read off the sema symbol (#3152/#3590)
+- #5990 [other]   (14d) docs/proposals/0128 (v0.338): §7 sentence "the default build prints `live`" for s28_2_0011 does not match the measured output (an empty line: UB read 
+- #6436 [other]   (10d) [sema] TypeResolution_Checks.cpp:15047 circular §11.8 citation — diagnostic names the section, not the spec
+- #6441 [other]   (10d) [codegen] the bz_obj_is_string "vtable-less => user class" discriminator is re-transcribed per site — 2 copies in tree, 2 more added by the #6413/#641
+- #6521 [other]   (8d) A third decayed `DefiniteAssignment.cpp:691` citation sits in the same paragraph the `narrow #2593` commit re-anchored (#6515 does not cover it)
+- #6526 [other]   (8d) docs/proposals/0005:635 makes a live claim about line numbers in ModuleLoader.cpp that is now false — and a proposal is NOT a dated snapshot
+- #6533 [other]   (8d) Stale citation: SymbolCollection.cpp:236 cited as the PropertySymbol construction site — the real site is :282
+- #6534 [other]   (8d) 0005 is a LIVE under-review proposal, not a snapshot — its ModuleLoader.cpp anchors are stale and it promises they are current
+- #6650 [other]   (7d) Windows build of bezelc (release artifact)
+- #6861 [other]   (6d) Support the bare LINQ method reference `g.First` as a function value (§27.6)
+- #7174 [other]   (3d) [docs][citations] 15 source/test comments cite the per-instantiation rule as "§14.2 rule 2" — but §14.2 is Constraints; the rule is §3.6 rule 2. TWO o
+
+## unassigned (78)
+
+- #1673 [other] [v0.184] memory-model fence audit (§30.13 edges 1-5 + object-specific guarantees; stdlib §6.2 echo)
+- #1721 [other] [compiler+runtime] spec §30.12 "Data-owning locks"/§22.12 rule 4/§28.13/§30.13/§30.14 (v0.186): Locked<T>/RwLocked<T> + guards
+- #1722 [other] [compiler+runtime] spec §30.14 "Data-parallel combinators"/stdlib §6.12 (v0.186): Parallel.Map/Reduce/ForEach + worker team
+- #1841 [other] impl: RawBytes two-slot (ptr,len) marshalling through FFI function types / callbacks (tail of #1720)
+- #2314 [other] string.AsAsciiByteSpan() retired in v0.188 (§3.4) but sema still accepts it; codegen rejects with a stale 'not yet supported' message at 0:0
+- #2664 [other] Span member typing is arity-unchecked for Length/IsEmpty/IndexOf/Contains/SequenceEqual — same accept-trap shape as #2312 (INFERRED, not reproduced)
+- #2723 [other] codegen: two follow-ups from the nested-body-emission sweep — currentReturnTypeNode_ saved without its #2688 twin at 3 sites; block-getter emitters ne
+- #3014 [other] Route AOT cache telemetry to its own sink, with a store_failures counter and errno — the surviving halves of #3003 and #3012
+- #3028 [other] spec grammar follow-up: amend A.4 `Param` to formally admit post-colon `owned?` (#3027 fix companion)
+- #3086 [other] [proposal 0091] Lift the owned-overload ban: ownership-mode applicability, Owned-suffix retirement
+- #3473 [other] codegen: §18.5 ALIGNMENT is silently dropped for an INLINE-ARRAY hole — `$"[{a,10}]"` prints `[[2]int]`, unpadded (§18.5 / §8.5 / §15.1, v0.283)
+- #3557 [other] Implement stdlib §6.12 Parallel (Map/Reduce/ForEach + worker team) — the v0.284 honesty tracker
+- #3558 [other] Bit-tier TryWrite* forms: documented, zero compiler support (byte tier fully implemented) — v0.284 honesty tracker
+- #3677 [other] codegen: enumMachineryElementName's allocSize-only key may share the #3663 same-size/different-layout hazard at its 6 other sites (arrenum/stackenum/d
+- #4725 [other] parser still accepts the removed `owned` ArgModifiers keyword at call-argument position (Appendix A.4 says no alternative exists, proposal 0090)
+- #4791 [sound] codegen: base(...)/this(...) chain with a named arg skipping a leading default zero-fills; sema false self-chain reject (§22.5/§12.8)
+- #4835 [other] codegen: inheritance-clause base-ctor call silently skips the base constructor when a slot is still unfilled after default filling (#4550 twin of #479
+- #4852 [sound] codegen: ctorForArgs picks a defaulted explicit ctor over an exact primary ctor when a mismatching 1-arity sibling exists — regression from #4790 fix 
+- #4957 [other] codegen: this(out var z, s.Length) chain into sole (out y, x) ctor ICEs #1386 (§22.3/§22.4)
+- #5446 [crash] s15_4_0007 SIGSEGVs at exit (banked-pass rule-corpus row): empty destructor + owned array element
+- #5464 [other] #5447 has no regression row for the inherited case its own ruling asked for
+- #5467 [other] #5404 coverage gap: inherited instance field not tested
+- #5863 [other] Harness prints "unavailable" labels on sanitizer counters even when the leg RAN
+- #5871 [other] §19.3 named destructuring over a CLASS head is entirely unimplemented (explicit "not yet supported" diagnostic)
+- #5881 [other] #5872 fix-forward: a97f9d8d's Sendability.cpp hunk hard-refuses every user-class buffer element
+- #5883 [other] Conflated skip sentinel: -2 means both 'no toolchain' and 'the dependency library failed to compile' — 39 test files
+- #5987 [other] Extension-method overloads on one receiver are not ranked by argument type (first-declared always runs)
+- #6174 [sound] codegen §6.6: user shift operator via compound assignment (v >>= e over operator >>(V,Object)) is never called: silent wrong value
+- #6218 [other] [codegen] Equals/GetHashCode declared off the Object-slot return type emits ill-typed IR in enum equality and Set/Dictionary key trampolines, and a ga
+- #6222 [sound] sema §23.4/§22.6 (v0.338): indexer overloads are not ranked — first-declared runs, even for an argument no indexer admits (string through [x: int])
+- #6274 [other] sema: B<string>.Foo(s) rejected 'no overload applicable' when class B<T> also declares sibling Foo(x: Item)
+- #6308 [other] Abstract indexer keyed by T is not seen as implemented by an override with the concrete key type (§12.1)
+- #6398 [leak] [codegen] an auto-property of class type has no ownership holder — every instance leaks
+- #6429 [other] [sema][silent acceptance] ConstFold.cpp findConstShiftDomainFault's depth>64 returns none, SKIPPING the 6.5/17.14 shift-domain rejection
+- #6431 [other] #6404 follow-up: direct getter form over-rejects while its laundered twin accepts
+- #6494 [sound] §17.7 forbids the `new()` shorthand in general expression contexts, but `Take(new())` reaches codegen's #1386 and a bare `new();` compiles clean
+- #6506 [other] §28.11 residuals after the #6468 fix: the return slot and AddRange bulk leg still ACCEPT spellings the rule names as rejected
+- #6511 [other] IGrouping: the #6510-era swallow is one level wider than #6503 fixed — ANY unrecognised member name on an IGrouping receiver still drops the statement
+- #6557 [sound] Add(ing) a dictionary entry into Array&lt;DictionaryEntry&lt;string,V&gt;&gt; does not retain the Key — use-after-free on read
+- #6568 [other] Clear -> Add -> Clear -> Clear repeated reports a stack-buffer-overflow (pre-existing, cause not traced)
+- #6617 [other] #6473 is BLOCKED on #4522 item 3: the prescribed release point is unreachable by construction (value column confirmed at 7,272 B / 404 allocs)
+- #6624 [other] #6609 R1 follow-up: t := r (RHS is a different binding in a compatible state) is accepted, rc=0
+- #6668 [other] Extension overload errors carry a false 'an instance member of the same name name-blocks extension lookup' note
+- #6669 [sound] [sema][soundness] a unit-returning call as an owned element argument is accepted: `l.AddLast(a.RemoveAt(0))` compiles, then ASan stack-buffer-overflow
+- #6754 [other] A Stream subclass CanRead override reads as false through a Stream variable (stdlib §7.1, v0.339)
+- #6785 [sound] A user class implementing IGrouping<int, int> reads garbage through an IGrouping<int, int> parameter (§11.2, stdlib §5, v0.340)
+- #6786 [other] A user interface that extends IGrouping<int, int> does not expose its Key or Count() members (§11.2, v0.340)
+- #6790 [other] §4.2/§22.6: a target-typed literal argument takes its widening hint from the first-declared overload only (f(double) declared before f(long) rejects '
+- #6801 [other] Untyped Console.WriteLine of a Range<ulong>/Range<uint> endpoint prints it signed (§16.3, v0.340)
+- #6851 [sound] Extension methods write a nested class's `private` field and `private set` property (§13.1, §26.3)
+- #6870 [other] internal error: interface-method call through a multi-bound T (class + interface) as a call argument (#1386 path)
+- #6875 [other] A ulong constant above LLONG_MAX (18446744073709551615UL) is accepted at an int/long/short/sbyte target and stored as -1
+- #6878 [other] Calling a user extension named like a §5 operator on IList<int> (e.Last(5)) fails LLVM verification: Load operand must be a pointer (§26.5, v0.340)
+- #6882 [other] [sema] a named argument that names no parameter of Console.Write/WriteLine is silently accepted (§22.5, v0.340)
+- #6960 [other] §17.14: a §6.5 shift-count fault in a short-circuited operand is still rejected (false and ((1 << 40) > 0))
+- #6962 [other] Class-level const initialized with int.MaxValue / long.MinValue is rejected as non-constant (local const accepts it)
+- #6989 [other] §16.6 reversed-bounds warning reads an ill-formed negative bound over a ulong scrutinee (follow-up to #6928)
+- #7024 [other] [sema][soundness] an unknown member on an Object receiver is accepted with a permissive warning and no dispatch (o.Bogus())
+- #7100 [other] always-available names outside the compiler's built-in table (Console, Math, Convert, Environment) are never resolved as types
+- #7111 [other] [sema] at a chain head in a VALUE position the enclosing type's nested type does not resolve: C.S() is 'unresolved identifier' (§2.7, v0.343)
+- #7113 [other] [sema] an enum-to-underlying-integer conversion is rejected at an initializer but admitted at a call argument: Substring(e) compiles where var y: int 
+- #7126 [other] [sema] the compiler's own 11.6/A.5 diagnostics tell the user the nested type is 'named by its bare name C.N inside that type's bodies' -- but at a CHA
+- #7164 [other] The defect
+- #7165 [sound] The defect
+- #7175 [other] [sema] a type-argument list on an EXTENSION PROPERTY is silently accepted (o.P<int> -> rc 0), while the same shape on an INSTANCE property is rejected
+- #7197 [other] [sema] the EXPRESSION position resolves neither the built-in INTERFACE names (20 of them: unresolved identifier) nor the §4.2 owning-collection constr
+- #7204 [sound] [codegen][soundness] an IList<T> member reference passed as an ARGUMENT is never checked against the parameter's function type: the thunk is minted at
+- #7205 [other] [codegen][divergence] a §5.1-convertible target for an IList<T> member reference is refused: the #5208 formation-site adapter is wired to a MethodSymb
+- #7208 [sound] [codegen][soundness] the IList<T> member-reference arm never checks the MODIFIER slots: var f: (ref int) -> bool := il.Contains compiles with NO diagn
+- #7209 [sound] [codegen][soundness] a using-var collection local inserted into a longer-lived container is FREED while the container still holds it - ASan heap-use-a
+- #7220 [other] [codegen] the 'parameter p → source argument index' lookup is re-implemented in FOUR codegen files — the duplication is the DIRECT CAUSE of the live d
+- #7233 [other] [sema][stdlib] a Math/Convert call at an UNDECLARED ARITY is accepted and the program PRINTS NOTHING - a silent no-output program, not a diagnostic
+- #7248 [sound] [codegen][sema] a TYPE NAME used as a plain VALUE is accepted and prints NOTHING (or the WRONG VALUE 0) - a type name is not a value
+- #7279 [sound] [codegen] an UNSIGNED argument at a FUNCTION-VALUE call is SIGN-EXTENDED - `f(4000000000u)` prints -294967296 (spec 5.1)
+- #7302 [other] a type fact does not compose through an early exit: after if a is not Dog then return the call is refused
+- #7317 [other] Stale LANGUAGE-SPEC line numbers are cited in three `tests/` comments (the #7309 class, spec side)
+- #7334 [other] A `double` formatted with a RUNTIME format string falls back to the plain rendering — the format argument is ignored
+- #7360 [other] stdlib 2.15's JSON mapping table has NO `ReadDecimal` row, and the JSON reader's decimal arm admits a BARE POINT and ignores the EXPONENT - a SPEC RUL

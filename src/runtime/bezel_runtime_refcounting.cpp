@@ -230,12 +230,16 @@ static void* bz_array_obj_tostring(void* o) {
     return bz_make_string(name, (int64_t)(sizeof(name) - 1));
 }
 static void* bz_sb_obj_tostring(void* o) {
-    char* data = nullptr;
-    int64_t len = 0;
-    bz_strbuilder_to_string(o, &data, &len);
-    void* s = bz_make_string(data ? data : "", len);
-    free(data);
-    return s;
+    // fix #7243 (spec §4.6 / stdlib §3.1, v0.344): render the builder's
+    // CONTENT — its code points, at the width the content's largest code
+    // point requires. This used to call the legacy byte-level
+    // `bz_strbuilder_to_string` and then `bz_make_string`, a width-1
+    // constructor that takes no width, so the width was dropped on the floor:
+    // "日" (U+65E5, stored as two bytes at width 2) came back as the TWO code
+    // points 229 and 101, while the builder's own ToString returned the ONE
+    // code point 26085 — the two routes of one operation disagreed (§8.5 makes
+    // them the same operation). See bz_strbuilder_to_string_obj.
+    return bz_strbuilder_to_string_obj(o);
 }
 static void* bz_mutex_obj_tostring(void*) {
     static const char name[] = "System.Threading.Mutex";

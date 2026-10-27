@@ -1,8 +1,270 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "llvm/ADT/STLFunctionalExtras.h"  // llvm::function_ref (fix #4901 shared-event gate)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
+#include "sema/ConstFold.hpp"  // fix #7285: §17.14 constant folding for the radix argument (§5.1)
 
 namespace bezel::codegen {
+
+namespace {
+
+// fix #7285 (spec §5.1, v0.344): the §5.1 WIDENING table — the integer-family
+// types that implicitly convert to `int`. Read off §5.1's own table ("From |
+// Implicitly converts to"): `sbyte` → `int`, `byte` → `int`, `short` → `int`,
+// `ushort` → `int`, `char` → `int`. `int` itself is the identity and is not
+// listed; `uint`/`ulong`/`long` are NOT in it (they reach an `int` parameter
+// only through §5.1's constant narrowing, below).
+bool parseRadixWidensToInt(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::SByte:
+        case sema::PrimitiveType::Byte:
+        case sema::PrimitiveType::Short:
+        case sema::PrimitiveType::UShort:
+        case sema::PrimitiveType::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// The type's keyword spelling, as the diagnostic spells it.
+const char* parseRadixTypeName(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::Bool:    return "bool";
+        case sema::PrimitiveType::Char:    return "char";
+        case sema::PrimitiveType::String:  return "string";
+        case sema::PrimitiveType::Byte:    return "byte";
+        case sema::PrimitiveType::SByte:   return "sbyte";
+        case sema::PrimitiveType::Short:   return "short";
+        case sema::PrimitiveType::UShort:  return "ushort";
+        case sema::PrimitiveType::Int:     return "int";
+        case sema::PrimitiveType::UInt:    return "uint";
+        case sema::PrimitiveType::Long:    return "long";
+        case sema::PrimitiveType::ULong:   return "ulong";
+        case sema::PrimitiveType::Float:   return "float";
+        case sema::PrimitiveType::Double:  return "double";
+        case sema::PrimitiveType::Decimal: return "decimal";
+        case sema::PrimitiveType::Object:  return "Object";
+        case sema::PrimitiveType::None:    break;
+    }
+    return "<unresolved>";
+}
+
+// The §17.14 constant-expression nodes inside `e` — the forms the shared
+// folder resolves BY NAME (a `const` reference, a member-access constant).
+void collectParseRadixConstNodes(const ast::Expr& e,
+                                 std::vector<const ast::Expr*>& out) {
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        collectParseRadixConstNodes(*ue->operand, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        collectParseRadixConstNodes(*be->left, out);
+        collectParseRadixConstNodes(*be->right, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (ce->condition) collectParseRadixConstNodes(*ce->condition, out);
+        if (ce->thenValue) collectParseRadixConstNodes(*ce->thenValue, out);
+        if (ce->elseValue) collectParseRadixConstNodes(*ce->elseValue, out);
+        return;
+    }
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        out.push_back(&e);
+}
+
+// The §17.14 folder resolves an identifier by NAME; this site resolves it
+// through the SYMBOL sema recorded for the very node — scope-correct, and
+// never a flat name search that could capture a shadowed binding.
+using ParseRadixResolver =
+    std::function<std::optional<long long>(std::string_view, int)>;
+
+// fix #7285 (spec §17.14, v0.344): the compile-time-constant VALUE of a
+// `const` REFERENCE, folded through the SHARED folder (`sema::foldIntConst` —
+// ONE implementation, shared with the inline-array-size and const-evaluation
+// passes).
+//
+// A local `const` is a §17.14 constant expression only when sema classified
+// it so (`LocalSymbol::isCompileTimeConst`): a RUNTIME `const` — a
+// single-assignment binding with a non-constant initializer — is not one, and
+// §5.1's constant narrowing does not reach it. A class-level `const`
+// (stdlib §22.12) always is; sema recorded its typed integer value
+// (`ConstMemberSymbol::intValue`), and ModuleLoader carried it for an
+// IMPORTED const (whose AST decl does not exist).
+std::optional<long long> parseRadixConstSymbolValue(
+        sema::Symbol* sym, const ParseRadixResolver& resolveIdent, int depth) {
+    if (!sym || depth > 8) return std::nullopt;
+    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+        if (!ls->isCompileTimeConst) return std::nullopt;
+        auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(ls->decl);
+        if (!lcd || !lcd->value) return std::nullopt;
+        return sema::foldIntConst(*lcd->value, resolveIdent, depth + 1);
+    }
+    if (auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(sym)) {
+        if (cs->intValue) return *cs->intValue;
+        // SEAM-ACCESSOR: local-path cast; `cs->intValue` above is the
+        // wire-carried value of an IMPORTED const (whose AST decl does not
+        // exist), so that read and this one are the TWO SOURCES of one
+        // both-sources accessor. #3152
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
+        if (!cd || !cd->value) return std::nullopt;
+        return sema::foldIntConst(*cd->value, resolveIdent, depth + 1);
+    }
+    return std::nullopt;
+}
+
+// fix #7285 (spec §17.14, v0.344): the compile-time-constant value of `e`
+// when it is a §17.14 constant expression, else nullopt.
+//
+// The §17.14 SET and its arithmetic come from the SHARED folder
+// (`sema::foldIntConst`); only the name resolution is local — the symbol
+// sema recorded for the node, so the answer is scope-correct.
+std::optional<long long> parseRadixConstValue(const sema::SemaContext& ctx,
+                                               const ast::Expr& e) {
+    std::vector<const ast::Expr*> constNodes;
+    collectParseRadixConstNodes(e, constNodes);
+    ParseRadixResolver resolveIdent;
+    std::function<std::optional<long long>(const ast::Expr& base,
+                                           std::string_view member,
+                                           bool& errorSeen)>
+        resolveMemberAccess;
+    resolveIdent = [&](std::string_view name,
+                       int depth) -> std::optional<long long> {
+        if (depth > 8) return std::nullopt;
+        for (const ast::Expr* n : constNodes) {
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(n);
+            if (!id || id->name != name) continue;
+            return parseRadixConstSymbolValue(ctx.exprSymbol(*id),
+                                              resolveIdent, depth);
+        }
+        return std::nullopt;
+    };
+    resolveMemberAccess = [&](const ast::Expr& base, std::string_view member,
+                              bool& errorSeen) -> std::optional<long long> {
+        errorSeen = false;
+        for (const ast::Expr* n : constNodes) {
+            auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(n);
+            if (!ma || ma->member != member) continue;
+            if (!ma->target || &*ma->target != &base) continue;
+            return parseRadixConstSymbolValue(ctx.exprSymbol(*ma),
+                                              resolveIdent, 0);
+        }
+        return std::nullopt;
+    };
+    // A `const` REFERENCE — read through the symbol sema recorded for THIS
+    // node.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        return parseRadixConstSymbolValue(ctx.exprSymbol(e), resolveIdent, 0);
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return parseRadixConstSymbolValue(ctx.exprSymbol(*ma), resolveIdent, 0);
+    return sema::foldIntConst(e, resolveIdent, 0, resolveMemberAccess);
+}
+
+// fix #7285 (spec §5.1 / §17.14 / §22.6, v0.344): how the `radix: int`
+// parameter (stdlib §9.1) admits the argument.
+//
+// §5.1 admits it by IDENTITY (`int`), by §5.1's WIDENING table (`sbyte`,
+// `byte`, `short`, `ushort`, `char` → `int`), or by §5.1's CONSTANT
+// NARROWING — "the source may be a compile-time constant of any integer type
+// — not only `int` — and the target any integer type whose range contains
+// the value, across signedness". Nothing else binds: a `bool`, a `string`, a
+// `double`, a `decimal`, and a RUNTIME `uint`/`ulong`/`long` bind to no
+// declared parameter, and §22.6 makes that "a compile error with no
+// candidates cited".
+struct ParseRadixBinding {
+    bool binds = false;              // the argument reaches the `int` parameter
+    bool constantType = false;       // ... only by §5.1's constant narrowing
+    bool outOfRange = false;         // ... and its value does not fit `int`
+    bool unknown = false;            // the argument's type is unresolved
+    bool nullableArg = false;        // the argument's type is `T?`
+    bool signedArg = false;          // the argument's type is signed
+    sema::PrimitiveType argType = sema::PrimitiveType::None;
+    std::optional<long long> value;  // the folded value (constant narrowing)
+};
+
+ParseRadixBinding parseRadixBinding(const sema::SemaContext& ctx,
+                                     const ast::Expr& arg) {
+    ParseRadixBinding b;
+    const sema::TypeRef* ty = ctx.exprType(arg);
+    if (!ty || ty->kind == sema::TypeRef::Kind::Error) {
+        // The type is unresolved: another diagnostic owns this call, and
+        // this arm has no type to judge the argument by.
+        b.unknown = true;
+        return b;
+    }
+    if (ty->kind != sema::TypeRef::Kind::Primitive) return b;
+    const sema::PrimitiveType p = ty->primitive;
+    // §5.1's nullable lifting converts a `T` to a `T?` — never a `T?` to a
+    // `T` — so a NULLABLE argument reaches no non-nullable `int` parameter.
+    // The nullability gate (#6782) has no row for this position (the
+    // `Convert.ToString` check leaves it there too), and the lowering this
+    // replaces truncated the nullable COMPANION (`{i8, i32}`) to i32 —
+    // malformed IR, an aborted compiler. The refusal belongs here.
+    if (ty->nullable) {
+        b.nullableArg = true;
+        b.argType = p;
+        b.signedArg = (p == sema::PrimitiveType::SByte ||
+                       p == sema::PrimitiveType::Short ||
+                       p == sema::PrimitiveType::Int ||
+                       p == sema::PrimitiveType::Long);
+        return b;
+    }
+    b.argType = p;
+    b.signedArg = (p == sema::PrimitiveType::SByte ||
+                   p == sema::PrimitiveType::Short ||
+                   p == sema::PrimitiveType::Int ||
+                   p == sema::PrimitiveType::Long);
+    if (p == sema::PrimitiveType::Int) {
+        b.binds = true;  // the identity
+        return b;
+    }
+    if (parseRadixWidensToInt(p)) {
+        b.binds = true;  // §5.1's widening table
+        return b;
+    }
+    if (p == sema::PrimitiveType::UInt || p == sema::PrimitiveType::ULong ||
+        p == sema::PrimitiveType::Long) {
+        // §5.1's CONSTANT NARROWING — the only route by which these three
+        // types reach an `int` parameter.
+        b.constantType = true;
+        if (auto cv = parseRadixConstValue(ctx, arg)) {
+            // The range: `uint`/`ulong` are unsigned, `long` is signed; the
+            // target is `int`. A constant whose value does not fit is a
+            // COMPILE ERROR at the conversion site (§5.1) — never a silent
+            // truncation.
+            const long long lo =
+                (p == sema::PrimitiveType::Long) ? -2147483648LL : 0;
+            const long long hi = 2147483647LL;
+            if (*cv >= lo && *cv <= hi) {
+                b.binds = true;
+                b.value = *cv;
+            } else {
+                b.outOfRange = true;
+            }
+        }
+        return b;
+    }
+    return b;  // bool / string / float / double / decimal → binds to nothing
+}
+
+// The diagnostic's "why" clause — the §5.1 rule the argument misses.
+std::string parseRadixWhy(const ParseRadixBinding& b) {
+    const std::string tn = parseRadixTypeName(b.argType);
+    if (b.outOfRange)
+        return ": the compile-time constant's value does not fit `int`'s range";
+    if (b.constantType)
+        return ": a `" + tn + "` reaches an `int` parameter only as a "
+               "compile-time constant (§5.1's constant narrowing)";
+    if (b.nullableArg)
+        return ": a `" + tn + "?` is never implicitly convertible to an `int` "
+               "(§5.1's nullable lifting converts a `T` to a `T?`, never the "
+               "other way)";
+    if (b.argType == sema::PrimitiveType::None)
+        return ": the argument is never implicitly convertible to an `int`";
+    return ": a `" + tn + "` is never implicitly convertible to an `int`";
+}
+
+}  // namespace
 
 
 // stdlib §3.2 v0.136: Encoding.{Utf8,Utf16,Utf32,Ascii}.GetBytes/GetString/Name.
@@ -683,6 +945,52 @@ llvm::Value* Emitter::emitStringFromFfiBuffer(llvm::Value* buf, bool wide) {
 }
 
 
+// THE ONE first-argument guard for the `Parse` / `TryParse` arms — the SHARED
+// spelling, used by every copy of those arms (fix #7299 / #7300; stdlib
+// §9.1 / §9.2 / §9.3 / §9.4 / §9.5, v0.344).
+//
+// stdlib §9.1 declares `Parse(s: string): int` and `TryParse(s: string, out
+// result: int): bool`; §9.2 declares the `double` / `float` forms; §9.3 the
+// `decimal` form; §9.4 the `bool` form; §9.5 the `char` form. Every one of
+// them declares the first parameter as a `string`, and §9.1 / §9.2 / §9.3 ALSO
+// declare a `ReadOnlyStringSpan` overload — §9.4 and §9.5 declare NONE, and
+// spec §5.1's implicit-conversion table has no span-to-string row, so a span
+// operand at `bool.Parse` / `char.Parse` is not a parseable operand either.
+// `spanOverloadDeclared` carries that per-receiver fact.
+//
+// The test is the operand's STATIC TYPE (the primitive `string`) OR the
+// LOWERED operand's SHAPE (the {ptr,i32,i32} `ReadOnlyStringSpan` record of
+// §3.3), the shape arm admitted only where the receiver DECLARES the span
+// overload. The shape alone is NOT enough — a class instance lowers to a
+// pointer too — and the static type alone is not enough either, because the
+// span overload's declared type is not the primitive `string`. The two
+// together are exact.
+//
+// An operand whose static type sema could not determine (`nullptr`) is
+// admitted on its SHAPE alone: a legal call must never be dropped on a typing
+// accident.
+//
+// `isSpanValue` is the caller's shape test (`Emitter::isStringSpanValue`),
+// passed in because the shape test is a private member of `Emitter` and this
+// helper is shared with the SECOND copy of these arms in
+// LlvmBackend_Calls.cpp (the `Decimal` / `Boolean` copies — #7300).
+bool sharedParseOperandAdmissible(
+        sema::SemaContext& ctx, const ast::Expr& e, llvm::Value* v,
+        llvm::function_ref<bool(llvm::Value*)> isSpanValue,
+        bool spanOverloadDeclared) {
+    const sema::TypeRef* t = ctx.exprType(e);
+    if (!t) {
+        // The static type is unknown — fall back to the SHAPE alone.
+        if (v->getType()->isPointerTy()) return true;
+        return spanOverloadDeclared && isSpanValue(v);
+    }
+    if (t->kind == sema::TypeRef::Kind::Primitive &&
+        t->primitive == sema::PrimitiveType::String)
+        return true;
+    return spanOverloadDeclared && isSpanValue(v);
+}
+
+
 llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -739,6 +1047,22 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     const auto& m = ma->member;
     using P = sema::PrimitiveType;
 
+    // THE FIRST-ARGUMENT GUARD for the `Parse` / `TryParse` arms below — a
+    // thin wrapper over the ONE shared spelling,
+    // `sharedParseOperandAdmissible` above, which carries the policy and the
+    // shared history of the #7290 / #7293 / #7294 guards.
+    //
+    // `spanOverloadDeclared` says whether the RECEIVER's type declares the
+    // `ReadOnlyStringSpan` overload of this member: stdlib §9.1 / §9.2 /
+    // §9.3 do; §9.4 (Boolean) and §9.5 (Char) do NOT — so a span
+    // operand at `bool.Parse` / `char.Parse` is not a parseable operand either.
+    auto isParseableOperand = [&](const ast::Expr& e, llvm::Value* v,
+                                  bool spanOverloadDeclared) -> bool {
+        return sharedParseOperandAdmissible(ctx_, e, v,
+                                            &Emitter::isStringSpanValue,
+                                            spanOverloadDeclared);
+    };
+
     // §11.8 / stdlib §2.19 (v0.176, #807): the compiler-provided conformance
     // members of the primitive tower. Reached only through a constrained type
     // parameter (sema rejects `int.Zero()` in ordinary code — §3.4's closed
@@ -765,9 +1089,25 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         llvm::Value* by = lowerExpr(*call.args[1].value);
         if (!v || !by) return nullptr;
-        // `by` is declared `long` — normalize to i64 first.
+        // `by` is declared `long` — normalize to i64 first. §5.1 (v0.344)
+        // converts VALUES, not bit patterns: the `uint` 4000000000 is
+        // 4000000000, not the `int32` -294967296 its low 32 bits read as, so
+        // an UNSIGNED source must ZERO-extend (`zext`) and a signed one
+        // sign-extend (`sext`) — a negative `by` keeps its sign.
+        //
+        // The signedness is the SOURCE EXPRESSION's own, read with
+        // `isUnsignedTargetExpr` — the house predicate the #7242 `double`-
+        // parameter converter and the #7250 mixed-operator fix use, so the
+        // three cannot disagree. It is NOT inferred from the bit width:
+        // `int` and `uint` are both 32 bits, `long` and `ulong` both 64.
+        //
+        // fix #7253 (spec §5.1, stdlib §2.19, v0.344): the widening was an
+        // unconditional `CreateSExt`, so an unsigned `by` arrived as a
+        // negative number.
         if (by->getType()->isIntegerTy() && !by->getType()->isIntegerTy(64))
-            by = builder_.CreateSExt(by, i64(), "step.by64");
+            by = isUnsignedTargetExpr(*call.args[1].value)
+                     ? builder_.CreateZExt(by, i64(), "step.by64")
+                     : builder_.CreateSExt(by, i64(), "step.by64");
         if (pt == P::Decimal) {
             // decimal: promote `by` and add via the runtime (§6.4 semantics).
             llvm::StructType* dst = decimalStructType();
@@ -794,13 +1134,96 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             return builder_.CreateFAdd(v, byFp, "step.f");
         }
         if (v->getType()->isIntegerTy()) {
-            // Integers and char: advance the value (code point) by `by`,
-            // performed at the value's own width (wrapping, like `+`).
-            unsigned w = v->getType()->getIntegerBitWidth();
-            llvm::Value* byW =
-                w < 64 ? builder_.CreateTrunc(by, v->getType(), "step.byw")
-                       : by;
-            return builder_.CreateAdd(v, byW, "step.i");
+            // Integers and char: advance the value (code point) by `by`, in
+            // T's own space (stdlib §2.19, v0.344) and CHECKED (spec §6.1,
+            // v0.344: "An operation whose mathematical result is not
+            // representable in the result type raises `OverflowException`").
+            //
+            // fix #7262 (spec §6.1, v0.344; stdlib §2.19, v0.344). The
+            // previous code advanced "at the value's own width (wrapping,
+            // like `+`)" — a false premise on its face: `+` on an integer
+            // type is CHECKED (spec §6.1), and the advance is an operation
+            // with a result type (T), so §6.1 governs it exactly as it
+            // governs `+`. The comment also claimed the question of what an
+            // out-of-range advance REPORTS was open; it is not (§6.1), and a
+            // `Step` CALL must return a value, so §16.3's silent stop (which
+            // describes a RANGE's iteration, whose advance is a different
+            // member and is left untouched by this change) has no analogue
+            // here.
+            //
+            // THE TRAP — WHY THE WRAP ENTERED, AND WHERE THE CHECK MUST BE.
+            // The old code TRUNCATED `by` to T's width BEFORE the add, so
+            // the add itself could never overflow: the wrap entered through
+            // the TRUNCATION, not through the add, and a check on the
+            // truncated add could therefore never fire. The check must be
+            // made on the MATHEMATICAL result, computed in a type wide
+            // enough to hold it, BEFORE the narrowing back to T's width.
+            //
+            // i128, not i64: `by` is the `long` parameter's value and the
+            // value is T's, so the exact sum can leave i64 itself (T = int
+            // and by = long.MaxValue). The comparison is against T's
+            // REPRESENTABLE RANGE, not against the sign of `by`: a NEGATIVE
+            // `by` is a legitimate advance downwards and is rejected only
+            // when the result leaves T's range.
+            //
+            // `char` gets its OWN domain (spec §4.5, §5.2, §16.3, v0.344):
+            // the code-point space U+0000–U+10FFFF with the SURROGATE block
+            // U+D800–U+DFFF excluded, because a surrogate code point is not
+            // a valid `char` value. A plain i32 range check would admit the
+            // surrogates; §16.3's own rule that the surrogate block is not
+            // part of `char`'s value sequence is what excludes them.
+            llvm::Type* wideTy = builder_.getInt128Ty();
+            const bool unsT = isUnsignedPrim(pt);
+            // The value's own mathematical value, restored per T's signedness
+            // (`char` is unsigned, so its code point is zero-extended).
+            llvm::Value* vWide =
+                unsT ? builder_.CreateZExt(v, wideTy, "step.vw")
+                     : builder_.CreateSExt(v, wideTy, "step.vw");
+            // `by` is the declared `long` parameter's value, so it extends
+            // signed.
+            llvm::Value* byWide = builder_.CreateSExt(by, wideTy, "step.bw");
+            llvm::Value* sum = builder_.CreateAdd(vWide, byWide, "step.sum");
+            llvm::Value* lo;
+            llvm::Value* hi;
+            if (pt == P::Char) {
+                lo = llvm::ConstantInt::get(wideTy, 0);
+                hi = llvm::ConstantInt::get(wideTy, 0x10FFFF);
+            } else {
+                const unsigned w = v->getType()->getIntegerBitWidth();
+                if (unsT) {
+                    lo = llvm::ConstantInt::get(wideTy, 0);
+                    hi = llvm::ConstantInt::get(
+                        wideTy, llvm::APInt::getMaxValue(w).zext(128));
+                } else {
+                    lo = llvm::ConstantInt::get(
+                        wideTy, llvm::APInt::getSignedMinValue(w).sext(128));
+                    hi = llvm::ConstantInt::get(
+                        wideTy, llvm::APInt::getSignedMaxValue(w).sext(128));
+                }
+            }
+            using Cmp = llvm::CmpInst;
+            llvm::Value* under =
+                builder_.CreateICmp(Cmp::ICMP_SLT, sum, lo, "step.under");
+            llvm::Value* over =
+                builder_.CreateICmp(Cmp::ICMP_SGT, sum, hi, "step.over");
+            llvm::Value* bad = builder_.CreateOr(under, over, "step.bad");
+            if (pt == P::Char) {
+                // §4.5 / §5.2 / §16.3 (v0.344): U+D800–U+DFFF are surrogate
+                // code points and are not valid `char` values, so a result
+                // there is not representable in `char` (§6.1).
+                llvm::Value* sgLo = builder_.CreateICmp(
+                    Cmp::ICMP_SGE, sum,
+                    llvm::ConstantInt::get(wideTy, 0xD800), "step.sglo");
+                llvm::Value* sgHi = builder_.CreateICmp(
+                    Cmp::ICMP_SLE, sum,
+                    llvm::ConstantInt::get(wideTy, 0xDFFF), "step.sghi");
+                bad = builder_.CreateOr(
+                    bad, builder_.CreateAnd(sgLo, sgHi, "step.sg"), "step.bad2");
+            }
+            emitGuardThrow(bad, "OverflowException");
+            // The result is representable in T, so the narrowing back to T's
+            // width is exact.
+            return builder_.CreateTrunc(sum, v->getType(), "step.i");
         }
         return nullptr;
     }
@@ -812,6 +1235,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #7299 (stdlib §9.5, v0.344): §9.5 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: char)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `char.Parse(16)`
+        // emitted
+        //   %str.len = load i64, i32 getelementptr inbounds nuw (%bz.string, i32 16, ...)
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, s, false)) return nullptr;
         llvm::Value* len = loadStringLen(s);
         llvm::Value* isOne = builder_.CreateICmpEQ(
             len, builder_.getInt64(1), "chp.one");
@@ -823,6 +1258,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #7299 (stdlib §9.5, v0.344): §9.5 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: char)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `char.Parse(16)`
+        // emitted
+        //   %str.len = load i64, i32 getelementptr inbounds nuw (%bz.string, i32 16, ...)
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, s, false)) return nullptr;
         // fix #2938 / §22.3: §22.3-admitted accessor targets (property /
         // indexer) bracket through `resolveOutAddrWithBracket`; the write-back
         // flushes at the normal-return exit below.
@@ -859,6 +1306,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #7299 (stdlib §9.5, v0.344): §9.5 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: char)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `char.Parse(16)`
+        // emitted
+        //   %str.len = load i64, i32 getelementptr inbounds nuw (%bz.string, i32 16, ...)
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, s, false)) return nullptr;
         llvm::Value* len = loadStringLen(s);
         llvm::Value* ok = builder_.CreateICmpEQ(
             len, builder_.getInt64(1), "chpon.ok");
@@ -877,6 +1336,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #7293 (stdlib §9.3, v0.344): the declared operand is a `string`
+        // (or the span overload's `ReadOnlyStringSpan`). This arm used to
+        // lower whatever it was handed into a string operand, so
+        // `decimal.TryParse(1.5, out m)` emitted
+        //   %str.data = load ptr, double 1.500000e+00, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED, the way the integer tower's
+        // `TryParse` arm drops one.
+        if (!isParseableOperand(*call.args[0].value, s, true)) return nullptr;
         // #5296 / stdlib §9.3 (v0.313, #1810): the span overload. This is the
         // arm the `decimal.TryParse` KEYWORD spelling reaches (the class-name
         // spelling has its own copy in LlvmBackend_Calls.cpp, fixed by the same
@@ -1137,8 +1607,30 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* start = lowerExpr(*call.args[argForParam[1]].value);
         llvm::Value* count = lowerExpr(*call.args[argForParam[2]].value);
         if (!arr || !start || !count) return nullptr;
-        llvm::Value* start64 = builder_.CreateSExt(start, i64(), "from.start");
-        llvm::Value* count64 = builder_.CreateSExt(count, i64(), "from.count");
+        // fix #7192 (§5.1, v0.343): widen the window's start/length BY THE
+        // SOURCE's signedness, through the emitter-scope `widenIntParam` helper
+        // — the same rule the sibling string arms use (#6639/#7104/#7169).
+        //
+        // This used to be a bare `CreateSExt(start, i64())`, so an UNSIGNED
+        // source's high bit was read as a sign bit: a `byte` 200 arrived as
+        // -56 and the bounds guard raised IndexOutOfRangeException on an
+        // in-range window. §5.1 admits `byte → int` as a LOSSLESS implicit
+        // conversion (the table row
+        // `| byte | short, ushort, int, uint, long, ulong, float, double, decimal |`),
+        // so a `byte` 200 IS the `int` 200, never -56.
+        //
+        // ⚠ The widening is a PREREQUISITE of the bounds guard below, not an
+        // extra: the guard must test the window's §5.1 value.
+        //
+        // The argument expressions are the ones the binding permutation
+        // selected (`call.args[argForParam[k]]`), so a REORDERED named-argument
+        // call widens the value that actually fills the parameter.
+        llvm::Value* start64 = widenIntParam(
+            call.args[argForParam[1]].value.get(), start, "from.start.s",
+            "from.start.z");
+        llvm::Value* count64 = widenIntParam(
+            call.args[argForParam[2]].value.get(), count, "from.count.s",
+            "from.count.z");
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
         llvm::Value* n = builder_.CreateCall(lenFn, {arr}, "from.n");
         // start in [0, n]; count >= 0; start + count <= n.
@@ -1249,11 +1741,52 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* cnt = lowerExpr(*call.args[cntArgIdx].value);
         if (!ch || !cnt) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* count64 = cnt->getType()->isIntegerTy(64)
-            ? cnt : builder_.CreateSExt(cnt, i64());
-        // Clamp negative counts to 0 (an empty string).
-        llvm::Value* neg = builder_.CreateICmpSLT(count64, builder_.getInt64(0));
-        count64 = builder_.CreateSelect(neg, builder_.getInt64(0), count64);
+        // fix #7120 (§5.1, §9.6, v0.343): widen the count to i64 BY THE
+        // SOURCE'S SIGNEDNESS, and RAISE on a negative count.
+        //
+        // §9.6 (v0.343) declares the count contract on the static
+        // `Repeat(c: char, count: int)`: "count < 0 raises
+        // ArgumentOutOfRangeException; count = 0 is \"\"". This arm used to
+        // CLAMP a negative count to 0 (an empty string) instead of raising,
+        // so the STATIC spelling silently disagreed with the INSTANCE
+        // spelling, which corrupted memory.
+        //
+        // ⚠ The widening is a PREREQUISITE of the guard, not an extra: the
+        // guard must test the count's §5.1 value, and §5.1 admits
+        // `byte → int` as a LOSSLESS conversion — an unsigned source must
+        // therefore ZERO-extend (a `byte` 200 is the int 200, never -56).
+        // The arm's old bare `CreateSExt` read the `byte` 200 as -56 and the
+        // clamp then hid it as 0 (that is the symptom #7117 reports; this
+        // widening repairs it). The count is now widened ONCE, and the SAME
+        // value is tested by the guard and used as the length.
+        //
+        // fix #7169 (§9.6, v0.343): the widening, the comparison and the
+        // raise are now the SHARED §9.6 count contract
+        // (`emitSection96CountContract`, in the emitter header) — the SAME
+        // function the instance `Repeat` arm and the `Pad*` arm call. This
+        // arm used to RE-IMPLEMENT the §5.1 widening inline (the shared
+        // helper was a local lambda in `LlvmBackend_String.cpp`, unreachable
+        // from here), and the pair drifted: #7104 fixed the instance arm's
+        // widening, #7117 filed this arm's, and #7120 had to repair this
+        // arm's widening AGAIN to make its own new guard correct. One
+        // definition, one rule.
+        //
+        // §9.6 (v0.343): "count < 0 raises ArgumentOutOfRangeException". The
+        // guard is emitted BEFORE the `malloc` below, so a negative count
+        // allocates nothing. `count = 0` is NOT an error (§9.6): the result
+        // is the empty string.
+        //
+        // The release set is EMPTY here: `Repeat(c: char, count: int)` holds
+        // no +1 string producer (a `char` and an `int` are not producers), so
+        // its throw edge has nothing to release — which is exactly why this
+        // arm's guard was a plain `emitGuardThrow`. The future
+        // `Repeat(unit: string, count: int)` overload (#7129/#7131) takes a
+        // `string` argument, and passes the `unit` argument's producer here
+        // so its throw edge releases it (§28.9/§31.4 — the #7159 shape) by
+        // construction, not by remembering.
+        llvm::Value* count64 = emitSection96CountContract(
+                call.args[cntArgIdx].value.get(), cnt, {},
+                "rep.s64", "rep.z64", "rep.neg");
         llvm::Value* chI8 = builder_.CreateTrunc(
             ch->getType()->isIntegerTy(32) ? ch
                 : builder_.CreateSExt(ch, i32()), i32());  // keep i32 for memset
@@ -1350,10 +1883,40 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         auto* fty = (pt == P::Float)
             ? llvm::Type::getFloatTy(llvm_)
             : llvm::Type::getDoubleTy(llvm_);
-        if (!a->getType()->isFloatingPointTy())
-            a = builder_.CreateSIToFP(a, fty, "ieee.a.fp");
-        if (!b->getType()->isFloatingPointTy())
-            b = builder_.CreateSIToFP(b, fty, "ieee.b.fp");
+        // fix #7251 (spec §5.1, v0.344): an INTEGER operand at a `double`
+        // parameter converts by VALUE, so an UNSIGNED source must use
+        // `uitofp` — the instruction that preserves the value — and never
+        // `sitofp`, which SIGN-EXTENDS the source's bit pattern. §5.1's
+        // widening table admits `byte`/`ushort`/`uint`/`ulong`/`char` at
+        // `float`/`double`, and stdlib §9.2 declares
+        // `IeeeEquals(a: double, b: double): bool` and
+        // `BitwiseEquals(a: double, b: double): bool`, so an unsigned
+        // argument DOES reach these parameters. The `uint` 4000000000 (bit
+        // pattern 0xEE6B2800) was read as the `int32` -294967296, so
+        // `Double.IeeeEquals(4000000000u, 4e9)` compared -294967296.0 with
+        // 4e9 and printed `False` — the two operands are the same number.
+        //
+        // `BitwiseEquals` needs no separate treatment: stdlib §9.2 declares
+        // its parameters as `double`, so §5.1's VALUE conversion happens
+        // FIRST and the member then compares the two `double`s' BIT
+        // PATTERNS. The integer 4000000000 converts to the `double` 4e9,
+        // whose bit pattern is the double's, so the answer is `True` — the
+        // same as `BitwiseEquals(4e9, 4e9)`. The `+0.0`/`-0.0` and NaN-payload
+        // distinctions the member draws are distinctions between the
+        // CONVERTED doubles and are untouched.
+        //
+        // The SIGNED path is untouched: an `int`/`long` operand keeps the
+        // `sitofp` it always had, so a negative signed operand keeps its
+        // sign and every signed result is bit-for-bit what it was.
+        auto ieeeToFp = [&](llvm::Value* v, const ast::Expr* srcE,
+                            const char* nm) -> llvm::Value* {
+            if (v->getType()->isFloatingPointTy()) return v;
+            if (srcE && isUnsignedTargetExpr(*srcE))
+                return builder_.CreateUIToFP(v, fty, std::string(nm) + ".uitofp");
+            return builder_.CreateSIToFP(v, fty, std::string(nm) + ".sitofp");
+        };
+        a = ieeeToFp(a, call.args[0].value.get(), "ieee.a");
+        b = ieeeToFp(b, call.args[1].value.get(), "ieee.b");
         if (m == "IeeeEquals") {
             // stdlib §9.2: fcmp oeq — ordered equal → false for any NaN.
             return builder_.CreateFCmpOEQ(a, b, "ieee.eq");
@@ -1365,6 +1928,79 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return builder_.CreateICmpEQ(ai, bi, "bw.eq");
     }
 
+    // stdlib §9.2 (v0.344, #7310): the non-finite spellings are matched
+    // EXACTLY — the whole input must be "NaN", "Infinity" or "-Infinity",
+    // case-sensitively.  strtod/strtof accept a whole FAMILY of inf/nan
+    // spellings in any case ("inf", "infinity", "nan", "NAN", "+Infinity",
+    // "-NaN"), so the parse arms below must not decide by sniffing the first
+    // character.  The comparison is made against the INPUT TEXT, never
+    // against the parsed value: a finite spelling that overflows to an
+    // infinity ("1e999") must still raise OverflowException, not
+    // FormatException.
+    auto emitExactNonFiniteSpelling = [&](llvm::Value* textPtr) -> llvm::Value* {
+        auto* strcmpFn = declareC("strcmp", i32(), {ptrTy(), ptrTy()});
+        static const char* kSpellings[3] = {"NaN", "Infinity", "-Infinity"};
+        llvm::Value* any = nullptr;
+        for (int k = 0; k < 3; ++k) {
+            llvm::Constant* lit =
+                llvm::ConstantDataArray::getString(llvm_, kSpellings[k], true);
+            unsigned idx = stringLiteralIdx_++;
+            auto* gv = new llvm::GlobalVariable(*module_, lit->getType(), true,
+                llvm::GlobalValue::PrivateLinkage, lit,
+                ".bz.fpnf." + std::to_string(idx));
+            llvm::Value* eq = builder_.CreateICmpEQ(
+                builder_.CreateCall(strcmpFn, {textPtr, gv}),
+                builder_.getInt32(0), "fpnf.eq");
+            any = any ? builder_.CreateOr(any, eq, "fpnf.any") : eq;
+        }
+        return any;
+    };
+
+    // stdlib §9.2 (v0.344, #7341): the grammar is "optionally a `.` followed by
+    // ONE OR MORE DIGITS", so a point with NO digit after it is a grammar
+    // violation.  The arms' "the LAST character strtod consumed must not be
+    // '.', 'e', 'E', '+' or '-'" test looks only at the FINAL character, so
+    // "5.e3" - whose last character is a digit - was admitted (the point was
+    // rejected only at the END of the input, as in "5." and "5.e").  This
+    // decides the rule directly: the input must have NO '.', or the character
+    // IMMEDIATELY AFTER the first '.' must be a digit.  Only the FIRST '.'
+    // can matter - a second one would have stopped strtod ("1.2.3"), which
+    // the trailing-garbage test rejects already.  The comparison is against
+    // the INPUT TEXT, so it does not disturb the range paragraph ("1e999"
+    // still reports out-of-range).  The span form carries the string form's
+    // contract (§9.2: "the span forms carry the string forms' contract"), so
+    // all three arms below share this one helper.
+    auto emitPointFollowedByDigit = [&](llvm::Value* textPtr) -> llvm::Value* {
+        auto* i8 = llvm::Type::getInt8Ty(llvm_);
+        auto* strchrFn = declareC("strchr", ptrTy(), {ptrTy(), i32()});
+        llvm::Value* dotPtr = builder_.CreateCall(
+            strchrFn, {textPtr, builder_.getInt32('.')}, "pfd.dot");
+        llvm::Value* hasDot = builder_.CreateNot(
+            builder_.CreateIsNull(dotPtr), "pfd.has");
+        // The byte AFTER the point.  With no point at all the address degrades
+        // to the FIRST byte of the input, which is always in bounds, so the
+        // load never runs off the end of the buffer (the parse input is
+        // NUL-terminated: the string buffer carries a terminator slot and
+        // parseWindow materializes a terminated window).
+        llvm::Value* dotOrText = builder_.CreateSelect(
+            hasDot, dotPtr, textPtr, "pfd.sel");
+        llvm::Value* dotIdx = builder_.CreateSub(
+            builder_.CreatePtrToInt(dotOrText, i64()),
+            builder_.CreatePtrToInt(textPtr, i64()), "pfd.idx");
+        llvm::Value* afterAddr = builder_.CreateGEP(
+            i8, textPtr,
+            builder_.CreateAdd(dotIdx, builder_.getInt64(1), "pfd.one"),
+            "pfd.after");
+        llvm::Value* loadAddr = builder_.CreateSelect(
+            hasDot, afterAddr, textPtr, "pfd.addr");
+        llvm::Value* afterChar = builder_.CreateLoad(i8, loadAddr, "pfd.ch");
+        llvm::Value* afterIsDigit = builder_.CreateICmpULT(
+            builder_.CreateSub(afterChar, llvm::ConstantInt::get(i8, '0')),
+            llvm::ConstantInt::get(i8, 10), "pfd.dig");
+        return builder_.CreateOr(
+            builder_.CreateNot(hasDot), afterIsDigit, "pfd.ok");
+    };
+
     // double.TryParse / float.TryParse(s, out result): bool — stdlib §9.2
     // #1227: on failure, out result receives the default (0.0), not the partial
     // parse value (e.g. 1.5 for "1.5abc"). Per §9.3: "TryParse returns false
@@ -1374,6 +2010,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         (pt == P::Double || pt == P::Float)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7293 (stdlib §9.2, v0.344): the declared operand is a `string`
+        // (or the span overload's `ReadOnlyStringSpan`). This arm used to
+        // lower whatever it was handed into a string operand, so
+        // `double.TryParse(1.5, out d)` emitted
+        //   %str.data = load ptr, double 1.500000e+00, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED, the way the integer tower's
+        // `TryParse` arm drops one.
+        if (!isParseableOperand(*call.args[0].value, strVal, true)) return nullptr;
         // #5296 / stdlib §9.2 (v0.313, #1810): the span overload — see the
         // integer tower arm above for the full rationale.
         auto win = parseWindow(strVal);
@@ -1423,31 +2070,43 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::ConstantInt::get(i8TyD, '+')),
             builder_.CreateICmpEQ(fcD,
                 llvm::ConstantInt::get(i8TyD, '-')), "tryp.isSignD");
-        llvm::Value* infMaskD = builder_.CreateOr(
-            builder_.CreateOr(
-                builder_.CreateICmpEQ(fcD,
-                    llvm::ConstantInt::get(i8TyD, 'i')),
-                builder_.CreateICmpEQ(fcD,
-                    llvm::ConstantInt::get(i8TyD, 'I'))),
-            builder_.CreateOr(
-                builder_.CreateICmpEQ(fcD,
-                    llvm::ConstantInt::get(i8TyD, 'n')),
-                builder_.CreateICmpEQ(fcD,
-                    llvm::ConstantInt::get(i8TyD, 'N'))),
-            "tryp.infMaskD");
-        llvm::Value* notDigitD = builder_.CreateAnd(
-            builder_.CreateAnd(
-                builder_.CreateNot(isSignD),
-                builder_.CreateNot(infMaskD)),
-            builder_.CreateICmpUGE(
-                builder_.CreateSub(fcD, llvm::ConstantInt::get(i8TyD, '0')),
-                llvm::ConstantInt::get(i8TyD, 10)), "tryp.ndigD");
         // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
         // per emitFloatParseOverflow: skip the optional sign before checking
         // for the hex form.  off = 0 if no sign, 1 if sign present.
         llvm::Value* offD = builder_.CreateZExt(isSignD, i64(), "tryp.offD");
         llvm::Value* fcOffD = builder_.CreateLoad(i8TyD,
             builder_.CreateGEP(i8TyD, strData, offD, "tryp.fcptr"), "tryp.fcOffD");
+        // stdlib §9.2 (v0.344, #7310): the non-finite spellings stand OUTSIDE
+        // the numeric grammar and are matched exactly, so the only thing this
+        // mask may decide is whether the numeric part STARTS with one of the
+        // non-finite letters ('i'/'I'/'n'/'N').  Whether the input IS one of
+        // the three admitted spellings is decided by the exact comparison
+        // below — a first-character sniff alone would admit "inf",
+        // "infinity", "nan", "INFINITY", "+Infinity" and "-NaN".
+        llvm::Value* nonFiniteLetterD = builder_.CreateOr(
+            builder_.CreateOr(
+                builder_.CreateICmpEQ(fcOffD,
+                    llvm::ConstantInt::get(i8TyD, 'i')),
+                builder_.CreateICmpEQ(fcOffD,
+                    llvm::ConstantInt::get(i8TyD, 'I'))),
+            builder_.CreateOr(
+                builder_.CreateICmpEQ(fcOffD,
+                    llvm::ConstantInt::get(i8TyD, 'n')),
+                builder_.CreateICmpEQ(fcOffD,
+                    llvm::ConstantInt::get(i8TyD, 'N'))),
+            "tryp.nfLetterD");
+        // stdlib §9.2 (v0.344, #7325): the digit rule applies to the
+        // character AFTER the optional sign — §9.2's grammar is "an optional
+        // sign (`+` or `-`), THEN one or more of the digits 0-9" — so a
+        // SIGNED BARE POINT ("+.5") has NO digit at all and is rejected,
+        // exactly as the unsigned bare point (".5") is.  This test used to
+        // read the FIRST character and to be WAIVED outright whenever that
+        // character was a sign, so a signed bare point slipped through.
+        llvm::Value* notDigitD = builder_.CreateAnd(
+            builder_.CreateNot(nonFiniteLetterD),
+            builder_.CreateICmpUGE(
+                builder_.CreateSub(fcOffD, llvm::ConstantInt::get(i8TyD, '0')),
+                llvm::ConstantInt::get(i8TyD, 10)), "tryp.ndigD");
         llvm::Value* isLeadingZeroD = builder_.CreateICmpEQ(
             fcOffD, llvm::ConstantInt::get(i8TyD, '0'), "tryp.lzeroD");
         // stdlib §9.2: the second character is read at position `off+1` when
@@ -1497,6 +2156,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                     builder_.CreateICmpEQ(lastCharD,
                         llvm::ConstantInt::get(i8TyD, '-')))),
             "tryp.blc");
+        // stdlib §9.2 (v0.344, #7310): a numeric part that starts with a
+        // non-finite letter is admitted only when the WHOLE input is exactly
+        // one of the three spellings §9.2 admits ("NaN", "Infinity",
+        // "-Infinity"); every other inf/nan spelling raises FormatException.
+        llvm::Value* exactNonFiniteD = emitExactNonFiniteSpelling(strData);
+        llvm::Value* nonFiniteOkD = builder_.CreateOr(
+            builder_.CreateNot(nonFiniteLetterD),
+            exactNonFiniteD, "tryp.nfok");
+        // stdlib §9.2 (v0.344, #7341): a point with NO digit after it is a
+        // grammar violation, whatever exponent follows it.
+        llvm::Value* pointOkD = emitPointFollowedByDigit(strData);
         llvm::Value* fmtOkD = builder_.CreateAnd(
             builder_.CreateAnd(
                 builder_.CreateAnd(
@@ -1504,8 +2174,12 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         builder_.CreateNot(fcWsD),
                         builder_.CreateNot(notDigitD)),
                     builder_.CreateAnd(advD, atNulD)),
-                builder_.CreateNot(badLastCharD)),
-            builder_.CreateNot(isHexFloatD),
+                builder_.CreateAnd(
+                    builder_.CreateNot(badLastCharD),
+                    nonFiniteOkD)),
+            builder_.CreateAnd(
+                builder_.CreateNot(isHexFloatD),
+                pointOkD),
             "tryp.fmtok");
         // stdlib §9.2 (v0.314, #5199/#5368): a finite spelling that rounds to a
         // non-finite value is out of range -> false (before the out store, so a
@@ -1544,6 +2218,31 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
          pt == P::SByte)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7285 (stdlib §9.1, v0.344): the declared operand is a
+        // `string` (or the span overload's `ReadOnlyStringSpan`). Anything
+        // else is NOT a parseable operand, and parseWindow's
+        // loadStringData on it emitted `%str.data = load ptr, i32 16` —
+        // malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A `string` lowers to a pointer
+        // and a span to the {ptr,i32,i32} record (isStringSpanValue), so
+        // the shape test discriminates them from an `int`, a `bool`, a
+        // `double` and a `decimal` operand exactly. A non-parseable
+        // operand is DROPPED, the way the `Parse(s, radix)` arm below
+        // drops a non-string first argument.
+        //
+        // fix #7290 (stdlib §9.1, v0.344): the SHAPE test above also
+        // admits a CLASS INSTANCE, because a class instance lowers to a
+        // plain pointer, exactly like a `string`. The arm then read the
+        // OBJECT'S OWN BYTES as a string descriptor and parsed them as
+        // TEXT — foreign memory, silently, with no abort and no
+        // diagnostic. So the guard now also requires the operand to BE a
+        // string: statically the primitive `string`, or — for the span
+        // overload — the {ptr,i32,i32} `ReadOnlyStringSpan` record of §3.3.
+        // The two arms of the family now agree: the three-argument
+        // `TryParse(s, radix, out result)` form below already refused a
+        // non-`string` first argument on the STATIC type alone (stdlib
+        // §9.1 declares no span overload of the radix form).
+        if (!isParseableOperand(*call.args[0].value, strVal, true)) return nullptr;
         // #5296 / stdlib §9.1 (v0.313, #1810): the span overload. A
         // `ReadOnlyStringSpan` is the {Source, Start, Length} record (§3.3), not
         // a string pointer, so `loadStringData` on it was a StructGEP of a
@@ -1648,6 +2347,157 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return ok;
     }
 
+    // stdlib §9.1: `TryParse(s: string, radix: int, out result: int): bool`
+    // — the RADIX form of the integer TryParse family (shape (c) of the §1
+    // Try convention: false exactly where `Parse(s, radix)` raises, and the
+    // out parameter receives the default).
+    //
+    // fix #7285 (stdlib §9.1, v0.344): the form was NOT lowered at all — a
+    // 3-argument call matched no arm, so the whole call was dropped and the
+    // `out` slot kept its zero-initialized value (the #2434 "failed to
+    // lower" warning): `int.TryParse("ff", 16, out v)` returned false with
+    // v = 0 for EVERY input. The radix argument is bound by §5.1 exactly as
+    // at the `Parse(s, radix)` site below, and the two forms agree.
+    //
+    // fix #7285 (stdlib §9.1, v0.344) — THE FIRST ARGUMENT. The declared
+    // form is `TryParse(s: string, radix: int, out result: int): bool`, and
+    // stdlib §9.1 declares NO span overload of the radix form, so the first
+    // argument is a `string` and nothing else. This arm used to lower
+    // whatever it was handed into a string operand, so `int.TryParse(16, 16,
+    // out v)` emitted `%str.data = load ptr, i32 16` — malformed IR, and
+    // the compiler ABORTED with "IR verification failed (malformed IR
+    // emitted)". The sibling `Parse(s, radix)` arm below already guards its
+    // first argument exactly this way (and DROPS the call), so the same
+    // guard here restores the behaviour this arm had before it existed —
+    // the 3-argument form matched no arm at all and was dropped.
+    //
+    // The guard comes FIRST, before the radix's own check: a call whose
+    // first argument is not a string is not a `TryParse` call at all, so it
+    // must not acquire a radix diagnostic either — that would be a NEW
+    // rejection of a program that compiled before.
+    if (m == "TryParse" && call.args.size() == 3 &&
+        call.args[0].value && call.args[1].value &&
+        (call.args[2].value || call.args[2].isDiscard) &&
+        (pt == P::Int || pt == P::Long || pt == P::UInt || pt == P::ULong ||
+         pt == P::Short || pt == P::UShort || pt == P::Byte ||
+         pt == P::SByte)) {
+        {
+            auto* sTy = ctx_.exprType(*call.args[0].value);
+            if (!sTy || sTy->kind != sema::TypeRef::Kind::Primitive ||
+                sTy->primitive != P::String)
+                return nullptr;
+        }
+        const ParseRadixBinding rb =
+            parseRadixBinding(ctx_, *call.args[1].value);
+        if (!rb.binds) {
+            if (!rb.unknown)
+                ctx_.diagnostics().report(
+                    Severity::Error,
+                    call.args[1].value->span.begin,
+                    "no matching overload of `" +
+                        std::string(parseRadixTypeName(pt)) +
+                        ".TryParse` — stdlib §9.1 declares "
+                        "`TryParse(s: string, radix: int, out result: " +
+                        std::string(parseRadixTypeName(pt)) +
+                        "): bool`, "
+                        "so the `radix` argument must be an `int` "
+                        "(stdlib §9.1; §5.1)" + parseRadixWhy(rb));
+            return nullptr;
+        }
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        auto win = parseWindow(strVal);
+        llvm::Value* strData = win.data;
+        // The `out` slot — §22.3 (see the 2-argument TryParse arm above for
+        // the accessor-bracket discipline).
+        llvm::Type* et = nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveBuiltinOutArg(
+            call.args[2], lowerPrimitive(pt), et, outArgs);
+        if (!outAddr) {
+            if (win.owned) emitStringRelease(win.owned);
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
+        // The radix, CONVERTED to the `int` the parameter declares (§5.1) —
+        // the same conversion the `Parse(s, radix)` site performs.
+        llvm::Value* radix = nullptr;
+        if (rb.value) {
+            radix = builder_.getInt32(static_cast<int32_t>(*rb.value));
+        } else {
+            radix = lowerExpr(*call.args[1].value);
+            if (!radix) return nullptr;
+            if (radix->getType()->isIntegerTy() &&
+                radix->getType()->getIntegerBitWidth() < 32)
+                radix = rb.signedArg ? builder_.CreateSExt(radix, i32())
+                                     : builder_.CreateZExt(radix, i32());
+        }
+        // strtoll/strtoull(data, &endptr, radix) — the value and the end
+        // pointer, for the format guard below.
+        const bool isULongR = (pt == P::ULong);
+        auto* strtoFnR = isULongR
+            ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
+            : declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
+        auto* endSlotR = entryAlloca(ptrTy());
+        llvm::Value* val64 = builder_.CreateCall(
+            strtoFnR, {strData, endSlotR, radix}, "tryp.val");
+        llvm::Value* endPtrR = builder_.CreateLoad(ptrTy(), endSlotR);
+        // ok = first-char not whitespace AND (endPtr != data) AND
+        // (*endPtr == '\0') — the §9.3 strict input grammar, the same guard
+        // the 2-argument TryParse arm and the `Parse(s, radix)` arm apply.
+        auto* i8TyR = llvm::Type::getInt8Ty(llvm_);
+        llvm::Value* fcR = builder_.CreateLoad(i8TyR, strData, "tryp.fc");
+        llvm::Value* fcWsR = builder_.CreateICmpULE(
+            fcR, llvm::ConstantInt::get(i8TyR, ' '), "tryp.fws");
+        llvm::Value* advR = builder_.CreateICmpNE(endPtrR, strData, "tryp.adv");
+        llvm::Value* endChR = builder_.CreateLoad(i8TyR, endPtrR, "tryp.end");
+        llvm::Value* atNulR = builder_.CreateICmpEQ(
+            endChR, llvm::ConstantInt::get(i8TyR, 0), "tryp.nul");
+        llvm::Value* ok = builder_.CreateAnd(
+            builder_.CreateNot(fcWsR),
+            builder_.CreateAnd(advR, atNulR), "tryp.ok");
+        // ulong additionally rejects a leading '-' (strtoull silently
+        // negates it) — the 2-argument TryParse arm's rule.
+        if (isULongR) {
+            llvm::Value* fcNeg = builder_.CreateICmpEQ(
+                fcR, llvm::ConstantInt::get(i8TyR, '-'), "tryp.neg");
+            ok = builder_.CreateAnd(ok, builder_.CreateNot(fcNeg), "tryp.okU");
+        }
+        // Store result: 0 on failure, the parsed value on success.
+        if (pt == P::Long || pt == P::ULong) {
+            llvm::Value* zero64 = builder_.getInt64(0);
+            llvm::Value* sel64 = builder_.CreateSelect(ok, val64, zero64, "tryp.sel");
+            storeTryParseOut(outAddr, et, sel64, ok);
+        } else {
+            // #1134 / stdlib §9.1: TryParse must return FALSE for an
+            // out-of-range value, not silently wrap the low bits.
+            int64_t rlo, rhi;
+            switch (pt) {
+                case P::Int:    rlo = INT32_MIN; rhi = INT32_MAX;  break;
+                case P::UInt:   rlo = 0;         rhi = UINT32_MAX; break;
+                case P::Short:  rlo = INT16_MIN; rhi = INT16_MAX;  break;
+                case P::UShort: rlo = 0;         rhi = UINT16_MAX; break;
+                case P::Byte:   rlo = 0;         rhi = UINT8_MAX;  break;
+                default:        rlo = INT8_MIN;  rhi = INT8_MAX;   break; // SByte
+            }
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateICmpSGE(
+                    val64, llvm::ConstantInt::getSigned(i64(), rlo)),
+                builder_.CreateICmpSLE(
+                    val64, llvm::ConstantInt::getSigned(i64(), rhi)),
+                "tryp.inrange");
+            ok = builder_.CreateAnd(ok, inRange, "tryp.ok2");
+            llvm::Type* tt = lowerPrimitive(pt);
+            llvm::Value* truncV = builder_.CreateTrunc(val64, tt);
+            llvm::Value* zeroV = llvm::ConstantInt::get(tt, 0);
+            llvm::Value* selV = builder_.CreateSelect(ok, truncV, zeroV, "tryp.sel");
+            storeTryParseOut(outAddr, et, selV, ok);
+        }
+        if (win.owned) emitStringRelease(win.owned);
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
+        return ok;
+    }
+
     // §9.4 / issue #654: bool.TryParse(s: string, out result: bool): bool.
     // Accepts "true"/"false" case-insensitively; everything else → false, ok=false.
     // Unlike Convert.ToBoolean, "1" is NOT accepted (only the two canonical words).
@@ -1655,6 +2505,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7299 (stdlib §9.4, v0.344): §9.4 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: bool)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `bool.Parse(16)`
+        // emitted
+        //   %str.data = load ptr, i32 16, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, strVal, false)) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
         // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
@@ -1705,6 +2567,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7299 (stdlib §9.4, v0.344): §9.4 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: bool)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `bool.Parse(16)`
+        // emitted
+        //   %str.data = load ptr, i32 16, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, strVal, false)) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
         auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
         llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
@@ -1735,6 +2609,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // fix #7299 (stdlib §9.4, v0.344): §9.4 declares `Parse(s: string)`,
+        // `TryParse(s: string, out result: bool)` and `ParseOrNull(s: string)` — and
+        // NO `ReadOnlyStringSpan` overload, so an operand that is not a
+        // `string` is not a parseable operand. This arm used to lower
+        // whatever it was handed into a string operand, so `bool.Parse(16)`
+        // emitted
+        //   %str.data = load ptr, i32 16, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A class instance (a pointer, like a
+        // `string`) was read as TEXT out of the object's own bytes. A
+        // non-parseable operand is DROPPED — the shared guard above.
+        if (!isParseableOperand(*call.args[0].value, strVal, false)) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
         auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
         llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
@@ -1782,13 +2668,57 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             (pt == P::Int || pt == P::UInt || pt == P::Short ||
              pt == P::UShort || pt == P::Byte || pt == P::SByte ||
              pt == P::Long || pt == P::ULong)) {
+            // fix #7285 (spec §5.1 / §22.6, v0.344): the `radix: int`
+            // parameter (stdlib §9.1) admits the argument by IDENTITY, by
+            // §5.1's WIDENING table, or by §5.1's CONSTANT NARROWING. An
+            // argument that binds to NO declared parameter is a COMPILE
+            // ERROR (§22.6: "If no candidate is applicable at all … the call
+            // is a compile error with no candidates cited") — never a
+            // silently degraded call, and never malformed IR.
+            //
+            // The lowering this replaces truncated the radix to i32 whatever
+            // its type: a `bool` (i1) radix produced `trunc i1 to i32` and a
+            // `byte` (i8) radix produced `trunc i8 to i32` — a trunc to a
+            // WIDER type, which is malformed IR and ABORTED the compiler
+            // ("IR verification failed"); a `double`/`decimal`/`string` radix
+            // produced `trunc double to i32`, equally malformed; a NULLABLE
+            // radix produced `trunc {i8, i32} to i32`, equally malformed; and
+            // a `long`/`ulong` radix was silently truncated to 32 bits.
+            const ParseRadixBinding rb =
+                parseRadixBinding(ctx_, *call.args[1].value);
+            if (!rb.binds) {
+                if (!rb.unknown)
+                    ctx_.diagnostics().report(
+                        Severity::Error,
+                        call.args[1].value->span.begin,
+                        "no matching overload of `" +
+                            std::string(parseRadixTypeName(pt)) +
+                            ".Parse` — stdlib §9.1 declares "
+                            "`Parse(s: string, radix: int): " +
+                            std::string(parseRadixTypeName(pt)) +
+                            "`, so the `radix` "
+                            "argument must be an `int` (stdlib §9.1; §5.1)" +
+                            parseRadixWhy(rb));
+                return nullptr;
+            }
             llvm::Value* sArg = lowerExpr(*call.args[0].value);
-            llvm::Value* radix = lowerExpr(*call.args[1].value);
-            if (!sArg || !radix) return nullptr;
+            if (!sArg) return nullptr;
             llvm::Value* data = loadStringData(sArg);
-            // radix is `int` (i32) — strtoll/strtoull `base` parameter.
-            if (!radix->getType()->isIntegerTy(32))
-                radix = builder_.CreateTrunc(radix, i32());
+            // The radix, CONVERTED to the `int` the parameter declares (§5.1):
+            // a widened value is EXTENDED (a trunc to a wider type is
+            // malformed IR), and a constant-narrowed value IS its folded
+            // value — §5.1's constant narrowing converts BY VALUE.
+            llvm::Value* radix = nullptr;
+            if (rb.value) {
+                radix = builder_.getInt32(static_cast<int32_t>(*rb.value));
+            } else {
+                radix = lowerExpr(*call.args[1].value);
+                if (!radix) return nullptr;
+                if (radix->getType()->isIntegerTy() &&
+                    radix->getType()->getIntegerBitWidth() < 32)
+                    radix = rb.signedArg ? builder_.CreateSExt(radix, i32())
+                                         : builder_.CreateZExt(radix, i32());
+            }
             // strtoull for the unsigned 64-bit width (so the full magnitude is
             // captured); strtoll for everything else, range-checked below.
             bool isULongR = (pt == P::ULong);
@@ -1858,6 +2788,21 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (m == "Parse" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
+        // fix #7294 (stdlib §9.1 / §9.2 / §9.3, v0.344): the declared
+        // operand is a `string` (or the span overload's `ReadOnlyStringSpan`).
+        // This arm had NO first-argument guard at all, and it did not even
+        // lower the operand into a string operand — it fell through to
+        // `return arg`, so `int.Parse(true)` handed the `bool` back as the
+        // parse result and `int.Parse(o)` handed back the OBJECT'S POINTER
+        // (the program printed a heap address). For the `decimal` receiver
+        // the operand DID reach the parser: `decimal.Parse(o)` read the
+        // object's own bytes as a string descriptor and parsed them as TEXT
+        // — foreign memory — and `decimal.Parse(1.5)` emitted
+        //   %str.data = load ptr, double 1.500000e+00, align 8
+        // — malformed IR, and the compiler ABORTED with "IR verification
+        // failed (malformed IR emitted)". A non-parseable operand is
+        // DROPPED, the way the `Parse(s, radix)` arm drops one.
+        if (!isParseableOperand(*call.args[0].value, arg, true)) return nullptr;
         // #747 R42: `decimal.Parse(s)` reaches this primitive handler via the
         // lowercase keyword receiver (pt==Decimal). Route it to bz_decimal_parse
         // exactly like `Decimal.Parse` (§6.4 / fix #521); without this it fell
@@ -2005,32 +2950,47 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         llvm::ConstantInt::get(i8TyF, '+')),
                     builder_.CreateICmpEQ(fcF,
                         llvm::ConstantInt::get(i8TyF, '-')), "parse.isSignF");
-                // Detect "inf" / "INF" / "INF" spellings (case-insensitive).
-                llvm::Value* infMask = builder_.CreateOr(
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'i')),
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'I'))),
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'n')),
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'N'))),
-                    "parse.infMask");
-                llvm::Value* notDigitF = builder_.CreateAnd(
-                    builder_.CreateAnd(
-                        builder_.CreateNot(isSignF),
-                        builder_.CreateNot(infMask)),
-                    builder_.CreateICmpUGE(
-                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
-                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
                 // per emitFloatParseOverflow: skip the optional sign before checking
                 // for the hex form.  off = 0 if no sign, 1 if sign present.
                 llvm::Value* offF = builder_.CreateZExt(isSignF, i64(), "parse.offF");
                 llvm::Value* fcOffF = builder_.CreateLoad(i8TyF,
                     builder_.CreateGEP(i8TyF, data, offF, "parse.fcptr"), "parse.fcOffF");
+                // stdlib §9.2 (v0.344, #7310): the non-finite spellings stand
+                // OUTSIDE the numeric grammar and are matched exactly, so this
+                // mask may only decide whether the numeric part STARTS with
+                // one of the non-finite letters ('i'/'I'/'n'/'N').  Whether the
+                // input IS one of the three admitted spellings is decided by
+                // the exact comparison below — a first-character sniff alone
+                // would admit "inf", "infinity", "nan", "INFINITY",
+                // "+Infinity" and "-NaN".
+                llvm::Value* nonFiniteLetter = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'i')),
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'I'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'n')),
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'N'))),
+                    "parse.nfLetter");
+                // stdlib §9.2 (v0.344, #7325): the digit rule applies to the
+                // character AFTER the optional sign — §9.2's grammar is "an
+                // optional sign (`+` or `-`), THEN one or more of the digits
+                // 0-9" — so a SIGNED BARE POINT ("+.5") has NO digit at all
+                // and is rejected, exactly as the unsigned bare point (".5")
+                // is.  This test used to read the FIRST character and to be
+                // WAIVED outright whenever that character was a sign, so a
+                // signed bare point slipped through.  Both the string form
+                // and the span form carry the same contract (§9.2: "the span
+                // forms carry the string forms' contract").
+                llvm::Value* notDigitF = builder_.CreateAnd(
+                    builder_.CreateNot(nonFiniteLetter),
+                    builder_.CreateICmpUGE(
+                        builder_.CreateSub(fcOffF, llvm::ConstantInt::get(i8TyF, '0')),
+                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
                     fcOffF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
                 // stdlib §9.2: the second character is read at position `off+1` when
@@ -2084,6 +3044,18 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                             builder_.CreateICmpEQ(lastChar,
                                 llvm::ConstantInt::get(i8TyF, '-')))),
                     "parse.blc");
+                // stdlib §9.2 (v0.344, #7310): a numeric part that starts with a
+                // non-finite letter is admitted only when the WHOLE input is
+                // exactly one of the three spellings §9.2 admits ("NaN",
+                // "Infinity", "-Infinity"); every other inf/nan spelling
+                // raises FormatException.
+                llvm::Value* exactNonFinite = emitExactNonFiniteSpelling(data);
+                llvm::Value* nonFiniteOk = builder_.CreateOr(
+                    builder_.CreateNot(nonFiniteLetter),
+                    exactNonFinite, "parse.nfok");
+                // stdlib §9.2 (v0.344, #7341): a point with NO digit after it
+                // is a grammar violation, whatever exponent follows it.
+                llvm::Value* pointOk = emitPointFollowedByDigit(data);
                 llvm::Value* validF = builder_.CreateAnd(
                     builder_.CreateAnd(
                         builder_.CreateAnd(
@@ -2091,8 +3063,12 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                                 builder_.CreateNot(fcWsF),
                                 builder_.CreateNot(notDigitF)),
                             builder_.CreateAnd(advF, atNulF)),
-                        builder_.CreateNot(badLastChar)),
-                    builder_.CreateNot(isHexFloatF),
+                        builder_.CreateAnd(
+                            builder_.CreateNot(badLastChar),
+                            nonFiniteOk)),
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isHexFloatF),
+                        pointOk),
                     "parse.vfmtF");
                 emitGuardThrow(builder_.CreateNot(validF, "parse.fmtbadF"),
                                "FormatException");
@@ -2204,25 +3180,6 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                         llvm::ConstantInt::get(i8TyF, '+')),
                     builder_.CreateICmpEQ(fcF,
                         llvm::ConstantInt::get(i8TyF, '-')), "parse.isSignF");
-                llvm::Value* infMask = builder_.CreateOr(
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'i')),
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'I'))),
-                    builder_.CreateOr(
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'n')),
-                        builder_.CreateICmpEQ(fcF,
-                            llvm::ConstantInt::get(i8TyF, 'N'))),
-                    "parse.infMask");
-                llvm::Value* notDigitF = builder_.CreateAnd(
-                    builder_.CreateAnd(
-                        builder_.CreateNot(isSignF),
-                        builder_.CreateNot(infMask)),
-                    builder_.CreateICmpUGE(
-                        builder_.CreateSub(fcF, llvm::ConstantInt::get(i8TyF, '0')),
-                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 auto* i64t = llvm::Type::getInt64Ty(llvm_);
                 // stdlib §9.2 (v0.314, #5444): reject signed hex float ("-0x1p3").
                 // per emitFloatParseOverflow: skip the optional sign before checking
@@ -2230,6 +3187,41 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 llvm::Value* offF = builder_.CreateZExt(isSignF, i64(), "parse.offF");
                 llvm::Value* fcOffF = builder_.CreateLoad(i8TyF,
                     builder_.CreateGEP(i8TyF, win.data, offF, "parse.fcptr"), "parse.fcOffF");
+                // stdlib §9.2 (v0.344, #7310): the non-finite spellings stand
+                // OUTSIDE the numeric grammar and are matched exactly, so this
+                // mask may only decide whether the numeric part STARTS with
+                // one of the non-finite letters ('i'/'I'/'n'/'N').  Whether the
+                // input IS one of the three admitted spellings is decided by
+                // the exact comparison below — a first-character sniff alone
+                // would admit "inf", "infinity", "nan", "INFINITY",
+                // "+Infinity" and "-NaN".
+                llvm::Value* nonFiniteLetter = builder_.CreateOr(
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'i')),
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'I'))),
+                    builder_.CreateOr(
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'n')),
+                        builder_.CreateICmpEQ(fcOffF,
+                            llvm::ConstantInt::get(i8TyF, 'N'))),
+                    "parse.nfLetter");
+                // stdlib §9.2 (v0.344, #7325): the digit rule applies to the
+                // character AFTER the optional sign — §9.2's grammar is "an
+                // optional sign (`+` or `-`), THEN one or more of the digits
+                // 0-9" — so a SIGNED BARE POINT ("+.5") has NO digit at all
+                // and is rejected, exactly as the unsigned bare point (".5")
+                // is.  This test used to read the FIRST character and to be
+                // WAIVED outright whenever that character was a sign, so a
+                // signed bare point slipped through.  Both the string form
+                // and the span form carry the same contract (§9.2: "the span
+                // forms carry the string forms' contract").
+                llvm::Value* notDigitF = builder_.CreateAnd(
+                    builder_.CreateNot(nonFiniteLetter),
+                    builder_.CreateICmpUGE(
+                        builder_.CreateSub(fcOffF, llvm::ConstantInt::get(i8TyF, '0')),
+                        llvm::ConstantInt::get(i8TyF, 10)), "parse.ndigF");
                 llvm::Value* isLeadingZeroF = builder_.CreateICmpEQ(
                     fcOffF, llvm::ConstantInt::get(i8TyF, '0'), "parse.lzeroF");
                 // stdlib §9.2: the second character is read at position `off+1` when
@@ -2277,6 +3269,19 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                             builder_.CreateICmpEQ(lastChar,
                                 llvm::ConstantInt::get(i8TyF, '-')))),
                     "parse.blc");
+                // stdlib §9.2 (v0.344, #7310): a numeric part that starts with a
+                // non-finite letter is admitted only when the WHOLE window is
+                // exactly one of the three spellings §9.2 admits ("NaN",
+                // "Infinity", "-Infinity"); every other inf/nan spelling
+                // raises FormatException.
+                llvm::Value* exactNonFinite = emitExactNonFiniteSpelling(win.data);
+                llvm::Value* nonFiniteOk = builder_.CreateOr(
+                    builder_.CreateNot(nonFiniteLetter),
+                    exactNonFinite, "parse.nfok");
+                // stdlib §9.2 (v0.344, #7341): a point with NO digit after it
+                // is a grammar violation, whatever exponent follows it.  The
+                // span form carries the string form's contract (§9.2:5265).
+                llvm::Value* pointOk = emitPointFollowedByDigit(win.data);
                 llvm::Value* validF = builder_.CreateAnd(
                     builder_.CreateAnd(
                         builder_.CreateAnd(
@@ -2284,8 +3289,12 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                                 builder_.CreateNot(fcWsF),
                                 builder_.CreateNot(notDigitF)),
                             builder_.CreateAnd(advF, atNulF)),
-                        builder_.CreateNot(badLastChar)),
-                    builder_.CreateNot(isHexFloatF),
+                        builder_.CreateAnd(
+                            builder_.CreateNot(badLastChar),
+                            nonFiniteOk)),
+                    builder_.CreateAnd(
+                        builder_.CreateNot(isHexFloatF),
+                        pointOk),
                     "parse.vfmtF");
                 // §28.3 (v0.303): the owned window from bz_str_slice_cp must be
                 // released on every exit path.  emitGuardThrow branches to an
@@ -6212,6 +7221,174 @@ bool Emitter::isSubscriptionExpr(const ast::Expr& e) {
 }
 
 
+// fix #6870 (§14.2 / §11.8, v0.343): the name a `type` constraint's bound
+// SPELLS, when it is a BARE single-part name — the shape a §14.2
+// TYPE-PARAMETER bound (`where T: U`) takes.
+//
+// Mirrors sema's `constraintBoundBareName`
+// (src/sema/TypeResolution_Checks.cpp): a LOCAL bound is the AST node, and a
+// bare name is a `QualifiedName` with exactly one part; an IMPORTED bound is
+// a resolved TypeRef, and a type PARAMETER is precisely the case the loader
+// cannot resolve — a Named ref with a null declaration whose `importedName`
+// holds the spelling.
+static std::string_view constraintBoundSpelling(
+        const sema::GenericParamConstraint& c) {
+    if (c.kind != "type") return {};
+    if (c.astBound) {
+        if (!c.astBound->name || c.astBound->name->parts.size() != 1)
+            return {};
+        return c.astBound->name->parts.back();
+    }
+    const sema::TypeRef* b = c.importedBound;
+    if (!b || b->kind != sema::TypeRef::Kind::Named || b->declaration)
+        return {};
+    if (!b->genericArgs.empty()) return {};  // `IFoo<T>`, not a bare parameter
+    std::string_view n = b->importedName;
+    if (n.empty() || n.find('.') != std::string_view::npos) return {};
+    return n;
+}
+
+// fix #6870 (§14.2 / §11.8, v0.343): does `gp`'s constraint set confine it to
+// REFERENCE types — i.e. may every legal substitution be a reference?
+//
+// §14.2's table, for the two bounds that admit REFERENCE types only:
+//   * `where T: class` — "Non-nullable reference types only — classes
+//     (including `Array<T>`, `OwningArray<T>`, and other heap collection
+//     types), interfaces, `string`, function types." `int` is none of those.
+//   * `where T: SomeClass` — "Non-nullable subtypes of `SomeClass` (the class
+//     itself and its descendants). Class types only; interfaces do not extend
+//     classes in Bezel." `int` is not a class type.
+//
+// A constraint set admits a VALUE type iff EVERY one of its constraints
+// admits it (the admitted set is the intersection), so ONE reference-only
+// constraint is enough to confine the parameter — hence the ANY-match.
+//
+// ⚠ A TYPE-PARAMETER bound (`where T: U`) is NOT reference-only. §14.2
+// ("Type-parameter bounds"): the bound "has subtype semantics: a
+// substitution S for `T` satisfies `where T: U` exactly when S is non-nullable
+// and is a *subtype of* the substitution for `U`" — "at `U := Object` the bound
+// admits `Object` and every class type … **at `U := long` it admits `long`
+// alone**". So a type-parameter bound admits VALUE types whenever the
+// parameter it names does, and the erasure to `ptr` is UNSOUND for it.
+//
+// ⇒⇒ THE DISCRIMINATOR IS THE SCOPE, NOT THE NAME. A user's type parameter
+// named after a builtin (`class C<Exception> where Exception: INumber<Exception>`)
+// SHADOWS the always-available `Exception` (§2.3: "every other always-
+// available name may be shadowed by local declarations"), and the bound
+// `where T: Exception` is then a TYPE-PARAMETER bound (§14.2: a bound naming
+// "another type parameter — of the same declaration, or of the enclosing
+// type"). MEASURED: such a bound and the builtin CLASS bound resolve to
+// TypeRefs that are IDENTICAL in every observable field (`declaration ==
+// nullptr`, the same syntactic head name, an AST node, no generic arguments),
+// so NO test on the resolved type can tell them apart — only the scope can.
+//
+// The INTERFACE bound (`where T: IFoo`) is deliberately NOT answered here:
+// §14.2 admits "classes implementing it, records and enums implementing it,
+// interfaces extending it, and primitives conforming through their
+// standard-library declarations or the compiler-provided conformances" — so
+// an interface-bounded parameter may hold a VALUE type, and the erased
+// template then has no single uniform representation (a class substitution
+// arrives as a pointer, a record substitution by value — MEASURED on
+// `B$V$spec$Dog` vs `B$V$spec$Pt`). Erasing such a parameter as a pointer
+// would be UNSOUND, and erasing it as the `int` placeholder leaves the erased
+// body unable to dispatch an interface member through it — a gap #6870
+// tracks and this change does not close.
+//
+// The other constraint kinds admit `int` (`notnull`, `value`, `hashable`,
+// `new()` — a defaultable value type, `sendable`), so those keep the `int`
+// placeholder erasure exactly as today.
+//
+// `visibleTypeParams` is the set of type-parameter names the constraint can
+// name — the DECLARATION's own parameters plus, for a method's constraint, the
+// ENCLOSING TYPE's parameters (§14.2's "of the same declaration, or of the
+// enclosing type").
+static bool typeParamHasClassBound(
+        sema::SemaContext& ctx,
+        const sema::GenericParamSymbol* gp,
+        const std::unordered_set<std::string_view>& visibleTypeParams) {
+    if (!gp) return false;
+    for (const sema::GenericParamConstraint& c : gp->constraints) {
+        if (c.kind == "class") return true;
+        if (c.kind != "type") continue;
+        // §14.2: a TYPE-PARAMETER bound names another type parameter of the
+        // same declaration or of the enclosing type. It admits whatever that
+        // parameter admits — value types included ("at `U := long` it admits
+        // `long` alone") — so it never confines this parameter to references,
+        // and this parameter must never be erased to `ptr`.
+        //
+        // The check is by SPELLING against the enclosing scope's type
+        // parameters, because the resolved TypeRef cannot distinguish the two
+        // (see above). It does NOT end the scan: a sibling reference-only
+        // constraint still confines the parameter (`where T: U, class`).
+        std::string_view spelling = constraintBoundSpelling(c);
+        if (!spelling.empty() && visibleTypeParams.count(spelling))
+            continue;
+        const sema::TypeRef* b = c.importedBound;
+        if (!b && c.astBound) b = ctx.resolvedType(*c.astBound);
+        if (!b || b->kind != sema::TypeRef::Kind::Named) continue;
+        if (b->declaration) {
+            if (b->declaration->kind == ast::TypeDeclKind::Class) return true;
+            continue;
+        }
+        // A DECL-LESS Named bound that is NOT a type parameter of the
+        // enclosing scope: the always-available EXCEPTION classes (§2.3's
+        // always-available set, whose module is `System`) resolve that way —
+        // they have no `ast::TypeDecl` — and they are classes. Every other
+        // decl-less Named bound is a builtin INTERFACE (the collection
+        // family, `IDisposable`, …), which §14.2 does not confine to
+        // reference types.
+        if (common::isBuiltinExceptionName(b->headName())) return true;
+    }
+    return false;
+}
+
+// fix #6870: the type-parameter names of a declaration's parameter list.
+static void collectTypeParamNames(
+        const std::vector<sema::Symbol*>& params,
+        std::unordered_set<std::string_view>& out) {
+    for (const sema::Symbol* s : params)
+        if (auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s))
+            out.insert(gp->name);
+}
+
+void Emitter::pushErasedRefScope(const sema::MethodSymbol* ms) {
+    std::unordered_map<std::string_view, bool> scope;
+    if (ms) {
+        // The names a constraint of this method can name: the METHOD's own
+        // parameters and the ENCLOSING TYPE's (§14.2's "of the same
+        // declaration, or of the enclosing type").
+        std::unordered_set<std::string_view> methodNames, classNames;
+        collectTypeParamNames(ms->genericParams, methodNames);
+        if (ms->parent) collectTypeParamNames(ms->parent->genericParams, classNames);
+        std::unordered_set<std::string_view> allNames = methodNames;
+        allNames.insert(classNames.begin(), classNames.end());
+        // The enclosing TYPE's own parameters are constrained against the
+        // TYPE's scope (their own siblings) — the same set the type's own
+        // erased layout is computed with, so the two agree.
+        if (ms->parent)
+            for (const sema::Symbol* s : ms->parent->genericParams)
+                if (auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s))
+                    scope[gp->name] = typeParamHasClassBound(ctx_, gp, classNames);
+        // The method's own parameters are constrained against the wider scope.
+        for (const sema::Symbol* s : ms->genericParams)
+            if (auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s))
+                scope[gp->name] = typeParamHasClassBound(ctx_, gp, allNames);
+    }
+    erasedRefScopes_.push_back(std::move(scope));
+}
+
+void Emitter::pushErasedRefScopeForType(const sema::TypeSymbol* ts) {
+    std::unordered_map<std::string_view, bool> scope;
+    if (ts) {
+        std::unordered_set<std::string_view> names;
+        collectTypeParamNames(ts->genericParams, names);
+        for (const sema::Symbol* s : ts->genericParams)
+            if (auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(s))
+                scope[gp->name] = typeParamHasClassBound(ctx_, gp, names);
+    }
+    erasedRefScopes_.push_back(std::move(scope));
+}
+
 // per §14.1/§14.2 + §26.5 (issue #391). Structurally unify a generic method's
 // declared return TypeRef against the concrete return type sema solved from the
 // call's target, binding any still-unbound method type parameter.
@@ -7213,17 +8390,89 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
             builder_.CreateBr(cont);
 
             builder_.SetInsertPoint(clsBB);
-            emitDisposeAndReclaim(recv);
-            // §28.2 v0.134 / issue #601: in checked-disposal
-            // mode the object is quarantined (not freed), so
-            // the slot must remain valid — the disposed-flag
-            // guard at the next member-entry reads through it.
-            // In unchecked mode, null the slot as usual to
-            // prevent a second reclaim.
-            if (!checkedDisposal_)
-                builder_.CreateStore(
-                    llvm::ConstantPointerNull::get(ptrTy()),
-                    slot);
+            // fix #7025 (follow-up, §28.2, v0.343): §28.2 — "An explicit
+            // `Dispose()` or direct `DisposeAsync()` performs **logical
+            // disposal only** — it sets the flag and runs the class's cleanup
+            // — and does not reclaim its receiver: the receiver's block stays
+            // live until the holder's release point, so the `Dispose()` the
+            // language itself issues there … reads a live flag in both modes,
+            // and a repeated call is the no-op stated above in both modes."
+            //
+            // The reclaim below (`emitDisposeAndReclaim` — the eager free) is
+            // sound ONLY while no BORROW points at the block. A method group
+            // over the receiver IS such a borrow (§27.6: "the instance is
+            // captured at formation — by reference for class- or
+            // interface-typed receivers"; §28.3: the cell does not own it), so
+            // the free would leave the group's capture dangling — measured: ASan
+            // "heap-use-after-free … READ of size 8" in `disposethunk$Dispose`
+            // for `var f := d.Dispose; d.Dispose(); f();`.
+            //
+            // Under such a borrow the call performs the LOGICAL half only and
+            // the RECLAIM moves to the holder's release point — the scope end
+            // — which is §28.2's own sentence ("the receiver's block stays
+            // live until the holder's release point").
+            //
+            // THE SLOT IS NOT NULLED on this path, and that is load-bearing:
+            // a group formed AFTER this call (`d.Dispose(); var f :=
+            // d.Dispose;`) reads the receiver's slot when it captures the
+            // instance, and a nulled slot is what made that shape SEGV
+            // (measured on the rejected fix-forward). The other reclaim paths
+            // for this block — the `using var` scope-end disposal, the
+            // unwind-only disposal — all reload THIS slot and are arbitrated
+            // by the scope-end null-guard, so the block is still reclaimed
+            // exactly once.
+            const bool groupBorrowed = receiverIsGroupBorrowed(target);
+            if (groupBorrowed) {
+                emitDynamicDispose(recv);
+                // The RECLAIM moves to the holder's release point. The
+                // holder's release point is registered as a scope-end
+                // disposal on the receiver's OWN slot, so the other reclaim
+                // paths for that block (`using var` scope end, the
+                // unwind-only path) find the same slot and the scope-end
+                // null-guard lets exactly one of them reclaim it.
+                //
+                // THE SCOPE IS THE RECEIVER'S BINDING'S SCOPE, not the scope
+                // this call sits in. §28.2: "the receiver's block stays live
+                // until the holder's release point" — the HOLDER is the
+                // binding that owns the block, so its release point is the
+                // end of the BINDING's own scope. Registering on the CALL
+                // SITE's scope frees the block when that scope ends, which
+                // for a `do … end` block or an `if` branch is BEFORE the
+                // holder's release point — the rejected fix-forward's
+                // measured "heap-use-after-free … READ of size 8" in
+                // `disposethunk$Dispose`.
+                //
+                // A receiver whose slot is NOT an alloca is an owned FIELD
+                // (§28.5) — its holder is the CONTAINING object, and §28.5's
+                // owned-field auto-dispose (the cascade the containing
+                // object's disposal runs) is that holder's release point: it
+                // reclaims the field's block when the containing object is
+                // disposed. Nothing is registered here for that shape.
+                if (auto* slotAlloca =
+                        llvm::dyn_cast<llvm::AllocaInst>(slot)) {
+                    std::size_t scopeIdx = 0;
+                    // The CONSERVATIVE fallback is REGISTER NOTHING (a
+                    // bounded leak) — `declScopeDisposeIndex`'s own contract
+                    // ("Every caller's false branch must be the conservative
+                    // one (register nothing) … the alternative reading is a
+                    // use-after-free"). It is NEVER "register on the call
+                    // site's scope".
+                    if (receiverBindingScopeIndex(target, scopeIdx))
+                        registerDeferredReclaim(slotAlloca, scopeIdx);
+                }
+            } else {
+                emitDisposeAndReclaim(recv);
+                // §28.2 v0.134 / issue #601: in checked-disposal
+                // mode the object is quarantined (not freed), so
+                // the slot must remain valid — the disposed-flag
+                // guard at the next member-entry reads through it.
+                // In unchecked mode, null the slot as usual to
+                // prevent a second reclaim.
+                if (!checkedDisposal_)
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()),
+                        slot);
+            }
             builder_.CreateBr(cont);
             builder_.SetInsertPoint(cont);
             // #2310 / §29.8 / §30.1 (#973a residual): also null
@@ -8620,6 +9869,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // `releaseBorrowedStringArgPins` releases them.  The post-call release is
         // installed below after the `CreateCall`.
         std::vector<llvm::Value*> closureStringPins;
+        // fix #7025 (follow-up, §28.3 / §27.6, v0.343): the fresh owned
+        // class arguments that are §28.3 unbound owned temporaries are queued
+        // on the K8 full-expression boundary in the argument loop below (the
+        // queue itself lives in `k8RecvTemps_`).
         for (std::size_t pi = 0; pi < call.args.size(); ++pi) {
             const auto& a = call.args[pi];
             if (!a.value) return nullptr;
@@ -8772,6 +10025,98 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (!v) return nullptr;
             }
             args.push_back(v);
+            // fix #7025 (follow-up, §28.3 / §27.6, v0.343): a FRESH owned
+            // class producer passed as a PLAIN (non-`owned`) argument of a
+            // function value is §28.3's UNBOUND OWNED TEMPORARY — "not bound
+            // to any name, not `move`d, and not returned, but used only by
+            // *borrowing* operations within the expression — as the receiver
+            // of a further call, as a non-`owned` argument, … Such a temporary
+            // is disposed at the **end of the full expression** in which it is
+            // produced, after every use of it within that expression has
+            // completed".
+            //
+            // The function-VALUE invoke path builds its own argument list (it
+            // does NOT route through `buildOrderedArgs`), so it never
+            // discharged the temporary — and the value stayed owned by nobody:
+            // MEASURED (ASan/LSan) on the reviewer's probe
+            // `var f: (Item) -> () := il.Add; f(new Item());` → "Direct leak of
+            // 16 byte(s) in 1 object(s)", while the byte-identical DIRECT call
+            // `il.Add(new Item());` is clean (the borrowing-collection `Add`
+            // arm discharges it — §28.11's "a retained fresh `Add` argument").
+            //
+            // THE GATE, and why each clause fails closed:
+            //   * the argument must be a FRESH owned CLASS producer — a
+            //     borrowed value is the callee's borrow, not the caller's
+            //     temporary, and disposing it would free a value the caller
+            //     does not own (a use-after-free);
+            //   * the FORMAL must be a plain CLASS-typed slot — an `owned`
+            //     slot consumes the argument (the callee owns it and
+            //     disposes it), a `scoped` slot may retain it, and a
+            //     non-class formal has no class block to dispose;
+            //   * the value must be a pointer — a value-typed producer has no
+            //     heap block.
+            // A formal typed at `Object`/an interface is NOT queued here: the
+            // callee's static type is then not the producer's class, so the
+            // dynamic type the callee sees is unknown here and the discharge
+            // would run against a type this site cannot prove. Leaking is the
+            // safe direction for that shape. (A `move` argument is excluded
+            // for the same reason: the shared producer classifier
+            // `common::isFreshOwnedClassProducer` recognises `new` and an
+            // `owned`-returning call, not a moved binding, whose source slot
+            // the transfer nulls — the leak is the safe direction there too.)
+            //
+            // WHERE the discharge runs. §28.3's rule 1: the temporary "is
+            // disposed at the end of the full expression in which it is
+            // produced, after every use of it within that expression has
+            // completed", and K8.4: "A plain parameter announces none: a callee
+            // that stores it holds the borrow under the borrowed-field rule's
+            // or the borrowing-collection store rule's recorded residual …
+            // and the temporary is still disposed at its boundary (K8.1)".
+            // ⇒ the discharge belongs on the K8 FULL-EXPRESSION BOUNDARY,
+            // not immediately after the call: the argument may be one of
+            // several operands of a larger full expression, and the callee's
+            // own copy of the borrow must be the last use. The
+            // `deferUnboundOwnedTempToK8` queue is the established mechanism
+            // for exactly this obligation (the same one #5297 installed for
+            // the discarded-`out owned` value: "dispose at the full
+            // statement's end, after every later operand — queue on the K8
+            // boundary instead of disposing right after the call"), and it
+            // also covers the EXCEPTION edge: the queue registers an
+            // unwind-only disposal, so a callee that raises discharges the
+            // temporary during unwinding (§28.3's *Exception-path discharge*).
+            if (v && v->getType()->isPointerTy() &&
+                isFreshOwnedClassProducer(a.value.get()) &&
+                pi < rt->funcParams.size() &&
+                rt->funcParams[pi].modifier.empty() &&
+                rt->funcParams[pi].type) {
+                const sema::TypeRef* formalTy =
+                    resolveTypeParamRef(rt->funcParams[pi].type);
+                if (formalTy && formalTy->kind == sema::TypeRef::Kind::Named &&
+                    formalTy->declaration &&
+                    formalTy->declaration->kind ==
+                        ast::TypeDeclKind::Class) {
+                    llvm::AllocaInst* slot = entryAllocaNullPtr();
+                    builder_.CreateStore(v, slot);
+                    if (!deferUnboundOwnedTempToK8(slot)) {
+                        // No K8 boundary to queue on (a disposer body): fall
+                        // back to an immediate, null-guarded discharge so the
+                        // value is not leaked outright.
+                        llvm::Value* obj =
+                            builder_.CreateLoad(ptrTy(), slot, "closown.arg");
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            obj, llvm::ConstantPointerNull::get(ptrTy()));
+                        auto* dispBB = llvm::BasicBlock::Create(
+                            llvm_, "closown.dispose", currentFn_);
+                        auto* contBB = llvm::BasicBlock::Create(
+                            llvm_, "closown.cont", currentFn_);
+                        builder_.CreateCondBr(isNull, contBB, dispBB);
+                        builder_.SetInsertPoint(dispBB);
+                        emitDisposeAndReclaim(obj);
+                        builder_.CreateBr(contBB);
+                        builder_.SetInsertPoint(contBB);
+                    }
+                }
+            }
             // fix #4078 (§28.14 / §27.5 / §28.9, v0.294): collect the lowered
             // closure-cell value for the post-call release when the AST was a
             // +1 producer AND the formal parameter is call-bounded (computed
@@ -8987,8 +10332,38 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
             if (declTy->isIntegerTy() && args[ai]->getType()->isFloatingPointTy())
                 args[ai] = builder_.CreateFPToSI(args[ai], declTy);
-            else if (declTy->isFloatingPointTy() && args[ai]->getType()->isIntegerTy())
-                args[ai] = builder_.CreateSIToFP(args[ai], declTy);
+            else if (declTy->isFloatingPointTy() && args[ai]->getType()->isIntegerTy()) {
+                // fix #7251 (spec §5.1, v0.344): an INTEGER argument at a
+                // `double` PARAMETER converts by VALUE, so an UNSIGNED source
+                // must use `uitofp` — the instruction that preserves the value
+                // — and never `sitofp`, which SIGN-EXTENDS the source's bit
+                // pattern. §5.1's widening table admits
+                // `byte`/`ushort`/`uint`/`ulong`/`char` at `float`/`double`,
+                // so an unsigned argument DOES reach a `double` parameter of a
+                // function type (§27.6). The `uint` 4000000000 (bit pattern
+                // 0xEE6B2800) was read as the `int32` -294967296, so
+                // `f(4000000000u)` against `f: (x: double) -> double` passed
+                // -294967296.0 and the callee printed `-294967296` instead of
+                // `4000000000`.
+                //
+                // The SOURCE EXPRESSION is the argument expression at the
+                // matching position: `args` carries the closure's env pointer
+                // at slot 0, so the args slot `ai` maps back to the
+                // funcParams index `ai - 1` and thence to `call.args[ai - 1]`
+                // — the same mapping the nullable-formal arm above uses.
+                //
+                // The SIGNED path is untouched: an `int`/`long` argument keeps
+                // the `sitofp` it always had, so a negative signed argument
+                // keeps its sign and every signed result is bit-for-bit what
+                // it was.
+                const ast::Expr* fpSrcE =
+                    (ai >= 1 && ai - 1 < call.args.size())
+                        ? call.args[ai - 1].value.get()
+                        : nullptr;
+                args[ai] = (fpSrcE && isUnsignedTargetExpr(*fpSrcE))
+                    ? builder_.CreateUIToFP(args[ai], declTy, "cl.arg.uitofp")
+                    : builder_.CreateSIToFP(args[ai], declTy, "cl.arg.sitofp");
+            }
             else if (declTy->isIntegerTy() && args[ai]->getType()->isIntegerTy()) {
                 unsigned db = declTy->getIntegerBitWidth();
                 unsigned sb = args[ai]->getType()->getIntegerBitWidth();
@@ -9104,6 +10479,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // double-free).
         if (!diverged_) {
             for (llvm::Value* cl : callBoundedClosures) emitClosureRelease(cl);
+            // fix #7025 (follow-up, §28.3 / §27.6, v0.343): §28.3's unbound
+            // owned temporaries — the fresh owned class arguments the callee
+            // only BORROWED (a plain formal) — are NOT discharged here: they
+            // are queued on the K8 FULL-EXPRESSION boundary above
+            // (`deferUnboundOwnedTempToK8`), which is the boundary §28.3's
+            // rule 1 and K8.4 name ("the temporary is still disposed at its
+            // boundary"). The same queue covers the exception edge (an
+            // unwind-only disposal), so a callee that raises discharges the
+            // temporary during unwinding (§28.3's *Exception-path
+            // discharge*).
             // fix #5438: discharge the borrowed-string pin vector on the
             // normal-return edge. fix #5441: allStringPins is closureStringPins
             // only now (the helper call was removed); direct +1 producers get
@@ -18944,16 +20329,60 @@ llvm::Value* Emitter::wrapArgForNullableValueFormal(llvm::Value* arg,
     return arg;
 }
 
+// fix #7263 (§5.1 "Implicit conversions", v0.344): is `t` a CONCRETE NUMERIC
+// PRIMITIVE — the only formal shape whose declared type §5.1's widening table
+// can convert an integer argument INTO?
+//
+// §5.1's table admits an unsigned integer at `long`/`ulong`/`float`/
+// `double`/`decimal`, and the widening "converts the VALUE" ("A value of one
+// type implicitly converts to another when no programmer-visible information
+// is lost"), so a `uint` argument at a `long` parameter is a legal call whose
+// value must arrive intact.
+//
+// The set is deliberately NARROW:
+//   * a NULLABLE primitive is excluded — a nullable value type is the tagged
+//     `{i8 hasValue; T}` carrier (spec §7.2), and that carrier's own payload
+//     widening is `wrapArgForNullableValueFormal`'s job (the #5046 / #4963
+//     lift), not a parameter-width question;
+//   * `bool` is excluded (spec §5.1: "Between integers and `bool`" is never
+//     implicit, and `i1` is not a width any widening applies to);
+//   * `string` / `Object` are excluded (reference types, not numeric);
+//   * a TYPE PARAMETER is excluded here — the caller resolves it through the
+//     active substitution first and asks again with the CONCRETE type.
+//
+// The answer is a POLICY question ("may this formal's declared type be the
+// target of a §5.1 widening?"), kept apart from the MECHANISM (the unsigned-
+// aware `coerceNumericToType`), which only a member of `Emitter` can reach.
+static bool isNumericFormalPrimitive(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Primitive || t->nullable)
+        return false;
+    using P = sema::PrimitiveType;
+    switch (t->primitive) {
+        case P::Byte: case P::SByte: case P::Short: case P::UShort:
+        case P::Int: case P::UInt: case P::Long: case P::ULong:
+        case P::Float: case P::Double: case P::Decimal: case P::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
 llvm::Value* Emitter::emitGenericSpecialization(
         sema::MethodSymbol* ms, std::vector<llvm::Value*>& args,
         const CallableInfo& ci,
         const std::vector<const ast::Expr*>* argExprs) {
     // Build the function type with concrete arg/ret types. Each param type
-    // defaults to its argument's LLVM type, BUT when the declared parameter is a
-    // nullable VALUE type `T?` (a bare value-type generic param under the active
-    // substitution) and the argument arrived as the bare `T` (or a null ptr),
-    // the specialized body reads the param as the tagged `{i8, T}` struct — so
-    // the argument must be wrapped HERE and the param typed as that struct.
+    // defaults to its argument's LLVM type, EXCEPT where the argument was
+    // converted into the DECLARED parameter type above (fix #7263, §5.1,
+    // v0.344) — a numeric formal now receives its argument already widened to
+    // the declared width, with the declared VALUE (an unsigned source
+    // zero-extends), and the parameter is typed as that declared type.
+    //
+    // The other exception is the nullable VALUE type `T?` (a bare value-type
+    // generic param under the active substitution): when the argument arrived
+    // as the bare `T` (or a null ptr), the specialized body reads the param as
+    // the tagged `{i8, T}` struct — so the argument must be wrapped HERE and
+    // the param typed as that struct.
     // Without this, a bare-`int` argument bound to a `T?` parameter leaves the
     // param as `i32`, and `v!` / `v ?? …` in the body extract a field from a
     // non-struct → LLVM GEP assertion crash (#846) / IR-verify failure (#845).
@@ -18976,8 +20405,82 @@ llvm::Value* Emitter::emitGenericSpecialization(
                               isUnsignedTargetExpr(*(*argExprs)[i]);
                 args[i] = wrapArgForNullableValueFormal(args[i], formal,
                                                          argUns);
+                // fix #7263 (§5.1, v0.344): the argument must reach the
+                // specialized parameter AT THE DECLARED PARAMETER TYPE.
+                //
+                // Until now the parameter's LLVM type was taken from the
+                // ARGUMENT (the `paramTys.push_back(args[i]->getType())`
+                // below), so an argument NARROWER than its declared formal
+                // reached the body unconverted — as an `i32` at a `long`
+                // (`i64`) parameter. The body then read the parameter at the
+                // DECLARED type, i.e. it applied the DECLARED type's
+                // SIGNEDNESS to the narrower's bit pattern: a `uint`
+                // 4000000000 (0xEE6B2800) was sign-extended to the `int64`
+                // -294967296, and the VALUE was lost.
+                //
+                // §5.1's widening table admits `uint` at `long`/`ulong`/
+                // `float`/`double`/`decimal` (and `byte`/`ushort` at every
+                // wider integer), and §5.1 converts the VALUE, not the bit
+                // pattern, so the conversion belongs HERE — at the generic
+                // call site, where the argument's SOURCE expression (and so
+                // its signedness) is still known. It CANNOT be recovered
+                // later: inside the body the parameter's type IS the declared
+                // `long`, so the unsignedness is already gone by then.
+                //
+                // The signedness is read through the ONE house predicate,
+                // `isUnsignedTargetExpr` (src/codegen/LlvmBackend_impl.hpp) —
+                // the same one the #7253 `Step` widening, the #7251
+                // `double`-parameter converter and the #5046 nullable lift
+                // use, so no two sites can disagree about an operand's
+                // signedness. It is NOT inferred from the bit width: `int`
+                // and `uint` are both 32 bits, `long` and `ulong` both 64.
+                //
+                // The conversion is the ORDINARY (non-generic) call path's
+                // own: `coerceNumericToType` with the source's real
+                // signedness, which is exactly what the plain path applies
+                // to the same argument at the same declared formal — so a
+                // generic and a plain parameter of the same declared type now
+                // receive the same value.
+                {
+                    // The DECLARED type of this parameter, resolved through the
+                    // active substitution when it is a bare type parameter
+                    // (`v: T` at `T = long`). An UNBOUND type parameter has no
+                    // declared concrete type and is left alone (the erased
+                    // `i32` placeholder must not become a conversion target).
+                    const sema::TypeRef* eff = formal;
+                    if (eff && eff->kind == sema::TypeRef::Kind::Named &&
+                        !eff->declaration) {
+                        eff = resolveTypeParamRef(eff);
+                        if (eff == formal) eff = nullptr;
+                    }
+                    if (isNumericFormalPrimitive(eff) &&
+                        !isByRefMod(ps->modifier)) {
+                        llvm::Type* want = lowerTypeRef(eff);
+                        llvm::Type* have = args[i]->getType();
+                        // Only a NUMERIC argument is converted: a `ref`/`out`
+                        // parameter's argument is the CALLER'S ADDRESS (spec
+                        // §22.3), and §5.1's widening table says nothing about
+                        // addresses. `i1` (`bool`) is excluded — §5.1 makes
+                        // every integer/`bool` conversion explicit.
+                        if (want && have != want &&
+                            (have->isIntegerTy() || have->isFloatingPointTy()) &&
+                            !have->isIntegerTy(1)) {
+                            llvm::Value* conv =
+                                coerceNumericToType(args[i], want, argUns);
+                            // Only adopt the conversion when it really produced
+                            // the declared type — `coerceNumericToType`
+                            // returns the value UNCHANGED for a pair §5.1
+                            // does not admit, and the parameter must then keep
+                            // the argument's own type (the pre-#7263 shape).
+                            if (conv->getType() == want) args[i] = conv;
+                        }
+                    }
+                }
             }
         }
+        // fix #7263 (§5.1, v0.344): the parameter's type is now the DECLARED
+        // parameter type (the argument was converted into it above), not the
+        // argument's own width.
         paramTys.push_back(args[i]->getType());
     }
     llvm::Function* specFn = buildSpecializedMethodFn(ms, ci, paramTys);
@@ -20943,6 +22446,53 @@ llvm::Value* Emitter::emitInlineGenericMethod(
                           isUnsignedTargetExpr(*(*argExprs)[argIdx]);
             llvm::Value* argVal = wrapArgForNullableValueFormal(
                 args[argIdx], formal, argUns);
+            // fix #7263 (§5.1, v0.344): the EXPRESSION-bodied twin of the
+            // conversion emitGenericSpecialization applies to a block-bodied
+            // generic method's parameters. This arm binds the parameter into
+            // the CALLER's own stack slot, and the slot was typed by the
+            // ARGUMENT's LLVM type — so an argument narrower than its
+            // declared formal reached the body unconverted, and the body read
+            // it at the DECLARED type (applying the declared type's
+            // SIGNEDNESS to the narrower's bit pattern: a `uint` 4000000000
+            // became the `int64` -294967296). With a `double` formal the slot
+            // stayed an `i32` and the body's own result was an `i32` where the
+            // declared `double` was required — an IR-verify failure ("Call
+            // parameter type does not match function signature!").
+            //
+            // §5.1 admits the conversion (the `uint`→`long`/`double` rows) and
+            // §5.1 converts the VALUE, so the conversion belongs HERE — at the
+            // generic call site, where the argument's source expression (and so
+            // its signedness, read through the house predicate
+            // `isUnsignedTargetExpr`) is still known. The signedness is NOT
+            // inferred from the bit width: `int` and `uint` are both 32 bits,
+            // `long` and `ulong` both 64.
+            {
+                const sema::TypeRef* eff = formal;
+                if (eff && eff->kind == sema::TypeRef::Kind::Named &&
+                    !eff->declaration) {
+                    eff = resolveTypeParamRef(eff);
+                    if (eff == formal) eff = nullptr;
+                }
+                // Only the EXPRESSION body reads this slot: a block-bodied
+                // generic method is monomorphized into its own function
+                // (emitGenericSpecialization -> buildSpecializedMethodFn ->
+                // bindParameters), which binds the parameter THERE and
+                // converts the argument at that site's own declared type —
+                // so converting here as well would only leave a DEAD
+                // conversion in the caller.
+                if (ci.bodyKind == ast::MethodBodyKind::Expression &&
+                    ci.exprBody && isNumericFormalPrimitive(eff)) {
+                    llvm::Type* want = lowerTypeRef(eff);
+                    llvm::Type* have = argVal->getType();
+                    if (want && have != want &&
+                        (have->isIntegerTy() || have->isFloatingPointTy()) &&
+                        !have->isIntegerTy(1)) {
+                        llvm::Value* conv =
+                            coerceNumericToType(argVal, want, argUns);
+                        if (conv->getType() == want) argVal = conv;
+                    }
+                }
+            }
             auto* slot = entryAlloca(argVal->getType());
             builder_.CreateStore(argVal, slot);
             paramSlots_[ms->params[pi]] = slot;
@@ -22428,6 +23978,17 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
 
 
 llvm::FunctionType* Emitter::methodFnType(const sema::MethodSymbol* ms) {
+    // fix #6870 (§14.2 / §11.8, v0.343): the erased template's
+    // function type must agree with the erased template's BODY — a
+    // reference-constrained type parameter is a `ptr` there, not the `int`
+    // placeholder. Scoped to this computation.
+    struct ErasedRefParamsGuard {
+        Emitter& e;
+        ErasedRefParamsGuard(Emitter& em, const sema::MethodSymbol* m) : e(em) {
+            e.pushErasedRefScope(m);
+        }
+        ~ErasedRefParamsGuard() { e.popErasedRefScope(); }
+    } erasedRefGuard(*this, ms);
     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
     if (!md) {
         // §2.5 / §12 (issue #328 item 2): an IMPORTED method has no AST decl;

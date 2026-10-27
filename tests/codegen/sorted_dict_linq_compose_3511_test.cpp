@@ -212,7 +212,7 @@ BEZEL_TEST(sorted_dict_linq_compose_3511, last_yields_the_greatest_key_3716) {
         "330");
 }
 
-// fix #3716 / stdlib §4.17, §5, line 3594: `ElementAt(1)` is the SECOND
+// fix #3716 / stdlib §4.17, §5: `ElementAt(1)` is the SECOND
 // element in ascending order (key 2), not the second one stored (key 1):
 // 2 * 100 + 20 = 220.
 BEZEL_TEST(sorted_dict_linq_compose_3511, element_at_one_is_second_ascending_3716) {

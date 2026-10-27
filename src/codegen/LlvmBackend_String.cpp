@@ -1046,9 +1046,49 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
         } else {
             return nullptr;
         }
+        // per stdlib §2.18 (v0.344, #7301): a non-finite value renders as
+        // "Infinity" / "-Infinity" / "NaN" — the names of the §9.2 constants,
+        // with no digits, no exponent and no '%' suffix — under EVERY
+        // floating specifier. C's own "%.2f" (and "%.2f%%") print "inf" /
+        // "nan" instead, so a non-finite operand must not reach snprintf.
+        //
+        // The test is on the OPERAND, before the percent scale: §2.18 speaks
+        // of the VALUE the caller holds, so a FINITE operand keeps the
+        // rendering it had — including the case where the ×100 of the percent
+        // specifier overflows to an infinity.
+        //
+        // The finite operand keeps the byte-identical rendering it had: the
+        // snprintf path below is unchanged and is only reached when the
+        // operand is finite.
+        llvm::Value* isNanF = builder_.CreateFCmpUNO(dv, dv, "fmt.isnan");
+        llvm::Value* isPosInfF = builder_.CreateFCmpOEQ(
+            dv, llvm::ConstantFP::getInfinity(dblTy), "fmt.isposinf");
+        llvm::Value* isNegInfF = builder_.CreateFCmpOEQ(
+            dv, llvm::ConstantFP::getInfinity(dblTy, /*Negative=*/true),
+            "fmt.isneginf");
+        llvm::Value* nonFiniteF = builder_.CreateOr(
+            builder_.CreateOr(isNanF, isPosInfF), isNegInfF, "fmt.nonfinite");
         if (scale != 1.0)
             dv = builder_.CreateFMul(dv, llvm::ConstantFP::get(dblTy, scale));
-        return emitSnprintfToString(snprintfFmt, dv);
+        auto* nfBB = llvm::BasicBlock::Create(llvm_, "fmt.nonfinite", currentFn_);
+        auto* finBB = llvm::BasicBlock::Create(llvm_, "fmt.finite", currentFn_);
+        auto* mergeBB = llvm::BasicBlock::Create(llvm_, "fmt.merge", currentFn_);
+        builder_.CreateCondBr(nonFiniteF, nfBB, finBB);
+        builder_.SetInsertPoint(nfBB);
+        // The runtime's non-finite rendering IS §2.18's spelling (it is the
+        // same text the no-format ToString() and the "R" specifier produce),
+        // so this one runtime entry serves the specifier path too.
+        auto* nfFn = declareC("bz_double_to_string_r", ptrTy(), {dblTy});
+        llvm::Value* nfStr = builder_.CreateCall(nfFn, {dv}, "dbl.nonfinite");
+        builder_.CreateBr(mergeBB);
+        builder_.SetInsertPoint(finBB);
+        llvm::Value* finStr = emitSnprintfToString(snprintfFmt, dv);
+        builder_.CreateBr(mergeBB);
+        builder_.SetInsertPoint(mergeBB);
+        llvm::PHINode* strPhi = builder_.CreatePHI(ptrTy(), 2, "fmt.str");
+        strPhi->addIncoming(nfStr, nfBB);
+        strPhi->addIncoming(finStr, finBB);
+        return strPhi;
     } else {
         // #1123: widen to i64 by the operand's signedness. For `X` (hex), format
         // the operand's natural-width BIT PATTERN — zero-extend so a sub-32-bit
@@ -1403,18 +1443,171 @@ llvm::Value* Emitter::emitStringOrdCmp(llvm::Value* l, llvm::Value* r) {
 }
 
 
+// fix #7159 / #6979 idiom (§28.9 / §31.4, v0.343): a guard that RAISES must
+// release the CALLER-OWNED +1 reference to the string producer it holds, ON
+// THE THROW EDGE.
+//
+// §28.9 (v0.343): a fresh runtime-managed string hands its consumer a +1
+// reference that the consumer must release EXACTLY ONCE. For a member call on
+// a +1 producer RECEIVER, that consumer is the CALLER, which releases it AFTER
+// the call returns (src/codegen/LlvmBackend_Exprs.cpp). A raise branches to
+// the unwind block, so the post-call release is UNREACHABLE and the reference
+// leaks; §31.4's built-in exceptions are trivial-dispose, so nothing else
+// releases it.
+//
+// With no caller-owned producer (a named local, a literal, a sentinel) this is
+// exactly `emitGuardThrow`.
+void Emitter::emitGuardThrowReleasingString(llvm::Value* cond, const char* name,
+                                             llvm::ArrayRef<llvm::Value*> ownedProducers) {
+    // fix #7169 (§9.6, v0.343): the release set is the LIST of the
+    // caller-owned +1 producers the call holds — the receiver's producer for a
+    // member call, a `string` argument's producer for a static call. With no
+    // producer this is exactly `emitGuardThrow`.
+    bool any = false;
+    for (llvm::Value* v : ownedProducers) if (v) { any = true; break; }
+    if (!any) { emitGuardThrow(cond, name); return; }
+    auto* errBB = llvm::BasicBlock::Create(llvm_, "chk.err", currentFn_);
+    auto* cont = llvm::BasicBlock::Create(llvm_, "chk.cont", currentFn_);
+    builder_.CreateCondBr(cond, errBB, cont);
+    builder_.SetInsertPoint(errBB);
+    for (llvm::Value* v : ownedProducers) if (v) emitStringRelease(v);
+    emitThrowBuiltin(name);
+    builder_.SetInsertPoint(cont);
+}
+
+
 llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                                    const ast::MemberAccessExpr& ma,
                                    llvm::Value* self) {
     const auto& method = ma.member;
     if (!ma.target) return nullptr;
+    // §28.9: the caller (LlvmBackend_Exprs.cpp) pre-lowers a +1 producer
+    // receiver and releases it AFTER this call returns. A raise leaves that
+    // path unreachable ⇒ the producer's reference would leak. Remember the
+    // receiver here so that a guard can release it on the throw edge (the
+    // fix #6979 idiom — a plain `emitGuardThrow` leaks it).
+    llvm::Value* callerOwnedSelf = self;
     if (!self) self = lowerExpr(*ma.target);
     if (!self) return nullptr;
 
+    // A range guard that raises, releasing the caller-owned producer receiver
+    // on the throw edge FIRST (§28.9 — the exception unwinds past the
+    // caller's post-call release, and §31.4's built-in exceptions are
+    // trivial-dispose, so nothing else releases the receiver). With no
+    // caller-owned receiver this is exactly `emitGuardThrow`.
+    //
+    // fix #7159 (§28.9 / §31.4, v0.343): EVERY raise inside this function goes
+    // through this one funnel — `emitGuardThrowReleasingString` — not through
+    // a plain `emitGuardThrow`. The #7120 lane fixed three arms (the instance
+    // `Repeat`, `PadLeft`/`PadRight`/`PadCenter`) and left the others raising
+    // through the plain helper, so their producer receivers leaked (35 B in 2
+    // allocations each). The leak is the CLASS, not the arm: a §9.6 member
+    // added here later must not be able to forget the release.
+    //
+    // fix #7169 (§9.6, v0.343): the release set is a LIST (the funnel takes
+    // one), so a member call that holds a producer receiver — and, later, a
+    // producer `string` ARGUMENT — passes both.
+    //
+    // fix #7222 (§9.6 / §28.9 / §28.3 / §28.6, v0.344): the ARGUMENT half is
+    // now WIRED.
+    //
+    // * §28.3.4 (Producers, v0.344), the "Parameter `p` (no modifier)" row:
+    //   a plain parameter is "Borrowed (source: caller)" — so the ARGUMENT's
+    //   reference is the CALLER's to discharge, once the call is over.
+    // * §28.6 (v0.344): "the callee receives a parameter-sourced borrow ...
+    //   the callee further borrows for the duration of the call" — the callee
+    //   owns NO reference and must not release it. stdlib §9.6 (v0.344) agrees:
+    //   `Insert(startIndex: int, value: string): string` carries no `owned`
+    //   marker on `value`.
+    // * §28.9 (v0.344): `string` is runtime-managed — "the implementation
+    //   reclaims the production; how is not specified" — so a production the
+    //   implementation drops on the floor is a LEAK the §28.3 rules forbid.
+    //
+    // The §9.6 member path lowers its arguments HERE, and it never reaches the
+    // ORDINARY call path that discharges a producer argument after the call
+    // (LlvmBackend_Calls2.cpp's post-call release — the #429 block that
+    // `emitBorrowedStringArgPins` defers to). => the discharge belongs HERE,
+    // in the member path — and it is a FAMILY defect, not one arm's: `Replace`
+    // (an arm no earlier lane touched) leaked exactly as `Insert` did.
+    //
+    // MEASURED on the base tree (c9dfae6c), `--sanitize=address`:
+    //   ("a"+"b").Insert(1, "x"+"y")   → 35 B in 2 allocations (the VALUE's
+    //                                     producer reference, never released)
+    //   ("a"+"b").Insert(1, "z")       → clean (a literal carries no producer
+    //                                     reference to discharge)
+    //   ("a"+"b").Replace("a","x"+"y") → 35 B in 2 allocations
+    //   ("a"+"b").Insert(999,"x"+"y")  → 35 B in 2 allocations (the RAISE
+    //                                     edge — the throw path skipped the
+    //                                     normal-path discharge too)
+    // The ordinary (non-§9.6) call path was the control: the same producer
+    // passed to a USER method is discharged there and leaks nothing.
+    //
+    // => TWO edges need the release: the member's NORMAL return (below, the
+    // scope discharge) and the THROW edge (the funnel's list, which is built
+    // from the producers lowered SO FAR — a raise unwinds past the normal-path
+    // discharge, exactly as it unwinds past the caller's post-call release of
+    // the receiver).
+    std::vector<llvm::Value*> strArgProducers;
+
+    // The NORMAL-return discharge — the counterpart of the throw edge's
+    // release in `guardThrowReleasingSelf` below. It runs at the member's
+    // exit, exactly once, on the path that returns a value. (The two edges
+    // are mutually exclusive: the throw edge leaves the member, the normal
+    // edge returns from it.)
+    struct ArgProducerDischarge {
+        Emitter* E;
+        std::vector<llvm::Value*>* Producers;
+        ~ArgProducerDischarge() {
+            if (!E || Producers->empty()) return;
+            // A DIVERGED lowering (a `throw` in argument position, §17.12)
+            // leaves the current block TERMINATED — the unwind edge owns the
+            // temporaries there, and emitting into a terminated block is
+            // invalid IR ("Basic Block ... does not have a terminator").
+            if (E->diverged_) return;
+            llvm::BasicBlock* bb = E->builder_.GetInsertBlock();
+            if (!bb || bb->getTerminator()) return;
+            for (llvm::Value* v : *Producers) E->emitStringRelease(v);
+        }
+    };
+    ArgProducerDischarge argProducerDischarge{this, &strArgProducers};
+
+    // fix #7222: the release set a raise discharges — the receiver's producer
+    // plus every ARGUMENT producer lowered so far (§28.9 — a raise unwinds
+    // past the normal-path discharge, exactly as it unwinds past the caller's
+    // post-call release of the receiver).
+    auto ownedOnThrow = [&]() -> std::vector<llvm::Value*> {
+        std::vector<llvm::Value*> owned;
+        if (callerOwnedSelf) owned.push_back(callerOwnedSelf);
+        for (llvm::Value* v : strArgProducers) owned.push_back(v);
+        return owned;
+    };
+    auto guardThrowReleasingSelf = [&](llvm::Value* cond, const char* name) {
+        emitGuardThrowReleasingString(cond, name, ownedOnThrow());
+    };
+
+    // fix #7222 (§9.6 / §28.9 / §28.3, v0.344): the ONE funnel through which
+    // this member path lowers an ARGUMENT. It RECORDS the argument's +1
+    // producer reference so the discharge above can release it exactly once.
+    //
+    // `isPlusOneStringProducer` is the SAME predicate the ordinary call
+    // path's post-call release uses (LlvmBackend_Calls2.cpp), so the §9.6
+    // member path and the ordinary path agree on WHICH arguments carry a
+    // producer reference — a `string` concatenation, an interpolation, a
+    // string-valued call result, a string-valued property read, a range
+    // slice. An `int`/`char`/`Range` argument is never one (the predicate is
+    // keyed on the argument's string type), so the funnel is safe for every
+    // parameter kind.
+    auto lowerArg = [&](size_t idx) -> llvm::Value* {
+        if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
+        llvm::Value* v = lowerExpr(*call.args[idx].value);
+        if (v && isPlusOneStringProducer(call.args[idx].value.get()))
+            strArgProducers.push_back(v);
+        return v;
+    };
+
     // Helpers for extracting the first string argument.
     auto getStrArg = [&](size_t idx) -> llvm::Value* {
-        if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
-        return lowerExpr(*call.args[idx].value);
+        return lowerArg(idx);
     };
     auto getIntArg = [&](size_t idx) -> llvm::Value* {
         if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
@@ -1441,8 +1634,58 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // precisely because it was NOT gated and the unwrap turned a clean ICE
         // into a silent wrong value. Do not route a new method through
         // getIntArg without adding it to `intPos` first.
-        return unwrapNarrowedNullableOperand(lowerExpr(*call.args[idx].value),
+        return unwrapNarrowedNullableOperand(lowerArg(idx),
                                              call.args[idx].value.get());
+    };
+    // fix #7169 (§9.6, v0.343): the §5.1 widening rules live in the EMITTER
+    // HEADER (`src/codegen/LlvmBackend_impl.hpp`) — `widenIntParam` and
+    // `fitToI32` are `Emitter` members now, not local lambdas of this
+    // function. stdlib §9.6's range contracts are enforced in TWO files (the
+    // instance arms here, the static `Repeat(c: char, count: int)` arm in
+    // `LlvmBackend_Calls2.cpp`), and a file-local helper is not reachable
+    // from the second file — so the static arm re-implemented the widening
+    // rule inline, and the pair drifted (#7104 fixed the instance arm,
+    // #7117 filed the static arm's, #7120 had to repair the static widening
+    // AGAIN to make its own new guard correct). One definition, one rule.
+
+    // fix #7180 (§22.5, v0.343): a NAMED argument binds to the PARAMETER it
+    // NAMES, never to the position it occupies. §22.5 (v0.343): "named
+    // arguments may appear in any order after positional arguments. Each
+    // supplied argument binds exactly one parameter". Sema binds a built-in
+    // member's named arguments correctly and PUBLISHES that binding — the
+    // `paramToArg` vector, PARAMETER index -> SOURCE argument index — through
+    // `ExprTC::checkBuiltinNamedArgs` -> `SemaContext::setBuiltinCallBinding`
+    // (src/sema/ExprTypecheck_Calls.cpp, src/sema/SemaContext.hpp). An arm
+    // that reads `call.args[p]` POSITIONALLY ignores that binding: the
+    // reordered call then hands a parameter the value of a DIFFERENT
+    // parameter — and, when the two parameters have different types, an `i1`
+    // to a `ptr` slot, which is malformed IR and aborted the compiler with
+    // "IR verification failed" (#7180, `s.Equals(ignoreCase := true, other :=
+    // "ABC")`).
+    //
+    // The registry's parameter order for a member (`kStringParamNames`,
+    // src/common/BuiltinRegistry.cpp) is the order these arms already assumed
+    // positionally — `Equals/2` is {other, ignoreCase}, `CompareTo/2` is
+    // {other, ignoreCase}, `IndexOf/2` is {value, startIndex}, `Substring/2`
+    // is {startIndex, length}, `AsSpan/2` is {start, length}, `Pad*/2` is
+    // {totalWidth, paddingChar}, `Insert/2` is {startIndex, value}, and
+    // `Replace/2` is {oldChar, newChar} / {oldValue, newValue} (both with the
+    // OLD operand first) — so PARAMETER p's source argument is `(*bnd)[p]`.
+    //
+    // A POSITIONAL call, and a named call already in DECLARATION order (the
+    // identity permutation), publish NOTHING — for those the positional read
+    // is the correct one, and the fallback below keeps it byte for byte.
+    const auto* bnd = ctx_.builtinCallBinding(call);
+    // The SOURCE argument index bound to PARAMETER `p` (0-based, in the
+    // registry's parameter order). `p` itself when there is no published
+    // binding.
+    auto srcArgIdx = [&](std::size_t p) -> std::size_t {
+        if (bnd && p < bnd->size()) {
+            const int ai = (*bnd)[p];
+            if (ai >= 0 && static_cast<std::size_t>(ai) < call.args.size())
+                return static_cast<std::size_t>(ai);
+        }
+        return p;
     };
 
     // §9.6 / §3.3 (#883): string.AsSpan() and its overloads → a ReadOnlyStringSpan
@@ -1459,7 +1702,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // (r: Range<int>) — Start = r.Start, Length = element count.
         if (call.args.size() == 1 && call.args[0].value &&
             isRangeType(ctx_.exprType(*call.args[0].value))) {
-            llvm::Value* rv = lowerExpr(*call.args[0].value);
+            llvm::Value* rv = lowerArg(0);
             if (!rv || !rv->getType()->isStructTy()) return nullptr;
             llvm::Value* lo = builder_.CreateTrunc(
                 builder_.CreateExtractValue(rv, {0u}), i32(), "ss.r.lo");
@@ -1476,7 +1719,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             llvm::Value* lenNeg = builder_.CreateICmpSLT(len, builder_.getInt32(0));
             llvm::Value* endOOB =
                 builder_.CreateICmpSGT(builder_.CreateAdd(lo, len), count);
-            emitGuardThrow(
+            guardThrowReleasingSelf(
                 builder_.CreateOr(builder_.CreateOr(startNeg, lenNeg), endOOB),
                 "IndexOutOfRangeException");
             return buildArraySpan(self, lo, len);
@@ -1485,9 +1728,13 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         if (call.args.size() == 1 && call.args[0].value) {
             llvm::Value* start = getIntArg(0);
             if (!start) return nullptr;
-            if (!start->getType()->isIntegerTy(32))
-                start = builder_.CreateTrunc(start, i32());
-            emitGuardThrow(
+            // fix #7106 (§5.1, v0.343): fit the start to the i32 slot by the
+            // SOURCE's signedness. A `trunc` to a WIDER type is malformed IR,
+            // so a `byte` start (i8) used to abort the compiler with "DestTy
+            // too big for Trunc"; and a `byte` 200 must reach the i32 slot as
+            // 200 (§5.1), not -56.
+            start = fitToI32(call.args[0].value.get(), start);
+            guardThrowReleasingSelf(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(start, builder_.getInt32(0)),
                     builder_.CreateICmpSGT(start, count)),
@@ -1497,20 +1744,39 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         }
         // (start, length)
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-            llvm::Value* start = getIntArg(0);
-            llvm::Value* len   = getIntArg(1);
+            // fix #7180 (§22.5, v0.343): `start` and `length` are PARAMETERS;
+            // a named argument binds the parameter it NAMES, so the source
+            // argument of each parameter comes from the published binding.
+            const std::size_t startSrc = srcArgIdx(0);
+            const std::size_t lenSrc   = srcArgIdx(1);
+            llvm::Value* start = nullptr;
+            llvm::Value* len   = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (startSrc <= lenSrc) {
+                start = getIntArg(startSrc);
+                if (!start) return nullptr;
+                len = getIntArg(lenSrc);
+            } else {
+                len = getIntArg(lenSrc);
+                if (!len) return nullptr;
+                start = getIntArg(startSrc);
+            }
             if (!start || !len) return nullptr;
-            if (!start->getType()->isIntegerTy(32))
-                start = builder_.CreateTrunc(start, i32());
-            if (!len->getType()->isIntegerTy(32))
-                len = builder_.CreateTrunc(len, i32());
-            emitGuardThrow(
+            // fix #7106 (§5.1, v0.343): same widen-by-signedness fit as the
+            // (start) arm above — the span's Start/Length are i32 slots, and a
+            // `trunc` to a WIDER type is malformed IR (the compiler-crash arm
+            // this replaces).
+            start = fitToI32(call.args[startSrc].value.get(), start);
+            len   = fitToI32(call.args[lenSrc].value.get(), len);
+            guardThrowReleasingSelf(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(start, builder_.getInt32(0)),
                     builder_.CreateICmpSGT(start, count)),
                 "IndexOutOfRangeException");
             llvm::Value* avail = builder_.CreateSub(count, start);
-            emitGuardThrow(
+            guardThrowReleasingSelf(
                 builder_.CreateOr(
                     builder_.CreateICmpSLT(len, builder_.getInt32(0)),
                     builder_.CreateICmpSGT(len, avail)),
@@ -1571,7 +1837,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // Neither "true" nor "false" → raise FormatException.
             llvm::Value* notTrueOrFalse = builder_.CreateNot(
                 builder_.CreateOr(cmpTrue, cmpFalse), "tobool.invalid");
-            emitGuardThrow(notTrueOrFalse, "FormatException");
+            guardThrowReleasingSelf(notTrueOrFalse, "FormatException");
             return cmpTrue;
         }
         // stdlib §9.6, #882: GetHashCode(): int — content-based hash consistent
@@ -1590,15 +1856,38 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // §9.6: Equals(other: string): bool — content equality (same as `=`).
     // Equals(other, ignoreCase: bool): bool — optional case-insensitive.
     if (method == "Equals" && !call.args.empty() && call.args[0].value) {
-        llvm::Value* other = getStrArg(0);
-        if (!other) return nullptr;
+        // fix #7180 (§22.5, v0.343): `other` and `ignoreCase` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally, the
+        // reordered call `s.Equals(ignoreCase := true, other := "ABC")` took
+        // `call.args[0]` — the `i1` — as the `other` STRING operand and handed
+        // it to a `ptr` parameter: malformed IR, and the compiler aborted with
+        // "IR verification failed" (#7180).
+        const std::size_t otherSrc = srcArgIdx(0);
         if (call.args.size() == 1) {
-            return emitStringEq(self, other);
+            llvm::Value* other1 = getStrArg(otherSrc);
+            if (!other1) return nullptr;
+            return emitStringEq(self, other1);
+        }
+        const std::size_t icSrc = srcArgIdx(1);
+        llvm::Value* other = nullptr;
+        llvm::Value* ignoreCase = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (otherSrc <= icSrc) {
+            other = getStrArg(otherSrc);
+            if (!other) return nullptr;
+            if (!call.args[icSrc].value) return nullptr;
+            ignoreCase = lowerArg(icSrc);
+        } else {
+            if (!call.args[icSrc].value) return nullptr;
+            ignoreCase = lowerArg(icSrc);
+            other = getStrArg(otherSrc);
+            if (!other) return nullptr;
         }
         // 2-arg form: Equals(other, ignoreCase).
         // ignoreCase=true → the code-point-wise case-folded compare
         // (bz_str_equals_ignorecase, fix #4483); false → plain equality.
-        llvm::Value* ignoreCase = lowerExpr(*call.args[1].value);
         if (!ignoreCase) return emitStringEq(self, other);
         // Fast path: ignoreCase=false → plain equality.
         auto* icBB = llvm::BasicBlock::Create(llvm_, "eq.ic", currentFn_);
@@ -1696,9 +1985,29 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // same runtime relation, which is what those two documents require.
     if (method == "CompareTo" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* other = getStrArg(0);
-        if (!other) return nullptr;
-        llvm::Value* ic = lowerExpr(*call.args[1].value);
+        // fix #7180 (§22.5, v0.343): `other` and `ignoreCase` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally,
+        // the reordered call `s.CompareTo(ignoreCase := true, other := "ABC")`
+        // handed the `i1` to the `ptr` `other` slot — malformed IR (the same
+        // crash #7180 reports for `Equals`).
+        const std::size_t otherSrc = srcArgIdx(0);
+        const std::size_t icSrc    = srcArgIdx(1);
+        llvm::Value* other = nullptr;
+        llvm::Value* ic = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (otherSrc <= icSrc) {
+            other = getStrArg(otherSrc);
+            if (!other) return nullptr;
+            if (!call.args[icSrc].value) return nullptr;
+            ic = lowerArg(icSrc);
+        } else {
+            if (!call.args[icSrc].value) return nullptr;
+            ic = lowerArg(icSrc);
+            other = getStrArg(otherSrc);
+            if (!other) return nullptr;
+        }
         if (!ic) return nullptr;
         llvm::Value* ic32 = ic->getType()->isIntegerTy(32)
             ? ic : builder_.CreateZExt(ic, i32());
@@ -1741,7 +2050,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 // narrowed non-null and its `{i8, i32}` box must be reduced to
                 // the code point `CreateICmpEQ` below compares against.
                 llvm::Value* needle = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[0].value), call.args[0].value.get());
+                    lowerArg(0), call.args[0].value.get());
                 if (!needle) return nullptr;
                 llvm::Value* len = loadStringLen(self);
                 auto* idxS = entryAlloca(i64());
@@ -1790,7 +2099,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 argTy->primitive == sema::PrimitiveType::Char) {
                 // fix #6547: same narrowed-`char?` unwrap as Contains above.
                 llvm::Value* needle = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[0].value), call.args[0].value.get());
+                    lowerArg(0), call.args[0].value.get());
                 if (!needle) return nullptr;
                 llvm::Value* len = loadStringLen(self);
                 auto* idxS = entryAlloca(i64());
@@ -1828,7 +2137,13 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // Linear scan starting at the code-point index startIndex; startIndex is
         // required to lie in [0, Length] (IndexOutOfRangeException otherwise).
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-            auto* argTy = ctx_.exprType(*call.args[0].value);
+            // fix #7180 (§22.5, v0.343): `value` and `startIndex` are
+            // PARAMETERS; a named argument binds the parameter it NAMES. The
+            // OVERLOAD is chosen by the type of the `value` operand, so that
+            // type is read from the parameter's source argument too.
+            const std::size_t valSrc   = srcArgIdx(0);
+            const std::size_t startSrc = srcArgIdx(1);
+            auto* argTy = ctx_.exprType(*call.args[valSrc].value);
             if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive &&
                 argTy->primitive == sema::PrimitiveType::Char) {
                 // fix #6547: same narrowed-`char?` unwrap as Contains above.
@@ -1836,21 +2151,37 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                 // flow-narrowed `int?` to its payload (§7.4). Sema gates this
                 // position (checkBuiltinStringCallArgs' intPos), so an
                 // un-narrowed `int?` is rejected before codegen.
-                llvm::Value* needle = unwrapNarrowedNullableOperand(
-                    lowerExpr(*call.args[0].value), call.args[0].value.get());
-                if (!needle) return nullptr;
-                llvm::Value* startV = getIntArg(1);
-                if (!startV) return nullptr;
+                llvm::Value* needle = nullptr;
+                llvm::Value* startV = nullptr;
+                // §22.5 (v0.343): the supplied argument expressions are
+                // evaluated in CALL-SITE TEXTUAL order — the expression
+                // written FIRST runs first, whatever parameter it binds to.
+                if (valSrc <= startSrc) {
+                    needle = unwrapNarrowedNullableOperand(
+                        lowerArg(valSrc),
+                        call.args[valSrc].value.get());
+                    if (!needle) return nullptr;
+                    startV = getIntArg(startSrc);
+                } else {
+                    startV = getIntArg(startSrc);
+                    if (!startV) return nullptr;
+                    needle = unwrapNarrowedNullableOperand(
+                        lowerArg(valSrc),
+                        call.args[valSrc].value.get());
+                }
+                if (!needle || !startV) return nullptr;
                 // Normalize startV to i64 for the loop counter / bounds check.
-                llvm::Value* start64 = startV->getType()->isIntegerTy(64)
-                    ? startV
-                    : builder_.CreateSExt(startV, i64(), "ioc2.s64");
+                // fix #6639 (§5.1): widen by the SOURCE's signedness — an
+                // unsigned `byte` startIndex zero-extends, so `byte` 200 stays
+                // 200 instead of becoming -56 and failing the bounds check.
+                llvm::Value* start64 = widenIntParam(call.args[startSrc].value.get(),
+                                                     startV, "ioc2.s64", "ioc2.z64");
                 llvm::Value* len = loadStringLen(self);
                 // Bounds check: 0 <= startIndex <= Length.
                 llvm::Value* oor = builder_.CreateOr(
                     builder_.CreateICmpSLT(start64, builder_.getInt64(0), "ioc2.sneg"),
                     builder_.CreateICmpSGT(start64, len, "ioc2.sbig"), "ioc2.oor");
-                emitGuardThrow(oor, "IndexOutOfRangeException");
+                guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
                 // Inline forward scan from startIndex, mirroring the 1-arg form.
                 auto* idxS = entryAlloca(i64());
                 builder_.CreateStore(start64, idxS);
@@ -1887,14 +2218,51 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // `start` is a code-point index (§4.6 adaptive-width strings); the
         // runtime bz_str_indexof_from honours the width-aware code-point model.
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
-            llvm::Value* sub = lowerExpr(*call.args[0].value);
-            if (!sub) return nullptr;
+            // fix #7180 (§22.5, v0.343): `value` and `startIndex` are
+            // PARAMETERS; a named argument binds the parameter it NAMES.
+            const std::size_t valSrc   = srcArgIdx(0);
+            const std::size_t startSrc = srcArgIdx(1);
+            llvm::Value* sub = nullptr;
             // fix #6562: startIndex via getIntArg (narrowed `int?` unwrap, §7.4).
-            llvm::Value* startVal = getIntArg(1);
-            if (!startVal) return nullptr;
+            llvm::Value* startVal = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (valSrc <= startSrc) {
+                sub = lowerArg(valSrc);
+                if (!sub) return nullptr;
+                startVal = getIntArg(startSrc);
+            } else {
+                startVal = getIntArg(startSrc);
+                if (!startVal) return nullptr;
+                sub = lowerArg(valSrc);
+            }
+            if (!sub || !startVal) return nullptr;
             // Normalize start to i64 for the runtime.
-            if (!startVal->getType()->isIntegerTy(64))
-                startVal = builder_.CreateSExt(startVal, i64(), "iof2.s64");
+            // fix #6639 (§5.1): widen by the SOURCE's signedness — an unsigned
+            // `byte` startIndex zero-extends, so `byte` 200 stays 200 instead
+            // of becoming -56 (which the runtime's negative-start clamp then
+            // silently turned into a search from 0).
+            startVal = widenIntParam(call.args[startSrc].value.get(), startVal,
+                                     "iof2.s64", "iof2.z64");
+            // fix #6641 (§9.6, v0.343): `IndexOf(value: string, startIndex: int
+            // := 0)` requires "0 <= startIndex <= Length (IndexOutOfRange-
+            // Exception otherwise)" — the SAME bound the char-needle arm
+            // checks. This arm had NO check, so an out-of-range start reached
+            // the runtime: `bz_str_indexof_from` clamps a negative start to 0
+            // (a silent search from the front) and returns -1 for a start past
+            // the end, instead of raising.
+            //
+            // ⚠ The check runs against the NORMALISED start — the value the
+            // search actually starts from (fix #6639), not a pre-widening one.
+            // A `byte` 200 widens to the int 200, which is a legal start on a
+            // long enough string; had the check seen a sign-extended -56 it
+            // would have rejected a program §5.1 and §9.6 both admit.
+            llvm::Value* len = loadStringLen(self);
+            llvm::Value* oor = builder_.CreateOr(
+                builder_.CreateICmpSLT(startVal, builder_.getInt64(0), "iof2.sneg"),
+                builder_.CreateICmpSGT(startVal, len, "iof2.sbig"), "iof2.oor");
+            guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
             auto* fn = declareC("bz_str_indexof_from", i32(),
                                 {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {self, sub, startVal}, "iof2.result");
@@ -1914,7 +2282,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             argTy->primitive == sema::PrimitiveType::Char) {
             // fix #6547: same narrowed-`char?` unwrap as Contains above.
             llvm::Value* needle = unwrapNarrowedNullableOperand(
-                lowerExpr(*call.args[0].value), call.args[0].value.get());
+                lowerArg(0), call.args[0].value.get());
             if (!needle) return nullptr;
             llvm::Value* len = loadStringLen(self);
             // Scan from len-1 down to 0.
@@ -1960,14 +2328,42 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // Delegates to bz_str_substring which uses the source string's width field
     // to copy the correct bytes (width * count) and preserves the source width.
     if (method == "Substring") {
-        llvm::Value* startV = getIntArg(0);
-        if (!startV) return nullptr;
-        llvm::Value* start64 = builder_.CreateSExt(startV, i64(), "sub.start");
-        bool hasLen = call.args.size() >= 2 && call.args[1].value;
+        // fix #7180 (§22.5, v0.343): `startIndex` and `length` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally,
+        // the reordered call `s.Substring(length := 2, startIndex := 1)` took
+        // `length` as the START and `startIndex` as the LENGTH — a silently
+        // wrong value ("c" instead of "bc").
+        const std::size_t startSrc = srcArgIdx(0);
+        const std::size_t lenSrc   = srcArgIdx(1);
+        bool hasLen = call.args.size() >= 2 && call.args[lenSrc].value;
+        llvm::Value* startV = nullptr;
+        llvm::Value* countArg = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (!hasLen || startSrc <= lenSrc) {
+            startV = getIntArg(startSrc);
+            if (!startV) return nullptr;
+            if (hasLen) countArg = lowerArg(lenSrc);
+        } else {
+            countArg = lowerArg(lenSrc);
+            startV = getIntArg(startSrc);
+            if (!startV) return nullptr;
+        }
+        // fix #7102 (§5.1, §9.6, v0.343): BOTH `int` parameters of Substring
+        // are widened by the SOURCE's signedness (widenIntParam above), not by
+        // a bare sign-extension. A `byte` 200 is the `int` 200 — the §5.1
+        // widening is lossless, so it must preserve the value; the bare
+        // CreateSExt read the unsigned source's high bit as a sign bit and
+        // delivered -56, which the arm's own bounds check then rejected.
+        llvm::Value* start64 = widenIntParam(call.args[startSrc].value.get(), startV,
+                                             "sub.start", "sub.zstart");
         // If length arg absent, pass -1 to signal "rest of string" to runtime.
         llvm::Value* count64 = hasLen
-            ? builder_.CreateSExt(lowerExpr(*call.args[1].value), i64(), "sub.count")
+            ? widenIntParam(call.args[lenSrc].value.get(), countArg,
+                            "sub.count", "sub.zcount")
             : builder_.getInt64(-1);
+        if (hasLen && !count64) return nullptr;
         // fix #747 R43 / §9.6 / language spec §4.6: an out-of-range start or
         // length raises IndexOutOfRangeException — the same convention every
         // string/span/array bounds operation follows (the runtime previously
@@ -1990,7 +2386,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             oor = builder_.CreateOr(
                 oor, builder_.CreateOr(lenNeg, endBig, "sub.loor"), "sub.oor");
         }
-        emitGuardThrow(oor, "IndexOutOfRangeException");
+        guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
         auto* fn = declareC("bz_str_substring", ptrTy(), {ptrTy(), i64(), i64()});
         return builder_.CreateCall(fn, {self, start64, count64}, "sub.result");
     }
@@ -1999,17 +2395,40 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // Detected by arg type being char (Char primitive).
     if (method == "Replace" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        auto* at0 = ctx_.exprType(*call.args[0].value);
+        // fix #7180 (§22.5, v0.343): `oldChar` and `newChar` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. The registry's two
+        // `Replace/2` rows ({oldChar, newChar} and {oldValue, newValue}) both
+        // carry the OLD operand first, so PARAMETER 0 is the old one in
+        // either overload.
+        const std::size_t oldSrc = srcArgIdx(0);
+        const std::size_t newSrc = srcArgIdx(1);
+        auto* at0 = ctx_.exprType(*call.args[oldSrc].value);
         if (at0 && at0->kind == sema::TypeRef::Kind::Primitive &&
             at0->primitive == sema::PrimitiveType::Char) {
             // fix #6547: same narrowed-`char?` unwrap as Contains above, on
             // BOTH operands — sema gates each (`oldChar` and `newChar` are
             // `char` parameters, stdlib §9.6), and the body both compares
             // `oldCh` against a code point and truncates `newCh` to `i8`.
-            llvm::Value* oldCh = unwrapNarrowedNullableOperand(
-                lowerExpr(*call.args[0].value), call.args[0].value.get());
-            llvm::Value* newCh = unwrapNarrowedNullableOperand(
-                lowerExpr(*call.args[1].value), call.args[1].value.get());
+            llvm::Value* oldCh = nullptr;
+            llvm::Value* newCh = nullptr;
+            // §22.5 (v0.343): the supplied argument expressions are evaluated
+            // in CALL-SITE TEXTUAL order — the expression written FIRST runs
+            // first, whatever parameter it binds to.
+            if (oldSrc <= newSrc) {
+                oldCh = unwrapNarrowedNullableOperand(
+                    lowerArg(oldSrc),
+                    call.args[oldSrc].value.get());
+                newCh = unwrapNarrowedNullableOperand(
+                    lowerArg(newSrc),
+                    call.args[newSrc].value.get());
+            } else {
+                newCh = unwrapNarrowedNullableOperand(
+                    lowerArg(newSrc),
+                    call.args[newSrc].value.get());
+                oldCh = unwrapNarrowedNullableOperand(
+                    lowerArg(oldSrc),
+                    call.args[oldSrc].value.get());
+            }
             if (!oldCh || !newCh) return nullptr;
             auto* i8Ty  = llvm::Type::getInt8Ty(llvm_);
             auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
@@ -2078,8 +2497,24 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // output width for the result (§4.6 adaptive storage).
     if (method == "Replace" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* oldStr = lowerExpr(*call.args[0].value);
-        llvm::Value* newStr = lowerExpr(*call.args[1].value);
+        // fix #7180 (§22.5, v0.343): `oldValue` and `newValue` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally, the
+        // reordered call `s.Replace(newValue := "X", oldValue := "b")` took
+        // the NEW value as the OLD one — a silently wrong value.
+        const std::size_t oldSrc = srcArgIdx(0);
+        const std::size_t newSrc = srcArgIdx(1);
+        llvm::Value* oldStr = nullptr;
+        llvm::Value* newStr = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (oldSrc <= newSrc) {
+            oldStr = lowerArg(oldSrc);
+            newStr = lowerArg(newSrc);
+        } else {
+            newStr = lowerArg(newSrc);
+            oldStr = lowerArg(oldSrc);
+        }
         if (!oldStr || !newStr) return nullptr;
         auto* fn = declareC("bz_str_replace", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
         return builder_.CreateCall(fn, {self, oldStr, newStr}, "repl.result");
@@ -2147,7 +2582,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // and `.Length` dereferenced null. (TrimStart/TrimEnd char-set overloads
         // are analogous but not yet wired; only Trim(set) is handled here.)
         if (method == "Trim" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* chars = lowerExpr(*call.args[0].value);
+            llvm::Value* chars = lowerArg(0);
             if (!chars) return nullptr;
             auto* fn = declareC("bz_str_trim_chars", ptrTy(), {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {self, chars}, "trim.chars.result");
@@ -2254,35 +2689,127 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // so any code point > U+00FF was corrupted. Strings store fixed-width code
     // points (§4.6); the runtime builds the padded result at the correct width
     // (widest of self's width and the pad char's), widening self's code points.
-    if ((method == "PadLeft" || method == "PadRight") &&
+    //
+    // fix #7133 / §9.6 (v0.343): `PadCenter(totalWidth[, paddingChar])` joins
+    // the same arm. stdlib §9.6 declares it with the SAME "Pad contract (all
+    // three Pad members)" as PadLeft/PadRight — `totalWidth <= Length` returns
+    // the original string unchanged, `totalWidth < 0` raises
+    // ArgumentOutOfRangeException — and adds the centering rule: "PadCenter
+    // splits the padding evenly; when it is odd, the extra character goes to
+    // the RIGHT: \"ab\".PadCenter(5) = \" ab  \"". The runtime helper's `align`
+    // byte selects the layout (0 = PadLeft, 1 = PadRight, 2 = PadCenter), so
+    // the centered mode is the SAME helper with one more layout, not a new
+    // mechanism.
+    if ((method == "PadLeft" || method == "PadRight" || method == "PadCenter") &&
         !call.args.empty() && call.args[0].value) {
-        llvm::Value* widthArg = lowerExpr(*call.args[0].value);
-        if (!widthArg) return nullptr;
-        llvm::Value* width64 = builder_.CreateSExt(widthArg, i64(), "pad.width");
+        // fix #7180 (§22.5, v0.343): `totalWidth` and `paddingChar` are
+        // PARAMETERS; a named argument binds the parameter it NAMES. Read
+        // positionally, the reordered call `s.PadLeft(paddingChar := 'x',
+        // totalWidth := 4)` took the PADDING CHARACTER as the WIDTH.
+        const std::size_t widthSrc = srcArgIdx(0);
+        const std::size_t padSrc   = srcArgIdx(1);
+        bool hasPad = call.args.size() >= 2 && call.args[padSrc].value;
+        llvm::Value* width64 = nullptr;
+        llvm::Value* padCharArg = nullptr;
+        // fix #7105 (§5.1, v0.343): widen the width to i64 BY THE SOURCE'S
+        // SIGNEDNESS. A bare `CreateSExt` read an unsigned `byte` totalWidth's
+        // high bit as a sign bit, so `byte` 200 arrived as -56 and the pad
+        // silently produced the ORIGINAL string (width 3) instead of a
+        // 200-code-point one — §5.1 admits `byte → int` as a LOSSLESS
+        // conversion, so the two spellings must agree.
+        //
+        // §9.6 (v0.343): "Pad contract (all three Pad members): ...
+        // totalWidth < 0 raises ArgumentOutOfRangeException." The runtime
+        // helper answers a width <= Length with "the original string
+        // unchanged", so a NEGATIVE width would silently return the receiver
+        // instead of raising ⇒ the guard must be emitted BEFORE the call.
+        //
+        // fix #7120 (§9.6, v0.343): the guard now covers ALL THREE Pad
+        // members. `PadCenter` already had one; `PadLeft`/`PadRight` answered
+        // a negative width with the receiver unchanged, so the three members
+        // disagreed about the SAME §9.6 contract. They now share ONE guard —
+        // the same `width64` (widened by the source's signedness, §5.1) and
+        // the same comparison — so the three spellings cannot drift apart.
+        // `PadCenter`'s raise is NOT weakened: it is that same guard, shared.
+        //
+        // fix #7169 (§9.6, v0.343): that shared guard is now the SHARED
+        // §9.6 count contract — `emitSection96CountContract`, in the emitter
+        // header, reachable from the static `Repeat` arm's file too. The
+        // widening, the comparison and the raise are ONE function, so the
+        // `Pad*` width and the `Repeat` count cannot drift apart either.
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to. The width's guard is emitted right
+        // after the width's own lowering, exactly as the positional form does
+        // (the padding character's expression is evaluated between the two
+        // only when the width is written first).
+        if (!hasPad || widthSrc <= padSrc) {
+            llvm::Value* widthArg = lowerArg(widthSrc);
+            if (!widthArg) return nullptr;
+            width64 = emitSection96CountContract(
+                    call.args[widthSrc].value.get(), widthArg, ownedOnThrow(),
+                    "pad.s64", "pad.z64", "pad.neg");
+            if (hasPad) padCharArg = lowerArg(padSrc);
+        } else {
+            padCharArg = lowerArg(padSrc);
+            llvm::Value* widthArg = lowerArg(widthSrc);
+            if (!widthArg) return nullptr;
+            width64 = emitSection96CountContract(
+                    call.args[widthSrc].value.get(), widthArg, ownedOnThrow(),
+                    "pad.s64", "pad.z64", "pad.neg");
+        }
         // Pad character: default space, or the 2nd arg (a code point, i32).
         llvm::Value* padCharI32 = builder_.getInt32(' ');
-        if (call.args.size() >= 2 && call.args[1].value) {
-            llvm::Value* pc = lowerExpr(*call.args[1].value);
-            if (pc && pc->getType()->isIntegerTy(32)) padCharI32 = pc;
-            else if (pc) padCharI32 = builder_.CreateZExtOrTrunc(pc, i32());
+        if (padCharArg) {
+            if (padCharArg->getType()->isIntegerTy(32)) padCharI32 = padCharArg;
+            else padCharI32 = builder_.CreateZExtOrTrunc(padCharArg, i32());
         }
-        // leftAlign = 1 for PadRight (self first, pad after); 0 for PadLeft.
-        llvm::Value* leftAlign =
-            builder_.getInt8(method == "PadRight" ? 1 : 0);
+        // align: 1 for PadRight (self first, pad after); 0 for PadLeft;
+        // 2 for PadCenter (padding split evenly, the odd extra on the RIGHT).
+        llvm::Value* align = builder_.getInt8(
+            method == "PadRight" ? 1 : (method == "PadCenter" ? 2 : 0));
         auto* fn = declareC("bz_str_pad", ptrTy(),
                             {ptrTy(), i64(), i32(), llvm::Type::getInt8Ty(llvm_)});
-        return builder_.CreateCall(fn, {self, width64, padCharI32, leftAlign},
+        return builder_.CreateCall(fn, {self, width64, padCharI32, align},
                                    "pad.result");
     }
 
     // §9.6: Repeat(n: int): string — repeat self n times.
     if (method == "Repeat" && call.args.size() == 1 && call.args[0].value) {
-        llvm::Value* nArg = lowerExpr(*call.args[0].value);
+        llvm::Value* nArg = lowerArg(0);
         if (!nArg) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
         llvm::Value* selfData = loadStringData(self);
-        llvm::Value* n64 = builder_.CreateSExt(nArg, i64(), "rep.n");
+        // fix #7104 (§5.1, v0.343): widen the count to i64 BY THE SOURCE'S
+        // SIGNEDNESS. A bare `CreateSExt` read an unsigned `byte` count's high
+        // bit as a sign bit, so `byte` 200 arrived as -56: the negative count
+        // reached the `malloc` below and the process died (SIGSEGV) instead of
+        // repeating the string 200 times. §5.1 admits `byte → int` as a
+        // LOSSLESS conversion, so the two spellings must agree.
+        //
+        // §9.6 (v0.343): the count contract — "count < 0 raises
+        // ArgumentOutOfRangeException; count = 0 is \"\"" — declared on the
+        // static `Repeat(c: char, count: int)` and, by "same count contract",
+        // on `Repeat(unit: string, count: int)`. The instance spelling
+        // repeats the RECEIVER as that unit, so it carries the same count
+        // contract.
+        //
+        // fix #7120 (§9.6, v0.343): the guard must be emitted BEFORE the
+        // `malloc` below. A negative count made `totalLen` negative, so
+        // `malloc` returned a 1-byte buffer and the copy loop wrote past it
+        // (heap-buffer-overflow ⇒ SIGSEGV without a sanitizer). `count = 0`
+        // is NOT an error (§9.6): `totalLen` is 0, the loop does not run and
+        // the result is "".
+        //
+        // fix #7169 (§9.6, v0.343): the widening, the comparison and the
+        // raise are now the SHARED §9.6 count contract
+        // (`emitSection96CountContract`, in the emitter header) — the SAME
+        // function the static `Repeat(c: char, count: int)` arm calls, so
+        // the two spellings cannot drift apart.
+        llvm::Value* n64 = emitSection96CountContract(
+                call.args[0].value.get(), nArg, ownedOnThrow(),
+                "rep.s64", "rep.z64", "rep.neg");
         llvm::Value* totalLen = builder_.CreateMul(selfLen, n64, "rep.total");
         auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
         auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
@@ -2323,8 +2850,8 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // Returns empty string if n is out of range.
     if (method == "GetField" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* delimArg = lowerExpr(*call.args[0].value);
-        llvm::Value* nArg = lowerExpr(*call.args[1].value);
+        llvm::Value* delimArg = lowerArg(0);
+        llvm::Value* nArg = lowerArg(1);
         if (!delimArg || !nArg) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
@@ -2487,18 +3014,70 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // §9.6: Insert(index, value): string — insert value at code-point position index.
     if (method == "Insert" && call.args.size() == 2 &&
         call.args[0].value && call.args[1].value) {
-        llvm::Value* idxV = getIntArg(0);
-        llvm::Value* ins  = getStrArg(1);
+        // fix #7180 (§22.5, v0.343): `startIndex` and `value` are PARAMETERS;
+        // a named argument binds the parameter it NAMES. Read positionally, the
+        // reordered call `s.Insert(value := "X", startIndex := 1)` took the
+        // STRING as the index (and the index as the string).
+        const std::size_t idxSrc = srcArgIdx(0);
+        const std::size_t valSrc = srcArgIdx(1);
+        llvm::Value* idxV = nullptr;
+        llvm::Value* ins  = nullptr;
+        // §22.5 (v0.343): the supplied argument expressions are evaluated in
+        // CALL-SITE TEXTUAL order — the expression written FIRST runs first,
+        // whatever parameter it binds to.
+        if (idxSrc <= valSrc) {
+            idxV = getIntArg(idxSrc);
+            if (!idxV) return nullptr;
+            ins = getStrArg(valSrc);
+        } else {
+            ins = getStrArg(valSrc);
+            idxV = getIntArg(idxSrc);
+        }
         if (!idxV || !ins) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
         llvm::Value* insLen  = loadStringLen(ins);
-        llvm::Value* idx64 = builder_.CreateSExt(idxV, i64(), "ins.idx");
-        // Clamp index to [0, selfLen]
-        llvm::Value* tooHigh = builder_.CreateICmpSGT(idx64, selfLen);
-        idx64 = builder_.CreateSelect(tooHigh, selfLen, idx64);
-        llvm::Value* tooLow = builder_.CreateICmpSLT(idx64, builder_.getInt64(0));
-        idx64 = builder_.CreateSelect(tooLow, builder_.getInt64(0), idx64);
+        // fix #7102 (§5.1, §9.6, v0.343): the `int` startIndex is widened by
+        // the SOURCE's signedness (widenIntParam above). A `byte` 200 is the
+        // `int` 200; the bare CreateSExt read it as -56, and the arm's clamp
+        // (removed by fix #7172 below) then pinned the insertion to the front
+        // of the string.
+        llvm::Value* idx64 = widenIntParam(call.args[idxSrc].value.get(), idxV,
+                                           "ins.idx", "ins.zidx");
+        // fix #7172 (§3.1, §9.6, §4.6, v0.343): the POSITION contract.
+        //
+        // stdlib §3.1 (v0.343), the `StringBuilder` twin's Contracts
+        // paragraph: "`Insert` and `Remove` raise `IndexOutOfRangeException`
+        // when the index or the `(startIndex, length)` window falls outside
+        // `0..Length`." §9.6 (v0.343) declares
+        //     public pure method Insert(startIndex: int, value: string): string;
+        // with NO contract paragraph of its own, so §3.1's twin is the only
+        // sentence that decides the behaviour — exactly as it decides
+        // `String.Remove` (#7168), whose twin arm raises it.
+        //
+        // Before this guard the arm CLAMPED the index to `[0, selfLen]`, so
+        // an out-of-range request returned a WRONG string with exit code 0 —
+        // the program reported success for a request the contract rejects.
+        // The bound is `0..Length` INCLUSIVE (both ends): `Insert(0, …)`
+        // prepends and `Insert(Length, …)` appends, and §4.6 makes a string's
+        // length a count of CODE POINTS, so the bound is in code points —
+        // the same bound the sibling `Remove` arm uses.
+        //
+        // The widened value (§5.1) is what the bound is tested on, so a `byte`
+        // 200 is the `int` 200 (#7102) and not -56.
+        llvm::Value* idxNeg = builder_.CreateICmpSLT(idx64,
+                                                     builder_.getInt64(0),
+                                                     "ins.sneg");
+        llvm::Value* idxBig = builder_.CreateICmpSGT(idx64, selfLen, "ins.sbig");
+        llvm::Value* oor = builder_.CreateOr(idxNeg, idxBig, "ins.soor");
+        // The guard RAISES, so it releases the caller-owned producer receiver
+        // on the throw edge (§28.9 — the #6979/#7159 idiom; see
+        // `emitGuardThrowReleasingString`). The `value` argument is a BORROW
+        // parameter (stdlib §2.6 — no `owned`), so the callee does not own
+        // its reference and must not release it; its disposal belongs to the
+        // caller's full-expression boundary (§28.3 K8.1), which is unchanged
+        // by this guard.
+        guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
         llvm::Value* resultLen = builder_.CreateAdd(selfLen, insLen, "ins.reslen");
         auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
         auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
@@ -2563,20 +3142,75 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen  = loadStringLen(self);
         llvm::Value* selfData = loadStringData(self);
-        llvm::Value* start64 = builder_.CreateSExt(startV, i64(), "rm.start");
+        // fix #7102 (§5.1, §9.6, v0.343): BOTH `int` parameters of Remove are
+        // widened by the SOURCE's signedness (widenIntParam above). A `byte`
+        // 200 is the `int` 200; the bare CreateSExt read it as -56, so the
+        // negative start reached `malloc` as a negative allocation size and
+        // then `memcpy` as a negative copy size — a memory-safety defect, not
+        // merely a wrong answer.
+        llvm::Value* start64 = widenIntParam(call.args[startArgIdx].value.get(),
+                                             startV, "rm.start", "rm.zstart");
+        // fix #7168 (§9.6, §3.1, §4.6, v0.343): the POSITION contract.
+        //
+        // `startIndex` is the string family's established spelling of a start
+        // POSITION (stdlib §1's "Window parameters" convention), and the
+        // family's position convention is uniform: an out-of-range position
+        // raises IndexOutOfRangeException — §4.6 ("`s[i]` … Out-of-range
+        // raises IndexOutOfRangeException"), §31.4 ("IndexOutOfRangeException
+        // — array or string index out of bounds"), §9.6's own `IndexOf`
+        // contract ("0 <= startIndex <= Length (IndexOutOfRangeException
+        // otherwise)"), the sibling `Substring` (which already raises it), and
+        // §3.1's StringBuilder twin ("`Insert` and `Remove` raise
+        // IndexOutOfRangeException when the index or the `(startIndex, length)`
+        // window falls outside `0..Length`").
+        //
+        // ⚠ §9.6 (v0.343) declares `Remove(startIndex)` and
+        // `Remove(startIndex, length)` with NO range contract of its own — the
+        // silence #7108 records. That silence cannot license an out-of-bounds
+        // READ: before this guard, `s.Remove(999)` computed a 999-byte
+        // `memcpy` from a 3-byte allocation (ASan: "heap-buffer-overflow …
+        // READ of size 999 … 0 bytes after 3-byte region"), and the 2-arg form
+        // did the same for a NEGATIVE count (a negative byte offset ⇒ a read
+        // BEFORE the buffer). The guard makes the out-of-range case a defined
+        // raise instead of a memory-safety defect; the exception type follows
+        // the family's position convention, not the count/width convention
+        // (§9.6's `Repeat` count and `Pad*` width raise
+        // ArgumentOutOfRangeException — those are NEGATIVE counts, not
+        // positions).
+        //
+        // The bound is in CODE POINTS (§4.6: a string's length is a count of
+        // code points), matching `Substring`'s guard beside it.
+        llvm::Value* startNeg = builder_.CreateICmpSLT(start64,
+                                                       builder_.getInt64(0),
+                                                       "rm.sneg");
+        llvm::Value* startBig = builder_.CreateICmpSGT(start64, selfLen,
+                                                       "rm.sbig");
+        llvm::Value* oor = builder_.CreateOr(startNeg, startBig, "rm.soor");
         // end = start + count (if given), else = selfLen
         llvm::Value* end64;
         if (call.args.size() >= 2 && call.args[1].value) {
-            llvm::Value* cntV = lowerExpr(*call.args[countArgIdx].value);
+            llvm::Value* cntV = lowerArg(countArgIdx);
             if (!cntV) return nullptr;
-            llvm::Value* cnt64 = builder_.CreateSExt(cntV, i64(), "rm.cnt");
+            llvm::Value* cnt64 = widenIntParam(call.args[countArgIdx].value.get(),
+                                                cntV, "rm.cnt", "rm.zcnt");
+            // The WINDOW: `length` must be >= 0 and the window must lie
+            // inside the receiver (§3.1's StringBuilder `Remove` contract; the
+            // `Substring(startIndex, length)` window beside it).
+            llvm::Value* cntNeg = builder_.CreateICmpSLT(cnt64,
+                                                          builder_.getInt64(0),
+                                                          "rm.cneg");
             end64 = builder_.CreateAdd(start64, cnt64, "rm.end");
-            // Clamp to selfLen
-            llvm::Value* pastEnd = builder_.CreateICmpSGT(end64, selfLen);
-            end64 = builder_.CreateSelect(pastEnd, selfLen, end64);
+            llvm::Value* endBig = builder_.CreateICmpSGT(end64, selfLen,
+                                                         "rm.ebig");
+            oor = builder_.CreateOr(oor,
+                    builder_.CreateOr(cntNeg, endBig, "rm.coor"), "rm.oor");
         } else {
             end64 = selfLen;  // remove from start to end of string
         }
+        // The guard RAISES, so it releases the caller-owned producer receiver
+        // on the throw edge (§28.9 — the #6979 idiom; see
+        // `emitGuardThrowReleasingString`).
+        guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
         // Result length = start + (selfLen - end)
         llvm::Value* tailLen = builder_.CreateSub(selfLen, end64, "rm.tail");
         llvm::Value* resultLen = builder_.CreateAdd(start64, tailLen, "rm.reslen");
@@ -2624,7 +3258,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             // fix #6547: same narrowed-`char?` unwrap as Contains above. Without
             // it the `CreateSExt` two lines below sexted the `{i8, i32}` box.
             llvm::Value* sepCh = unwrapNarrowedNullableOperand(
-                lowerExpr(*call.args[0].value), call.args[0].value.get());
+                lowerArg(0), call.args[0].value.get());
             if (!sepCh) return nullptr;
             if (!sepCh->getType()->isIntegerTy(32))
                 sepCh = builder_.CreateSExt(sepCh, i32());
@@ -2637,7 +3271,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // bz_array_t*). No case existed → the call emitted nothing and the
         // uninitialized result array crashed on Count/dispose.
         if (argTy && argTy->kind == sema::TypeRef::Kind::Named) {
-            llvm::Value* seps = lowerExpr(*call.args[0].value);
+            llvm::Value* seps = lowerArg(0);
             if (!seps) return nullptr;
             auto* fn = declareC("bz_str_split_chars", ptrTy(), {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {self, seps}, "split.chars.result");
@@ -2648,7 +3282,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         if (!argTy || argTy->kind != sema::TypeRef::Kind::Primitive ||
             argTy->primitive != sema::PrimitiveType::String)
             return nullptr;
-        llvm::Value* delim = lowerExpr(*call.args[0].value);
+        llvm::Value* delim = lowerArg(0);
         if (!delim) return nullptr;
         auto* fn = declareC("bz_str_split_str", ptrTy(), {ptrTy(), ptrTy()});
         return builder_.CreateCall(fn, {self, delim}, "split.result");
@@ -2756,15 +3390,25 @@ const sema::TypeRef* Emitter::recordMemberType(const sema::Symbol* m) {
 // declared member. // per stdlib §3.1 / §8.5 / §18.5
 llvm::Value* Emitter::emitStringBuilderToString(llvm::Value* sb) {
     if (!sb || !sb->getType()->isPointerTy()) return nullptr;
-    // Use the runtime helper to concatenate all string parts.
-    auto* outDataSlot = entryAlloca(ptrTy());
-    auto* outLenSlot  = entryAlloca(i64());
-    auto* fn = declareC("bz_strbuilder_to_string",
-                        llvm::Type::getVoidTy(llvm_),
+    // fix #7229 (spec §4.6 / stdlib §3.1, v0.344): the builder's content is
+    // flattened in the CODE-POINT domain and packed at ONE width — the
+    // narrowest that fits the largest code point in the value (§4.6) — and the
+    // runtime helper REPORTS that width. This used to store a hard-coded width
+    // of 1, so a width-2 part's two-bytes-per-code-point storage was read as
+    // one byte per code point and every code point above U+00FF was mangled;
+    // the length stored was the byte count, not the code-point count §4.6
+    // defines. The width must follow the VALUE, not the parts' widths: a
+    // mutator may narrow the content, and stdlib §9.6's `IsAscii` answers
+    // from the width in O(1).
+    auto* outDataSlot  = entryAlloca(ptrTy());
+    auto* outWidthSlot = entryAlloca(i8());
+    auto* fn = declareC("bz_strbuilder_flatten",
+                        i64(),
                         {ptrTy(), ptrTy(), ptrTy()});
-    builder_.CreateCall(fn, {sb, outDataSlot, outLenSlot});
-    llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
-    llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
+    // The helper returns the content's code-point count (§4.6's length).
+    llvm::Value* len = builder_.CreateCall(fn, {sb, outDataSlot, outWidthSlot});
+    llvm::Value* data  = builder_.CreateLoad(ptrTy(), outDataSlot);
+    llvm::Value* width = builder_.CreateLoad(i8(), outWidthSlot);
     // Build a bz.string object from the malloc'd buffer.
     // #422: allocate the full header size (now 32 bytes incl. rc), not
     // a hardcoded 24 — writing rc into field 3 of a 24-byte block would
@@ -2776,7 +3420,7 @@ llvm::Value* Emitter::emitStringBuilderToString(llvm::Value* sb) {
         builder_.CreateStructGEP(stringType(), sobj, 0));
     builder_.CreateStore(len,
         builder_.CreateStructGEP(stringType(), sobj, 1));
-    builder_.CreateStore(builder_.getInt8(1),
+    builder_.CreateStore(width,
         builder_.CreateStructGEP(stringType(), sobj, 2));
     initStringRc(sobj);  // #422: producer's reference, rc := 1
     return sobj;

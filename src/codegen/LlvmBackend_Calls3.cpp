@@ -32,6 +32,47 @@ static int64_t lazyElemSize(llvm::Type* ty, const llvm::DataLayout& dl) {
     return 8;  // i64 / double / pointer (string, class)
 }
 
+// fix #7160 (§27.6 / stdlib §5, v0.343): the RESULT type of a §5 callback
+// argument — a projection selector, a predicate, a key function, a combiner.
+//
+// A lambda carries a Function TypeRef whose `funcReturn` is its result type,
+// and so does the QUALIFIED method-reference spelling (`C.M` / `obj.M`):
+// sema types that one in `resolveMemberAccess`. The BARE spelling (`M`) — the
+// one §27.6 forms as "a reference to a method" — carries NO Function TypeRef
+// at all: sema's call-resolution slice leaves the expression untyped, and
+// fix #4897 (v0.307) synthesized the missing type only inside
+// `checkAssignable`, so it never reached the expression.
+//
+// The consequence was a MIS-SIZED type-erased slot. §5's `Select<U>(selector:
+// (T) -> U)` sizes the lazy element slot from the selector's RESULT type; with
+// no type to read, the lowering fell back to `i32`, so a `string` projection
+// got a 4-byte slot (`bz_lazy_new`'s `e->cur = malloc(esz)`) while the
+// consumer read the element as an 8-byte pointer — an out-of-bounds READ of
+// size 8 (ASan: heap-buffer-overflow), and the trampoline called the closure
+// with an `i32` result type, truncating the returned pointer.
+//
+// Recover the result type from the METHOD the reference names. §27.6's
+// target-typed overload selection may have chosen an overload other than the
+// one `exprSymbol` bound (fix #5019); the selection's choice wins when it
+// published one.
+static sema::TypeRef* linqSelectorResultType(sema::SemaContext& ctx,
+                                             const ast::Expr* arg) {
+    if (!arg) return nullptr;
+    if (sema::TypeRef* t = ctx.exprType(*arg))
+        if (t->kind == sema::TypeRef::Kind::Function && t->funcReturn)
+            return t->funcReturn;
+    sema::MethodSymbol* ms =
+        dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*arg));
+    if (!ms) return nullptr;
+    if (sema::MethodSymbol* chosen = ctx.methodRefSelectedOverload(*arg))
+        ms = chosen;
+    // The declared result: §2.5's BOTH-SOURCES accessor — the AST return type
+    // for a method of this module, the loader's side table for an imported one
+    // (`sema::methodReturnResolvedType`, #4988's consolidation; reading
+    // `ms->decl` here would be a class-3 AST-gated read — #3152).
+    return sema::methodReturnResolvedType(*ms, ctx);
+}
+
 bool Emitter::isLazyEnumerableType(const sema::TypeRef* rt) {
     // The lazy LINQ sentinel: a Named TypeRef with no declaration and no
     // astNode, carrying the element type as genericArgs[0]. Produced only by
@@ -3440,15 +3481,131 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     if (!src) return nullptr;
     llvm::Type* elemTy = elemLlvmOf(elemRef);
 
+    // fix #7160 (reviewer follow-up): the element type the CONSUMER reads back
+    // out of a lazy operator's slot.  Sema types the operator's OWN result as
+    // the lazy-enumerable sentinel whose genericArgs[0] is U (stdlib §5's
+    // `Select<U>` / `SelectMany<U>`); the terminal drain copies U-sized
+    // elements out of that slot, so a slot narrower than U is an
+    // out-of-bounds read (the reported #7160 heap-buffer-overflow).
+    auto resultElemRef = [&](const ast::Expr& c) -> sema::TypeRef* {
+        const sema::TypeRef* rt = ctx_.exprType(c);
+        if (!isLazyEnumerableType(rt)) return nullptr;
+        if (rt->genericArgs.empty()) return nullptr;
+        return rt->genericArgs[0];
+    };
+
+    // fix #7214 (§27.6 / stdlib §5, v0.344): the RESULT type of a §5 callback
+    // that is HELD IN A LOCAL — `var f := Cat; xs.Zip(ys, f)`.
+    //
+    // §27.6: "A reference's **formed type** ... is the callee's own signature
+    // read as a function type" — a method reference is a function value. The
+    // BARE spelling (`Cat`) is the one §27.6 forms as "a reference to a
+    // method", and it carries NO Function TypeRef on the EXPRESSION
+    // (issue #7182): sema's
+    // call-resolution slice leaves it untyped, and fix #4897 (v0.307)
+    // synthesized the missing type only inside `checkAssignable`, so it never
+    // reached the expression — nor the INFERRED local that binds it, whose
+    // `declType` is null for the same reason.
+    //
+    // So for the local-held spelling `linqSelectorResultType` finds no type at
+    // all and the §5 lowering falls back to its `i32` default. The
+    // consequence is the #7160 defect in its local-held form: the element
+    // slot is sized from the `i32` fallback and the trampoline calls the
+    // callback with an `i32` RESULT type, TRUNCATING the returned pointer; the
+    // consumer then dereferences the mangled element pointer (measured: ASan
+    // SEGV in the generated program, `xs.Zip(ys, f)` with a `string` combiner).
+    //
+    // The recovery reads the local's INITIALIZER — the reference the local
+    // binds — and asks the SAME method-reference recovery the bare spelling
+    // uses (`linqSelectorResultType` on the initializer), so the two
+    // spellings of one reference resolve to one result type. The local's own
+    // declared type is consulted first: an ANNOTATED local
+    // (`var f: (string, string) -> string := Cat;`) carries the Function
+    // TypeRef already, and the identifier's own `exprType` carries it too.
+    //
+    // fix #7246 (§27.6 / stdlib §5, v0.344): the local may be an ALIAS of
+    // another local — `var f := Cat; var g := f; xs.Zip(ys, g);` — and then
+    // the initializer is an IDENTIFIER, which carries no type of its own, so
+    // the one-level recovery found nothing and the lowering still fell back
+    // to `i32` (measured: the same truncation #7214 removed for the
+    // one-level case — an ASan SEGV on the low 32 bits of the element
+    // pointer). The recovery therefore FOLLOWS THE CHAIN of local
+    // initializers: while the initializer is itself a reference to a local,
+    // the walk continues at that local.
+    //
+    // §27.6: "A reference's **formed type** ... is the callee's own signature
+    // read as a function type" — the reference IS a function value, so
+    // binding it to a local and then ALIASING that local is an ordinary use
+    // of the same value (§12.7's *Function-typed targets* reads the alias
+    // `var g := f;` as an ordinary binding), and stdlib §5's
+    // `Zip<U,R>(other, combine: (T,U) -> R)` takes a function VALUE, so the
+    // aliased spelling is an admitted combiner that owes the same lowering.
+    //
+    // The walk stops at the first local that carries a Function TypeRef of
+    // its own (an ANNOTATED local, `var f: (string, string) -> string := …;`)
+    // or whose initializer names a method reference; a local whose
+    // initializer is neither contributes no type and the walk stops there.
+    //
+    // The chain's NULLABILITY does not change the recovered type: the
+    // callback's RESULT type is a property of the method the chain names,
+    // and a nullable function-typed local along the chain
+    // (`var g: ((string, string) -> string)? := f;`) still names that same
+    // result type — only the reference's own nullability differs, and the
+    // §5 lowering reads the RESULT slot, not the reference's.
+    //
+    // The walk is CYCLE-GUARDED: a local initialised from itself, or a cycle
+    // of locals (`var a := b; var b := a;`), would otherwise loop forever, so
+    // a declaration already visited ends the walk. The hop bound is a second,
+    // belt-and-braces limit on a pathological chain.
+    auto localHeldCallbackResultType = [&](size_t i) -> sema::TypeRef* {
+        if (i >= call.args.size() || !call.args[i].value) return nullptr;
+        const ast::Expr* a = call.args[i].value.get();
+        // The local declarations walked so far — the cycle guard's memory.
+        std::vector<const ast::Node*> seen;
+        const ast::Expr* cur = a;
+        for (unsigned hop = 0; hop < 64; ++hop) {
+            auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*cur));
+            // Not a local: the expression itself names the reference (the
+            // bare spelling) and the direct recovery applies. At the first
+            // hop this repeats the attempt the call site already made and
+            // found empty; at a later hop it cannot happen, because the walk
+            // only advances to an expression that names a local.
+            if (!ls) return linqSelectorResultType(ctx_, cur);
+            // The local's OWN declared type wins: an ANNOTATED local
+            // (`var f: (string, string) -> string := Cat;`) carries the
+            // Function TypeRef already, and so does the identifier's own
+            // `exprType` (read by `linqSelectorResultType` at the call
+            // sites, before this recovery is consulted at all).
+            if (ls->declType && ls->declType->kind == sema::TypeRef::Kind::Function &&
+                ls->declType->funcReturn)
+                return ls->declType->funcReturn;
+            if (!ls->decl) return nullptr;
+            if (std::find(seen.begin(), seen.end(), ls->decl) != seen.end())
+                return nullptr;  // cycle — stop rather than loop
+            seen.push_back(ls->decl);
+            LocalDeclInitView view = localDeclInitView(ls->decl);
+            if (!view.init || view.init == cur) return nullptr;
+            // The initializer is the reference the local binds. If it is
+            // ITSELF a local reference, follow it to that local; otherwise
+            // it is the method reference itself and the one-level recovery
+            // applies to it.
+            if (!dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*view.init)))
+                return linqSelectorResultType(ctx_, view.init);
+            cur = view.init;
+        }
+        return nullptr;
+    };
+
     // #422 / §28.9 / §28.3: a LAZY operator stores its closure in the enumerator
     // (e->closure) and invokes it LATER during iteration — so the closure must
-    // OUTLIVE the call. When it was produced INLINE (a lambda literal), it is a
-    // +1 transient the enumerator owns; mark the enumerator with
-    // bz_lazy_own_closure so bz_lazy_dispose releases it at enumerator dispose
-    // (NOT here — a call-site release would be a use-after-free). A closure
-    // arriving via a variable/field is a BORROW and is left untouched. Mirrors
-    // the GetOrAdd/eager factoryIsInlineLambda guard.
-    auto argIsInlineLambda = [&](size_t i) -> bool {
+    // OUTLIVE the call. When it was produced INLINE (a lambda literal, or a
+    // method reference — §27.6 — both of which mint a fresh +1 closure cell at
+    // the reference site), it is a +1 transient the enumerator owns; mark the
+    // enumerator with bz_lazy_own_closure so bz_lazy_dispose releases it at
+    // enumerator dispose (NOT here — a call-site release would be a
+    // use-after-free). A closure arriving via a variable/field is a BORROW and
+    // is left untouched. Mirrors the GetOrAdd/eager factoryIsInlineLambda guard.
+    auto argIsFreshClosureCell = [&](size_t i) -> bool {
         if (i >= call.args.size() || !call.args[i].value) return false;
         const ast::Expr* a = call.args[i].value.get();
         if (dynamic_cast<const ast::LambdaExpr*>(a)) return true;
@@ -3459,10 +3616,28 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // ClosureProducer recognizes for the bound-local path. Without this the
         // cell leaked (40 bytes; #1758 pre-gate review). Keyed off the shared
         // predicate so the owned set matches the produced set exactly.
-        return isPrimIntrinsicMethodRef(a);
+        if (isPrimIntrinsicMethodRef(a)) return true;
+        // fix #7160 (§27.6 / stdlib §5, v0.343): an ORDINARY method reference
+        // (`Select(Identity)`, `Select(c.Identity)`) is a fresh +1 closure cell
+        // too — `makeMethodThunk` -> `buildMethodClosureCell` callocs one cell
+        // PER REFERENCE (§27.6 / #1170), exactly like an inline lambda literal.
+        // The enumerator must own it and release it at dispose; without that
+        // the cell leaked (64 B per operator call) — the leak the §5
+        // method-reference selector family carried. A BARE identifier is a
+        // cell only for a STATIC method (the instance spelling binds `this`
+        // through `currentThis_`); a MemberAccessExpr is a cell for either.
+        // Mirror `isPlusOneClosureProducer`'s shape exactly, so the release
+        // never arms on a reference that produced no cell.
+        auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*a));
+        if (!ms) return false;
+        if (dynamic_cast<const ast::MemberAccessExpr*>(a)) return true;
+        if (dynamic_cast<const ast::IdentifierExpr*>(a) && isStaticMethod(ms))
+            return true;
+        return false;
     };
     // Thread the enumerator pointer through bz_lazy_own_closure(e) iff the
-    // operator's closure arg was an inline lambda; otherwise return it unchanged.
+    // operator's closure arg was a fresh +1 closure cell (an inline lambda or
+    // a method reference); otherwise return it unchanged.
     auto ownClosureIf = [&](llvm::Value* e, bool inlineLambda) -> llvm::Value* {
         if (!inlineLambda || !e) return e;
         auto* fn = declareC("bz_lazy_own_closure", ptrTy(), {ptrTy()});
@@ -3496,25 +3671,47 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Function* tramp = buildLinqTrampoline(0, elemTy, nullptr);
         auto* whereFn = declareC("bz_lazy_where", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(whereFn, {src, closure, tramp}, "linq.where");
-        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+        return ownClosureIf(e, argIsFreshClosureCell(0));  // #422: release on dispose
     }
     if (m == "Select" && call.args.size() == 1 && call.args[0].value) {
-        sema::TypeRef* retSemaType = nullptr;
+        // fix #7160 (§27.6 / stdlib §5, v0.343): the projection's RESULT type
+        // — the bare method-reference spelling carries no Function TypeRef, and
+        // the `i32` fallback sized the element slot for an `i32` projection
+        // (an out-of-bounds read for every wider one).
+        sema::TypeRef* retSemaType =
+            linqSelectorResultType(ctx_, call.args[0].value.get());
+        // fix #7214 (§27.6 / stdlib §5, v0.344): the callback is HELD IN A
+        // LOCAL — `var f := Make; xs.Select(f)` — and the local-held spelling
+        // carries no Function TypeRef on the argument expression either.
+        if (!retSemaType) retSemaType = localHeldCallbackResultType(0);
         llvm::Type* outTy = i32();
-        if (auto* lamTy = ctx_.exprType(*call.args[0].value))
-            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
-                retSemaType = lamTy->funcReturn;
-                if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
-            }
+        if (retSemaType) {
+            if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
+        }
         llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
         if (!closure) return nullptr;
         llvm::Function* tramp = buildLinqTrampoline(1, elemTy, outTy);
+        // The slot must hold BOTH the value the selector WRITES (the width of
+        // its result type R) and the value the consumer READS (the width of
+        // sema's element type U).  For a lambda or a qualified method
+        // reference the two are the same (U is the callback's Function
+        // TypeRef's result).  For the BARE method-reference spelling they
+        // differ: sema still types the result as the SOURCE element type,
+        // because a bare method group carries no Function TypeRef (#4897) —
+        // so the slot is sized to the wider of the two, which is both
+        // read-safe for the consumer and write-safe for the selector.
         int64_t outEsz = lazyElemSize(outTy, module_->getDataLayout());
+        if (sema::TypeRef* uRef = resultElemRef(call)) {
+            if (auto* uTy = lowerTypeRef(uRef)) {
+                int64_t uEsz = lazyElemSize(uTy, module_->getDataLayout());
+                if (uEsz > outEsz) outEsz = uEsz;
+            }
+        }
         auto* selFn = declareC("bz_lazy_select", ptrTy(),
                                {ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(selFn,
             {src, builder_.getInt64(outEsz), closure, tramp}, "linq.select");
-        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+        return ownClosureIf(e, argIsFreshClosureCell(0));  // #422: release on dispose
     }
     if (m == "Take" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* nV = lowerExpr(*call.args[0].value);
@@ -3555,7 +3752,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                               {ptrTy(), ptrTy(), ptrTy(), i32()});
         llvm::Value* e = builder_.CreateCall(obFn,
             {src, closure, tramp, builder_.getInt32(desc)}, "linq.orderby");
-        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+        return ownClosureIf(e, argIsFreshClosureCell(0));  // #422: release on dispose
     }
     // stdlib §5 Combination: Concat(other) — yield all of self, then all of
     // `other`. Lower `other` (an Array<T> or lazy IEnumerable<T>) to its own lazy
@@ -3582,22 +3779,40 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Value* e = builder_.CreateCall(fn, {src, closure, tramp},
                                    m == "TakeWhile" ? "linq.takewhile"
                                                     : "linq.skipwhile");
-        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+        return ownClosureIf(e, argIsFreshClosureCell(0));  // #422: release on dispose
     }
     // stdlib §5 Projection: SelectMany(selector: (T)->IEnumerable<U>) — flatten.
     // The selector returns an inner collection; the trampoline wraps it as a lazy
     // enumerator. The inner element size U comes from the selector's return type
     // (a collection/lazy carrying U at genericArgs[0]).
     if (m == "SelectMany" && call.args.size() == 1 && call.args[0].value) {
-        sema::TypeRef* retSemaType = nullptr;
+        // fix #7160 (§27.6 / stdlib §5, v0.343): the selector's result type
+        // (IEnumerable<U> / Array<U>) — the inner element size is sized from
+        // it, so the bare method-reference spelling needs the same recovery
+        // `Select` does.
+        //
+        // NOTE: this slot is NOT sized by the `Select` rule (the wider of the
+        // consumer's element width and the producer's write width).  The
+        // runtime's SELECTMANY arm copies the inner element into the slot
+        // with the slot's own width (`memcpy(e->cur, p, e->esz)`), so the
+        // slot width is simultaneously the COPY width — widening it to the
+        // consumer's width would over-read the inner array instead of the
+        // slot.  The two constraints agree once sema types the result as the
+        // INNER element type (the bare method-reference spelling still types
+        // it as the source element type), so the residual is a sema gap, not
+        // a slot-sizing gap.
+        sema::TypeRef* retSemaType =
+            linqSelectorResultType(ctx_, call.args[0].value.get());
+        // fix #7214 (§27.6 / stdlib §5, v0.344): the callback is HELD IN A
+        // LOCAL — `var f := Make; xs.Select(f)` — and the local-held spelling
+        // carries no Function TypeRef on the argument expression either.
+        if (!retSemaType) retSemaType = localHeldCallbackResultType(0);
         llvm::Type* innerElemTy = i32();
-        if (auto* lamTy = ctx_.exprType(*call.args[0].value))
-            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
-                retSemaType = lamTy->funcReturn;  // IEnumerable<U> / Array<U>
-                if (!retSemaType->genericArgs.empty() && retSemaType->genericArgs[0])
-                    if (auto* t = lowerTypeRef(retSemaType->genericArgs[0]))
-                        innerElemTy = t;
-            }
+        if (retSemaType) {
+            if (!retSemaType->genericArgs.empty() && retSemaType->genericArgs[0])
+                if (auto* t = lowerTypeRef(retSemaType->genericArgs[0]))
+                    innerElemTy = t;
+        }
         llvm::Value* closure = lowerLinqLambda(call.args[0].value.get(), retSemaType);
         if (!closure) return nullptr;
         int64_t innerEsz = lazyElemSize(innerElemTy, module_->getDataLayout());
@@ -3640,7 +3855,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                               {ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(smFn,
             {src, builder_.getInt64(innerEsz), closure, tramp}, "linq.selectmany");
-        return ownClosureIf(e, argIsInlineLambda(0));  // #422: release on dispose
+        return ownClosureIf(e, argIsFreshClosureCell(0));  // #422: release on dispose
     }
     // stdlib §5 Combination: Zip<U,R>(other, combine: (T,U)->R) — pair positionally.
     if (m == "Zip" && call.args.size() == 2 &&
@@ -3653,13 +3868,19 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Type* bTy = elemLlvmOf(otherElem);
         // The combine lambda `(T, U) -> R`. Lower it with the expected function
         // type so unannotated params get the right element LLVM types.
-        sema::TypeRef* retSemaType = nullptr;
+        // fix #7160 (§27.6 / stdlib §5, v0.343): the combiner's RESULT type —
+        // the same recovery `Select` does (the Zip output slot is sized from
+        // it).
+        sema::TypeRef* retSemaType =
+            linqSelectorResultType(ctx_, call.args[1].value.get());
+        // fix #7214 (§27.6 / stdlib §5, v0.344): the combiner is HELD IN A
+        // LOCAL — `var f := Cat; xs.Zip(ys, f)` — and the local-held spelling
+        // carries no Function TypeRef on the argument expression either.
+        if (!retSemaType) retSemaType = localHeldCallbackResultType(1);
         llvm::Type* outTy = i32();
-        if (auto* lamTy = ctx_.exprType(*call.args[1].value))
-            if (lamTy->kind == sema::TypeRef::Kind::Function && lamTy->funcReturn) {
-                retSemaType = lamTy->funcReturn;
-                if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
-            }
+        if (retSemaType) {
+            if (auto* t = lowerTypeRef(retSemaType)) outTy = t;
+        }
         auto* combRef = ctx_.makeTypeRef();
         combRef->kind = sema::TypeRef::Kind::Function;
         combRef->funcReturn = retSemaType;
@@ -3673,12 +3894,23 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         expectedFunctionType_ = savedExp;
         if (!closure) return nullptr;
         llvm::Function* tramp = buildZipTrampoline(elemTy, bTy, outTy);
+        // The same slot-width rule as `Select`: the slot must hold both the
+        // value the combiner WRITES (its result type R) and the value the
+        // consumer READS (sema's element type U).  For a bare method-reference
+        // combiner the two differ (sema still types the result as the source
+        // element type), so the slot is sized to the wider of the two.
         int64_t outEsz = lazyElemSize(outTy, module_->getDataLayout());
+        if (sema::TypeRef* uRef = resultElemRef(call)) {
+            if (auto* uTy = lowerTypeRef(uRef)) {
+                int64_t uEsz = lazyElemSize(uTy, module_->getDataLayout());
+                if (uEsz > outEsz) outEsz = uEsz;
+            }
+        }
         auto* zipFn = declareC("bz_lazy_zip", ptrTy(),
                                {ptrTy(), ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(zipFn,
             {src, down, builder_.getInt64(outEsz), closure, tramp}, "linq.zip");
-        return ownClosureIf(e, argIsInlineLambda(1));  // #422: combine is args[1]
+        return ownClosureIf(e, argIsFreshClosureCell(1));  // #422: combine is args[1]
     }
     // stdlib §5 Set-like lazy: Union/Intersect/Except(other: IEnumerable<T>).
     // Each builds a membership dict from `other` at construction, then yields
@@ -3720,9 +3952,10 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                               {ptrTy(), ptrTy(), ptrTy(), i32()});
         llvm::Value* e = builder_.CreateCall(tbFn,
             {src, closure2, tramp2, builder_.getInt32(desc2)}, "linq.thenby");
-        // Mark closure2 as owned by the THENBY enumerator if it was an inline
-        // lambda — disposed via own_closure2 at bz_lazy_dispose.
-        if (argIsInlineLambda(0) && e) {
+        // Mark closure2 as owned by the THENBY enumerator if it was a fresh
+        // +1 closure cell (an inline lambda or a method reference) — disposed
+        // via own_closure2 at bz_lazy_dispose.
+        if (argIsFreshClosureCell(0) && e) {
             auto* fn = declareC("bz_lazy_own_closure2", ptrTy(), {ptrTy()});
             e = builder_.CreateCall(fn, {e}, "linq.owncl2");
         }

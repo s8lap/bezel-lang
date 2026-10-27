@@ -1340,6 +1340,37 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
     }
 
+    // fix #7025 (follow-up, §27.6 / §28.2, v0.343): an expression body that is
+    // a method-group REFERENCE to a class's own compiler-generated `Dispose`
+    // has NO sema type — the generated member has no MethodDecl and no
+    // MethodSymbol (§28.2: "the name is the compiler's"), so sema binds
+    // nothing to the reference and the lambda's body type is null. The
+    // expr-body return type would then be the `i32` fallback while the body
+    // lowers to a FUNCTION VALUE (a closure cell), and the emitted `ret` does
+    // not match the function's return type:
+    //
+    //   Function return type does not match operand type of return inst!
+    //   ret ptr %5
+    //
+    // — the IR verifier rejects the module and the compile fails with "IR
+    // verification failed (malformed IR emitted)". The ordinary §27.6
+    // reference (`lambda() => d.Ping`) has a sema-typed body and gets the
+    // function value's representation (`ptr`); give the class-`Dispose`
+    // reference the same type, HERE, before the return type is derived.
+    //
+    // The type is the member's OWN signature read as a function type (§27.6):
+    // `Dispose()` takes no parameter and returns nothing (§28.2), so
+    // `() -> ()`.
+    if (lam.exprBody && !ctx_.exprType(*lam.exprBody) &&
+        isClassDisposeMethodRef(lam.exprBody.get())) {
+        sema::TypeRef* fnTy = ctx_.makeTypeRef();
+        fnTy->kind = sema::TypeRef::Kind::Function;
+        sema::TypeRef* unitTy = ctx_.makeTypeRef();
+        unitTy->kind = sema::TypeRef::Kind::Unit;
+        fnTy->funcReturn = unitTy;
+        ctx_.setExprType(lam.exprBody.get(), fnTy);
+    }
+
     // Pre-determine return type from sema's exprType of the body.
     // retSemaTy tracks the sema TypeRef that SET retTy (used below for
     // nullable-value promotion in the expr-body emit path — fix #541 / §7).
@@ -4699,6 +4730,51 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
     if (srcNullableRecord) {
         nullableTag = builder_.CreateExtractValue(src, {0u}, "with.nul.tag");
         src = builder_.CreateExtractValue(src, {1u}, "with.nul.payload");
+    }
+    // fix #7044 (§12.7 / §9.5 / §7.4, v0.340): a §12.7 TYPE-NARROWED
+    // source — `if c is P then … c with(…) end;` over `c: P?` — reads as the
+    // BARE record `P`, but its STORAGE is still the tagged `{i8, P}` nullable
+    // carrier: §12.7 retypes the READ, not the storage, and the carrier's
+    // DECLARED type (`P?`) is what codegen lays out. `rt` above is the
+    // NARROWED type, so it is non-nullable and the #1273 test ("a nullable
+    // record source") answers NO: the unwrap was skipped and the TAGGED
+    // value was stored into the BARE record copy alloca — a 24-byte store
+    // into a 16-byte slot (ASan: stack-buffer-overflow, WRITE of size 24)
+    // and a copy whose first field is the tag byte.
+    //
+    // The unwrap is keyed on the SOURCE's DECLARED type (the carrier's
+    // storage type, which the narrowing left alone) and on the lowered value
+    // carrying EXACTLY that carrier's layout — so a plain non-nullable
+    // record source (whose own layout can coincidentally be `{i8, T}`) is
+    // untouched. §12.7 narrows only a simple variable, so the source of a
+    // narrowed `with` is an identifier or a parameter; anything else keeps
+    // the pre-fix behaviour.
+    if (!srcNullableRecord && !nullableTag) {
+        const sema::TypeRef* srcDeclTy = nullptr;
+        if (auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(we.source.get())) {
+            if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
+                if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+                    srcDeclTy = ls->declType;
+                else if (auto* ps =
+                             dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                    srcDeclTy = ps->resolvedDeclType;
+                    if (!srcDeclTy && ps->declType)
+                        srcDeclTy = ctx_.resolvedType(*ps->declType);
+                }
+            }
+        }
+        if (srcDeclTy && srcDeclTy->nullable &&
+            srcDeclTy->kind == sema::TypeRef::Kind::Named &&
+            srcDeclTy->declaration &&
+            srcDeclTy->declaration->kind == ast::TypeDeclKind::Record &&
+            !src->getType()->isPointerTy()) {
+            llvm::StructType* carrier =
+                llvm::StructType::get(llvm_, {nullablePrimHasValTy(), st});
+            if (src->getType() == carrier)
+                src = builder_.CreateExtractValue(src, {1u},
+                                                  "with.nul.payload");
+        }
     }
     // The GEP base: a spilled copy of the source record.
     llvm::Value* base = entryAlloca(st);

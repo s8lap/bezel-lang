@@ -20,6 +20,22 @@
 
 namespace bezel {
 
+// per §22.12 (v0.343): the outcome of the generics-vs-less-than scan.
+//
+// `None`  — the `<` does NOT open generic arguments; it stays the relational
+//           operator.
+// `Dot`   — the closing `>` is followed by `.`: the chain continues, so the
+//           type arguments belong to a TYPE (a chain-head receiver, or a
+//           nested type reached through a dotted segment — §11.6).
+// `Other` — the closing `>` is followed by one of §22.12's other seven
+//           successors: the type arguments belong to a METHOD (an explicit
+//           type-argument list, §14.1 / §27.6).
+enum class GenericArgsCloser {
+    None,
+    Dot,
+    Other,
+};
+
 class Parser {
 public:
     Parser(Lexer& lexer, DiagnosticEngine& diagnostics);
@@ -339,19 +355,25 @@ private:
     // `=>` (an expression, or `do … end`), so one old lambda yields one
     // diagnostic instead of a cascade.
     void skipRetiredLambdaBody();
-    // per §14.1: disambiguates `Method<T>(…)` (method-level type args) from
-    // `expr < T > (expr)` (relational comparison chain). peekAt(0) is the `<`
-    // token. Returns true iff the `<` starts a generic-arg list that closes
-    // with `>` followed immediately by `(` — the only context in which the
-    // programmer writes explicit method type args. Uses bounded lookahead;
-    // bails out (returns false) on EOF or on tokens that cannot appear inside
-    // a type-argument list.
-    bool tokensLookLikeMethodTypeArgs();
-    // per §14.1 / §22.12 (issue #520): disambiguates `GenericClass<T>.Member`
-    // (receiver-position explicit type args) from `expr < T > (expr)`.
-    // Like tokensLookLikeMethodTypeArgs() but requires `>` to be followed by
-    // `.` (dot) rather than `(` — the dot being the static-member access.
-    bool tokensLookLikeReceiverTypeArgs();
+    // per §22.12 (v0.343): the generics-vs-less-than resolution, in ONE
+    // place.  Disambiguates a generic-argument list (`Id<T>(…)`,
+    // `Registry<T>.Make(…)`, `Tree<T>.Node<U>.Create()`) from a relational
+    // comparison chain (`expr < T > expr`).  peekAt(0) is the `<` token.
+    //
+    // The rule is PURELY SYNTACTIC and its successor set is NORMATIVE: the
+    // closing `>` must be immediately followed by a token that can continue a
+    // primary expression — `.`, `?.`, `(`, `[` — or by a token that cannot
+    // begin an operand — `)`, `]`, `,`, `;`.  That set is spelled out once,
+    // in `genericArgsCloserFollows` (Parser_Exprs.cpp), and this ONE scan
+    // applies it; every commit point consults this scan, so the set cannot
+    // drift per site again.
+    //
+    // Returns `None` when the `<` is the relational operator, `Dot` when the
+    // closing `>` is followed by `.` (the type arguments belong to a type),
+    // `Other` when it is followed by one of the other seven successors (the
+    // type arguments belong to a method).  Uses bounded lookahead; bails out
+    // on EOF or on tokens that cannot appear inside a type-argument list.
+    GenericArgsCloser tokensLookLikeGenericArgs();
     // Slice 11: a single statement. Dispatches on the first token: `var` /
     // `using` for LocalDecl, `return` for ReturnStmt, otherwise an
     // expression that may be the start of an AssignmentStmt or an

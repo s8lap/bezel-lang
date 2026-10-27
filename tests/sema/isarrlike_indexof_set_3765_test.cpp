@@ -31,19 +31,19 @@
 //     isArrLike family too, not just the borrowing side.
 //
 // Citations verified verbatim against docs/Bezel_Standard_Library.md:
-//   - stdlib §4.4 `Array<T>` (line 1573): `public method IndexOf(item: T): int;`
-//   - stdlib §4.5 `OwningArray<T>` (line 1671): `public method IndexOf(item: T): int;`
-//   - stdlib §4.6 `LinkedList<T>` (line 1839-1864): no `IndexOf` declared;
+//   - stdlib §4.4 `Array<T>`: `public method IndexOf(item: T, startIndex: int := 0): int;`
+//   - stdlib §4.5 `OwningArray<T>`: `public method IndexOf(item: T): int;`
+//   - stdlib §4.6 `LinkedList<T>`: no `IndexOf` declared;
 //     declared members are `AddFirst/AddLast/AddBefore/AddAfter/RemoveFirst/
 //     RemoveLast/RemoveNode/Find` plus the §4.1 `ICollection<T>` operations.
-//   - stdlib §4.7 `OwningLinkedList<T>` (line 1880-1915): no `IndexOf` declared.
-//   - stdlib §4.10 `Set<T>`/`OwningSet<T>` (line 2234-2282): no `IndexOf`
+//   - stdlib §4.7 `OwningLinkedList<T>`: no `IndexOf` declared.
+//   - stdlib §4.10 `Set<T>`/`OwningSet<T>`: no `IndexOf`
 //     declared; declared members are `Add/TryAdd/UnionWith/IntersectWith/
 //     ExceptWith/IsSubsetOf/IsSupersetOf` (Set) plus `Pop/TryPop/Drain` and
 //     the §4.2 `IOwningCollection<T>` operations (OwningSet).
-//   - stdlib §4.11 `Stack<T>`/`OwningStack<T>`/`Queue<T>`/`OwningQueue<T>`
-//     (line 2303-2353): no `IndexOf` declared on any of the four.
-//   - stdlib §4.18 `SortedSet<T>` (line 3330-3348): no `IndexOf` declared
+//   - stdlib §4.11 `Stack<T>`/`OwningStack<T>`/`Queue<T>`/`OwningQueue<T>`:
+//     no `IndexOf` declared on any of the four.
+//   - stdlib §4.18 `SortedSet<T>`: no `IndexOf` declared
 //     (already pinned by `sortedset_isarrlike_3730_test.cpp`).
 //
 // Mechanical verification (per [[regression-test-pins-the-bug]]): the REJECT

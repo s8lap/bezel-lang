@@ -1,19 +1,19 @@
 // Codegen tests for #469: LINQ terminal throwing contracts (stdlib §5).
 //
-// stdlib §5 (line 2515):
+// stdlib §5:
 //   "First/Last/Single/ElementAt throw InvalidOperationException (or
 //    IndexOutOfRangeException for ElementAt) on missing-element; the *OrNull
 //    variants return null instead."
 //
-// stdlib §5 (lines 2528–2529):
+// stdlib §5.1:
 //   "Min(): T  — throws if empty"
 //   "Max(): T  — throws if empty"
 //
-// stdlib §5 (lines 2445–2446):
+// stdlib §5:
 //   "First(): T  — throws if empty"
-//   "First(predicate): T"  (throws if no match, per §5 line 2515)
+//   "First(predicate): T"  (throws if no match, per §5)
 //
-// stdlib §5 (line 2451):
+// stdlib §5:
 //   "Single(): T  — throws if not exactly one"
 //
 // These tests verify:
@@ -40,8 +40,8 @@ int run(const std::string& src) {
 
 // ── First() on empty → InvalidOperationException ─────────────────────────────
 
-// stdlib §5 line 2445: "First(): T — throws if empty"
-// stdlib §5 line 2515: "throw InvalidOperationException … on missing-element"
+// stdlib §5: "First(): T — throws if empty"
+// stdlib §5: "throw InvalidOperationException … on missing-element"
 BEZEL_TEST(linq_throw_469, first_empty_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -56,8 +56,8 @@ BEZEL_TEST(linq_throw_469, first_empty_throws_spec_5) {
 
 // ── Last() on empty → InvalidOperationException ───────────────────────────────
 
-// stdlib §5 line 2449: "Last(): T"
-// stdlib §5 line 2515: "throw InvalidOperationException … on missing-element"
+// stdlib §5: "Last(): T"
+// stdlib §5: "throw InvalidOperationException … on missing-element"
 BEZEL_TEST(linq_throw_469, last_empty_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -72,8 +72,8 @@ BEZEL_TEST(linq_throw_469, last_empty_throws_spec_5) {
 
 // ── Single() on empty → InvalidOperationException ─────────────────────────────
 
-// stdlib §5 line 2451: "Single(): T — throws if not exactly one"
-// stdlib §5 line 2515: "throw InvalidOperationException … on missing-element"
+// stdlib §5: "Single(): T — throws if not exactly one"
+// stdlib §5: "throw InvalidOperationException … on missing-element"
 BEZEL_TEST(linq_throw_469, single_empty_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -88,7 +88,7 @@ BEZEL_TEST(linq_throw_469, single_empty_throws_spec_5) {
 
 // ── Single() on a 2-element array → InvalidOperationException ─────────────────
 
-// stdlib §5 line 2451: "throws if not exactly one" — ≥2 elements also throws
+// stdlib §5: "throws if not exactly one" — ≥2 elements also throws
 BEZEL_TEST(linq_throw_469, single_multi_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -104,7 +104,7 @@ BEZEL_TEST(linq_throw_469, single_multi_throws_spec_5) {
 
 // ── Min() on empty → InvalidOperationException ────────────────────────────────
 
-// stdlib §5.1 line 2528: "Min(): T — throws if empty"
+// stdlib §5.1: "Min(): T — throws if empty"
 BEZEL_TEST(linq_throw_469, min_empty_throws_spec_5_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -119,7 +119,7 @@ BEZEL_TEST(linq_throw_469, min_empty_throws_spec_5_1) {
 
 // ── Max() on empty → InvalidOperationException ────────────────────────────────
 
-// stdlib §5.1 line 2529: "Max(): T — throws if empty"
+// stdlib §5.1: "Max(): T — throws if empty"
 BEZEL_TEST(linq_throw_469, max_empty_throws_spec_5_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -134,8 +134,8 @@ BEZEL_TEST(linq_throw_469, max_empty_throws_spec_5_1) {
 
 // ── Min(selector) on empty → InvalidOperationException ───────────────────────
 
-// stdlib §5 line 2463: "Min<U>(selector: (T)->U): U where U: IComparable<U>"
-// Also covered by §5 line 2515 general principle: throws on missing-element.
+// stdlib §5: "Min<U>(selector: (T)->U): U where U: IComparable<U>"
+// Also covered by §5 general principle: throws on missing-element.
 BEZEL_TEST(linq_throw_469, min_selector_empty_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -150,7 +150,7 @@ BEZEL_TEST(linq_throw_469, min_selector_empty_throws_spec_5) {
 
 // ── Max(selector) on empty → InvalidOperationException ───────────────────────
 
-// stdlib §5 line 2464: "Max<U>(selector: (T)->U): U where U: IComparable<U>"
+// stdlib §5: "Max<U>(selector: (T)->U): U where U: IComparable<U>"
 BEZEL_TEST(linq_throw_469, max_selector_empty_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -165,8 +165,8 @@ BEZEL_TEST(linq_throw_469, max_selector_empty_throws_spec_5) {
 
 // ── First(predicate) with no match → InvalidOperationException ────────────────
 
-// stdlib §5 line 2446: "First(predicate: (T)->bool): T"
-// stdlib §5 line 2515: "throw InvalidOperationException … on missing-element"
+// stdlib §5: "First(predicate: (T)->bool): T"
+// stdlib §5: "throw InvalidOperationException … on missing-element"
 BEZEL_TEST(linq_throw_469, first_pred_no_match_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -182,8 +182,8 @@ BEZEL_TEST(linq_throw_469, first_pred_no_match_throws_spec_5) {
 
 // ── ElementAt(i) out of range → IndexOutOfRangeException ─────────────────────
 
-// stdlib §5 line 2453: "ElementAt(index: int): T"
-// stdlib §5 line 2515: "IndexOutOfRangeException for ElementAt"
+// stdlib §5: "ElementAt(index: int): T"
+// stdlib §5: "IndexOutOfRangeException for ElementAt"
 BEZEL_TEST(linq_throw_469, element_at_oor_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -214,7 +214,7 @@ BEZEL_TEST(linq_throw_469, element_at_neg_throws_spec_5) {
 
 // ── Positive regression: First() / Last() / Single() on valid arrays ──────────
 
-// stdlib §5 line 2445: First() returns first element when non-empty.
+// stdlib §5: First() returns first element when non-empty.
 BEZEL_TEST(linq_throw_469, first_nonempty_still_works_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -224,7 +224,7 @@ BEZEL_TEST(linq_throw_469, first_nonempty_still_works_spec_5) {
         "end Main; end C;"), 42);
 }
 
-// stdlib §5 line 2449: Last() returns last element when non-empty.
+// stdlib §5: Last() returns last element when non-empty.
 BEZEL_TEST(linq_throw_469, last_nonempty_still_works_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -234,7 +234,7 @@ BEZEL_TEST(linq_throw_469, last_nonempty_still_works_spec_5) {
         "end Main; end C;"), 7);
 }
 
-// stdlib §5 line 2451: Single() returns the element when there is exactly one.
+// stdlib §5: Single() returns the element when there is exactly one.
 BEZEL_TEST(linq_throw_469, single_exactly_one_still_works_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -254,7 +254,7 @@ BEZEL_TEST(linq_throw_469, min_max_nonempty_still_works_spec_5_1) {
         "end Main; end C;"), 1);
 }
 
-// stdlib §5 line 2446: First(pred) still returns match when one exists.
+// stdlib §5: First(pred) still returns match when one exists.
 BEZEL_TEST(linq_throw_469, first_pred_match_still_works_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -264,7 +264,7 @@ BEZEL_TEST(linq_throw_469, first_pred_match_still_works_spec_5) {
         "end Main; end C;"), 4);
 }
 
-// stdlib §5 line 2453: ElementAt(i) in range still returns the element.
+// stdlib §5: ElementAt(i) in range still returns the element.
 BEZEL_TEST(linq_throw_469, element_at_inrange_still_works_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -276,7 +276,7 @@ BEZEL_TEST(linq_throw_469, element_at_inrange_still_works_spec_5) {
 
 // ── *OrNull variants on empty still return null, NOT throw ───────────────────
 
-// stdlib §5 line 2447: "FirstOrNull(): T? — null if empty"
+// stdlib §5: "FirstOrNull(): T? — null if empty"
 // Must NOT throw even though the source is empty.
 BEZEL_TEST(linq_throw_469, first_or_null_empty_returns_null_spec_5) {
     BEZEL_EXPECT_EQ(run(
@@ -287,7 +287,7 @@ BEZEL_TEST(linq_throw_469, first_or_null_empty_returns_null_spec_5) {
         "end Main; end C;"), 1);
 }
 
-// stdlib §5 line 2450: "LastOrNull(): T? — null if empty"
+// stdlib §5: "LastOrNull(): T? — null if empty"
 BEZEL_TEST(linq_throw_469, last_or_null_empty_returns_null_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -297,7 +297,7 @@ BEZEL_TEST(linq_throw_469, last_or_null_empty_returns_null_spec_5) {
         "end Main; end C;"), 1);
 }
 
-// stdlib §5 line 2452: "SingleOrNull(): T? — null if not exactly one"
+// stdlib §5: "SingleOrNull(): T? — null if not exactly one"
 BEZEL_TEST(linq_throw_469, single_or_null_empty_returns_null_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -336,7 +336,7 @@ BEZEL_TEST(linq_throw_469, first_empty_exception_is_typed_spec_5) {
 
 // ── First() throw on lazy pipeline (Where → First with no match) ──────────────
 
-// stdlib §5 line 2446 + 2515: First(pred) also throws on lazy pipelines.
+// stdlib §5: First(pred) also throws on lazy pipelines.
 BEZEL_TEST(linq_throw_469, lazy_first_pred_no_match_throws_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "

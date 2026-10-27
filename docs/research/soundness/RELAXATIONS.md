@@ -83,7 +83,7 @@ Spec and compiler agree on all three.
 over-rejection (60 of 12,327 accepted programs lost, none of them unsound). That means K5.3 is
 **already the relaxed choice**: it is the place where the language deliberately stops short of a
 borrow checker and leans on the flag. There is no further relaxation of K5.3 itself — a kill
-cannot be "more admitted" than admitted. The two places where `Dispose()` *is* frozen (K5.7,
+cannot be "more admitted" than admitted. *(Caveat, added 2026-10-27: bzcore counts a flag-backstopped fault as sound, so "none of them unsound" does not mean the lost programs were harmless. A use through the borrow that the `Dispose()` dominates is a fault on every run, and rejecting it is not mere over-rejection. A narrow compile error for that straight-line case is being drafted as a proposal; the full freeze stays declined.)* The two places where `Dispose()` *is* frozen (K5.7,
 sources captured under a `scoped` storage admission; K5.8, a `§30.12` guard's interior borrows)
 are the two shapes where the flag is not an admissible backstop — the stored callback's later
 invocation is invisible at the kill, the guard's interior carries no flag at all — and
@@ -301,8 +301,7 @@ and a review of how many would become ambiguous after an unrelated edit.
    by the `Dispose()` and the surviving borrow is flag-backstopped, so K5's conjuncts (i) and (ii)
    both hold *for the earlier kill* — but the spec should say it in one sentence (K5.2 or §28.7
    *Overwrite while borrowed*: "a reassignment that displaces an explicitly-disposed or moved-from
-   value kills nothing and is not frozen"). Filed as a spec question in this report, not on GitHub
-   (lane rule).
+   value kills nothing and is not frozen"). Filed as [#7364](https://github.com/s8lap/bezel-lang/issues/7364).
 2. **Checked mode works as specified** for every program here: each stale read through a borrow
    raised `DisposedAccessException` (exit 70), including through the loop back edge (k52_p5) and
    after an overwrite-at-release-point store (k52_p3).
@@ -313,7 +312,7 @@ and a review of how many would become ambiguous after an unrelated edit.
 4. Minor: the K5.2 diagnostic says the later use *"would read freed memory"*; in the default
    checked build it would raise `DisposedAccessException`. Wording only.
 5. Minor: the must-use warning (K3.14) is emitted beside the freeze error in k52_p1/p4; harmless,
-   but a rejected program's secondary lint is noise.
+   but a rejected program's secondary lint is noise. Items 4 and 5 are filed as [#7365](https://github.com/s8lap/bezel-lang/issues/7365).
 
 ## 6. Files
 

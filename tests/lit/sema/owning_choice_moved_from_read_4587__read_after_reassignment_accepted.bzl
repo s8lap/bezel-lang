@@ -53,6 +53,10 @@ end C;
 // declarations.
 
 // CHECK-NOT: error
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: already moved out
 // CHECK: warning: owned value in `b` is implicitly disposed at the end of its scope (§28.3 must-use / auto-drop)
 // CHECK-NOT: error
 // CHECK-NOT: already moved out

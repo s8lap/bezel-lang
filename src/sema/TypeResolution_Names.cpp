@@ -1,7 +1,10 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include <algorithm>  // fix #7083: std::sort / std::find — the ambiguity
+                       // diagnostic's module list must be deterministic
 #include <cstdio>   // send-back #4305: unhandledNullDeclClassConstraintSlot
 #include <cstdlib>  // send-back #4305: unhandledNullDeclClassConstraintSlot
+#include <vector>   // fix #7083: the colliding modules' names
 
 #include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
 #include "common/OwnershipFacts.hpp"   // isMoveOnlyValueType — §14.4 / §15.3 (#3794)
@@ -2786,14 +2789,28 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
 // member un-declarable. So the stop fires in a NESTED type's body and nowhere
 // else; a top-level type's own member of the name does not stop the search.
 //
-// One further axis is NOT covered, declared rather than assumed:
+// One further axis is NOT covered by the STOP, declared rather than assumed:
 //   * BASE types. §2.7's rule-1 ranking paragraph says "the enclosing type's
 //     accessible members (inherited included)", but §2.7's "Through nesting"
 //     paragraph — the one stating the stop rule quoted above — enumerates the
 //     chain as "the nested type and then each type enclosing it", with no base
 //     types in it, and inheritance is a separate axis with its own accessor
-//     (`baseTypes`). Widening to base types is a strictly larger change with a
-//     much larger blast radius, and is filed separately rather than smuggled in.
+//     (`baseTypes`). Widening the STOP to base types is a strictly larger
+//     change with a much larger blast radius, and is filed separately rather
+//     than smuggled in.
+//
+// fix #7012 (v0.340) covers the OTHER half of that axis, and the two are
+// different questions. The stop asks whether an enclosing type ends the search
+// WITHOUT a type to hand back; §2.7's normative table answers that a
+// same-named member of any other kind, "on the type's own body or on a type
+// enclosing it, DECLARED OR INHERITED", NEITHER BINDS NOR ENDS THE SEARCH at a
+// bare type name — so a base's same-named method, field or property is still
+// not a blocker here, and the deferral above stands unchanged. What #7012 adds
+// is the arm that finds a type to RETURN: a base's NESTED TYPE of the name,
+// which that same row admits as "the innermost answer". The qualified spelling
+// (`K.N` through the derived type) is a third question again — §11.6 gives a
+// nested type its DECLARING path (`Outer.Nested`) and §2.8.3 rule 3 identifies
+// a type by its declaring qualified name, so it is not claimed here either way.
 //
 // fix #6401 (§21.10 + §2.7 "Through nesting", v0.338): a §21.10 LOCAL type is
 // now a LINK of that chain. `resolveNamed`'s §21.10 arm pairs the local type's
@@ -2821,10 +2838,198 @@ bool Resolver::enclosingTypeMemberBlocksBareName(
 // The stop is placed so it can only ADD a rejection, never remove one: the
 // symbol `lookupName` would have returned is returned unchanged, and
 // `*stoppedAt` is a separate answer the caller decides about.
+//
+// fix #7012 (§2.7, v0.340) adds the ONE thing this walk was still missing and
+// that its own scope note below declined to guess at: a BASE type's nested
+// type. The note is right that widening the STOP to base types is a different
+// and larger change — this is not that. The stop answers "does an enclosing
+// type end the search without a type to hand back"; the arm added here answers
+// "is there a type to hand back", and it only ever admits a NESTED TYPE of the
+// name, which is precisely what §2.7's normative table says a bare type name
+// may bind to. A base's same-named member of any OTHER kind is untouched: it
+// still neither binds nor ends the search, per that row.
+//
+// §2.7, "Enclosing-type members": "Inside a type's bodies, the enclosing
+// type's accessible members (INHERITED INCLUDED; instance and static, ...)
+// participate in rule 1's bare-name lookup at a position fixed by the name's
+// syntactic shape, decided before any lookup." The table's Bare type name row
+// is that position, and states the answer in both halves: the enclosing type's
+// members rank "between local scope and module declarations, NESTED TYPES ONLY"
+// and "a nested type of the name, DECLARED OR INHERITED, is the innermost
+// answer (§2.2 selecting by arity)".
+//
+// §11.6 names the generic case outright, and it is the one this arm could not
+// have reached by extending a lexical chain: a type nested in a generic type "is
+// named only where §2.7's enclosing-type lookup reaches it, or reaches a
+// non-generic type enclosing it below the generic one (`Node<int>` in `Tree`'s
+// own declaration OR IN THE BODY OF A TYPE DERIVING FROM `Tree`; `Inner.Leaf`
+// there for a `Leaf` nested in a non-generic `Inner`)".
+//
+// WHY THE SCOPE CHAIN CANNOT EXPRESS IT. A body scope registers only the type's
+// GENERIC PARAMETERS and NESTED TYPES (`resolveTypeDecl`'s §11.3/#482 loop),
+// and `resolveMember` gives a nested type's body scope the OUTER type's body
+// scope as its parent — so LEXICAL nesting has always resolved through the
+// chain. Inheritance is a separate axis with its own accessor (`baseTypes`), and
+// no Scope carries it. MEASURED on the base (5c3e10f7), `class B { public class
+// N }` with `class K: B` reporting a bare `N` in `K`'s body: "unresolved type
+// name `N`", twice, with a generic base (`B<T>` / `K: B<int>`) and with a
+// generic nested type (`B<T>`'s `N<U>` spelled `N<string>`) failing identically.
+// The qualified spelling was unaffected — `B.N` from outside resolves (#7012).
+
+// fix #7012 (§13.1 / §11.6, v0.340): is `inner` nested (directly or
+// transitively) inside `outer`? The file-local twin of `isNestedWithin` in
+// TypeResolution_Checks.cpp, which backs the same §11.6 mutual-access rule for
+// ordinary member access and §12.2's `private` hiding carve-out; duplicated
+// internal-linkage for the reason that copy gives — the two checkers live in
+// different translation units with no shared utility header for a helper this
+// narrow. Keep the two in step.
+static bool typeNestedWithin(const TypeSymbol* inner, const TypeSymbol* outer) {
+    if (!inner || !outer) return false;
+    for (const Symbol* m : outer->members) {
+        if (const auto* nts = dynamic_cast<const NestedTypeSymbol*>(m)) {
+            if (nts->type == inner) return true;
+            if (nts->type && typeNestedWithin(inner, nts->type)) return true;
+        }
+    }
+    return false;
+}
+
+// fix #7012 (§13.1, §13.4, §11.6, §12.2, v0.340): is the inherited nested type
+// `nts` — declared in `declaring`, reached by walking `link`'s base chain —
+// accessible at the site being resolved?
+static bool inheritedNestedTypeAccessible(SemaContext& ctx, TypeSymbol* link,
+                                          TypeSymbol* declaring,
+                                          const NestedTypeSymbol* nts) {
+    switch (nts->visibility) {
+        case ast::Visibility::Public:
+        case ast::Visibility::None:
+            // §13.1: "`public` — Anyone who can see the enclosing context".
+            // `None` is not reachable for a nested type: §11.6 requires the
+            // visibility keyword ("omitting the keyword is a compile error, not
+            // a default"), and §13.3 gives no member kind a default.
+            //
+            // §11.6's EFFECTIVE-VISIBILITY clamp ("a nested type's effective
+            // visibility is the more restrictive of its declared visibility and
+            // its enclosing class's visibility") needs no arm here, and the
+            // reason is structural rather than assumed: a non-public enclosing
+            // type that would clamp a `public` nested type below `public` is
+            // itself unreachable from another module, because an `internal`
+            // top-level type is not exported at all. MEASURED cross-module, an
+            // `internal class Outer` wrapping the declaring class: naming it
+            // from the importing module fails with "module `Lib` has no public
+            // type `Outer` (§2.7)" before any member of it is considered. The
+            // one place the clamp could still bite — same module — is the case
+            // where every type involved is visible by §13.1 anyway.
+            return true;
+        case ast::Visibility::Internal:
+            // §13.1: "`internal` — Code in the same module"; §13.4 closes
+            // `internal` by compilation, so an imported declaring type or an
+            // imported member of it is out of reach in either role.
+            return !ctx.isImported(nts) && !ctx.isImported(declaring);
+        case ast::Visibility::Protected:
+            // §13.1: "`protected` — The declaring class and all classes derived
+            // from it". `declaring` is reached ONLY by walking `link`'s own
+            // base chain, so `link` is by construction a class derived from
+            // `declaring` — the second half of the level, which is why this arm
+            // cannot fail. The test is on `link`, the type whose members this
+            // rank of the lookup consults (§2.7 "Through nesting" ranks "each
+            // type enclosing it ... at the rank the table gives ITS members"),
+            // and not on the innermost body being resolved: §2.7's
+            // accessibility sentence adds that in a nested type's body "the
+            // `private` and `protected` members of every type enclosing the
+            // body ... count as accessible", so a `protected` nested type of a
+            // base reaches a nested type's body as well as the derived type's
+            // own. (MEASURED, the value-position twin does NOT: a `protected
+            // static` member of a base is NOT reachable by bare name from a
+            // nested type's body — `unresolved identifier `S``. The two
+            // positions are separate rules and only this one is claimed.)
+            return true;
+        case ast::Visibility::Private:
+            // §13.1: "`private` — The declaring class only", extended by §11.6
+            // "in both directions" between a class and the types nested in it
+            // "at any depth", and by §12.2's carve-out — "a derived class
+            // nested inside the base class (§11.6) sees the base's `private`
+            // members and is blocked by them". `link` is strictly a DERIVED
+            // class here, never `declaring` itself, so the two nesting tests
+            // are the whole of what is left.
+            return typeNestedWithin(link, declaring) ||
+                   typeNestedWithin(declaring, link);
+    }
+    return true;
+}
+
+// fix #7012 (§2.7 "Through nesting" + §2.2 arity, v0.340): the nearest type,
+// breadth-first through `link`'s base chain, that carries a nested type of
+// `name` whose arity the reference fixes and that is accessible at the site.
+//
+// fix #7084 (§2.2, v0.343): `arityMismatch` is the out-parameter that keeps
+// the FIRST accessible candidate whose arity the reference does NOT fix. Such
+// a candidate is not the one §2.2's arity rule SELECTS, but it IS one of the
+// candidates — "where none has that arity, it resolves to the first of them
+// and is Appendix C.1's arity error" — so the caller can resolve to it and
+// report the arity error instead of an unresolved name. The parameter is
+// in/out: a candidate found at an earlier link is kept.
+static NestedTypeSymbol* findInheritedNestedType(SemaContext& ctx,
+                                                 TypeSymbol* link,
+                                                 std::string_view name,
+                                                 std::size_t refArity,
+                                                 NestedTypeSymbol** arityMismatch) {
+    if (!link) return nullptr;
+    // Nearest base first: the order `ExprTC::lookupMember` and this file's
+    // `findFieldInTypeChain` both use for an inherited member. Two bases
+    // declaring the same nested-type name would be a sibling-base ambiguity,
+    // which those two carry as a separate slice too — §12.2 forbids the
+    // ordinary shape (a derived type may not reuse the name of an inherited
+    // member visible at its declaration site), so the two never meet at a
+    // declaration that this arm can reach.
+    std::vector<TypeSymbol*> frontier(link->baseTypes.begin(),
+                                      link->baseTypes.end());
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        TypeSymbol* base = frontier[i];
+        if (!base || base == link) continue;
+        for (Symbol* m : base->members) {
+            auto* nts = dynamic_cast<NestedTypeSymbol*>(m);
+            if (!nts || !nts->type || nts->name != name) continue;
+            // §13.1 / §13.4: a member that is not accessible at the site is
+            // not a candidate at all, so it is not "one of them" either.
+            if (!inheritedNestedTypeAccessible(ctx, link, base, nts)) continue;
+            // §2.7 "Through nesting": the enclosing-type lookup ends at "the
+            // first type that has a NESTED TYPE of the name, declared or
+            // inherited, WHOSE ARITY THE REFERENCE FIXES (§2.2)". §2.2: "a
+            // reference resolves to the first, in that rule's order, whose
+            // arity its type-argument list fixes". So an arity-mismatched
+            // candidate is not the one SELECTED: the walk continues to the
+            // next base rather than binding it. fix #7084: it is still
+            // remembered, because §2.2's fallback — "where none has that
+            // arity, it resolves to the first of them and is Appendix C.1's
+            // arity error" — resolves to it when NOTHING matches.
+            if (nts->type->genericParams.size() != refArity) {
+                if (arityMismatch && !*arityMismatch) *arityMismatch = nts;
+                continue;
+            }
+            return nts;
+        }
+        for (TypeSymbol* b : base->baseTypes) frontier.push_back(b);
+    }
+    return nullptr;
+}
+
 Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
                                      TypeSymbol** stoppedAt,
                                      const ast::Type* resolving) {
     if (stoppedAt) *stoppedAt = nullptr;
+    // fix #7012 (§2.7 "Through nesting" + §2.2, v0.340): the arity this
+    // reference fixes. `resolving` IS the node being resolved — the one call
+    // site passes `&t`, the `ast::Type` `resolveNamed` is resolving (the same
+    // node §2.7's `property Color: Color` carve-out reads above) — so this
+    // reads it off rather than adding a parameter and a header declaration.
+    const std::size_t refArity =
+        resolving ? resolving->genericArgs.size() : 0;
+    // fix #7084 (§2.2, v0.343): the FIRST inherited nested type of the name
+    // whose arity the reference does NOT fix. Kept across the walk, because
+    // §2.2's fallback resolves to the first of the candidates when NONE of
+    // them has the reference's arity.
+    NestedTypeSymbol* arityMismatch = nullptr;
     for (Scope* s = scope; s; s = s->parent) {
         // §2.7 rule 1 ranks local scope ABOVE the enclosing type's members, so
         // a name carried by this scope (a local, a parameter, a generic-
@@ -2833,17 +3038,99 @@ Symbol* Resolver::lookupBareTypeName(std::string_view name, Scope* scope,
         // carries nothing can end the search below.
         auto it = s->names.find(name);
         if (it != s->names.end()) return it->second;
-        if (stoppedAt) {
-            for (const auto& entry : typeBodyScopes_) {
-                if (entry.first != s) continue;
-                if (enclosingTypeMemberBlocksBareName(entry.second, name,
-                                                     resolving)) {
-                    *stoppedAt = entry.second;
-                    break;
-                }
+        // The type whose body this scope IS, if it is a type body scope: §2.7's
+        // enclosing-type link, paired with its owner by `typeBodyScopes_` (see
+        // that field's declaration for why a scope alone cannot say it).
+        TypeSymbol* link = nullptr;
+        for (const auto& entry : typeBodyScopes_) {
+            if (entry.first == s) {
+                link = entry.second;
+                break;
             }
-            if (*stoppedAt) return nullptr;
         }
+        if (!link) continue;
+        // The §2.7 stop, unchanged and still ahead of anything added below: it
+        // only ever takes a member of a kind a TYPE position cannot use, and it
+        // is load-bearing for four pinned rows (named above).
+        if (stoppedAt &&
+            enclosingTypeMemberBlocksBareName(link, name, resolving)) {
+            *stoppedAt = link;
+            return nullptr;
+        }
+        // fix #7012: a base type's nested type, which the chain cannot reach.
+        // Placed after the stop so the stop keeps its exact precedence, and
+        // after `s->names` so a DECLARED nested type of the link still wins —
+        // which is §2.7's own order, "declared or inherited", declared first.
+        if (NestedTypeSymbol* inherited =
+                findInheritedNestedType(ctx_, link, name, refArity,
+                                        &arityMismatch))
+            return inherited;
+    }
+    // fix #7084 (§2.2, §2.3, Appendix C.1, v0.343): §2.2's arity rule reads
+    //
+    //   "Arity selects among the types rule 1 of §2.7 finds for an
+    //    identifier: a reference resolves to the first, in that rule's order,
+    //    whose arity its type-argument list fixes; where none has that arity,
+    //    it resolves to the first of them and is Appendix C.1's arity error,
+    //    never an alias, a member or a module prefix."
+    //
+    // The walk above ended with NOTHING bound, and the candidate it found is an
+    // inherited nested type whose arity the reference does NOT fix. §2.2's
+    // fallback — "where NONE has that arity" — is the CONDITION for resolving
+    // to it, so it may be bound only after the other rule-1 candidate sources
+    // have been consulted. Two of them are not visible to this walk:
+    //
+    //   * the §2.3 ALWAYS-AVAILABLE names, which the CALLER resolves (Slice
+    //     S24) whenever this returns null; and
+    //   * the §2.2 AMBIGUOUS-IMPORT set, which the CALLER reports (its
+    //     `ambiguousImportNames_` arm) whenever this returns null.
+    //
+    // Both are consulted below, so a name one of them owns is never stolen by
+    // the fallback:
+    //
+    //   * The always-available name's arity is compared with the reference's
+    //     EXACTLY as Slice S24 compares them — including the §2.3 Row 5
+    //     sentinel `kBuiltinTaskLike`, which means the `Task` family is
+    //     available at arity 0 AND 1 ("Importing `System.Threading` is not
+    //     required to use the `Task` family", §2.3). When the always-
+    //     available name HAS the reference's arity it is a candidate of that
+    //     arity, so §2.2's fallback does not apply ("where none has that
+    //     arity"), and the caller resolves the always-available name instead —
+    //     §2.7 rule 1's own worked example: "`Array<int>` passes over it to
+    //     the always-available `Array<T>`" (an arity-mismatched candidate is
+    //     PASSED OVER, not fatal).
+    //   * The ambiguous-import set is consulted at the reference's arity:
+    //     two imported modules exporting the same (name, arity) make the bare
+    //     name ambiguous (§2.2), and that diagnostic must not be swallowed by
+    //     the fallback.
+    //
+    // Only when NEITHER has the name does §2.2's fallback apply: the
+    // reference "resolves to the first of them" — that inherited nested type —
+    // and is Appendix C.1's arity error. Returning it binds the name, and the
+    // ordinary generic-arity check (the one the LEXICAL twin of this shape —
+    // a nested type in a type's OWN body — already reaches) reports it.
+    //
+    // Before this, the arity-mismatched candidate was skipped and the name
+    // was left unresolved, so the diagnostic was "unresolved type name `N`" —
+    // LESS specific than the lexical twin's "generic-argument count does not
+    // match type's generic-parameter count", and not the diagnostic §2.2
+    // names for this shape.
+    if (arityMismatch) {
+        int builtinAr = builtinTypeArity(name);
+        if (builtinAr != kNotBuiltin) {
+            // The same comparison Slice S24 makes (the sentinel means arity 0
+            // AND 1), so the two sites cannot disagree about whether the
+            // always-available name is a candidate of the reference's arity.
+            bool ok = (builtinAr == kBuiltinTaskLike)
+                          ? (refArity == 0 || refArity == 1)
+                          : (refArity == static_cast<std::size_t>(builtinAr));
+            if (ok) return nullptr;  // the always-available name owns it
+        }
+        if (!ambiguousImportNames_.empty() &&
+            ambiguousImportNames_.count(
+                std::make_pair(std::string(name), refArity)))
+            return nullptr;  // §2.2's collision diagnostic stands
+        return arityMismatch;
     }
     return nullptr;
 }
@@ -3731,6 +4018,210 @@ void Resolver::recordStaticReceiverInstantiation(const ast::IdentifierExpr& id,
                                /*siteKey=*/&id, id.span.begin);
 }
 
+// fix #7164 (§14.1 / §2.2 / §2.3 / Appendix C.1, v0.343): the §14.1 arity
+// rule at an EXPRESSION-position type reference.
+//
+// THE TYPE POSITION ENFORCES IT, THE EXPRESSION POSITION DID NOT.  The type
+// position's check is `resolveNamed`'s "Generic-arity check" (this file):
+// it compares the reference's type-argument count with the resolved type's
+// declared parameter count and reports "generic-argument count does not
+// match type's generic-parameter count".  An EXPRESSION-position type
+// reference — `Box<int>.Make(…)`, `var v := Box<int>;` — is an
+// `ast::IdentifierExpr` carrying `typeArgs`, NOT an `ast::Type` node, so
+// `resolveNamed` was never called for it: the expression pass hand-built the
+// instantiated TypeRef (ExprTypecheck_Exprs.cpp's IdentifierExpr arm) and
+// never compared the two counts.  A wrong count was therefore accepted
+// silently and the program ran — the type position and the expression
+// position disagreed about the SAME reference, which is the shape this fixes.
+//
+// §2.2's arity SELECTION comes FIRST, exactly as `resolveNamed` applies it:
+// the reference's type-argument list selects among §2.7 rule 1's candidate
+// types ("a reference resolves to the first, in that rule's order, whose
+// arity its type-argument list fixes").  So a reference whose arity matches a
+// DIFFERENT candidate — an imported type of the same name at that arity, or a
+// §2.3 always-available built-in at that arity — denotes THAT candidate, and
+// the §14.1 arity rule is checked against it, not against the bare-name scope
+// entry this lookup found.  A reference whose arity matches no candidate is
+// the arity error.  The two tables consulted here (`importedByArity_` and
+// `builtinTypeArity`) are the SAME two `resolveNamed` applies the selection
+// with, so the two positions cannot drift apart.
+//
+// The diagnostic TEXT is the type position's text, verbatim: one rule, one
+// message.  A second wording for the same rule would make the same defect
+// read two ways depending on which position it was written in.
+void Resolver::checkExprTypeRefArity(const ast::IdentifierExpr& id,
+                                     Scope* scope) {
+    if (id.typeArgs.empty()) return;
+    const std::size_t refArity = id.typeArgs.size();
+    // §2.7 rule 1: the head name must denote a TYPE.  A name that resolves
+    // to something else (a local, a parameter, a method) is §22.12's rule —
+    // "a name that resolves to a non-generic entity after a
+    // syntactically-successful generic reading is an ordinary error at that
+    // name" — which is a DIFFERENT rule and is not this one.
+    Symbol* sym = lookupName(id.name, scope);
+    if (auto* aliasSym = dynamic_cast<TypeAliasSymbol*>(sym)) {
+        // §14.1 (v0.343): "… and the same holds for a generic type alias".
+        // The TYPE position enforces the alias's arity — `resolveNamed`'s
+        // alias arm reports "generic-argument count does not match type
+        // alias `X`'s generic-parameter count (§27.8)" — so the expression
+        // position must enforce the SAME count with the SAME wording.  The
+        // alias's declared count is its OWN parameter count (an alias's
+        // arity is its own; §27.8's alias-transparency does not change it).
+        // An alias whose AST declaration is not here (an IMPORTED alias)
+        // has no declared count to compare against, exactly as in the type
+        // position, whose alias arm is likewise gated on the declaration.
+        const auto* aliasDecl =
+            dynamic_cast<const ast::TypeAlias*>(aliasSym->decl);
+        if (!aliasDecl) return;
+        if (refArity != aliasDecl->genericParams.size()) {
+            ctx_.diagnostics().report(
+                Severity::Error, id.span.begin,
+                "generic-argument count does not match type alias `" +
+                    std::string(aliasDecl->name) +
+                    "`'s generic-parameter count (\xC2\xA7""27.8)");
+        }
+        return;
+    }
+    auto* tsym = dynamic_cast<TypeSymbol*>(sym);
+    if (!tsym) {
+        // No type of that name in scope.  The name is then either a §2.3
+        // always-available built-in (whose arity Slice S24 owns, and which the
+        // expression position has no type reference of its own to
+        // instantiate) or not a type at all.  Neither is §14.1's arity rule
+        // applied to a user type, so there is nothing to check here.
+        return;
+    }
+    if (tsym->genericParams.size() == refArity) return;  // the rule holds
+    // §2.2 arity selection — the same two candidates `resolveNamed` consults
+    // (see the comment above).  A candidate of the reference's arity means
+    // the reference denotes THAT type, not the one the bare-name lookup
+    // found, so the arity rule is not violated here: this reference belongs
+    // to the type position's selection, not to this check.
+    {
+        auto it = importedByArity_.find(
+            std::make_pair(std::string(id.name), refArity));
+        if (it != importedByArity_.end() && it->second) return;
+        const int builtinAr = builtinTypeArity(id.name);
+        if (builtinAr != kNotBuiltin) {
+            // fix #7084's sentinel: the `Task` family is available at arity 0
+            // AND 1 (§2.3 Row 5), so the comparison is the one Slice S24
+            // makes, not a plain equality against the table's negative value.
+            const bool ok = (builtinAr == kBuiltinTaskLike)
+                                ? (refArity == 0 || refArity == 1)
+                                : (refArity == static_cast<std::size_t>(builtinAr));
+            if (ok) return;
+        }
+    }
+    // §14.1 / Appendix C.1: every type reference supplies exactly the
+    // declared number of type arguments.  "Bezel has no raw and no open
+    // generic type reference" — a reference that supplies a different number
+    // than the type declares is an error, and the type position already
+    // says so with this text.
+    ctx_.diagnostics().report(Severity::Error, id.span.begin,
+                               "generic-argument count does not match type's "
+                               "generic-parameter count");
+}
+
+// fix #7013 (§2.2, §11.6, v0.340): §2.2's arity selection, for a reference
+// that fixes arity 0 — a chain HEAD, which §11.6 calls "a bare enclosing
+// segment" ("A bare enclosing segment fixes arity 0").
+//
+// §2.2's collision AND shadowing rules compare names "together with their
+// generic arity", and its arity rule is "Arity selects among the types rule 1
+// of §2.7 finds for an identifier: a reference resolves to the first, in that
+// rule's order, whose arity its type-argument list fixes". So a current
+// module's `C<T>` (arity 1) does NOT shadow an imported `C` (arity 0): the two
+// are "two names, neither colliding with nor shadowing the other" (§2.2's own
+// `Counter` / `Counter<K>` example, whose usable spellings are `Counter.Bump()`
+// — a chain head — and `Counter<string>`). A head that fixes arity 0 therefore
+// selects the imported arity-0 `C`, and §11.6's "In a type position, therefore,
+// no name passes through a generic enclosing type" is satisfied because the
+// selected `C` is NOT generic.
+//
+// The candidate set is rule 1's, in rule 1's order, with the arity filter
+// applied to each candidate in turn:
+//
+//   * the SCOPE chain first (local scope, then the enclosing type's
+//     accessible members, then the current module's declarations) — a
+//     candidate whose arity does not match is SKIPPED, not fatal, because
+//     §2.2's rule is "the first, in that rule's order, whose arity its
+//     type-argument list fixes". That walk needs `Scope`, which is private
+//     to `Resolver`, so it lives at the call site;
+//   * then the IMPORTED names, which this helper looks up. The import loop
+//     in TypeResolution.cpp keys its current-module shadowing test on the
+//     BARE name (`if (localNames.count(std::string_view(t->name))) continue;`),
+//     so it skips the imported arity-0 `C` before recording it in
+//     `importedByArity_` — the table the #5172 arity redirect consults — and
+//     the scope chain therefore never holds it. This lookup reaches the
+//     module's exported-type list directly (`ctx_.importedTypesOf(dotted)`,
+//     the same list that loop walks), restricted to the modules THIS FILE
+//     imported (`sourceImports_`).
+//
+// Returns the unique imported type of that (name, arity), or null. When two
+// or more DISTINCT imported modules export that pair — §2.2's collision, which
+// the caller reports — `*ambiguousModules` receives the ORIGIN modules' names.
+//
+// fix #7083 (§2.2, v0.343): §2.2 requires the collision diagnostic to cite
+// BOTH ORIGINS ("When two imported modules export the same public name, the
+// bare name is ambiguous: using it unqualified is a compile error citing both
+// origins"), so the module names are collected here rather than dropped.
+//
+// DETERMINISM. `sourceImports_` is an `unordered_set`, so the order in which
+// its members are visited is not the order they were imported in, and it is
+// not a property to rely on for a diagnostic's TEXT: the names are SORTED
+// before they are handed to the caller, so the message is byte-identical from
+// run to run however the set happens to be laid out.
+static TypeSymbol* selectImportedTypeByArity(
+    SemaContext& ctx, const std::unordered_set<std::string>& sourceImports,
+    std::string_view name, std::size_t arity,
+    std::vector<std::string>* ambiguousModules) {
+    if (ambiguousModules) ambiguousModules->clear();
+    TypeSymbol* found = nullptr;
+    std::vector<std::string> modules;
+    for (const std::string& mod : sourceImports) {
+        const auto* exported = ctx.importedTypesOf(mod);
+        if (!exported) continue;
+        for (TypeSymbol* t : *exported) {
+            if (!t || t->name != name) continue;
+            if (t->genericParams.size() != arity) continue;
+            // §2.3 Row 10 / #5140: an always-available name and an imported
+            // public of the same identifier are ambiguous in bare use, and
+            // the (identifier, arity) keying for the always-available set is
+            // an OPEN question there (#5140's HOLD). This lookup stays out of
+            // that set rather than deciding it.
+            if (isAlwaysAvailableBareName(t->name)) continue;
+            if (!found) found = t;
+            // The same module may list the pair twice (a duplicate export);
+            // it is ONE origin, so it is recorded once.
+            if (std::find(modules.begin(), modules.end(), mod) == modules.end())
+                modules.push_back(mod);
+        }
+    }
+    // §2.2 collision: two (or more) DISTINCT imported modules export this
+    // (name, arity), so the bare name has no unique referent.
+    if (modules.size() >= 2) {
+        if (ambiguousModules) {
+            std::sort(modules.begin(), modules.end());
+            *ambiguousModules = modules;
+        }
+        return nullptr;
+    }
+    return found;
+}
+
+// fix #7083 (§2.2, v0.343): the origin modules of a §2.2 collision, as the
+// diagnostic's list: "`LA` and `LB`", or "`LA`, `LB` and `LC`". The names are
+// already sorted by the caller, so the text does not depend on the order the
+// imports were visited in.
+static std::string citeOriginModules(const std::vector<std::string>& modules) {
+    std::string out;
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        if (i) out += i + 1 == modules.size() ? " and " : ", ";
+        out += "`" + modules[i] + "`";
+    }
+    return out;
+}
+
 // fix #6965 review (§11.6, §2.2, Appendix C.1, v0.340): a dotted type name
 // passes THROUGH the segment that names `enclosing` to reach `part`. That
 // segment carries no type arguments (A.5's `TypeNoNullable ::= QualifiedName
@@ -3766,6 +4257,293 @@ static bool reportGenericEnclosingSegment(DiagnosticEngine& diags,
             "<...>.Make()`) or a local declared without a type annotation "
             "(\xc2\xa7""11.6, Appendix C.1, v0.340)");
     return true;
+}
+
+// fix #7085 (§2.7 warning row, v0.343): the chain-head warning row's FIRST
+// half — "chain head resolves to a type while a same-named accessible member
+// exists — warn, *unless* the member's declared type is the resolved type (or
+// an instantiation of the resolved generic)".
+//
+// Extracted from `warnChainHeadTypeShadows` (the VALUE path's site, called
+// from ExprTypecheck_Exprs.cpp) so the TYPE path (this file's `resolveNamed`)
+// and the VALUE path emit ONE rule's text: §2.7's warning row is one rule
+// with two positions, and two texts would let the two sites drift apart.
+//
+// The CARVE-OUT is the rule's own: the member's declared type must not BE
+// the resolved type. For a NESTED TYPE the member's declared type is the
+// type itself, so the carve-out holds exactly when the nested type IS the
+// resolved type — the case where nothing is shadowed and no warning is
+// wanted. `storageComponentType` answers the question for the member kinds
+// it covers (a field, a property); a nested type has no storage component,
+// so its own type is read here.
+//
+// The REMEDY differs by POSITION, and the VALUE position's text stays
+// byte-identical to its pre-#7085 text:
+//
+//   * VALUE position (the `warnChainHeadTypeShadows` site, called from
+//     ExprTypecheck_Exprs.cpp): the shadowed member is a VALUE member (a
+//     field, a property, a method, a const, an event) and `this.<X>`
+//     reaches it — §2.7's own example is `this.Data.W()`.
+//
+//   * TYPE position (this file's `resolveNamed`): the shadowed member is
+//     always a NESTED TYPE — a type body scope registers only the type's
+//     generic parameters and its nested types (`resolveTypeDecl`'s
+//     §11.3/#482 loop and the §21.10 local-type arm), never a value member
+//     — and `this.C` does not even PARSE in a type position (MEASURED:
+//     "expected type name"). §2.7's remedy for a shadowed member is "the
+//     enclosing type's name for statics", which for a nested type is
+//     `Outer.C` — the spelling that reaches it (MEASURED: `Outer.C.N`
+//     compiles and prints the nested type's value).
+enum class ChainHeadWarningPosition { Value, Type };
+
+static void warnChainHeadMemberShadowedByType(
+    SemaContext& ctx, std::string_view headName,
+    const TypeSymbol* resolvedType, const Symbol* shadowedEnclosingMember,
+    SourceLocation loc, ChainHeadWarningPosition position) {
+    if (!shadowedEnclosingMember || !resolvedType) return;
+    const TypeRef* memberType =
+        storageComponentType(shadowedEnclosingMember, ctx);
+    bool carveOut = false;
+    if (memberType && memberType->kind == TypeRef::Kind::Named &&
+        memberType->declaration == resolvedType) {
+        carveOut = true;
+    }
+    // §2.7 generic carve-out: the member's declared type is an
+    // instantiation of the resolved generic (e.g. `property Buffer:
+    // Buffer<int>` with resolved type `Buffer`).
+    if (!carveOut && memberType && memberType->kind == TypeRef::Kind::Named &&
+        memberType->declaration == resolvedType &&
+        !resolvedType->genericParams.empty()) {
+        carveOut = true;
+    }
+    // fix #7085: a NESTED TYPE member declares no storage component, so the
+    // carve-out above cannot see it; its declared type is the type itself.
+    const TypeSymbol* memberTypeSym = nullptr;
+    if (const auto* nts =
+            dynamic_cast<const NestedTypeSymbol*>(shadowedEnclosingMember))
+        memberTypeSym = nts->type;
+    else if (const auto* ts =
+                 dynamic_cast<const TypeSymbol*>(shadowedEnclosingMember))
+        memberTypeSym = ts;
+    if (!carveOut && memberTypeSym && memberTypeSym == resolvedType)
+        carveOut = true;
+    if (carveOut) return;
+    if (position == ChainHeadWarningPosition::Type) {
+        // fix #7085 (round 2): the TYPE position's shadowed member is a
+        // NESTED TYPE, and `this.<X>` does not parse in a type position —
+        // §2.7's remedy is "the enclosing type's name for statics", which
+        // for a nested type is `<EnclosingType>.<X>`.
+        //
+        // fix #7085 (round 3): that qualified spelling EXISTS only when the
+        // DECLARING type is not generic. §11.6 — "In a type position,
+        // therefore, no name passes through a generic enclosing type" — and
+        // A.5 (a type-argument list attaches to the END of a qualified type
+        // name) forbid every qualified form of a nested type under a
+        // generic enclosing type: MEASURED, `Outer.C` is the §11.6 /
+        // Appendix C.1 arity error ("the bare enclosing segment in
+        // `Outer.C` supplies none") and `Outer<int>.C` is A.5's parse error.
+        // ⇒ The warning must not offer a spelling that does not compile;
+        // in that case it says what §11.6 says the reachability IS (the
+        // coordinator's interim ruling on #7121 — the warning still fires,
+        // because §2.7's warning row says warn and "the type wins for chain
+        // purposes" is useful information).
+        //
+        // MEASURED, the qualified spelling `Owner.Member` compiles when
+        // the DECLARING type is non-generic AND the NESTED type is
+        // non-generic: for a module-level declaring type, one nested in
+        // another type, one nested inside a generic type, a LOCAL type
+        // (§21.10), and one whose nested type is private or protected; and
+        // for a non-generic type BELOW a generic one (§11.6's "reaches a
+        // non-generic type enclosing it below the generic one").
+        //
+        // fix #7085 (round 5): the spelling's EXISTENCE is decided by
+        // ARITY — the resolution rule §2.2 states ("a reference resolves
+        // to the first, in that rule's order, whose arity its type-argument
+        // list fixes") and §14.1 states ("Every such reference supplies
+        // exactly the declared number of type arguments"):
+        //
+        //   * the reference's type-argument list attaches to the LAST
+        //     segment (A.5), so the spelling `Owner.Member` carries NO
+        //     arguments at all — the head's arity is fixed at 0 by §11.6
+        //     ("A bare enclosing segment fixes arity 0") and the member's
+        //     by the empty list;
+        //   * ⇒ the spelling RESOLVES to the nested type iff the
+        //     DECLARING type's arity is 0 AND the NESTED type's arity is
+        //     0; otherwise the reference is Appendix C.1's arity error.
+        //
+        // The TEXT is read off the SAME two arities, so a sentence in the
+        // warning cannot claim a spelling the rule above rejects, nor deny
+        // one it admits — the defect class round 3 and round 4 both fell
+        // into (round 4's generic-nested text asserted "no qualified
+        // spelling reaches it in a type position" while `Outer.C<int>`
+        // reaches it: MEASURED rc 0, stdout "6").
+        //
+        // MEASURED — kind × genericity × position, every candidate
+        // spelling's rc and stdout (`4` = the module-level (shadowing)
+        // type, `6` = the declaring type's nested type, `5` / `7` = their
+        // static members):
+        //
+        //   declaring type non-generic / nested type non-generic
+        //     `Outer.C`             rc 0, "6"  (the remedy)
+        //     `Outer.C.N`           rc 0, "6"
+        //     bare `C`              rc 0, "6"
+        //   declaring type non-generic / nested type generic
+        //     `Outer.C`             rc 1  (Appendix C.1's arity error)
+        //     `Outer.C<...>`        rc 0, "6"  (the nested TYPE itself)
+        //     `Outer.C<...>.N`      rc 1  (A.5)
+        //     `Outer.C<...>.Make()` rc 0, "7"  (the nested type's OWN
+        //       type-argument list supplies its argument, and the declaring
+        //       type is not generic, so the reference is not raw — the
+        //       static member of the instantiated nested type)
+        //     bare `C`              rc 1  (Appendix C.1's arity error)
+        //     bare `C<...>`         rc 0, "6"
+        //     bare `C<...>.N`       rc 1  (A.5)
+        //   declaring type generic / nested type non-generic
+        //     `Outer.C`             rc 1  (§11.6's arity error)
+        //     `Outer<int>.C`        rc 1  (A.5)
+        //     bare `C`              rc 0, "6"
+        //     `Outer<int>.C.Make()` rc 0, "7"  (a static member — the ONE
+        //       qualified route that is spec-legal here: the chain head
+        //       supplies the ENCLOSING type's arguments, and the nested
+        //       type is not generic, so the reference is not raw)
+        //   declaring type generic / nested type generic
+        //     `Outer.C`             rc 1  (§11.6's arity error)
+        //     `Outer.C<...>`        rc 1  (§11.6's arity error)
+        //     `Outer<int>.C`        rc 1  (A.5)
+        //     `Outer<int>.C<...>`   rc 1  (A.5)
+        //     bare `C<...>`         rc 0, "6"
+        //     `Outer<int>.C.Make()` rc 0, "7" — but ONLY through a
+        //       PRE-EXISTING arity gap in the chain-head receiver path
+        //       (the enclosing segment's arguments are not checked there),
+        //       and the reference is RAW (§14.1: "Bezel has no raw and no
+        //       open generic type reference") ⇒ it must not be advised.
+        //
+        // RE-MEASURED on the tree that carries the #7135 pick (`c9c5b24c8e`):
+        // the whole 78-probe enumeration was re-run and diffed against the
+        // round-5 results. EXACTLY ONE row above moved, and it moved because
+        // #7135 added the `.`-successor commit at a DOTTED SEGMENT (§22.12,
+        // v0.343): `Outer.C<...>` used to leave its `<...>` to the
+        // relational-operator parser, so `Outer.C<...>.Make()` failed with
+        // "expected expression" — a PARSE error, which is what this row
+        // said before — and it now parses as an instantiated nested type,
+        // whose type arguments are applied (§11.6), so the reference is
+        // fully instantiated and the call is admitted.
+        //
+        // THREE other probes moved with it, and this table does not list
+        // those spellings, so they are recorded here rather than left
+        // silent: `Outer<int>.C<...>.Make()` in an EXPRESSION position is
+        // now rc 0, "7" (in BOTH the generic-declaring and the
+        // non-generic-declaring cell — the second of those is accepted only
+        // through the same chain-head arity gap the grid above records), and
+        // `Local.C<...>.Make()` is now rc 0, "7" (a LOCAL declaring type
+        // takes the non-generic rows above, so this follows the row above).
+        //
+        // A LOCAL declaring type is never generic (§21.10: "The
+        // `GenericParams?` slot must be empty (v1) — a local type declares
+        // no type parameters of its own"), so it takes the non-generic
+        // rows above with the local type's own name: `Local.C` (rc 0,
+        // "6"), `Local.C<...>` (rc 0, "6"), `Local.C<...>.N` (rc 1, A.5),
+        // `Local.C<...>.Make()` (rc 0, "7").
+        const auto* nts =
+            dynamic_cast<const NestedTypeSymbol*>(shadowedEnclosingMember);
+        const TypeSymbol* owner = nts ? nts->parent : nullptr;
+        const TypeSymbol* nested = nts ? nts->type : nullptr;
+        const bool ownerGeneric =
+            owner && !owner->genericParams.empty();
+        const bool nestedGeneric =
+            nested && !nested->genericParams.empty();
+        const std::string head(headName);
+        const std::string ownerName =
+            (owner && !owner->name.empty()) ? std::string(owner->name) : head;
+        const std::string prefix =
+            std::string("warning: chain head `") + head +
+            "` resolves to type `" + std::string(resolvedType->name) +
+            "` while the enclosing type declares a same-named nested "
+            "type — the type wins for chain purposes; ";
+        if (!ownerGeneric && !nestedGeneric) {
+            // The qualified spelling EXISTS (neither segment's arity is
+            // non-zero) — MEASURED: it compiles in every such case.
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                prefix + "qualify with `" + ownerName + "." + head +
+                    "` to reach the nested type (\xC2\xA7""2.7)");
+        } else if (ownerGeneric && !nestedGeneric) {
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                prefix + "the enclosing type `" + ownerName +
+                    "` is generic, so its nested type has no qualified "
+                    "spelling: \xC2\xA7""11.6 names it by its bare name "
+                    "inside that type's bodies — where a bare type name "
+                    "reaches it, though this chain head takes the shadowing "
+                    "type — and reaches it elsewhere through a static member "
+                    "or a local declared without a type annotation "
+                    "(\xC2\xA7""2.7, \xC2\xA7""11.6)");
+        } else if (!ownerGeneric && nestedGeneric) {
+            // The nested type is generic: the qualified spelling carries
+            // no arguments, so it is Appendix C.1's arity error — but the
+            // spelling WITH the nested type's own arguments reaches the
+            // TYPE (A.5 admits a type-argument list at the end of a
+            // qualified type name), and no qualified spelling can then
+            // name one of its members. MEASURED: `Outer.C<...>` ⇒ rc 0,
+            // "6"; `Outer.C<...>.N` ⇒ rc 1 (A.5).
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                prefix + "the nested type is generic, so `" + ownerName +
+                    "." + head +
+                    "` names it without its arguments — every reference "
+                    "supplies exactly the declared number of type arguments "
+                    "(\xC2\xA7""14.1) — while `" + ownerName + "." + head +
+                    "<...>` reaches the nested type itself (a type-argument "
+                    "list attaches to the end of a qualified type name, "
+                    "Appendix A.5); no qualified spelling can then name one "
+                    "of its members, and inside the declaring type's bodies "
+                    "the bare name with its own arguments reaches the type "
+                    "(\xC2\xA7""2.2, \xC2\xA7""2.7, \xC2\xA7""11.6)");
+        } else {
+            // BOTH segments carry arity: the enclosing type's forbids every
+            // qualified form in a type position (§11.6), and the nested
+            // type's forbids a bare reference (§14.1) — so no qualified
+            // spelling reaches the type at all, and the only route is the
+            // bare name with its own arguments inside the declaring type's
+            // bodies (§2.7's enclosing-type lookup). MEASURED: `Outer.C` and
+            // `Outer.C<...>` ⇒ rc 1 (§11.6); `Outer<int>.C` and
+            // `Outer<int>.C<...>` ⇒ rc 1 (A.5); bare `C<...>` ⇒ rc 0, "6".
+            ctx.diagnostics().report(
+                Severity::Warning, loc,
+                prefix + "the enclosing type `" + ownerName +
+                    "` is generic, so its nested type has no qualified "
+                    "spelling: \xC2\xA7""11.6 names it by its bare name "
+                    "inside that type's bodies — where a bare type name "
+                    "reaches it, though this chain head takes the shadowing "
+                    "type — and the nested type is generic, so that bare "
+                    "name must carry its own arguments (a bare reference "
+                    "fixes arity 0, \xC2\xA7""14.1); no qualified spelling "
+                    "can carry those arguments and then name one of its "
+                    "members (a type-argument list attaches to the end of a "
+                    "qualified type name, Appendix A.5) "
+                    "(\xC2\xA7""2.2, \xC2\xA7""2.7, \xC2\xA7""11.6)");
+        }
+        return;
+    }
+    std::string memberKind = "member";
+    if (dynamic_cast<const FieldSymbol*>(shadowedEnclosingMember))
+        memberKind = "field";
+    else if (dynamic_cast<const PropertySymbol*>(shadowedEnclosingMember))
+        memberKind = "property";
+    else if (dynamic_cast<const MethodSymbol*>(shadowedEnclosingMember))
+        memberKind = "method";
+    else if (dynamic_cast<const ConstMemberSymbol*>(shadowedEnclosingMember))
+        memberKind = "const";
+    else if (dynamic_cast<const EventSymbol*>(shadowedEnclosingMember))
+        memberKind = "event";
+    ctx.diagnostics().report(
+        Severity::Warning, loc,
+        std::string("warning: chain head `") + std::string(headName) +
+            "` resolves to type `" + std::string(resolvedType->name) +
+            "` while the enclosing type declares a same-named " + memberKind +
+            " — the type wins for chain purposes; qualify with `this." +
+            std::string(headName) + "` to reach the " + memberKind +
+            " (\xC2\xA7""2.7)");
 }
 
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
@@ -3902,6 +4680,24 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     }
     // Look up the first part.
     Symbol* sym = nullptr;
+    // fix #7085 (§2.7 chain-head row, v0.343): the ENCLOSING TYPE's member
+    // of the chain head's name, DEFERRED — see the chain-head branch below
+    // and the warning-row site after the `if (!sym)` block. Null unless the
+    // chain head found one.
+    Symbol* chainHeadEnclosingMember = nullptr;
+    bool chainHeadHasEnclosingMember = false;
+    // fix #7085: is `s` the scope of a TYPE BODY — §2.7's "Through nesting"
+    // link? A type's body scope registers ONLY the type's generic parameters
+    // and its NESTED TYPES (§11.3 / #482): never its fields, methods,
+    // properties or events. So "the name is carried by a type-body scope" IS
+    // "the enclosing type declares a member of that name", which is the
+    // distinction §2.7's table turns on. The pairing is the one
+    // `typeBodyScopes_` keeps (each body scope with the type that owns it).
+    auto isTypeBodyScope = [this](const Scope* s) {
+        for (const auto& entry : typeBodyScopes_)
+            if (entry.first == s) return true;
+        return false;
+    };
     // fix #6383 follow-up (§2.7 "Through nesting", v0.338): §2.7's stop rule,
     // applied to the one shape it is stated for — a BARE name. A chain head
     // (`Box.Red`) is a different row of §2.7's normative table, where the
@@ -3934,7 +4730,162 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             return;
         }
     } else {
-        sym = lookupName(first, scope);
+        // fix #7085 (§2.7 chain-head row, v0.343): §2.7's NORMATIVE TABLE
+        // ranks the enclosing type's accessible members LAST at a chain head
+        // — "Chain head — name followed by `.`: Enclosing-type members rank:
+        // last, after aliases" — and its prose says "Because the chain-head
+        // member fallback ranks below imports, it is the one rule-1 source a
+        // later-added import or type declaration can preempt — loudly in
+        // practice, since the preempting type must itself host the accessed
+        // member".
+        //
+        // The scope chain is walked innermost-first, and a type's OWN body
+        // scope sits INSIDE the module scope: so the walk below DEFERS a hit
+        // in a type-body scope (§2.7's "Through nesting" link — the
+        // enclosing type's own scope) and keeps looking outward, through the
+        // current module's declarations and the imported bare names. The
+        // deferred member is used only when no earlier rule-1 position
+        // answers the name (the site after the `if (!sym)` block below).
+        //
+        // A LOCAL scope (a block, a method's parameters) sits INSIDE the type
+        // body scope and is NOT deferred: §2.7 rule 1 puts local scope
+        // first, at every head shape.
+        //
+        // fix #7085 (round 2): a type body scope registers TWO kinds of name
+        // — the type's NESTED TYPES and its GENERIC PARAMETERS (the
+        // `typeScope.names[g.name] = nullptr` markers `resolveTypeDecl`
+        // writes). Only the first kind is a MEMBER, and only a member is
+        // ranked last by §2.7's chain-head row. A type parameter is not a
+        // member, and §11.6 puts it out of scope in a nested type
+        // ENTIRELY ("The enclosing type's type parameters are therefore not
+        // in scope in a nested type's declaration … A reference to one is a
+        // compile error naming this rule"), so it is not "ranked last" — it
+        // must still be FOUND, so that §11.6's check fires and the
+        // §11.6/§14.1 diagnostic is emitted. Deferring it would let the
+        // name resolve outward to a module-level or imported type of the
+        // same name, and DELETE that compile error.
+        chainHeadEnclosingMember = nullptr;
+        chainHeadHasEnclosingMember = false;
+        for (Scope* s = scope; s; s = s->parent) {
+            auto it = s->names.find(first);
+            if (it == s->names.end()) continue;
+            if (isTypeBodyScope(s)) {
+                if (it->second == nullptr) {
+                    // A TYPE-PARAMETER marker (§11.6) — not a member.
+                    if (!chainHeadHasEnclosingMember) {
+                        // Nothing else binds the name: the marker binds it
+                        // (the name is unresolved as a type, and §11.6's
+                        // check below diagnoses the reference).
+                        break;
+                    }
+                    // An inner MEMBER already binds the name, and this
+                    // (outer) parameter is out of scope in a nested type
+                    // (§11.6) — so it is not a candidate at all; keep
+                    // looking outward for the earlier rule-1 positions.
+                    continue;
+                }
+                if (!chainHeadHasEnclosingMember) {
+                    chainHeadEnclosingMember = it->second;
+                    chainHeadHasEnclosingMember = true;
+                }
+                continue;  // §2.7 chain-head row: ranks LAST
+            }
+            sym = it->second;
+            break;
+        }
+        // fix #7013 (§2.2, §11.6, v0.340): the CHAIN HEAD is a bare
+        // enclosing segment, and §11.6 says "A bare enclosing segment fixes
+        // arity 0" — A.5 admits a type-argument list after the LAST segment
+        // only, so the head of a dotted type name is always arity 0. §2.2's
+        // arity rule then selects among rule 1's candidates: "a reference
+        // resolves to the first, in that rule's order, whose arity its
+        // type-argument list fixes". A generic head is therefore NOT a
+        // candidate for a chain head — and §11.6 agrees ("In a type position,
+        // therefore, no name passes through a generic enclosing type").
+        //
+        // So when the scope lookup found a GENERIC type for the head, the
+        // arity-0 candidate is the imported non-generic type of the same
+        // name, and §2.2's shadowing rule (which compares names "together
+        // with their generic arity") says the current module's `C<T>` does
+        // not shadow it. Select it here so `C.N` reaches the imported `C`'s
+        // nested type instead of the §11.6 arity error.
+        //
+        // When there is no such candidate, `sym` stays the generic head and
+        // the existing §11.6 arity error stands (nothing else changes).
+        if (TypeSymbol* head = dynamic_cast<TypeSymbol*>(sym)) {
+            if (!head->genericParams.empty()) {
+                // Rule 1's SCOPE positions, in order: local scope, then the
+                // current module's declarations (the enclosing type's
+                // accessible members rank LAST at a chain head — see the
+                // walk above). A candidate whose arity does not match is
+                // SKIPPED, not fatal (§2.2's rule is "the first, in that
+                // rule's order, whose arity its type-argument list
+                // fixes"). A scope entry that is not a TYPE is not an arity
+                // candidate at all — §2.2's rule selects among "the types
+                // rule 1 of §2.7 finds" — so the walk stops there and the
+                // name stays bound to that non-type, as before.
+                TypeSymbol* selected = nullptr;
+                for (Scope* s = scope; s; s = s->parent) {
+                    auto it = s->names.find(first);
+                    if (it == s->names.end()) continue;
+                    // fix #7085: the enclosing type's members rank LAST at a
+                    // chain head, so they are not consulted here — the
+                    // IMPORTED position comes first, and the deferred member
+                    // is the last candidate (below).
+                    if (isTypeBodyScope(s)) continue;
+                    auto* ts = dynamic_cast<TypeSymbol*>(it->second);
+                    if (!ts) break;  // a non-type binds the name here
+                    if (ts->genericParams.empty()) {
+                        selected = ts;
+                        break;
+                    }
+                    // Arity mismatch — skip this candidate, keep looking.
+                }
+                std::vector<std::string> ambiguousModules;
+                if (!selected) {
+                    // Rule 1's IMPORTED positions.
+                    selected = selectImportedTypeByArity(
+                        ctx_, sourceImports_, first, 0, &ambiguousModules);
+                }
+                if (!selected && chainHeadHasEnclosingMember) {
+                    // fix #7085: the enclosing type's member is the LAST
+                    // rule-1 candidate at a chain head, so it is consulted
+                    // only when neither the scope positions nor the imports
+                    // hold an arity-0 type of the name. A nested type of the
+                    // enclosing type is carried as a `NestedTypeSymbol`
+                    // (§11.3 / #482), whose TYPE is the candidate.
+                    if (auto* nts = dynamic_cast<NestedTypeSymbol*>(
+                            chainHeadEnclosingMember)) {
+                        if (nts->type && nts->type->genericParams.empty())
+                            selected = nts->type;
+                    } else if (auto* ts = dynamic_cast<TypeSymbol*>(
+                                   chainHeadEnclosingMember)) {
+                        if (ts->genericParams.empty()) selected = ts;
+                    }
+                }
+                if (selected) {
+                    sym = selected;
+                } else if (!ambiguousModules.empty()) {
+                    // fix #7083 (§2.2, v0.343): §2.2 requires the collision
+                    // diagnostic to cite BOTH ORIGINS — "When two imported
+                    // modules export the same public name, the bare name is
+                    // ambiguous: using it unqualified is a compile error citing
+                    // both origins; the fix is qualification (full module name
+                    // or an alias)". The origin modules are named here, in a
+                    // deterministic (sorted) order.
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("bare name `") + std::string(first) +
+                        "` is ambiguous: imported modules " +
+                        citeOriginModules(ambiguousModules) +
+                        " export a type with this name and arity; qualify it "
+                        "via a module-qualified name or an import alias "
+                        "(\xC2\xA7""2.2)");
+                    ref.kind = TypeRef::Kind::Error;
+                    return;
+                }
+            }
+        }
     }
     if (!sym) {
         // Unknown — but a null lookup may also mean "name is in scope as
@@ -3943,14 +4894,23 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // presence, which would also match any real symbol (type name, etc.)
         // stored in the scope.
         bool isGeneric = false;
-        if (!qualifiedBuiltin)
-            for (Scope* s = scope; s; s = s->parent) {
-                auto it = s->names.find(first);
-                if (it != s->names.end() && it->second == nullptr) {
-                    isGeneric = true;
-                    break;
+        if (!qualifiedBuiltin) {
+            // fix #7085 (round 2): when the chain head bound the name to the
+            // enclosing type's MEMBER (the deferred one — §2.7's chain-head
+            // row ranks it last), a type-parameter marker further out is NOT
+            // a candidate for the name: §11.6 puts the enclosing type's type
+            // parameters out of scope in a nested type, so the name is the
+            // member's — and the member's own type wins the chain.
+            if (!chainHeadHasEnclosingMember) {
+                for (Scope* s = scope; s; s = s->parent) {
+                    auto it = s->names.find(first);
+                    if (it != s->names.end() && it->second == nullptr) {
+                        isGeneric = true;
+                        break;
+                    }
                 }
             }
+        }
         if (isGeneric) {
             // Generic parameter — record as a Named with no declaration.
             // Sema slice 3+ will treat generic-param TypeRefs specially.
@@ -4148,8 +5108,29 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                         // generic-parameter count" against the local
                         // declaration.
                         int builtinAr = builtinTypeArity(first);
-                        if (builtinAr != kNotBuiltin &&
-                            builtinAr == static_cast<int>(refArity)) {
+                        // fix #7084 (§2.2, §2.3, v0.343): the SENTINEL
+                        // `kBuiltinTaskLike` means the `Task` family is
+                        // available at arity 0 AND 1 (§2.3 Row 5), so the
+                        // comparison is the one Slice S24 makes below, not a
+                        // plain equality against the table's (negative) value
+                        // — with the plain equality the two sentinel names can
+                        // never match a reference's arity here. NOTE (MEASURED
+                        // by reading this block): at its present site the
+                        // branch assigns `sym = nullptr` INSIDE `if (!sym)`,
+                        // so it is a no-op today — the always-available names
+                        // are resolved by Slice S24, which is where the
+                        // sentinel decides. The comparison is made
+                        // consistent with Slice S24 so the two sites cannot
+                        // disagree.
+                        bool builtinArityMatches = false;
+                        if (builtinAr != kNotBuiltin) {
+                            builtinArityMatches =
+                                (builtinAr == kBuiltinTaskLike)
+                                    ? (refArity == 0 || refArity == 1)
+                                    : (refArity ==
+                                       static_cast<std::size_t>(builtinAr));
+                        }
+                        if (builtinArityMatches) {
                             sym = nullptr;
                         }
                     }
@@ -5033,9 +6014,20 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // reference's arity is `t.genericArgs.size()`; for a bare reference
         // (arity 0) we check (first, 0).
         std::size_t refArityForAmbiguity = t.genericArgs.size();
-        if (!ambiguousImportNames_.empty() &&
-            ambiguousImportNames_.count(
-                std::make_pair(std::string(first), refArityForAmbiguity))) {
+        auto ambiguousIt = ambiguousImportNames_.find(
+            std::make_pair(std::string(first), refArityForAmbiguity));
+        if (ambiguousIt != ambiguousImportNames_.end()) {
+            // fix #7096 (§2.2, v0.343): §2.2 requires the collision
+            // diagnostic to cite BOTH ORIGINS — "When two imported modules
+            // export the same public name, the bare name is ambiguous: using
+            // it unqualified is a compile error citing both origins; the fix
+            // is qualification (full module name or alias)". The origin
+            // modules are read from the collision table, which the import
+            // loop fills with them (TypeResolution.cpp); they are already
+            // sorted and deduplicated there, so the text does not depend on
+            // the order the imports were visited in. The wording and the
+            // origin list are the chain-head collision site's (#7083), so the
+            // two sites read as one rule.
             ctx_.diagnostics().report(
                 Severity::Error, t.span.begin,
                 std::string("bare name `") + std::string(first) +
@@ -5043,9 +6035,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                      ? std::string("")
                      : std::string("<") +
                            std::to_string(refArityForAmbiguity) + ">") +
-                "` is ambiguous: multiple imported modules export a type "
-                "with this name and arity; qualify it via a module-qualified "
-                "name or an import alias (\xC2\xA7""2.2)");
+                "` is ambiguous: imported modules " +
+                citeOriginModules(ambiguousIt->second) +
+                " export a type with this name and arity; qualify it via a "
+                "module-qualified name or an import alias (\xC2\xA7""2.2)");
             ref.kind = TypeRef::Kind::Error;
             return;
         }
@@ -5413,16 +6406,54 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 return;
             }
         }
-        {
-            std::string msg = std::string("unresolved type name `") +
-                              std::string(first) + "`";
-            std::string hint = owningRenameHint(first);  // v0.168 (#1372)
-            if (!hint.empty()) msg += "; " + hint;
-            ctx_.diagnostics().report(Severity::Error, t.span.begin, msg);
+        // fix #7085 (§2.7 chain-head row, v0.343): the enclosing type's
+        // member is the LAST rule-1 candidate at a chain head, so it is the
+        // answer only when no EARLIER position answered the name. Every
+        // earlier position is consulted above — the module's declarations
+        // (#6425's local-type head and the module-children fallback), the
+        // import ALIASES (§2.2), the imported bare names (the §2.2
+        // collision arm), and the always-available names (Slice S24) — and
+        // each of them returned or set `sym` when it applied. Nothing did,
+        // so the deferred member is bound here rather than the name being
+        // reported unresolved.
+        if (chainHeadHasEnclosingMember && chainHeadEnclosingMember) {
+            sym = chainHeadEnclosingMember;
+        } else {
+            {
+                std::string msg = std::string("unresolved type name `") +
+                                  std::string(first) + "`";
+                std::string hint = owningRenameHint(first);  // v0.168 (#1372)
+                if (!hint.empty()) msg += "; " + hint;
+                ctx_.diagnostics().report(Severity::Error, t.span.begin, msg);
+            }
+            ref.kind = TypeRef::Kind::Error;
+            return;
         }
-        ref.kind = TypeRef::Kind::Error;
-        return;
         }  // end of the `if (!sym)` that the #6425 local-type head can leave
+    }
+    // fix #7085 (§2.7 warning row, v0.343): "chain head resolves to a type
+    // while a same-named accessible member exists — warn, *unless* the
+    // member's declared type is the resolved type (or an instantiation of the
+    // resolved generic)".
+    //
+    // The chain head resolved to a type that is NOT the enclosing type's
+    // same-named member (the member is the deferred one, above), so that
+    // member is shadowed at this chain head and the spec asks for the
+    // warning. The carve-out — the member's declared type IS the resolved
+    // type — is decided inside the helper, and it holds exactly for the
+    // nested-type member whose type IS the resolved type (nothing is
+    // shadowed then).
+    if (chainHeadHasEnclosingMember && chainHeadEnclosingMember &&
+        chainHeadEnclosingMember != sym) {
+        const TypeSymbol* resolvedType = nullptr;
+        if (const auto* ts = dynamic_cast<const TypeSymbol*>(sym))
+            resolvedType = ts;
+        else if (const auto* nts = dynamic_cast<const NestedTypeSymbol*>(sym))
+            resolvedType = nts->type;
+        if (resolvedType)
+            warnChainHeadMemberShadowedByType(
+                ctx_, first, resolvedType, chainHeadEnclosingMember,
+                t.span.begin, ChainHeadWarningPosition::Type);
     }
     // For multi-part QualifiedNames, descend through the looked-up symbol's
     // nested types for each subsequent part. Per Grammar A.8 / §11.3:
@@ -6005,9 +7036,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
             std::string_view part = t.name->parts[pi];
             // per §11.6 (v0.340): no type name passes through a generic
             // enclosing segment — Appendix C.1's arity error. (§2.2's arity
-            // selection of a same-named NON-generic head is not implemented
-            // here: a local `C<T>` keeps an imported `C` out of the scope
-            // entirely, so that program was already rejected — #7013.)
+            // selection of a same-named NON-generic head is applied at the
+            // HEAD lookup above — fix #7013: a chain head fixes arity 0, so
+            // a generic head loses to an imported non-generic type of the
+            // same name, and this error is what stands when there is none.)
             if (reportGenericEnclosingSegment(ctx_.diagnostics(), t, tsym,
                                               part)) {
                 ref.kind = TypeRef::Kind::Error;
@@ -6072,6 +7104,74 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 for (const auto& ga : t.genericArgs) {
                     if (!ga) continue;
                     ref.genericArgs.push_back(resolveType(*ga, scope));
+                }
+                // fix #7010 (§2.2 arity selection, §2.3, §16.3, v0.340):
+                // §2.2 names this exact case — "a non-generic `Counter`
+                // and the always-available `Counter<K>` are two names,
+                // neither colliding with nor shadowing the other" — so
+                // `Range<T>` at a user `record Range` is the BUILTIN
+                // `Range<T>`, and the ref must carry the builtin's
+                // identity, not merely a null declaration.
+                //
+                // MEASURED before this arm, at `record Range(Lo, Hi)` +
+                // `var xs: Range<int> := r` (r the user record): the ref
+                // reached the typecheck pass as a Named with
+                // `declaration == nullptr`, so EVERY identity test keyed
+                // on `builtinClassSym("Range")` missed it —
+                //   * the §16.3 `T` restriction never ran (`Range<bool>`,
+                //     `Range<float>`, `Range<string>` all accepted; the
+                //     same spellings without a user `Range` are rejected
+                //     with §16.3's diagnostic), and
+                //   * `var xs: Range<int> := r` was accepted, because the
+                //     identity-conversion test compares declarations and
+                //     two null declarations compare equal, so the user
+                //     RECORD was taken as a `Range<int>`.
+                // The counter `Set` shows why the arm cannot be narrowed to
+                // `Range` alone: `record Set(V)` + `Set<bool>` is likewise
+                // accepted (MEASURED on the base, unchanged by this commit —
+                // `Set<T>`'s hashability rule is §3.6/§8.3, not an
+                // element-type restriction, so that one is a separate gap).
+                // `Set`'s own TypeRef shape is already CONSISTENT across both
+                // paths, because the always-available generic collections
+                // carry `declaration = nullptr` with or without a shadowing
+                // declaration. `Range` is the outlier precisely because §16.3
+                // requires its pointer-equality stamp, and `Ptr` and the
+                // synthesized interfaces need theirs for the same reason.
+                //
+                // The stamp is exactly what Slice S24 applies for the
+                // same names on the no-shadowing path (`first == "Range"`
+                // → `ctx_.builtinClassSym("Range")`, its `Ptr` and
+                // synthesized-interface siblings), so both spellings now
+                // produce ONE TypeRef shape. The §16.3 element check is
+                // duplicated here rather than shared because S24's copy
+                // sits in a different translation-unit-local helper and
+                // this arm runs after S24 in the same pass.
+                std::string_view headName = t.name->parts.front();
+                if (headName == "Range") {
+                    ref.declaration = ctx_.builtinClassSym("Range");
+                    // §16.3 (v0.340): T is restricted to the integer types
+                    // and `char`. `ref.genericArgs[0]` is post-resolution
+                    // (the loop above), so the predicate reads a resolved
+                    // TypeRef; an unresolved forward reference is null and
+                    // keeps the predicate's null-tolerant contract, the
+                    // downstream use re-erroring.
+                    if (!ref.genericArgs.empty() &&
+                        !isValidRangeElementType(ref.genericArgs[0])) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("`Range<T>` requires T to be one of "
+                                        "the integer types or `char` \xe2\x80\x94 "
+                                        "got `") +
+                                rangeElementTypeName(ref.genericArgs[0]) +
+                                "` (\xc2\xa7""16.3)");
+                    }
+                } else if (headName == "Ptr") {
+                    // §10.5 / stdlib §5: `Ptr<T>` is a compiler-intrinsic
+                    // record; the sibling of the `Range` arm in Slice S24.
+                    ref.declaration = ctx_.builtinClassSym("Ptr");
+                } else if (SemaContext::isSynthesizedBuiltinInterfaceName(
+                               headName)) {
+                    ref.declaration = ctx_.builtinInterfaceSym(headName);
                 }
             } else {
                 ctx_.diagnostics().report(
@@ -7290,6 +8390,13 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         // spelling. Runs after the loop above so every argument already has a
         // resolved TypeRef to record.
         recordStaticReceiverInstantiation(*id, scope);
+        // fix #7164 (§14.1 / §2.2 / Appendix C.1, v0.343): the §14.1 arity
+        // rule at this EXPRESSION position.  The type position enforces it
+        // (`resolveNamed`'s "Generic-arity check"); this spelling is not an
+        // `ast::Type` node, so it never reached that check and a wrong count
+        // was accepted silently.  Runs after the recording above so the two
+        // halves see the same site.
+        checkExprTypeRefArity(*id, scope);
         return;
     }
     // Literals + ThisBaseTypeOf — no nested Types/Exprs.
@@ -7348,58 +8455,13 @@ void warnChainHeadTypeShadows(
     // Color: Color` idiom is exactly the case where it IS, and the
     // warning would falsely advise `this.` qualification for what is
     // already the same store.
-    if (shadowedEnclosingMember && resolvedType) {
-        const TypeRef* memberType =
-            storageComponentType(shadowedEnclosingMember, ctx);
-        bool carveOut = false;
-        if (memberType && memberType->kind == TypeRef::Kind::Named &&
-            memberType->declaration == resolvedType) {
-            carveOut = true;
-        }
-        // §2.7 generic carve-out: the member's declared type is an
-        // instantiation of the resolved generic (e.g.
-        // `property Buffer: Buffer<int>` with resolved type `Buffer`).
-        // Detected when the member's declared TypeRef is Named, the
-        // resolved type is a generic, and the member's declaration is
-        // the same generic type symbol. (An exact-arity check isn't
-        // necessary: a member declared with the wrong number of type
-        // args would already have been rejected at the declaration
-        // site, so a Named TypeRef whose declaration matches the
-        // resolved generic is by construction an instantiation of it.)
-        if (!carveOut && memberType &&
-            memberType->kind == TypeRef::Kind::Named &&
-            memberType->declaration == resolvedType &&
-            !resolvedType->genericParams.empty()) {
-            carveOut = true;
-        }
-        if (!carveOut) {
-            std::string memberKind = "member";
-            if (dynamic_cast<const FieldSymbol*>(shadowedEnclosingMember))
-                memberKind = "field";
-            else if (dynamic_cast<const PropertySymbol*>(
-                         shadowedEnclosingMember))
-                memberKind = "property";
-            else if (dynamic_cast<const MethodSymbol*>(
-                         shadowedEnclosingMember))
-                memberKind = "method";
-            else if (dynamic_cast<const ConstMemberSymbol*>(
-                         shadowedEnclosingMember))
-                memberKind = "const";
-            else if (dynamic_cast<const EventSymbol*>(
-                         shadowedEnclosingMember))
-                memberKind = "event";
-            ctx.diagnostics().report(
-                Severity::Warning, loc,
-                std::string("warning: chain head `") + std::string(headName) +
-                    "` resolves to type `" +
-                    std::string(resolvedType->name) +
-                    "` while the enclosing type declares a same-named " +
-                    memberKind + " — the type wins for chain purposes; "
-                    "qualify with `this." + std::string(headName) +
-                    "` to reach the " + memberKind +
-                    " (\xC2\xA7""2.7)");
-        }
-    }
+    //
+    // fix #7085: the half is now `warnChainHeadMemberShadowedByType`, the
+    // ONE text for the rule — the TYPE path (`resolveNamed`, this file)
+    // calls the same helper, so the two positions cannot drift apart.
+    warnChainHeadMemberShadowedByType(ctx, headName, resolvedType,
+                                       shadowedEnclosingMember, loc,
+                                       ChainHeadWarningPosition::Value);
 
     // (B) §2.7 consequence: a type named `A` in scope shadows an imported
     // module-name prefix `A.…` — warn when both readings exist. The local

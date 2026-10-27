@@ -1,380 +1,603 @@
-# All-proposals master implementation plan + dependency graph
+# Master plan — defect campaigns for the autonomous sessions
 
-*Capstone deliverable of the 2026-07-11 spec-quality run. Dependency-first view over **all 39** numbered proposals (0001–0039). Complements — does not replace — [`implementation-roadmap-2026-07.md`](implementation-roadmap-2026-07.md), which sequences the same work as R0→R8 run-shapes. This document adds the explicit **proposal-to-proposal DAG** the roadmap does not carry.*
+*Working paper, non-normative. Written 2026-10-27 against main `c7f491704` (spec v0.345), from a full
+measurement of the tracker ([`MEASUREMENTS.md`](master-plan/MEASUREMENTS.md): 1613 open, 5339 closed) and the
+landing record of the last 24 days. It replaces the July proposal DAG (`master-plan.md` as it stood,
+archived as [`master-plan-2026-07.md`](master-plan-2026-07.md), §5) and absorbs the lesson of
+[`defect-campaign-2026-09.md`](defect-campaign-2026-09.md), the last attempt at this. Nothing here opens,
+closes or re-labels an issue by itself, and nothing here changes a rule in `CLAUDE.md`: where this plan
+asks for one, it says so and the owner decides.*
 
-*Sources: `docs/proposals/README.md` (status ground truth, per spec-change-process §8), `phase8-interactions.json` (the 37-item verified interaction map — primary dependency data), `phase8-scoreboard.json` (issue state), and the headers of the ten most-entangled proposals. Written against docs **v0.185**; **refreshed 2026-07-12** for the graduation run (docs now **v0.188**, main `ebfa7e0`). **Nine proposals have now graduated into the normative docs** (`superseded`): 0003/0032/0033 (v0.186), 0035 (v0.187), 0034/0036/0037/0038/0039 (v0.188) — see §1's graduated ledger. The graduation is docs-only; no *implementation* has landed yet, so the R1–R8 build tracks are unchanged in size — but the nine graduated proposals are now spec-complete and their remaining work is pure compiler catch-up (impl trackers #1705–#1737).*
-
-*Currency note 2026-07-14: docs are now **v0.191** (defect-sweep revisions v0.189–v0.191, main `1469b21`); no proposal status changed — the delta is six new R0-layer compiler trackers (#1781–#1786, headlined by the §28.3 Task-family ownership ruling, #1786) and one new design-review item (#1787, iterable-frame ownership). The roadmap's 2026-07-14 refresh note carries the detail; this plan's dependency graph is unaffected.*
-
-*Currency note 2026-08-11: docs are now **v0.241** (this note's coverage horizon; the in-flight elegance-graduation program, v0.242+ / proposals 0078–0090, is deliberately not covered — its ledger rows land with the program-close banner: **§1·Δ·E below, landed 2026-08-11 at program close**). The gap since 2026-07-14 is large and this plan's ledger no longer describes the proposal population: the 2026-07-18 future-directions program added **0041–0054** (plus the separately-filed **0040** build-system sketch), the later trains added **0055–0077**, and twenty-nine proposals graduated in the interval, several partially (0044/0045/0051 Part A; 0061 §1; 0075 stages 1–2; 0076's criterial rule; 0077 stage 1) — the v0.198–v0.204 batch (0041–0046, 0048–0051 Part A; recorded in the roadmap's 2026-07-19/20 banners) plus the v0.205–v0.238 batch (0023, 0055–0059, 0061–0067, 0072–0077; recorded in the roadmap's 2026-08-11 banner). §1·Δ below carries the bucket-by-bucket deltas. Two standing §1 claims are corrected by the deltas: "no proposal is implemented yet" is no longer true (the 2026-07-20 impl run landed sixteen features of the v0.198–v0.204 layer — see the roadmap's banner), and the header's "all 39 numbered proposals (0001–0039)" now describes only this document's original DAG scope, not the ledger population. The dependency graph of §2 is unchanged for the 0001–0039 set; the new drafts' edges are recorded in §1·Δ(d) rather than merged into §2a's table. The 2026-07-28 proposals-syntax-currency sweep modernized retired spellings across all non-superseded proposals (38 sites, 15 files) — read it before picking up any pre-v0.217 draft.*
-
-*Currency note 2026-08-18 (this re-baseline): docs are now **v0.261** (main at the v0.261 merge, `ee8c82db`). The gap v0.250 → v0.261 is the 2026-08-12 defect-resolution batch (v0.251–v0.254), the 2026-08-18 spec-question batch (v0.255), and the 2026-08-18 **review program** (the defect train v0.256, then proposals 0093–0102 + 0094 stage 2 graduating across five trains, v0.257–v0.261), all ruled under the owner's 2026-08-18 delegation. **§1·Δ·G below is this re-baseline's ledger delta and compiler-work inventory** — executed as the review program's closing step per the owner's direction ("adjust the master implementation plan with the needed compiler implementation work from today's spec work run"); the run-shaped sequencing lives in the roadmap's matching 2026-08-18 banner (this plan carries the what/priority, the roadmap the ordering — cross-referenced, not duplicated). One carrier fact: per the v0.260 changelog entry's Migration lead, **#3248 and this plan are the named carriers of the 0100/0102 compiler surfaces** — §1·Δ·G(b) item 5 is their record.*
+**Owner's direction (2026-10-27):** *"Rather than attacking the entire defect surface in parallel, focus
+on particular topics or features and ensure that we actually fix something properly at every step."*
 
 ---
 
-## 1. Status ledger
+## 0. Why a campaign plan, in numbers
 
-**Nine proposals have graduated (`Status: superseded`) — spec-complete, compiler catch-up outstanding.** No proposal is *implemented* yet (the R1–R8 build tracks are all still "to build"), but the graduation run landed the spec/stdlib side of nine designs into v0.186–v0.188. Beyond that, the **R0 substrate** partially landed (spec rulings v0.179–v0.185 that some proposals name as prerequisites — e.g. 0006's scoped-construction landed v0.180, 0031's throw-operand rule landed v0.182); those are compiler-catch-up items too. The "Prereq landed" column below flags draft proposals whose *blocking spec ruling* is already in the docs, so implementation can begin the moment the proposal is picked up.
+- The tracker went from **555 open (week 38) to 1613 (today)**, ×2.9 in six weeks. Last week: **770
+  opened, 297 closed**. The pool is not slow: it lands ~**47 fix commits a day** and closes an issue a
+  median of **one day** after filing. The surface grows because intake runs 1.5–2.6× closure.
+- **63% of the last fortnight's intake is produced by our own process**: review probes, lane matrices,
+  "found while fixing". **59% of all open issues** describe themselves as a sibling, residual, twin,
+  follow-up or pre-existing (26% on 2026-09-17). Each narrow fix is correct and reviewed, and is
+  followed by a filed sibling. That is the loop the September plan named and did not break.
+- The September plan got the method right (families by **shared mechanism**, anchors before instances,
+  done = members close, verify-first, loop-amplified ASan rows, a falsification rule the I1 lane
+  actually exercised). Its anchors landed in four days. **Its members did not close**: G 19/21 open,
+  H 10/10, A 26/43, M 15/17, I2 12/13. It did not stick because nothing in a session's routine read it:
+  it had no WIP limit, no intake rule, no entry re-measurement step scheduled after the anchors, no
+  owner-decision batch, and a progress table only one lane ever updated. This plan is those five things.
 
-### 1·0. Graduated (superseded) — spec landed, compiler catch-up tracked (9)
+---
 
-| # | Title | Graduated | Impl trackers (compiler catch-up) |
-|---|---|---|---|
-| 0003 | `Locked<T>` / `RwLocked<T>` | v0.186 (`3d08ec2`) | #1721 |
-| 0032 | Parallel extensions | v0.186 (`3d08ec2`) | #1722 / #1723 / #1724; Stage-2 gate #1725; consume-site #1726 |
-| 0033 | FFI v2 (+ `env` instance-callback extension) | v0.186 (`3d08ec2`) | #1705–#1720 |
-| 0035 | Retire the `event` member kind | v0.187 (`7024955`) | #1727 / #1728 (needs #1646 first); #1704 liftable; #1647 closed |
-| 0034 | Module identity + program assembly | v0.188 (`ebfa7e0`) | #1729–#1734 (+ #1398 build driver) |
-| 0036 | Demote owning inline arrays to Extended | v0.188 (`ebfa7e0`) | #1737 (conformance staging); #1385 stays open *(since closed — resolved by v0.260's A13 retirement; residuals ride #3263, §1·Δ·G(c))* |
-| 0037 | Remove object-initializer blocks | v0.188 (`ebfa7e0`) | #1735 |
-| 0038 | Retire `ReadOnlyAsciiByteSpan` | v0.188 (`ebfa7e0`) | #1736 |
-| 0039 | One specificity rule for extensions | v0.188 (`ebfa7e0`) | #1307 (re-scoped) |
+## 1. How to use this plan (the coordinator's session routine)
 
-### 1·Δ. Ledger deltas 2026-07-14 → 2026-08-11 (docs v0.191 → v0.241)
+A coordinator session follows these steps in order. Every step is a command or a table edit; none needs
+judgement about *what* to work on — that judgement is made once, below, and revised only at a campaign's
+exit review.
 
-**(a) Graduated (`superseded`) since this plan's last refresh — 29 proposals (10 in the v0.198–v0.204 batch + 19 in v0.205–v0.238).** The v0.198–v0.204 batch is summarized (the roadmap's 2026-07-19 banner is its detailed record); the v0.205+ batch is tabled in full. Every graduation is docs-only at landing; the impl-tracker column is the compiler catch-up.
+**1.1 Session start.**
+1. Read §6 (the progress table). The **active campaign** is the row with `status = ACTIVE`. If none,
+   take the top `QUEUED` row whose `blocked on` column is empty; set it `ENTRY` and run §2.2.
+2. Run the campaign's label query (§1.6) to get the live member list:
+   `gh api 'repos/s8lap/bezel-lang/issues?state=open&labels=campaign:<slug>&per_page=100&page=N'`.
+3. Run the five-source claim check per member exactly as `CLAUDE.md` *Claims* says. Members whose repro
+   no longer fails on staging are closed with the commit that fixed them named (not "cannot reproduce").
+4. Dispatch lanes from the campaign's lane plan (§3), anchor lane first.
 
-*v0.198–v0.204 (the future-directions graduation run, 2026-07-19):* **0046** ownership kernel → v0.198/v0.199 (zero compiler work; escalated rulings #2042/#2043 — both since ruled at v0.223); **0041** `choice` → v0.200 (#2044–#2047); **0048**/**0049**/**0050** → v0.201 (#2048–#2051); **0042** `pure` → v0.202 (#2052); **0043** contracts → v0.203 (#2053); **0044** spec deltas + **0045** normative deltas + **0051 Part A** → v0.204 (#2054/#2055). Substantially implemented by the 2026-07-20 run.
+**1.2 WIP limit.** **One campaign is active per repository.** A second may be `ACTIVE` only when all
+three hold: it is in the *other track* (§3: ownership/codegen-disposal vs sema/stdlib-surface), its lane
+plan declares hot files disjoint from the first's, and the first cannot use the pool (its lanes are
+serialised by the one-disposal-lane rule, or it is `blocked on` a ruling). Never three. When the owner
+asked for "one, maybe two", this is the "maybe two": a second track, never a second front in the same
+code.
 
-*v0.205–v0.238:*
+**1.3 Lanes inside a campaign.** The pool stays at six (`CLAUDE.md`); the campaign decides what the six
+do: one **anchor lane** (Opus, always) until the anchor lands and is reviewed; then **instance lanes**,
+one per sub-family from the campaign's lane plan, each file-disjoint by declaration in its brief; a
+**reviewer** per handback (review-contract); a **harvest lane** per 4–6 picks. A lane brief names the
+campaign, the sub-family, its members, the shared code path, and the DONE instrument it must extend
+(§2.3). The standing rule *"at most one disposal/ownership/async/iterator lane at a time"* serialises
+most of the ownership track. **Owner-ruled 2026-10-27 (§4.7):** inside a campaign, once its anchor has
+landed and been reviewed, ownership-track lanes may run concurrently when their declared hot-file sets
+are disjoint; before the anchor lands, serialise.
 
-| # | Proposal | Graduated | Impl trackers (compiler catch-up) |
-|---|---|---|---|
-| 0023 | Task.WhenEach — streaming fan-in family | v0.212 | tracker filed at landing (v0.212 entry); input seam #1813 resolved-and-closed v0.222 (#1881/#1655 remain) |
-| 0055 | Parenthesized contract clauses | v0.207 | the #2053 slice-1 parser lane (#2070 superseded) |
-| 0056 | Arm-position transfer marker | v0.209 | tracker filed at landing (v0.209 entry) |
-| 0057 | Paren-delimited expression forms | v0.208 | tracker filed at landing; corpus migrates with the parser |
-| 0058 | Readonly-field narrowing | v0.214 | trackers filed at landing (v0.214 entry) |
-| 0059 | Uniform trailing commas | v0.214 | trackers filed at landing (v0.214 entry) |
-| 0061 | Expression-form studies — **§1 only** (binding atom) | v0.216 | #2098; §2 stays an evidence-gated study |
-| 0062 | Small-stdlib ergonomics batch | v0.215 | trackers filed at landing; #2089 closed |
-| 0063 | Fluent-discard exemption | v0.215 | trackers filed at landing (v0.215 entry) |
-| 0064 | Keyword-led lambdas | v0.217 | #2101 (+#2102 adjacency, closed v0.220) |
-| 0065 | Named-destructure patterns | v0.224 | tracker filed at landing, sequenced with the #2079 syntax family (#1409 was the design tracker) |
-| 0066 | Method-local type declarations | v0.225 | tracker filed at landing (#1405 was the design tracker) |
-| 0067 | Small-stdlib ergonomics batch II | v0.228 | #2242 |
-| 0072 | Nullable-return convenience tier | v0.231 | #2347 |
-| 0073 | One-shot serialization facade | v0.232 | #2349 (+#2352 piggyback pin; rides #2337) |
-| 0074 | Small-stdlib ergonomics batch III (item 4 landed v0.230) | v0.231 | #2348 — carries the one BREAKING item, the `Environment` rename |
-| 0075 | Result ergonomics — **stages 1–2** | v0.233 | #2354/#2355; stage 3 = recorded deferrals, R5 gate re-armed |
-| 0076 | Error-model study — criterial rule; R1–R6 ruled 2026-07-29 | v0.229 | #2337 (SerializationException surface); #2338 (graduation obligations) |
-| 0077 | Silent tracking — **stage 1** | v0.238 | stage 2 = #2654/#2655/#2656/#2660 (landed ahead per Q4) + #2676 behind #2672 |
+**1.4 An issue outside the active campaign is triaged, not worked.** Triage = add exactly one
+`campaign:<slug>` label from §3 (or `parking-lot` if none fits), nothing else. Triage happens in the
+same turn the issue is seen (a lane filing a sibling labels it; a coordinator reading the tracker labels
+it). Three exceptions, and only these, may be dispatched outside the campaign: (a) a gate FAIL fix-forward
+(mandatory anyway); (b) a §3 *campaign 0* enabler the active campaign's DONE instrument needs; (c) an
+explicit owner directive. "It looks important" is not an exception; it becomes a `parking-lot` or
+campaign label and waits.
 
-**(b) New accepted (owner-review batch 2026-07-24, delegated rulings).** **0002** Http server — accepted (was draft; §1b's row and §2's Layer-2 gating unchanged in content); **0054** traceability — accepted, phase 1. Same batch discharged two §4b embedded sub-question gates: **0012**'s v1 scope + equality co-declaration ruled (#1445) and **0020**'s engine family ruled FINAL (#1449) — those two rows of §4b are done in their named parts (0020's `Match` shape is not recorded as ruled).
+**1.5 Spec trains interleave at campaign boundaries.** Campaign lanes never amend `docs/`. A spec
+question found in a campaign is filed with `spec-question`/`spec-defect` **and** the campaign label, the
+affected hunk is held out (lane-contract rule 12), and the coordinator appends it to the campaign
+record's *Questions for the next train* list. A train is requested from the owner when the active
+campaign exits, when its question list reaches ten, or when a member is blocked on one. When a train
+lands, **its new `spec-tracking` trackers are triaged in the same session**: those citing the active
+campaign's sections join its backlog (and count in its DONE), the rest get a campaign label and wait.
+Today's instance: the 14 v0.345 trackers (#7344–#7357) — #7354 and #7357 fall to `using-heads`, #7350
+and #7353 to `nullable-carrier`; #7344 (a method reference to `Dispose`) and #7345 (explicit `Dispose()`
+reclaims at the call) are candidates for `using-heads` / `producer-temporaries` that their entry checks
+confirm; the other eight wait under `spec-trains` (Appendix B).
 
-**(c) New drafts / in-set status flips.** New drafts absent from every §1 bucket: **0040** build system (draft sketch, tooling-only; #1908 — the #1398 SCC kernel is its Stage 0); **0047** mechanized core semantics (draft; #2034); **0052** compiler diagnostics + query API (draft; #2039); **0053** property-based specification (draft; #2040); **0060** channel give-back protocol (draft consolidation stub, created v0.210 — makes the previously-phantom "give-back-protocol RFC" citations real; no design decided); **0068** cryptographic primitives (draft); **0069** compression: gzip + DEFLATE (draft); **0070** first-class `Uri` (draft); **0071** file metadata `FileStatus`/`File.GetStatus` (draft). In-set flips: **0004** MVU refreshed to v0.216 (still early draft, unscheduled); **0005** loses its "(stale)" qualifier in the README (still draft, XL); **0026** gained the 2026-07-28 `TakeLast`/`SkipLast` rider. §1c stays empty; §1·0's original nine rows are unchanged.
+**1.6 Labels (the first coordinator session creates them with `gh label create`, a tracker edit of the
+same kind as the issue filing lanes already do; it touches no file in the repo).**
+One `campaign:<slug>` per row of §3, plus `parking-lot`. The plan's member lists are the initial labelling
+(`docs/proposals/papers/master-plan/work/out/campaign-members.tsv`, 1613 rows, exclusive). A label is the only state
+the tracker carries; everything else is in §6 and the campaign record.
 
-**(d) New proposal-to-proposal dependencies declared by the new proposals** (README rows; not merged into §2a — the 0001–0039 DAG is unchanged):
+---
 
-| Proposal | Declares |
-|---|---|
-| 0068 crypto | the **0007 OpenSSL-seam linkage** is its load-bearing open question; accumulators follow the 0008/0029 chaining shape; `RandomNumberGenerator` is a replay intercept point (0045 seam) |
-| 0069 compression | **hard: 0006** (stream wrappers over an owned inner stream); one-shots per **0009**'s shape; system-zlib is the owner question |
-| 0070 Uri | additive over **0001/0002** — their string-URL v1 surfaces stay frozen; no build-order edge |
-| 0071 file metadata | **0012/0016** bridges recorded for `ModifiedAt`; **zero overlap with 0017** (seam stated) |
-| 0053 property testing | parameterized **0022** test methods; **0041**-aware generators; exhaustive mode gated on **0042** purity; **0045** seed/journal determinism; the **0043** contract bridge |
-| 0047 Lean model | models **0046**'s kernel (K1–K9) |
-| 0060 give-back stub | consolidates the four deferred channel features (stdlib §6.9 material); no edges — nothing decided |
+## 2. The campaign model
 
-### 1·Δ·E. Ledger delta at program close, 2026-08-11 (docs v0.241 → v0.246): the elegance graduation, proposals 0078–0090
+**2.1 Definition.** A campaign is **one topic**: a set of spec sections, one or two shared code paths,
+and the open issues whose mechanism lives there. It has a slug, a track, a record file
+(`docs/proposals/papers/campaigns/<slug>.md`, created at ENTRY from the template in §2.5), a lane plan,
+and a DONE instrument. It is not a label for a symptom ("leaks") and not a file ("everything in
+`LlvmBackend_Setup.cpp`"): the September clustering rule stands — *members name the same predicate,
+emitter or ordering*.
 
-**(a) Graduated (`superseded`) — eleven proposals across five composed trains** (owner-ruled 2026-08-11, all questions as recommended; per-train detail in the v0.242–v0.246 changelog entries; every graduation is docs-only at landing, and the impl-tracker column — the compiler catch-up — is sequenced by [`catchup-run-sequence-2026-08-12.md`](catchup-run-sequence-2026-08-12.md), the run's starting page):
+**2.2 Entry check (status `ENTRY`, one lane, Opus, read-mostly).** Before any fix:
+1. **Re-measure every member on HEAD.** Each member gets a row: `#N | reproduces / moved / fixed-by
+   <sha> / cannot-build-repro | MEASURED evidence`. Issues whose repro is stale are re-derived from the
+   title's mechanism, not dropped. (Of four headline repros spot-checked for this plan, one — #3469 —
+   has already moved from SIGSEGV to a compile-time rejection; see `MEASUREMENTS.md` §7.)
+2. **Draw the sub-families by shared code path** (file and function, read at HEAD), and apply the
+   September falsification rule: a sub-family whose shared site would close fewer than half its members
+   is split, and the split is recorded.
+3. **Name the anchor**: the one authority that, once it exists, makes every member either a missing arm
+   of it or a different campaign. If the anchor is a design nobody has written, the entry lane writes it
+   into the record (one page) and the coordinator sends it to the owner only if it changes a rule.
+4. **Build the DONE instrument's skeleton**: the grid or matrix §2.3 names, as conformance cases or a
+   generator, run once on HEAD to record the baseline (how many cells wrong today).
+5. **List the rulings needed** (§4.8) and the rule-corpus `fail` rows in scope
+   (`baseline.tsv` filtered by the campaign's sections).
+The entry lane's handback is the first version of the campaign record. Only then does the status become
+`ACTIVE`.
 
-| # | Proposal | Graduated | Impl trackers (compiler catch-up) |
-|---|---|---|---|
-| 0078 | Checked enum conversions | v0.242 | #3044 |
-| 0079 | Shift-count domain | v0.242 | #3045 (the four masking-pin files flip) |
-| 0080 | Exception-derived throwables | v0.243 | #3046 (~215-site base sweep lands ahead of the §31.1 flip as a no-op commit; two permissive-rule pin files flip polarity) |
-| 0081 | Abandonment lints (both) | v0.243 | #3047 (zero existing corpus sites fire either lint) |
-| 0083 | Reserved discard | v0.244 | #3049 (the A.1 `Identifier` split + 128-site `var _ :=` migration; subsumes #2679, closed against its landing) |
-| 0084 | `equality skip` | v0.244 | #3050 (the one-directional eligibility gate as landed — gate-corrected) |
-| 0085 | Pure-body `for` elision | v0.244 | #3051 (the `pure_body_22_15` rejection pin flips; the elision is mandatory inside pure bodies) |
-| 0086 | Consistency & record-keeping batch (all eight items) | v0.242 | #3052 (incl. the 86-site `sealed abstract` → `closed` test respell) |
-| 0087 | Statics vocabulary | v0.245 | #3053 — **zero compiler work**; the Q3 check_docs derivation check (3b) landed with the train; **closed** |
-| 0089 | Generic-leaves retirement | v0.245 | #3055 (~1,000 sema lines delete; six test files flip) |
-| 0090 | Transfer-marker unification | v0.246 | #3056 (the ~633-line four-regex-family corpus respell; the owned-slot-store family drops its marker rather than respelling it) |
+**2.3 DONE is measured, not declared.** A campaign is DONE when **all** of these print true:
+- every member at entry is **closed by a `fix #N` commit** or **re-scoped** with one of three recorded
+  reasons: *split to campaign X* (labelled), *blocked on ruling #R* (the ruling is filed and linked), or
+  *not a defect* (the spec sentence that says so is quoted);
+- every rule-corpus case citing the campaign's sections is `pass`, or its `fail` row carries an `issue:`
+  header pointing at an OPEN issue labelled for another campaign or a ruling;
+- the **DONE instrument is green**: the campaign's grid (face × representation, receiver × argument kind,
+  head kind × binding form, …) runs under `BEZEL_AOT_FORCE_SANITIZE=address` with every cell *correct or
+  rejected with the named diagnostic*, and never a wild jump, a leak or a compiler abort; the grid is a
+  conformance set or a `scripts/regression_matrix.py` shape, so it runs at every gate afterwards;
+- the relevant research-matrix cells (`docs/research/{borrow-flow,disposal,generics}-matrix`), where the
+  campaign's sections have cells, are re-run and clean or re-filed;
+- **no in-scope sibling filed during the campaign is left untriaged**: each is a member (closed) or
+  labelled for a later campaign with its mechanism named;
+- `scripts/check_leak_census.py`, the toolchain-skip ratchet and the campaign's own ratchet (if the anchor
+  created one — e.g. `check_nested_body_scope_coverage.py`, `check_enumerable_grid_spellings.py`) are
+  banked **lower**, not sideways.
 
-**(b) 0088 — accepted; stage 1 graduated v0.243, stage 2 owner-gated.** Stage 1 (rationale §5.7's concrete-selector cliff record; the declaration-site generify-remedy diagnostic is compiler-side, #3054, XS) graduated with train B. Stage 2 — the `sourced` return-position marker — stays in the proposal, gated on the first real concrete-selector want (the 0051 Part B evidence posture). The proposal does not flip to superseded.
+**2.4 Exit review (status `EXIT`, a fresh reviewer, never the campaign's lanes).** Re-runs the DONE
+checks with its own instruments, reads the record, and writes one paragraph per sub-family: what the
+anchor was, what it closed, what it split, what it taught. The exit review names the **next campaign's
+first lane brief** (the reviewer saw the neighbouring defects). The coordinator then flips §6 to `DONE`
+or, if a DONE line fails, to `ACTIVE` with the failing line as the next lane. A campaign may also exit as
+`RE-SCOPED` when the entry check or an anchor lane proves the topic is two topics; the record says why.
 
-**(c) 0082 — accepted pending C3 (README row: `under-review — drafted 2026-08-11`).** Owner-accepted 2026-08-11 with its staging recommendation honored: graduation runs as its own small Train F (v0.247+) only if the C3 prototype passes. Stage 0 measured 2026-08-11: C1 PASS (7/11 strict; every single-choice reading passes), C2 pass on the letter (#2042); C3 — the scoped await-bind desugaring prototyped behind a flag, verified to be the §28.10 cleanup-stack slot and nothing else — is the #3048 local-lane handoff. C3-fail → 0051 §3.5's decline path (a DECLINED.md record closing the v0.182 liftable). Train F does not block program close (owner sequencing ruling).
+**2.5 Campaign record template** (`docs/proposals/papers/campaigns/<slug>.md`):
+```
+# Campaign <slug> — <title>
+Track · Sections · Shared code paths (file:function @ sha) · Anchor (issue or one-page design)
+## Members at entry (table: #, severity, HEAD status MEASURED, sub-family, lane, outcome)
+## Sub-families and lane plan (hot files per lane; order; model tier)
+## DONE instrument (what it is, where it lives, baseline cells wrong at entry)
+## Rulings needed (issue, what it unblocks, asked on <date>)
+## Questions for the next train (filed spec-question numbers)
+## Siblings filed during the campaign (#, triaged to)
+## Lane records (one block per handback: SHAs, rows, fail-without proof, matrix result)
+## Exit review
+```
+The record is updated **in the same commit** as the pick that changes it (the September plan asked each
+lane to do this; only one did — so it is now the integrator's step in `pick_stage.sh`'s turn, like
+`harvest.tsv`).
 
-**(d) Tracking-issue states at close.** Two closed: **#3053** (zero compiler work — the check_docs derivation check was the train's own deliverable) and **#3060** (the §30.5/A7 seam, resolved by train E's docs). The rest — **#3044/#3045/#3046/#3047/#3049/#3050/#3051/#3052/#3054/#3055/#3056** — are open as labeled (`bug`, the #2654 spec-ahead-of-impl convention) catch-up trackers, and **#3048** is open as the design-validation lane feeding Train F; all are sequenced, with the three recorded ordering constraints and the no-soundness-grade classification, by the run-sequence page above.
+---
 
-**(e) Two owner-queued open questions** (recorded at v0.246, question-only — not ruled; they queue for the owner now that Train E has landed): **(E-f1)** the §22.6 owned-overloading ban / stdlib Try-pair naming — `M(move x)` vs `M(x)` is now call-site-distinct with no declaration-token ambiguity left, satisfying the ban's own carve-out criterion; **(E-f2)** the §3.14 named-destructure no-transfer liftable — the unified marker gives named slots a natural transfer spelling for the first time (0090 carries it as gap G5). Both are recorded in the rationale beside their home records (§3.10, §3.14). *(Both closed at v0.250 — §1·Δ·F row (b) below.)*
+## 3. The campaigns, ranked
 
-### 1·Δ·F. Ledger delta 2026-08-12 (docs v0.246 → v0.250): Train F and the Train E follow-on train
+**Ranking criteria, in order.** *Value*: memory-safety and crashes before wrong values before leaks
+before diagnostics. *Leverage*: one authority that closes many members and stops the sibling stream.
+*Risk*: how many hot files, how many lanes can run, whether a wrong anchor trades a leak for a UAF.
+*Dependencies*: owner rulings, spec trains, the soundness research's recommended gate, other campaigns.
 
-**(a) Graduated (`superseded`) — three proposals across two trains** (per-train detail in the v0.249 and v0.250 changelog entries; graduations docs-only at landing, compiler catch-up sequenced by [`catchup-run-sequence-2026-08-12.md`](catchup-run-sequence-2026-08-12.md)); v0.247/v0.248 were the guide-revalidation and spec-example-defect revisions (changelog entries; no proposal ledger movement):
+**Two tracks** keep the WIP-2 option honest. **Ownership track** (codegen disposal, ownership pass,
+iterators, async, closures): campaigns here share `LlvmBackend_Setup.cpp`, `_Disposal.cpp`, `_Stmts.cpp`,
+`Ownership*.cpp` and are serialised by the one-disposal-lane rule. **Sema/stdlib track** (sema admission,
+builtin arms, nullable, generics, cross-module): `ExprTypecheck*.cpp`, `TypeResolution*.cpp`,
+`LlvmBackend_String.cpp`, `ModuleLoader.cpp`. Counts below are from the exclusive assignment
+(`MEASUREMENTS.md` §5); S/C/L = soundness / crash / leak members.
 
-| # | Proposal | Graduated | Impl trackers (compiler catch-up) |
-|---|---|---|---|
-| 0082 | Pattern A scoped bind (Train F; owner-ruled 2026-08-11, C1/C2/C3 gates passed) | v0.249 | #3048 (production trigger; the conditional-producer predicate; the Q4 teaching diagnostics; #3074 ordered first — the `const` mis-accept) |
-| 0091 | Owned-overload lift (E-f1 executed; resolved 2026-08-12 under the owner's delegation, all questions as recommended) | v0.250 | #3086 — **after #3056**: the applicability filter, the erasure-guard clash, the reworded §22.6 diagnostics, the `WhenAll`/`WhenEach` recognition re-keying (47 name-keyed `src/` sites + the runtime symbol), the 49 gtest `*Owned` helper-line renames |
-| 0092 | Named-destructure transfer (E-f2 executed; resolved 2026-08-12 under the owner's delegation, all questions as recommended) | v0.250 | #3087 — after #3056, with/behind #1409 (no shipped named-slot parser exists); the move-only-value-payload gap is spec defect #3094 |
-
-**(b) The E-f1/E-f2 questions of row (e) are closed** — resolved 2026-08-12 under the owner's delegation ("Please work to resolve all questions the right way as you see fit. Once resolved, graduate both proposals into the docs"), all fifteen questions as recommended; the rulings and their reasoning live in rationale §3.10 (the lift record) and §3.14 (the marked-slot record), the migration in the v0.250 changelog entry. #3086/#3087 join the R0-adjacent catch-up sequence behind #3056 (items 20–21 of the run-sequence page).
-
-### 1·Δ·G. Ledger delta 2026-08-18 (docs v0.250 → v0.261): the review program — re-baselined as its closing step
-
-*Stamped 2026-08-18, the review program's closing step, ruled under the owner's 2026-08-18 delegation. This section is the program's compiler-work inventory — the **what and the priority**; the **sequencing** (ordering constraints, run shape) is the roadmap's matching 2026-08-18 banner — cross-referenced, not duplicated. Every item below was verified against its changelog entry's Migration/Spec-ahead-of-impl ledger (the authoritative per-revision work statement) and carries its issue number and spec revision.*
-
-**(a) Graduated (`superseded`) — ten proposals across five trains, v0.257–v0.261** (per-train detail in the changelog entries; every graduation docs-only at landing; the impl-tracker column is the compiler catch-up). The interleaving revisions: v0.251–v0.254 were the 2026-08-12 defect-resolution batch — their small impl arms ride the standing **#2045**/**#2053** trackers, no new rows (except #3117, row (b) item 3) — and v0.255 (the four-ruling spec-question batch) and v0.256 (the program's defect train) filed the pre-program tail of row (b).
-
-| # | Proposal | Graduated | Impl trackers (compiler catch-up) |
-|---|---|---|---|
-| 0093 | Kernel vocabulary & kill table (charter B1+B2) | v0.257 | **zero compiler work** (five optional `src/` diagnostic-string conforms recorded at 0093 §5, untracked) |
-| 0095 | Census rename + `defaultable` (B4+B5) | v0.257 | **zero compiler work** (zero diagnostic-string edits, measured at landing) |
-| 0096 | Iterable calls-mint unification (C1) | v0.258 | **#3257** — the program's headline structural item; supersedes #3246's sema arm (#3246 closed) |
-| 0097 | Superseded-exception snapshots (C3) | v0.259 | **#3261** (0097 arm — incl. the gate-measured sema/ABI surface) |
-| 0098 | Stdlib surface program (C7) | v0.259 | **#3261** (0098 arm — the rename surface, `ElementAtOrNull`, `Sum`) |
-| 0099 | `ScopeGuard` (C5) | v0.259 | **#3261** (0099 arm) |
-| 0100 | The body seam, examined and closed (C12; the owner's own seam ruling) | v0.260 | **#3248** + this plan (row (b) item 5) — keyword reservation first |
-| 0101 | A13 retirement study — conducted, concluded in **Rule B** | v0.260 | **#3263** — the memory-safety headline (row (b) item 1) |
-| 0102 | Named-move lift + small records (C4/C2/C6/C8) | v0.260 | this plan (row (b) item 5) — the test flip behind **#3056** |
-| 0094 | Enumeration dedup + announcement table (B3; stage 2, re-derived post-0096) | v0.261 | **zero compiler work** ("no compiler surface moves and no test migration arises") |
-
-**(b) The compiler-work inventory, in priority order.** Two headline entries lead — **#3263**'s memory-safety defects and **#3257**'s unification — then the pre-program sema tail, the feature/stdlib layer, the parser/lexer lane, hygiene; **#3262** is dev-box-gated.
-
-1. **#3263 (v0.260, 0101) — memory-safety codegen at owning-inline-array whole-value reassignment.** Three defects measured at HEAD, all in `lowerOwningInlineArrayReassign`'s territory: **(i)** the **literal-RHS ordering UAF** — the collection-literal path disposes displaced slots *before* evaluating literal elements, so a throwing element observes disposed slots (violates the K9.5 RHS-first shape; the main path is verified RHS-first); **(ii)** the **moved-from-LHS double-free** — the lowering consults no moved-from state for the LHS, so `var b := a; a := X;` disposes slots whose obligations left with the move (invisible to the suite today: the pinning test is sema-only); **(iii)** **no slot nulling in the per-slot pass** — disposed slots dangle on the exception edge, contradicting §28.7's "left empty", and the §28.4 multi-value-cleanup continuation is unimplemented. Each needs a `runAot` + ASan regression citing spec v0.260. Adjacent, same tracker: verify the lowering does **not** run at static-field targets (the §22.13 posture requires the exclusion; its type-keyed guard appears to admit them); the **#1549 warning** retires at locals/instance fields and is retained at the form-(iv) static locus (its two positive assertions flip to no-warning-plus-disposal pins; `no_warning_when_whole_array_moved_out_first` additionally becomes a `runAot` disposal pin); re-cite `move_only_inline_array_reassign_drop_on_overwrite_1385_test.cpp`'s phantom "§28.7 v0.215" header to v0.260 (the stale comment cite rides the same tracker); sema transfers per-slot moved-from state on whole-value moves; and the new **K5.2 freeze-reach sema arm** — a whole-value reassignment under a live borrow of the displaced value, slot-object borrows included, newly rejected — whose zero-corpus figure (the read-only 15-site/4-file reconstruction) **the type checker must confirm**, the recorded obligation.
-2. **#3257 (v0.258, 0096) — the iterable calls-mint unification.** The v0.258 entry's Migration ledger is the normative work order. **Core rule:** calls-mint recognition re-keys to the **mint-announcing families** (Task + the eight iterable/enumerator heads + the lazy query) at every callee kind, keyed on the **declared, pre-substitution** return type — on the caller side *and* for lambda admission at function-type targets (the K2.4 keying); the v0.223 owning-head instance/extension rejection and the instance/extension `owned`-marker requirement **retire** (**42** currently-rejected declarations become legal as written). **New rejections/mechanisms landed at the v0.258 gate:** stored-view borrow returns rejected with the property-face remedy (the v0.190 stored-task wording); §27.6's formation bar for lazy-query-kinded callees at derived-interface return slots (the `OrderBy`/`OrderByDescending`/`ThenBy`/`ThenByDescending` quartet) with the `IOrderedEnumerable<T>` → `IEnumerable<T>` adapter bridge; property references over iterable-family-typed properties rejected at formation (stdlib measured clean — zero such properties); §27.1.1's pre-substitution reading at **storage loci** — a mint-announcing-returning function value stored into a field/property whose declared type carries a bare-type-parameter return slot is rejected at family substitutions, **Task family included** (the one recorded Task-side verdict move); **§28.14(2)** generalized to both families (a call-bounded callback's minted frame consumed to its K6.1 bound); the quartet's direct call reclassifies **borrow → mint**; **§29.11's layered model** — the container obligation discharged by the standard rules, the affine enumeration right spent at consumption points, K3.14's must-use warning **suppressed at statically-visible consumption points** and otherwise **newly warned** on plain-`var`-bound queries; **§29.1's uniform owned contract** — the shipped runtime alias guard (v0.235, #2384) already conforms, so the obligation is **verify no regression at the 7 self-returning corpus sites**, not new machinery. **Test migration (16 sites):** the 7 self-returning sites need no respell (the runtime guard covers them); the 5 owning-head view pins (`owning_iterable_head_borrow_return_2369` ×3, `deferred_activation_frame_return_1660` ×2) re-point at the new rule; the 4 `Items()` stored-view declarations in `ienumerable_vtable_linq_995_test.cpp` respell to the property face **with a property-face behavioral companion for each pinned behavior**. Plus the stdlib runtime's `Drain()` fresh-frame change. **#3255** is the open static receiver-returning seam (a design record, deliberately not part of this catch-up). **Supersedes #3246's sema arm — #3246 closed**; a fence implementation landing now would implement rejected text.
-3. **The pre-program sema/regression tail (v0.254–v0.256)** — independent of #3257 and of each other: **#3117 (v0.254)** — the §12.7 boxed-location write rejection, sema: three position families rejected (lvalue-chain statements extending the narrowed binding, `ref`/`out` arguments over such chains, by-address `extern` inline-array arguments), the bare-binding compound/`++`/`--` forms staying accepted (the gate-corrected refinement); cite §12.7, v0.254. **#3124 (v0.255)** — value receivers are borrows, sema: member-body stores landing in the **receiver's own storage** rejected (accessor bodies included; the mediating class-hop shape stays accepted; constructor-bodies carve), plus the blanket settable-interface-conformance rejection; measured flip surface **33** record setter bodies across 14 files + **2** method-body sites (both inside already-rejected programs — no green flip) + **2** green conformance tests on the conformance arm alone (`xmod_interface_property_setter_itable_arc_2506`, `xmod_interface_named_local_setter_arc_2535`); cite §9.4, v0.255. **#3240 (v0.255)** — the compound-arithmetic throwable widening: a compound assignment or `++`/`--` whose desugared form is throwable (`/=`, `mod=`, checked `+=`) is an unrestored exception edge — a small widening in `findThrowable28_8_1`, riding the **#3080** family's existing surface; cite §28.8.1, v0.255. **#3242 (v0.255)** — the `Range` generic-substitution `ToString` rendering residue (`Range<char>` through an unresolved `T` renders code points) — a codegen bug under the existing each-component rule; cite §8.5, v0.255. **#3245 (v0.256)** — the ctor-unwind destructor-body **regression test** (implemented behavior already matches; the test is the missing pin: the throwing class's own destructor body does not run on constructor unwind, the base's does); cite §22.9, v0.256.
-4. **The feature/stdlib layer:** **#3261 (v0.259, 0097–0099)** — *0097:* the runtime `SupersededChain` field + the append helper at the two supersession drop paths in `src/codegen/LlvmBackend_Disposal.cpp` (**earliest-first**: chain-then-snapshot, the deliberate mirror of `CauseChain`'s order), the best-effort §17.7 allocation carve-out, the self-supersession no-op + per-raise clearing for owner-owned instances, the two report printers (§33.3, §32.8) + `ToString()` rendering — **plus the gate-measured sema surface** superseding 0097 §7's "no new classification, no new diagnostic": the §31.4 exception header is a **fixed layout baked into the compiler** (`src/sema/Symbol.hpp`), so the new property is a **cross-module ABI change**; `BuiltinExcMember` is a closed enum whose three consumers (member lookup, `base.X`, §12.2 hiding — #2971/#2983/#2984) each need the new case; and the unknown-member diagnostic enumerates the surface by name (`ExprTypecheck_Calls.cpp`). *0098:* `ElementAtOrNull`; the `OwningSet` `Take`/`TryTake` → `Pop`/`TryPop` rename — **10** test call sites, **27** name-keyed recognitions across **8** `src/` files, the **#2582** family gate re-keyed with the `Pop` arity split (the 0091 `WhenAll` shape), the **4** LINQ-control sites verified unchanged; `Sum` → the two `INumber` generics with the byte-family acceptance and the overflow-checked-in-element-type behavior. *0099:* the `ScopeGuard` implementation + the freeze and dismiss-path behavior tests. Cite v0.259. **#3247** (charter C9) — the three §11.8 promotions: `FromCollectionLiteral` → a real `ICollectionLiteralTarget` static interface member (honest caveat: shrinks-not-vanishes — the dictionary form stays outside, the built-in list becomes conformance-derived); `IDeserializable.Deserialize` → a true static interface method; §16.3's `Range` element restriction → an `ISteppable` constraint. Any order among the three; the spec-side recognition prose simplifies as each lands. **#3249** — the `FrozenArray` implementation (comment-only in `src/` today; stdlib §4.19 surface + the §22.12 suppression-set/synchronized-set wiring), the **2** test respells (`enum_property_restrictions_2499_test.cpp` — whose `.Length` nit the migration incidentally fixes — and `static_fields_test.cpp`), and the `spec_0031` conformance-row flip out of the `blocked-on-#1723` skip class.
-5. **The parser/lexer lane (0100 + 0102 — carried by #3248 and this plan, per the v0.260 entry):** *0100 (v0.260)* — reserve `requires`/`ensures`/`invariant` in the lexer/parser with the reserved-word diagnostic; the 2053 contextuality pin (`contract_clauses_2053_test.cpp:280`, `requires_as_parameter_name_not_a_marker_spec_22_16`) flips to a negative test; then the **0055-§3 diagnostic's final form** (#3248 item 3) — a non-abstract member parsing body-less *while carrying clauses* draws the clauses-precede-the-body note — with **keyword reservation FIRST** (the sequencing constraint: reservation is what fixes the note's final content, the parenthesize-or-rename remedy half being obsolete under it). *0102 (v0.260)* — sema **deletes** the named-argument rejection for move-rooted arguments and its §22.5-citing diagnostic (overload resolution untouched by construction); `owned_marker_transfer_test.cpp:81` (`named_owned_argument_rejected_spec_a7`) respells to `item := move x` and **inverts to an accept — sequenced behind #3056**, as the charter directs; new spec-cited `runAot` regressions per 0102 §1.4 (named move accepted and consuming; the pair's owned member by name; field/slot take-outs; `out var`/`scoped` named forms still rejected; the mixed-ordering pin).
-6. **#3262 — dev-box-gated: the conformance-corpus merge-regeneration.** Three revisions behind at filing (v0.257–v0.259: net `spec_0324` + 213 drifted files, then +7 cases with ~109 renumbered `stdlib_NNNN` ids), with v0.260's 10 content-changed case files stacking on top (v0.261 adds nothing). **Merge, not overwrite**: every hand-derived `manifest.tsv` annotation carried forward, remapped by (doc, section, content) — never by id; the seven new cases classified against a freshly built `bezelc`, the oracle's build recorded (the v0.247 protocol). **Needs the dev box** — the remote container's LLVM 18/20 cannot build the classification oracle against HEAD's newer `llvm::Triple` API. Fold in while there: the **177-vs-178** active-count off-by-one (committed manifest vs `tests/conformance/README.md`) and the extractor **argv guard** (`extract_doc_examples.py` treats `--help` as an output root). Should **precede any large test-migration batch** so baselines are current.
-7. **Hygiene — #3248:** the two stray Pascal `begin` residues absorbed by bare `hasErrors()` assertions (`vacuous_lint_factory_call_chain_claimed_3017_test.cpp:332`, `pure_residuals_2061_test.cpp:337`); the harness-lint proposal over the measured ~1,039-assertion absorption class (error-expecting tests assert message substrings); item 3 is the 0055-§3 diagnostic of item 5 above. **The runJit ratchet, flagged here per the charter:** the program charter recorded the count measured UP at **61** against CLAUDE.md's 60 pinned 2026-08-08; re-measured at this re-baseline's HEAD (the v0.261 merge), the CLAUDE.md recipe reproduces **exactly the pinned 60 `runJit(` + 3 `runJitChecked(`** — the 61 does not reproduce, so per that file's own suspect-the-recipe rule the ratchet is treated as **intact**, and the discrepancy is recorded against #3248 for a recipe-pinned re-verify rather than a raised count.
-
-**(c) Retired / superseded on the record.** **#3246** — its sema arm is **superseded by #3257** at v0.258 (the landed fence text was removed, not amended); the issue is closed. **#1385** — closed-completed, and this plan's "stays open" rows were stale: v0.260's A13 study found the Rule-B codegen **already shipped** since the #1385 fix (`lowerOwningInlineArrayReassign` — reverse slot order, RHS-first, null-guard skip), the spec amended to match through the delegated study; §1·0's 0036 row and §4a's 0036 bullet are annotated in place, and the residual work is **#3263**'s three defects, not #1385. **#1549** — re-scoped at v0.260: the reassignment warning retires at locals/instance fields (it warned of a leak that no longer happens) and is retained at the form-(iv) static locus; the test flips ride #3263 (the roadmap's R0 disposal-tail row is annotated in place). **Open design records, deliberately not schedulable build rows:** **#3255** (§29.1's static receiver-returning protocol form), **#3258** (§22.13's throwing exit-time disposer — four open questions on both exit paths), **#3259** (the §31.4 rendering promise's declaring member).
-
-### 1a. Accepted (delegated) — owner-blessed, schedulable now (14)
-
-*(0003 graduated — see §1·0.)*
-
-| # | Title | Status | Tracking | Impl | Prereq landed? |
-|---|---|---|---|---|---|
-| 0006 | Concrete stream family | accepted (delegated) | #1433 | none | **yes** (v0.180 scoped-construction) |
-| 0007 | System.Net substrate | accepted (delegated) | #1436 | none | runtime event loop + OpenSSL owner ruling pending |
-| 0008 | Integer toolkit | accepted (delegated) | #1437 | none | **yes** (no deps) |
-| 0009 | Base64 + hex | accepted (delegated) | #1434 | none | **yes** (no deps) |
-| 0011 | Process | accepted (delegated) | #1440 | none | needs 0006; kill-on-dispose owner Q |
-| 0012 | DateTimeOffset + TimeZoneInfo | accepted (delegated) | #1445 | none | needs 0010; §9.6-override owner Q |
-| 0013 | Environment surface | accepted (delegated) | #1441 | none | **yes** (no deps) |
-| 0018 | Async File family | accepted (delegated) | #1447 | none | **yes** (independent of 0006) |
-| 0020 | Regex **[RFC]** | accepted (delegated) | #1449 | none | engine-family owner Q (RE2) |
-| 0022 | Test framework **[RFC]** | accepted (delegated) | #1453 | none | Assert lib **yes**; `test`-modifier fork owner Q |
-| 0023 | Task.WhenEach | accepted (delegated) | #1450 | none | **yes** (v0.179 deferred-activation) |
-| 0027 | SplitSpans | accepted (delegated) | #1458 | none | **yes** (no deps) |
-| 0028 | Random extensions | accepted (delegated) | #1459 | none | **yes** (no deps) |
-| 0030 | Unicode normalization | accepted (delegated) | #1455 | none | **yes** (no deps) |
-
-### 1b. Draft — needs a routine owner accept before graduation (13)
-
-*(0032, 0033, 0034 graduated — see §1·0.)*
-
-| # | Title | Status | Tracking | Impl | Note |
-|---|---|---|---|---|---|
-| 0001 | Networking / `Http` client | draft | #1376 | none | hard dep 0007 |
-| 0002 | `Http` server | draft | #1402 | none | hard dep 0001 |
-| 0005 | Self-hosting stdlib collections | draft (stale) | #545 | none | XL; multi-run; refresh banner |
-| 0010 | Serialization value builtins + WriteBytes | draft | #1435 | none | hard dep 0009 |
-| 0014 | Signal hooks | draft | #1442 | none | runtime drain thread |
-| 0015 | PeriodicTimer | draft | #1443 | none | #1378 closed |
-| 0016 | Monotonic time | draft | #1444 | none | no deps |
-| 0017 | TempFile + Path/Directory | draft | #1446 | none | no deps |
-| 0019 | JSON DOM | draft | #1461 | none | hard dep 0010; +0006 streaming |
-| 0021 | Structured logging | draft | #1460 | none | hard dep 0006 |
-| 0024 | PriorityQueue | draft | #1451 | none | no deps |
-| 0025 | BitArray | draft | #1452 | none | soft dep 0008 (PopCount, severable) |
-| 0026 | LINQ additions | draft | #1457 | none | no deps |
-| 0029 | Checksums | draft | #1454 | none | hard dep 0008 |
-| 0031 | Verify / Unreachable / Debug | draft | #1456 | none | v0.182 throw-operand landed |
-
-*(0004 lives in 1d; count above is the draft build-track set.)*
-
-### 1c. RFC — owner-gated design changes (0 — all graduated)
-
-All five simplification/demotion RFCs graduated in this run (owner-accepted 2026-07-12) and moved to §1·0: **0035** → v0.187; **0036**, **0037**, **0038**, **0039** → v0.188. This bucket is now empty; the owner-decision gate that §4a projected onto the graph is discharged.
-
-### 1d. Not scheduled (owner-declared out of the near-term plan) (3)
-
-| # | Title | Status | Tracking | Why |
+| # | campaign (track) | open (S/C/L) | why here | depends on |
 |---|---|---|---|---|
-| 0004 | Bezel MVU | early draft | #1410 | XL; explicitly unscheduled (proposal-only by owner decision) |
-| 0005 | Self-hosting collections | draft (stale) | #545 | XL; multi-run; listed in 1b for completeness |
+| 0 | **Enablers** (standing, ≤1 lane) | 166 total; worked only as DONE-instrument needs | measurement must not lie before anything is declared fixed | owner: #2924/#7145 policy |
+| 1 | **`using var` / `await using` over every head kind** (ownership) | 24 (7/3/5) | heap-buffer-overflow and SEGV measured today on a two-line program; bounded; the pilot that proves the mechanics | ruling #3493 for half the members |
+| 2 | **Built-in call admission: typed arms for the stdlib surface** (sema) | 189 (33/53/0) | 53 compiler aborts and 33 wrong-value/soundness; the largest intake stream (159 filed in 30 d) is being fixed one arm at a time right now | none hard |
+| 3 | **Enumerable heads and iterator frames: one bridge per face** (ownership) | 125 (43/9/27) | highest soundness density (wild jumps, UAF); September's G family untouched (19/21); grid instrument already sketched | campaign 1 (shares `registerUsingDisposal`) |
+| 4 | **Producer temporaries and boxes: one discharge authority** (ownership) | 148 (14/7/98) | the largest leak family and the loop's main engine (116 filed in 30 d); contains the UAFs #6393, #6983, #6409 | campaign 3 (shares the minting gate) |
+| 5 | **Nullable carrier unwrap at every value consumer** (sema/codegen) | 54 (14/0/0) + the builtin-position subset handled in 2 | tagged carrier read as a value: garbage, malformed IR; one unwrap authority | campaign 2 |
+| 6 | **Closures and capture cells, second pass** (ownership) | 111 (24/3/49) | A's anchor (#2718) landed; 26 old members plus ~40 new; #4522 names the four shapes the refcount "deliberately declines" | campaign 4 |
+| 7 | **Generic instantiation boundaries** (sema/codegen) | 88 (17/13/3) | I2/I3 untouched (12/13, 8/9); the S3 codegen anchor #4567 is filed and unworked | campaign 5 |
+| 8 | **Owned collections: element lifetime in the runtime** (ownership/runtime) | 77 (13/1/30) | string/class elements of built-in collections leak or over-release; `elem_disposer` stamp per mint site; filed faster than closed | ruling #6358; campaign 4 |
+| 9 | **Borrow provenance and the sink rule** (ownership pass) | 96 (30/1/17) | the v0.320–v0.345 soundness trackers for §28.3/§28.14/§9.7; accept-side holes that become UAFs | soundness research Stage 0 (pinmap), a train |
+| 10 | **Choice payload lifetime and layout** (ownership/codegen) | 30 (10/6/10) | stack-buffer-overflow at construction (#6167), owning-match UAF (#5453); small | campaign 4 |
+| 11 | **Async return slot and frame-carried locals** (ownership/async) | 32 (16/1/7) | task result dangling (#6051, #6097, #6098); frame fields for captured cells | campaigns 1, 6 |
+| 12 | **Cross-module parity: retire AST-gated symbol reads** (sema) | 25 (9/2/4) + the cross-module halves parked in 7/8 | #6364: the import-blind-cast family is unbounded while `check_imported_symbol_reads` is baselined at 31 | campaign 7 |
+| 13 | **Records, statics, contracts, exceptions** (mixed) | 49 (9/0/1) | remainder; re-cluster at its entry check | — |
+| — | spec-trains (222 unclaimed `spec-tracking`), features-proposals (99), parking-lot (78) | — | triaged, not worked, until a campaign claims them | — |
+
+### Campaign 0 — Enablers (standing; never more than one pool slot; not a campaign in §6's sense)
+
+Worked only when a DONE instrument needs them, in this order: **(a)** `internal:` degrade → the compiler
+stops (#7145 measured a NULL-deref binary shipped after an `internal:` note; #2924's disposition record
+is the anchor; the *pointer-degrade* sites flip to Error — **owner decision**, §4.8); **(b)** lit
+`CHECK-NOT` ordering vacuity (#7065, #7069, #7070, #7071) — a plan-wide oracle hole; **(c)** the
+uninstrumented hand-rolled emit runners (#3917) and the leak census blind spot (#7335); **(d)** the
+checked-disposal default (#4602, **owner decision**); **(e)** promote `docs/proposals/papers/master-plan/work/*.py`
+to `scripts/tracker/` so §6's numbers are reproducible from the repo (a coordinator decision).
+
+### Campaign 1 — `using var` / `await using` over every head kind (ownership track; the pilot)
+
+**Scope.** Spec §28.10, §28.12, §30.7 (v0.345), stdlib §2.10 (`IAsyncDisposable` extends
+`IDisposable` since v0.345, #7354). Label `campaign:using-heads`. Shared code path: `registerUsingDisposal`
+(its `asyncDispose` arm and the two spellings of the builtin-collection build, #3471), the sema vacuity
+check (§28.9 warning), `classOfLocal`/`usingVarBuiltinHeadName` (#3482).
+
+**Members (24).** Sub-family **U1 — RHS kinds with no class disposal obligation take the class path**:
+#7322 (string RHS, heap-buffer-overflow — MEASURED SIGSEGV today), #7327 (function-typed RHS),
+#7283 (lambda), #7306 (string), #7337 (`Object`-declared holding a runtime-managed value), #7338
+(`Type` token missing from the runtime-managed set — sema and codegen disagree), #7339 (`Object` holding
+a string), #3482 (generic type-parameter head reads word 0 as a vtable), #7326 (`await using` outside an
+async body not rejected), #7316/#7305/#7357 (value-like choice copy path leaks), #7345 (v0.345: explicit
+`Dispose()` reclaims at the call where the spec says logical disposal only — the holder frees).
+Sub-family **U2 — `DisposeAsync` keyed on the declared type** (September's H): #3493 (anchor: the
+dispatch point), #3483 (interface head runs the destructor), #3516 (abstract head), #3515 (derived
+level's owned fields stranded), #7328 (interface/base-typed RHS takes the synchronous path), #5653
+(v0.328: await the run-time object's `DisposeAsync`), #7354 (v0.345 conformance), #1531/#1603 (direct
+`DisposeAsync()` physical reclamation incl. the fault edge). Sub-family **U3 — async enumerators**:
+#2623 (owned field holding an async enumerator), #2624 (explicit `Dispose()` plus scope end leaks the
+pending advance), #6194 (`using var t := tcs.Task` then `await t` hangs). Cleanup: #3471.
+
+**Entry check.** Re-measure all 24 on HEAD (two moved today already: #7305 fixed the construction
+path, #7322's fix left #7327). Build the DONE grid: **head kind** {class, derived-behind-base, interface,
+abstract, generic `T` (class-constrained / unconstrained), string, function value, value-like choice,
+owning choice, `Object` holding each of these, `Type`, built-in collection, async enumerator, `Task`} ×
+**binding form** {`using var`, `await using var`, explicit `Dispose()`, explicit `DisposeAsync()`, copy
+of a `using var` local, field store} — every cell is *disposed exactly once / vacuous with the §28.9
+warning / rejected with the §28.10–§28.12 diagnostic*, run under ASan. About 90 cells; many already
+exist as corpus cases (`s28_10_*`, `s28_12_*`) — the entry lane dedups against `cases/` first.
+
+**Anchor.** One predicate, shared by sema and codegen, answering *"what disposal obligation does this
+RHS carry, and of which kind"* (none / class sync / class async / value-like payload / move-only),
+keyed on the **runtime representation** where the declared type is `Object`, `T` or an interface.
+U1 needs no ruling: §28.9 (v0.345) already says these values have no `Dispose()`. U2 needs the #3493
+ruling (a fixed vtable slot vs an `IAsyncDisposable` itable lookup at the disposal site); **ask for it
+in the first session**, so it is ruled by the time U1 lands.
+
+**Lane split (serialised by the one-disposal-lane rule).** Lane U1 (Opus): the predicate + the U1
+members + the grid's sync half; files `LlvmBackend_Disposal.cpp`, the `registerUsingDisposal` site, the
+sema vacuity check. Lane U2 (Opus, after the ruling): the dispatch point + U2 members + the async half of
+the grid. Lane U3 (Sonnet, after U1): the three async-enumerator members and the #3471 de-duplication.
+Each lane: `runAotChecked` rows, loop-amplified, with the **double-free control row** (`CLAUDE.md`:
+never trade a leak for a UAF). Expected duration: two sessions. While U-lanes are serialised, the pool's
+other slots run **Campaign 2** (the other track).
+
+**DONE.** §2.3 with: the grid green under ASan; `s28_10_*`/`s28_12_*` fail rows re-banked (baseline
+has 2 under §28.10 and 5 under §28.12 today); U2 either closed or every member re-scoped *blocked on
+#3493* if the ruling has not arrived — in which case the campaign exits `RE-SCOPED`, with U1 and U3 DONE
+and U2 re-queued behind the ruling.
+
+### Campaign 2 — Built-in call admission: typed arms for the stdlib surface (sema/stdlib track)
+
+**Scope.** Spec §22.6 (applicability and ambiguity), §22.5 (named arguments), §5.1 (conversions), §7.3/
+§7.4 (nullability at parameters), §17.4; stdlib §2 (primitives: `Parse`/`TryParse`/`ToString(format)`/
+radix, `Math`, `Convert`), §3 (`StringBuilder`, `Encoding`), §9.6 (string members). Label
+`campaign:builtin-call-admission`. Shared code path: the hand-written per-builtin arms in
+`ExprTypecheck_Calls.cpp` (named in 110 open issues), `LlvmBackend_String.cpp`, the `isStrBld`/`Parse`
+arms in `LlvmBackend_Setup.cpp`, `BuiltinRegistry.cpp`.
+
+**Mechanism (QUOTED from the members).** A builtin member is recognised by **head name** and lowered by an
+arm that trusts its argument shapes: a non-string first argument to `int.TryParse` aborts the compiler
+(#7290), the decimal arms are "a second copy in a different file" (#7300), a user class named
+`StringBuilder` is claimed by the builtin arm (#7217, #6845), nullable carriers reach `Math.Floor`
+unwrapped (#7297 — MEASURED today), `Math.Max(3u, 4000000000u)` prints 3 (#6864), a reordered named
+argument hands an `i1` to a `ptr` parameter (#7180). Today's landing log shows the loop in motion:
+`narrow #7290`, `narrow #7293`, `narrow #7299`, `narrow #7300`, `fix #7313` — one arm per commit.
+
+**Members (189; the full list is `work/out/campaign-members.md`).** Sub-families:
+**B0 anchor** — a single admission gate: every builtin call resolves against a declared signature
+(the stdlib index is the source: `Bezel_Standard_Library.md`, mirrored in `BuiltinRegistry`) *before*
+lowering; arity, §5.1 conversions, §7.3 nullability, §22.5 named arguments and the receiver's **symbol**
+(not its name) are checked there, once; an arm that is reached with an unadmitted shape is a compiler
+bug by construction (an `internal:` that stops, campaign 0(a)).
+**B1 Parse/TryParse/radix** (#7285, #7290, #7293, #7294, #7299, #7300, #7286, #7295, #7296, #7304,
+#7315, #7320, #7323, #7325, #7341, #7268, #7271, #1792, #7258, #4890 spec-question).
+**B2 ToString(format)/Convert rendering** (#7265, #7284, #7358, #7287, #7329, #7359, #7361, #7362,
+#7319, #7331, #7333, #7336, #7303, #7311, #7239, #7291, #7234, #7242, #6782, #6825, #7267 leak twin in
+campaign 4).
+**B3 Math/Convert argument typing** (#7297, #7232, #7218, #7219, #7227, #7254, #6647, #6884, #6648,
+#6864, #6865, #6942, #6295, #7061, #7249, #7252, #7253, #7274, #7292 double evaluation).
+**B4 StringBuilder and string member arms** (#7244, #6809, #7154, #7180, #6635, #6636, #6826, #7217,
+#6845, #6159, #7210, #7221, #7228, #7229, #7108, #7189, #7198, #7245, #7129, #7277, #7130, #6753,
+#6755, #6777, #6780, #6820, #7028).
+**B5 nullable carrier at a builtin position** (#6823, #6255, #6637, #2625, #2642, #7342, #6646, #6873,
+#6116, #6126, #7004, #7089 — the general rule is campaign 5; B5 takes only the builtin-position cells).
+**B6 null at a non-nullable builtin parameter** (#6810, #6811, #6812).
+The remaining ~90 rule-matched members (sema-side overload ranking on builtin heads, `?.` spellings,
+`Object`-held builtins) are confirmed or re-labelled at the entry check.
+
+**Entry check.** Re-measure; build the DONE generator: **receiver kind** {each primitive, `string`,
+`StringBuilder`, `Math`/`Convert` statics, nullable of each, `Object` holding each, a user type named like
+a builtin, a type parameter} × **argument kind** {matching, §5.1-convertible, wrong type, nullable
+(narrowed / not), null literal, class instance, unit} × **spelling** {positional, named, reordered named,
+`?.`, method reference}. Verdict per cell from the stdlib signature: accept-and-run, or reject with the
+§22.6 wording. The generator's existing precedent is `scripts/regression_matrix.py`. Baseline cells wrong
+at entry are the campaign's number to drive to zero.
+
+**Lane split.** B0 (Opus) first and alone in `ExprTypecheck_Calls.cpp`; then at most three instance
+lanes with disjoint arms: B1+B2 (Sonnet; the radix/format arms), B3+B6 (Sonnet; `Math`/`Convert` and
+null admission), B4 (Opus; `StringBuilder`/string, touches `LlvmBackend_String.cpp` and the runtime
+`bz_sb_*` calls), then B5 (Opus). Every rejection added or removed sweeps embedded test programs
+(lane-contract 19b) — this campaign flips many permissive-acceptance pins, each named in the commit body.
+
+**DONE.** §2.3 with: generator green (0 compiler aborts, 0 `IR verification failed`, every wrong-shape
+cell rejected by §22.6); members closed or re-scoped; the stdlib §2/§3/§9 corpus fail rows (25 + 3 + 6
+today) re-banked; the `permissive-acceptance` warning count in `src/` for builtin heads banked lower.
+
+### Campaign 3 — Enumerable heads and iterator frames: one bridge per face (ownership track)
+
+**Scope.** Spec §29.2 (iteration protocol and wrapper frames), §29.11 (single consumption), §28.6
+(getters are borrow-producing positions), §21.4/§21.5 (`for`, `break`), §26.5 (extensions on
+`IEnumerable<T>`); stdlib §5 (query operators), §4 heads. Label `campaign:enumerable-heads`. Shared
+code path (QUOTED from G and the new members): `wrapAsIEnumerableForTarget` and its gate,
+`lowerIEnumerableFor`, `wrapArrayAsIOwningEnumerator`, `registerIterableSourceDisposal`, the §5
+terminal arms' minting gate and `freeFreshInputTemp`, the getter-frame faces
+(`propBlockGetterReturnKinds_`, `kPropGetterReturnMint`), spread over `LlvmBackend_Assign/_Calls2/
+_Calls3/_Iterators/_Setup/_Stmts.cpp`.
+
+**Mechanism.** The runtime representation behind an `IEnumerable<T>`/`IOwningEnumerable<T>` head is
+chosen per **face** (local, return, getter, argument, field, `for`, interface dispatch, user class
+implementing the interface), and each face has its own bridge or none; a missing bridge drives the
+§29.11 protocol on a vtable whose slot is out of bounds (the recurring `pc = 1` wild jump), or frees a
+field the holder owns (#6387), or hands back a bare slot pointer with no +1 (#6393).
+
+**Members (125).** **E0 anchor**: one bridge keyed on the *runtime* representation, consulted at every
+face (September G's prescription, never executed). **E1 getter frames and laundering (§28.6)**: #3469
+(now fenced by the getter diagnostic — the fence is #6451's complaint), #6451, #6487, #6489, #6490,
+#6491, #6493, #6539, #6403, #6407, #6438, #6447, #6387, #3370, #3363, #3390. **E2 argument and
+parameter faces**: #6453, #6455, #6406, #6409, #6412, #6415, #3475, #7039, #2297, #4007, #4009, #4010,
+#6703. **E3 §5 terminals, the minting gate and materializers**: #6393, #6396, #7160, #7179, #7183,
+#7184, #7212, #7213, #6563, #6567, #6613, #6556, #6559, #6626, #6712, #6759, #4706, #7178 (an exception
+inside a selector is swallowed), #3576, #6138, #6242, #6246. **E4 `for` lowering**: #6185 (loses its
+index across a suspension), #6186, #6245, #6277, #6280, #6545, #6964, #6473, #4886, #4887, #4888,
+#6819, #6890, #6863. **E5 owning heads and §29.11 single consumption**: #2307, #3478, #3476, #3479,
+#4827, #4828, #3561, #3406, #2520, #3519, #1839, #3544, #6356, #6360, #3522, #7063. Spec-question
+candidates already visible: #4740 (does a span mutation invalidate an enumerator), #2331.
+
+**Entry check.** Re-measure (G's 19 are 60–105 days old; expect several to have moved like #3469).
+The DONE instrument is G's **face × representation grid**: faces {local, return, getter (block / arrow
+/ virtual / interface-dispatched), argument (owned formal / borrowed formal / interface formal), field
+store, `for` (with `break`, with `await`/`yield` in the body), `_ :=` discard, interpolation hole,
+extension receiver} × representations {Array family, Set/Dictionary snapshot, sorted snapshot, lazy
+pipeline (eager and lazy terminals), sync iterator frame, async iterator frame, user class implementing
+`IEnumerable<T>`, string as `IEnumerable<char>`, `IOwningEnumerable<T>` heads, imported each}. The
+existing `scripts/check_enumerable_grid_spellings.py` + `enumerable_grid_spellings.baseline` is the
+spelling half; the entry lane extends it into run-and-check cells. Every cell: correct, or **rejected**,
+never a wild jump.
+
+**Lane split.** E0 (Opus) alone first. Then E1 (Opus; `_Setup.cpp` getter faces), E3 (Opus;
+`_Calls3.cpp` terminals), E4 (Sonnet; `_Stmts.cpp`/`_Iterators.cpp`), E2 and E5 (Sonnet, after E0's
+bridge covers their faces) — pairwise file-disjoint by declaration, otherwise serialised (§1.3).
+
+**DONE.** §2.3 with: the grid green under ASan; the §29 corpus fail rows (7 today) and the stdlib §5
+row (1) re-banked; `enumerable_grid_spellings.baseline` lower; the `itmap$` wild-jump signature absent from
+every cell's ASan log.
+
+### Campaigns 4–13, summarised
+
+**4 — Producer temporaries and boxes (ownership).** Members: #7152 (a temporary at an interface- or
+`Object`-typed formal is never discharged — "a fourth arm of the K8 rule"), #7171, #7187, #7188, #7211,
+#7230, #7231, #7267, #7272, #7222, #6775, #6632, #6889, #6896, #7190, #6736, #6744, #6857, #7278,
+#6938, #6421 (`_ :=` discard), #6444, #6633, #5350, #6003, #6117; boxes (F): #7005, #7298, #6769,
+#6827, #6929, #6926, #6733, #6209, #6093, #6094, #6085, #6930, #5951, #6149, #4841, #4782, #6832,
+#3447, #3480, #2760, #3908, #3905. Anchor: one answer to *"is this expression a +1 producer, and who
+discharges it"* (`isFreshOwnedClassProducer`, the §5 minting NAME list, `freeFreshInputTemp`) consulted
+by every arm, with **statement-end discharge of every unbound producer** as the default and escape as the
+exception. DONE instrument: producer kind {string op, `ToString`, `new` builtin, collection literal,
+query terminal, box mint, user `owned` return} × position {argument (plain / owned / interface /
+`Object`), receiver, `while`/`if` condition, interpolation hole, index, discard, `return`, field store,
+`base(...)`}; under ASan, 0 leaks and 0 double frees. Risk: the highest — the bias "leak over UAF" is
+correct and every row needs its double-free control.
+
+**5 — Nullable carrier unwrap (sema/codegen).** #7004, #7089, #7066, #6659, #6677, #6084, #6116,
+#6126, #6254, #6750, #2620, #6072/#6073 (four conversion positions never checked), #6225
+(spec-question: is `T? → Object` a conversion), #6859, #6482, #5903 (v0.335 *a narrowing converts
+nothing*), #5522, #6731, #6723, #6724, #7350, #7353, #6772. Anchor: one unwrap-before-consume authority
+in the lowering of a §7.4/§12.7-narrowed read, and one §5.1 conversion check applied at every position
+(#6072 lists `??`, `for var t: T in`, target-typed lambda body, `yield return`).
+
+**6 — Closures and capture cells, second pass (ownership).** September A's 26 open plus: #7288, #7112,
+#7183, #6953, #7031, #6766, #6839, #6628, #6480, #6212, #6213, #6226, #6230, #6269, #6306, #5927,
+#6108, #6127/#6137, #5850, #5851, #5866, #5228, #4938, #4860, #4534, #4535, #4542, #4522 (the four
+declined shapes), #4474; sink-rule members #6634, #6651, #6652, #6653, #6710, #7259, #7038, #6141.
+Entry check decides whether #2718's refcount is complete (then the members are missing arms) or the
+"deliberately declined" shapes need a second mechanism (then a design page). Must land as **one series on
+one tree** (#4438's interaction record).
+
+**7 — Generic instantiation boundaries (sema/codegen).** I2: #2289, #2291, #3348, #3378, #3524, #2650,
+#2220, #2861, #2020, #710, #3655, #3659, #3526; I3: #3501, #3525, #3486, #3474, #3495, #3485, #3514,
+#2580; new: #7021, #7056, #6792, #6931, #6932, #6927, #6257, #6254, #6232, #6112, #6021, #4861,
+#4862, #7062, #7066, #6866, #6747, #6315, #4980, #5417, #6392, #6443, #6407; anchors #4567 (codegen
+substitution authority), #4568 (`substitutedChoicePayloadType`); #2735/#2736 (I1's unfinished split).
+Rule: *no template-emitted code is ever entered with a substituted-type object*. DONE instrument: the
+generics research matrix's substitution kinds × constructs, run as programs.
+
+**8 — Owned collections: element lifetime in the runtime (ownership/runtime).** #6936, #6937, #7058,
+#7059, #7060, #6945, #6992, #6993, #6994, #6691, #6238, #6282, #6145, #6943 (imported), #2648/#2645
+(the stamp), #6516, #6514, #7216, #6672, #6685, #6760, #6995, #7052, #7053, #7043, #2327, #3393, #4332,
+#2762, #2676, #2672/#2685, #6184, #6448 (spec-question), #6467, #6365, #6488, #6186; the §28.2
+disposed-guard trio #7076, #7081, #7082 and #6314. Anchor: one `elem_disposer` stamp keyed on the element
+type at every mint site (literal, `new`, imported literal, `From`, snapshot), and one release path per
+runtime container in `bezel_runtime_collections.cpp`. Needs ruling #6358 (does `bz_dict_free` release
+string keys — a co-ownership contract question).
+
+**9 — Borrow provenance and the sink rule (ownership pass).** The `spec-tracking` soundness trackers of
+v0.320–v0.345 for §28.3 (provenance clauses, consume-site freeze, set-erasing positions,
+bare-type-parameter returns), §28.14, §9.7, §30.5: #5516, #5517, #5518, #5539, #5552, #5553, #5561,
+#5562, #5565, #5623, #5649, #5650, #5697, #5698, #5699, #5700, #5702, #5704, #5718, #5719, #5720,
+#5721, #5722, #5803, #5819, #5820, #5829, #5830, #5831, #5903, #5904, #5933; the measured holes #7107,
+#7097, #7240, #7092, #6886, #5973, #5974, #5845, #6136, #6616, #6708, #6737, #7087, #7075, #6848; B's
+`checkRead` members #3967, #4102, #4122, #4124, #3979, #3959, #3999, #4055, #4450; C's #4428, #3827,
+#3520, #3569; M's predicates #4301, #4277, #4274, #4291, #4360, #2615, #2636, #2705, #2690, #1933,
+#2577, #2569, #2551, #2570, #3632, #2671, #2740. **Depends on the soundness research's Stage 0**
+(`docs/research/soundness/README.md` on `origin/claude/sharp-wozniak-2ocblf`): the pin map that lists,
+per K/A clause, the matrix cells and corpus cases to re-judge is exactly this campaign's entry
+instrument, and its item 1 (a `kernel:` header on the 435 §28/§30.5 cases) is what makes "every
+rule-corpus case in scope" computable. Recommend the owner schedule Stage 0 as the next train's tooling
+item, before this campaign reaches ENTRY. The three research matrices are re-run (targeted) at this
+campaign's exit.
+
+**10 — Choice payload lifetime and layout.** #7316, #7357, #7305, #7047, #6738, #6170, #6233, #5912,
+#5992, #6014, #6168, #6167, #5453, #5153, #4804, #4684, #4634, #6164, #6165, #6084, #6232, #6478,
+#3905, #2220, #6034, #6043, #6638, #6640, #4816, #4883, #3939, #2571. Anchor: one payload-slot
+layout/lifetime authority (construction, copy, match binding, box) — the J family's classifier is done;
+this is its codegen twin.
+
+**11 — Async return slot and frame-carried locals.** #6097, #6098, #6099, #6051, #5949, #5311, #5280,
+#5276, #5410, #5982, #5981, #6194, #6211, #6245, #4883, #5015, #6173, #6446, #5831, #5699, #5704,
+#5719, #5722, #5657, #5900, #3403, #3466, #3928, #1422. Anchor: the §30.5 return-slot ownership and a
+frame field for every captured cell holder.
+
+**12 — Cross-module parity.** #6364 (anchor: ratchet `check_imported_symbol_reads` to zero), #7223,
+#7062, #7078, #6943, #6944, #6991, #6994, #7008, #6743, #6833, #6918, #6927, #6932, #6360, #6206,
+#6257, #6289, #6043, #5214, #3671, #3655, #3378, #3357, #3350, #2861, #2648, #2650, #2735, #2291,
+#1425, #2590, #7281 (spec). Every campaign 3–11 carries its imported twin as a grid column; this
+campaign is what is left after they run.
+
+**13 — Records, statics, contracts, exceptions** (#6204, #6206, #6497, #6498, #4645 §22.16 invariants;
+#6856–#6858; #7057; #2295, #2114 generic statics; #3966; #1882/#1878 throwing destructors; #2215
+§28.8.1). Re-cluster at entry; expect it to split into two small campaigns.
 
 ---
 
-## 2. The dependency graph (the heart)
+## 4. Rules that keep a campaign honest
 
-Edges are derived from `phase8-interactions.json` and cross-checked against the ten most-entangled proposal headers. Two edge classes:
-
-- **HARD** (→): X cannot be implemented before Y exists (Y's types/tokens appear in X's surface).
-- **SOFT** (⇢): X shares surface with Y; land together to avoid rework, but neither strictly blocks the other.
-
-Landed-spec-ruling prerequisites (v0.179–v0.185), runtime substrate work, and owner decisions are **not** proposal edges — they are annotated separately because they gate *scheduling*, not *ordering among proposals*.
-
-### 2a. Per-proposal edges
-
-| Proposal | HARD depends on | SOFT shares-surface-with | Blocks (downstream) |
-|---|---|---|---|
-| 0006 stream family | — *(v0.180 landed)* | 0018, 0029, 0001, 0019, 0021, 0032(naming) | **0011, 0021, 0019, 0001, 0002, 0029** |
-| 0008 integer toolkit | — | 0022, 0025, 0029, §2.19 INumber | **0029, 0025** |
-| 0009 base64/hex | — | 0027 (§3.5 numbering) | **0010** |
-| 0010 serialization | **0009** | 0012, 0019, 0021 | **0012, 0019** |
-| 0007 net substrate | — *(runtime+OpenSSL)* | 0002, 0011, 0033(§9) | **0001** → 0002 |
-| 0001 http client | **0007**, 0006(body) | 0002 (one API) | **0002** |
-| 0002 http server | **0001** | 0007, 0006, 0003, 0014, 0021 | 0021(as consumer) |
-| 0011 process | **0006** | 0007, 0013, 0014, 0033(§9) | — |
-| 0012 datetimeoffset | **0010** | 0016 (temporal cluster) | — |
-| 0019 json dom | **0010**, 0006(streaming) | 0021, 0004 (owned-tree) | — |
-| 0021 logging | **0006** (file sink) | 0010, 0014, 0002(consumer), 0003 | — |
-| 0025 bitarray | 0008 (soft/severable — PopCount) | 0024 (numbering) | — |
-| 0029 checksums | **0008** | 0006(stream forms), 0008(accumulator) | — |
-| 0032 parallel | **0003**-as-amended | 0006(naming), TaskScope | — |
-| 0033 ffi v2 | §32 amendment train *(landed v0.186)* | 0007/0011/0014(§9), 0034(symbol seam) | 0007/0011/0014 runtime routings |
-| 0034 module identity | evidence bugs + #1398 | 0033 (linking/symbol seam), #1365 | 0033(shared seam) |
-| 0003 locked | — *(#1391 static-init)* | 0032, 0002, 0021 | **0032** |
-| 0014 signal hooks | — *(runtime drain)* | 0011, 0002, 0021, 0033 | 0002/0021(soft) |
-| 0015 periodic timer | — *(#1378 closed)* | 0016, TaskScope | — |
-| 0016 monotonic time | — | 0012, 0015 (temporal) | — |
-| 0020 regex | — *(#1381 landed)* | 0022, 0027, 0030(Unicode tables) | — |
-| 0022 test framework | — *(v0.182+#1505)* | 0031, 0008, #1398(fork c) | — |
-| 0023 wheneach | — *(v0.179)* | TaskScope, 0032 (fan-in) | — |
-| 0031 verify/debug | — *(v0.182)* | 0022 (Assert/Verify) | — |
-| 0013, 0017, 0024, 0026, 0027, 0028, 0030, 0018 | — | numbering/adjacency only | — |
-
-Standalone leaves (no proposal edges in *or* out): **0013, 0016, 0017, 0024, 0026, 0027, 0028, 0030** — pure additive utilities, schedulable in any order.
-
-### 2b. Topological build order (layers)
-
-**Layer 0 — zero HARD proposal-dependency; can start immediately** (some gated on landed rulings / runtime / an owner sub-question, annotated):
-
-- **0006 stream family** ← *the hub; highest fan-out (blocks 5)*. Ruling landed.
-- **0008 integer toolkit** ← blocks 0029, 0025.
-- **0009 base64/hex** ← blocks 0010.
-- **0003 locked** ← blocks 0032 (needs #1391 static-init sync to be airtight).
-- 0013, 0016, 0017, 0024, 0026, 0027, 0028, 0030 — additive leaves.
-- 0018 async file — *deliberately independent of 0006* (interaction map: "none hard").
-- 0023 wheneach, 0031 verify, 0015 periodic timer — landed-ruling-gated only.
-- 0014 signal hooks — runtime drain thread.
-- 0007 net substrate — **gated on runtime event loop + OpenSSL owner ruling** (no proposal dep, but heavy substrate).
-- 0020 regex — engine-family owner ruling (XL).
-- 0022 test framework — Assert lib now; discovery fork owner Q.
-- 0033 ffi v2 — **gated on the six §32 amendments landing first** + Stage-B layout owner ruling.
-- 0034 module identity — spec-only; **gated on owner §2.8 rulings + #1398 build driver**.
-
-**Layer 1 — one HARD proposal edge:**
-
-- **0010 serialization** → 0009
-- **0011 process** → 0006
-- **0029 checksums** → 0008
-- **0025 bitarray** → 0008 (severable)
-- **0001 http client** → 0007 (+0006)
-- **0021 logging** → 0006
-- **0032 parallel** (Stage 0/1) → 0003
-
-**Layer 2 — two-deep:**
-
-- **0012 datetimeoffset** → 0010 → 0009
-- **0019 json dom** → 0010 → 0009 (+0006)
-- **0002 http server** → 0001 → 0007
-- 0032 Stage 1.5 / Stage 2 → owner ratifications (design-gated, not a build layer)
-
-**Layer 3 — consumer co-land:** 0021 is *consumed by* 0002 (its "first consumer"); 0021 itself is Layer 1 and buildable earlier, but the end-to-end logging-in-the-server scenario is not exercisable until 0002 (Layer 2) exists.
+1. **One root cause per lane.** A lane brief names one shared code path and the members that sit on it.
+   A lane that finds a second site stops, records the split in the campaign record, and files or
+   re-labels the members — it does not fix both. (September's I1 lane did this correctly and is the
+   model: *"one mechanism across four layers, each layer needs its own anchor"*.)
+2. **Fix the family, not the instance.** A `fix #N` commit in a campaign must say which other members
+   it closes or why it closes only one (`narrow #N` with the family named). A narrow fix is allowed only
+   when the anchor is not yet landed *and* the member is a measured memory-safety defect on a path users
+   reach; otherwise the instance waits for the anchor.
+3. **Measure the siblings before closing.** Before `fix #N` is picked, the producer's handback lists the
+   neighbouring shapes it ran (lane-contract 19a's matrix) *in the campaign's DONE grid's terms* — the
+   same cells, so the grid grows with every fix instead of a scratch matrix nobody keeps. A sibling the
+   matrix exposes is filed with the campaign label in the same handback, never left for a reviewer.
+4. **The "narrow fix produces a sibling" loop is broken at intake, not at fixing.** When a review or a
+   lane finds a new shape: if it is *inside the active campaign's scope*, it is a member — labelled,
+   added to the record, and the campaign is not DONE until it is closed or re-scoped; if it is *outside*,
+   it gets its campaign label and is not worked. Filing stays mandatory (lane-contract 18); working it
+   does not follow from filing it. The weekly signal that the loop is broken: §6's *in-scope siblings
+   filed* column falls while *closed* rises; the plan is failing if both rise together for two sessions,
+   and the exit review must say why (anchor incomplete, or family drawn too wide).
+5. **Stop and file a spec question when** the spec does not decide a cell of the DONE grid, two members
+   cite the same section for opposite verdicts, a fix would flip a banked `pass` corpus row, or a
+   closed-form rule (a table, a closed list) is missing the case. File with `spec-question`/
+   `spec-defect` + the campaign label; hold the hunk out; keep working the cells the spec does decide.
+   Never resolve it in code (`CLAUDE.md` rule 1); never let it stall the campaign — the member is
+   re-scoped *blocked on #R* and the DONE line still holds.
+6. **Never weaken, never relabel to hide.** A `parking-lot` or `campaign:` label never changes a
+   severity label; a member re-scoped *not a defect* quotes the spec sentence. The test rules of
+   `CLAUDE.md` apply unchanged.
+7. **Lane concurrency inside a campaign (asks the owner).** The standing rule allows one
+   disposal/ownership/async/iterator lane at a time. Inside an ownership-track campaign, after the anchor
+   has landed and been reviewed, this becomes *file-disjoint by declared hot-file sets*, with the
+   coordinator checking the sets against `claims.tsv` before dispatch. **Owner-approved 2026-10-27**
+   and written into `CLAUDE.md` *Pools*. Before the anchor lands, campaigns serialise.
+8. **Owner decisions are batched at campaign boundaries.** The first batch was asked and **ruled on
+   2026-10-27** (owner-approved; each ruling is posted on its issue):
+   - **#3493**: dispatch `await using` on the run-time object through a `DisposeAsync` dispatch-table
+     slot (option 2), covering #5653 and #3483 too; reclamation stays with #3515, then #3516.
+   - **#2924 / #7145**: every `internal:` degrade site becomes `Severity::Error`, with a ratchet holding
+     the warning-site count at 0; a newly failing program is a lowering gap filed to its campaign.
+   - **#4602**: bound checked-mode retention (keep the header word with the disposed flag, free the
+     payload; header-only for arrays, dictionaries and closure cells), then default to checked, add
+     `--unchecked-disposal`, keep `--checked-disposal` as a no-op. **Amended:** at an explicit
+     `Dispose()` where the K5 liveness proves no borrow of the value survives, reclaim in full at the
+     call (no retention); retain only where a borrow may survive or the analysis is unsure (spans,
+     `Shared<T>`, collection elements, unknown provenance). Also retain where a later release of the same binding
+     (scope end, overwrite, a repeated `Dispose()`) is reached on a *maybe-consumed* join and would
+     read the flag; where the explicitly-disposed post-state is static there, emit nothing. Check elision is a later campaign, after
+     the soundness model checks its premise.
+   - **#6358**: the dictionary records at construction that its keys are strings, and every free path
+     (`bz_dict_free`, `Remove`, `Clear`, overwrite) releases them; no per-site emission.
+   - **#1877 / #3379**: the 2026-07-24 refcounting ruling stands; split the umbrella into per-kind
+     sub-issues at campaign 4's entry, each fixed as refcount adoption for that kind.
+   - **Soundness research Stage 0** (the pinmap): a campaign-0 enabler, required before campaign 9's
+     entry check, not before.
+   - **`CLAUDE.md`**: the WIP/intake rule (§1.2, §1.4) and rule 7 above are now standing rules there.
+   Later campaigns add theirs at their entry check.
+9. **Progress is reported in one table (§6), updated at the end of every session**, in the same
+   commit that updates the campaign record. Each row's numbers are produced by the label query and the
+   corpus runner, not typed from memory; the session's handback to the owner is that table plus three
+   lines: what landed, what is blocked, what is asked.
 
 ---
 
-## 3. Critical path
+## 5. What happens to the old plan
 
-The longest, heaviest dependency chain — and the one gating the most downstream value — is the **networking stack**:
+*Done 2026-10-27, in the commit that installed this plan; the list is kept as the record of what moved.*
 
+- **Archive the July DAG as a dated paper**: `git mv docs/proposals/papers/master-plan.md
+  docs/proposals/papers/master-plan-2026-07.md`, add a one-line banner at its top ("Archived 2026-10-27;
+  the proposal DAG and status ledger are historical; the live plan is `master-plan.md`"), and install this
+  document as `docs/proposals/papers/master-plan.md`. The DAG's content is not lost: the proposal
+  status ground truth is `docs/proposals/README.md` (spec-change process §8), and the DAG's build layers
+  stay relevant for the feature programme, which this plan leaves to `implementation-roadmap-2026-07.md`
+  and the `features-proposals` label (99 trackers, not worked by campaigns).
+- **Cross-references to update** (every file that links `master-plan.md`, from `git grep`):
+  - `docs/proposals/README.md:263` — the *Working papers* row: retitle to the campaign plan, add a row
+    for `master-plan-2026-07.md` ("the 2026-07 proposal DAG, archived").
+  - `docs/proposals/papers/implementation-roadmap-2026-07.md:81` and `:134` — cite
+    `master-plan-2026-07.md §1·Δ·G(b)` (the parser/lexer lane and the RFC subtraction note refer to the
+    old ledger).
+  - `docs/proposals/papers/defect-campaign-2026-09.md:8` and `:791` — "sequenced by `master-plan.md`"
+    becomes `master-plan-2026-07.md`; add a banner at its top: "Superseded 2026-10-27 by
+    `master-plan.md`'s campaigns; family outcomes measured in `MEASUREMENTS.md` §6".
+  - `docs/proposals/0011-process.md:381`, `:388` — "master-plan §4b" → `master-plan-2026-07.md §4b`.
+  - `docs/proposals/0115-collection-literal-borrowing-span-family.md:187` — the charter C9 citation
+    `master-plan.md:141` → `master-plan-2026-07.md:141`.
+  - `docs/proposals/0103-shared-value-generics-study.md:190`,
+    `papers/proposals-currency-2026-08-11.md:3`, `papers/stdlib-readiness-2026-08-11.md:106` — same
+    rename.
+  These are docs-only edits to non-normative papers (no version bump, spec-change process §5 item 5's
+  guide-pass rule by analogy); they belong in the same commit as the archive move.
+- **`defect-campaign-2026-09.md` stays** as the record of the family method and of what its anchors
+  closed; its §2–§3 family tables are superseded by the campaign records this plan creates.
+- **`MEASUREMENTS.md` and `work/`** land beside the plan (`docs/proposals/papers/master-plan/`), so the
+  numbers in §0 and §3 can be re-run; campaign 0(e) moves the scripts under `scripts/tracker/` if the
+  coordinator wants them gate-adjacent.
+
+---
+
+## 6. Progress table
+
+*Updated at the end of every session, in the commit that updates the campaign record. Numbers come
+from the label query and the corpus runner. Status ∈ QUEUED · ENTRY · ACTIVE · EXIT · DONE · RE-SCOPED.*
+
+| # | campaign | track | status | entry date | members at entry (S/C/L/other) | closed | re-scoped | in-scope siblings filed / triaged | corpus fails in scope (entry → now) | grid cells wrong (entry → now) | blocked on | last session | next action |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | enablers | — | standing | — | — | — | — | — | — | — | — | — | #2924/#7145 errors; #4602 bounded retention, then default flip (ruled 2026-10-27) |
+| 1 | using-heads | ownership | QUEUED | — | 24 (7/3/5/9) | 0 | 0 | 0 / 0 | §28.10: 2, §28.12: 5 → — | — | — | — | ENTRY: re-measure 24, build the head × form grid |
+| 2 | builtin-call-admission | sema | QUEUED | — | 189 (33/53/0/103) | 0 | 0 | 0 / 0 | stdlib §2: 25, §3: 3, §9: 6 → — | — | — | — | ENTRY after 1's entry lane is dispatched (other track) |
+| 3 | enumerable-heads | ownership | QUEUED | — | 125 (43/9/27/46) | 0 | 0 | 0 / 0 | §29: 7, stdlib §5: 1 → — | — | campaign 1 | — | — |
+| 4 | producer-temporaries | ownership | QUEUED | — | 148 (14/7/98/29) | 0 | 0 | 0 / 0 | §28.3/§28.9 subset → — | — | campaign 3 | — | — |
+| 5 | nullable-carrier | sema | QUEUED | — | 54 (14/0/0/40) | 0 | 0 | 0 / 0 | §7: tbd | — | campaign 2 | — | — |
+| 6 | closures-cells | ownership | QUEUED | — | 111 (24/3/49/35) | 0 | 0 | 0 / 0 | §27.5/§28.14 subset | — | campaign 4 | — | — |
+| 7 | generic-boundaries | sema | QUEUED | — | 88 (17/13/3/55) | 0 | 0 | 0 / 0 | §14: tbd | generics matrix: 1 ambiguous | campaign 5 | — | — |
+| 8 | collection-elements | ownership/runtime | QUEUED | — | 77 (13/1/30/33) | 0 | 0 | 0 / 0 | stdlib §4: 22, §6: 23 | — | campaign 4 | — | — |
+| 9 | borrow-provenance | ownership | QUEUED | — | 96 (30/1/17/48) | 0 | 0 | 0 / 0 | §28.3: 9, §28.6: 2, §28.14: 4, §9.7: 6 | matrices: 0 open at v0.336 | soundness Stage 0; a train | — | — |
+| 10 | choice-payloads | ownership | QUEUED | — | 30 (10/6/10/4) | 0 | 0 | 0 / 0 | §35: tbd | — | campaign 4 | — | — |
+| 11 | async-frames | ownership | QUEUED | — | 32 (16/1/7/8) | 0 | 0 | 0 / 0 | §30: 7 | — | campaigns 1, 6 | — | — |
+| 12 | cross-module | sema | QUEUED | — | 25 (9/2/4/10) | 0 | 0 | 0 / 0 | §2.5/§2.8: tbd | `imported_symbol_reads` baseline 31 → 0 | campaign 7 | — | — |
+| 13 | records-statics-misc | mixed | QUEUED | — | 49 (9/0/1/39) | 0 | 0 | 0 / 0 | §8, §22: tbd | — | — | — | re-cluster at entry |
+
+**Session handback format** (three lines under the table): *Landed:* `fix #…` × n, members closed n,
+grid cells cleared n. *Blocked:* rulings awaited, with dates asked. *Asked:* new spec questions filed
+(numbers), labels added (count).
+
+---
+
+## Appendix A — the mechanical commands
+
+```bash
+# live member list of the active campaign (paginate explicitly)
+gh api 'repos/s8lap/bezel-lang/issues?state=open&labels=campaign:<slug>&per_page=100&page=1'
+# corpus fail rows in scope (sections as the campaign lists them)
+python3 tests/conformance/rules/runner.py build/bezelc --filter 28.12
+grep -E '^s28_(10|12)_' tests/conformance/rules/baseline.tsv | grep -c 'fail'
+# the campaign's grid under ASan (the entry lane names the filter)
+BEZEL_AOT_FORCE_SANITIZE=address scripts/agent_check.sh --area codegen <grid-suite>
+# re-measure the tracker (the plan's numbers)
+docs/proposals/papers/master-plan/work/fetch_issues.sh all && python3 -I docs/proposals/papers/master-plan/work/measure.py
+python3 -I docs/proposals/papers/master-plan/work/campaigns.py
+# triage a new issue
+gh issue edit <N> --add-label 'campaign:<slug>'      # or parking-lot
 ```
-runtime nonblocking event loop + OpenSSL TLS seam   (runtime + owner ruling)
-        │
-        ▼
-   0007 System.Net substrate  (L)
-        │
-        ▼
-   0001 Http client           (L)   ← also draws 0006 for body streaming
-        │
-        ▼
-   0002 Http server           (L)   ← also draws 0003, 0014, 0006
-        │
-        ▼
-   0021 logging as the server's first consumer  (end-to-end scenario)
-```
 
-Three Large proposals in strict series, sitting on top of the run's biggest unbuilt runtime substrate. Nothing shortens it: 0001 cannot start until 0007's socket/TLS types exist; 0002 cannot start until 0001's `HttpResponse`/`HttpHeaders`/error roots exist.
+## Appendix B — the initial labelling
 
-A **second, lighter critical chain** runs three-deep through serialization: `0009 → 0010 → {0012, 0019}`. It is all S/M work and fully parallel to networking.
-
-**What parallelizes off the critical path:** essentially the entire stdlib. While the networking chain is in flight, Layer 0 + Layer 1 of the two serialization/integer chains and all eight additive leaves proceed independently. Concretely, three teams can run at once with no contention:
-1. **Networking team**: runtime loop → 0007 → 0001 → 0002 (the critical path).
-2. **Foundations team**: 0006 (hub) + 0008 + 0009, then 0010/0011/0029/0025/0012/0019.
-3. **Utilities team**: 0013/0016/0017/0024/0026/0027/0028/0030/0018/0023/0031/0015/0014 — the leaf batch, 2–3 per docs graduation.
-
-The critical path length, not total work, is what bounds calendar time; keep 0007's runtime substrate staffed first.
-
----
-
-## 4. Owner-decision gates (the review queue projected onto the plan)
-
-Per spec-change-process §8, the README `Status` column **is** the owner-review queue. Projected onto scheduling, three tiers:
-
-### 4a. Hard gates — DISCHARGED (the 5 RFCs graduated 2026-07-12)
-
-These were **design changes** (§2 of the process) needing a proposal→accept→graduation. The owner accepted all five on 2026-07-12 and they graduated into the normative docs; the gate is closed. What remains is compiler catch-up (§1·0), not a decision:
-
-- **0035** event-member demotion → **graduated v0.187** (`7024955`); #1550 closed, #1647 closed by construction, impl #1727/#1728 (after #1646).
-- **0036** owning-inline-array demotion → **graduated v0.188** (`ebfa7e0`); #1551 closed, conformance staging #1737; **#1385** (whole-value reassignment) stays open, orthogonal. *(Since resolved: v0.260's A13 retirement adopted per-slot drop-on-overwrite, the codegen already shipped — §1·Δ·G(c); residual defects ride #3263.)*
-- **0037** remove object-initializer blocks → **graduated v0.188**; #1648 closed, impl #1735.
-- **0038** retire `ReadOnlyAsciiByteSpan` → **graduated v0.188**; #1649 closed, impl #1736; #971 item 3 retired.
-- **0039** one specificity rule for extensions → **graduated v0.188**; #1650 closed, impl re-scoped onto #1307.
-
-### 4b. Embedded sub-question gates — schedulable, but one owner decision gates *part* of the work
-
-The proposal is accepted/draftable and most of it can proceed, but a load-bearing sub-decision blocks a specific piece:
-
-- **0007** — **OpenSSL 3.x TLS-seam ruling**: the sockets/`Dns`/`TcpListener` half proceeds; `TlsClientStream` waits on the backend ruling.
-- **0011** — **kill-on-dispose**: the "disposal SIGKILLs+reaps" semantics is the load-bearing owner question; the rest of the surface is settled.
-- **0012** — **instant-order equality overriding §9.6 structural** (first stdlib record to do so) + the full-offset wire form.
-- **0020** — **engine family (RE2) + `Match` shape** (RFC): the whole proposal is gated on these two.
-- **0022** — **discovery fork** (the `test` modifier, RFC): the `Assert` library + `using var` fixtures ship under any fork; only the discovery endpoint waits.
-- **0032** — DISCHARGED: graduated v0.186. The §28.13 widening (q4) and 0003 amendments landed; Stage-2 design (q5–q9) is recorded design-now/ship-later (#1725). Implementation only now (#1722–#1726).
-- **0033** — DISCHARGED: graduated v0.186. Layout promise (q4) and the six §32 amendments landed as spec; the `env` instance-callback extension landed too. Implementation only now (#1705–#1720).
-- **0034** — DISCHARGED: graduated v0.188. The four §2.8 rulings landed as normative spec; the entry-point widening (OQ5) was ruled and recorded in §33.1. Implementation only now (#1729–#1734 + #1398).
-- **0010** — mechanism choice (Option A, compiler-provided conformances, recommended) awaits owner accept as part of graduating this draft.
-
-### 4c. Routine-accept gates — the plain drafts
-
-Every proposal in §1b is `draft` and therefore technically on the owner's accept queue, but these are low-risk stdlib additions the roadmap already treats as accepted-in-spirit. They need a routine accept, not a design decision: 0001, 0002, 0005, 0010, 0014, 0015, 0016, 0017, 0019, 0021, 0024, 0025, 0026, 0029, 0031.
-
-### 4d. Confirm-delegated
-
-The 15 `accepted (delegated)` proposals (§1a) carry "owner review pending" in their headers. They are blessed to schedule; the pending review is a confirmation, not a scheduling block.
-
----
-
-## 5. Reconciliation with the existing roadmap (deltas only)
-
-The roadmap's R0→R8 sequence and this DAG **agree** on the big structure: R0 soundness first; D1 foundations (0008/0009/0010/0006) before D2/D3 consumers; networking as R4 in the order 0007→0001→0002; 0032 as R5, FFI as R6, modules as R7, RFCs as R8 owner-gated. The roadmap already records 0012→0010, 0011→0006, 0029→0008, 0019→0006. Four deltas the dependency view surfaces:
-
-1. **0006 should start FIRST in R1, not last.** R1 lists the order `0008 → 0009 → 0010 → 0006`, but by the DAG **0006 has zero proposal-dependencies and the highest fan-out (blocks 0011, 0021, 0019, 0029-streams, 0001, 0002)**. Sequencing it last delays every consumer. 0006, 0008, 0009 are all Layer 0 and should run in parallel at the front of R1; only 0010 is genuinely sequenced (after 0009). **Recommendation: pull 0006 to the front of R1 (or a dedicated early lane).**
-
-2. **0032 → 0003 is a proposal-to-proposal edge the roadmap does not reflect.** R5 describes 0032's dependencies as internal stages + owner rulings q4–q9, but the interaction map records that **0032 hard-depends on `0003`-as-amended** (Locked/RwLocked joins the synchronized set 0032 Stage 1.5 widens; per #1404 comment). Moreover **those 0003 amendments are not yet landed in 0003's file** — a prerequisite sub-task R5 omits. **Recommendation: add "0003 (amended)" as an explicit R5 predecessor, and file/track the 0003-amendment sub-task.**
-
-3. **0018 async-file is deliberately independent of 0006.** R2 groups 0018 after the D1 streams and the hub narrative implies it needs 0006, but the interaction map is explicit: **"none hard (deliberately independent of 0006)"** — 0018 only *shares surface* via the optional StreamReader encoding path. It can land in Layer 0 alongside the leaves, before 0006. Minor, but it frees 0018 from the D1 gate.
-
-4. **0021 logging's dependencies span waves; its end-to-end scenario can't be exercised until R4.** R3 places 0021, but 0021's stated "first consumer" is **0002 (R4)**. 0021 is buildable at Layer 1 (needs only 0006), but the http-server-logging scenario that validates it is a Layer 2 / R4 event. **Recommendation: build 0021 in R3 as planned, but schedule its integration test with 0002 in R4.**
-
-No delta contradicts the roadmap's wave assignment; these refine intra-wave order and surface two under-recorded edges (0032→0003, and 0006's hub priority).
-
----
-
-## 6. This run's additions (2026-07-11)
-
-- **v0.184 (ownership-coherence) + v0.185 (stdlib + currency sweep) landed**, taking the docs from v0.183 → v0.185. These bumped the normative baseline the compiler must catch up to.
-- **~52 new `#16xx` tracking issues** were filed for the v0.184/v0.185 spec-ahead-of-impl deltas (per `phase8-scoreboard.json`; `total_open_issues` now 187). These are **R0 (soundness catch-up) work** and, like the earlier v0.179–v0.183 trackers, **precede all proposal implementation** — the compiler must implement the landed rulings before the stdlib waves are meaningful. (Residual older R0 opens are small: v0.179 {#1523, #1525, #1527, #1531}, v0.180 {#1538}, v0.181 {#1565}, v0.182 {#1571}, v0.183 none.)
-- **Three new RFCs added (owner-gated): 0037, 0038, 0039** — all simplification/deletion design-changes (remove object-initializer blocks; retire `ReadOnlyAsciiByteSpan`; prune extension-specificity rules 2–3). They join 0035/0036 as the R8 owner-review batch (§4a). Each carries a conformance-corpus checklist per spec-change-process §6 (the systematic blind spot the 0037–0039 batch surfaced).
-- **0035 was deepened** (owner-directed) to a two-line existing-mechanism floor + a sealed `ISharedEvent<out T>`/`SharedEventSource<T>` static pair engaging the live #1647 rule-5 alias gap.
-
-**Net effect on the plan:** the critical path's true head is not 0007 but **R0** — the ~52 #16xx items plus the residual v0.179–v0.182 opens. Until R0 is discharged the spec is normative and the compiler is behind; every proposal in Layers 0–3 assumes the R0 rulings are implemented. Sequence R0 first, then the three parallel teams of §3.
+`docs/proposals/papers/master-plan/work/out/campaign-members.tsv` assigns each of the 1613 open issues to exactly one
+slug (seeded members from the issue bodies, the rest by title rule; 78 `unassigned` → `parking-lot`,
+222 unclaimed `spec-tracking` → `spec-trains`, 99 → `features-proposals`). The first coordinator
+session applies it with `gh issue edit --add-label` in batches of 100 and records the count in §6. The
+assignment is a starting point; every campaign's entry check corrects it for its own members.

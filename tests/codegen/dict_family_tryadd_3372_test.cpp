@@ -52,13 +52,10 @@ int run(const std::string& prog) {
     return r.ran ? r.exitCode : -999;
 }
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Plain program wrapper — no resource class.
 std::string prog(const std::string& mainBody) {
@@ -188,7 +185,6 @@ BEZEL_TEST(dict_family_tryadd_3372, dictionary_string_value_plusone_only_on_inse
         "var a := d.TryAdd(1, \"alpha\"); "
         "var b := d.TryAdd(1, \"beta\"); "
         "return int(a) * 4 + int(not b) * 2 + int(d[1] = \"alpha\"); "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 7);
 }
@@ -244,7 +240,6 @@ BEZEL_TEST(dict_family_tryadd_3372, owning_dictionary_tryadd_both_edges_leak_fre
         "var b := d.TryAdd(1, new R(20)); "
         "var c := d.TryAdd(2, new R(30)); "
         "return int(a) * 8 + int(not b) * 4 + int(c) * 2 + int(d.Count = 2); "));
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 15);
 }

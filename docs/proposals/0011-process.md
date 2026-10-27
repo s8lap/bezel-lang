@@ -378,14 +378,14 @@ The seven §6 owner questions are resolved as follows; the §30.14 `Process`-not
 
 ## Delegated re-validation 2026-08-11 (stdlib-wave readiness; owner review in repo)
 
-The planning papers (master-plan §4b; the roadmap) still carry **kill-on-dispose (Q1)** as this proposal's load-bearing open gate. Under the owner's 2026-08-11 delegation ("work autonomously... don't ask me for confirmations or rulings"; review-in-repo) that gate is now **closed**: the seven 2026-07-07 rulings above were re-validated against the moved docs (v0.238–v0.247) and **stand unchanged — kill-on-dispose is CONFIRMED FINAL**. The premise check, so a reviewer can reconstruct it:
+The planning papers (`master-plan-2026-07.md` §4b; the roadmap) still carry **kill-on-dispose (Q1)** as this proposal's load-bearing open gate. Under the owner's 2026-08-11 delegation ("work autonomously... don't ask me for confirmations or rulings"; review-in-repo) that gate is now **closed**: the seven 2026-07-07 rulings above were re-validated against the moved docs (v0.238–v0.247) and **stand unchanged — kill-on-dispose is CONFIRMED FINAL**. The premise check, so a reviewer can reconstruct it:
 
 - **v0.238 (silent tracking, proposal 0077)** touched the *trivial-dispose ceremony* only and reaffirmed that no user class gains a runtime lifetime mechanism; `Process` declares a destructor (non-trivial by definition), so the kill+reap disposal semantics and the §28.4 bounded-destructor framing are untouched.
 - **v0.243 (Exception-derived throwables, proposal 0080)** requires every throw operand to derive from `Exception`; the §6 taxonomy roots under `IOException` ⊂ `Exception` and needs no change.
 - **v0.246 (transfer-marker unification, proposal 0090)** respelled the caller-side markers in this document (2026-08-11 currency sweep); declaration positions (`Take*(): owned Stream`, `Start(...): owned Process`) keep `owned` per the declaration/action split. No consume position in this design is among v0.246's changed forms beyond the already-applied respells.
 - The alternatives table is unmoved: detach-on-dispose still orphans a live OS process (the §28 leak class), and Rust's drop-and-leave-running remains the recorded counter-example, not a precedent.
 
-Consequence: the 0011 implementation lane proceeds on the recorded surface with no open design question; the master-plan §4b row for 0011 should read *discharged* (README/planning-paper updates are the coordinator's).
+Consequence: the 0011 implementation lane proceeds on the recorded surface with no open design question; the `master-plan-2026-07.md` §4b row for 0011 should read *discharged* (README/planning-paper updates are the coordinator's).
 
 ## 7. Relationship to existing work
 

@@ -501,30 +501,43 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         e->name = current_.text;
         advance();
         // per §14.1 / §22.12 (issue #520): optional explicit type arguments
-        // on an identifier in receiver position, e.g. `Registry<int>.Make(7)`.
-        // Only parsed when the disambiguating scan confirms `< TypeArgList > .`
-        // (dot follows the closing `>`) — the static-member-access receiver
-        // form.  Relational chains (`a < b > c`) have a non-dot token after
-        // the `>`, so the scan returns false and leaves `<` for the binary
-        // expression parser to handle as a relational operator.
-        if (isPunctuator("<") && tokensLookLikeReceiverTypeArgs()) {
-            advance(); // past `<`
-            e->typeArgs.push_back(parseType());
-            while (isPunctuator(",")) {
-                advance(); // past `,`
-                // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
-                // before the closing angle — consumeClosingAngle below
-                // handles `>` / `>>` / `>=` / `>>=`.
-                if (current_.kind == TokenKind::Punctuator &&
-                    !current_.text.empty() &&
-                    current_.text.front() == '>') {
-                    break;
-                }
+        // on an identifier in expression position — the static-member-access
+        // receiver form (`Registry<int>.Make(7)`) and the explicit-type-
+        // argument callee form (`Id<string>("hello")`).  A.7 gives the
+        // identifier its `GenericArgs?` slot on the PrimaryAtom itself
+        // (`PrimaryAtom ::= … | Identifier GenericArgs?`).
+        //
+        // fix #7163 (§22.12, v0.343): the commit is decided by ONE scan
+        // (tokensLookLikeGenericArgs) that applies §22.12's successor set
+        // verbatim — all eight successors, `?.` and `[` among them — so the
+        // set cannot drift per site again.  A relational chain (`a < b > c`)
+        // keeps its relational parse: a closing `>` followed by anything
+        // outside the set leaves the `<` to the relational-operator parser.
+        if (isPunctuator("<")) {
+            const GenericArgsCloser closer = tokensLookLikeGenericArgs();
+            if (closer != GenericArgsCloser::None) {
+                advance(); // past `<`
                 e->typeArgs.push_back(parseType());
-            }
-            if (!consumeClosingAngle()) {
-                diagnostics_.report(Severity::Error, current_.location,
-                    "expected '>' to close receiver type-argument list");
+                while (isPunctuator(",")) {
+                    advance(); // past `,`
+                    // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
+                    // before the closing angle — consumeClosingAngle below
+                    // handles `>` / `>>` / `>=` / `>>=`.
+                    if (current_.kind == TokenKind::Punctuator &&
+                        !current_.text.empty() &&
+                        current_.text.front() == '>') {
+                        break;
+                    }
+                    e->typeArgs.push_back(parseType());
+                }
+                if (!consumeClosingAngle()) {
+                    diagnostics_.report(Severity::Error, current_.location,
+                        closer == GenericArgsCloser::Dot
+                            ? "expected '>' to close receiver type-argument "
+                              "list"
+                            : "expected '>' to close method type-argument "
+                              "list");
+                }
             }
         }
         return std::unique_ptr<ast::Expr>(e.release());
@@ -968,14 +981,36 @@ bool Parser::checkRetiredParenLambda() {
     return true;
 }
 
-// per §14.1 (issue #509): disambiguate `Method<T>(…)` (explicit method type
-// args) from `expr < T > (expr)` (relational chain).  peekAt(0) is the `<`
-// token after the member identifier has been consumed.
+// per §22.12 (v0.343) — THE generics-vs-less-than resolution, in ONE place.
+//
+// "After an identifier in expression position, a `<` opens generic arguments
+// **iff** scanning forward finds a balanced `<…>` group (respecting nesting)
+// whose closing `>` is immediately followed by a token that can continue a
+// primary expression — `.`, `?.`, `(`, or `[` — or by a token that cannot
+// begin an operand — `)`, `]`, `,`, or `;` (a relational `>` always has a
+// right operand, so no relational reading is lost; this is how a method
+// reference at explicit type arguments, `xs.Select(Util.Id<int>)` or
+// `var k := Util.Keep<Pair>;`, parses as one, §27.6).  Otherwise the `<` is
+// the relational operator."
+//
+// fix #7163: that successor set is spelled out HERE, once, and ONE scan
+// (tokensLookLikeGenericArgs) applies it.  It used to be split across two
+// helpers that each covered a different SUBSET of the eight successors — the
+// method scan admitted `(`, `)`, `]`, `,`, `;` and the receiver scan admitted
+// only `.` — so `?.` and `[` were honoured NOWHERE, and the set could drift
+// per site again.  Every commit point (A.7's `PrimaryAtom` / `PrimarySuffix`
+// `GenericArgs?` slots) consults this one scan.
+//
+// The relational reading is not lost: a closing `>` followed by anything
+// outside the set leaves the `<` to the relational-operator parser, and the
+// spec's own example — `f(a<b, c>(d))` parses as a generic call, not as two
+// relational arguments — shows the generic reading winning for the `(`
+// successor; to express the relational reading there, parenthesize.
 //
 // Strategy: scan forward counting angle-bracket depth.  A token sequence that
-// matches `< (TypeArgToken | ",")* > (` is a type-arg list; anything else
-// (EOF, statement-terminator keyword, relational-expression operand like a
-// number or operator) is a relational `<`.
+// matches `< (TypeArgToken | ",")* >` followed by one of §22.12's successors
+// is a type-arg list; anything else (EOF, statement-terminator keyword,
+// relational-expression operand like a number or operator) is a relational `<`.
 //
 // "TypeArgToken" is conservative: identifier, primitive-type keyword, `?`
 // (nullable suffix), `[` / `]` (inline-array prefix), `<` / `>` (nested
@@ -993,18 +1028,16 @@ bool Parser::checkRetiredParenLambda() {
 // keywords cannot appear as expression operands, so admitting them cannot
 // turn a relational `<` into a false type-arg reading; an ill-formed
 // combination still reaches parseType, the authority.
-// per §27.6 (v0.338; proposal 0164) / §22.12: a generic method's type-argument
-// list is followed by `(` at a call, and by `)`, `]`, `,` or `;` where the
-// name is a method REFERENCE (`xs.Select(Util.Id<int>)`, `var f := Util.Id<int>;`).
-// None of the four can follow a `>` that closes a relational chain (the chain
-// would lack its right operand), so the scan stays unambiguous.
-static bool methodTypeArgsCloserFollows(const Token& after) {
-    if (after.kind != TokenKind::Punctuator) return false;
-    return after.text == "(" || after.text == ")" || after.text == "]" ||
-           after.text == "," || after.text == ";";
-}
+//
+// The IntLiteral of an inline-array type's size (`[2]T`, `[2 owned]U`) is a
+// valid token inside a type-arg list.  FloatLiteral, CharLiteral and
+// StringLiteral are rejected — they cannot appear in any valid type
+// argument.
+//
+// The successor set itself is `genericArgsCloserFollows` (Parser_impl.hpp) —
+// §22.12's eight successors, spelled out once.
 
-bool Parser::tokensLookLikeMethodTypeArgs() {
+GenericArgsCloser Parser::tokensLookLikeGenericArgs() {
     // peekAt(0) must be `<`.
     std::size_t k = 1;                // start scanning after the opening `<`
     std::size_t depth = 1;            // nesting level of `<` / `>`
@@ -1012,36 +1045,40 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
     static const std::size_t kLimit = 64; // prevent scanning unbounded input
     for (std::size_t guard = 0; guard < kLimit; ++guard, ++k) {
         const Token& t = peekAt(k);
-        if (t.kind == TokenKind::EndOfFile) return false;
+        if (t.kind == TokenKind::EndOfFile) return GenericArgsCloser::None;
         if (t.kind == TokenKind::Punctuator) {
             if (t.text == "<") { ++depth; continue; }
-            if (t.text == ">>" ) {
+            if (t.text == ">>") {
                 // Lexer emits ">>" as one token; consuming two `>`s.
                 if (depth <= 2) {
                     // The outer `>` closes this generic-arg list and the
-                    // inner `>` would be left to the caller.  Treat this
-                    // as closing: after the `>>`, we need `(`.
-                    if (parenDepth != 0) return false; // `>>` inside function `(…)`
+                    // inner `>` closes the nested one.
+                    if (parenDepth != 0) return GenericArgsCloser::None; // `>>` inside function `(…)`
                     const Token& after = peekAt(k + 1);
                     if (depth == 2) {
-                        // both `>` consumed here; we need `(` next, or a
-                        // reference's list terminator (§27.6, v0.338).
-                        return methodTypeArgsCloserFollows(after);
+                        // both `>`s consumed here; the successor is next.
+                        if (!genericArgsCloserFollows(after))
+                            return GenericArgsCloser::None;
+                        return after.text == "." ? GenericArgsCloser::Dot
+                                                 : GenericArgsCloser::Other;
                     }
                     // depth == 1: `>>` closes this list twice (malformed),
                     // bail out.
-                    return false;
+                    return GenericArgsCloser::None;
                 }
                 depth -= 2; continue;
             }
             if (t.text == ">") {
-                if (parenDepth != 0) return false; // `>` inside function-type `(…)`
+                if (parenDepth != 0) return GenericArgsCloser::None; // `>` inside function-type `(…)`
                 --depth;
                 if (depth == 0) {
-                    // The closing `>` of the arg list.  Confirm `(` follows,
-                    // or a method reference's list terminator (§27.6).
+                    // The closing `>` of the arg list.  §22.12's successor
+                    // set decides whether the generic reading commits.
                     const Token& after = peekAt(k + 1);
-                    return methodTypeArgsCloserFollows(after);
+                    if (!genericArgsCloserFollows(after))
+                        return GenericArgsCloser::None;
+                    return after.text == "." ? GenericArgsCloser::Dot
+                                             : GenericArgsCloser::Other;
                 }
                 continue;
             }
@@ -1050,7 +1087,7 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
             // scan stays sound (an unmatched `)` cannot be a type-arg list).
             if (t.text == "(") { ++parenDepth; continue; }
             if (t.text == ")") {
-                if (parenDepth == 0) return false;
+                if (parenDepth == 0) return GenericArgsCloser::None;
                 --parenDepth; continue;
             }
             // `->` separates a function type's parameters from its return;
@@ -1061,7 +1098,7 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
                 t.text == "[" || t.text == "]") continue;
             // Any other punctuator (e.g. `+`, `-`, `*`, `=`,
             // `..`) cannot appear inside a type arg; bail out.
-            return false;
+            return GenericArgsCloser::None;
         }
         if (t.kind == TokenKind::Keyword) {
             // Primitive-type keywords (int, string, bool, …) are valid type
@@ -1074,93 +1111,20 @@ bool Parser::tokensLookLikeMethodTypeArgs() {
             if (isPrimitiveTypeKeyword(t.text)) continue;
             if (t.text == "owned" || t.text == "ref" || t.text == "out" ||
                 t.text == "env") continue;
-            return false;
+            return GenericArgsCloser::None;
         }
         if (t.kind == TokenKind::Identifier) continue; // type name component
         // IntLiteral (the size in an inline-array type: `[2]T`, `[2 owned]U`)
-        // is valid in a type-arg list; the `> ... (` check below correctly
+        // is valid in a type-arg list; the successor check above correctly
         // distinguishes a generic call from a relational chain.  FloatLiteral,
         // CharLiteral and StringLiteral are rejected — they cannot appear in
         // any valid type argument.
         if (t.kind == TokenKind::IntLiteral) continue;
         if (t.kind == TokenKind::FloatLiteral || t.kind == TokenKind::CharLiteral ||
             t.kind == TokenKind::StringLiteral)
-            return false;
+            return GenericArgsCloser::None;
     }
-    return false; // exceeded scan limit
-}
-
-// per §14.1 / §22.12 (issue #520): disambiguate `GenericClass<T>.Member`
-// (explicit receiver type args, static access) from a relational `<` chain.
-// peekAt(0) is the `<` token after the identifier has been consumed.
-//
-// Identical strategy to tokensLookLikeMethodTypeArgs() except that the
-// closing `>` must be followed by `.` (dot) — the start of the `.Member`
-// access — rather than `(` (an argument list).  This allows:
-//   `Registry<int>.Make(7)`   → receiver type-arg list (> followed by .)
-// while still leaving:
-//   `a < b > 0`               → relational chain (> followed by numeric/ident)
-//   `Wrapper.Identity<int>(v)` → method type-arg list (handled by #509)
-// both parsed correctly.
-bool Parser::tokensLookLikeReceiverTypeArgs() {
-    std::size_t k = 1;                // start scanning after the opening `<`
-    std::size_t depth = 1;
-    std::size_t parenDepth = 0;       // function-type parameter-list nesting (#2191)
-    static const std::size_t kLimit = 64;
-    for (std::size_t guard = 0; guard < kLimit; ++guard, ++k) {
-        const Token& t = peekAt(k);
-        if (t.kind == TokenKind::EndOfFile) return false;
-        if (t.kind == TokenKind::Punctuator) {
-            if (t.text == "<") { ++depth; continue; }
-            if (t.text == ">>") {
-                if (depth <= 2) {
-                    if (parenDepth != 0) return false; // `>>` inside function `(…)`
-                    const Token& after = peekAt(k + 1);
-                    if (depth == 2) {
-                        return after.kind == TokenKind::Punctuator &&
-                               after.text == ".";
-                    }
-                    return false;
-                }
-                depth -= 2; continue;
-            }
-            if (t.text == ">") {
-                if (parenDepth != 0) return false; // `>` inside function-type `(…)`
-                --depth;
-                if (depth == 0) {
-                    // The closing `>` of the arg list.  Confirm `.` follows —
-                    // a static-member access, not a call-argument list.
-                    const Token& after = peekAt(k + 1);
-                    return after.kind == TokenKind::Punctuator &&
-                           after.text == ".";
-                }
-                continue;
-            }
-            // §A.5 FunctionType (and unit `()`) as a GenericArg (#2191):
-            // track the parameter-list nesting so the scan stays sound.
-            if (t.text == "(") { ++parenDepth; continue; }
-            if (t.text == ")") {
-                if (parenDepth == 0) return false;
-                --parenDepth; continue;
-            }
-            if (t.text == "->" || t.text == ":") continue;
-            if (t.text == "," || t.text == "?" ||
-                t.text == "[" || t.text == "]") continue;
-            return false;
-        }
-        if (t.kind == TokenKind::Keyword) {
-            if (isPrimitiveTypeKeyword(t.text)) continue;
-            // §A.5 FuncParamMods (`owned` / `ref` / `out`) inside a
-            // function-type GenericArg (#2191). `env` is also valid here
-            // (it appears in function-type param lists inside extern decls).
-            if (t.text == "owned" || t.text == "ref" || t.text == "out" ||
-                t.text == "env") continue;
-            return false;
-        }
-        if (t.kind == TokenKind::Identifier) continue;
-        return false;
-    }
-    return false; // exceeded scan limit
+    return GenericArgsCloser::None; // exceeded scan limit
 }
 
 ast::Param Parser::parseLambdaParam() {
@@ -2125,33 +2089,43 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
     for (;;) {
         // per §14.1 (issue #561): explicit method-level type arguments on a bare
         // identifier call — `Id<string>("hello")` — where the identifier is in
-        // callee position (no leading dot). The disambiguating scan confirms
-        // `< TypeArgList > (` so this is a generic call, not a relational chain.
-        // Store the type args on the IdentifierExpr so sema and codegen can
-        // substitute T→concrete when typing and emitting the call.
-        if (isPunctuator("<") && tokensLookLikeMethodTypeArgs()) {
+        // callee position (no leading dot). Store the type args on the
+        // IdentifierExpr so sema and codegen can substitute T→concrete when
+        // typing and emitting the call.
+        //
+        // fix #7163 (§22.12, v0.343): the disambiguating scan is the ONE scan
+        // (tokensLookLikeGenericArgs), applying §22.12's successor set
+        // verbatim.  A plain identifier's list was already committed at the
+        // PrimaryAtom site above (A.7's `Identifier GenericArgs?` slot), so
+        // the commit here covers the identifier heads that site does not
+        // reach — the keyword spellings `this` / `base` / a primitive type
+        // name, which the parser also carries as an IdentifierExpr.
+        if (isPunctuator("<")) {
             if (auto* idHead =
                     dynamic_cast<ast::IdentifierExpr*>(head.get())) {
                 if (idHead->typeArgs.empty()) {
-                    advance(); // past `<`
-                    idHead->typeArgs.push_back(parseType());
-                    while (isPunctuator(",")) {
-                        advance(); // past `,`
-                        // per §1.6 / proposal 0059 (v0.214): optional
-                        // trailing `,` before the closing angle.
-                        if (current_.kind == TokenKind::Punctuator &&
-                            !current_.text.empty() &&
-                            current_.text.front() == '>') {
-                            break;
-                        }
+                    const GenericArgsCloser closer = tokensLookLikeGenericArgs();
+                    if (closer != GenericArgsCloser::None) {
+                        advance(); // past `<`
                         idHead->typeArgs.push_back(parseType());
+                        while (isPunctuator(",")) {
+                            advance(); // past `,`
+                            // per §1.6 / proposal 0059 (v0.214): optional
+                            // trailing `,` before the closing angle.
+                            if (current_.kind == TokenKind::Punctuator &&
+                                !current_.text.empty() &&
+                                current_.text.front() == '>') {
+                                break;
+                            }
+                            idHead->typeArgs.push_back(parseType());
+                        }
+                        if (!consumeClosingAngle()) {
+                            diagnostics_.report(
+                                Severity::Error, current_.location,
+                                "expected '>' to close method type-argument list");
+                        }
+                        continue; // loop back — the `(` call-suffix follows
                     }
-                    if (!consumeClosingAngle()) {
-                        diagnostics_.report(
-                            Severity::Error, current_.location,
-                            "expected '>' to close method type-argument list");
-                    }
-                    continue; // loop back — the `(` call-suffix follows
                 }
             }
         }
@@ -2170,9 +2144,39 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             // per §14.1 (issue #509): optional explicit method-level type
             // arguments `<T1, T2, ...>` following the member name.  Only
             // parsed when the disambiguating scan confirms the `<` is a
-            // generic-arg list (closes with `>` followed by `(`), not a
-            // relational `<` operator.
-            if (isPunctuator("<") && tokensLookLikeMethodTypeArgs()) {
+            // generic-arg list, not a relational `<` operator.
+            //
+            // fix #7135 (§11.6 / §22.12 / A.7, v0.343): a closing `>` followed
+            // by a `.` at a DOTTED segment denotes the NESTED TYPE's own type
+            // arguments — §11.6's worked example `Tree<int>.Node<int>.Create()`,
+            // whose `Node<int>` is a nested type reached through the chain head
+            // that supplies the enclosing type's arguments.  A.7's grammar
+            // gives the dotted segment a `GenericArgs?` slot
+            // (`PrimarySuffix ::= "." Identifier GenericArgs?`) and points it
+            // at §22.12's resolution.
+            //
+            // fix #7163 (§22.12, v0.343): the scan is the ONE scan
+            // (tokensLookLikeGenericArgs), applying §22.12's successor set
+            // verbatim — all eight successors, `?.` and `[` among them, so
+            // the set cannot drift per site again.
+            //
+            // The relational reading is untouched: a `<` whose closing `>` is
+            // followed by anything outside the set stays the relational
+            // operator, so `a.b < c`, `a.b < c > d` and `a.b < c > .d` keep
+            // their relational parse.
+            bool haveTypeArgs = false;
+            bool nestedTypeArgs = false;
+            if (isPunctuator("<")) {
+                const GenericArgsCloser closer = tokensLookLikeGenericArgs();
+                if (closer != GenericArgsCloser::None) {
+                    haveTypeArgs = true;
+                    // The nested-type form: the closing `>` is followed by a
+                    // `.`, so the type arguments belong to the nested type
+                    // this segment names (§11.6's `Tree<int>.Node<int>`).
+                    nestedTypeArgs = (closer == GenericArgsCloser::Dot);
+                }
+            }
+            if (haveTypeArgs) {
                 advance(); // past `<`
                 access->typeArgs.push_back(parseType());
                 while (isPunctuator(",")) {
@@ -2188,7 +2192,11 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                 }
                 if (!consumeClosingAngle()) {
                     diagnostics_.report(Severity::Error, current_.location,
-                        "expected '>' to close method type-argument list");
+                        nestedTypeArgs
+                            ? "expected '>' to close nested type-argument "
+                              "list"
+                            : "expected '>' to close method type-argument "
+                              "list");
                 }
             }
             access->span.begin = suffixBegin;
@@ -2213,27 +2221,33 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
             // per §14.1/§22.12 (issue #1278): optional explicit method-level
             // type arguments `<T1, T2, ...>` following the member name on a
             // null-conditional access — `obj?.Method<T>(...)`. Mirrors the
-            // `.` branch above verbatim: only parsed when the disambiguating
-            // scan confirms the `<` closes with `>` followed by `(`, not a
-            // relational `<` operator (§22.12's generics-vs-less-than rule,
-            // which the grammar states applies identically to `?.`).
-            if (isPunctuator("<") && tokensLookLikeMethodTypeArgs()) {
-                advance(); // past `<`
-                a->typeArgs.push_back(parseType());
-                while (isPunctuator(",")) {
-                    advance(); // past `,`
-                    // per §1.6 / proposal 0059 (v0.214): optional trailing
-                    // `,` before the closing angle.
-                    if (current_.kind == TokenKind::Punctuator &&
-                        !current_.text.empty() &&
-                        current_.text.front() == '>') {
-                        break;
-                    }
+            // `.` branch above verbatim, and consults the same ONE scan
+            // (fix #7163, §22.12, v0.343): the grammar states §22.12's
+            // generics-vs-less-than rule applies identically to `?.`.
+            if (isPunctuator("<")) {
+                const GenericArgsCloser closer = tokensLookLikeGenericArgs();
+                if (closer != GenericArgsCloser::None) {
+                    advance(); // past `<`
                     a->typeArgs.push_back(parseType());
-                }
-                if (!consumeClosingAngle()) {
-                    diagnostics_.report(Severity::Error, current_.location,
-                        "expected '>' to close method type-argument list");
+                    while (isPunctuator(",")) {
+                        advance(); // past `,`
+                        // per §1.6 / proposal 0059 (v0.214): optional trailing
+                        // `,` before the closing angle.
+                        if (current_.kind == TokenKind::Punctuator &&
+                            !current_.text.empty() &&
+                            current_.text.front() == '>') {
+                            break;
+                        }
+                        a->typeArgs.push_back(parseType());
+                    }
+                    if (!consumeClosingAngle()) {
+                        diagnostics_.report(Severity::Error, current_.location,
+                            closer == GenericArgsCloser::Dot
+                                ? "expected '>' to close nested type-argument "
+                                  "list"
+                                : "expected '>' to close method type-argument "
+                                  "list");
+                    }
                 }
             }
             a->span.begin = suffixBegin;

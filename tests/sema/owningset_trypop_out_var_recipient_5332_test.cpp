@@ -18,7 +18,7 @@
 // assignment (soundness hole), so `var s: R := b11;` was waved through for
 // the wrong reason.
 //
-// #5312 (narrowing): stdlib §1 (v0.315), line 47 — "Every shape-(a) signature
+// #5312 (narrowing): stdlib §1 (v0.315) — "Every shape-(a) signature
 // in this document carries the `when true` nullability postcondition on its
 // out parameter (language spec §22.4) ... so in a region where the call is
 // known `true`, the recipient is narrowed non-null and no `!` is needed; the

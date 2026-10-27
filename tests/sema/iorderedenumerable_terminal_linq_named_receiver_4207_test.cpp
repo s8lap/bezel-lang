@@ -8,7 +8,7 @@
 // genericArgs[0], same as lazy sentinel) and add IOrderedEnumerable to
 // lowerToLazyEnumerator/tryLowerLazyLinqCall in LlvmBackend_Calls3.cpp.
 //
-// spec references: stdlib §5 (IOrderedEnumerable<T>: IEnumerable<T>, line 3592)
+// spec references: stdlib §5 (IOrderedEnumerable<T>: IEnumerable<T>)
 
 #include <string>
 

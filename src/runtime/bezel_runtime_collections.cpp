@@ -577,6 +577,26 @@ void bz_array_free_dynamic(void* arrp) {
     bz_array_free(arrp, ((bz_array_t*)arrp)->elem_disposer);
 }
 
+// fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL twin of
+// bz_array_free_dynamic — same "consult the header's recorded disposer" rule
+// (the static head is erased, so the backing may be a borrowing Array<T> or an
+// owning OwningArray<T>), but the block is QUARANTINED rather than reclaimed:
+// the data buffer is freed, the header survives with disposed=1, and the
+// header's disposed flag stays readable for the §28.2 backstop.
+//
+// WHY THE QUARANTINE. §28.3's store-rule residual admits a call that stores
+// a borrow of a plain (non-`owned`) argument into a field, and the temporary
+// is NOT lifetime-extended: it is disposed at its boundary while the stored
+// borrow may still be read afterwards. In checked mode the read must raise
+// DisposedAccessException (§28.2 K4.1), which requires the disposed flag to
+// still be readable — so the release must not reclaim the block. Unchecked
+// mode keeps the immediate free: use-after-dispose is undefined there
+// (§28.2's checked/unchecked split), so the release reclaims as before.
+void bz_array_mark_disposed_dynamic(void* arrp) {
+    if (!arrp) return;
+    bz_array_mark_disposed(arrp, ((bz_array_t*)arrp)->elem_disposer);
+}
+
 // #6439 (§28.6 / §28.11, v0.338): the OWNING enumerable WRAP's slot-1 free, for
 // the BORROWING `IEnumerable<T>` head only. Same header-consulting rule as
 // `bz_array_free_dynamic`, with `fallback` standing in for a header the
@@ -3017,7 +3037,15 @@ static bz_lazy_t* bz_lazy_new(int32_t kind, int64_t esz) {
     e->kind = kind;
     e->esz = esz;
     e->idx = 0;
-    if (esz > 0) e->cur = malloc((size_t)esz);
+    // fix #7160 (stdlib §5, v0.343): the element slot is ZEROED, not merely
+    // allocated.  A projection whose result type is narrower than the
+    // element type the consumer reads (the bare method-reference spelling,
+    // where sema still types the result as the source element type) writes
+    // only its own width into the slot, and the consumer then reads the
+    // remaining bytes — with a plain malloc those bytes are uninitialized
+    // heap.  The slot is reused for every element and the producer always
+    // writes the same width, so zeroing it once keeps the tail deterministic.
+    if (esz > 0) e->cur = calloc(1, (size_t)esz);
     return e;
 }
 
@@ -3902,8 +3930,80 @@ static int32_t bz_lazy_movenext(bz_lazy_t* e) {
 // the pipeline still holds its own, and dispose then brings each Key 1 → 2 → 1,
 // with `bz_array_free` / `bz_array_mark_disposed` completing 1 → 0 at the
 // snapshot's end of life.
+//
+// fix #7167 / §9.6 (v0.343) — THE DRAIN'S ELEMENT-WIDTH CONTRACT.
+//
+// The pipeline's current element lives in `e->cur`, a scratch buffer the
+// runtime allocated with EXACTLY `e->esz` bytes (bz_lazy_new: `if (esz > 0)
+// e->cur = malloc((size_t)esz)`), and every bz_lazy_movenext arm writes at
+// most `e->esz` bytes into it. The drain, on the other hand, copies `esz`
+// bytes out of it — `esz` being the WIDTH THE CALLER ASKED FOR.
+//
+// When the caller asks for a WIDER element than the pipeline produces, that
+// copy runs off the end of the element slot: an out-of-bounds READ.
+// MEASURED on this tree (the #7167 repro, both shapes, `bezelc
+// --sanitize=address`):
+//
+//   string.Join(",", Array<int>)  →  "ERROR: AddressSanitizer:
+//     heap-buffer-overflow ... READ of size 8 ... in memcpy
+//     <- bz_array_add (collections.cpp:327)
+//     <- bz_lazy_drain_to_array (collections.cpp:3932)"
+//     "0 bytes after 4-byte region", allocated by bz_lazy_new:3040 (the
+//     4-byte `e->cur` of an `int` element);
+//
+//   string.Join(",", "ab")        →  the same report, the 4-byte region being
+//     the `char` element slot of a string source (bz_lazy_from_owned_array).
+//
+// Both are the SAME defect at the runtime layer: the drain trusts the
+// caller's width over the width the pipeline actually holds. The caller's
+// width is the wrong one in both repros — `string.Join`'s codegen arm
+// hard-codes `esz = 8` (the width of a `string` pointer) whatever the items
+// sequence's element type is — but the runtime's copy width must never depend
+// on that: the copy is bounded by the bytes the element slot holds.
+//
+// ⇒ THE FIX: the drain's copy width is bounded by the pipeline's own width.
+// A caller that asks for a wider element than the pipeline produces gets NO
+// snapshot of those elements — the drain refuses the materialization and
+// returns an EMPTY snapshot, so no consumer can read a slot that was never
+// written, and the out-of-bounds read is IMPOSSIBLE.
+//
+// WHY AN EMPTY SNAPSHOT AND NOT A TRUNCATED ONE. Copying `e->esz` bytes into
+// an `esz`-wide slot would leave the remaining bytes uninitialized, and the
+// consumer (the `string.Join` arm) reads each slot as a `string` pointer —
+// so a truncated slot is a wild pointer, i.e. the crash moves rather than
+// disappears. An empty snapshot leaves the consumer with nothing to read.
+//
+// DISPOSE BEFORE RETURNING. The refusal path never drains the pipeline, so
+// the pipeline's own disposal (its owned source array, its inline-lambda
+// closures) must run here or it leaks. `bz_lazy_dispose` is the same call the
+// normal path makes below, and it runs the pipeline's release exactly once.
+//
+// NOT A TYPE CHECK. The runtime knows an element's WIDTH, not its TYPE: an
+// `Array<SomeClass>` element is also 8 bytes wide, and the drain cannot tell
+// it from a `string`. The PRIMARY defence for `string.Join`'s items argument
+// is the front end: stdlib §9.6 declares `items: IEnumerable<string>`, so an
+// `Array<int>` (or a bare `string`) is not an admissible argument and the
+// call must be REJECTED before it reaches codegen. That gate is a separate
+// defect (reported to the coordinator); the width bound here is the backstop
+// that makes the out-of-bounds read impossible for every element type whose
+// width differs from the caller's.
+//
+// THE WIDTH BOUND IS ONE-SIDED ON PURPOSE. Only a WIDER request is refused.
+// A caller asking for a NARROWER element than the pipeline produces copies
+// fewer bytes than the slot holds — that is memory-safe, and the two width
+// functions the compiler uses (`lazyElemSize` and `collectionElemSize`) are
+// documented mirrors rather than the same function, so a narrow disagreement
+// is not a proof of a mis-lowering. Refusing it would turn a benign
+// disagreement into an empty result for a correct program.
 static void* bz_lazy_drain_to_array(bz_lazy_t* e, int64_t esz,
                                     bool coown_str_dict_keys) {
+    if (esz > e->esz) {
+        // #7167: the caller's element width exceeds the width the pipeline's
+        // element slot actually holds. Refuse the materialization (see the
+        // contract above) instead of copying past the slot.
+        bz_lazy_dispose(e);
+        return bz_array_alloc(esz, 8);  // an EMPTY snapshot (count == 0)
+    }
     void* arr = bz_array_alloc(esz, 8);
     void** vt = (void**)e->vtable;
     typedef int32_t (*mn_t)(void*);

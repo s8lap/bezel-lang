@@ -65,6 +65,8 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::hasErrorMessage;
 using bezel::test::JitResult;
 using bezel::test::OwnershipResult;
@@ -148,19 +150,44 @@ BEZEL_TEST(lambda_reassign_explicit_dispose_reclaimed_slot_4270,
         "end; "
         "return acc;"));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
-    // Pre-fix: the stale sticky bit makes the second y.Dispose() free x's
-    // live object; x.Dispose() then use-after-frees it. jr.ran becomes
-    // false with an ASan heap-use-after-free report. Post-fix: the reset
-    // makes the second y.Dispose() correctly dispatch-only (no reclaim);
-    // x.Dispose() is the sole reclaim of x's object. Clean, exit 0.
-    BEZEL_EXPECT_TRUE(jr.ran);
-    BEZEL_EXPECT_EQ(jr.exitCode, 0);
+    // VERDICT FLIPPED by fix #7091 (§28.3/§28.6, v0.340) — this program is
+    // now REJECTED at compile time, and that is the spec-correct outcome:
+    // `y := z;` makes `y` a borrow of `z`, which is itself a borrow of the
+    // owned `x` (§28.3's *Consuming positions for an owned-local read*:
+    // "a plain alias binding is a borrow of `x`"), so the second
+    // `y.Dispose();` is a `Dispose()` THROUGH A BORROW — §28.6's compile
+    // error. Before #7091 the §28.6 receiver check read the receiver's
+    // alias source ONE hop only, so this two-hop chain was admitted and
+    // double-freed at run time; #7091 follows the chain to the ROOT owner
+    // (`x`) and names it in the diagnostic.
+    //
+    // The RUNTIME coverage of this file's own #4270 sticky-bit hazard (the
+    // stale `explicitDisposeReclaimedSlot` bit) is unchanged and lives in
+    // the row below (`runtime_coverage_rebind_to_parameter_borrow_...`) and
+    // in row D (`axis_member_access_rebind_after_reclaim_no_crash_28_3`).
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(jr));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
+        jr, "cannot call `Dispose()` on `y`"));
+    BEZEL_EXPECT_TRUE(
+        diagnosticMessageContains(jr, "borrow (an alias) of `x`"));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(jr, "§28.6"));
 }
 
 // ============================================================================
 // B. OWNERSHIP-PASS POSITIVE — the fix is a codegen/dataflow-state gate, not
 // a new rejection; the issue's own repro shape must be accepted with zero
 // ownership diagnostics.
+//
+// The one line DROPPED from the issue's program is the second
+// `y.Dispose();`: fix #7091 (§28.3/§28.6, v0.340) made that call the §28.6
+// compile error it always was — `y` is a borrow of `z`, a borrow of the
+// owned `x`, so disposing through it is a dispose THROUGH A BORROW — and the
+// full program's new verdict is pinned by row A above. What this row still
+// pins is the invariant that matters for #4270: the REBIND itself
+// (`y := z;`, a borrow over a disposed slot) must not be rejected by the
+// ownership pass — the #4270 fix is a dataflow-state reset, not a new
+// rejection, and the §28.3 state-match rule for an owned-state LHS is a
+// SEPARATE, still-unimplemented rule (not this fix's business).
 // ============================================================================
 
 BEZEL_TEST(lambda_reassign_explicit_dispose_reclaimed_slot_4270,
@@ -173,12 +200,66 @@ BEZEL_TEST(lambda_reassign_explicit_dispose_reclaimed_slot_4270,
         "  y.Dispose(); "
         "  var z := x; "
         "  y := z; "
-        "  y.Dispose(); "
         "  x.Dispose(); "
         "  return 0; "
         "end; "
         "return f();"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// ============================================================================
+// B2. THE #4270 RUNTIME COVERAGE, RE-POINTED AT A SHAPE THAT IS STILL
+// ACCEPTED — the successor of row A's runtime assertions.
+//
+// Row A's program is now correctly REJECTED (§28.6, #7091), so the sticky
+// `explicitDisposeReclaimedSlot` bit's hazard needs a shape the compiler
+// still admits. This one rebinds `y` onto a borrow of a PARAMETER (`p`)
+// instead of a borrow of an owned local (`x`): a parameter is not an owned
+// tracked local, so the §28.6 alias chain has no owner to walk to
+// (§28.3: "the caller retains ownership" — the parameter is a borrow), and
+// the dispose stays admitted.
+//
+// The hazard is the SAME one #4270 fixed, and it is still REACHABLE: with
+// the #4270 reset disabled, the stale bit makes the second `y.Dispose()`
+// reclaim `p`'s object — the CALLER's `q` — and the caller's `q.Dispose()`
+// then use-after-frees it (MEASURED: "AddressSanitizer: heap-use-after-free
+// … in main", the #4270 hazard with the borrow source moved from an owned
+// local to a parameter). With the #4270 reset in place the second dispose is
+// dispatch-only (no reclaim) and `q.Dispose()` is the sole reclaim of `q`'s
+// object — clean, exit 0.
+// ============================================================================
+
+BEZEL_TEST(lambda_reassign_explicit_dispose_reclaimed_slot_4270,
+           runtime_coverage_rebind_to_parameter_borrow_after_reclaim_28_3) {
+    JitResult jr = runAotChecked(wrap(
+        "var q := new Res(7); "
+        "var f := lambda(p: Res): int => do "
+        "  var x := new Res(5); "
+        "  var y := x; "
+        "  y := new Res(9); "
+        "  y.Dispose(); "
+        "  var z := p; "
+        "  y := z; "
+        "  y.Dispose(); "
+        "  x.Dispose(); "
+        "  return 0; "
+        "end; "
+        "var i := 0; "
+        "var acc := 0; "
+        "while i < 200 do "
+        "  acc := acc + f(q); "
+        "  i := i + 1; "
+        "end; "
+        "q.Dispose(); "
+        "return acc;"));
+    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(jr));
+    // Pre-#4270 (the sticky-bit reset removed): the stale bit makes the
+    // second y.Dispose() reclaim the CALLER's `q`; q.Dispose() then
+    // use-after-frees it. Post-#4270: the reset makes the second
+    // y.Dispose() dispatch-only (no reclaim); q.Dispose() is the sole
+    // reclaim of q's object. Clean, exit 0.
+    BEZEL_EXPECT_TRUE(jr.ran);
+    BEZEL_EXPECT_EQ(jr.exitCode, 0);
 }
 
 // ============================================================================

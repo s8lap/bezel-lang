@@ -24,6 +24,11 @@ class P
   end Main;
 end P;
 
+// #7065: the same needle, written ABOVE the positive match. A negative
+// directive scans only the region between the surrounding matches, so the
+// copy below the match alone let this wording through when it came FIRST.
+// CHECK-NOT: Invalid indices for GEP
+// CHECK-NOT: IR verification failed
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: a collection literal `[...]` cannot target the interface type `IEnumerable` — §15.4 admits only a concrete collection target (an inline array, `Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, `LinkedList`, `Dictionary`); construct one of those and pass it
 // CHECK-SAME: (§15.4)
 //

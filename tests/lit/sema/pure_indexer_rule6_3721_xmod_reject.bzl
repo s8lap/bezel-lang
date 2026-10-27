@@ -9,7 +9,9 @@
 // Property arm), so the importer-side answer matches the exporter's own
 // compilation of the character-identical source.
 //
-// CHECK-NOT: internal:
+// #6620: `internal:` is codegen-only and cannot occur on a row that
+// rejects in the front end; this needle is the front end's own ICE marker.
+// CHECK-NOT: internal compiler error
 module App3721X;
 import IdxLib3721;
 

@@ -64,7 +64,18 @@ struct LocalOwnership {
     // every one of them. `joinInto` (Ownership_Checks.cpp, fix #4236
     // send-back) additionally OR-merges it across a branch join that
     // converges to the same state, so which arm is listed first cannot
-    // change whether a post-join alias is recognized. Deliberately NOT
+    // change whether a post-join alias is recognized.
+    //
+    // fix #7091 (§28.3 "Ownership state of locals" / §28.6 "Who may call
+    // Dispose()", v0.340): the field records the ROOT of the alias chain,
+    // not the direct source, when the source is itself an alias. A ONE-hop
+    // alias (`var b := a;`) records `a` — unchanged. A TWO-hop chain
+    // (`var b := a; var il := b;`) records `a` as well, because `b` is a
+    // borrow and does not own the value: the §28.6 diagnostic the field
+    // feeds says "it is a borrow (an alias) of `X`, which still owns it",
+    // and only the root satisfies "which still owns it". The chain is
+    // followed by `disposeAliasChainRoot` (Ownership.cpp), a file-local
+    // static over the same `states_` map. Deliberately NOT
     // reused from `source`
     // (borrowSourceForExpr's Shape 1): that field's populate gate
     // (returnedExprMayBorrow -> isBorrowableType) answers FALSE for every
@@ -79,6 +90,40 @@ struct LocalOwnership {
     // radius this fix does not take on; a separate field keeps the change
     // exactly as narrow as the bug it fixes.
     sema::Symbol* disposeAliasSource = nullptr;
+    // fix #7092 (§28.3 "Ownership state of locals" / §15.4 / §28.6,
+    // v0.340): true when this local's CURRENT value is an OWNED collection
+    // LITERAL — §28.3's producers row: "Collection literal (`[1, 2, 3]`)
+    // targeting a reference type (`Array<T>`, `OwningArray<T>`, `Set<T>`,
+    // `Dictionary<K, V>`, etc.) | Owned".
+    //
+    // A collection literal is CONTEXT-TYPED (§15.4: "A collection literal has
+    // no standalone type. It is well-typed only in a context that provides
+    // the target type"), so sema records NO `exprType` for the literal node
+    // and `producerState`'s collection-literal arm (fix #4338's) never fires
+    // for it. At a DECLARATION the context is the local's declared type,
+    // which `isOwnedCollectionLiteralLocal` (Ownership.cpp, fix #7073's)
+    // reads; at an ASSIGNMENT the context is the LHS's declared type, and
+    // there is no such helper — this field IS that fact.
+    //
+    // It records an OWNERSHIP fact about the local's VALUE and NOTHING else:
+    // the local's ownership STATE is untouched by it, so the §28.3
+    // state-match rule and the must-use lint see no change from fix #7092
+    // (issue #7092's own note: "Do not change the literal's ownership state
+    // without checking the §28.3 state-match rule and the must-use lint").
+    // The field is read ONLY by the §28.6 borrow-receiver check's
+    // alias-source gate, which needs to know that the local OWNS the value
+    // an alias would dispose.
+    //
+    // Set and CLEARED on every plain reassignment (the same sites that
+    // re-derive `disposeAliasSource` above), so a rebind away from the
+    // literal (`a := new Array<int>(3);`) does not leave a stale owner
+    // fact behind. It is deliberately NOT merged by `joinInto`
+    // (Ownership_Checks.cpp): on a branch join the fact is inherited from
+    // the front branch, which is the SAFE direction — "this local MAY hold
+    // an owned literal" makes the alias-source gate fire, and §28.6 rejects
+    // a dispose through a borrow on every path where the local is not the
+    // owner anyway.
+    bool ownsCollectionLiteral = false;
     // For Owned: a back-pointer to the AST node where the obligation
     // was created (the `:= EXPR` site), used for diagnostic notes.
     const ast::Node* obligationOrigin = nullptr;

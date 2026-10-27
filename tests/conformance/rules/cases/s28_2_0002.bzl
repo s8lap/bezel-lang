@@ -2,8 +2,9 @@
 //! doc: spec
 //! section: 28.2
 //! title: Dispose through a record receiver has no such member
-//! rule: `Dispose()` is not on `Object`; it is class-only. Records, enums, primitives,
-//!   and inline arrays do not implement `IDisposable`.
+//! rule: `Dispose()` is not on `Object`; it is class-only — a member of class
+//!   types and of the interfaces that are or extend `IDisposable` or declare
+//!   it (below), and of nothing else
 //! expect: reject
 //! diagnostic: Dispose
 module Conf;

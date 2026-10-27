@@ -48,15 +48,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent:
-// runAotChecked returns ran=false with a "SKIP" diagnostic. clang is required to
-// build this repo, so a skip is not expected — guard anyway.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 // Count non-overlapping occurrences of `needle` in `hay`.
 int countOccurrences(const std::string& hay, const std::string& needle) {
@@ -168,7 +163,6 @@ BEZEL_TEST(generic_owning_iter_icmp_crash_1837,
 BEZEL_TEST(generic_owning_iter_icmp_crash_1837,
            instantiated_at_class_disposes_clean_spec_29_1) {
     JitResult r = runAotChecked(kInstantiatedManualProtocol);
-    if (wasSkipped(r)) return;  // ASan toolchain unavailable — skip, not a failure
     BEZEL_EXPECT_TRUE(r.ran);            // compiled + LSan-clean (no leaked frame)
     BEZEL_EXPECT_EQ(r.exitCode, 6);      // 1 + 2 + 3
     // Each yielded element disposed exactly once (a leak or double-free would also

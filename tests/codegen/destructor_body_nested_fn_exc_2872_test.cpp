@@ -37,13 +37,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is absent.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 int runFull(const std::string& program) {
     auto r = runAot(program);
@@ -181,7 +178,6 @@ BEZEL_TEST(destructor_body_nested_fn_2872, self_method_call_loop_amplified_dispo
         // 15 constructions; each destructor adds Helper(1)+1 = 3.
         "  return Box<string>.Made * 10 + Box<string>.Gone; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 195);   // 15*10 + 45
 }
@@ -220,7 +216,6 @@ BEZEL_TEST(destructor_body_nested_fn_2872, unwind_disposal_static_touch_still_co
         "  end; "
         "  return n; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 111);
 }
@@ -253,7 +248,6 @@ BEZEL_TEST(destructor_body_nested_fn_2872, unwind_disposal_with_self_call_comple
         "  end; "
         "  return n; "
         "end Main; end C;");
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 111);
 }

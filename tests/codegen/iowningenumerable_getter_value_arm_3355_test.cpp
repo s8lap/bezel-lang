@@ -105,14 +105,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// A checked run is SKIPPED (not failed) when the ASan link toolchain is
-// absent: runAotChecked returns ran=false with a "SKIP" diagnostic.
-bool wasSkipped(const JitResult& r) {
-    if (r.ran) return false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("SKIP") != std::string::npos) return true;
-    return false;
-}
+// No toolchain-SKIP guard here: a box without the C toolchain must FAIL
+// these rows loudly, not pass them vacuously (fix #3733's toolchain-SKIP
+// burn-down — the checker's remedy is to delete the guard, not to return
+// on it).
 
 constexpr int kExpectedSum = 35;  // 5 + 10 + 20
 
@@ -156,7 +152,6 @@ BEZEL_TEST(iowningenumerable_getter_value_arm_3355,
         "  end Main; "
         "end Main;";
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);          // no SIGSEGV on slot-4 read
     BEZEL_EXPECT_EQ(r.exitCode, kExpectedSum);
 }
@@ -292,7 +287,6 @@ BEZEL_TEST(iowningenumerable_getter_value_arm_3355,
     const std::string src =
         storedViewProgram("IOwningEnumerable", "var e := c.Items;");
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     // runAotChecked runs the generated program under ASan WITH LSan enabled,
     // and fails the run on any "ERROR: LeakSanitizer" / "detected memory
     // leaks" headline — so `ran` is itself the leak assertion here.
@@ -312,7 +306,6 @@ BEZEL_TEST(iowningenumerable_getter_value_arm_3355,
     const std::string src =
         storedViewProgram("IEnumerable", "var e := c.Items;");
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kStoredViewExit);
 }
@@ -330,7 +323,6 @@ BEZEL_TEST(iowningenumerable_getter_value_arm_3355,
     const std::string src = storedViewProgram(
         "IOwningEnumerable", "var e: IOwningEnumerable<Item> := c.Items;");
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kStoredViewExit);
 }
@@ -349,7 +341,6 @@ BEZEL_TEST(iowningenumerable_getter_value_arm_3355,
     const std::string src = storedViewProgram(
         "IOwningEnumerable", "var e := c.Items;", /*shorthand=*/true);
     JitResult r = runAotChecked(src);
-    if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kStoredViewExit);
 }

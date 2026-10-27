@@ -46,7 +46,7 @@
 // the stdlib's own reference implementation of `OwningDictionary<K, V>` declares
 // `private _comparer: IEqualityComparer<K>;` — an unmarked, i.e. BORROWING,
 // field held for the collection's whole life — and calls `_comparer.Equals(...)`
-// inside `Add` (Bezel_Standard_Library.md:2040 and :2057/:2083), and spec §9.7
+// inside `Add` (stdlib §4.9), and spec §9.7
 // confirms a direct class-typed borrow field is supported and statically
 // checked. The borrow reading is already modelled normatively.
 //
@@ -200,7 +200,7 @@ BEZEL_TEST(set_dict_comparer_ctor_2722, set_literal_unaffected) {
 // per stdlib §4.17 (`SortedDictionary<K, V>`) / §4.18 (`SortedSet<T>`), #2722:
 // the SORTED family is deliberately out of scope — §4.17 says ordering comes
 // from `IComparable<K>.CompareTo` and that there is "no separate comparer
-// parameter" (the sentence sits at document line 3020), so what a comparer means
+// parameter", so what a comparer means
 // there is a separate question. This pins that the fix did not disturb them.
 BEZEL_TEST(set_dict_comparer_ctor_2722, sorted_family_unaffected) {
     BEZEL_EXPECT_EQ(run(plain(

@@ -1,6 +1,6 @@
-// fix #4729 (spec §29.1, stdlib §5 line 3641-3645, v0.305): `MinOrNull` /
+// fix #4729 (spec §29.1, stdlib §5.1, v0.305): `MinOrNull` /
 // `MaxOrNull` over `IEnumerable<T> where T: IComparable<T>` on unsigned
-// numeric elements must compare UNSIGNED. §5's declaration:
+// numeric elements must compare UNSIGNED. §5.1's declaration:
 //
 //     public method MaxOrNull(): T?;   // null if empty
 //
@@ -61,7 +61,7 @@ std::string progU32() {
 
 }  // namespace
 
-// §29.1 / stdlib §5 line 3641-3645, v0.305: `Array<uint>.MinOrNull()` /
+// §29.1 / stdlib §5.1, v0.305: `Array<uint>.MinOrNull()` /
 // `.MaxOrNull()` returns `uint?` whose value field is the UNSIGNED
 // extreme. Pre-fix prints `3\n4294967295\n` (signed comparison: -1 < 1,
 // so 3 wins Max; -1 wins Min and prints as 4294967295 — bit pattern

@@ -1,6 +1,8 @@
 #include "codegen/LlvmBackend_impl.hpp"
 #include "common/OwnershipFacts.hpp"  // fix #3189: calleeReturnsOwned — the M2 owned-return channel
+#include "common/BuiltinRegistry.hpp"  // fix #7286 fix-forward: builtinParamIsNonNullable — the §7 gate's own registry
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
+#include "sema/ConstFold.hpp"  // fix #7271: §17.14 constant folding for the radix argument (§5.1)
 
 #include <limits>
 
@@ -14,6 +16,185 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
                                        void* ove_vtable, void* fe_vtable);
 
 namespace bezel::codegen {
+
+namespace {
+
+// The §17.14 constant-expression folder resolves an identifier by NAME; this
+// site resolves it through the SYMBOL sema recorded for the very node —
+// scope-correct, and never a flat name search that could capture a shadowed
+// binding (the discipline `constValueForPatternName` uses for the same
+// reason).
+using RadixConstResolver =
+    std::function<std::optional<long long>(std::string_view, int)>;
+
+// fix #7271 (spec §5.1 / §17.14, v0.344): the compile-time-constant VALUE of
+// a `const` REFERENCE (`sym`), folded through the SHARED folder
+// (`sema::foldIntConst` — ONE implementation, shared with the inline-array-
+// size and the const-evaluation passes).
+//
+// A local `const` is a §17.14 constant expression only when sema classified
+// it so (`LocalSymbol::isCompileTimeConst`): a RUNTIME `const` — a
+// single-assignment binding with a non-constant initializer — is not one, and
+// §5.1's constant narrowing does not reach it. A class-level `const`
+// (stdlib §22.12) always is; sema recorded its typed integer value, and
+// ModuleLoader carried it for an IMPORTED const (whose AST decl does not
+// exist).
+std::optional<long long> radixConstSymbolValue(
+        sema::Symbol* sym, const RadixConstResolver& resolveIdent, int depth) {
+    if (!sym || depth > 8) return std::nullopt;
+    if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+        if (!ls->isCompileTimeConst) return std::nullopt;
+        auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(ls->decl);
+        if (!lcd || !lcd->value) return std::nullopt;
+        return sema::foldIntConst(*lcd->value, resolveIdent, depth + 1,
+                                   nullptr);
+    }
+    if (auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(sym)) {
+        if (cs->intValue) return *cs->intValue;
+        // SEAM-ACCESSOR: local-path cast; `cs->intValue` above is the
+        // wire-carried value of an IMPORTED const (whose AST decl does not
+        // exist), so that read and this one are the TWO SOURCES of one
+        // both-sources accessor. #3152
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
+        if (!cd || !cd->value) return std::nullopt;
+        return sema::foldIntConst(*cd->value, resolveIdent, depth + 1,
+                                   nullptr);
+    }
+    return std::nullopt;
+}
+
+// The `const`-bearing NODES inside `e` — the §17.14 forms only (a literal, a
+// `const` reference, a unary/binary operator over constant operands, an
+// if-expression). The shared folder's identifier and member-access resolvers
+// answer for exactly these.
+void collectRadixConstNodes(const ast::Expr& e,
+                             std::vector<const ast::Expr*>& out) {
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        collectRadixConstNodes(*ue->operand, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        collectRadixConstNodes(*be->left, out);
+        collectRadixConstNodes(*be->right, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        if (ce->condition) collectRadixConstNodes(*ce->condition, out);
+        if (ce->thenValue) collectRadixConstNodes(*ce->thenValue, out);
+        if (ce->elseValue) collectRadixConstNodes(*ce->elseValue, out);
+        return;
+    }
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e) ||
+        dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        out.push_back(&e);
+}
+
+// fix #7271 (spec §5.1 / §17.14, v0.344): the compile-time-constant value of
+// `e` when it is a §17.14 constant expression, else nullopt.
+//
+// The §17.14 SET and its arithmetic come from the SHARED folder
+// (`sema::foldIntConst`); only the name resolution is local — the symbol
+// sema recorded for the node, so the answer is scope-correct.
+std::optional<long long> radixConstValue(const sema::SemaContext& ctx,
+                                          const ast::Expr& e) {
+    std::vector<const ast::Expr*> constNodes;
+    collectRadixConstNodes(e, constNodes);
+    RadixConstResolver resolveIdent;
+    std::function<std::optional<long long>(const ast::Expr& base,
+                                           std::string_view member,
+                                           bool& errorSeen)>
+        resolveMemberAccess;
+    resolveIdent = [&](std::string_view name,
+                       int depth) -> std::optional<long long> {
+        if (depth > 8) return std::nullopt;
+        for (const ast::Expr* n : constNodes) {
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(n);
+            if (!id || id->name != name) continue;
+            return radixConstSymbolValue(ctx.exprSymbol(*id), resolveIdent,
+                                         depth);
+        }
+        return std::nullopt;
+    };
+    resolveMemberAccess = [&](const ast::Expr& base, std::string_view member,
+                              bool& errorSeen) -> std::optional<long long> {
+        errorSeen = false;
+        for (const ast::Expr* n : constNodes) {
+            auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(n);
+            if (!ma || ma->member != member) continue;
+            if (!ma->target || &*ma->target != &base) continue;
+            return radixConstSymbolValue(ctx.exprSymbol(*ma), resolveIdent,
+                                         0);
+        }
+        return std::nullopt;
+    };
+    // A `const` REFERENCE — read through the symbol sema recorded for THIS
+    // node.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e))
+        return radixConstSymbolValue(ctx.exprSymbol(e), resolveIdent, 0);
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return radixConstSymbolValue(ctx.exprSymbol(*ma), resolveIdent, 0);
+    return sema::foldIntConst(e, resolveIdent, 0, resolveMemberAccess);
+}
+
+// The §5.1 widening table, read off the spec's own table (v0.344): the
+// integer-family types that implicitly widen to `int`. `int` itself is the
+// identity and is not listed.
+bool radixWidensToInt(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::SByte:
+        case sema::PrimitiveType::Byte:
+        case sema::PrimitiveType::Short:
+        case sema::PrimitiveType::UShort:
+        case sema::PrimitiveType::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// fix #7286 fix-forward: the RENDERING BUFFER of an integer `ToString(...)`
+// — the stack buffer the snprintf rendering writes into — and the maximum
+// PADDING WIDTH that buffer can hold. 66 bytes hold the widest value the
+// formatters render (64 bits + a sign + the NUL); the width is bounded by
+// the buffer so a user-supplied width ("D100", "D99999999999") can never
+// outgrow it. The LITERAL format spelling and the RUNTIME format spelling
+// share the two constants, so the two spellings of one overload agree on
+// the bound.
+constexpr unsigned kToStringBuf = 66;
+constexpr unsigned kToStringMaxWidth = kToStringBuf - 1;
+
+// The unsigned minimum of two integers (a compare and a select — this
+// LLVM's IRBuilder has no integer min helper).
+llvm::Value* umin(llvm::IRBuilder<>& b, llvm::Value* a, llvm::Value* c,
+                  const char* name) {
+    llvm::Value* lt = b.CreateICmpULT(a, c, name);
+    return b.CreateSelect(lt, a, c, name);
+}
+
+// The type name, as the diagnostic spells it.
+const char* radixTypeName(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::Bool:    return "bool";
+        case sema::PrimitiveType::Char:    return "char";
+        case sema::PrimitiveType::String:  return "string";
+        case sema::PrimitiveType::Byte:    return "byte";
+        case sema::PrimitiveType::SByte:   return "sbyte";
+        case sema::PrimitiveType::Short:   return "short";
+        case sema::PrimitiveType::UShort:  return "ushort";
+        case sema::PrimitiveType::Int:     return "int";
+        case sema::PrimitiveType::UInt:    return "uint";
+        case sema::PrimitiveType::Long:    return "long";
+        case sema::PrimitiveType::ULong:   return "ulong";
+        case sema::PrimitiveType::Float:   return "float";
+        case sema::PrimitiveType::Double:  return "double";
+        case sema::PrimitiveType::Decimal: return "decimal";
+        case sema::PrimitiveType::Object:  return "Object";
+        case sema::PrimitiveType::None:    break;
+    }
+    return "<unresolved>";
+}
+
+}  // namespace
 
 // fix #5035 (§14.1 / §2.8.3, v0.307): true when `paramName` names a generic
 // parameter of `currentMethod` (the method whose body is CURRENTLY being
@@ -49,6 +230,23 @@ namespace bezel::codegen {
 // this exact placeholder body, treating a still-bare `T` as `int` is not a
 // guess: it is the one representation every possible caller has already been
 // forced into.
+// fix #7086 (§14.2, stdlib §4.1 / §4.2, v0.340): the member names a
+// builtin COLLECTION head's documented surface can establish — the ones this
+// fix admits through a type parameter's constraint. A CALL to one of them on
+// a receiver whose substituted type is NOT a collection has no dispatch at
+// all: sema bound no member (the head carries no declaration, so there is
+// nothing to bind) and the collection dispatch is structural (an array-backed
+// receiver only). The guard below refuses that shape loudly.
+//
+// The names are the ones `builtinCollectionMemberSig` (src/sema/
+// ExprTypecheck_Calls.cpp, the sema half of this fix) admits — the two
+// properties and the instance methods — MINUS the enumeration members, which
+// have their own refusal (the enumeration path, not the collection one).
+static bool isCollectionSurfaceMemberName(std::string_view m) {
+    return m == "Count" || m == "IsReadOnly" || m == "Add" || m == "Clear" ||
+           m == "Contains" || m == "Remove" || m == "Insert";
+}
+
 static sema::TypeRef* genericParamSoundAtI32ForPlaceholder(
         sema::SemaContext& ctx, sema::MethodSymbol* currentMethod,
         std::string_view paramName) {
@@ -219,6 +417,146 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 retainValueLikeChoiceValue(&e, v, rt);
     }
     return v;
+}
+
+// fix #7098 (§5.1, v0.343): does `from` derive from `to`? The class /
+// interface hierarchy walk §5.1's reference conversions need ("a type to an
+// interface it implements or conforms to", "class to base class").
+static bool listMemberDerivesFrom(sema::TypeSymbol* from, sema::TypeSymbol* to,
+                                   int depth) {
+    if (!from || !to || depth > 16) return false;
+    if (from == to) return true;
+    for (sema::TypeSymbol* b : from->baseTypes)
+        if (listMemberDerivesFrom(b, to, depth + 1)) return true;
+    return false;
+}
+
+// fix #7098 (spec §27.6 / §5.1, v0.343): the §27.6 FORMATION VERDICT for a
+// bare `IList<T>` member reference (`il.Contains`, `il.Add`, …) — is the
+// ANNOTATED target function type compatible with the member's OWN signature?
+//
+// THE DIRECTION MATTERS. §27.6 (v0.343): "The reference's signature must be
+// compatible with the target function type: its parameter and return types
+// unify with the target's under the standard implicit-conversion rules
+// (§5.1)." For a PARAMETER slot the value ARRIVES as the TARGET's type and is
+// handed to the CALLEE, so the TARGET's slot type must convert to the
+// CALLEE's; for the RETURN slot it is the other way round (the CALLEE's type
+// converts to the TARGET's).
+//
+// THE ORDINARY §27.6 REFERENCE IS CHECKED THE SAME WAY, and MEASURED on the
+// staging tip: over `N(x: int): bool`, the target `(long) -> bool` is
+// REJECTED ("the initializer for `f` has a type that is not implicitly
+// convertible to the target type (§5.1)") — `long` does not convert to `int`
+// — while the target `(byte) -> bool` is ADMITTED (the §27.6 formation-site
+// adapter widens the argument). The `IList<T>` arm has no MethodSymbol, so
+// sema never checked it, and its codegen arm did not check it either: it
+// `return nullptr`'d SILENTLY on a mismatch (a #7098 defect — the program
+// compiled and then SEGFAULTED).
+//
+// CONSERVATIVE: a pair this predicate cannot judge is NOT convertible, so a
+// formation is refused rather than minted at an ABI the call site would
+// violate. (sema's own `ExprTC::implicitlyConvertible` takes the same
+// stance, and it is not reachable from codegen.)
+static bool listMemberSlotConverts(const sema::TypeRef* from,
+                                   const sema::TypeRef* to) {
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    if (!from || !to) return false;
+    if (from->kind == K::Function || to->kind == K::Function) return false;
+    // Identity (§5.1's first row).
+    if (sema::typeRefEqual(from, to)) return true;
+    // §5.1's nullable lift: `T` converts to `T?`.
+    if (!from->nullable && to->nullable) {
+        sema::TypeRef bare = *to;
+        bare.nullable = false;
+        return listMemberSlotConverts(from, &bare);
+    }
+    // §7.1: dropping the null case is never implicit.
+    if (from->nullable && !to->nullable) return false;
+    // §5.1's numeric / char widening table — sema's ONE copy
+    // (`sema::primitiveImplicitlyWidens`), not a second, drifting one.
+    if (from->kind == K::Primitive && to->kind == K::Primitive)
+        return sema::primitiveImplicitlyWidens(from->primitive, to->primitive);
+    // §5.1's reference conversions: any type to `Object`.
+    if (to->kind == K::Primitive && to->primitive == P::Object) return true;
+    // §5.1's reference conversions: a class / interface to a base of it.
+    if (from->kind == K::Named && to->kind == K::Named &&
+        from->declaration && to->declaration)
+        return listMemberDerivesFrom(from->declaration, to->declaration, 0);
+    return false;
+}
+
+// fix #7098 (§27.6 / §5.1, v0.343): the whole formation verdict — is the
+// TARGET function type compatible with the CALLEE's own signature?
+static bool listMemberTargetConverts(const sema::TypeRef* target,
+                                     const sema::TypeRef* callee) {
+    using K = sema::TypeRef::Kind;
+    if (!target || !callee) return false;
+    if (target->kind != K::Function || callee->kind != K::Function) return false;
+    // §27.1.1: the rule is "slot-wise over equal parameter counts".
+    if (target->funcParams.size() != callee->funcParams.size()) return false;
+    for (std::size_t i = 0; i < callee->funcParams.size(); ++i)
+        if (!listMemberSlotConverts(target->funcParams[i].type,
+                                    callee->funcParams[i].type))
+            return false;
+    // The return slot runs the other way (the CALLEE's type reaches the
+    // TARGET's).
+    return listMemberSlotConverts(callee->funcReturn, target->funcReturn);
+}
+
+// fix #7098 (§27.6, v0.343): spell a type for the formation diagnostic.
+static std::string listMemberTypeSpelling(const sema::TypeRef* t) {
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    if (!t) return "?";
+    if (t->kind == K::Unit) return "()";
+    if (t->kind == K::Primitive) {
+        switch (t->primitive) {
+            case P::Bool:    return "bool";
+            case P::Char:    return "char";
+            case P::String:  return "string";
+            case P::Byte:    return "byte";
+            case P::SByte:   return "sbyte";
+            case P::Short:   return "short";
+            case P::UShort:  return "ushort";
+            case P::Int:     return "int";
+            case P::UInt:    return "uint";
+            case P::Long:    return "long";
+            case P::ULong:   return "ulong";
+            case P::Float:   return "float";
+            case P::Double:  return "double";
+            case P::Decimal: return "decimal";
+            case P::Object:  return "Object";
+            default:         return "?";
+        }
+    }
+    if (t->kind == K::Named) {
+        std::string s(t->headName());
+        if (!t->genericArgs.empty()) {
+            s += "<";
+            for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                if (i) s += ", ";
+                s += listMemberTypeSpelling(t->genericArgs[i]);
+            }
+            s += ">";
+        }
+        return s;
+    }
+    return "?";
+}
+
+// fix #7098 (§27.6, v0.343): the member's OWN signature, spelled the way
+// §27.1 writes a function type — `(int) -> bool`.
+static std::string listMemberSignatureSpelling(const sema::TypeRef* fnTy) {
+    if (!fnTy) return "?";
+    std::string s = "(";
+    for (std::size_t i = 0; i < fnTy->funcParams.size(); ++i) {
+        if (i) s += ", ";
+        s += listMemberTypeSpelling(fnTy->funcParams[i].type);
+    }
+    s += ") -> ";
+    s += listMemberTypeSpelling(fnTy->funcReturn);
+    return s;
 }
 
 llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
@@ -1558,6 +1896,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         return lowerConditional(*cond);
     }
     if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // fix #7086 (§14.2, v0.340): the CONCRETE type a bare-type-parameter
+        // receiver stands for, and the receiver node it belongs to. Filled in
+        // by the member-callee block below; consumed at the `lowerCall`
+        // dispatch, which is where the collection dispatch reads the
+        // receiver's SEM type.
+        const ast::Expr* callRecvExpr = nullptr;
+        const sema::TypeRef* callRecvConcreteTy = nullptr;
         // CG42: `x?.M(args)` — a call whose callee is a null-conditional
         // member access skips the call when the receiver is null.
         if (call->callee) {
@@ -1649,6 +1994,126 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         if (auto* p = genericParamSoundAtI32ForPlaceholder(
                                 ctx_, currentMethod_, tt->headName()))
                             tt = p;
+                    }
+                    // fix #7086 (§14.2, v0.340): a receiver typed as a BARE
+                    // TYPE PARAMETER (`x: T` under `where T: IList<int>`)
+                    // stands for the CONCRETE type the parameter is
+                    // substituted with — the same authority the #6757
+                    // exception-surface arm below reads ("A receiver typed as
+                    // a bare type parameter … resolves to its concrete type
+                    // through the active substitution, as every other
+                    // receiver does"). The collection dispatch
+                    // (`tryLowerCollectionInstanceCall`) reads the receiver's
+                    // SEM type, so the concrete type is carried to the
+                    // `lowerCall` dispatch, where it is restated for the
+                    // duration of that call's lowering.
+                    //
+                    // Only a CONCRETE COLLECTION substitution is carried: the
+                    // generic TEMPLATE body (the dead placeholder, `T` at its
+                    // i32 representation) has no substitution, so the bare `T`
+                    // stands there and the dispatch keeps its established
+                    // behaviour. The OWNING list interface is excluded for the
+                    // reason `tryLowerCollectionInstanceCall` excludes it:
+                    // mutation through it disposes owned elements.
+                    {
+                        auto* recvTy = ctx_.exprType(*ma->target);
+                        // The same `isBareTypeParamRef` gate: the concrete
+                        // type is the one the RECEIVER'S OWN type parameter
+                        // is substituted with, and `resolveTypeParamRef`
+                        // resolves BY HEAD NAME — an ungated call would
+                        // resolve a receiver whose type is spelled like a
+                        // generic parameter (the #5449 `G.Stack<int>` shape)
+                        // to that parameter's substitution.
+                        auto* concTy = isBareTypeParamRef(recvTy)
+                                           ? resolveTypeParamRef(recvTy)
+                                           : recvTy;
+                        bool concOwning = false;
+                        // The ENUMERATION members are carried only for a
+                        // CONCRETE array-backed collection: the enumeration
+                        // path has no dispatch for a LIST-INTERFACE receiver
+                        // (the same gap the non-generic form reports as
+                        // #2457 — "GetEnumerator on built-in type `IList`
+                        // produced no value"), and restating the receiver as
+                        // the interface would leave the enumerator with no
+                        // value at all.
+                        bool memberIsEnumerator =
+                            ma->member == "GetEnumerator" ||
+                            ma->member == "GetOwningEnumerator";
+                        if (concTy && concTy != recvTy) {
+                            if (memberIsEnumerator && !isCollectionTypeName(concTy)) {
+                                // fix #7086 (§14.2, stdlib §4.12, v0.340): the
+                                // enumeration call reached through a type
+                                // parameter has NO dispatch for a receiver
+                                // that is not a concrete array-backed
+                                // collection. Without this the compiler
+                                // emitted an enumerator over a value it
+                                // cannot enumerate, and the program SEGFAULTED
+                                // at the first `MoveNext()` (MEASURED: exit
+                                // 139) — a crash is worse than a rejection.
+                                // The non-generic spelling of the same shape
+                                // is REJECTED by the compiler
+                                // (#2457), so the type-parameter spelling is
+                                // rejected too.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, call->span.begin,
+                                    "`" + std::string(ma->member) +
+                                        "` through a type parameter has no "
+                                        "dispatch for the substituted "
+                                        "receiver type `" +
+                                        std::string(concTy->headName()) +
+                                        "`: the compiler can enumerate a "
+                                        "CONCRETE array-backed collection "
+                                        "through a constrained type parameter "
+                                        "(stdlib §4.12 / §4.1); the "
+                                        "collection-interface heads erase the "
+                                        "concrete backing");
+                                return nullptr;
+                            }
+                            if (isCollectionTypeName(concTy) ||
+                                (!memberIsEnumerator &&
+                                 isListInterfaceName(concTy, &concOwning) &&
+                                 !concOwning)) {
+                                callRecvExpr = ma->target.get();
+                                callRecvConcreteTy = concTy;
+                            } else if (isCollectionSurfaceMemberName(ma->member) &&
+                                       ctx_.exprSymbol(*ma) == nullptr) {
+                                // fix #7086 (§14.2, stdlib §4.1, v0.340): the
+                                // substituted type is NOT a collection, so the
+                                // structural collection dispatch has no arm for
+                                // it — and sema bound NO member symbol for the
+                                // call (the constraint head carries no
+                                // declaration, which is why the member was
+                                // admitted at all). There is therefore no
+                                // dispatch for this call, and the statement
+                                // would be DROPPED SILENTLY: MEASURED, the
+                                // user's own `Add` was never called and the
+                                // program printed the wrong answer with no
+                                // diagnostic. The #2445 substitution-site
+                                // diagnostic covers the READ path (the same
+                                // shape's `Count` read is rejected); the CALL
+                                // path has no equivalent, so this refusal
+                                // supplies it.
+                                //
+                                // A call that DID bind a member symbol (a
+                                // constraint that declares the member itself —
+                                // a user interface or a user class) is
+                                // dispatched the ordinary way and is not
+                                // refused here.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, call->span.begin,
+                                    "`" + std::string(ma->member) +
+                                        "` through a type parameter has no "
+                                        "dispatch for the substituted "
+                                        "receiver type `" +
+                                        std::string(concTy->headName()) +
+                                        "`: the compiler can call a "
+                                        "collection member through a "
+                                        "constrained type parameter only for "
+                                        "an array-backed collection (stdlib "
+                                        "§4.1 / §4.2)");
+                                return nullptr;
+                            }
+                        }
                     }
                     // fix #2661 (spec §8.5, v0.252): `Range<T>.ToString()` —
                     // §8.5's AUTO-EQUALITY BODY-RECORD default, which §8.5
@@ -2101,6 +2566,42 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             ma->member == "ToString") {
                             llvm::Value* recv = lowerExpr(*ma->target);
                             if (!recv) return nullptr;
+                            // fix #7319 (spec §7.4 / §22.6, v0.344): a
+                            // §7.4-NARROWED NULLABLE PRIMITIVE receiver is the
+                            // PAYLOAD, not the `{i8 hasValue; T}` CARRIER.
+                            //
+                            // §7.4: "Member access, method calls, and indexing
+                            // on a nullable value are compile errors unless the
+                            // compiler has narrowed it to non-null", and §22.6:
+                            // "a read of a binding §7.4 has narrowed non-null is
+                            // of its non-nullable type" — so at this call site
+                            // the receiver IS the `int` / `double` / `decimal`
+                            // it denotes, and stdlib §2.18's format overload
+                            // renders THAT value (its vocabulary table fixes
+                            // the rendering each intrinsic type gets).
+                            //
+                            // The carrier was reaching the formatter instead:
+                            // `recv` was the whole `{i8 hasValue; T}` struct,
+                            // so an `int?` printed the carrier's BYTES and a
+                            // `double?` reached an `fcmp` against a `double`
+                            // — malformed IR the verifier rejected (the
+                            // compiler aborted). This arm never asked
+                            // `tt->nullable`, the way the NO-ARGUMENT arm above
+                            // does; that arm delegates a nullable receiver to
+                            // `emitValueToString`, which branches on the tag
+                            // and renders the payload, and is why `x.ToString()`
+                            // was always right.
+                            //
+                            // The soundness precondition `unwrapNarrowedNullableOperand`
+                            // names — "a SEMA GATE already rejects the
+                            // un-narrowed form" — HOLDS here: sema's §7.4
+                            // member-access gate rejects an un-narrowed
+                            // nullable receiver ("member access `.ToString` on a
+                            // nullable value requires narrowing it to non-null
+                            // first (§7.4)"), so only a narrowed read reaches
+                            // this arm. The helper is a no-op for every
+                            // non-nullable receiver.
+                            recv = unwrapNarrowedNullableOperand(recv, tt);
                             // §9.3 (#1099B): decimal ToString(format) — route to
                             // the runtime decimal formatter (honors the "F"/"f"
                             // fixed-point specifier; other/malformed formats fall
@@ -2148,24 +2649,215 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 std::string digits = bezelFmt.size() > 1 ? bezelFmt.substr(1) : "";
                                 using P = sema::PrimitiveType;
                                 bool isFP = tt->primitive == P::Double || tt->primitive == P::Float;
+                                // fix #7301 (stdlib §2.18, v0.344): the floating
+                                // specifiers render a non-finite value by NAME
+                                // ("Infinity" / "-Infinity" / "NaN"), so the
+                                // snprintf path below must not see one.
+                                bool fpFormat = false;
                                 if ((spec == 'F' || spec == 'G' || spec == 'E') && isFP) {
                                     char pfspec = spec == 'F' ? 'f' : (spec == 'E' ? 'e' : 'g');
                                     printfFmt = "%." + (digits.empty() ? "2" : digits) + pfspec;
+                                    fpFormat = true;
                                     // Widen float to double for snprintf.
                                     if (tt->primitive == P::Float)
                                         recv = builder_.CreateFPExt(recv, llvm::Type::getDoubleTy(llvm_));
                                 } else if (spec == 'X' || spec == 'D') {
                                     // §18.5: D/X with digits = min width, zero-padded.
                                     // D5 → %05d, X4 → %04X.
-                                    char pfspec2 = spec == 'X' ? 'X' : 'd';
+                                    //
+                                    // fix #7329 (stdlib §2.18, v0.344): the
+                                    // receiver of the integer row's `D`/`X`
+                                    // specifiers may be an integer of ANY
+                                    // width — the table names `long` and
+                                    // `byte` explicitly, so every width is
+                                    // CONFORMING and the specifiers must WORK
+                                    // at every width. This arm converted the
+                                    // receiver with `CreateFPToSI(recv,
+                                    // i32())` — an FP→SI conversion applied
+                                    // to an INTEGER payload — which is
+                                    // malformed IR for every width but 32
+                                    // ("FPToSI source must be FP or FP
+                                    // vector"), so the compiler ABORTED on a
+                                    // `byte`/`sbyte`/`short`/`ushort`/`long`/
+                                    // `ulong` receiver.
+                                    //
+                                    // The value is now widened the way the
+                                    // interpolation path's
+                                    // `emitWithFormatSpec` widens it (in
+                                    // src/codegen/LlvmBackend_String.cpp): to
+                                    // i64, sign-extended for a signed
+                                    // receiver and zero-extended for an
+                                    // unsigned one (the `D` decimal), and
+                                    // zero-extended for `X` (the natural-width
+                                    // BIT PATTERN), with the conversion
+                                    // carrying the `ll` length modifier so the
+                                    // full 64 bits are read — a bare `%d`/`%X`
+                                    // reads only 32 of them.
+                                    //
+                                    // The SIGNEDNESS is the RECEIVER's own
+                                    // TYPE's (the house predicate
+                                    // `isUnsignedTargetExpr`) — never the bit
+                                    // width's: `int` and `uint` are both 32
+                                    // bits and `long` and `ulong` are both 64
+                                    // bits. stdlib §2.18's integer row gives
+                                    // "`D`/`Dn` decimal" — the DECIMAL of the
+                                    // value the caller holds — so an unsigned
+                                    // receiver renders its unsigned value.
+                                    //
+                                    // A FLOATING receiver keeps the rendering
+                                    // it had (the value truncated to an int by
+                                    // `fptosi`), and a MALFORMED tail keeps
+                                    // its format string verbatim (and so its
+                                    // 32-bit conversion), exactly as before.
+                                    const bool recvIsInt =
+                                        recv->getType()->isIntegerTy();
+                                    const bool recvUnsigned = recvIsInt &&
+                                        isUnsignedTargetExpr(*ma->target);
+                                    // The digit tail: the specifier's own count
+                                    // (all digits) or a malformed suffix.
+                                    std::size_t runLen = 0;
+                                    while (runLen < digits.size() &&
+                                           digits[runLen] >= '0' &&
+                                           digits[runLen] <= '9')
+                                        runLen++;
+                                    const bool tailOk = (runLen == digits.size());
+                                    // The C conversion that renders the value.
+                                    std::string pfspec2;
+                                    if (recvIsInt && tailOk) {
+                                        if (spec == 'X')
+                                            pfspec2 = "llX";
+                                        else
+                                            pfspec2 = recvUnsigned ? "llu"
+                                                                   : "lld";
+                                    } else {
+                                        pfspec2 = (spec == 'X' ? "X" : "d");
+                                    }
                                     if (!digits.empty())
                                         printfFmt = std::string("%0") + digits + pfspec2;
                                     else
-                                        printfFmt = spec == 'X' ? "%X" : "%d";
-                                    if (!recv->getType()->isIntegerTy(32))
+                                        printfFmt = "%" + pfspec2;
+                                    // fix #7286 fix-forward: the WIDTH in the
+                                    // literal is unbounded ("D1000000000"
+                                    // builds a 1000000000-wide field), and the
+                                    // rendering buffer is a fixed 66 bytes —
+                                    // so the width is clamped to what the
+                                    // buffer can hold, exactly as the RUNTIME
+                                    // format spelling clamps its run-time
+                                    // width. Only a digit run whose VALUE
+                                    // exceeds the bound is rewritten; a run
+                                    // within it (and every malformed suffix)
+                                    // keeps the format string verbatim, so the
+                                    // pre-existing spellings ("D4", "D4x")
+                                    // render exactly as they did.
+                                    if (!digits.empty()) {
+                                        if (runLen > 0) {
+                                            // The digit run's value, saturating.
+                                            unsigned long long w = 0;
+                                            bool over = false;
+                                            for (std::size_t i = 0; i < runLen; i++) {
+                                                const unsigned d =
+                                                    (unsigned)(digits[i] - '0');
+                                                if (w > (kToStringMaxWidth - d) / 10ULL) {
+                                                    over = true;
+                                                    break;
+                                                }
+                                                w = w * 10ULL + d;
+                                            }
+                                            if (over || w > kToStringMaxWidth) {
+                                                printfFmt = std::string("%0") +
+                                                    std::to_string(
+                                                        (unsigned long long)
+                                                            kToStringMaxWidth) +
+                                                    digits.substr(runLen) +
+                                                    pfspec2;
+                                            }
+                                        }
+                                    }
+                                    // The VALUE the conversion reads.
+                                    if (recvIsInt) {
+                                        if (tailOk) {
+                                            // Widen to i64 — never narrowed:
+                                            // the `D` decimal preserves the
+                                            // value (sign-extended for a signed
+                                            // receiver, zero-extended for an
+                                            // unsigned one) and the `X` bit
+                                            // pattern is the receiver's own
+                                            // natural width's (zero-extended, so
+                                            // a `byte` 255 renders "FF", not
+                                            // "FFFFFFFF").
+                                            const bool zeroExt =
+                                                (spec == 'X') || recvUnsigned;
+                                            if (!recv->getType()->isIntegerTy(64))
+                                                recv = zeroExt
+                                                    ? builder_.CreateZExt(recv, i64())
+                                                    : builder_.CreateSExt(recv, i64());
+                                        } else if (!recv->getType()->isIntegerTy(32)) {
+                                            // A malformed tail keeps the 32-bit
+                                            // conversion it had (`%d`/`%X` read
+                                            // 32 bits).
+                                            recv = builder_.CreateTrunc(recv, i32());
+                                        }
+                                    } else if (!recv->getType()->isIntegerTy(32)) {
+                                        // A FLOATING receiver: the value is
+                                        // truncated to an int by `fptosi` (the
+                                        // rendering it had).
                                         recv = builder_.CreateFPToSI(recv, i32());
+                                    }
                                 } else {
                                     return emitPrimitiveToString(recv, tt->primitive);
+                                }
+                                // per stdlib §2.18 (v0.344, #7301): "The
+                                // no-format `ToString()` and every floating
+                                // specifier (`F`, `E`, `G` and `P`, with or
+                                // without a digit count, and `R`) render a NaN
+                                // as `NaN`, positive infinity as `Infinity` and
+                                // negative infinity as `-Infinity` — the names
+                                // of the `NaN`, `PositiveInfinity` and
+                                // `NegativeInfinity` constants (§9.2) — with no
+                                // digits, no exponent and no `%` suffix."
+                                //
+                                // C's own "%.2f" prints "inf" / "nan", so a
+                                // non-finite operand must not reach it. The
+                                // FINITE operand keeps the byte-identical
+                                // rendering it had: the snprintf path below is
+                                // unchanged and is reached only for a finite
+                                // operand.
+                                llvm::BasicBlock* nfBB = nullptr;
+                                llvm::BasicBlock* finBB = nullptr;
+                                llvm::BasicBlock* mergeBB = nullptr;
+                                llvm::Value* nfStr = nullptr;
+                                if (fpFormat) {
+                                    llvm::Type* dblTy = llvm::Type::getDoubleTy(llvm_);
+                                    llvm::Value* isNanV = builder_.CreateFCmpUNO(
+                                        recv, recv, "ts.isnan");
+                                    llvm::Value* isPosInfV = builder_.CreateFCmpOEQ(
+                                        recv, llvm::ConstantFP::getInfinity(dblTy),
+                                        "ts.isposinf");
+                                    llvm::Value* isNegInfV = builder_.CreateFCmpOEQ(
+                                        recv, llvm::ConstantFP::getInfinity(dblTy, true),
+                                        "ts.isneginf");
+                                    llvm::Value* nonFiniteV = builder_.CreateOr(
+                                        builder_.CreateOr(isNanV, isPosInfV),
+                                        isNegInfV, "ts.nonfinite");
+                                    nfBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.nonfinite", currentFn_);
+                                    finBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.finite", currentFn_);
+                                    mergeBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.merge", currentFn_);
+                                    builder_.CreateCondBr(nonFiniteV, nfBB, finBB);
+                                    builder_.SetInsertPoint(nfBB);
+                                    // The runtime's non-finite rendering IS
+                                    // §2.18's spelling (it is the same text
+                                    // the no-format ToString() and the "R"
+                                    // specifier produce), so this one runtime
+                                    // entry serves the specifier path too.
+                                    auto* nfFn = declareC("bz_double_to_string_r",
+                                                         ptrTy(), {dblTy});
+                                    nfStr = builder_.CreateCall(nfFn, {recv},
+                                                                "dbl.nonfinite");
+                                    builder_.CreateBr(mergeBB);
+                                    builder_.SetInsertPoint(finBB);
                                 }
                                 // Emit snprintf with the translated format.
                                 llvm::Constant* fmtData = llvm::ConstantDataArray::getString(
@@ -2180,24 +2872,52 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     snpFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "snprintf", module_.get());
                                 }
                                 auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-                                llvm::Value* buf = entryAlloca(llvm::ArrayType::get(i8Ty, 64));
-                                llvm::Value* bufPtr = builder_.CreateGEP(llvm::ArrayType::get(i8Ty, 64), buf, {builder_.getInt64(0), builder_.getInt64(0)});
-                                llvm::Value* wr = builder_.CreateCall(snpFn, {bufPtr, builder_.getInt64(64), fmtGV, recv}, "ts.wr");
+                                llvm::Value* buf = entryAlloca(
+                                    llvm::ArrayType::get(i8Ty, kToStringBuf));
+                                llvm::Value* bufPtr = builder_.CreateGEP(
+                                    llvm::ArrayType::get(i8Ty, kToStringBuf), buf,
+                                    {builder_.getInt64(0), builder_.getInt64(0)});
+                                llvm::Value* wr = builder_.CreateCall(
+                                    snpFn,
+                                    {bufPtr, builder_.getInt64(kToStringBuf), fmtGV,
+                                     recv},
+                                    "ts.wr");
                                 auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
                                 auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
                                 llvm::Value* l64 = builder_.CreateSExt(wr, i64());
-                                llvm::Value* dSz = builder_.CreateAdd(l64, builder_.getInt64(1));
+                                // fix #7286 fix-forward: snprintf's RETURN VALUE
+                                // is the length the output WOULD have had; the
+                                // bytes actually in the buffer are
+                                // `min(return, size - 1)`. Copying `l64` bytes
+                                // read past the buffer whenever the output was
+                                // truncated, and copied ADJACENT STACK BYTES
+                                // into the string the program receives.
+                                llvm::Value* written = umin(
+                                    builder_, l64,
+                                    builder_.getInt64(kToStringBuf - 1),
+                                    "ts.wlen");
+                                llvm::Value* dSz =
+                                    builder_.CreateAdd(written, builder_.getInt64(1));
                                 llvm::Value* dc = builder_.CreateCall(mallocFn, {dSz}, "ts.data");
-                                builder_.CreateCall(memcpyFn, {dc, bufPtr, l64});
-                                llvm::Value* np = builder_.CreateGEP(i8Ty, dc, l64);
+                                builder_.CreateCall(memcpyFn, {dc, bufPtr, written});
+                                llvm::Value* np = builder_.CreateGEP(i8Ty, dc, written);
                                 builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), np);
                                 uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
                                 llvm::Value* so = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "ts.obj");
                                 builder_.CreateStore(dc, builder_.CreateStructGEP(stringType(), so, 0));
-                                builder_.CreateStore(l64, builder_.CreateStructGEP(stringType(), so, 1));
+                                builder_.CreateStore(written, builder_.CreateStructGEP(stringType(), so, 1));
                                 builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
                                     builder_.CreateStructGEP(stringType(), so, 2));
                                 initStringRc(so);  // #422: producer's reference, rc := 1
+                                if (fpFormat) {
+                                    builder_.CreateBr(mergeBB);
+                                    builder_.SetInsertPoint(mergeBB);
+                                    llvm::PHINode* strPhi =
+                                        builder_.CreatePHI(ptrTy(), 2, "ts.str");
+                                    strPhi->addIncoming(nfStr, nfBB);
+                                    strPhi->addIncoming(so, finBB);
+                                    return strPhi;
+                                }
                                 return so;
                             }
                             // stdlib §9.1 (#518): ToString(radix: int) — the arg is an
@@ -2215,49 +2935,674 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                                   tt->primitive == P::Short ||
                                                   tt->primitive == P::UShort);
                                 auto* argTy = ctx_.exprType(*call->args[0].value);
-                                bool argIsInt = argTy &&
+                                // fix #7286: the pieces both renderings share —
+                                // a C string constant, and the snprintf
+                                // rendering that becomes a fresh Bezel
+                                // `string` (the shape the LITERAL format path
+                                // already uses).
+                                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                                // The rendering buffer: `kToStringBuf` bytes
+                                // (64 bits of value + a sign + the NUL).
+                                // A NUL-terminated C string constant, as a
+                                // pointer the renderers can pass on.
+                                auto globalCString = [&](const char* s) -> llvm::Value* {
+                                    auto* data = llvm::ConstantDataArray::getString(
+                                        llvm_, s, true);
+                                    unsigned id = stringLiteralIdx_++;
+                                    auto* gv = new llvm::GlobalVariable(
+                                        *module_, data->getType(), true,
+                                        llvm::GlobalValue::PrivateLinkage, data,
+                                        ".bz.rts.cstr." + std::to_string(id));
+                                    gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                                    return builder_.CreateInBoundsGEP(
+                                        data->getType(), gv,
+                                        {builder_.getInt64(0), builder_.getInt64(0)});
+                                };
+                                // The rendering: snprintf into a stack buffer,
+                                // then the fresh `string` the text becomes
+                                // (rc := 1, the producer's reference).
+                                auto emitSnprintfString =
+                                    [&](llvm::Value* fmtPtr,
+                                        llvm::ArrayRef<llvm::Value*> args) -> llvm::Value* {
+                                    auto* snpFn = module_->getFunction("snprintf");
+                                    if (!snpFn) {
+                                        auto* ft = llvm::FunctionType::get(
+                                            i32(), {ptrTy(), i64(), ptrTy()}, true);
+                                        snpFn = llvm::Function::Create(
+                                            ft, llvm::GlobalValue::ExternalLinkage,
+                                            "snprintf", module_.get());
+                                    }
+                                    auto* buf = entryAlloca(
+                                        llvm::ArrayType::get(i8Ty, kToStringBuf));
+                                    llvm::Value* bPtr = builder_.CreateGEP(
+                                        llvm::ArrayType::get(i8Ty, kToStringBuf), buf,
+                                        {builder_.getInt64(0), builder_.getInt64(0)});
+                                    std::vector<llvm::Value*> callArgs = {
+                                        bPtr, builder_.getInt64(kToStringBuf), fmtPtr};
+                                    for (llvm::Value* a : args) callArgs.push_back(a);
+                                    llvm::Value* wr =
+                                        builder_.CreateCall(snpFn, callArgs, "ts.wr");
+                                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                                    auto* memcpyFn = declareC("memcpy", ptrTy(),
+                                                               {ptrTy(), ptrTy(), i64()});
+                                    llvm::Value* l64 = builder_.CreateSExt(wr, i64());
+                                    // fix #7286 fix-forward: snprintf's RETURN
+                                    // VALUE is the length the output WOULD have
+                                    // had — the bytes actually in the buffer are
+                                    // `min(return, size - 1)`. Copying `l64`
+                                    // bytes out of the buffer read past it
+                                    // whenever the output was truncated, and
+                                    // copied ADJACENT STACK BYTES into the
+                                    // string the program receives. The written
+                                    // length is what the copy, the
+                                    // allocation, the NUL and the string's
+                                    // own length must all use.
+                                    llvm::Value* written = umin(
+                                        builder_, l64,
+                                        builder_.getInt64(kToStringBuf - 1),
+                                        "ts.wlen");
+                                    llvm::Value* dSz =
+                                        builder_.CreateAdd(written, builder_.getInt64(1));
+                                    llvm::Value* dc =
+                                        builder_.CreateCall(mallocFn, {dSz}, "ts.data");
+                                    builder_.CreateCall(memcpyFn, {dc, bPtr, written});
+                                    llvm::Value* np = builder_.CreateGEP(i8Ty, dc, written);
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty, 0), np);
+                                    uint64_t strBytes = module_->getDataLayout()
+                                        .getTypeAllocSize(stringType());
+                                    llvm::Value* so = builder_.CreateCall(
+                                        mallocFn, {builder_.getInt64(strBytes)}, "ts.obj");
+                                    builder_.CreateStore(
+                                        dc, builder_.CreateStructGEP(stringType(), so, 0));
+                                    builder_.CreateStore(
+                                        written, builder_.CreateStructGEP(stringType(), so, 1));
+                                    builder_.CreateStore(
+                                        llvm::ConstantInt::get(i8Ty, 1),
+                                        builder_.CreateStructGEP(stringType(), so, 2));
+                                    initStringRc(so);  // #422: producer's reference, rc := 1
+                                    return so;
+                                };
+                                // fix #7271 (spec §5.1 / §22.6, v0.344): the
+                                // `radix: int` parameter (stdlib §9.1) admits
+                                // the argument by IDENTITY, by the §5.1
+                                // widening table, or by §5.1's CONSTANT
+                                // NARROWING — a compile-time constant of ANY
+                                // integer type whose value fits `int`'s range,
+                                // ACROSS SIGNEDNESS ("a `uint`-typed constant
+                                // `7` is admissible where `int` is expected").
+                                // An argument that binds to NO declared
+                                // parameter is a COMPILE ERROR (§22.6) — never
+                                // a silently degraded call.
+                                //
+                                // The verdict is the ONE
+                                // `Convert.ToString(value, toBase)` already
+                                // gets (stdlib §2.3: "`ToString(value, toBase)`
+                                // returns the text `value.ToString(toBase)`
+                                // returns"), so the two spellings agree: the
+                                // `uint` literal is ADMITTED (and renders the
+                                // radix form), and a runtime `uint` is
+                                // REJECTED, at both spellings.
+                                bool radixBinds = false;
+                                bool radixIsString = false;
+                                bool radixIsNullable = false;
+                                bool radixConstType = false;
+                                bool radixConstOutOfRange = false;
+                                // fix #7286 fix-forward (§7 / §7.4 / §22.6,
+                                // v0.344): does the SEMANTIC §7 NULLABILITY
+                                // GATE own this call's argument position?
+                                //
+                                // The house's gate is `ExprTC::
+                                // reportBuiltinArgIfNullable` (#6782): for a
+                                // built-in call it reports "the argument to
+                                // `X.Y` is nullable but the target type is
+                                // non-nullable (§7)" — but it STANDS DOWN for a
+                                // §7.4-NARROWED read (`isNarrowedNonNullRead`),
+                                // and the registry row that reaches this position
+                                // is `common::builtinParamIsNonNullable`'s.
+                                //
+                                // So at a gate-owned position, a NULLABLE
+                                // argument that REACHED codegen is a §7.4-
+                                // NARROWED read: sema's gate already decided it
+                                // is legal, and §22.6 makes its type at the call
+                                // its NON-NULLABLE type ("a read of a binding
+                                // §7.4 has narrowed non-null is of its
+                                // non-nullable type ... so a narrowed `d: Dog?`
+                                // is exact at a `Dog` parameter"). This block's
+                                // own nullable rejection is therefore a SECOND
+                                // spelling of a decision sema already makes —
+                                // and a wrong one, for it rejected the narrowed
+                                // read the gate admits.
+                                //
+                                // The predicate is the REGISTRY's own (one
+                                // spelling, not a copy): `{"Int32", "ToString",
+                                // 1, 0}` is §9.1's `ToString(format: string)`
+                                // position, and the primitive keyword the
+                                // registry maps is the receiver's own.
+                                const bool gateOwnsPosition =
+                                    common::builtinParamIsNonNullable(
+                                        radixTypeName(tt->primitive), "ToString",
+                                        /*argCount=*/1, /*position=*/0);
+                                // fix #7286 (spec §17.14 / §5.1, v0.344): the
+                                // FOLDED value of the argument, when it is a
+                                // §17.14 constant expression. The RENDERER
+                                // needs it: an LLVM `ConstantInt` read cannot
+                                // see the value of a constant EXPRESSION the
+                                // compiler folds (`8u + 8u`), so the renderer
+                                // fell back to the DECIMAL text.
+                                std::optional<long long> foldedRadix;
+                                if (argTy &&
                                     argTy->kind == sema::TypeRef::Kind::Primitive &&
-                                    (argTy->primitive == P::Int ||
-                                     argTy->primitive == P::Long);
-                                if (isIntRecv && argIsInt) {
+                                    argTy->primitive != P::String && !argTy->nullable)
+                                    foldedRadix =
+                                        radixConstValue(ctx_, *call->args[0].value);
+                                if (argTy &&
+                                    argTy->kind == sema::TypeRef::Kind::Primitive) {
+                                    const P pt = argTy->primitive;
+                                    // fix #7286 fix-forward (§7.4 / §22.6,
+                                    // v0.344): at a gate-owned position an
+                                    // ADMITTED nullable argument is a NARROWED
+                                    // read — §7.4's "assignment: ... and from a
+                                    // declaration whose initializer is such an
+                                    // `expr` — `var x: T? := expr;` ... which is
+                                    // the declaration's assignment" and §7.4's
+                                    // null test both establish the narrowing, and
+                                    // §22.6 makes the read's type at the call
+                                    // its NON-NULLABLE type. So it is judged as
+                                    // the non-nullable primitive it is — the
+                                    // same dispatch the non-nullable argument
+                                    // takes.
+                                    const bool narrowedNullable =
+                                        argTy->nullable && gateOwnsPosition;
+                                    if (argTy->nullable && !narrowedNullable) {
+                                        // §7.10: a NULLABLE argument is the
+                                        // NULLABILITY gate's question (the
+                                        // house leaves it to that gate, exactly
+                                        // as the `Convert.ToString` check
+                                        // does), not this arm's.
+                                        radixIsNullable = true;
+                                    } else if (pt == P::String) {
+                                        // stdlib §9.1's OTHER one-argument
+                                        // overload: `ToString(format: string)`.
+                                        // Whether the FORMAT argument binds is
+                                        // that overload's question, not this
+                                        // arm's.
+                                        radixIsString = true;
+                                    } else if (pt == P::Int) {
+                                        radixBinds = true;  // identity
+                                    } else if (radixWidensToInt(pt)) {
+                                        radixBinds = true;  // §5.1 widening
+                                    } else if (pt == P::Long || pt == P::UInt ||
+                                               pt == P::ULong) {
+                                        // §5.1's constant narrowing: the ONLY
+                                        // route by which these three types
+                                        // reach an `int` parameter.
+                                        radixConstType = true;
+                                        if (foldedRadix) {
+                                            const long long cv = *foldedRadix;
+                                            // The range: `uint`/`ulong` are
+                                            // unsigned, `long` is signed; the
+                                            // target is `int`. A constant
+                                            // whose value does not fit is a
+                                            // COMPILE ERROR at the conversion
+                                            // site (§5.1) — never a silent
+                                            // truncation.
+                                            const long long lo =
+                                                (pt == P::Long) ? -2147483648LL : 0;
+                                            const long long hi = 2147483647LL;
+                                            radixBinds = (cv >= lo && cv <= hi);
+                                            radixConstOutOfRange = !radixBinds;
+                                        }
+                                    }
+                                }
+                                // fix #7286 (spec §5.1 / §7.1 / §22.6, v0.344):
+                                // a NULLABLE argument binds to NO §9.1
+                                // parameter. §5.1's nullable conversions lift
+                                // only to the NULLABLE form — "`S?` implicitly
+                                // converts to `T?` whenever `S` implicitly
+                                // converts to `T`" — so `int?` reaches
+                                // neither `ToString(radix: int)` nor
+                                // `ToString(format: string)`, and §7.1's "the
+                                // compiler enforces the distinction at every
+                                // assignment, parameter pass, and return"
+                                // is the rule that refuses it. §22.6: "If no
+                                // candidate is applicable at all … the call is
+                                // a compile error with no candidates cited."
+                                // A nullable radix used to be SILENTLY
+                                // ABSORBED and the program printed the
+                                // receiver's DECIMAL text.
+                                //
+                                // fix #7286 fix-forward (§7 / §7.4 / §22.6,
+                                // v0.344): this rejection applies ONLY where
+                                // the SEMANTIC §7 nullability gate does NOT own
+                                // the position. Where the gate DOES own it, the
+                                // gate has already decided — it rejects an
+                                // un-narrowed nullable argument and ADMITS a
+                                // §7.4-narrowed one — and a second spelling
+                                // here would contradict it (it rejected the
+                                // narrowed read the gate admits). The gate's
+                                // registry has no row for the other integer
+                                // receivers (`uint`, `long`, `ulong`, `byte`,
+                                // `sbyte`, `short`, `ushort`), so this block
+                                // still owns THOSE positions — and it still
+                                // over-rejects a NARROWED nullable there, which
+                                // is the residual D3 leaves open (the remedy:
+                                // the registry rows for those heads plus sema's
+                                // `primitiveKeywordHead` entries).
+                                if (isIntRecv && radixIsNullable && !gateOwnsPosition) {
+                                    std::string argName = "the argument";
+                                    if (argTy &&
+                                        argTy->kind == sema::TypeRef::Kind::Primitive)
+                                        argName = std::string("a nullable `") +
+                                            radixTypeName(argTy->primitive) + "`";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        call->args[0].value->span.begin,
+                                        "no matching overload of `ToString` — stdlib §9.1 "
+                                        "declares `ToString(radix: int): string` and "
+                                        "`ToString(format: string): string`, and a NULLABLE "
+                                        "argument binds to neither: " + argName +
+                                        " — §5.1's nullable conversions lift only to the "
+                                        "nullable form, so no §9.1 parameter admits it "
+                                        "(stdlib §9.1; §5.1; §7.1; §22.6)");
+                                    return nullptr;
+                                }
+                                // The rejection: a located, spec-cited
+                                // diagnostic naming the argument and the type
+                                // stdlib §9.1 declares there — the shape the
+                                // `Convert.ToString` check uses.
+                                if (isIntRecv && !radixIsString && !radixBinds) {
+                                    std::string argName = "the argument";
+                                    if (argTy &&
+                                        argTy->kind == sema::TypeRef::Kind::Primitive)
+                                        argName = std::string("a `") +
+                                            radixTypeName(argTy->primitive) + "`";
+                                    std::string why;
+                                    if (radixConstOutOfRange)
+                                        why = ": the compile-time constant's value does not fit `int`'s range";
+                                    else if (radixConstType)
+                                        why = ": " + argName +
+                                            " reaches an `int` parameter only as a compile-time constant (§5.1's constant narrowing)";
+                                    else
+                                        why = ": " + argName +
+                                            " is never implicitly convertible to an `int`";
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        call->args[0].value->span.begin,
+                                        "no matching overload of `ToString` — stdlib §9.1 "
+                                        "declares `ToString(radix: int): string`, so the "
+                                        "`radix` argument must be an `int` (stdlib §9.1; "
+                                        "§5.1)" + why);
+                                    return nullptr;
+                                }
+                                // fix #7286 (stdlib §9.1 / §2.18, v0.344): the
+                                // OTHER one-argument overload —
+                                // `ToString(format: string)` — with a RUNTIME
+                                // format argument. stdlib §9.1 declares `public
+                                // pure method ToString(format: string): string;`
+                                // and a `string` argument binds to it EXACTLY
+                                // (§22.6: the radix overload's `int` parameter
+                                // admits no `string`). The overload's parameter
+                                // is a `string` — the VALUE, not the literal
+                                // text — so the rendering is a RUNTIME one: the
+                                // format is read at run time and the rendering
+                                // dispatched on it. The old path handled only a
+                                // string LITERAL, so a format held in a
+                                // variable fell through to the no-format
+                                // renderer and printed the DECIMAL text.
+                                //
+                                // The VOCABULARY is the one the LITERAL path
+                                // already implements (stdlib §2.18's integer
+                                // row as the house renders it: `D`/`Dn`
+                                // decimal, `X`/`Xn` hex), so the two spellings
+                                // of the same overload AGREE. §2.18's wider
+                                // vocabulary (`B`, the lower-case `x`) and its
+                                // FormatException for an unrecognized specifier
+                                // are a separate gap, in BOTH spellings.
+                                if (isIntRecv && radixIsString) {
+                                    llvm::Value* fmtArg =
+                                        lowerExpr(*call->args[0].value);
+                                    if (!fmtArg) return nullptr;
+                                    // The format's VALUE, as UTF-8: a Bezel
+                                    // string's bytes are code points at the
+                                    // string's own width, so its bytes are not
+                                    // its characters (stdlib §3.1 — the
+                                    // runtime's own decoder).
+                                    auto* toUtf8 = declareC(
+                                        "bz_string_to_utf8z", ptrTy(), {ptrTy()});
+                                    llvm::Value* cf = builder_.CreateCall(
+                                        toUtf8, {fmtArg}, "fmt.u8");
+                                    // The specifier: the first code point.
+                                    llvm::Value* c0p = builder_.CreateGEP(
+                                        i8Ty, cf, {builder_.getInt64(0)}, "fmt.c0p");
+                                    llvm::Value* c0 = builder_.CreateLoad(
+                                        i8Ty, c0p, "fmt.c0");
+                                    llvm::Value* isD = builder_.CreateOr(
+                                        builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, 'D')),
+                                        builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, 'd')),
+                                        "fmt.isD");
+                                    llvm::Value* isX = builder_.CreateOr(
+                                        builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, 'X')),
+                                        builder_.CreateICmpEQ(
+                                            c0, llvm::ConstantInt::get(i8Ty, 'x')),
+                                        "fmt.isX");
+                                    // The digit suffix: the minimum digit
+                                    // count (stdlib §2.18's `Dn` / `Xn`).
+                                    //
+                                    // fix #7286 fix-forward: the utf8 buffer is
+                                    // `n*4+1` bytes (the runtime's own
+                                    // `bz_string_to_utf8z`), so for an EMPTY
+                                    // string it is ONE byte and a `+1` GEP
+                                    // pointed past its end — a one-byte heap
+                                    // over-read in `strspn`. The byte LENGTH
+                                    // bounds every read below: the suffix
+                                    // starts at offset 1 only when there IS a
+                                    // first byte, and at offset 0 otherwise
+                                    // (where the NUL is, so the digit run is
+                                    // empty and the specifier is not one this
+                                    // path renders).
+                                    auto* strlenFn = declareC(
+                                        "strlen", i64(), {ptrTy()});
+                                    llvm::Value* blen = builder_.CreateCall(
+                                        strlenFn, {cf}, "fmt.blen");
+                                    llvm::Value* hasSpec = builder_.CreateICmpUGT(
+                                        blen, builder_.getInt64(0), "fmt.hasspec");
+                                    llvm::Value* suffixOff = builder_.CreateSelect(
+                                        hasSpec, builder_.getInt64(1),
+                                        builder_.getInt64(0), "fmt.sfxoff");
+                                    llvm::Value* cf1 = builder_.CreateGEP(
+                                        i8Ty, cf, {suffixOff}, "fmt.cf1");
+                                    auto* strspnFn = declareC(
+                                        "strspn", i64(), {ptrTy(), ptrTy()});
+                                    llvm::Value* digitChars =
+                                        globalCString("0123456789");
+                                    llvm::Value* dlen = builder_.CreateCall(
+                                        strspnFn, {cf1, digitChars}, "fmt.dlen");
+                                    // The character right after the digit
+                                    // prefix must be the NUL — else the tail
+                                    // is not a width, and the specifier is not
+                                    // one this path renders.
+                                    llvm::Value* tailp = builder_.CreateGEP(
+                                        i8Ty, cf,
+                                        {builder_.CreateAdd(suffixOff, dlen)},
+                                        "fmt.tailp");
+                                    llvm::Value* tailc =
+                                        builder_.CreateLoad(i8Ty, tailp, "fmt.tail");
+                                    llvm::Value* tailOk = builder_.CreateICmpEQ(
+                                        tailc, llvm::ConstantInt::get(i8Ty, 0),
+                                        "fmt.tailok");
+                                    // The width: the digits' value.
+                                    auto* strtolFn = declareC(
+                                        "strtol", i64(), {ptrTy(), ptrTy(), i32()});
+                                    llvm::Value* width64 = builder_.CreateCall(
+                                        strtolFn,
+                                        {cf1, llvm::ConstantPointerNull::get(ptrTy()),
+                                         builder_.getInt32(10)},
+                                        "fmt.width");
+                                    // fix #7286 fix-forward: the width is
+                                    // USER-CONTROLLED at run time — the digit
+                                    // run is unbounded ("D99999999999" is
+                                    // 1215752191 after the truncation to i32),
+                                    // and the rendering buffer is a fixed
+                                    // 66 bytes. Bound the width by the buffer
+                                    // (the same bound the LITERAL spelling
+                                    // clamps its digit run to), so the padding
+                                    // can never outgrow the buffer.
+                                    llvm::Value* widthBounded = umin(
+                                        builder_, width64,
+                                        builder_.getInt64(kToStringMaxWidth),
+                                        "fmt.wbnd");
+                                    llvm::Value* width = builder_.CreateTrunc(
+                                        widthBounded, i32(), "fmt.w32");
+                                    // The buffer is the runtime's own; release
+                                    // it (every read above precedes this).
+                                    auto* freeFn = declareC(
+                                        "free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                                    builder_.CreateCall(freeFn, {cf});
+                                    // The recognized form: the specifier this
+                                    // path renders, with a digit suffix that is
+                                    // exactly digits.
+                                    llvm::Value* recognized = builder_.CreateAnd(
+                                        builder_.CreateOr(isD, isX), tailOk,
+                                        "fmt.rec");
+                                    auto* fmtBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.fmt", currentFn_);
+                                    auto* plainBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.plain", currentFn_);
+                                    auto* mrgBB = llvm::BasicBlock::Create(
+                                        llvm_, "ts.mrg", currentFn_);
+                                    builder_.CreateCondBr(recognized, fmtBB, plainBB);
+                                    builder_.SetInsertPoint(fmtBB);
+                                    // The value: the receiver's OWN (the
+                                    // literal format path's value), widened to
+                                    // the format's own width.
+                                    const bool recvIs64 =
+                                        recv->getType()->isIntegerTy(64);
+                                    // fix #7286 fix-forward: the SIGNEDNESS is
+                                    // the receiver's own TYPE's (the house
+                                    // predicate `isUnsignedTargetExpr`) —
+                                    // never the bit width's: `int` and `uint`
+                                    // are both 32 bits and `long` and `ulong`
+                                    // are both 64 bits.
+                                    const bool recvUnsigned =
+                                        isUnsignedTargetExpr(*ma->target);
+                                    llvm::Value* val = recv;
+                                    if (!recvIs64) {
+                                        val = recvUnsigned
+                                            ? builder_.CreateZExt(recv, i32(), "ts.zx")
+                                            : builder_.CreateSExt(recv, i32(), "ts.sx");
+                                    }
+                                    // fix #7286 fix-forward: the DECIMAL
+                                    // conversion must match the value's
+                                    // SIGNEDNESS: a SIGNED printf conversion
+                                    // renders a `uint` of 4000000000 as
+                                    // "-294967296" and a `ulong` of
+                                    // 18446744073709551615 as "-1", where the
+                                    // no-format rendering of the same value
+                                    // (stdlib §9.1: "The no-format `ToString()`
+                                    // ... emits the text `ToString(10)` emits")
+                                    // gives "4000000000" and
+                                    // "18446744073709551615". The widening
+                                    // above is right; feeding the result to a
+                                    // signed conversion was not.
+                                    //
+                                    // The HEX conversion needs no signedness
+                                    // arm: the `X` conversion renders the
+                                    // argument's BITS, so the same length
+                                    // modifier serves both.
+                                    llvm::Value* decFmt = globalCString(
+                                        recvIs64 ? (recvUnsigned ? "%0*llu" : "%0*ld")
+                                                 : (recvUnsigned ? "%0*u" : "%0*d"));
+                                    llvm::Value* hexFmt = globalCString(
+                                        recvIs64 ? "%0*lX" : "%0*X");
+                                    llvm::Value* fptr = builder_.CreateSelect(
+                                        isX, hexFmt, decFmt, "ts.fptr");
+                                    llvm::Value* sval =
+                                        emitSnprintfString(fptr, {width, val});
+                                    auto* fmtEnd = builder_.GetInsertBlock();
+                                    builder_.CreateBr(mrgBB);
+                                    // The unrecognized form: the no-format
+                                    // rendering (the literal path's own
+                                    // fallback for a specifier it does not
+                                    // render).
+                                    builder_.SetInsertPoint(plainBB);
+                                    llvm::Value* pval =
+                                        emitPrimitiveToString(recv, tt->primitive);
+                                    auto* plainEnd = builder_.GetInsertBlock();
+                                    builder_.CreateBr(mrgBB);
+                                    builder_.SetInsertPoint(mrgBB);
+                                    auto* phi = builder_.CreatePHI(ptrTy(), 2, "ts.str");
+                                    phi->addIncoming(sval, fmtEnd);
+                                    phi->addIncoming(pval, plainEnd);
+                                    return phi;
+                                }
+                                if (isIntRecv && radixBinds) {
                                     llvm::Value* radix = lowerExpr(*call->args[0].value);
                                     if (!radix) return nullptr;
-                                    // Normalize receiver to i32 (or i64 for long).
-                                    bool isLong = (tt->primitive == P::Long ||
-                                                   tt->primitive == P::ULong);
-                                    if (isLong) {
-                                        if (!recv->getType()->isIntegerTy(64))
-                                            recv = builder_.CreateSExt(recv, i64());
-                                    } else {
-                                        if (!recv->getType()->isIntegerTy(32))
-                                            recv = builder_.CreateSExt(recv, i32());
+                                    // fix #7286 fix-forward (§7.4 / §22.6,
+                                    // v0.344): a §7.4-NARROWED nullable read is
+                                    // of its NON-NULLABLE type at the call, so
+                                    // the value that reaches the formatter is the
+                                    // PAYLOAD of the `{i8 hasValue; T}` carrier
+                                    // the read still loads — not the carrier.
+                                    // The house's own unwrap for this operand
+                                    // (`unwrapNarrowedNullableOperand`, keyed
+                                    // on the operand's own sema type) is the
+                                    // one spelling of it; it is a no-op for
+                                    // every non-nullable operand.
+                                    //
+                                    // The soundness precondition that helper
+                                    // names — "a SEMA GATE already rejects the
+                                    // un-narrowed form" — HOLDS here: the §7
+                                    // nullability gate (#6782) rejects an
+                                    // un-narrowed nullable argument at this
+                                    // position (see `gateOwnsPosition`), and a
+                                    // narrowed one is what reaches codegen.
+                                    radix = unwrapNarrowedNullableOperand(
+                                        radix, argTy);
+                                    // fix #7258 (stdlib §9.1, v0.344): the radix
+                                    // rendering shows the receiver's OWN value.
+                                    // §9.1: "`ToString(radix)` emits the
+                                    // lower-case digits — a `-` for a negative
+                                    // value followed by the magnitude's digits
+                                    // most significant first" and "T.Parse(n.
+                                    // ToString(radix), radix) is n for every value
+                                    // of every integer type and every admitted
+                                    // radix". So the value must reach the
+                                    // formatter UNCHANGED: an unsigned receiver is
+                                    // NOT sign-extended (a `byte` 200 is 200, not
+                                    // -56) and a 64-bit value is NOT narrowed to
+                                    // 32 bits (a `long` 4000000000 is
+                                    // 4000000000, not -294967296).
+                                    //
+                                    // The signedness is the RECEIVER's own TYPE's
+                                    // (the house predicate
+                                    // `isUnsignedTargetExpr`) — NEVER the bit
+                                    // width's: `int` and `uint` are both 32 bits
+                                    // and `long` and `ulong` are both 64 bits.
+                                    const bool recvUnsigned =
+                                        isUnsignedTargetExpr(*ma->target);
+                                    // The MAGNITUDE, in a common 64-bit domain:
+                                    // widened (never narrowed), value preserved.
+                                    llvm::Value* mag = recv;
+                                    if (!mag->getType()->isIntegerTy(64))
+                                        mag = recvUnsigned
+                                            ? builder_.CreateZExt(mag, i64(), "rts.zx")
+                                            : builder_.CreateSExt(mag, i64(), "rts.sx");
+                                    // A negative SIGNED value renders as '-' plus
+                                    // its magnitude's digits (§9.1); an unsigned
+                                    // value is never negative.
+                                    llvm::Value* isNeg = nullptr;
+                                    if (!recvUnsigned) {
+                                        isNeg = builder_.CreateICmpSLT(
+                                            mag, builder_.getInt64(0), "rts.neg");
+                                        mag = builder_.CreateSelect(
+                                            isNeg,
+                                            builder_.CreateSub(
+                                                builder_.getInt64(0), mag, "rts.m"),
+                                            mag, "rts.mag");
                                     }
-                                    // Resolve radix from a constant int.
-                                    const char* fmt = "%d";  // fallback: decimal
-                                    bool isBinary = false;
-                                    if (auto* cr = llvm::dyn_cast<llvm::ConstantInt>(radix)) {
-                                        uint64_t r = cr->getZExtValue();
-                                        if (r == 16) fmt = isLong ? "%llx" : "%x";
-                                        else if (r == 8) fmt = isLong ? "%llo" : "%o";
+                                    // The RADIX (fix #7286): the FOLDED §17.14
+                                    // value when the argument is a compile-time
+                                    // constant, else the RUNTIME value. The
+                                    // selection used to read the argument as an
+                                    // LLVM `ConstantInt`, which cannot see the
+                                    // value of a constant EXPRESSION the
+                                    // compiler folds (`8u + 8u`) nor of a
+                                    // runtime `int` radix — so an ADMITTED
+                                    // radix rendered the DECIMAL text.
+                                    // An unadmitted radix keeps the decimal
+                                    // fallback (the §9.1 ArgumentException is a
+                                    // BANKED divergence — corpus l2_3_0003).
+                                    const char* fmt = "%s%llu";  // fallback: decimal
+                                    bool isBinary = false;  // the compile-time radix 2
+                                    llvm::Value* rtIsBinary = nullptr;  // the runtime radix 2
+                                    llvm::Value* rtFmt = nullptr;       // the runtime format
+                                    if (foldedRadix) {
+                                        const uint64_t r = (uint64_t)*foldedRadix;
+                                        if (r == 16) fmt = "%s%llx";
+                                        else if (r == 8) fmt = "%s%llo";
                                         else if (r == 2) isBinary = true;
-                                        else fmt = isLong ? "%lld" : "%d";
-                                    } else {
-                                        // Non-constant radix: fall back to decimal.
-                                        fmt = isLong ? "%lld" : "%d";
+                                    } else if (radix->getType()->isIntegerTy()) {
+                                        // A RUNTIME radix: the format is
+                                        // selected at RUN time (stdlib §9.1:
+                                        // "`ToString(radix)` emits the
+                                        // lower-case digits … and takes the
+                                        // same radix set" — 2, 8, 10 and 16).
+                                        llvm::Value* r64 = radix;
+                                        if (!r64->getType()->isIntegerTy(64)) {
+                                            const bool radixUnsigned =
+                                                isUnsignedTargetExpr(*call->args[0].value);
+                                            r64 = radixUnsigned
+                                                ? builder_.CreateZExt(r64, i64(), "rts.rzx")
+                                                : builder_.CreateSExt(r64, i64(), "rts.rsx");
+                                        }
+                                        llvm::Value* isHex = builder_.CreateICmpEQ(
+                                            r64, builder_.getInt64(16), "rts.hex");
+                                        llvm::Value* isOct = builder_.CreateICmpEQ(
+                                            r64, builder_.getInt64(8), "rts.oct");
+                                        rtIsBinary = builder_.CreateICmpEQ(
+                                            r64, builder_.getInt64(2), "rts.bin");
+                                        llvm::Value* decPtr = globalCString("%s%llu");
+                                        llvm::Value* hexPtr = globalCString("%s%llx");
+                                        llvm::Value* octPtr = globalCString("%s%llo");
+                                        rtFmt = builder_.CreateSelect(
+                                            isHex, hexPtr,
+                                            builder_.CreateSelect(isOct, octPtr, decPtr),
+                                            "rts.fmt");
                                     }
                                     // Binary path: emit a bit-scan loop.
-                                    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-                                    const unsigned BUF = 66;  // 64 bits + sign + NUL
-                                    if (isBinary) {
-                                        // Reuse the Convert.ToString(n,2) inline logic.
-                                        // Widen to i64 so the same loop handles both int and long.
-                                        llvm::Value* n64 = isLong
-                                            ? recv
-                                            : builder_.CreateSExt(recv, i64());
-                                        auto* buf2 = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
+                                    //
+                                    // fix #7286: the radix 2 rendering is
+                                    // reached from the COMPILE-TIME radix and
+                                    // from the RUNTIME radix, so it sits behind
+                                    // a branch whose condition is the
+                                    // compile-time answer or the runtime
+                                    // comparison.
+                                    llvm::Value* binCond =
+                                        isBinary ? llvm::ConstantInt::getTrue(llvm_)
+                                                 : (rtIsBinary
+                                                        ? rtIsBinary
+                                                        : llvm::ConstantInt::getFalse(llvm_));
+                                    auto* binOuterBB = llvm::BasicBlock::Create(
+                                        llvm_, "rts.bin", currentFn_);
+                                    auto* snpOuterBB = llvm::BasicBlock::Create(
+                                        llvm_, "rts.snp", currentFn_);
+                                    auto* mrgOuterBB = llvm::BasicBlock::Create(
+                                        llvm_, "rts.mrg", currentFn_);
+                                    builder_.CreateCondBr(binCond, binOuterBB, snpOuterBB);
+                                    builder_.SetInsertPoint(binOuterBB);
+                                    llvm::Value* binVal = nullptr;
+                                    llvm::BasicBlock* binEnd = nullptr;
+                                    {
+                                        // The MAGNITUDE's digits, MSB first; the
+                                        // sign byte comes first for a negative
+                                        // value (§9.1).
+                                        llvm::Value* off = builder_.getInt64(0);
+                                        llvm::Value* signByte =
+                                            llvm::ConstantInt::get(i8Ty, '0');
+                                        if (isNeg) {
+                                            off = builder_.CreateSelect(
+                                                isNeg, builder_.getInt64(1),
+                                                builder_.getInt64(0), "rts.off");
+                                            signByte = builder_.CreateSelect(
+                                                isNeg,
+                                                llvm::ConstantInt::get(i8Ty, '-'),
+                                                llvm::ConstantInt::get(i8Ty, '0'),
+                                                "rts.sigb");
+                                        }
+                                        llvm::Value* n64 = mag;
+                                        auto* buf2 = entryAlloca(
+                                            llvm::ArrayType::get(i8Ty, kToStringBuf));
                                         llvm::Value* b2Ptr = builder_.CreateGEP(
-                                            llvm::ArrayType::get(i8Ty, BUF), buf2,
+                                            llvm::ArrayType::get(i8Ty, kToStringBuf), buf2,
                                             {builder_.getInt64(0), builder_.getInt64(0)});
+                                        // The sign byte; the digits overwrite it
+                                        // when the value is not negative.
+                                        builder_.CreateStore(signByte, b2Ptr);
                                         llvm::Value* isZero = builder_.CreateICmpEQ(
                                             n64, builder_.getInt64(0));
                                         auto* zeroBB = llvm::BasicBlock::Create(
@@ -2269,13 +3614,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         builder_.CreateCondBr(isZero, zeroBB, nonBB);
                                         // zero → "0"
                                         builder_.SetInsertPoint(zeroBB);
+                                        llvm::Value* z0 = builder_.CreateGEP(
+                                            i8Ty, b2Ptr, off);
                                         builder_.CreateStore(
-                                            llvm::ConstantInt::get(i8Ty, '0'), b2Ptr);
+                                            llvm::ConstantInt::get(i8Ty, '0'), z0);
                                         llvm::Value* z1 = builder_.CreateGEP(
-                                            i8Ty, b2Ptr, builder_.getInt64(1));
+                                            i8Ty, b2Ptr,
+                                            builder_.CreateAdd(off,
+                                                builder_.getInt64(1)));
                                         builder_.CreateStore(
                                             llvm::ConstantInt::get(i8Ty, 0), z1);
-                                        llvm::Value* zlen = builder_.getInt64(1);
+                                        llvm::Value* zlen = builder_.CreateAdd(
+                                            off, builder_.getInt64(1));
                                         auto* zeroBBEnd = builder_.GetInsertBlock();
                                         builder_.CreateBr(binBB);
                                         // non-zero: scan MSB then emit each bit.
@@ -2314,7 +3664,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                         llvm::Value* startBP = builder_.CreateLoad(
                                             i32(), bitPos);
                                         builder_.CreateStore(startBP, emBP);
-                                        builder_.CreateStore(builder_.getInt64(0), emLen);
+                                        builder_.CreateStore(off, emLen);
                                         auto* emCBB = llvm::BasicBlock::Create(
                                             llvm_, "bn2.ec", currentFn_);
                                         auto* emBBB = llvm::BasicBlock::Create(
@@ -2387,62 +3737,69 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                             llvm::ConstantInt::get(i8Ty, 1),
                                             builder_.CreateStructGEP(stringType(), so2, 2));
                                         initStringRc(so2);
-                                        return so2;
+                                        // fix #7286: the binary rendering is
+                                        // one arm of the radix dispatch, so
+                                        // it joins the merge instead of
+                                        // returning.
+                                        binVal = so2;
+                                        binEnd = builder_.GetInsertBlock();
+                                        builder_.CreateBr(mrgOuterBB);
                                     }
                                     // Non-binary: snprintf with the chosen format.
-                                    llvm::Constant* fmtData2 = llvm::ConstantDataArray::getString(
-                                        llvm_, fmt, true);
-                                    unsigned fid2 = stringLiteralIdx_++;
-                                    auto* fmtGV2 = new llvm::GlobalVariable(
-                                        *module_, fmtData2->getType(), true,
-                                        llvm::GlobalValue::PrivateLinkage, fmtData2,
-                                        ".bz.rts.fmt." + std::to_string(fid2));
-                                    fmtGV2->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
-                                    auto* snpFn2 = module_->getFunction("snprintf");
-                                    if (!snpFn2) {
-                                        auto* ft2 = llvm::FunctionType::get(
-                                            i32(), {ptrTy(), i64(), ptrTy()}, true);
-                                        snpFn2 = llvm::Function::Create(
-                                            ft2, llvm::Function::ExternalLinkage,
-                                            "snprintf", module_.get());
+                                    // The sign prefix: "-" for a negative SIGNED
+                                    // value, "" otherwise (§9.1's '-' followed by
+                                    // the magnitude's digits). The DIGITS
+                                    // themselves are the lower-case ones (§9.1).
+                                    builder_.SetInsertPoint(snpOuterBB);
+                                    llvm::Value* signPtr2 = nullptr;
+                                    {
+                                        auto* emptyData = llvm::ConstantDataArray::getString(
+                                            llvm_, "", true);
+                                        unsigned sid2 = stringLiteralIdx_++;
+                                        auto* emptyGV = new llvm::GlobalVariable(
+                                            *module_, emptyData->getType(), true,
+                                            llvm::GlobalValue::PrivateLinkage,
+                                            emptyData,
+                                            ".bz.rts.sign." + std::to_string(sid2));
+                                        emptyGV->setUnnamedAddr(
+                                            llvm::GlobalValue::UnnamedAddr::Global);
+                                        llvm::Value* emptyPtr = builder_.CreateInBoundsGEP(
+                                            emptyData->getType(), emptyGV,
+                                            {builder_.getInt64(0), builder_.getInt64(0)});
+                                        signPtr2 = emptyPtr;
+                                        if (isNeg) {
+                                            auto* minusData = llvm::ConstantDataArray::getString(
+                                                llvm_, "-", true);
+                                            unsigned mid2 = stringLiteralIdx_++;
+                                            auto* minusGV = new llvm::GlobalVariable(
+                                                *module_, minusData->getType(), true,
+                                                llvm::GlobalValue::PrivateLinkage,
+                                                minusData,
+                                                ".bz.rts.sign." + std::to_string(mid2));
+                                            minusGV->setUnnamedAddr(
+                                                llvm::GlobalValue::UnnamedAddr::Global);
+                                            llvm::Value* minusPtr = builder_.CreateInBoundsGEP(
+                                                minusData->getType(), minusGV,
+                                                {builder_.getInt64(0), builder_.getInt64(0)});
+                                            signPtr2 = builder_.CreateSelect(
+                                                isNeg, minusPtr, emptyPtr, "rts.sign");
+                                        }
                                     }
-                                    auto* buf3 = entryAlloca(llvm::ArrayType::get(i8Ty, BUF));
-                                    llvm::Value* bPtr3 = builder_.CreateGEP(
-                                        llvm::ArrayType::get(i8Ty, BUF), buf3,
-                                        {builder_.getInt64(0), builder_.getInt64(0)});
-                                    llvm::Value* wr2 = builder_.CreateCall(
-                                        snpFn2,
-                                        {bPtr3, builder_.getInt64(BUF), fmtGV2, recv},
-                                        "rts.wr");
-                                    auto* mallocFn3 = declareC("malloc", ptrTy(), {i64()});
-                                    auto* memcpyFn3 = declareC("memcpy", ptrTy(),
-                                                               {ptrTy(), ptrTy(), i64()});
-                                    llvm::Value* l642 = builder_.CreateSExt(wr2, i64());
-                                    llvm::Value* dSz3 = builder_.CreateAdd(
-                                        l642, builder_.getInt64(1));
-                                    llvm::Value* dc3 = builder_.CreateCall(
-                                        mallocFn3, {dSz3}, "rts.d");
-                                    builder_.CreateCall(memcpyFn3, {dc3, bPtr3, l642});
-                                    llvm::Value* np4 = builder_.CreateGEP(
-                                        i8Ty, dc3, l642);
-                                    builder_.CreateStore(
-                                        llvm::ConstantInt::get(i8Ty, 0), np4);
-                                    uint64_t sBytes3 = module_->getDataLayout()
-                                        .getTypeAllocSize(stringType());
-                                    llvm::Value* so3 = builder_.CreateCall(
-                                        mallocFn3,
-                                        {builder_.getInt64(sBytes3)}, "rts.o");
-                                    builder_.CreateStore(
-                                        dc3,
-                                        builder_.CreateStructGEP(stringType(), so3, 0));
-                                    builder_.CreateStore(
-                                        l642,
-                                        builder_.CreateStructGEP(stringType(), so3, 1));
-                                    builder_.CreateStore(
-                                        llvm::ConstantInt::get(i8Ty, 1),
-                                        builder_.CreateStructGEP(stringType(), so3, 2));
-                                    initStringRc(so3);
-                                    return so3;
+                                    // fix #7286: the format is the compile-time
+                                    // one, or the RUN-time selection among the
+                                    // three admitted radices.
+                                    llvm::Value* fmtPtr =
+                                        rtFmt ? rtFmt : globalCString(fmt);
+                                    llvm::Value* snpVal = emitSnprintfString(
+                                        fmtPtr, {signPtr2, mag});
+                                    auto* snpEnd = builder_.GetInsertBlock();
+                                    builder_.CreateBr(mrgOuterBB);
+                                    // The merge: the radix dispatch's result.
+                                    builder_.SetInsertPoint(mrgOuterBB);
+                                    auto* phi = builder_.CreatePHI(ptrTy(), 2, "rts.str");
+                                    phi->addIncoming(binVal, binEnd);
+                                    phi->addIncoming(snpVal, snpEnd);
+                                    return phi;
                                 }
                             }
                             return emitPrimitiveToString(recv, tt->primitive);
@@ -2450,6 +3807,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                 }
             }
+        }
+        if (callRecvExpr && callRecvConcreteTy) {
+            // fix #7086 (§14.2, v0.340): restate the receiver's type as the
+            // CONCRETE type it stands for, for the duration of this call's
+            // lowering, so the collection dispatch sees the receiver it
+            // dispatches on. The statement is RESTORED afterwards: the AST
+            // and its sema types are shared by every specialization of a
+            // generic body (§2.8.3 rule 4 — one body, one substitution at a
+            // time), so a type left restated would be read by the NEXT
+            // specialization, whose concrete type is a different one.
+            auto* savedRecvTy = ctx_.exprType(*callRecvExpr);
+            ctx_.setExprType(callRecvExpr,
+                             const_cast<sema::TypeRef*>(callRecvConcreteTy));
+            llvm::Value* lowered = lowerCall(*call);
+            ctx_.setExprType(callRecvExpr, savedRecvTy);
+            return lowered;
         }
         return lowerCall(*call);
     }
@@ -2513,6 +3886,127 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (!ix->target || ix->indices.empty() || !ix->indices[0].value)
             return nullptr;
+        // fix #7171 (§28.3 / §4.6, v0.343): the UNBOUND OWNED TEMPORARY
+        // receiver discharge for the string index / slice path.
+        //
+        // §28.3 (v0.343) requires an unbound owned temporary to be "disposed
+        // at the END of the FULL EXPRESSION in which it is produced, after
+        // every use of it within that expression has completed", and an index
+        // / slice access is one of the BORROWING uses of such a temporary.
+        // This arm lowered the receiver with `lowerExpr(*ix->target)` and
+        // returned the index / slice result with NO discharge registered, so a
+        // producer receiver (`("a" + "b")[0..0]`) leaked for the whole
+        // program — the RECEIVER, not the result (the leaked byte count
+        // tracks the receiver's length: 32 B header + the receiver's code
+        // points + NUL).
+        //
+        // MEASURED on this lane's base (e0a44e9c), `bezelc --sanitize=address`
+        // with `ASAN_OPTIONS=detect_leaks=1` (one call each):
+        //
+        //   var k := "a";  var c: char := (k + "cd")[0];
+        //       -> 36 byte(s) leaked in 2 allocation(s)   (receiver "acd")
+        //   var k := "ab"; var t: string := (k + "cd")[0..3];
+        //       -> 37 byte(s) leaked in 2 allocation(s)   (receiver "abcd")
+        //   var k := "ab"; var r := 0..3; (k + "cd")[r];
+        //       -> 37 byte(s) leaked in 2 allocation(s)
+        //   var k := "ab"; (k + "cd")[0..999]   (the raise CAUGHT)
+        //       -> 37 byte(s) leaked in 2 allocation(s)
+        //
+        // and the CONTROL shapes were already clean:
+        //
+        //   Console.WriteLine((k + "cd").Length);   -> clean
+        //   var s := k + "cd"; var c := s[0];        -> clean
+        //
+        // ⇒ the member-access form releases the temporary and the index forms
+        // do not; the bound-receiver form is clean because the local's own
+        // scope-end disposal covers it. The defect is the UNBOUND TEMPORARY
+        // receiver in index / slice position.
+        //
+        // THE COUNTERPART IS THE COLLECTION INDEXER PATH
+        // (`LlvmBackend_Assign.cpp`'s `lowerCollectionIndexerGet`, ~line 706),
+        // which DOES register a §28.3 receiver discharge
+        // (`disposeStack_.back().push_back(d)`). This is that path's missing
+        // string twin — the same shape, the same scope-end registration, the
+        // same `unwindOnly = false` (fires on BOTH the normal and the unwind
+        // exit; a given exit goes one way only, so it runs exactly once).
+        //
+        // ⚠ THE DISCHARGE IS A SCOPE-END REGISTRATION, NOT AN INLINE FREE.
+        // The index result is read OUT of the receiver: the char path loads
+        // the code point from the receiver's bytes (`loadCodePoint`) and the
+        // slice path COPIES them (`emitStringSliceBytes`'s memcpy). An inline
+        // free at the lowering path's return would free the very header the
+        // next instruction loads — a use-after-free. §28.3's own wording is
+        // the reason: the temporary is disposed "after every use of it within
+        // that expression has completed". So the receiver's reference must
+        // outlive the index read, and the scope-end pass is where it dies.
+        //
+        // ⚠ REGISTRATION IS AT THE PRODUCTION, NOT AT THE RETURN — the same
+        // discipline the collection path records. The receiver is registered
+        // immediately after it is produced, so the `IndexOutOfRangeException`
+        // the bounds check raises (§4.6 / §31.2) is covered too: §28.3's
+        // exception-path paragraph discharges an already-produced,
+        // not-yet-consumed unbound owned temporary during unwinding, and an
+        // `emitGuardThrow` edge reaches the scope's unwind pass with the
+        // receiver already produced. Registering after the read would leave
+        // that path leaking.
+        //
+        // THE GATE IS THE ONE THE SANCTIONED STRING RELEASES USE.
+        // `isPlusOneStringProducer` is the SAME predicate every other §28.9
+        // string-producer release keys on — the `.Length` / `.IsAscii`
+        // member-access arms above, `releaseConcatIntermediate`, and the
+        // borrowed-string-argument pin skip (`emitBorrowedStringArgPins`) —
+        // so this registration and those releases cover the SAME population
+        // and can never disagree about it: a bound / `move`d / returned /
+        // literal receiver is not one of those shapes, is not registered here,
+        // and is freed by its own owner (no double-free). A string-returning
+        // CALL is deliberately excluded by that predicate (the callee may
+        // return a borrow), so a call receiver keeps the pre-existing leak —
+        // the safe direction, and the same posture the collection path takes
+        // for a shape it does not recognise.
+        //
+        // ⚠ THE SCOPE END IS LATER THAN THE FULL-EXPRESSION END. §28.3 names
+        // the full-expression boundary; the scope end is the nearest
+        // registration point the disposal machinery offers, and it is LATER,
+        // so the receiver merely outlives its boundary — the safe direction,
+        // exactly as the collection path's own registration records ("the
+        // table merely outlives its boundary, which is the safe direction").
+        // The receiver is unreachable by any other name (it is an unbound
+        // temporary), so nothing can observe the delay.
+        auto registerIndexReceiverDischarge = [&](llvm::Value* recv) {
+            if (!recv) return;
+            // No enclosing scope to discharge through, or a disposer body —
+            // the pre-existing leak, the safe direction (§28.3's "else it
+            // leaks"). A disposer body has no scope of its own to register
+            // into (the same gate the collection path applies).
+            if (disposeStack_.empty() || emittingDisposerBody_) return;
+            if (!isPlusOneStringProducer(ix->target.get())) return;
+            // Belt-and-braces: only a heap pointer is a disposable string.
+            if (!recv->getType()->isPointerTy()) return;
+            // `entryAllocaNullPtr` (#2733), NOT a bare `entryAlloca`: a
+            // disposal pass can be reached on a path that never ran this
+            // store (an unwind out of the index operand evaluated after the
+            // production, a sibling branch), and the slot must read null there.
+            llvm::AllocaInst* slot = entryAllocaNullPtr();
+            builder_.CreateStore(recv, slot);
+            Disposal d{slot, nullptr};
+            // Fires on BOTH exits: the reference dies on the normal edge (the
+            // scope-end boundary §28.3 names) and on the unwind edge (its
+            // exception-path paragraph), and a given exit goes one way only,
+            // so this runs exactly once per scope exit.
+            d.unwindOnly = false;
+            // §28.9: the string's own reference is dropped with
+            // `bz_string_release` (refcounted; null- and sentinel-safe). The
+            // receiver is a heap +1 producer, so this is its ONLY reference.
+            d.stringRelease = true;
+            // Null the slot after the release so the discharge is IDEMPOTENT.
+            // A scope can be traversed twice on distinct paths (the
+            // `emitDisposalsInRange` + `emitAllDisposals` shape the
+            // `awaitedTaskTemp` arm documents), and a second release of an
+            // already-freed string is a refcount over-release (a runtime
+            // abort), not a no-op.
+            d.nullSlotAfterRelease = true;
+            disposeStack_.back().push_back(d);
+        };
         // CG27e (§4.6): string indexer `s[i]` → char (i32 code point).
         {
             // Pre-warm: if the target has no sema type yet (lambda param with
@@ -2542,6 +4036,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         ix->indices[0].value.get())) {
                     llvm::Value* strPtr = lowerExpr(*ix->target);
                     if (!strPtr) return nullptr;
+                    // fix #7171: register the receiver's §28.3 discharge AT
+                    // THE PRODUCTION — before the slice's own bounds check can
+                    // raise (§3.4), so the throw edge is covered too.
+                    registerIndexReceiverDischarge(strPtr);
                     return emitStringRangeSlice(strPtr, *range);
                 }
                 // R33: the index may be a Range *value* (a variable / call
@@ -2553,6 +4051,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (auto* idxTy = ctx_.exprType(*ix->indices[0].value)) {
                     if (isRangeType(idxTy)) {
                         llvm::Value* strPtr = lowerExpr(*ix->target);
+                        // fix #7171: register the receiver's §28.3 discharge as
+                        // soon as the receiver exists — BEFORE the index
+                        // operand is lowered, so an exception raised while
+                        // evaluating the index operand still discharges the
+                        // already-produced receiver (§28.3's exception-path
+                        // paragraph).
+                        if (strPtr) registerIndexReceiverDischarge(strPtr);
                         llvm::Value* rv = lowerExpr(*ix->indices[0].value);
                         if (!strPtr || !rv) return nullptr;
                         return emitStringRangeSliceValue(strPtr, rv);
@@ -2560,6 +4065,11 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 }
                 // §4.6: a single int index `s[i]` returns the i-th char.
                 llvm::Value* strPtr = lowerExpr(*ix->target);
+                // fix #7171: same discipline as the range-value arm above —
+                // register the receiver's §28.3 discharge at the production,
+                // before the index operand is lowered and long before the
+                // bounds check can raise (§4.6 / §31.2).
+                if (strPtr) registerIndexReceiverDischarge(strPtr);
                 llvm::Value* idx = lowerExpr(*ix->indices[0].value);
                 if (!strPtr || !idx) return nullptr;
                 // fix #2799 / §7.4: a §7.4-flow-narrowed `int?` arrives here
@@ -5591,7 +7101,27 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // AST-structural, not symbol-based.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "IsReadOnly") {
-            auto* tt = ctx_.exprType(*ma->target);
+            // fix #7086 (§14.2, v0.340): a receiver typed as a BARE TYPE
+            // PARAMETER (`x: T` under `where T: ICollection<int>`) stands for
+            // the CONCRETE type the parameter is substituted with, so the
+            // read resolves to that concrete type's own `IsReadOnly` — the
+            // same authority the #6757 exception-surface arm below already
+            // reads ("A receiver typed as a bare type parameter … resolves to
+            // its concrete type through the active substitution, as every
+            // other receiver does"). Without it the read saw the bare `T`,
+            // matched no family, and degraded the slot to zero.
+            //
+            // `resolveTypeParamRef` resolves BY HEAD NAME, so it is gated on
+            // the receiver's type really being a bare type PARAMETER
+            // (`isBareTypeParamRef` — the #5024 helper's gate). Without the
+            // gate a receiver whose type is spelled like a generic parameter
+            // is resolved to that parameter's substitution: the #5449 shape
+            // (`import System.Collections.Generic as G;` + `class
+            // Holder<Stack>` + `new G.Stack<int>()`) resolved `G.Stack<int>`
+            // to `string`, and the count read degraded to zero.
+            auto* recvTy = ctx_.exprType(*ma->target);
+            auto* tt = isBareTypeParamRef(recvTy) ? resolveTypeParamRef(recvTy)
+                                                   : recvTy;
             // fix-forward #6776 (§2.5, v0.340): no astNode gate; an imported builtin
             // (astNode-less, head in `importedName`) must match the same arm.
             std::string_view cn =
@@ -5608,6 +7138,110 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 lowerExpr(*ma->target);
                 return llvm::ConstantInt::get(i1(), 0);
             }
+            // fix #7017 (stdlib §4.1 / §4.2, v0.340): the same read through
+            // a BUILTIN COLLECTION INTERFACE receiver — `ICollection<T>`
+            // (stdlib §4.1), `IList<T>` (§4.1, which inherits it),
+            // `IOwningCollection<T>` (§4.2) and `IOwningList<T>` (§4.2, which
+            // inherits it). The member is DECLARED on those heads (§4.1:
+            // "readonly property IsReadOnly: bool;" on `ICollection<T>`; §4.2:
+            // the same on `IOwningCollection<T>`), and the #6997 sema arm
+            // admits it (it is in the head's documented surface), so the read
+            // reached codegen — and NOTHING lowered it: the local degraded to
+            // a zero-initialised value with the #2434 warning and the program
+            // answered `False` by accident, not by reading the member.
+            //
+            // The VALUE is the same constant the seven concrete families get
+            // above, and for the same reason: §4.1 fixes it — "`IsReadOnly`
+            // is `false` for every standard collection implementing
+            // `ICollection<T>` … The standard library currently ships no
+            // read-only `ICollection<T>` implementation" — and §4.2's owning
+            // pair is implemented by the owning standard collections
+            // (OwningArray §4.5, OwningLinkedList §4.7, OwningSet §4.10),
+            // whose `IsReadOnly` the #4746 arm above already answers `false`.
+            //
+            // THE ONE CASE THE CONSTANT DOES NOT COVER, measured and filed.
+            // §4.1 contemplates a "user-defined read-only implementation",
+            // and a user class CAN hold such a slot — `public class
+            // MyList: IList<int> … end MyList;` followed by `var il:
+            // IList<int> := new MyList();` is accepted (§5.1). Through that
+            // receiver the constant is wrong: the head erases the concrete
+            // layout with no itable, so the read has nothing to dispatch
+            // through. MEASURED on this lane's base, over a `MyList` whose
+            // `_a` is `[1,2,3]` and whose `IsReadOnly` returns `true`:
+            // `il.Count` → `0`, `il.Contains(2)` → `False`,
+            // `il.IsReadOnly` → `False` — all three wrong, all three with no
+            // diagnostic. That is #7063, whose scope is the whole
+            // user-implementation family; this arm answers only the standard
+            // collections, which §4.1 and §4.2 pin to `false`. The pre-fix
+            // #2434 fallback printed `False` for that receiver too, so this
+            // is not a regression — it is the same wrong answer reached
+            // deliberately instead of accidentally, and only for a case
+            // #7063 already owns. The other available answer, an Error, is
+            // excluded: §27.6 resolves a bare reference "on the value exactly
+            // as the call `v.Scaled()` is", and §4.1 DECLARES this member on
+            // these heads, so the read resolves; rejecting it would turn an
+            // accepted program into a rejection — the silent-acceptance
+            // inversion this repo treats as its worst defect class.
+            //
+            // The read is TYPED here (as `bool`) because sema does not type
+            // it on an interface receiver (the #4746 sema arm admits the seven
+            // CONCRETE families only), so without this the expression would
+            // stay untyped and every consumer that keys on the semantic type
+            // — the `Console.WriteLine` renderer (a nullable/primitive
+            // dispatch keyed on `ctx_.exprType`), and an INFERRED local's
+            // declared type — would see "no type" instead of `bool`. The
+            // #2781 arm above already mints the same type from codegen for
+            // the same reason (an `Object` universal member has no
+            // MethodSymbol and no sema type), and patches the bound local's
+            // declared type with it; this arm does the same for the same
+            // reason.
+            if (cn == "ICollection" || cn == "IList" ||
+                cn == "IOwningCollection" || cn == "IOwningList") {
+                sema::TypeRef* boolTy =
+                    ctx_.primitiveTypeRef(sema::PrimitiveType::Bool);
+                ctx_.setExprType(&e, boolTy);
+                // The inferred-local twin of the #2781 patch: when this read
+                // IS the initializer of a local, sema left that local's
+                // DECLARED type null — sema types the member only on the
+                // seven CONCRETE families, never on an interface receiver —
+                // so the binding carries no type even though the read's own
+                // type is `bool`. Restoring it here is the #2781 precedent's
+                // exact mechanism ("sema left the binding local's declType
+                // null … Restore it here from the exprType we just set"). A
+                // post-sema codegen-only patch is safe — sema does not read a
+                // local's declared type again after the initializer is
+                // typechecked.
+                //
+                // fix #7017 + the #3614 shape (§21.1, v0.340): the
+                // initializer is read through the SHARED `localDeclInitView`
+                // authority (#2802/#3402), NOT through a `const
+                // ast::LocalDecl*` dynamic_cast. A §21.1 `const` local is a
+                // DIFFERENT AST node (`ast::LocalConstDecl`, whose
+                // initializer field is `value`, not `initializer`), so that
+                // cast is null for it and the `const` form was SILENTLY
+                // SKIPPED — the exact defect shape the #3591 ratchet family
+                // exists to catch (this file's grandfathered ceiling is ONE
+                // bare site, so a second one is a gate-blocking violation;
+                // #3614 is the in-repo precedent for this very repair:
+                // "read the … triple through the shared `localDeclInitView`
+                // instead of re-deriving it via a LocalDecl-only
+                // dynamic_cast"). `localDeclInitView` is the ONE place the
+                // LocalDecl/LocalConstDecl split is decoded, so both kinds are
+                // recognized identically — and the site is no longer a bare
+                // cast at all.
+                for (const auto& sym : ctx_.symbols()) {
+                    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
+                    if (!ls || !ls->decl) continue;
+                    LocalDeclInitView view = localDeclInitView(ls->decl);
+                    if (!view.init || view.init != &e) continue;
+                    ls->declType = boolTy;
+                    break;
+                }
+                // Lower the receiver for its side effects and discard the
+                // value: the property does not depend on the object's state.
+                lowerExpr(*ma->target);
+                return llvm::ConstantInt::get(i1(), 0);
+            }
         }
     }
     // §3: Array<T>.Length / .Count — runtime bz_array_len.
@@ -5615,7 +7249,30 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // Dictionary<K,V>.Count — runtime bz_dict_count.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && (ma->member == "Length" || ma->member == "Count")) {
-            auto* tt = ctx_.exprType(*ma->target);
+            // fix #7086 (§14.2, v0.340): a receiver typed as a BARE TYPE
+            // PARAMETER (`x: T` under `where T: IList<int>`) stands for the
+            // CONCRETE type the parameter is substituted with, so the count
+            // read resolves to that concrete type's own count — the same
+            // authority the #6757 exception-surface arm below already reads
+            // ("A receiver typed as a bare type parameter … resolves to its
+            // concrete type through the active substitution, as every other
+            // receiver does"). Without it the read saw the bare `T`, matched
+            // no collection arm, and degraded the slot to zero.
+            //
+            // The generic TEMPLATE body (the dead placeholder, `T` at its i32
+            // representation) has no substitution, so `resolveTypeParamRef`
+            // returns the bare `T` unchanged there and the read falls through
+            // to the #2547 degrade — the dead body's own established
+            // behaviour, in a body no live call reaches.
+            //
+            // The same `isBareTypeParamRef` gate as the `IsReadOnly` arm
+            // above: `resolveTypeParamRef` resolves BY HEAD NAME, so an
+            // ungated call would resolve a receiver whose type is spelled
+            // like a generic parameter (the #5449 `G.Stack<int>` shape) to
+            // that parameter's substitution.
+            auto* recvTy = ctx_.exprType(*ma->target);
+            auto* tt = isBareTypeParamRef(recvTy) ? resolveTypeParamRef(recvTy)
+                                                   : recvTy;
             // StringBuilder.Length: sum of all part lengths.
             // fix-forward #6776 (§2.5, stdlib §3.1, v0.340): `headName()`
             // alone, so an IMPORTED `StringBuilder` (astNode-less, head in
@@ -5713,6 +7370,25 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (isOB) {
                     llvm::Value* obj = lowerExpr(*ma->target);
                     if (obj) {
+                        // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL
+                        // backstop for this arm. OwningBuffer<T> is bz_array_t-backed
+                        // (the same header `bz_array_is_disposed` reads), so this is
+                        // the same guard the isCollectionTypeName arm below emits —
+                        // this arm was simply missed. Without it the read reports the
+                        // QUARANTINED header's count, which `bz_array_mark_disposed`
+                        // zeroed: a silently empty 0 instead of §28.2 K4.1's
+                        // DisposedAccessException.
+                        if (checkedDisposal_) {
+                            llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                            auto* isFn = declareC("bz_array_is_disposed", i8Ty,
+                                                  {ptrTy()});
+                            llvm::Value* flag =
+                                builder_.CreateCall(isFn, {obj}, "cd.arrdis");
+                            llvm::Value* disposed = builder_.CreateICmpNE(
+                                flag, llvm::ConstantInt::get(i8Ty, 0),
+                                "cd.disposed");
+                            emitGuardThrow(disposed, "DisposedAccessException");
+                        }
                         auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
                         llvm::Value* cnt64 = builder_.CreateCall(fn, {obj});
                         return builder_.CreateTrunc(cnt64, i32(), "ob.cnt");
@@ -5776,6 +7452,25 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (isListInterfaceName(tt)) {
                 llvm::Value* obj = lowerExpr(*ma->target);
                 if (obj) {
+                    // fix #7045 (§28.2 / §28.3, v0.340): the CHECKED-DISPOSAL
+                    // backstop for this arm. The arm's own #853 note establishes
+                    // that these interfaces are implemented ONLY by Array<T> /
+                    // OwningArray<T>, both bz_array_t*-backed, so the erased
+                    // receiver carries the same header `bz_array_is_disposed`
+                    // reads — the same guard the isCollectionTypeName arm emits.
+                    // Without it the read reports the QUARANTINED header's count,
+                    // which `bz_array_mark_disposed` zeroed: a silently empty 0
+                    // instead of §28.2 K4.1's DisposedAccessException.
+                    if (checkedDisposal_) {
+                        llvm::Type* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                        auto* isFn = declareC("bz_array_is_disposed", i8Ty,
+                                              {ptrTy()});
+                        llvm::Value* flag =
+                            builder_.CreateCall(isFn, {obj}, "cd.arrdis");
+                        llvm::Value* disposed = builder_.CreateICmpNE(
+                            flag, llvm::ConstantInt::get(i8Ty, 0), "cd.disposed");
+                        emitGuardThrow(disposed, "DisposedAccessException");
+                    }
                     auto* fn = declareC("bz_array_len", i64(), {ptrTy()});
                     llvm::Value* len64 = builder_.CreateCall(fn, {obj});
                     return builder_.CreateTrunc(len64, i32(), "ilist.len");
@@ -8350,6 +10045,109 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
             return cell;
         }
+        // fix #7025 (§8.7 / §27.6 / §28.2, v0.340): a bare method-group
+        // reference to a CLASS's own compiler-generated `Dispose`
+        // (`var f := d.Dispose;`).
+        //
+        // The generated `Dispose` has no MethodDecl and no MethodSymbol
+        // (§28.2: the name is the compiler's), so the CG60 path fell
+        // through to `ret nullptr` and the local degraded to a zero value
+        // (the #2434 warning) — the call was a SILENT NO-OP, or (with a
+        // `() -> ()` annotation) a SIGSEGV.
+        //
+        // §27.6: the member is resolved on the value "exactly as the call
+        // `v.Scaled()` is", and `d.Dispose()` is accepted and works — so the
+        // reference form is accepted and produces a real callable.
+        //
+        // Placed AFTER the MethodSymbol arm: a real MethodSymbol (a user
+        // interface's declared `Dispose`, reached through a user interface)
+        // is the ordinary §27.6 reference and keeps its own thunk.
+        if (isClassDisposeMethodRef(&e)) {
+            // The reference's function type: `() -> ()` — §28.2's `Dispose()`
+            // takes no parameter and returns nothing.
+            sema::TypeRef* fnTy = ctx_.makeTypeRef();
+            fnTy->kind = sema::TypeRef::Kind::Function;
+            sema::TypeRef* unitTy = ctx_.makeTypeRef();
+            unitTy->kind = sema::TypeRef::Kind::Unit;
+            fnTy->funcReturn = unitTy;
+            ctx_.setExprType(&e, fnTy);
+            // … and the BINDING LOCAL's declType, so `f()` dispatches
+            // through the closure-call path. Sema left the local untyped
+            // because the member has no symbol (the #2781 Object-member
+            // arm's patch, verbatim): without it, `f()`'s lowerCall arm
+            // sees a null declType on the LocalSymbol and silently
+            // degrades to the #2434 zero-init — the closure cell is BUILT
+            // but never called.
+            //
+            // fix #7025 (follow-up, §21.1 / §27.6, v0.340): the binding
+            // local is found through the SHARED `bindingLocalSymbol`
+            // authority, which reads BOTH local-declaration forms — a §21.1
+            // runtime `const` local is an `ast::LocalConstDecl` (initializer
+            // field `value`), NOT an `ast::LocalDecl` (field `initializer`),
+            // so the previous `dynamic_cast<const ast::LocalDecl*>` scan
+            // MISSED every `const` spelling: `const f := d.Dispose;` kept a
+            // null declType, the call degraded to the #2434 zero-init, and
+            // the group was a silent no-op.
+            sema::LocalSymbol* ls = bindingLocalSymbol(&e);
+            if (ls && ls->declType) {
+                // fix #7025 (follow-up, §27.6 / §5.1, v0.340): an ANNOTATED
+                // local (`var f: (int) -> int := d.Dispose;`). §27.6: "The
+                // reference's signature must be compatible with the target
+                // function type: its parameter and return types unify with
+                // the target's under the standard implicit-conversion rules
+                // (§5.1)." The formed type is `() -> ()` (§28.2's `Dispose()`
+                // takes no parameter and returns nothing), so an annotation
+                // with a different arity or return type is INCOMPATIBLE.
+                //
+                // The previous revision OVERWROTE the user's annotation
+                // unconditionally (`ls->declType = fnTy`), which turned a
+                // loud base failure (the annotation's type drove the call
+                // into the null cell → SIGSEGV) into a SILENT wrong answer
+                // (the call ran the group with the wrong shape and the
+                // statement emitted nothing) — the repo's top defect class.
+                // This arm does not overwrite: on a mismatch it REFUSES with
+                // a located diagnostic, and — because the ordinary §27.6
+                // reference form is REJECTED by sema for the same mismatch
+                // ("the initializer for `f` has a type that is not implicitly
+                // convertible to the target type (§5.1)", measured) — it
+                // refuses with that same verdict, LOCATED, rather than
+                // letting the program degrade into a runtime failure.
+                //
+                // ⚠ THE #7014 ARM NOW REFUSES THE SAME WAY (fix #7098,
+                // §27.6 / §5.1, v0.343). It used NOT to: on a signature
+                // mismatch it `return nullptr` — a SILENT non-lowering, not a
+                // diagnostic — so the program kept the pre-fix behaviour (the
+                // local stayed as the annotation left it) and the CALL
+                // SEGFAULTED (measured: rc 139, ASan "SEGV on unknown address
+                // 0x000000000008"). It now refuses with a located §27.6
+                // diagnostic, exactly as this arm does. (An earlier revision
+                // of this comment claimed the #7014 arm "already refuses on a
+                // mismatch instead of overwriting", and that was false —
+                // the review measured it: `Exprs.cpp`'s #7014 arm returned
+                // nullptr and kept the pre-fix behaviour.)
+                const sema::TypeRef* declTy = ls->declType;
+                const bool compatible =
+                    declTy->kind == sema::TypeRef::Kind::Function &&
+                    declTy->funcParams.empty() && declTy->funcReturn &&
+                    declTy->funcReturn->kind == sema::TypeRef::Kind::Unit;
+                if (!compatible) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        std::string("the method group over `") +
+                            std::string(ma->member) +
+                            "` has the signature `() -> ()`, which is not "
+                            "compatible with the declared type of `" +
+                            std::string(ls->name) +
+                            "` — §27.6: \"The reference's signature must be "
+                            "compatible with the target function type\" "
+                            "(§5.1)");
+                    return nullptr;
+                }
+            } else if (ls) {
+                ls->declType = fnTy;
+            }
+            return makeClassDisposeThunk(*ma);
+        }
         // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
         // method (`int.Parse`, `char.IsDigit`, …) — no MethodSymbol (intrinsics
         // are name-recognized) — that sema typed as a function value. Back it with
@@ -8358,6 +10156,138 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // it). isPrimIntrinsicMethodRef keys the disposal sites to this same set.
         if (isPrimIntrinsicMethodRef(&e))
             return makePrimIntrinsicThunk(*ma, ctx_.exprType(e));
+        // fix #7014 (stdlib §4.1, spec §27.6, v0.340): a bare method-group
+        // reference to a member of the array-backed BORROWING LIST interface
+        // `IList<T>` (`il.Contains`, `il.Add`, `il.Insert`, …).
+        //
+        // §27.6: "the member resolved on the value exactly as the call
+        // `v.Scaled()` is" — and the CALL form of these members LOWERS
+        // (through the identical bz_array_* bridge the concrete `Array<T>`
+        // uses: `IList<T>` is implemented only by the array-backed
+        // `Array<T>`, stdlib §4.1 / §4.4). So the reference form must be
+        // EMITTED, not rejected. It has NO MethodSymbol (an interface head has
+        // no method DECLARATION to bind), so the CG60 path fell through to
+        // `ret nullptr` and the local degraded to a zero value — calling the
+        // method group was a SIGSEGV (measured: rc 139).
+        //
+        // The POLYMORPHIC collection interfaces (ICollection<T> /
+        // IOwningCollection<T> / IOwningList<T>) are NOT reached here: their
+        // call form is fenced (#853) and their reference form is rejected to
+        // match (the arm below).
+        if (isBuiltinListMemberMethodRef(&e)) {
+            sema::TypeRef* fnTy = builtinListMemberFnType(*ma);
+            if (!fnTy) return nullptr;
+            // The BINDING LOCAL's declared type. Sema could not type it (the
+            // member has no symbol), so codegen restores it — the #2781
+            // Object-member arm's discipline: without a function-typed local,
+            // `f(x)` never dispatches through the closure-call path.
+            sema::LocalSymbol* ls = bindingLocalSymbol(&e);
+            auto sameTy = [this](const sema::TypeRef* a,
+                                 const sema::TypeRef* b) {
+                if (!a || !b) return a == b;
+                return typeRefIdentityKey(a) == typeRefIdentityKey(b);
+            };
+            if (ls && ls->declType) {
+                // An ANNOTATED local (`var f: (int) -> bool := il.Contains;`).
+                //
+                // fix #7098 (spec §27.6 / §5.1, v0.343): the ANNOTATION must
+                // be COMPATIBLE with the member's own signature, and a
+                // mismatch is REFUSED with a located diagnostic — the #7025
+                // arm's discipline, verbatim (it refuses a `Dispose` group
+                // whose annotation does not match, for the same reason).
+                //
+                // §27.6 (v0.343): "The reference's signature must be
+                // compatible with the target function type: its parameter and
+                // return types unify with the target's under the standard
+                // implicit-conversion rules (§5.1)."
+                //
+                // BEFORE THIS, THE MISMATCH WAS SILENT: the arm `return
+                // nullptr`'d, the reference did NOT lower, the local degraded
+                // to a zero-initialized value (the #2434 warning) and the CALL
+                // SEGFAULTED — MEASURED on the staging tip: compile rc 0 with
+                // only the internal #2434 warning, run rc 139, and under
+                // ASan "SEGV on unknown address 0x000000000008 … rax =
+                // 0x0000000000000008". A program that COMPILES and then
+                // SEGFAULTS is strictly worse than a rejection.
+                //
+                // TWO VERDICTS, because §27.6 admits a bridge that this arm
+                // does not build:
+                //  - INCOMPATIBLE: §5.1 admits no conversion in the needed
+                //    direction (e.g. the target `(long) -> bool` over
+                //    `Contains(item: int)` — `long` does not convert to
+                //    `int`). The formation is a compile error, and the
+                //    diagnostic says so.
+                //  - BRIDGED: §5.1 DOES admit a conversion (e.g. the target
+                //    `(byte) -> bool` over `Contains(item: int)` — `byte`
+                //    converts to `int`), so §27.6's "formation may bridge
+                //    representation-changing conversions by synthesizing an
+                //    adapter" would admit it. This arm does NOT synthesize
+                //    that adapter (the #5208 formation-site adapter is wired
+                //    to a MethodSymbol's thunk, and an interface head has no
+                //    MethodSymbol), so the formation is refused — LOUDLY,
+                //    with the remedy, rather than minted at an ABI the call
+                //    site would violate.
+                const sema::TypeRef* declTy = ls->declType;
+                bool identical =
+                    declTy->kind == sema::TypeRef::Kind::Function &&
+                    declTy->funcParams.size() == fnTy->funcParams.size() &&
+                    sameTy(declTy->funcReturn, fnTy->funcReturn);
+                for (std::size_t i = 0; identical && i < fnTy->funcParams.size();
+                     ++i)
+                    if (!sameTy(declTy->funcParams[i].type,
+                                fnTy->funcParams[i].type))
+                        identical = false;
+                if (!identical) {
+                    const bool bridged =
+                        listMemberTargetConverts(declTy, fnTy);
+                    ctx_.diagnostics().report(
+                        Severity::Error, e.span.begin,
+                        std::string("the method group over `") +
+                            std::string(ma->member) + "` has the signature `" +
+                            listMemberSignatureSpelling(fnTy) + "`, which is " +
+                            (bridged ? "not the declared type of `"
+                                     : "not compatible with the declared type of `") +
+                            std::string(ls->name) +
+                            "` — §27.6: \"The reference's signature must be "
+                            "compatible with the target function type: its "
+                            "parameter and return types unify with the target's "
+                            "under the standard implicit-conversion rules "
+                            "(§5.1)\"" +
+                            (bridged
+                                 ? ": this compiler cannot yet bridge the "
+                                   "difference with a formation-site adapter, "
+                                   "so the formation is refused here — write a "
+                                   "lambda that converts explicitly"
+                                 : ""));
+                    return nullptr;
+                }
+            } else if (ls) {
+                ls->declType = fnTy;
+            }
+            ctx_.setExprType(&e, fnTy);
+            return makeBuiltinListMemberThunk(*ma, fnTy);
+        }
+        // fix #7014 (stdlib §4.1 / §4.2, spec §27.6, v0.340): a bare
+        // method-group reference to a member a BUILTIN COLLECTION INTERFACE
+        // head declares (`co.Contains`, `ol.Insert`, …) has no MethodSymbol
+        // (an interface head has no method declaration to bind), so the CG60
+        // path fell through to `ret nullptr` and the local degraded to a zero
+        // value — calling the method group was a SIGSEGV (measured: rc 139).
+        //
+        // §27.6: "the member resolved on the value exactly as the call
+        // `v.Scaled()` is" — and the CALL form of these members is rejected by
+        // the #853 fence (the interface erases the concrete backing, so no
+        // single bz_* call is sound). The reference form must be rejected
+        // identically; the arm below lowers a synthetic call through that same
+        // path so the fence fires with the same diagnostic and location. The
+        // PROPERTY form on the same heads is already rejected by the matching
+        // fence in the property arm above, so this makes all three agree.
+        //
+        // Placed AFTER the MethodSymbol arm: a real MethodSymbol (a user
+        // class's method reached through a user interface) is the ordinary
+        // §27.6 reference and must keep its own thunk.
+        if (isBuiltinCollMemberMethodRef(&e))
+            return lowerBuiltinCollMemberRef(*ma);
     }
     return nullptr;
 }
@@ -9157,6 +11087,36 @@ void Emitter::fitUserOperatorArgs(
         if (isNullableValueTy(pt))
             args[i] = wrapArgForNullableValueFormal(v, pt);
     }
+}
+
+// §6.2 (v0.344) mixed int/floating operator + §5.1 (v0.344) implicit
+// conversions: promote an operand to the floating type of the operation.
+//
+// §5.1 converts VALUES, not bit patterns, so the instruction depends on the
+// SIGNEDNESS of the operand's own declared type:
+//
+//   - an UNSIGNED source (`byte`/`ushort`/`uint`/`ulong`, and an enum with an
+//     unsigned underlying) converts with `uitofp`, which zero-extends;
+//   - a SIGNED source converts with `sitofp`, which sign-extends.
+//
+// Reading the bit pattern of a `uint` 4000000000 (0xEE6B2800) as SIGNED
+// yields the `int32` -294967296, so `1.5 + 4000000000u` computed
+// -294967294.5 instead of 4000000001.5.
+//
+// The signedness is decided by the CALLER, which knows the operand's source
+// expression; the ONE predicate for that question is `isUnsignedTargetExpr`
+// (the same one the `double`-parameter converter of #7242 uses), so the two
+// cannot disagree about it.
+//
+// A floating operand that is NARROWER than the operation's floating type is
+// widened with `fpext` (a `float` mixed with a `double` widens the `float`).
+static llvm::Value* promoteOperandToFP(llvm::IRBuilder<>& b, llvm::Value* v,
+                                        llvm::Type* fty, bool unsignedSrc) {
+    if (!v->getType()->isFloatingPointTy())
+        return unsignedSrc ? b.CreateUIToFP(v, fty) : b.CreateSIToFP(v, fty);
+    if (v->getType() != fty)
+        return b.CreateFPExt(v, fty);
+    return v;
 }
 
 llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
@@ -10243,15 +12203,31 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                        ? l->getType()
                        : r->getType())
                 : (lFP ? l->getType() : r->getType());
-        auto toFP = [&](llvm::Value* v) -> llvm::Value* {
-            if (!v->getType()->isFloatingPointTy())
-                return builder_.CreateSIToFP(v, fty);  // §6.2 int promote
-            if (v->getType() != fty)
-                return builder_.CreateFPExt(v, fty);   // float → double
-            return v;
-        };
-        l = toFP(l);
-        r = toFP(r);
+        // fix #7250 (§6.2, §5.1, v0.344): the INTEGER operand of a mixed
+        // int/floating operator is promoted to the floating type, and §5.1
+        // converts VALUES, not bit patterns. The promotion therefore reads
+        // the operand's own signedness: an UNSIGNED source (`byte`,
+        // `ushort`, `uint`, `ulong`) converts with `uitofp` (a zero-
+        // extension), a SIGNED one with `sitofp` (a sign-extension).
+        //
+        // `sitofp` on the `uint` 4000000000 (bit pattern 0xEE6B2800) read
+        // it as the `int32` -294967296, so `1.5 + 4000000000u` computed
+        // -294967294.5 instead of 4000000001.5 — the same class of defect
+        // #7242 fixed for a `double` PARAMETER of a call, in a different
+        // mechanism (a binary operator, not a call).
+        //
+        // The signedness is asked through the ONE predicate
+        // `isUnsignedTargetExpr` — the same one the `double`-parameter
+        // converter of #7242 uses — so the two converters cannot disagree
+        // about it. `l` is the lowering of `bin.left` and `r` the lowering
+        // of `bin.right` (nothing between the operand lowering and here
+        // reorders them: the `this`-receiver load and the narrowed-nullable
+        // unwrap each keep their side), so each side's signedness is that
+        // of its own source expression.
+        const bool lUns = bin.left && isUnsignedTargetExpr(*bin.left);
+        const bool rUns = bin.right && isUnsignedTargetExpr(*bin.right);
+        l = promoteOperandToFP(builder_, l, fty, lUns);
+        r = promoteOperandToFP(builder_, r, fty, rUns);
         if (op == "+") return builder_.CreateFAdd(l, r);
         if (op == "-") return builder_.CreateFSub(l, r);
         if (op == "*") return builder_.CreateFMul(l, r);
@@ -10549,16 +12525,8 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     (plainSide == l) ? bin.left.get() : bin.right.get();
                 bool payUns   = structExpr && isUnsignedTargetExpr(*structExpr);
                 bool plainUns = plainExpr && isUnsignedTargetExpr(*plainExpr);
-                auto toFP = [&](llvm::Value* v, bool uns) -> llvm::Value* {
-                    if (!v->getType()->isFloatingPointTy())
-                        return uns ? builder_.CreateUIToFP(v, fty)
-                                   : builder_.CreateSIToFP(v, fty);
-                    if (v->getType() != fty)
-                        return builder_.CreateFPExt(v, fty);
-                    return v;
-                };
-                eqPayload = toFP(eqPayload, payUns);
-                plainSide = toFP(plainSide, plainUns);
+                eqPayload = promoteOperandToFP(builder_, eqPayload, fty, payUns);
+                plainSide = promoteOperandToFP(builder_, plainSide, fty, plainUns);
             }
             if (structSide && plainSide && nvTy && eqPayload &&
                 plainSide->getType() == eqPayload->getType()) {
@@ -10845,16 +12813,8 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                                ? lPay->getType()
                                : rPay->getType())
                         : (lFP ? lPay->getType() : rPay->getType());
-                auto toFP = [&](llvm::Value* v, bool u) -> llvm::Value* {
-                    if (!v->getType()->isFloatingPointTy())
-                        return u ? builder_.CreateUIToFP(v, fty)
-                                 : builder_.CreateSIToFP(v, fty);
-                    if (v->getType() != fty)
-                        return builder_.CreateFPExt(v, fty);
-                    return v;
-                };
-                lPay = toFP(lPay, lUns);
-                rPay = toFP(rPay, rUns);
+                lPay = promoteOperandToFP(builder_, lPay, fty, lUns);
+                rPay = promoteOperandToFP(builder_, rPay, fty, rUns);
             } else if (lPay->getType()->isIntegerTy() &&
                        rPay->getType()->isIntegerTy() &&
                        lPay->getType() != rPay->getType()) {
