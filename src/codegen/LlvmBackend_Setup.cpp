@@ -22042,33 +22042,129 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         // one, else the initializer's), which is what the disposal would read
         // — not the runtime class of some object, which the compiler cannot
         // know and §28.12 forbids it from using anyway.
-        auto awaitUsingSlotMayHoldClass = [&]() -> bool {
-            const sema::TypeRef* effTy = nullptr;
-            if (ld->type) effTy = ctx_.resolvedType(*ld->type);
-            if (!effTy && ld->initializer) effTy = ctx_.exprType(*ld->initializer);
-            // Unclassifiable: keep the pre-existing path (no new behaviour).
-            if (!effTy) return true;
-            if (effTy->kind == sema::TypeRef::Kind::Primitive) {
+        //
+        // fix #7337 / #7327 (§28.12, §28.9, §28.10, v0.344): THE DECLARED
+        // TYPE ALONE IS NOT THE SLOT'S REPRESENTATION. #7322's predicate read
+        // the DECLARED type when the binding had one, so a binding whose
+        // declared type is `Object` (or any interface) answered "may hold a
+        // class" for EVERY right-hand side — including a right-hand side that
+        // is a RUNTIME-MANAGED value, whose word 0 is a DATA pointer and not
+        // a vtable:
+        //
+        //   await using var x: Object := o.ToString();  -> the string's
+        //       payload pointer is read as a vtable, so slot 2 is read at
+        //       payload+16 — 14 bytes past the end of the 2-byte payload
+        //       (ASan: heap-buffer-overflow, READ of size 8).
+        //   await using var x: Object := "hi";           -> the literal's
+        //       slot 2 is a null pointer (ASan: SEGV at 0x0).
+        //
+        // and a FUNCTION-TYPED right-hand side was never named by the
+        // predicate's switch at all (`sema::TypeRef::Kind::Function`), so it
+        // fell through to the conservative "may hold a class" answer and the
+        // closure's word 0 was read as a vtable (ASan: SEGV):
+        //
+        //   await using var f := lambda() => 1;          -> SEGV.
+        //
+        // §28.12:7490 decides the shape: "`await using` selects the
+        // logical-disposal path by the class of the object the binding HOLDS
+        // ... never by the binding's static type", and it names the
+        // `Object`-typed and interface-typed bindings as the ones that
+        // dispatch on the RUNTIME class ("through `Object`, and through any
+        // interface"). So the static type is not the answer — the object the
+        // binding holds is. What the COMPILER can know about that object is
+        // the RIGHT-HAND SIDE's own type, so the predicate now reads it too
+        // and takes the NARROWER answer for the RUNTIME-MANAGED values
+        // (§28.9 — a `string`, a function value): they have NO class, so
+        // §28.12:7488's "scope exit takes the synchronous disposal (or the
+        // no-op) and likewise awaits nothing" is the whole of it.
+        //
+        // THE MIRROR, MEASURED: a CLASS right-hand side keeps the async path.
+        // `await using var u: Object := new Solo();` still awaits Solo's
+        // DisposeAsync (the initializer's type is the class Solo), so the
+        // narrowing does not cost a class its asynchronous disposal — §28.12:7490's
+        // "through `Object`" case is exactly this one.
+        //
+        // The narrowed shapes take the PLAIN chain's arms — the same arms the
+        // plain `using var` spelling reaches, which is what §28.12 means by
+        // "takes §28.10's admission unchanged" (§28.10:7260 — "the disposal at
+        // scope end is a no-op ... and the only effect is the reassignability
+        // restriction") — so the two twins agree again.
+        // per §28.12, §28.9, §28.10, fix #7337, fix #7327
+        auto typeMayHoldClass = [](const sema::TypeRef* t) -> int {
+            // 1 = may hold a class object, 0 = may NOT, -1 = unclassifiable.
+            if (!t) return -1;
+            switch (t->kind) {
+            case sema::TypeRef::Kind::Primitive:
                 // `Object` is the ONE primitive that can hold a class
                 // instance (or a boxed value); every other primitive is a
                 // value type or a runtime-managed value (§28.9) — no class,
                 // no disposal obligation.
-                return effTy->primitive == sema::PrimitiveType::Object;
-            }
-            if (effTy->kind == sema::TypeRef::Kind::Named) {
+                return t->primitive == sema::PrimitiveType::Object ? 1 : 0;
+            case sema::TypeRef::Kind::Named:
                 // A declaration-less head (a type parameter, or a builtin
                 // class the #3449 gate did not claim) MAY be a class: keep
                 // the pre-existing path.
-                if (!effTy->declaration) return true;
+                if (!t->declaration) return 1;
                 // Class / interface: may hold a class instance.
-                if (effTy->declaration->kind == ast::TypeDeclKind::Class ||
-                    effTy->declaration->kind == ast::TypeDeclKind::Interface)
-                    return true;
+                if (t->declaration->kind == ast::TypeDeclKind::Class ||
+                    t->declaration->kind == ast::TypeDeclKind::Interface)
+                    return 1;
                 // Record / enum / choice: a VALUE TYPE (§9 / §10 / §35.4) —
                 // no class, no disposal obligation.
-                return false;
+                return 0;
+            case sema::TypeRef::Kind::Function:
+                // §28.9: a FUNCTION-TYPED value is runtime-managed — it
+                // "carries no disposal obligation", and "a `using var` local
+                // of function type is nonetheless permitted (disposal at
+                // scope end is a no-op)". A function value is not a class,
+                // so there is no vtable to dispatch on: its word 0 is not
+                // one, and reading it as one is the out-of-bounds read this
+                // arm removes (#7327).
+                return 0;
+            default:
+                // The unit type, an inline array, an error type: not
+                // classifiable here — keep the pre-existing path.
+                return -1;
             }
-            return true;
+        };
+        auto awaitUsingSlotMayHoldClass = [&]() -> bool {
+            const sema::TypeRef* initTy =
+                ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr;
+            // The EFFECTIVE type: the declared type when there is one, else
+            // the initializer's (as #7322 read it).
+            const sema::TypeRef* declTy =
+                ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
+            if (!declTy) declTy = initTy;
+            int declAns = typeMayHoldClass(declTy);
+            // Unclassifiable (-1): keep the pre-existing path (may hold a
+            // class) — no new behaviour.
+            bool mayHold = (declAns != 0);
+            // fix #7337: the RIGHT-HAND SIDE's own kind is the axis
+            // (§28.12:7490 — "never by the binding's static type"). A
+            // RUNTIME-MANAGED value (§28.9 — a `string`, a function value)
+            // has NO class: word 0 of one is a data pointer, not a vtable,
+            // so the class disposal over it is the out-of-bounds read this
+            // arm removes. An `Object`-declared (or interface-declared)
+            // binding over such a right-hand side therefore takes the
+            // NO-OP path, whatever the declaration says.
+            //
+            // WHY ONLY THE RUNTIME-MANAGED VALUES NARROW, AND NOT THE VALUE
+            // TYPES. A value-typed right-hand side stored into an `Object`
+            // slot is BOXED (§8.6) into a runtime box — a heap object whose
+            // word 0 IS a vtable, so the class path is sound for it (and it
+            // is what reclaims the box today). The runtime-managed values
+            // are the ones whose word 0 is NOT a vtable, and they are the
+            // ones §28.9 exempts from manual disposal outright. A
+            // FUNCTION-typed right-hand side is runtime-managed too (§28.9)
+            // and is the second hole the predicate had (#7327).
+            if (initTy) {
+                bool initIsRuntimeManaged =
+                    (initTy->kind == sema::TypeRef::Kind::Primitive &&
+                     initTy->primitive == sema::PrimitiveType::String) ||
+                    initTy->kind == sema::TypeRef::Kind::Function;
+                if (initIsRuntimeManaged) mayHold = false;
+            }
+            return mayHold;
         };
         // fix #2739 (§30.5/§30.6, v0.240): an `await using var` bound to a
         // borrowing BUILTIN collection literal (`await using var xs: Array<int> :=
@@ -22514,6 +22610,14 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 // (with #7322) for this one too — §28.10's "the only effect
                 // is the reassignability restriction" means the two spellings
                 // have the SAME runtime lifetime.
+                //
+                // fix #7337 / #7327 (v0.344): this arm is now also reached by
+                // a DECLARED-type binding whose right-hand side is
+                // runtime-managed or function-typed (`await using var x:
+                // Object := o.ToString();`, `await using var f := lambda() =>
+                // 1;`) — the declared type alone did not decide the
+                // representation, and the class disposal read the value's
+                // word 0 as a vtable. See `awaitUsingSlotMayHoldClass` above.
             }
         }
     }
