@@ -21,6 +21,7 @@
 // table against the pre-refactor snapshot.
 
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -645,6 +646,94 @@ struct BuiltinFormals {
     // parameter is required.
     std::size_t required = 0;
 };
+
+// The DECLARED TYPE of a built-in parameter, as a bit set: ONE position can
+// admit several declared types (§22.6's overload set — `int.Parse` declares
+// both `Parse(s: string)` and `Parse(s: ReadOnlyStringSpan)`, and
+// `int.ToString` declares both `ToString(format: string)` and
+// `ToString(radix: int)`).
+//
+// `kBPTAny` is the ZERO value and means "this position has no type opinion":
+// the admission gate must not refuse on it. A row that has not been
+// transcribed yet carries it, and a MISS therefore costs a rejection that does
+// not fire, never a false rejection — the fail-safe direction every table in
+// this registry takes.
+enum BuiltinParamType : std::uint32_t {
+    kBPTAny    = 0u,
+    kBPTString = 1u << 0,   // `string`
+    kBPTSpan   = 1u << 1,   // `ReadOnlyStringSpan`
+    kBPTInt    = 1u << 2,
+    kBPTLong   = 1u << 3,
+    kBPTUInt   = 1u << 4,
+    kBPTULong  = 1u << 5,
+    kBPTByte   = 1u << 6,
+    kBPTSByte  = 1u << 7,
+    kBPTShort  = 1u << 8,
+    kBPTUShort = 1u << 9,
+    kBPTFloat  = 1u << 10,
+    kBPTDouble = 1u << 11,
+    kBPTDecimal = 1u << 12,
+    kBPTBool   = 1u << 13,
+    kBPTChar   = 1u << 14,
+    kBPTObject = 1u << 15,  // `Object` (every type reaches it by boxing)
+    kBPTOut    = 1u << 16,  // an `out` slot: positional-only, no type opinion
+};
+
+// ONE declared form of a built-in member or constructor, read out of the ONE
+// parameter table (see `builtinParamForms`).
+struct BuiltinParamForm {
+    // The form's parameter count.
+    std::size_t total = 0;
+    // The declared parameter names, in declaration order. An empty vector
+    // means the table carries no §22.5 name surface for this form.
+    std::vector<std::string_view> names;
+    // The leading parameters that carry no default.
+    std::size_t required = 0;
+    // The declared parameter TYPE at each position: a `BuiltinParamType` bit
+    // set, or `kBPTAny` where the table has no type opinion.
+    std::vector<std::uint32_t> kinds;
+    // The §7.3 NON-NULLABLE positions of this form: bit `p` set means the
+    // parameter at position `p` is declared non-nullable in EVERY overload of
+    // this argument count.
+    std::uint8_t nonNullable = 0;
+    // The DECLARED SIGNATURE of this form, exactly as the standard library
+    // writes it ("`Parse(s: string, radix: int): int`"), with the return
+    // type the declaration carries. Empty for a form the standard library
+    // does not spell out.
+    std::string_view sig;
+};
+
+// The declared forms of the built-in member `typeHead.member` (or of the
+// built-in CONSTRUCTOR `typeHead`, when `member` is empty) that admit
+// `argCount` arguments, in the table's declaration order.
+//
+// This is the ONE read of the built-in parameter table: the parameter NAME
+// (§22.5), the parameter TYPE (§5.1) and the parameter NULLABILITY (§7.3) of
+// a form come from ONE row, so a caller that needs two of them cannot read
+// two tables that disagree. `builtinParamNameCandidates` and
+// `builtinParamIsNonNullable` are the two older spellings of a query over
+// the same table.
+//
+// The head `"String"` (the static call spelling) normalizes to `"string"`,
+// and the primitive keyword spellings (`int`, `bool`, …) normalize to the
+// standard-library head §9.1-§9.5 declares.
+// per §22.5 / §22.6 / §5.1 / §7.3 / stdlib §2.3, §2.5, §2.6, §3.1, §3.2,
+// §7.3, §7.4, §9.1-§9.6
+std::vector<BuiltinParamForm> builtinParamForms(std::string_view typeHead,
+                                                 std::string_view member,
+                                                 std::size_t argCount);
+
+// The `argCount` that asks `builtinParamForms` for EVERY declared form of a
+// member, whatever its arity — the §22.6 arity question's own ("does the
+// standard library declare this member at all?").
+inline constexpr std::size_t kBuiltinAnyArity = static_cast<std::size_t>(-1);
+
+// The head the built-in parameter table is keyed by: the primitive keyword
+// spellings (`int`, `bool`, …) name the same standard-library types
+// §9.1-§9.5 declares, and the static call spelling of the string class is
+// `String` where the table says `string`.
+// per §9.1 / stdlib §9.1-§9.6, fix #7296
+std::string_view builtinParamHeadSpelling(std::string_view typeHead);
 
 // The MEMBER table (#3398, widened by #3424). Returns every candidate whose
 // declared shape admits `argCount` arguments (`required <= argCount <=

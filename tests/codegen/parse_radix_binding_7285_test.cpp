@@ -173,6 +173,22 @@ void expectCompiledWithoutIRFailure(const JitResult& r) {
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "codegen error"));
 }
 
+
+// THE REFUSAL (campaign 2, `builtin-call-admission`): §22.6 (v0.344) — "If
+// no candidate is applicable at all ... the call is a compile error with no
+// candidates cited". The declared surface of the standard library (stdlib
+// §9.1-§9.5, §2.5, §2.6) declares the FIRST parameter of this member as a
+// `string`, and §5.1 admits no conversion to `string` from the operand these
+// rows pass — so the call reaches no candidate and the compiler REFUSES it,
+// at a real location, with that one diagnostic.
+//
+// The oracle is the diagnostic text plus a real location, never the absence
+// of a diagnostic.
+void expectRefused(const JitResult& r, const char* needle) {
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, needle));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -520,18 +536,14 @@ BEZEL_TEST(parse_radix_binding_7285, mirror_site_admits_a_uint_constant_radix) {
 BEZEL_TEST(parse_radix_binding_7285,
            tryparse_radix_form_with_an_int_first_argument_does_not_abort) {
     JitResult r = runAot(tryParseFirstArgProg("16", "16"));
-    expectCompiledWithoutIRFailure(r);
-    // The call is DROPPED (it is not a `TryParse` call at all), so the out
-    // slot keeps its zero-initialized value — the base arm's behaviour.
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n0\n"));
+    expectRefused(r, "no matching overload of `int.TryParse`");
 }
 
 // The `bool` first argument — the same shape, a different type.
 BEZEL_TEST(parse_radix_binding_7285,
            tryparse_radix_form_with_a_bool_first_argument_does_not_abort) {
     JitResult r = runAot(tryParseFirstArgProg("true", "16"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n0\n"));
+    expectRefused(r, "no matching overload of `int.TryParse`");
 }
 
 // The two-argument `TryParse(s, out result)` form has the same hole, and it
@@ -539,8 +551,7 @@ BEZEL_TEST(parse_radix_binding_7285,
 BEZEL_TEST(parse_radix_binding_7285,
            two_argument_tryparse_with_a_non_string_first_argument_does_not_abort) {
     JitResult r = runAot(tryParseTwoArgFirstArgProg("16"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n0\n"));
+    expectRefused(r, "no matching overload of `int.TryParse`");
 }
 
 // The POSITIVE CONTROL: the correct shape still parses. This is the row that
@@ -557,10 +568,7 @@ BEZEL_TEST(parse_radix_binding_7285,
 BEZEL_TEST(parse_radix_binding_7285,
            parse_radix_form_with_a_non_string_first_argument_does_not_abort) {
     JitResult r = runAot(parseFirstArgProg("16", "16"));
-    expectCompiledWithoutIRFailure(r);
-    // The whole `Console.WriteLine` statement emits nothing — not even the
-    // line terminator (the #3079 warning) — so the program prints nothing.
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string(""));
+    expectRefused(r, "no matching overload of `int.Parse`");
 }
 
 // ---------------------------------------------------------------------------

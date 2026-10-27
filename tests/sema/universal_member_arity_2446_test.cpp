@@ -277,18 +277,31 @@ BEZEL_TEST(sema_universal_member_arity_2446, choice_correct_arity_accepted) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §8.1 / §9.5: a static call on a primitive type name that shares the
-// universal-member name (`char.ToString(c: char)`) must NOT be falsely
-// rejected — the receiver is a type-name IdentifierExpr (a TypeSymbol),
-// not an instance value, so the universal-arity check is suppressed.
-BEZEL_TEST(sema_universal_member_arity_2446, char_static_tostring_accepted) {
+// §8.1 / §9.5 / §2.18: a static call on a primitive type name that shares the
+// universal-member name (`char.ToString('z')`) must NOT be falsely rejected by
+// the UNIVERSAL-ARITY check — the receiver is a type-name IdentifierExpr (a
+// TypeSymbol), not an instance value, so that check is suppressed.
+//
+// fix-forward (campaign 2's anchor): the call IS rejected, but by the §22.6
+// ADMISSION gate, not by the universal-arity check. Stdlib §9.5 declares
+// `ToString(): string` and §2.18's vocabulary for `char` is empty, so the
+// `ToString(format: string)` FORM (which fix #7333/#7336 put back into the
+// built-in parameter table) takes a FORMAT STRING — and a `char` argument
+// reaches no candidate. The row therefore asserts the §22.6 diagnostic: a
+// §8.1 arity diagnostic here would be the false rejection this row exists to
+// catch. (RENAMED from `char_static_tostring_accepted`; the lit twin is
+// `tests/lit/sema/sema_unknown_primitive_method_spec3_4__char_tostring_with_an_argument_is_rejected.bzl`.)
+BEZEL_TEST(sema_universal_member_arity_2446,
+           char_static_tostring_with_an_argument_is_rejected) {
     auto r = parseSemaAll(
         "module M; "
         "class C public static method Main(): int "
         "  var s := char.ToString('z'); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(anyDiagContains(
+        r, "no matching overload of `char.ToString`"));
 }
 
 // §8.1 / §2.3: a static call on a builtin class name that shares the

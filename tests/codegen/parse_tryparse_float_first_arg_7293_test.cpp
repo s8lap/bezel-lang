@@ -60,6 +60,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -100,6 +101,22 @@ void expectCompiledWithoutIRFailure(const JitResult& r) {
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "compiler CRASHED"));
 }
 
+
+// THE REFUSAL (campaign 2, `builtin-call-admission`): §22.6 (v0.344) — "If
+// no candidate is applicable at all ... the call is a compile error with no
+// candidates cited". The declared surface of the standard library (stdlib
+// §9.1-§9.5, §2.5, §2.6) declares the FIRST parameter of this member as a
+// `string`, and §5.1 admits no conversion to `string` from the operand these
+// rows pass — so the call reaches no candidate and the compiler REFUSES it,
+// at a real location, with that one diagnostic.
+//
+// The oracle is the diagnostic text plus a real location, never the absence
+// of a diagnostic.
+void expectRefused(const JitResult& r, const char* needle) {
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, needle));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -111,8 +128,7 @@ void expectCompiledWithoutIRFailure(const JitResult& r) {
 BEZEL_TEST(parse_tryparse_float_first_arg_7293,
            double_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(tryParseProg("double", "double", "7.0", "1.5", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n7\n"));
+    expectRefused(r, "no matching overload of `double.TryParse`");
 }
 
 // The same for `float` — the arm is shared, but the literal must be a
@@ -121,16 +137,14 @@ BEZEL_TEST(parse_tryparse_float_first_arg_7293,
 BEZEL_TEST(parse_tryparse_float_first_arg_7293,
            float_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(tryParseProg("float", "float", "7.0f", "1.5f", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n7\n"));
+    expectRefused(r, "no matching overload of `float.TryParse`");
 }
 
 // An `int` first argument — the same shape, a different type.
 BEZEL_TEST(parse_tryparse_float_first_arg_7293,
            int_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(tryParseProg("double", "double", "7.0", "16", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n7\n"));
+    expectRefused(r, "no matching overload of `double.TryParse`");
 }
 
 // ---------------------------------------------------------------------------
@@ -144,16 +158,14 @@ BEZEL_TEST(parse_tryparse_float_first_arg_7293,
 BEZEL_TEST(parse_tryparse_float_first_arg_7293,
            class_instance_first_argument_is_not_parsed_as_text) {
     JitResult r = runAot(tryParseProg("double", "double", "7.0", "o", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n7\n"));
+    expectRefused(r, "no matching overload of `double.TryParse`");
 }
 
 // The same for the `float` receiver.
 BEZEL_TEST(parse_tryparse_float_first_arg_7293,
            float_class_instance_first_argument_is_not_parsed_as_text) {
     JitResult r = runAot(tryParseProg("float", "float", "7.0f", "o", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n7\n"));
+    expectRefused(r, "no matching overload of `float.TryParse`");
 }
 
 // ---------------------------------------------------------------------------

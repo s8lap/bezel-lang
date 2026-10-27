@@ -18696,6 +18696,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // Run the §7 check against the §3.3-declared non-nullable char/string kinds.
     checkBuiltinSpanCallArgs(ce);
 
+    // The BUILTIN CALL ADMISSION GATE — the anchor's ONE resolver. A call to
+    // a built-in member of the VALUE built-ins (the primitive tower, `Guid`,
+    // the temporal records) is resolved against the ONE built-in parameter
+    // table: its arity, §5.1's conversions, §7.3's nullability and §22.5's
+    // named arguments. When no candidate is reachable the call is a compile
+    // error with no candidates cited (§22.6) — ONE diagnostic, not a silently
+    // dropped call.
+    // per §22.6 / §5.1 / §7.3 / §22.5, stdlib §9.1-§9.5, §2.5, §2.6
+    checkBuiltinCallAdmission(ce);
+
     // §7.5 / FINDING [3] ADDENDUM: a null-conditional call `x?.M(args)` is
     // ALWAYS nullable — it returns null when the receiver is null. The callee is
     // a NullCondMemberExpr; lift the (raw) return type recorded above to its
@@ -22655,6 +22665,514 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
             continue;
         reportBuiltinArgIfNullable(a.value.get(), what);
     }
+}
+
+// ---------------------------------------------------------------------------
+// The BUILTIN CALL ADMISSION GATE — the anchor's ONE resolver.
+//
+// campaign 2 (`builtin-call-admission`): a call to a built-in member is
+// resolved against the ONE built-in parameter table
+// (`common::kBuiltinParams`, src/common/BuiltinRegistry.cpp), which carries the
+// parameter NAME (§22.5), the parameter TYPE (§5.1) and the parameter
+// NULLABILITY (§7.3) of every DECLARED FORM. When no candidate is reachable
+// the call is a compile error with no candidates cited (§22.6) and ONE
+// diagnostic says so, naming the declared form the argument misses.
+//
+// THE REACH. The gate owns the VALUE built-ins — the primitive tower
+// (stdlib §9.1), `Double`/`Float` (§9.2), `Decimal` (§9.3), `Boolean` (§9.4),
+// `Char` (§9.5), `Guid` (§2.6) and the temporal records (§2.5) — whose
+// declared surface the table carries IN FULL, parameter type included. The
+// `string` / `Encoding` / `StringBuilder` / `Math` / `Convert` surface is
+// owned by the checks that already read it (`checkBuiltinStringCallArgs`,
+// `checkBuiltinStringBuilderCall`, `checkBuiltinMathConvertCallArgs`), and
+// this gate stands down there so that one call never draws two diagnostics.
+//
+// THE RULING IT APPLIES. §22.6 (v0.344): "If no candidate is applicable at all
+// — no candidate is reachable: a conversion §5.1 does not admit as implicit,
+// a parameter-count difference at a function-typed slot, a method-reference
+// formation that fails, or an inference that finds no binding — the call is a
+// compile error with no candidates cited, because no overload was reachable."
+// The R35 rulings for #7290 / #7293 / #7294 chose "guard-and-drop" — a
+// silently dropped call with an `internal:` degrade — for the parse-operand
+// guards, and that is the silent-acceptance inversion campaign 2 exists to
+// remove: the call is ADMITTED and answers `false` (or emits nothing) for a
+// program the standard library makes a compile error.
+//
+// THE ADMISSIBILITY TEST is §5.1's own: identity and the widening table
+// first, then the constant narrowing ("the source may be a compile-time
+// constant of any integer type — not only `int` — and the target any integer
+// type whose range contains its value, across signedness"). §5.1's nullable
+// lifting governs the nullability half: a `T?` converts to `T?` and never to
+// `T`, so a still-nullable value reaches no non-nullable parameter, and the
+// `null` literal reaches none either (§7.3).
+namespace {
+
+// The primitive a `BuiltinParamType` bit names. `kBPTSpan` has no primitive
+// (a `ReadOnlyStringSpan` is a record), and `kBPTObject` is the `Object`
+// primitive.
+bool builtinParamTypePrimitive(std::uint32_t bit, PrimitiveType* out) {
+    switch (bit) {
+        case common::kBPTString:  *out = PrimitiveType::String;  return true;
+        case common::kBPTInt:     *out = PrimitiveType::Int;     return true;
+        case common::kBPTLong:    *out = PrimitiveType::Long;    return true;
+        case common::kBPTUInt:    *out = PrimitiveType::UInt;    return true;
+        case common::kBPTULong:   *out = PrimitiveType::ULong;   return true;
+        case common::kBPTByte:    *out = PrimitiveType::Byte;    return true;
+        case common::kBPTSByte:   *out = PrimitiveType::SByte;   return true;
+        case common::kBPTShort:   *out = PrimitiveType::Short;   return true;
+        case common::kBPTUShort:  *out = PrimitiveType::UShort;  return true;
+        case common::kBPTFloat:   *out = PrimitiveType::Float;   return true;
+        case common::kBPTDouble:  *out = PrimitiveType::Double;  return true;
+        case common::kBPTDecimal: *out = PrimitiveType::Decimal; return true;
+        case common::kBPTBool:    *out = PrimitiveType::Bool;    return true;
+        case common::kBPTChar:    *out = PrimitiveType::Char;    return true;
+        case common::kBPTObject:  *out = PrimitiveType::Object;  return true;
+        default: return false;
+    }
+}
+
+// The phrase for a declared parameter type, as the diagnostic spells it.
+std::string builtinParamTypePhrase(std::uint32_t kind) {
+    if (kind & common::kBPTString) return "a `string`";
+    if (kind & common::kBPTSpan) return "a `ReadOnlyStringSpan`";
+    if (kind & common::kBPTInt) return "an `int`";
+    if (kind & common::kBPTLong) return "a `long`";
+    if (kind & common::kBPTUInt) return "a `uint`";
+    if (kind & common::kBPTULong) return "a `ulong`";
+    if (kind & common::kBPTByte) return "a `byte`";
+    if (kind & common::kBPTSByte) return "an `sbyte`";
+    if (kind & common::kBPTShort) return "a `short`";
+    if (kind & common::kBPTUShort) return "a `ushort`";
+    if (kind & common::kBPTFloat) return "a `float`";
+    if (kind & common::kBPTDouble) return "a `double`";
+    if (kind & common::kBPTDecimal) return "a `decimal`";
+    if (kind & common::kBPTBool) return "a `bool`";
+    if (kind & common::kBPTChar) return "a `char`";
+    if (kind & common::kBPTObject) return "an `Object`";
+    return "the declared type";
+}
+
+// The declared parameter type, as the diagnostic spells it.
+std::string builtinParamTypeSpelling(std::uint32_t kind) {
+    if (kind & common::kBPTString) return "string";
+    if (kind & common::kBPTSpan) return "ReadOnlyStringSpan";
+    if (kind & common::kBPTInt) return "int";
+    if (kind & common::kBPTLong) return "long";
+    if (kind & common::kBPTUInt) return "uint";
+    if (kind & common::kBPTULong) return "ulong";
+    if (kind & common::kBPTByte) return "byte";
+    if (kind & common::kBPTSByte) return "sbyte";
+    if (kind & common::kBPTShort) return "short";
+    if (kind & common::kBPTUShort) return "ushort";
+    if (kind & common::kBPTFloat) return "float";
+    if (kind & common::kBPTDouble) return "double";
+    if (kind & common::kBPTDecimal) return "decimal";
+    if (kind & common::kBPTBool) return "bool";
+    if (kind & common::kBPTChar) return "char";
+    if (kind & common::kBPTObject) return "Object";
+    if (kind & common::kBPTOut) return "out";
+    return "the declared type";
+}
+
+// One DECLARED FORM, quoted the way the standard library declares it. Where
+// the ONE parameter table carries the standard library's own signature text
+// (`stdlib §9.1`'s "`Parse(s: string, radix: int): int`"), that text IS the
+// quote — a diagnostic that names a built-in's declared form names the
+// standard library's words, return type included, not a re-spelling of them.
+std::string builtinParamFormDecl(std::string_view member,
+                                 const common::BuiltinParamForm& f) {
+    if (!f.sig.empty()) return "`" + std::string(f.sig) + "`";
+    std::string s = "`" + std::string(member) + "(";
+    for (std::size_t i = 0; i < f.total; ++i) {
+        if (i) s += ", ";
+        const std::uint32_t k = f.kinds[i];
+        if (k & common::kBPTOut) { s += "out"; continue; }
+        s += f.names[i].empty() ? std::string("arg") : std::string(f.names[i]);
+        s += ": ";
+        s += builtinParamTypeSpelling(k);
+    }
+    s += ")`";
+    return s;
+}
+
+// The declared parameter type, when it is an INTEGER type — the case §5.1's
+// constant narrowing is about.
+bool builtinParamTypeIsInteger(std::uint32_t kind, PrimitiveType* out) {
+    for (std::uint32_t bit = 1; bit; bit <<= 1) {
+        if (!(kind & bit)) continue;
+        PrimitiveType declared = PrimitiveType::None;
+        if (!builtinParamTypePrimitive(bit, &declared)) continue;
+        if (!isIntegerPrimitiveTypeForOverload(declared)) continue;
+        *out = declared;
+        return true;
+    }
+    return false;
+}
+
+// HOW CLOSE a candidate's DECLARED type at the failing position is to the
+// argument's own type class — the §5.1 question that candidate is asking.
+// Smaller is closer, and the resolver reports against the closest candidate
+// so that the diagnostic names the parameter the argument was really asking
+// about.
+//
+//   1  both are INTEGER types: §5.1's constant narrowing is the question
+//      ("the source may be a compile-time constant of any integer type …
+//      across signedness"), so this candidate is the one the argument
+//      reaches;
+//   2  the declared type is an integer and the argument is not: the argument
+//      binds to no integer parameter, and the integer candidate is still the
+//      closer of the two;
+//   3  the declared type is a `string` and the argument is not;
+//   4  anything else.
+//
+// WITHOUT this the diagnostic reported against the FIRST declared form of the
+// member and named the wrong parameter: an integer receiver declares both
+// `ToString(format: string)` and `ToString(radix: int)`, so a `uint` radix
+// was reported as "the `format` argument must be a `string`" — the wrong
+// parameter and the wrong conversion. The seven rows of
+// `uint_radix_rejected_7271` pin the precise wording.
+int builtinCandidateDistance(std::uint32_t kind, TypeRef* argTy) {
+    PrimitiveType declared = PrimitiveType::None;
+    if (builtinParamTypeIsInteger(kind, &declared)) {
+        const bool argIsInt =
+            argTy && argTy->kind == TypeRef::Kind::Primitive &&
+            isIntegerPrimitiveTypeForOverload(argTy->primitive);
+        return argIsInt ? 1 : 2;
+    }
+    if (kind & common::kBPTString) return 3;
+    return 4;
+}
+
+// WHY an argument reaches no declared parameter of that type: the §5.1 /
+// §7.3 reason, in the standard library's own vocabulary.
+//
+//  - §7.3: a still-nullable value reaches no non-nullable parameter — §5.1's
+//    nullable lifting converts a `T` to a `T?`, never the other way;
+//  - §5.1: an integer type the declared type does not take reaches it only
+//    as a COMPILE-TIME CONSTANT (the constant-narrowing rule), and a constant
+//    whose value does not fit the target's range is a compile error at the
+//    conversion site — never a silent truncation;
+//  - otherwise the conversion §5.1 does not make implicit.
+std::string builtinArgWhy(const ast::Expr* argExpr,
+                          std::optional<long long> cv, TypeRef* argTy,
+                          std::uint32_t kind) {
+    const std::string targetPhrase = builtinParamTypePhrase(kind);
+    const std::string targetName = builtinParamTypeSpelling(kind);
+    if (argTy->nullable)
+        return "a `" + spellTypeRefForDiag(argTy) +
+               "` is never implicitly convertible to " + targetPhrase +
+               " (§5.1's nullable lifting converts a `T` to a `T?`, never the "
+               "other way)";
+    PrimitiveType declared = PrimitiveType::None;
+    if (argTy->kind == TypeRef::Kind::Primitive &&
+        isIntegerPrimitiveTypeForOverload(argTy->primitive) &&
+        builtinParamTypeIsInteger(kind, &declared)) {
+        if (cv && !fitsInIntType(*cv, declared))
+            return "the compile-time constant's value does not fit `" +
+                   targetName + "`'s range";
+        return "a `" + spellTypeRefForDiag(argTy) + "` reaches " + targetPhrase +
+               " parameter only as a compile-time constant";
+    }
+    return "a `" + spellTypeRefForDiag(argTy) +
+           "` is never implicitly convertible to " + targetPhrase;
+}
+
+// The standard-library section that declares the surface of this head, for
+// the diagnostic.
+std::string_view builtinParamHeadSection(std::string_view head) {
+    if (head == "Double" || head == "Float") return "stdlib §9.2";
+    if (head == "Decimal") return "stdlib §9.3";
+    if (head == "Boolean") return "stdlib §9.4";
+    if (head == "Char") return "stdlib §9.5";
+    if (head == "Guid") return "stdlib §2.6";
+    if (head == "DateTime" || head == "DateOnly" || head == "TimeOnly" ||
+        head == "TimeSpan")
+        return "stdlib §2.5";
+    return "stdlib §9.1";
+}
+
+// The gate's REACH: the VALUE built-ins, whose declared surface the ONE
+// parameter table carries in full. A `string` / `Encoding` /
+// `StringBuilder` / `Math` / `Convert` receiver is owned by the check that
+// already reads that surface, and this gate stands down there so that one
+// call never draws two diagnostics.
+bool isBuiltinValueParamHead(std::string_view head) {
+    return head == "SByte" || head == "Byte" || head == "Int16" ||
+           head == "UInt16" || head == "Int32" || head == "UInt32" ||
+           head == "Int64" || head == "UInt64" || head == "Double" ||
+           head == "Float" || head == "Decimal" || head == "Boolean" ||
+           head == "Char" || head == "Guid" || head == "DateTime" ||
+           head == "DateOnly" || head == "TimeOnly" || head == "TimeSpan";
+}
+
+}  // namespace
+
+// §5.1: is the argument admissible at a parameter whose DECLARED type is
+// `kind`? `kBPTAny` (no type opinion) and `kBPTOut` (an `out` slot) admit
+// everything — a table that has not been transcribed yet must not cost a
+// false rejection.
+bool ExprTC::builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
+                                  std::uint32_t kind) {
+    if (kind == 0) return true;
+    if (kind & common::kBPTOut) return true;
+    if (!argTy) return true;
+    // §5.1's identity and widening, over every DECLARED type at this
+    // position.
+    for (std::uint32_t bit = 1; bit; bit <<= 1) {
+        if (!(kind & bit)) continue;
+        PrimitiveType declared = PrimitiveType::None;
+        if (!builtinParamTypePrimitive(bit, &declared)) {
+            // `ReadOnlyStringSpan` is a record, not a primitive: the name
+            // decides.
+            if (bit == common::kBPTSpan && argTy->kind == TypeRef::Kind::Named &&
+                argTy->headName() == "ReadOnlyStringSpan")
+                return true;
+            continue;
+        }
+        if (argTy->kind == TypeRef::Kind::Primitive) {
+            if (argTy->primitive == declared) return true;
+            if (primitiveWidens(argTy->primitive, declared)) return true;
+        } else if (argTy->kind == TypeRef::Kind::Named) {
+            // §5.1's reference conversions: "any type to `Object`" — a value
+            // type by boxing, a reference type directly.
+            if (declared == PrimitiveType::Object) return true;
+        }
+    }
+    // §5.1's CONSTANT NARROWING: an integer compile-time constant converts to
+    // any integer type whose range contains its value, ACROSS SIGNEDNESS. The
+    // probe asks the question WITHOUT the rewrite (the same two-pass shape
+    // `checkBuiltinMathConvertCallArgs` uses), so it cannot change the AST.
+    if (argExpr && argTy->kind == TypeRef::Kind::Primitive &&
+        isIntegerPrimitiveTypeForOverload(argTy->primitive)) {
+        if (auto cv = foldIntConstExprTC(*argExpr)) {
+            for (std::uint32_t bit = 1; bit; bit <<= 1) {
+                if (!(kind & bit)) continue;
+                PrimitiveType declared = PrimitiveType::None;
+                if (!builtinParamTypePrimitive(bit, &declared)) continue;
+                if (!isIntegerPrimitiveTypeForOverload(declared)) continue;
+                if (declared == argTy->primitive) return true;
+                if (primitiveWidens(argTy->primitive, declared)) return true;
+                if (fitsInIntType(*cv, declared)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// §22.6: is the argument at `p` admissible at a parameter whose DECLARED
+// type is `kind`? `std::nullopt` means "this position is not the admission
+// question" — an untyped argument, a discard, or a `ref`/`out`/`owned`/
+// `scoped` slot, whose type the callee's own rules govern (§22.3).
+std::optional<bool> ExprTC::builtinArgAdmittedAt(const ast::CallExpr& ce,
+                                                  std::size_t p,
+                                                  std::uint32_t kind) {
+    const auto& a = ce.args[p];
+    if (!a.value) return std::nullopt;
+    // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+    // the caller slot under its own rule; the slot's type is not the
+    // admission question here.
+    if (!a.modifier.empty()) return std::nullopt;
+    if (a.isDiscard) return std::nullopt;
+    TypeRef* argTy = ctx_.exprType(*a.value);
+    if (!argTy || argTy->kind == TypeRef::Kind::Error) return std::nullopt;
+    // §7.3: the `null` literal reaches no non-nullable parameter.
+    if (dynamic_cast<const ast::NullLiteralExpr*>(a.value.get())) return false;
+    // fix #7286 (§22.6, v0.344): the STATIC TYPE of an argument at a call
+    // is its type AT THE CALL — a read of a binding §7.4 has narrowed
+    // non-null is of its non-nullable type. Sema keeps a narrowed read's
+    // exprType at the DECLARED `T?`, so the narrowing is read from the
+    // §7.4 facts (the same read `checkBuiltinMathConvertCallArgs` makes).
+    //
+    // The narrowing read is the KIND-GENERAL one (`scrutineeTypeAfterNarrowing`,
+    // §19.1 / §7.11), NOT `operandStaticTypeAt`: that helper is primitive-only
+    // (§7.11's operand path), so for a §7.4-narrowed RECORD — a
+    // `ReadOnlyStringSpan?` narrowed by `if sp <> null then …` — it returned
+    // the declared type unchanged, still nullable, and the call was refused
+    // even though §7.4 had established the read as non-null. That was an
+    // over-refusal of a legal call: the landed row
+    // `sema_builtin_nullable_string_param_6782.a47_parse_narrowed_span_accepted_s7_4`
+    // (green on the base) pins it.
+    TypeRef* effTy = argTy;
+    if (argTy->nullable) {
+        if (!isNarrowedNonNullRead(a.value.get())) return false;
+        effTy = scrutineeTypeAfterNarrowing(a.value.get(), argTy);
+        if (!effTy) return std::nullopt;
+    }
+    // §5.1's nullable lifting: `S?` converts to `T?` and never to `T`.
+    if (effTy->nullable) return false;
+    return builtinArgAdmitsKind(a.value.get(), effTy, kind);
+}
+
+// §22.6: is the CALL admissible against this declared form? A candidate is
+// applicable when every bound argument reaches its parameter.
+bool ExprTC::builtinFormApplicable(const ast::CallExpr& ce,
+                                    const common::BuiltinParamForm& form) {
+    for (std::size_t p = 0; p < form.total && p < ce.args.size(); ++p) {
+        auto admitted = builtinArgAdmittedAt(ce, p, form.kinds[p]);
+        if (admitted && !*admitted) return false;
+    }
+    return true;
+}
+
+void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
+    // ONE diagnostic per call: a check that already spoke about THIS call has
+    // the first word. The §7.3 nullability gate, the §5.1 type gate and the
+    // §22.5 binder all report at a location INSIDE this call's span, and so
+    // does a gate that runs earlier in `typeCall` (fix #7333's format-spec
+    // gate, which reports at `ce.span.begin`). The gate stands down rather
+    // than adding a second diagnostic to the same call.
+    for (const auto& d : ctx_.diagnostics().diagnostics()) {
+        if (d.severity != Severity::Error) continue;
+        if (d.location.line != ce.span.begin.line) continue;
+        if (d.location.offset < ce.span.begin.offset) continue;
+        if (d.location.offset > ce.span.end.offset) continue;
+        return;
+    }
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt || member.empty()) return;
+    // THE HEAD of the call: the receiver's type, or the type name of a static
+    // call (`int.Parse`, `Guid.Parse`).
+    std::string_view head;
+    if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
+        if (recvTy->kind == TypeRef::Kind::Primitive) {
+            head = primitiveKeywordHead(recvTy->primitive);
+        } else if (recvTy->kind == TypeRef::Kind::Named) {
+            if (recvTy->declaration) {
+                // A USER type: its members carry declarations and the ordinary
+                // user-method machinery checks them. A built-in class symbol
+                // (`builtinClassSym`: `Guid`, `DateTime`, …) has no AST.
+                if (recvTy->declaration->decl) return;
+                head = recvTy->declaration->name;
+            } else {
+                head = recvTy->headName();
+            }
+        }
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+        head = id->name;
+    }
+    if (head.empty()) return;
+    // The head as the user SPELLED it (the diagnostic names it) and the head
+    // the ONE parameter table is keyed by (the keyword spelling names the
+    // standard-library type §9.1-§9.5 declares).
+    const std::string headSpelled(head);
+    head = common::builtinParamHeadSpelling(head);
+    if (!isBuiltinValueParamHead(head)) return;
+    // THE DECLARED FORMS of this member. The gate has an opinion only where
+    // the table declares the member at all.
+    const std::vector<common::BuiltinParamForm> allForms =
+        common::builtinParamForms(head, member, common::kBuiltinAnyArity);
+    if (allForms.empty()) return;
+    std::vector<common::BuiltinParamForm> forms;
+    for (const auto& f : allForms)
+        if (f.total == ce.args.size()) forms.push_back(f);
+    const std::string sec(builtinParamHeadSection(head));
+    const std::string callee = headSpelled + "." + std::string(member);
+    if (forms.empty()) {
+        // §22.6: an argument count no declared form has reaches no candidate.
+        std::string decls;
+        for (const auto& f : allForms) {
+            if (!decls.empty()) decls += " / ";
+            decls += builtinParamFormDecl(member, f);
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "no matching overload of `" + callee + "` — the call supplies " +
+                std::to_string(ce.args.size()) + " argument(s) but " + sec +
+                " declares " + decls +
+                " — the call is a compile error with no candidates cited "
+                "(§22.6)");
+        return;
+    }
+    // APPLICABILITY: a candidate is applicable when every bound argument
+    // reaches its parameter. The diagnostic names the position the BEST
+    // candidate misses.
+    //
+    // THE BEST CANDIDATE is the one that is CLOSEST to applicable: the most
+    // arguments it admits, and — among those — the candidate whose DECLARED
+    // type at the failing position is the closest to the argument's own type
+    // class (§5.1's own question). Without the second half the diagnostic
+    // reported against the FIRST declared form and named the WRONG parameter:
+    // `ToString(format: string)` and `ToString(radix: int)` are both declared
+    // on an integer receiver, and a `uint` radix reaches NEITHER — but the
+    // `format` form is declared first, so the report said "the `format`
+    // argument must be a `string`" where the argument is an integer and the
+    // §5.1 question is the radix's. The seven rows of
+    // `uint_radix_rejected_7271` pin the precise wording (the base's).
+    const common::BuiltinParamForm* best = nullptr;
+    std::size_t bestAdmits = 0;
+    std::size_t bestFail = 0;
+    bool bestFails = true;
+    int bestDistance = 0;
+    for (const auto& f : forms) {
+        std::size_t admits = 0;
+        std::size_t fail = 0;
+        bool fails = false;
+        for (std::size_t p = 0; p < f.total && p < ce.args.size(); ++p) {
+            auto admitted = builtinArgAdmittedAt(ce, p, f.kinds[p]);
+            if (!admitted) continue;
+            if (*admitted) { ++admits; continue; }
+            if (!fails) { fail = p; fails = true; }
+        }
+        int distance = 0;
+        if (fails) {
+            TypeRef* argTy = ctx_.exprType(*ce.args[fail].value);
+            distance = builtinCandidateDistance(f.kinds[fail], argTy);
+        }
+        if (!best || admits > bestAdmits ||
+            (admits == bestAdmits && distance < bestDistance)) {
+            best = &f;
+            bestAdmits = admits;
+            bestFail = fail;
+            bestFails = fails;
+            bestDistance = distance;
+        }
+    }
+    if (!bestFails) return;  // some candidate is applicable: the call resolves
+    // THE DECLARED FORMS, quoted.
+    std::string decls;
+    for (const auto& f : forms) {
+        if (!decls.empty()) decls += " / ";
+        decls += builtinParamFormDecl(member, f);
+    }
+    const std::uint32_t kind =
+        best && bestFail < best->kinds.size() ? best->kinds[bestFail] : 0;
+    // THE PARAMETER the best candidate misses, by its DECLARED NAME (§22.5) —
+    // "`radix`", not "position 1": the standard library names its parameters,
+    // and the diagnostic that cites the declaration names them too.
+    const std::string param =
+        (best && bestFail < best->names.size() && !best->names[bestFail].empty())
+            ? "the `" + std::string(best->names[bestFail]) + "` argument"
+            : "the argument at position " + std::to_string(bestFail);
+    // WHY the argument reaches it: §5.1's conversion rule, or §7.3's
+    // nullability. The type read is the type AT THE CALL — a §7.4-narrowed
+    // read is of its non-nullable type, so the reason never blames a
+    // nullability the narrowing has already discharged.
+    std::string why;
+    if (bestFail < ce.args.size() && ce.args[bestFail].value) {
+        TypeRef* argTy = ctx_.exprType(*ce.args[bestFail].value);
+        if (argTy && argTy->kind != TypeRef::Kind::Error) {
+            TypeRef* effTy = argTy;
+            if (argTy->nullable)
+                effTy = scrutineeTypeAfterNarrowing(
+                    ce.args[bestFail].value.get(), argTy);
+            // §17.14's constant fold, asked WITHOUT the rewrite (the same
+            // two-pass shape `checkBuiltinMathConvertCallArgs` uses), so it
+            // cannot change the AST.
+            std::optional<long long> cv;
+            if (effTy && effTy->kind == TypeRef::Kind::Primitive &&
+                isIntegerPrimitiveTypeForOverload(effTy->primitive))
+                cv = foldIntConstExprTC(*ce.args[bestFail].value);
+            why = builtinArgWhy(ce.args[bestFail].value.get(), cv,
+                                effTy ? effTy : argTy, kind);
+        }
+    }
+    ctx_.diagnostics().report(
+        Severity::Error, ce.span.begin,
+        "no matching overload of `" + callee + "` — " + sec + " declares " +
+            decls + ", so " + param + " must be " +
+            builtinParamTypePhrase(kind) + (why.empty() ? "" : " — " + why) +
+            " — the call is a compile error with no candidates cited "
+            "(§22.6)");
 }
 
 // fix #3424 / #3425 (§22.5 "Optional parameters and named arguments",

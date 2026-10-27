@@ -90,6 +90,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -149,6 +150,22 @@ const char kDateTimeText[] = "2020-01-02T03:04:05";
 const char kDateOnlyText[] = "2020-01-02";
 const char kTimeOnlyText[] = "03:04:05";
 
+
+// THE REFUSAL (campaign 2, `builtin-call-admission`): §22.6 (v0.344) — "If
+// no candidate is applicable at all ... the call is a compile error with no
+// candidates cited". The declared surface of the standard library (stdlib
+// §9.1-§9.5, §2.5, §2.6) declares the FIRST parameter of this member as a
+// `string`, and §5.1 admits no conversion to `string` from the operand these
+// rows pass — so the call reaches no candidate and the compiler REFUSES it,
+// at a real location, with that one diagnostic.
+//
+// The oracle is the diagnostic text plus a real location, never the absence
+// of a diagnostic.
+void expectRefused(const JitResult& r, const char* needle) {
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, needle));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -162,9 +179,7 @@ const char kTimeOnlyText[] = "03:04:05";
 BEZEL_TEST(parse_receiver_first_arg_7313,
            guid_parse_non_string_does_not_abort_the_compiler_spec_2_6) {
     JitResult r = runAot(parseProg("Guid", "16"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("00000000-0000-0000-0000-000000000000\n"));
+    expectRefused(r, "no matching overload of `Guid.Parse`");
 }
 
 // `Guid.TryParse(16, out r)`. On the base arm the compiler ABORTED (same
@@ -175,17 +190,14 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
            guid_tryparse_non_string_does_not_abort_the_compiler_spec_2_6) {
     JitResult r = runAot(tryParseProg(
         "Guid", "16", std::string("Guid.Parse(\"") + kGuidText + "\")"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kGuidText + "\n");
+    expectRefused(r, "no matching overload of `Guid.TryParse`");
 }
 
 // `DateTime.Parse(16)`.
 BEZEL_TEST(parse_receiver_first_arg_7313,
            datetime_parse_non_string_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(parseProg("DateTime", "16"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0001-01-01T00:00:00\n"));
+    expectRefused(r, "no matching overload of `DateTime.Parse`");
 }
 
 // `DateTime.TryParse(16, out r)`.
@@ -193,17 +205,14 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
            datetime_tryparse_non_string_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(tryParseProg(
         "DateTime", "16", std::string("DateTime.Parse(\"") + kDateTimeText + "\")"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kDateTimeText + "\n");
+    expectRefused(r, "no matching overload of `DateTime.TryParse`");
 }
 
 // `DateOnly.Parse(16)`.
 BEZEL_TEST(parse_receiver_first_arg_7313,
            dateonly_parse_non_string_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(parseProg("DateOnly", "16"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0001-01-01\n"));
+    expectRefused(r, "no matching overload of `DateOnly.Parse`");
 }
 
 // `DateOnly.TryParse(16, out r)`.
@@ -211,17 +220,14 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
            dateonly_tryparse_non_string_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(tryParseProg(
         "DateOnly", "16", std::string("DateOnly.Parse(\"") + kDateOnlyText + "\")"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kDateOnlyText + "\n");
+    expectRefused(r, "no matching overload of `DateOnly.TryParse`");
 }
 
 // `TimeOnly.Parse(16)`.
 BEZEL_TEST(parse_receiver_first_arg_7313,
            timeonly_parse_non_string_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(parseProg("TimeOnly", "16"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("00:00:00\n"));
+    expectRefused(r, "no matching overload of `TimeOnly.Parse`");
 }
 
 // `TimeOnly.TryParse(16, out r)`.
@@ -229,9 +235,7 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
            timeonly_tryparse_non_string_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(tryParseProg(
         "TimeOnly", "16", std::string("TimeOnly.Parse(\"") + kTimeOnlyText + "\")"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kTimeOnlyText + "\n");
+    expectRefused(r, "no matching overload of `TimeOnly.TryParse`");
 }
 
 // ---------------------------------------------------------------------------
@@ -248,36 +252,28 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
            guid_tryparse_double_argument_does_not_abort_the_compiler_spec_2_6) {
     JitResult r = runAot(tryParseProg(
         "Guid", "1.5", std::string("Guid.Parse(\"") + kGuidText + "\")"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kGuidText + "\n");
+    expectRefused(r, "no matching overload of `Guid.TryParse`");
 }
 
 BEZEL_TEST(parse_receiver_first_arg_7313,
            datetime_tryparse_double_argument_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(tryParseProg(
         "DateTime", "1.5", std::string("DateTime.Parse(\"") + kDateTimeText + "\")"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kDateTimeText + "\n");
+    expectRefused(r, "no matching overload of `DateTime.TryParse`");
 }
 
 BEZEL_TEST(parse_receiver_first_arg_7313,
            dateonly_tryparse_double_argument_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(tryParseProg(
         "DateOnly", "1.5", std::string("DateOnly.Parse(\"") + kDateOnlyText + "\")"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kDateOnlyText + "\n");
+    expectRefused(r, "no matching overload of `DateOnly.TryParse`");
 }
 
 BEZEL_TEST(parse_receiver_first_arg_7313,
            timeonly_tryparse_double_argument_does_not_abort_the_compiler_spec_2_5) {
     JitResult r = runAot(tryParseProg(
         "TimeOnly", "1.5", std::string("TimeOnly.Parse(\"") + kTimeOnlyText + "\")"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kTimeOnlyText + "\n");
+    expectRefused(r, "no matching overload of `TimeOnly.TryParse`");
 }
 
 // ---------------------------------------------------------------------------
@@ -291,9 +287,7 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
 BEZEL_TEST(parse_receiver_first_arg_7313,
            guid_parse_class_instance_is_not_read_as_text_spec_2_6) {
     JitResult r = runAot(parseProg("Guid", "o", /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("00000000-0000-0000-0000-000000000000\n"));
+    expectRefused(r, "no matching overload of `Guid.Parse`");
 }
 
 // ⚠ NO `Guid.TryParse` CLASS-INSTANCE ROW, AND THE REASON IS A RUNTIME FACT,
@@ -315,8 +309,7 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
 BEZEL_TEST(parse_receiver_first_arg_7313,
            datetime_parse_class_instance_is_not_read_as_text_spec_2_5) {
     JitResult r = runAot(parseProg("DateTime", "o", /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0001-01-01T00:00:00\n"));
+    expectRefused(r, "no matching overload of `DateTime.Parse`");
 }
 
 BEZEL_TEST(parse_receiver_first_arg_7313,
@@ -324,16 +317,13 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
     JitResult r = runAot(tryParseProg(
         "DateTime", "o", std::string("DateTime.Parse(\"") + kDateTimeText + "\")",
         /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kDateTimeText + "\n");
+    expectRefused(r, "no matching overload of `DateTime.TryParse`");
 }
 
 BEZEL_TEST(parse_receiver_first_arg_7313,
            dateonly_parse_class_instance_is_not_read_as_text_spec_2_5) {
     JitResult r = runAot(parseProg("DateOnly", "o", /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0001-01-01\n"));
+    expectRefused(r, "no matching overload of `DateOnly.Parse`");
 }
 
 BEZEL_TEST(parse_receiver_first_arg_7313,
@@ -341,16 +331,13 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
     JitResult r = runAot(tryParseProg(
         "DateOnly", "o", std::string("DateOnly.Parse(\"") + kDateOnlyText + "\")",
         /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kDateOnlyText + "\n");
+    expectRefused(r, "no matching overload of `DateOnly.TryParse`");
 }
 
 BEZEL_TEST(parse_receiver_first_arg_7313,
            timeonly_parse_class_instance_is_not_read_as_text_spec_2_5) {
     JitResult r = runAot(parseProg("TimeOnly", "o", /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("00:00:00\n"));
+    expectRefused(r, "no matching overload of `TimeOnly.Parse`");
 }
 
 BEZEL_TEST(parse_receiver_first_arg_7313,
@@ -358,9 +345,7 @@ BEZEL_TEST(parse_receiver_first_arg_7313,
     JitResult r = runAot(tryParseProg(
         "TimeOnly", "o", std::string("TimeOnly.Parse(\"") + kTimeOnlyText + "\")",
         /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText,
-                    std::string("False\n") + kTimeOnlyText + "\n");
+    expectRefused(r, "no matching overload of `TimeOnly.TryParse`");
 }
 
 // ---------------------------------------------------------------------------

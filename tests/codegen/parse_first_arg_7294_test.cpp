@@ -63,6 +63,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -98,6 +99,22 @@ void expectCompiledWithoutIRFailure(const JitResult& r) {
     BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "compiler CRASHED"));
 }
 
+
+// THE REFUSAL (campaign 2, `builtin-call-admission`): §22.6 (v0.344) — "If
+// no candidate is applicable at all ... the call is a compile error with no
+// candidates cited". The declared surface of the standard library (stdlib
+// §9.1-§9.5, §2.5, §2.6) declares the FIRST parameter of this member as a
+// `string`, and §5.1 admits no conversion to `string` from the operand these
+// rows pass — so the call reaches no candidate and the compiler REFUSES it,
+// at a real location, with that one diagnostic.
+//
+// The oracle is the diagnostic text plus a real location, never the absence
+// of a diagnostic.
+void expectRefused(const JitResult& r, const char* needle) {
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, needle));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -108,16 +125,14 @@ void expectCompiledWithoutIRFailure(const JitResult& r) {
 // result and the program printed 1.
 BEZEL_TEST(parse_first_arg_7294, bool_first_argument_is_not_the_parse_result) {
     JitResult r = runAot(parseProg("int", "int", "true", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `int.Parse`");
 }
 
 // A `char` first argument. On the base arm the program printed 97 — the
 // character's own code point, handed back as the parse result.
 BEZEL_TEST(parse_first_arg_7294, char_first_argument_is_not_the_parse_result) {
     JitResult r = runAot(parseProg("int", "int", "'a'", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `int.Parse`");
 }
 
 // A `double` first argument. On the base arm the program printed garbage
@@ -126,32 +141,28 @@ BEZEL_TEST(parse_first_arg_7294, char_first_argument_is_not_the_parse_result) {
 // "Call parameter type does not match function signature".
 BEZEL_TEST(parse_first_arg_7294, double_first_argument_does_not_abort) {
     JitResult r = runAot(parseProg("int", "int", "1.5", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `int.Parse`");
 }
 
 // The `long` receiver — the arm is shared with the rest of the integer
 // tower, so the row pins that the guard is not `int`-specific.
 BEZEL_TEST(parse_first_arg_7294, long_bool_first_argument_is_not_the_result) {
     JitResult r = runAot(parseProg("long", "long", "true", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `long.Parse`");
 }
 
 // The `double` receiver. On the base arm the compiler ABORTED here ("Call
 // parameter type does not match function signature", `%1 = load i1`).
 BEZEL_TEST(parse_first_arg_7294, double_receiver_bool_first_argument) {
     JitResult r = runAot(parseProg("double", "double", "true", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `double.Parse`");
 }
 
 // A CLASS INSTANCE. On the base arm the program printed the object's HEAP
 // ADDRESS (559997728) — the pointer, handed back as the parse result.
 BEZEL_TEST(parse_first_arg_7294, class_instance_is_not_the_parse_result) {
     JitResult r = runAot(parseProg("int", "int", "o", ""));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `int.Parse`");
 }
 
 // ---------------------------------------------------------------------------

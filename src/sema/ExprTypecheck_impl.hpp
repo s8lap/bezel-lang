@@ -4731,6 +4731,36 @@ private:
     // (readonly fields included). Never a type check.
     void reportBuiltinArgIfNullable(const ast::Expr* arg, const std::string& what);
 
+    // The BUILTIN CALL ADMISSION GATE — the anchor's ONE resolver (campaign 2,
+    // `builtin-call-admission`). A call to a built-in member is resolved
+    // against the ONE built-in parameter table (`common::kBuiltinParams`):
+    // its ARITY, its §5.1 conversions, its §7.3 nullability and its §22.5
+    // named-argument binding. When no candidate is reachable the call is a
+    // compile error with no candidates cited (§22.6) and ONE diagnostic says
+    // so, naming the declared form the argument misses.
+    //
+    // A check that already spoke about this call has the first word: the
+    // gate stands down rather than adding a second diagnostic to the same
+    // call.
+    // per §22.6 / §5.1 / §7.3 / §22.5, stdlib §9.1-§9.5, §2.5, §2.6
+    void checkBuiltinCallAdmission(const ast::CallExpr& ce);
+    // Is the argument at `p` admissible at a parameter whose DECLARED type
+    // is `kind`? `std::nullopt` means "this position is not the admission
+    // question" (an untyped argument, a discard, a `ref`/`out` slot).
+    std::optional<bool> builtinArgAdmittedAt(const ast::CallExpr& ce,
+                                             std::size_t p,
+                                             std::uint32_t kind);
+    // Is the argument admissible at a parameter whose DECLARED type is
+    // `kind`? §5.1's identity and widening, then §5.1's constant narrowing.
+    // `kBPTAny` (no type opinion) and `kBPTOut` (an `out` slot) admit
+    // everything — a table that has not been transcribed yet must not cost a
+    // false rejection.
+    bool builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
+                              std::uint32_t kind);
+    // Is the CALL admissible against this declared form?
+    bool builtinFormApplicable(const ast::CallExpr& ce,
+                                const common::BuiltinParamForm& form);
+
     // fix #3398 (spec §22.5 "Optional parameters and named arguments",
     // v0.283; stdlib §1 Conventions — *Window parameters*; §9.6; §3.2):
     // §22.5 BINDING for a call to a BUILT-IN member.

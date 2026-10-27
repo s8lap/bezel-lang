@@ -823,6 +823,376 @@ changed** (fixed: the reject set is pinned by count AND by name). **A3 — the `
 anchored one needle for the wrong reason** (fixed). **AND THE COORDINATOR'S MID-TASK CORRECTION — the
 three cells whose expectation was wrong — IS R4 ABOVE.**
 
+**Lane `r36-c2-l0-anchor` (the ANCHOR lane — this commit).**
+
+* **SHAs:** see the hand-back. Branch `r36-c2-l0-anchor`, rebased onto the staging tip `9961f766`.
+* **Files:** `src/common/BuiltinRegistry.cpp` (the ONE parameter table), `src/common/BuiltinRegistry.hpp`
+  (its reader), `src/sema/ExprTypecheck_Calls.cpp` (the ONE resolver), `src/sema/ExprTypecheck_impl.hpp`
+  (the resolver's declarations), `tests/sema/builtin_call_admission_7372_test.cpp` (new — 28 rows),
+  six `tests/codegen/` files (66 flipped rows) and one `tests/lit/` file (1 flipped row). **No `src/codegen/`
+  and no `src/runtime/` file was touched.**
+
+**THE DELIVERABLE — ONE TABLE + ONE RESOLVER.**
+
+* **THE ONE TABLE** is `common::kBuiltinParams` (`src/common/BuiltinRegistry.cpp`): **287 rows**, one row
+  per DECLARED FORM of a built-in member or constructor, each row carrying the parameter NAME (§22.5), the
+  parameter TYPE (§5.1), the parameter NULLABILITY (§7.3) and the DECLARED SIGNATURE (the standard
+  library's own text, return type included) of that form. It **replaced three independent tables** — the
+  74 parameter-NAME rows (string / Encoding / StringBuilder / Math / Convert), the 45 constructor-name
+  rows, and the 93-row NULLABILITY table — and it is the FIRST table to carry the parameter TYPE at all.
+  Sixteen rows that the standard library does NOT declare (a `ReadOnlyStringSpan` + `radix` form — stdlib
+  §9.1 declares the span forms and the radix forms, never the two together) were REMOVED rather than
+  transcribed.
+* **THE ONE RESOLVER** is `ExprTC::checkBuiltinCallAdmission` (`src/sema/ExprTypecheck_Calls.cpp`),
+  consulted exactly once, from the tail of the `checkBuiltin*` block of `ExprTC::typeCall`. It resolves
+  the call against the DECLARED set — arity, the §5.1 conversion (identity, widening, and the
+  constant narrowing), the §7.3 nullability (with §7.4's narrowing read), the §22.5 named arguments and
+  the receiver's SYMBOL — and, when NO candidate is reachable, it emits **ONE §22.6 diagnostic**: "no
+  matching overload of `<head>.<member>` … the call is a compile error with no candidates cited (§22.6)".
+  It REFUSES; it never drops, never degrades and never answers a wrong value.
+* **THE REACH** is the VALUE built-ins — the primitive tower (stdlib §9.1), `Double`/`Float` (§9.2),
+  `Decimal` (§9.3), `Boolean` (§9.4), `Char` (§9.5), `Guid` (§2.6) and the temporal records (§2.5) —
+  whose declared surface the table carries in full. The `string` / `Encoding` / `StringBuilder` / `Math`
+  / `Convert` surface stays with the checks that already read it, so one call never draws two
+  diagnostics.
+* **THE DIAGNOSTIC TEXT** (the grid's families must contain it): the message OPENS with the §22.6
+  family phrase "no matching overload of `X`" and CLOSES with "the call is a compile error with no
+  candidates cited (§22.6)". In between it names the DECLARED form (the standard library's own
+  signature text), the parameter by its §22.5 NAME ("so the `radix` argument must be an `int`"), and
+  WHY the argument does not reach it (§5.1 / §7.3).
+
+**FAIL-WITHOUT — PER CELL, AND WHICH SITE CARRIES THE FIX.**
+
+The fix is ONE unit (the table + the resolver): reverting `src/common/BuiltinRegistry.cpp` alone breaks
+the build (the table's reader lives in the header), so the arm was measured by reverting all four
+`src/` files, **rebuilding the test binary**, and re-running the grid and the filters. Both arms ran
+**the same 113 cells and the same 261 rows across the twelve filters** (the case count is the tell:
+21521 and 8612 tests in the two unfiltered populations, unchanged between the arms).
+
+| cell | without the fix | with the fix | the site that carries it |
+|---|---|---|---|
+| `int_parse_int` | INTERNAL | OK | the RESOLVER (the base dropped the call with an `internal:` degrade) |
+| `int_parse_bool` | INTERNAL | OK | the RESOLVER |
+| `int_parse_char` | INTERNAL | OK | the RESOLVER |
+| `int_parse_double` | INTERNAL | OK | the RESOLVER |
+| `int_parse_object` | INTERNAL | OK | the RESOLVER (the base read the object's POINTER as text) |
+| `long_parse_intarg` | INTERNAL | OK | the RESOLVER |
+| `double_parse_int` | INTERNAL | OK | the RESOLVER |
+| `decimal_parse_double` | INTERNAL | OK | the RESOLVER |
+| `bool_parse_int` | INTERNAL | OK | the RESOLVER |
+| `char_parse_radix` | INTERNAL | OK | the RESOLVER |
+| `int_tryparse_int` | ACCEPTED | OK | the RESOLVER (the base answered `false`) |
+| `int_tryparse_double` | ACCEPTED | OK | the RESOLVER |
+| `bool_tryparse_int` | ACCEPTED | OK | the RESOLVER |
+| `char_tryparse_int` | ACCEPTED | OK | the RESOLVER |
+| `double_tryparse_int` | ACCEPTED | OK | the RESOLVER |
+| `decimal_tryparse_double` | ACCEPTED | OK | the RESOLVER |
+| `guid_tryparse_int` | ACCEPTED | OK | the RESOLVER |
+| `decimal_tostring_radix` | ABORT | OK | the RESOLVER (the base ABORTED the compiler) |
+
+**18 cells moved to OK (10 INTERNAL, 7 ACCEPTED, 1 ABORT) ON THE STAGING TIP `9961f766`. The TABLE
+carries no fail-without row of its own** — it is READ by the resolver, and it is reverted together with
+it; the eighteen rows above are all carried by the RESOLVER. **THE TWO `*_tostring_format` CELLS ARE NOT
+THIS LANE'S ON THAT TIP**: the tip carries #7333's format-spec gate (`src/sema/Formattability.hpp`), and
+it refuses `(true).ToString("F4")` and `('z').ToString("F4")` FIRST — with "a format spec requires an
+intrinsically-formattable receiver (a numeric/temporal/Guid) or one implementing `IFormattable`; `bool`
+is neither (§2.18; §18.5)" — so the resolver stands down (one call never draws two diagnostics) and the
+two cells are REJECTED-with-that-diagnostic on BOTH arms. **=> THE GRID'S NEEDLE FAMILIES FOR THOSE TWO
+CELLS MUST CARRY #7333's WORDING** (the entry lane owns the grid); on the pre-tip base `68212aea` they
+were this lane's (ACCEPTED → OK), and the anchor's own wording still satisfies them there.
+
+**THE MATRIX RESULT** (`scripts/builtin_admission_grid.py`, this lane's `build/bezelc`, **measured on the
+rebased tree — the staging tip `9961f766` plus this lane's commit**). The script's OWN summary line,
+**WITHOUT the fix** (same tree, the four `src/` files reverted, the test binary rebuilt):
+
+```
+113 cells, 48 wrong
+  OK        65
+  ACCEPTED  23
+  REJECTED  4
+  ABORT     8
+  INTERNAL  13
+  campaign 2: 109 cells, 47 wrong
+  campaign 5: 4 cells, 1 wrong
+NATIVE SANITIZER: 0 check(s) skipped
+```
+
+and **WITH the fix**:
+
+```
+113 cells, 30 wrong
+  OK        83
+  ACCEPTED  16
+  REJECTED  4
+  ABORT     7
+  INTERNAL  3
+  campaign 2: 109 cells, 29 wrong
+  campaign 5: 4 cells, 1 wrong
+NATIVE SANITIZER: 0 check(s) skipped
+```
+
+**18 CELLS MOVED TO OK (10 INTERNAL, 7 ACCEPTED, 1 ABORT) AND NO CELL MOVED THE OTHER WAY** — a per-cell
+diff of the two TSVs (`grid-armA3/grid.tsv` vs `grid-fix3/grid.tsv`, the `class` column) lists exactly
+the eighteen cells above and no other class change. **29 of campaign 2's 109 cells and 1 of campaign 5's
+4 are still wrong.** (On the pre-tip base `68212aea` the same measurement reads 84 / 17 / 7 / 3 / 2 = 29
+wrong — the tip's own two commits moved three cells: `user_class_named_stringbuilder` ACCEPTED → OK and
+the two `*_tostring_format` cells INTERNAL/ACCEPTED → REJECTED.) The **ASan leg is identical to the
+plain leg** and prints **`NATIVE SANITIZER: 0 check(s) skipped`**; so does the test harness's ASan leg
+over the seven filters. The corpus check is **`0 REGRESSION, 4 UNBANKED row(s)`** — no banked `pass` row
+moved — and the lit diagnostic track is **`Passed: 2562 (100.00%)`**.
+
+**THE FOUR CORPUS ROWS THIS CHANGE FLIPS (the coordinator re-banks them; the baseline file is NOT in this
+commit):**
+
+```
+s22_6_0112	fail	divergence   -> pass
+s22_6_0113	fail	divergence   -> pass
+s22_6_0114	fail	divergence   -> pass
+l9_5_0004	fail	#7295         -> pass
+```
+
+**THE BEHAVIOUR FLIPS** (each row now asserts a located compile error with the named diagnostic — the
+oracle is the diagnostic text plus a real location, never the absence of a diagnostic): **50 rows** in
+six `tests/codegen/` files — `parse_radix_binding_7285_test.cpp` (4), `parse_first_arg_7294_test.cpp`
+(6), `decimal_parse_first_arg_7300_test.cpp` (5), `parse_bool_char_first_arg_7299_test.cpp` (11),
+`parse_tryparse_float_first_arg_7293_test.cpp` (5), `parse_receiver_first_arg_7313_test.cpp` (19) — and
+**one `tests/lit/` row** (`sema_unknown_primitive_method_spec3_4__char_tostring_is_accepted.bzl`,
+RENAMED to `…_char_tostring_with_an_argument_is_rejected.bzl`: stdlib §9.5 declares no one-argument
+`Char.ToString`, so `char.ToString('z')` reaches no candidate). **THE 50 FLIPPED ROWS FAIL WITHOUT THE
+FIX AND ARE GREEN WITH IT** (the arm without the fix runs 4 + 6 + 5 + 11 + 5 + 19 = 50 failures — exactly
+these rows). **THE SIXTEEN diagnostic-text rows of `parse_radix_binding_7285_test.cpp` ARE GREEN ON BOTH
+ARMS** — the codegen's radix diagnostic satisfied them before, and the resolver's diagnostic satisfies
+them now; they carry no fail-without of their own. **THE LIT ROW IS GREEN ON BOTH ARMS TOO**, with
+opposite content: the base compiled `char.ToString('z')` (so the old ACCEPT control was green) and the
+anchor refuses it (so the new REJECT control is green).
+
+**THE ROW-LEVEL FAIL-WITHOUT (the whole twelve-filter set, both arms).** Without the fix the twelve
+filters run **79 failures out of 261 rows** — 4 + 6 + 5 + 11 + 5 + 19 = 50 in the six `tests/codegen/`
+parse files, **24 in `tests/sema/builtin_call_admission_7372_test.cpp`** (its 24 refusal rows; its 11
+control rows are green on BOTH arms), **4 in `tests/codegen/parse_tryparse_class_instance_first_arg_7290_test.cpp`**
+(the four rows the fix-forward flipped from the #7290 lane's DROP semantics) and **1 in
+`tests/sema/universal_member_arity_2446_test.cpp`** (the `char.ToString('z')` row the fix-forward
+flipped). With the fix **all 261 rows are green**. The case count is the tell: the arm runs the same
+261 rows, none of them disappears. **The three other reviewer-named files need no flip and carry no
+fail-without of their own**: `uint_radix_rejected_7271` (18 rows, green on BOTH arms — the base's own
+radix check refused those shapes with the same needle), `format_spec_receiver_vocabulary_7333`
+(22 rows, green on both arms) and `sema_builtin_nullable_string_param_6782` (43 rows, green on both
+arms — the base accepts the narrowed span).
+
+**THE B6 MEMBERSHIP, MEASURED.** All FIVE of the B6 members are B6 by mechanism, and the lane plan's
+table (which lists #6782 / #6825 under L3) is the tracker-state error: **#6810** = §22.5's named
+argument bypassing the null check on a built-in non-nullable `string` parameter; **#6811** = §7.3's
+built-in non-string reference parameters declared non-nullable accepting `null`; **#6812** = §7.3's
+built-in non-nullable `string` parameters outside the #6782 table accepting `null`; **#6782** =
+`TimeSpan.ToString(null)` / `DateTime.ToString(null)`; **#6825** = `long.ToString(null)` accepted
+because the #6782 type map has no `Int64` (or other integer primitive) head.
+
+**BUT ONLY #6812 IS CLOSED BY THIS COMMIT — THE OTHER THREE ARE ALREADY REFUSED ON THE BASE ARM (measured
+on the fail-without arm, i.e. with this lane's four `src/` files reverted):** `TimeSpan.ToString(null)`
+and `DateTime.ToString(null)` (#6782) → "the argument to `TimeSpan.ToString` is nullable but the target
+type is non-nullable (§7)"; `a.ToString(format := null)` (#6810, the NAMED spelling) → the same
+refusal; `new InvalidOperationException("m", null)` and `Console.WriteLine(null)` (#6811) → refused.
+**Those three are NOT credited to this commit: the base already refuses them.** #6812's own
+measured families split the same way — `Encoding.UTF8.GetBytes(null)` is refused on the base by
+#6957's §3.2 check ("`Encoding.GetBytes` expects a `string` or `ReadOnlyStringSpan` source (stdlib
+§3.2); got `Object?`"), while `Environment.GetInt(null)`, `File.ReadAllTextAsync(null)` and
+`File.WriteAllTextAsync(null, null)` **COMPILE on the base arm** and are refused by this commit.
+
+**#6825 IS CLOSED BY THIS COMMIT, AND THE REVIEW CORRECTED THIS LANE'S PREMISE.** `long.ToString(null)`
+IS already refused on the base (the base's 93-row table carries the `Int64` head since #7296's fix) —
+but the OTHER shapes of #6825 are not: `long.Parse(null)` and `long.TryParse(null, out v)` **COMPILE on
+the base arm (printing `0`)** and are refused by this commit, because #6782's type map had no `Int64`
+head for the `Parse` / `TryParse` members. Four new rows pin them (and `long.Parse(16)`), so #6825 is
+now complete.
+
+**THE TWELVE NON-NULLABLE POSITIONS THIS COMMIT ADDS TO THE ONE TABLE** (each one is a position the
+base's 93-row table did not carry — the base's rows are all still carried, position for position, by the
+one table's mask: a mechanical diff of the base's 93 rows against the merged mask finds **0 rows of
+coverage lost**). The first eight came with the anchor; the last four were found by reading stdlib
+§2.4 / §10.1 / §10.2 for the families #6812 names:
+
+| head | member | arity | position | declaration |
+|---|---|---|---|---|
+| `File` | `ReadAllTextAsync` | 1 | 0 | stdlib §7.3 `ReadAllTextAsync(path: string, token := …)` |
+| `File` | `ReadAllTextAsync` | 2 | 0 | as above (the two-argument form) |
+| `File` | `WriteAllTextAsync` | 2 | 0 | stdlib §7.3 `WriteAllTextAsync(path: string, contents: string, token := …)` |
+| `File` | `WriteAllTextAsync` | 2 | 1 | as above (the `contents` parameter) |
+| `File` | `WriteAllTextAsync` | 3 | 0 | as above (the three-argument form) |
+| `File` | `WriteAllTextAsync` | 3 | 1 | as above (the `contents` parameter) |
+| `Environment` | `GetInt` | 1 | 0 | stdlib §2.4 `GetInt(name: string): int?` |
+| `Environment` | `GetBool` | 1 | 0 | stdlib §2.4 `GetBool(name: string): bool?` |
+| `Environment` | `Get` | 1 | 0 | stdlib §2.4 `Get(name: string): string?` |
+| `Environment` | `Set` | 2 | 0 | stdlib §2.4 `Set(name: string, value: string?)` — position 1 is declared `string?` and stays nullable |
+| `CString` | `From` | 1 | 0 | stdlib §10.1 `From(s: string): owned CString` |
+| `WString` | `From` | 1 | 0 | stdlib §10.2 `From(s: string): owned WString` |
+
+**THE CONTROL FOR THE NULLABILITY HALF** is `Environment.Set("BEZEL_ADMISSION_CONTROL", null)` — the
+`value` parameter is declared `string?`, so it is admitted, and the row asserts that it compiles and
+runs. The nullability mask does not spread from a non-nullable position to a nullable one.
+
+**THE ISSUE CLOSURE DECISIONS** (the commit's SUBJECT carries the tokens; each one decided by the issue's
+own text and by a measurement on the fail-without arm):
+
+* **CLOSED IN FULL — `fix #6825`, `fix #7284`, `fix #7290`, `fix #7293`, `fix #7294`, `fix #7295`,
+  `fix #7299`, `fix #7300`, `fix #7323`.** #7290 = the two-argument `int.TryParse` with a non-string first argument
+  (the base arm COMPILES it, with an `internal:` degrade); #7293 = the `double` / `float` / `decimal`
+  `TryParse` arms (the base arm compiles them); #7294 = the one-argument `int.Parse` arm with a class
+  instance (the base arm compiles it, and reads the object's pointer as text); #7295 =
+  `char.Parse(s, radix)` (the base arm DROPS it silently — the corpus row `l9_5_0004` flips fail →
+  pass); #7299 = the `bool` / `char` `Parse` / `TryParse` / `ParseOrNull` receivers (the base arm
+  compiles them — the corpus rows `s22_6_0112`, `s22_6_0113`, `s22_6_0114` flip fail → pass); #7300 =
+  the `decimal` `Parse` / `TryParse` arms (the base arm compiles them); #7323 = the umbrella — the
+  parse-operand guards DROP the call where §22.6 says it is a compile error, and the drop is silent; the
+  resolver now refuses every one of those shapes with a located §22.6 diagnostic.
+  **#7284** = the `decimal` radix `ToString` — `(15m).ToString(16)` ABORTED the compiler on the base
+  arm (stdlib §9.3 declares no radix `ToString` for `decimal`, so no candidate is reachable) and is a
+  located §22.6 refusal here; the grid's own map says `MEMBER['decimal_tostring_radix'] = '#7284'`.
+  **#6825** = the integer tower's `Parse` / `TryParse` at a `null` or a non-string first argument: the
+  base arm ACCEPTED `long.Parse(null)` and `long.TryParse(null, out v)` (printing `0`) because the
+  #6782 type map had no `Int64` head; both are refused here, and `long.Parse(16)` is refused too
+  (the review's coverage gap — the row it named is now in
+  `tests/sema/builtin_call_admission_7372_test.cpp`).
+* **CLOSED IN PART — `narrow #6812`, `narrow #7372`.** #6812: the twelve non-nullable positions above
+  ARE closed (the base arm accepts them all), but the `string` / `Encoding` / `StringBuilder` / `Math` /
+  `Convert` heads STAND DOWN from the gate, so part of #6812's surface is still open — a PARTIAL close.
+  #7372: its own text splits the remedy in two: "1. THE ADMISSION (campaign
+  `builtin-call-admission`) … 2. THE DEGRADE (campaign 0 … every `internal:` degrade becomes
+  `Severity::Error`)". Half 1 is this commit's; **half 2 is campaign 0's**, so the issue is only
+  PARTIALLY closed.
+* **NOT CLOSED, AND NOT NAMED — each one measured on the fail-without arm:**
+  * **#7285** — the issue is about the RADIX argument. The base arm ALREADY refuses a `bool` / `string` /
+    runtime-`uint` radix (the R35 "narrow #7285" fix, with its own message), and a `uint` CONSTANT
+    radix is ADMITTED by both arms — §5.1 (v0.345) admits it ("value-based, not type-based … across
+    signedness"), and the residual defect is the RENDERING, which is #7271's (codegen). The four rows
+    this commit flips in `parse_radix_binding_7285_test.cpp` are the FIRST-ARGUMENT shapes, which are
+    #7290's family, not #7285's.
+  * **#7271, #7286, #7315** — `src/codegen/**` territory: the uint-radix RENDERING, the `ToString`-radix
+    class, and the three-spelling guard policy. Reported, not fixed.
+  * **#7296** — the named-argument spelling of a primitive `ToString` radix: the base's #7296 fix already
+    owns it (the `Int64` / `Byte` / … rows are in the base's table); this commit carries the same rows
+    into the one table and changes no behaviour.
+  * **#7304** — `int.TryParse(this, out v)`: the base arm accepts it and so does this commit. `this` and
+    `base` are left UNRESOLVED by the identifier lookup, so the argument's type is not determined and the
+    resolver has no opinion about it — the gate deliberately does NOT refuse an argument whose type it
+    cannot determine ("a legal call must never be dropped on a typing accident", #7315's rule). The fix
+    belongs where `this` / `base` are resolved (`src/sema/ExprTypecheck_Exprs.cpp`), not in the admission
+    table. **Reported with its repro.**
+  * **#7313** — CLOSED before this commit (its 19 rows are flipped here — the resolver refuses what the
+    drop did — but the issue is not named, because it is not open).
+  * **#6782, #6810, #6811** — already refused on the base arm (measured above); this commit does
+    not change their behaviour.
+
+**THE FIX-FORWARD (the review of `0412dcf0` was a REJECT; five items, all fixed).** The reviewer
+measured 15 landed-green rows in five files that the tip broke. **TWO OF THEM WERE REJECT-LEVEL
+OVER-REFUSALS OF LEGAL CALLS** — the one defect class that would make the ONE table worse than the
+three tables it replaced — so they were fixed first, and each fix carries its own regression row.
+
+1. **THE `ToString(format: string)` FORM ON A `bool` / `char` RECEIVER (REJECT-LEVEL OVER-REFUSAL).**
+   Stdlib §2.18 (v0.345) lists "`bool`, `char`, `string` | *(none)* | a format spec on these is a
+   compile error" — the FORM is declared for them (they are "intrinsically formattable"), and only the
+   VOCABULARY is empty. The table carried only `ToString(): string` for `Boolean` and `Char`, so the
+   gate refused `b.ToString(fmt)` — a legal call the landed control
+   `a_bool_receiver_with_a_runtime_format_still_compiles_7336` pins. **THE FIX:** the two
+   `ToString(format: string)` ROWS went back into the table (stdlib §2.18's own words, cited in the
+   row), and #7333's format-spec gate keeps refusing a LITERAL spec on a `bool` / `char` receiver.
+   **#7336's open defect — the runtime form renders the plain text — stays open.** The two new rows in
+   `tests/sema/builtin_call_admission_7372_test.cpp` are the anti-over-rejection controls.
+2. **THE §7.4 NARROWING AT A SPAN PARAMETER (REJECT-LEVEL OVER-REFUSAL).** `var sp:
+   ReadOnlyStringSpan? := …; if sp <> null then var n := int.Parse(sp); end;` compiles on the base
+   (the landed row `sema_builtin_nullable_string_param_6782.a47_parse_narrowed_span_accepted_s7_4`
+   is green there) and the tip REFUSED it. The cause: the narrowing read used §7.11's `operandStaticTypeAt`,
+   which is PRIMITIVE-ONLY, so for a §7.4-narrowed RECORD it returned the declared type unchanged —
+   still nullable — and the call was refused. **THE FIX:** the kind-general narrowing read
+   (`scrutineeTypeAfterNarrowing`, §19.1 / §7.11) is used instead, and the resolver tries EVERY
+   declared form of the member (the `string` form AND the `ReadOnlyStringSpan` form). The new row
+   `builtin_call_admission_7372.int_parse_with_a_narrowed_span_is_unchanged` is the control.
+3. **FOUR UNDECLARED BEHAVIOUR FLIPS** in the #7290 lane's landed
+   `tests/codegen/parse_tryparse_class_instance_first_arg_7290_test.cpp`: its four pins asserted the
+   #7290 lane's GUARD-AND-DROP semantics ("False\n7\n"). §22.6 (v0.344) says a call that reaches no
+   candidate "is a compile error with no candidates cited", so the four rows now assert the located
+   §22.6 REFUSAL (the two control rows — a `string` first argument and the `ReadOnlyStringSpan`
+   overload — still compile and run).
+4. **A DIAGNOSTIC-TEXT REGRESSION — seven rows of `uint_radix_rejected_7271`.** The tip's message named
+   the WRONG parameter and the WRONG conversion: it reported against the FIRST declared one-argument
+   `ToString` form (`format: string`) instead of the radix form, so it said "the `format` argument must
+   be a `string`" where the argument is an integer. **THE FIX:** the resolver reports against the
+   CLOSEST candidate — the one whose DECLARED type at the failing position is closest to the
+   argument's own type class (§5.1's own question) — so a `uint` / `ulong` / `long` / `double` / `bool`
+   radix is reported against `ToString(radix: int): string` again, with §5.1's constant-narrowing
+   reason. The seven rows are green again, and the fix changed no other row.
+5. **THE LIT TWIN WAS RENAMED; ITS GTEST TWIN WAS NOT.** `sema_universal_member_arity_2446.char_static_tostring_accepted`
+   (the gtest twin of the renamed lit case) asserted that `char.ToString('z')` compiles; the tip
+   refuses it — correctly (stdlib §9.5 declares no one-argument `ToString` for `char`, and §2.18's
+   vocabulary for `char` is empty, so a `char` argument reaches no candidate). The row is RENAMED to
+   `char_static_tostring_with_an_argument_is_rejected` and now asserts the §22.6 diagnostic, so it
+   still pins what it was written to pin (the §8.1 universal-ARITY check must not be the one that
+   rejects it). The lit case's own CHECK lines were updated to the new wording — the arity text it
+   pinned is gone, and that text change is named in the commit body.
+   **Two more items from the review:** the `File` async rows' declared MINIMUMS were corrected (the
+   `token` parameter is optional — `token: CancellationToken := CancellationToken.None` — so the
+   two-argument form requires ONE argument and the three-argument form TWO), and the review's coverage
+   gap (`long.Parse(16)` is refused and was pinned by no row) is closed by four new rows.
+
+**THE DEFECTS THIS LANE FOUND AND DID NOT FIX** (reported to the coordinator; no issue was filed):
+
+* **THE GRID CELLS `int_parse_radix_uint`, `int_tostring_radix_uint` AND `int_tryparse_nullable` EXPECT A
+  REJECT THAT THE SPEC DOES NOT ASK FOR.** Spec §5.1 (v0.345): "The rule is **value-based, not
+  type-based**: the source may be a compile-time constant of **any** integer type — not only `int` — and
+  the target any integer type whose range contains the value, **across signedness**" — so
+  `int.Parse("ff", 16u)` and `(255).ToString(16u)` ARE admissible, and the landed #7285 fix admits them
+  deliberately (`uint_literal_radix_still_parses_hex`). Spec §7.4 (v0.345): "from a declaration whose
+  initializer is such an expr — `var x: T? := expr;`" — so `var s: string? := "16";` narrows `s`
+  non-null, and §5.1's own wording ("so an **un-narrowed** `Animal?` is rejected at an `Object`
+  parameter") admits the narrowed read. **The three cells must NOT be turned green by refusing these
+  programs** — that is the campaign failure mode ("the grid goes green by rejecting programs the spec
+  admits"). The gate admits all three, exactly as §5.1 and §7.4 say.
+* **THE COMPILER IS INCONSISTENT ABOUT A NARROWED READ AT A BUILT-IN PARAMETER**: `int.TryParse(s, out
+  v)` over a narrowed `string?` is ADMITTED and RUNS (the §7.4 facts are honoured), while
+  `int.Parse("ff", radix)` over a narrowed `int?` is REFUSED — by the CODEGEN's radix check
+  (`src/codegen/LlvmBackend_Calls2.cpp`), which does not read §7.4's facts. The 7285 row
+  `nullable_int_radix_is_rejected` pins that refusal. **The refusal contradicts §5.1's "un-narrowed"
+  wording**, so the codegen's radix check over-rejects. It is in `src/codegen/**` — **not this lane's
+  file** — and it is reported, not fixed.
+* **`int_tostring_radix_string` ((255).ToString("16")) and `double_tostring_format_bad` / `_c` / `_d`:
+  the compiler PRINTS instead of raising.** Stdlib §2.18: an unrecognized format specifier raises
+  `FormatException`; the compiler prints the value and raises nothing. The grid wants a `fault`. The fix
+  is in the format path (codegen / runtime), not in an admission gate — **this lane cannot make the cell
+  green, and must not**: the call IS admissible (`ToString(format: string)` is declared), so the
+  diagnostic would be wrong.
+* **`int_tostring_format_x` ((255).ToString("x")) prints `FF`, the grid wants `ff`.** Stdlib §9.1 /
+  §2.18 name `X` (upper-case) as the hexadecimal specifier, and the grid's `int_tostring_format_X` cell
+  (want `FF`) is green; the `x` cell's expectation contradicts it — an unrecognized specifier is a
+  `FormatException`, not a lower-case rendering. Reported to the campaign's L3.
+* **`string.Repeat(unit: string, count: int)` (#7129 / #7277) STAYS OPEN.** Stdlib §9.6 (v0.345)
+  declares BOTH overloads; the compiler implements only the `char` one and refuses the `string` one
+  ("'string.Repeat' requires a `char` first argument"). The gate STANDS DOWN on the `string` head (that
+  surface is the `checkBuiltinStringCallArgs` check's), so the anchor neither causes nor fixes that
+  refusal — **the two issues stay open and are not closed by this commit.**
+* **`Math.Abs(float)` MUST RESOLVE TO `Abs(double)` (#7061) AND `Math.Abs(uint)` MUST STAY AN AMBIGUOUS
+  CALL (#7254).** Per the coordinator's R2 ruling (stdlib §2.2 declares exactly four `Abs` overloads), the
+  table's shape is the declared one, and the anchor does not touch the `Math` head: `math_abs_float` and
+  `math_abs_uint` are **not** this lane's cells and are reported, not fixed.
+* **`Math.Abs(null)` ABORTS THE COMPILER** (found while probing the nullability half, MEASURED):
+  `var v := Math.Abs(null);` → `bezelc: codegen error: IR verification failed (malformed IR emitted)`.
+  Stdlib §2.2 declares `Abs(value: int): int` (and the `long` / `float` / `double` overloads) — a `null`
+  literal reaches no candidate, so by §22.6 (v0.344) the call is a compile error; instead the compiler
+  emits malformed IR and aborts. **The `Math` head is outside this lane's reach** (the resolver stands
+  down there, so that one call never draws two diagnostics), and `builtinMathConvertSurface` is still an
+  UN-FOLDED table — so the remedy belongs to the lane that folds the `Math` / `Convert` surface into the
+  one table. **Reported with its repro.**
+* **THE UN-FOLDED TYPE TABLES**: `builtinStringBuilderSurface` (8 rows) and `builtinMathConvertSurface`
+  (34 rows) in `src/sema/ExprTypecheck_Calls.cpp` are still INDEPENDENT parameter-type tables beside the
+  ONE table. **L2 / L4 should move them into `kBuiltinParams`** — that is the "anchor versus seven
+  hand-written checks" debt the campaign exists to close, and this lane did not close it (those heads
+  are the sibling lanes' reach).
+* **THE NEW `StringBuilder(initial := null)` CONSTRUCTOR HALF OF #6810** lives in the constructor path
+  (`src/sema/ExprTypecheck_Exprs.cpp`), which the coordinator put out of this lane's reach.
+
+**WHAT THIS LANE DID NOT CHECK.** The full suite (the coordinator's gate); the `lit` track's FULL
+history (one run, before and after the flip: 2562 passed); the ASan leg of the whole corpus (the corpus
+was measured under the plain oracle, with the harness's ASan leg run over the seven filters); and the
+`src/codegen/**` and `src/runtime/**` behaviour (untouched).
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*

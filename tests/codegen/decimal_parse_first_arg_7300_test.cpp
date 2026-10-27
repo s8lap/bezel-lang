@@ -69,6 +69,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -115,6 +116,22 @@ std::string tryParseProg(const std::string& receiver, const std::string& first,
                 obj);
 }
 
+
+// THE REFUSAL (campaign 2, `builtin-call-admission`): §22.6 (v0.344) — "If
+// no candidate is applicable at all ... the call is a compile error with no
+// candidates cited". The declared surface of the standard library (stdlib
+// §9.1-§9.5, §2.5, §2.6) declares the FIRST parameter of this member as a
+// `string`, and §5.1 admits no conversion to `string` from the operand these
+// rows pass — so the call reaches no candidate and the compiler REFUSES it,
+// at a real location, with that one diagnostic.
+//
+// The oracle is the diagnostic text plus a real location, never the absence
+// of a diagnostic.
+void expectRefused(const JitResult& r, const char* needle) {
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, needle));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -129,8 +146,7 @@ std::string tryParseProg(const std::string& receiver, const std::string& first,
 BEZEL_TEST(decimal_parse_first_arg_7300,
            decimal_tryparse_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(tryParseProg("decimal", "1.5"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n7\n"));
+    expectRefused(r, "no matching overload of `decimal.TryParse`");
 }
 
 // `decimal.Parse(1.5)`. On the base arm the compiler ABORTED with "Call
@@ -141,8 +157,7 @@ BEZEL_TEST(decimal_parse_first_arg_7300,
     JitResult r = runAot(prog(
         "    var m := decimal.Parse(1.5);\n"
         "    Console.WriteLine(m);\n"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `decimal.Parse`");
 }
 
 // The CLASS-NAME spelling `Decimal.Parse(1.5)` — the same copy of the arm.
@@ -151,8 +166,7 @@ BEZEL_TEST(decimal_parse_first_arg_7300,
     JitResult r = runAot(prog(
         "    var m := Decimal.Parse(1.5);\n"
         "    Console.WriteLine(m);\n"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `Decimal.Parse`");
 }
 
 // ---------------------------------------------------------------------------
@@ -169,8 +183,7 @@ BEZEL_TEST(decimal_parse_first_arg_7300,
         "    var m := decimal.Parse(o);\n"
         "    Console.WriteLine(m);\n",
         /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `decimal.Parse`");
 }
 
 // The same for the `TryParse` form. On the base arm it printed "False" /
@@ -179,8 +192,7 @@ BEZEL_TEST(decimal_parse_first_arg_7300,
 BEZEL_TEST(decimal_parse_first_arg_7300,
            decimal_tryparse_class_instance_is_not_parsed_as_text) {
     JitResult r = runAot(tryParseProg("decimal", "o", "", /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n7\n"));
+    expectRefused(r, "no matching overload of `decimal.TryParse`");
 }
 
 // ---------------------------------------------------------------------------

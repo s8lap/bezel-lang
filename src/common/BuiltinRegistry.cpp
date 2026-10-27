@@ -551,261 +551,366 @@ constexpr std::array<BuiltinExceptionEdge, 29> kBuiltinExceptionHierarchy = {{
 // `required` counts the LEADING parameters that declare no default, so one
 // row answers for every admissible argument count of an overload with §22.5
 // optional parameters.
-struct BuiltinParamNameRow {
+// ONE row of the built-in parameter table: a DECLARED FORM of a built-in
+// member (or of a built-in constructor, whose `member` is empty), carrying
+// the parameter NAME (\u00a722.5), the parameter TYPE (\u00a75.1) and the
+// parameter NULLABILITY (\u00a77.3) of that form.
+//
+// This is the ONE table the built-in parameter facts live in. It replaced
+// three independent ones \u2014 the parameter-NAME rows (74 rows across
+// string / Encoding / StringBuilder / Math / Convert and the 45 constructor
+// rows), the 93-row NULLABILITY table, and (for the surface the admission
+// gate owns) the parameter-TYPE rows that no table carried at all. A form's
+// name, type and nullability are ONE row, so the consumers cannot read two
+// tables that disagree.
+//
+// `kinds[p]` is the declared parameter TYPE at position `p` as a
+// `BuiltinParamType` bit set; `kBPTAny` (the zero value) means "no type
+// opinion at this position", so a surface that has not been transcribed yet
+// costs a rejection that does not fire, never a false one.
+//
+// `nonNullable` is a bit mask: bit `p` set means the parameter at position `p`
+// is declared non-nullable in EVERY overload of this argument count.
+//
+// Every row is transcribed from the standard-library document's own
+// declaration; nothing here is inferred. The standard-library section cited
+// per group.
+struct BuiltinParamRow {
     std::string_view head;
     std::string_view member;   // empty for a CONSTRUCTOR row
-    std::uint8_t total;
-    std::uint8_t required;
-    std::array<std::string_view, 8> names;
+    std::uint8_t total;        // the form's parameter count
+    std::uint8_t required;     // the LEADING parameters that declare no default
+    std::uint8_t nonNullable;  // bit `p` set: position `p` is non-nullable
+    std::array<std::string_view, 8> names;   // the \u00a722.5 declared names
+    std::array<std::uint32_t, 8> kinds;      // the declared parameter types
+    // The DECLARED SIGNATURE, exactly as the standard library writes it \u2014
+    // "`Parse(s: string, radix: int): int`" \u2014 with the RETURN type the
+    // declaration carries. Empty for the rows the admission gate does not
+    // quote. A diagnostic that names a built-in's declared form quotes the
+    // standard library's own words, not a re-spelling of them.
+    std::string_view sig;
 };
 
-// stdlib §9.6 `String` (v0.283). The STATIC members are keyed under the same
-// `"string"` head as the instance ones — no §9.6 member name is both, so one
-// table answers both spellings and the lookup normalizes `"String"` to
-// `"string"`.
-//
-// The four overload pairs #3398 had to OMIT — `Replace/2`, `Repeat/2`,
-// `Split/1`, `AsSpan/1` — are present since #3424 as MULTIPLE candidate rows
-// at the same argument count. `Trim/0`, `ToUpper/0` and the other nullary
-// members carry no parameters and so cannot take a named argument at all.
-constexpr std::array<BuiltinParamNameRow, 37> kStringParamNames = {{
-    // Construction (static)
-    {"string", "From", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"string", "From", 3, 3, {"buffer", "start", "length", "", "", "", "", ""}},  // renamed v0.282 (§1)
-    {"string", "FromCStringPointer", 1, 1, {"p", "", "", "", "", "", "", ""}},
-    {"string", "FromWStringPointer", 1, 1, {"p", "", "", "", "", "", "", ""}},
-    {"string", "Join", 2, 2, {"separator", "items", "", "", "", "", "", ""}},
-    // §9.6 declares two arity-2 `Repeat` overloads that disagree (#3424).
-    {"string", "Repeat", 2, 2, {"c", "count", "", "", "", "", "", ""}},
-    {"string", "Repeat", 2, 2, {"unit", "count", "", "", "", "", "", ""}},
-    // Inspection (static). fix #3854 (stdlib §9.6, v0.290): `IsNullOrEmpty`
-    // was impl-ahead-of-spec surface (retired at v0.290, proposal 0123 R6) —
-    // deleted, not just left unregistered here, so its row does not silently
-    // resurrect a named-argument binding for a call the sema layer now rejects.
-    {"string", "IsNullOrWhiteSpace", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    // Inspection (instance)
-    {"string", "Contains", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"string", "StartsWith", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"string", "EndsWith", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"string", "IndexOf", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"string", "IndexOf", 2, 2, {"value", "startIndex", "", "", "", "", "", ""}},
-    {"string", "LastIndexOf", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    // Substring / span views
-    {"string", "Substring", 1, 1, {"startIndex", "", "", "", "", "", "", ""}},
-    {"string", "Substring", 2, 2, {"startIndex", "length", "", "", "", "", "", ""}},
-    // §9.6 declares `AsSpan(start)` and `AsSpan(r: Range<int>)` (#3424).
-    {"string", "AsSpan", 1, 1, {"start", "", "", "", "", "", "", ""}},
-    {"string", "AsSpan", 1, 1, {"r", "", "", "", "", "", "", ""}},
-    {"string", "AsSpan", 2, 2, {"start", "length", "", "", "", "", "", ""}},
-    // Modification
-    {"string", "Trim", 1, 1, {"chars", "", "", "", "", "", "", ""}},
-    {"string", "PadLeft", 1, 1, {"totalWidth", "", "", "", "", "", "", ""}},
-    {"string", "PadLeft", 2, 2, {"totalWidth", "paddingChar", "", "", "", "", "", ""}},
-    {"string", "PadRight", 1, 1, {"totalWidth", "", "", "", "", "", "", ""}},
-    {"string", "PadRight", 2, 2, {"totalWidth", "paddingChar", "", "", "", "", "", ""}},
-    {"string", "PadCenter", 1, 1, {"totalWidth", "", "", "", "", "", "", ""}},
-    {"string", "PadCenter", 2, 2, {"totalWidth", "paddingChar", "", "", "", "", "", ""}},
-    {"string", "Insert", 2, 2, {"startIndex", "value", "", "", "", "", "", ""}},
-    {"string", "Remove", 1, 1, {"startIndex", "", "", "", "", "", "", ""}},
-    {"string", "Remove", 2, 2, {"startIndex", "length", "", "", "", "", "", ""}},  // renamed v0.282 (§1)
-    // §9.6 declares two arity-2 `Replace` overloads that disagree (#3424).
-    {"string", "Replace", 2, 2, {"oldChar", "newChar", "", "", "", "", "", ""}},
-    {"string", "Replace", 2, 2, {"oldValue", "newValue", "", "", "", "", "", ""}},
-    // §9.6 declares `Split(separator: char)`, `Split(separator: string)` and
-    // `Split(separators: Array<char>)` — two candidate names at arity 1.
-    {"string", "Split", 1, 1, {"separator", "", "", "", "", "", "", ""}},
-    {"string", "Split", 1, 1, {"separators", "", "", "", "", "", "", ""}},
-    // Comparison and equality. fix #3853 (stdlib §9.6, v0.290, proposal 0123
-    // R6): the static `Compare(a, b)` / `Compare(a, b, ignoreCase)` rows this
-    // table used to carry were RETIRED — deleted, not just left unregistered,
-    // so they do not silently resurrect a named-argument binding for a call
-    // the sema layer now rejects outright (the #3854 `IsNullOrEmpty` pattern
-    // above). The instance replacement is the 2-arg `CompareTo` row below,
-    // parallel to `Equals`'s.
-    {"string", "CompareTo", 1, 1, {"other", "", "", "", "", "", "", ""}},
-    {"string", "CompareTo", 2, 2, {"other", "ignoreCase", "", "", "", "", "", ""}},
-    // §9.6 declares BOTH `Equals(other: string?)` and the `Object?` override
-    // at arity 1, and they AGREE on the name, so the single row answers both.
-    {"string", "Equals", 1, 1, {"other", "", "", "", "", "", "", ""}},
-    {"string", "Equals", 2, 2, {"other", "ignoreCase", "", "", "", "", "", ""}},
+constexpr std::array<BuiltinParamRow, 287> kBuiltinParams = {{
+    {"string", "From", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "From", 3, 3, 0x00, {"buffer", "start", "length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "FromCStringPointer", 1, 1, 0x00, {"p", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "FromWStringPointer", 1, 1, 0x00, {"p", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Join", 2, 2, 0x00, {"separator", "items", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Repeat", 2, 2, 0x00, {"c", "count", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Repeat", 2, 2, 0x00, {"unit", "count", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "IsNullOrWhiteSpace", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Contains", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "StartsWith", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "EndsWith", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "IndexOf", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "IndexOf", 2, 2, 0x00, {"value", "startIndex", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "LastIndexOf", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Substring", 1, 1, 0x00, {"startIndex", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Substring", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "AsSpan", 1, 1, 0x00, {"start", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "AsSpan", 1, 1, 0x00, {"r", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "AsSpan", 2, 2, 0x00, {"start", "length", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Trim", 1, 1, 0x00, {"chars", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "PadLeft", 1, 1, 0x00, {"totalWidth", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "PadLeft", 2, 2, 0x00, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "PadRight", 1, 1, 0x00, {"totalWidth", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "PadRight", 2, 2, 0x00, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "PadCenter", 1, 1, 0x00, {"totalWidth", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "PadCenter", 2, 2, 0x00, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Insert", 2, 2, 0x00, {"startIndex", "value", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Remove", 1, 1, 0x00, {"startIndex", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Remove", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Replace", 2, 2, 0x00, {"oldChar", "newChar", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Replace", 2, 2, 0x00, {"oldValue", "newValue", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Split", 1, 1, 0x00, {"separator", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Split", 1, 1, 0x00, {"separators", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "CompareTo", 1, 1, 0x00, {"other", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "CompareTo", 2, 2, 0x00, {"other", "ignoreCase", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Equals", 1, 1, 0x00, {"other", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "Equals", 2, 2, 0x00, {"other", "ignoreCase", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Encoding", "GetBytes", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Encoding", "GetBytes", 2, 2, 0x00, {"s", "destination", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Encoding", "GetString", 1, 1, 0x00, {"bytes", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Encoding", "GetByteCount", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"StringBuilder", "Append", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"StringBuilder", "AppendLine", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"StringBuilder", "AppendFormat", 2, 2, 0x01, {"format", "args", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"StringBuilder", "Insert", 2, 2, 0x02, {"index", "value", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"StringBuilder", "Remove", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"StringBuilder", "Replace", 2, 2, 0x03, {"oldValue", "newValue", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Abs", 1, 1, 0x00, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Min", 2, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Max", 2, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Clamp", 3, 3, 0x00, {"value", "low", "high", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Sqrt", 1, 1, 0x00, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Pow", 2, 2, 0x00, {"x", "y", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Floor", 1, 1, 0x00, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Ceiling", 1, 1, 0x00, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Round", 2, 1, 0x00, {"x", "digits", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Truncate", 1, 1, 0x00, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Sign", 1, 1, 0x00, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "Fmod", 2, 2, 0x00, {"x", "y", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "IEEERemainder", 2, 2, 0x00, {"x", "y", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "DivRem", 3, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "DivRem", 3, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "ToInt32", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "ToInt64", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "ToDouble", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "ToDecimal", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "ToBoolean", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "ToString", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "ToString", 2, 2, 0x00, {"value", "toBase", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "TryToInt32", 2, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "TryToInt64", 2, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "TryToDouble", 2, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "TryToDecimal", 2, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Convert", "TryToBoolean", 2, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"DateTime", "", 3, 3, 0x00, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"DateTime", "", 8, 6, 0x00, {"year", "month", "day", "hour", "minute", "second", "millisecond", "kind"}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"DateOnly", "", 3, 3, 0x00, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"TimeOnly", "", 4, 2, 0x00, {"hour", "minute", "second", "millisecond", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"StringBuilder", "", 1, 1, 0x01, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"StringBuilder", "", 1, 1, 0x01, {"initial", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ReadOnlyStringSpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ExceptionInfo", "", 3, 3, 0x00, {"TypeName", "Message", "StackTrace", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Span", "", 3, 3, 0x00, {"Buffer", "Start", "Length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ReadOnlySpan", "", 3, 3, 0x00, {"Buffer", "Start", "Length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ArraySpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ReadOnlyArraySpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Array", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Array", "", 2, 2, 0x00, {"size", "fill", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningArray", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningBuffer", "", 1, 1, 0x00, {"length", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningBuffer", "", 2, 2, 0x00, {"length", "init", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"LinkedList", "", 1, 1, 0x00, {"source", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Dictionary", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Dictionary", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Dictionary", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningDictionary", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningDictionary", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningDictionary", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Set", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Set", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Set", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningSet", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningSet", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningSet", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Shared", "", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Random", "", 1, 1, 0x00, {"seed", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Semaphore", "", 1, 1, 0x00, {"initialCount", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Semaphore", "", 2, 2, 0x00, {"initialCount", "maxCount", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Channel", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Exception", "", 2, 2, 0x00, {"message", "cause", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ArgumentException", "", 2, 2, 0x00, {"message", "paramName", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ArgumentOutOfRangeException", "", 2, 2, 0x00, {"message", "paramName", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"TimeoutException", "", 2, 2, 0x00, {"message", "inner", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"FileStream", "", 2, 2, 0x00, {"path", "mode", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"FileStream", "", 3, 3, 0x00, {"path", "mode", "access", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"JsonSerializer", "", 1, 1, 0x00, {"options", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"JsonDeserializer", "", 1, 1, 0x00, {"input", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"JsonDeserializer", "", 2, 2, 0x00, {"input", "options", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"BinaryDeserializer", "", 2, 2, 0x00, {"input", "ignoreUnknownFields", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"SByte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): sbyte"},
+    {"SByte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): sbyte"},
+    {"SByte", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): sbyte"},
+    {"SByte", "ParseOrNull", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): sbyte?"},
+    {"SByte", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: sbyte): bool"},
+    {"SByte", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: sbyte): bool"},
+    {"SByte", "TryParse", 3, 3, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, kBPTOut, 0, 0, 0, 0, 0}, "TryParse(s: string, radix: int, out result: sbyte): bool"},
+    {"SByte", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"SByte", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"SByte", "ToString", 1, 1, 0x01, {"radix", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "ToString(radix: int): string"},
+    {"Byte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): byte"},
+    {"Byte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): byte"},
+    {"Byte", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): byte"},
+    {"Byte", "ParseOrNull", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): byte?"},
+    {"Byte", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: byte): bool"},
+    {"Byte", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: byte): bool"},
+    {"Byte", "TryParse", 3, 3, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, kBPTOut, 0, 0, 0, 0, 0}, "TryParse(s: string, radix: int, out result: byte): bool"},
+    {"Byte", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"Byte", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Byte", "ToString", 1, 1, 0x01, {"radix", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "ToString(radix: int): string"},
+    {"Int16", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): short"},
+    {"Int16", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): short"},
+    {"Int16", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): short"},
+    {"Int16", "ParseOrNull", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): short?"},
+    {"Int16", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: short): bool"},
+    {"Int16", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: short): bool"},
+    {"Int16", "TryParse", 3, 3, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, kBPTOut, 0, 0, 0, 0, 0}, "TryParse(s: string, radix: int, out result: short): bool"},
+    {"Int16", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"Int16", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Int16", "ToString", 1, 1, 0x01, {"radix", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "ToString(radix: int): string"},
+    {"UInt16", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): ushort"},
+    {"UInt16", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): ushort"},
+    {"UInt16", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): ushort"},
+    {"UInt16", "ParseOrNull", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): ushort?"},
+    {"UInt16", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: ushort): bool"},
+    {"UInt16", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: ushort): bool"},
+    {"UInt16", "TryParse", 3, 3, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, kBPTOut, 0, 0, 0, 0, 0}, "TryParse(s: string, radix: int, out result: ushort): bool"},
+    {"UInt16", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"UInt16", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"UInt16", "ToString", 1, 1, 0x01, {"radix", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "ToString(radix: int): string"},
+    {"Int32", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): int"},
+    {"Int32", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): int"},
+    {"Int32", "Parse", 2, 2, 0x01, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): int"},
+    {"Int32", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): int?"},
+    {"Int32", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: int): bool"},
+    {"Int32", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: int): bool"},
+    {"Int32", "TryParse", 3, 3, 0x01, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, kBPTOut, 0, 0, 0, 0, 0}, "TryParse(s: string, radix: int, out result: int): bool"},
+    {"Int32", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"Int32", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Int32", "ToString", 1, 1, 0x01, {"radix", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "ToString(radix: int): string"},
+    {"UInt32", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): uint"},
+    {"UInt32", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): uint"},
+    {"UInt32", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): uint"},
+    {"UInt32", "ParseOrNull", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): uint?"},
+    {"UInt32", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: uint): bool"},
+    {"UInt32", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: uint): bool"},
+    {"UInt32", "TryParse", 3, 3, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, kBPTOut, 0, 0, 0, 0, 0}, "TryParse(s: string, radix: int, out result: uint): bool"},
+    {"UInt32", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"UInt32", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"UInt32", "ToString", 1, 1, 0x01, {"radix", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "ToString(radix: int): string"},
+    {"Int64", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): long"},
+    {"Int64", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): long"},
+    {"Int64", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): long"},
+    {"Int64", "ParseOrNull", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): long?"},
+    {"Int64", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: long): bool"},
+    {"Int64", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: long): bool"},
+    {"Int64", "TryParse", 3, 3, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, kBPTOut, 0, 0, 0, 0, 0}, "TryParse(s: string, radix: int, out result: long): bool"},
+    {"Int64", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"Int64", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Int64", "ToString", 1, 1, 0x01, {"radix", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "ToString(radix: int): string"},
+    {"UInt64", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): ulong"},
+    {"UInt64", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): ulong"},
+    {"UInt64", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): ulong"},
+    {"UInt64", "ParseOrNull", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): ulong?"},
+    {"UInt64", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: ulong): bool"},
+    {"UInt64", "TryParse", 2, 2, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: ulong): bool"},
+    {"UInt64", "TryParse", 3, 3, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, kBPTOut, 0, 0, 0, 0, 0}, "TryParse(s: string, radix: int, out result: ulong): bool"},
+    {"UInt64", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"UInt64", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"UInt64", "ToString", 1, 1, 0x01, {"radix", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "ToString(radix: int): string"},
+    {"Double", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): double"},
+    {"Double", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): double"},
+    {"Double", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): double?"},
+    {"Double", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: double): bool"},
+    {"Double", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: double): bool"},
+    {"Double", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"Double", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Float", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): float"},
+    {"Float", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): float"},
+    {"Float", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): float?"},
+    {"Float", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: float): bool"},
+    {"Float", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: float): bool"},
+    {"Float", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"Float", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Decimal", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): decimal"},
+    {"Decimal", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): decimal"},
+    {"Decimal", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): decimal?"},
+    {"Decimal", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: decimal): bool"},
+    {"Decimal", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: decimal): bool"},
+    {"Decimal", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"Decimal", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Decimal", "Round", 1, 1, 0x00, {"digits", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Round(digits: int): decimal"},
+    {"Boolean", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): bool"},
+    {"Boolean", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): bool?"},
+    {"Boolean", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: bool): bool"},
+    {"Boolean", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    // fix #7333 / #7336 (stdlib §2.18, v0.345): the FORM is declared for
+    // `bool` and `char`; only the VOCABULARY is empty. §2.18's table lists
+    // "`bool`, `char`, `string` | *(none)* | a format spec on these is a
+    // compile error" — the format form exists for them (they are
+    // "intrinsically formattable"), and what a format spec means there is
+    // nothing. So the `ToString(format: string)` ROW belongs here, and the
+    // SPEC is what the format-spec gate refuses (a LITERAL spec on a
+    // `bool`/`char` receiver), never the form's absence. Without the row
+    // the admission gate refused `b.ToString(fmt)` — a legal call that the
+    // landed control `a_bool_receiver_with_a_runtime_format_still_compiles_7336`
+    // pins — and split the two spellings of one overload.
+    {"Boolean", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Char", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): char"},
+    {"Char", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): char?"},
+    {"Char", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: char): bool"},
+    {"Char", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    // fix #7333 / #7336 (stdlib §2.18, v0.345): the `char` twin of the
+    // `Boolean` row above — the form is declared, the vocabulary is empty.
+    {"Char", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"Guid", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): Guid"},
+    {"Guid", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): Guid?"},
+    {"Guid", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: Guid): bool"},
+    {"Guid", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"Guid", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"DateTime", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): DateTime"},
+    {"DateTime", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): DateTime?"},
+    {"DateTime", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: DateTime): bool"},
+    {"DateTime", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"DateTime", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"DateOnly", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): DateOnly"},
+    {"DateOnly", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): DateOnly?"},
+    {"DateOnly", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: DateOnly): bool"},
+    {"DateOnly", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"DateOnly", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"TimeOnly", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): TimeOnly"},
+    {"TimeOnly", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): TimeOnly?"},
+    {"TimeOnly", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: TimeOnly): bool"},
+    {"TimeOnly", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"TimeOnly", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    {"TimeSpan", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
+    {"TimeSpan", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    // fix #6812 (stdlib §7.3, v0.344): the ASYNC text members. Their
+    // `token` parameter is declared `token: CancellationToken :=
+    // CancellationToken.None` — OPTIONAL — so the two-argument form requires
+    // ONE argument and the three-argument form requires TWO. The `required`
+    // column is the declared MINIMUM, not the arity.
+    {"File", "ReadAllTextAsync", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllTextAsync", 2, 1, 0x01, {"path", "token", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllTextAsync", 2, 2, 0x03, {"path", "contents", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllTextAsync", 3, 2, 0x03, {"path", "contents", "token", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "GetInt", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "GetBool", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #6812 (§7.3, v0.340; stdlib §2.4 v0.344): the REST of stdlib §2.4's
+    // `Environment` surface. `Get(name: string): string?` and
+    // `Set(name: string, value: string?)` declare their FIRST parameter
+    // non-nullable, exactly as `GetInt` / `GetBool` do, so the `null` literal
+    // reaches no candidate there either (§7.3). `Set`'s SECOND parameter is
+    // declared `string?` — nullable — so only position 0 is non-nullable
+    // (`Environment.Set("A", null)` stays legal).
+    {"Environment", "Get", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "Set", 2, 2, 0x01, {"name", "value", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #6812 (§7.3, v0.340; stdlib §10.1 / §10.2 v0.344): the FFI-boundary
+    // string factories. `CString.From(s: string): owned CString` and
+    // `WString.From(s: string): owned WString` declare their parameter
+    // non-nullable, so `CString.From(null)` reaches no candidate (§7.3).
+    {"CString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"WString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllText", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllText", 2, 0, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllBytes", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllBytes", 2, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllLines", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllLines", 2, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Exists", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Delete", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Copy", 3, 0, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Move", 2, 0, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Exists", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "CreateDirectory", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Delete", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Delete", 2, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "GetFiles", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "GetDirectories", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "Combine", 2, 0, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFileName", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetExtension", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFileNameWithoutExtension", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetDirectoryName", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFullPath", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"TextWriter", "Write", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"TextWriter", "WriteLine", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
 }};
 
-// stdlib §3.2 `Encoding` (v0.290). No overload at a shared arity disagrees on
-// names here, so the whole declared surface is covered.
-//
-// fix #3851 (stdlib §3.2 / §1, v0.290, proposal 0123 R5 Option B): dropped
-// the three-argument `GetString(bytes, start, length)` row (was renamed to
-// the (start, length) window convention at v0.282; retired outright at
-// v0.290 — a window over an Array<byte> is a slice, not a parameter pair).
-// The call form is rejected in sema (ExprTypecheck_Calls.cpp) ahead of the
-// named-argument lookup this table serves, so removing the row costs no
-// coverage: a 3-argument `GetString` call never reaches
-// `checkBuiltinNamedArgs` un-rejected.
-constexpr std::array<BuiltinParamNameRow, 4> kEncodingParamNames = {{
-    {"Encoding", "GetBytes", 1, 1, {"s", "", "", "", "", "", "", ""}},
-    {"Encoding", "GetBytes", 2, 2, {"s", "destination", "", "", "", "", "", ""}},
-    {"Encoding", "GetString", 1, 1, {"bytes", "", "", "", "", "", "", ""}},
-    {"Encoding", "GetByteCount", 1, 1, {"s", "", "", "", "", "", "", ""}},
-}};
 
-// fix #3424 — stdlib §3.1 `StringBuilder` (v0.283). Every `Append` /
-// `AppendLine` overload declares its single parameter `value`, so one row per
-// argument count answers all of them.
-constexpr std::array<BuiltinParamNameRow, 6> kStringBuilderParamNames = {{
-    {"StringBuilder", "Append", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"StringBuilder", "AppendLine", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"StringBuilder", "AppendFormat", 2, 2, {"format", "args", "", "", "", "", "", ""}},
-    {"StringBuilder", "Insert", 2, 2, {"index", "value", "", "", "", "", "", ""}},
-    {"StringBuilder", "Remove", 2, 2, {"startIndex", "length", "", "", "", "", "", ""}},
-    {"StringBuilder", "Replace", 2, 2, {"oldValue", "newValue", "", "", "", "", "", ""}},
-}};
-// fix #3424 (stdlib §2.2 / spec §22.5, v0.315): `Math` static methods that
-// declare named parameters.  DivRem has an `out` parameter; §22.5 makes the
-// `out` slot positional-only but the by-value `a` and `b` slots may be named.
-// Uses the partial-naming shape: the `out` slot is an empty string.
-constexpr std::array<BuiltinParamNameRow, 15> kMathParamNames = {{
-    {"Math", "Abs", 1, 1, {"x", "", "", "", "", "", "", ""}},
-    {"Math", "Min", 2, 2, {"a", "b", "", "", "", "", "", ""}},
-    {"Math", "Max", 2, 2, {"a", "b", "", "", "", "", "", ""}},
-    {"Math", "Clamp", 3, 3, {"value", "low", "high", "", "", "", "", ""}},
-    {"Math", "Sqrt", 1, 1, {"x", "", "", "", "", "", "", ""}},
-    {"Math", "Pow", 2, 2, {"x", "y", "", "", "", "", "", ""}},
-    {"Math", "Floor", 1, 1, {"x", "", "", "", "", "", "", ""}},
-    {"Math", "Ceiling", 1, 1, {"x", "", "", "", "", "", "", ""}},
-    {"Math", "Round", 2, 1, {"x", "digits", "", "", "", "", "", ""}},
-    {"Math", "Truncate", 1, 1, {"x", "", "", "", "", "", "", ""}},
-    {"Math", "Sign", 1, 1, {"x", "", "", "", "", "", "", ""}},
-    {"Math", "Fmod", 2, 2, {"x", "y", "", "", "", "", "", ""}},
-    {"Math", "IEEERemainder", 2, 2, {"x", "y", "", "", "", "", "", ""}},
-    // DivRem overloads (stdlib §2.2): 3 params, 2 named (a, b), 1 positional-only.
-    {"Math", "DivRem", 3, 2, {"a", "b", "", "", "", "", "", ""}},
-    {"Math", "DivRem", 3, 2, {"a", "b", "", "", "", "", "", ""}},  // long overload
-}};
-
-// fix #3424 (stdlib §2.3 / spec §22.5, v0.315): `Convert` static methods that
-// declare named parameters.  Each TryTo* method has an `out` parameter; §22.5 makes
-// the `out` slot positional-only but the by-value `value` slot may be named.
-// Uses the partial-naming shape: the `out` slot is an empty string.
-constexpr std::array<BuiltinParamNameRow, 12> kConvertParamNames = {{
-    {"Convert", "ToInt32", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "ToInt64", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "ToDouble", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "ToDecimal", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "ToBoolean", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "ToString", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "ToString", 2, 2, {"value", "toBase", "", "", "", "", "", ""}},
-    // TryTo* overloads (stdlib §2.3): 2 params, 1 named (value), 1 positional-only.
-    {"Convert", "TryToInt32", 2, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "TryToInt64", 2, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "TryToDouble", 2, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "TryToDecimal", 2, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Convert", "TryToBoolean", 2, 1, {"value", "", "", "", "", "", "", ""}},
-}};
-
-// fix #3425 — the built-in CONSTRUCTOR rows) (§17.7's closed constructor
-// surface; the argument-taking constructors the standard library declares).
-// A head absent here rejects a named `new` argument loudly rather than
-// binding it positionally, so the coverage below is a floor, not a contract
-// (the remaining argument-taking heads are issue 3534).
-//
-// The stdlib heads whose only declared constructor is parameterless
-// (`SortedDictionary`, `SortedSet`, `Stack`, `Queue`, `Mutex`, `Stopwatch`,
-// `CancellationTokenSource`, `TaskScope`, the event sources, the
-// task-completion sources, …) carry no row for the same reason `Trim/0`
-// carries none: a nullary constructor cannot take a named argument.
-//
-// fix #3533 (stdlib §2.5 / spec §22.5, v0.315): DateTime's eight-parameter
-// constructor (year, month, day, hour, minute, second, millisecond, kind) — all
-// eight parameters are named in the table. The row uses the 8-element names array
-// (wider than the pre-#3533 four-element limit).
-constexpr std::array<BuiltinParamNameRow, 35> kBuiltinCtorParamNames = {{
-    // stdlib §2.5 — the temporal value records.
-    {"DateTime", "", 3, 3, {"year", "month", "day", "", "", "", "", ""}},
-    {"DateTime", "", 8, 6, {"year", "month", "day", "hour", "minute", "second", "millisecond", "kind"}},
-    {"DateOnly", "", 3, 3, {"year", "month", "day", "", "", "", "", ""}},
-    {"TimeOnly", "", 4, 2, {"hour", "minute", "second", "millisecond", "", "", "", ""}},
-    // stdlib §3.1 — `StringBuilder(capacity)` and `StringBuilder(initial)`
-    // share an argument count and disagree on names: two candidates (#3424's
-    // overload-aware lookup is what admits them).
-    {"StringBuilder", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
-    {"StringBuilder", "", 1, 1, {"initial", "", "", "", "", "", "", ""}},
-    // stdlib §3.3 / §31.4 — the two record-shaped reserved builtins whose
-    // `lowerNew` arm honours the binding BY NAME (#3098); see
-    // `isBuiltinCtorLoweredByName`.
-    {"ReadOnlyStringSpan", "", 3, 3, {"Source", "Start", "Length", "", "", "", "", ""}},
-    {"ExceptionInfo", "", 3, 3, {"TypeName", "Message", "StackTrace", "", "", "", "", ""}},
-    // stdlib §4.14 / §4.15 — the span records' direct constructors. Lowered
-    // by POSITION (LlvmBackend_Exprs2.cpp), so a reorder stays rejected.
-    {"Span", "", 3, 3, {"Buffer", "Start", "Length", "", "", "", "", ""}},
-    {"ReadOnlySpan", "", 3, 3, {"Buffer", "Start", "Length", "", "", "", "", ""}},
-    {"ArraySpan", "", 3, 3, {"Source", "Start", "Length", "", "", "", "", ""}},
-    {"ReadOnlyArraySpan", "", 3, 3, {"Source", "Start", "Length", "", "", "", "", ""}},
-    // stdlib §4.2 / §4.5 / §4.6 / §4.8 / §4.14 — the collections.
-    {"Array", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
-    {"Array", "", 2, 2, {"size", "fill", "", "", "", "", "", ""}},
-    {"OwningArray", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
-    {"OwningBuffer", "", 1, 1, {"length", "", "", "", "", "", "", ""}},
-    {"OwningBuffer", "", 2, 2, {"length", "init", "", "", "", "", "", ""}},
-    {"LinkedList", "", 1, 1, {"source", "", "", "", "", "", "", ""}},
-    {"Dictionary", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
-    {"Dictionary", "", 1, 1, {"comparer", "", "", "", "", "", "", ""}},
-    {"Dictionary", "", 2, 2, {"capacity", "comparer", "", "", "", "", "", ""}},
-    {"OwningDictionary", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
-    {"OwningDictionary", "", 1, 1, {"comparer", "", "", "", "", "", "", ""}},
-    {"OwningDictionary", "", 2, 2, {"capacity", "comparer", "", "", "", "", "", ""}},
-    {"Set", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
-    {"Set", "", 1, 1, {"comparer", "", "", "", "", "", "", ""}},
-    {"Set", "", 2, 2, {"capacity", "comparer", "", "", "", "", "", ""}},
-    {"OwningSet", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
-    {"OwningSet", "", 1, 1, {"comparer", "", "", "", "", "", "", ""}},
-    {"OwningSet", "", 2, 2, {"capacity", "comparer", "", "", "", "", "", ""}},
-    // stdlib §2.16 / §6.3 / §6.4 / §6.7 / §7.2 / §8.2 — the remaining
-    // argument-taking reserved heads.
-    {"Shared", "", 1, 1, {"value", "", "", "", "", "", "", ""}},
-    {"Random", "", 1, 1, {"seed", "", "", "", "", "", "", ""}},
-    {"Semaphore", "", 1, 1, {"initialCount", "", "", "", "", "", "", ""}},
-    {"Semaphore", "", 2, 2, {"initialCount", "maxCount", "", "", "", "", "", ""}},
-    {"Channel", "", 1, 1, {"capacity", "", "", "", "", "", "", ""}},
-}};
-
-// fix #3534 (stdlib §2.14 / §2.15 / §7.2 / spec §22.5, v0.315): add
-// FileStream, JsonSerializer, JsonDeserializer, and BinaryDeserializer
-// constructor rows.  FileStream's 2-param form defaults `access` to
-// FileAccess.ReadWrite, so the row says total=2, required=2 (all positional
-// args must be supplied by the caller; the default is applied post-binding).
-// JsonSerializer has two arity-1 candidates (no-arg and options); overload
-// resolution picks the no-arg form when no argument is given, the options form
-// when JsonOptions is passed.  Each JsonDeserializer input form and each
-// BinaryDeserializer form has its own row; the 2-param forms use the partial
-// naming shape (one param named, one positional).
-constexpr std::array<BuiltinParamNameRow, 6> kBuiltinSerializationCtorParamNames = {{
-    // stdlib §7.2 — FileStream.
-    {"FileStream", "", 2, 2, {"path", "mode", "", "", "", "", "", ""}},
-    {"FileStream", "", 3, 3, {"path", "mode", "access", "", "", "", "", ""}},
-    // stdlib §2.15 — JsonSerializer.
-    {"JsonSerializer", "", 1, 1, {"options", "", "", "", "", "", "", ""}},
-    // stdlib §2.15 — JsonDeserializer.
-    {"JsonDeserializer", "", 1, 1, {"input", "", "", "", "", "", "", ""}},
-    {"JsonDeserializer", "", 2, 2, {"input", "options", "", "", "", "", "", ""}},
-    // stdlib §2.14 — BinaryDeserializer.
-    // BinaryDeserializer(input, ignoreUnknownFields) — both named.
-    {"BinaryDeserializer", "", 2, 2, {"input", "ignoreUnknownFields", "", "", "", "", "", ""}},
-}};
-
-// fix #3425 — the built-in EXCEPTION constructors (spec §31.4). `Exception`
-// declares `(message)` and `(message, cause)`; `ArgumentException` and
-// `ArgumentOutOfRangeException` declare `(message, paramName)` instead
-// (stdlib §2.5); `TimeoutException` declares `(message, inner)` (stdlib §6.1).
-//
-// The one-argument `(message)` form is shared by the WHOLE family and is
-// answered generically in the lookup below from `isBuiltinExceptionName`, so
-// only the arity-2 forms — where the family DISAGREES — need rows here.
-constexpr std::array<BuiltinParamNameRow, 4> kBuiltinExceptionCtorParamNames = {{
-    {"Exception", "", 2, 2, {"message", "cause", "", "", "", "", "", ""}},
-    {"ArgumentException", "", 2, 2, {"message", "paramName", "", "", "", "", "", ""}},
-    {"ArgumentOutOfRangeException", "", 2, 2, {"message", "paramName", "", "", "", "", "", ""}},
-    {"TimeoutException", "", 2, 2, {"message", "inner", "", "", "", "", "", ""}},
-}};
 
 // fix #3425: the two record-shaped builtins whose `lowerNew` arm resolves each
 // argument to its FIELD SLOT BY NAME before lowering (#3098,
@@ -1660,16 +1765,48 @@ std::string_view primitiveBuiltinSpelling(int primitive) {
 
 namespace {
 
-// Collect every row of `tbl` whose declared shape admits `argCount`
-// arguments, in the table's declaration order. Shared by the member and
-// constructor lookups so the "required <= argCount <= total" admission rule
-// has one spelling. // per §22.5, fix #3424 / #3425
-template <typename Tbl>
-void collectRows(const Tbl& tbl, std::string_view head, std::string_view member,
+// The head the ONE parameter table is keyed by. The primitive keyword
+// spellings name the same standard-library types §9.1-§9.5 declares ("SByte,
+// Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64"), and the static call
+// spelling of the string class is `String` where the table says `string`.
+// per §9.1 / stdlib §9.1-§9.6, fix #7296
+std::string_view normaliseBuiltinParamHead(std::string_view head) {
+    if (head == "String") return "string";
+    if (head == "int") return "Int32";
+    if (head == "bool") return "Boolean";
+    if (head == "char") return "Char";
+    if (head == "double") return "Double";
+    if (head == "float") return "Float";
+    if (head == "decimal") return "Decimal";
+    if (head == "byte") return "Byte";
+    if (head == "sbyte") return "SByte";
+    if (head == "short") return "Int16";
+    if (head == "ushort") return "UInt16";
+    if (head == "uint") return "UInt32";
+    if (head == "long") return "Int64";
+    if (head == "ulong") return "UInt64";
+    return head;
+}
+
+// Does this row carry a §22.5 NAME surface? A row that carries only the type
+// and the nullability is not a named-argument candidate.
+bool rowCarriesNames(const BuiltinParamRow& r) {
+    for (std::size_t i = 0; i < r.total; ++i)
+        if (!r.names[i].empty()) return true;
+    return false;
+}
+
+// Collect every row of the ONE parameter table whose declared shape admits
+// `argCount` arguments, in the table's declaration order. Shared by the
+// member and constructor lookups so the "required <= argCount <= total"
+// admission rule has one spelling. // per §22.5, fix #3424 / #3425
+void collectRows(std::string_view head, std::string_view member,
                  std::size_t argCount, std::vector<BuiltinFormals>& out) {
-    for (const auto& r : tbl) {
+    head = normaliseBuiltinParamHead(head);
+    for (const auto& r : kBuiltinParams) {
         if (r.head != head || r.member != member) continue;
         if (argCount < r.required || argCount > r.total) continue;
+        if (!rowCarriesNames(r)) continue;
         BuiltinFormals f;
         f.names.assign(r.names.begin(),
                        r.names.begin() + static_cast<std::ptrdiff_t>(r.total));
@@ -1680,6 +1817,14 @@ void collectRows(const Tbl& tbl, std::string_view head, std::string_view member,
 
 }  // namespace
 
+// The head the built-in parameter table is keyed by — the public spelling of
+// `normaliseBuiltinParamHead`, so a caller that reads the table itself asks
+// the table the question.
+// per §9.1 / stdlib §9.1-§9.6, fix #7296
+std::string_view builtinParamHeadSpelling(std::string_view typeHead) {
+    return normaliseBuiltinParamHead(typeHead);
+}
+
 // fix #3398 (§22.5, v0.283; stdlib §1 / §9.6 / §3.2), widened and made
 // overload-aware by fix #3424: see the header.
 std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead,
@@ -1687,18 +1832,8 @@ std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead
                                                        std::size_t argCount) {
     // The static call spelling is `String.From(...)`; the instance receiver's
     // head is the `string` keyword. One table answers both.
-    if (typeHead == "String") typeHead = "string";
     std::vector<BuiltinFormals> out;
-    if (typeHead == "string")
-        collectRows(kStringParamNames, typeHead, member, argCount, out);
-    else if (typeHead == "Encoding")
-        collectRows(kEncodingParamNames, typeHead, member, argCount, out);
-    else if (typeHead == "StringBuilder")
-        collectRows(kStringBuilderParamNames, typeHead, member, argCount, out);
-    else if (typeHead == "Math")
-        collectRows(kMathParamNames, typeHead, member, argCount, out);
-    else if (typeHead == "Convert")
-        collectRows(kConvertParamNames, typeHead, member, argCount, out);
+    collectRows(typeHead, member, argCount, out);
     return out;
 }  // per §22.5 / stdlib §1 / §9.6 / §3.1 / §3.2
 
@@ -1706,11 +1841,7 @@ std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead
 std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
     std::string_view typeHead, std::size_t argCount) {
     std::vector<BuiltinFormals> out;
-    collectRows(kBuiltinCtorParamNames, typeHead, /*member=*/"", argCount, out);
-    collectRows(kBuiltinExceptionCtorParamNames, typeHead, /*member=*/"",
-                argCount, out);
-    collectRows(kBuiltinSerializationCtorParamNames, typeHead, /*member=*/"",
-                argCount, out);
+    collectRows(typeHead, /*member=*/"", argCount, out);
     // Spec §31.4: every standard exception type declares `constructor(message:
     // string)`; the arity-2 forms disagree across the family and are the rows
     // above. Answered from the hierarchy rather than one row per name so a new
@@ -1738,101 +1869,6 @@ std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
 // do (`String.IsNullOrWhiteSpace(value: string?)`, the `Equals(other:
 // string?, ignoreCase)` form) are deliberately absent. Standard-library
 // section cited per group.
-namespace {
-struct BuiltinNonNullableParamRow {
-    std::string_view head;
-    std::string_view member;
-    std::size_t argCount;
-    std::size_t position;
-};
-
-constexpr BuiltinNonNullableParamRow kBuiltinNonNullableParams[] = {
-    // §2.3 `Convert`: To*(value: string), TryTo*(value: string, out result).
-    {"Convert", "ToInt32", 1, 0},   {"Convert", "ToInt64", 1, 0},
-    {"Convert", "ToDouble", 1, 0},  {"Convert", "ToDecimal", 1, 0},
-    {"Convert", "ToBoolean", 1, 0}, {"Convert", "TryToInt32", 2, 0},
-    {"Convert", "TryToInt64", 2, 0}, {"Convert", "TryToDouble", 2, 0},
-    {"Convert", "TryToDecimal", 2, 0}, {"Convert", "TryToBoolean", 2, 0},
-    // §2.5 `DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`: ToString(format:
-    // string); Parse(s: string), TryParse(s: string, out result), ParseOrNull(s).
-    {"DateTime", "ToString", 1, 0},   {"DateTime", "Parse", 1, 0},
-    {"DateTime", "TryParse", 2, 0},   {"DateTime", "ParseOrNull", 1, 0},
-    {"TimeSpan", "ToString", 1, 0},
-    {"DateOnly", "ToString", 1, 0},   {"DateOnly", "Parse", 1, 0},
-    {"DateOnly", "TryParse", 2, 0},   {"DateOnly", "ParseOrNull", 1, 0},
-    {"TimeOnly", "ToString", 1, 0},   {"TimeOnly", "Parse", 1, 0},
-    {"TimeOnly", "TryParse", 2, 0},   {"TimeOnly", "ParseOrNull", 1, 0},
-    // §2.6 `Guid`: ToString(format: string); Parse / TryParse / ParseOrNull.
-    {"Guid", "ToString", 1, 0},       {"Guid", "Parse", 1, 0},
-    {"Guid", "TryParse", 2, 0},       {"Guid", "ParseOrNull", 1, 0},
-    // §3.1 `StringBuilder`: constructor(initial: string); Append, AppendLine,
-    // AppendFormat(format: string, args), Insert(index, value: string),
-    // Replace(oldValue: string, newValue: string).
-    {"StringBuilder", "", 1, 0},        {"StringBuilder", "Append", 1, 0},
-    {"StringBuilder", "AppendLine", 1, 0},
-    {"StringBuilder", "AppendFormat", 2, 0},
-    {"StringBuilder", "Insert", 2, 1},  {"StringBuilder", "Replace", 2, 0},
-    {"StringBuilder", "Replace", 2, 1},
-    // §7.3 `File`: every path or text parameter.
-    {"File", "ReadAllText", 1, 0},      {"File", "WriteAllText", 2, 0},
-    {"File", "WriteAllText", 2, 1},     {"File", "ReadAllBytes", 1, 0},
-    {"File", "WriteAllBytes", 2, 0},    {"File", "ReadAllLines", 1, 0},
-    {"File", "WriteAllLines", 2, 0},    {"File", "Exists", 1, 0},
-    {"File", "Delete", 1, 0},           {"File", "Copy", 3, 0},
-    {"File", "Copy", 3, 1},             {"File", "Move", 2, 0},
-    {"File", "Move", 2, 1},
-    // §7.4 `Directory` and `Path`.
-    {"Directory", "Exists", 1, 0},      {"Directory", "CreateDirectory", 1, 0},
-    {"Directory", "Delete", 1, 0},      {"Directory", "Delete", 2, 0},
-    {"Directory", "GetFiles", 1, 0},    {"Directory", "GetDirectories", 1, 0},
-    {"Path", "Combine", 2, 0},          {"Path", "Combine", 2, 1},
-    {"Path", "GetFileName", 1, 0},      {"Path", "GetExtension", 1, 0},
-    {"Path", "GetFileNameWithoutExtension", 1, 0},
-    {"Path", "GetDirectoryName", 1, 0}, {"Path", "GetFullPath", 1, 0},
-    // §9.1 `Int32`: ToString(format: string); Parse / TryParse / ParseOrNull,
-    // and the radix overloads Parse(s, radix) and TryParse(s, radix, out).
-    {"Int32", "ToString", 1, 0},        {"Int32", "Parse", 1, 0},
-    {"Int32", "TryParse", 2, 0},        {"Int32", "ParseOrNull", 1, 0},
-    {"Int32", "Parse", 2, 0},           {"Int32", "TryParse", 3, 0},
-    // fix #7296 (§9.1, v0.344): the OTHER integer receivers. stdlib §9.1
-    // declares "SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64",
-    // and every one of them carries §9.1's `ToString(format: string)` /
-    // `ToString(radix: int)` pair — so the §7 nullability gate must own
-    // that argument position at these receivers as well, exactly as it owns
-    // `Int32`'s. Without these rows the gate did not reach them: a NARROWED
-    // nullable radix was over-rejected there (the primitive site's own
-    // rejection owned the position) while the POSITIONAL and the MIRROR
-    // spellings admitted it.
-    {"Byte", "ToString", 1, 0},         {"SByte", "ToString", 1, 0},
-    {"Int16", "ToString", 1, 0},        {"UInt16", "ToString", 1, 0},
-    {"UInt32", "ToString", 1, 0},       {"Int64", "ToString", 1, 0},
-    {"UInt64", "ToString", 1, 0},
-    // §9.2 `Double` and `Float`.
-    {"Double", "ToString", 1, 0},       {"Double", "Parse", 1, 0},
-    {"Double", "TryParse", 2, 0},       {"Double", "ParseOrNull", 1, 0},
-    {"Float", "ToString", 1, 0},        {"Float", "Parse", 1, 0},
-    {"Float", "TryParse", 2, 0},        {"Float", "ParseOrNull", 1, 0},
-    // §9.3 `Decimal`.
-    {"Decimal", "ToString", 1, 0},      {"Decimal", "Parse", 1, 0},
-    {"Decimal", "TryParse", 2, 0},      {"Decimal", "ParseOrNull", 1, 0},
-    // §9.4 `Boolean` and §9.5 `Char`: Parse / TryParse / ParseOrNull only.
-    {"Boolean", "Parse", 1, 0},         {"Boolean", "TryParse", 2, 0},
-    {"Boolean", "ParseOrNull", 1, 0},   {"Char", "Parse", 1, 0},
-    {"Char", "TryParse", 2, 0},         {"Char", "ParseOrNull", 1, 0},
-    // §7.4 `TextWriter`, and §2.1 `Console`, whose `Write`/`WriteLine` "are"
-    // `Console.Out.Write`/`WriteLine`: every one-argument overload (`string`,
-    // `Object`, `char`, `bool`, the numeric primitives) is non-nullable, so
-    // an un-narrowed `T?` or a `null` literal has no applicable overload
-    // (§7.1, §5.1, §22.6, v0.340; owner ruling on #6778). The `Console`
-    // spellings are checked against these rows by the `Console` arm of
-    // `typeCall`; an interpolated string (whose holes render `null`, §18.5)
-    // is a non-nullable `string` and is not affected.
-    {"TextWriter", "Write", 1, 0},      {"TextWriter", "WriteLine", 1, 0},
-    // §31.4: the standard exception constructors are the wildcard in
-    // `builtinParamIsNonNullable`, not rows.
-};
-}  // namespace
-
 bool builtinParamIsNonNullable(std::string_view typeHead,
                                std::string_view member, std::size_t argCount,
                                std::size_t position) {
@@ -1845,32 +1881,49 @@ bool builtinParamIsNonNullable(std::string_view typeHead,
     if (member.empty() && (argCount == 1 || argCount == 2) &&
         position < argCount && isBuiltinExceptionName(typeHead))
         return true;
-    // A primitive receiver or a static call spelled with its keyword (`int.Parse`,
-    // `bool.Parse`) names the same stdlib type as the declared head.
-    std::string_view head = typeHead;
-    if (head == "int") head = "Int32";
-    else if (head == "bool") head = "Boolean";
-    else if (head == "char") head = "Char";
-    else if (head == "double") head = "Double";
-    else if (head == "float") head = "Float";
-    else if (head == "decimal") head = "Decimal";
-    // fix #7296 (§9.1, v0.344): the other integer keywords name the same
-    // stdlib types §9.1 declares — "SByte, Byte, Int16, UInt16, Int32,
-    // UInt32, Int64, UInt64" — so the keyword spelling and the declared head
-    // reach the same rows.
-    else if (head == "byte") head = "Byte";
-    else if (head == "sbyte") head = "SByte";
-    else if (head == "short") head = "Int16";
-    else if (head == "ushort") head = "UInt16";
-    else if (head == "uint") head = "UInt32";
-    else if (head == "long") head = "Int64";
-    else if (head == "ulong") head = "UInt64";
-    for (const auto& r : kBuiltinNonNullableParams)
-        if (r.head == head && r.member == member && r.argCount == argCount &&
-            r.position == position)
+    // A primitive receiver or a static call spelled with its keyword
+    // (`int.Parse`, `bool.Parse`) names the same stdlib type as the declared
+    // head; fix #7296 (§9.1, v0.344) extended that to the other integer
+    // keywords — "SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64".
+    const std::string_view head = normaliseBuiltinParamHead(typeHead);
+    for (const auto& r : kBuiltinParams) {
+        if (r.head != head || r.member != member) continue;
+        if (r.total != argCount) continue;
+        if (position < r.total && (r.nonNullable & (1u << position)))
             return true;
+    }
     return false;
 }  // per §7.3 (v0.340) / stdlib §2.3–§9.5, §31.4, fix #6782
+
+// The ONE read of the built-in parameter table: the declared forms of
+// `typeHead.member` (or of the constructor `typeHead`, when `member` is
+// empty) at `argCount` arguments, each carrying its parameter NAMES (§22.5),
+// its parameter TYPES (§5.1) and its parameter NULLABILITY (§7.3).
+//
+// `argCount` == kBuiltinAnyArity returns every declared form of the member,
+// whatever its arity — the question "does the standard library declare this
+// member at all?" is the §22.6 arity question's own.
+std::vector<BuiltinParamForm> builtinParamForms(std::string_view typeHead,
+                                                 std::string_view member,
+                                                 std::size_t argCount) {
+    const std::string_view head = normaliseBuiltinParamHead(typeHead);
+    std::vector<BuiltinParamForm> out;
+    for (const auto& r : kBuiltinParams) {
+        if (r.head != head || r.member != member) continue;
+        if (argCount != kBuiltinAnyArity && r.total != argCount) continue;
+        BuiltinParamForm f;
+        f.total = r.total;
+        f.required = r.required;
+        f.nonNullable = r.nonNullable;
+        f.sig = r.sig;
+        for (std::size_t i = 0; i < r.total; ++i) {
+            f.names.push_back(r.names[i]);
+            f.kinds.push_back(r.kinds[i]);
+        }
+        out.push_back(std::move(f));
+    }
+    return out;
+}  // per §22.5 / §22.6 / §5.1 / §7.3, stdlib §2.3-§9.6
 
 bool isBuiltinCtorLoweredByName(std::string_view head) {
     return contains(kBuiltinCtorLoweredByNameHeads, head);

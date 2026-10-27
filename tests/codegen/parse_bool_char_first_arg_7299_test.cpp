@@ -84,6 +84,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -141,6 +142,22 @@ std::string parseOrNullProg(const std::string& receiver,
                 "else Console.WriteLine(\"some\"); end;\n");
 }
 
+
+// THE REFUSAL (campaign 2, `builtin-call-admission`): §22.6 (v0.344) — "If
+// no candidate is applicable at all ... the call is a compile error with no
+// candidates cited". The declared surface of the standard library (stdlib
+// §9.1-§9.5, §2.5, §2.6) declares the FIRST parameter of this member as a
+// `string`, and §5.1 admits no conversion to `string` from the operand these
+// rows pass — so the call reaches no candidate and the compiler REFUSES it,
+// at a real location, with that one diagnostic.
+//
+// The oracle is the diagnostic text plus a real location, never the absence
+// of a diagnostic.
+void expectRefused(const JitResult& r, const char* needle) {
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, needle));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -154,8 +171,7 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
     JitResult r = runAot(prog(
         "    var v := bool.Parse(16);\n"
         "    Console.WriteLine(v);\n"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
+    expectRefused(r, "no matching overload of `bool.Parse`");
 }
 
 // `bool.TryParse(16, out b)`. On the base arm the compiler ABORTED. The
@@ -164,8 +180,7 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
 BEZEL_TEST(parse_bool_char_first_arg_7299,
            bool_tryparse_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(tryParseProg("bool", "bool", "true", "16", "v"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\nTrue\n"));
+    expectRefused(r, "no matching overload of `bool.TryParse`");
 }
 
 // `char.Parse(16)`. On the base arm the compiler ABORTED with three load
@@ -176,8 +191,7 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
     JitResult r = runAot(prog(
         "    var v := char.Parse(16);\n"
         "    Console.WriteLine(int(v));\n"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `char.Parse`");
 }
 
 // `char.TryParse(16, out c)`. On the base arm the compiler ABORTED. The
@@ -186,24 +200,21 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
 BEZEL_TEST(parse_bool_char_first_arg_7299,
            char_tryparse_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(tryParseProg("char", "char", "'z'", "16", "int(v)"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n122\n"));
+    expectRefused(r, "no matching overload of `char.TryParse`");
 }
 
 // `bool.ParseOrNull(16)` — the same class of defect in the *OrNull tier.
 BEZEL_TEST(parse_bool_char_first_arg_7299,
            bool_parse_or_null_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(parseOrNullProg("bool", "16"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("null\n"));
+    expectRefused(r, "no matching overload of `bool.ParseOrNull`");
 }
 
 // `char.ParseOrNull(16)` — the same class of defect in the *OrNull tier.
 BEZEL_TEST(parse_bool_char_first_arg_7299,
            char_parse_or_null_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(parseOrNullProg("char", "16"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("null\n"));
+    expectRefused(r, "no matching overload of `char.ParseOrNull`");
 }
 
 // The CLASS-NAME spelling `Boolean.TryParse(16, out b)`. This is the
@@ -213,8 +224,7 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
 BEZEL_TEST(parse_bool_char_first_arg_7299,
            boolean_tryparse_first_argument_does_not_abort_the_compiler) {
     JitResult r = runAot(tryParseProg("Boolean", "bool", "true", "16", "v"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\nTrue\n"));
+    expectRefused(r, "no matching overload of `Boolean.TryParse`");
 }
 
 // ---------------------------------------------------------------------------
@@ -231,8 +241,7 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
         "    var v := bool.Parse(o);\n"
         "    Console.WriteLine(v);\n",
         /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
+    expectRefused(r, "no matching overload of `bool.Parse`");
 }
 
 // The same for the `char` receiver.
@@ -242,8 +251,7 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
         "    var v := char.Parse(o);\n"
         "    Console.WriteLine(int(v));\n",
         /*obj=*/true));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `char.Parse`");
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +269,7 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
         "    var sp := new ReadOnlyStringSpan(\"true\", 0, 4);\n"
         "    var v := bool.Parse(sp);\n"
         "    Console.WriteLine(v);\n"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("False\n"));
+    expectRefused(r, "no matching overload of `bool.Parse`");
 }
 
 // The same for the `char` receiver.
@@ -272,8 +279,7 @@ BEZEL_TEST(parse_bool_char_first_arg_7299,
         "    var sp := new ReadOnlyStringSpan(\"a\", 0, 1);\n"
         "    var v := char.Parse(sp);\n"
         "    Console.WriteLine(int(v));\n"));
-    expectCompiledWithoutIRFailure(r);
-    BEZEL_EXPECT_EQ(r.stdoutText, std::string("0\n"));
+    expectRefused(r, "no matching overload of `char.Parse`");
 }
 
 // ---------------------------------------------------------------------------
