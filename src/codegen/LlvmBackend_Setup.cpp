@@ -26496,7 +26496,14 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                 }
             }
         }
-        if (call->args.empty() && call->callee) {
+        // fix #7312 (stdlib §9.1 / §2.18, v0.344): the ONE-ARGUMENT `ToString`
+        // OVERLOADS — `ToString(format: string)` and `ToString(radix: int)` —
+        // are recognized by the SAME receiver-type test as the no-argument
+        // spelling, so the primitive ToString family has ONE recognition site
+        // (the `check_nullable_string_producer_guard` ratchet counts them).
+        // The gate is therefore `args.size() <= 1`, not `args.empty()`, and
+        // each arity is decided INSIDE the one receiver-type test.
+        if (call->args.size() <= 1 && call->callee) {
             if (auto* ma =
                     dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
                 if (ma->member == "ToString" && ma->target) {
@@ -26509,7 +26516,64 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             case P::ULong: case P::UShort:
                             case P::Float: case P::Double: case P::Decimal:
                             case P::Char:
-                                return true;  // emitPrimitiveToString → rc=1 heap string
+                                // The NO-ARGUMENT spelling: emitPrimitiveToString
+                                // → rc=1 heap string.
+                                if (call->args.empty())
+                                    return true;
+                                // fix #7312 (stdlib §9.1 / §2.18, v0.344): the
+                                // ONE-ARGUMENT overloads mint a fresh +1 string
+                                // exactly as the no-argument one does. The
+                                // member-call arm that lowers them
+                                // (LlvmBackend_Exprs.cpp) builds the result the
+                                // same way: an inline `malloc` +
+                                // `initStringRc` (rc := 1) for the
+                                // literal-format path, the runtime's
+                                // `bz_double_to_string_r` /
+                                // `bz_decimal_to_string_fmt` /
+                                // `bz_char_to_string` (each a header at rc := 1)
+                                // for the rest, and `emitPrimitiveToString`
+                                // (rc := 1) for a specifier the arm does not
+                                // render itself.
+                                //
+                                // WHY THIS WAS NEEDED. With the one-argument
+                                // shape unclassified, every consumer of the
+                                // result treated it as a BORROW: a local bind
+                                // retained it ON TOP of the producer's own +1
+                                // and released only its own retain at scope
+                                // end, and the other consumers (a call
+                                // argument, a field store, a `return`, a concat
+                                // operand, an interpolation hole) released
+                                // nothing at all. The producer's +1 was
+                                // stranded and the string was never reclaimed.
+                                // MEASURED (#7312): 39 bytes in 2 allocations per
+                                // call, unbounded in a loop (200 iterations:
+                                // 7800 bytes in 400 allocations — one
+                                // allocation pair per call).
+                                //
+                                // THE CALLEE MUST NOT BE A SEMA-RESOLVED USER
+                                // METHOD. A primitive receiver cannot carry a
+                                // user member — but the gate keeps the
+                                // classification to the BUILTIN overloads, the
+                                // same `calleeResolvedBySema` test the `?.` arm
+                                // above uses, and keeps this arm DISJOINT from
+                                // `isUserMethodStringReturnCall` (which admits a
+                                // user method's `string` return and would
+                                // otherwise release the same reference a second
+                                // time).
+                                //
+                                // THE RECEIVER'S NULLABILITY IS NOT CONSULTED,
+                                // and must not be: §7.4 (v0.343) rejects every
+                                // member access on an un-narrowed nullable
+                                // receiver, so a nullable receiver that reaches
+                                // codegen has been narrowed, and §7.11
+                                // (v0.343) says a narrowed operand IS a
+                                // non-nullable operand. This is #7139's
+                                // invariant, and it is why the ratchet
+                                // `check_nullable_string_producer_guard` counts
+                                // the receiver-type tests here.
+                                if (!calleeResolvedBySema(*call, ctx_))
+                                    return true;
+                                break;
                             case P::Object:
                                 // fix #2846 (§8.5 "ToString" / §8.6 "Boxing" /
                                 // §28.9, v0.240): `o.ToString()` on an
@@ -26580,7 +26644,8 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                                 // call is an ordinary method call and
                                 // `isUserMethodStringReturnCall` (below) is the
                                 // arm that decides.
-                                if (!dynamic_cast<sema::MethodSymbol*>(
+                                if (call->args.empty() &&
+                                    !dynamic_cast<sema::MethodSymbol*>(
                                         ctx_.exprSymbol(*call->callee)))
                                     return true;
                                 break;
@@ -26588,6 +26653,12 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                                 break;  // Bool → sentinel; String → identity
                         }
                     }
+                    // fix #7312 (stdlib §9.1 / §2.18, v0.344): the Named and
+                    // builtin-exception spellings below are the NO-ARGUMENT
+                    // `ToString()` shape's. stdlib §9.1 declares a
+                    // one-argument `ToString` only on the numeric and char
+                    // primitives, so a one-argument call on a class, an
+                    // interface or a builtin exception is not that overload.
                     // fix #2846 (§8.5 / §8.6 / §28.9, v0.240) — the NAMED
                     // spellings of the same `lowerObjectToString` shape the
                     // `P::Object` case above covers. `Object` is not always the
@@ -26609,7 +26680,8 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     // This mirrors LlvmBackend_Calls2.cpp's own gate
                     // (`isIfaceRecv || isNamedClassRecv`) rather than
                     // re-deriving it.
-                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                    if (call->args.empty() &&
+                        tt && tt->kind == sema::TypeRef::Kind::Named &&
                         tt->declaration &&
                         (tt->declaration->kind == ast::TypeDeclKind::Interface ||
                          tt->declaration->kind == ast::TypeDeclKind::Class) &&
@@ -26647,7 +26719,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     //     exception object's word 0 is one of the vtables
                     //     `bz_obj_is_string` scans, so it answers "not a
                     //     string") and are +1-or-sentinel regardless.
-                    if (isBuiltinExceptionTypeRef(tt) &&
+                    if (call->args.empty() && isBuiltinExceptionTypeRef(tt) &&
                         !dynamic_cast<sema::MethodSymbol*>(
                             ctx_.exprSymbol(*call->callee)))
                         return true;
