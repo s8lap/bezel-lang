@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.344. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.345. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.344 and `Bezel_Standard_Library.md` v0.344 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.345 and `Bezel_Standard_Library.md` v0.345 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -695,7 +695,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.344 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.345 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -741,8 +741,8 @@ public static class Console
   public static method Write(value: string);   Write(value: Object);
   public static method WriteLine();  WriteLine(value: string);  WriteLine(value: Object);
   //   WriteLine appends Environment.NewLine; Write appends nothing. Console.Write/WriteLine
-  //   ARE Console.Out.Write/WriteLine (one destination, call order). A null Object argument
-  //   renders as the four characters `null` (§18.5's rendering; no ToString dispatch).
+  //   ARE Console.Out.Write/WriteLine (one destination, call order). No overload takes string?
+  //   or Object?: print a maybe-null value as $"{x}" (absent renders `null`, §18.5) or x ?? "…".
   // + per-type Write/WriteLine overloads for bool and every numeric primitive
   public static method ReadLine(): string?;            // null at EOF
   public static method ReadKey(): char;                // EndOfStreamException at end of input
@@ -803,7 +803,7 @@ The seven temporal format specifiers (`yyyy MM dd HH mm ss fff`) each render a f
 public interface IComparable<T>    method CompareTo(other: T): int;   end
 public interface IEquatable<T>     method Equals(other: T): bool;     end
 public interface IDisposable       method Dispose();                  end   // every class implicitly implements
-public interface IAsyncDisposable  method DisposeAsync(): Task;       end
+public interface IAsyncDisposable: IDisposable  method DisposeAsync(): Task;  end
 public interface IFormattable      method ToString(format: string): string;   end
 public class Subscription  destructor; end     // no public ctor; returned as `owned Subscription`
 ```
@@ -872,7 +872,7 @@ end
 
 **Serialization vocabulary** (auto-imported): `ISerializer` and `IDeserializer` (the `WriteInt`/`ReadInt`-style scalar pairs plus `BeginObject`/`WriteFieldName`/`EndObject` and `BeginArray`/`EndArray` framing — stdlib §2.14 lists all of them), `ISerializable` (`Serialize(s: ISerializer)`), and `IDeserializable` — a **marker**: the compiler recognizes `static method Deserialize(d: IDeserializer): T` / `: owned T` / `: owned Shared<C>` by name. Records and enums declaring `: ISerializable, IDeserializable` get synthesized bodies; a record or choice used as a **component** must declare the conformance itself (enums need not), or the enclosing declaration is rejected; `serialized "<name>" | skip | optional` customizes; `$id`/`$ref`/`$type`/`$case` are reserved field names. A **derived class** serializes its base chain's components first: every base declaring a component must itself declare `ISerializable` or `IDeserializable` and leave both members synthesized, and for `IDeserializable` the selected constructor binds each inherited component (`Shared`/`Weak?` ones aside) by name, as it binds own ones (`class D(v: int, x: int): B(v), ISerializable, IDeserializable` capturing `x`, over a `class B(v: int)` capturing `v`; `class D(): B(999), …` is rejected). Without a `polymorphic` registry, a class's synthesized `Serialize` raises `SerializationException` for a derived instance (through a base-typed field or receiver, or inherited by a subclass that does not declare `ISerializable` itself), so each subclass you serialize declares the interfaces itself and keeps their members synthesized (hand-writing `Serialize`/`Deserialize` over a base's synthesized one is §12.2 hiding, rejected); an `abstract` or `closed` class with no registry and a synthesized `Serialize` is rejected as an owned, `T?`, `Shared<T>` or collection-element component type (a `Weak<T>` or borrowing back-edge is fine), and cannot declare `IDeserializable` without hand-writing `Deserialize`. Concrete formats (`import System.Serialization;`): `JsonSerializer`/`JsonDeserializer`/`BinarySerializer`/`BinaryDeserializer`, `JsonOptions`, and the facades `Json.ToText<T>`/`ToBytes<T>`/`Parse<T>` (value targets only)/`ParseOwned<T>` (`where T: class`) and `Binary.ToBytes<T>`/`Parse<T>`/`ParseOwned<T>` (the binary format's one knob, a trailing `ignoreUnknownFields: bool := false` — strict by default — is on both `BinaryDeserializer` constructors and on `Binary.Parse<T>`/`ParseOwned<T>`, over either byte-span family).
 
-**Static-interface abstractions:** `ICollectionLiteralTarget<TSelf, T>` (`static FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned TSelf`) and `IOwningCollectionLiteralTarget<TSelf, T>` (`static FromCollectionLiteral(owned elements: OwningArray<T>): owned TSelf`) — the sequence-literal target pair (spec §15.4.1): a user **class** declares exactly one, at `TSelf` = itself (`class Ring<T>: ICollectionLiteralTarget<Ring<T>, T>`), and the built-ins declare it too — `Array/LinkedList/Set/Stack/Queue<T>` the borrowing one, the five `Owning*<T>` the owning one — so each lists a callable `FromCollectionLiteral`; `INumber<T>` (`static Zero()`, `static One()`, operators `+ - * /`, `<`), `ISteppable<T>` (`static Step(value: T, by: long): owned T`, `<`), `IParsable<T>` (`static Parse(s: string): owned T`, `static TryParse(s: string, out owned value: T?): bool`). Conformers: the ten numeric primitives conform to all three; `char` conforms to `ISteppable`/`IParsable`; **`string` and `bool` conform to none**.
+**Static-interface abstractions:** `ICollectionLiteralTarget<TSelf, T>` (`static FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned TSelf`) and `IOwningCollectionLiteralTarget<TSelf, T>` (`static FromCollectionLiteral(owned elements: OwningArray<T>): owned TSelf`) — the sequence-literal target pair (spec §15.4.1): a user **class** declares exactly one, at `TSelf` = itself (`class Ring<T>: ICollectionLiteralTarget<Ring<T>, T>`), and the built-ins declare it too — `Array/LinkedList/Set/Stack/Queue<T>` the borrowing one, the five `Owning*<T>` the owning one — so each lists a callable `FromCollectionLiteral`; `INumber<T>` (`static Zero()`, `static One()`, operators `+ - * /`, `<`), `ISteppable<T>` (`static Step(value: T, by: long): owned T`, `<`), `IParsable<T>` (`static Parse(s: string): owned T`, `static TryParse(s: string, out owned value: T?): bool`). Conformers: the eleven numeric primitives conform to all three; `char` conforms to `ISteppable`/`IParsable`; **`string` and `bool` conform to none**.
 
 ### 5.3 `System.Text` (auto)
 
@@ -1828,7 +1828,11 @@ public method Log(params items: Array<string>);             // WRONG: no `params
 var c := new Config() with(Timeout := 30);                  // WRONG: `with` needs a RECORD source
 var caller: (a: int, b: int) -> int := Sub;  caller(b := 2, a := 100);   // WRONG: a call through a FUNCTION VALUE admits no named argument (§27.1)
 var u := uint(-1);   var b2 := byte(300);   var c2 := char(0xD800);   // WRONG: a CONSTANT operand the conversion would reject is a COMPILE error (§5.2)
+var r := -1..3000000000U;                                     // WRONG: a range literal's endpoints need one common type, as `-1 + 3000000000U` does (§16.1, §6.2) — `-1L..3000000000L`; a constant that fits the other endpoint's type adopts it (`-5..10U` is a `Range<int>`), and against an operand (`x in -1..3000000000U`, `x: long`) the literal is read at `x`'s type
+if u in -5..10 then ... end;   case u of -5..10 => ... end;   // WRONG when `u` is `uint`/`ulong`: `-5` is no `uint` value and `uint` does not convert to `int` (§17.5, §19.3) — write `0..10`; over `byte`/`ushort` the `in` is a `Range<int>` test, the PATTERN still an error
+case b of 300 => ... end;      case b of > 300 => ... end;    // WRONG over a `byte`: a pattern constant converts to the scrutinee's type (§19.3) — an arm that could never match is an error, not a dead arm; the EXPRESSION `b in 300..400` is admitted and false
 var d := ch - '0';   var nx := char(ch + 1);   ch *= 2;             // WRONG: `char` is not arithmetic (§3.5) — `int(ch) - int('0')`, `char(int(ch) + 1)`; only `ch += n;`, `ch -= n;`, `ch++;`, `ch--;` advance a code point (§6.6)
+case ch of 65 => ... end;   case ch of >= 65 => ... end;   case ch of 65..90 => ... end;   // WRONG over a `char` `ch`: a pattern constant is read at the scrutinee's type and no integer converts to `char` (§19.3, §5.1) — `'A'`, `>= 'A'`, `'A'..'Z'`, or `case int(ch) of …`; the EXPRESSION `ch = 65` is admitted (§3.5)
 var c3 := char(65.5);                                         // WRONG: no float/double/decimal → char — char(int(x)) (§5.2)
 if p is IShape then ... end;                                  // WRONG over a value-typed `p` (primitive, record, enum, choice, inline array, `()`): a class, interface, `string` or `Object` target is rejected (§12.7)
 if i is long then ... end;                                    // WRONG over an `int` `i`: a different value type is rejected too — `is` tests the type, not whether the value fits
@@ -2259,6 +2263,18 @@ end;
 
 > §19.3: a named slot borrows or copies and never transfers, in an owning match included. To own a payload, destructure positionally — `Ready(var c, var n)` transfers every owned payload at once, and `Ready(var c, _)` disposes the discarded sibling with the construct.
 
+```bezel
+var s := "hello";
+s.Dispose();                                     // ERROR: `string` has no `Dispose()` — runtime-managed, nothing to dispose (§8.7, §28.9)
+var il: IList<int> := new Array<int>(2);
+il.Dispose();                                    // ERROR: `IList<T>` does not extend `IDisposable`, so `Dispose` is not a member — `_ := il;`, `using var`, or scope end (§8.7)
+using var d := new Connection("a");
+var f := d.Dispose;                              // ERROR: no method reference to `Dispose`/`DisposeAsync`, on any receiver — write `d.Dispose();` or `_ := d;` (§27.6)
+method Drop<T>(owned x: T) where T: class  x.Dispose();  end Drop;   // ERROR: `where T: class` admits `string` and interfaces without the member — `_ := x;`, or `where T: IDisposable` (§8.7)
+```
+
+> §8.7, §28.9, §27.6: `Dispose()` is a member of class types and of the interfaces that are or extend `IDisposable` or declare it, and of nothing else — `Object`, `string`, `Type`, boxes, function values and every other interface type (`IList<T>`, `IEnumerable<T>`, a user interface without it) have none, nor has a `T` under `where T: class` alone, and an owned value held at such a type is disposed by scope end, `using var` or the discard, which dispatch to the runtime type. A method reference to `Dispose` or `DisposeAsync` is rejected at its formation on every receiver: disposal is announced at its site, never handed out as a function value. A callback that must dispose takes an `owned` parameter — `lambda(owned x: Connection) => x.Dispose()`, called with `move d`.
+
 ### 7.3 Value kinds
 
 ```bezel
@@ -2328,11 +2344,12 @@ Console.WriteLine($"{Tag.B}");      // ERROR: no generated `ToString` beside a d
 public record Ticket(Id: int)
   public ToString: int := 0;                                          // ERROR: `Equals`, `GetHashCode` and `ToString` are reserved for the Object slot on every value kind (§9.2)
   public static method Equals(a: Object?, b: Object?): bool => false;   // ERROR: the same rule — a static of one of the names is rejected at any parameter list
+  public method GetType(): int => Id;                                   // ERROR: `GetType` and `ReferenceEquals` are reserved on every value kind too, at every member kind and parameter list (§9.2)
   public method Equals(other: Ticket, tolerance: int): bool => true;    // fine: an instance method at another parameter list is an ordinary member (§10.5)
 end Ticket;
 ```
 
-> §9.2: a value kind reserves the three names exactly as §12.2 does on a class — an instance method at another parameter list is an overload, everything else of the name (a static, a field, a property, a `const`, a nested type) is rejected. A `static class` is outside the class rule: `Convert.ToString(value: int)` is the standard library's own instance (§11.7).
+> §9.2: a value kind reserves the three names exactly as §12.2 does on a class — an instance method at another parameter list is an overload, everything else of the name (a static, a field, a property, a `const`, a nested type) is rejected; `GetType` and `ReferenceEquals` have no admitted spelling at all on a value kind, and an interface declares neither (§11.2). A `static class` is outside the class rule: `Convert.ToString(value: int)` is the standard library's own instance (§11.7).
 
 A record whose constructor carries a contract clause:
 
@@ -2743,6 +2760,7 @@ total += price;                                // ERROR when either is nullable
 count++;                                       // ERROR when count is `int?`;  ✓ count := (count ?? 0) + 1;
 if (flags & ADMIN) <> 0 then Grant(); end;     // ERROR when flags is `uint?` — lifted, it would FAIL OPEN
 case n of  1..5 => "small", _ => "other" end;  // ERROR when n is `int?`;  ✓ case n ?? 0 of ...
+if s is string? then ... end;                  // not an error, but the SAME test as `s is string`: FALSE at null (§12.7) — the null test is `s is null`
 ```
 
 > §7.11: operators do not lift over nullable value types. **Rejected**, on either side and in the mixed `T?`/`T` pairing: binary `+ - * / mod & | ^ << >>`; unary `+ - ~`; relational `< <= > >=`; every compound-assignment form; and `++`/`--`. **Retained**: `=`/`<>` (equality is total over an absent operand — `null = null` is `true`), `??`, `?.`, `?(args)`, `??=`. There is no three-valued logic: `and`/`or`/`not` take `bool` only. **Pattern position rides the same rule** — a relational or range pattern over a nullable scrutinee is *rejected*, not silently never-matching (§19.3, §16.6). A scrutinee narrowed non-null before the `case` (`var n: int? := 80;`, or inside `if n <> null then`) is not nullable there: ordering patterns are admitted, and the match needs no `null` arm to be exhaustive (§19.1). Narrowing a **local** restores the ordinary operators: `if a <> null then var s := a + 1; end;` (§7.4). A non-null initializer or assignment narrows too: `var m: int? := 0; m += 1;` is fine until `m` is reassigned from a nullable expression. For an `invariant` over a *mutable* nullable field, where narrowing is unavailable, use the short-circuit form (`and` short-circuits) or declare the field `readonly`:
@@ -2758,6 +2776,14 @@ end constructor;
 ```
 
 > §22.8: a `readonly` field is assigned in a field initializer or in the constructor's own body (for `static readonly`, its static initializer or `static constructor()`), never inside a lambda, which can run after construction. Assign in the constructor; let the lambda read.
+
+```bezel
+public method Reset()
+  this.Cells[0] := 0;   // ERROR: an element store lands in the `readonly` field's own storage — outside the constructor it is rejected like `Cells := …` (§22.8)
+end Reset;
+```
+
+> §22.8: a member store into a `readonly` field — an inline-array element, a settable member of a record-typed field, a `ref`/`out` binding of one — is admitted only where the whole-field store is: the constructor's own body through `this` (for a `static readonly` field, the static constructor's), outside any lambda. It does not count toward the single-assignment rule, so a constructor may fill its own `readonly` array element by element.
 
 ```bezel
 public static method Run(s: string?): int
