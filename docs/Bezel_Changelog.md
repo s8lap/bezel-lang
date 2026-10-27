@@ -15244,7 +15244,7 @@ The critiques' substantive findings:
   - The folded JSON-number sentence read "a nonzero digit followed by digits" (excluding `5`) and swept a string in a number's place into *malformed* (the Errors paragraph calls it a type mismatch); both fixed.
   - Rationale §2.7's *Member vs type at a chain head* record still said the warning covers "the one residual case" of a type head; it now names the alias head.
 - `G`:
-  - **The reach was undercounted by 24 gtest rows and one banked corpus row** — the `Task`-family fixtures (`Task.FromResult`, `ch.Receive()`, `cb()`, user `async` calls) and five `owned`-returning-call rows: 62 rows in 21 files, not 38 in 16. Every added row is the same certain dangle or abandonment, with the same one-line remedy; the 19 task rows run today only because the compiler does not dispose task temporaries at the boundary ((tracker `G-Q-k8-move-task`, filed when this revision merges)).
+  - **The reach was undercounted by 24 gtest rows and one banked corpus row** — the `Task`-family fixtures (`Task.FromResult`, `ch.Receive()`, `cb()`, user `async` calls) and five `owned`-returning-call rows: 62 rows in 21 files, not 38 in 16. Every added row is the same certain dangle or abandonment, with the same one-line remedy; the 19 task rows run today only because the compiler does not dispose task temporaries at the boundary ([#7428](https://github.com/s8lap/bezel-lang/issues/7428)).
   - **Two unedited passages stated the old admission**: K8.4's plain-parameter sentence (the derivation line claimed K8.4 while K8.4's text admitted the store) and §28.14 rule 2's fan-out sentence, which predates calls-mint and described `pending.Add(cb())` — an abandonment §28.14 itself forbids — as an accumulation. Both are restated.
   - §15.4's position set did not say how a receiver typed at a derived interface or a type parameter is read; it is now the member the call resolves to (stdlib §4.1's equality-search posture).
 - `S`:
@@ -15335,12 +15335,12 @@ The composition step resolved these seams:
   *Doc-only (the compiler matches or nothing changes):* #7364 (the compiler already gates the freeze on an owned LHS); the #7343 §2.2 reading; Guide 04, stdlib §6.7 and the code-generation reference's restatements; the declined `!` and slot leg.
 
   *Spec-ahead-of-impl (tracking issues filed at landing):*
-  - 0205: (tracker `F-0205-same-var`, filed when this revision merges) (the same-variable promotion) and (tracker `F-0205-holder`, filed when this revision merges) (the holder check); [#7371](https://github.com/s8lap/bezel-lang/issues/7371) (the checked-mode fault through a span, independent), notes on [#7369](https://github.com/s8lap/bezel-lang/issues/7369) and [#7370](https://github.com/s8lap/bezel-lang/issues/7370), whose straight-line repros become the compile error.
-  - 0206: (tracker `F-0206-impl`, filed when this revision merges).
+  - 0205: [#7435](https://github.com/s8lap/bezel-lang/issues/7435) (the same-variable promotion) and [#7441](https://github.com/s8lap/bezel-lang/issues/7441) (the holder check); [#7371](https://github.com/s8lap/bezel-lang/issues/7371) (the checked-mode fault through a span, independent), notes on [#7369](https://github.com/s8lap/bezel-lang/issues/7369) and [#7370](https://github.com/s8lap/bezel-lang/issues/7370), whose straight-line repros become the compile error.
+  - 0206: [#7436](https://github.com/s8lap/bezel-lang/issues/7436).
   - 0207: [#3047](https://github.com/s8lap/bezel-lang/issues/3047), retitled and relabelled `spec-tracking`; notes on [#7141](https://github.com/s8lap/bezel-lang/issues/7141), [#3393](https://github.com/s8lap/bezel-lang/issues/3393) and [#3873](https://github.com/s8lap/bezel-lang/issues/3873).
-  - 0208: (tracker `S-0208-index`, filed when this revision merges); the divisor arm folded into [#6961](https://github.com/s8lap/bezel-lang/issues/6961) (relabelled `spec-tracking`; one arm of `checkConstEvalFault` serves both); (tracker `S-0208-literal`, filed when this revision merges), with a note on [#7366](https://github.com/s8lap/bezel-lang/issues/7366).
-  - 0209: (tracker `S-0209-impl`, filed when this revision merges).
-  - #7343: (tracker `Q-7343-impl`, filed when this revision merges). #7360: the runtime work folded into [#7340](https://github.com/s8lap/bezel-lang/issues/7340) (relabelled `spec-tracking`). #7367 and #7368 are their own trackers (relabelled `spec-tracking`).
+  - 0208: [#7437](https://github.com/s8lap/bezel-lang/issues/7437); the divisor arm folded into [#6961](https://github.com/s8lap/bezel-lang/issues/6961) (relabelled `spec-tracking`; one arm of `checkConstEvalFault` serves both); [#7442](https://github.com/s8lap/bezel-lang/issues/7442), with a note on [#7366](https://github.com/s8lap/bezel-lang/issues/7366).
+  - 0209: [#7438](https://github.com/s8lap/bezel-lang/issues/7438).
+  - #7343: [#7439](https://github.com/s8lap/bezel-lang/issues/7439). #7360: the runtime work folded into [#7340](https://github.com/s8lap/bezel-lang/issues/7340) (relabelled `spec-tracking`). #7367 and #7368 are their own trackers (relabelled `spec-tracking`).
   - Not spec items: the replacing `move` at an assignment or declaration right-hand side does not parse on the current compiler, which 0205's and 0206's remedy and four critic probes need — noted on [#5923](https://github.com/s8lap/bezel-lang/issues/5923); the checked-disposal default is still [#4602](https://github.com/s8lap/bezel-lang/issues/4602)'s.
 
   *Owner decisions recorded:*
@@ -15349,16 +15349,16 @@ The composition step resolved these seams:
   - The two declines (the definitely-null `!`; the slot leg) and the two reversed-on-reason declines (v0.180's "no soundness gain"; v0.238's "cannot be scoped by signature") are listed above for the owner's review.
 
   *Filed:*
-  - (tracker `G-Q-addrange`, filed when this revision merges) (`spec-question`): the many-element forms — `AddRange` of a fresh owning temporary, `ArraySpan<T>.Fill` and `Array<T>(size, fill)` with a fresh class value — are outside 0207's single-element rule; extend it or keep them at the backstop (and the checked build does not fault today).
-  - (tracker `G-Q-getoradd`, filed when this revision merges) (`bug`): `GetOrAdd`'s lambda factory returning a fresh class value is admitted where the same lambda at a `(K) -> V` local is rejected.
-  - (tracker `G-Q-k8-move-task`, filed when this revision merges) (`bug`): a `move` or `Task`-family temporary at a plain argument is not disposed at its K8 boundary.
-  - (tracker `G-Q-fanout`, filed when this revision merges) (`spec-question`): §28.14 rule 2 — a call-bounded callback's dynamically-sized fan-out has no spelling once `pending.Add(cb())` is an error.
-  - (tracker `G-Q-whenall`, filed when this revision merges) (`spec-question`): stdlib §6.7 has no owning `WhenAll` for `Task` or a value-result `Task<T>`; and the compiler accepts `WhenAll` over an `OwningArray<Task<int>>`.
-  - (tracker `S-Q-open-range-var`, filed when this revision merges) (`bug`): an open-ended `Range<int>` variable iterates silently with exit 0 instead of raising at `GetEnumerator`.
-  - (tracker `S-Q-tier`, filed when this revision merges) (`spec-question`): §22.16 states a clause's tier per clause while the floor proves per substituted call.
-  - (tracker `F-Q-model-field-gen`, filed when this revision merges) (`infra`): the executable kernel model needs a per-field value generation to measure 0206, and the twelve mixed-kill joins measured separately.
-  - (tracker `F-Q-7.4-implicit-disposal`, filed when this revision merges) (`spec-question`, a hypothesis): does an implicit disposal invalidate a mutably captured local's §7.4 narrowing, as it breaks 0206's window?
-  - (tracker `M-Q-0047-T3`, filed when this revision merges) (`spec-question`): the kernel model finds proposal 0047 §2.3's reduction argument wrong — with owned fields, the replacing `move` and a local borrow of the slot's value, T3 is conditional on K4.3's trust clause inside Layer 1 (6 of 169,632 accepted programs at five statements).
+  - [#7426](https://github.com/s8lap/bezel-lang/issues/7426) (`spec-question`): the many-element forms — `AddRange` of a fresh owning temporary, `ArraySpan<T>.Fill` and `Array<T>(size, fill)` with a fresh class value — are outside 0207's single-element rule; extend it or keep them at the backstop (and the checked build does not fault today).
+  - [#7427](https://github.com/s8lap/bezel-lang/issues/7427) (`bug`): `GetOrAdd`'s lambda factory returning a fresh class value is admitted where the same lambda at a `(K) -> V` local is rejected.
+  - [#7428](https://github.com/s8lap/bezel-lang/issues/7428) (`bug`): a `move` or `Task`-family temporary at a plain argument is not disposed at its K8 boundary.
+  - [#7440](https://github.com/s8lap/bezel-lang/issues/7440) (`spec-question`): §28.14 rule 2 — a call-bounded callback's dynamically-sized fan-out has no spelling once `pending.Add(cb())` is an error.
+  - [#7429](https://github.com/s8lap/bezel-lang/issues/7429) (`spec-question`): stdlib §6.7 has no owning `WhenAll` for `Task` or a value-result `Task<T>`; and the compiler accepts `WhenAll` over an `OwningArray<Task<int>>`.
+  - [#7430](https://github.com/s8lap/bezel-lang/issues/7430) (`bug`): an open-ended `Range<int>` variable iterates silently with exit 0 instead of raising at `GetEnumerator`.
+  - [#7431](https://github.com/s8lap/bezel-lang/issues/7431) (`spec-question`): §22.16 states a clause's tier per clause while the floor proves per substituted call.
+  - [#7432](https://github.com/s8lap/bezel-lang/issues/7432) (`infra`): the executable kernel model needs a per-field value generation to measure 0206, and the twelve mixed-kill joins measured separately.
+  - [#7433](https://github.com/s8lap/bezel-lang/issues/7433) (`spec-question`, a hypothesis): does an implicit disposal invalidate a mutably captured local's §7.4 narrowing, as it breaks 0206's window?
+  - [#7434](https://github.com/s8lap/bezel-lang/issues/7434) (`spec-question`): the kernel model finds proposal 0047 §2.3's reduction argument wrong — with owned fields, the replacing `move` and a local borrow of the slot's value, T3 is conditional on K4.3's trust clause inside Layer 1 (6 of 169,632 accepted programs at five statements).
 
   *Decided or recorded rather than filed:* the JSON-number definition (folded into #7360's ruling); `/=`, `mod=`, the parenthesized literal and `await for` (folded into 0208); 0209's carriers and `try` model (folded); the `static requires` question (a ruling on #7368); §28.6's stale "warning" sentence and the window's `move` of any field path (folded into 0205/0206); the replacing-`move` parse (a note on #5923).
 
