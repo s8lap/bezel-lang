@@ -3,8 +3,9 @@
 //! section: 2.2
 //! title: an import alias cannot collide with a type declared in the module
 //! rule: An alias may not collide with another alias, an imported module's
-//!   name segment in qualifier position, a type declared in the file's
-//!   module, or an unambiguously imported public bare name.
+//!   name segment in qualifier position, a type declared in the file's module
+//!   (a top-level declaration ... ), or an unambiguously imported public bare
+//!   name.
 //! expect: reject
 //! diagnostic: alias
 module Conf;

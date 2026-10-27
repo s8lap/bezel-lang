@@ -30,7 +30,8 @@ public class Program
   public static method Main()
     var a := new Account(10m);
     try
-      a.Withdraw(-5m);
+      var amount: decimal := -5m;
+      a.Withdraw(amount);
     catch
       var ex: ContractViolationException => Console.WriteLine("caught"),
     end;
