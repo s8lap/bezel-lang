@@ -24504,9 +24504,34 @@ bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
 // fix #6170 step 2 (§28.9 / §35.4, v0.338): is `ldNode` a value-like choice
 // local initialized by a plain COPY of a named local or parameter
 // (`var b := a;`)? Such a local, when armed, retains the whole value at bind.
+//
+// fix #7316 / §28.10 (v0.344): the `using var` SPELLING of that same copy
+// (`using var b := a;`) IS the same copy, and the `v.isUsing` refusal this
+// predicate used to carry is GONE. The spelling decides the DISPOSAL
+// OBLIGATION (§28.10: "`using var` accepts a value-type or runtime-managed
+// right-hand side. For ordinary value types and runtime-managed types, the
+// disposal at scope end is a no-op (these types do not require disposal per
+// §28.9), and the only effect is the reassignability restriction" — spec
+// §28.10, line 7260); it does NOT decide whether the value is copied. A
+// value type is copied on assignment (§3.6), so `b` holds an INDEPENDENT copy
+// of the choice value and must own its own reference to the runtime-managed
+// payload string (§28.9) — exactly as its plain-`var` twin does. The two
+// spellings must therefore have the SAME RUNTIME LIFETIME, which is what the
+// refusal broke: the `using var` copy was never a candidate, never armed, and
+// so never released the payload's reference at scope end (the leak #7316
+// reports).
+//
+// THE ADMISSION OF A SPELLING IS THE CALLER'S, AND IT IS DECIDED UPSTREAM OF
+// THIS PREDICATE — so `await using var` stays refused either way:
+//   - `valueLikeChoiceLocalMintsStringPayload`'s `allowUsingVar` gate refuses
+//     the `await using var` spelling (§28.12 owns that spelling, #7306)
+//     BEFORE it reaches the copy branch below;
+//   - the retain-at-bind site (armValueLikeChoiceStrRelease) gates on the
+//     ARMED set, and the `await using var` spelling is never in it, because
+//     the candidate scan excludes it from the `using var` choice arm.
 bool Emitter::valueLikeChoiceLocalIsCopy(const ast::Node* ldNode) const {
     LocalDeclInitView v = localDeclInitView(ldNode);
-    if (!v.init || v.isUsing) return false;
+    if (!v.init) return false;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(v.init);
     if (!id || id->name == "this" || id->name == "base") return false;
     sema::Symbol* sym = ctx_.exprSymbol(*id);
@@ -29517,10 +29542,21 @@ void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
     // Emitted BEFORE every arming gate below and keyed on set membership
     // alone: if a gate then declines to register the release, the retain is a
     // leak, never a release without a retain.
+    //
+    // fix #7316 / §28.10 (v0.344): the retain-at-bind of the `using var`
+    // SPELLING of that copy (`using var b := a;`). The classification call
+    // takes the `allowUsingVar` opt-in, exactly as the scope-end registration
+    // below does, so the two spellings of the copy retain and release
+    // symmetrically — §28.10: "the only effect is the reassignability
+    // restriction" (spec §28.10, line 7260), so the runtime lifetime of the
+    // `using var` copy must be the plain-`var` copy's. The `await using var`
+    // spelling stays refused: the mint refuses it (§28.12 owns that spelling,
+    // #7306), and the eligibility membership gate above never admits it.
     if (valueLikeChoiceStrReleaseEligible_.count(declNode) &&
         valueLikeChoiceLocalIsCopy(ld)) {
         if (const sema::TypeRef* crt =
-                valueLikeChoiceLocalMintsStringPayload(ld);
+                valueLikeChoiceLocalMintsStringPayload(
+                    ld, /*retainedArgs=*/nullptr, /*allowUsingVar=*/true);
             crt && crt->declaration)
             emitValueLikeChoiceActiveCaseStrRelease(slot, crt->declaration,
                                                     crt, /*retain=*/true);
