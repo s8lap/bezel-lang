@@ -1131,10 +1131,10 @@ extern "C" int64_t bz_strbuilder_flatten(void* parts_arr, char** out_data,
 // — this renderer — and its whole purpose was to be that caller's byte-level
 // view of the content. With the caller repaired it has no caller left, and a
 // byte-level view of the content is exactly the thing that must not come
-// back: it is the defect. (`bz_sb_append_format` builds its own byte buffer
-// and is a SEPARATE defect — #7229's residual (b) — left for another lane;
-// it consumes the rendered string's raw bytes, whose count is unchanged by
-// this fix, so its output is byte-for-byte what it was.)
+// back: it is the defect. (`bz_sb_append_format` was the OTHER byte-level
+// site — #7229's residual (b) — and it was repaired in the code-point domain
+// by #7244's width half; it no longer consumes the rendered string's raw
+// bytes either.)
 extern "C" void* bz_strbuilder_to_string_obj(void* parts_arr) {
     auto* arr = (bz_array_t*)parts_arr;
     uint32_t* cps = nullptr;
@@ -1326,10 +1326,47 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
     auto* fmt = (bz_string_struct*)format_ptr;
     auto* args = (bz_array_t*)args_arr;
 
-    // StringBuilder operates in width-1 (byte) mode; format strings are width-1
-    // (the ASCII placeholder chars {, }, digits are read as raw bytes).
-    const char* fb = (const char*)fmt->data;
-    int64_t nb = fmt->len * (fmt->width ? fmt->width : 1);
+    // fix #7244 (spec §4.6 / stdlib §3.1, v0.344): the format and every
+    // rendered argument are CODE-POINT SEQUENCES, not byte strings.
+    //
+    // §4.6 (v0.344): a `string` "stores each code point in `width` bytes (1, 2
+    // or 4), the width chosen PER STRING at construction based on the largest
+    // code point in the value" — so a string's DATA is not its TEXT: a width-2
+    // value's two bytes are ONE code point, and reading them as two bytes
+    // yields two different characters.
+    //
+    // The previous implementation worked in the BYTE domain throughout: it
+    // read the format as raw bytes (`nb = fmt->len * fmt->width`, i.e. the
+    // format's BYTE count) and copied each rendered argument's raw bytes into
+    // a width-1 output buffer. Two defects follow from that, and both are
+    // observable:
+    //
+    //   * A WIDE ARGUMENT was split into Latin-1 code points. The rendered
+    //     "日" (U+65E5, stored as the two bytes E5 65 at width 2) became the
+    //     TWO code points 229 and 101, so the builder's Length counted two
+    //     characters where the argument's text has one, and the builder's
+    //     content was not the argument's text at all.
+    //   * A WIDE FORMAT was read as 16-bit units interpreted as BYTES, so its
+    //     literal text was garbage (every other byte was a NUL).
+    //
+    // The fix works in the code-point domain end to end: the format's code
+    // points are read one at a time, each rendered argument contributes ITS
+    // OWN code points, and the result is appended as a fresh part packed at
+    // the narrowest width that fits its largest code point (§4.6's own rule —
+    // the same rule `bz_sb_content_cps` and `bz_cps_width` already apply to
+    // the builder's other mutators).
+    //
+    // Read one code point of `s` at code-point index `i`. A width outside
+    // {1,2,4} is malformed; answer as width 1 (the pre-fix byte-mode
+    // assumption) rather than reading the buffer at a width it does not have.
+    auto scp = [](const bz_string_struct* s, int64_t i) -> uint32_t {
+        if (s->width == 2) return ((const uint16_t*)s->data)[i];
+        if (s->width == 4) return ((const uint32_t*)s->data)[i];
+        return ((const uint8_t*)s->data)[i];
+    };
+    // The format's code-point count (§4.6's length) and its code points.
+    const int64_t nf = fmt->len;
+    auto fcp = [&](int64_t i) -> uint32_t { return scp(fmt, i); };
     int64_t nargs = args ? args->count : 0;
     void** argSlots = args ? (void**)args->data : nullptr;
 
@@ -1344,12 +1381,12 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
     // `lowerObjectToString` states and relies on ("the vtable thunks mint, a
     // literal is an immortal sentinel on which retain/release are no-ops"), so
     // the value is EITHER a fresh +1 heap string or an immortal sentinel. This
-    // helper is the caller: it borrows the rendered bytes and copies them into
-    // its own buffer, so the reference is ITS to discharge. It did not — the
-    // rendered string leaked (measured: 34 B / 2 allocations for a
+    // helper is the caller: it borrows the rendered CODE POINTS and copies them
+    // into its own buffer, so the reference is ITS to discharge. It did not —
+    // the rendered string leaked (measured: 34 B / 2 allocations for a
     // `StringBuilder` argument, whose render is `bz_strbuilder_to_string_obj`'s
     // fresh +1). The release is DEFERRED past the second pass below, because
-    // the second pass memcpy's out of the rendered string's OWN data buffer,
+    // the second pass reads out of the rendered string's OWN data buffer,
     // which the release frees.
     //
     // NOTE ON THE SPEC ANCHOR. §28.3 K1.6 (v0.344) says the runtime-managed
@@ -1374,8 +1411,17 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
     // pointer as a vtable and then reads slot 3 out of the DATA BUFFER, so
     // whether it faults depends on the bytes that follow the buffer — i.e. on
     // the heap layout. Changing this allocation's size would silently change
-    // #7244's reproduction, and #7244 is a DIFFERENT defect this lane must not
-    // touch (it is named in the issue and left open below).
+    // #7244's reproduction.
+    //
+    // #7244 HAS TWO HALVES. The WIDTH half — this function's byte-level
+    // rendering of the format and of each rendered argument — is repaired
+    // here (see the code-point-domain comment above). The VTABLE half — a
+    // `string` argument has no vtable, so the slot-3 dispatch below reads the
+    // string's DATA pointer as one — is NOT repairable here: the sound
+    // discriminator is `bz_obj_is_string(obj, vtable_table)`
+    // (src/runtime/bezel_runtime.h), and the vtable table is the per-module
+    // global the CODEGEN emits, so only the AppendFormat lowering in
+    // src/codegen/LlvmBackend_Calls.cpp can supply it. That half stays OPEN.
     struct ArgStr { void* owned; int64_t len; };
     ArgStr* astr = (ArgStr*)malloc((size_t)(nargs > 0 ? nargs : 1) * sizeof(ArgStr));
     for (int64_t k = 0; k < nargs; k++) {
@@ -1392,78 +1438,85 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
         void* strObj = ((bz_tostr_fn)toStrFnP)(obj);
         if (!strObj) continue;
         auto* s = (bz_string_struct*)strObj;
-        astr[k].len = s->len * (s->width ? s->width : 1);
+        astr[k].len = s->len;                        // a CODE-POINT count (§4.6)
         astr[k].owned = strObj;                    // the +1 this helper owns
     }
-    // The rendered bytes live in the owned string's own data buffer; a
-    // null/undispatchable argument has no owned string and renders as "".
-    auto argData = [&](int64_t k) -> const char* {
-        return astr[k].owned ? (const char*)((bz_string_struct*)astr[k].owned)->data
-                             : "";
+    // The rendered CODE POINTS live in the owned string's own data buffer (at
+    // that string's own width); a null/undispatchable argument has no owned
+    // string and renders as "".
+    auto argCps = [&](int64_t k, int64_t i) -> uint32_t {
+        return scp((const bz_string_struct*)astr[k].owned, i);
     };
 
-    // Parse one placeholder beginning at fb[i]=='{'. On success sets idx/close
+    // Parse one placeholder beginning at fcp(i)=='{'. On success sets idx/close
     // (index of '}') and returns true; a malformed/empty index returns false.
     auto parsePlaceholder = [&](int64_t i, int64_t& idx, int64_t& close)
         -> bool {
         int64_t j = i + 1;
-        if (j >= nb || fb[j] < '0' || fb[j] > '9') return false;  // need a digit
+        if (j >= nf) return false;                               // need a digit
+        uint32_t d = fcp(j);
+        if (d < '0' || d > '9') return false;                    // need a digit
         int64_t v = 0;
-        while (j < nb && fb[j] >= '0' && fb[j] <= '9') { v = v * 10 + (fb[j] - '0'); j++; }
+        while (j < nf) {
+            uint32_t c = fcp(j);
+            if (c < '0' || c > '9') break;
+            v = v * 10 + (int64_t)(c - '0');
+            j++;
+        }
         // Skip optional ,alignment and :formatString up to the closing brace.
-        while (j < nb && fb[j] != '}') j++;
-        if (j >= nb || fb[j] != '}') return false;               // no closing brace
+        while (j < nf && fcp(j) != '}') j++;
+        if (j >= nf) return false;                               // no closing brace
         idx = v;
         close = j;
         return true;
     };
 
-    // First pass: total output byte length.
+    // First pass: the output's CODE-POINT count (§4.6's length).
     int64_t total = 0;
-    for (int64_t i = 0; i < nb;) {
-        char c = fb[i];
+    for (int64_t i = 0; i < nf;) {
+        uint32_t c = fcp(i);
         if (c == '{') {
-            if (i + 1 < nb && fb[i + 1] == '{') { total++; i += 2; continue; }
+            if (i + 1 < nf && fcp(i + 1) == '{') { total++; i += 2; continue; }
             int64_t idx = -1, close = -1;
             if (parsePlaceholder(i, idx, close)) {
                 if (idx >= 0 && idx < nargs) total += astr[idx].len;
                 i = close + 1;
             } else { total++; i++; }                              // literal '{'
         } else if (c == '}') {
-            if (i + 1 < nb && fb[i + 1] == '}') { total++; i += 2; continue; }
+            if (i + 1 < nf && fcp(i + 1) == '}') { total++; i += 2; continue; }
             total++; i++;
         } else { total++; i++; }
     }
 
-    // Second pass: fill the buffer.
-    char* buf = (char*)malloc((size_t)(total + 1));
+    // Second pass: fill the CODE-POINT buffer.
+    uint32_t* cps = (uint32_t*)malloc((size_t)(total > 0 ? total : 1) *
+                                       sizeof(uint32_t));
     int64_t off = 0;
-    for (int64_t i = 0; i < nb;) {
-        char c = fb[i];
+    for (int64_t i = 0; i < nf;) {
+        uint32_t c = fcp(i);
         if (c == '{') {
-            if (i + 1 < nb && fb[i + 1] == '{') { buf[off++] = '{'; i += 2; continue; }
+            if (i + 1 < nf && fcp(i + 1) == '{') { cps[off++] = '{'; i += 2; continue; }
             int64_t idx = -1, close = -1;
             if (parsePlaceholder(i, idx, close)) {
                 if (idx >= 0 && idx < nargs && astr[idx].len > 0) {
-                    memcpy(buf + off, argData(idx), (size_t)astr[idx].len);
-                    off += astr[idx].len;
+                    for (int64_t k = 0; k < astr[idx].len; k++)
+                        cps[off++] = argCps(idx, k);
                 }
                 i = close + 1;
-            } else { buf[off++] = fb[i++]; }
+            } else { cps[off++] = c; i++; }
         } else if (c == '}') {
-            if (i + 1 < nb && fb[i + 1] == '}') { buf[off++] = '}'; i += 2; continue; }
-            buf[off++] = fb[i++];
-        } else { buf[off++] = fb[i++]; }
+            if (i + 1 < nf && fcp(i + 1) == '}') { cps[off++] = '}'; i += 2; continue; }
+            cps[off++] = c; i++;
+        } else { cps[off++] = c; i++; }
     }
-    buf[off] = '\0';
 
     // fix #7272 (spec §28.9, v0.344; the slot-3 contract in
     // src/codegen/LlvmBackend_String.cpp's `lowerObjectToString`): discharge
-    // the reference the slot-3 renderer handed us. The bytes are copied (the
-    // second pass above memcpy'd out of the rendered string's own data
+    // the reference the slot-3 renderer handed us. The CODE POINTS are copied
+    // (the second pass above read them out of the rendered string's own data
     // buffer), so this helper holds the last reference to it and nobody else
     // will. The release is here — AFTER the second pass — because the second
-    // pass memcpy's out of the rendered string's own data buffer, which this
+    // pass reads out of the rendered string's own data buffer, which this
     // frees.
     //
     // `bz_string_release` is null-safe and a no-op on the immortal literal
@@ -1478,14 +1531,20 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
         if (astr[k].owned) bz_string_release(astr[k].owned);
     free(astr);
 
-    // Wrap the formatted bytes as a fresh +1 width-1 part and append it (like
+    // Wrap the formatted CODE POINTS as a fresh +1 part and append it (like
     // Append — the builder does not own/retain its parts, so the allocation is
     // the existing tolerated leak; no part is freed here).
-    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
-    memcpy(strObj, &buf, sizeof(void*));                 // data
-    memcpy(strObj + 8, &off, sizeof(int64_t));           // len
-    strObj[16] = 1;                                      // width = 1 (byte mode)
-    bz_string_init_rc(strObj);                           // producer's reference, rc := 1
+    //
+    // fix #7244 (spec §4.6, v0.344): the part is packed at the NARROWEST
+    // width that fits its largest code point — §4.6's own rule ("selected at
+    // construction based on the largest code point in the value"). The
+    // pre-fix part was a WIDTH-1 buffer whose `len` was a BYTE count, so a
+    // wide result was not a string at all: its bytes were read back as
+    // Latin-1 code points. `bz_sb_string_from_cps` is the same constructor
+    // the builder's other mutators use, so the part's width now follows its
+    // content exactly as they do.
+    void* strObj = bz_sb_string_from_cps(cps, off, bz_cps_width(cps, off));
+    free(cps);
     bz_array_add(arr, &strObj, 8);
 }
 
