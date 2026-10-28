@@ -6922,6 +6922,30 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // §3: stdlib collection types — allocate via runtime.
         if (tnode && tnode->name && !tnode->name->parts.empty()) {
             std::string_view colName = tnode->name->parts[0];
+            // fix #7455 (§22.5, v0.345): a built-in constructor's named
+            // arguments bind BY NAME.  Sema's checkBuiltinCtorNamedArgs runs the
+            // shared §22.5 binder (the same one a call and a user `new` reach)
+            // and publishes the parameter -> argument binding through
+            // setBuiltinCallBinding; the arms below used to read ne.args[i]
+            // POSITIONALLY, so a reordered named constructor computed a
+            // SILENTLY WRONG value.  ctorArgFor(param) returns the argument
+            // §22.5 bound to that parameter, or nullptr when the parameter
+            // keeps its declared default.
+            auto ctorArgFor = [&](std::size_t param) -> const ast::CallArgument* {
+                const auto* bnd = ctx_.builtinCallBinding(ne);
+                if (!bnd) {
+                    // No binding published: the named arguments are in
+                    // declaration order, so the positional read is the
+                    // §22.5 binding.
+                    if (param < ne.args.size()) return &ne.args[param];
+                    return nullptr;
+                }
+                if (param >= bnd->size()) return nullptr;
+                int argIdx = (*bnd)[param];
+                if (argIdx < 0 || static_cast<std::size_t>(argIdx) >= ne.args.size())
+                    return nullptr;
+                return &ne.args[static_cast<std::size_t>(argIdx)];
+            };
             // Determine element size from the first generic arg (if present).
             // For pointer-typed elements (class, string) → sizeof(ptr) = 8.
             // For int → 4, long → 8, double → 8, bool → 1, etc.
@@ -8472,10 +8496,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             //        new DateTime(year, month, day, hour, minute, second, ms).
             // DateTime is a scalar i64 tick value — no heap allocation.
             if (colName == "DateTime") {
+                // §22.5: idx is the PARAMETER position; the argument that
+                // binds to it is the one the published binding names.
                 auto getI32 = [&](size_t idx) -> llvm::Value* {
-                    if (idx >= ne.args.size() || !ne.args[idx].value)
+                    const ast::CallArgument* a = ctorArgFor(idx);
+                    if (!a || !a->value)
                         return builder_.getInt32(0);
-                    llvm::Value* v = lowerExpr(*ne.args[idx].value);
+                    llvm::Value* v = lowerExpr(*a->value);
                     if (!v) return builder_.getInt32(0);
                     if (!v->getType()->isIntegerTy(32))
                         v = builder_.CreateTrunc(v, i32());
@@ -8507,10 +8534,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // per §2.5 / #1357: new DateOnly(year, month, day) — stored as i32 day number.
             // Compute: bz_datetime_parts_to_ticks(y,m,d,0,0,0,0) / TICKS_PER_DAY
             if (colName == "DateOnly") {
+                // §22.5: idx is the PARAMETER position (year, month, day).
                 auto getI32do = [&](size_t idx) -> llvm::Value* {
-                    if (idx >= ne.args.size() || !ne.args[idx].value)
+                    const ast::CallArgument* a = ctorArgFor(idx);
+                    if (!a || !a->value)
                         return builder_.getInt32(1);
-                    llvm::Value* v = lowerExpr(*ne.args[idx].value);
+                    llvm::Value* v = lowerExpr(*a->value);
                     if (!v) return builder_.getInt32(1);
                     if (!v->getType()->isIntegerTy(32))
                         v = builder_.CreateTrunc(v, i32());
@@ -8532,10 +8561,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // per §2.5 / #1357: new TimeOnly(hour, minute, second[, ms]) — stored
             // as i32 ms from midnight.
             if (colName == "TimeOnly") {
+                // §22.5: idx is the PARAMETER position (hour, minute, second,
+                // millisecond).
                 auto getI32to = [&](size_t idx) -> llvm::Value* {
-                    if (idx >= ne.args.size() || !ne.args[idx].value)
+                    const ast::CallArgument* a = ctorArgFor(idx);
+                    if (!a || !a->value)
                         return builder_.getInt32(0);
-                    llvm::Value* v = lowerExpr(*ne.args[idx].value);
+                    llvm::Value* v = lowerExpr(*a->value);
                     if (!v) return builder_.getInt32(0);
                     if (!v->getType()->isIntegerTy(32))
                         v = builder_.CreateTrunc(v, i32());
