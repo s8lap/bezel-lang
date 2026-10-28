@@ -1,0 +1,24 @@
+bounds: vars=2 len=4 features=trust --if   (1.6 s)
+baseline kernel:
+     52688  programs
+     34825  reject:K1.3-read-of-moved
+     12122  accept
+     11382  fault-never
+      3234  reject:state-match
+      1560  flag-read-at-release
+      1087  reject:K3-consume-of-non-owned
+       850  reject:§28.6-dispose-of-borrow
+       818  accept-with-warning
+       818  §28.2-warned
+       572  programs-with-puse
+       468  fault-every
+       299  reject:K5.2-frozen-overwrite
+       272  fault-some
+       258  programs-with-kuse
+       211  reject:K5.1-frozen-transfer
+        60  reject:K7.3-mixed-merge
+        18  K4.3-trust-residual (T3 under the recorded clause)
+        18  VIOLATIONS
+K4.3 trust residual (T3 fails without the recorded slot-kill-by-move clause): 18 programs, e.g. new a / newk b a / send a / kuse b
+programs with a flag read of an already-disposed object at a release site, by site kind: {'explicit': 204, 'scope-end': 1112, 'overwrite': 278, 'cascade': 2}
+T1/T2/T3 hold on every accepted program

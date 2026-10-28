@@ -1,0 +1,73 @@
+units: {'rules': 3800, 'docs': 802, 'lit': 2562, 'gtest': 189}
+units with hits: {'rules': 71, 'docs': 16, 'lit': 20, 'gtest': 28}
+stats: {'units': 7353, 'classes': 15649, 'hits': 222, 'coll_local_sources': 35, 'scoped_params_class': 19, 'scoped_params_func': 43, 'scoped_stores': 11, 'rejected_shapes': 24, 'unresolved_rhs': 2}
+
+hits by corpus/shape:
+  docs   field-init           6
+  docs   field-store          6
+  docs   form3-registration   1
+  docs   scoped-field         3
+  gtest  field-store          95
+  gtest  primary-capture      2
+  gtest  prop-store           11
+  lit    comparer             2
+  lit    field-init           1
+  lit    field-store          17
+  lit    frame-store          2
+  lit    scoped-field         1
+  rules  coll-store           11
+  rules  field-store          51
+  rules  form3-registration   2
+  rules  frame-fireandforget  1
+  rules  primary-capture      2
+  rules  prop-store           1
+  rules  scoped-field         6
+  rules  slot-displaced       1
+
+hits by shape/kind:
+  coll-store           2   2
+  coll-store           3   1
+  coll-store           U   7
+  coll-store           V   1
+  comparer             C   2
+  field-init           U   7
+  field-store          1   1
+  field-store          2   5
+  field-store          3   47
+  field-store          4   3
+  field-store          N   3
+  field-store          U   68
+  field-store          V   42
+  form3-registration   D   3
+  frame-fireandforget  F   1
+  frame-store          F   2
+  primary-capture      U   4
+  prop-store           2   2
+  prop-store           3   1
+  prop-store           U   4
+  prop-store           V   5
+  scoped-field         D   10
+  slot-displaced       S   1
+
+hits by corpus/expect:
+  docs   error/diagnose           5
+  docs   fragment/compiles        11
+  gtest  mixed                    108
+  lit    accept                   16
+  lit    reject                   7
+  rules  ?                        1
+  rules  accept                   21
+  rules  quiet                    1
+  rules  reject                   30
+  rules  run                      19
+  rules  warn                     3
+
+accepted-tier (rules/docs/lit) store hits by kind:
+  total 61: 1=1, 2=5, 3=9, 4=2, N=2, U=38, V=4
+  name hints among U: {'': 25, 'registry-shape': 6, 'owner-name': 7}
+gtest store hits by kind: total 108: 2=3, 3=35, U=29, V=41
+gtest distinct sites (unit,class.member,target,source): 49: 2=3, 3=12, U=20, V=14
+all store hits (every corpus, every tier): 203: 1=1, 2=9, 3=49, 4=3, N=3, U=90, V=48
+
+kinds: {'N': 3, 'V': 48, 'U': 90, 'D': 13, '3': 49, '2': 9, 'S': 1, 'F': 3, '4': 3, '1': 1, 'C': 2}
+virality (signatures needing `kept` per hit): {1: 180, 2: 19}
