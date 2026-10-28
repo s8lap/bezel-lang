@@ -266,12 +266,26 @@ BEZEL_TEST(runtime_format_spec_vocabulary_7361,
 // always done so: `$"{42:F2}"` is "42.00"). The runtime spelling rendered
 // the plain text for all of them.
 //
-// THIS ROW PINS THE AGREEMENT BETWEEN THE TWO SPELLINGS, NOT THE CHOICE OF
-// ANSWER: whether §2.18's FLOATING-row specifiers are recognized on an
-// INTEGER receiver is an OPEN SPEC QUESTION (routed to the next train; the
-// compiler's answer does not change in this batch). What is pinned here is
-// only that the runtime spelling and the literal spelling of ONE specifier
-// answer ALIKE — which holds whichever way that question is decided.
+// THIS ROW PINS THE COMPILER'S CURRENT ANSWER, NOT ONLY THE AGREEMENT BETWEEN
+// THE TWO SPELLINGS. TWO parts of the question are OPEN and are routed to the
+// next train (the compiler's answer does not change in this batch):
+//
+//   (a) DOES §2.18's FLOATING-row vocabulary apply to an INTEGER receiver at
+//       all? §2.18 (v0.345) gives per-KIND rows, and `int` is in the INTEGER
+//       row (`D`/`X`/`B`);
+//   (b) IF SO, WITH WHAT DEFAULT DIGIT COUNT? §2.18 (v0.345) fixes a default
+//       only for `F` ("n decimals, default 2") and says NOTHING about a
+//       default for `E`, `G` or `P` — the six digits (`E`/`G`) and the two
+//       decimals (`F`) rendered below are the HOUSE's, taken from the shared
+//       routine (`emitWithFormatSpec`).
+//
+// The row's EXPECTED STDOUT is therefore the compiler's CURRENT answer
+// ("42.00|42.00" and so on), not an answer-agnostic property: a ruling that
+// the FLOATING vocabulary does NOT apply to an INTEGER receiver — or that
+// fixes a different default digit count — would require EDITING THIS ROW, not
+// merely re-routing the question. What the row pins today is that the runtime
+// spelling and the literal spelling of ONE specifier answer ALIKE, and the
+// values they agree on.
 BEZEL_TEST(runtime_format_spec_vocabulary_7361,
            the_two_spellings_agree_on_the_floating_specifiers_2_18) {
     expectOutput(
@@ -295,6 +309,74 @@ BEZEL_TEST(runtime_format_spec_vocabulary_7361,
         "4.000000E+09|4.000000E+09\n");
 }
 
+// THE ANSWER-AGNOSTIC HALF OF THE SAME PIN. The row above states the
+// compiler's CURRENT answer in full; this row states the property that holds
+// WHICHEVER WAY the open question is ruled: the three spellings of one
+// specifier — the RUN-time one (a format in a VARIABLE), the LITERAL one and
+// the INTERPOLATION one (§18.5's dispatch, v0.345) — ANSWER ALIKE.
+//
+// The program does not compare against a constant: it asks each spelling for
+// its answer (a rendering, or "<fault>" when the spelling raises
+// `FormatException`) and prints "agree" only when all three answers are the
+// same. So the row is green under the LENIENT reading (all three render) AND
+// under the STRICT one (all three raise), and under any ruling of the
+// DEFAULT DIGIT COUNT (all three use the shared routine's), while a spelling
+// that drifts from the other two — the defect this lane's family is about —
+// turns the row RED.
+//
+// The interpolation spelling is what makes the row FAIL WITHOUT THE FIX: the
+// two MEMBER spellings already agreed with each other before the runtime
+// spelling rendered §2.18's table (they both printed the plain text "42"),
+// so a row comparing only those two would be green on the pre-fix arm — the
+// trap the review found. The interpolation answered "42.00" there, so the
+// three-way comparison is RED there.
+BEZEL_TEST(runtime_format_spec_vocabulary_7361,
+           the_three_spellings_of_one_specifier_answer_alike_2_18) {
+    expectOutput(
+        prog("    var i: int := 42;\n"
+             "    var fF2: string := \"F2\";\n"
+             "    var fE: string := \"E\";\n"
+             "    var rt: string := \"\";\n"
+             "    var lit: string := \"\";\n"
+             "    var itp: string := \"\";\n"
+             "    try\n"
+             "      rt := i.ToString(fF2);\n"
+             "    catch FormatException => rt := \"<fault>\";\n"
+             "    end;\n"
+             "    try\n"
+             "      lit := i.ToString(\"F2\");\n"
+             "    catch FormatException => lit := \"<fault>\";\n"
+             "    end;\n"
+             "    try\n"
+             "      itp := $\"{i:F2}\";\n"
+             "    catch FormatException => itp := \"<fault>\";\n"
+             "    end;\n"
+             "    if rt = lit and lit = itp then\n"
+             "      Console.WriteLine(\"F2:agree\");\n"
+             "    else\n"
+             "      Console.WriteLine(\"F2:differ\");\n"
+             "    end;\n"
+             "    try\n"
+             "      rt := i.ToString(fE);\n"
+             "    catch FormatException => rt := \"<fault>\";\n"
+             "    end;\n"
+             "    try\n"
+             "      lit := i.ToString(\"E\");\n"
+             "    catch FormatException => lit := \"<fault>\";\n"
+             "    end;\n"
+             "    try\n"
+             "      itp := $\"{i:E}\";\n"
+             "    catch FormatException => itp := \"<fault>\";\n"
+             "    end;\n"
+             "    if rt = lit and lit = itp then\n"
+             "      Console.WriteLine(\"E:agree\");\n"
+             "    else\n"
+             "      Console.WriteLine(\"E:differ\");\n"
+             "    end;\n"),
+        "F2:agree\n"
+        "E:agree\n");
+}
+
 // ===========================================================================
 // THE FAULT — a specifier outside the vocabulary.
 // ===========================================================================
@@ -314,6 +396,30 @@ BEZEL_TEST(runtime_format_spec_vocabulary_7361,
            a_malformed_runtime_suffix_raises_format_exception_2_18) {
     expectFormatException("(255).ToString(fmt)",
                            "    var fmt: string := \"D4x\";\n");
+}
+
+// §18.5's ALIGNMENT prefix (`,WIDTH[:FORMAT]`) is an INTERPOLATION form (spec
+// §18.5, v0.345), not a §2.18 specifier: §2.18 (v0.345)'s vocabulary contains
+// no `,` at all, and
+// "An unrecognized specifier raises `FormatException` (strict-fault, as
+// everywhere)". So BOTH spellings of a `,`-prefixed format must FAULT — the
+// LITERAL one and the RUN-time one. Before the runtime spelling rendered
+// §2.18's table it rendered the receiver's plain text ("42") for a format
+// outside the vocabulary, so a `,`-prefixed format rendered instead of
+// faulting; this row pins the FAULT at both spellings.
+//
+// The oracle is the FAULT, not the exit code: each program catches
+// `FormatException` and prints "11", which the plain rendering ("99") cannot
+// produce.
+BEZEL_TEST(runtime_format_spec_vocabulary_7361,
+           the_alignment_prefix_is_not_a_specifier_and_faults_2_18) {
+    // The LITERAL spelling.
+    expectFormatException("i.ToString(\",10\")",
+                           "    var i: int := 42;\n");
+    // The RUN-time spelling — the same format, held in a VARIABLE.
+    expectFormatException("i.ToString(fmt)",
+                           "    var i: int := 42;\n"
+                           "    var fmt: string := \",10\";\n");
 }
 
 // ===========================================================================

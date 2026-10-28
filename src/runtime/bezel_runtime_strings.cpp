@@ -1796,11 +1796,17 @@ extern "C" void bz_rawbytes_free(void* rbp) {
 // stdlib §2.18 (v0.345) / fix #7334: the FLOATING row of the format-specifier
 // table, rendered from a format specifier that is only known at RUN time.
 //
-// §2.18's Floating row: "`F`/`Fn` fixed-point (n decimals, default 2) ·
-// `E`/`En` scientific (default 6) · `G`/`Gn` general (default 6) · `P`/`Pn`
-// percent (×100, `%` suffix, default 2) · `R` round-trip", and the row's
-// fault: "An unrecognized specifier raises `FormatException` (strict-fault, as
-// everywhere)".
+// §2.18's Floating row reads: "`F`/`Fn` fixed-point (n decimals, default 2) ·
+// `E`/`En` scientific · `G`/`Gn` general · `P`/`Pn` percent (×100, `%` suffix)
+// · `R` round-trip" — the document fixes a DEFAULT DIGIT COUNT FOR `F` ONLY,
+// and says NOTHING about a default for `E`, `G` or `P`. The defaults used below
+// for `E`/`G`/`P` are the HOUSE's, not the document's: they are the SHARED
+// routine's — `emitWithFormatSpec` (src/codegen/LlvmBackend_String.cpp) renders
+// "%.6E"/"%.6G" and "%.2f"/"%.2f%%" — so that the two spellings of one
+// specifier answer alike.
+//
+// The row's fault (stdlib §2.18, v0.345): "An unrecognized specifier raises
+// `FormatException` (strict-fault, as everywhere)".
 //
 // The LITERAL spelling of `ToString(format)` renders this table in
 // `emitWithFormatSpec` (src/codegen/LlvmBackend_String.cpp); the helpers
@@ -1812,7 +1818,8 @@ extern "C" void bz_rawbytes_free(void* rbp) {
 //     `E`/`G` ("e" → "1.500000e+00", "E" → "1.500000E+00"); `F` and `P` have
 //     no case-sensitive output;
 //   * the digit count after the letter is optional; `F`/`P` default to two
-//     decimals and `E`/`G` to six;
+//     decimals and `E`/`G` to six — the HOUSE's defaults (§2.18 fixes only
+//     `F`'s);
 //   * the count is CLAMPED to 65 — the same bound the literal spelling clamps
 //     it to (fix #7286), so a huge count renders alike at both spellings;
 //   * `R` is the round-trip rendering and takes NO count ("R2" is not in the
