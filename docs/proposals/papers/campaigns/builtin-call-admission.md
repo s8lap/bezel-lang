@@ -825,7 +825,7 @@ Six members are spec-questions and are **held out** of the lanes:
 **The ENTRY lane filed no issue (lanes may not file); every defect it found is reported to the
 coordinator in the hand-back with a minimal repro and a §-citation (see *Lane records*).**
 
-**=> BUT THE **COORDINATOR** HAS FILED **FOUR** SINCE — **EACH WITH EXACTLY ONE
+**=> BUT THE **COORDINATOR** HAS FILED **EIGHT** SINCE — **EACH WITH EXACTLY ONE
 `campaign:builtin-call-admission` LABEL, EACH FROM A **REVIEWER's MEASUREMENT** (NOT FROM A LANE's
 WORD), AND EACH WITH A MINIMAL REPRO AND A §-CITATION IN ITS BODY:**
 
@@ -835,6 +835,10 @@ WORD), AND EACH WITH A MINIMAL REPRO AND A §-CITATION IN ITS BODY:**
 | **#7420** | **`StringBuilder.AppendLine`'s VALUE TYPE IS NOT CHECKED AGAINST stdlib §3.1's DECLARED SURFACE** — `AppendLine(5)`, `AppendLine('c')` and `AppendLine(true)` all compile and append | §22.6, §5.1, stdlib §3.1 (v0.345) | the B4a lane's reviewer |
 | **#7421** | **THE §9.6 ARGUMENT-TYPE FAMILY AT `Trim` / `Equals` / `IsNullOrWhiteSpace` — TWO OF THEM **ABORT THE COMPILER** AND `Trim(null)` IS A **SILENT ACCEPTANCE** THAT PRINTS `abc`** | §9.6, §7.3, §22.6 (v0.345) | the B4a lane's reviewer |
 | **#7425** | **THE WIDTH-2 `string` SURFACE **WRITES OUT OF BOUNDS** — AN ASAN HEAP-BUFFER-OVERFLOW **WRITE** — AND THE DEFECT REACHES **BEYOND `Remove`**, SO A **LENGTH-ONLY ORACLE MISSES IT** | §4.6 (v0.345) | the B4a lane's reviewer |
+| **#7446** | **SEMA CONSULTS A USER's EXTENSION FOR A MEMBER THE RECEIVER **INHERITS**, AND TYPES THE CALL BY IT — SO THE PROGRAM STORES THE BUILT-IN's `int` IN A `string`-TYPED LOCAL** (the two spellings disagree: the `string` one is admitted and yields an `int`, the `int` one is refused). **SOUNDNESS.** | §26.5 rule 1, §5.1 (v0.345); stdlib §4.1, "Block-by-name" (v0.345) | the L1 lane's reviewer |
+| **#7447** | **A USER EXTENSION NAMED `Length` OVER `Array<T>` IS **REFUSED** — *"no member `Length` on `Array<T>`: use `Count`"* — THOUGH `Array<T>` DECLARES NO `Length` AND §26.5 RULE 2 REQUIRES THE EXTENSION BLOCKS TO BE CONSULTED** | §26.5 rule 2 (v0.345); stdlib §4.4, "Count vs Length" (v0.345) | the L1 lane's reviewer |
+| **#7448** | **A USER EXTENSION NAMED `Sum` OVER `Array<T>` IS **SILENTLY DROPPED** — THE PROGRAM PRINTS THE BUILT-IN's `6`, NOT THE EXTENSION's `77`** — the SAME MECHANISM AS #6159, ONE NAME OVER, so the built-in's arm claims the name for a name the receiver does not declare | §26.5 rules 2 and 3 (v0.345); stdlib §4.4, §5 (v0.345) | the L1 lane's reviewer |
+| **#7449** | **A METHOD REFERENCE TO AN `IList<T>` MEMBER UNDER A SAME-NAMED USER EXTENSION **SEGFAULTS** — ASan stack-buffer-overflow — AND WITHOUT THE EXTENSION THE SAME PROGRAM MERELY DEGRADES** | §27.6, §26.5 (v0.345); stdlib §4.1 (v0.345) | the L1 lane's reviewer |
 
 
 ## Lane records
