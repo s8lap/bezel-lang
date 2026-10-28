@@ -21150,9 +21150,34 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     // fix #7173 (§14.5, v0.345): an explicit type-argument list on a §9.6
     // member — none of them declares a type parameter, so any list is a
     // compile error (§14.5's all-or-nothing rule).
+    //
+    // fix #7454 (§26.5 rule 1 / rule 2, v0.345): the rejection belongs to
+    // the BUILT-IN head, and the built-in head answers only for a name it
+    // DECLARES. stdlib §9.6 declares no member named `Tag`, so §26.5 rule 2
+    // ("If the receiver's type declares no instance member of that name, the
+    // compiler searches the current module and all imported modules ... for
+    // extension blocks") requires the extension blocks to be consulted, and
+    // the CALLEE is then the extension's member — which DOES declare a type
+    // parameter, so §14.5's all-or-nothing rule is read off THAT member
+    // (the compiler's own §14.5 check, which reads the resolved
+    // MethodSymbol's declared count, has already ruled on its list by the
+    // time this runs).
+    //
+    // THE GATE IS THE RESOLVED CALLEE, not the receiver's name — the same
+    // discipline #6159's picked fix applies in the CODEGEN direction
+    // (`61f72d0e`): a built-in member has no MethodSymbol (its members are
+    // typed by NAME alone), so a callee that IS an extension member is
+    // exactly the case where the built-in head does not answer. A §9.6
+    // member keeps this rejection even when a same-named extension exists:
+    // §26.5 rule 1 commits instance resolution by NAME, so the extension is
+    // unreachable and the built-in is the callee.
     {
+        Symbol* calleeSym = ctx_.exprSymbol(*ce.callee);
+        auto* calleeMs = dynamic_cast<MethodSymbol*>(calleeSym);
+        const bool calleeIsExtensionMember =
+            calleeMs && calleeMs->extensionDecl;
         const std::size_t given = builtinCalleeTypeArgCount(ce.callee.get());
-        if (given)
+        if (given && !calleeIsExtensionMember)
             ctx_.diagnostics().report(
                 Severity::Error, ce.span.begin,
                 builtinExplicitTypeArgsMessage("string", m, given));
