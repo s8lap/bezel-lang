@@ -110,7 +110,7 @@ BEZEL_TEST(narrowed_residual_7285,
     expectRefused(r,
         "stdlib §9.1 declares `Parse(s: string, radix: int): int`, so the "
         "`radix` argument must be an `int` — a `uint` reaches an `int` "
-        "parameter only as a compile-time constant — the call is a compile "
+        "parameter only as a compile-time constant (§5.1) — the call is a compile "
         "error with no candidates cited (§22.6)");
 }
 
@@ -122,7 +122,7 @@ BEZEL_TEST(narrowed_residual_7285,
     expectRefused(r,
         "stdlib §9.1 declares `TryParse(s: string, radix: int, out result: "
         "int): bool`, so the `radix` argument must be an `int` — a `ulong` "
-        "reaches an `int` parameter only as a compile-time constant — the call "
+        "reaches an `int` parameter only as a compile-time constant (§5.1) — the call "
         "is a compile error with no candidates cited (§22.6)");
 }
 
@@ -134,7 +134,7 @@ BEZEL_TEST(narrowed_residual_7285, int_parse_with_a_bool_radix_is_refused) {
     expectRefused(r,
         "stdlib §9.1 declares `Parse(s: string, radix: int): int`, so the "
         "`radix` argument must be an `int` — a `bool` is never implicitly "
-        "convertible to an `int` — the call is a compile error with no "
+        "convertible to an `int` (§5.1) — the call is a compile error with no "
         "candidates cited (§22.6)");
 }
 
@@ -144,7 +144,7 @@ BEZEL_TEST(narrowed_residual_7285, int_parse_with_a_string_radix_is_refused) {
     expectRefused(r,
         "stdlib §9.1 declares `Parse(s: string, radix: int): int`, so the "
         "`radix` argument must be an `int` — a `string` is never implicitly "
-        "convertible to an `int` — the call is a compile error with no "
+        "convertible to an `int` (§5.1) — the call is a compile error with no "
         "candidates cited (§22.6)");
 }
 
@@ -160,7 +160,7 @@ BEZEL_TEST(narrowed_residual_7285,
     expectRefused(r,
         "stdlib §9.1 declares `Parse(s: string): int` / "
         "`Parse(s: ReadOnlyStringSpan): int`, so the `s` argument must be a "
-        "`string` — a `int` is never implicitly convertible to a `string` — "
+        "`string` — a `int` is never implicitly convertible to a `string` (§5.1) — "
         "the call is a compile error with no candidates cited (§22.6)");
 }
 
@@ -173,7 +173,7 @@ BEZEL_TEST(narrowed_residual_7285,
     expectRefused(r,
         "stdlib §9.1 declares `Parse(s: string): int` / "
         "`Parse(s: ReadOnlyStringSpan): int`, so the `s` argument must be a "
-        "`string` — a `bool` is never implicitly convertible to a `string` — "
+        "`string` — a `bool` is never implicitly convertible to a `string` (§5.1) — "
         "the call is a compile error with no candidates cited (§22.6)");
 }
 

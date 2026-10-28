@@ -101,7 +101,7 @@ BEZEL_TEST(narrowed_residual_7372, int_parse_with_an_int_first_argument_is_refus
     expectRefused(r,
         "stdlib §9.1 declares `Parse(s: string): int` / "
         "`Parse(s: ReadOnlyStringSpan): int`, so the `s` argument must be a "
-        "`string` — a `int` is never implicitly convertible to a `string` — "
+        "`string` — a `int` is never implicitly convertible to a `string` (§5.1) — "
         "the call is a compile error with no candidates cited (§22.6)");
 }
 
@@ -115,7 +115,7 @@ BEZEL_TEST(narrowed_residual_7372,
         "stdlib §9.1 declares `TryParse(s: string, out result: int): bool` / "
         "`TryParse(s: ReadOnlyStringSpan, out result: int): bool`, so the `s` "
         "argument must be a `string` — a `int` is never implicitly convertible "
-        "to a `string` — the call is a compile error with no candidates cited "
+        "to a `string` (§5.1) — the call is a compile error with no candidates cited "
         "(§22.6)");
 }
 
@@ -125,7 +125,7 @@ BEZEL_TEST(narrowed_residual_7372, bool_parse_with_an_int_first_argument_is_refu
     expectRefused(r,
         "stdlib §9.4 declares `Parse(s: string): bool`, so the `s` argument "
         "must be a `string` — a `int` is never implicitly convertible to a "
-        "`string` — the call is a compile error with no candidates cited "
+        "`string` (§5.1) — the call is a compile error with no candidates cited "
         "(§22.6)");
 }
 
@@ -137,7 +137,7 @@ BEZEL_TEST(narrowed_residual_7372,
     expectRefused(r,
         "stdlib §9.5 declares `TryParse(s: string, out result: char): bool`, "
         "so the `s` argument must be a `string` — a `int` is never implicitly "
-        "convertible to a `string` — the call is a compile error with no "
+        "convertible to a `string` (§5.1) — the call is a compile error with no "
         "candidates cited (§22.6)");
 }
 
@@ -148,7 +148,7 @@ BEZEL_TEST(narrowed_residual_7372,
     expectRefused(r,
         "stdlib §9.2 declares `Parse(s: string): double` / "
         "`Parse(s: ReadOnlyStringSpan): double`, so the `s` argument must be a "
-        "`string` — a `double` is never implicitly convertible to a `string` — "
+        "`string` — a `double` is never implicitly convertible to a `string` (§5.1) — "
         "the call is a compile error with no candidates cited (§22.6)");
 }
 
@@ -161,7 +161,7 @@ BEZEL_TEST(narrowed_residual_7372,
         "stdlib §9.3 declares `TryParse(s: string, out result: decimal): bool` "
         "/ `TryParse(s: ReadOnlyStringSpan, out result: decimal): bool`, so "
         "the `s` argument must be a `string` — a `double` is never implicitly "
-        "convertible to a `string` — the call is a compile error with no "
+        "convertible to a `string` (§5.1) — the call is a compile error with no "
         "candidates cited (§22.6)");
 }
 
@@ -173,7 +173,7 @@ BEZEL_TEST(narrowed_residual_7372,
     expectRefused(r,
         "stdlib §2.6 declares `TryParse(s: string, out result: Guid): bool`, "
         "so the `s` argument must be a `string` — a `int` is never implicitly "
-        "convertible to a `string` — the call is a compile error with no "
+        "convertible to a `string` (§5.1) — the call is a compile error with no "
         "candidates cited (§22.6)");
 }
 
@@ -187,7 +187,7 @@ BEZEL_TEST(narrowed_residual_7372, long_parse_with_a_null_first_argument_is_refu
         "`Parse(s: ReadOnlyStringSpan): long`, so the `s` argument must be a "
         "`string` — a `Object?` is never implicitly convertible to a `string` "
         "(§5.1's nullable lifting converts a `T` to a `T?`, never the other "
-        "way) — the call is a compile error with no candidates cited (§22.6)");
+        "way) (§5.1) — the call is a compile error with no candidates cited (§22.6)");
 }
 
 // A CLASS INSTANCE reaches no §9.1 parameter either — and before the anchor
@@ -200,7 +200,7 @@ BEZEL_TEST(narrowed_residual_7372,
     expectRefused(r,
         "stdlib §9.1 declares `Parse(s: string): int` / "
         "`Parse(s: ReadOnlyStringSpan): int`, so the `s` argument must be a "
-        "`string` — a `Object` is never implicitly convertible to a `string` — "
+        "`string` — a `Object` is never implicitly convertible to a `string` (§5.1) — "
         "the call is a compile error with no candidates cited (§22.6)");
 }
 
