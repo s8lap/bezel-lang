@@ -89,11 +89,28 @@ BEZEL_TEST(codegen_collection_interface_method_reference_7449,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "FORMED\nDONE\n");
     // The ASan leg: 0 == the program ran to completion with no sanitizer
-    // report. -1 means the toolchain is unavailable (the leg is then
-    // skipped, and the stdout assertion above still carries the row).
+    // report. -1 == the ASan runtime object is absent, and -2/-3/-4 are
+    // the harness's INFRA classes (compile / link / system()), which the
+    // shared helper marks FAILED itself (#4504).
+    //
+    // There is deliberately NO early-return guard on the -1 result here.
+    // That shape is a "swallowing guard" (#3682): a missing ASan runtime
+    // would read as a SKIP and the row would then report a clean PASS
+    // while the leg is off — the row would assert nothing about memory
+    // safety in either direction. `check_native_asan_leg_skips.py`
+    // refuses a new site of that shape, and this file is absent from
+    // `scripts/native_asan_leg_skips.grandfather`.
+    //
+    // ASan is available on this host, so there is no debt to grandfather
+    // and nothing to skip. If the runtime ever does go missing, the
+    // `asan >= 0` assertion below FAILS the row, which is the correct
+    // outcome: the oracle cannot be trusted, and silence would be a lie.
+    // (This comment deliberately does not quote that guard's source text:
+    // the checker matches it textually, so reproducing it here would
+    // manufacture the very violation it is warning about.)
     int asan = bezel::test::runUnderAsanValue(src, 0, "bezel_7449ext");
-    if (asan == -1) return;
-    BEZEL_EXPECT_EQ(asan, 0);
+    BEZEL_EXPECT_TRUE(asan >= 0);  // -1 runtime absent / -2 compile / -3 link / -4 system()
+    BEZEL_EXPECT_EQ(asan, 0);      // sanitizer report -> 1, non-zero exit -> mismatch
 }
 
 // The CONTROL: with NO extension the program compiled, ran and degraded
@@ -105,7 +122,10 @@ BEZEL_TEST(codegen_collection_interface_method_reference_7449,
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.stdoutText, "FORMED\nDONE\n");
+    // The CONTROL's ASan leg — same contract as the DEFECT row's: no
+    // early-return guard on -1, so a missing ASan runtime FAILS the row
+    // instead of silently skipping it (see the DEFECT row's comment).
     int asan = bezel::test::runUnderAsanValue(src, 0, "bezel_7449noext");
-    if (asan == -1) return;
-    BEZEL_EXPECT_EQ(asan, 0);
+    BEZEL_EXPECT_TRUE(asan >= 0);  // -1 runtime absent / -2 compile / -3 link / -4 system()
+    BEZEL_EXPECT_EQ(asan, 0);      // sanitizer report -> 1, non-zero exit -> mismatch
 }
