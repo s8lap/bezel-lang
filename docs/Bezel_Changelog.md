@@ -15571,7 +15571,7 @@ The independent critique accepted the train with fixes. Its substantive findings
   *Doc-only:* the comparer-held clause in rationale §5.31 and the code-generation reference; proposal 0131's currency note and README row; the statement of the slot kill's residual.
 
   *Spec-ahead-of-impl (tracking issue filed at landing):*
-  - 0210: (tracker `0210-impl`, filed when this revision merges). Its run probes need the replacing `move` to parse ([#5923](https://github.com/s8lap/bezel-lang/issues/5923)'s note).
+  - 0210: [#7479](https://github.com/s8lap/bezel-lang/issues/7479). Its run probes need the replacing `move` to parse ([#5923](https://github.com/s8lap/bezel-lang/issues/5923)'s note).
 
   *Owner decisions recorded:*
   - The owner's 2026-10-28 approval of this train, on a review branch, under the 2026-10-08 delegation.
