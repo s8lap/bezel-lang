@@ -72,7 +72,7 @@ rows where `campaign == builtin-call-admission`).
 | #6116 | crash | RE-LABEL (MEASURED) | X-5 | re-label | - | `bq ?? b = b` fails IR verification; campaign 5 |
 | #6126 | crash | RE-LABEL (rule) | X-5 | re-label | - | nullable function value in an interpolation hole SEGVs; campaign 5 |
 | #6151 | other | RE-LABEL (rule) | X-13 | re-label | - | GetHashCode on a choice listing an interface declaring it does not lower |
-| #6159 | other | REPRODUCES (rule) | B0-symbol | re-label | Y | a user extension named Count/Length on a builtin receiver: the intrinsic answers |
+| #6159 | other | FIXED (MEASURED) | B0-symbol | L1 | Y | a user extension named Count/Length on a builtin receiver: the intrinsic answers **FIXED BY THE L1 LANE `97fcdc5d`** (`fix #6159`): `Length`/`Count` ARE NOW BOUND BY THE RECEIVER's DECLARED SURFACE AND NOT BY ITS NAME (spec §26.5, v0.345).|
 | #6181 | other | RE-LABEL (rule) | X-7 | re-label | - | choiceHoldsBorrows reads a generic choice's payloads unsubstituted; campaign 7 |
 | #6187 | other | RE-LABEL (rule) | X-13 | re-label | - | try/catch does not catch an exception from an Object-typed receiver's ToString |
 | #6228 | other | RE-LABEL (rule) | X-7 | re-label | Y | interface witness picks the wrong overload for generic instantiations; campaign 7 |

@@ -1576,6 +1576,73 @@ the runtime-format vocabulary).**
   `builtinTypeName` are **UNTOUCHED** — the lane's `Calls.cpp` hunks are in
   `tryLowerBuiltinClassCall` **ONLY**.
 
+**Lane `r36-c2-l1` (the receiver's DECLARED SURFACE — the campaign's SECOND "what is the receiver?"
+lane, and the L1-DISCRIMINATOR's SIBLING).**
+
+* **SHA (the lane's commit; PICKED onto staging as `61f72d0e`):** `97fcdc5d` **fix #6159**. **ONE
+  CLOSURE: #6159.**
+* **THE MECHANISM.** The built-in `Length` / `Count` intrinsic arms in
+  `Emitter::tryLowerCollectionInstanceCall` (`src/codegen/LlvmBackend_Calls.cpp`) recognised the
+  built-in by the member **NAME** alone, so they answered calls that **sema had already bound to the
+  USER's extension**: the user's code was **SILENTLY DROPPED** and the program printed the
+  built-in's number (**3**) instead of the extension's.
+* **THE GOVERNING TEXT.** spec §26.5 rule 1 (v0.345): *"If `x`'s declared type (or any base type)
+  **declares** any instance member named `Foo` — of any arity, applicability, or accessibility —
+  instance resolution is committed and extension blocks are **never consulted** for that name on
+  that receiver."* **=> INSTANCE RESOLUTION COMMITS ONLY WHEN THE RECEIVER's DECLARED SURFACE
+  CONTAINS THE NAME; OTHERWISE RULE 2 ADMITS THE EXTENSION BLOCKS, AND §22.6's PIPELINE BINDS THE
+  CALL TO THAT CANDIDATE** (stage 3 applicability, stage 4 ranking, and stage 7's "no applicable
+  candidate at all" error).
+* **THE FIX.** The built-in is recognised by the **RESOLVED CALLEE SYMBOL** (sema stamps the
+  selected extension's `MethodSymbol` on the member-access callee — the same symbol the extension
+  lowering in `LlvmBackend_Calls2.cpp` reads) **PLUS** the receiver's **DECLARED SURFACE**:
+  `Length` — stdlib §3.1 `StringBuilder`, §4.14 `OwningBuffer` and §4.19 `FrozenArray` declare it,
+  and **no collection head does** (§4.4's "Count vs Length" convention: *"A type declares one or the
+  other, never both"*); `Count` — stdlib §4.4–§4.11 and §4.17–§4.18 declare or inherit it, the six
+  collection interfaces inherit it from `IReadOnlyCollection<T>` (stdlib §4.1), and **an inherited
+  member commits rule 1 too** (the stdlib's "Block-by-name" convention). **THE DECLINE HAPPENS
+  BEFORE ANY RECEIVER IR IS EMITTED, SO A RECEIVER EXPRESSION IS EVALUATED EXACTLY ONCE.**
+* **THE FLIP IS **FIVE ROWS IN A **NEW** FILE** (`tests/codegen/extension_member_receiver_symbol_6159_test.cpp`),
+  **NOT A PRE-EXISTING ROW**: `sb_count_user_extension_wins` **3 -> 77**,
+  `sb_count_user_extension_return_type` **3 -> EXTSBC**,
+  `sb_count_with_argument_user_extension_wins` **3 -> 82**,
+  `ilist_length_user_extension_wins` **3 -> 77**,
+  `ilist_length_ienumerable_extension_wins` **3 -> 77**. **THE FAIL-WITHOUT IS **5 passed / 5
+  failed**; PASS-WITH IS **10 passed / 0 failed** — **THE SAME TEN ROWS ON BOTH ARMS, SO NO ROW
+  DISAPPEARED.** THE FIVE OTHER ROWS ARE THE **MIRROR / CONTROL** ROWS AND ARE **UNCHANGED**:
+  `sb_length_declared_member_wins` (3), `ilist_count_inherited_member_wins` (3),
+  `array_count_declared_member_wins` (3), `no_extension_builtin_still_answers` (3/3/3),
+  `unrelated_extension_unaffected` (77).
+* **NO PRE-EXISTING TEST WAS FLIPPED** — no gtest or lit test pinned the old value, and **no
+  conformance corpus row contains a user extension named `Count` or `Length` on a builtin collection
+  receiver, so NO CORPUS ROW CHANGES VERDICT.** THE LIT DIAGNOSTIC TRACK IS GREEN: **2562 passed
+  (100.00%)**.
+* **THE REVIEWER (`a54f16a8277ad8b54`) RULED **ACCEPT-W-NOTES**, AND ITS ONE LOAD-BEARING NOTE WAS
+  THE **CLOSURE WORD.**** **THE REVIEWER MEASURED THE RESIDUAL ON **FIVE ARMS** (INCLUDING
+  `origin/main` `e7d55d02`) AND FOUND IT **PRE-EXISTING AND UNCHANGED** BY THE COMMIT: **SEMA
+  CONSULT'S A USER's EXTENSION FOR A NAME THE RECEIVER **INHERITS**, AND TYPES THE CALL BY IT, SO
+  THE PROGRAM STORES THE BUILT-IN's `int` IN A `string`-TYPED LOCAL.** **=> THE REVIEWER's RULING
+  WAS `narrow #6159` — **UNLESS THE RESIDUAL CARRIES ITS OWN ISSUE** (THE TRACKER REFUSES NEW
+  CREATES ONLY FOR LANES; `gh api` CREATION WORKS FOR THE COORDINATOR).** **=> THE COORDINATOR HAS
+  NOW **FILED THAT RESIDUAL AS **#7446**** (soundness-class, with a minimal repro, the §26.5 rule-1
+  quotation and its line number), **SO `fix #6159` STANDS** AND THE RESIDUAL IS TRACKED IN ITS OWN
+  RIGHT.
+* **THE REVIEWER's OTHER FOUR FINDINGS ARE FILED AS ISSUES** — **#7446** (the inherited-member type
+  confusion, **soundness**), **#7447** (`extension Array<int> Length()` is **REFUSED** though
+  `Array<T>` declares no `Length` — §26.5 rule 2), **#7448** (`extension Array<int> Sum()` is
+  **SILENTLY DROPPED** — the built-in claims the name; the same mechanism as this lane's, one name
+  over, so it needs its own lane), **#7449** (a method reference to an `IList<T>` member under a
+  same-named user extension **SEGFAULTS**, ASan stack-buffer-overflow — **soundness**). **THE
+  REVIEWER's FIFTH FINDING — `FrozenArray<T>.Length()` / `.Count()` printing `0` — **DID NOT
+  REPRODUCE** AT THE COORDINATOR's PROBE (`FrozenArray<int>.From([1,2,3])` prints `3` and `3`), SO IT
+  IS **NOT** FILED AND THE REVIEWER's EXACT REPRO IS **UNCONFIRMED**.
+* **THE REVIEWER's FILE-ATTRIBUTION CORRECTION — **THE COORDINATOR's FILE-DISJOINTNESS BOOKKEEPING
+  MUST SHOW **TWO** LANES INSIDE `src/codegen/LlvmBackend_Calls.cpp`**** (THE L1 LANE AND THE
+  B3c LANE). **THE LANE's `#6295` "NOT MY FILE" VERDICT MIS-ATTRIBUTES THE FILE**: THE
+  `Math.Max<int?>` SITE IS `src/codegen/LlvmBackend_Calls.cpp` **— THE LANE's OWN FILE**, IN A
+  DIFFERENT FUNCTION (`Emitter::tryLowerBuiltinClassCall`). **THE VERDICT ITSELF HOLDS** (A
+  DIFFERENT FUNCTION IS OUT OF SCOPE FOR THAT COMMIT); **ONLY THE FILE ATTRIBUTION WAS WRONG.**
+
 ### Coordinator block — 2026-10-28 (the campaign's integrator steps)
 
 * **THE ANCHOR IS PICKED** (`2250daa52`) — *"fix #6825 #7284 #7290 #7293 #7294 #7295 #7299 #7300
