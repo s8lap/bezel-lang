@@ -1,6 +1,6 @@
 # v0.350 critic and completion — proposal-0131 review train
 
-> **Landing note (2026-10-28).** The draft proposal this record calls 0210 landed as proposal **0214** (`docs/proposals/0214-report-a-transfer-of-a-slot-displaced-value.md`), because 0210 is recorded as never used and recorded gaps are not reused. Paths under `scratch/` name working files that were not committed.
+> **Landing note (2026-10-28).** Paths under `scratch/` name working files that were not committed.
 
 
 Base: origin/main `5a984a691` (spec v0.349; the docs are byte-identical to the review's `293b9278c`, the one commit between them touches only `papers/master-plan.md`). Tree: `scratch/v0350/work/tree` (exported, `git init`, `v0350.json` applied, proposal copied in). Compiler: r35 `bezelc 0.0.0-f6863e62`, `--checked-disposal --report-trust-admissions`. Nothing posted, committed, or edited under `docs/`/`tests/` of any real checkout.
@@ -35,7 +35,7 @@ Base: origin/main `5a984a691` (spec v0.349; the docs are byte-identical to the r
 
 **F8 (E5).** "(a v0.349 review edit proposes it)" would be stale on landing → item (v) rewritten for the narrowed exception; "landed on 2026-10-13" → 2026-10-12 (`cd21669f8` committer date; author date 2026-10-09); "the review's issues name them" → #7465–#7471; new item (viii) for 0210. E1's citation (proposal 0138 §7, v0.327) and E4's facts (#5604; `s28_3_0162`–`0167` are 0157's cases; v0.334/0169; v0.346/0207) verified.
 
-**F9 (numbering).** 0210 has no file on main but **is** in README's never-used list ("0210, 0211, 0212 and 0213 (reserved for the v0.346 train) were never used"). Kept 0210 (the brief's number; the sequence stays dense) and edited that sentence: 0210 removed from the list, one sentence added saying it numbers the v0.350 train's proposal. The pinned v0.346 changelog line and DECLINED's v0.346 index-size parenthetical ("0210–0213 … not needed") are dated history and stay. If the owner prefers never reusing a recorded-unused number, rename to 0214 and drop edits `0210-readme-never-used*`.
+**F9 (numbering).** 0210 had no file on main but was on the README's never-used list, reserved for the v0.346 train. At the owner's direction (2026-10-28) the proposal keeps 0210, and the never-used list drops 0210–0213: they were reserved and never allocated, so removing them leaves the numbering chronological. The pinned v0.346 changelog line stays as dated history.
 
 **Not in scope / unchanged.** Appendix C lists no report sites (checked); Guide 01 §2's report sentence is generic and stays true; §28.8.1's "bounded afterwards by the taker" needs no change; the review's other candidates (callee-side certain dangles, always-on) stay declined on recorded grounds and get no new rows.
 

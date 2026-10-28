@@ -1,4 +1,4 @@
-# Proposal 0214 — The trust-admission report names a transfer of a slot-displaced value
+# Proposal 0210 — The trust-admission report names a transfer of a slot-displaced value
 
 | | |
 |---|---|

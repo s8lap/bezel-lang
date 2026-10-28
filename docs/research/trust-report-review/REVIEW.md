@@ -1,6 +1,6 @@
 # Review of proposal 0131 (the trust-admission report) against spec v0.349 and the r35 compiler
 
-> **Landing note (2026-10-28).** The draft proposal this record calls 0210 landed as proposal **0214** (`docs/proposals/0214-report-a-transfer-of-a-slot-displaced-value.md`), because 0210 is recorded as never used and recorded gaps are not reused. Paths under `scratch/` name working files that were not committed.
+> **Landing note (2026-10-28).** Paths under `scratch/` name working files that were not committed.
 
 
 Read-only base: `docs/research/trust-report-review/head` = origin/main `293b9278c` (spec v0.349). Compiler: r35 release `bezelc 0.0.0-f6863e62`. Model: `docs/research/soundness/bzcore-l1/bzcore.py`. Everything marked MEASURED was run in this review (`probes/results.md`, `work/sweep/`, `work/bzcore_f1_v3l5.txt`); QUOTED marks text or numbers taken from the tree. Nothing under `docs/`, `tests/`, `src/` was edited; nothing was posted.
