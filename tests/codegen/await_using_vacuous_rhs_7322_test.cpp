@@ -113,25 +113,23 @@ void expectRunsClean(const std::string& program,
     BEZEL_EXPECT_EQ(r.stdoutText, expectedStdout);
 }
 
-// The memory-safety-only oracle, for the one shape whose ACCEPTANCE is a
-// separate, still-open question (see the row's comment): it asserts that the
-// compiler emitted no out-of-bounds access, and says nothing about whether
-// the program compiled and ran.
-void expectNoMemorySafetyDefect(const std::string& program) {
-    JitResult r = runAotChecked(program);
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_FALSE(bezel::test::diagnosticMessageContains(r, "sanitizer fired"));
-    BEZEL_EXPECT_FALSE(bezel::test::diagnosticMessageContains(r, "AddressSanitizer"));
-    BEZEL_EXPECT_FALSE(
-        bezel::test::diagnosticMessageContains(r, "heap-buffer-overflow"));
-}
+// (The memory-safety-only oracle that once stood here — "the compiler emitted
+// no out-of-bounds access", saying nothing about whether the program compiled
+// and ran — is GONE, and it is gone because it is what made a row VACUOUS.
+// Its only user was the row whose program was the corpus case s28_12_0015's,
+// in a PLAIN (non-async) `Main`; §28.12 now REJECTS that program, so "no
+// out-of-bounds access" was satisfied by a compile-time rejection and the row
+// could no longer fail. The row was RE-SPELLED into an admitted context (an
+// `async` lambda) and now uses the FULL oracle above, which asserts the
+// ADMISSION — the program ran, exited 0, printed — as well as the absence of
+// the over-read.)
 
 // ---- Source shapes -------------------------------------------------------
 
-// The harvest lane's corpus case s28_12_0015's PROGRAM, in the shape this
-// defect is about: a runtime-managed right-hand side (a `string` returned by
-// a call — a borrow right-hand side per §28.10's "using var initialized from
-// a borrow"), inside an async method, which is the context §28.12 admits.
+// The SHAPE this defect is about: a runtime-managed right-hand side (a
+// `string` returned by a call — a borrow right-hand side per §28.10's "using
+// var initialized from a borrow"), inside an async method, which is the
+// context §28.12 admits.
 const char* kVacuousStringAsync =
     "module Conf; "
     "public class Program "
@@ -249,29 +247,38 @@ const char* kInterfaceTypedAsyncDisposable =
     "  end Main; "
     "end Program;";
 
-// The corpus case s28_12_0015's PROGRAM VERBATIM: the same binding in a
-// PLAIN (non-async) method.
+// The corpus case s28_12_0015's PROGRAM, RE-SPELLED into a context §28.12
+// ADMITS: the same vacuous binding (a runtime-managed right-hand side — a
+// `string` returned by a call, a borrow right-hand side per §28.10's "using
+// var initialized from a borrow") inside an `async` LAMBDA, which §28.12
+// names beside the async method ("`await using` is valid only inside an
+// async method or async lambda" — §28.12, v0.345, spec:7502).
 //
-// ⚠ THIS ROW PINS MEMORY SAFETY ONLY, NOT THE PROGRAM'S ACCEPTANCE. §28.12:7486
-// says "`await using` is valid only inside an async method or async lambda",
-// and the corpus case s28_12_0015 (the harvest lane's tree) carries the
-// verdict `reject` for exactly this program on exactly that ground — the
-// §28.12:7486 sentence, not the right-hand side's kind. That MISSING
-// REJECTION is a separate defect in a separate layer (a sema check; the
-// compiler's own §30.2 gate already rejects a bare `await` outside an async
-// method with "`await` is valid only inside an `async` method or `async`
-// lambda"), and it is filed separately. Asserting here that the program
-// COMPILES would make this row a false record the moment that rejection
-// lands; asserting only that the compiler emitted no out-of-bounds access
-// keeps the row true under both futures, and it still FAILS on the pre-fix
-// compiler (which segfaults here).
-const char* kVacuousStringPlainMain =
+// ⚠ WHY IT IS RE-SPELLED, AND WHY THE OLD SHAPE COULD NOT FAIL. The row
+// used to run the program in a PLAIN (non-async) `Main` and asserted MEMORY
+// SAFETY ONLY ("the compiler emitted no out-of-bounds access"), deliberately
+// saying nothing about the program's acceptance, so that the row would stay
+// true whether or not the missing §28.12 rejection landed. That rejection has
+// landed (fix #7326: `await using` outside an async context is a compile
+// error at the declaration — §28.12, v0.345, spec:7502), so the program is
+// now REJECTED at compile time — and a rejected program emits no
+// out-of-bounds access, so the row's only assertion was satisfied VACUOUSLY
+// and the row COULD NO LONGER FAIL. The row is now pinned in an ADMITTED
+// context and uses the FULL oracle: the program must be ADMITTED (it ran,
+// exited 0, printed "[1]") AND free of the over-read. The enclosing `Main`
+// is still NOT async — the binding lives in the `async` lambda's own frame,
+// which is the shape that differs from the method-shaped row above.
+const char* kVacuousStringAsyncLambda =
     "module Conf; "
     "public class Program "
     "  public static method Main() "
-    "    var o := 1; "
-    "    await using var t := o.ToString(); "
-    "    Console.WriteLine($\"[{t}]\"); "
+    "    var f := async lambda() => do "
+    "      var o := 1; "
+    "      await using var t := o.ToString(); "
+    "      Console.WriteLine($\"[{t}]\"); "
+    "    end; "
+    "    using var task := f(); "
+    "    task.Wait(); "
     "  end Main; "
     "end Program;";
 
@@ -340,12 +347,14 @@ BEZEL_TEST(await_using_vacuous_rhs_7322,
     expectRunsClean(kVacuousStringAsyncAcrossSuspend, "[1]\n");
 }
 
-// §28.12:7486 / the corpus case s28_12_0015's program — memory safety only;
-// see the shape's comment for why the program's ACCEPTANCE is not pinned
-// here.
+// §28.12 (v0.345, spec:7502) / the corpus case s28_12_0015's program,
+// RE-SPELLED into an `async` lambda — the context §28.12 admits — so that
+// the row asserts BOTH that the program is ADMITTED and that the over-read
+// does not happen. See the shape's comment for why the plain-`Main` spelling
+// had to go.
 BEZEL_TEST(await_using_vacuous_rhs_7322,
-           the_vacuous_await_using_outside_an_async_method_reads_no_out_of_bounds_spec_28_12) {
-    expectNoMemorySafetyDefect(kVacuousStringPlainMain);
+           the_vacuous_await_using_in_an_async_lambda_in_a_plain_main_reads_no_out_of_bounds_spec_28_12) {
+    expectRunsClean(kVacuousStringAsyncLambda, "[1]\n");
 }
 
 // ===========================================================================
