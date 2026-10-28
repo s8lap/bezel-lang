@@ -10,9 +10,10 @@
 //! expect: reject
 //! diagnostic: IDisposable
 //! issue: 7490
-//! notes: the compiler admits it — `Resolver::checkRecordRestrictions` walks the module's
-//!   children, so a nested record escapes every §9.6/§9.7 record restriction; a class 1
-//!   divergence tracked by #7490.
+//! notes: the compiler ADMITTED it until fix #7490 — `Resolver::checkRecordRestrictions`
+//!   walked the module's children, so a nested record escaped every §9.6/§9.7 record
+//!   restriction. The reach now covers the nested types of this module at any depth, and
+//!   this case is rejected with "record `R` may not implement `IDisposable` (§9.7)".
 module Conf;
 
 public class Outer

@@ -2857,17 +2857,48 @@ void Resolver::checkTypeAccessorVisibility(TypeSymbol* t) {
 }
 
 // #3152: every `hasAstAutoPropertyDecl` in this function is the AST-ONLY
-// predicate on purpose. The walk is over `ctx_.module()->children` and each
-// arm requires the member's own `ast::PropertyDecl` (it reads `pd->type` to
-// classify the declared type), so no imported symbol reaches it and the two
-// predicates coincide. Contrast `classHasOwnStorage` in
-// `checkClassSerializationEligibilityLate`, which climbs `t->baseTypes` and
-// therefore DOES leave the module — that one asks the storage question.
+// predicate on purpose. The walk is over this module's OWN declaration tree
+// (see the reach note below) and each arm requires the member's own
+// `ast::PropertyDecl` (it reads `pd->type` to classify the declared type), so
+// no imported symbol reaches it and the two predicates coincide. Contrast
+// `classHasOwnStorage` in `checkClassSerializationEligibilityLate`, which
+// climbs `t->baseTypes` and therefore DOES leave the module — that one asks
+// the storage question.
+//
+// fix #7490 (§9.6 / §9.7 / §28.12, v0.350): THE REACH. This walk used to
+// iterate `ctx_.module()->children` — MODULE-LEVEL ONLY — so a `record`
+// declared INSIDE A CLASS BODY was never visited by ANY of §9.7's checks, and
+// a `record` nested inside a nested type was never visited either. The
+// asymmetry was the defect: §28.12 states ONE sentence ("a record, enum or
+// choice that lists it, or lists an interface extending it, is a compile
+// error at the declaration"), and the enum and choice arms of it were applied
+// at every nesting depth (`checkEnumRestrictions` and `checkChoiceRestrictions`
+// both route through the shared recursive walker, `forEachTypeAndNested`,
+// since fix #3574) while the record arm was applied at depth 0 only. A nested
+// `record` therefore ESCAPED EVERY §9.6/§9.7 RECORD RESTRICTION: it could
+// name `IDisposable` (§9.7 / §28.12), derive from a class (§9.6), declare a
+// destructor or an `owned` field (§9.7), and be `abstract` — each admitted.
+//
+// The fix is a REACH change ONLY, and it is the SAME reach the sibling checks
+// already use: `forEachTypeAndNested` (fix #3574, §11.6 "Nested types",
+// v0.286) is the ONE recursive walk over every type this module declares —
+// each top-level type and, transitively, every type nested inside one, at
+// ANY depth, pre-order in declaration order. Nothing else in this function
+// changes: the predicates, the diagnostic texts, and the diagnostic sites are
+// all exactly as they were, so every module-level verdict is unchanged and
+// the module-level diagnostic ORDER is unchanged (the walk visits the
+// module's top-level types in the same `ctx_.module()->children` order this
+// function used; only the nested types are new, and they are new VISITS, not
+// new verdicts).
+//
+// The walk stays LOCAL-ONLY — `forEachTypeAndNested` draws from
+// `ctx_.module()->children` and from the nested types inside them, never an
+// imported type — so the #3152 seam properties below are preserved (and the
+// SEAM-ACCESSOR markers beside them still hold).
 void Resolver::checkRecordRestrictions() {
     if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t || t->kind != ast::TypeDeclKind::Record) continue;
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind != ast::TypeDeclKind::Record) return;
         // §9.6 / §12.5 (issue #2431): `abstract` is defined ONLY for a
         // class — §12.5 ("Abstract classes and members") states "`abstract`
         // on a class permits abstract members and forbids direct
@@ -2990,9 +3021,11 @@ void Resolver::checkRecordRestrictions() {
                 //
                 // fix #3650 (#3152 drain): the shared both-sources accessor —
                 // `fs` here is always a member of `t`, which this function's
-                // caller (checkRecordRestrictions) draws only from
-                // `ctx_.module()->children`, so `fs` is never imported and
-                // `fieldDeclTypeOf` never takes the null-`decl` branch here.
+                // caller (checkRecordRestrictions) draws only from THIS
+                // MODULE's own declaration tree (`forEachTypeAndNested` —
+                // module-level types and the types nested inside them), so
+                // `fs` is never imported and `fieldDeclTypeOf` never takes
+                // the null-`decl` branch here.
                 const ast::Type* ftypeAst = sema::fieldDeclTypeOf(fs);
                 if (ftypeAst) {
                     const TypeRef* rt = ctx_.resolvedType(*ftypeAst);
@@ -3021,7 +3054,8 @@ void Resolver::checkRecordRestrictions() {
             if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
                 if (hasAstAutoPropertyDecl(ps)) {
                     // SEAM-ACCESSOR: `ps` is a member of `t`, which checkRecordRestrictions draws only
-                    // from `ctx_.module()->children` — never an imported symbol (#3152).
+                    // from THIS MODULE's own declaration tree (`forEachTypeAndNested`) — never an
+                    // imported symbol (#3152).
                     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                     if (pd && pd->type) {
                         const TypeRef* rt = ctx_.resolvedType(*pd->type);
@@ -3096,9 +3130,9 @@ void Resolver::checkRecordRestrictions() {
         // asymmetry and left the chain broken; the chain is what §28.12
         // states, so the chain is what is implemented here.
         //
-        // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children`
-        // (checkRecordRestrictions's own loop) — never an imported type
-        // (#3152).
+        // SEAM-ACCESSOR: `t` is drawn from THIS MODULE's own declaration tree
+        // (checkRecordRestrictions's own `forEachTypeAndNested` walk) — never
+        // an imported type (#3152).
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
             DisposalListing listing = disposalListingOf(td, ctx_);
             if (!listing.baseName.empty()) {
@@ -3125,7 +3159,7 @@ void Resolver::checkRecordRestrictions() {
                     "reference) for a recursive structure (§9)");
             }
         }
-    }
+    });
 }
 
 // #2208 (§35.1, v0.226): a choice may not transitively contain itself through
