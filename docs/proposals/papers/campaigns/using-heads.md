@@ -1367,6 +1367,21 @@ record's own baseline tree **`d9f11d15`**; the anchor's tree **`e4a55c95`**. Scr
 *Every claim below is labelled **MEASURED** (I ran it), **QUOTED** (I read it in a file, an issue
 or a commit) or **HYPOTHESIS**.*
 
+#### ⚠ ONE CORRECTION TO THIS EXIT REVIEW — **2026-10-28, THE U4 LANE's REVIEWER**
+
+**THE `(A9)` SECTION BELOW SAID *"#7354 REPRODUCES IN **TWO** OF ITS FOUR SHAPES"* AND NAMED THE
+SECOND AS *"A GENERIC METHOD WITH `where T: IDisposable` **COMPILES**"*.** **THAT SECOND HALF IS
+**WRONG**, AND IT IS **STRUCK IN PLACE**:**
+
+* **§28.12 (v0.345), `docs/Bezel_Language_Spec.md:7475`, QUOTED:** *"`where T: IDisposable` **admits
+  it and every interface extending it** (`IAsyncEnumerator<T>` among them)."*
+* **#7354's OWN ISSUE BODY SAYS SO: ITS SHAPE 1 IS *"required: admitted"*.**
+* **=> THE BOUND ADMITTING `IAsyncDisposable` (AND `IAsyncEnumerator<int>`) IS THE **SPECIFIED**
+  BEHAVIOUR, NOT A DEFECT. **#7354's REMAINING CONTENT IS **SHAPE 3 ALONE** — THE `record`'s
+  DECLARATION-SITE BAN — **AND THE `choice`'s IS **#7394's**.**
+* **THE REVIEWER MEASURED ALL FOUR SHAPES ON BOTH ARMS. **THE OTHER THREE HOLD AS THE SPEC AND THE
+  ISSUE REQUIRE.**
+
 ### (A) THE AUDIT — is the record true?
 
 **(A1) THE GRID — THE RECORD'S HEADLINE NUMBER IS TRUE FOR ITS OWN TREE AND STALE FOR THE
@@ -1609,9 +1624,20 @@ the record should date it as a timestamp rather than as "LIVE".**
 * **RE-MEASURED (the members I named for the next lane):** **#7326 REPRODUCES** — `await using
   var t := o.ToString();` in a non-async `static method Main()` **compiles** (rc = 0), with only the
   §28.9 vacuity warning, against §28.12 (v0.345): "`await using` is valid only inside an async
-  method or async lambda". **#7354 REPRODUCES in two of its four shapes** — a `record` declaring
+  method or async lambda". **#7354 REPRODUCES in **ONE** of its four shapes** — a `record` declaring
   `IAsyncDisposable` **compiles** (against §28.12: "a record, enum or choice that lists it … is a
-  compile error at the declaration"), and a generic method with `where T: IDisposable` **compiles**.
+  compile error at the declaration").
+  **⚠ CORRECTED 2026-10-28 BY THE U4 LANE's REVIEWER (its §4): **THE SECOND HALF OF THIS SENTENCE
+  — "a generic method with `where T: IDisposable` **compiles**" — WAS **NOT** A REPRODUCTION, AND IT
+  IS **STRUCK**.** **§28.12 (v0.345, `docs/Bezel_Language_Spec.md:7475`) SAYS THE BOUND **ADMITS**
+  THE INTERFACE AND EVERY INTERFACE EXTENDING IT: *"where T: IDisposable` admits it and every
+  interface extending it (`IAsyncEnumerator<T>` among them)"* — **AND #7354's OWN ISSUE BODY SAYS
+  SO: ITS SHAPE 1 IS *"required: admitted"*.** **=> THE BOUND ADMITTING `IAsyncDisposable` IS THE
+  **SPECIFIED** BEHAVIOUR, NOT A DEFECT, AND #7354's REMAINING CONTENT IS **SHAPE 3 ALONE** (THE
+  RECORD'S DECLARATION-SITE BAN; **THE CHOICE'S IS #7394's**).** **THE REVIEWER MEASURED IT ON
+  BOTH ARMS AND MEASURED THE OTHER THREE SHAPES AS HOLDING: THE BOUND ADMITS; `d.Dispose()` ON A
+  VALUE HELD AT `IAsyncDisposable` RUNS THE DESTRUCTOR; AND `using var` OVER AN `IAsyncDisposable`
+  TAKES THE SYNCHRONOUS PATH.****
 * **NOT RE-MEASURED:** the other 22 members' per-row repros (they are QUOTED from the record); the
   copies lane's and the anchor's gtest rows under `scripts/agent_check.sh`; the U2/U3 lane's
   fail-without (it is under a separate review); the grid's 17-mutation check (I ran the gate's own
@@ -1845,7 +1871,10 @@ campaign 1 exits.
 * The **U2/U3 lane's** fail-without (`4823c418`, `fc09c0ca`) — not re-measured; it is under a
   separate review. Its issue states and its non-picked status I did check.
 * **22 of the 24 members' per-row repros** — QUOTED from the record, not re-measured (only #7326
-  and two of #7354's four shapes, above).
+  and **one** of #7354's four shapes, above — **THE COUNT WAS "two" UNTIL 2026-10-28, WHEN THE U4
+  LANE's REVIEWER SHOWED THAT THE SECOND OF THE TWO WAS NOT A REPRODUCTION AT ALL: A
+  `where T: IDisposable` BOUND ADMITTING `IAsyncDisposable` IS **REQUIRED** BY §28.12 (v0.345,
+  spec:7475) AND BY #7354's OWN ISSUE BODY.**).
 * The `object_string` twin leak, #2624's repro, the §29.1 ruling's outcome, the `type_token`
   deferral row, the coverage-gap arithmetic's *intent*, the `9 n/a` cells' reasons, and the
   `--twins` variant of the grid (I ran the brief's command without `--twins`; the record's baseline
