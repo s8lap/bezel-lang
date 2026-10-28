@@ -32719,50 +32719,85 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // entirely. To properly reject `Array.Length`, we must emit the
                 // "no member" diagnostic here so the expression is rejected
                 // before it reaches codegen's lowering.
-                if (ma.member == "Length" && cn == "Array") {
+                // fix #7447 (spec §26.5 rule 2, v0.345): the six `Length`
+                // rejects below answer with the SIBLING member's name, but
+                // the receiver's declared surface declares NO `Length` at all
+                // (stdlib §4.4 declares `Count` and `Capacity` on `Array<T>`;
+                // §4.11 declares `Count` on `Stack<T>` / `Queue<T>` and their
+                // Owning twins). §26.5 rule 2 therefore REQUIRES the extension
+                // blocks to be consulted: "If the receiver's type declares no
+                // instance member of that name, the compiler searches the
+                // current module and all imported modules ... for extension
+                // blocks on `x`'s type, base types, or implemented
+                // interfaces". A user `extension Array<int> Length()` is
+                // legal and must be admitted.
+                //
+                // The gate is the house's §26.5 form the sibling arms in this
+                // block use: a same-named user extension keeps the CALL
+                // accepted (the CALL spelling is the extension member's
+                // call form), while the BARE reference keeps the rejection
+                // (the bare form is §27.6's method-reference formation, and
+                // the bare spellings of the collection heads have their own
+                // handling — #6997's arm and the `?.` twin below).
+                //
+                // The diagnostic also gains its §-section: it read
+                // "(stdlib \S4.4)" — a LITERAL BACKSLASH-S, so the message
+                // carried NO §-character at all.
+                const bool lengthCallWithExtension =
+                    ma.member == "Length" && &ma == calleeOfCallCtx_ &&
+                    lookupExtensionMember(tt, ma.member, nullptr,
+                                          ma.span.begin,
+                                          /*reportAmbiguity=*/false) != nullptr;
+                if (ma.member == "Length" && cn == "Array" &&
+                    !lengthCallWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `Array<T>`: use `Count` "
-                        "(stdlib \\S4.4)");
+                        "(stdlib §4.4)");
                     return;
                 }
-                if (ma.member == "Length" && cn == "OwningArray") {
+                if (ma.member == "Length" && cn == "OwningArray" &&
+                    !lengthCallWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `OwningArray<T>`: use `Count` "
-                        "(stdlib \\S4.5)");
+                        "(stdlib §4.5)");
                     return;
                 }
                 // fix #5416 (§4.11, v0.315): `Stack<T>`/`OwningStack<T>`/
                 // `Queue<T>`/`OwningQueue<T>` declare `Count` (via
                 // IReadOnlyCollection<T>), not `Length` — the Count-vs-Length
                 // convention (§4.4 p.74) applies to resizable collections.
-                if (ma.member == "Length" && cn == "Stack") {
+                if (ma.member == "Length" && cn == "Stack" &&
+                    !lengthCallWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `Stack<T>`: use `Count` "
-                        "(stdlib \\S4.11)");
+                        "(stdlib §4.11)");
                     return;
                 }
-                if (ma.member == "Length" && cn == "OwningStack") {
+                if (ma.member == "Length" && cn == "OwningStack" &&
+                    !lengthCallWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `OwningStack<T>`: use `Count` "
-                        "(stdlib \\S4.11)");
+                        "(stdlib §4.11)");
                     return;
                 }
-                if (ma.member == "Length" && cn == "Queue") {
+                if (ma.member == "Length" && cn == "Queue" &&
+                    !lengthCallWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `Queue<T>`: use `Count` "
-                        "(stdlib \\S4.11)");
+                        "(stdlib §4.11)");
                     return;
                 }
-                if (ma.member == "Length" && cn == "OwningQueue") {
+                if (ma.member == "Length" && cn == "OwningQueue" &&
+                    !lengthCallWithExtension) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "no member `Length` on `OwningQueue<T>`: use `Count` "
-                        "(stdlib \\S4.11)");
+                        "(stdlib §4.11)");
                     return;
                 }
             }
@@ -38471,12 +38506,14 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             }
             if (nm.member == "Length") {
                 const char* sec = nullptr;
-                if (cn == "Array") sec = "Array<T>`: use `Count` (stdlib \\S4.4)";
-                else if (cn == "OwningArray") sec = "OwningArray<T>`: use `Count` (stdlib \\S4.5)";
-                else if (cn == "Stack") sec = "Stack<T>`: use `Count` (stdlib \\S4.11)";
-                else if (cn == "OwningStack") sec = "OwningStack<T>`: use `Count` (stdlib \\S4.11)";
-                else if (cn == "Queue") sec = "Queue<T>`: use `Count` (stdlib \\S4.11)";
-                else if (cn == "OwningQueue") sec = "OwningQueue<T>`: use `Count` (stdlib \\S4.11)";
+                // fix #7447: the literal backslash-S became the section
+                // sign — the message carried NO §-character before.
+                if (cn == "Array") sec = "Array<T>`: use `Count` (stdlib §4.4)";
+                else if (cn == "OwningArray") sec = "OwningArray<T>`: use `Count` (stdlib §4.5)";
+                else if (cn == "Stack") sec = "Stack<T>`: use `Count` (stdlib §4.11)";
+                else if (cn == "OwningStack") sec = "OwningStack<T>`: use `Count` (stdlib §4.11)";
+                else if (cn == "Queue") sec = "Queue<T>`: use `Count` (stdlib §4.11)";
+                else if (cn == "OwningQueue") sec = "OwningQueue<T>`: use `Count` (stdlib §4.11)";
                 // fix #6071 (§4.7-§4.10, §4.17, §4.18): every other built-in
                 // collection head (Set, Dictionary, LinkedList, SortedSet, ...)
                 // declares `Count`, never `Length` — the `.` form rejects it

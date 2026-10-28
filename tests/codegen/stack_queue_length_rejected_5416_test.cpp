@@ -45,7 +45,7 @@ BEZEL_TEST(stack_queue_length_rejected_5416, stack_length_rejected_stdlib_4_11) 
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(hasError(
         program,
-        "no member `Length` on `Stack<T>`: use `Count` (stdlib \\S4.11)"));
+        "no member `Length` on `Stack<T>`: use `Count` (stdlib \xC2\xA7""4.11)"));
 }
 
 // fix #5416 (§4.11, v0.315): `.Length` rejected on OwningStack<T>
@@ -60,7 +60,7 @@ BEZEL_TEST(stack_queue_length_rejected_5416, owningstack_length_rejected_stdlib_
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(hasError(
         program,
-        "no member `Length` on `OwningStack<T>`: use `Count` (stdlib \\S4.11)"));
+        "no member `Length` on `OwningStack<T>`: use `Count` (stdlib \xC2\xA7""4.11)"));
 }
 
 // fix #5416 (§4.11, v0.315): `.Length` rejected on Queue<T>
@@ -74,7 +74,7 @@ BEZEL_TEST(stack_queue_length_rejected_5416, queue_length_rejected_stdlib_4_11) 
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(hasError(
         program,
-        "no member `Length` on `Queue<T>`: use `Count` (stdlib \\S4.11)"));
+        "no member `Length` on `Queue<T>`: use `Count` (stdlib \xC2\xA7""4.11)"));
 }
 
 // fix #5416 (§4.11, v0.315): `.Length` rejected on OwningQueue<T>
@@ -89,7 +89,7 @@ BEZEL_TEST(stack_queue_length_rejected_5416, owningqueue_length_rejected_stdlib_
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(hasError(
         program,
-        "no member `Length` on `OwningQueue<T>`: use `Count` (stdlib \\S4.11)"));
+        "no member `Length` on `OwningQueue<T>`: use `Count` (stdlib \xC2\xA7""4.11)"));
 }
 
 // fix #5416 (§4.11, v0.315): `.Count` (the declared member) still works on Stack<T>
