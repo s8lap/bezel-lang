@@ -275,3 +275,40 @@ BEZEL_TEST(sema_string_declared_param_types_7421, split_string_control) {
         "Console.WriteLine(parts.Count);",
         "2\n");
 }
+
+// ── THE `string.Repeat` OVERLOAD SET — A FLIP THAT WAS **NOT** PINNED ────
+//
+// stdlib §9.6 (v0.345) declares TWO overloads of `string.Repeat`:
+//   public static pure method Repeat(c: char, count: int): string;
+//   public static pure method Repeat(unit: string, count: int): string;
+// §4.2's INTEGER TYPES ARE EXACTLY `byte`, `sbyte`, `short`, `ushort`, `int`,
+// `uint`, `long`, `ulong` — **`char` IS NOT AMONG THEM** — SO §5.1's CONSTANT
+// NARROWING ("any INTEGER TYPE whose range contains its value") NEVER REACHES
+// `char`, AND §5.1's CONVERSION TABLE HAS NO `int -> char` ROW (THE `char`
+// ROW GOES THE OTHER WAY).  §22.6 GIVES THE CALL NO APPLICABLE CANDIDATE.
+//
+// => `string.Repeat(5, 2)` IS **REFUSED**, AND `string.Repeat('x', 2)` IS
+// **ADMITTED**.
+//
+// THE DECLARED-PARAMETER CHANGE MADE THIS FLIP: BEFORE IT, AN `int` FIRST
+// ARGUMENT WAS **SILENTLY ADMITTED** (IT MATCHED NEITHER DECLARED OVERLOAD),
+// AND AFTER IT, THE CALL IS REFUSED.  **THIS ROW PINS THE FLIP** — IT IS
+// THE ONE BEHAVIOUR CHANGE OF THAT LANE THAT NO ROW PINNED, SO A LATER
+// CHANGE COULD RE-ADMIT IT WITHOUT ANYTHING FAILING.
+BEZEL_TEST(sema_string_declared_param_types_7421,
+           repeat_int_first_argument_is_rejected) {
+    expectRejected(
+        "Console.WriteLine(string.Repeat(5, 2));",
+        "no matching overload of `string.Repeat` — stdlib §9.6 declares "
+        "`Repeat(c: char, count: int): string` / "
+        "`Repeat(unit: string, count: int): string`, so the `c` argument "
+        "must be a `string` or a `char` — the argument has type `int`, which "
+        "is never implicitly convertible to it (§5.1)");
+}
+
+// The CONTROL: a `char` first argument IS one of the declared overloads, so
+// the call is admitted and repeats it.
+BEZEL_TEST(sema_string_declared_param_types_7421,
+           repeat_char_first_argument_is_admitted) {
+    expectStdout("Console.WriteLine(string.Repeat('x', 2));", "xx\n");
+}
