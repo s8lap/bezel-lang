@@ -1,12 +1,15 @@
 # Bezel Language Specification
 
-**Version 0.345 — October 2026**
+**Version 0.350 — October 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
 This document is the normative reference for the language. It defines syntax, type system, ownership rules, and the semantics of every construct. The specification is partitioned into a Core level and a set of Extended features; Appendix D defines the levels and what a conformance claim at each means. It is intentionally dense — written to be precise rather than introductory — and is best read alongside its companion documents: the design rationale, which explains *why* each decision was made and records the alternatives considered; the standard library, which catalogs the types and methods the language ships with; and the revision changelog, which carries the per-revision narrative history.
 
 If this is your first encounter with Bezel, the rationale's opening section is a gentler starting point: it sketches the goals of the language and the shape of its memory model before the spec's formal definitions begin. If you want concrete code first, the short companion guides (memory and ownership; errors and nullability; modeling data) work from worked examples. Once you know what you are looking for, this document is the place to look it up.
+
+<a id="sec-example-convention"></a>
+**Examples.** Examples may omit the declarations around them. A block may begin without the module declaration that [§2.1](#sec-module-declarations) requires; a method, constructor, property or field shown at the outer level is a member of an enclosing class; and statements shown at the outer level are the body of a method. Bezel itself has no top-level methods, fields or statements ([A.2](#sec-source-file); rationale [§2.2](Bezel_Design_Rationale.md#sec-no-top-level-functions-or-fields)): the omission is a convention of this document, not a form of the language.
 
 <a id="sec-contents"></a>
 ## Contents
@@ -131,7 +134,7 @@ import System.Threading;
 
 `import` makes the public names of the named module visible in the current file. Imports are file-scoped: an import in one file has no effect on other files in the same module. Public `extern` methods ([§32](#sec-foreign-function-interface)) are **not** among the bare names an import makes visible: they are reachable only through a qualifier — the module name or an alias ([§32.2](#sec-scoping), stated explicitly).
 
-**Aliases.** An import may bind a file-scoped alias: `import BankingApp.Transactions as Tx;` — thereafter `Tx.Ledger` names that module's public `Ledger`. The alias is an additional *qualifier*, not a rename: the module's publics are still visible by bare name (subject to the collision rule below), and the full dotted module name also remains usable as a qualifier (`BankingApp.Transactions.Ledger`). An alias may not collide with another alias, an imported module's name segment in qualifier position, a type declared in the file's module, or an **unambiguously imported public bare name**: [§2.7](#sec-name-resolution-order) rule 1 resolves imported bare names before aliases with no backtracking, so a same-named alias would be unreachable in every chain-head position — the collision is an error at the alias declaration rather than a silently dead alias.
+**Aliases.** An import may bind a file-scoped alias: `import BankingApp.Transactions as Tx;` — thereafter `Tx.Ledger` names that module's public `Ledger`. The alias is an additional *qualifier*, not a rename: the module's publics are still visible by bare name (subject to the collision rule below), and the full dotted module name also remains usable as a qualifier (`BankingApp.Transactions.Ledger`). An alias may not collide with another alias, an imported module's name segment in qualifier position, a type declared in the file's module (a top-level declaration: a same-named type nested in one leaves the alias live, since the alias outranks it at a chain head, where [§2.7](#sec-name-resolution-order)'s warning row covers the overlap), or an **unambiguously imported public bare name**: [§2.7](#sec-name-resolution-order) rule 1 resolves imported bare names before aliases with no backtracking, so a same-named alias would be unreachable in every chain-head position — the collision is an error at the alias declaration rather than a silently dead alias.
 
 **Collisions.** When two imported modules export the same public name, the **bare** name is ambiguous: using it unqualified is a compile error citing both origins; the fix is qualification (full module name or alias). Imports never shadow one another, and import order is immaterial. For this collision rule and the shadowing rule below, names are compared together with their generic arity, the component [§2.8.3](#sec-transitive-closure-and-type-identity) rule 3 adds to a type's identifier, and every reference fixes that arity by its type-argument list ([§14.1](#sec-generic-declarations) *Instantiation and its site*, [Appendix C.1](#sec-appendix-c-type-system)): a non-generic `Counter` and the always-available `Counter<K>` are two names, neither colliding with nor shadowing the other (so a file importing a library's `Counter` uses both `Counter.Bump()` and `Counter<string>`), while an imported `Counter<T>` and `Counter<K>` collide. Arity selects among the types rule 1 of [§2.7](#sec-name-resolution-order) finds for an identifier: a reference resolves to the first, in that rule's order, whose arity its type-argument list fixes; where none has that arity, it resolves to the first of them and is [Appendix C.1](#sec-appendix-c-type-system)'s arity error, never an alias, a member or a module prefix. A declaration in the *current module* shadows any same-named import for bare-name purposes (the import stays reachable by qualifier) — the same shadowing already specified for auto-imported names ([§2.3](#sec-always-available-names)).
 
@@ -207,11 +210,69 @@ A dotted name `A.B` (and longer chains) can in principle read as a module-qualif
 | Bare callee (incl. explicit method type args) | `Helper();` `Method<int>(x)` | same | a callee is not a receiver |
 | Head continued by `?.` or postfix `!` | `Color?.ToString()` | same | these operators demand a nullable *value*; static access is spelled with `.` alone |
 | **Bare type name** — a name the grammar reads only as a `Type`: an ascription, `new`, a generic argument, a base or interface list, the right operand of `is`, `is not` or `as`, a `typeof` or `default` operand, a destructuring pattern's head, a `where` clause (a single-identifier pattern is not one: A.7 decides it by what the name resolves to) — and the head segment of a qualified name in such a position (`C.N` in an ascription), which is not a chain head | `private M: Box<int>? := null;` | **between local scope and module declarations, nested types only** | a type position names a type, and only types are candidates: a nested type of the name, declared or inherited, is the innermost answer ([§2.2](#sec-imports) selecting by arity), and a same-named member of any other kind — on the type's own body or on a type enclosing it, declared or inherited — neither binds nor ends the search (`public property Status: string` beside `public method Kind(): Status`) |
-| **Warning row:** chain head resolves to a type while a same-named accessible member, a nested type included, exists | — | — | warn, *unless* the member's declared type is the resolved type (or an instantiation of the resolved generic) — the `property Color: Color` idiom; qualify `this.` to reach an instance member, the enclosing type's name a static or a nested type (the paragraph below) |
+| **Warning row:** chain head resolves to a type, or to an import alias ([§2.2](#sec-imports)), while a same-named accessible member, a nested type included, exists | — | — | warn, *unless* the member's declared type is the resolved type (or an instantiation of the resolved generic) — the `property Color: Color` idiom, which an alias, naming a module, never meets; qualify `this.` to reach an instance member, the enclosing type's name a static or a nested type (the paragraph below) |
 
-The head's shape is decided from tokens alone, **before any lookup**, per the table above ([§22.12](#sec-static-members)'s balanced scan commits a generic-argument group at a chain head and at an explicit-type-argument callee alike); the winner is fixed by position, never by whether the losing candidate could have hosted the next segment — resolution never backtracks (recorded decline of C#-style dual-meaning lookup). A member shadowed at a chain head stays reachable by qualifying (`this.Data.W()`; the enclosing type's name for a static or a nested type, with its arguments where the enclosing type is generic — `Outer<int>.s`, `Outer<int>.C.M()` ([§11.6](#sec-nested-types))); a type shadowed by a member or local stays reachable via rule 2's module qualification. Because the chain-head member fallback ranks below imports, it is the one rule-1 source a later-added import or type declaration can preempt — loudly in practice, since the preempting type must itself host the accessed member — which is what the table's warning row polices (the `property Color: Color` and `property Buffer: Buffer<int>` idioms are its carve-out; qualify with `this.` to reach the member). A nested type ([§11.6](#sec-nested-types)) ranks as the table ranks the enclosing type's members at each head shape: last at a chain head, where a same-named import or module declaration wins and the warning row fires, and innermost at a type position, bare or at the head of a qualified name, where nothing shadows it. [§19.8](#sec-inside-enum-scrutinees)'s scrutinee-driven pattern prefix-omission is not reordered by this paragraph.
+The head's shape is decided from tokens alone, **before any lookup**, per the table above ([§22.12](#sec-static-members)'s balanced scan commits a generic-argument group at a chain head and at an explicit-type-argument callee alike); the winner is fixed by position, never by whether the losing candidate could have hosted the next segment — resolution never backtracks (recorded decline of C#-style dual-meaning lookup). A member shadowed at a chain head stays reachable by qualifying (`this.Data.W()`; the enclosing type's name for a static or a nested type, with its arguments where the enclosing type is generic — `Outer<int>.s`, `Outer<int>.C.M()` ([§11.6](#sec-nested-types))); a type shadowed by a member or local stays reachable via rule 2's module qualification. Because the chain-head member fallback ranks below imports, it is the one rule-1 source a later-added import, import alias or type declaration can preempt — loudly in practice, since the preempting type, or the alias's module, must itself host the accessed member — which is what the table's warning row polices, for an alias head as for a type head (the `property Color: Color` and `property Buffer: Buffer<int>` idioms are its carve-out; qualify with `this.` to reach the member). A nested type ([§11.6](#sec-nested-types)) ranks as the table ranks the enclosing type's members at each head shape: last at a chain head, where a same-named import, import alias or module declaration wins and the warning row fires, and innermost at a type position, bare or at the head of a qualified name, where nothing shadows it. [§19.8](#sec-inside-enum-scrutinees)'s scrutinee-driven pattern prefix-omission is not reordered by this paragraph.
+
+*Example.* A chain head ranks the enclosing type's members last, and a bare value read ranks them before the module's declarations:
+
+```bezel
+enum Color
+  Red, Green;
+end Color;
+
+class Lamp
+  public property Color: Color := Color.Red;          // chain head: the type `Color` wins; no warning, the member's type is `Color`
+
+  public method IsRed(): bool => Color = Color.Red;   // a bare `Color` is the property; `Color.Red` is the constant
+end Lamp;
+```
+
+*Example.* The winner is fixed before any lookup, so a chain head that resolves to a type does not fall back to a same-named field:
+
+```bezel
+class Data
+  public static method Version(): int => 1;
+end Data;
+
+class Report
+  private Data: string := "abc";
+
+  public method Text(): string => Data;              // a bare value read: the field outranks the type
+  public method Size(): int => this.Data.Length;     // qualified with `this.`: the field
+  public method Ver(): int => Data.Version();        // chain head: the type `Data`; the warning row warns of the field
+  public method Bad(): int => Data.Length;           // error (§2.7): the chain head is the type `Data`, which has no `Length`; no backtracking
+end Report;
+```
 
 **Through nesting.** In a nested type's bodies ([§11.6](#sec-nested-types)), the enclosing-type lookup visits the nested type and then each type enclosing it, innermost first, at the rank the table gives its members (a nested type at the rank the preceding paragraph gives it for the head shape); the first type that has an accessible member of that name, declared or inherited, ends the search. At a type position only nested types are candidates (the table's bare-type-name row): the first type that has a nested type of the name, declared or inherited, whose arity the reference fixes ([§2.2](#sec-imports)) ends the search there, and a member of any other kind, on the nested type itself or on a type enclosing it, does not. A member found on an enclosing type, rather than on the nested type itself, is admitted by bare name only when it is a static member or a nested type. A bare reference to an enclosing type's **instance** member is a compile error naming this rule, for the reason a static body cannot make one: the nested type's body has no instance of the enclosing type. It is reached through one (`o.M()`, the access §11.6 grants). A bare reference to a static member of an enclosing **generic** type is likewise a compile error naming this rule. The nested type is one type whatever the enclosing instantiation, and the enclosing type's type parameters are not in scope in it (§11.6), so it has no current instantiation of the enclosing type, as that type's own bodies have ([§22.12](#sec-static-members)): nothing selects the member's per-instantiation cell or gives its type a meaning. The remedy is a chain head that supplies the arguments, `Outer<int>.s`. Nested types of an enclosing type, generic or not, are reached by bare name, since a nested type is one type and needs no instantiation. Ending the search at the first type that has the name, even when the member cannot be used there, keeps a bare name from passing over an enclosing member and silently resolving to a same-named module declaration or import. An enclosing type's type parameter, found at that type's link (rule 1), ends the search for its name the same way: it cannot be used in the nested type's bodies ([§11.6](#sec-nested-types)), and a same-named module declaration or import is not reached by the bare name. It is a rule of the positions at which the table ranks members; at a type position nothing but a nested type could be meant, so a type's body names a type by its bare name whatever same-named members it or its enclosing types declare. A local type's bodies ([§21.10](#sec-local-type-declarations)) follow this paragraph, the type whose body declares the local type standing first among its enclosing types: the lookup visits the local type, then that type, then the types that type's own bodies visit after it (its enclosing types, or, where it is itself a local type, the types this sentence gives it), innermost first. A member found on one of those types, rather than on the local type itself, is admitted by bare name only when it is a static member of a non-generic type or a nested type, and a bare reference to an instance member, or to a static member of a generic type, is the compile error above, for the reasons above: the local type's body has no instance of that type, and the local type is one type whatever that type's instantiation (§21.10). Accessibility in a nested type's bodies, and in a local type's, is that of [§11.6](#sec-nested-types): the `private` and `protected` members of every type enclosing the body — for a local type, the type whose body declares it and that type's enclosing types — count as accessible, so such a member ends the search at its type as a `public` one does; whether it may then be used by bare name is the kind rule above.
+
+*Example.* A nested type's body reaches an enclosing type's static member by bare name, and its instance members only through an instance:
+
+```bezel
+class Outer
+  private _count: int := 0;
+
+  private static method Limit(): int => 10;
+
+  public class Inner
+    public method Max(): int => Limit();               // allowed: a static member of the enclosing type
+    public method CountOf(o: Outer): int => o._count;  // allowed: reached through an instance (§11.6)
+  end Inner;
+end Outer;
+```
+
+*Example.* A bare reference to an enclosing type's instance member is the compile error:
+
+```bezel
+class Counter
+  private _count: int := 0;
+
+  public class View
+    public method Count(): int => _count;   // error (§2.7): an enclosing instance member; this body has no instance of `Counter`
+  end View;
+end Counter;
+```
 
 Consequences worth stating: a type named `A` in scope **shadows** a module-name prefix `A.…` for chain purposes (the compiler warns when both readings exist — qualify via an alias to reach the module); two module prefixes cannot be ambiguous (module names are exact); and because resolution never backtracks, the meaning of a chain is determined by its shortest resolvable head — adding an unrelated import can make a previously-erroring chain resolve, but can never silently *change* a chain that already resolved (rule 1 outranks rule 2, and rule-1 resolutions are collision-checked) — with the one warned exception of the chain-head member fallback above.
 
@@ -498,6 +559,23 @@ Common rules, normative for every derived type property:
 3. **Part of the public contract.** A declaration change that flips a derived type property of a public type — adding a destructor flips trivial-dispose; adding a computed property in the wrong form flips auto-hashable; adding or removing a contract clause on a record's constructor flips constructor-only ([§9.9](#sec-constructor-only-records)); adding or removing `equality skip` on a member ([§9.2](#sec-equality-skip)) flips comparison results and hash values for clients and can flip auto-hashable/hashable — is a breaking change for clients relying on it, exactly as a signature change is (the artifact interface carries the clause as it carries `serialized` clauses, [§2.8.2](#sec-artifact-interface)). Library documentation should state the properties a type's clients are expected to rely on. An edit that adds a requirement under rule 2 to a public generic declaration — to a member body, a field, or a declaration it reaches — is breaking in the same sense, for the instantiations it newly rejects ([§2.8.6](#sec-interface-delta-classification)'s requirement-summary rows).
 4. **Named in diagnostics.** A diagnostic produced by a property-dependent rule names the property in the words of the table above, so the reader can find the defining section.
 
+*Example.* A property follows from structure, and a generic type's use of its parameter is a requirement read at each instantiation:
+
+```bezel
+class Node
+end Node;
+
+record Key(Id: int, Name: string);     // auto-hashable: every component is admissible
+record Ref(Id: int, Target: Node);     // not auto-hashable: a class-typed component (computed, rule 1)
+
+class Tally<T>
+  public static method Same(a: T, b: T): bool => a.Equals(b);  // a use of `T`'s equality, read at each instantiation
+end Tally;
+
+var k: Tally<Key>? := null;     // allowed
+var r: Tally<Ref>? := null;     // error (rule 2): `Tally<Ref>` is rejected where it is named, `Same` called or not
+```
+
 Dispatch of *behavior* (not merely admissibility) on a derived type property — as the element category does for buffer and collection slot semantics ([§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) — is reserved to compiler-known standard-library types; it is not a user-available mechanism in this revision; two scoped exceptions are recorded. The **C-compatible** classification ([§32.13](#sec-c-compatible-records)) — whose consequence is a static representation guarantee, compile-time-visible and constant, never behavior dispatch — was ratified with the FFI's structured-data design (rationale §16.5). The **choice classification** ([§35.4](#sec-choice-classification)) does flip per-instantiation behavior (copy vs. move on assignment, disposal vs. none at scope end), and is admitted because the dispatch is performed by the language on a language construct — derived from structure, identical for every user, with no user-programmable hook — the recorded generalization path of the compiler-known specializations (rationale §5.15); users still cannot write code conditioned on a type parameter's category. The reservation bounds the **user-facing surface** — what user code may condition on — not an implementation's realization strategy for generics, which [§11.8](#sec-static-interface-members) leaves open so long as the observable binding is unchanged. Conditioning a member's **admissibility** — as distinct from its behavior — on the enclosing type's arguments is a separate mechanism, reserved to the standard library and defined at [§14.2](#sec-conditionally-admitted-members); its conditions are not confined to the properties of this section.
 
 New rules added to this specification that need a structural classification of types must define it as a derived type property under the rules of this section, rather than introducing a parallel mechanism.
@@ -760,7 +838,7 @@ var q := -7 / 3;                      // -2
 var r := -7 mod 3;                    // -1
 ```
 
-Division and `mod` raise `DivideByZeroException` when the right operand is zero.
+Division and `mod` raise `DivideByZeroException` when the right operand is zero. A right operand that is a compile-time constant ([§17.14](#sec-constant-expressions)) equal to zero — `x / 0`, `x mod Z` over `const Z := 0` — is a **compile error at the operator**, whatever the left operand's value, never a deferred `DivideByZeroException`: the fault depends on no value the dividend could take, so it is decided where it is written, the posture of [§6.5](#sec-bitwise-operations)'s constant shift count; a non-constant zero divisor raises at run time. The rule reaches an operation performed at an integer type or `decimal` ([§6.2](#sec-mixed-type-arithmetic)); a binary-floating-point operation — `x / 0` over a `double` `x` included — has no division fault ([§6.3](#sec-floating-point-arithmetic)). The rule reads the right operand alone and makes the expression no more constant than it was (`5 / 0` is already a faulting constant expression under [§17.14](#sec-constant-expressions)); `/=` and `mod=` inherit it through their desugaring ([§6.6](#sec-compound-assignments)).
 
 `mod` is defined on integer types and on `decimal` (where it follows the same dividend-sign rule and raises `DivideByZeroException` when the divisor is zero). It is **not** defined on `float` or `double`; an expression of the form `x mod y` where either operand has a binary floating-point type is a compile error. The reason is that `mod` carries no floating-point semantics in this spec — the natural choice (IEEE 754 remainder, or C `fmod`) is a deliberate decision rather than a syntactic afterthought, and naming it explicitly avoids the ambiguity. The standard library exposes `Math.Fmod(x: double, y: double): double` for the C-compatible same-sign-as-dividend remainder, and `Math.IEEERemainder(x: double, y: double): double` for the IEEE 754 nearest-even form.
 
@@ -781,7 +859,7 @@ Modulo on floating-point values is intentionally not provided as an operator. Us
 <a id="sec-decimal-arithmetic"></a>
 ### 6.4 Decimal arithmetic
 
-`decimal` arithmetic raises `OverflowException` on overflow and `DivideByZeroException` on division by zero. There is no `Infinity` or `NaN` for `decimal`.
+`decimal` arithmetic raises `OverflowException` on overflow and `DivideByZeroException` on division by zero; a constant zero divisor — `d / 0m`, `d mod 0.0m` — is the compile error [§6.1](#sec-integer-arithmetic) states for a constant zero right operand. There is no `Infinity` or `NaN` for `decimal`.
 
 The result of `+`, `-`, `*`, and `/` is the exact result when [§4.4](#sec-decimal) can represent it. Otherwise it is the exact result rounded at the largest scale *s* ≤ 28 whose rounded mantissa is at most 2^96 − 1 — to nearest, a tie to the even last digit, the rounding `Decimal.Round` and the format specifiers use (stdlib [§9.3](Bezel_Standard_Library.md#sec-decimal), [§2.18](Bezel_Standard_Library.md#sec-iformattable)). **Overflow** is a result that does not fit at scale 0; a nonzero result that rounds to zero is zero (`-1e-28m / 3m` is `0`). So `1m / 3m` is `0.3333333333333333333333333333`, `2m / 3m` is `0.6666666666666666666666666667`, `100m / 7m` is `14.285714285714285714285714286`, and `decimal.MaxValue / 10m` is `7922816251426433759354395033.5`.
 
@@ -818,7 +896,7 @@ The compound assignment operators are `+=`, `-=`, `*=`, `/=`, `mod=`, `&=`, `|=`
 
 [§17.6](#sec-increment-decrement-on-indexer-slots)'s indexer desugaring is the indexer instance of this rule. A.6's lvalue shape applies unchanged: a method-call result cannot base the chain — extract it to a local first. The store is an ordinary assignment: for an owned target, [§28.7](#sec-reassigning-owned-fields)'s drop-on-overwrite applies.
 
-**Typing; the narrow-integer write-back.** Let T be the left-hand side's type and R the type of `x op e` under the rules of this chapter ([§6.2](#sec-mixed-type-arithmetic) promotion, [§6.5](#sec-bitwise-operations) shifts and bitwise, [§25.2](#sec-operator-overloading-restrictions) overloads). If R is T, or R implicitly converts to T ([§5.1](#sec-implicit-conversions)), the result is stored directly. Otherwise, when **T is an integer type or `char` and R is an integer type**, the result is converted back to T by the corresponding [§5.2](#sec-explicit-conversions) **checked** narrowing: `b += 10` on `b: byte` is `b := byte(b + 10)` — the addition runs in `int` per §6.2, and a result outside `byte`'s range raises `OverflowException` ([§6.1](#sec-integer-arithmetic)'s checked posture; never a silent truncation). An integer constant right operand with no §6.2 promotion against T enters `x op e` only by [§5.1](#sec-implicit-conversions)'s constant narrowing at T, so one outside T's range is a compile error, not a run-time fault: `u += -1` over `u: uint`, and `u += -3000000000`, whose unsuffixed literal takes no wider type here ([§4.2](#sec-integer-types)); `u += -3_000_000_000L` widens `u` to `long` and takes the checked write-back. A `char` operand is not arithmetic ([§3.5](#sec-operators-on-primitive-types)), so a `char` target admits only `+=` and `-=` — the code-point advance [§17.6](#sec-the-increment-and-decrement-operators)'s `c++` and `c--` desugar to — with R the type of `int(x) op e`, and the write-back applies the §5.2 code-point rules: `c += 1` is `c := char(int(c) + 1)`. The right operand is typed as in `int op e` under §6.2 — `sbyte`, `byte`, `short`, `ushort`, `int` or `long`, or an integer constant under [§5.1](#sec-implicit-conversions)'s constant narrowing; a `char` right operand is not arithmetic either (`c -= d` over `d: char` is rejected — write `c := char(int(c) - int(d))`), and a non-constant `uint` or `ulong` operand has no §6.2 promotion with `int` and is a compile error. `c *= 2`, `c /= 2` and `c mod= n` are compile errors — `char` is not an arithmetic type, so a code point is advanced, never scaled — and a bitwise or shift form on a `char` target has no R ([§6.5](#sec-bitwise-operations)). In every other case the compound form is a **compile error** naming the explicit remedy — notably a binary-float or `decimal` result against a different LHS type (`b += 1.5`; `f += 2.5` where `f: float` promotes to `double`): the §5.2 float narrowings round or truncate *silently*, which is precisely the information loss [§5.1](#sec-implicit-conversions)'s admission line exists to exclude; write `f := float(f + 2.5);` when that loss is intended. The write-back is scoped to the compound form only: plain `b := b + 10` remains the §6.2/§5.1 compile error it has always been, so the no-implicit-narrowing rule is undisturbed everywhere else. The shift forms never need it: a shift's result already has the left operand's type ([§6.5](#sec-bitwise-operations)). `x <<= k` and `x >>= k` inherit [§6.5](#sec-bitwise-operations)'s count-domain rule through the desugaring: an out-of-domain count is the same fault — compile error for a constant count, `OverflowException` at runtime otherwise.
+**Typing; the narrow-integer write-back.** Let T be the left-hand side's type and R the type of `x op e` under the rules of this chapter ([§6.2](#sec-mixed-type-arithmetic) promotion, [§6.5](#sec-bitwise-operations) shifts and bitwise, [§25.2](#sec-operator-overloading-restrictions) overloads). If R is T, or R implicitly converts to T ([§5.1](#sec-implicit-conversions)), the result is stored directly. Otherwise, when **T is an integer type or `char` and R is an integer type**, the result is converted back to T by the corresponding [§5.2](#sec-explicit-conversions) **checked** narrowing: `b += 10` on `b: byte` is `b := byte(b + 10)` — the addition runs in `int` per §6.2, and a result outside `byte`'s range raises `OverflowException` ([§6.1](#sec-integer-arithmetic)'s checked posture; never a silent truncation). An integer constant right operand with no §6.2 promotion against T enters `x op e` only by [§5.1](#sec-implicit-conversions)'s constant narrowing at T, so one outside T's range is a compile error, not a run-time fault: `u += -1` over `u: uint`, and `u += -3000000000`, whose unsuffixed literal takes no wider type here ([§4.2](#sec-integer-types)); `u += -3_000_000_000L` widens `u` to `long` and takes the checked write-back. A `char` operand is not arithmetic ([§3.5](#sec-operators-on-primitive-types)), so a `char` target admits only `+=` and `-=` — the code-point advance [§17.6](#sec-the-increment-and-decrement-operators)'s `c++` and `c--` desugar to — with R the type of `int(x) op e`, and the write-back applies the §5.2 code-point rules: `c += 1` is `c := char(int(c) + 1)`. The right operand is typed as in `int op e` under §6.2 — `sbyte`, `byte`, `short`, `ushort`, `int` or `long`, or an integer constant under [§5.1](#sec-implicit-conversions)'s constant narrowing; a `char` right operand is not arithmetic either (`c -= d` over `d: char` is rejected — write `c := char(int(c) - int(d))`), and a non-constant `uint` or `ulong` operand has no §6.2 promotion with `int` and is a compile error. `c *= 2`, `c /= 2` and `c mod= n` are compile errors — `char` is not an arithmetic type, so a code point is advanced, never scaled — and a bitwise or shift form on a `char` target has no R ([§6.5](#sec-bitwise-operations)). In every other case the compound form is a **compile error** naming the explicit remedy — notably a binary-float or `decimal` result against a different LHS type (`b += 1.5`; `f += 2.5` where `f: float` promotes to `double`): the §5.2 float narrowings round or truncate *silently*, which is precisely the information loss [§5.1](#sec-implicit-conversions)'s admission line exists to exclude; write `f := float(f + 2.5);` when that loss is intended. The write-back is scoped to the compound form only: plain `b := b + 10` remains the §6.2/§5.1 compile error it has always been, so the no-implicit-narrowing rule is undisturbed everywhere else. The shift forms never need it: a shift's result already has the left operand's type ([§6.5](#sec-bitwise-operations)). `x <<= k` and `x >>= k` inherit [§6.5](#sec-bitwise-operations)'s count-domain rule through the desugaring: an out-of-domain count is the same fault — compile error for a constant count, `OverflowException` at runtime otherwise. `x /= e` and `x mod= e` inherit [§6.1](#sec-integer-arithmetic)'s divisor rule the same way: a constant zero `e` is a compile error, a non-constant zero raises `DivideByZeroException`.
 
 **Nullable targets and operands.** A read-modify-write compound assignment — `+=`, `-=`, `*=`, `/=`, `mod=`, `&=`, `|=`, `^=`, `<<=`, `>>=` — takes the verdict its expansion `x op e` has on a nullable operand ([§7.11](#sec-lifted-operators)): a target or right operand whose static type, read after [§7.4](#sec-member-access-on-nullable-values)'s narrowing, is nullable — a nullable reference-typed target included — is a **compile error** naming §7.11's remedies (`b := (b ?? 0) + 1;`, `b := b! + 1;`, or a narrowing check), and one §7.4 has narrowed non-null is a non-nullable operand, the store leaving the narrowing in place. The narrow-integer write-back above is a typing rule and is unreached on a nullable operand. `??=` is unaffected: it is not a read-modify-write (below). The `++`/`--` forms take the same reading ([§17.6](#sec-the-increment-and-decrement-operators)).
 
@@ -1360,7 +1438,52 @@ Consequently a store that would land in the **receiver's own storage** is a **co
 
 Two boundaries. **Constructor bodies are not receiver positions**: a record constructor initializes the value under construction — `Width := width;` is [§9.2](#sec-body-records)'s own canonical form, governed by [§22.8](#sec-field-initializers)'s once-only and [§7.9](#sec-definite-assignment-for-non-nullable-fields)'s definite-assignment machinery — so its stores to the record's own storage are the initialization the form exists for, not stores through a borrowed receiver. **Settable properties keep their purpose**: an external store through a named binding's lvalue chain — `r.X := 5` on a settable auto-property — remains legal, the store landing in `r`'s storage, announced by the assignment itself. What runs there is the **synthesized** auto-property setter, a receiver-writing member body invoked as an accessor ([§6.6](#sec-compound-assignments)'s accounting invokes getter and setter each exactly once; [§22.15](#sec-pure-members) classifies the auto-property setter as never pure; [§22.16](#sec-contract-clauses) instruments auto-property setters alike; [§9.5](#sec-non-destructive-update-with)'s never-invokes-setters contrast is a contrast precisely because assignment does invoke them) — and it is legal because this rule governs **author-written** bodies: the synthesized setter's store is the external assignment's own store, directed at the named binding's storage and announced at the call site. What retires is the author-written store into the receiver's own storage: a record may still declare a block-form property or indexer (a member outside [§9.2](#sec-body-records)'s list merely suppresses auto-equality, [§9.3](#sec-combined-form)) — including a setter in the mediating shape above, every store landing beyond a class- or interface-typed hop — but a *setter body* whose store lands in the receiver's own storage is rejected like any other member body. And a value kind cannot **conform to an interface that declares a settable property or indexer member** at all: the conformance is rejected at the declaration ([§9.6](#sec-records-and-inheritance)), exactly as for a missing member — a **blanket** rejection, not keyed on where the supplied accessor's stores would land (the deliberate simplification and its recorded cost: rationale [§9.13](Bezel_Design_Rationale.md#sec-value-receivers-are-borrows-rationale)). That conformance rejection — not any vacuity — is what closes the **boxed** case: receiver-writing members do exist on value kinds, the synthesized auto-property setter being one, but a box's dispatch faces are `Object` and the conformed interfaces ([§8.6](#sec-boxing)), `Object` declares no settable member ([§8.1](#sec-definition)), and no conformable interface may — so no member reachable through a box writes any receiver, and `i.X := 42` through an interface view of a boxed record has no settable member to name.
 
+*Example.* A record member body may not store into its receiver; a constructor, an external store and a store beyond a class-typed hop may:
+
+```bezel
+class Log
+  public property Count: int;
+end Log;
+
+record Meter
+  public property Reading: int;
+  public readonly property Sink: Log;
+
+  public constructor(sink: Log)
+    Reading := 0;                                    // allowed: a constructor body is not a receiver position
+    Sink := sink;
+  end constructor;
+
+  public method Bump() => Reading := Reading + 1;   // error (§9.4): the store lands in the receiver's own storage
+  public method Note() => Sink.Count += 1;          // allowed: the store lands beyond a class-typed hop
+  public method Bumped(): Meter => this with(Reading := Reading + 1);  // the record update idiom
+end Meter;
+
+using var log := new Log();
+var m := new Meter(log);
+m.Reading := 5;                                      // allowed: an external store through the binding `m`
+```
+
 **The receiver value is fixed at the call.** A member call on a **copyable** value-kind receiver — a record, enum or primitive receiver, a copyable choice or inline-array receiver ([§15.3](#sec-move-only-value-types)), directly held, narrowed non-null ([§7.4](#sec-member-access-on-nullable-values)), or boxed ([§8.6](#sec-boxing)); a declared member or an extension member ([§26.7](#sec-ownership-in-extensions)) alike — runs over **the value its receiver expression denoted when that expression was evaluated** — for a boxed receiver, the payload of the box it denoted. For the whole activation `this` denotes that value — its own bytes, the references it holds included, though not the objects those references name: no store that runs during the call — to the storage the receiver expression named, through any alias of it, or to anything else — changes what `this` denotes, and the activation's completion stores nothing back. The receiver value is a **full-expression temporary** of the call ([K8](#sec-kernel-k8)), and the borrow `this` is bounded by it ([K8.4](#sec-kernel-k8)); a borrow-bearing receiver value carries into the call exactly the borrows the receiver expression's value carried, checked at the call site by [§9.7](#sec-records-and-disposal)'s rules as every other read of that value is. A member whose activation outlives the call — an `async` member ([§30.1](#sec-async-methods)) or an iterator member ([§29.3](#sec-iterator-methods)) — holds the fixed receiver value in its frame, as the frame holds a plain value argument ([§29.4](#sec-lazy-evaluation)), the value's borrows becoming carried sources of the frame ([K6](#sec-kernel-k6)). A **closure** formed in the body — a lambda that names `this`, explicitly or through a bare member read resolving to the receiver, or a bound method reference over it ([§27.6](#sec-method-references)) — captures the fixed receiver value **by copy**, taken at the closure's formation into its heap capture cell ([§27.5](#sec-closures)), as a bound reference captures a value-shaped receiver and as a frame holds the value above; the copy is unobservable, since nothing writes what `this` denotes for the whole activation and the store rejection above reads a lambda body inside the member body as the member body, and one inside a value kind's constructor body as a member body too, a function value outliving the construction window ([§22.8](#sec-field-initializers)) — a chain rooted at the captured `this` that reaches the value is rejected there. The capture contributes to the closure's source set exactly what a captured local of the receiver's type contributes ([§28.3](#sec-borrow-lifetime-rules)'s closure bullet, provenance clause 1): nothing where the type holds no borrows ([§3.6](#sec-derived-type-properties)), so such a closure is capture-free and goes wherever a capture-free function value goes — returned, stored, passed to a set-erasing position — and the sources of the borrows the value carries where it holds them (in the body, `this`'s, [K2](#sec-kernel-k2)), so the closure meets the sink rule as any capture-bearing one does and is bound, invoked and passed within the body under that bullet. In a **move-only** receiver's member body (below) a lambda's capture is [§28.9](#sec-runtime-managed-types)'s move-only capture — a borrow of the in-place storage, bounded by the call — and such a closure may not outlive the activation; a bound method reference over that `this` is [§27.6](#sec-method-references)'s formation error. For a generic value kind both counts are read at each instantiation ([§3.6](#sec-derived-type-properties) rule 2): at one whose classification is owning, a closure over `this` that would outlive the activation is a requirement of the constructed type, rejected at every site that names that type, as [§19.3](#sec-patterns)'s write-point rule is at a move-only substitution. In a value kind's **constructor** body the same copy is a whole-value read of `this` under [§22.7](#sec-observing-this-during-construction) rule 1, and the closure holds the value as of its formation: a later store in the body does not reach it. The rule governs what the member **reads**, and an author-written accessor that an assignment or compound assignment invokes ([§6.6](#sec-compound-assignments)) is a member call like any other. The **synthesized** auto-property setter alone runs no author-written body: it stores where the assignment itself stores — the named location — and that store is the assignment's (the boundary above).
+
+*Example.* The activation runs over the value its receiver expression denoted when that expression was evaluated:
+
+```bezel
+record Snap(N: int)
+  public method Show(shelf: Shelf)
+    shelf.Item := new Snap(99);       // overwrites the storage the receiver expression named
+    Console.WriteLine($"{N}");        // prints 1: `this` is the value the receiver denoted at the call
+  end Show;
+end Snap;
+
+class Shelf
+  public Item: Snap := new Snap(1);
+end Shelf;
+
+using var s := new Shelf();
+s.Item.Show(s);
+Console.WriteLine($"{s.Item.N}");     // prints 99
+```
 
 Whether the implementation realizes the fixed value as a **copy** or passes the source storage **in place** is unobservable for a copyable value kind and is the implementation's choice, under one obligation. Storage is passed in place only to a member whose activation ends before the call returns, and only where **no code reachable during the call can write or release it**: a [stable local](#sec-stable-locals) of the calling body over the call ([§7.4](#sec-member-access-on-nullable-values)); storage inside such a local's value, reached without leaving the value (the key above); or storage inside the enclosing activation's own fixed receiver, reached the same way. Everywhere else it is copied. For a **move-only** receiver ([§15.3](#sec-move-only-value-types)) the choice is not free: see *Move-only receivers* below.
 
@@ -1435,6 +1558,32 @@ A borrow-bearing record **holds borrows** ([§3.6](#sec-derived-type-properties)
   3. The **null-source** form (the static-field bullet above), which carries no borrow at all and is returnable from any member, a `static` method included — `public static method None(): Handle => new Handle(null);`.
 - A borrow-bearing record may not be captured by a closure that escapes its source's scope: the capture contributes the sources of the borrows the record carries to the closure's source set, every value the captured binding is assigned, in the enclosing body or in a lambda body, counted ([§28.3](#sec-borrow-lifetime-rules)'s closure bullet, provenance clause 1), so the closure is held to that bullet's sink rule by a non-empty set — no field, collection, `return` or set-erasing position, whichever sources the record carries, a parameter's included — and the results of invoking it, and every deferred-activation frame or storage-bounded holder it rides, are bounded by them.
 - A borrow-bearing record value may be **copied into a collection** only when every carried borrow's source provably outlives the collection's own binding scope: a store into a collection that is a field, is reachable from one, is held by a parameter that is not `owned` or reached through one, escapes the method, or whose binding's scope strictly encloses a carried source's scope is rejected at the store site ([§28.11](#sec-element-slot-policy)'s copy slots carry this obligation). The check is the same structural scope comparison as [§28.3](#sec-local-variables-ownership-and-borrows)'s borrow rules; the **store** admits no trust residual for a record-carried borrow (the instance-field bullet's posture). A kill of a carried source while the collection retains the value — a move, transfer, reassignment or disposal of the source, which no traced holder sees, a collection's slots being outside [K5.5](#sec-kernel-k5)'s holders ([K5.6](#sec-kernel-k5)) — is [§28.11](#sec-borrowing-collections)'s collection-held clause, with its domain obligation and [K4.1](#sec-kernel-k4)'s backstop, as for a class-typed borrow: a read through a carried span meets the flag ([§28.2](#sec-checked-disposal)). A collection of `CancellationToken`s whose source is declared before the collection remains expressible. In a generic body (the paragraph above this list) a `class Bag<T>` whose `Put(t: T)` copies `t` into a field-held `Array<T>` is admitted at the declaration and at `Bag<Item>` ([§28.11](#sec-borrowing-collections)'s store rule, under its residual) and rejected wherever `Bag<Pair>` is named. **The standard library's value-copy members** are stores under this bullet, read at the call over the declared signature ([§3.6](#sec-derived-type-properties) rule 2: the member's body contributes no requirement). Which members copy, whence each copied value's sources are read and where the destination lies are [§28.11](#sec-borrowing-collections)'s *Value-copy members*, read here at an instantiation at which `T` holds borrows. So `var ys := xs.ToArray();` over a local `Array<Pair>` is admitted exactly as `ys.Add(xs[0])` is, and so is `for var p in xs.Sorted(cmp) do … end`; `_keep := xs.ToArray();`, `return xs.ToArray();`, `var ys := xs.ToArray(); return ys;` and `_all.AddRange(xs)` are rejected at the call, whatever the sources of `xs`'s elements, as a store into a field-held or escaping collection is, with no residual. A copy whose elements carry no borrow — a value type that holds none, a null-source value, a `string` — is a copy and nothing more ([#5693](https://github.com/s8lap/bezel-lang/issues/5693)).
+
+*Example.* A borrow-bearing record beside one that is not:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+record Pair(Item: Item?);                   // borrow-bearing: a class-typed component
+record Label(Text: string);                 // not borrow-bearing: `string` is runtime-managed
+
+class Holder
+  private owned _item: Item := new Item("own");
+  private _label: Label := new Label("x");  // admitted: a `Label` carries no borrow
+  private _pair: Pair := new Pair(null);    // admitted: the null-source form carries none either
+
+  public method View(): Pair => new Pair(_item);            // admitted: receiver-sourced (return form 1)
+  public static method Wrap(i: Item): Pair => new Pair(i);  // error (return bullet): a plain parameter's borrow
+  public method Keep(i: Item) => _pair := new Pair(i);      // error (instance-field bullet)
+end Holder;
+
+using var i := new Item("i");
+var p := new Pair(i);                       // admitted: a local within its source's life
+var q := new Pair(new Item("t"));           // error (no-temporary-source bullet)
+Console.WriteLine(p.Item!.Name);
+```
 
 For typical short-lived uses — a record passed by value to a synchronous call frame, a `CancellationToken` ([§30.8](#sec-cancellation)) handed to an async call that completes before the source is disposed — these rules are automatic and require no annotation. (Asynchronous state-machine frames are the non-automatic case: borrow-bearing records are forbidden as `async` parameters and results, constrained as locals across `await` — [§30.1](#sec-async-methods) — and not declarable as a `Task<T>` result type at all ([§30.5](#sec-result-lifetime-and-task-disposal)'s holds-borrows row), with `CancellationToken` as the single stdlib-certified exception, [§30.8](#sec-cancellation).)
 
@@ -2399,16 +2548,67 @@ A type-bound constraint — naming a class or interface — implies non-null T. 
 
 **`value` requires a non-nullable value type.** A nullable value type — `int?`, `Priority?`, `DateTime?`, and the nullable form of any record or enum — does *not* satisfy `where T: value`, and `where T: notnull` likewise excludes every nullable type, value or reference: a nullable type is a distinct type from its non-nullable form ([§7.1](#sec-non-nullable-and-nullable-types)). To accept a nullable value type, write the constraint against the underlying value type and use `T?` in the body.
 
+*Example.* `value` excludes the nullable value types, which `new()` admits as defaultable:
+
+```bezel
+enum Level
+  Low := 1, High := 2;
+end Level;
+
+class Holder<T> where T: value
+end Holder;
+
+class Fresh<T> where T: new()
+end Fresh;
+
+var a: Holder<int>? := null;      // allowed
+var b: Holder<int?>? := null;     // error (§14.2): a nullable value type does not satisfy `value`
+var c: Fresh<int?>? := null;      // allowed: a nullable value type is defaultable; there `new T()` is `null`
+var d: Fresh<Level>? := null;     // error (§14.2): `Level` has no zero-valued constant, so is not defaultable
+```
+
 `T?` always denotes the nullable form of T. `default(T)` produces the zero/null value of T ([§17.11](#sec-the-default-operator)).
 
 A constraint combination that admits no type — `class, value`; `value` with `IDisposable` or an interface extending it, whose conforming set holds classes and interfaces only (*A type parameter as the type argument* below); and every other combination whose admitted sets are disjoint as a matter of language rule — is a compile error at the declaration. A combination empty only by **declaration** — a class bound naming a `sealed` class beside an interface that class does not implement — is not: it is well-formed, and no type argument satisfies it until the declarations it names change.
 
 **Type-parameter bounds (`where T: U`).** A constraint whose bound is another type parameter — of the same declaration, or of the enclosing type — is grammatical and has subtype semantics: a substitution S for `T` satisfies `where T: U` exactly when S is non-nullable and is a *subtype of* the substitution for `U` — identical to it, a class derived from a class substitution ([§12](#sec-inheritance-and-dispatch)), or a type conforming to an interface substitution (the conformance rule below) — and by these three relations only: no other implicit conversion of [§5.1](#sec-implicit-conversions) satisfies the bound, neither boxing to `Object`, numeric widening, nullable wrapping nor a variance-induced conversion, while a value type conforming to an interface substitution satisfies it by conformance (its boxing realized in the body, [§5.1](#sec-implicit-conversions)'s type-parameter row). At `U := Object` the bound admits `Object` and every class type, and nothing else: `string`, interfaces and function types are not classes ([§8.1](#sec-definition)) — the `class` constraint admits them, the three relations do not — and a value type reaches `Object` only by boxing, which they exclude; at `U := long` it admits `long` alone; at a nullable substitution for `U` it admits no type, none being identical to it and a nullable type being neither a class nor an interface. The check runs at instantiation, after both parameters are substituted. Inside the body, a `T`-typed value is usable in any `U`-typed position, and `T` conforms to every interface that `U`'s own constraints guarantee; an unconstrained `U` contributes only `Object`'s surface. Like every type-bound constraint, `where T: U` implies non-null `T` (`T?` is the nullable companion). A self-referential bound (`where T: T`) or a cycle among type-parameter bounds (`where T: U` together with `where U: T`) is a compile error at the declaration.
 
+*Example.* A type-parameter bound admits identity, derivation and conformance, and no other conversion:
+
+```bezel
+class Animal
+end Animal;
+
+class Dog: Animal
+end Dog;
+
+class Rel<T, U> where T: U
+end Rel;
+
+var a: Rel<Dog, Animal>? := null;    // allowed: a class derived from the class substitution for `U`
+var b: Rel<int, long>? := null;      // error (§14.2): numeric widening does not satisfy the bound
+var c: Rel<int, Object>? := null;    // error (§14.2): nor does boxing
+```
+
 **A type parameter as the type argument.** Where a constraint's satisfaction turns on a type parameter in scope, it is decided at the instantiation site ([§14.1](#sec-generic-declarations)) that names the argument, by the constraints of the parameters it turns on — the assumption under which the enclosing declaration is checked ([§3.6](#sec-derived-type-properties) rule 2); for a method type parameter of an override or interface implementation, they are its constraint set as *Constraints on overrides and interface implementations* below defines it. An unsatisfied constraint is a compile error at that site, naming the constraint, the argument and the parameter it turns on; nothing of it is carried to the naming declaration's instantiations, which satisfy the constraint by construction ([§14.1](#sec-generic-declarations) *Instantiation and its site*). The remedy is a constraint on the parameter that guarantees it, or an argument whose satisfaction does not turn on the parameter. Two cases:
 
 1. **The argument is a type parameter `P`** — a field `C<W>` in `class Box<W>`, a call `G<U>(…)` at written or inferred type arguments in the body of `F<U>`: the constraint is decided **at that site, by `P`'s own constraints**. `P` satisfies the constraint exactly when its constraints guarantee it at every substitution they admit, as a matter of language rule — an ordinary interface's conforming set is open, so an interface bound excludes only what a language rule excludes. So for `class C<T> where T: new()`, `C<W>` is admitted in `class Box<W> where W: new()` and rejected in an unconstrained `class Box<W>`. `class` is guaranteed, for instance, by `where W: class`, by a class bound, and by a bound naming `IDisposable` or an interface extending it, whose conforming set holds classes and interfaces only (*Worked example: `where T: IDisposable`* below). A type bound guarantees `where T: IFoo` by *Interface conformance* rule 6 below, and `where T: SomeClass` when it names `SomeClass` or a class derived from it, directly or through a `where W: V` chain. A derived-property constraint is guaranteed only by `P`'s carrying the same constraint, since nothing is inferred (*Derived-property constraints* below).
 2. **The argument contains a type parameter** (`C<Pair<W>>`, `C<Array<W>>`, `C<W?>`), or, under `where T: U`, the argument for `T` has a bound whose argument is or contains one (`C<Widget, X>` in `class Box<X>`, for `class C<T, U> where T: U`): the constraint is decided at that site, and holds exactly when it holds at every substitution of those parameters that their constraints admit, as a matter of language rule; for a derived-property constraint, a parameter the argument contains counts as having the property only where it carries the same constraint. So `C<Array<W>>` satisfies `class` and fails `value` whatever `W`'s constraints; `C<W?>` fails `notnull`, `class`, `value` and every type bound (the owning family's `where T: class`, which [§14.4](#sec-owned-as-a-generic-argument)'s element rule reads nullability-stripped, excepted), and satisfies `hashable` exactly where `W` carries `hashable` ([§3.6](#sec-derived-type-properties)'s hashable row, clause (c)) and `new()` exactly where `W`'s constraints guarantee a value type (as `where W: value` does, `W?` then being a nullable value type); and `C<Widget, X>` is rejected in an unconstrained `Box<X>`, which admits `X = int`.
+
+*Example.* A constraint whose satisfaction turns on a type parameter is decided where the argument is named, by that parameter's own constraints:
+
+```bezel
+class Maker<T> where T: new()
+end Maker;
+
+class Good<W> where W: new()
+  private _m: Maker<W>? := null;    // allowed: `W`'s own constraint guarantees `new()`
+end Good;
+
+class Bad<W>
+  private _m: Maker<W>? := null;    // error (§14.2): decided here by `W`'s constraints, and `W` has none
+end Bad;
+```
 
 <a id="sec-derived-property-constraints"></a>
 #### Derived-property constraints
@@ -2512,7 +2712,9 @@ A user-defined generic type that needs to own its elements composes over `Owning
 public class OwningCache<T> where T: class
   private owned _items: OwningArray<T>;
 
-  public constructor() _items := new OwningArray<T>(); end;
+  public constructor()
+    _items := new OwningArray<T>();
+  end;
 
   public method Add(owned item: T)
     _items.Add(move item);
@@ -2786,7 +2988,7 @@ The `move arr[i]` form is admitted on both `[N owned]T?` and `[N owned]T` slots 
 Every inline array `[N]T` (with any modifier combination) exposes:
 
 - `arr.Length: int` — compile-time constant N.
-- Indexer `arr[i]` for read and write. Bounds checking applies; a constant index proven in-range at compile time elides the check.
+- Indexer `arr[i]` for read and write. Bounds checking applies; a constant index proven in-range at compile time elides the check, and a constant index ([§17.14](#sec-constant-expressions)) outside `0..<N` — negative, or `N` or more — is a **compile error at the index**, for a read and for a write alike, never a deferred `IndexOutOfRangeException`: the extent is part of the type, so the fault depends on no state, and it is decided where it is written — the posture of [§5.2](#sec-explicit-conversions)'s constant-operand rule and [§6.5](#sec-bitwise-operations)'s constant shift count. A non-constant index — a loop variable, a runtime `const` ([§21.1](#sec-runtime-const-locals)), any computed value — is bounds-checked at run time.
 - `arr.ToArray(): owned Array<T>` — a fresh heap array of the N slots: value-typed slots copied; class-typed slots stored as borrows. For `[N owned]…` arrays the result borrows the slots — the inline array retains ownership, matching the iteration/equality borrow rule below.
 - `arr.Contains(item: T): bool` — a linear search comparing `item` with each element by the element type's `Equals` ([§9.2](#sec-equality-through-a-type-parameter)'s first kind). Through [§17.5](#sec-the-in-operator)'s structural `Contains` lookup this makes `x in arr` well-formed with no grammar change.
 
@@ -2846,6 +3048,28 @@ The move-only value type kinds in this specification are two: the owning inline 
 - **Equality**: move-only values support equality via borrowing comparison (reads each slot without moving), provided their element types support equality.
 - **Pattern binding**: a `case` binding over a move-only scrutinee is a **borrow** of the value; consuming operations through the binding (`move s[i]`) are rejected ([§19.3](#sec-patterns)). In an **owning match** over an owning choice ([§35.5](#sec-owning-match)), a case-payload of move-only value type matched by a **positional slot** instead **transfers into its binding at arm selection**, exactly as an `owned` payload does; a **named slot** keeps the borrow ([§19.3](#sec-patterns)); the transferred binding is then a move-only owned local of the arm body's scope under this section's rules. A borrowing-match binding of a move-only payload may not be live at a write point of the construct unless the scrutinee's source is provably unwritten ([§19.3](#sec-patterns)).
 - **Member calls**: a bodied member call on a move-only receiver passes the receiver's storage in place at every source, `this` a borrow of that storage for the activation; an `async` or iterator member cannot be called on a move-only receiver ([§9.4](#sec-value-receivers-are-borrows) *Move-only receivers*).
+
+*Example.* An owning inline array moves at a plain binding and a plain argument, and drops its displaced slots on reassignment:
+
+```bezel
+class Res(name: string)
+  public property Name: string => name;
+
+  destructor
+    Console.WriteLine($"disposed {name}");
+  end destructor;
+end Res;
+
+public static method Take(arr: [2 owned]Res?) => Console.WriteLine("taken");
+
+var a: [2 owned]Res? := [new Res("x"), null];
+var b := a;                            // moves: a copy is impossible, so no marker is written
+Console.WriteLine(a[0]!.Name);         // error: `a` is moved-from
+b := [new Res("y"), new Res("z")];     // drop-on-overwrite: "x" is disposed after the new value is built
+Take(b);                               // a by-value-move parameter: unmarked; `b` is moved-from
+var c: [2 owned]Res? := [new Res("w"), null];
+Take(move c);                          // error: the marker is rejected at a move-only argument
+```
 
 `using var` is admitted for move-only inline arrays per the general rule of [§28.10](#sec-using-var) (which admits `using var` for any value-type or runtime-managed RHS). For a move-only inline-array local, `using var` has no disposal effect (scope-end auto-dispose runs whether or not `using var` is applied), and its only observable consequence is preventing reassignment; an unmarked move-only initializer is **adopted**, not pinned ([§28.10](#sec-using-var)). Programs that want to express "this owning inline-array binding is fixed at construction and may not be rebound" may use `using var arr: [16 owned]Connection?;`; programs that do not need the reassignment lock use plain `var`. Both are admitted; both produce identical runtime behavior at scope end, and neither draws a diagnostic — the must-use lint does not attach at this kind (*Local lifetime* above).
 
@@ -2908,7 +3132,7 @@ The **sequence literal** form `[e1, e2, ...]` (bare expressions) targets every s
 - `Set<T>`, `OwningSet<T>`: duplicates are collapsed (see below). For `Set<T>` the resulting iteration order **is** the literal's textual order of first occurrences — insertion order, which stdlib [§4.10](Bezel_Standard_Library.md#sec-sett-and-ownedsett) guarantees; `OwningSet<T>` makes no iteration-order guarantee (same section).
 - `Dictionary<K, V>`, `OwningDictionary<K, V>`: insertion order follows textual order; this matters because dictionary iteration is insertion-ordered (stdlib [§4.8](Bezel_Standard_Library.md#sec-dictionaryk-v)).
 
-For owning targets, the literal's element expressions must produce owned values; ownership transfers from each expression into the constructed collection. This applies uniformly to `OwningArray<T>`, `OwningLinkedList<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningSet<T>`, and `OwningDictionary<K, V>` (value position; its key position is a borrowing position, which the fresh-store warning below reaches — the literal-site rejection of this paragraph is deliberately not extended to it). (For fresh trivial-dispose nodes transferred into owning element slots, the literal-tree ownership rule below assigns each node's aggregate to its owning slot.)
+For owning targets, the literal's element expressions must produce owned values; ownership transfers from each expression into the constructed collection. This applies uniformly to `OwningArray<T>`, `OwningLinkedList<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningSet<T>`, and `OwningDictionary<K, V>` (value position; its key position is a borrowing position, which the fresh-store rule below reaches at the store site). (For fresh trivial-dispose nodes transferred into owning element slots, the literal-tree ownership rule below assigns each node's aggregate to its owning slot.)
 
 For **borrowing-family** targets (every borrowing-form target under [§15.4.1](#sec-the-user-defined-sequence-literal-protocol) — `Array<T>`, `Set<T>`, `LinkedList<T>`, `Stack<T>`, `Queue<T>`, and any user class that is one — and the key and value positions of `Dictionary<K, V>`), each element expression of **non-trivial-dispose class type** ([§28.9](#sec-runtime-managed-types)) must be a **borrow** whose source satisfies the store rule of [§28.11](#sec-borrowing-collections); an element expression that is a **fresh producer** of such a type — an unbound owned temporary ([§28.3](#sec-unbound-owned-temporaries)): a `new` expression, a nested collection literal targeting a non-trivial-dispose collection type (built-in, or any sequence-literal target under [§15.4.1](#sec-the-user-defined-sequence-literal-protocol) — the factory result is `owned TSelf`), or an `owned`-returning call — is rejected at the literal site. The temporary would be disposed at the end of the declaration statement, leaving the constructed collection holding a dangling borrow from birth — the statically-certain dangle of [§9.7](#sec-records-and-disposal)'s no-temporary-source rule, and an escape of a fresh owned value into a non-owning location ([§28.6](#sec-leak-prevention)). The remedy names the source first — `using var c := new Connection("a"); var conns: Array<Connection> := [c];` — or uses the owning family (`OwningArray<Connection>`), which takes ownership.
 
@@ -2925,7 +3149,7 @@ This is what keeps this section's own nested-literal examples well-formed: in th
 5. **`Add` after construction is not a literal position** (the store paragraph below). Aggregate membership never grows.
 6. **Field initializers**: a fresh class-typed literal tree in a field initializer ([§22.8](#sec-field-initializers)) requires an `owned` field — [§28.6](#sec-leak-prevention)'s fresh-store rule, applied uniformly at trivial-dispose types — and the aggregate is then freed in the containing object's teardown cascade. An `owned` field of trivial-dispose type does not flip the containing class's classification ([§28.9](#sec-runtime-managed-types)).
 
-The rejection of non-trivial fresh producers is deliberately **literal-only** (recorded): `Add`, `Insert`, and the indexer-set on a borrowing collection remain governed by [§28.3](#sec-unbound-owned-temporaries)'s unbound-temporary admission and [§28.11](#sec-borrowing-collections)'s residual-trust store rule — an opaque callee's signature type-announces no retention — so `coll.Add(new Connection("a"))` stays admissible and stays the borrow-lifetime hazard that checked disposal mode backstops. A literal is a language construct whose storage semantics the compiler fully knows; it does not hide behind signature-level trust. The same admission covers a **fresh trivial-dispose argument** — `groups.Add("odds", [1, 3, 5]);` — as the same hazard: the argument is an unbound owned temporary (or a K8-temporary-owned aggregate, per resolution 1) freed at its K8 boundary, so the collection retains a reference to a freed instance, backstopped by checked disposal mode ([§28.2](#sec-checked-disposal)). Because the retention is statically certain to outlive the value, the compiler **must warn** when a store-position argument in a **borrowing position** — `Add`/`Insert` and the indexer-set on a borrowing-family collection, key and value positions alike, and the **key** position of `OwningDictionary<K, V>`, which owns its values and not its keys (stdlib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)), so a class-typed key is held as a borrow exactly as `Dictionary<K, V>`'s is — is a **fresh unbound owned temporary of class type** ([§28.3](#sec-unbound-owned-temporaries)): a `new` expression, a collection literal, an `owned`-returning call result, a `move` result, or a **`Task`-family call result** (calls mint, [§28.3](#sec-producers)) — the trivial-dispose shape above and the full non-trivial set alike (the taken #1813 follow-on; rationale [§5.28](Bezel_Design_Rationale.md#sec-silent-tracking)). The warning names the [K8](#sec-kernel-k8) boundary at which the argument dies and the remedies — bind the source to a named holder first (`var odds: Array<int> := [1, 3, 5]; groups.Add("odds", odds);` — the annotation supplies the literal's target type, and the store rule's ordinary residual then attaches to `odds`), or use the owning family, whose store positions take ownership (`OwningDictionary<string, Array<int>>`, whose `Add` takes the value `owned` — for an owning map's *key* only the first remedy applies, `using var k := new K(); od[k] := v;`, and only where [§28.11](#sec-borrowing-collections)'s store rule admits the bound key, the collection not outliving `k`'s scope; for dynamic task fan-in, `OwningArray<OwningTask<T>>` with the owning `Task.WhenAll` overload, stdlib [§6.7](Bezel_Standard_Library.md#sec-task-static-helpers)). The stated hazard splits by family: for a **trivial-dispose** argument the boundary event is the compiler's free and the hazard is the retained dangling reference (checked-mode `DisposedAccessException` on later use, [§28.2](#sec-checked-disposal)); for a **`Task`-family** argument the boundary event is the task's disposal — the operation is *abandoned*: it runs to its terminal state unsupervised and its result, if owned, is disposed on arrival ([§30.5](#sec-result-lifetime-and-task-disposal)) — and the slot dangles besides; for any other non-trivial-dispose class the boundary event is the value's disposal and the hazard is the dangling slot. The warning does not narrow the admission: the program remains accepted, no `using var` is demanded, and the recorded literal-only-rejection asymmetry above stands unchanged.
+The literal-site rejection has a **store-site counterpart** (recorded; rationale [§5.28](Bezel_Design_Rationale.md#sec-silent-tracking)): a **fresh unbound owned temporary of class type** ([§28.3.11](#sec-unbound-owned-temporaries)) — a `new` expression, a collection literal, an `owned`-returning call result, a `move` result, or a **`Task`-family call result** (calls mint, [§28.3](#sec-producers)) — in a **single-element store position of a borrowing-family collection** is a **compile error at the store site**. The positions are the single-element stores of [§28.11](#sec-borrowing-collections)'s value-copy shape (ii) — `Add`, `Insert`, `Push`, `Enqueue`, `TryAdd`, `LinkedList<T>`'s `AddFirst`/`AddLast`/`AddBefore`/`AddAfter`, `GetOrAdd`'s key, `Counter<K>.Increment`'s key — and the indexer-set, **key and value positions alike**, on every collection of the borrowing family (stdlib [§4.1](Bezel_Standard_Library.md#sec-borrowing-collection-interfaces): the standard borrowing collections and the four borrowing interfaces) — the position is the member the call resolves to, so a receiver typed at an interface extending one of the four or at a type parameter constrained to one is covered, while a user class's own member called at its own type is not (the posture of stdlib §4.1's equality search) — and the **key** position of `OwningDictionary<K, V>`, which owns its values and not its keys (stdlib [§4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)), so a class-typed key is held as a borrow exactly as `Dictionary<K, V>`'s is. The rule covers the trivial-dispose shape — `groups.Add("odds", [1, 3, 5]);`, where the argument is an unbound owned temporary (or a K8-temporary-owned aggregate, per resolution 1) — and the full non-trivial set alike: the argument dies at its [K8](#sec-kernel-k8) boundary (the end of the statement) while the collection retains a reference to it, so the slot dangles with certainty from the statement's end — the escape of a borrow of a temporary past its boundary that [K8.4](#sec-kernel-k8) rejects, the same dangle [§28.11](#sec-borrowing-collections)'s store rule rejects for a borrow of a scope-bound binding, at the narrowest scope a value can have, and the same escape of a fresh owned value into a non-owning location as [§28.6](#sec-leak-prevention)'s fresh-store error. The boundary event splits by family — for a **trivial-dispose** argument the compiler's free, for a **`Task`-family** argument the task's disposal (the operation would be *abandoned*: run to its terminal state unsupervised, its result, if owned, disposed on arrival, [§30.5](#sec-result-lifetime-and-task-disposal)), for any other non-trivial-dispose class the value's disposal — and the diagnostic names the boundary and the remedies: bind the value to a named holder first (`var odds: Array<int> := [1, 3, 5]; groups.Add("odds", odds);` — the annotation supplies the literal's target type, and the store rule's ordinary residual then attaches to `odds`; `using var c := new Connection("a"); conns.Add(c);`), or use the owning family, whose store positions take ownership (`OwningDictionary<string, Array<int>>`, whose `Add` takes the value `owned`; `OwningArray<Connection>` — for an owning map's *key* only the first remedy applies, `using var k := new K(); od[k] := v;`, and only where [§28.11](#sec-borrowing-collections)'s store rule admits the bound key, the collection not outliving `k`'s scope; for dynamic task fan-in, `OwningArray<OwningTask<T>>` with the owning `Task.WhenAll` overload, stdlib [§6.7](Bezel_Standard_Library.md#sec-task-static-helpers)). The rule reaches no other callee: the store positions above are compiler-known members whose declared signatures the standard library reads as stores ([§28.11](#sec-borrowing-collections), *Value-copy members*), while a plain parameter of a **user-declared** member — `sink.Consume(new X())`, a user class's own `Add`, a [§15.4.1](#sec-the-user-defined-sequence-literal-protocol) target's included — announces no retention and keeps [§28.3.11](#sec-unbound-owned-temporaries)'s unbound-temporary admission under the residual trust [K4.3](#sec-kernel-k4) records (rationale [§5.24](Bezel_Design_Rationale.md#sec-the-full-expression-boundary)), the temporary dying at its boundary and a later use through a stored reference meeting [§28.2](#sec-checked-disposal)'s backstop.
 
 For `Set<T>`, the literal elements must have type `T`. Duplicate elements (per `T`'s equality contract) are silently collapsed; the first occurrence in textual order is retained. For `OwningSet<T>`, duplicates are silently collapsed and each later duplicate's owned element is disposed at construction (the set retains only the first instance per equality class).
 
@@ -3147,7 +3371,7 @@ end Range;
 
 `Contains` is the operation invoked by `in` ([§17.5](#sec-the-in-operator)). **Normative formula:** `Contains(v)` is `true` iff the range is **nonempty under iteration** (`IsEmpty` is `false`) **and** `min(Start, End) <= v <= max(Start, End)`, with `v = End` additionally excluded when `IsEndInclusive` is `false`; a `null` endpoint (open-ended form) imposes no bound on its side and never makes the range empty. `Step` affects membership only through emptiness/direction — `0..10 step 2` contains `3`. Consequently an iteration-empty range contains nothing: `50 in 100..0` is `false` (matching Rust and Python), while `(100..0 step -1).Contains(50)` is `true` (descending and nonempty). A caller who wants *unordered-interval* membership over possibly-inverted endpoints writes it explicitly: `Math.Min(a,b) <= v and v <= Math.Max(a,b)`.
 
-`GetEnumerator` produces an enumerator that yields values from `Start` to `End` (inclusive or exclusive per `IsEndInclusive`), incrementing by `Step`. Calling `GetEnumerator` on an open-ended range raises `InvalidOperationException`. The compiler warns when an open-ended range literal appears directly in a `for` statement or other iteration context.
+`GetEnumerator` produces an enumerator that yields values from `Start` to `End` (inclusive or exclusive per `IsEndInclusive`), incrementing by `Step`. Calling `GetEnumerator` on an open-ended range raises `InvalidOperationException`. An open-ended range literal written directly as the source of a `for` statement is a compile error ([§16.5](#sec-iteration-open-ended-ranges)).
 
 <a id="sec-iteration-over-rangechar"></a>
 #### Iteration over `Range<char>`
@@ -3205,10 +3429,10 @@ The compiler may optimize `for var i in rangeExpr do ... end` into a counted loo
 <a id="sec-iteration-open-ended-ranges"></a>
 #### Open-ended ranges
 
-Iterating an open-ended range raises `InvalidOperationException` at the call to `GetEnumerator`, before any iteration occurs. The compiler emits a warning when an open-ended range literal appears in an iteration context:
+Iterating an open-ended range raises `InvalidOperationException` at the call to `GetEnumerator`, before any iteration occurs. An open-ended range **literal** — `10..`, `..5`, `..` — written directly as the source expression of a `for` statement ([§21.4](#sec-the-for-statement)), parenthesized or not, is a **compile error at the literal**: no execution reaches the loop body, so no program with this shape has a meaning to preserve, and the diagnostic names what the form is for, slicing and patterns. The rule reads the source expression as written and nothing else: the same literal reached through a variable, a call, a parenthesized chain (`(10..).Where(…)`) or any other expression is the run-time fault.
 
 ```bezel
-for var i in 10.. do ... end;     // WARNING: open-ended range cannot be iterated
+for var i in 10.. do ... end;     // ERROR: an open-ended range literal cannot be iterated
 ```
 
 For ranges stored in variables, the check is deferred to runtime:
@@ -4254,7 +4478,9 @@ For async iteration, see `await for` ([§30.7](#sec-asynchronous-programming-asy
 ```bezel
 scan: for var row in rows do
   for var cell in row do
-    if cell.Bad then break scan; end;
+    if cell.Bad then
+      break scan;
+    end;
   end;
 end scan;
 ```
@@ -4413,6 +4639,43 @@ An expression body under a declared return type is a **declared-result position*
 - `out owned` — output parameter that produces an owned value. The callee assigns an owned value through the parameter; the caller receives ownership and must discharge it (typically with `out using var` at the call site, [§22.4](#sec-inline-out-declarations)). The combination `out owned` is the only modifier compound; the others are mutually exclusive.
 - `scoped` — storage-bounded retention ([§28.14](#sec-scoped-callback-parameters)). On a *function-typed* parameter: the callee may store the callback, bounded by the storing object's lifetime; the caller's captures are checked against that bound. On a **class- or interface-typed** parameter (except one whose declared type, nullability stripped, is `Object`, [§28.14](#sec-scoped-callback-parameters)): the callee may store the *borrow* in a direct non-owned field of the bounding object; the caller's argument is checked against the same bound and **frozen** until the bound's scope exits, upgrading [§28.3](#sec-local-variables-ownership-and-borrows)'s residual-trust back-reference to a static guarantee. **Call-site marker:** a class- or interface-typed `scoped` argument is written `M(scoped x)` — the same mark-it-at-the-site discipline as the `move` marker above, though `scoped` remains an *argument modifier*: it marks a lending mode, not an action, and the asymmetry is deliberate; a fresh producer is rejected ([§9.7](#sec-records-and-disposal)'s no-temporary-source rule — bind it first). Function-typed arguments (lambda literals, method references) carry no call-site marker — their admission is capture-based. A function-typed parameter *without* `scoped` is **call-bounded**: the callee may invoke the callback during the call but may not retain it past the call ([§28.14](#sec-scoped-callback-parameters)). *(the transfer marker likewise appears in local binding and assignment positions — `var y := move x;`, `y := move x;` — [§28.3](#sec-local-variables-ownership-and-borrows).)*
 
+*Example.* A `ref` parameter is read at its declared type and narrowed through a local copy:
+
+```bezel
+public static method Bump(ref x: int?)
+  if x <> null then
+    x := x + 1;                 // error (§22.3): a `ref` parameter is never flow-narrowed
+  end;
+end Bump;
+
+public static method Inc(ref x: int?)
+  var c := x;
+  if c <> null then
+    x := c + 1;                 // allowed: the local copy `c` is narrowed
+  end;
+end Inc;
+```
+
+*Example.* An `out` recipient receives the callee's slot on normal return only:
+
+```bezel
+public static method Fill(out n: int, fail: bool)
+  n := 42;
+  if fail then
+    throw new InvalidOperationException("fail");
+  end;
+end Fill;
+
+var n := 1;
+try
+  Fill(out n, true);
+catch
+  InvalidOperationException => Console.WriteLine($"{n}")    // prints 1: an exception exit copies nothing out
+end try;
+Fill(out n, false);
+Console.WriteLine($"{n}");                                  // prints 42: copied out on normal return
+```
+
 <a id="sec-ref-and-out-argument-locations"></a>
 #### `ref` and `out` argument locations
 
@@ -4423,6 +4686,41 @@ A `ref` or `out` argument must be an **assignable storage location** — the [§
 **A bare variable names its declared location.** A `ref` or `out` argument that is a bare local or parameter (`ref a`, `out a`) names that variable's storage, so its static type at the `ref`/`out` position (for this rule and for [§14.5](#sec-type-argument-inference)'s exact unification alike) is the variable's **declared** type. No flow narrowing applies to it, neither [§7.4](#sec-member-access-on-nullable-values)'s non-null narrowing nor [§12.7](#sec-type-tests-is-is-not-as)'s type narrowing. Inside `if a is Dog then … end;` over `a: Animal`, `ref a` matches a `ref x: Animal` parameter and not a `ref x: Dog` one, and at `M<T>(ref x: T)` it binds `T` to `Animal`; over `n: int?` narrowed non-null, `ref n` matches `ref x: int?` and not `ref x: int`. A `ref` callee's alias is live for the whole call, and §7.4 drops a mutably captured variable's narrowing only after the call, so a narrowed referent type would let a closure that captured `a` store an `Animal` that the callee then reads as a `Dog`. To pass the narrowed value, copy it out: `var d: Dog := a; G(ref d);`. This paragraph governs the bare variable only: a chain rooted at a narrowed variable (`ref a.Tag`, `ref o[0]`) reads its root, and the location it names is typed by its final hop, subject at a boxed location to §12.7's write rule and, inside a narrowed nullable value, to [§7.4](#sec-member-access-on-nullable-values)'s *Storage inside a narrowed nullable value*, which rejects `ref n.X` over `n: Pt?`.
 
 **`ref` local and field targets alias; accessor targets bracket.** A `ref` argument naming a mutable local or writable field is a true alias: callee writes are visible through the caller's location immediately (the `Swap(ref a, ref b)` semantics [§14.1](#sec-generic-declarations) presupposes). An **indexer slot or property** target is instead **copy-in / copy-out** under [§17.6](#sec-increment-decrement-on-indexer-slots)'s evaluate-once discipline: the receiver and every index expression are evaluated exactly once, in [§22.5](#sec-optional-parameters-and-named-arguments)'s call-site textual order; for `ref`, the getter is called once to produce the callee's slot value (for `out` no getter call occurs); on **normal return** the setter is called once with the slot's final value. Write-backs for multiple accessor-mediated arguments run in argument textual order — `Swap(ref a[i], ref a[i])` is defined, the textually later write-back winning — and on an exception exit no write-back occurs, composing with the copy-out rule above. Accessor-mediated arguments are never aliases of each other or of anything else during the call.
+
+*Example.* A `ref` argument has the parameter's referent type exactly, and a bare variable names its declared location:
+
+```bezel
+public static method Twice(ref x: long) => x := x * 2;
+public static method Clear(ref x: int?) => x := null;
+
+var i := 3;
+Twice(ref i);                 // error (§22.3): `int` is not exactly `long`; no widening at a `ref` argument
+var m: int? := 3;
+if m <> null then
+  Clear(ref m);               // allowed: `ref m` names the declared `int?` location, not the narrowed `int`
+end;
+```
+
+*Example.* A property target is read once and written back once, on normal return:
+
+```bezel
+class Gauge
+  private _v: int := 1;
+
+  public property Value: int
+    get => _v;
+    set => do
+      Console.WriteLine($"set {value}");
+      _v := value;
+    end;
+  end Value;
+end Gauge;
+
+public static method Twice(ref x: int) => x := x * 2;
+
+using var g := new Gauge();
+Twice(ref g.Value);           // getter once, then the setter once on normal return: prints "set 2"
+```
 
 <a id="sec-inline-out-declarations"></a>
 ### 22.4 Inline `out` declarations
@@ -5090,7 +5388,9 @@ public static class AppConfig                    // LoadConfigAsync(): Task<Conf
   end Preload;
 
   public static async method GetConfig(): Task<Config>   // pattern (b)'s accessor
-    if _cfg = null then _cfg := LoadConfigAsync(); end;
+    if _cfg = null then
+      _cfg := LoadConfigAsync();
+    end;
     return await _cfg!;
   end GetConfig;
 end AppConfig;
@@ -5110,7 +5410,9 @@ There is deliberately **no** synchronous-access, async-initialized, plain class-
 ```bezel
 private static _cfg: Task<Config>? := null;
 public static async method GetConfig(): Task<Config>
-  if _cfg = null then _cfg := LoadConfigAsync(); end;
+  if _cfg = null then
+    _cfg := LoadConfigAsync();
+  end;
   return await _cfg!;
 end GetConfig;
 ```
@@ -5204,6 +5506,32 @@ A pure body may contain exactly the following; the list is closed, and everythin
 
 Prohibited, as the closed list's contrapositive: any store whose target root is an instance field, a static field, an indexer slot of a class instance, or whose access path dereferences a class-typed reference (stores to `this`'s fields outside pure constructors' birth stores included); every owned-consuming or disposal-running operation (`Dispose()`, `move`, `owned` arguments, `set(owned)` stores, the consuming discard); **class construction** — `new C(…)`, collection literals of class collection types, calls returning `owned` class instances — except the throw operand below (constructors and destructors run arbitrary user code, and an owned instance drags in the discharge machinery); **invoking function-typed values** (the value's type carries no effect information); `await`; `yield`; `extern` calls.
 
+*Example.* A pure body may mutate its own frame but no storage outside it, and may call only pure members:
+
+```bezel
+class Stats
+  private _calls: int := 0;
+
+  public static method Log(s: string) => Console.WriteLine(s);
+
+  public pure method Sum(xs: Array<int>): int
+    var total := 0;                     // frame-local mutation is admitted
+    for var x in xs do
+      total += x;                       // a concrete `Array<T>` source: no enumerator is constructed
+    end;
+    return total;
+  end Sum;
+
+  public pure method Calls(): int
+    _calls += 1;                        // error (§22.15): a store to an instance field
+    return _calls;
+  end Calls;
+
+  public pure method Apply(f: (int) -> int): int => f(1);   // error (§22.15): invoking a function-typed value
+  public pure method Shout(s: string) => Log(s);            // error (§22.15): a call to a member not declared pure
+end Stats;
+```
+
 <a id="sec-pure-throw"></a>
 #### The throw carve-out
 
@@ -5240,6 +5568,20 @@ Each pure body is checked in isolation against the rules above; every call site 
 3. **Monotone down the chain.** An override matches against the nearest overridden declaration: once a chain member is pure, every further override is pure.
 
 Admission therefore implies that every dynamic target of the dispatched call is a checked pure body. `pure` is not an overload discriminator ([§22.6](#sec-overloading)): like `async`, it constrains the body and the contract, not selection. A generic pure member is checked once, at its declaration, under its constraints; calls on constraint-typed values resolve to the constraint interface's declared members — none pure in this revision — so generic pure bodies handle type-parameter-typed values opaquely (copy, hold, return). Nothing purity-relevant depends on the substitution.
+
+*Example.* An override keeps the purity of the member it overrides, and may add it:
+
+```bezel
+class Shape
+  public pure virtual method Area(): double => 0.0;
+  public virtual method Name(): string => "shape";
+end Shape;
+
+class Square: Shape
+  public override method Area(): double => 4.0;            // error (§22.15 rule 1): purity is never dropped
+  public pure override method Name(): string => "square";  // allowed (rule 2): purity may be strengthened
+end Square;
+```
 
 <a id="sec-pure-accessors"></a>
 #### Properties, indexers, accessors
@@ -5330,7 +5672,7 @@ Purity is what makes the tier system coherent: because a clause has no effects, 
 
 **`ContractViolationException`** joins the built-in hierarchy ([§31.4](#sec-standard-exception-types)), deriving directly from `Exception` — clause evaluation is a language operation, like the indexer's `IndexOutOfRangeException`. It is catchable; its `Message` carries the clause kind, the member, and the clause's source text. Programs must not use it for control flow — it reports a bug (a caller bug for `requires`, an implementation bug for `ensures`/`invariant`), not an outcome.
 
-**`requires` violations are always-on**: an unproven `requires` clause is compiled as a runtime check in every build mode; it is never elided. (A proven clause is discharged statically and compiles to nothing — elision-by-proof is the only elision. An implementation may additionally elide the check at a particular call site it can statically discharge — unobservable by purity — but the clause's recorded tier stays checked.) This is the always-on posture of the `throw new ArgumentException(…)` prologue the clause replaces; the remedy for hot paths is the proven ratchet, not a knob.
+**`requires` violations are always-on**: an unproven `requires` clause is compiled as a runtime check in every build mode; it is never elided. A call whose written arguments make a `requires` clause a constant expression folding to `false` — `Half(-4)` under `requires(n > 0)`, `new C(-1)` under `requires(v > 0)` — is a **compile error at the call**, not a run-time violation: the clause is discharged at every call site by substitution (*The tier system* below), and a clause the substitution folds `false` is the prover floor's statically violated contract, wherever the call is written. (A proven clause is discharged statically and compiles to nothing — elision-by-proof is the only elision. An implementation may additionally elide the check at a particular call site it can statically discharge — unobservable by purity — but the clause's recorded tier stays checked.) This is the always-on posture of the `throw new ArgumentException(…)` prologue the clause replaces; the remedy for hot paths is the proven ratchet, not a knob.
 
 **`ensures` and `invariant` run under checked-contracts mode** — a per-build choice between two conformance modes, independent of [§28.2](#sec-checked-disposal)'s disposal-checking mode: in **unchecked (release) mode** — the default — unproven `ensures` and `invariant` clauses are not evaluated; in **checked-contracts mode** they are evaluated at this section's points, a `false` clause raising `ContractViolationException`. The two modes give identical observable behavior for every program whose checked clauses never evaluate `false` and never fault: clauses are pure, so non-evaluation is unobservable by construction — the deliberate contrast with §28.2, whose release relaxation is undefined behavior. `requires` clauses are outside the mode entirely.
 
@@ -5339,9 +5681,42 @@ Purity is what makes the tier system coherent: because a clause has no effects, 
 
 Every contract clause occupies exactly one **tier**, determined statically per clause: **proven** — discharged statically at the clause's discharge site, never evaluated at runtime, zero cost in every mode (prover soundness is a conformance obligation); **checked** — compiled to a runtime evaluation at this section's points, under the mode rules above.
 
-**Discharge sites differ by clause kind.** An `ensures` clause is discharged at the **declaring body**: the prover shows every normal-completion path establishes it — `static ensures` makes an unprovable body a compile error at the declaration ([§22.4](#sec-out-nullability-postcondition)'s existing rule). An `invariant` member takes no `static` qualifier (*Class invariants* below). A `requires` clause is the body's assumption; its discharge site is **every call site**: the caller's compiler substitutes the actual arguments into the clause and discharges the instance — `static requires` makes an undischargeable call a compile error at that call, and the callee compiles no runtime check because every admitted call carries a proof. A **`static requires` clause may mention only state its call sites can see** (the member's parameters, and members visible to every caller); a `static requires` over non-public state is a compile error at the declaration. Checked `requires` clauses are unrestricted.
+**Discharge sites differ by clause kind.** An `ensures` clause is discharged at the **declaring body**: the prover shows every normal-completion path establishes it — `static ensures` makes an unprovable body a compile error at the declaration ([§22.4](#sec-out-nullability-postcondition)'s existing rule). An `invariant` member takes no `static` qualifier (*Class invariants* below). A `requires` clause is the body's assumption; its discharge site is **every call site**: the caller's compiler substitutes the actual arguments into the clause and discharges the instance — `static requires` makes an undischargeable call a compile error at that call, and the callee compiles no runtime check because every admitted call carries a proof. A `static requires` over the member's parameters is therefore admitted at the declaration under every prover, the current floor included: under the floor a call whose arguments make the substituted clause a constant expression folding `true` is discharged (`Half(8)` against `static requires(n > 0)`), and every other call is the compile error at that call (`Half(k)` over a non-constant `k`). A **`static requires` clause may mention only state its call sites can see** (the member's parameters, and members visible to every caller); a `static requires` over non-public state is a compile error at the declaration. Checked `requires` clauses are unrestricted.
 
-**The current prover floor** — exactly two things inhabit the proven tier: a clause whose expression (after call-site substitution, for `requires`) is a **constant expression** ([§17.14](#sec-constant-expressions)) folding to `true` (folding to `false` is a compile error at the clause — a statically violated contract; a faulting constant folding is a compile error per §17.14's own rule); and the `when true`/`when false` postconditions of [§22.4](#sec-out-nullability-postcondition) — which this section defines as `static ensures` clauses, proven by the existing [§7](#sec-nullability-2) nullability flow analysis over the declaring body. Apart from those, every authored clause is therefore **checked**: the runtime tier stands alone, and the prover grows under a fixed meaning. The **Contract proving** conformance feature (Appendix [D.2](#sec-extended-features)) fixes the extended prover fragment now, so the `static` qualifier's meaning never drifts: linear integer arithmetic over parameters, fields, `result`, and `old` captures (under [§6.1](#sec-integer-arithmetic)'s checked semantics); null tests composed with §7's flow narrowing; and case analysis over enums, closed hierarchies ([§19.6](#sec-exhaustiveness)), and choice cases ([§35](#sec-choices)). Everything outside the fragment stays checked; `static` on an out-of-fragment clause is an error, never a silent downgrade to a runtime check.
+**The current prover floor** — exactly two things inhabit the proven tier: a clause whose expression (after call-site substitution, for `requires`) is a **constant expression** ([§17.14](#sec-constant-expressions)) folding to `true` (folding to `false` is a compile error at the clause's discharge site — the call, for a `requires` clause — a statically violated contract; a faulting constant folding is a compile error per §17.14's own rule); and the `when true`/`when false` postconditions of [§22.4](#sec-out-nullability-postcondition) — which this section defines as `static ensures` clauses, proven by the existing [§7](#sec-nullability-2) nullability flow analysis over the declaring body. Apart from those, every authored clause is therefore **checked**: the runtime tier stands alone, and the prover grows under a fixed meaning. The **Contract proving** conformance feature (Appendix [D.2](#sec-extended-features)) fixes the extended prover fragment now, so the `static` qualifier's meaning never drifts: linear integer arithmetic over parameters, fields, `result`, and `old` captures (under [§6.1](#sec-integer-arithmetic)'s checked semantics); null tests composed with §7's flow narrowing; and case analysis over enums, closed hierarchies ([§19.6](#sec-exhaustiveness)), and choice cases ([§35](#sec-choices)). Everything outside the fragment stays checked; `static` on an out-of-fragment clause is an error, never a silent downgrade to a runtime check.
+
+*Example.* A `requires` clause is discharged at each call by substituting the arguments:
+
+```bezel
+public static method Half(n: int): int
+  requires(n > 0)
+  => n / 2;
+
+var k := 6;
+Console.WriteLine($"{Half(k)}");      // checked at run time, in every build mode
+Console.WriteLine($"{Half(-4)}");     // error (§22.16): the substituted clause folds to `false`
+```
+
+*Example.* A `static requires` over a parameter is admitted at the declaration, and a call whose substituted clause folds to `true` discharges it:
+
+```bezel
+public static method Quarter(n: int): int
+  static requires(n > 0)
+  => n / 4;
+
+Console.WriteLine($"{Quarter(8)}");     // discharged
+```
+
+*Example.* Every other call is rejected at the call, a variable argument among them:
+
+```bezel
+public static method Quarter(n: int): int
+  static requires(n > 0)
+  => n / 4;
+
+var k := 8;
+Console.WriteLine($"{Quarter(k)}");   // error (§22.16): `k` is not a constant expression, so the clause cannot be discharged
+```
 
 <a id="sec-contract-inheritance"></a>
 #### Inheritance, interfaces, and dispatch
@@ -5355,6 +5730,22 @@ Contracts are **slot-bound**: a clause declared on a virtual or abstract member,
 5. **Monotone down the chain**: an override inherits from its nearest overridden declaration transitively; `ensures` additions accumulate and nothing is dropped mid-chain.
 6. **Clause context is the declaring type**: an inherited clause evaluates as declaring-type code (it may read the base's `private` fields), and `result` in an inherited `ensures` binds to the actual invocation's returned value (type-identical by §12.1's exact-return-match rule).
 7. **Abstract members carry clauses** — the intended home: the slot's contract written where the slot is declared, every concrete subclass bound.
+
+*Example.* An override inherits the slot's `requires` clauses verbatim and may add `ensures` clauses:
+
+```bezel
+abstract class Scaler
+  public abstract method Scale(f: int): int
+    requires(f > 0);
+end Scaler;
+
+class Doubler: Scaler
+  public override method Scale(f: int): int
+    requires(f < 100)          // error (§22.16 rule 3): an override declares no `requires`
+    ensures(result >= f)       // allowed (rule 2): an added postcondition, conjoined with the inherited ones
+    => f * 2;
+end Doubler;
+```
 
 Clauses never distinguish overloads and are not part of [§22.6](#sec-overloading) resolution; two members differing only in clauses are the same signature and clash.
 
@@ -5426,7 +5817,9 @@ An expression-bodied property's (or indexer's) body is checked against the decla
 public property Balance: decimal
   get => _balance;
   set => do
-    if value < 0m then throw new ArgumentException("Balance cannot be negative"); end;
+    if value < 0m then
+      throw new ArgumentException("Balance cannot be negative");
+    end;
     _balance := value;
   end;
 end Balance;
@@ -5463,7 +5856,9 @@ public property [row: int, col: int]: double => _grid[row * _width + col];
 public property [key: string]: int
   get => _values[key];
   set => do
-    if value < 0 then throw new ArgumentException("must be non-negative"); end;
+    if value < 0 then
+      throw new ArgumentException("must be non-negative");
+    end;
     _values[key] := value;
   end;
 end;
@@ -5746,7 +6141,9 @@ end;
 
 extension Array<T>
   public method First(): T
-    if this.Count = 0 then throw new InvalidOperationException("empty array"); end;
+    if this.Count = 0 then
+      throw new InvalidOperationException("empty array");
+    end;
     return this[0];
   end First;
 end;
@@ -5904,8 +6301,12 @@ Inside a value-returning block-bodied lambda, `return` is required on every exit
 
 ```bezel
 var classify := lambda(score: int): string? => do
-  if score < 0 then return null; end;
-  if score >= 90 then return "A"; end;
+  if score < 0 then
+    return null;
+  end;
+  if score >= 90 then
+    return "A";
+  end;
   return "pass";
 end;
 ```
@@ -6000,7 +6401,7 @@ var counter: (IEnumerable<int>) -> int := IEnumerable<int>.Count;
 
 Indexers cannot be used as method references; the parameter list makes the natural function type ambiguous.
 
-**No method reference to `Dispose` or `DisposeAsync`.** A method reference naming `Dispose` or `DisposeAsync` — bound (`d.Dispose` over a class- or interface-typed receiver, formed inside a closure or outside one) or type-qualified (`D.Dispose`, `IDisposable.Dispose`) — is a compile error at the formation, whatever the receiver. Explicit disposal is a site-announced kill of an owned binding ([§28.6](#sec-who-may-dispose); [K3.9](#sec-kernel-k3)) whose explicitly-disposed post-state body-local liveness records and [§28.2](#sec-checked-disposal)'s use-after-dispose warning reads; an invocation through a function value would dispose at a site no liveness can see, through the borrow the reference captured — the ground on which [§28.3](#sec-captured-owned-bindings) rejects a closure disposing a captured owned binding and [§28.6](#sec-who-may-dispose) rejects a disposal through a borrow. The diagnostic names the spellings that announce the kill: the call `d.Dispose();`, the discard `_ := d;` ([§17.13](#sec-the-discard-_)), or a lambda that disposes a value it receives as an `owned` parameter (`lambda(owned x: D) => x.Dispose()`, invoked with `move d`, [§28.9](#sec-runtime-managed-types)). Where the receiver's type has no `Dispose` member at all ([§8.7](#sec-dispose-is-not-on-object)), the no-member diagnostic applies instead.
+**No method reference to `Dispose` or `DisposeAsync`.** A method reference naming `Dispose` or `DisposeAsync` — bound (`d.Dispose` over a class- or interface-typed receiver, formed inside a closure or outside one) or type-qualified (`D.Dispose`, `IDisposable.Dispose`) — is a compile error at the formation, whatever the receiver. Explicit disposal is a site-announced kill of an owned binding ([§28.6](#sec-who-may-dispose); [K3.9](#sec-kernel-k3)) whose explicitly-disposed post-state body-local liveness records and [§28.2](#sec-checked-disposal)'s use-after-dispose error reads; an invocation through a function value would dispose at a site no liveness can see, through the borrow the reference captured — the ground on which [§28.3](#sec-captured-owned-bindings) rejects a closure disposing a captured owned binding and [§28.6](#sec-who-may-dispose) rejects a disposal through a borrow. The diagnostic names the spellings that announce the kill: the call `d.Dispose();`, the discard `_ := d;` ([§17.13](#sec-the-discard-_)), or a lambda that disposes a value it receives as an `owned` parameter (`lambda(owned x: D) => x.Dispose()`, invoked with `move d`, [§28.9](#sec-runtime-managed-types)). Where the receiver's type has no `Dispose` member at all ([§8.7](#sec-dispose-is-not-on-object)), the no-member diagnostic applies instead.
 
 A method reference, bound or unbound, or a property reference formed over a **conditionally-admitted member** ([§14.2](#sec-conditionally-admitted-members) — `Array<T>.Sort()`, the equality search's `Contains`, `Dictionary<K, V>.TryGetValue` at `V`) is a use of the member: at a receiver instantiation that does not satisfy the member's condition, the formation is rejected **at the formation site** with the condition's diagnostic and remedy, exactly as the call would be, and never at an invocation through the formed value — an invocation reads the function type, not the receiver's type arguments, so the formation is the only site at which the condition can be read. The overload is selected against the target first; the condition is read on the overload selected and takes no part in the selection or in [§22.6](#sec-overloading)'s applicability — its failure is an error, never a candidate's drop-out, and where the reference is an argument to an overloaded callee it is read once, on the reference as formed at the candidate the call selects. So `var s: () -> () := xs.Sort;` at `xs: Array<Widget>`, for a `Widget` conforming to no `IComparable<Widget>`, is rejected naming the comparer-taking overload, which the same reference against a comparer-taking target selects and no condition reaches; `var tg := d.TryGetValue;` at `d: Dictionary<string, [3]int>` is rejected by the nullable-companion condition, the formed type having a slot at the `([3]int)?` [§15.1](#sec-inline-arrays) admits nowhere; and in a generic body the condition is read as [§14.2](#sec-conditionally-admitted-members) rule 2 reads it for a call — `xs.Sort` over an `Array<T>` needs `where T: IComparable<T>`, and `xs.Contains` over one is the body's own equality use, checked where the call would be — at the declaration's instantiations, or at the body of a dispatched generic method ([§14.2](#sec-dispatched-generic-methods)) over its own parameter.
 
@@ -6241,9 +6642,9 @@ The two modes give identical observable behavior for every program that never us
 
 Checked mode is implementable with state the language already requires: idempotent disposal implies a per-instance disposed flag, and the split between logical disposal and physical reclamation ([§28.12](#sec-asynchronous-disposal)) gives the implementation latitude to defer reclaiming a disposed instance's memory in checked mode (quarantine, delayed free) so that the flag remains readable after disposal. The check itself is a flag test on member entry; implementations are expected to omit it entirely in unchecked builds, so unchecked builds pay no cost for the mode's existence.
 
-**The compiler-inserted free.** Every class instance is reclaimed by compiler-inserted code at its **holder's release point** — scope end for a local, a `using var` or an `owned` parameter ([§28.3](#sec-owned-local-discharge-requirement)); the [K8](#sec-kernel-k8) boundary for an unbound owned temporary ([§28.3](#sec-unbound-owned-temporaries)); the overwrite for a displaced value — the overwrite that completes: one abandoned by the displaced value's throwing disposer leaves the value at the location to its next release point ([§28.7](#sec-reassigning-owned-fields)); the containing object's teardown for an `owned` field or an owning-inline-array slot ([§28.4](#sec-the-destructor)); the container's cascade or removing operation for an owning-collection element ([§28.11](#sec-collection-element-ownership)); the exit pass for a static ([§22.13](#sec-disposal-of-static-owned-fields)); and, where the runtime is the holder, its own release — a `Shared<T>` value at its last handle's disposal ([§28.13](#sec-shared-ownership)), a thrown exception after its catch arm ([§31.1](#sec-throwing)), a killed frame's owned state at the frame's teardown ([§29.8](#sec-iterators-with-owned-parameters), [§30.1](#sec-async-methods)) — and nowhere else. The **free** there is **logical disposal followed by reclamation**: the idempotent `Dispose()`, a no-op where the flag is already set, then the release of the block. An explicit `Dispose()` or direct `DisposeAsync()` ([§28.6](#sec-who-may-dispose)) performs **logical disposal only** — it sets the flag and runs the class's cleanup — and does not reclaim its receiver: the receiver's block stays live until the holder's release point, so the `Dispose()` the language itself issues there — the cascade over an explicitly disposed field, a drop-on-overwrite over an explicitly disposed value, the exit pass — reads a live flag in both modes, and a repeated call is the no-op stated above in both modes. Where a direct `DisposeAsync()`'s task has not reached its terminal state at the holder's release point, reclamation is deferred to that terminal state: the release point neither awaits nor blocks ([§28.12](#sec-asynchronous-disposal)'s *Implicit discharge is synchronous*), and the block is released by whichever of the two comes later. The same deferral holds for a `Task`-family value disposed before it settles: its block stays live until its terminal state, the continuation's disposals running first ([§30.5](#sec-disposing-an-unsettled-task)). For a **trivial-dispose** instance ([§28.9](#sec-trivial-dispose-classes)) the free runs no user code (the class has none to run). Riding the flag is what makes checked mode's backstop uniform across the language: a member access through a surviving borrow of a freed trivial-dispose instance — a store-rule residual, a retained fresh `Add` argument ([§15.4](#sec-collection-literals), [§28.11](#sec-borrowing-collections)) — raises `DisposedAccessException` deterministically, exactly as for a non-trivial class; no class in the language dangles without this backstop. The costs are stated and checked-mode-only: trivial-dispose instances carry the per-instance flag word, member access through a borrow is a live flag test in checked mode, and [§28.12](#sec-asynchronous-disposal)'s logical/physical split may quarantine their physical reclamation; unchecked builds pay nothing, per this section's existing posture.
+**The compiler-inserted free.** Every class instance is reclaimed by compiler-inserted code at its **holder's release point** — scope end for a local, a `using var` or an `owned` parameter ([§28.3](#sec-owned-local-discharge-requirement)); the [K8](#sec-kernel-k8) boundary for an unbound owned temporary ([§28.3](#sec-unbound-owned-temporaries)); the overwrite for a displaced value — the overwrite that completes: one abandoned by the displaced value's throwing disposer leaves the value at the location to its next release point ([§28.7](#sec-reassigning-owned-fields)); the containing object's teardown for an `owned` field or an owning-inline-array slot ([§28.4](#sec-the-destructor)); the container's cascade or removing operation for an owning-collection element ([§28.11](#sec-collection-element-ownership)); the exit pass for a static ([§22.13](#sec-disposal-of-static-owned-fields)); and, where the runtime is the holder, its own release — a `Shared<T>` value at its last handle's disposal ([§28.13](#sec-shared-ownership)), a thrown exception after its catch arm ([§31.1](#sec-throwing)), a killed frame's owned state at the frame's teardown ([§29.8](#sec-iterators-with-owned-parameters), [§30.1](#sec-async-methods)) — and nowhere else. The **free** there is **logical disposal followed by reclamation**: the idempotent `Dispose()`, a no-op where the flag is already set, then the release of the block. An explicit `Dispose()` or direct `DisposeAsync()` ([§28.6](#sec-who-may-dispose)) performs **logical disposal only** — it sets the flag and runs the class's cleanup — and does not reclaim its receiver: the receiver's block stays live until the holder's release point, so the `Dispose()` the language itself issues there — the cascade over an explicitly disposed field, a drop-on-overwrite over an explicitly disposed value, the exit pass — reads a live flag in both modes, and a repeated call is the no-op stated above in both modes. Where a direct `DisposeAsync()`'s task has not reached its terminal state at the holder's release point, reclamation is deferred to that terminal state: the release point neither awaits nor blocks ([§28.12](#sec-asynchronous-disposal)'s *Implicit discharge is synchronous*), and the block is released by whichever of the two comes later. The same deferral holds for a `Task`-family value disposed before it settles: its block stays live until its terminal state, the continuation's disposals running first ([§30.5](#sec-disposing-an-unsettled-task)). For a **trivial-dispose** instance ([§28.9](#sec-trivial-dispose-classes)) the free runs no user code (the class has none to run). Riding the flag is what makes checked mode's backstop uniform across the language: a member access through a surviving borrow of a freed trivial-dispose instance — a store-rule residual, a fresh argument a user-declared member retains ([§15.4](#sec-collection-literals), [§28.3](#sec-unbound-owned-temporaries)) — raises `DisposedAccessException` deterministically, exactly as for a non-trivial class; no class in the language dangles without this backstop. The costs are stated and checked-mode-only: trivial-dispose instances carry the per-instance flag word, member access through a borrow is a live flag test in checked mode, and [§28.12](#sec-asynchronous-disposal)'s logical/physical split may quarantine their physical reclamation; unchecked builds pay nothing, per this section's existing posture.
 
-The compiler additionally **must** emit a compile-time warning when a local variable is used (read, borrowed from, or consumed) after an explicit `Dispose()` or direct `DisposeAsync()` call ([§28.12](#sec-asynchronous-disposal)) — or a discard of the binding ([§17.13](#sec-the-discard-_)) — on the same variable that dominates the use site on every path: the straight-line subset of use-after-dispose (derives: [K4.2](#sec-kernel-k4) + [K7.4](#sec-kernel-k7)). A second `Dispose()` or `DisposeAsync()` on the same binding is such a use and draws this warning ([K3.9](#sec-kernel-k3)'s **explicitly-disposed** post-state): the no-op carve-out above states the **runtime** contract of a repeated call and suppresses no diagnostic. The warning-free spelling of idempotence is one explicit disposal — the auto-drop and a `using var`'s scope-end disposal are not repeat calls, the binding having reached a discharge point ([§28.3](#sec-owned-local-discharge-requirement)). A *conditional* kill is treated more strictly: at a join of an explicitly-disposed path with a still-owned path the variable is **maybe-consumed** and a later use is a compile error ([§28.3](#sec-ownership-state-of-locals)). **The split is between the two kills, never between the use forms**: under a *dominating* kill every use in the list above draws this warning — a **consume** exactly as a read does, `move x` and an `owned` argument position included — and under a *conditional* kill every one of them is [§28.3](#sec-ownership-state-of-locals)'s error. A diagnostic that varies with the syntactic position of the use rather than with the kill is not this rule: the two spellings describe one program state, and the checked-disposal backstop (this section's `DisposedAccessException`) is what stands behind both.
+**Use after a dominating explicit disposal.** A use of a local variable — a read, a borrow taken from it, a member access, an argument position, a consume — after an explicit `Dispose()` or direct `DisposeAsync()` call ([§28.12](#sec-asynchronous-disposal)) — or a discard of the binding ([§17.13](#sec-the-discard-_)) — on the same variable that dominates the use site on every path is a **compile error**: the straight-line subset of use-after-dispose (derives: [K4.2](#sec-kernel-k4) + [K7.4](#sec-kernel-k7)). The same error reaches a use **through a local borrow of the variable's value**: where a local holds a borrow of that value — an alias (`var b := a;`, `const b := a;`), a `using var` pin ([§28.10](#sec-using-var)), a value that holds the borrow (a span over it, a borrow-bearing record or choice, [§9.7](#sec-records-and-disposal)), a closure that captures such a holder, or an iterator, enumerator or lazy-query frame that carries it ([§28.3](#sec-consume-site-freeze) *Frame locals*) — taken while the variable held that value, and every value in the holder's source set ([K2.2](#sec-kernel-k2)) has been so disposed on every path to the use, a use of the holder — a read or member access through it, passing it, re-borrowing it, invoking the closure, enumerating or disposing the frame — is the same compile error; the diagnostic names the use, the holder, the disposed source and the disposing site. The kill itself stays permitted ([K5.3](#sec-kernel-k5)): what is rejected is the use the kill makes certain to fault, and a disposal after the borrow's last use changes no verdict. A reassignment of the variable between the kill and the use does not lift the error — the holder still borrows the disposed value, whose release point the store is ([§28.3](#sec-ownership-state-of-locals) *State match on reassignment*) — while a holder re-bound to the variable's new value (`b := a;` after `a := new …;`) takes a fresh borrow. A closure that captures the variable itself, rather than a holder of its value, reads the variable when it is invoked ([§27.5](#sec-closures)): its invocation after the kill is a use of the variable under the first sentence, and a reassignment between the kill and the invocation lifts it as it lifts any other read of the variable. One use is exempt: a second `Dispose()` or `DisposeAsync()`, or a second discard, of the same binding is the runtime no-op the carve-out above defines and draws a compile-time **warning** ([K3.9](#sec-kernel-k3)'s **explicitly-disposed** post-state): the no-op carve-out states the **runtime** contract of a repeated call and suppresses no diagnostic. The warning-free spelling of idempotence is one explicit disposal — the auto-drop and a `using var`'s scope-end disposal are not repeat calls, the binding having reached a discharge point ([§28.3](#sec-owned-local-discharge-requirement)). A *conditional* kill of the variable: at a join of an explicitly-disposed path with a still-owned path the variable is **maybe-consumed** and a later use is a compile error ([§28.3](#sec-ownership-state-of-locals)). A holder whose source was disposed on only some paths to the use — a kill at the end of a loop body reaching the next iteration's use among them — is not rejected: a use through it raises `DisposedAccessException` in checked disposal mode and is undefined behavior unchecked, the runtime backstop above. **The split is between the kills, never between the use forms**: under a *dominating* kill every use in the list above is this error — a **consume** exactly as a read is, `move x` and an `owned` argument position included, the repeated explicit disposal alone excepted — and under a *conditional* kill of the variable every one of them is [§28.3](#sec-ownership-state-of-locals)'s error. A diagnostic that varies with the syntactic position of the use rather than with the kill is not this rule: the two spellings describe one program state, and the checked-disposal backstop (this section's `DisposedAccessException`) is what stands behind the uses the analysis cannot see.
 
 `Dispose()` is not on `Object`; it is class-only — a member of class types and of the interfaces that are or extend `IDisposable` or declare it (below), and of nothing else ([§8.7](#sec-dispose-is-not-on-object) lists the types that have none, the runtime-managed types among them).
 
@@ -6268,7 +6669,7 @@ The `owned` keyword ([§28.5](#sec-owned-fields), [§28.8](#sec-ownership-transf
 
 **Map of this section.** §28.3 is the core of the chapter, in thirteen parts:
 
-1. [§28.3.1 The ownership kernel (K1–K9)](#sec-ownership-kernel): the nine principles every rule in this chapter and §30.5 derives from.
+1. [§28.3.1 The ownership kernel (K1–K9)](#sec-ownership-kernel): the nine principles every rule in this chapter and §30.5 derives from, each closed by a short example.
 2. [§28.3.2 The axiom register (A1–A15)](#sec-axiom-register): the recorded decisions the kernel cannot derive.
 3. [§28.3.3 Ownership state of locals](#sec-ownership-state-of-locals): whether a local is owned or borrowed, and how reassignment and branch merges treat it.
 4. [§28.3.4 Producers](#sec-producers): the ownership state of each expression form.
@@ -6297,6 +6698,22 @@ The `owned` keyword ([§28.5](#sec-owned-fields), [§28.8](#sec-ownership-transf
 
 Every rule of this chapter and of [§30.5](#sec-result-lifetime-and-task-disposal) is one of: a kernel principle below, a derivation from them, or a recorded axiom (register at the end of this subsection; reasons in the rationale). Derivation and axiom tags — *derives: K…* / *axiom A…* — mark the classification at each rule. A future revision that adds an ownership rule states which kind it is.
 
+**Examples.** Each clause below closes with a short example. The examples illustrate the clauses and add no rule, and follow the document's [example convention](#sec-example-convention); they share one class, whose destructor reports the instance it disposes. A comment names the clause a line exercises: `// error (…)` marks a line the cited rule rejects, and where a case is left to [K4.1](#sec-kernel-k4)'s backstop the comment gives its outcome in checked disposal mode ([§28.2](#sec-checked-disposal)).
+
+```bezel
+class Widget
+  public readonly property Name: string;
+
+  public constructor(name: string)
+    Name := name;
+  end constructor;
+
+  destructor
+    Console.WriteLine($"disposed {Name}");
+  end destructor;
+end Widget;
+```
+
 <a id="sec-kernel-k1"></a>
 **K1 — Value classification.** At every program point, every expression and binding of class or interface type (K1.6 exempts the runtime-managed remainder) has exactly one ownership classification — the two reference kinds of this section's opening, completed by the transfer and analysis states:
 
@@ -6309,12 +6726,22 @@ Every rule of this chapter and of [§30.5](#sec-result-lifetime-and-task-disposa
 
    - **uninitialized** — declared, unassigned; unreadable ([§7.9](#sec-definite-assignment-for-non-nullable-fields)). The local adopts the state of the first assignment that reaches it ([§28.3](#sec-ownership-state-of-locals)'s adoption clause).
    - **polymorphic-null** — `var x: T? := null;` before the first non-null assignment; adopts the state of that assignment, by the same clause. A null arm or RHS is compatible with either target, having no value to own.
-   - **explicitly-disposed** — the binding after a site-announced kill that moves no obligation ([K4.2](#sec-kernel-k4)'s `Dispose()` or direct `DisposeAsync()` call and discard, the [consume table](#sec-consume-table)'s row K3.9). Scope-end machinery skips its disposal — the block is still freed at the holder's release point, [§28.2](#sec-checked-disposal)'s compiler-inserted free — and a straight-line read falls under [§28.2](#sec-checked-disposal)'s use-after-dispose warning regime rather than the moved-from error.
+   - **explicitly-disposed** — the binding after a site-announced kill that moves no obligation ([K4.2](#sec-kernel-k4)'s `Dispose()` or direct `DisposeAsync()` call and discard, the [consume table](#sec-consume-table)'s row K3.9). Scope-end machinery skips its disposal — the block is still freed at the holder's release point, [§28.2](#sec-checked-disposal)'s compiler-inserted free — and a use the kill dominates is [§28.2](#sec-checked-disposal)'s use-after-dispose error (a repeated explicit disposal its warning), distinct from the moved-from error.
    - **unclassified** — a class- or interface-typed local that holds a runtime-managed value (K1.6) and no classified one — every value so far runtime-managed, or a runtime-managed value stored over a classified one, which the store displaced ([§28.3](#sec-ownership-state-of-locals) *State match*): `var o: Object := 7;`, `var o: Object := "s";` — a boxing conversion ([§8.6](#sec-boxing)) or another runtime-managed production, the [§28.3](#sec-producers) producers table's runtime-managed row; a value that holds borrows is never boxed at a local ([§8.6](#sec-boxing-of-borrow-bearing-records)). It carries no obligation and no source, so a read of it is no borrow ([§30.5](#sec-result-lifetime-and-task-disposal)'s runtime-managed operand); it adopts the state of the first classified assignment that reaches it, by the same clause.
 
 5. **Atoms.** Fresh productions are owned: `new`, reference-typed collection literals, `owned`-returning calls, `move` results, owned operator results. Reads of storage lend: a field, property, indexer, or slot read is a borrow whose source is the storage's holder. Reads of named bindings lend unless the position consumes (K3): an unmarked read of an owned binding is a borrow of the binding. Calls lend by default: an instance method's plain (non-`owned`) class-typed return is a borrow whose source is the receiver — sound jointly with the callee-side admission rules (K2.4). A static callee's plain class- or interface-typed return is admissible only where the declared type announces the classification (**type-announced**, K2.4/K6.2), and is otherwise rejected at the declaration (the static-return rule, *Factory methods* below). (The *Producers* table below is the worked enumeration; the [announcement table](#sec-announcement-table) beside it is the per-callee-kind matrix for calls.)
 6. **The runtime-managed exemption; the trivial-dispose ceremony exemption.** Values of runtime-managed type (`string`, `Type`, boxed value types, function values) and of ordinary value type carry no classification and no obligation; `owned` markers over them are inadmissible or erased per instantiation ([§28.1](#sec-where-the-owned-modifier-can-appear)). Trivial-dispose class instances ([§28.9](#sec-runtime-managed-types)) carry the classification **and the free obligation**, but the obligation's *user-visible* content is empty and its discharge is never demanded *of the program*: any undischarged trivial-dispose value is freed silently by the compiler at its owner's release point — no warning (the ceremony exemption), no user code (the class has none to run; the free sets the disposed flag, [§28.2](#sec-checked-disposal)). The exemption is ceremony-only: the borrow half of the machinery — source sets, escape checks, the freeze — is demanded over trivial-sourced references everywhere, and every rule of this chapter reads them by its letter.
 7. **One holder.** An obligation has exactly one holder at a time; every transfer moves it, never copies it. Copy-semantics holders (record fields) therefore cannot hold obligations ([§28.5](#sec-owned-fields)).
+
+*Example.* A fresh production is owned, an unmarked read lends, and a `move` leaves the binding moved-from:
+
+```bezel
+var a := new Widget("a");     // owned: a fresh production (K1.5)
+var b := a;                   // borrowed: an unmarked read of an owned binding lends (K1.5)
+Console.WriteLine(b.Name);
+using var c := move a;        // `c` owned; `a` moved-from (K1.3)
+Console.WriteLine(a.Name);    // error (K1.3): `a` is unreadable until reassigned
+```
 
 <a id="sec-kernel-k2"></a>
 **K2 — The source algebra.** Every borrow carries a **source set**. A source is one of:
@@ -6329,6 +6756,25 @@ The taxonomy defines what a source *is* and how it bounds a borrow; which source
 2. **Union under composition.** Joins, `??` and arm meets, transitive re-borrows, and frame carriage combine borrows by taking the union of their source sets.
 3. **Escape must be bounded.** A borrow may not reach a holder — a binding of wider scope, a field, a collection, a frame, a return — whose lifetime the checker cannot bound by the borrow's source set. Where scopes are statically comparable (locals, temporaries, loop back edges), violation is rejected. Where they are not, an admission is made only under K4's posture: a structural, decidable check at the site plus a recorded residual obligation with a named backstop ([§28.3](#sec-local-variables-ownership-and-borrows), [§28.11](#sec-collection-element-ownership)).
 4. **Signature-level re-establishment.** A callee's declared signature announces its result's source set — the **type-announced** classification: read off the declared, pre-substitution type, [K6.2](#sec-kernel-k6) being the frame instance — as a function of the call's receiver and arguments — the bare-type-parameter source set, the deferred-activation frame's carried sources — and every caller re-establishes the set against its own actuals. A borrow whose source no caller could re-establish (a scope-bound local, a temporary, a parameter source the signature does not announce) may not be returned.
+
+*Example.* A plain return must name a source every caller re-establishes (K2.4), and a borrow may not reach a binding that outlives its source (K2.3):
+
+```bezel
+class Shelf
+  private owned _top: Widget := new Widget("top");
+
+  public method Top(): Widget => _top;          // allowed (K2.4): a receiver-sourced borrow
+  public method Pick(w: Widget): Widget => w;   // error (K2.4): a plain return announces the receiver, not `w`
+end Shelf;
+
+using var outer := new Widget("outer");
+var keep := outer;                          // allowed (K2.3): `outer` outlives `keep`
+do
+  using var inner := new Widget("inner");
+  keep := inner;                            // error (K2.3): the borrow would outlive its source `inner`
+end;
+Console.WriteLine(keep.Name);
+```
 
 <a id="sec-kernel-k3"></a>
 **K3 — Discharge and consumption.** The obligation on an owned value is discharged at exactly one of the eleven **owned-consuming positions** — the rows of the consume table below, its single definition site, grouped by the three consume families. Three principles (K3.13–K3.15) follow the table.
@@ -6349,15 +6795,46 @@ The taxonomy defines what a source *is* and how it bounds a borrow; which source
 | K3.6 | the owned parameter-or-plain-local source of a Pattern A chaining `return await` ([§30.5](#sec-result-lifetime-and-task-disposal)) | `return await` — the form is the keyword | **moved-from** | **unfrozen** ([K5.4](#sec-kernel-k5): by the criterion — (i) at the form, (ii) by the intact-referent disjunct) | none at the site — deferred to the outer task's teardown, transitively (no flag the K4.1 backstop can schedule) |
 | K3.7 | the operand of `yield return` in an owning iterator ([§29.2](#sec-iterator-yield-ownership)) | none — the declared owning interface announces | **moved-from** | frozen (K5.1; [§29.2](#sec-iterator-yield-ownership)) | none here — the consumer's |
 | K3.8 | the operand of `throw` ([§31.1](#sec-the-throw-operand)) | none — the keyword announces | **moved-from** | **unfrozen** (K4.2, K5.3)† | after the matching catch arm completes, or at termination if uncaught ([§31.1](#sec-the-throw-operand)) |
-| K3.9 | explicit disposal of an owned binding — the marker-free discard `_ := x;` ([§17.13](#sec-the-discard-_)), or a `Dispose()` or direct `DisposeAsync()` call (`x.Dispose()`, `x?.Dispose()`, `x!.Dispose()`, and the same spellings of `DisposeAsync()`, awaited or not, [§28.12](#sec-asynchronous-disposal)) on an owned receiver, the receiver-classification rules, including the declaring-type field admission, being [§28.6](#sec-leak-prevention)'s (an override's chained `base.DisposeAsync()` is [§28.12](#sec-asynchronous-disposal)'s chain, not a position of this row) | the discard statement itself, or the `Dispose()` / `DisposeAsync()` call — no marker | **explicitly-disposed** — straight-line use afterward is [§28.2](#sec-checked-disposal)'s mandatory use-after-dispose warning | **unfrozen** (K4.2, K5.3)† | logical disposal at the end of the discard statement ([§17.13](#sec-the-discard-_)) or at the call (for `DisposeAsync()`, completing at the returned task's terminal state, [§28.12](#sec-asynchronous-disposal)); reclamation at the holder's release point ([§28.2](#sec-checked-disposal)'s compiler-inserted free) |
+| K3.9 | explicit disposal of an owned binding — the marker-free discard `_ := x;` ([§17.13](#sec-the-discard-_)), or a `Dispose()` or direct `DisposeAsync()` call (`x.Dispose()`, `x?.Dispose()`, `x!.Dispose()`, and the same spellings of `DisposeAsync()`, awaited or not, [§28.12](#sec-asynchronous-disposal)) on an owned receiver, the receiver-classification rules, including the declaring-type field admission, being [§28.6](#sec-leak-prevention)'s (an override's chained `base.DisposeAsync()` is [§28.12](#sec-asynchronous-disposal)'s chain, not a position of this row) | the discard statement itself, or the `Dispose()` / `DisposeAsync()` call — no marker | **explicitly-disposed** — a use the kill dominates, through the binding or through a local borrow of its value, is [§28.2](#sec-checked-disposal)'s use-after-dispose error, a repeated explicit disposal its warning | **unfrozen** (K4.2, K5.3)† | logical disposal at the end of the discard statement ([§17.13](#sec-the-discard-_)) or at the call (for `DisposeAsync()`, completing at the returned task's terminal state, [§28.12](#sec-asynchronous-disposal)); reclamation at the holder's release point ([§28.2](#sec-checked-disposal)'s compiler-inserted free) |
 | — | **Family 3 — displacement** (K3.11) | | | | |
-| K3.11 | reassignment of an owned location — a consume of the **displaced** value (drop-on-overwrite, [§28.7](#sec-reassigning-owned-fields)) | the kill of the displaced value is unspelled; the RHS follows the state-match rule (*Ownership state of locals* below) | none arises — the kill's subject is the **displaced** value; the binding takes the new value and stays readable | frozen at a binding (K5.2); slot overwrites are outside the freeze (K5.6) | after the RHS is evaluated (RHS-first; [K9.5](#sec-kernel-k9) is the slot analog); where that disposal raises, the store is abandoned and the location keeps the logically disposed value to its next release point ([§28.7](#sec-reassigning-owned-fields)) |
+| K3.11 | reassignment of an owned location — a consume of the **displaced** value (drop-on-overwrite, [§28.7](#sec-reassigning-owned-fields)) | the kill of the displaced value is unspelled; the RHS follows the state-match rule (*Ownership state of locals* below) | none arises — the kill's subject is the **displaced** value; the binding takes the new value and stays readable | frozen at a binding (K5.2), on the paths where the displaced value is still owned — a store over an explicitly-disposed or moved-from binding kills nothing; slot overwrites are outside the freeze (K5.6) | after the RHS is evaluated (RHS-first; [K9.5](#sec-kernel-k9) is the slot analog); where that disposal raises, the store is abandoned and the location keeps the logically disposed value to its next release point ([§28.7](#sec-reassigning-owned-fields)) |
+
+*Example.* A row from each family; every line is accepted:
+
+```bezel
+class Box
+  private owned _w: Widget? := null;
+
+  public method Put(owned w: Widget) => _w := w;  // K3.1: the owned field announces the store; no marker
+end Box;
+
+using var box := new Box();
+var a := new Widget("a");
+box.Put(move a);                // K3.3: an owned argument takes the marker
+var b := new Widget("b");
+var c := move b;                // K3.4: a marked binding transfer; `b` is moved-from
+c := new Widget("c");           // K3.11: displaces "b", disposed after the right-hand side
+_ := c;                         // K3.9: the discard disposes "c" at the statement's end
+```
 
    Three principles govern the enumeration:
 
 13. **Marker economy.** A consume is spelled by the transfer marker (`move x`) except at a **marker-free position**, where the target or keyword already announces it — the table's Spelling column is the definition site of which is which. An **unmarked read of a class-typed binding never consumes**: `var b := a;` is always a borrow for class-typed `a`. (Move-only *value* types move on unmarked assignment and plain parameter passing, per [§15.3](#sec-move-only-value-types)'s own scope note; K3.12.) Fresh producers need no marker anywhere (no live binding is invalidated).
 14. **Affinity.** An owned value that reaches its scope's end undischarged and not moved-from is disposed there implicitly; the implicit drop of a plain-`var` local or undischarged `owned` parameter carries the must-use warning (a lint over a sound program; not at a trivial-dispose value — [K1.6](#sec-kernel-k1)'s ceremony exemption).
 15. **Edge parity.** The exception edge performs the same implicit disposal as the normal edge, on the single establishment-ordered cleanup stack; the only difference is the lint. Unbound temporaries join the same stack at their production.
+
+*Example.* The marker is written where nothing else announces the consume (K3.13), and an undischarged value is disposed at its scope's end (K3.14):
+
+```bezel
+public static method Take(owned w: Widget) => w.Dispose();
+
+var a := new Widget("a");
+var b := a;                     // a borrow: an unmarked read never consumes (K3.13)
+Take(new Widget("t"));          // a fresh producer takes no marker (K3.13)
+Take(a);                        // error (K3.13, §22.3): this call consumes `a`; write `Take(move a)`
+using var u := new Widget("u"); // a `using var`: disposed at scope end, no warning
+var v := new Widget("v");       // auto-dropped at scope end, with the must-use warning (K3.14)
+```
 
 <a id="sec-kernel-k4"></a>
 **K4 — Kills, site-announcement, and the backstop posture.** A **kill** ends a value's life under its current holder. Three independent bits classify every kill — each a property the kernel already reasons with, named here once:
@@ -6372,7 +6849,35 @@ The [consume table](#sec-consume-table) records the verdicts these bits decide, 
 
 1. **The backstop.** Disposal is idempotent and flag-setting; in checked disposal mode ([§28.2](#sec-checked-disposal)) any later use through any alias faults deterministically as `DisposedAccessException`, and unchecked mode is the same language with the check elided. This is the runtime backstop every trust admission names.
 2. **Site-announced kills.** A kill that is both **keyword-visible at the kill site** and **flag-backstopped** is **site-announced**, and is permitted while borrows of the value live: the announcement is the reader's notice and the flag is the safety net. The closed set is exactly the [consume table](#sec-consume-table)'s three rows tagged K4.2 — explicit disposal (`Dispose()`, a direct `DisposeAsync()` call, or the discard), `throw x`, and Pattern B `await` of an owned operand (a borrowed operand's award spends the task and kills nothing, [§30.5](#sec-result-lifetime-and-task-disposal)) — with each kill's post-state and disposal moment in the table's columns.
-3. **Recorded trust, or nothing.** Where an admission's temporal guarantee can neither be statically compared (K2.3) nor flag-backstopped — the domain clause ([§28.3](#sec-borrow-lifetime-rules)'s field-store bullet, clause 4): a borrowed-from object transferred to, or made reachable from, another domain stays alive, so no flag is ever set — the rule must either reject statically or carry an **individually recorded trust clause**. The recorded clauses (field-held, collection-held, comparer-held and frame-held borrows versus domain transfer; [§28.3](#sec-local-variables-ownership-and-borrows), stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic), [§30.1](#sec-async-methods)) are the model's honest limit, and no new admission may be made without recording its clause or its backstop. No clause covers a **static-held** borrow, and none is needed: a borrow of anything but static storage is stored into no static field or static property ([§28.3](#sec-borrow-lifetime-rules)'s *Static stores*) — across domains the flag is no backstop, so the always-live holder admits only what lives as long as it does. (A borrow held *inside* an object a static references is that object's field-, collection- or frame-held clause, with [§22.12](#sec-static-members) rule 4's confinement obligation where the static is warned.) The recorded set is enumerable, and the trust-admission report mode ([§28.3](#sec-diagnostics)) enumerates it at every site.
+3. **Recorded trust, or nothing.** Where an admission's temporal guarantee can neither be statically compared (K2.3) nor flag-backstopped — the domain clause ([§28.3](#sec-borrow-lifetime-rules)'s field-store bullet, clause 4): a borrowed-from object transferred to, or made reachable from, another domain stays alive, so no flag is ever set — the rule must either reject statically or carry an **individually recorded trust clause**. The recorded clauses (field-held, collection-held, comparer-held and frame-held borrows versus domain transfer; [§28.3](#sec-local-variables-ownership-and-borrows), stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic), [§30.1](#sec-async-methods)) are the model's honest limit, and no new admission may be made without recording its clause or its backstop. No clause covers a **static-held** borrow, and none is needed: a borrow of anything but static storage is stored into no static field or static property ([§28.3](#sec-borrow-lifetime-rules)'s *Static stores*) — across domains the flag is no backstop, so the always-live holder admits only what lives as long as it does. (A borrow held *inside* an object a static references is that object's field-, collection- or frame-held clause, with [§22.12](#sec-static-members) rule 4's confinement obligation where the static is warned.) The recorded set is enumerable, and the trust-admission report mode ([§28.3](#sec-diagnostics)) enumerates it at every site, the slot kill by move's residual that [§28.3.9](#sec-consume-site-freeze) *Scope* clause 1 states apart.
+
+*Example.* An explicit `Dispose()` while a borrow lives is permitted (K4.2). The flag catches a later use on the path where the kill ran (K4.1), and a use that the kill precedes on every path is [§28.2](#sec-checked-disposal)'s compile error:
+
+```bezel
+var flag := new Random().NextBoolean();
+var a := new Widget("a");
+var b := a;                         // a live local borrow of the value `a` holds
+if flag then
+  a.Dispose();                      // allowed (K4.2, K5.3): a site-announced kill is not frozen
+end;
+Console.WriteLine(b.Name);          // flag true: DisposedAccessException in checked mode (K4.1)
+var c := new Widget("c");
+var d := c;
+c.Dispose();
+Console.WriteLine(d.Name);          // error (§28.2): the disposal of `c` precedes this use on every path
+```
+
+*Example.* A plain field that holds a parameter's borrow is admitted on the field-held trust clause (K4.3), and the trust-admission report ([§28.3](#sec-diagnostics)) names the store:
+
+```bezel
+class Tag
+  private _owner: Widget;           // a plain field: it holds a borrow
+
+  public constructor(owner: Widget)
+    _owner := owner;                // allowed (K4.3): the field-held trust clause; the report mode names this store
+  end constructor;
+end Tag;
+```
 
 <a id="sec-kernel-k5"></a>
 **K5 — The freeze.** Consuming an owned **binding** (a local or `owned` parameter; the consume table's positions) while a live local borrow of its current value exists is a compile error, **unless the kill is unfrozen** — and a kill is unfrozen exactly when both hold (rationale [§5.1](Bezel_Design_Rationale.md#sec-owned-not-borrows)):
@@ -6383,13 +6888,51 @@ The [consume table](#sec-consume-table) records the verdicts these bits decide, 
    The criterion is stated here once; the [consume table](#sec-consume-table)'s Frozen column reads it off, and every placement — [§30.12](#sec-thread-synchronization)'s guard instance included, clause 8 — is its consequence, not a second list:
 
 1. the family-1 transfers and owning-iterator `yield return` (the table's rows K3.1–K3.4, K3.7, K3.12) are frozen — each **fails (ii)**: an obligation-moving kill sets no flag, and its surviving borrows' referents are neither flagged nor guaranteed intact for the borrows' whole life;
-2. drop-on-overwrite of a binding (row K3.11) is frozen although it disposes — it **fails (i)**: the reassignment is not keyword-visible as a kill of the *old* value, and the flag it does set is irrelevant once (i) fails;
+2. drop-on-overwrite of a binding (row K3.11) is frozen although it disposes — it **fails (i)**: the reassignment is not keyword-visible as a kill of the *old* value, and the flag it does set is irrelevant once (i) fails. The clause is about a store that **disposes**: a reassignment whose displaced value was already killed — an **explicitly-disposed** LHS, whose `Dispose()`, direct `DisposeAsync()` or discard was the kill and is unfrozen by clause 3, or a **moved-from** one, which displaces nothing — kills nothing and is not frozen ([§28.3](#sec-ownership-state-of-locals) *State match on reassignment*, items 2 and 3): the moved-from store releases nothing, and the explicitly-disposed store runs no user code and only reclaims a block whose surviving borrows already rest on that kill's flag, as a borrow of a displaced slot value does (clause 6); either way a surviving borrow still names the displaced value, never the new one ([§28.2](#sec-checked-disposal)). A **maybe-consumed** LHS is frozen exactly when a path on which the binding still owns the displaced value reaches the store, since the store disposes it there;
 3. the [K4.2](#sec-kernel-k4) site-announced kills (rows K3.5, K3.8, K3.9) are unfrozen — each **satisfies (i)**, and **satisfies (ii)** wherever the surviving borrows are backstopped by the kill's own flag, which is every case but the two recorded in clauses 7 and 8;
 4. a Pattern A chaining `return await x` (row K3.6) is unfrozen **by the criterion**: (i) holds — the `return await` keywords are the kill site ([§30.5](#sec-result-lifetime-and-task-disposal)) — and (ii) holds because every borrow that survives the kill has its referent left **intact and disposal-tracked**: the new holder (the outer task) cannot dispose the chained task before the body, `finally` blocks included, completes, so no surviving borrow needs a flag;
 5. the freeze is **body-local by construction** — the clause bounds what *liveness* means, not what is frozen: liveness is the backward dataflow over one body, borrows are traced through `using var` pins, an argument or operand of the same full expression evaluated before the consume and used by its call or operator ([§28.3](#sec-consume-site-freeze)), live closures, locals of borrow-bearing record or inline-array type or of choice types that hold borrows ([§9.7](#sec-records-and-disposal); [§15.1.2](#sec-inline-array-members); [§35.4](#sec-choice-classification)'s holds-borrows property), and locals — a `for` desugaring's hidden `__source` ([§29.2](#sec-desugaring-of-for)) included — holding an iterator or enumerator frame or a lazy query ([K6](#sec-kernel-k6)), each a live local borrow of every source the frame carries, transitively through the frames and closures it carries, as a live closure value is of its captures' sources, the frame's own disposal — explicit, at a `using var`'s scope end, or [K3.14](#sec-kernel-k3)'s auto-drop — counting as a use, since a partially-consumed frame's disposal runs its pending cleanup ([§29.7](#sec-disposal-of-partially-consumed-iterators)) ([§28.3](#sec-consume-site-freeze) *Frame locals*); and this is why a closure may not consume its captured owned bindings (K2 + decidability);
 6. **fields and collection slots are not frozen** — the clause bounds what the freeze's *subject* is: slot aliases are not body-local, and a slot kill disposes — the K4 backstop is real there; the slot kill *by move* is instead governed by K4.3's domain clause ([§28.3](#sec-consume-site-freeze), [§28.7](#sec-reassigning-owned-fields), [§28.11](#sec-collection-element-ownership));
 7. a [§28.14](#sec-scoped-callback-parameters) storage admission freezes the admitted captures against the site-announced kills as well — a **derivation from (ii)**, not an exception: the surviving borrow lives in a stored callback whose invocation site is statically invisible at the kill, and the storage admission's promise is a fully static bound, so a runtime flag is not an admissible backstop for it — stated with its reason at [§28.14](#sec-scoped-callback-parameters), under axiom [A11](#sec-axiom-register)'s forms (the freeze's subject is the captured **binding**: a captured or passed borrow of a slot's current value — class- or interface-typed, or a span over it — keeps clause 6's runtime-checked posture under this admission as under any other, [§28.14](#sec-scoped-callback-parameters) *scoped construction*);
 8. a [§30.12](#sec-thread-synchronization) guard's site-announced kills are frozen while borrows sourced from the guard live — likewise a **derivation from (ii)**: killing a guard sets the disposed flag on the *guard*, while the surviving borrows reference the lock's *interior*, on which no flag is set, the lock released out from under them — stated with its reason at [§30.12](#sec-thread-synchronization).
+
+*Example.* A transfer (clause 1) and a drop-on-overwrite (clause 2) of a binding are frozen while a borrow of its value is live:
+
+```bezel
+var a := new Widget("a");
+var b := a;                    // a live local borrow of the value `a` holds
+var c := move a;               // error (K5.1): cannot consume `a` while the borrow held by `b` is live
+var x := new Widget("x");
+var y := x;
+x := new Widget("x2");         // error (K5.2): the store would dispose the value `y` borrows
+Console.WriteLine(b.Name + y.Name);
+```
+
+*Example.* A live closure is a live local borrow of its captures' sources (clause 5):
+
+```bezel
+var a := new Widget("a");
+var show := lambda() => a.Name;   // a live closure: a live local borrow of `a` (K5.5)
+var c := move a;                  // error (K5.1, K5.5): cannot consume `a` while `show` is live
+Console.WriteLine(show());
+```
+
+*Example.* A field is not frozen (clause 6): the store runs, and the borrow it leaves stale faults at its next use. The store is in another method, so [§28.7](#sec-reassigning-owned-fields)'s rule for a use after a dominating field write does not reach the use; with `_w := new Widget("second");` written in `Show` in place of the call, the use would be that rule's compile error:
+
+```bezel
+class Shelf
+  private owned _w: Widget := new Widget("first");
+
+  public method Replace() => _w := new Widget("second");  // allowed (K5.6): a field store is not frozen
+
+  public method Show()
+    var b := _w;                   // a local borrow of the field's value
+    Replace();                     // disposes "first" under `b`
+    Console.WriteLine(b.Name);     // DisposedAccessException in checked mode (K4.1)
+  end Show;
+end Shelf;
+```
+
 <a id="sec-kernel-k6"></a>
 **K6 — Frames are values.** A deferred activation — a task (`Task`, `Task<T>`, `OwningTask<T>`), an iterator or async-iterator frame (enumerable or enumerator, borrowing or owning), a lazy query — is a **value** with an ordinary K1 classification that additionally **carries a source set** (K2): the constructing call's receiver, the sources its plain arguments contribute ([§28.3](#sec-argument-contributions) — a reference-typed argument its source set, a value that holds borrows, a span among them, the sources of the borrows it carries, a `CancellationToken` excepted at a frame), and the capture-set contributions of its plain function-typed arguments, transitively.
 
@@ -6398,6 +6941,21 @@ The [consume table](#sec-consume-table) records the verdicts these bits decide, 
 3. **Containers: calls mint, storage lends.** A call whose declared return type is **mint-announcing** — a `Task`-family type, or an iterable-family type (a [§29.3](#sec-iterator-methods)/[§30.7](#sec-asynchronous-programming-async-iterators) iterable or enumerator interface, or a lazy query) — produces a fresh **owned** frame at every call site; a read of frame **storage** (property, field, slot) lends a borrow of the storage; callee-side, the unmarked mint-announcing return type transfers the container like an `owned` return (axiom [A15](#sec-axiom-register)'s self-returning enumerator excepted).
 4. **Frames versus the freeze.** Frame-held borrows live in the frame, not in any local borrow binding. A **task's** are not traced by K5: their outlives-obligation is the K4.3-recorded settlement clause ([§30.1](#sec-async-methods)), discharged trivially by awaiting before any source's scope exits and structurally by `TaskScope`; the abandonment idioms carry the residual explicitly, under [§30.1](#sec-async-methods)'s bans on a holds-borrows parameter and on a caller-sourced holds-borrows local across a suspension, a binding an `async` lambda captures from its enclosing scope among them. An **iterator, enumerator or lazy-query** frame is traced by K5.5 through the local that holds it, as a closure value is through its local: its carried sources are frozen while that local is live against the silent kills, the site-announced kills staying unfrozen under their flag, which reaches a read through a span the frame may hold ([§29.4](#sec-lazy-evaluation)) as it reaches any member access ([§28.2](#sec-checked-disposal)); the K4.3 frame clause still names the residual for a frame no traced local holds.
 5. **Interaction with K8.** A frame sourced by an unbound temporary must itself be consumed to its bound within the same full expression; a frame that escapes the expression is rejected — the reject-not-extend posture.
+
+*Example.* An iterator's frame carries the sources of its plain arguments, so a returned frame is admitted exactly where every caller re-establishes them:
+
+```bezel
+public static method Names(w: Widget): IEnumerable<string>
+  yield return w.Name;
+end Names;
+
+public static method Forward(w: Widget): IEnumerable<string> => Names(w);  // allowed (K6.2): every caller re-establishes `w`
+
+public static method Local(): IEnumerable<string>
+  using var w := new Widget("local");
+  return Names(w);               // error (K6.2): the returned frame carries the `using var` `w`
+end Local;
+```
 
 <a id="sec-kernel-k7"></a>
 **K7 — The join rule.** At every control-flow join — statement merges, `??`, `if` expressions, expression-position `case` arms, loop back edges — a variable's or expression's state is the lattice meet, owned ⊑ borrowed:
@@ -6410,14 +6968,38 @@ The [consume table](#sec-consume-table) records the verdicts these bits decide, 
 
 The direction is deliberate: rejection at 3 rather than demotion is what makes the meet leak-free (rationale [§5.6](Bezel_Design_Rationale.md#sec-the-lattice-direction-at-control-flow-joins)).
 
+*Example.* The meet over expression arms; Patterns 1 and 2 of [§28.3](#sec-ownership-state-of-locals) are the statement forms:
+
+```bezel
+var flag := new Random().NextBoolean();
+var a := new Widget("a");
+var c := (if flag then new Widget("b") else move a);  // owned ⊓ owned (K7.1); `a` consumed only when selected
+Console.WriteLine(a.Name);                        // error (K7.4): `a` is maybe-consumed after the join
+var d := (if flag then c else new Widget("d"));   // error (K7.3): borrowed ⊓ owned (an unmarked `c` lends)
+var e := (if flag then c else null);              // borrowed: the null arm absorbs (K7.5)
+```
+
 <a id="sec-kernel-k8"></a>
 **K8 — The full-expression boundary.** A **full expression** is a maximal expression — not a subexpression of any larger expression — at the enumerated positions (initializers, assignment RHSs, expression statements, a constructor's `base(…)`/`this(…)` chaining clause ([§12.8](#sec-constructor-chaining)), each *evaluation* of a condition or guard, `for` sources, `return`/`throw`/`yield return` operands, `case` scrutinees).
 
 1. Unbound owned temporaries are disposed at their full expression's end, after their uses, in reverse production order — on the normal edge as on the exception edge, where the pass runs during unwinding.
 2. Conditions and guards are per-evaluation boundaries: temporaries never accumulate across iterations.
 3. A `case` scrutinee's boundary is the whole construct — pattern bindings are borrows of the scrutinee, and the temporary survives arm selection, guard evaluation, and the selected arm's completion — in statement position exactly as in expression position.
-4. A temporary is an admissible borrow source only within its boundary; a borrow or frame that would escape it is **rejected, never lifetime-extended** — the language has no general lifetime-extension mechanism ([§9.7](#sec-records-and-disposal); rationale [§5.24](Bezel_Design_Rationale.md#sec-the-full-expression-boundary)). The escapes rejected are every escape [K2.3](#sec-kernel-k2) can compare — among them a binding, store, capture, `return` or `yield return` of the borrow in the producing body — and every retention a declaration announces — among them a returned frame (K6.5), a frame carrying the borrow taken by an `owned` parameter or owning slot (`Task.FireAndForget`, [§28.3](#sec-unbound-owned-temporaries)), a borrow-bearing record's field or a holds-borrows choice's payload ([§9.7](#sec-records-and-disposal), [§35.4](#sec-choice-classification)), a `scoped` parameter ([§28.14](#sec-scoped-callback-parameters)), and a `ref` or `out` location. A plain parameter announces none: a callee that stores it holds the borrow under the borrowed-field rule's or the borrowing-collection store rule's recorded residual ([§28.3](#sec-borrow-lifetime-rules), [§28.11](#sec-borrowing-collections)), and the temporary is still disposed at its boundary (K8.1).
+4. A temporary is an admissible borrow source only within its boundary; a borrow or frame that would escape it is **rejected, never lifetime-extended** — the language has no general lifetime-extension mechanism ([§9.7](#sec-records-and-disposal); rationale [§5.24](Bezel_Design_Rationale.md#sec-the-full-expression-boundary)). The escapes rejected are every escape [K2.3](#sec-kernel-k2) can compare — among them a binding, store, capture, `return` or `yield return` of the borrow in the producing body — and every retention a declaration announces — among them a returned frame (K6.5), a frame carrying the borrow taken by an `owned` parameter or owning slot (`Task.FireAndForget`, [§28.3](#sec-unbound-owned-temporaries)), a borrow-bearing record's field or a holds-borrows choice's payload ([§9.7](#sec-records-and-disposal), [§35.4](#sec-choice-classification)), a `scoped` parameter ([§28.14](#sec-scoped-callback-parameters)), and a `ref` or `out` location. A plain parameter announces none: a callee that stores it holds the borrow under the borrowed-field rule's or the borrowing-collection store rule's recorded residual ([§28.3](#sec-borrow-lifetime-rules), [§28.11](#sec-borrowing-collections)), and the temporary is still disposed at its boundary (K8.1). The single-element store positions of the standard borrowing-family collections, and `OwningDictionary<K, V>`'s key, are the exception: their declared signatures are read as stores ([§28.11](#sec-borrowing-collections) *Value-copy members*; the owning map's key is held as a borrow, [§28.11](#sec-element-slot-policy)), so the retention is announced and a fresh unbound owned temporary there is [§15.4](#sec-collection-literals)'s fresh-store error.
 5. A binding atom ([§17.15](#sec-the-binding-atom)) is the boundary for its own bindings: a binding whose initializer is an owned production is a **named unbound owned temporary** whose boundary is the atom — disposed at the atom's completion if undischarged, after the body's evaluation, in reverse clause order; clause 4 applies to the atom boundary verbatim.
+
+*Example.* A temporary lends within its full expression and to nothing past it:
+
+```bezel
+class Shelf
+  private owned _top: Widget := new Widget("top");
+
+  public method Top(): Widget => _top;
+end Shelf;
+
+Console.WriteLine(new Shelf().Top().Name);  // allowed (K8.4): a borrow within the boundary; disposed at its end (K8.1)
+var t := new Shelf().Top();                 // error (K8.4): `t` would borrow from a temporary disposed at this statement's end
+```
 
 <a id="sec-kernel-k9"></a>
 **K9 — Fields are object state, not scope state.** A field's obligation belongs to the object: it is discharged by the destructor cascade (owned fields, reverse declaration order) or by drop-on-overwrite, never by any scope's end, and no scope-end machinery ever touches it. Consequences:
@@ -6427,6 +7009,28 @@ The direction is deliberate: rejection at 3 rather than demotion is what makes t
 3. a constructor's `move` is governed by definite assignment before first assignment ([§7.9](#sec-definite-assignment-for-non-nullable-fields)); a destructor body reads and takes the fields of the object it tears down as any other body does — the replacing `move`, or the bare take at a nullable field — and may dispose one its own class declares early ([§28.6](#sec-who-may-dispose)), the cascade's later call being the no-op; no body takes a non-nullable owned location bare ([§28.8.1](#sec-constructors-and-destructors));
 4. static owned storage — a `static owned` field, and the slots of a `static readonly` owning inline array ([§22.12](#sec-static-members) note (h)) — admits no `move`, no slot store and no explicit disposal: it is the always-live source ([K2](#sec-kernel-k2)), whose referent every borrow of it may be held against as process-lived, so it is neither taken nor replaced and is disposed only by the exit pass ([§28.8.1](#sec-the-move-expression), [§22.12](#sec-static-members), [§22.13](#sec-disposal-of-static-owned-fields), [§28.6](#sec-who-may-dispose));
 5. drop-on-overwrite (K3.11) is RHS-first, so a throwing RHS leaves the slot untouched and still-owned, and a throwing disposer of the displaced value leaves that value at the slot, logically disposed, to the slot's next release point ([§28.7](#sec-reassigning-owned-fields)); the replacing `move` evaluates its replacement first by the same order, and its exchange disposes nothing — the displaced value is its result.
+
+*Example.* The replacing `move` is the one owned read of an owned field:
+
+```bezel
+class Holder
+  private owned _w: Widget := new Widget("first");
+  private owned _spare: Widget? := new Widget("spare");
+
+  public method Swap(): owned Widget => move _w with new Widget("second");  // K9.1: stores "second", yields "first" owned
+  public method Detach(): owned Widget? => move _spare;                     // K9.1: at a nullable field, `move` alone stores null
+end Holder;
+```
+
+*Example.* A bare take of a non-nullable owned field would leave the field empty, which K9.2 excludes:
+
+```bezel
+class Keeper
+  private owned _w: Widget := new Widget("kept");
+
+  public method Take(): owned Widget => move _w;  // error (K9.2, K9.3): a bare take would leave a hole
+end Keeper;
+```
 
 <a id="sec-axiom-register"></a>
 #### 28.3.2 The axiom register (A1–A15)
@@ -6463,9 +7067,9 @@ A local's ownership state is one of [K1](#sec-kernel-k1)'s classifications, infe
 **State match on reassignment** (derives: [K1.7](#sec-kernel-k1) + [K3.11](#sec-kernel-k3)). Reassignment to an existing `var x` is state-matched: the RHS carries the LHS's classification. Assigning a borrow to an owned-state LHS, or an owned value to a borrowed-state LHS, is rejected — the mismatch would silently drop or double-hold a disposal obligation. By LHS state:
 
 1. an **owned-state** LHS requires an owned RHS — a fresh producer, or a named owned binding under the explicit transfer marker (`x := move y;`) — and disposes the displaced value per drop-on-overwrite ([§28.7](#sec-reassigning-owned-fields)), subject to the consume-site freeze below; a **borrowed-state** LHS requires a borrow (or `null`) RHS. A self-assignment is no exception: for an owned-state class-typed local `t`, `t := t;` stores the unmarked read `t`, a borrow, into an owned-state LHS and is rejected at the assignment by this rule, not a [§28.7](#sec-reassigning-owned-fields) discharge. A **runtime-managed** RHS — a box, a `string`, a function value, a `Type` — carries no classification and is outside the match: it displaces as the LHS's state prescribes and leaves the local unclassified (*A runtime-managed RHS into a classified local*, below).
-2. A **moved-from** LHS is an owned-state LHS holding no live value: it requires an owned RHS and displaces nothing ([§28.7](#sec-reassigning-owned-fields)'s liveness test).
-3. An **explicitly-disposed** LHS requires an owned RHS too and displaces a **logically disposed** value: the store is that value's release point — [§28.2](#sec-checked-disposal)'s compiler-inserted free, the `Dispose()` a no-op on the set flag and then the reclamation of the block (deferred, as there, to the terminal state of a direct `DisposeAsync()`'s task that has not reached it) — so the overwrite runs no user code and is non-throwable, exactly as the scope end of an explicitly-disposed binding frees it without disposing it again.
-4. A **maybe-consumed** LHS ([K1](#sec-kernel-k1) state 4) is an owned-state LHS whose displaced value exists on exactly the paths that did not consume it: the store requires an owned RHS, disposes the displaced value on the paths that still own it, frees the logically disposed value on the explicitly-disposed paths and displaces nothing on the moved-from ones — the per-path discharge [K7.4](#sec-kernel-k7) already demands at scope end — and leaves the binding owned and readable.
+2. A **moved-from** LHS is an owned-state LHS holding no live value: it requires an owned RHS and displaces nothing ([§28.7](#sec-reassigning-owned-fields)'s liveness test), so the consume-site freeze does not reach it ([K5.2](#sec-kernel-k5)).
+3. An **explicitly-disposed** LHS requires an owned RHS too and displaces a **logically disposed** value: the store is that value's release point — [§28.2](#sec-checked-disposal)'s compiler-inserted free, the `Dispose()` a no-op on the set flag and then the reclamation of the block (deferred, as there, to the terminal state of a direct `DisposeAsync()`'s task that has not reached it) — so the overwrite runs no user code and is non-throwable, exactly as the scope end of an explicitly-disposed binding frees it without disposing it again. The kill was the explicit disposal, so the store is not frozen by a live borrow of the displaced value ([K5.2](#sec-kernel-k5)); that borrow keeps naming the logically disposed value, and a use through it that the disposal dominates is [§28.2](#sec-checked-disposal)'s compile error.
+4. A **maybe-consumed** LHS ([K1](#sec-kernel-k1) state 4) is an owned-state LHS whose displaced value exists on exactly the paths that did not consume it: the store requires an owned RHS, disposes the displaced value on the paths that still own it, frees the logically disposed value on the explicitly-disposed paths and displaces nothing on the moved-from ones — the per-path discharge [K7.4](#sec-kernel-k7) already demands at scope end — and leaves the binding owned and readable. The store is frozen by a live local borrow of the displaced value exactly when it disposes that value on some path ([K5.2](#sec-kernel-k5)).
 
 Reassignment is the one operation the unreadable states admit ("unreadable until reassigned"), which is what makes the loop-carried spelling — `… Take(move r); … r := new Res(); end;` at the body's end — the ordinary way to carry an owned binding across iterations.
 
@@ -6577,6 +7181,31 @@ One question decides the caller-side ownership of every call: *what does the cal
 
 Row 6's three *cannot arise* cells state a derived fact: every callee kind but the static one contributes a structural source, so the empty set arises only at static declarations — where the rejection is the sourceless-factory rule. Rows 2 and 3 differ in spelling only: the explicit marker changes nothing.
 
+*Example.* What a caller receives, row by row, read off each callee's declared return type:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+class Shelf
+  private owned _top: Item := new Item("top");
+
+  public method Top(): Item => _top;                   // row 4, instance: a borrow, source the receiver
+  public method Spare(): owned Item => new Item("s");  // row 1: owned
+end Shelf;
+
+public static method Either<T>(a: T, b: T): T => a;    // row 5: a borrow of the arguments' sources
+public static method Keep(owned i: Item) => i.Dispose();
+
+using var s := new Shelf();
+var t := s.Top();                      // borrowed, source `s`
+var o := s.Spare();                    // owned
+var p := Either(t, o);                 // borrowed, sources {s, o}, though `T` is `Item` here
+Keep(move o);                          // error (K5.1): `p` borrows `o` and is still live
+Console.WriteLine(p.Name);
+```
+
 <a id="sec-argument-contributions"></a>
 **The sources an argument contributes (derives: [K2.2](#sec-kernel-k2) + [K2.4](#sec-kernel-k2)).** Where a rule counts the sources a call's plain (non-`owned`) arguments contribute — to a function-value invocation's borrow (rows 4 and 5 above), to a `ref` or plain `out` location (*Borrow lifetime rules*' *A `ref` or plain `out` location outlives the call*), to a field-stored borrow (*Borrow lifetime rules*' field-store bullet, clause 2), or to a deferred-activation frame (*Deferred-activation callees*, *Returning a deferred-activation frame*, [§29.4](#sec-lazy-evaluation)), or to the value `GetOrAdd` stores ([§28.11](#sec-borrowing-collections)) — it counts each argument by kind:
 
@@ -6601,6 +7230,30 @@ A `static` method or `operator` declaration — wherever it occurs: a class, a `
 
 Every admissible static signature is therefore **type-announced**: the caller reads a static call's classification off the declared return type, with no heuristic, and discharges an `owned` result under the standard rules. Instance methods are untouched: outside the mint-announcing families (next), a non-`owned` class-typed instance return remains a borrow whose source is the receiver, and an instance method that produces a fresh value must declare `owned` ([§28.6](#sec-leak-prevention)). Documentation phrases like "returns a fresh instance" carry no weight in any classification; the signature is the only transfer signal. *(Derivation — [K2.4](#sec-kernel-k2): this rule and the callee-side borrow-return prohibition of *Borrow lifetime rules* are opposite sides of one boundary, enforced together.)*
 
+*Example.* The admissible static signatures, and two that the rule rejects at the declaration:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+class Registry
+  private static owned readonly _default: Item := new Item("default");
+
+  public static property Default: Item => _default;              // a static property getter lends static storage
+
+  public static method Create(): owned Item => new Item("new");  // `owned`: the caller owns the result
+
+  public static method Names(): IEnumerable<string>              // mint-announcing: each call is a fresh frame
+    yield return "a";
+  end Names;
+
+  public static method First<T>(xs: Array<T>): T => xs[0];       // bare `T` with a source: a borrow of `xs`
+  public static method Lookup(): Item => _default;               // error: a static call has no source; the property above lends
+  public static method Make<T>(): T where T: new() => new T();   // error (note 2): an empty source set; spell `owned T`
+end Registry;
+```
+
 **Calls mint for the mint-announcing families (derives: [K6.2](#sec-kernel-k6) + [K6.3](#sec-kernel-k6)).** The instance-method borrow classification above has one type-keyed exception, in clauses:
 
 1. **The rule.** A **call** whose declared return type — read from the signature *before* generic substitution, with nullability stripped (`Task?`, `IEnumerable<T>?` qualify) — is a **mint-announcing type** produces an **owned** frame at the call site, at every callee kind — the [announcement table](#sec-announcement-table)'s rows 2–3, all four columns (interface dispatch classifies at the declaring signature: the table's inheritance rule).
@@ -6611,6 +7264,25 @@ Every admissible static signature is therefore **type-announced**: the caller re
 6. **Borrow returns rejected.** Returning a **borrow** — a bare field or property read, a plain parameter, a captured binding — is a compile error (the [§29.1](#sec-iterator-protocol) self-returning enumerator's `return this;` is the one admitted receiver return, axiom [A15](#sec-axiom-register)), with the remedy named: a *stored* frame is re-exposed through a **property, field, or collection slot**, whose reads are borrows of their storage ([§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)'s source-owns-task rule; [§22.13](#sec-static-initialization-order)(b)'s cache read as `_cfg!`; the stored-view face `public property Items: IEnumerable<Item> => _items;`, lend-only under axiom [A4](#sec-axiom-register)), or at a **concrete collection type**, whose non-`owned` instance return is an ordinary receiver-sourced borrow.
 7. **Function-type targets.** The callee side at a function-type target is keyed the same way: a lambda's admission is read against the target slot's declared, pre-substitution return type ([K2.4](#sec-kernel-k2)), never against the type an inference or an explicit substitution gives it. A slot whose declared return is a bare type parameter is therefore never mint-announcing at any instantiation: the lambda takes *Bare-type-parameter returns*' callee-side admission (below) — a capture- or plain-parameter-sourced borrow is admitted (`xs.Select(lambda(x) => x.Items)` over a property-face `Items` at `U = IEnumerable<Item>`), a fresh frame is an owned production, rejected at the return path (`Wrap<IEnumerable<int>>(lambda() => Nums())` over a yield-based static `Nums`).
 8. **Scope notes.** A bare-type-parameter return (`First<T>(): T`) is *Bare-type-parameter returns*' at every instantiation, never this rule's — the receiver-and-argument-sourced borrow is exactly what element and cache accessors over collections of tasks or iterables keep ([§30.5](#sec-result-lifetime-and-task-disposal)). An explicit `owned` on a mint-announcing return is row 3's emphasis (`GetEnumerator(): owned IEnumerator<T>`, [§29.1](#sec-iterator-protocol)).
+
+*Example.* A mint-announcing return supplies a fresh or owned frame (clause 5); stored state is re-exposed through a property or at a concrete collection type (clause 6):
+
+```bezel
+class Feed
+  private owned _lines: Array<string> := new Array<string>();
+
+  public property Lines: IEnumerable<string> => _lines;  // admitted: a property read lends the stored collection
+
+  public method Backing(): Array<string> => _lines;      // admitted: a concrete collection type lends (row 4)
+
+  public method Numbers(): IEnumerable<int>              // admitted: an iterator mints a fresh frame per call
+    yield return 1;
+  end Numbers;
+
+  public method Again(): IEnumerable<int> => Numbers();  // admitted: a forwarded minting call
+  public method All(): IEnumerable<string> => _lines;    // error (clause 6): a borrow where the type announces a fresh frame
+end Feed;
+```
 
 <a id="sec-bare-type-parameter-returns"></a>
 **Bare-type-parameter returns (derives: [K2.4](#sec-kernel-k2); empty source set → rejected at the declaration — *Factory methods* above).** In clauses:
@@ -6664,6 +7336,21 @@ So over `interface ISink<V> method Take(f: (V) -> ()); method Put(f: () -> V); e
 
 **Concrete-slot function bodies (derives: [K2.4](#sec-kernel-k2) — the row's type announcement has a callee side).** A lambda checked against a function-type target whose return slot — read from the target's declared, pre-substitution slot type ([K2.4](#sec-kernel-k2)) — is a **concrete class or interface type** (not `owned`; not mint-announcing, whose callee side is the calls-mint rule above) admits on each return path exactly the sources the producers row's callers re-establish: `null` (for a nullable slot), a capture-sourced borrow, a plain-parameter-sourced borrow, or static storage. A **fresh owned value** — a constructor, `move`, factory-call, `Task`-family or iterable-family call result, or any other owned production — is rejected at the return path ([§28.6](#sec-leak-prevention): the row classifies every invocation as a borrow, so no caller would ever dispose it); spell the slot's return `owned` to transfer (`init: (int) -> owned T`, stdlib §4.14). At value and runtime-managed check-site types that carry no borrow the admission is vacuous ([§3.6](#sec-derived-type-properties) rule 2). A lambda checked against a slot whose declared return is a bare type parameter takes the bare-T admission above at every substitution, inferred or explicit. A lambda whose return type at the check site, nullability stripped, is a value type that holds borrows ([§3.6](#sec-derived-type-properties)) — a concrete such type, or an `owned` or `where T: value` bare-type-parameter slot at such a substitution (rows 1 and 7) — admits on each return path a value whose every carried borrow is capture-sourced, plain-parameter-sourced or static storage (`null` and a null-source value carry none); a carried borrow of its own scope-bound local, `using var` or `owned` parameter, or of a temporary, is rejected at the return path ([§9.7](#sec-records-and-disposal)'s return bullet, read for a function body). The check site is the lambda's target slot or, with no target, its ascribed or inferred return type. The result of invoking a function value whose return type, after substitution and with nullability stripped, is such a type carries the union row 4 states for a function-value invocation: the function value's source set and what every plain argument contributes ([*The sources an argument contributes*](#sec-argument-contributions)). Over `record Pair(Item: Item)`, `var g: (Item) -> Pair := lambda(i) => new Pair(i);` is admitted and `return g(x);` with `x` scope-bound is rejected at the return. A method reference needs no clause: the method's body is checked against its own signature, and [§27.1.1](#sec-function-type-assignability)/[§27.6](#sec-method-references) admit only compatible faces into the slot.
 
+*Example.* A lambda at a concrete class-return slot lends; one that produces a value needs an `owned` slot:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+using var i := new Item("i");
+var get: () -> Item := lambda() => i;                       // admitted: a capture-sourced borrow
+var make: () -> owned Item := lambda() => new Item("m");    // admitted: an `owned` slot transfers
+var bad: () -> Item := lambda() => new Item("b");           // error: no caller of `bad` would dispose the result
+using var m := make();
+Console.WriteLine(get().Name + m.Name);
+```
+
 **Iterator and iterable returns (derives: [K6.2](#sec-kernel-k6) + [K6.3](#sec-kernel-k6) — an instance of the calls-mint rule).** A method whose body uses `yield return` or `yield break` (synchronous or async, returning one of the eight iterable/enumerator heads per [§29.3](#sec-iterator-methods)) is a factory by construction — its return is the freshly-constructed state machine — and its natural return type is the iterable interface, unmarked, at **every callee kind** (the [announcement table](#sec-announcement-table)'s row 2); an explicit `owned` is admissible emphasis with identical semantics. A composed-frame non-iterator body (`static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);`) is admitted by the same clause, *Returning a deferred-activation frame* below governing its carried sources. The standard library follows the convention: the `IEnumerable<T>` extensions (`Where`, `Select`, etc.) return **lazy queries** under [§29.11](#sec-multiple-enumeration)'s enumeration-right discipline, and the owning-collection `Drain()` methods returning `IOwningEnumerable<T>` (stdlib §4.5) and the async twin `ReceiveAll()` (stdlib §6.9) are ordinary minting instance members.
 <a id="sec-move-semantics-for-owned-locals"></a>
 #### 28.3.7 Move semantics for owned locals
@@ -6673,6 +7360,39 @@ Reading an owned local `x` in one of the [consume table](#sec-consume-table)'s p
 Where the transfer is spelled and where it is marker-free is the table's Spelling column, stated once there: the marker at the call site — `M(move x)` ([§22.3](#sec-parameter-modifiers)) — and in **local binding and assignment positions** — `var y := move x;`, `y := move x;`, `using var y := move x;` ([§28.10](#sec-using-var) adoption); no marker at the marker-free positions — an **`owned` field or owning-collection slot**, `return` under an `owned` return type or an unmarked mint-announcing return type ([K3.2](#sec-kernel-k3)), or a user-declared `set(owned)` property or indexer ([§23.3](#sec-block-form-properties): `cache.Current := c;` consumes without a call-site marker, exactly as at the stdlib owning-collection indexer-set, whose setters are themselves declared `set(owned)`) — and none anywhere for a fresh producer (no live binding is invalidated).
 
 Three spelling errors follow, mirroring the call-site marker's rules: the marker on a **borrow or fresh-producer right-hand side**; a marked reassignment into a **borrowed-state** LHS (the state-match rule above); and the marker **at a marker-free position** — `return move x;` under an `owned` return, `throw move x`, `_ := move x;`, an owned-field or `set(owned)` store spelled `sink._f := move x;`, a Pattern B `await move t` ([§30.5](#sec-result-lifetime-and-task-disposal)), an owning iterator's `yield return move x;` — **one spelling per site**: the announcement is the spelling there, and the diagnostic names it.
+
+*Example.* The marker is written where nothing else announces the transfer, and nowhere else:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+class Sink
+  public owned Kept: Item? := null;
+
+  public method Keep(owned i: Item) => Kept := i;    // an `owned` field store: no marker
+end Sink;
+
+using var s := new Sink();
+var a := new Item("a");
+s.Keep(move a);                                      // an `owned` argument: the marker is required
+s.Keep(move new Item("n"));                          // error: a fresh producer takes no marker
+var d := new Item("d");
+s.Kept := move d;                                    // error: an `owned` field announces the consume
+```
+
+*Example.* An unmarked alias is a borrow, so the marker on it has nothing to transfer:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+using var owner := new Item("o");
+var b := owner;                      // the aliasing idiom: a borrow; `owner` keeps the value
+var c := move b;                     // error: `b` is a borrow; there is nothing to transfer
+```
 
 A fresh declaration (`var y := move x;`, `using var y := move x;`), an **uninitialized** LHS (`var y: Res; … y := move x;`), or a **polymorphic-null** LHS (`var best: Res? := null; … best := move cur;` — the null-literal producers row) adopts owned state from the marked transfer, exactly as it would from a fresh producer — the last two by the adoption clause of *Ownership state of locals*, which an **unclassified** LHS (`var o: Object := 7; … o := move c;`) takes as well.
 
@@ -6754,6 +7474,77 @@ A borrowed value's lifetime is the lifetime of its *source* ([K2.1](#sec-kernel-
   5. **Exclusions and remedies.** A `scoped` parameter is never a set-erasing position: it is declared at a function type, or at a class or interface type other than `Object` ([§28.14](#sec-scoped-callback-parameters)). The remedies are a capture-free function value; a parameter declared at a function type and invoked within the call ([§28.14](#sec-scoped-callback-parameters)); a `scoped` one where the callee must retain the callback; and, for a selector, the expression form `(if c then f else g)`, whose arms keep their sets.
   6. **Routes with no caller conversion.** Four routes reach a set-erasing position with no conversion at a caller, and each has its own rule: a method reference formed over one ([§28.14](#sec-scoped-callback-parameters)'s *method-reference formation bar*, which exempts an `out` parameter on clause 2's ground); a function value a generic body forms at a type with a type parameter in a parameter slot, or in a return slot reached through return slots only (*Function values a generic body forms over its type parameters*); a function-typed parameter of a method implementing or overriding a generic declaration, whose slots are read at the declaring signature (*Implementations and overrides read their function-typed parameters at the declaring signature*); and a flow-narrowed carrier, which is read at its declared type (clause 1); a type parameter nested two function types deep has no declaration or body type to reach one from (*A type parameter occurs in a function type at depth one only*). A value that holds borrows at a position declared `Object` or an interface type is the twin case, decided by [§9.7](#sec-records-and-disposal)'s *borrow-erasing position* bullet: a box announces no source either.
 
+*Example.* The field-store bullet: a plain parameter's borrow may be stored, a scope-bound source's may not:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+class Tag
+  private _item: Item? := null;                  // a plain field: it holds a borrow
+
+  public method Attach(i: Item) => _item := i;   // admitted (clause 2): a plain parameter, under clause 3's residual
+
+  public method Adopt(owned i: Item)
+    _item := i;                                  // error (clause 2): an `owned` parameter is scope-bound
+  end Adopt;
+
+  public method Local()
+    using var i := new Item("local");
+    _item := i;                                  // error (clause 1): a scope-bound local
+  end Local;
+end Tag;
+```
+
+*Example.* The local-scope bullet, at a loop back edge:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+using var first := new Item("first");
+var prev := first;
+for var k in 0..<3 do
+  using var cur := new Item($"item {k}");
+  Console.WriteLine(prev.Name);
+  prev := cur;                         // error: `prev` carries the borrow around the back edge; `cur` is per-iteration
+end;
+```
+
+*Example.* The closure bullet: a closure that captures a borrow may be invoked or passed on, but not returned:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+public static method Twice(f: () -> string): string => f() + f();
+public static method Label(i: Item): () -> string => lambda() => i.Name;  // error (sink rule): a return slot announces no source set
+
+using var i := new Item("i");
+var label := lambda() => i.Name;            // a closure: its source set is {i}
+Console.WriteLine(label() + Twice(label));  // admitted: invoked, and passed to a call-bounded parameter
+```
+
+*Example.* Only a capture-free closure may be stored:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+class Panel
+  public Render: (() -> string)? := null;
+end Panel;
+
+using var panel := new Panel();
+using var i := new Item("i");
+panel.Render := lambda() => "fixed";     // admitted: a capture-free value may be stored
+panel.Render := lambda() => i.Name;      // error (sink rule): a field announces no source set
+```
+
 A borrowed value may be passed as a non-`owned` argument to another call: the callee further borrows for the duration of the call, and retains the borrow past the call only where its declaration announces the retention (a deferred-activation frame, a `scoped` parameter, a `ref` or `out` location) or under a recorded trust clause ([K4.3](#sec-kernel-k4)), as a store into a field or a borrowing collection is (the field-store bullet above, [§28.11](#sec-borrowing-collections)).
 
 **A `ref` or plain `out` location outlives the call** (derives: [K2.3](#sec-kernel-k2) + [K2.4](#sec-kernel-k2), with [K2.2](#sec-kernel-k2)'s union). A `ref` or plain `out` argument location ([§22.3](#sec-ref-and-out-argument-locations)) whose type, after substitution, can carry a borrow — a class or interface type, a function type, or a borrow-bearing record, choice or inline array ([§3.6](#sec-derived-type-properties); an inline array of class or interface elements among them) — is caller storage: the callee may store into it a borrow sourced at its receiver, a plain parameter, or static storage, and a borrow of its own scope-bound locals, temporaries or `owned` parameters is rejected there as at a field. Where the location's declared type is a function type it is also a function-typed holder (*Function-typed holders* above), so a function value stored there is admitted only capture-free. A borrow sourced at a `scoped` parameter is not a plain-parameter source and is rejected there: its own value, which [§28.14](#sec-scoped-callback-parameters) admits only into the bounding object's fields, a borrow reached through it, and the result of invoking it. The caller therefore treats each such location as receiving any borrow the call carries: the sources the receiver and every plain (non-`owned`, non-`scoped`) argument contribute, each counted by kind as [*The sources an argument contributes*](#sec-argument-contributions) states (the receiver as an argument of its type: at a constructor call, the object or value constructed, read as the binding or field its result initializes or, for an unbound result, as an unbound owned temporary bounded to the full expression, [*Unbound owned temporaries*](#sec-unbound-owned-temporaries); in a `this(...)` or `base(...)` constructor chain, `this`), and the current value of every such `ref` argument. At the call, each of those borrows must be admissible into each such location exactly as the direct assignment of it would be — the local bullet's scope comparison at a local or parameter, the field rule above at a field, the assignment through the accessor at an accessor target (the *property stores of a borrow-carrying value* and *property and indexer stores* bullets above) — and a violation is rejected at the call site; after the call the location's source set is their union — except at a location whose type, after substitution, is a function type: the callee can store there only a capture-free function value (the holder rule above; at a bare type parameter, *Set-erasing positions*), so the call's borrows need no admissibility check against it, and on the call's normal return an `out` location carries the empty set and a `ref` location the set it carried before the call (on an exception exit an `out` recipient keeps its prior value, [§22.3](#sec-parameter-modifiers), and so its prior set). A `ref` argument's current value at a location declared at a bare type parameter is still checked there as at a set-erasing position (*Set-erasing positions*): that check, not this one, is what keeps the location capture-free. An `out _` discard names no location and takes no part. The rule reads only the callee's signature: a callee that stores nothing is checked as one that stores everything.
@@ -6765,15 +7556,35 @@ Consuming an owned **binding** — a local or an `owned` parameter — while a *
 
 A borrow is *live* at a consume site when some path from the site reaches a later use of it — [K5.5](#sec-kernel-k5)'s body-local backward dataflow, traced directly, through a `using var` pin ([§28.10](#sec-using-var)), or through a closure value that is itself still live. A borrow of the consumed binding passed as an argument or operand evaluated **before** a consuming argument of the same call ([§22.5](#sec-optional-parameters-and-named-arguments)'s textual order) is such a borrow, its use being the call itself (a value-typed argument read from it, `Add(x.Id, move x)`, is no borrow and is unaffected): `Sink(x, move x)` and `Sink(x.Child(), move x)` are rejected at the `move`, since the callee would hold a plain parameter aliasing its own `owned` parameter — a relation no body-local freeze on the callee's side can see; transfer first and borrow from the new owner, or borrow after the call. A live local of a **value type that holds borrows** ([§3.6](#sec-derived-type-properties)'s holds-borrows property: a borrow-bearing record ([§9.7](#sec-records-and-disposal)) — a span is the canonical case —, a borrow-bearing inline array, whose held borrows' sources are its one source set ([§15.1.2](#sec-inline-array-members)), or a choice that holds borrows whatever its classification ([§35.4](#sec-choice-classification))) counts as a live local borrow of every held borrow's source (stated explicitly, because stdlib §4.19's construction-time soundness is load-bearing on it): `var s := buf.AsSpan();` freezes `buf` against `FrozenArray<T>.From(move buf)` — and every other consume — for as long as `s` is live. The check is decidable and local to the method body ([K5.5](#sec-kernel-k5)); the diagnostic names the consumed binding, the borrow, and the borrow's surviving use.
 
-**Frame locals** (derives: [K2.1](#sec-kernel-k2) + [K2.2](#sec-kernel-k2) + [K5.5](#sec-kernel-k5)). A live local holding an iterator or enumerator frame or a lazy query — `var it := Each(xs.AsSpan());`, `var q := xs.Where(f);`, the `for` desugaring's hidden `__source` ([§29.2](#sec-desugaring-of-for)) — counts as a live local borrow of every source the frame carries (*Deferred-activation callees* below; [K6](#sec-kernel-k6)), transitively through the frames and closures it carries, exactly as a live closure value counts for its captures' sources: `sink.Take(move xs);` while `it` or `q` has a later use is rejected, as it is under a live closure over `xs`. The frame's own **disposal** is such a use — an explicit `Dispose()`, a `using var`'s scope end, or [K3.14](#sec-kernel-k3)'s auto-drop — because a partially-consumed frame's disposal runs its pending cleanup, `finally` blocks included, which may read the carried sources ([§29.7](#sec-disposal-of-partially-consumed-iterators)); so a bound frame keeps its sources frozen until it is disposed or moved. The remedies: transfer first, then re-derive the frame from the new owner; enumerate the frame through an unbound call (`for var x in Each(xs.AsSpan()) do … end;`, whose hidden `__source` is disposed at the loop's exit) or dispose it (`it.Dispose();`) before the transfer. The site-announced kills of a carried borrow stay unfrozen under the flag: every read the frame makes through it is a member access, a read through a carried span included ([§28.2](#sec-checked-disposal); the next paragraph). A task local is not traced ([K6.4](#sec-kernel-k6)): its carried borrows are held under [§30.1](#sec-async-methods)'s recorded settlement clause.
+**Frame locals** (derives: [K2.1](#sec-kernel-k2) + [K2.2](#sec-kernel-k2) + [K5.5](#sec-kernel-k5)). A live local holding an iterator or enumerator frame or a lazy query — `var it := Each(xs.AsSpan());`, `var q := xs.Where(f);`, the `for` desugaring's hidden `__source` ([§29.2](#sec-desugaring-of-for)) — counts as a live local borrow of every source the frame carries (*Deferred-activation callees* below; [K6](#sec-kernel-k6)), transitively through the frames and closures it carries, exactly as a live closure value counts for its captures' sources: `sink.Take(move xs);` while `it` or `q` has a later use is rejected, as it is under a live closure over `xs`. The frame's own **disposal** is such a use — an explicit `Dispose()`, a `using var`'s scope end, or [K3.14](#sec-kernel-k3)'s auto-drop — because a partially-consumed frame's disposal runs its pending cleanup, `finally` blocks included, which may read the carried sources ([§29.7](#sec-disposal-of-partially-consumed-iterators)); so a bound frame keeps its sources frozen until it is disposed or moved. The remedies: transfer first, then re-derive the frame from the new owner; enumerate the frame through an unbound call (`for var x in Each(xs.AsSpan()) do … end;`, whose hidden `__source` is disposed at the loop's exit) or dispose it (`it.Dispose();`) before the transfer. The site-announced kills of a carried borrow stay unfrozen under the flag: every read the frame makes through it is a member access, a read through a carried span included ([§28.2](#sec-checked-disposal); the next paragraph) — and a use of the frame local that such a kill of its every source dominates is [§28.2](#sec-checked-disposal)'s compile error. A task local is not traced ([K6.4](#sec-kernel-k6)): its carried borrows are held under [§30.1](#sec-async-methods)'s recorded settlement clause.
 
-**Span-carried borrows and the site-announced kills** (derives: [K5.3](#sec-kernel-k5) + [K4.1](#sec-kernel-k4)). A span — a buffer- or array-backed span (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans), [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)) — reads and writes its window through its backing object's accessors, so the flag a site-announced kill sets reaches every later read through it ([§28.2](#sec-checked-disposal)): `var s := xs.AsSpan(); xs.Dispose(); Console.WriteLine(s[0]);` compiles, and the read faults as `DisposedAccessException` in checked disposal mode, exactly as a read through any other surviving borrow of `xs` does — the unfrozen posture a record whose carried borrows are object references (`Pair(Item: Item)`) has. Dispose after the span's last use. What the liveness trace above reads a span local, or a frame or closure that carries a span, for is the **silent** kills: a `move`, transfer or reassignment of the span's source is frozen while that holder is live.
+**Span-carried borrows and the site-announced kills** (derives: [K5.3](#sec-kernel-k5) + [K4.1](#sec-kernel-k4)). A span — a buffer- or array-backed span (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans), [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)) — reads and writes its window through its backing object's accessors, so the flag a site-announced kill sets reaches every later read through it ([§28.2](#sec-checked-disposal)): `var s := xs.AsSpan(); xs.Dispose(); Console.WriteLine(s[0]);` is rejected at the read — the kill dominates it, [§28.2](#sec-checked-disposal)'s use after a dominating explicit disposal — while `var s := xs.AsSpan(); if c then xs.Dispose(); end; Console.WriteLine(s[0]);` compiles, and the read faults as `DisposedAccessException` in checked disposal mode on the path that disposed, exactly as a read through any other surviving borrow of `xs` does — the unfrozen posture a record whose carried borrows are object references (`Pair(Item: Item)`) has. Dispose after the span's last use. What the liveness trace above reads a span local, or a frame or closure that carries a span, for is the **silent** kills: a `move`, transfer or reassignment of the span's source is frozen while that holder is live.
 
-**Unborrowed reassignment stays legal** — only the silent kill under a live borrow is rejected, and the site-announced kills stay unfrozen under their flag backstop ([K5.3](#sec-kernel-k5); [K5.7](#sec-kernel-k5)/[K5.8](#sec-kernel-k5)'s two recorded shapes excepted, each stated at its home). The one idiom the freeze rejects — borrow, transfer the source into a longer-lived owner, keep using the pre-transfer borrow — has a mechanical rewrite: transfer first, then re-borrow from the new owner (`pool.Add(move item); var b := pool[pool.Count - 1]; b.Configure();`).
+**Unborrowed reassignment stays legal** — only the silent kill under a live borrow is rejected, and the site-announced kills stay unfrozen under their flag backstop ([K5.3](#sec-kernel-k5); [K5.7](#sec-kernel-k5)/[K5.8](#sec-kernel-k5)'s two recorded shapes excepted, each stated at its home) — a use through the borrow that such a kill dominates being [§28.2](#sec-checked-disposal)'s compile error rather than a fault. The one idiom the freeze rejects — borrow, transfer the source into a longer-lived owner, keep using the pre-transfer borrow — has a mechanical rewrite: transfer first, then re-borrow from the new owner (`pool.Add(move item); var b := pool[pool.Count - 1]; b.Configure();`).
 
-**Scope.** Fields and collection slots are **not** frozen ([K5.6](#sec-kernel-k5)): a borrow of `obj.f`'s or `coll[i]`'s current value is invalidated by an overwrite or mutation of the slot under the runtime-checked posture ([§28.7](#sec-reassigning-owned-fields), [§28.11](#sec-element-slot-policy)). Four clauses:
+*Example.* Two consumes the freeze rejects: a borrow passed earlier in the same call, and a live frame local:
 
-1. **Slot kills by move.** A slot kill *by move* — `move box.f with e` (or a bare `move box.f` at a nullable `f`) into a transfer, a spawn argument, or one of the domain-reachable constructions of the domain clause — disposes nothing and sets no flag, and is governed by the borrow lifetime rules' domain clause above ([K4.3](#sec-kernel-k4)), a recorded obligation, not by this exemption. The object the move took is not flagged, and the location is never left empty: the replacing `move` ([§28.8.1](#sec-the-replacing-move)) stores its replacement in the step that takes, so an alias of the holder — a borrowing-match binding addressing a move-only field's storage ([§15.3](#sec-move-only-value-types) *Pattern binding*) included — reads the replacement, as after any overwrite ([§9.4](#sec-value-receivers-are-borrows)).
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+public static method Both(a: Item, owned b: Item) => b.Dispose();
+public static method Take(owned xs: OwningArray<Item>) => xs.Dispose();
+
+var x := new Item("x");
+Both(x, move x);                               // error: the first argument still borrows `x`
+var xs := new OwningArray<Item>();
+var q := xs.Where(lambda(i) => i.Name <> "");  // a frame local: a live borrow of `xs`
+Take(move xs);                                 // error: `q` still has a later use
+for var i in q do
+  Console.WriteLine(i.Name);
+end;
+```
+
+**Scope.** Fields and collection slots are **not** frozen ([K5.6](#sec-kernel-k5)): a borrow of `obj.f`'s or `coll[i]`'s current value is invalidated by an overwrite or mutation of the slot under the runtime-checked posture ([§28.7](#sec-reassigning-owned-fields), [§28.11](#sec-element-slot-policy)) — a use of a local borrow of an owned field's current value that a visible disposing write of the field dominates, with no invalidating operation between the borrow and the write, being [§28.7](#sec-reassigning-owned-fields)'s compile error (*Use after a dominating field write*), the write itself unfrozen. Four clauses:
+
+1. **Slot kills by move.** A slot kill *by move* — `move box.f with e` (or a bare `move box.f` at a nullable `f`) into a transfer, a spawn argument, or one of the domain-reachable constructions of the domain clause — disposes nothing and sets no flag, and is governed by the borrow lifetime rules' domain clause above ([K4.3](#sec-kernel-k4)), a recorded obligation, not by this exemption. The object the move took is not flagged, and the location is never left empty: the replacing `move` ([§28.8.1](#sec-the-replacing-move)) stores its replacement in the step that takes, so an alias of the holder — a borrowing-match binding addressing a move-only field's storage ([§15.3](#sec-move-only-value-types) *Pattern binding*) included — reads the replacement, as after any overwrite ([§9.4](#sec-value-receivers-are-borrows)). The trust-admission report ([§28.3](#sec-diagnostics), clause 3) names the transfer of the taken value while a local read directly from the moved path in the same body is still used; any other holder of the displaced value in the body — an alias of such a local, a closure, a borrow-bearing record or choice, a borrow returned by a member — and a borrow whose slot a replacing `move` in another body displaces (a callee's `move _f` under a caller's `var b := a.F;`) carry the obligation with no report line: their source sets name the holder, not the slot's value ([K5](#sec-kernel-k5)), and a callee's `move` is not visible in the caller. A field-, collection- or frame-held borrow of the displaced value is reported at its own store.
 2. **Whole-value reassignment of an owning inline array.** An owning inline array's **whole-value** reassignment at a **local binding** is a binding consume under [K5.2](#sec-kernel-k5), not a slot overwrite: the exemption covers a store into `arr[i]`, not a store into `arr` ([§15.3](#sec-move-only-value-types)'s *Whole-value reassignment* rule); at an owning-inline-array **field**, the whole-value overwrite stays under this exemption's runtime-checked posture, like every owned-field overwrite ([§28.7](#sec-reassigning-owned-fields)).
 3. **Captured sources under a storage admission.** The [§28.14](#sec-scoped-callback-parameters) admission freeze on captured sources is the storage-bounded form of this rule, covering the site-announced kills as well — [K5.7](#sec-kernel-k5)'s derivation from the criterion's conjunct (ii), stated at [§28.14](#sec-scoped-callback-parameters).
 4. **Value-kind receivers.** A value-kind receiver's source is **not** frozen either: a copyable receiver's member runs over the call's fixed receiver value ([§9.4](#sec-value-receivers-are-borrows)), so overwriting the source during the call — a mutably captured local, a field through an alias — changes nothing the member reads; a move-only receiver's member borrows the source in place under this exemption's runtime-checked posture, with [§19.3](#sec-patterns)'s write-point rule closing the one read the flag cannot backstop.
@@ -6807,6 +7618,30 @@ The implicit cleanup does **not** apply to:
 
 A user who wants to perform additional cleanup on the exception path (logging the partial result, performing a partial-state recovery) writes an explicit `try`/`finally` or `try`/`catch`/`throw` around the relevant operations. The implicit auto-dispose composes with explicit `finally` blocks on the single establishment-ordered cleanup stack of [§28.10](#sec-using-var): an owned local's implicit disposal is established at its declaration — exactly as if it were a `using var` — so a `finally` established *after* the declaration runs before the disposal (with the local still in scope), and one established *before* it runs after. Undischarged `owned` parameters' implicit disposals are established at entry to the body, in declaration order — so, undischarged, they are disposed in reverse declaration order, for a method, a constructor, a lambda and an uncaptured primary-constructor parameter alike, as an iterator's ([§29.8](#sec-iterators-with-owned-parameters)) and an async method's ([§30.1](#sec-async-methods)) are — and an expression's unbound owned temporaries at their production (see *Unbound owned temporaries* below).
 
+*Example.* One cleanup stack serves the normal exit, the unwind and a `finally`:
+
+```bezel
+class Res(name: string)
+  public property Name: string => name;
+
+  destructor
+    Console.WriteLine($"disposed {name}");
+  end destructor;
+end Res;
+
+var a := new Res("a");               // a plain `var`: its normal-exit drop draws the must-use warning
+using var b := new Res("b");
+try
+  var c := new Res("c");
+  throw new InvalidOperationException("boom");   // the unwind disposes "c" first
+catch
+  InvalidOperationException => Console.WriteLine("caught"),
+finally
+  Console.WriteLine("finally");      // established at the `try`, so it runs after "c" and before "b" and "a"
+end try;
+// prints: disposed c, caught, finally; then, at scope end, disposed b, disposed a
+```
+
 <a id="sec-unbound-owned-temporaries"></a>
 #### 28.3.11 Unbound owned temporaries
 
@@ -6828,6 +7663,35 @@ This is the unnamed-temporary counterpart of the discard contract ([§17.13](#se
 
 For example, in `Folded(src).Sorted()` where `Folded(src): owned Array<T>` and `Sorted` borrows its receiver, the `Folded(src)` temporary is borrowed by `Sorted`, then disposed once the statement completes — exactly once, with no leak and no double-free. Disposal runs *after* the borrowing use, so the receiver is live for the duration of the call.
 
+*Example.* Where each temporary's boundary falls:
+
+```bezel
+class Res(name: string)
+  public property Name: string => name;
+
+  destructor
+    Console.WriteLine($"disposed {name}");
+  end destructor;
+end Res;
+
+public static method Make(n: string): owned Res => new Res(n);
+public static method Fail(): int => throw new InvalidOperationException("boom");
+public static method Both(a: Res, n: int) => Console.WriteLine(a.Name);
+
+Console.WriteLine(Make("t").Name + " read");          // "t" lends to `.Name`; disposed at the statement's end
+var len := (var r := Make("atom"); r.Name.Length);    // a binding atom: "atom" is disposed at the atom's end
+Console.WriteLine(len);
+case Make("c") of                                     // a scrutinee temporary lives to the end of the `case`
+  var c when c.Name = "c" => Console.WriteLine("matched " + c.Name),
+  _ => ()
+end case;
+try
+  Both(new Res("early"), Fail());                     // the unwind disposes "early": `Both` never began
+catch
+  InvalidOperationException => Console.WriteLine("caught"),
+end try;
+```
+
 **A callee that stores a plain argument.** A non-`owned` argument position is a borrowing use whatever the callee's body does with the parameter, and the temporary's disposal at its boundary does not depend on that body. Where the callee stores the parameter, the store is the borrowed-field rule's caller-side residual (*Borrow lifetime rules* above) or the borrowing-collection store rule's ([§28.11](#sec-borrowing-collections)): the stored borrow dangles from the boundary on, and the temporary is not lifetime-extended ([K8.4](#sec-kernel-k8)) — in `holder.Hold(new Item());`, where `Hold(x: Item)` assigns `x` to a field, the `Item` is disposed at the end of the statement. A retention a declaration announces is rejected instead: the deferred-activation callees below, a borrow-bearing record's or choice's construction ([§9.7](#sec-records-and-disposal)), a `scoped` parameter ([§28.14](#sec-scoped-callback-parameters)), and an assignment through an instance property of a class or interface, which is a store, not a call (*Property stores of a borrow-carrying value* above): `holder.Item := new Item();` is rejected unless `Item`'s setter is declared `set(owned)`.
 
 The rule is uniform across the source of the temporary: a user method declared `owned` and the standard-library materializers — themselves declared `owned`: `ToArray(): owned Array<T>`, `Sorted()`, `Reversed()`, `ToSet(): owned Set<T>`, `ToDictionary(...): owned Dictionary<K, V>` ([§5.11](Bezel_Design_Rationale.md#sec-owning-collections); these own the *container*, borrowing the elements) — are treated identically, so an unbound materializer result in a chain (`items.Where(p).ToArray().Length`) is reclaimed at end-of-statement by the same rule. The `owned` return qualifier is the single signal that drives the reclaim; there is no special-cased list of method names.
@@ -6837,6 +7701,33 @@ The rule is uniform across the source of the temporary: a user method declared `
 **The capture-set contribution.** A function value is runtime-managed ([§28.9](#sec-runtime-managed-types)) and is itself no borrow — but the borrows its closure captures are, and they ride the frame exactly as long as the callback does ([§28.14](#sec-scoped-callback-parameters)'s frame residence): a plain function-typed argument contributes its **source set** to the frame's, as the closure bullet's provenance clauses read it off the argument's statically-known provenance (*Borrow lifetime rules* above), **transitively** — a lambda literal its captured borrows' sources (provenance clause 1, a captured value that is itself a function value or a deferred-activation frame contributing *its* sources by this same rule; a captured `CancellationToken` is excepted here as an argument one is); a method reference its receiver's source (clause 2); a plain function-typed **parameter** of the enclosing body — the one statically opaque form that can carry borrow captures — **itself** as a carried source, which every caller re-establishes against its own actual argument by this same rule (clause 3); an invocation the invoked value's set (clause 4); a local the union of what the flow analysis traces it to, in any mix (clause 6). A function value read from a field, a collection element, a property or indexer, or a method call's result contributes nothing (clauses 4–5), and soundly so: the closure-escape rules admit a borrow-capturing closure into none of those locations. The one storing location that does hold capture-bearing callbacks — a `scoped` field ([§28.14](#sec-scoped-callback-parameters)) — is no counterexample: its value cannot reach this position at all, passing it to a deferred-activation callee's plain function-typed parameter being exactly the escaping read-out [§28.14](#sec-scoped-callback-parameters) bars, and a `scoped` parameter has no admitted path into a plain function-typed argument position either.
 
 **Temporaries as sources.** An unbound owned temporary passed as a plain argument to such a callee — or reached through a plain function-typed argument's capture-set contribution (a method reference over a fresh receiver) — is admissible only when the returned frame is itself fully consumed **within the same full expression**: an iterable frame enumerated there, a task consumed to settlement there (awaited, or blocked on outside a domain, [§30.3](#sec-the-task-taskt-and-ownedtaskt-types)). Where the frame outlives the expression — bound to a name (`using var t := SumAsync(Nums(3));`), returned, stored, passed to `Task.FireAndForget`, or used as a `for`/`await for` source (whose desugaring binds it, [§29.2](#sec-desugaring-of-for)) — the program is rejected: the temporary dies at the full expression's end, so the violation of the frame's source-outlives-bound obligation ([K6.1](#sec-kernel-k6); for a task, [§30.1](#sec-async-methods)'s source-outlives-settlement obligation) is statically certain, and the reject posture — not [§30.1](#sec-async-methods)'s trust posture, which covers only sources whose lifetimes the checker cannot compare — applies, the same reject-not-extend posture as [§9.7](#sec-records-and-disposal)'s no-temporary-source rule for records. The classification is deliberately conservative: it is by declared return type, so a callee returning an already-materialized collection typed as `IEnumerable<T>`, or an async callee that happens to complete before returning, is treated as borrow-carrying all the same; the remedy is always the same one line — bind the source first: `var src := Source(3); await for var line in Shout(src) do … end;`.
+
+*Example.* A plain-parameter store takes a temporary under the residual; a deferred-activation frame takes one only when it is consumed within the expression:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+class Holder
+  private _last: Item? := null;
+
+  public property Current: Item? => _last;
+
+  public method Hold(r: Item) => _last := r;              // stores a plain parameter (the field-store residual)
+end Holder;
+
+public static method Letters(r: Item): IEnumerable<string>  // its frame carries the borrow of `r`
+  yield return r.Name;
+end Letters;
+
+using var h := new Holder();
+h.Hold(new Item("held"));                                // admitted: "held" is disposed at the statement's end
+Console.WriteLine(Letters(new Item("n")).Count());       // admitted: the frame is consumed within the expression
+for var s in Letters(new Item("f")) do                   // error: the loop binds the frame past the temporary
+end;
+Console.WriteLine(h.Current!.Name);                      // DisposedAccessException in checked mode (K4.1)
+```
 
 <a id="sec-returning-a-deferred-activation-frame"></a>
 **Returning a deferred-activation frame (derives: [K6.2](#sec-kernel-k6) + [K2.4](#sec-kernel-k2)).** The callee-side borrow-return prohibition (*Borrow lifetime rules* above) does not apply to a return whose declared type is one of the deferred-activation kinds — the [§29.3](#sec-iterator-methods)/[§30.7](#sec-asynchronous-programming-async-iterators) iterable and enumerator interfaces, a lazy query, or a `Task`-family type (the [announcement table](#sec-announcement-table)'s rows 2–3): the declared return type itself announces the borrow-carrying classification (**type-announced**, [K6.2](#sec-kernel-k6)), and every caller re-establishes the returned frame's constraints against **its own** receiver and arguments. A non-iterator method may therefore compose and return such a frame — `public static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` (an instance or extension callee states the same contract in the same unmarked spelling; `owned` remains admissible emphasis) — provided every borrow the returned frame carries is sourced from the method's own parameters or receiver (directly or through the receiver's fields, the receiver-sourced notion of [§28.6](#sec-leak-prevention)); an iterator method is the canonical instance, its returned state machine carrying exactly its parameters' borrows ([§29.4](#sec-lazy-evaluation)). A returned frame carrying a borrow of anything else — a scope-bound local, a `using var`, a temporary — is rejected at the return site, since the frame would outlive the source; the remedy is to materialize instead (return an `owned` collection whose elements outlive the method: at a class or interface element type a `ToArray()` snapshot's slots still borrow the source's elements, so [§28.11](#sec-element-slot-policy) rejects `return local.ToArray()` over a scope-bound local). The callee-side check is structural over the returned expression's construction: the frame's carried sources are what the deferred-activation calls that built it put in it (*Deferred-activation callees* above), followed transitively through intermediate frames. In a generic body an argument whose type is a type parameter, or whose borrow-bearing or holds-borrows classification turns on one, therefore counts what it contributes at every substitution its constraints admit. A capture-set contribution that reaches a scope-bound local, a `using var`, or a temporary is rejected at the return site exactly as a directly-carried borrow of one is — `return Doubled(nums, lambda(x) => scale.Apply(x));` over a `using var scale` is the canonical reject — while a contribution that is the method's own plain function-typed parameter, or a capture sourced from its parameters or receiver, is admitted. The classification stays by declared return type (a method returning an already-materialized collection typed as `IEnumerable<T>` is treated as borrow-carrying all the same; declare the return `owned Array<T>` to advertise the stronger contract). This exception lifts only the borrow-return prohibition and governs the *carried* borrows: the container itself transfers under *Calls mint for the mint-announcing families* above — fresh or owned on every return path, a borrowed container rejected — and [§28.6](#sec-leak-prevention)'s owned-escape rules are unaffected for values *outside* the families (a materialized collection returned as `Array<T>`, a `move` result, still requires an `owned` return type).
@@ -6850,11 +7741,11 @@ The compiler must produce error messages that name the variable, its current own
 
 1. **The clauses:** the **field-held** clause (the borrowed-field store rule above, wherever restated), the **collection-held** clause ([§28.11](#sec-borrowing-collections)'s store rule, a store whose receiver the structural check leaves unclassified included), the **comparer-held** clause (stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic)), the **frame-held** clause ([§30.1](#sec-async-methods), [§30.5](#sec-result-lifetime-and-task-disposal)), and [§28.14](#sec-scoped-callback-parameters)'s registration-lifetime and quiescence residuals, each stated at its home.
 2. **The warning** names the rule and its clause, the borrow and its source, the holder, the obligation (the source outlives the holder's use of it, and is neither transferred to another domain nor consumed into a domain-reachable construction while held), and the static remedies available at that site: `scoped` ([§28.14](#sec-scoped-callback-parameters)), a `SlotHandle` key in place of the borrow (stdlib [§4.21](Bezel_Standard_Library.md#sec-owning-slot-map)), a `Shared<T>` handle ([§28.13](#sec-shared-ownership)), an owning-family holder ([§28.11](#sec-collection-element-ownership)), or awaiting the frame to settlement ([§30.1](#sec-async-methods)).
-3. **Site.** The site is the admitting site — the store, the call, the abandon or the `await` the clause admits — except for a collection element sourced in the body (a borrow of an owned local or `owned` parameter, a value that holds one, or an iterator, enumerator or lazy-query frame carrying one, or a borrow of such a frame, transitively), which is reported at the **transfer** of that binding by an obligation-moving kill that sets no flag the [K4.1](#sec-kernel-k4) backstop can schedule (the [consume table](#sec-consume-table)'s rows K3.1–K3.4, K3.6, K3.7 and K3.12), on a path from the store or, for a store in a lambda body, anywhere in the enclosing body: that transfer is where [§28.11](#sec-borrowing-collections)'s collection-held clause comes into force, the consume-site freeze leaving it admitted.
+3. **Site.** The site is the admitting site — the store, the call, the abandon or the `await` the clause admits — except for a collection element sourced in the body (a borrow of an owned local or `owned` parameter, a value that holds one, or an iterator, enumerator or lazy-query frame carrying one, or a borrow of such a frame, transitively), which is reported at the **transfer** of that binding by an obligation-moving kill that sets no flag the [K4.1](#sec-kernel-k4) backstop can schedule (the [consume table](#sec-consume-table)'s rows K3.1–K3.4, K3.6, K3.7 and K3.12), on a path from the store or, for a store in a lambda body, anywhere in the enclosing body: that transfer is where [§28.11](#sec-borrowing-collections)'s collection-held clause comes into force, the consume-site freeze leaving it admitted. The same holds for a **slot-displaced value**: where a replacing `move` ([§28.8.1](#sec-the-replacing-move)) — `move r.f with e`, or a bare `move r.f` at a nullable `f` — takes an owned field's value after a local was initialized from a direct read of the same path ([§28.7](#sec-reassigning-owned-fields)'s *Use after a dominating field write* form, `r` not assigned between the read and the `move`), the transfer of the taken value at the same rows — the `move` itself where it stands in one of their positions, or a transfer of the binding that received it — is reported on a path on which that local is used after the transfer: that transfer is where [§28.3.9](#sec-consume-site-freeze) *Scope* clause 1's slot kill by move meets the domain clause, the freeze leaving it admitted, since no live borrow names the taker. The kill itself is never reported, nor a transfer the local's last use precedes.
 
-The report is informative: it changes no verdict and no generated code, and outside the mode it is not emitted. **A compilation unit that emits no report under the mode carries no recorded trust clause**: every borrow it holds in a field, a collection slot, a pending frame or a task that retains one ([§30.9](#sec-exception-handling-in-async-methods), [§30.10](#sec-standard-library-task-helpers)) is statically bounded ([K2.3](#sec-kernel-k2)) or absent. The claim reaches exactly the recorded clauses — not the flag-backstopped kills (the site-announced kills, [K4.2](#sec-kernel-k4), and a reassignment's drop-on-overwrite, [K3.11](#sec-kernel-k3), each runtime-checked under [§28.2](#sec-checked-disposal)), not [§22.12](#sec-static-members)'s statics obligations (their own declaration-site warnings), not the documented trust of the foreign-function boundary ([§32.10](#sec-boundary-contract)), and not the certification grants of axiom [A10](#sec-axiom-register) — and it is per compilation unit: a program-wide claim needs every artifact in the build's closure compiled under the mode.
+The report is informative: it changes no verdict and no generated code, and outside the mode it is not emitted. **A compilation unit that emits no report under the mode carries no recorded trust clause**: every borrow it holds in a field, a collection slot, a pending frame or a task that retains one ([§30.9](#sec-exception-handling-in-async-methods), [§30.10](#sec-standard-library-task-helpers)) is statically bounded ([K2.3](#sec-kernel-k2)) or absent. The claim reaches exactly the recorded clauses — not the flag-backstopped kills (the site-announced kills, [K4.2](#sec-kernel-k4), and a reassignment's drop-on-overwrite, [K3.11](#sec-kernel-k3), each runtime-checked under [§28.2](#sec-checked-disposal)), not [§22.12](#sec-static-members)'s statics obligations (their own declaration-site warnings), not the documented trust of the foreign-function boundary ([§32.10](#sec-boundary-contract)), and not the certification grants of axiom [A10](#sec-axiom-register), nor, of the slot kill by move, more than clause 3's slot-displaced entry: the residual [§28.3.9](#sec-consume-site-freeze) *Scope* clause 1 states carries no line — and it is per compilation unit: a program-wide claim needs every artifact in the build's closure compiled under the mode.
 
-These rules ensure that every owned class instance is disposed **exactly once** at runtime — a frame the process abandons rather than unwinds excepted (every live frame at `Environment.Exit` and a spawned domain's at `Main`'s completion, and, at an `Environment.Exit` call made inside the exit pass, the frames live in the pass and every static it had not yet reached, [§33.3](#sec-exit-code); [§22.13](#sec-static-initialization-order)'s abnormal conditions), whose owned state the process exit reclaims without disposal — and that no owned reference is silently leaked (drop-on-overwrite, [§28.7](#sec-reassigning-owned-fields), covers every overwrite — the move-only inline array's whole-value reassignment included, per slot, [§15.3](#sec-move-only-value-types)). Borrow **liveness** is enforced statically for locals, returns, and captures *up to explicit disposal*: the consume-site freeze rejects a move, transfer, or reassignment of a borrowed-from binding, and the scope rules reject every escape past the source's scope — but an **explicit `Dispose()`** of a borrowed-from source is deliberately not statically tracked (rationale [§5.1](Bezel_Design_Rationale.md#sec-owned-not-borrows)'s recorded trade-off; the one exception is a source frozen by a [§28.14](#sec-scoped-callback-parameters) storage admission, whose disposal *is* statically rejected for the bound's extent): use through a surviving borrow raises `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and is undefined behavior unchecked. For *field-held* and *collection-held* borrows ([§28.11](#sec-borrowing-collections)'s store rule), liveness holds up to the caller-side lifetime obligations of the bullets above, backstopped by checked disposal mode.
+These rules ensure that every owned class instance is disposed **exactly once** at runtime — a frame the process abandons rather than unwinds excepted (every live frame at `Environment.Exit` and a spawned domain's at `Main`'s completion, and, at an `Environment.Exit` call made inside the exit pass, the frames live in the pass and every static it had not yet reached, [§33.3](#sec-exit-code); [§22.13](#sec-static-initialization-order)'s abnormal conditions), whose owned state the process exit reclaims without disposal — and that no owned reference is silently leaked (drop-on-overwrite, [§28.7](#sec-reassigning-owned-fields), covers every overwrite — the move-only inline array's whole-value reassignment included, per slot, [§15.3](#sec-move-only-value-types)). Borrow **liveness** is enforced statically for locals, returns, and captures *up to explicit disposal*: the consume-site freeze rejects a move, transfer, or reassignment of a borrowed-from binding, and the scope rules reject every escape past the source's scope — but an **explicit `Dispose()`** of a borrowed-from source is deliberately not frozen (rationale [§5.1](Bezel_Design_Rationale.md#sec-owned-not-borrows)'s recorded trade-off; the one exception is a source frozen by a [§28.14](#sec-scoped-callback-parameters) storage admission, whose disposal *is* statically rejected for the bound's extent): a use through a surviving borrow that the disposal dominates on every path is [§28.2](#sec-checked-disposal)'s compile error, and any other such use raises `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and is undefined behavior unchecked. For *field-held* and *collection-held* borrows ([§28.11](#sec-borrowing-collections)'s store rule), liveness holds up to the caller-side lifetime obligations of the bullets above, backstopped by checked disposal mode.
 
 <a id="sec-choosing-a-disposal-form"></a>
 #### 28.3.13 Choosing a disposal form (recap)
@@ -6880,21 +7771,21 @@ Doctrine (non-normative): reach for **`using var`** when the value lives and die
 A class may declare at most one destructor. Its body runs exactly once, the first time `Dispose()` is called.
 
 ```bezel
-class FileStream
+class NativeFile
   private _handle: IntPtr;
 
   public constructor(path: string)
     using var cpath := CString.From(path);
     _handle := NativeOpen(cpath);
+    if _handle = IntPtr.Zero then
+      throw new IOException($"cannot open {path}");
+    end;
   end constructor;
 
   destructor
-    if _handle <> IntPtr.Zero then
-      NativeClose(_handle);
-      _handle := IntPtr.Zero;
-    end;
+    NativeClose(_handle);       // runs exactly once: the generated Dispose() is idempotent
   end destructor;
-end FileStream;
+end NativeFile;
 ```
 
 The compiler generates a public, idempotent `Dispose()` that:
@@ -7004,7 +7895,7 @@ Passing an owned field as a plain argument is permitted; the callee receives a p
 
 Explicit disposal — `x.Dispose()`, the `x?.Dispose()` / `x!.Dispose()` spellings, a **direct `DisposeAsync()` call** in the same three spellings, awaited or not ([§28.12](#sec-asynchronous-disposal)), and the discard of a named owned binding ([§17.13](#sec-the-discard-_)) — requires a receiver the disposer **owns** (derives: [K3.9](#sec-kernel-k3)): an owned local or `owned` parameter, a `using var`, an unbound owned temporary ([§28.3](#sec-unbound-owned-temporaries)), a `move` result, or an `owned` field — or a slot of an owning inline array ([§15.1.1](#sec-owning-inline-arrays)) a field holds — read by code of the owning object's declaring type, or a slot of an owning inline array held by an owned local or `owned` parameter of the body (an element of an owning collection is a borrow, below). The field admission covers the [§28.7](#sec-reassigning-owned-fields) dispose-then-assign legacy and the destructor body's early close of a field ([§28.8.1](#sec-constructors-and-destructors)) unchanged, and it is by **declaring type**, matching [§13.1](#sec-levels)'s class-level privacy: code of class C may dispose an `owned` field of any C instance it can reach — the same access symmetry as any private-member touch. (A receiver-instance-only restriction would introduce an access category the language does not otherwise draw.) The calls and the discard are one consume-table row ([K3.9](#sec-kernel-k3)): the same site-announced kill, the same explicitly-disposed post-state — the scope-end machinery of a `using var` or `await using var` whose `DisposeAsync()` was called directly skips it like any explicitly-disposed binding — the logical disposal at the disposing statement — for `DisposeAsync()`, beginning there and completing at the returned task's terminal state ([§28.12](#sec-asynchronous-disposal)) — and reclamation at the holder's release point ([§28.2](#sec-checked-disposal)'s compiler-inserted free).
 
-**After an explicit `Dispose()` of an owned field, or of a slot of an owning inline array a field or a local holds, nothing further is required.** The call is an **early release point**, not a discharge of the slot's obligation: the slot keeps its reference and its [K9](#sec-kernel-k9) obligation, and the containing object's teardown still runs the cascade over it ([§28.4](#sec-the-destructor) step 2) — a local array's scope-end pass likewise ([§15.3](#sec-move-only-value-types) *Whole-value reassignment*'s liveness clause) — where the second call is [§28.2](#sec-the-idisposable-contract)'s no-op and the block is then reclaimed — the explicit call performed logical disposal only, and the compiler's single free stays at the holder's release point, the containing object's teardown ([§28.2](#sec-checked-disposal)'s compiler-inserted free). No replacement is owed: the call leaves the slot holding its disposed value, not a hole ([K9.2](#sec-kernel-k9)) — which is why a non-nullable `owned` field, for which no replacement exists short of acquiring a fresh resource, is admitted here as readily as a nullable one. A method may therefore dispose an owned field and return (the early-close shape), reassign it ([§28.7](#sec-reassigning-owned-fields)'s dispose-then-assign), or assign `null` to a nullable one. A later **read** of the slot is not statically diagnosed — [§28.2](#sec-checked-disposal)'s use-after-dispose warning is a straight-line rule over a **local**, while a field's value is readable and reassignable from every method of its declaring type and this section's admission is by declaring type, not by receiver instance — so the reader is [K4.1](#sec-kernel-k4)'s backstop: a member access through it raises `DisposedAccessException` in checked disposal mode and is undefined unchecked, the posture [§28.7](#sec-reassigning-owned-fields) states for an overwritten field and [§28.3](#sec-diagnostics) states for disposal of a borrowed-from source.
+**After an explicit `Dispose()` of an owned field, or of a slot of an owning inline array a field or a local holds, nothing further is required.** The call is an **early release point**, not a discharge of the slot's obligation: the slot keeps its reference and its [K9](#sec-kernel-k9) obligation, and the containing object's teardown still runs the cascade over it ([§28.4](#sec-the-destructor) step 2) — a local array's scope-end pass likewise ([§15.3](#sec-move-only-value-types) *Whole-value reassignment*'s liveness clause) — where the second call is [§28.2](#sec-the-idisposable-contract)'s no-op and the block is then reclaimed — the explicit call performed logical disposal only, and the compiler's single free stays at the holder's release point, the containing object's teardown ([§28.2](#sec-checked-disposal)'s compiler-inserted free). No replacement is owed: the call leaves the slot holding its disposed value, not a hole ([K9.2](#sec-kernel-k9)) — which is why a non-nullable `owned` field, for which no replacement exists short of acquiring a fresh resource, is admitted here as readily as a nullable one. A method may therefore dispose an owned field and return (the early-close shape), reassign it ([§28.7](#sec-reassigning-owned-fields)'s dispose-then-assign), or assign `null` to a nullable one. A later **read** of the slot is statically diagnosed only within [§28.7](#sec-reassigning-owned-fields)'s window — a read of the field, or a use of a local borrow of its value, that the call dominates with no invalidating operation between them is a compile error (*Use after a dominating field write*) — and otherwise not: [§28.2](#sec-checked-disposal)'s use-after-dispose error is a rule over a **local** and the borrows traced from it, while a field's value is readable and reassignable from every method of its declaring type and this section's admission is by declaring type, not by receiver instance — so the reader is [K4.1](#sec-kernel-k4)'s backstop: a member access through it raises `DisposedAccessException` in checked disposal mode and is undefined unchecked, the posture [§28.7](#sec-reassigning-owned-fields) states for an overwritten field and [§28.3](#sec-diagnostics) states for disposal of a borrowed-from source.
 
 `Dispose()` or a direct `DisposeAsync()` call through a **borrow** is a compile error. The borrow receivers: a borrowed local or parameter — including `this`: an object may not dispose itself out from under its owner, so a Close()-style method that wants disposal semantics lets the owner dispose, or puts the work in the class's `destructor` (with one exemption: in the body of a `DisposeAsync` override itself, not in a lambda nested in it, `base.DisposeAsync()` is [§28.12](#sec-asynchronous-disposal) step 2's chain, not a disposal of `this`, and is admitted; no other `this`-rooted disposal call is, in that body or elsewhere) — a non-`owned` field read, an owned-field read outside the declaring class, a `static owned` field read (a borrow of [K2](#sec-kernel-k2)'s always-live source, which only [§22.13](#sec-disposal-of-static-owned-fields)'s exit pass disposes — [K9.4](#sec-kernel-k9)), a getter or other non-`owned` call result (a `Task`-family call result is an owned temporary — [§28.3](#sec-producers) — and is not in this list), a `catch`-arm binding ([§31.1](#sec-exception-ownership)), a pattern binding ([§19.3](#sec-patterns)), a captured owned binding inside a closure ([§28.3](#sec-captured-owned-bindings), [§28.9](#sec-runtime-managed-types)), and an element borrow of an **owning** collection (`pool[i].Dispose()` — use `Remove`/`RemoveAt`, the indexer-set, or `move coll[i]`, whose forms keep the slot state coherent, [§28.11](#sec-collections-do-not-own-elements)). The check is structural and decidable — it reads the receiver expression's ownership classification, which [§28.3](#sec-local-variables-ownership-and-borrows) already computes at every call site. A method reference to `Dispose` or `DisposeAsync` is not an explicit-disposal form and is rejected at its formation over every receiver ([§27.6](#sec-method-references)): invoked, it would dispose through the borrow it captured, at a site this rule cannot read.
 
@@ -7046,7 +7937,9 @@ end Resize;
 
 An explicit `field.Dispose();` before the assignment remains legal and behavior-preserving — `Dispose` is idempotent ([§28.2](#sec-the-idisposable-contract)), so the implicit disposal of an already-disposed value is a no-op — and the store is the disposed block's release point, where [§28.2](#sec-checked-disposal)'s compiler-inserted free reclaims it; an explicitly-disposed owned local that is reassigned takes the same free at the store ([§28.3](#sec-ownership-state-of-locals) *State match on reassignment*).
 
-**Overwrite while borrowed.** Reassigning a plain-`var` owned **local** while a live local borrow of its current value exists is rejected by the consume-site freeze ([K5.2](#sec-kernel-k5); [§28.3](#sec-consume-site-freeze)) — the implicit disposal would silently invalidate the borrow. Reassigning an owned **field or collection slot** is not statically frozen ([K5.6](#sec-kernel-k5); the consume table's frozen column, [§28.3](#sec-consume-table)); a borrow of the displaced value is invalidated at the overwrite, caught as `DisposedAccessException` in checked disposal mode and undefined unchecked — the same runtime-checked posture as explicit `Dispose()` (rationale [§5.1](Bezel_Design_Rationale.md#sec-owned-not-borrows)).
+**Overwrite while borrowed.** Reassigning a plain-`var` owned **local** while a live local borrow of its current value exists is rejected by the consume-site freeze ([K5.2](#sec-kernel-k5); [§28.3](#sec-consume-site-freeze)) — the implicit disposal would silently invalidate the borrow. A local whose value was already killed — explicitly disposed or discarded, or moved from — is outside the freeze: its reassignment disposes nothing ([K5.2](#sec-kernel-k5)), and a borrow that survived the earlier kill still names the value that kill took, not the new one — a use of it that an explicit disposal dominates being [§28.2](#sec-checked-disposal)'s compile error (*Use after a dominating explicit disposal*). Reassigning an owned **field or collection slot** is not statically frozen ([K5.6](#sec-kernel-k5); the consume table's frozen column, [§28.3](#sec-consume-table)); a borrow of the displaced value is invalidated at the overwrite, caught as `DisposedAccessException` in checked disposal mode and undefined unchecked — the same runtime-checked posture as explicit `Dispose()` (rationale [§5.1](Bezel_Design_Rationale.md#sec-owned-not-borrows)).
+
+**Use after a dominating field write.** A local initialized from a direct read of an **owned** field — `var b := r.f;` or `const b := r.f;`, `r` being `this` (written or implicit) or a local variable or non-`ref` parameter, `f` an owned instance field reachable there — borrows the field's current value ([§28.3](#sec-producers)). A **disposing write** of the same path — a reassignment `r.f := e;` (drop-on-overwrite, [K3.11](#sec-kernel-k3); the store of `null` at a nullable `f` included) or an explicit `r.f.Dispose()` or direct `r.f.DisposeAsync()` where [§28.6](#sec-who-may-dispose) admits it — that follows the borrow with **no invalidating operation between them** on any path from the borrow to the write — no call (a constructor's included), accessor read or write, user-defined operator, function-value invocation or `await` ([§7.4](#sec-member-access-on-nullable-values)'s forms), no `yield return` (the consumer runs at the suspension), no disposal of another value (a discard, a scope-end or drop-on-overwrite disposal: each runs a destructor the body does not show), no other write to `r.f`, no `move` of any field path (the replacing `move`, [§28.8.1](#sec-the-replacing-move), is the one operation that takes a value out of a field, through whatever root it names the field by), and no write to `r` (an assignment, a `ref` or `out` argument, a mutable capture) — kills that value with certainty: nothing in the window can have taken it out. The window ends where the write's right-hand side begins — the store displaces the value it finds once that operand is evaluated, so a right-hand side that itself takes the value out (`r.f := Take();` over a `Take()` that performs a replacing `move` of `r.f`) leaves a use rejected that would not fault; evaluate such an operand into a local first (`var n := Take(); r.f := move n;`), which puts the call in the window. A use of the local — a read, a member access, an argument, a re-borrow — that such a write **dominates** on every path, the local a stable local ([§7.4](#sec-member-access-on-nullable-values) *Stable locals*) not assigned between the borrow and the use, is a **compile error**, and so is a read of `r.f` itself after an explicit `r.f.Dispose()` or `r.f.DisposeAsync()` that dominates it in the same window — a second `r.f.Dispose()` or `r.f.DisposeAsync()` there excepted, the no-op [§28.2](#sec-the-idisposable-contract) defines; the diagnostic names the use, the borrow and the write. The write itself stays permitted ([K5.6](#sec-kernel-k5)): what is rejected is the use the write makes certain to fault. Use the borrow before the write, or take the value out with the replacing `move`, whose result the taker owns. A write on only some paths to the use, a window with an invalidating operation in it, a borrow held through another holder — an alias of the local, a closure, a span over the field's buffer, a borrow-bearing record or choice — a path of more than one field segment, and an owning-collection or owning-inline-array slot ([§28.11](#sec-owning-collections), [§15.1.1](#sec-owning-inline-arrays)) stay under the runtime-checked posture above.
 
 **Ordering and exceptions.** A throwing RHS leaves the field/local untouched and still-owned ([K9.5](#sec-kernel-k9); it is disposed later by the normal unwinding rules): the implicit path has no exception-unsafe window, unlike the manual dispose-then-assign pattern's hazard of a disposed field holding a dangling reference while the constructor throws. Disposers themselves are still expected not to throw ([§28.4](#sec-the-destructor)); a throwing disposer during overwrite propagates after the store is abandoned, leaving the new value an unbound owned temporary disposed by [§28.3](#sec-unbound-owned-temporaries)'s unbound-temporary rule — on this exception edge, during the unwind. **The abandoned store abandons the reclamation with it.** The location keeps the displaced value, now logically disposed with its flag set — a non-nullable location is never emptied ([K9.2](#sec-kernel-k9)), and the block is not freed, since the store that would have been its release point did not complete ([§28.2](#sec-checked-disposal)'s compiler-inserted free) — and a binding so overwritten stays owned. The value is then what an explicitly disposed field or slot is ([§28.6](#sec-who-may-dispose)): the holder keeps its reference and its obligation, a later read of it is [K4.1](#sec-kernel-k4)'s backstop (`DisposedAccessException` in checked disposal mode, undefined unchecked), and the location's **next** release point — the containing object's cascade, the scope end, the collection's cascade or removing operation, or the next overwrite — issues [§28.2](#sec-the-idisposable-contract)'s no-op `Dispose()` and frees the block, once. For the owning inline array the composition is stated rather than derived: the per-slot pass is a **multi-value cleanup** in [§28.4](#sec-the-destructor)'s sense — a slot disposer that throws does not stop the pass, the remaining live slots are still disposed, and a later throw supersedes an earlier one under [§31.2](#sec-try-catch-finally)'s ordinary rule — after which the store is abandoned exactly as above: the RHS value (its own slots intact) is the unbound owned temporary the unwind disposes, and every slot the pass disposed keeps its logically disposed object — an owning choice's payloads likewise ([§35.4](#sec-choice-classification)) — so [§15.1.1](#sec-owning-inline-arrays)'s slot invariant holds unchanged, each such slot is live by [§15.3](#sec-move-only-value-types)'s test, and the array's next release point — its scope end, its holder's teardown, or a later whole-value reassignment whose pass meets the set flag — frees each slot object exactly once, as on the normal edge.
 
@@ -7181,7 +8074,7 @@ The compiler does not warn about undisposed runtime-managed values and does not 
 
 A class whose disposal **provably runs no user code and releases only memory** — it has no destructor, no `owned` fields of non-trivial-dispose type, no fields of move-only value type ([§15.3](#sec-move-only-value-types) — an owning inline array, `[N owned]T?` or `[N owned]T`, [§15.1.1](#sec-owning-inline-arrays), or an owning choice, nullable or not, [§35.4](#sec-choice-classification): the field is owned-bearing, and the generated `Dispose()` disposes it, [§28.4](#sec-the-destructor)), and its base class (if any, other than `Object`) is itself trivial-dispose — is a **trivial-dispose class** — a property of a **declared class**, computed from that declaration's own structure and carried as such in the artifact interface ([§3.6](#sec-derived-type-properties) rule 3, [§2.8.2](#sec-artifact-interface)). It is therefore not defined for a **compiler-synthesized frame** — an iterator or async state machine, or a lazy query value ([K2](#sec-kernel-k2)'s *frame* source, [K6](#sec-kernel-k6)) — which declares nothing for the check to read: the ceremony exemption does not reach a frame, and the must-use lint applies to a frame-typed owned local on [§28.3](#sec-owned-local-discharge-requirement)'s ordinary terms ([§29.11](#sec-multiple-enumeration) states the bound-query case) (derives: [K1.6](#sec-kernel-k1) — empty *user-visible* obligation content). The check is recursive and, for generics, per-instantiation ([§3.6](#sec-derived-type-properties) rule 2; the next subsection): an `owned` field whose declared type is itself trivial-dispose does **not** disqualify the holder — the synthesized disposal cascade over such fields frees memory and runs no user code, which is exactly what the property asserts. Mutually-recursive `owned` trivial-dispose references are admitted; the property is evaluated coinductively (assume the types under test trivial-dispose, then check the rules) — the same convention sendability states for its own recursive `owned` references ([§30.14](#sec-sendable-types)). *Provably runs no user code and releases only memory* means the generated `Dispose()` performs no user-authored work: it releases the instance's own allocation (including the intrinsic backing storage of the compiler-known borrowing collections, part of the instance's single allocation — [§28.11](#sec-borrowing-collections)) and the trivial-dispose trees under its `owned` trivial-dispose fields; storage released by a declared destructor is not in that category (`OwningBuffer<T>`, below). Trivial-dispose classes are tracked like every other class — references to them are classified, source-bounded, and escape-checked by the letter of this chapter's rules. The exemption's principle: the ceremony announces observable disposal *effects*, and a trivial-dispose class's disposal has none to announce — which is why the exemption's boundary is exactly this section's runs-no-user-code line, and why it extends no further (Design Rationale [§5.28](Bezel_Design_Rationale.md#sec-silent-tracking)). They are exempt from the **ceremony** only:
 
-- No **must-use / auto-drop diagnostic** attaches to a trivial-dispose value. The [§28.3](#sec-owned-local-discharge-requirement) must-use warning is not emitted at the implicit-drop site of a plain-`var` owned local, of an undischarged `owned` parameter — a method's, an iterator's ([§29.8](#sec-iterators-with-owned-parameters)), or an async method's ([§30.1](#sec-async-methods)) — or of an owning iteration variable ([§29.2](#sec-desugaring-of-for)) whose type is trivial-dispose; nor at a `new` expression of a trivial-dispose class type whose result reaches no `owned` location or `using var`. The exemption is over the **obligation**, not over the expression that produced the value: the obligation's user-visible content is empty, and the compiler frees the undischarged value at its holder's release point ([K1.6](#sec-kernel-k1)). **This exemption's** classification is read from the **produced type** where the drop site's value has a statically-known producer (a `new` expression, an `owned`-returning call), and from the **declared type** otherwise ([§3.6](#sec-derived-type-properties) rule 1's declared-types posture); *statically-known producer* is [§28.3](#sec-producers)'s own notion, whose producers table already classifies every initializer, so the key asks for no analysis the compiler does not already run at every binding. The produced-type arm is what keeps the exemption **value**-keyed, as [K1.6](#sec-kernel-k1) states it: a trivial-dispose *declared* type standing over a destructor-bearing production — `var b: Base := new Derived();` at a trivial-dispose `Base` — is not exempt. The **interface** clause sits inside that key rather than beside it: an interface type is never trivial-dispose, its conformance set being open across modules ([§21.9](#sec-statement-form-of-expressions)'s possibly-non-trivial-dispose reading), so a drop site is unexempt wherever the key selects an interface type — every site with no statically-known producer whose declared type is an interface, and every producer whose *produced* type is itself an interface (an `owned IThing`-returning call). Where a producer is present, its produced type decides in both directions whatever the declared type is: `var b: Base := new Derived();` above is not exempt, and `var t: IThing := new TrivialThing();` at a trivial-dispose `TrivialThing` is — an open conformance set says nothing about a value whose class the producer already fixes, which is what value-keying means. The one adjacent diagnostic is [§15.4](#sec-collection-literals)'s store-position lint — a distinct warning with its own trigger, not this exemption's; [§21.9](#sec-statement-form-of-expressions)'s discarded-result warning is likewise unaffected.
+- No **must-use / auto-drop diagnostic** attaches to a trivial-dispose value. The [§28.3](#sec-owned-local-discharge-requirement) must-use warning is not emitted at the implicit-drop site of a plain-`var` owned local, of an undischarged `owned` parameter — a method's, an iterator's ([§29.8](#sec-iterators-with-owned-parameters)), or an async method's ([§30.1](#sec-async-methods)) — or of an owning iteration variable ([§29.2](#sec-desugaring-of-for)) whose type is trivial-dispose; nor at a `new` expression of a trivial-dispose class type whose result reaches no `owned` location or `using var`. The exemption is over the **obligation**, not over the expression that produced the value: the obligation's user-visible content is empty, and the compiler frees the undischarged value at its holder's release point ([K1.6](#sec-kernel-k1)). **This exemption's** classification is read from the **produced type** where the drop site's value has a statically-known producer (a `new` expression, an `owned`-returning call), and from the **declared type** otherwise ([§3.6](#sec-derived-type-properties) rule 1's declared-types posture); *statically-known producer* is [§28.3](#sec-producers)'s own notion, whose producers table already classifies every initializer, so the key asks for no analysis the compiler does not already run at every binding. The produced-type arm is what keeps the exemption **value**-keyed, as [K1.6](#sec-kernel-k1) states it: a trivial-dispose *declared* type standing over a destructor-bearing production — `var b: Base := new Derived();` at a trivial-dispose `Base` — is not exempt. The **interface** clause sits inside that key rather than beside it: an interface type is never trivial-dispose, its conformance set being open across modules ([§21.9](#sec-statement-form-of-expressions)'s possibly-non-trivial-dispose reading), so a drop site is unexempt wherever the key selects an interface type — every site with no statically-known producer whose declared type is an interface, and every producer whose *produced* type is itself an interface (an `owned IThing`-returning call). Where a producer is present, its produced type decides in both directions whatever the declared type is: `var b: Base := new Derived();` above is not exempt, and `var t: IThing := new TrivialThing();` at a trivial-dispose `TrivialThing` is — an open conformance set says nothing about a value whose class the producer already fixes, which is what value-keying means. The one adjacent diagnostic is [§15.4](#sec-collection-literals)'s fresh-store rule — a distinct error with its own trigger, not this exemption's; [§21.9](#sec-statement-form-of-expressions)'s discarded-result warning is likewise unaffected.
 - The discard statement `_ := expr;` ([§17.13](#sec-the-discard-_)) is legal for a trivial-dispose class: the value is freed at end of statement, no user code running — the same timing as for a non-trivial-dispose class ([§17.13](#sec-the-discard-_)); the difference is only whether the discard does cleanup work.
 - Every trivial-dispose instance has exactly one statically-known holder at every point — the [K1](#sec-kernel-k1) classification it carries ([§28.3](#sec-local-variables-ownership-and-borrows)) — and the compiler inserts a **free** ([§28.2](#sec-checked-disposal): logical disposal followed by reclamation — the per-instance disposed flag is set, no user code runs, and checked disposal mode backstops a surviving borrow exactly as for any other class) at that holder's release point: scope end for locals and `using var` ([§28.3](#sec-owned-local-discharge-requirement)); the K8 boundary for unbound temporaries ([§28.3](#sec-unbound-owned-temporaries)); drop-on-overwrite for reassignment ([§28.7](#sec-reassigning-owned-fields)); the containing object's teardown for `owned` fields ([§28.5](#sec-owned-fields)); process exit for statics ([§22.13](#sec-static-initialization-order)); after the matching catch arm for throw operands ([§31.1](#sec-the-throw-operand)); frame teardown for frame-held values ([§29.8](#sec-iterators-with-owned-parameters), [§30.1](#sec-async-methods)); and the aggregate owner's release point for literal-tree nodes ([§15.4](#sec-collection-literals)).
 
@@ -7292,7 +8185,7 @@ end Process;
 <a id="sec-using-var-initialized-from-a-borrow"></a>
 #### `using var` initialized from a borrow
 
-When the right-hand side of a `using var` declaration is a borrow rather than an owned value (a method call without an `owned` return — unless its declared return type is a `Task`-family type, an owned production per [§28.3](#sec-producers) — an indexer access, a field read, or an unmarked read of a **borrow-state** named binding (a plain parameter, a borrowing alias or loop variable, a captured owned binding inside a closure) — an unmarked read of a class- or interface-typed named **owned** binding is rejected (*Adopting a named owned binding* above), and an unmarked read of a **move-only value** binding moves instead and is an owned right-hand side, [§15.3](#sec-move-only-value-types)), the `using var` does **not** assume a disposal obligation (derives: [K2](#sec-kernel-k2) — no obligation can be assumed from a borrow): at scope end, no `Dispose()` is called, because the value is not owned by this scope. The `using var` still **pins** the borrow's source for the duration of the scope — meaning the borrow lifetime rules of [§28.3](#sec-local-variables-ownership-and-borrows) treat the source as in-scope for the using-var's entire lexical extent. Concretely: the borrow stays **live** until the using-var's scope ends, exactly as if it were used at every point up to that end, and the [consume-site freeze](#sec-consume-site-freeze) then governs every consume of the source in that range — the frozen kills (a move, a transfer, a reassignment of the binding) are compile errors, and the **site-announced** kills stay unfrozen under their flag backstop ([K4.2](#sec-kernel-k4), [K5.3](#sec-kernel-k5)): an explicit `Dispose()` of the source is permitted, and a read through the pinned binding afterwards raises `DisposedAccessException` in checked disposal mode ([§28.2](#sec-checked-disposal)). The pin adds no exception to [K5](#sec-kernel-k5)'s two recorded shapes; the [§28.14](#sec-scoped-callback-parameters) storage admission remains the one admission whose captured sources are frozen against explicit disposal as well ([§28.3](#sec-diagnostics)). Pinning is a compile-time constraint, not a runtime mechanism; the compiler enforces it by extending the borrow's required-liveness range to cover the using-var's scope.
+When the right-hand side of a `using var` declaration is a borrow rather than an owned value (a method call without an `owned` return — unless its declared return type is a `Task`-family type, an owned production per [§28.3](#sec-producers) — an indexer access, a field read, or an unmarked read of a **borrow-state** named binding (a plain parameter, a borrowing alias or loop variable, a captured owned binding inside a closure) — an unmarked read of a class- or interface-typed named **owned** binding is rejected (*Adopting a named owned binding* above), and an unmarked read of a **move-only value** binding moves instead and is an owned right-hand side, [§15.3](#sec-move-only-value-types)), the `using var` does **not** assume a disposal obligation (derives: [K2](#sec-kernel-k2) — no obligation can be assumed from a borrow): at scope end, no `Dispose()` is called, because the value is not owned by this scope. The `using var` still **pins** the borrow's source for the duration of the scope — meaning the borrow lifetime rules of [§28.3](#sec-local-variables-ownership-and-borrows) treat the source as in-scope for the using-var's entire lexical extent. Concretely: the borrow stays **live** until the using-var's scope ends, exactly as if it were used at every point up to that end, and the [consume-site freeze](#sec-consume-site-freeze) then governs every consume of the source in that range — the frozen kills (a move, a transfer, a reassignment of the binding) are compile errors, and the **site-announced** kills stay unfrozen under their flag backstop ([K4.2](#sec-kernel-k4), [K5.3](#sec-kernel-k5)): an explicit `Dispose()` of the source is permitted; a read through the pinned binding that the disposal dominates is [§28.2](#sec-checked-disposal)'s compile error, and one the disposal reaches on only some paths raises `DisposedAccessException` in checked disposal mode ([§28.2](#sec-checked-disposal)). The pin adds no exception to [K5](#sec-kernel-k5)'s two recorded shapes; the [§28.14](#sec-scoped-callback-parameters) storage admission remains the one admission whose captured sources are frozen against explicit disposal as well ([§28.3](#sec-diagnostics)). Pinning is a compile-time constraint, not a runtime mechanism; the compiler enforces it by extending the borrow's required-liveness range to cover the using-var's scope.
 
 This case is what allows the for-loop desugaring ([§29.2](#sec-desugaring-of-for)) to wrap an arbitrary source in `using var __source := source` without taking ownership when `source` is borrowed; programmers also encounter it directly when using `using var` for scope-pinning of a borrowed iterable.
 
@@ -7345,9 +8238,9 @@ For a borrowing collection, the slot policy's copy, shared-reference, and borrow
 1. parameter-sourced (a parameter that is not `owned`), receiver-sourced, and field-sourced borrows are admitted;
 2. a borrow of a **scope-bound binding** — an `owned` parameter included, its value being disposed at the method's end ([§28.3](#sec-owned-local-discharge-requirement)) — stored into a collection that provably outlives that scope — the collection is a field, is reachable from one, is held by a parameter that is not `owned` or reached through one (caller storage, which outlives every scope of the body), escapes the method, or is a local of strictly wider scope — is **rejected** at the store site;
 3. A collection an **`owned` parameter** holds is the body's own — the body disposes it at its end with its other owned bindings (*Auto-drop (affine)*, [§28.3](#sec-owned-local-discharge-requirement)) — and is read as a local of the body's outermost block ([§28.3](#sec-borrow-lifetime-rules)'s parameter-scope sentence): a store of a top-level local's borrow into it is admitted under the residual below, a store of a borrow of a binding declared in a nested block is rejected, and a store into it where it escapes the method is rejected by clause 2; [§9.7](#sec-records-and-disposal)'s collection bullet reads such a collection by the same comparison;
-4. a **fresh unbound owned temporary** of class type passed to `Add`/`Insert`/indexer-set is not a borrow of any named source but a temporary that dies at its K8 boundary ([§28.3](#sec-unbound-owned-temporaries)): the store is admitted under [§15.4](#sec-collection-literals)'s recorded literal-only-rejection asymmetry and draws that section's fresh-store warning (the retained reference dangles at the K8 boundary, backstopped by checked disposal mode, [§28.2](#sec-checked-disposal)).
+4. a **fresh unbound owned temporary** of class type in a single-element store position — `Add`/`Insert`/indexer-set and the other stores [§15.4](#sec-collection-literals) names — is not a borrow of any named source but a temporary that dies at its K8 boundary ([§28.3.11](#sec-unbound-owned-temporaries)): the store is **rejected** at the store site by [§15.4](#sec-collection-literals)'s fresh-store rule — clause 2's rejection with the source's scope at its narrowest, the full expression, at whose end the slot would already dangle; the rule covers the key position of `OwningDictionary<K, V>` with the rest of this check.
 
-The residual is a [K4.3](#sec-kernel-k4)-recorded trust clause: whether each admitted element's source actually outlives the collection's use of it is the programmer's obligation, with [K4.1](#sec-kernel-k4)'s backstop as the named safety net; the obligation carries the borrowed-field rule's **domain clause** ([§28.3](#sec-borrow-lifetime-rules), clause 4) for each admitted element's source object while the collection retains the borrow. A value that holds borrows copied into a collection under [§9.7](#sec-records-and-disposal)'s scope comparison carries the same obligation for each source its carried borrows name, against a kill of that source while the collection retains the value; a read through a carried span meets the backstop as any member access does ([§28.2](#sec-checked-disposal)). The trust-admission report ([§28.3](#sec-diagnostics)) names a parameter-, receiver- or field-path-sourced element at its store, and an element sourced in the body at a transfer of its source that the store reaches.
+The residual is a [K4.3](#sec-kernel-k4)-recorded trust clause: whether each admitted element's source actually outlives the collection's use of it is the programmer's obligation, with [K4.1](#sec-kernel-k4)'s backstop as the named safety net; the obligation carries the borrowed-field rule's **domain clause** ([§28.3](#sec-borrow-lifetime-rules), clause 4) for each admitted element's source object while the collection retains the borrow. A value that holds borrows copied into a collection under [§9.7](#sec-records-and-disposal)'s scope comparison carries the same obligation for each source its carried borrows name, against a kill of that source while the collection retains the value; a read through a carried span meets the backstop as any member access does ([§28.2](#sec-checked-disposal)). The trust-admission report ([§28.3](#sec-diagnostics)) names a parameter-, receiver- or field-path-sourced element at its store, and an element sourced in the body at a transfer of its source that the store reaches. A store into a collection that is a local of the body and does not escape it, of a parameter that is not `owned` or of `this` — the binding itself, not a value read through it — is not reported: the scope comparison bounds the element ([K2.3](#sec-kernel-k2)), and the body holds no obligation for the object such a binding names, so no kill in it can transfer that object. An element read through a field path stays reported at its store into such a collection too, since the body's own replacing `move` can take the field's value out and transfer it ([§28.3.9](#sec-consume-site-freeze) *Scope* clause 1).
 
 **Value-copy members.** A standard-library member's body contributes no requirement ([§3.6](#sec-derived-type-properties) rule 2), so what it stores is read off its **declared signature**, by three shapes over the members of the standard library's collections, spans and buffers and of its query operators (stdlib [§4](Bezel_Standard_Library.md#sec-value-copy-members), [§5](Bezel_Standard_Library.md#sec-system-collections-linq)):
 
@@ -7373,7 +8266,7 @@ end BankAccount;
 
 `owned` on the field handles container disposal, and the owning collection's cascade disposes every element — no destructor is needed. A class wanting *selective or interleaved* cleanup takes elements out first — `Drain()` in a loop, `move _transactions[i] with fresh` (an element replaced in place), or the `Pop*` family — into owned bindings whose disposal it controls.
 
-A dictionary whose holder owns the **values** is `OwningDictionary<K, V>` by construction: it owns its values, its keys are ordinarily value-like — a class-typed key is held as a borrow, and [§15.4](#sec-collection-literals)'s fresh-store warning reaches that position — and `Dispose()` cascades over the values ([stdlib §4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)). The reverse asymmetry (owned keys, borrowed values) has no collection form; a holder with that shape keeps the keys in an owning collection of their own.
+A dictionary whose holder owns the **values** is `OwningDictionary<K, V>` by construction: it owns its values, its keys are ordinarily value-like — a class-typed key is held as a borrow, and [§15.4](#sec-collection-literals)'s fresh-store rule reaches that position — and `Dispose()` cascades over the values ([stdlib §4.9](Bezel_Standard_Library.md#sec-owneddictionaryk-v)). The reverse asymmetry (owned keys, borrowed values) has no collection form; a holder with that shape keeps the keys in an owning collection of their own.
 
 <a id="sec-owning-collections"></a>
 #### Owning collections
@@ -7564,6 +8457,31 @@ The closure-capture rule ([§28.3](#sec-borrow-lifetime-rules)) admits a functio
 
 The caller side is correspondingly unrestricted: **any** closure — capture-bearing or not — may be passed to a call-bounded parameter (one whose declared return slot is a bare type parameter at a function-type substitution excepted: a set-erasing position's return-slot arm, [§28.3](#sec-borrow-lifetime-rules)'s *Set-erasing positions*), since every captured source trivially outlives the call; for a deferred-activation callee the admission is re-keyed to the returned frame (below). The default completes the lattice: plain = call-bounded, `scoped` = storage-bounded.
 
+*Example.* A `scoped` constructor parameter stores a capture-bearing callback, bounded by a `using var` holder:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+class Button
+  private scoped _onClick: () -> ();
+
+  public constructor(scoped onClick: () -> ())
+    _onClick := onClick;                    // the callee stores a `scoped` callback in the bounding object
+  end constructor;
+
+  public method Replace(f: () -> ()) => _onClick := f;   // error: a plain parameter is call-bounded, never stored
+  public method Click() => _onClick();                   // only the declaring type's own bodies invoke it
+end Button;
+
+using var log := new Item("log");
+using var b := new Button(lambda() => Console.WriteLine("clicked " + log.Name));  // admitted: `log` is declared before `b`
+b.Click();
+var c := new Button(lambda() => Console.WriteLine(log.Name));   // error: the bounding object `c` is no `using var`
+log.Dispose();                                                  // error (K5.7): `log` is frozen while `b` is in scope
+```
+
 **The stdlib retention register.** Standard-library callees state their retention in their signatures — `scoped` where they store — and the per-position roster is the standard library's, not this section's: stdlib §6.5's subscribe positions and stdlib §6.10's `Spawn` declare `scoped`; the shared-event subscribe positions admit **capture-free** handlers only (stated at stdlib §6.5, keyed on the resolved callee; a user implementation of `ISharedEvent<T>` gains no retention right); the lazy query operators' retention is frame residence below, a consequence of their deferred-activation signatures (stdlib §5); the spawn positions of [§30.14](#sec-multiple-domains) (stdlib §6.12) sit under §30's capture and sendability rules; and [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)'s task-completion-source admission is axiom [A10](#sec-axiom-register)'s carve (*Relation to §30.11* below).
 
 **The method-reference formation bar (protects the position-keyed register admissions — axioms [A10](#sec-axiom-register)/[A11](#sec-axiom-register) — and [§28.3](#sec-borrow-lifetime-rules)'s *Set-erasing positions*).** Register positions are stated at the callee, not marked in the parameter's function type, so **forming a method reference over a capture-free-register position is a compile error** (covering every register entry: `Domain.Spawn`'s and the shared-event positions): the formed value's plain function type would erase the admission, and a call through it would reach the trusted storing implementation under the caller side above, which admits any closure (`scoped` is part of function-type identity, [§27.1](#sec-function-types), and survives formation, so `scoped` positions need no such bar). Forming a method reference is likewise a compile error when a parameter slot of the formed function type is, nullability stripped, a function type and binds to a callee parameter, other than an `out` parameter, that is a set-erasing position ([§28.3](#sec-borrow-lifetime-rules)'s *Set-erasing positions*) — one declared `Object`, or at a bare type parameter that the formation's substitution makes a function type (`var add := xs.Add;` at `xs: Array<() -> int>`; `var keep: (() -> int) -> () := k.Keep;` over `Keep(o: Object)`; `var put: (ref () -> int) -> () := b.Put<() -> int>;` over `Put<T>(ref x: T)`): a call through the formed value passes its argument to a plain or `ref` function-typed slot, which the caller side admits whatever its set, while the callee's position is announcement-erasing ([§28.3](#sec-borrow-lifetime-rules)'s closure bullet). An `out` parameter is exempt (`var tg := d.TryGetValue;` at `d: Dictionary<string, () -> int>` is admitted): a call through the formed value passes it a location and no value, and what the callee copies out is capture-free; on the call's normal return the location carries the empty set ([§28.3](#sec-borrow-lifetime-rules)'s *A `ref` or plain `out` location outlives the call*). No function value stands in for the reference: a lambda's own plain function-typed parameter contributes itself ([§28.3](#sec-borrow-lifetime-rules)'s provenance clause 3) and is call-bounded, so `lambda(g) => xs.Add(g)` is rejected in its body as `xs.Add` is at formation. The remedy is the direct call at each site — `xs.Add(f)` — where the argument's own source set is checked.
@@ -7572,7 +8490,7 @@ The caller side is correspondingly unrestricted: **any** closure — capture-bea
 
 1. **Frame residence** (derives: [K6.1](#sec-kernel-k6) + [K6.2](#sec-kernel-k6)). A callee whose call mints a deferred-activation frame (the kinds of [§28.3](#sec-unbound-owned-temporaries) *Deferred-activation callees*: an `async` callee's task; an iterator or async-iterator callee's enumerable or enumerator frame, [§29.3](#sec-iterator-methods), [§30.7](#sec-asynchronous-programming-async-iterators); a lazy query operator's query value, stdlib §5) holds a plain function-typed parameter in that frame, and frame residence is **not** an escape sink: the deferred-activation return type is the signature-level announcement of the retention ([K6.2](#sec-kernel-k6)), exactly as it announces the frame's carried borrows ([§28.3](#sec-returning-a-deferred-activation-frame)). The bound is the **frame's life** (K6.1): a task's settlement ([§30.1](#sec-async-methods)); an iterator frame's completion or disposal ([§29.4](#sec-lazy-evaluation), [§29.7](#sec-disposal-of-partially-consumed-iterators) — the `for` desugaring's `using var` bounds both, [§29.2](#sec-desugaring-of-for); `await for`'s, [§30.7](#sec-asynchronous-programming-async-iterators)); a lazy query's single-consumption point ([§29.11](#sec-multiple-enumeration); the retention transfers into the consuming frames by the transitive rule of [§28.3](#sec-unbound-owned-temporaries)). Caller side, the callback's captured borrows' sources are **carried sources of the frame** ([§28.3](#sec-unbound-owned-temporaries)'s capture-set contribution), bounded by the ordinary borrow machinery — the scope and store rules and the frame-return check — and, for a task, by [§30.1](#sec-async-methods)'s source-outlives-settlement obligation where lifetimes cannot be statically compared, discharged by awaiting before the captured sources' scopes exit (the abandonment idioms carry the residual as they do for object borrows). Callee side, the sink checks above govern the body's own uses of the parameter and extend transitively to the frame: a call-bounded callback **forwarded** to a plain function-typed parameter of another deferred-activation call rides that call's frame — admitted when the frame is consumed within the callee or returned under a deferred-activation return type (the outer caller re-establishes against its own arguments); a frame that carries the callback and escapes any other way — stored in a field or in a collection that is not purely local (*The call-bounded default* above), captured by an escaping closure — is an escape of the callback itself, rejected by these same rules applied transitively. An iterator callee that needs owned state alongside a callback declares an `owned` parameter beside it ([§29.8](#sec-iterators-with-owned-parameters)). No `scoped` spelling is involved: `scoped` states open-ended storage in an object, while frame residence is bounded by a value the caller's own flow analysis tracks (rationale [§5.25](Bezel_Design_Rationale.md#sec-deferred-activation-capture)).
 
-2. **A minted frame inherits the call bound.** A callee — synchronous or async — that **invokes** a call-bounded callback whose invocation **mints a deferred-activation frame** must consume the frame to its [K6.1](#sec-kernel-k6) bound before returning — a task awaited to settlement, an iterator or query frame enumerated or disposed — and may not store it, return it, or otherwise let it escape the call. Returning it, storing it, passing a task to `Task.FireAndForget`, or binding it and dropping it undisposed-to-settlement (`using var t := cb();` with no await) lets the callback's caller-sourced environment outlive the call through the still-running frame ([§30.5](#sec-result-lifetime-and-task-disposal)) and is an **escape sink**, rejected by the same structural verification as the other sinks above; so is storing or returning a minted iterator or query frame. In a **synchronous** callee a task-returning invocation is itself rejected (derives: [K6.3](#sec-kernel-k6) + [K3](#sec-kernel-k3) — the minted task inherits the call bound, and a non-`async` body has no consuming position for it): a non-`async` body cannot await the returned task (and blocking on it is barred inside continuations, [§30.3](#sec-the-task-taskt-and-ownedtaskt-types)), so invoking a plain function-typed parameter whose invocation yields a `Task`-family value is a compile error there — declare the parameter `scoped` (shifting the admission to the caller under the storage-bounded rules above) or make the callee `async`. An iterable- or query-minting invocation carries no such rejection: a synchronous body consumes the frame by enumerating or disposing it. The await-to-settlement requirement is per-path and admits **fan-out**: the returned tasks may be accumulated in a purely local collection provided every one of them is awaited to settlement before the callee returns on every path — `await Task.WhenAll(pending)` ([§30.10](#sec-standard-library-task-helpers)) discharges all of its inputs, since the aggregate completes only after every input settles.
+2. **A minted frame inherits the call bound.** A callee — synchronous or async — that **invokes** a call-bounded callback whose invocation **mints a deferred-activation frame** must consume the frame to its [K6.1](#sec-kernel-k6) bound before returning — a task awaited to settlement, an iterator or query frame enumerated or disposed — and may not store it, return it, or otherwise let it escape the call. Returning it, storing it, passing a task to `Task.FireAndForget`, or binding it and dropping it undisposed-to-settlement (`using var t := cb();` with no await) lets the callback's caller-sourced environment outlive the call through the still-running frame ([§30.5](#sec-result-lifetime-and-task-disposal)) and is an **escape sink**, rejected by the same structural verification as the other sinks above; so is storing or returning a minted iterator or query frame. In a **synchronous** callee a task-returning invocation is itself rejected (derives: [K6.3](#sec-kernel-k6) + [K3](#sec-kernel-k3) — the minted task inherits the call bound, and a non-`async` body has no consuming position for it): a non-`async` body cannot await the returned task (and blocking on it is barred inside continuations, [§30.3](#sec-the-task-taskt-and-ownedtaskt-types)), so invoking a plain function-typed parameter whose invocation yields a `Task`-family value is a compile error there — declare the parameter `scoped` (shifting the admission to the caller under the storage-bounded rules above) or make the callee `async`. An iterable- or query-minting invocation carries no such rejection: a synchronous body consumes the frame by enumerating or disposing it. The await-to-settlement requirement is per-path and admits **fan-out**: the returned tasks may be accumulated in a purely local collection provided every one of them is awaited to settlement before the callee returns on every path — `await Task.WhenAll(pending)` ([§30.10](#sec-standard-library-task-helpers)) discharges all of its inputs, since the aggregate completes only after every input settles. The collection holds the tasks through named bindings (`var t1 := cb(); var t2 := cb(); var pending: Array<Task> := [t1, t2];`): a minted task stored straight into a borrowing slot, `pending.Add(cb())`, dies at its [K8](#sec-kernel-k8) boundary and is [§15.4](#sec-collection-literals)'s fresh-store error, not an accumulation.
 
 **Class- and interface-typed `scoped` parameters: scoped construction.** The `scoped` modifier extends beyond function types: a class- or interface-typed parameter may be declared `scoped` — `constructor(scoped stream: Stream)` — applying the same two-sided contract to a **passive borrow** instead of a callback:
 
@@ -7580,6 +8498,29 @@ The caller side is correspondingly unrestricted: **any** closure — capture-bea
 - **Caller side:** the argument carries the call-site marker — `new StreamReader(scoped stream)` ([§22.3](#sec-parameter-modifiers)) — and is admitted under the bounding-object forms above with *the argument's borrow source* in place of a closure's capture set: the source must satisfy the same declared-before/self/`this`-derived tests, and it is **frozen** until the bound's scope exits. A **fresh producer** argument is rejected (`new StreamReader(scoped new FileStream(...))` — the unbound owned temporary dies at the end of the full expression, [§9.7](#sec-records-and-disposal)'s no-temporary-source rule: bind the source first). A **value-typed argument** at an interface-typed `scoped` parameter reaches it by boxing ([§8.6](#sec-boxing)) with the same marker and is admitted exactly where [§9.7](#sec-records-and-disposal)'s instance-field bullet admits storing the value in an instance field of a class: a value that is not borrow-bearing, or one in that bullet's null-source form (a move-only value does not box, [§8.6](#sec-boxing)); any other admitted value's box carries no borrow, so the argument has no borrow source: it is admitted under every bounding object and freezes nothing, its own location included, since the box holds a copy fixed at boxing. A borrow-bearing value is rejected there, as at every parameter declared `Object` or an interface type, plain or `scoped` ([§9.7](#sec-records-and-disposal)'s *borrow-erasing position* bullet); the remedy is a class implementing the interface. At an argument whose type is a type parameter the condition is read at each instantiation ([§3.6](#sec-derived-type-properties) rule 2).
 - **No quiescence obligation arises:** a stored borrow is passive data — it never fires. With declared-before admission, the freeze, and reverse-declaration-order disposal ([§28.10](#sec-using-var)), the source provably outlives the bounding object *including its destructor*: the guarantee on the **source** is fully static, with no recorded trust clause. The bound is on the source, not on what a slot read through it currently holds: an argument whose borrow is of a field's, property's or slot's **current value** — `new Reader(scoped _s)` under the `this` arm, `scoped owner.Child` under a parameter or local `owner` — is admitted on its source's standing, and a later overwrite, `move` or disposal of that slot (`_s := new Stream();`, `owner.Reset()`) is [K5.6](#sec-kernel-k5)'s posture under this admission exactly as under a plain field-held borrow: slots are not frozen, the displaced object is disposed and flagged, and a member access through the stored borrow afterwards is [K4.1](#sec-kernel-k4)'s deterministic `DisposedAccessException` in checked disposal mode ([§28.2](#sec-checked-disposal)) — the runtime-checked posture every borrow of a slot's current value carries ([§28.3](#sec-consume-site-freeze) *Scope*), not a new admission and not a [K4.3](#sec-kernel-k4) clause — the trust-admission report ([§28.3](#sec-diagnostics)) stays silent at a scoped construction.
 - **Not at `Object`:** a parameter whose declared type, nullability stripped, is `Object` may not be declared `scoped`; the declaration is a compile error. `Object` is the one class to which a function value also converts ([§3.1](#sec-type-kinds)), so such a parameter would receive a callback and a borrow under one declaration, while the two contracts differ in the argument's call-site marker and in the field that may hold it; a position declared `Object` is set-erasing in any case ([§28.3](#sec-borrow-lifetime-rules)'s *Set-erasing positions*). Declare the parameter at the class or interface type the callee stores.
+
+*Example.* The class-typed form: a source declared before the holder is admitted, a fresh producer is not:
+
+```bezel
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
+class Reader
+  private _src: Item;                       // a plain field holding the borrow
+
+  public constructor(scoped src: Item)
+    _src := src;                            // a static bound: no trust clause is recorded
+  end constructor;
+
+  public method Read(): string => _src.Name;
+end Reader;
+
+using var file := new Item("file");
+using var r := new Reader(scoped file);     // admitted: `file` is declared before `r`
+Console.WriteLine(r.Read());
+using var t := new Reader(scoped new Item("tmp"));  // error: a fresh producer dies at the statement's end
+```
 
 The asymmetry with ordinary borrows is deliberate: a parameter-sourced *object* borrow may be stored into a field under §28.3's borrowed-field rule, a structural check whose residual is the caller's trust, while a call-bounded *function* value may not be stored at all — a closure's true bound is its capture set, which a plain signature does not carry, so neither party is positioned to accept the trust; `scoped` is the signature-carried form of it, and frame residence (*Call-bounded × deferred activation* above) is not a store but the retention the deferred-activation return type itself type-announces (rationale [§5.25](Bezel_Design_Rationale.md#sec-deferred-activation-capture)).
 
@@ -7891,6 +8832,24 @@ Each `GetEnumerator()` call produces an independent enumerator. Iterating the sa
 
 A **lazy query** — a value produced by a deferred LINQ operator ([stdlib §5](Bezel_Standard_Library.md#sec-system-collections-linq), e.g. `using var q := xs.Where(...)`) — is **single-consumption**. It may be enumerated **at most once**: the first enumeration (a `for` loop, or a terminal operator such as `Count`, `First`, or `ToArray`) **spends** its enumeration right — an affine discipline, the way `move` is for ownership, though it is the right that is spent, not the binding's ownership (the layered reading at this paragraph's end). A second enumeration, or any other use after the first, is a compile error where the flow analysis can see it statically (the diagnostic points to `.ToArray()`); where a re-enumeration is reachable only at runtime, it raises `InvalidOperationException` (the same loud-failure discipline as mutation-during-iteration, [§29.12](#sec-mutation-during-iteration)). To enumerate the results more than once, materialize first: `using var ys := xs.Where(...).ToArray();` produces an owned `Array<T>`, which — like any collection — may be enumerated any number of times. This is stricter than the C# precedent, which silently re-executes a deferred query on each enumeration; Bezel makes the re-execution explicit (it interacts with the borrow lifetime of the query's source) rather than implicit. (A lazy or single-pass source whose backing is itself external, such as a streaming reader, follows the same single-consumption rule; the iterable an iterator method mints over an `owned` or move-only parameter is that case by rule ([§29.8](#sec-iterators-with-owned-parameters)) — this section's consumption points, its static error and run-time `InvalidOperationException`, its must-use lint and its remedies are its own, a `GetEnumerator()` or `GetAsyncEnumerator()` call counting as the enumeration it begins.) The lazy query is, ownership-wise, an ordinary minted caller-owned frame like every iterable-family call result ([§28.3](#sec-producers)): its **container obligation** is discharged by the standard rules — `using var`, a transfer, an explicit dispose, or [K3.14](#sec-kernel-k3)'s auto-drop. This section's single-consumption rule governs a second, orthogonal thing: the frame's **enumeration right**, which is affine and spent at exactly one of the consumption points below. The two are layered, not identified — the consumption points are not [K3](#sec-kernel-k3) positions and consume no binding's ownership ([K3.13](#sec-kernel-k3)'s no-silent-consume is uniform here as everywhere) — so a bound query is spelled `using var q := xs.Where(…);` where the frame is to be scope-disposed. Under a plain `var` the frame is an ordinary undischarged owned local at its scope end, and **both halves of the lint hold**: a bound lazy query whose enumeration right is **never spent** draws [K3.14](#sec-kernel-k3)'s must-use warning at its auto-drop, naming the binding — the lint on its ordinary terms ([§28.3](#sec-owned-local-discharge-requirement)), a bound query frame being an owned local like any other; and that warning is **suppressed where the binding's enumeration right is spent** at a statically visible consumption point — the normative list below — the auto-drop still running. A spent right is [§28.3](#sec-owned-local-discharge-requirement)'s one suppression condition that discharges no obligation, and that section's suppression sentence is the closed set for this warning here as everywhere (derives: [K3.14](#sec-kernel-k3) — the lint's predicate; no classification, obligation, or disposal moment moves).
 
+*Example.* A collection is re-iterable; a lazy query is spent by its first enumeration, and materializing it first gives a collection:
+
+```bezel
+var xs: Array<int> := [5, 12, 30];
+using var big := xs.Where(lambda(x) => x > 10);
+Console.WriteLine(big.Count());                              // spends `big`'s enumeration right
+for var x in big do                                          // error (§29.11): `big` was already enumerated
+  Console.WriteLine(x);
+end;
+using var kept := xs.Where(lambda(x) => x > 10).ToArray();   // materialize first
+for var x in kept do                                         // an owned Array<int>: enumerated any number of times
+  Console.WriteLine(x);
+end;
+for var x in kept do
+  Console.WriteLine(x);
+end;
+```
+
 **Consumption points (normative list).** A *bound* lazy query's enumeration right is spent by exactly these uses:
 
 1. **Enumeration or a terminal operator** (`for`, `Count`, `First`, `ToArray`, …) — the case above — a `GetEnumerator()` or `GetAsyncEnumerator()` call on the query counting as the enumeration it begins, exactly as for the iterable an iterator method mints ([§29.8](#sec-iterators-with-owned-parameters)): `var e := q.GetEnumerator();` spends `q`, and a `for var x in q` after it is the static error.
@@ -7899,6 +8858,31 @@ A **lazy query** — a value produced by a deferred LINQ operator ([stdlib §5](
 
 Inside a callee, a plain `IEnumerable<T>` parameter is **statically untracked** — the affine tracking is by provenance, not by type — so a violation there is enforced only by the runtime `InvalidOperationException` guard. The diagnostic for every static consumption error names the consumed binding, the consuming use, and the remedy the remedies paragraph below names for the source's provenance: over a collection-backed or owning source, the `.ToArray()` re-enumeration remedy; over a minting source at a class or interface element type, consumption inside the borrowing loop body or owning iteration — never materialization, which there yields dead borrows.
 
+*Example.* Consumption points 2 and 3, the lint's two halves, and an untracked callee parameter:
+
+```bezel
+public static method Total(xs: IEnumerable<int>): int
+  var sum := 0;
+  for var x in xs do
+    sum += x;
+  end;
+  return sum;
+end Total;
+
+public static method Twice(xs: IEnumerable<int>): int => Total(xs) + Total(xs);   // untracked here
+
+var xs: Array<int> := [5, 12, 30];
+var q := xs.Where(lambda(x) => x > 0);       // spent below: no must-use warning
+var q2 := q.Select(lambda(x) => x * 2);      // point 2: spends `q`; the right moves into `q2`
+Console.WriteLine(Total(q2));                // point 3: spends `q2`; the frame stays the caller's
+for var x in q do                            // error (§29.11): `q` was spent by `Select`
+  Console.WriteLine(x);
+end;
+var idle := xs.Where(lambda(x) => x < 0);    // never spent: K3.14's must-use warning at its auto-drop
+Console.WriteLine(Twice(xs));                // a collection: re-iterable
+Console.WriteLine(Twice(xs.Where(lambda(x) => x > 1)));   // InvalidOperationException at the second enumeration
+```
+
 **The terminal-accessor provenance warning (#3047).** The **class-element terminal accessors** are the compiler-known stdlib [§5](Bezel_Standard_Library.md#sec-system-collections-linq) members whose result at a class or interface element type is a borrow of the element: `First`/`FirstOrNull`/`Last`/`LastOrNull`/`Single`/`SingleOrNull`/`ElementAt`/`ElementAtOrNull` (with the predicate forms where they exist — `ElementAt`/`ElementAtOrNull` carry none, an index having no predicate analogue), the no-selector aggregations `Min()`/`Max()` and their `MinOrNull()`/`MaxOrNull()` forms (the `OrNull` forms returning `T?`), and `Aggregate(seed, fold)` on its receiver leg (the seed leg is caller-supplied and sound — the over-warn note below). A call to one **must draw a warning** iff the receiver's statically-tracked provenance — the same flow tracing this section performs for single-consumption, followed through the deferred lazy operators, callback-free and callback-taking alike — roots at a **directly-called iterator method, compiled in the same compilation unit, at least one of whose reachable `yield return` sites classifies as an enumerator-owned yield** ([§29.2](#sec-iterator-yield-ownership), [#3285](https://github.com/s8lap/bezel-lang/issues/3285)).
 
 An **enumerator-owned yield** — a yield whose element the iterator's own state-machine frame owns while the consumer holds it — arises in either of the two arms [§29.2](#sec-iterator-yield-ownership) admits: **minting** — a fresh producer (a `new` expression, an `owned`-returning call, any unbound owned temporary) or a `move` result, [§29.2](#sec-iterator-yield-ownership)'s first owned-class-typed bullet, which the enumerator owns outright and disposes on the next advance — or **adopting** — an unmarked read of a **name** denoting a binding the iterator's own frame **owns**: an owned local, a `using var` holding an owned value, or an `owned` parameter of the iterator body ([§29.4](#sec-lazy-evaluation)'s frame-resident-source list), [§29.2](#sec-iterator-yield-ownership)'s borrowed-expression bullet, which [§29.7](#sec-disposal-of-partially-consumed-iterators)'s pass disposes when the enumerator is disposed. Ownership of the binding is the operative fact, not its spelling: an unmarked `using var` initialized from a **borrow** assumes no disposal obligation ([§28.10](#sec-using-var)) and yielding its name is an ordinary re-borrow, not an adopting yield — as is every other re-borrow, in particular a re-borrow of a parameter-sourced collection's element, which is the dominant filter-and-project iterator shape.
@@ -7906,6 +8890,39 @@ An **enumerator-owned yield** — a yield whose element the iterator's own state
 Such a borrow is dead on arrival: the element is owned by the terminal's internal enumerator, which the terminal disposes before returning ([§29.2](#sec-iterator-yield-ownership)), so a later use faults deterministically in checked disposal mode ([§28.2](#sec-checked-disposal); undefined behavior unchecked). When every reachable yield of the traced iterator is enumerator-owned, the diagnostic states the fault as certain; when yields are mixed (some re-borrows of parameter-sourced collections, some enumerator-owned, in either arm), it states that the element may not survive the call.
 
 The remedies are stdlib §5's own, and **materializing is not among them ([#2557](https://github.com/s8lap/bezel-lang/issues/2557))**: `ToArray()`/`ToSet()`/`ToDictionary(…)` at a class or interface element type build **borrowing** collections ([§28.11](#sec-element-slot-policy)'s borrow-slot row), so the materialized slots dangle exactly as the accessor result does — materialize-first is this section's *re-enumeration* remedy, over a live backing, not a liveness remedy. What does remedy it: consuming each element inside the loop body that borrows it (the borrow is valid until the next advance, [§29.2](#sec-iterator-yield-ownership)); or giving the elements an owner — the producer declaring an owning enumeration return type ([§29.3](#sec-iterator-methods)) and the consumer taking each element through owning iteration into an owning collection (`IOwningEnumerable<T>`, stdlib [§4.13](Bezel_Standard_Library.md#sec-owning-enumeration-interfaces)), the accessor then applying to that collection. Where the producer is a borrowing minting iterator the consumer cannot change, no retention remedy exists: the borrowing protocol has no transfer-out ([§29.1](#sec-current-semantics-on-borrowing-and-owning-enumerators)).
+
+*Example.* An accessor over a minting iterator warns and one over a concrete collection is silent; the first remedy uses each element inside the loop body:
+
+```bezel
+class Probe
+  public readonly property Id: int;
+
+  public constructor(id: int)
+    Id := id;
+  end constructor;
+
+  destructor
+    Console.WriteLine($"disposed {Id}");
+  end destructor;
+end Probe;
+
+public static method Mint(n: int): IEnumerable<Probe>
+  var i := 0;
+  while i < n do
+    yield return new Probe(i);      // a minting yield: the enumerator owns each element
+    i++;
+  end;
+end Mint;
+
+using var nine := new Probe(9);
+var kept: Array<Probe> := [nine];
+using var probes := Mint(3);
+var p := probes.First();          // warns (§29.11): `First` disposes the element before it returns
+var k := kept.First();            // silent: a concrete collection root
+for var q in Mint(3) do           // the remedy: use each element in the borrowing body
+  Console.WriteLine(q.Id);
+end;
+```
 
 **Two pass-through nodes.** At a class or interface element type the trace does **not** stop at a **materializer result** — `ToArray()`/`ToSet()`/`ToDictionary(…)` — nor at an **`IGrouping<TKey, T>`** bound as the iteration variable of a `for` whose source expression is a `GroupBy(…)` call whose own receiver the trace resolves. Both build a new **container** and no new **owner**: their element slots hold borrows of the enumerated elements ([§28.11](#sec-element-slot-policy)'s borrow-slot row; stdlib [§5](Bezel_Standard_Library.md#sec-system-collections-linq)'s materialization note and its `GroupBy` paragraph, where the grouping's buffer holds borrows of *the source's own* elements and is filled by exhausting the source). The container's own ownership therefore says nothing about the elements', and the trace follows the elements past the node to the receiver's root. **They are pass-through nodes, never roots: the verdict is always the root's** — a materializer or a grouping over a concrete-collection root stays silent, and the presence of either in the chain is never itself evidence of anything. At a value, `string`, or runtime-managed element type both remain **stops**, no borrow being produced. The propagation is keyed on the `GroupBy` operator, not on the iteration variable's type: an enumerable-typed loop variable that is itself an *element* of a traced sequence carries no provenance from that sequence, its own elements having a different owner.
 
@@ -7941,7 +8958,9 @@ The standard pattern for removing during iteration:
 ```bezel
 var toRemove := new Array<Transaction>();
 for var t in transactions do
-  if t.IsExpired then toRemove.Add(t); end;
+  if t.IsExpired then
+    toRemove.Add(t);
+  end;
 end;
 for var t in toRemove do
   _ := transactions.Remove(t);   // `Remove` returns `bool` — discard it (§21.9)
@@ -7994,15 +9013,128 @@ Modifier order: `visibility static async ... method ...`.
 
 **Borrow-bearing parameters and results are forbidden (derives: [K2.1](#sec-kernel-k2) + [K6.1](#sec-kernel-k6) — a frame outlives the synchronous call; stack slots cannot enter it).** An `async` method, `async` lambda, or async iterator may not declare a parameter whose type is a value type that **holds borrows** ([§3.6](#sec-derived-type-properties)'s holds-borrows property): a borrow-bearing record ([§9.7](#sec-records-and-disposal)) — a span (stdlib §4.14, §4.15) or any record carrying a non-runtime-managed borrow —, a borrow-bearing inline array ([§15.1](#sec-inline-arrays): `[2]Item` for a class `Item`, `[2]Pair` for a borrow-bearing record `Pair`), or a choice that holds borrows ([§35.4](#sec-choice-classification): whatever its classification, an *owning* choice that holds borrows included — [#3110](https://github.com/s8lap/bezel-lang/issues/3110)), nor a result/element type that is such a value type; wherever a parameter's declared type is or contains a type parameter the check is re-applied after substitution at each instantiation of the declaration that declares the parameter ([§3.6](#sec-derived-type-properties) rule 2, [§14.1](#sec-generic-declarations)) — a generic `async` method's at its calls and formations, a generic type's `async` member's at every site naming the type (`Runner<Pair>` over `class Runner<T>` with `async method Go(x: T)` is rejected wherever it is named) — so an instantiation whose type argument makes a parameter borrow-carrying is rejected at the instantiation site; in an `async` body of a dispatched generic method ([§14.2](#sec-dispatched-generic-methods)), which `async` does not reach through the dispatched signature ([§28.12](#sec-asynchronous-disposal)), the check is decided at that body as its other requirements are: a compile error unless the declaring method's constraints establish that the parameter's type holds no borrows ([§3.6](#sec-derived-type-properties)'s holds-borrows property: a class bound, `where T: class` or `where T: sendable` does). The reason is structural: an ordinary borrow is bounded by the synchronous call frame that receives it and is unwound at return ([§28.3](#sec-local-variables-ownership-and-borrows), [§8.6](#sec-boxing)), but an async method captures its parameters into a heap-allocated state-machine frame that outlives the synchronous call and lives until the task settles — a moment the caller does not lexically bound, since the task is an ordinary heap value that may be stored, moved, awaited elsewhere, or fire-and-forgotten ([§30.10](#sec-standard-library-task-helpers)). A borrow captured into that frame from a caller-side source therefore has no stack frame whose unwinding bounds it, and [§28.3](#sec-local-variables-ownership-and-borrows)'s frame-local borrow-lifetime rules cannot establish that the source outlives the frame. The **one exception** is a borrow-bearing record the standard library certifies with a normatively-stated source-outlives-task obligation backstopped by checked disposal mode ([§28.2](#sec-the-idisposable-contract)): currently only `CancellationToken` ([§30.8](#sec-cancellation); axiom [A10](#sec-axiom-register)), whose borrowed source is a disposal-tracked `CancellationTokenSource` and whose default argument is the null-source sentinel `CancellationToken.None` ([§9.7](#sec-records-and-disposal)) — the [K4.3](#sec-kernel-k4) residual-trust shape, on the same stdlib-certified footing as [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet). Records whose only borrows are of **declared** runtime-managed types (`string`-backed spans such as `ReadOnlyStringSpan`, function types) are not borrow-bearing ([§9.7](#sec-records-and-disposal)) and are unaffected — no declared field type is a boxed value type, that being a category of runtime *value* ([§28.9](#sec-runtime-managed-types), [§8.6](#sec-boxing)). Where a buffer must cross an `await`, pass a heap-owned window — an `Array<T>` with explicit `offset`/`count`, or an owned result type. This rule keys on the **`async` modifier**, which is what makes a declaration's frame this section's business; a standard-library position whose declared signature carries none — `async` being implementation-side and invisible in signatures ([§28.12](#sec-asynchronous-disposal)) — but whose implementation nevertheless holds its parameter in a frame until settlement is outside the rule's scope and states its own retention and obligation where it is declared. There is exactly one such position: `AsyncEventSource<T>.RaiseAsync` (stdlib [§6.5](Bezel_Standard_Library.md#sec-events-ievent-eventsource)), whose `T` this section does not restrict and stdlib §6.5 does, as this rule restricts an `async` parameter: no value type that holds borrows, `CancellationToken` excepted, a compile error at the instantiation ([#5711](https://github.com/s8lap/bezel-lang/issues/5711)).
 
+*Example.* A span parameter holds borrows; a heap-owned window and a `CancellationToken` do not bar the declaration:
+
+```bezel
+public static async method HeadAsync(s: ReadOnlySpan<int>): Task<int>   // error (§30.1): a span parameter holds borrows
+  await Task.Delay(1);
+  return s[0];
+end HeadAsync;
+
+public static async method HeadAsync(xs: Array<int>, offset: int): Task<int>   // allowed: a heap-owned window
+  await Task.Delay(1);
+  return xs[offset];
+end HeadAsync;
+
+public static async method PauseAsync(token: CancellationToken): Task   // allowed: the one certified exception
+  await Task.Delay(1, token);
+end PauseAsync;
+```
+
 **`ref` and `out` parameters are forbidden (derives: [K2.1](#sec-kernel-k2) + [K6.1](#sec-kernel-k6)).** An `async` method, `async` lambda, or iterator method — synchronous or async ([§29.3](#sec-iterator-methods)) — may not declare a `ref` or `out` parameter; a compile error at the declaration. The grammar admits the modifiers through the shared `Param` production and the rejection is semantic — the same over-admit-and-reject pattern as [§22.10](#sec-methods-and-constructors-primary-constructors)'s primary constructors and [§23.4](#sec-indexers)'s indexer parameter lists. The reason is the same structural one as the borrow-bearing rule above: a `ref`/`out` argument is a reference to a caller stack slot, bounded by the synchronous call — but these bodies capture their parameters into a heap-allocated state-machine frame that outlives the synchronous call, so the captured slot reference dangles the moment the method returns its task or enumerable at the first suspension; and [§22.3](#sec-parameter-modifiers)'s `out` contract ("must assign every `out` parameter on every exit path") has no coherent exit for a body whose synchronous exit *is* that early return. The rule extends to conversions: an `async` lambda may not be assigned to a function type ([§27.1](#sec-function-types)) whose parameter list carries a `ref`/`out` slot. Non-`async` methods that merely *return* `Task`-family types are unaffected (a user-written such body has no state machine — the out-contract completes synchronously; the standard-library exception noted above is a `Task`-returning *payload* position, not a `ref`/`out` one, so it does not qualify this sentence), as are `owned` parameters ([§29.8](#sec-iterators-with-owned-parameters), above); other parameter modifiers' admissibility is governed by their own sections ([§28.14](#sec-scoped-callback-parameters) for `scoped`). (The alternative — requiring every `out` assigned before the first suspension point — was considered and declined: it is coherent for `out` only and unsound for `ref` (the callee can *read* the dead slot after resumption, not just write it), fragile (inserting an `await` above the assignment breaks callers), and has no known use case; C# rejects both, for both method kinds.)
+
+*Example.* The same `out` parameter on an `async` method and on a `Task`-returning method without `async`:
+
+```bezel
+public static async method ParseAsync(text: string, out n: int): Task   // error (§30.1): `out` on an `async` method
+  n := text.Length;
+  await Task.Delay(1);
+end ParseAsync;
+
+public static method Parse(text: string, out n: int): Task   // allowed: no `async`, so no frame
+  n := text.Length;
+  return Task.Delay(1);
+end Parse;
+```
 
 **Borrow-bearing record locals across suspension (derives: [K2.1](#sec-kernel-k2) + [K6.1](#sec-kernel-k6) — frame-resident sources).** A local of a value type that holds borrows ([§3.6](#sec-derived-type-properties)'s holds-borrows property: a borrow-bearing record or inline array, or a choice that holds borrows whatever its classification, [§35.4](#sec-choice-classification)), whose live range — [§28.3](#sec-consume-site-freeze)'s liveness, through a closure the body forms over it included — crosses a suspension point (`await`, `await using`, `await for`, or — in an async iterator — `yield return`, which suspends the frame while the consumer runs arbitrary code between `MoveNextAsync` calls, [§29.3](#sec-iterator-methods), [§30.7](#sec-asynchronous-programming-async-iterators)) is captured into the state-machine frame together with the borrows it carries. It is admitted across the suspension **iff every borrow it carries has a frame-resident source**: an owned local, a `using var`/`await using var`, or an `owned` parameter of the same async body — locations the frame itself owns (below), which therefore provably survive every suspension. A borrow whose source is caller-side — a plain parameter, `this`, a field reached through `this`, or a capture from an enclosing scope — does not qualify: the source's owner may dispose it while the frame is suspended, and, as with the parameter rule above, a local of a value type that holds borrows crosses a suspension point only where every borrow it carries is bounded statically — the frame-resident sources above ([§9.7](#sec-records-and-disposal)'s instance-field bullet states the posture; a value a frame-resident collection holds, or a closure the frame carries, rides the settlement clause below and [§28.11](#sec-borrowing-collections)'s collection-held clause with [K4.1](#sec-kernel-k4)'s backstop instead). The program is rejected at the suspension point, naming the local, the non-resident source, and the remedy: re-derive the record after the `await`, or copy the borrowed data into frame-owned storage before it. Values of a stdlib-certified borrow-bearing record (currently only `CancellationToken`) are exempt however obtained — they carry the certified source-outlives-settlement obligation of [§30.8](#sec-cancellation) instead. An enclosing scope's local or parameter of such a type that an `async` lambda captures is such a local of the lambda's body, live there as [§28.3](#sec-consume-site-freeze)'s liveness reads a local — through a closure the body forms over it included — so it crosses a suspension point wherever a use of it follows one of the body's own suspension points on some path; the borrows it carries are sourced in the enclosing scope, which the lambda's frame does not own, so the capture never meets the frame-resident condition, and such a use is rejected at the suspension point (a `CancellationToken` exempt as above; an assignment to the binding is not a use of its borrows). Read the capture before the body's first suspension, or copy the borrow-free data the body needs out of it there (`var first := s[0];` over a captured span `s`); the task the lambda's invocation mints still carries the capture's sources ([§28.3](#sec-borrow-lifetime-rules)'s provenance clause 4) for its own escape routes. (A **synchronous** iterator's `yield return` is subject to the same rule — its heap frame has the same shape; see [§29.4](#sec-lazy-evaluation).)
 
+*Example.* A span over a plain parameter may not cross an `await`; a span over a `using var` of the same body may:
+
+```bezel
+public static async method FirstAsync(xs: Array<int>): Task<int>
+  var s := xs.AsSpan();           // borrows `xs`, a plain parameter: a caller-side source
+  await Task.Delay(1);            // error (§30.1): `s` is live across this `await`
+  return s[0];
+end FirstAsync;
+
+public static async method LocalFirstAsync(): Task<int>
+  using var arr := new Array<int>();
+  arr.Add(7);
+  var s := arr.AsSpan();          // borrows `arr`, a `using var` of this body: frame-resident
+  await Task.Delay(1);            // admitted
+  return s[0];
+end LocalFirstAsync;
+```
+
 **`owned` parameters transfer into the frame (derives: [K3](#sec-kernel-k3) with the frame as scope).** An async method's `owned` parameters transfer into the state-machine frame at call time, exactly as an iterator's do ([§29.8](#sec-iterators-with-owned-parameters)). The body may move them out under the ordinary rules — chaining one with `return await <param>` moves it into the outer task's chained slot ([§30.5](#sec-result-lifetime-and-task-disposal)) and counts as such a move-out, so the outer task's teardown, not this rule, disposes it; any `owned` parameter never moved out is disposed by the frame when the task reaches its terminal state — on every completion path (success, fault, and cancellation), after the body's `using var` cleanups and `finally` clauses, in reverse declaration order ([§28.4](#sec-the-destructor)'s ordering). Parameters of move-only value type ([§15.3](#sec-move-only-value-types)) carrying no borrows ride the same machinery (a parameter whose declared type is or contains a type parameter among them, at every instantiation whose substitution makes that type move-only — the frame's discharge keyed per instantiation as the borrow-bearing rule above is, [§3.6](#sec-derived-type-properties) rule 2) — an owning choice that holds borrows is rejected by the borrow-bearing rule above ([§35.4](#sec-choice-classification)'s holds-borrows property), never reaching this one. An `owned` parameter never discharged by the body carries the [§28.3](#sec-owned-local-discharge-requirement) must-use warning at its declaration; `using var c := move conn;` on entry is the warning-free way to declare frame-lifetime intent. Disposing a not-yet-settled task does not cut this short: the underlying operation runs to its terminal state ([§30.5](#sec-result-lifetime-and-task-disposal)), and the frame's parameters are disposed then; what the frame then delivers into the disposed task — a result, a chained or retained source task ([§30.9](#sec-exception-handling-in-async-methods)), a fault instance — is disposed by the continuation the disposal attached ([§30.5](#sec-disposing-an-unsettled-task)).
+
+*Example.* The examples from here to the end of this section share one class, whose destructor reports the instance it closes:
+
+```bezel
+class Conn
+  public readonly property Name: string;
+
+  public constructor(name: string)
+    Name := name;
+  end constructor;
+
+  destructor
+    Console.WriteLine($"closed {Name}");
+  end destructor;
+end Conn;
+```
+
+*Example.* An `owned` argument moves into the frame at the call, and adopting it on entry is the warning-free spelling. The statements print `called`, `sent on a`, `closed a`, `settled`:
+
+```bezel
+public static async method SendAsync(owned conn: Conn): Task
+  using var c := move conn;           // adopt on entry: frame lifetime, no must-use warning
+  await Task.Delay(1);
+  Console.WriteLine($"sent on {c.Name}");
+end SendAsync;
+
+var a := new Conn("a");
+using var t := SendAsync(move a);     // `a` transfers into the frame at the call
+Console.WriteLine("called");
+await t;
+Console.WriteLine("settled");
+```
 
 **Borrowed parameters, `this`, and captures are held until settlement (derives: [K6.4](#sec-kernel-k6) + [K4.3](#sec-kernel-k4)).** An async method's plain (non-`owned`) parameters of class or interface type ([§28.3](#sec-local-variables-ownership-and-borrows)'s borrow vocabulary), its `this` receiver, and an `async` lambda's captures are borrows captured into the state-machine frame, as is the capture-set contribution of a call's plain function-typed arguments ([§28.3](#sec-unbound-owned-temporaries)) — all held not for the duration of the synchronous call but until the task **settles**. The call-site admission is unchanged (any borrow admissible as an argument remains admissible, [§28.3](#sec-local-variables-ownership-and-borrows), with the statically-certain exceptions of [§28.3](#sec-unbound-owned-temporaries)'s deferred-activation rules: an unbound owned temporary may not source a borrow into a frame — iterator or task — that escapes the full expression, and a callback argument's capture-set contribution is rejected by the ordinary scope, store, and frame-return rules where the frame provably escapes a contributed source's lifetime); what the frame adds is a temporal obligation on the **caller**: *every borrow source reaching an async call must outlive the settlement of the returned task, and the borrowed object must not be transferred to another domain — nor consumed into a domain-reachable construction ([§28.3](#sec-local-variables-ownership-and-borrows)'s domain-clause extension) — before that settlement.* The domain clause ([§28.3](#sec-borrow-lifetime-rules)'s field-store bullet, clause 4) is stated here because a frame-held borrow is invisible to the consume-site freeze ([§28.3](#sec-consume-site-freeze) — it lives in the state machine, in no local borrow binding); as everywhere, its violation has no runtime backstop. The obligation is a [K4.3](#sec-kernel-k4)-recorded trust clause: the structural checks are decidable, the temporal guarantee is the programmer's, with [K4.1](#sec-kernel-k4)'s backstop as the named safety net — a violation is a deterministic `DisposedAccessException` in checked disposal mode ([§28.2](#sec-the-idisposable-contract)) and undefined behavior in unchecked mode. The obligation is discharged trivially by the dominant shape — awaiting the task before any source's scope exits — and structurally by `TaskScope` ([§30.10](#sec-standard-library-task-helpers); stdlib [§6.10](Bezel_Standard_Library.md#sec-taskscope)), whose disposal quiesces its children before the enclosing scope unwinds. The shapes that carry a live residual are the abandonment idioms — `using var t := call();` dropped without an await, and `Task.FireAndForget(call())` — where an argument's or the receiver's owner can dispose it while the frame is suspended ([§30.10](#sec-standard-library-task-helpers) names the hazard). Abandon only tasks whose inputs are owned (transferred in), sendable-copied, `string`/value-typed, or otherwise guaranteed to outlive the operation; supervise everything else to settlement.
 
+*Example.* Awaiting before the source's scope ends discharges the settlement obligation; abandoning the task leaves it to the caller's trust:
+
+```bezel
+public static async method ShowAsync(c: Conn): Task
+  await Task.Delay(1);
+  Console.WriteLine(c.Name);          // `c` is held in the frame until the task settles
+end ShowAsync;
+
+using var c := new Conn("b");
+await ShowAsync(c);                   // the dominant shape: settled before `c`'s scope ends
+Task.FireAndForget(ShowAsync(c));     // compiles: `c`'s scope ends before this task settles, which breaks
+                                      // the caller's trust (K4.3); DisposedAccessException in checked mode
+                                      // (K4.1) when it resumes
+```
+
 An async method's `return expression;` completes the task with the value at the body's normal completion: the operand is held in the frame's return slot while the return edge's cleanups run, and a raise from one of them faults the task and disposes the slot's value in the frame's unwind ([§28.3](#sec-unbound-owned-temporaries) *The return slot*; [§30.5](#sec-result-lifetime-and-task-disposal): a faulted task has no owned result). Under `OwningTask<T>`, or `Task<T>` at a class or interface T, the operand is a consuming position ([K3.2](#sec-kernel-k3)): a named owned binding returned there is moved-from, and a borrow other than a `return await` chain ([§30.5](#sec-result-lifetime-and-task-disposal)'s kinds 2 and 3) is rejected. `return;` (in `Task`-returning forms) completes the task with no value. Falling off the end of a `Task`-returning async method is equivalent to `return;`. A `Task<T>`-returning async method must `return` a value on every path.
+
+*Example.* Under `Task<T>` at a class `T` the `return` operand is owned, or a `return await` chain:
+
+```bezel
+class Pool
+  private owned _spare: Conn := new Conn("spare");
+
+  public async method OpenAsync(): Task<Conn>
+    await Task.Delay(1);
+    return new Conn("fresh");          // a consuming position (K3.2): an owned value
+  end OpenAsync;
+
+  public async method SpareAsync(): Task<Conn> => _spare;              // error (§30.1): a borrow is no result here
+  public async method AgainAsync(): Task<Conn> => await OpenAsync();   // a `return await` chain (§30.5)
+end Pool;
+```
 
 <a id="sec-await"></a>
 ### 30.2 `await`
@@ -8076,7 +9208,7 @@ Reading `Result` on a completed `Task<T>` whose `T` is a **class** type (Pattern
 A `Task` or `Task<T>` may be awaited from multiple places, sequentially or concurrently. Every awaiter sees the same eventual state. The underlying computation runs once. Continuations resume in unspecified order, but never concurrently with one another within a domain ([§30.13](#sec-runtime-model)).
 
 <a id="sec-multiple-awaits-on-ownedtaskt"></a>
-`OwningTask<T>` is single-consumer by type — the Pattern B container of [§30.5](#sec-result-lifetime-and-task-disposal) (derives: [K2](#sec-kernel-k2) fan-out vs. [K1.7](#sec-kernel-k1) — one obligation moves once; `InvalidOperationException` is its dynamic dual): **the first await spends the task regardless of outcome** (success, fault, or cancellation), and a second await raises `InvalidOperationException`, even after a successful first await — the result has already been moved out. (The "awaiting a faulted task re-raises" rule of [§30.9](#sec-exception-handling-in-async-methods) applies to `Task`/`Task<T>` and to the *first* await of an `OwningTask<T>` only.) Sharing an `OwningTask<T>` across multiple potential awaiters is not the intended pattern. For fan-out with a class-typed result, use `Task<T>` (Pattern A); for single-consumer ownership-transferring resource production, use `OwningTask<T>` (Pattern B).
+`OwningTask<T>` is single-consumer by type — the Pattern B container of [§30.5](#sec-result-lifetime-and-task-disposal) (derives: [K2](#sec-kernel-k2) fan-out vs. [K1.7](#sec-kernel-k1) — one obligation moves once; `InvalidOperationException` is its dynamic dual): **the first await spends the task regardless of outcome** (success, fault, or cancellation), and a second await raises `InvalidOperationException`, even after a successful first await — the result has already been moved out. A second await **through the same named binding** — a local of any binding form, or a non-`ref` parameter — that the first award dominates on every path is a **compile error** ([§30.5](#sec-result-lifetime-and-task-disposal) *Consumer-side rules*): the award right is spent exactly as [§29.11](#sec-multiple-enumeration)'s enumeration right is, statically where the flow analysis can see it and at run time otherwise. (The "awaiting a faulted task re-raises" rule of [§30.9](#sec-exception-handling-in-async-methods) applies to `Task`/`Task<T>` and to the *first* await of an `OwningTask<T>` only.) Sharing an `OwningTask<T>` across multiple potential awaiters is not the intended pattern. For fan-out with a class-typed result, use `Task<T>` (Pattern A); for single-consumer ownership-transferring resource production, use `OwningTask<T>` (Pattern B).
 
 <a id="sec-result-lifetime-and-task-disposal"></a>
 ### 30.5 Result lifetime and task disposal
@@ -8176,7 +9308,7 @@ Disposal timing, exception behavior, and borrow bounds are **identical to the ha
 
 **`OwningTask<T>` for class or interface T (Pattern B)** (derives: [K1](#sec-kernel-k1) + [K3](#sec-kernel-k3) — the await mints an owned result, which must reach a discharging position)**:** the await must appear in an **owned-consuming context** — the consume table's positions ([§28.3](#sec-consume-table)), not re-listed here. The Pattern-B-specific instances: the announcing `return` type may be one that *wraps* `owned T` (such as `OwningTask<T>` — in whose `async` body `return c;` of a named owned binding is [K3.2](#sec-kernel-k3)'s marker-free consume, and `return move c;` the redundant marker of [§28.3](#sec-move-semantics-for-owned-locals)); the owned binding forms are `using var x := await ...` (the canonical form; `await using var x := await ...` for an asynchronously-disposable result) and `var x := await ...`, which introduces an owned local of class type T under [§28.3](#sec-local-variables-ownership-and-borrows)'s standard discharge rules from the binding point forward; and the discard statement `_ := await ...;` ([§17.13](#sec-the-discard-_), [K3.9](#sec-kernel-k3)) disposes the awaited result at the end of the statement as an unbound owned temporary ([§28.3](#sec-unbound-owned-temporaries)): the end-of-statement counterpart of `using var _ := await ...;`.
 
-An **owned** operand task is disposed implicitly by the award, without disposing its result; a **borrowed** one is spent and stays its holder's (both below); either way the task cannot be awaited again, and a second await raises `InvalidOperationException`.
+An **owned** operand task is disposed implicitly by the award, without disposing its result; a **borrowed** one is spent and stays its holder's (both below); either way the task cannot be awaited again. A second await **through the same local or non-`ref` parameter binding**, whatever the binding's ownership, that the first award dominates on every path is a **compile error at the second await**, naming the first; a second award reachable only at run time — through a field, a slot or another binding, or on a path the first award does not dominate — raises `InvalidOperationException`. The spent award is a flow fact of the binding, read exactly as [§7.4](#sec-member-access-on-nullable-values) reads its narrowing facts: established at the award, holding at a point only when it holds on every path that reaches it ([§7.4](#sec-member-access-on-nullable-values)'s `try` model included), and invalidated by a reassignment of the binding, by passing it as a `ref` or `out` argument, and by a mutable capture across the award itself. For an owned operand the award is also the binding's consume (below), so the second await is a moved-from read as well; the verdict is the same.
 
 The await operator on a `OwningTask<T>` for class T is itself **owned-consuming with respect to its operand** (derives: [K3.5](#sec-kernel-k3) + [K4.2](#sec-kernel-k4)): when the awaited expression is an owned task value (a plain owned local of `OwningTask<T>` — not a `using var` binding: a `using var` cannot be moved out of ([§28.3](#sec-local-variables-ownership-and-borrows)), so a read of it is a borrow and such an await is the borrowed-operand case below — an iteration variable from draining an `OwningArray<OwningTask<T>>`, an `owned` parameter, or any other owned-typed expression of `OwningTask<T>`), the await consumes the task as part of the operation and satisfies the discharge requirement on the operand — **on all outgoing edges of the await, including the fault/cancel (exception) edge**: after a faulted first await, an owned operand is moved-from per [§28.3](#sec-local-variables-ownership-and-borrows), and a retry requires binding a fresh task. The runtime's implicit task-disposal and the static discharge are one event seen from two sides. Like `throw x` ([§31.1](#sec-the-throw-operand)) and the discard `_ := x;` ([§17.13](#sec-the-discard-_)), this consume is a [K4.2](#sec-kernel-k4) **site-announced kill** with a runtime backstop — the `await` keyword plus the single-consumer operand type are the announcement, and the await's implicit disposal sets the disposed flag, so a stale borrow of the operand faults as `DisposedAccessException` in checked disposal mode ([§28.2](#sec-checked-disposal)) — and so joins no consume-site freeze list. The position is **marker-free** ([K3.13](#sec-kernel-k3)'s set): the transfer marker is not admitted where the target already announces the consume ([§28.3](#sec-move-semantics-for-owned-locals)); it is [K3.5](#sec-kernel-k3) in the kernel's owned-consuming enumeration. The natural patterns therefore work without explicit task disposal — the await's implicit disposal *is* the discharge:
 
@@ -8191,7 +9323,7 @@ var theTask := SomeFactory();   // theTask: owned OwningTask<T>
 using var result := await theTask;  // theTask discharged by the await
 ```
 
-Pattern B tasks are single-consumer by type — once awaited they are spent, and sharing a `OwningTask<T>` across multiple potential awaiters is not the intended pattern. When the operand is **borrowed** — a `using var` binding, a plain task parameter, an `owned` field read without `move`, an owning-collection slot, a borrowing-iteration variable, a task reached through static storage — the await **spends** the task ([§30.4](#sec-multiple-awaits-on-ownedtaskt): the first award, whatever its outcome) and disposes **nothing**: the award is not a kill, no discharge is owed for the operand, and the task stays owned by its holder, which disposes it as it disposes any other task it holds — a `using var` at its scope end (deferred to the faulted task's teardown where the operand's fault escaped the awaiting body, [§30.9](#sec-exception-handling-in-async-methods)), a field by the object's cascade, a slot by the collection, static storage by [§22.13](#sec-disposal-of-static-owned-fields)'s exit pass alone ([K9.4](#sec-kernel-k9)). A spent task's later disposal finds no result to dispose; its fault instance, where it has one, is disposed then ([§30.9](#sec-exception-handling-in-async-methods)'s moment), which is what lets a fault that escaped the awaiting body stay retained by borrow (§30.9 *Fault ownership*). The `using var task := SomeFactory(); var x := await task;` shape is one common form: the await awards the result, and the `using var`'s scope end disposes the task.
+Pattern B tasks are single-consumer by type — once awaited they are spent, and sharing a `OwningTask<T>` across multiple potential awaiters is not the intended pattern. When the operand is **borrowed** — a `using var` binding, a plain task parameter, an `owned` field read without `move`, an owning-collection slot, a borrowing-iteration variable, a task reached through static storage — the await **spends** the task ([§30.4](#sec-multiple-awaits-on-ownedtaskt): the first award, whatever its outcome) and disposes **nothing**: the award is not a kill, no discharge is owed for the operand, and the task stays owned by its holder, which disposes it as it disposes any other task it holds — a `using var` at its scope end (deferred to the faulted task's teardown where the operand's fault escaped the awaiting body, [§30.9](#sec-exception-handling-in-async-methods)), a field by the object's cascade, a slot by the collection, static storage by [§22.13](#sec-disposal-of-static-owned-fields)'s exit pass alone ([K9.4](#sec-kernel-k9)). A spent task's later disposal finds no result to dispose; its fault instance, where it has one, is disposed then ([§30.9](#sec-exception-handling-in-async-methods)'s moment), which is what lets a fault that escaped the awaiting body stay retained by borrow (§30.9 *Fault ownership*). The `using var task := SomeFactory(); var x := await task;` shape is one common form: the await awards the result, and the `using var`'s scope end disposes the task. A second `await task` the first dominates is the compile error above; one it does not dominate — in a loop body whose first iteration awarded, or after a `try` whose protected block awarded — raises `InvalidOperationException`.
 
 ```bezel
 // Canonical form: using-var binding
@@ -8488,7 +9620,7 @@ These compose with the rest of the async machinery; awaiting them works like awa
 
 **Aggregation contracts.** `Task.WhenAll` (all input forms, the owning overload included) completes only after **every** input has settled — it never abandons laggards. If every input succeeded it completes successfully (for the generic form, with the results in input order); otherwise awaiting it re-raises the exception of the **first non-successful input in input order** — a cancelled input counting as `OperationCanceledException` — per the first-fault-no-aggregation posture (stdlib [§6.10](Bezel_Standard_Library.md#sec-taskscope), rationale §13.5); the other inputs' faults remain observable on those tasks individually. When that first non-successful input is **faulted**, the re-raise is **by borrow of the input task's owned fault instance** ([§30.9](#sec-exception-handling-in-async-methods) fault ownership) — an aggregate task owns no fault of its own, so every fault keeps a single owner; when it is **cancelled**, the runtime raises a fresh `OperationCanceledException`, exactly as awaiting that input directly would ([§30.3](#sec-the-task-taskt-and-ownedtaskt-types)). `WhenAll` of an **empty** array returns an already-completed task. `Task.WhenAny` completes when the first input **settles in any state** (success, fault, or cancellation), yielding its index; awaiting `WhenAny` never re-raises an input's fault — the caller inspects the winner. `WhenAny` of an empty array raises `ArgumentException` **synchronously at the call site**, not as a faulted task (it could never complete, and the misuse is local). The owning `WhenAll` overload behaves as its stdlib §6.7 sketch shows, now as **contract**: inputs are awaited in input order; on the first non-successful input, results already produced are disposed with their tasks and laggards' eventual results are disposed on production ([§30.5](#sec-result-lifetime-and-task-disposal) disposal continuations), and awaiting re-raises that first fault — the first non-successful input task itself is **retained by the aggregate and disposed with it**, so the re-raised instance remains owned by its own task, transitively, for the aggregate's lifetime; on all-success the returned array owns every result; the owning overload over an empty array returns an already-completed task owning an empty array. The borrowing aggregators (`Array<Task>`/`Array<Task<T>>` inputs) hold their inputs as **frame borrows across suspension** — [§30.1](#sec-async-methods)'s obligation applies, extended through consumption: the input tasks (and the array) must outlive the aggregate task's settlement **and every await or `Result` read of the aggregate**, and of every task that retains the aggregate ([§30.9](#sec-exception-handling-in-async-methods) *Fault ownership*) — a faulted aggregate's re-raise borrows an instance an input task owns, so disposing an input after the aggregate settles but before it is consumed would dangle the re-raise.
 
-**Structured fan-out: `TaskScope`.** The default posture for concurrent fan-out is the structured nursery `TaskScope` (stdlib [§6.10](Bezel_Standard_Library.md#sec-taskscope)): children are spawned into a lexically-scoped owner consumed by `await using`; `await Join()` is mandatory on the normal path and is the single re-raise site (first fault wins and cancels siblings via the scope's token); disposal **quiesces** — no child outlives the scope — which is what discharges [§30.1](#sec-async-methods)'s source-outlives-settlement obligation structurally. The two discard idioms above are the exceptional escape hatches, not the default: `FireAndForget` severs fault propagation (logged only), and the `using var`-drop severs it silently *and* leaves the running frame's borrows unsupervised ([§30.1](#sec-async-methods), [§30.5](#sec-result-lifetime-and-task-disposal)); both are appropriate only for genuinely unsupervised work whose inputs the task owns. (Storing a freshly-minted task into a **borrowing** collection slot is not a third idiom: the slot takes no ownership, so the task dies at the statement's [K8](#sec-kernel-k8) boundary — abandoned unsupervised, the slot dangling besides — and the store draws [§15.4](#sec-collection-literals)'s fresh-store warning; hold each task in a named binding, or use `OwningArray<OwningTask<T>>` with the owning `Task.WhenAll` overload for dynamic fan-in, stdlib [§6.7](Bezel_Standard_Library.md#sec-task-static-helpers).)
+**Structured fan-out: `TaskScope`.** The default posture for concurrent fan-out is the structured nursery `TaskScope` (stdlib [§6.10](Bezel_Standard_Library.md#sec-taskscope)): children are spawned into a lexically-scoped owner consumed by `await using`; `await Join()` is mandatory on the normal path and is the single re-raise site (first fault wins and cancels siblings via the scope's token); disposal **quiesces** — no child outlives the scope — which is what discharges [§30.1](#sec-async-methods)'s source-outlives-settlement obligation structurally. The two discard idioms above are the exceptional escape hatches, not the default: `FireAndForget` severs fault propagation (logged only), and the `using var`-drop severs it silently *and* leaves the running frame's borrows unsupervised ([§30.1](#sec-async-methods), [§30.5](#sec-result-lifetime-and-task-disposal)); both are appropriate only for genuinely unsupervised work whose inputs the task owns. (Storing a freshly-minted task into a **borrowing** collection slot is not a third idiom: the slot takes no ownership, so the task would die at the statement's [K8](#sec-kernel-k8) boundary — abandoned unsupervised, the slot dangling besides — and the store is rejected by [§15.4](#sec-collection-literals)'s fresh-store rule; hold each task in a named binding, or use `OwningArray<OwningTask<T>>` with the owning `Task.WhenAll` overload for dynamic fan-in, stdlib [§6.7](Bezel_Standard_Library.md#sec-task-static-helpers).)
 
 <a id="sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet"></a>
 ### 30.11 `TaskCompletionSource<T>` and `OwningTaskCompletionSource<T>`
@@ -8775,6 +9907,38 @@ A type is **sendable** — a derived type property ([§3.6](#sec-derived-type-pr
 
 Sendability of a generic instantiation is checked at the instantiation or call site under the rules of [§3.6](#sec-derived-type-properties); diagnostics name the property ("not sendable"), the offending type, and the failing rule.
 
+*Example.* `Channel<T>` requires `where T: sendable` (stdlib §6.9), so each instantiation below applies the rules above:
+
+```bezel
+import System.Threading;
+
+sealed class Note
+  public property Text: string := "";
+end Note;
+
+sealed class Job                        // sendable: `sealed` (rule 1); an `int` and an `owned` sendable class (rule 2)
+  public property Id: int;
+  private owned _note: Note := new Note();
+end Job;
+
+class OpenJob                           // open: neither `sealed` nor `closed`
+  public property Id: int;
+end OpenJob;
+
+sealed class Linked
+  private _next: Job? := null;          // a non-`owned` class field: a back-reference
+end Linked;
+
+record Handler(Run: () -> ());          // a function type inside a record
+record Point(X: int, Y: int);
+
+using var a := new Channel<Job>();      // a sendable class crosses as an owned transfer
+using var b := new Channel<Point>();    // a sendable record crosses as a copy
+using var c := new Channel<OpenJob>();  // error (§30.14 rule 1): an open class is not sendable
+using var d := new Channel<Linked>();   // error (§30.14 rule 3): a non-`owned` class-typed field
+using var e := new Channel<Handler>();  // error (§30.14): a function-typed component disqualifies the record
+```
+
 **Moved trivial-dispose instances: the free obligation transfers with the move.** Sendability does not key on trivial-dispose — a sealed trivial-dispose class with sendable fields is sendable under the transfer-closed rules above (rule 2's admission of `owned` sendable-class fields composes with [§28.9](#sec-runtime-managed-types)'s definition, so a type can be simultaneously trivial-dispose and sendable). When a sendable trivial-dispose instance crosses a domain boundary — a spawn argument, a task result, a channel element — its compiler-inserted free obligation ([§28.9](#sec-runtime-managed-types)) transfers with the move: the receiving domain's owner — the `owned` entry parameter, the awaited join result, the `Receive` result — frees the instance at that owner's release point, and the origin binding is left moved-from as usual. No cross-domain bookkeeping exists or is needed: the instance has exactly one owner at all times, in whichever domain currently holds it. Pre-transfer aliases of a moved trivial-dispose instance are governed by this section's recorded residual obligations **verbatim** — the field-held, collection-held, and pending-frame borrows of the paragraph above carry the same domain clause at trivial-sourced borrows as at any other. The channel-internal disposal sites ([§30.15](#sec-channels) — undelivered items disposed at the channel's disposal; the item disposed by a faulting send) need no separate clause: disposal of a trivial-dispose item *is* the flag-setting free ([§28.2](#sec-checked-disposal), [§28.9](#sec-runtime-managed-types)), so those rules already state the free.
 
 <a id="sec-spawning-domains"></a>
@@ -8801,7 +9965,50 @@ The compiler enforces at the call site:
 - **The entry must be capture-free**: a non-capturing lambda or a static method reference. A capturing lambda or an instance method reference is rejected — captures and receivers are borrows of the origin domain ([§28.9](#sec-runtime-managed-types)). Data enters the new domain only through the explicit `arg` parameters, which must be of sendable types; class-typed arguments are `owned` and are moved through the spawn into the entry's parameter.
 - **Argument and result types must be sendable**, per the rules above — and a class type crosses only through an `owned` row: an instantiation of a plain `arg: A` row or a plain `R` result row at a class type other than `string` and the runtime-managed `Type`, which cross as shared immutable references (stdlib [§6.8](Bezel_Standard_Library.md#sec-domain); the value-element rows of [§6.12](Bezel_Standard_Library.md#sec-parallel) likewise), explicit, inferred, or reached through a user generic's substitution ([§3.6](#sec-derived-type-properties) rule 2's instantiation-site rule), is a compile error at the call site naming the `owned` row.
 
+*Example.* Data enters a spawned domain only through the entry's argument, and a class argument only by `move`:
+
+```bezel
+import System.Threading;
+
+sealed class Counter
+  public property N: int;
+end Counter;
+
+public static method Bump(owned c: Counter): int
+  using var k := move c;
+  k.N += 1;
+  return k.N;
+end Bump;
+
+public static method Peek(c: Counter): int => c.N;
+
+var c := new Counter();
+using var j := Domain.Spawn(Bump, move c);       // `c` crosses by `move` and is moved-from here
+var limit := 3;
+using var x := Domain.Spawn(lambda() => limit);  // error (§30.14): the entry captures `limit`
+var d := new Counter();
+var view := d;
+using var y := Domain.Spawn(Bump, move d);       // error (§30.14, K5.1): `view` still borrows `d`
+Console.WriteLine(view.N);
+var e := new Counter();
+using var z := Domain.Spawn(Peek, e);            // error (§30.14): a class crosses only through an `owned` row
+```
+
 **Async entries.** An entry may be an `async` function — a capture-free `async` lambda or a static `async` method reference; its function type is `() -> Task`, `() -> Task<R>`, or `() -> OwningTask<R>` ([§30.6](#sec-async-lambdas)). The runtime runs the entry as the spawned domain's first continuation and **awaits the returned task within that domain** — the exact analog of how the runtime drives an `async` `Main` ([§33.2](#sec-accepted-signatures)). The entry's task object never crosses the boundary: it lives and dies in the spawned domain; for the `OwningTask<R>` form the runtime is its single Pattern B consumer, and only the **sendable** result (or the fault, as `DomainFaultedException`) crosses into the join handle under the unchanged rules. In overload resolution, an entry whose return type is in the `Task` family resolves to the async forms; the synchronous generic forms never bind `R` to a task type (task types are not sendable, so every such binding was already an error — the preference changes no program's meaning).
+
+*Example.* A static `async` method reference as the entry:
+
+```bezel
+import System.Threading;
+
+public static async method TickAsync(): Task<int>
+  await Task.Delay(1);
+  return 7;
+end TickAsync;
+
+using var k := Domain.Spawn(TickAsync);   // `() -> Task<int>`: the new domain awaits the entry's task
+Console.WriteLine(await k);               // the join is an ordinary `Task<int>` here: prints 7
+```
 
 The join handle is an ordinary task of the spawning domain. Awaiting an `OwningTask<R>` join follows Pattern B ([§30.5](#sec-result-lifetime-and-task-disposal)): single consumer, ownership of the (sendable) result transfers to the awaiter — the existing single-consumer transfer semantics are exactly the cross-domain join semantics, unchanged. `Task`/`Task<R>` joins follow Pattern A.
 
@@ -11694,6 +12901,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - A `with` expression whose source expression's static type is a constructor-only record is a compile error at the `with` expression ([§9.5](#sec-non-destructive-update-with), [§9.9](#sec-constructor-only-records)).
 - An integer-to-enum cast `E(n)` is checked against the declared constants ([§5.4](#sec-enum-casts)): a constant operand equal to no declared constant is a compile error at the cast site; a non-constant operand equal to no declared constant raises `OverflowException` at runtime. No value of an enum type exists that is not equal to a declared constant.
 - A shift count outside `0..width−1` of the left operand's type ([§6.5](#sec-bitwise-operations)) is a compile error when the count is a constant — including in constant-expression evaluation ([§17.14](#sec-constant-expressions)) — and raises `OverflowException` at runtime otherwise; `<<=`/`>>=` inherit the rule ([§6.6](#sec-compound-assignments)).
+- A `/` or `mod` performed at an integer type or `decimal` whose right operand is a compile-time constant equal to zero is a compile error at the operator, whatever the left operand's value ([§6.1](#sec-integer-arithmetic), [§6.4](#sec-decimal-arithmetic)); a binary-floating-point operation is outside the rule; `/=`/`mod=` inherit the rule ([§6.6](#sec-compound-assignments)); a non-constant zero divisor raises `DivideByZeroException` at runtime.
+- A compile-time-constant index outside an inline array's `0..<N` is a compile error at the index, for a read and for a write ([§15.1.2](#sec-inline-array-members)); a non-constant index is bounds-checked at runtime.
 - An explicit conversion whose operand is a compile-time constant the conversion would reject is a compile error at the conversion site, never a deferred `OverflowException` ([§5.2](#sec-explicit-conversions), [§5.3](#sec-nullable-casts), and the enum-to-integer cast `I(e)` of [§5.4](#sec-enum-casts), which applies §5.2's conversion as its second step); a non-constant operand raises at runtime, and a saturating conversion is unaffected. The conversion expression is still not a constant expression ([§17.14](#sec-constant-expressions)).
 - A collection literal targeting a reference type produces an owned value that must reach an owned location ([§15.4](#sec-collection-literals), [§28.3](#sec-local-variables-ownership-and-borrows)); one targeting an inline-array type produces a value, ownership arising only at `[N owned]…` slots ([§15.3](#sec-move-only-value-types)).
 - Nullable field, property, or `ref`-parameter access — other than the narrowing `readonly`-field form — without copying to a local is rejected; only [§7.4](#sec-narrowing-applies-to-locals-only)'s narrowing carriers are narrowed, and a `ref` parameter never is, to non-null or to a type ([§7.4](#sec-narrowing-applies-to-locals-only), [§12.7](#sec-type-tests-is-is-not-as)).
@@ -11706,6 +12915,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `=`, `<>`, `Equals` and `GetHashCode` on an inline array whose element type, nullability stripped, is not hashable, and `Contains` on one whose element type, nullability stripped, has no member for [§9.2](#sec-equality-through-a-type-parameter)'s first kind, are a compile error at the use site, and an inline array over a non-hashable element type, like a nullable `T?` over a non-hashable `T`, is not hashable ([§15.1.2](#sec-inline-array-members), [§3.6](#sec-derived-type-properties)); nor is a function type, whose `GetHashCode` agrees with its equality but whose lambdas equal themselves only ([§3.6](#sec-derived-type-properties) clause (e), [§27.7.1](#sec-equality-of-function-values)).
 - A storage component marked `equality skip` ([§9.2](#sec-equality-skip)) is removed from the auto-equality membership computation — every other role untouched, the generated `=` and `GetHashCode` computing over the same reduced set — under §9.2's placement discipline (storage components only; a non-storage member draws the inert-annotation compile error).
 - A range literal is typed from its position where that supplies an integer type or `char` and every written endpoint converts to it ([§5.1](#sec-implicit-conversions)), and otherwise from its endpoints as a binary operator's operands are ([§6.2](#sec-mixed-type-arithmetic)); a pair with no common type is a compile error at the range expression ([§16.1](#sec-construction)).
+- An open-ended range literal written directly as the source of a `for` statement is a compile error at the literal ([§16.5](#sec-iteration-open-ended-ranges)); an open-ended range reached any other way raises `InvalidOperationException` at `GetEnumerator` ([§16.3](#sec-the-ranget-type)).
 
 <a id="sec-appendix-c-visibility"></a>
 ### C.2 Visibility
@@ -11778,12 +12988,14 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - Iterator yield ownership is determined by the iterator's declared return type — enumerator-owned yields with a borrowing iteration variable at the non-owning heads, per-`MoveNext` transfer to an owned iteration variable at the `IOwning*` heads ([§29.2](#sec-iterator-yield-ownership); [K6.2](#sec-kernel-k6)).
 - In an owning iterator, `yield return x;` on a named owned binding is a marker-free consume joining the consume-site freeze (the [consume table](#sec-consume-table)'s [K3.7](#sec-kernel-k3) row; [K5.1](#sec-kernel-k5)); in a borrowing iterator the same unmarked read is a re-borrow of the frame-resident binding ([§29.2](#sec-desugaring-of-for), [§28.3](#sec-move-semantics-for-owned-locals)).
 - A discard statement `_ := x;` over a named owned binding is a marker-free consume and a site-announced kill — disposed at end of statement, the binding left explicitly-disposed, no transfer marker, and unfrozen ([§17.13](#sec-the-discard-_), [§28.3](#sec-move-semantics-for-owned-locals); K4.2 + [K5.3](#sec-kernel-k5)).
+- A use of a local after an explicit `Dispose()`, direct `DisposeAsync()` or discard of it that dominates the use on every path, and a use of a local holder of a borrow of its value — an alias, a `using var` pin, a span or borrow-bearing value over it, a closure capturing such a holder, a frame carrying it — whose every source was so disposed, is a compile error; a repeated explicit disposal of the same binding is a warning; a kill on only some paths to a holder's use is the checked-mode fault ([§28.2](#sec-checked-disposal); K4.2 + [K7.4](#sec-kernel-k7) + [K2.2](#sec-kernel-k2); the kill itself stays unfrozen, [K5.3](#sec-kernel-k5)).
+- A use of a local borrow of an owned field's current value — `var b := r.f;`, `r` being `this` or a local or non-`ref` parameter — after a disposing write of the same field (a reassignment, an explicit `Dispose()` or `DisposeAsync()`) that follows the borrow with no invalidating operation between them and dominates the use, and a read of the field itself after such an explicit disposal in that window, is a compile error; the write stays unfrozen ([§28.7](#sec-reassigning-owned-fields); [K3.11](#sec-kernel-k3)/[K3.9](#sec-kernel-k3) at a slot + [K7.4](#sec-kernel-k7); [K5.6](#sec-kernel-k5) untouched).
 - A local holding an iterator or enumerator frame or a lazy query — a `for` desugaring's hidden `__source` included — is a live local borrow of every source the frame carries, its own disposal counting as a use, so a `move`, transfer or reassignment of a carried source while it is live is a compile error ([§28.3](#sec-consume-site-freeze) *Frame locals*; K5.5).
 - A closure may read a captured owned binding (as a borrow) but may not assign to it, transfer from it, or dispose it ([§28.3](#sec-captured-owned-bindings); K2 + [K5.5](#sec-kernel-k5)).
 - The must-use warning covers undischarged `owned` parameters of iterators and async methods, attached at the parameter declaration, at every non-trivial-dispose declared type ([§28.3](#sec-owned-local-discharge-requirement), [§28.9](#sec-trivial-dispose-classes), [§29.8](#sec-iterators-with-owned-parameters), [§30.1](#sec-async-methods); K3.14 + [K1.6](#sec-kernel-k1)).
 - An iterable minted by an iterator method that declares an `owned` or move-only parameter is single-consumption under [§29.11](#sec-multiple-enumeration)'s rule: a second consumption is a compile error where the flow analysis sees it and `InvalidOperationException` at run time ([§29.8](#sec-iterators-with-owned-parameters); [K6.1](#sec-kernel-k6)).
 - A returned deferred-activation frame may carry only parameter- or receiver-sourced borrows — its carried sources being what its building calls' receivers and plain arguments contribute ([§28.3](#sec-argument-contributions)), a plain function-typed argument's capture-set contribution ([§28.3](#sec-unbound-owned-temporaries)) and, in a generic body, a type-parameter-typed argument's contribution at every substitution its constraints admit among them; carrying a scope-bound local's, `using var`'s, or temporary's borrow out through the return, directly or through a callback's capture, is rejected ([§28.3](#sec-returning-a-deferred-activation-frame); K6.2 + K2.4).
-- A fresh-producer element of non-trivial-dispose class type in a borrowing-family collection literal is rejected (bind the source first, or use the owning family), a trivial-dispose fresh element instead joining the literal tree as an aggregate-owned node, and `Add`/`Insert`/indexer-set keeping their admissions with the [§15.4](#sec-collection-literals) store warning on fresh unbound owned temporaries ([§15.4](#sec-collection-literals), [§28.11](#sec-borrowing-collections); [K8.4](#sec-kernel-k8) + K2.3).
+- A fresh-producer element of non-trivial-dispose class type in a borrowing-family collection literal is rejected (bind the source first, or use the owning family), a trivial-dispose fresh element instead joining the literal tree as an aggregate-owned node; and a fresh unbound owned temporary of class type — a `new` expression, a collection literal, an `owned`-returning call, a `move`, a `Task`-family call — in a single-element store position of a borrowing-family collection (`Add`/`Insert`/indexer-set and the other stores [§15.4](#sec-collection-literals) names, key and value positions alike) or in the key position of `OwningDictionary<K, V>` is rejected at the store site, a plain parameter of a user-declared member keeping the unbound-temporary admission ([§15.4](#sec-collection-literals), [§28.11](#sec-borrowing-collections); [K8.4](#sec-kernel-k8) + K2.3).
 - A stdlib §5 class-element terminal accessor or no-selector aggregation call whose receiver's statically-traced provenance roots at a directly-called same-unit iterator with at least one reachable **enumerator-owned** yield — minted or adopted, [§29.2](#sec-iterator-yield-ownership)'s two arms — draws the terminal-accessor provenance warning, acceptance unchanged; at a class or interface element type a materializer result and a `GroupBy` grouping are pass-through nodes of that trace, never roots. The member set, the predicate, the pass-through nodes, and the exhaustive silent-root set are normative at [§29.11](#sec-multiple-enumeration) (predicate widened).
 - A call to a [§29.12](#sec-mutation-during-iteration) structural operation whose receiver is the same binding the enclosing `for`/`await for` iterates, in the loop's own callable body, from which the loop's next advance is reachable, draws the mutation-during-iteration warning, acceptance unchanged; a call followed on every path by an exit from the loop is exempt, a call inside a nested lambda or local type body the loop does not sequence is outside the rule, and a modification through a different binding is not traced ([§29.12](#sec-mutation-during-iteration)).
 - Implicit discharge — auto-drop, exception-path cleanup, drop-on-overwrite, cascades, frame teardown — always takes the synchronous `Dispose()` path; only `await using` (or an awaited direct `DisposeAsync()`) runs asynchronous cleanup ([§28.12](#sec-asynchronous-disposal); the implicit forms are K3.14/K3.15, K3.11, [K9](#sec-kernel-k9)'s cascade, and [K6](#sec-kernel-k6)'s frame teardown).
@@ -11859,7 +13071,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - The `with` clause in `await for ... with token` must be of type `CancellationToken`.
 - Awaiting a `Task<T>` for class or interface T (Pattern A — axiom [A3](#sec-axiom-register)) requires the awaited expression to be an admitted borrow source under [§30.5](#sec-result-lifetime-and-task-disposal)'s closure — [K2](#sec-kernel-k2)'s named-location taxonomy, an unbound owned temporary whose borrowed result is confined to its full expression, the chained Pattern A return, or the scoped await-bind desugaring ([§30.5](#sec-the-scoped-await-bind), `.Result` in lockstep) — every other escape of the borrow rejected.
 - A `return` in an `async` body under `Task<T>` for class or interface T, other than `return await`, supplies an owned expression, a runtime-managed value, or `null` under a nullable T; a borrow — a field read, a plain parameter, a borrowed local, a capture, static storage, a getter or indexer result — is a compile error at the return site, for a trivial-dispose class as for any other ([§30.5](#sec-result-lifetime-and-task-disposal); K1 + K2.4).
-- `await` on a `OwningTask<T>` (Pattern B — A3's owned-transfer container) must appear in an owned-consuming context ([K3](#sec-kernel-k3)'s positions), an owned operand consumed on all edges as a site-announced kill (the [consume table](#sec-consume-table)'s [K3.5](#sec-kernel-k3) row — no marker, no freeze, disposed-flag backstop; K4.2), a second await a compile-time moved-from read on an owned operand and `InvalidOperationException` on a borrowed one ([§30.5](#sec-result-lifetime-and-task-disposal)).
+- `await` on a `OwningTask<T>` (Pattern B — A3's owned-transfer container) must appear in an owned-consuming context ([K3](#sec-kernel-k3)'s positions), an owned operand consumed on all edges as a site-announced kill (the [consume table](#sec-consume-table)'s [K3.5](#sec-kernel-k3) row — no marker, no freeze, disposed-flag backstop; K4.2), a second await through the same local or non-`ref` parameter binding, owned or borrowed, that the first dominates on every path a compile error, and a second award the first does not dominate `InvalidOperationException` ([§30.4](#sec-multiple-awaiters)) ([§30.5](#sec-result-lifetime-and-task-disposal)).
 - `OwningTask<T>` is a compile error when T's underlying (nullability-stripped) type is neither a class nor an interface type ([§14.4](#sec-owned-as-a-generic-argument)). The argument-type check is performed during type checking; the diagnostic identifies the rejected argument and points at [§14.4](#sec-owned-as-a-generic-argument).
 - An `async` method, `async` lambda, or async iterator declares no parameter, result, or element type that is a value type that holds borrows — a borrow-bearing record, a borrow-bearing inline array ([§15.1](#sec-inline-arrays)), or a choice that holds borrows ([§30.1](#sec-async-methods), [§3.6](#sec-derived-type-properties)'s holds-borrows property, [§35.4](#sec-choice-classification); [K2.1](#sec-kernel-k2) + [K6.1](#sec-kernel-k6)); `CancellationToken` is the single stdlib-certified exception (axiom [A10](#sec-axiom-register)); for generic async methods the check re-applies after substitution.
 - `Task<T>` is a compile error at the declaration when T is a value type that holds borrows, `CancellationToken` excepted — at every site forming the type, `TaskCompletionSource<T>`, `Task.FromResult<T>` and `Task.WhenAll<T>` instantiations included, re-applied after substitution through user generics ([§30.5](#sec-result-lifetime-and-task-disposal); K2.1 + K6.1; axiom [A10](#sec-axiom-register) for the exception).

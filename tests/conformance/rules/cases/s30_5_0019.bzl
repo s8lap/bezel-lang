@@ -30,12 +30,16 @@ public class Demo
     return new Res();
   end Make;
 
+  public static async method Retry(t: OwningTask<Res>): Task
+    using var again := await t;
+  end Retry;
+
   public static async method Main(): Task
     do
       using var t := Make();
       using var r := await t;
       try
-        using var again := await t;
+        await Retry(t);
       catch
         InvalidOperationException => Console.WriteLine("spent")
       end try;

@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.345. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.350. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.345 and `Bezel_Standard_Library.md` v0.345 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.350 and `Bezel_Standard_Library.md` v0.350 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -479,7 +479,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 **`using var`** (§28.10): owned, disposed at the block's end on **every** exit edge, non-reassignable, and **never movable out of**. `using var fresh := new Buffer(); … return fresh;` is a compile error; a factory uses plain `var`.
 
 - `using var y := move x;` — **adoption**: the standard way to turn an owned local, parameter or loop-variable obligation into scope-bound disposal.
-- `using var y := x;` (unmarked, `x` a **class- or interface-typed** named **owned** binding — an owned `var`/`using var` local, an owned loop variable, an `out owned` recipient, an owning-match binding, an `owned` parameter, a bare `T`; `x!`, `(x)`, `using var _ := x;` and `await using var y := x;` alike, and an `if`/`case`/`??` arm-meet whose every arm is such a read — `(if c then a else b)`, `a ?? b` — null and `throw` arms aside) — a **compile error**: the form says neither adopt nor view. Write `move x` to adopt; for a view that leaves the obligation with `x`, write `var y := x;` or `const y := x;` (a borrow, live to its last use) — for `using var _ := x;`, delete it; to hold `x` itself to this block's end, declare `x` with `using var`. Over a **borrow-state** source (a plain parameter, a borrowing alias or loop variable, a captured owned binding inside a closure), a **call** without an owned return, a **field** or an **indexer**, `using var y := …;` is a **borrow-pin**: no obligation is assumed, the source keeps it, and the pin extends the source's required liveness to this block's end — moving, transferring or reassigning the source under the pin is rejected, while an explicit `Dispose()` of it is not (a site-announced kill; a later read through `y` faults in checked mode).
+- `using var y := x;` (unmarked, `x` a **class- or interface-typed** named **owned** binding — an owned `var`/`using var` local, an owned loop variable, an `out owned` recipient, an owning-match binding, an `owned` parameter, a bare `T`; `x!`, `(x)`, `using var _ := x;` and `await using var y := x;` alike, and an `if`/`case`/`??` arm-meet whose every arm is such a read — `(if c then a else b)`, `a ?? b` — null and `throw` arms aside) — a **compile error**: the form says neither adopt nor view. Write `move x` to adopt; for a view that leaves the obligation with `x`, write `var y := x;` or `const y := x;` (a borrow, live to its last use) — for `using var _ := x;`, delete it; to hold `x` itself to this block's end, declare `x` with `using var`. Over a **borrow-state** source (a plain parameter, a borrowing alias or loop variable, a captured owned binding inside a closure), a **call** without an owned return, a **field** or an **indexer**, `using var y := …;` is a **borrow-pin**: no obligation is assumed, the source keeps it, and the pin extends the source's required liveness to this block's end — moving, transferring or reassigning the source under the pin is rejected, while an explicit `Dispose()` of it is not (a site-announced kill; a later read through `y` that the disposal always precedes is a compile error, and one it precedes on only some paths faults in checked mode, §28.2).
 - `using var y := x;` (unmarked, `x` a **move-only value** binding — §15.3's owning inline arrays and owning choices) — **adopts**, not pins: the unmarked read *moves*, leaving `x` moved-from (a copy is impossible, so there is nothing for a marker to disambiguate). Scope-end auto-dispose runs under plain `var` too; `using var` adds the reassignment lock, and over an owning **choice** also suppresses the must-use warning on that auto-drop (§15.3, §35.4).
 - `using var _ := expr;` — the anonymous owning binding (`using var _ := mutex.Acquire();`). Not for a `Task`-family value (§17.13).
 - Admissible over value-typed, runtime-managed and move-only right-hand sides, where disposal is a no-op — safe to use uniformly in generic code.
@@ -497,7 +497,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 Disposing an **owned field** from code of its declaring type (`_resource.Dispose();`) is an early release point and demands nothing afterwards (§28.6): the field keeps its reference, the container's teardown still cascades over it as a no-op, and no replacement is stored — unlike `move obj.f with e`, which exchanges the field's value for `e`. A later read of that field is not diagnosed; it faults in checked disposal mode.
 
-`_ := x;` leaves the binding **explicitly-disposed**: a later straight-line **use** is a mandatory use-after-dispose warning, and a use after a *conditional* discard is a compile error at the merge. *Use* is read, borrow **and consume** alike — `move x` and an `owned` argument position draw the same verdict a plain read does, the severity being decided by which kill reached the binding and never by the shape of the use (§28.2). Discarding **the task itself** — `_ := task`, `using var _ := task` — is **rejected** for the `Task` family; use `Task.FireAndForget(t)`, or a *named* `using var t := …` (§17.13). Discarding an **awaited result** is a different statement and is legal: `_ := await t;` is a Pattern B owned-consuming position that disposes the result at the statement's end (§30.5).
+`_ := x;` leaves the binding **explicitly-disposed**: a later **use** that the discard always precedes — of `x`, or of a local borrow of its value — is a compile error, a second `_ := x;` or `x.Dispose()` a warning (a no-op), and a use after a *conditional* discard is a compile error at the merge. *Use* is read, borrow **and consume** alike — `move x` and an `owned` argument position draw the same verdict a plain read does, the verdict being decided by which kill reached the binding and never by the shape of the use (§28.2). Discarding **the task itself** — `_ := task`, `using var _ := task` — is **rejected** for the `Task` family; use `Task.FireAndForget(t)`, or a *named* `using var t := …` (§17.13). Discarding an **awaited result** is a different statement and is legal: `_ := await t;` is a Pattern B owned-consuming position that disposes the result at the statement's end (§30.5).
 
 **`ref` / `out`** (§22.3, §22.4). Written at the declaration **and** at the call site. `out` is copy-out-on-normal-return: the callee must assign on every normal-completion path; on the exception edge the recipient is untouched.
 
@@ -560,7 +560,7 @@ Five corollaries you will need constantly:
 |---|---|---|
 | `Task` / `Task<T>`, T a value, `string`, or runtime-managed | the value; no ownership crosses the await | any form; the awaited expression may be a bare producer call |
 | `Task<T>`, class T — **Pattern A** | a **borrow** of the one underlying result, whose lifetime is the task's ("disposing the task disposes the result"); the task may be awaited from multiple places, and every awaiter receives a borrow of that same result | the operand must be a **named location** — a `using var`/`await using var` local, an `owned` parameter, an owning-collection slot, a borrowing-iteration variable, admitted static task storage — or an unbound temporary whose borrowed result is used **within that same full expression**. The result borrow may flow to a `var` binding, a non-owned argument, or a `return` under the same Pattern A type; it may **not** flow to a `using var` binding, an `owned` field or slot, an `owned` argument, or an `owned T` return. `var x := await Producer();` — a fresh `var`/`const` whose initializer is *exactly* the await — is the **scoped await-bind**, desugared to a hidden pinned slot; `using var x := await …`, assignment to an existing local, and compositions like `(await E).Name` are not |
-| `OwningTask<T>`, class T — **Pattern B** | the single **owned** result: awaiting transfers ownership. The task may be awaited at most once for a successful result; a second await raises `InvalidOperationException` | an owned-consuming context: `using var x := await …`, `var x := await …`, an `owned` argument or slot store, a `return` under `owned T`, an owning `yield return`, or `_ := await …;`. The await **consumes its operand** when that operand is an owned task value — and the position is marker-free, so it takes **no `move`**; a **borrowed** operand (a `using var`, a plain parameter, a field, a slot) is only **spent** — its holder still disposes it |
+| `OwningTask<T>`, class T — **Pattern B** | the single **owned** result: awaiting transfers ownership. The task may be awaited at most once for a successful result; a second await through the same local or parameter binding that the first dominates is a compile error, and a second award reached any other way raises `InvalidOperationException` | an owned-consuming context: `using var x := await …`, `var x := await …`, an `owned` argument or slot store, a `return` under `owned T`, an owning `yield return`, or `_ := await …;`. The await **consumes its operand** when that operand is an owned task value — and the position is marker-free, so it takes **no `move`**; a **borrowed** operand (a `using var`, a plain parameter, a field, a slot) is only **spent** — its holder still disposes it, and a second `await` of the same `using var` or parameter that the first dominates is rejected (§30.4) |
 | `OwningTask<T>` over a value, `string`, or runtime-managed T; either task type over a **move-only** value (an owning choice, an owning inline array) | — | a compile error |
 
 Choose by intent: `OwningTask<T>` for resource acquisition (one fresh single-consumer result), `Task<T>` for fan-out (several subscribers reading the same eventual result). An `async` **lambda** takes its wrapper from its ascription, else from a closed target slot, else from its own body — and a body returning a fresh owned class infers `OwningTask<C>`, so at a generic `(…) -> Task<R>` slot such a lambda is **inapplicable** (the candidate drops out): write `async lambda(x): Task<C> => …` to bind `R` (§30.6).
@@ -591,7 +591,7 @@ Do not form a method reference whose parameter is a function type over such a pa
 
 **Merges must agree** (§28.3). owned ⊓ owned = owned. borrowed ⊓ borrowed = borrowed, sources unioned. **owned ⊓ borrowed = rejected.** owned ⊓ moved-from = maybe-consumed (unreadable). The rule governs `if` statements, `if` expressions, `??`, and expression-`case` arms identically.
 
-**The consume-site freeze** (§28.3). Consuming an owned **binding** while a **live local borrow of its current value** exists is a compile error. Frozen: every transfer (a `move` at an argument, binding, assignment or arm; a store into an `owned` field, an owning slot or a `set(owned)`; a `return` under an `owned` or mint-announcing return, or of an `async` body's result under `OwningTask<T>` or a class- or interface-typed `Task<T>`; an owning iterator's `yield return`) and drop-on-overwrite. **Not** frozen — these are site-announced kills, permitted while borrows live: an explicit `Dispose()` (including `x?.Dispose()`), the discard `_ := x;`, `throw x`, and a Pattern B `await` on an owned `OwningTask<T>` binding — a span over the binding's value included: a span read goes through the buffer's or array's own indexer, so after the kill it faults in checked mode like any other stale read (§28.2). A local holding an iterator frame or a lazy query (`var it := Each(xs)`, `var q := xs.Where(f)`) is a live borrow of every source it carries, like a closure, until the frame is disposed (its disposal may run the iterator's pending `finally`). Fields and collection slots are **not** frozen. The mechanical rewrite for the frozen case is **transfer first, then re-borrow from the new owner**.
+**The consume-site freeze** (§28.3). Consuming an owned **binding** while a **live local borrow of its current value** exists is a compile error. Frozen: every transfer (a `move` at an argument, binding, assignment or arm; a store into an `owned` field, an owning slot or a `set(owned)`; a `return` under an `owned` or mint-announcing return, or of an `async` body's result under `OwningTask<T>` or a class- or interface-typed `Task<T>`; an owning iterator's `yield return`) and drop-on-overwrite. **Not** frozen — these are site-announced kills, permitted while borrows live: an explicit `Dispose()` (including `x?.Dispose()`), the discard `_ := x;`, `throw x`, and a Pattern B `await` on an owned `OwningTask<T>` binding — a span over the binding's value included. But a use of a borrow of the killed value — an alias, a `const`, a `using var` pin, a span or borrow-bearing record over it, a closure capturing one of these, a frame carrying it — that an explicit `Dispose()`, `DisposeAsync()` or discard of **every** source of the borrow always precedes is a **compile error** at the use (§28.2), a reassignment of the source in between lifting nothing; dispose after the last use, or re-borrow from the new value. A kill the compiler cannot prove precedes the use (one branch; the end of a loop body before the next iteration) leaves the use to the run time: a span read goes through the buffer's or array's own indexer, so after the kill it faults in checked mode like any other stale read (§28.2). A local holding an iterator frame or a lazy query (`var it := Each(xs)`, `var q := xs.Where(f)`) is a live borrow of every source it carries, like a closure, until the frame is disposed (its disposal may run the iterator's pending `finally`). Fields and collection slots are **not** frozen. The mechanical rewrite for the frozen case is **transfer first, then re-borrow from the new owner**.
 
 **Borrow-bearing records** (§9.7). A record is borrow-bearing if it has at least one **borrow-carrying** field: one whose declared type is a reference type (class or interface, nullable or not), an inline array whose element type is a reference type or a borrow-bearing record or choice (`[2]Pair` for a borrow-bearing `Pair`), or another borrow-bearing record or choice. The predicate reads **declared field types**, never runtime contents — so `string`-, `Type`- and function-typed fields are *not* borrow-carrying, while a field declared `Object` or an interface type **is**, nullable or not. A nullable `Pair?` holds exactly what `Pair` holds, written or reached by substitution (§3.6 *Nullable forms*).
 
@@ -667,11 +667,11 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 **Element disposal is the owner's, always** (§28.6). `Dispose()` requires a receiver you own: an owned local or `owned` parameter, a `using var`, an unbound owned temporary, a `move` result, or an `owned` field / owning slot read by code of the owning object's declaring type. Through a **borrow it is a compile error with no exception** — a borrowed local or parameter, **`this`**, a non-`owned` field read, an owned-field read outside the declaring class, a getter result, a `catch`-arm binding, a pattern binding, a captured owned binding inside a closure, and an element borrow of *either* family. A borrowed **owning collection** may be added to, removed from, drained and read — the pass-and-fill idiom `method Fill(a: OwningArray<T>)  a.Add(…)` is core — but it may not be `Dispose`d.
 
-**Fresh values into collections** (§15.4, §28.11). On the **owning** family a fresh producer is idiomatic and warning-free: `pool.Add(new Connection("a"));`. On the **borrowing** family the same shape via `Add`/`Insert`/indexer-set is admitted but **warns** (the temporary dies at the statement's end and the slot dangles) — and so does a fresh class-typed **key** into an `OwningDictionary`, whose keys are borrowed (bind the key first: `using var k := new K(); od[k] := v;`), and inside a collection **literal** a fresh non-trivial-dispose element is a hard **error** at the literal site — bind first, or use the owning family. Runtime-managed elements are unaffected: `summary.Add(name)` on an `Array<string>` carries no obligation and no warning.
+**Fresh values into collections** (§15.4, §28.11). On the **owning** family a fresh producer is idiomatic and warning-free: `pool.Add(new Connection("a"));`. On the **borrowing** family the same shape via `Add`/`Insert`/indexer-set is a compile **error** (the temporary would die at the statement's end and the slot dangle) — and so is a fresh class-typed **key** into an `OwningDictionary`, whose keys are borrowed (bind the key first: `using var k := new K(); od[k] := v;`), and a fresh non-trivial-dispose element inside a collection **literal** is the same error at the literal site — bind first, or use the owning family. A user-declared member's plain parameter is not a store position: `sink.Consume(new X())` compiles, the temporary dying at the statement's end. Runtime-managed elements are unaffected: `summary.Add(name)` on an `Array<string>` carries no obligation and no diagnostic.
 
 ### 4.6 The diagnostics you will actually hit
 
-Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **non-nullable field or slot `move`d without `with`**; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store warning** on a borrowing collection; the **terminal-accessor provenance warning**; the **mutation-during-iteration warning** (§4.5); and `_ := someTask;` / `using var _ := someTask;`. One more is opt-in: build with `--report-trust-admissions` (spec §28.3's trust-admission report mode) and every borrow of a parameter, `this` or a field you store in a plain field or a collection, every transfer of a local or `owned` parameter that a collection may still hold a borrow of, and every abandoned task frame draws a warning naming the lifetime you are trusting and the static spelling that would prove it (`scoped`, a `SlotHandle`, `Shared<T>`, the owning family, `await`); a unit that stays silent under the flag holds no trusted lifetime at all.
+Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **non-nullable field or slot `move`d without `with`**; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store error** on a borrowing collection (and on a fresh `OwningDictionary` key); the **terminal-accessor provenance warning**; the **mutation-during-iteration warning** (§4.5); and `_ := someTask;` / `using var _ := someTask;`. One more is opt-in: build with `--report-trust-admissions` (spec §28.3's trust-admission report mode) and every borrow of a parameter, `this` or a field you store in a plain field or a collection (a method-local collection holding the parameter or `this` itself excepted), every comparer you hand to a hash collection's constructor (stdlib §4: retained as a borrow), every transfer of a local or `owned` parameter that a collection may still hold a borrow of, every transfer of a value you took out of a field with `move … with` while a local read from that field before the `move` is still used after the transfer, and every abandoned task frame draws a warning naming the lifetime you are trusting and the static spelling that would prove it (`scoped`, a `SlotHandle`, `Shared<T>`, the owning family, `await`); a unit that stays silent under the flag holds no trusted lifetime at all, short of the slot-kill residual spec §28.3.9 names (an alias of that local, a borrow read through a member, or a callee's `move`).
 
 <a id="sec-recommended-diagnostic-wordings"></a>
 **Recommended wordings.** The spec fixes what each of these diagnostics names (spec §28.3 *Diagnostics*, §28.10's adoption rule, §30.5's near-miss forms, §35.5); the words below are its recommendations, kept here as teaching text. The compiler's own text may differ: match a diagnostic by what it names, not by its words.
@@ -683,6 +683,8 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 | A moved-from local is read (K1) | *"Owned value in `x` was already moved out at line N."* |
 | A `using var` is moved (A5) | *"Cannot move out of `using var` `x`; `using var` is scope-bound."* |
 | The consume-site freeze (K5; reused by §35.5) | *"Cannot consume `x` here: the borrow held by `b` (declared at line N) is still live."* |
+| A use after a dominating explicit disposal (§28.2) — through the variable, or through a holder of a borrow of its value | *"Use of `b` after the explicit disposal of `a` at line N, which precedes this use on every path; `b` borrows the value `a` held there. Dispose after the last use."* |
+| A use after a dominating field write (§28.7) — a local borrow of an owned field's value, or the field itself after its explicit disposal, in one straight run of code | *"Use of `b` after the write to `_w` at line N, which precedes this use on every path with nothing between the borrow and the write that could have moved the value out; `b` borrows the value `_w` held at line M. Use `b` first, or take the value out with `move _w with …`."* |
 | An unmarked `using var` over a named owned binding, or over an `if`/`case`/`??` arm-meet of such bindings alone (§28.10; over a `using var` source only the view is offered, and for `using var _ := x;` the view is replaced by deleting the declaration) | *"`using var c := conn;` does not say whether it adopts or views the owned binding `conn`: write `using var c := move conn;` to adopt it, or `var c := conn;` / `const c := conn;` to view it."* — for the arm form, *"`using var best := (if c then a else b)` does not say what happens to `a` and `b`: mark the arms, `(if c then move a else move b)`, to adopt whichever is selected, or write `var best := …;` / `const best := …;` to view it"* (over `a ?? b`, the rewrite `(if a <> null then move a else move b)`). |
 | `using var x := await FetchAsync(url);` (§30.5) | *"`await` on a `Task<Config>` produces a borrow of the task's result, which §30.5's may-not-flow list bars from a `using var` binding. No pin is needed — write `var x := await …;` and the compiler pins the task (the result is valid to the end of this block), or use the explicit two-line form to name the task."* |
 | `x := await FetchAsync(url);` into an existing local (§30.5) | *"the scoped await-bind applies to a fresh `var`/`const` declaration only: the hidden task is pinned to this block, but `x` is not this declaration's binding. Bind the task first: `using var task := …; x := await task;` (§30.5)."* |
@@ -695,7 +697,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.345 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.350 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1828,6 +1830,9 @@ public method Log(params items: Array<string>);             // WRONG: no `params
 var c := new Config() with(Timeout := 30);                  // WRONG: `with` needs a RECORD source
 var caller: (a: int, b: int) -> int := Sub;  caller(b := 2, a := 100);   // WRONG: a call through a FUNCTION VALUE admits no named argument (§27.1)
 var u := uint(-1);   var b2 := byte(300);   var c2 := char(0xD800);   // WRONG: a CONSTANT operand the conversion would reject is a COMPILE error (§5.2)
+var a3: [3]int := [1, 2, 3];   var v3 := a3[5];   a3[3] := 9;          // WRONG: a CONSTANT index outside the inline array's `0..<N` is a COMPILE error, read or write (§15.1.2) — the extent is in the type
+var q0 := x / 0;   var q1 := x mod Z;   x /= 0;                        // WRONG for any integer or `decimal` `x` and a constant `Z := 0`: a constant zero divisor is a COMPILE error at the operator (§6.1, §6.4, §6.6)
+for var i in 10.. do ... end;                                          // WRONG: an open-ended range LITERAL as a `for` source is a COMPILE error (§16.5)
 var r := -1..3000000000U;                                     // WRONG: a range literal's endpoints need one common type, as `-1 + 3000000000U` does (§16.1, §6.2) — `-1L..3000000000L`; a constant that fits the other endpoint's type adopts it (`-5..10U` is a `Range<int>`), and against an operand (`x in -1..3000000000U`, `x: long`) the literal is read at `x`'s type
 if u in -5..10 then ... end;   case u of -5..10 => ... end;   // WRONG when `u` is `uint`/`ulong`: `-5` is no `uint` value and `uint` does not convert to `int` (§17.5, §19.3) — write `0..10`; over `byte`/`ushort` the `in` is a `Range<int>` test, the PATTERN still an error
 case b of 300 => ... end;      case b of > 300 => ... end;    // WRONG over a `byte`: a pattern constant converts to the scrutinee's type (§19.3) — an arm that could never match is an error, not a dead arm; the EXPRESSION `b in 300..400` is admitted and false
@@ -1838,7 +1843,7 @@ if p is IShape then ... end;                                  // WRONG over a va
 if i is long then ... end;                                    // WRONG over an `int` `i`: a different value type is rejected too — `is` tests the type, not whether the value fits
 ```
 
-> §21.4/A.6: the loop is `for … in … do … end;`. A.7's `PrimarySuffix` admits `.`, `?.`, `[…]`, `(…)`, `?(…)`, `!`, `with(…)` — and no `?[`. §14.5: class/record/interface type arguments are never inferred; §15.4: a collection literal is well-typed only where a target type is supplied. §20: the conditional is a parenthesized atom. §17.6, §17.2: `++`/`--` and assignments are statements. §4.1: conditions are `bool`. §19.3, §27.4: destructuring lives in patterns and lambda parameters. §22.14: pass an `Array<T>` and write the literal at the call site. §9.5: `with` on a class-typed source is the retired object-initializer reading. §5.2/§5.4: an explicit conversion whose operand is a **compile-time constant** the conversion would reject — `uint(-1)`, `byte(300)`, `char(0xD800)`, `int(1e30)`, an enum cast matching no declared constant — is a compile error **at the conversion site**, never a deferred `OverflowException`; the runtime fault is for **non-constant** operands, and unreachable code is not exempt. A saturating conversion is unaffected: `float(1e300)` is `Infinity`, constant operand or not.
+> §21.4/A.6: the loop is `for … in … do … end;`. A.7's `PrimarySuffix` admits `.`, `?.`, `[…]`, `(…)`, `?(…)`, `!`, `with(…)` — and no `?[`. §14.5: class/record/interface type arguments are never inferred; §15.4: a collection literal is well-typed only where a target type is supplied. §20: the conditional is a parenthesized atom. §17.6, §17.2: `++`/`--` and assignments are statements. §4.1: conditions are `bool`. §19.3, §27.4: destructuring lives in patterns and lambda parameters. §22.14: pass an `Array<T>` and write the literal at the call site. §9.5: `with` on a class-typed source is the retired object-initializer reading. §15.1.2 / §6.1 / §16.5: a written operand that fixes the fault — a constant index past an inline array's extent, a constant zero right operand of `/` or `mod` (integer or `decimal`, a non-constant dividend changing nothing), an open-ended range literal as a `for` source — is a compile error at the site; a computed index, a non-constant divisor and a range reached through a variable or a call keep their run-time faults. §5.2/§5.4: an explicit conversion whose operand is a **compile-time constant** the conversion would reject — `uint(-1)`, `byte(300)`, `char(0xD800)`, `int(1e30)`, an enum cast matching no declared constant — is a compile error **at the conversion site**, never a deferred `OverflowException`; the runtime fault is for **non-constant** operands, and unreachable code is not exempt. A saturating conversion is unaffected: `float(1e300)` is `Infinity`, constant operand or not.
 
 ```bezel
 for var t in transactions do Process(t); end;
@@ -1850,6 +1855,7 @@ c++;    count := count + 1;
 if count <> 0 then ... end;
 case point of Point(var a, var b) => Use(a, b) end;
 public method Log(items: Array<string>);     Log(["a", "b", "c"]);
+var v3 := a3[k];   var q0 := x / d;   for var i in 10..20 do ... end;   // a computed index and a non-constant divisor are checked at run time; a closed range iterates
 var c := new Config(timeout := 30, retries := 3);             // named constructor arguments
 var caller: (a: int, b: int) -> int := Sub;  caller(100, 2);              // a function type's names are documentation only; the call is positional
 if (var o: Object := p; o is IShape) then ... end;            // box first, then test the box — unless `p` holds borrows (a span, a record with a class-typed field): it reaches no `Object` local (§9.7), and its static type already answers the test
@@ -2024,18 +2030,62 @@ async method CloseAsync(d: IAsyncDisposable): Task  await d.DisposeAsync();  end
 > §28.6: `Dispose()` needs a receiver you own. A borrowed parameter, `this`, a getter result, a `catch` binding, a pattern binding and an element borrow of *either* family are all rejected, with no exception. `DisposeAsync()` takes the same rule, awaited or not; the one `this`-rooted call admitted is `base.DisposeAsync()` inside your own `DisposeAsync` override.
 
 ```bezel
+var a := new Widget();
+var b := a;                       // a borrow of a's value
+a.Dispose();                      // OK: an explicit disposal is never frozen
+Console.WriteLine(b.Name);        // ERROR: the disposal of `a` precedes this use on every path
+a := new Widget();
+Console.WriteLine(b.Name);        // ERROR: `b` still borrows the disposed value
+b := a;                           // OK: a fresh borrow of the new value
+Console.WriteLine(b.Name);        // OK
+
+var s := xs.AsSpan();
+xs.Dispose();
+Console.WriteLine(s[0]);          // ERROR: same rule through a span
+
+var c := a;
+if cond then a.Dispose(); end;
+Console.WriteLine(c.Name);        // compiles; faults in checked mode when the branch ran
+```
+
+> §28.2: a use — read, member access, argument, re-borrow, consume — of a local after an explicit `Dispose()`, `DisposeAsync()` or discard that precedes it on every path is a compile error, and so is a use of an alias, `const`, `using var` pin, span, borrow-bearing record, closure or frame over the disposed value. Only a repeated disposal of the same binding (a no-op) stays a warning. A disposal on some paths only is left to the run time (`DisposedAccessException` in the default, checked build). Dispose after the last use.
+
+```bezel
+public class Holder
+  private owned _w: Widget := new Widget("first");
+  public method Swap()
+    var b := _w;                    // a borrow of the field's current value
+    _w := new Widget("second");     // OK: a field write is never frozen — it disposes the first widget
+    Console.WriteLine(b.Name);      // ERROR: the write precedes this use on every path, with nothing between
+  end Swap;
+  public method Close()
+    _w.Dispose();
+    Console.WriteLine(_w.Name);     // ERROR: a read of the field after its explicit disposal, same window
+  end Close;
+  public method Rotate()
+    var b := _w;
+    Log();                          // a call: it could have taken the value out (`move _w with …`)
+    _w := new Widget("third");
+    Console.WriteLine(b.Name);      // compiles; faults in checked mode
+  end Rotate;
+end Holder;
+```
+
+> §28.7: a local borrow of an owned field's value (`var b := _w;`, `var b := h.W;` with `h` a local or parameter) used after a reassignment or explicit disposal of that field that follows the borrow with no call (a constructor's included), accessor, user operator, function-value invocation, `await`, `yield return`, disposal of another value, other write to the path or `move` of any field in between, and precedes the use on every path, is a compile error; so is a read of the field after its own explicit disposal in that window. The write is not frozen. Use the borrow first, or take the value out with the replacing `move`. A write on some paths only, a window with a call in it, a borrow held through an alias, closure, span or record, and an owning-collection slot (`var w := xs[0]; xs.RemoveAt(0); w.Ping();`, §7.5) stay run-time faults.
+
+```bezel
 pool.Clear();                                                  // disposes every element through the owner
 for var conn in pool.Drain() do using var c := move conn; ... end;
 ```
 
 ```bezel
 var tasks := new Array<Task<string>>();
-tasks.Add(File.ReadAllTextAsync(path));    // compiles, but WARNS: the fresh task has no holder
+tasks.Add(File.ReadAllTextAsync(path));    // ERROR: the fresh task has no holder — abandoned at the statement's end
 var conns: Array<Connection> := [new Connection("a")];   // ERROR: hard rejection at the literal site
 _ := DoTelemetryAsync();                                 // ERROR: a Task may not be discarded
 ```
 
-> §15.4's fresh-store lint on the borrowing family; the collection-**literal** form of the same shape is an error, not a warning. §17.13: `Task.FireAndForget(t)` (supervised) or `using var t := …;` (unsupervised) are the two legal not-awaiting spellings — *named*; the anonymous `using var _ := t;` is rejected like the discard.
+> §15.4's fresh-store rule on the borrowing family: a fresh unbound owned temporary — `new`, a collection literal, an `owned`-returning call, a `move`, a `Task`-family call — in `Add`/`Insert`/indexer-set position (and a fresh `OwningDictionary` key) is rejected at the store site, as the collection-**literal** form of the same shape is at the literal site; bind first (`using var t := …; tasks.Add(t);`) or use the owning family. §17.13: `Task.FireAndForget(t)` (supervised) or `using var t := …;` (unsupervised) are the two legal not-awaiting spellings — *named*; the anonymous `using var _ := t;` is rejected like the discard.
 
 ```bezel
 using var t1 := File.WriteAllTextAsync(pathA, report);   // named holders
@@ -2651,6 +2701,7 @@ private owned _tcs: TaskCompletionSource<Pair>;          // record Pair(Item: It
 using var t := Domain.Spawn<Counter>(Bump, c);           // ERROR: a class argument crosses only through the owned row
 private owned readonly _ev: AsyncEventSource<ReadOnlySpan<byte>> := new();   // ERROR: no async event payload that holds borrows — the raise frame holds it until settlement
 private static owned readonly _conn: OwningTask<Conn> := ConnectAsync();   // ERROR: no static of a single-award task, `readonly` or not
+using var tok := await t;   using var tok2 := await t;   // ERROR over any `t` of `OwningTask<T>` — a `using var`, a plain parameter, an owned local: the first award spends the task, and a second the first dominates is rejected (§30.4)
 ```
 
 > - §30.3: blocking waits are a compile error lexically inside `async` bodies.
@@ -2664,6 +2715,7 @@ private static owned readonly _conn: OwningTask<Conn> := ConnectAsync();   // ER
 > - §30.5: `Task<T>` over a value type that holds borrows is rejected wherever the type is formed — a `TaskCompletionSource<Pair>` field, `Task.FromResult(pair)` — `CancellationToken` excepted.
 > - stdlib §6.5: `AsyncEventSource<T>` admits no such T either — `RaiseAsync` holds the payload in its frame until the task settles — `CancellationToken` excepted; raise a class payload (the buffer object, or a class holding it with an offset and a length) or borrow-free data.
 > - stdlib §6.8: `Domain.Spawn`'s plain argument and result rows admit no class but `string` and `Type`; a class crosses through the `owned` row, by `move`.
+> - §30.4 / §30.5: a Pattern B task is awarded once. Through a plain owned local the second await is a moved-from read; through a `using var`, a plain parameter or any other local it is the same compile error wherever the first award dominates the second; through a field or a slot, or on a path the first award does not dominate (a loop's second iteration, the point after a `try` whose block awarded), it raises `InvalidOperationException`. Bind a fresh task for a second acquisition.
 > - §22.12 note (j): no static field or auto-property is of type `OwningTask<T>` — process-global storage of a single-award task is awarded once, to whichever domain's await reaches it first; hold a one-shot acquisition in a local or an owned instance field, and share a process-lived result through the `Task<T>?` cache, which every awaiter borrows.
 
 ```bezel
@@ -2676,6 +2728,7 @@ done.SetResult(item.Count);                               // done: TaskCompletio
 using var t := Domain.Spawn(Bump, move c);                // Bump(owned c: Counter): the owned row moves the object across
 private owned readonly _ev: AsyncEventSource<Chunk> := new();               // Chunk: a CLASS holding the buffer with an offset and a length — or raise borrow-free data
 using var g := await mutex.AcquireAsync();
+using var tok := await t;   using var t2 := sem.AcquireAsync();   using var tok2 := await t2;   // one task, one award
 ```
 
 ```bezel
@@ -2727,6 +2780,16 @@ end Listen;
 ```
 
 Not `ArgumentException` here: the `Argument*` family blames the calling code, and no caller is at fault.
+
+```bezel
+Console.WriteLine(Half(-4));     // Half(n: int) requires(n > 0) — WRONG: the written argument folds the clause to `false`, a COMPILE error at the call (§22.16), not a run-time ContractViolationException
+```
+
+> §22.16: a `requires` clause is discharged at every call site by substituting the written arguments; a constant argument that folds the clause `false` is the prover floor's statically violated contract, and one that folds it `true` discharges the call. A non-constant argument keeps the always-on run-time check.
+
+```bezel
+Console.WriteLine(Half(n));      // a run-time value: the clause is checked at the call, in every build mode
+```
 
 ### 7.8 Nullability narrowing
 
