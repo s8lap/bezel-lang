@@ -1539,6 +1539,10 @@ void Resolver::checkEnumRestrictions() {
         // "Inheritance from another type" ban is about a CLASS base; the
         // interface list §10 states an enum may carry is not one, and the
         // disposal interfaces are the ones it may not carry.
+        // SEAM-ACCESSOR: `t` is drawn from `forEachTypeAndNested` (#3574),
+        // which walks only this module's own declaration tree — never an
+        // imported symbol (#3152). The record arm of this same check carries
+        // the same marker, for the same reason.
         if (auto* etd = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
             DisposalListing listing = disposalListingOf(etd, ctx_);
             if (!listing.baseName.empty()) {
@@ -2112,6 +2116,10 @@ void Resolver::checkChoiceRestrictions() {
         // stays off the surface everywhere: choices do not implement
         // `IDisposable` (§8.7)". §28.12 names the choice in the same
         // declaration-site ban as the record and the enum.
+        // SEAM-ACCESSOR: `t` is drawn from `forEachTypeAndNested` (#3574),
+        // which walks only this module's own declaration tree — never an
+        // imported symbol (#3152). The record arm of this same check carries
+        // the same marker, for the same reason.
         if (auto* ctd = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
             DisposalListing listing = disposalListingOf(ctd, ctx_);
             if (!listing.baseName.empty()) {
