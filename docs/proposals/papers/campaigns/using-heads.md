@@ -281,7 +281,7 @@ with the tracker.
 | #7283 | `87fdfa67 fix #7337, #7327` (the function-typed `await using` shape; #7327 is its re-file) | **not a defect at HEAD.** A function value is runtime-managed, and §28.9 says *"None of them is a class, and none has a `Dispose()` member: `x.Dispose()` over a value of one of these types is a compile error"*, so the `await using` spelling of it carries no disposal obligation, and §28.12's "`await using var` takes §28.10's admission unchanged" admits it. **The ISSUE is CLOSED** (2026-10-27T14:43:18Z), fixed by **`87fdfa67`** — the commit is named in the issue's own closing comment. |
 | #7306 | `9bb9387f narrow #7322` (the vacuous `await using` shape) | as #7283, for a string (also runtime-managed, §28.9). **The ISSUE is CLOSED** (2026-10-27T14:43:15Z), fixed by **`9bb9387f`**. |
 | #7322 | `9bb9387f narrow #7322` (its own part) and `87fdfa67` (the two shapes it was split into: #7327 and #7337) | as #7283; the commit names this issue. **The ISSUE is CLOSED** (2026-10-27T14:43:21Z). |
-| #7327 | `87fdfa67 fix #7337, #7327` | **closed by the fix** — the commit is in `origin/main`. The ISSUE is CLOSED. |
+| #7327 | `87fdfa67 fix #7337, #7327` | **closed by the fix** — the commit is in `origin/main`; **THE ISSUE WAS CLOSED MANUALLY (ITS `closed` EVENT NAMES NO COMMIT)**. |
 | #7337 | `87fdfa67 fix #7337, #7327` | **closed by the fix** — the commit is in `origin/main`. The ISSUE is CLOSED. |
 
 **Summary of the 24:** **reproduces 15** (#1531, #1603, #2623, #3471, #3482, #3483,

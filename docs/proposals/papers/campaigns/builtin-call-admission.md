@@ -1304,6 +1304,10 @@ was measured under the plain oracle, with the harness's ASan leg run over the se
 discriminator lane).**
 
 * **SHA (picked onto staging):** `9961f766` **fix #7217 #6845**. **TWO CLOSURES: #7217, #6845.**
+* **=> THE SAME ATTRIBUTION CAVEAT AS THE `r36-c2-l5b` SUMMARY: THE SPACE-SEPARATED FORM BINDS **ONE**
+  REFERENCE, SO `9961f766`'s SUBJECT CLOSED **#7217 ALONE**; **#6845 WAS CLOSED BY THE **CLOSURE
+  MANIFEST** COMMIT `b6a0684b4`'s OWN SUBJECT** (MEASURED FROM #6845's `closed` EVENT, WHICH NAMES
+  `b6a0684b4` AND NOT `9961f766`).**
 * **ONE CAUSE, TWO SYMPTOMS.** The codegen decided *"is this receiver the builtin `StringBuilder`?"*
   by **HEAD NAME**, so a USER-DECLARED class named `StringBuilder` was claimed by the builtin's arm:
   the user's own method was then either **SILENTLY DROPPED** (#7217 — the program printed only
@@ -1330,6 +1334,13 @@ discriminator lane).**
 
 * **SHAs (picked onto staging):** `35ce8f04` **fix #7245**, `62735ebc` **narrow #7167, fix #7189
   #7198**, `e44ba7aa` **narrow #7244**. **THREE CLOSURES: #7245, #7189, #7198.**
+* **=> THE SAME ATTRIBUTION CAVEAT AS THE `r36-c2-l5b` SUMMARY: `62735ebc`'s SUBJECT IS THE SAME
+  SPACE-SEPARATED FORM — `fix`, THEN **#7189 #7198** — SO IT BOUND **#7189 ALONE**, AND **#7198 WAS
+  CLOSED BY ITS **BODY** (`Fixes #7198`, ITS OWN LINE).** **THE COUNT IS UNCHANGED — THREE — BUT THE
+  CARRIER IS NOT THE SUBJECT**, AND THAT IS WHY THE MASTER PLAN's §6 ROW 3 COUNTS #7198 AS **0**
+  SUBJECT-CLAIMED AND **1** BODY-CLOSED. **NOTE THAT BOTH ISSUES' `closed` EVENTS NAME THE **SAME**
+  COMMIT (`62735ebc4` FOR #7189 AND FOR #7198) — THE EVENT SAYS *WHO*, AND ONLY A SUBJECT-AND-BODY
+  SCAN SAYS *WHICH PART*.**
 * **#7245 — `String.IsAscii` ANSWERED FROM THE STORAGE WIDTH, NOT THE CONTENT.** stdlib §9.6
   (v0.344) defines the property by the value (*"true iff every code point < 128 (O(1))"*), and spec
   §4.6 makes the per-string width invisible at the language level (*"The choice of width is
@@ -1530,6 +1541,19 @@ the runtime-format vocabulary).**
 * **SHAs (picked onto staging):** `9b94de4b` **fix #7311 #7359 #7265 #7303 #7362 #7358**,
   `2b77209f` **fix #7336**, `0585bb01` **fix #7361**, `9ec7f3e0` **fix #7249**, `eb698157` **fix
   #7252**, `f85f4a4d` **fix #7334**. **ELEVEN CLOSURES.**
+* **=> THE ELEVEN CLOSURES ARE ELEVEN, BUT **THE ATTRIBUTION IS NOT WHAT THE SUBJECT LINES SAY**,
+  AND THE NEXT COORDINATOR MUST NOT READ #7303 AS A SUBJECT CLOSURE.** THE SPACE-SEPARATED FORM BINDS
+  **ONE** REFERENCE, SO `9b94de4b`'s SUBJECT CLOSED **#7311 ALONE**; **#7265 #7358 #7359 #7362 WERE
+  CLOSED BY THE **CLOSURE MANIFEST** COMMIT `b6a0684b4`'s OWN SUBJECT** (ITS COMMA-SEPARATED,
+  OWN-KEYWORD FORM); AND **#7303 WAS CLOSED BY `dbe770ee`'s **BODY** — FROM A SENTENCE THAT
+  *INSTRUCTS* A **FUTURE** LANE (*"IF A LANE CLOSES" … ", THIS ROW MUST BE RE-BANKED"*), WHERE THE
+  CLOSING KEYWORD IMMEDIATELY BEFORE THE REFERENCE EXECUTED.** THE DEFECTS WERE FIXED BY THE LANE's
+  COMMITS; **THE ISSUES** WERE CLOSED BY WHICHEVER COMMIT's SUBJECT OR BODY CARRIED THE KEYWORD —
+  AND FOR FIVE OF THE SIX THAT WAS **NOT** THE LANE's COMMIT. **AND THE LINE's OWN LABEL IS
+  IMPRECISE: THE SHAs IT LISTS ARE **NOT** ON `origin/main`** (MEASURED, ONE BY ONE) — **THE ELEVEN
+  LANDED ON: #7311 → `bc4e9cb4`; #7336 → `a4b574468`; #7361 → `285e28937`; #7249 → `d7441cc05`;
+  #7252 → `1077d0037`; #7334 → `f76f2b9f8`; #7265 #7358 #7359 #7362 → `b6a0684b4`; #7303 →
+  `dbe770ee`.**
 * **#7311's OWN DISPATCH INSTRUCTION IS THE LANE's CHARTER:** *"FIND THE SHARED FORMATTING ROUTINE
   AND MAKE BOTH PATHS USE IT … **Two call sites producing two answers is the defect; fixing one of
   them is not a fix**."* **SO THE FIRST COMMIT NAMES SIX ISSUES DELIBERATELY: THEY ARE SIX VIEWS OF
