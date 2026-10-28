@@ -48,7 +48,7 @@
 //   unchanged.
 //
 // Cite: language spec §28.12 / §9.7 / §8.7 / §14.2 rule 3 (v0.345);
-// stdlib §2.18, §4.12, §4.13 for the built-in extension chain.
+// stdlib §2.10, §4.2, §4.12, §4.13 for the built-in extension chain.
 
 #include "support/aot_result_asserts.hpp"  // failedAtCompileTimeWithRealLocation
 #include "support/aot_support.hpp"         // runAot, runAotChecked
@@ -233,6 +233,102 @@ BEZEL_TEST(disposal_interface_chain_7354,
         "(§9.7, §28.12)"));
 }
 
+// ---------------------------------------------------------------------------
+// #7424 — the two owning-collection interfaces the chain table OMITTED.
+//
+// The chain table is the BUILT-IN side of the rule, and it is hand-written
+// (the built-in interfaces have no user declaration, so the compiler holds no
+// extension chain for them anywhere). The standard library declares TEN
+// interfaces in this family — §2.10's `IDisposable` and `IAsyncDisposable`,
+// §4.2's `IOwningCollection<T>` and `IOwningList<T>`, §4.12's `IEnumerator<T>`
+// and `IAsyncEnumerator<T>`, §4.13's four owning iteration interfaces — and
+// NINE of them extend `IDisposable`. The table listed EIGHT: `IOwningCollection<T>`
+// (stdlib §4.2) and `IOwningList<T>` (stdlib §4.2, through
+// `IOwningCollection<T>`) were missing, so a record listing either was
+// ADMITTED.
+//
+// §28.12: "a record, enum or choice that lists it, or lists an interface
+// extending it, is a compile error at the declaration" — and `IOwningCollection<T>`
+// IS "an interface extending it" (stdlib §4.2: "public interface
+// IOwningCollection<T>: IReadOnlyCollection<T>, IDisposable").
+BEZEL_TEST(disposal_interface_chain_7354,
+           record_listing_i_owning_collection_is_rejected_spec_28_12) {
+    const std::string p = prog({
+        "module Conf;",
+        "public class Res",
+        "  public constructor() end constructor;",
+        "end Res;",
+        "public record R: IOwningCollection<Res> public _x: int := 0; end R;",
+    });
+    BEZEL_EXPECT_TRUE(rejectedAt(
+        p, 5, 8,
+        "record `R` may not implement `IOwningCollection` — "
+        "`IOwningCollection` extends `IDisposable` (§9.7, §28.12)"));
+}
+
+// The SECOND missing head, and the one that reaches `IDisposable` only
+// THROUGH `IOwningCollection<T>` (stdlib §4.2: "public interface
+// `IOwningList<T>: IReadOnlyList<T>, IOwningCollection<T>`").
+BEZEL_TEST(disposal_interface_chain_7354,
+           record_listing_i_owning_list_is_rejected_spec_28_12) {
+    const std::string p = prog({
+        "module Conf;",
+        "public class Res",
+        "  public constructor() end constructor;",
+        "end Res;",
+        "public record R: IOwningList<Res> public _x: int := 0; end R;",
+    });
+    BEZEL_EXPECT_TRUE(rejectedAt(
+        p, 5, 8,
+        "record `R` may not implement `IOwningList` — `IOwningList` extends "
+        "`IOwningCollection`, which extends `IDisposable` (§9.7, §28.12)"));
+}
+
+// THE CHAIN ROW for the newly-added head: a USER interface that extends
+// `IOwningCollection<T>` is a disposal interface too, so a record listing IT
+// is a compile error at the declaration (§28.12).
+BEZEL_TEST(disposal_interface_chain_7354,
+           record_listing_a_user_interface_extending_i_owning_collection_is_rejected_spec_28_12) {
+    const std::string p = prog({
+        "module Conf;",
+        "public class Res",
+        "  public constructor() end constructor;",
+        "end Res;",
+        "public interface MyDisp: IOwningCollection<Res> end MyDisp;",
+        "public record R: MyDisp public _x: int := 0; end R;",
+    });
+    BEZEL_EXPECT_TRUE(rejectedAt(
+        p, 6, 8,
+        "record `R` may not implement `MyDisp` — `MyDisp` extends "
+        "`IOwningCollection`, which extends `IDisposable` (§9.7, §28.12)"));
+}
+
+// §28.12 names the enum in the same declaration-site ban.
+BEZEL_TEST(disposal_interface_chain_7354,
+           enum_listing_i_owning_collection_is_rejected_spec_28_12) {
+    const std::string p = prog({
+        "module Conf;",
+        "public enum E: IOwningCollection<int> A, B; end E;",
+    });
+    BEZEL_EXPECT_TRUE(rejectedAt(
+        p, 2, 8,
+        "enum `E` may not implement `IOwningCollection` — "
+        "`IOwningCollection` extends `IDisposable` (§8.7, §28.12)"));
+}
+
+// §28.12 names the choice too.
+BEZEL_TEST(disposal_interface_chain_7354,
+           choice_listing_i_owning_list_is_rejected_spec_28_12) {
+    const std::string p = prog({
+        "module Conf;",
+        "public choice C: IOwningList<int> A, B; end C;",
+    });
+    BEZEL_EXPECT_TRUE(rejectedAt(
+        p, 2, 8,
+        "choice `C` may not implement `IOwningList` — `IOwningList` extends "
+        "`IOwningCollection`, which extends `IDisposable` (§8.7, §28.12)"));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CONTROL rows — green on BOTH arms; they prove the fix widened nothing.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -376,4 +472,27 @@ BEZEL_TEST(disposal_interface_chain_7354,
         "end Program;",
     });
     expectRunsClean(p, "done\ndtor\n");
+}
+
+// §28.12 / §14.2 rule 3: "`where T: IDisposable` admits it and every
+// interface extending it". The bound still admits `IOwningCollection<T>` —
+// the compiler SEES the edge (stdlib §4.2: it extends `IDisposable`), and the
+// omission was in the hand-written chain table alone (fix #7424).
+BEZEL_TEST(disposal_interface_chain_7354,
+           where_idisposable_still_admits_i_owning_collection_spec_14_2) {
+    const std::string p = prog({
+        "module Conf;",
+        "public class Res",
+        "  public constructor() end constructor;",
+        "end Res;",
+        "public class Box<T> where T: IDisposable end Box;",
+        "public class Program",
+        "  public static method Main()",
+        "    var b := new Box<IOwningCollection<Res>>();",
+        "    var c := new Box<IOwningList<Res>>();",
+        "    Console.WriteLine(\"hi\");",
+        "  end Main;",
+        "end Program;",
+    });
+    expectCompiles(p);
 }

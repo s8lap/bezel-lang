@@ -1317,7 +1317,9 @@ namespace {
 // records `IAsyncDisposable : IDisposable`. The chain is therefore stated
 // HERE, once, per its normative sources:
 //
-//   stdlib §2.18 — "public interface IAsyncDisposable: IDisposable"
+//   stdlib §2.10 — "public interface IAsyncDisposable: IDisposable"
+//   stdlib §4.2  — "public interface IOwningCollection<T>: IReadOnlyCollection<T>, IDisposable"
+//                  "public interface IOwningList<T>: IReadOnlyList<T>, IOwningCollection<T>"
 //   stdlib §4.12 — "public interface IEnumerator<out T>: IDisposable" and
 //                  "public interface IAsyncEnumerator<out T>: IAsyncDisposable"
 //   stdlib §4.13 — the four owning iteration interfaces:
@@ -1325,6 +1327,22 @@ namespace {
 //                  `IOwningEnumerator<T>: IDisposable`,
 //                  `IOwningAsyncEnumerable<T>: IAsyncDisposable`,
 //                  `IOwningAsyncEnumerator<T>: IAsyncDisposable`
+//
+// THE TABLE IS HAND-WRITTEN, AND A HAND-WRITTEN TABLE IS WHAT PRODUCED
+// #7424. The standard library declares TEN interfaces in this family (§2.10's
+// two, §4.2's two, §4.12's two, §4.13's four) and NINE of them extend
+// `IDisposable`; this table listed EIGHT, so `IOwningCollection<T>` and
+// `IOwningList<T>` were missing and a record listing either was ADMITTED
+// (fix #7424). THE TABLE MUST EVENTUALLY BE DERIVED MECHANICALLY FROM THE
+// STANDARD LIBRARY DOCUMENT — beside `kBuiltinExceptionHierarchy` in
+// `src/common/BuiltinRegistry.*`, the exactly-analogous built-in hierarchy
+// table — so that a FUTURE standard-library interface extending
+// `IDisposable` cannot miss again. That move is DEFERRED: `src/common/**` is
+// another lane's file in this batch (the B4a fix-forward lane is in
+// `BuiltinRegistry.cpp`), so the two missing heads are added HERE, where this
+// check needs them, and the derivation is recorded here rather than done.
+// Until that move, the chain is DUPLICATED: `src/common/DisposalKind.cpp`
+// special-cases the `IAsyncDisposable` head BY NAME.
 //
 // The USER side of the chain is not a table at all: a user interface's own
 // extension clause is carried on its symbol (`TypeSymbol::baseTypes` for a
@@ -1336,7 +1354,7 @@ struct DisposalHeadParent {
     std::string_view parent;   // empty for `IDisposable` itself
 };
 
-constexpr std::array<DisposalHeadParent, 8> kDisposalHeadParents = {{
+constexpr std::array<DisposalHeadParent, 10> kDisposalHeadParents = {{
     {"IDisposable", ""},
     {"IAsyncDisposable", "IDisposable"},
     {"IEnumerator", "IDisposable"},
@@ -1345,6 +1363,10 @@ constexpr std::array<DisposalHeadParent, 8> kDisposalHeadParents = {{
     {"IOwningEnumerator", "IDisposable"},
     {"IOwningAsyncEnumerable", "IAsyncDisposable"},
     {"IOwningAsyncEnumerator", "IAsyncDisposable"},
+    // §4.2 (fix #7424): the two owning-collection interfaces. `IOwningList`
+    // reaches `IDisposable` THROUGH `IOwningCollection`.
+    {"IOwningCollection", "IDisposable"},
+    {"IOwningList", "IOwningCollection"},
 }};
 
 // Is `head` one of the built-in disposal interfaces? (the direct case)
