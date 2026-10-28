@@ -9863,13 +9863,13 @@ void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
         st = lookupStateFor(*id);
         if (!st) return;  // defensive — the insertion above always succeeds
     } else {
+        auto* lsym = dynamic_cast<sema::LocalSymbol*>(ssym);
+        if (!lsym) return;
         // LOCALDECL-ONLY: mirrors `markOwningChoiceLocalMovedFrom`'s `sld` gate —
         // a §21.1 `const` local can never BIND an owning-choice production (§21.1
         // forbids the initializer that would admit it), so it is never enrolled
         // in the scope-end active-case disposal pass and has no read obligation
         // for this to protect either way.
-        auto* lsym = dynamic_cast<sema::LocalSymbol*>(ssym);
-        if (!lsym) return;
         auto* ld = dynamic_cast<const ast::LocalDecl*>(lsym->decl);
         if (!ld) return;
     }
