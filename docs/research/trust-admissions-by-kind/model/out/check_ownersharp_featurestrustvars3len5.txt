@@ -1,0 +1,27 @@
+# Rule change: owner-outlives, sharp: a linked child moved out carries its owner (derived retention at the move)
+rules: {'linked_fmove_carries': True}
+bounds: vars=3 len=5 features=trust   (65.0 s)
+
+## Newly accepted: 0
+## Newly rejected: 138
+    new a / disp a / link a / fmove b a / puse b
+        runs: FAULT  warnings: §28.2-use-after-dispose
+    new a / disp a / link a / fmove c a / puse c
+        runs: FAULT  warnings: §28.2-use-after-dispose
+    new a / link a / disp a / fmove b a / puse b
+        runs: FAULT  warnings: §28.2-use-after-dispose
+    fault profile under the baseline: 24 fault on every execution, 0 on some execution, 114 never fault (pure over-rejection)
+    witness (every): new a / disp a / link a / fmove b a / puse b
+    witness (never): new a / link a / fmove b a / asg a / brw c b
+    of the newly rejected, 12 carried a §28.2 warning at the baseline and 126 were silent
+## Newly unsound (accepted by the mutant, violating T1/T2/T3): 0
+## Newly warned (verdict unchanged): 0
+## Newly un-warned (verdict unchanged): 0
+## Trace changed (verdict unchanged): 0
+
+## Evaluation (paste-ready)
+Model: bzcore L1 (spec v0.345), bounds vars=3 len=5 features=trust: 1407726 programs, 331791 accepted at the baseline (49188 with a §28.2 warning), 0 violations.
+Under "owner-outlives, sharp: a linked child moved out carries its owner (derived retention at the move)": 331653 accepted; 0 newly accepted (0 unsound), 138 newly rejected, 312 unsound among all accepted; 0 newly warned, 0 newly un-warned; trace changed in 0.
+Of the newly rejected programs, 24 fault on every execution, 0 on some execution and 114 never fault.
+Run-time residual: at the baseline 35046 accepted programs fault on every execution and 0 on some; under the change 35022 and 0 (checked-mode DisposedAccessException remains the backstop for these).
+Witness of a newly rejected program: new a / disp a / link a / fmove b a / puse b (runs: FAULT)

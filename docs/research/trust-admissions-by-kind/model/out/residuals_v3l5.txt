@@ -1,0 +1,40 @@
+== baseline: residual/unsound accepted programs = 318 {('K4.3-trust-residual',): 318}
+    new a / newk b a / send a / kuse b runs: RACE
+    new a / newk c a / send a / kuse c runs: RACE
+    new b / newk a b / send b / kuse a runs: RACE
+    new b / newk c b / send b / kuse c runs: RACE
+    new c / newk a c / send c / kuse a runs: RACE
+    new c / newk b c / send c / kuse b runs: RACE
+    decl a / asg a / newk b a / send a / kuse b runs: RACE
+    decl a / asg a / newk c a / send a / kuse c runs: RACE
+    via puse: 12 via kuse: 300
+== derived: residual/unsound accepted programs = 18 {('K4.3-trust-residual',): 18}
+    new a / fbrw b a / fmove c a / send c / puse b runs: RACE
+    new a / fbrw b a / fmove c a / send c / use b runs: RACE
+    new a / fbrw c a / fmove b a / send b / puse c runs: RACE
+    new a / fbrw c a / fmove b a / send b / use c runs: RACE
+    new a / link a / fmove b a / send a / puse b runs: RACE
+    new a / link a / fmove c a / send a / puse c runs: RACE
+    new b / fbrw a b / fmove c b / send c / puse a runs: RACE
+    new b / fbrw a b / fmove c b / send c / use a runs: RACE
+    via puse: 12 via kuse: 0
+== sharp: residual/unsound accepted programs = 312 {('K4.3-trust-residual',): 312}
+    new a / newk b a / send a / kuse b runs: RACE
+    new a / newk c a / send a / kuse c runs: RACE
+    new b / newk a b / send b / kuse a runs: RACE
+    new b / newk c b / send b / kuse c runs: RACE
+    new c / newk a c / send c / kuse a runs: RACE
+    new c / newk b c / send c / kuse b runs: RACE
+    decl a / asg a / newk b a / send a / kuse b runs: RACE
+    decl a / asg a / newk c a / send a / kuse c runs: RACE
+    via puse: 6 via kuse: 300
+== both: residual/unsound accepted programs = 12 {('K4.3-trust-residual',): 12}
+    new a / fbrw b a / fmove c a / send c / puse b runs: RACE
+    new a / fbrw b a / fmove c a / send c / use b runs: RACE
+    new a / fbrw c a / fmove b a / send b / puse c runs: RACE
+    new a / fbrw c a / fmove b a / send b / use c runs: RACE
+    new b / fbrw a b / fmove c b / send c / puse a runs: RACE
+    new b / fbrw a b / fmove c b / send c / use a runs: RACE
+    new b / fbrw c b / fmove a b / send a / puse c runs: RACE
+    new b / fbrw c b / fmove a b / send a / use c runs: RACE
+    via puse: 6 via kuse: 0
