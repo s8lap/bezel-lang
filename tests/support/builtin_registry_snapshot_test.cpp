@@ -906,6 +906,17 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
         "IOwningEnumerable", "IOwningEnumerator",
         "IAsyncEnumerable", "IAsyncEnumerator",
         "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+        // fix #7456 (§9.7 / §14.2 / §28.12; stdlib §2.10 / §4.2 / §4.12 /
+        // §4.13, v0.345): the whole built-in DISPOSAL FAMILY is DERIVED into
+        // this table (the `common::kBuiltinDisposalFamilyHeads` chain), so
+        // the four heads the table used to miss are IN now: `IDisposable`,
+        // `IAsyncDisposable`, `IOwningCollection<T>` and `IOwningList<T>`.
+        // §8.7: "The compiler generates `IDisposable` on every non-static
+        // class"; §28.12: the disposal dispatches through any interface to
+        // the runtime class — so a `using var` at one of these heads carries a
+        // REAL §28.10 obligation and the vacuity lint must not deny it.
+        "IDisposable", "IAsyncDisposable",
+        "IOwningCollection", "IOwningList",
         "Channel", "ChannelSender",
         "EventSource", "AsyncEventSource",
         // fix #1832 (stdlib §6.5, v0.187): SharedEventSource<T> — same

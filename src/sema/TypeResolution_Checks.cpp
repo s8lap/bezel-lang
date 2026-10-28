@@ -1333,55 +1333,43 @@ namespace {
 // two, §4.2's two, §4.12's two, §4.13's four) and NINE of them extend
 // `IDisposable`; this table listed EIGHT, so `IOwningCollection<T>` and
 // `IOwningList<T>` were missing and a record listing either was ADMITTED
-// (fix #7424). THE TABLE MUST EVENTUALLY BE DERIVED MECHANICALLY FROM THE
-// STANDARD LIBRARY DOCUMENT — beside `kBuiltinExceptionHierarchy` in
-// `src/common/BuiltinRegistry.*`, the exactly-analogous built-in hierarchy
-// table — so that a FUTURE standard-library interface extending
-// `IDisposable` cannot miss again. That move is DEFERRED: `src/common/**` is
-// another lane's file in this batch (the B4a fix-forward lane is in
-// `BuiltinRegistry.cpp`), so the two missing heads are added HERE, where this
-// check needs them, and the derivation is recorded here rather than done.
-// Until that move, the chain is DUPLICATED: `src/common/DisposalKind.cpp`
-// special-cases the `IAsyncDisposable` head BY NAME.
+// (fix #7424).
+//
+// fix #7456 / #7457 (v0.345): THE DERIVATION IS DONE. The chain now lives in
+// ONE table — `common::kBuiltinDisposalFamilyHeads`, in
+// `src/common/BuiltinRegistry.cpp`, beside `kBuiltinExceptionHierarchy` (the
+// exactly-analogous built-in hierarchy table) — and the two functions below
+// READ it. A FUTURE standard-library interface extending `IDisposable` now
+// lands in ONE place, and the three sites that answer "is this head a
+// disposal interface?" cannot disagree again:
+//
+//   * THIS check (the declaration-site rejection) — the chain below;
+//   * the §28.10 vacuity lint — `MethodOwnership::rhsIsDisposableClassType`
+//     (src/ownership/Ownership.cpp) reads `common::isBuiltinDisposalFamilyHead`;
+//   * the `where`-bound check — `primitiveNeverConformsToBuiltinIface`
+//     (src/sema/TypeRef.hpp) reads the same predicate.
+//
+// Before the derivation the three views DISAGREED and the disagreement
+// shipped two defects: the lint's table knew six of the family's ten heads
+// (#7456 — a false "no disposal obligation" warning over an object that HAS
+// a destructor) and the bound check knew two (#7457 — a record type argument
+// against `where T: IEnumerator<R>` was ADMITTED).
 //
 // The USER side of the chain is not a table at all: a user interface's own
 // extension clause is carried on its symbol (`TypeSymbol::baseTypes` for a
 // user base, `TypeSymbol::nonSymbolBaseRefs` for a built-in base), and
 // `declaresBuiltinInterface` is the ONE place the question "does this type
 // declare built-in interface `name`?" is answered (Symbol.hpp).
-struct DisposalHeadParent {
-    std::string_view head;
-    std::string_view parent;   // empty for `IDisposable` itself
-};
-
-constexpr std::array<DisposalHeadParent, 10> kDisposalHeadParents = {{
-    {"IDisposable", ""},
-    {"IAsyncDisposable", "IDisposable"},
-    {"IEnumerator", "IDisposable"},
-    {"IAsyncEnumerator", "IAsyncDisposable"},
-    {"IOwningEnumerable", "IDisposable"},
-    {"IOwningEnumerator", "IDisposable"},
-    {"IOwningAsyncEnumerable", "IAsyncDisposable"},
-    {"IOwningAsyncEnumerator", "IAsyncDisposable"},
-    // §4.2 (fix #7424): the two owning-collection interfaces. `IOwningList`
-    // reaches `IDisposable` THROUGH `IOwningCollection`.
-    {"IOwningCollection", "IDisposable"},
-    {"IOwningList", "IOwningCollection"},
-}};
 
 // Is `head` one of the built-in disposal interfaces? (the direct case)
 bool isBuiltinDisposalInterfaceHead(std::string_view head) {
-    for (const auto& d : kDisposalHeadParents)
-        if (d.head == head) return true;
-    return false;
+    return common::isBuiltinDisposalFamilyHead(head);
 }
 
 // The interface the built-in disposal head `head` extends (empty for
 // `IDisposable` itself).
 std::string_view disposalHeadParent(std::string_view head) {
-    for (const auto& d : kDisposalHeadParents)
-        if (d.head == head) return d.parent;
-    return {};
+    return common::builtinDisposalFamilyParent(head);
 }
 
 // The LEAF name of a built-in base reference: the AST name's LAST part (the

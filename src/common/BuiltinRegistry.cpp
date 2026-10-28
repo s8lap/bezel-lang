@@ -1323,6 +1323,101 @@ bool isBuiltinInterfaceHead(std::string_view n) {
     return contains(kBuiltinInterfaceHeads, n);
 }
 
+// fix #7456 / #7457 (spec §9.7 / §14.2 / §28.12, stdlib §2.10 / §4.2 /
+// §4.12 / §4.13, v0.345): THE BUILT-IN DISPOSAL FAMILY — the interfaces that
+// extend `IDisposable` directly or transitively.
+//
+// This is the ONE table the compiler now derives every "is this head a
+// disposal interface?" answer from. THREE questions were answered by THREE
+// DISAGREEING hand-lists, and the disagreement produced two shipped defects:
+//
+//   * the §28.10 vacuity lint's table (`kDisposableBuiltinHeadNames`, below)
+//     knew SIX of the family's ten heads, so a binding declared at
+//     `IDisposable` / `IAsyncDisposable` / `IOwningCollection<T>` /
+//     `IOwningList<T>` was told "the RHS is a value-typed/runtime-managed
+//     value with no disposal obligation" while the obligation was real and
+//     discharged (#7456);
+//   * the `where`-bound check (`primitiveNeverConformsToBuiltinIface`,
+//     src/sema/TypeRef.hpp) knew TWO, so a RECORD type argument against
+//     `where T: IEnumerator<R>` was ADMITTED although §9.7 forbids a record
+//     from implementing `IDisposable` "directly or through an interface
+//     extending it" (#7457);
+//   * the declaration-site chain table (`kDisposalHeadParents`,
+//     src/sema/TypeResolution_Checks.cpp) knew all TEN — and its own header
+//     recorded the RESIDUAL: "THE TABLE MUST EVENTUALLY BE DERIVED
+//     MECHANICALLY … so that a FUTURE standard-library interface extending
+//     `IDisposable` cannot miss again" (#7424).
+//
+// The table below IS that derivation: one hand-written table, in the
+// data-only registry (beside `kBuiltinExceptionHierarchy`, the exactly-
+// analogous built-in hierarchy table), read by all three sites.
+//
+// THE MEMBERS, AND WHERE EACH IS DECLARED (stdlib §2.10 / §4.2 / §4.12 /
+// §4.13, v0.345):
+//
+//   interface              extends              stdlib
+//   --------------------- -------------------- --------
+//   IDisposable           — (root)             §2.10
+//   IAsyncDisposable       IDisposable          §2.10
+//   IOwningCollection<T>   IDisposable          §4.2
+//   IOwningList<T>         IOwningCollection<T> §4.2
+//   IEnumerator<out T>     IDisposable          §4.12
+//   IAsyncEnumerator<out T> IAsyncDisposable    §4.12
+//   IOwningEnumerable<T>   IDisposable          §4.13
+//   IOwningEnumerator<T>   IDisposable          §4.13
+//   IOwningAsyncEnumerable<T> IAsyncDisposable  §4.13
+//   IOwningAsyncEnumerator<T> IAsyncDisposable  §4.13
+//
+// Spec §14.2's worked example (`where T: IDisposable`) names the same
+// closure: "an interface conforms exactly when it extends `IDisposable`
+// (rule 3): `IAsyncDisposable`, `IEnumerator<T>`, `IAsyncEnumerator<T>`, and
+// any user-defined interface that lists `IDisposable` in its extension
+// clause"; stdlib §2.10 adds "the interfaces that extend `IDisposable`
+// directly or transitively".
+//
+// The USER side of the family is not a table: a user interface's own
+// extension clause is carried on its symbol (`TypeSymbol::baseTypes` for a
+// user base, `TypeSymbol::nonSymbolBaseRefs` for a built-in base), and
+// `declaresBuiltinInterface` is the ONE place the question "does this type
+// declare built-in interface `name`?" is answered (Symbol.hpp). Only the
+// BUILT-IN heads are tabulated here.
+// per §9.7 / §14.2 / §28.12, stdlib §2.10 / §4.2 / §4.12 / §4.13, fix #7456,
+// fix #7457
+constexpr std::array<BuiltinDisposalFamilyHead, 10> kBuiltinDisposalFamilyHeads = {{
+    {"IDisposable", ""},
+    {"IAsyncDisposable", "IDisposable"},
+    // §4.12 — the two borrowing enumeration interfaces.
+    {"IEnumerator", "IDisposable"},
+    {"IAsyncEnumerator", "IAsyncDisposable"},
+    // §4.13 — the four owning iteration interfaces.
+    {"IOwningEnumerable", "IDisposable"},
+    {"IOwningEnumerator", "IDisposable"},
+    {"IOwningAsyncEnumerable", "IAsyncDisposable"},
+    {"IOwningAsyncEnumerator", "IAsyncDisposable"},
+    // §4.2 — the two owning-collection interfaces. `IOwningList` reaches
+    // `IDisposable` THROUGH `IOwningCollection`.
+    {"IOwningCollection", "IDisposable"},
+    {"IOwningList", "IOwningCollection"},
+}};
+
+// Is `head` one of the built-in disposal interfaces? (the DIRECT case — the
+// transitive closure is walked by the callers that have a chain to walk)
+// per §9.7 / §14.2 / §28.12, fix #7456, fix #7457
+bool isBuiltinDisposalFamilyHead(std::string_view head) {
+    for (const auto& d : kBuiltinDisposalFamilyHeads)
+        if (d.head == head) return true;
+    return false;
+}
+
+// The interface the built-in disposal head `head` extends (empty for
+// `IDisposable` itself).
+// per §9.7 / §14.2 / §28.12, fix #7456, fix #7457
+std::string_view builtinDisposalFamilyParent(std::string_view head) {
+    for (const auto& d : kBuiltinDisposalFamilyHeads)
+        if (d.head == head) return d.parent;
+    return {};
+}
+
 // fix #2992 (§28.3 / §28.9 / §28.10, v0.240): the built-in type heads whose
 // `using var` carries a REAL §28.10 disposal obligation — the set the §28.10
 // vacuity lint (rhsIsDisposableClassType Path 2) uses to decide a `using var`
@@ -1396,9 +1491,29 @@ constexpr std::array<std::string_view, 41> kDisposableBuiltinHeadNames = {
     "TaskCompletionSource", "OwningTaskCompletionSource",
 };
 
+// fix #7456 (§9.7 / §14.2 / §28.12, stdlib §2.10 / §4.2 / §4.12 / §4.13,
+// v0.345): the table now carries the WHOLE built-in DISPOSAL FAMILY, derived
+// from `kBuiltinDisposalFamilyHeads` (the one hand-written chain table, above)
+// rather than spelled out a second time. The lint's table knew only SIX of the
+// family's TEN heads, so a binding declared at `IDisposable` /
+// `IAsyncDisposable` / `IOwningCollection<T>` / `IOwningList<T>` was told
+// "the RHS is a value-typed/runtime-managed value with no disposal obligation"
+// while the obligation was REAL and discharged (§8.7: "The compiler generates
+// `IDisposable` on every non-static class"; §28.12: the disposal dispatches
+// through any interface to the runtime class).
+//
+// The four heads are NOT added as literal rows above: they are DERIVED, so a
+// future standard-library interface extending `IDisposable` cannot miss again
+// — the residual #7424's own header recorded ("THE TABLE MUST EVENTUALLY BE
+// DERIVED MECHANICALLY … so that a FUTURE standard-library interface
+// extending `IDisposable` cannot miss again"). The literal rows the six
+// already carried are KEPT (they are the six the table's history names), and
+// the derived term is a strict superset of them.
+// per §28.3 / §28.9 / §28.10, fix #2992, fix #7456
 bool isDisposableBuiltinHeadName(std::string_view head) {
-    return contains(kDisposableBuiltinHeadNames, head);
-}  // per §28.3 / §28.9 / §28.10, fix #2992
+    return contains(kDisposableBuiltinHeadNames, head) ||
+           isBuiltinDisposalFamilyHead(head);
+}
 
 // fix #3017 (§28.3 / §28.9 / §28.10, v0.240): the 13 built-in class heads
 // the codegen auto-drop chain (registerUsingDisposal) claims disposal for but

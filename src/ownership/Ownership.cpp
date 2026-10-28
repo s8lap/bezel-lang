@@ -8541,6 +8541,47 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     // imported carried verdict). The anchor does not change that decision —
     // it changes who ANSWERS it, so the two sites cannot drift.
     if (!rt) return false;
+    // fix #7456 (§9.7 / §14.2 / §28.12; stdlib §2.10 / §4.2 / §4.12 / §4.13,
+    // v0.345): A DECLARED TYPE AT ONE OF THE BUILT-IN DISPOSAL INTERFACES
+    // CARRIES A REAL §28.10 DISPOSAL OBLIGATION — the lint must not call it
+    // vacuous.
+    //
+    // §8.7: "The compiler generates `IDisposable` on every non-static class."
+    // §28.12: the disposal dispatches "through any interface — `IDisposable`
+    // or one deriving from it" to the runtime class. So a value held at
+    // `IDisposable` / `IAsyncDisposable` / `IEnumerator<T>` /
+    // `IAsyncEnumerator<T>` / `IOwningCollection<T>` / `IOwningList<T>` /
+    // the four `IOwning*` iteration interfaces is disposed at scope end, and
+    // the §28.10 lint's premise — "the RHS is a value-typed/runtime-managed
+    // value with no disposal obligation (§28.9)" — is FALSE for it: none of
+    // the §28.9 runtime-managed kinds is a class (§28.9: "None of them is a
+    // class"), and none of them is a disposal interface.
+    //
+    // The head is read from the DECLARED type only when that type is a
+    // DECLARATION-LESS Named head (a built-in interface head — the shape
+    // `IDisposable` and the rest resolve to, having no synthesized
+    // declaration). A USER interface is not decided here: the §28.10 lint's
+    // own population for a user interface is the interface's own members
+    // (`common::classifyDisposal`'s class/interface arm reads a destructor or
+    // an `owned` field), and a user interface's extension chain is walked by
+    // the DECLARATION-site check (`disposalInterfaceAncestor`,
+    // src/sema/TypeResolution_Checks.cpp), not here.
+    //
+    // This arm is what makes the lint's answer UNIFORM over the family: the
+    // six heads `common::isDisposableBuiltinHeadName` already carried answer
+    // "obligation" through the verdict's `carriesObligation`, while the four
+    // it missed (`IDisposable`, `IAsyncDisposable`, `IOwningCollection<T>`,
+    // `IOwningList<T>`) answered "no obligation" and the lint fired on a
+    // binding whose object HAS a destructor (#7456). The family is ONE table
+    // now — `common::isBuiltinDisposalFamilyHead`
+    // (src/common/BuiltinRegistry.cpp) — read here and by the `where`-bound
+    // check (`primitiveNeverConformsToBuiltinIface`, src/sema/TypeRef.hpp)
+    // and by the declaration-site chain table
+    // (`src/sema/TypeResolution_Checks.cpp`), so the three views cannot
+    // disagree again.
+    if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+        common::isBuiltinDisposalFamilyHead(rt->headName()))
+        return true;
     return common::classifyDisposal(rt, ctx_).carriesObligation;
 }
 

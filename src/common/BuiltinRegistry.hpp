@@ -479,6 +479,60 @@ bool isBuiltinInterfaceHead(std::string_view n);
 // separately. // per §28.3 / §28.9 / §28.10, fix #2992
 bool isDisposableBuiltinHeadName(std::string_view head);
 
+// fix #7456 / #7457 (spec §9.7 / §14.2 / §28.12; stdlib §2.10 / §4.2 /
+// §4.12 / §4.13, v0.345): THE BUILT-IN DISPOSAL FAMILY — the interfaces that
+// extend `IDisposable` directly or transitively.
+//
+// This is the ONE table every "is this head a disposal interface?" answer is
+// derived from. Before it existed, THREE hand-lists answered that question
+// and DISAGREED: the §28.10 vacuity lint's table knew six of the family's
+// ten heads (#7456), the `where`-bound check knew two (#7457), and the
+// declaration-site chain table knew all ten (#7424, whose own header recorded
+// the derivation as its residual).
+//
+// `isBuiltinDisposalFamilyHead` answers the DIRECT case — "is this head one
+// of the family's members?". A caller that has a chain to walk (the
+// declaration-site check) reads `builtinDisposalFamilyParent` to walk it.
+//
+// The family, and where each member is declared (stdlib §2.10 / §4.2 / §4.12
+// / §4.13):
+//
+//   IDisposable              (root)                §2.10
+//   IAsyncDisposable          extends IDisposable  §2.10
+//   IOwningCollection<T>      extends IDisposable  §4.2
+//   IOwningList<T>            extends IOwningCollection<T>  §4.2
+//   IEnumerator<out T>        extends IDisposable  §4.12
+//   IAsyncEnumerator<out T>   extends IAsyncDisposable  §4.12
+//   IOwningEnumerable<T>      extends IDisposable  §4.13
+//   IOwningEnumerator<T>      extends IDisposable  §4.13
+//   IOwningAsyncEnumerable<T> extends IAsyncDisposable  §4.13
+//   IOwningAsyncEnumerator<T> extends IAsyncDisposable  §4.13
+//
+// Spec §14.2's worked example names the same closure ("an interface conforms
+// exactly when it extends `IDisposable` (rule 3): `IAsyncDisposable`,
+// `IEnumerator<T>`, `IAsyncEnumerator<T> …`") and stdlib §2.10 states it for
+// the bound ("the interfaces that extend `IDisposable` directly or
+// transitively").
+//
+// The USER side of the family is not tabulated: a user interface's own
+// extension clause is carried on its symbol (`TypeSymbol::baseTypes` for a
+// user base, `TypeSymbol::nonSymbolBaseRefs` for a built-in base), and
+// `declaresBuiltinInterface` is the ONE place the question "does this type
+// declare built-in interface `name`?" is answered (Symbol.hpp).
+// per §9.7 / §14.2 / §28.12, stdlib §2.10 / §4.2 / §4.12 / §4.13, fix #7456,
+// fix #7457
+struct BuiltinDisposalFamilyHead {
+    std::string_view head;    // the interface's own (unqualified) name
+    std::string_view parent;  // the interface it extends; empty for the root
+};
+
+bool isBuiltinDisposalFamilyHead(std::string_view head);
+
+// The interface the built-in disposal head `head` extends — empty for
+// `IDisposable` itself, and empty for a head outside the family.
+// per §9.7 / §14.2 / §28.12, fix #7456, fix #7457
+std::string_view builtinDisposalFamilyParent(std::string_view head);
+
 // fix #3017 (§28.3 / §28.9 / §28.10, v0.240): the 13 built-in class heads
 // the codegen auto-drop chain (registerUsingDisposal, LlvmBackend_Setup.cpp)
 // claims disposal for but that are DELIBERATELY ABSENT from
