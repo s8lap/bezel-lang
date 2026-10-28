@@ -1740,6 +1740,74 @@ CALL).**
   `int.Parse(radix := "x", s := 5)`) PLUS **ONE FALSE REJECTION THAT BECOMES A CORRECTLY-LOWERED
   CALL** (`sb.Insert(value := "X", index := 0)`). **NO TEST WAS WEAKENED.**
 
+**Lane `r36-c2-extension-inherited` (the §26.5 EXTENSION FAMILY — the rule-1/rule-2 admission over
+`Array<T>`, `IList<T>` and `string`).**
+
+* **SHAs (4 picks, all `ACCEPT-W-NOTES`):** `95f7acb97` · `a3aa2f27d8` · `eab7ac14ad` · `7626bb4d4e`.
+* **Fix issues: #7454 #7446 #7449 #7447 — **ALL FOUR** ARE **TRUE CLOSURES** (every subject is
+  `fix #N`).**
+* **Files:** `src/sema/ExprTypecheck_Calls.cpp` plus
+  `tests/sema/builtin_extension_explicit_type_args_7454_test.cpp`,
+  `tests/sema/collection_interface_inherited_member_7446_test.cpp`,
+  `tests/codegen/collection_interface_method_reference_7449_test.cpp`,
+  `tests/codegen/collection_length_extension_7447_test.cpp` and
+  `tests/codegen/stack_queue_length_rejected_5416_test.cpp`.
+* **WHAT IT FIXED.**
+  * `95f7acb97` — **THE BUILT-IN STRING HEAD MUST NOT ANSWER FOR A MEMBER THE USER's EXTENSION
+    OWNS** (§26.5 rule 1: instance resolution commits by name, so the extension block is never
+    consulted for that name on that receiver).
+  * `a3aa2f27d8` — **SEMA APPLIES §26.5 RULE 1 TO **INHERITED** MEMBERS, FOR TYPING AS WELL AS FOR
+    DISPATCH** — `IList<T>` INHERITS `GetEnumerator`, so the built-in must answer and the extension
+    is unreachable.
+  * `eab7ac14ad` — **A METHOD REFERENCE TO AN `IList<T>` MEMBER UNDER A SAME-NAMED USER EXTENSION IS
+    ASAN-CLEAN** (§27.6: the reference resolves "exactly as the call `v.Scaled()` is").
+  * `7626bb4d4e` — **A USER EXTENSION NAMED `Length` OVER `Array<T>` IS ADMITTED** (§26.5 rule 2).
+* **FAIL-WITHOUT (MECHANICAL, WITH THE **TEST BINARY** REBUILT — the tests fork an in-process
+  `Driver::compileFile` linked into `bezel_tests_sema` / `bezel_tests_codegen`):**
+  * `95f7acb97` — `src/sema/ExprTypecheck_Calls.cpp` reverted to `ea7cd9ac` ⇒ filter
+    `builtin_extension_explicit_type_args_7454` runs **7 rows with 3 FAILING** (exactly the three
+    DEFECT rows, every one a new row of this file) and 4 passing (the CONTROL rows, green on both
+    arms by design) ⇒ with the fix restored, **7 passed, 0 failed**. The pre-existing row
+    `extension_method_spec_26_5` goes **0 passed, 1 failed → 1 passed, 0 failed** over the same
+    revert — **THAT ROW IS THE GATE-BLOCKING ONE.**
+  * `a3aa2f27d8` — reverted to `f58d0806` ⇒ filter `collection_interface_inherited_member_7446` runs
+    **8 rows with 4 FAILING** — `ilist_count_string_target_rejected`,
+    `ilist_count_bool_extension_int_target_prints_the_builtin_count`,
+    `ilist_null_cond_count_answers_the_builtin` and
+    `ilist_null_cond_count_without_extension_answers_the_builtin` — every one a new row of this
+    file ⇒ with the fix restored, **8 passed, 0 failed**.
+  * `eab7ac14ad` — reverted to `f58d0806` ⇒ filter `collection_interface_method_reference_7449` runs
+    **2 rows with 1 FAILING** (`same_named_extension_reference_is_clean`, a new row of this file) and
+    1 passing (the CONTROL row) ⇒ with the fix restored, **2 passed, 0 failed**, and the ASan-forced
+    leg (`BEZEL_AOT_FORCE_SANITIZE=address`) reports **"NATIVE SANITIZER: 0 check(s) skipped"**.
+    The failing arm reports "[ ASAN ] … sanitizer reported a problem (exitcode=99)", **which is the
+    ASan leg RUNNING (not skipped) and catching the stack-buffer-overflow.**
+  * `7626bb4d4e` — reverted to `bf102816` ⇒ filter `collection_length_extension_7447` runs **5 rows
+    with 3 FAILING** (`array_length_user_extension_is_admitted`,
+    `stack_length_user_extension_is_admitted` and
+    `array_length_without_an_extension_is_still_refused` — the last one fails because the pre-fix
+    diagnostic carries no §-character) and 2 passing (the CONTROL rows) ⇒ with the fix restored,
+    **5 passed, 0 failed**.
+* **TESTED.** The lit diagnostic track is green on this tree (**2562 passed, 100.00%**). The
+  `extension` (480), `length` (354), `count` (758), `collection` (1399), `array` (2808), `stack`
+  (313) and `queue` (170) filters are green unchanged. **THE CONFORMANCE CORPUS, READ-ONLY, REPORTS
+  `3693 cases: 3157 ok, 231 known-divergent, 296 unclassified, 0 REGRESSION, 9 UNBANKED`** — the same
+  nine pre-existing unbanked rows as before the change (the runner's exit code is 1 for those, **not**
+  for a regression), and the only line that differs from the previous report is a Guid's random
+  payload in one UNCLASSIFIED row.
+* **MATRIX RESULT.** **THE c2 GRID's CELL COUNT IS NOT CLAIMED BY THIS LANE** — the campaign-2 DONE
+  instrument's census is in *DONE instrument* above.
+* **THE RESIDUALS THIS LANE'S **REVIEWER** (`a0d9a2b448819c340`) FOUND — **FOUR** OF THEM ARE FILED
+  AS THEIR OWN ISSUES, NOT FIXED HERE:** the **BARE** receiver-qualified reference `a.Length` is
+  **STILL REFUSED** while `a.Length()` is admitted (§27.6 says the reference resolves "exactly as
+  the call … is") ⇒ **#7474**; its **TYPE-QUALIFIED** twin `Array<int>.Length` **COMPILES BUT
+  DEGRADES** (the slot is zero-initialised and the program prints NOTHING) ⇒ **#7475**; an extension
+  over a **§9.6 PROPERTY** is still reachable (`s.Length()` is admitted permissively, warns, and the
+  program prints NOTHING) ⇒ **#7477**; and a **NULL-CONDITIONAL** `c?.Count()` on a NULLABLE
+  `IEnumerable<int>` is a **HEAP-USE-AFTER-FREE** ⇒ **#7478**. **=> #7474's SUBJECT IS THE BARE
+  SPELLING, WHICH IS **NOT** #7447's BODY's REPRO (#7447's IS THE **CALL** SPELLING) — SO #7447
+  STAYS CLOSED.**
+
 ### Coordinator block — 2026-10-28 (the campaign's integrator steps)
 
 * **THE ANCHOR IS PICKED** (`2250daa52`) — *"fix #6825 #7284 #7290 #7293 #7294 #7295 #7299 #7300
