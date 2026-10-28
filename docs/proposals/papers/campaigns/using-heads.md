@@ -1393,8 +1393,7 @@ ISSUE ON PURPOSE). **=> PICKED (2026-10-28): `cdf348ec` -> `e239820b2c`, `fc09c0
   (**ACCEPT-W-NOTES**). **THE PICKED SHAs ON STAGING: `a37947ec` (`narrow #7326 fix #7396`) ·
   `dc0fd710` (`narrow #7354 fix #7394`) · `70e7d059` (`narrow #7424`) · `5794390c`
   (`narrow #7354`) · `f5d9ef22` (`narrow #7326`) · `431fed95` (`narrow #7424`).**
-* **=> TWO **TRUE** CLOSURES: **#7394** AND **#7396**. **THREE ISSUES STAY OPEN: **#7326**, **#7354**
-  AND **#7424** (THEIR SUBJECTS CARRY `narrow`, WHICH IS NOT A CLOSING KEYWORD).**
+* **=> TWO **TRUE** CLOSURES: **#7394** AND **#7396**. **AT THE PICK, **THREE** ISSUES STAY OPEN: **#7326**, **#7354** AND **#7424** (THEIR SUBJECTS CARRY `narrow`, WHICH IS NOT A CLOSING KEYWORD). **=> **CORRECTION (THE COORDINATOR, 2026-10-28 22:40): **#7326 IS **NO LONGER PARTIAL** — ITS RESIDUAL (THE §28.10 VACUITY LINT's OVER-FIRE, **#7456**) IS **FIXED** BY THE DISPOSAL-FAMILY LANE (`19fd5710`), WHICH IS AN ANCESTOR OF STAGING — **SO #7326 IS **WHOLE**, AND **TWO** ISSUES (NOT THREE) REMAIN OPEN.**
 
 **THE COORDINATOR's SUBJECT AMENDMENT (2026-10-28) — THE REVIEWER's FIRST NOTE, DISCHARGED.**
 
@@ -1431,7 +1430,7 @@ RE-MEASURE THE ENTRY CHECK).**
 |---|---|---|
 | **#7396** | **CLOSED** — an `await using` outside an async method or async lambda is now **REFUSED** (§28.12), with the diagnostic at a real location | — |
 | **#7394** | **CLOSED** — a `record`/`enum`/`choice` declaring `IAsyncDisposable` is now **REFUSED AT THE DECLARATION**, with the **INTERFACE CHAIN** named (not a name test) | — |
-| **#7326** | **PARTIAL** — the §28.12 rejection lands and is pinned (four rows), but the §28.10 **VACUITY LINT** over-fires on an `IDisposable`/`IAsyncDisposable`/`IOwningCollection<T>`/`IOwningList<T>`-declared binding | the lint's over-fire — **#7456** |
+| **#7326** | **WHOLE** — the §28.12 rejection lands and is pinned (four rows), **AND the §28.10 **VACUITY LINT**'s over-fire — THE RESIDUAL, **#7456** — IS FIXED by the disposal-family lane (`19fd5710`)** | — (nothing) |
 | **#7354** | **PARTIAL** — the **declaration-site** rejection follows the chain, and the enum/choice/nested controls are added, but the **NESTED-RECORD reach gap** is not fixed | `Resolver::checkRecordRestrictions` iterates `ctx_.module()->children` — **MODULE-LEVEL ONLY** — so a `record` **inside a `class`** escapes every §9.6/§9.7 record restriction. **ALREADY TRACKED AS THE COORDINATOR's RESIDUAL COMMENT ON #7354 (2026-10-27)** |
 | **#7424** | **PARTIAL** — the two missing heads are added and their rows pass, but the **MECHANICAL DERIVATION** into `src/common/BuiltinRegistry.*` is deferred to that file's owner | the derivation — **AND IT IS MEASURED TO MATTER: #7456 AND #7457 ARE ITS TWO SYMPTOMS** |
 
@@ -1493,18 +1492,17 @@ ALREADY TRACKED.**
 | arm | the reverted file | filter | result |
 |---|---|---|---|
 | **A** | `src/sema/TypeResolution_Checks.cpp` → `af244910^` (the 8-head table) | `--area sema disposal_interface_chain_7354` | **22 passed, 6 failed** — **EXACTLY** the six #7424 REJECT rows |
-| **B** | the same file → `d31cd5aa` (the name-based check) | the same | **13 passed, 15 failed** — including the two F7 nested rows; **the four F7 CONTROLS ARE `[  OK  ]`** |
+| **B** | the same file → `a37947ec` (the **PICKED** name-based check; the lane's original `d31cd5aa` is **NOT** on staging, so a reader must use the picked SHA) | the same | **13 passed, 15 failed** — including the two F7 nested rows; **the four F7 CONTROLS ARE `[  OK  ]`** |
 | **C** | `src/codegen/LlvmBackend_Setup.cpp` → `9bb9387f^` (pre-#7322), the NEW test file | `--area codegen await_using_vacuous_rhs_7322` | **3 passed, 7 failed** |
 | **D** | the same backend, the OLD test file | the same | **4 passed, 6 failed** — **THE OLD ROW PASSES (THE VACUITY, MEASURED)** |
 
 **EVERY REVERTED FILE WAS RESTORED, AND `git status --short` WAS **CLEAN** AFTER EACH ARM AND AT THE
 END.**
 
-**THE CORPUS — READ-ONLY, AGAINST A COPY. **THE PICK: `3693 cases: 3157 ok, 233 known-divergent, 296
-unclassified, 0 REGRESSION, 7 UNBANKED`. THE BASE `b19567b1`: `3693 cases: 3157 ok, 234
+**THE CORPUS — READ-ONLY, AGAINST A COPY. **THE **LANE TIP** — **NOT** THE PICK: THE FIGURES ARE THE REVIEWER's MEASUREMENT ON THE LANE's OWN TIP, AND THE PICK ITSELF (`a37947ec`) WAS NOT MEASURED: `3693 cases: 3157 ok, 233 known-divergent, 296 unclassified, 0 REGRESSION, 7 UNBANKED`. THE BASE `b19567b1`: `3693 cases: 3157 ok, 234
 known-divergent, 296 unclassified, 0 REGRESSION, 6 UNBANKED`.** **=> 0 REGRESSION ON BOTH ARMS, AND
 THE UNBANKED SET DIFFERS BY **EXACTLY ONE ROW**: `s28_12_0015` — **BANKED `fail`, AND IT NOW PASSES**,
-MOVED BY THE LANE's OWN `d31cd5aa` (ITS CORPUS ROW IS "await using outside an async method is a
+MOVED BY THE LANE's OWN `a37947ec` — THE **PICKED** COMMIT (ITS CORPUS ROW IS "await using outside an async method is a
 compile error"). **=> THAT IS THE EXPECTED CONSEQUENCE OF THE FIX, AND THE COORDINATOR RE-BANKS
 `baseline.tsv` **LAST**, BEFORE THE GATE. THE OTHER SIX ARE **PRE-EXISTING** ON THE BASE ARM.**
 
@@ -1529,7 +1527,7 @@ ADMITTED — NO REGRESSION**).
 **THE ONE PRE-EXISTING ROW WHOSE **PROGRAM** CHANGED: `ownership_using_var_choice_copy_7316.
 await_using_var_choice_copy_is_unchanged` — THE PROGRAM MOVED TO `public static async method Main():
 Task` (THE OLD ONE IS NOW REJECTED BY §28.12), **ITS EXPECTATION IS UNCHANGED** (COMPILES, RUNS, EXITS
-0, PRINTS `done`), **AND ITS NAME IS UNCHANGED.** NAMED IN `d31cd5aa`'s BODY WITH THE ⚠ MARKER. **THE
+0, PRINTS `done`), **AND ITS NAME IS UNCHANGED.** NAMED IN `a37947ec`'s BODY — THE **PICKED** COMMIT — WITH THE ⚠ MARKER. **THE
 NEEDLE `record `R` may not implement `IDisposable`` + `(§9.7)` IS **PRESERVED BYTE-IDENTICALLY** IN THE
 SOURCE FOR THE DIRECT CASE — AND **IT IS NOT A VACUOUS `CHECK-NOT`**: THE LIT TRACK IS **2562 (100.00%)**
 AND THE gtest ROW `record_listing_idisposable_is_rejected_spec_9_7` PINS THE SAME TEXT AT A REAL
@@ -1540,8 +1538,8 @@ NOT FILE).**
 
 | # | the one-line mechanism | where |
 |---|---|---|
-| **#7456** | **THE §28.10 VACUITY LINT OVER-FIRES ON AN `IDisposable`/`IAsyncDisposable`/`IOwningCollection<T>`/`IOwningList<T>`-DECLARED BINDING WHOSE OBJECT HAS A DESTRUCTOR — THE WARNING CLAIMS "NO DISPOSAL OBLIGATION (§28.9)" WHILE THE SCOPE-END DISPOSAL **DOES** RUN** | `src/common/BuiltinRegistry.cpp`'s `kDisposableBuiltinHeadNames` (42 names) IS **MISSING** FOUR HEADS; `common::classifyDisposal` ANSWERS "no obligation"; `MethodOwnership::rhsIsDisposableClassType` (`src/ownership/Ownership.cpp`) BELIEVES IT |
-| **#7457** | **A `where` BOUND NAMING `IEnumerator<T>`/`IAsyncEnumerator<T>` **ADMITS A RECORD** TYPE ARGUMENT — THE BOUND CHECK DOES NOT CONSULT THE TRANSITIVE CLOSURE** | `src/sema/TypeRef.hpp`'s `primitiveNeverConformsToBuiltinIface` NAMES **ONLY** `IDisposable` AND `IAsyncDisposable` — **THE SAME TWO-HEAD NARROWING THE CHAIN TABLE JUST FIXED, IN A SECOND FILE** |
+| **#7456** | **THE §28.10 VACUITY LINT OVER-FIRES ON AN `IDisposable`/`IAsyncDisposable`/`IOwningCollection<T>`/`IOwningList<T>`-DECLARED BINDING WHOSE OBJECT HAS A DESTRUCTOR — THE WARNING CLAIMS "NO DISPOSAL OBLIGATION (§28.9)" WHILE THE SCOPE-END DISPOSAL **DOES** RUN** | `src/common/BuiltinRegistry.cpp`'s `kDisposableBuiltinHeadNames` (**41** names — `std::array<std::string_view, 41>`) IS **MISSING** FOUR HEADS; `common::classifyDisposal` ANSWERS "no obligation"; `MethodOwnership::rhsIsDisposableClassType` (`src/ownership/Ownership.cpp`) BELIEVES IT |
+| **#7457** | **A `where` BOUND NAMING **ANY OF THE **EIGHT** HEADS OUTSIDE THE TWO** `IDisposable`/`IAsyncDisposable` **ADMITS A RECORD** TYPE ARGUMENT — THE BOUND CHECK DOES NOT CONSULT THE TRANSITIVE CLOSURE. **THE ISSUE's OWN TABLE MEASURED **TWO** HEADS; THE DISPOSAL-FAMILY LANE's RE-MEASUREMENT SHOWED **EIGHT**: WITH THE BOUND INTERFACE's OWN TYPE ARGUMENT A **CLASS** (THE SHAPE THE ISSUE's OWN `Res` IS MEANT TO BE), **ALL EIGHT** OF `IEnumerator` `IAsyncEnumerator` `IOwningEnumerable` `IOwningEnumerator` `IOwningAsyncEnumerable` `IOwningAsyncEnumerator` `IOwningCollection` `IOwningList` **ADMIT** A RECORD TYPE ARGUMENT. **AND THE TWO-HEAD SHAPE IN THE ISSUE's OWN TABLE WAS REJECTED BY **THE OWNING HEADS' OWN `where T: class`** (stdlib §4.2 / §4.13), **NOT** BY THE DISPOSAL RULE — **WHICH IS WHY THE ISSUE's TABLE UNDERSTATED IT** | THE **CALL SITE** IS `src/sema/TypeResolution_Checks.cpp`'s RECORD/ENUM-AGAINST-A-DISPOSAL-BOUND GUARD, WHICH CALLS `src/sema/TypeRef.hpp`'s `primitiveNeverConformsToBuiltinIface` — **WHICH NAMES **ONLY** `IDisposable` AND `IAsyncDisposable`** — **AND THAT CALL SITE IS **~190 LINES AWAY IN THE **SAME FILE** AS THE CHAIN TABLE THE #7424 LANE JUST FIXED: **THE SAME TWO-HEAD NARROWING, IN **ONE** FILE, IN **TWO** PLACES** |
 
 **=> BOTH ARE **PRE-EXISTING** (IDENTICAL ON THE BASE ARM) AND **BOTH ARE THE **SAME
 MECHANICAL DERIVATION** #7424's RESIDUAL NAMES. **=> THE COORDINATOR DISPATCHED A **CAMPAIGN-1
