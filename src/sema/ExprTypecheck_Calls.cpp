@@ -29197,6 +29197,38 @@ static bool isDocumentedBuiltinCollectionMember(std::string_view head,
     return false;
 }
 
+// fix #7446 (§26.5 rule 1, v0.345): does the receiver's DECLARED surface —
+// counting its INHERITED members — declare an instance member of this name?
+//
+// Spec §26.5 rule 1 (v0.345, docs/Bezel_Language_Spec.md:5714): "If `x`'s
+// declared type (or any base type) *declares* any instance member named
+// `Foo` — of any arity, applicability, or accessibility — instance
+// resolution is committed and extension blocks are **never consulted** for
+// that name on that receiver."
+//
+// THE HOLE. The eight built-in collection INTERFACE heads carry no user
+// TypeSymbol (their TypeRef is a Named ref with a null `declaration`), so
+// the ordinary `lookupMember` walk over a TypeSymbol's base chain cannot
+// answer the question for them — and the name they INHERIT is two levels
+// up: stdlib §4.1 declares `pure readonly property Count: int` on
+// `IReadOnlyCollection<out T>`, and `IList<T>` inherits it through
+// `IReadOnlyList<T>`. The stdlib's own authority for that surface is
+// `isDocumentedBuiltinCollectionMember` (stdlib §4.1 / §4.2 / §4.12 /
+// §4.13), which counts the inherited members — the same convention the
+// stdlib's own "Block-by-name" row states ("extension resolution commits to
+// instance members by name, inherited ones included").
+//
+// The concrete collection heads (Array, Stack, Queue, Set, ...) are NOT
+// here: their `Count`/`Capacity` are typed by resolveMemberAccess's own
+// per-family arm, which returns before any extension block is consulted,
+// so they never reach the lookup this predicate guards.
+static bool builtinCollectionSurfaceDeclaresMember(const TypeRef* recvTy,
+                                                   std::string_view member) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return false;
+    return isDocumentedBuiltinCollectionMember(recvTy->headName(), member);
+}
+
 // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the SHAPE of a
 // documented builtin-collection member.
 //
@@ -35601,8 +35633,56 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // `extension int`). Consulted last — after every builtin/intrinsic
         // member above — so a real builtin member always wins (no shadow).
         // The receiver's compile-time type is `ma.target`'s exprType.
+        //
+        // fix #7446 (§26.5 rule 1, v0.345): the built-in member above wins
+        // only for a member the receiver's DECLARED surface actually
+        // DECLARES — and the surface of a built-in collection INTERFACE head
+        // includes the members it INHERITS (stdlib §4.1: `IList<T>` inherits
+        // `Count` from `IReadOnlyCollection<T>`). Before this gate the
+        // extension blocks were consulted for such an INHERITED name, and
+        // the call was TYPED by the extension's own signature — so a program
+        // stored the built-in's `int` in a `string`-typed local:
+        //
+        //   extension IList<int> public method Count(): string => "USER"; end;
+        //   var c: IList<int> := a;
+        //   var s: string := c.Count();   // COMPILED, and printed 3
+        //
+        // §26.5 rule 1 commits instance resolution by NAME (the stdlib's own
+        // "Block-by-name" row: "extension resolution commits to instance
+        // members by name, inherited ones included"), so the extension is
+        // unreachable for that name on that receiver — for TYPING as well as
+        // for dispatch.
         if (ma.target) {
             if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
+                if (builtinCollectionSurfaceDeclaresMember(recvTy, ma.member)) {
+                    // The committed instance member's OWN type is the
+                    // built-in's. `Count` is `pure readonly property Count:
+                    // int` (stdlib §4.1), and the CALL spelling `c.Count()`
+                    // is §5's `method Count(): int` over `IEnumerable<T>` —
+                    // the same `int` the concrete collections' `Count`
+                    // gives (stdlib §4.4). Typing it here is what makes the
+                    // two spellings of the call AGREE: the `int` spelling is
+                    // admitted and the `string` spelling is refused by §5.1,
+                    // where before the fix the `string` spelling was admitted
+                    // (with the built-in's `int` in a `string`-typed local)
+                    // and the `int` spelling was refused.
+                    //
+                    // The BARE spelling `c.Count` is the §4.1 PROPERTY read,
+                    // and the compiler does not model a property read on a
+                    // declaration-less interface head: the read is left
+                    // untyped and the reference degrades (#3079 / #7090's
+                    // family — a method reference to an `IList<T>` member).
+                    // Typing that here would change a shape #7090 owns, so
+                    // the typing is confined to the CALL spelling.
+                    if (ma.member == "Count" && &ma == calleeOfCallCtx_) {
+                        ctx_.setExprType(
+                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                        return;
+                    }
+                    // Any other committed member: the extension blocks are
+                    // not consulted, and the member's own typing (where the
+                    // compiler has one) stands as it is.
+                } else {
                 // §26.5 (#714): pass outBinding to capture the free-var
                 // binding when a generic extension matched via ancestor lookup.
                 std::vector<std::pair<std::string, sema::TypeRef*>> binding;
@@ -35621,6 +35701,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprExtBinding(&ma, std::move(binding));
                     resolveExtensionMember(ma, ext);
                     return;
+                }
                 }
             }
         }
@@ -38231,9 +38312,20 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             // arity-mismatched call (`obj?.M()` against `M(x: int)`) gets
             // the arity-specific diagnostic from the lookup, not the
             // bare-reference "no member" reject downstream.
-            member = lookupExtensionMember(
-                recvTy, nm.member, nullptr, nm.span.begin,
-                /*reportAmbiguity=*/true, currentCallArity_);
+            //
+            // fix #7446 (§26.5 rule 1, v0.345): the `?.` twin of the `.`
+            // form's gate. §26.5 rule 1 commits instance resolution by
+            // NAME for a member the receiver's declared type — or any base
+            // type — declares, and the extension blocks are then NEVER
+            // consulted for that name on that receiver. `IList<T>` INHERITS
+            // `Count` from `IReadOnlyCollection<T>` (stdlib §4.1), so a
+            // same-named extension over an `IList<T>` receiver is unreachable
+            // here too.
+            if (!builtinCollectionSurfaceDeclaresMember(recvTy, nm.member)) {
+                member = lookupExtensionMember(
+                    recvTy, nm.member, nullptr, nm.span.begin,
+                    /*reportAmbiguity=*/true, currentCallArity_);
+            }
         }
         // §7.5 / #751: a string/primitive built-in member (e.g. `Length`) has
         // no Symbol — resolveMemberAccess types these via a large inlined
