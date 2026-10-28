@@ -833,7 +833,7 @@ WORD), AND EACH WITH A MINIMAL REPRO AND A §-CITATION IN ITS BODY:**
 |---|---|---|---|
 | **#7419** | **A REORDERED NAMED CALL ON `Debug.Assert` IS REFUSED BY THE **POSITIONAL** SHARED RESOLVER, AND THE DIAGNOSTIC NAMES THE **WRONG** PARAMETER** — a LANE-INTRODUCED false rejection of a legal §22.5 program | §22.5, §8.2, §22.6 (v0.345) | the B4a lane's reviewer |
 | **#7420** | **`StringBuilder.AppendLine`'s VALUE TYPE IS NOT CHECKED AGAINST stdlib §3.1's DECLARED SURFACE** — `AppendLine(5)`, `AppendLine('c')` and `AppendLine(true)` all compile and append | §22.6, §5.1, stdlib §3.1 (v0.345) | the B4a lane's reviewer |
-| **#7421** | **THE §9.6 ARGUMENT-TYPE FAMILY AT `Trim` / `Equals` / `IsNullOrWhiteSpace` — TWO OF THEM **ABORT THE COMPILER** AND `Trim(null)` IS A **SILENT ACCEPTANCE** THAT PRINTS `abc`** | §9.6, §7.3, §22.6 (v0.345) | the B4a lane's reviewer |
+| **#7421** | **THE §9.6 ARGUMENT-TYPE FAMILY AT `Trim` / `Equals` / `IsNullOrWhiteSpace` — THREE OF THEM **ABORT THE COMPILER** (`s.Trim(5)`, `s.Equals(5)`, `string.IsNullOrWhiteSpace(5)`) AND `s.Trim(null)` IS A **SILENT ACCEPTANCE** THAT PRINTS `abc`** | §9.6, §7.3, §22.6 (v0.345) | the B4a lane's reviewer |
 | **#7425** | **THE WIDTH-2 `string` SURFACE **WRITES OUT OF BOUNDS** — AN ASAN HEAP-BUFFER-OVERFLOW **WRITE** — AND THE DEFECT REACHES **BEYOND `Remove`**, SO A **LENGTH-ONLY ORACLE MISSES IT** | §4.6 (v0.345) | the B4a lane's reviewer |
 | **#7446** | **SEMA CONSULTS A USER's EXTENSION FOR A MEMBER THE RECEIVER **INHERITS**, AND TYPES THE CALL BY IT — SO THE PROGRAM STORES THE BUILT-IN's `int` IN A `string`-TYPED LOCAL** (the two spellings disagree: the `string` one is admitted and yields an `int`, the `int` one is refused). **SOUNDNESS.** | §26.5 rule 1, §5.1 (v0.345); stdlib §4.1, "Block-by-name" (v0.345) | the L1 lane's reviewer |
 | **#7447** | **A USER EXTENSION NAMED `Length` OVER `Array<T>` IS **REFUSED** — *"no member `Length` on `Array<T>`: use `Count`"* — THOUGH `Array<T>` DECLARES NO `Length` AND §26.5 RULE 2 REQUIRES THE EXTENSION BLOCKS TO BE CONSULTED** | §26.5 rule 2 (v0.345); stdlib §4.4, "Count vs Length" (v0.345) | the L1 lane's reviewer |
@@ -1350,8 +1350,11 @@ discriminator lane).**
   ASSIGNABILITY CHECK AGAINST THE DECLARED PARAMETER TYPE, IN SEMA, AT THE CALL**, and it must
   refuse all four. **#7167 IS `narrow` BECAUSE THE FAMILY THAT STAYS OPEN IS NAMED IN THE BODY.**
 * **#7244 (narrowed) — `AppendFormat`'s FORMAT AND ARGUMENTS WERE RENDERED IN THE **BYTE** DOMAIN
-  INSTEAD OF THE **CODE-POINT** DOMAIN.** spec §4.6 (v0.345): *"A string's DATA is not its TEXT …
-  the width is an implementation detail of the STORAGE and never of the TEXT."* stdlib §3.1
+  INSTEAD OF THE **CODE-POINT** DOMAIN.** spec §4.6 (v0.345, `docs/Bezel_Language_Spec.md:593`)
+  makes the per-string width invisible at the language level (*"The choice of width is invisible at
+  the language level; programs observe only the `char` sequence and its length"*), and the same
+  section fixes the code-point model (*"The user-visible model is 'a sequence of code points indexed
+  in O(1)'"*, `docs/Bezel_Language_Spec.md:593`). stdlib §3.1
   (v0.345) declares `AppendFormat(format: string, args: Array<Object>): StringBuilder` and says
   *"each hole optionally carrying a format spec after a colon"*. **MEASURED ON THE BASE:**
   `AppendFormat("x{0}y", <"日">)` gave Length 4 and the text `x` + U+00E5 + U+0065 + `y`;
@@ -1389,22 +1392,26 @@ discriminator lane).**
   SPELLING (`Math.Sign<string>("x")` ABORTS; `Math.Sign<int>(true)` COMPILES AND PRINTS `-1`)
   **BYPASSES THE CHECK ENTIRELY**. **THE TWO SUBJECTS ARE NOW `narrow #7227 narrow #7218`, WITH
   BOTH RESIDUAL FAMILIES NAMED IN THE BODY.**
-* **THE THREE `narrow`s ON THE FOLD COMMIT NAME THEIR OWN FAMILIES:** #7232's OTHER HALF IS **NOT**
+* **THE FOUR `narrow`s ON THE FOLD COMMIT NAME THEIR OWN FAMILIES:** #7232's OTHER HALF IS **NOT**
   THIS GATE's — **A §7.4-NARROWED NULLABLE IS LEGAL AT A `double` PARAMETER, SO IT MUST COMPILE AND
   RUN, AND THE `Math` / `Convert` LOWERING LOADS THE WHOLE NULLABLE BOX INSTEAD OF EXTRACTING THE
   PAYLOAD** (that is `src/codegen`, another lane's file); #7297 face (b) is **THE SAME** NARROWED
   CASE; #6647's `Math.Abs(decimal?)` half is **THE SAME NARROWED CASE AT A `decimal` PAYLOAD**, so
   the `double` REMEDY DOES NOT GENERALISE TO IT.
-* **THE `narrow #7232` FIX-FORWARD (`b19567b1`) REACHED THE **NAMED** SPELLING:** `(255).ToString(radix
-  := null)` IS NOW REFUSED BY THE §7 GATE, LIKE THE POSITIONAL SPELLING #7296's ROW ALREADY PINNED
-  FOR THE `int` HEAD.
+* **THE **NAMED** SPELLING OF THE §7 GATE CAME FROM **`0afb1c46`** (`narrow #7286: … and the §7 gate
+  now owns the named spelling`), **NOT** FROM THE `narrow #7232` FIX-FORWARD (`b19567b1`, WHICH
+  TOUCHES ONLY `src/sema/ExprTypecheck_Calls.cpp` AND ITS OWN `math_convert_nullability_7232_7418`
+  ROWS):** `(255).ToString(radix := null)` IS REFUSED BY THE §7 GATE, **LIKE THE POSITIONAL SPELLING
+  #7296's ROW ALREADY PINNED FOR THE `int` HEAD** — **AND #7296's ROW PINS **BOTH** SPELLINGS.**
+  `0afb1c46` IS AN **ANCESTOR** OF `b19567b1`.
 
 **Lane `r36-c2-b4a` (the `string` / `StringBuilder` / `Debug` HEADS — the campaign's FOURTH instance
 lane).**
 
 * **SHAs (picked onto staging):** `ebe6182c` **fix #6635**, `4900aed9` **fix #6636**, `7a811ab9` **fix
   #6826**, `6b6b0ff4` **fix #6780**, `54952bef` **fix #7173**, `a01f4547` **fix #7207**. **SIX
-  CLOSURES.**
+  COMMITS, BUT **ONLY FIVE** ARE **NEW** CLOSURES — #7207 IS A **RE-CLAIM** (IT WAS **ALREADY
+  CLOSED IN `origin/main`** BY `fa4c09fe`); SEE THE BULLET BELOW.**
 * **THE LANE WAS TOLD TO REBASE ONTO THE ANCHOR **AND** B3a** (it owns the same two `src/` files),
   **TO RE-DERIVE THE `constexpr std::array<BuiltinParamRow, N>` ROW COUNT FROM THE REBASED FILE**
   (**THE COUNTS ARE **NOT** ADDITIVE**), AND TO RE-BASE ITS OWN FAIL-WITHOUT.
@@ -1478,8 +1485,9 @@ lane).**
     **THIS IS **EXACTLY** THE MECHANISM THE SAME LANE CITED AS REASON 1 FOR **DECLINING** TO ROUTE
     `StringBuilder` THROUGH THE SHARED RESOLVER — **APPLIED TO A DIFFERENT HEAD IN THE SAME LANE.**
     **ON THE BASE THAT CALL **ABORTED THE COMPILER**, SO THE TIP IS NOT A REGRESSION FROM A WORKING
-    PROGRAM; IT TRADES A CRASH FOR A FALSE REJECTION. **THE FIX LANE IS DISPATCHED (see the
-    coordinator's block below).**
+    PROGRAM; IT TRADES A CRASH FOR A FALSE REJECTION. **THE FIX LANE IS DISPATCHED: THE BRANCH IS
+    `r36-c2-b4a-ff`, IT IS UNDER REVIEW, AND IT CARRIES #7420's FIX (`3ea0c84a` **fix #7420**) AND
+    #7419's `narrow` (`42aa408c` **narrow #7419**).**
   * **FINDING 2 LEAVES PART OF #7207's OWN SUBJECT OPEN** — *`StringBuilder.AppendLine`'s **VALUE
     TYPE** IS STILL UNCHECKED.* **stdlib §3.1 DECLARES **ONE** VALUE TYPE
     (`AppendLine(value: string)`) AND **NO** PER-TYPE OVERLOADS (UNLIKE `Append`, WHICH HAS SEVEN),
