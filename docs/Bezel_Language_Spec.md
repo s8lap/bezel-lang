@@ -1,12 +1,15 @@
 # Bezel Language Specification
 
-**Version 0.348 — October 2026**
+**Version 0.349 — October 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
 This document is the normative reference for the language. It defines syntax, type system, ownership rules, and the semantics of every construct. The specification is partitioned into a Core level and a set of Extended features; Appendix D defines the levels and what a conformance claim at each means. It is intentionally dense — written to be precise rather than introductory — and is best read alongside its companion documents: the design rationale, which explains *why* each decision was made and records the alternatives considered; the standard library, which catalogs the types and methods the language ships with; and the revision changelog, which carries the per-revision narrative history.
 
 If this is your first encounter with Bezel, the rationale's opening section is a gentler starting point: it sketches the goals of the language and the shape of its memory model before the spec's formal definitions begin. If you want concrete code first, the short companion guides (memory and ownership; errors and nullability; modeling data) work from worked examples. Once you know what you are looking for, this document is the place to look it up.
+
+<a id="sec-example-convention"></a>
+**Examples.** Examples may omit the declarations around them. A block may begin without the module declaration that [§2.1](#sec-module-declarations) requires; a method, constructor, property or field shown at the outer level is a member of an enclosing class; and statements shown at the outer level are the body of a method. Bezel itself has no top-level methods, fields or statements ([A.2](#sec-source-file); rationale [§2.2](Bezel_Design_Rationale.md#sec-no-top-level-functions-or-fields)): the omission is a convention of this document, not a form of the language.
 
 <a id="sec-contents"></a>
 ## Contents
@@ -217,8 +220,10 @@ The head's shape is decided from tokens alone, **before any lookup**, per the ta
 enum Color
   Red, Green;
 end Color;
+
 class Lamp
   public property Color: Color := Color.Red;          // chain head: the type `Color` wins; no warning, the member's type is `Color`
+
   public method IsRed(): bool => Color = Color.Red;   // a bare `Color` is the property; `Color.Red` is the constant
 end Lamp;
 ```
@@ -229,8 +234,10 @@ end Lamp;
 class Data
   public static method Version(): int => 1;
 end Data;
+
 class Report
   private Data: string := "abc";
+
   public method Text(): string => Data;              // a bare value read: the field outranks the type
   public method Size(): int => this.Data.Length;     // qualified with `this.`: the field
   public method Ver(): int => Data.Version();        // chain head: the type `Data`; the warning row warns of the field
@@ -245,7 +252,9 @@ end Report;
 ```bezel
 class Outer
   private _count: int := 0;
+
   private static method Limit(): int => 10;
+
   public class Inner
     public method Max(): int => Limit();               // allowed: a static member of the enclosing type
     public method CountOf(o: Outer): int => o._count;  // allowed: reached through an instance (§11.6)
@@ -258,6 +267,7 @@ end Outer;
 ```bezel
 class Counter
   private _count: int := 0;
+
   public class View
     public method Count(): int => _count;   // error (§2.7): an enclosing instance member; this body has no instance of `Counter`
   end View;
@@ -554,11 +564,14 @@ Common rules, normative for every derived type property:
 ```bezel
 class Node
 end Node;
+
 record Key(Id: int, Name: string);     // auto-hashable: every component is admissible
 record Ref(Id: int, Target: Node);     // not auto-hashable: a class-typed component (computed, rule 1)
+
 class Tally<T>
   public static method Same(a: T, b: T): bool => a.Equals(b);  // a use of `T`'s equality, read at each instantiation
 end Tally;
+
 var k: Tally<Key>? := null;     // allowed
 var r: Tally<Ref>? := null;     // error (rule 2): `Tally<Ref>` is rejected where it is named, `Same` called or not
 ```
@@ -1431,17 +1444,21 @@ Two boundaries. **Constructor bodies are not receiver positions**: a record cons
 class Log
   public property Count: int;
 end Log;
+
 record Meter
   public property Reading: int;
   public readonly property Sink: Log;
+
   public constructor(sink: Log)
     Reading := 0;                                    // allowed: a constructor body is not a receiver position
     Sink := sink;
   end constructor;
+
   public method Bump() => Reading := Reading + 1;   // error (§9.4): the store lands in the receiver's own storage
   public method Note() => Sink.Count += 1;          // allowed: the store lands beyond a class-typed hop
   public method Bumped(): Meter => this with(Reading := Reading + 1);  // the record update idiom
 end Meter;
+
 using var log := new Log();
 var m := new Meter(log);
 m.Reading := 5;                                      // allowed: an external store through the binding `m`
@@ -1458,9 +1475,11 @@ record Snap(N: int)
     Console.WriteLine($"{N}");        // prints 1: `this` is the value the receiver denoted at the call
   end Show;
 end Snap;
+
 class Shelf
   public Item: Snap := new Snap(1);
 end Shelf;
+
 using var s := new Shelf();
 s.Item.Show(s);
 Console.WriteLine($"{s.Item.N}");     // prints 99
@@ -1543,17 +1562,23 @@ A borrow-bearing record **holds borrows** ([§3.6](#sec-derived-type-properties)
 *Example.* A borrow-bearing record beside one that is not:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 record Pair(Item: Item?);                   // borrow-bearing: a class-typed component
 record Label(Text: string);                 // not borrow-bearing: `string` is runtime-managed
+
 class Holder
   private owned _item: Item := new Item("own");
   private _label: Label := new Label("x");  // admitted: a `Label` carries no borrow
   private _pair: Pair := new Pair(null);    // admitted: the null-source form carries none either
+
   public method View(): Pair => new Pair(_item);            // admitted: receiver-sourced (return form 1)
   public static method Wrap(i: Item): Pair => new Pair(i);  // error (return bullet): a plain parameter's borrow
   public method Keep(i: Item) => _pair := new Pair(i);      // error (instance-field bullet)
 end Holder;
+
 using var i := new Item("i");
 var p := new Pair(i);                       // admitted: a local within its source's life
 var q := new Pair(new Item("t"));           // error (no-temporary-source bullet)
@@ -2529,10 +2554,13 @@ A type-bound constraint — naming a class or interface — implies non-null T. 
 enum Level
   Low := 1, High := 2;
 end Level;
+
 class Holder<T> where T: value
 end Holder;
+
 class Fresh<T> where T: new()
 end Fresh;
+
 var a: Holder<int>? := null;      // allowed
 var b: Holder<int?>? := null;     // error (§14.2): a nullable value type does not satisfy `value`
 var c: Fresh<int?>? := null;      // allowed: a nullable value type is defaultable; there `new T()` is `null`
@@ -2550,10 +2578,13 @@ A constraint combination that admits no type — `class, value`; `value` with `I
 ```bezel
 class Animal
 end Animal;
+
 class Dog: Animal
 end Dog;
+
 class Rel<T, U> where T: U
 end Rel;
+
 var a: Rel<Dog, Animal>? := null;    // allowed: a class derived from the class substitution for `U`
 var b: Rel<int, long>? := null;      // error (§14.2): numeric widening does not satisfy the bound
 var c: Rel<int, Object>? := null;    // error (§14.2): nor does boxing
@@ -2569,9 +2600,11 @@ var c: Rel<int, Object>? := null;    // error (§14.2): nor does boxing
 ```bezel
 class Maker<T> where T: new()
 end Maker;
+
 class Good<W> where W: new()
   private _m: Maker<W>? := null;    // allowed: `W`'s own constraint guarantees `new()`
 end Good;
+
 class Bad<W>
   private _m: Maker<W>? := null;    // error (§14.2): decided here by `W`'s constraints, and `W` has none
 end Bad;
@@ -2679,7 +2712,9 @@ A user-defined generic type that needs to own its elements composes over `Owning
 public class OwningCache<T> where T: class
   private owned _items: OwningArray<T>;
 
-  public constructor() _items := new OwningArray<T>(); end;
+  public constructor()
+    _items := new OwningArray<T>();
+  end;
 
   public method Add(owned item: T)
     _items.Add(move item);
@@ -3019,9 +3054,14 @@ The move-only value type kinds in this specification are two: the owning inline 
 ```bezel
 class Res(name: string)
   public property Name: string => name;
-  destructor Console.WriteLine($"disposed {name}"); end destructor;
+
+  destructor
+    Console.WriteLine($"disposed {name}");
+  end destructor;
 end Res;
+
 public static method Take(arr: [2 owned]Res?) => Console.WriteLine("taken");
+
 var a: [2 owned]Res? := [new Res("x"), null];
 var b := a;                            // moves: a copy is impossible, so no marker is written
 Console.WriteLine(a[0]!.Name);         // error: `a` is moved-from
@@ -4438,7 +4478,9 @@ For async iteration, see `await for` ([§30.7](#sec-asynchronous-programming-asy
 ```bezel
 scan: for var row in rows do
   for var cell in row do
-    if cell.Bad then break scan; end;
+    if cell.Bad then
+      break scan;
+    end;
   end;
 end scan;
 ```
@@ -4605,6 +4647,7 @@ public static method Bump(ref x: int?)
     x := x + 1;                 // error (§22.3): a `ref` parameter is never flow-narrowed
   end;
 end Bump;
+
 public static method Inc(ref x: int?)
   var c := x;
   if c <> null then
@@ -4618,13 +4661,16 @@ end Inc;
 ```bezel
 public static method Fill(out n: int, fail: bool)
   n := 42;
-  if fail then throw new InvalidOperationException("fail"); end;
+  if fail then
+    throw new InvalidOperationException("fail");
+  end;
 end Fill;
+
 var n := 1;
 try
   Fill(out n, true);
 catch
-  InvalidOperationException => Console.WriteLine($"{n}")   // prints 1: an exception exit copies nothing out
+  InvalidOperationException => Console.WriteLine($"{n}")    // prints 1: an exception exit copies nothing out
 end try;
 Fill(out n, false);
 Console.WriteLine($"{n}");                                  // prints 42: copied out on normal return
@@ -4646,6 +4692,7 @@ A `ref` or `out` argument must be an **assignable storage location** — the [§
 ```bezel
 public static method Twice(ref x: long) => x := x * 2;
 public static method Clear(ref x: int?) => x := null;
+
 var i := 3;
 Twice(ref i);                 // error (§22.3): `int` is not exactly `long`; no widening at a `ref` argument
 var m: int? := 3;
@@ -4659,12 +4706,18 @@ end;
 ```bezel
 class Gauge
   private _v: int := 1;
+
   public property Value: int
     get => _v;
-    set => do Console.WriteLine($"set {value}"); _v := value; end;
+    set => do
+      Console.WriteLine($"set {value}");
+      _v := value;
+    end;
   end Value;
 end Gauge;
+
 public static method Twice(ref x: int) => x := x * 2;
+
 using var g := new Gauge();
 Twice(ref g.Value);           // getter once, then the setter once on normal return: prints "set 2"
 ```
@@ -5335,7 +5388,9 @@ public static class AppConfig                    // LoadConfigAsync(): Task<Conf
   end Preload;
 
   public static async method GetConfig(): Task<Config>   // pattern (b)'s accessor
-    if _cfg = null then _cfg := LoadConfigAsync(); end;
+    if _cfg = null then
+      _cfg := LoadConfigAsync();
+    end;
     return await _cfg!;
   end GetConfig;
 end AppConfig;
@@ -5355,7 +5410,9 @@ There is deliberately **no** synchronous-access, async-initialized, plain class-
 ```bezel
 private static _cfg: Task<Config>? := null;
 public static async method GetConfig(): Task<Config>
-  if _cfg = null then _cfg := LoadConfigAsync(); end;
+  if _cfg = null then
+    _cfg := LoadConfigAsync();
+  end;
   return await _cfg!;
 end GetConfig;
 ```
@@ -5454,7 +5511,9 @@ Prohibited, as the closed list's contrapositive: any store whose target root is 
 ```bezel
 class Stats
   private _calls: int := 0;
+
   public static method Log(s: string) => Console.WriteLine(s);
+
   public pure method Sum(xs: Array<int>): int
     var total := 0;                     // frame-local mutation is admitted
     for var x in xs do
@@ -5462,10 +5521,12 @@ class Stats
     end;
     return total;
   end Sum;
+
   public pure method Calls(): int
     _calls += 1;                        // error (§22.15): a store to an instance field
     return _calls;
   end Calls;
+
   public pure method Apply(f: (int) -> int): int => f(1);   // error (§22.15): invoking a function-typed value
   public pure method Shout(s: string) => Log(s);            // error (§22.15): a call to a member not declared pure
 end Stats;
@@ -5515,6 +5576,7 @@ class Shape
   public pure virtual method Area(): double => 0.0;
   public virtual method Name(): string => "shape";
 end Shape;
+
 class Square: Shape
   public override method Area(): double => 4.0;            // error (§22.15 rule 1): purity is never dropped
   public pure override method Name(): string => "square";  // allowed (rule 2): purity may be strengthened
@@ -5629,6 +5691,7 @@ Every contract clause occupies exactly one **tier**, determined statically per c
 public static method Half(n: int): int
   requires(n > 0)
   => n / 2;
+
 var k := 6;
 Console.WriteLine($"{Half(k)}");      // checked at run time, in every build mode
 Console.WriteLine($"{Half(-4)}");     // error (§22.16): the substituted clause folds to `false`
@@ -5640,6 +5703,7 @@ Console.WriteLine($"{Half(-4)}");     // error (§22.16): the substituted clause
 public static method Quarter(n: int): int
   static requires(n > 0)
   => n / 4;
+
 Console.WriteLine($"{Quarter(8)}");     // discharged
 ```
 
@@ -5649,6 +5713,7 @@ Console.WriteLine($"{Quarter(8)}");     // discharged
 public static method Quarter(n: int): int
   static requires(n > 0)
   => n / 4;
+
 var k := 8;
 Console.WriteLine($"{Quarter(k)}");   // error (§22.16): `k` is not a constant expression, so the clause cannot be discharged
 ```
@@ -5673,6 +5738,7 @@ abstract class Scaler
   public abstract method Scale(f: int): int
     requires(f > 0);
 end Scaler;
+
 class Doubler: Scaler
   public override method Scale(f: int): int
     requires(f < 100)          // error (§22.16 rule 3): an override declares no `requires`
@@ -5751,7 +5817,9 @@ An expression-bodied property's (or indexer's) body is checked against the decla
 public property Balance: decimal
   get => _balance;
   set => do
-    if value < 0m then throw new ArgumentException("Balance cannot be negative"); end;
+    if value < 0m then
+      throw new ArgumentException("Balance cannot be negative");
+    end;
     _balance := value;
   end;
 end Balance;
@@ -5788,7 +5856,9 @@ public property [row: int, col: int]: double => _grid[row * _width + col];
 public property [key: string]: int
   get => _values[key];
   set => do
-    if value < 0 then throw new ArgumentException("must be non-negative"); end;
+    if value < 0 then
+      throw new ArgumentException("must be non-negative");
+    end;
     _values[key] := value;
   end;
 end;
@@ -6071,7 +6141,9 @@ end;
 
 extension Array<T>
   public method First(): T
-    if this.Count = 0 then throw new InvalidOperationException("empty array"); end;
+    if this.Count = 0 then
+      throw new InvalidOperationException("empty array");
+    end;
     return this[0];
   end First;
 end;
@@ -6229,8 +6301,12 @@ Inside a value-returning block-bodied lambda, `return` is required on every exit
 
 ```bezel
 var classify := lambda(score: int): string? => do
-  if score < 0 then return null; end;
-  if score >= 90 then return "A"; end;
+  if score < 0 then
+    return null;
+  end;
+  if score >= 90 then
+    return "A";
+  end;
   return "pass";
 end;
 ```
@@ -6622,14 +6698,16 @@ The `owned` keyword ([§28.5](#sec-owned-fields), [§28.8](#sec-ownership-transf
 
 Every rule of this chapter and of [§30.5](#sec-result-lifetime-and-task-disposal) is one of: a kernel principle below, a derivation from them, or a recorded axiom (register at the end of this subsection; reasons in the rationale). Derivation and axiom tags — *derives: K…* / *axiom A…* — mark the classification at each rule. A future revision that adds an ownership rule states which kind it is.
 
-**Examples.** Each clause below closes with a short example. The examples illustrate the clauses and add no rule; they share one class, whose destructor reports the instance it disposes. A comment names the clause a line exercises: `// error (…)` marks a line the cited rule rejects, and where a case is left to [K4.1](#sec-kernel-k4)'s backstop the comment gives its outcome in checked disposal mode ([§28.2](#sec-checked-disposal)).
+**Examples.** Each clause below closes with a short example. The examples illustrate the clauses and add no rule, and follow the document's [example convention](#sec-example-convention); they share one class, whose destructor reports the instance it disposes. A comment names the clause a line exercises: `// error (…)` marks a line the cited rule rejects, and where a case is left to [K4.1](#sec-kernel-k4)'s backstop the comment gives its outcome in checked disposal mode ([§28.2](#sec-checked-disposal)).
 
 ```bezel
 class Widget
   public readonly property Name: string;
+
   public constructor(name: string)
     Name := name;
   end constructor;
+
   destructor
     Console.WriteLine($"disposed {Name}");
   end destructor;
@@ -6684,6 +6762,7 @@ The taxonomy defines what a source *is* and how it bounds a borrow; which source
 ```bezel
 class Shelf
   private owned _top: Widget := new Widget("top");
+
   public method Top(): Widget => _top;          // allowed (K2.4): a receiver-sourced borrow
   public method Pick(w: Widget): Widget => w;   // error (K2.4): a plain return announces the receiver, not `w`
 end Shelf;
@@ -6725,6 +6804,7 @@ Console.WriteLine(keep.Name);
 ```bezel
 class Box
   private owned _w: Widget? := null;
+
   public method Put(owned w: Widget) => _w := w;  // K3.1: the owned field announces the store; no marker
 end Box;
 
@@ -6777,7 +6857,9 @@ The [consume table](#sec-consume-table) records the verdicts these bits decide, 
 var flag := new Random().NextBoolean();
 var a := new Widget("a");
 var b := a;                         // a live local borrow of the value `a` holds
-if flag then a.Dispose(); end;      // allowed (K4.2, K5.3): a site-announced kill is not frozen
+if flag then
+  a.Dispose();                      // allowed (K4.2, K5.3): a site-announced kill is not frozen
+end;
 Console.WriteLine(b.Name);          // flag true: DisposedAccessException in checked mode (K4.1)
 var c := new Widget("c");
 var d := c;
@@ -6790,6 +6872,7 @@ Console.WriteLine(d.Name);          // error (§28.2): the disposal of `c` prece
 ```bezel
 class Tag
   private _owner: Widget;           // a plain field: it holds a borrow
+
   public constructor(owner: Widget)
     _owner := owner;                // allowed (K4.3): the field-held trust clause; the report mode names this store
   end constructor;
@@ -6839,7 +6922,9 @@ Console.WriteLine(show());
 ```bezel
 class Shelf
   private owned _w: Widget := new Widget("first");
+
   public method Replace() => _w := new Widget("second");  // allowed (K5.6): a field store is not frozen
+
   public method Show()
     var b := _w;                   // a local borrow of the field's value
     Replace();                     // disposes "first" under `b`
@@ -6863,7 +6948,9 @@ end Shelf;
 public static method Names(w: Widget): IEnumerable<string>
   yield return w.Name;
 end Names;
+
 public static method Forward(w: Widget): IEnumerable<string> => Names(w);  // allowed (K6.2): every caller re-establishes `w`
+
 public static method Local(): IEnumerable<string>
   using var w := new Widget("local");
   return Names(w);               // error (K6.2): the returned frame carries the `using var` `w`
@@ -6906,6 +6993,7 @@ var e := (if flag then c else null);              // borrowed: the null arm abso
 ```bezel
 class Shelf
   private owned _top: Widget := new Widget("top");
+
   public method Top(): Widget => _top;
 end Shelf;
 
@@ -6928,8 +7016,9 @@ var t := new Shelf().Top();                 // error (K8.4): `t` would borrow fr
 class Holder
   private owned _w: Widget := new Widget("first");
   private owned _spare: Widget? := new Widget("spare");
+
   public method Swap(): owned Widget => move _w with new Widget("second");  // K9.1: stores "second", yields "first" owned
-  public method Detach(): owned Widget? => move _spare;  // K9.1: at a nullable field, `move` alone stores null
+  public method Detach(): owned Widget? => move _spare;                     // K9.1: at a nullable field, `move` alone stores null
 end Holder;
 ```
 
@@ -6938,6 +7027,7 @@ end Holder;
 ```bezel
 class Keeper
   private owned _w: Widget := new Widget("kept");
+
   public method Take(): owned Widget => move _w;  // error (K9.2, K9.3): a bare take would leave a hole
 end Keeper;
 ```
@@ -7094,14 +7184,20 @@ Row 6's three *cannot arise* cells state a derived fact: every callee kind but t
 *Example.* What a caller receives, row by row, read off each callee's declared return type:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 class Shelf
   private owned _top: Item := new Item("top");
+
   public method Top(): Item => _top;                   // row 4, instance: a borrow, source the receiver
   public method Spare(): owned Item => new Item("s");  // row 1: owned
 end Shelf;
+
 public static method Either<T>(a: T, b: T): T => a;    // row 5: a borrow of the arguments' sources
 public static method Keep(owned i: Item) => i.Dispose();
+
 using var s := new Shelf();
 var t := s.Top();                      // borrowed, source `s`
 var o := s.Spare();                    // owned
@@ -7137,14 +7233,21 @@ Every admissible static signature is therefore **type-announced**: the caller re
 *Example.* The admissible static signatures, and two that the rule rejects at the declaration:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 class Registry
   private static owned readonly _default: Item := new Item("default");
+
   public static property Default: Item => _default;              // a static property getter lends static storage
+
   public static method Create(): owned Item => new Item("new");  // `owned`: the caller owns the result
+
   public static method Names(): IEnumerable<string>              // mint-announcing: each call is a fresh frame
     yield return "a";
   end Names;
+
   public static method First<T>(xs: Array<T>): T => xs[0];       // bare `T` with a source: a borrow of `xs`
   public static method Lookup(): Item => _default;               // error: a static call has no source; the property above lends
   public static method Make<T>(): T where T: new() => new T();   // error (note 2): an empty source set; spell `owned T`
@@ -7167,11 +7270,15 @@ end Registry;
 ```bezel
 class Feed
   private owned _lines: Array<string> := new Array<string>();
+
   public property Lines: IEnumerable<string> => _lines;  // admitted: a property read lends the stored collection
+
   public method Backing(): Array<string> => _lines;      // admitted: a concrete collection type lends (row 4)
+
   public method Numbers(): IEnumerable<int>              // admitted: an iterator mints a fresh frame per call
     yield return 1;
   end Numbers;
+
   public method Again(): IEnumerable<int> => Numbers();  // admitted: a forwarded minting call
   public method All(): IEnumerable<string> => _lines;    // error (clause 6): a borrow where the type announces a fresh frame
 end Feed;
@@ -7232,7 +7339,10 @@ So over `interface ISink<V> method Take(f: (V) -> ()); method Put(f: () -> V); e
 *Example.* A lambda at a concrete class-return slot lends; one that produces a value needs an `owned` slot:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 using var i := new Item("i");
 var get: () -> Item := lambda() => i;                       // admitted: a capture-sourced borrow
 var make: () -> owned Item := lambda() => new Item("m");    // admitted: an `owned` slot transfers
@@ -7254,11 +7364,16 @@ Three spelling errors follow, mirroring the call-site marker's rules: the marker
 *Example.* The marker is written where nothing else announces the transfer, and nowhere else:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 class Sink
   public owned Kept: Item? := null;
+
   public method Keep(owned i: Item) => Kept := i;    // an `owned` field store: no marker
 end Sink;
+
 using var s := new Sink();
 var a := new Item("a");
 s.Keep(move a);                                      // an `owned` argument: the marker is required
@@ -7270,7 +7385,10 @@ s.Kept := move d;                                    // error: an `owned` field 
 *Example.* An unmarked alias is a borrow, so the marker on it has nothing to transfer:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 using var owner := new Item("o");
 var b := owner;                      // the aliasing idiom: a borrow; `owner` keeps the value
 var c := move b;                     // error: `b` is a borrow; there is nothing to transfer
@@ -7359,13 +7477,19 @@ A borrowed value's lifetime is the lifetime of its *source* ([K2.1](#sec-kernel-
 *Example.* The field-store bullet: a plain parameter's borrow may be stored, a scope-bound source's may not:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 class Tag
   private _item: Item? := null;                  // a plain field: it holds a borrow
+
   public method Attach(i: Item) => _item := i;   // admitted (clause 2): a plain parameter, under clause 3's residual
+
   public method Adopt(owned i: Item)
     _item := i;                                  // error (clause 2): an `owned` parameter is scope-bound
   end Adopt;
+
   public method Local()
     using var i := new Item("local");
     _item := i;                                  // error (clause 1): a scope-bound local
@@ -7376,7 +7500,10 @@ end Tag;
 *Example.* The local-scope bullet, at a loop back edge:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 using var first := new Item("first");
 var prev := first;
 for var k in 0..<3 do
@@ -7389,21 +7516,29 @@ end;
 *Example.* The closure bullet: a closure that captures a borrow may be invoked or passed on, but not returned:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 public static method Twice(f: () -> string): string => f() + f();
 public static method Label(i: Item): () -> string => lambda() => i.Name;  // error (sink rule): a return slot announces no source set
+
 using var i := new Item("i");
-var label := lambda() => i.Name;         // a closure: its source set is {i}
+var label := lambda() => i.Name;            // a closure: its source set is {i}
 Console.WriteLine(label() + Twice(label));  // admitted: invoked, and passed to a call-bounded parameter
 ```
 
 *Example.* Only a capture-free closure may be stored:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 class Panel
   public Render: (() -> string)? := null;
 end Panel;
+
 using var panel := new Panel();
 using var i := new Item("i");
 panel.Render := lambda() => "fixed";     // admitted: a capture-free value may be stored
@@ -7430,15 +7565,21 @@ A borrow is *live* at a consume site when some path from the site reaches a late
 *Example.* Two consumes the freeze rejects: a borrow passed earlier in the same call, and a live frame local:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 public static method Both(a: Item, owned b: Item) => b.Dispose();
 public static method Take(owned xs: OwningArray<Item>) => xs.Dispose();
+
 var x := new Item("x");
 Both(x, move x);                               // error: the first argument still borrows `x`
 var xs := new OwningArray<Item>();
 var q := xs.Where(lambda(i) => i.Name <> "");  // a frame local: a live borrow of `xs`
 Take(move xs);                                 // error: `q` still has a later use
-for var i in q do Console.WriteLine(i.Name); end;
+for var i in q do
+  Console.WriteLine(i.Name);
+end;
 ```
 
 **Scope.** Fields and collection slots are **not** frozen ([K5.6](#sec-kernel-k5)): a borrow of `obj.f`'s or `coll[i]`'s current value is invalidated by an overwrite or mutation of the slot under the runtime-checked posture ([§28.7](#sec-reassigning-owned-fields), [§28.11](#sec-element-slot-policy)) — a use of a local borrow of an owned field's current value that a visible disposing write of the field dominates, with no invalidating operation between the borrow and the write, being [§28.7](#sec-reassigning-owned-fields)'s compile error (*Use after a dominating field write*), the write itself unfrozen. Four clauses:
@@ -7482,8 +7623,12 @@ A user who wants to perform additional cleanup on the exception path (logging th
 ```bezel
 class Res(name: string)
   public property Name: string => name;
-  destructor Console.WriteLine($"disposed {name}"); end destructor;
+
+  destructor
+    Console.WriteLine($"disposed {name}");
+  end destructor;
 end Res;
+
 var a := new Res("a");               // a plain `var`: its normal-exit drop draws the must-use warning
 using var b := new Res("b");
 try
@@ -7523,20 +7668,25 @@ For example, in `Folded(src).Sorted()` where `Folded(src): owned Array<T>` and `
 ```bezel
 class Res(name: string)
   public property Name: string => name;
-  destructor Console.WriteLine($"disposed {name}"); end destructor;
+
+  destructor
+    Console.WriteLine($"disposed {name}");
+  end destructor;
 end Res;
+
 public static method Make(n: string): owned Res => new Res(n);
 public static method Fail(): int => throw new InvalidOperationException("boom");
 public static method Both(a: Res, n: int) => Console.WriteLine(a.Name);
+
 Console.WriteLine(Make("t").Name + " read");          // "t" lends to `.Name`; disposed at the statement's end
 var len := (var r := Make("atom"); r.Name.Length);    // a binding atom: "atom" is disposed at the atom's end
 Console.WriteLine(len);
-case Make("c") of                                    // a scrutinee temporary lives to the end of the `case`
+case Make("c") of                                     // a scrutinee temporary lives to the end of the `case`
   var c when c.Name = "c" => Console.WriteLine("matched " + c.Name),
   _ => ()
 end case;
 try
-  Both(new Res("early"), Fail());                    // the unwind disposes "early": `Both` never began
+  Both(new Res("early"), Fail());                     // the unwind disposes "early": `Both` never began
 catch
   InvalidOperationException => Console.WriteLine("caught"),
 end try;
@@ -7555,19 +7705,27 @@ The rule is uniform across the source of the temporary: a user method declared `
 *Example.* A plain-parameter store takes a temporary under the residual; a deferred-activation frame takes one only when it is consumed within the expression:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 class Holder
   private _last: Item? := null;
+
   public property Current: Item? => _last;
+
   public method Hold(r: Item) => _last := r;              // stores a plain parameter (the field-store residual)
 end Holder;
+
 public static method Letters(r: Item): IEnumerable<string>  // its frame carries the borrow of `r`
   yield return r.Name;
 end Letters;
+
 using var h := new Holder();
 h.Hold(new Item("held"));                                // admitted: "held" is disposed at the statement's end
 Console.WriteLine(Letters(new Item("n")).Count());       // admitted: the frame is consumed within the expression
-for var s in Letters(new Item("f")) do end;              // error: the loop binds the frame past the temporary
+for var s in Letters(new Item("f")) do                   // error: the loop binds the frame past the temporary
+end;
 Console.WriteLine(h.Current!.Name);                      // DisposedAccessException in checked mode (K4.1)
 ```
 
@@ -7613,21 +7771,21 @@ Doctrine (non-normative): reach for **`using var`** when the value lives and die
 A class may declare at most one destructor. Its body runs exactly once, the first time `Dispose()` is called.
 
 ```bezel
-class FileStream
+class NativeFile
   private _handle: IntPtr;
 
   public constructor(path: string)
     using var cpath := CString.From(path);
     _handle := NativeOpen(cpath);
+    if _handle = IntPtr.Zero then
+      throw new IOException($"cannot open {path}");
+    end;
   end constructor;
 
   destructor
-    if _handle <> IntPtr.Zero then
-      NativeClose(_handle);
-      _handle := IntPtr.Zero;
-    end;
+    NativeClose(_handle);       // runs exactly once: the generated Dispose() is idempotent
   end destructor;
-end FileStream;
+end NativeFile;
 ```
 
 The compiler generates a public, idempotent `Dispose()` that:
@@ -8302,20 +8460,26 @@ The caller side is correspondingly unrestricted: **any** closure — capture-bea
 *Example.* A `scoped` constructor parameter stores a capture-bearing callback, bounded by a `using var` holder:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 class Button
   private scoped _onClick: () -> ();
+
   public constructor(scoped onClick: () -> ())
     _onClick := onClick;                    // the callee stores a `scoped` callback in the bounding object
   end constructor;
+
   public method Replace(f: () -> ()) => _onClick := f;   // error: a plain parameter is call-bounded, never stored
-  public method Click() => _onClick();     // only the declaring type's own bodies invoke it
+  public method Click() => _onClick();                   // only the declaring type's own bodies invoke it
 end Button;
+
 using var log := new Item("log");
 using var b := new Button(lambda() => Console.WriteLine("clicked " + log.Name));  // admitted: `log` is declared before `b`
 b.Click();
 var c := new Button(lambda() => Console.WriteLine(log.Name));   // error: the bounding object `c` is no `using var`
-log.Dispose();                              // error (K5.7): `log` is frozen while `b` is in scope
+log.Dispose();                                                  // error (K5.7): `log` is frozen while `b` is in scope
 ```
 
 **The stdlib retention register.** Standard-library callees state their retention in their signatures — `scoped` where they store — and the per-position roster is the standard library's, not this section's: stdlib §6.5's subscribe positions and stdlib §6.10's `Spawn` declare `scoped`; the shared-event subscribe positions admit **capture-free** handlers only (stated at stdlib §6.5, keyed on the resolved callee; a user implementation of `ISharedEvent<T>` gains no retention right); the lazy query operators' retention is frame residence below, a consequence of their deferred-activation signatures (stdlib §5); the spawn positions of [§30.14](#sec-multiple-domains) (stdlib §6.12) sit under §30's capture and sendability rules; and [§30.11](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)'s task-completion-source admission is axiom [A10](#sec-axiom-register)'s carve (*Relation to §30.11* below).
@@ -8338,14 +8502,20 @@ log.Dispose();                              // error (K5.7): `log` is frozen whi
 *Example.* The class-typed form: a source declared before the holder is admitted, a fresh producer is not:
 
 ```bezel
-class Item(name: string) public property Name: string => name; end Item;
+class Item(name: string)
+  public property Name: string => name;
+end Item;
+
 class Reader
   private _src: Item;                       // a plain field holding the borrow
+
   public constructor(scoped src: Item)
     _src := src;                            // a static bound: no trust clause is recorded
   end constructor;
+
   public method Read(): string => _src.Name;
 end Reader;
+
 using var file := new Item("file");
 using var r := new Reader(scoped file);     // admitted: `file` is declared before `r`
 Console.WriteLine(r.Read());
@@ -8667,11 +8837,17 @@ A **lazy query** — a value produced by a deferred LINQ operator ([stdlib §5](
 ```bezel
 var xs: Array<int> := [5, 12, 30];
 using var big := xs.Where(lambda(x) => x > 10);
-Console.WriteLine(big.Count());                    // spends `big`'s enumeration right
-for var x in big do Console.WriteLine(x); end;     // error (§29.11): `big` was already enumerated
+Console.WriteLine(big.Count());                              // spends `big`'s enumeration right
+for var x in big do                                          // error (§29.11): `big` was already enumerated
+  Console.WriteLine(x);
+end;
 using var kept := xs.Where(lambda(x) => x > 10).ToArray();   // materialize first
-for var x in kept do Console.WriteLine(x); end;    // an owned Array<int>: enumerated any number of times
-for var x in kept do Console.WriteLine(x); end;
+for var x in kept do                                         // an owned Array<int>: enumerated any number of times
+  Console.WriteLine(x);
+end;
+for var x in kept do
+  Console.WriteLine(x);
+end;
 ```
 
 **Consumption points (normative list).** A *bound* lazy query's enumeration right is spent by exactly these uses:
@@ -8687,15 +8863,21 @@ Inside a callee, a plain `IEnumerable<T>` parameter is **statically untracked** 
 ```bezel
 public static method Total(xs: IEnumerable<int>): int
   var sum := 0;
-  for var x in xs do sum += x; end;
+  for var x in xs do
+    sum += x;
+  end;
   return sum;
 end Total;
+
 public static method Twice(xs: IEnumerable<int>): int => Total(xs) + Total(xs);   // untracked here
+
 var xs: Array<int> := [5, 12, 30];
 var q := xs.Where(lambda(x) => x > 0);       // spent below: no must-use warning
 var q2 := q.Select(lambda(x) => x * 2);      // point 2: spends `q`; the right moves into `q2`
 Console.WriteLine(Total(q2));                // point 3: spends `q2`; the frame stays the caller's
-for var x in q do Console.WriteLine(x); end; // error (§29.11): `q` was spent by `Select`
+for var x in q do                            // error (§29.11): `q` was spent by `Select`
+  Console.WriteLine(x);
+end;
 var idle := xs.Where(lambda(x) => x < 0);    // never spent: K3.14's must-use warning at its auto-drop
 Console.WriteLine(Twice(xs));                // a collection: re-iterable
 Console.WriteLine(Twice(xs.Where(lambda(x) => x > 1)));   // InvalidOperationException at the second enumeration
@@ -8714,13 +8896,16 @@ The remedies are stdlib §5's own, and **materializing is not among them ([#2557
 ```bezel
 class Probe
   public readonly property Id: int;
+
   public constructor(id: int)
     Id := id;
   end constructor;
+
   destructor
     Console.WriteLine($"disposed {Id}");
   end destructor;
 end Probe;
+
 public static method Mint(n: int): IEnumerable<Probe>
   var i := 0;
   while i < n do
@@ -8728,12 +8913,15 @@ public static method Mint(n: int): IEnumerable<Probe>
     i++;
   end;
 end Mint;
+
 using var nine := new Probe(9);
 var kept: Array<Probe> := [nine];
 using var probes := Mint(3);
 var p := probes.First();          // warns (§29.11): `First` disposes the element before it returns
 var k := kept.First();            // silent: a concrete collection root
-for var q in Mint(3) do Console.WriteLine(q.Id); end;   // the remedy: use each element in the borrowing body
+for var q in Mint(3) do           // the remedy: use each element in the borrowing body
+  Console.WriteLine(q.Id);
+end;
 ```
 
 **Two pass-through nodes.** At a class or interface element type the trace does **not** stop at a **materializer result** — `ToArray()`/`ToSet()`/`ToDictionary(…)` — nor at an **`IGrouping<TKey, T>`** bound as the iteration variable of a `for` whose source expression is a `GroupBy(…)` call whose own receiver the trace resolves. Both build a new **container** and no new **owner**: their element slots hold borrows of the enumerated elements ([§28.11](#sec-element-slot-policy)'s borrow-slot row; stdlib [§5](Bezel_Standard_Library.md#sec-system-collections-linq)'s materialization note and its `GroupBy` paragraph, where the grouping's buffer holds borrows of *the source's own* elements and is filled by exhausting the source). The container's own ownership therefore says nothing about the elements', and the trace follows the elements past the node to the receiver's root. **They are pass-through nodes, never roots: the verdict is always the root's** — a materializer or a grouping over a concrete-collection root stays silent, and the presence of either in the chain is never itself evidence of anything. At a value, `string`, or runtime-managed element type both remain **stops**, no borrow being produced. The propagation is keyed on the `GroupBy` operator, not on the iteration variable's type: an enumerable-typed loop variable that is itself an *element* of a traced sequence carries no provenance from that sequence, its own elements having a different owner.
@@ -8770,7 +8958,9 @@ The standard pattern for removing during iteration:
 ```bezel
 var toRemove := new Array<Transaction>();
 for var t in transactions do
-  if t.IsExpired then toRemove.Add(t); end;
+  if t.IsExpired then
+    toRemove.Add(t);
+  end;
 end;
 for var t in toRemove do
   _ := transactions.Remove(t);   // `Remove` returns `bool` — discard it (§21.9)
@@ -8830,10 +9020,12 @@ public static async method HeadAsync(s: ReadOnlySpan<int>): Task<int>   // error
   await Task.Delay(1);
   return s[0];
 end HeadAsync;
+
 public static async method HeadAsync(xs: Array<int>, offset: int): Task<int>   // allowed: a heap-owned window
   await Task.Delay(1);
   return xs[offset];
 end HeadAsync;
+
 public static async method PauseAsync(token: CancellationToken): Task   // allowed: the one certified exception
   await Task.Delay(1, token);
 end PauseAsync;
@@ -8848,6 +9040,7 @@ public static async method ParseAsync(text: string, out n: int): Task   // error
   n := text.Length;
   await Task.Delay(1);
 end ParseAsync;
+
 public static method Parse(text: string, out n: int): Task   // allowed: no `async`, so no frame
   n := text.Length;
   return Task.Delay(1);
@@ -8864,6 +9057,7 @@ public static async method FirstAsync(xs: Array<int>): Task<int>
   await Task.Delay(1);            // error (§30.1): `s` is live across this `await`
   return s[0];
 end FirstAsync;
+
 public static async method LocalFirstAsync(): Task<int>
   using var arr := new Array<int>();
   arr.Add(7);
@@ -8880,9 +9074,11 @@ end LocalFirstAsync;
 ```bezel
 class Conn
   public readonly property Name: string;
+
   public constructor(name: string)
     Name := name;
   end constructor;
+
   destructor
     Console.WriteLine($"closed {Name}");
   end destructor;
@@ -8897,6 +9093,7 @@ public static async method SendAsync(owned conn: Conn): Task
   await Task.Delay(1);
   Console.WriteLine($"sent on {c.Name}");
 end SendAsync;
+
 var a := new Conn("a");
 using var t := SendAsync(move a);     // `a` transfers into the frame at the call
 Console.WriteLine("called");
@@ -8913,6 +9110,7 @@ public static async method ShowAsync(c: Conn): Task
   await Task.Delay(1);
   Console.WriteLine(c.Name);          // `c` is held in the frame until the task settles
 end ShowAsync;
+
 using var c := new Conn("b");
 await ShowAsync(c);                   // the dominant shape: settled before `c`'s scope ends
 Task.FireAndForget(ShowAsync(c));     // compiles: `c`'s scope ends before this task settles, which breaks
@@ -8927,11 +9125,13 @@ An async method's `return expression;` completes the task with the value at the 
 ```bezel
 class Pool
   private owned _spare: Conn := new Conn("spare");
+
   public async method OpenAsync(): Task<Conn>
     await Task.Delay(1);
     return new Conn("fresh");          // a consuming position (K3.2): an owned value
   end OpenAsync;
-  public async method SpareAsync(): Task<Conn> => _spare;   // error (§30.1): a borrow is no result here
+
+  public async method SpareAsync(): Task<Conn> => _spare;              // error (§30.1): a borrow is no result here
   public async method AgainAsync(): Task<Conn> => await OpenAsync();   // a `return await` chain (§30.5)
 end Pool;
 ```
@@ -9711,21 +9911,27 @@ Sendability of a generic instantiation is checked at the instantiation or call s
 
 ```bezel
 import System.Threading;
+
 sealed class Note
   public property Text: string := "";
 end Note;
+
 sealed class Job                        // sendable: `sealed` (rule 1); an `int` and an `owned` sendable class (rule 2)
   public property Id: int;
   private owned _note: Note := new Note();
 end Job;
+
 class OpenJob                           // open: neither `sealed` nor `closed`
   public property Id: int;
 end OpenJob;
+
 sealed class Linked
   private _next: Job? := null;          // a non-`owned` class field: a back-reference
 end Linked;
+
 record Handler(Run: () -> ());          // a function type inside a record
 record Point(X: int, Y: int);
+
 using var a := new Channel<Job>();      // a sendable class crosses as an owned transfer
 using var b := new Channel<Point>();    // a sendable record crosses as a copy
 using var c := new Channel<OpenJob>();  // error (§30.14 rule 1): an open class is not sendable
@@ -9763,15 +9969,19 @@ The compiler enforces at the call site:
 
 ```bezel
 import System.Threading;
+
 sealed class Counter
   public property N: int;
 end Counter;
+
 public static method Bump(owned c: Counter): int
   using var k := move c;
   k.N += 1;
   return k.N;
 end Bump;
+
 public static method Peek(c: Counter): int => c.N;
+
 var c := new Counter();
 using var j := Domain.Spawn(Bump, move c);       // `c` crosses by `move` and is moved-from here
 var limit := 3;
@@ -9790,10 +10000,12 @@ using var z := Domain.Spawn(Peek, e);            // error (§30.14): a class cro
 
 ```bezel
 import System.Threading;
+
 public static async method TickAsync(): Task<int>
   await Task.Delay(1);
   return 7;
 end TickAsync;
+
 using var k := Domain.Spawn(TickAsync);   // `() -> Task<int>`: the new domain awaits the entry's task
 Console.WriteLine(await k);               // the join is an ordinary `Task<int>` here: prints 7
 ```

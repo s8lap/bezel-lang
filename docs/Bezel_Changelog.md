@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.348 — October 2026**
+**Companion to the Bezel Language Specification, v0.349 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15489,5 +15489,38 @@ The composition step resolved these seams:
 **Doc corpus.** No corpus file is committed (the #1380 rule). The cases that need the manifest note `wrap:mixed`, plus two expectation notes, are recorded for the next regeneration on [#4505](https://github.com/s8lap/bezel-lang/issues/4505). The §29.11 terminal-accessor warning stays tracked on [#3047](https://github.com/s8lap/bezel-lang/issues/3047), as lint B.
 
 **Migration:** doc-only.
+
+---
+
+### v0.349 changelog (v0.348 → v0.349)
+
+**Editorial: the example convention is stated, and the v0.347–v0.348 examples are laid out like the rest of the code.** On 2026-10-28 the owner reviewed the new examples: "Some are ok, but it helps to have `end Name;` on their own lines, have an empty line between declarations and methods etc. Perhaps something close to C#-style formatting will do?" Class: **editorial** (spec-change process §2). No rule, verdict, grammar or diagnostic changes, no existing anchor moves (one, `sec-example-convention`, is added), and no token of any example changes. No document other than the spec changes, apart from the version headers and the code-generation reference's pins.
+
+**The problem.**
+- **An unstated convention.** Since v0.347, examples leave out their enclosing declarations. A method shown at the outer level is a member of a class, and statements shown at the outer level are a method body. Almost every example also omits the module declaration that §2.1 requires. The spec never said so. Bezel has no top-level methods or statements, so a reader could take such a block for a program.
+- **Crowded layout.** Many of the new blocks put a whole class on one line (`class Item(name: string) public property Name: string => name; end Item;`). Others ran declarations, members and statements together with no blank line between them, or wrote a one-line `if`, loop or destructor body that Guide 7 §2 writes in block form.
+
+**The changes.**
+- **The convention, in the front matter.** A new paragraph, *Examples*, says that examples may omit the declarations around them: a block may begin without the module declaration §2.1 requires, a method, constructor, property or field shown at the outer level is a member of an enclosing class, and statements shown at the outer level are the body of a method. It cites Appendix A.2 and rationale §2.2 for the fact that the language has no such top-level forms. §28.3.1's *Examples* paragraph now points to it. Neither the code-generation reference nor Guide 7 contradicts it.
+- **A formatting pass over 61 of the 66 blocks that v0.347 and v0.348 added, and nine older blocks.** The layout follows Guide 7 (§2 *Layout*, §4, the §6 worked example), and C# conventions where the guide is silent:
+  - a block's `end Name;` goes on its own line, aligned with its opener, and no class is written on one line;
+  - a blank line separates top-level declarations, and separates declarations from the statements after them;
+  - inside a type, a blank line separates multi-line members, separates the fields from what follows, and separates the properties from the methods; a run of one-line members of one kind stays together;
+  - each run of trailing comments keeps one column (Guide 7 §3);
+  - `if`, `for`, a destructor body and a multi-statement `do` go in block form, one statement per line.
+
+  Only whitespace and line breaks change. Five one-line loops and one one-line `if` had a trailing comment after `end;`; that comment now sits on the line it annotates, with its wording unchanged. The blocks grow from 632 to 821 lines. The five unchanged new blocks are plain statement runs that were already laid out this way.
+- **§28.4's destructor example, rewritten.** The `FileStream` example reset `_handle := IntPtr.Zero` after closing it and guarded the close with `if _handle <> IntPtr.Zero`. Both are habits from other languages' disposal patterns. The destructor body runs exactly once (the generated `Dispose()` is idempotent), so the reset is a dead store, and it contradicts the section's own "no manual `_disposed` flag". The guard only covers an open that returns no handle without failing. The class is now `NativeFile`, so it no longer shares its name with the standard library's `FileStream`. Its constructor throws `IOException` when the open returns `IntPtr.Zero`, and its destructor just closes. Because the throw comes before anything is acquired, the example also shows §28.4's next rule: a construction that fails runs no destructor and leaks nothing. Measured on r35 with libc `fopen`/`fclose` behind `NativeOpen`/`NativeClose`: one `close` per instance across an explicit `Dispose()` and scope end, and none after a failed open.
+- **Older examples.** A survey of all 300 older blocks flagged 22. Nine are changed. §14.4's `OwningCache<T>` had its constructor written on one line. Eight blocks had a one-line `if` statement, which Guide 7 §2 writes in block form: §21.5, §22.13 (two), §23.3, §23.4, §26.5.1, §27.3 and §29.12. The other 13 are left as they are. They are one-line loops, `case` and `catch` arms in short statement blocks (`for var c in "hello" do Console.WriteLine(c); end;`), a grouped listing, or a false positive. The older blocks grow from 96 to 116 lines.
+
+**How the pass was checked.**
+- **Token identity.** For every changed block, the token stream is identical before and after. The comments are identical in text and order.
+- **The doc-example extractor** gives the same 802 cases, with identical classes, expectations and notes, before and after. 75 case files change: the 70 blocks, and the kernel cases that chain §28.3.1's `Widget` block.
+- **The r35 release compiler** (`bezelc 0.0.0-f6863e62`, `--checked-disposal`) compiled each of the 75 cases under both `classify_wrap` and `wrap_mixed`, and the annotated committed cases under their notes as well. Before and after, it gives the same verdict and the same diagnostics, apart from line numbers. Every program prints the same output. The K4 example draws `Random`, so its output varies from run to run; both of its outcomes appear before and after.
+- **The doc corpus.** The block count is unchanged, so every case id stays where it was. Seven of the older blocks changed are committed cases: `spec_0062`, `spec_0130`, `spec_0158`, `spec_0159`, `spec_0166`, `spec_0168` and `spec_0185`. Three of them carry hand annotations: `spec_0159` (`preamble; env:LoadConfigAsync`), `spec_0166` (`wrap:mixed; env:_balance`) and `spec_0168` (`env:_grid,_items,_values,_width`). With the annotations applied, r35 gives the same result before and after. At the next regeneration each block matches by whitespace-normalized content, or by the same-section similarity fallback.
+
+**Migration.** None: doc-only.
+
+**Checks.** `scripts/check_docs.sh` is clean. EXTRACT finds 553 fragments, the same count as v0.348. `scripts/check_proposals.sh`, `build_book.py --check` and `corpus.py lint --strict` are clean.
 
 ---
