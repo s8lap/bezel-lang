@@ -3,7 +3,7 @@
 docs/proposals/papers/defect-campaign-2026-09.md, list the issue numbers it names and their state today."""
 import json, re, sys, os, collections
 here=os.path.dirname(os.path.abspath(__file__))
-repo=os.path.abspath(os.path.join(here,'../../..'))
+repo=os.path.abspath(os.path.join(here,'../../../../..'))
 doc=open(os.path.join(repo,'docs/proposals/papers/defect-campaign-2026-09.md')).read()
 state={}
 for name in ('issues-open.jsonl','issues-closed.jsonl'):
