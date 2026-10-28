@@ -1303,6 +1303,206 @@ static bool isClassOwnTypeEquals(const TypeSymbol* t, const MethodSymbol* ms,
     return true;
 }
 
+namespace {
+
+// §28.12 / §14.2 rule 3 / §9.7 (v0.345): the BUILT-IN interfaces that extend
+// `IDisposable` — directly or transitively — and so may not be listed by a
+// record, an enum or a choice (§8.7, §9.7, §28.12).
+//
+// Every one of them is a NULL-DECLARATION built-in (no user TypeSymbol —
+// `Resolver::builtinTypeArity`, TypeResolution_Names.cpp: the `IDisposable` /
+// `IAsyncDisposable` / `IFormattable` family and the §4 collection family
+// have none), so the compiler holds NO extension chain for them anywhere:
+// there is no table in `src/common/BuiltinRegistry.*` (or elsewhere) that
+// records `IAsyncDisposable : IDisposable`. The chain is therefore stated
+// HERE, once, per its normative sources:
+//
+//   stdlib §2.18 — "public interface IAsyncDisposable: IDisposable"
+//   stdlib §4.12 — "public interface IEnumerator<out T>: IDisposable" and
+//                  "public interface IAsyncEnumerator<out T>: IAsyncDisposable"
+//   stdlib §4.13 — the four owning iteration interfaces:
+//                  `IOwningEnumerable<T>: IDisposable`,
+//                  `IOwningEnumerator<T>: IDisposable`,
+//                  `IOwningAsyncEnumerable<T>: IAsyncDisposable`,
+//                  `IOwningAsyncEnumerator<T>: IAsyncDisposable`
+//
+// The USER side of the chain is not a table at all: a user interface's own
+// extension clause is carried on its symbol (`TypeSymbol::baseTypes` for a
+// user base, `TypeSymbol::nonSymbolBaseRefs` for a built-in base), and
+// `declaresBuiltinInterface` is the ONE place the question "does this type
+// declare built-in interface `name`?" is answered (Symbol.hpp).
+struct DisposalHeadParent {
+    std::string_view head;
+    std::string_view parent;   // empty for `IDisposable` itself
+};
+
+constexpr std::array<DisposalHeadParent, 8> kDisposalHeadParents = {{
+    {"IDisposable", ""},
+    {"IAsyncDisposable", "IDisposable"},
+    {"IEnumerator", "IDisposable"},
+    {"IAsyncEnumerator", "IAsyncDisposable"},
+    {"IOwningEnumerable", "IDisposable"},
+    {"IOwningEnumerator", "IDisposable"},
+    {"IOwningAsyncEnumerable", "IAsyncDisposable"},
+    {"IOwningAsyncEnumerator", "IAsyncDisposable"},
+}};
+
+// Is `head` one of the built-in disposal interfaces? (the direct case)
+bool isBuiltinDisposalInterfaceHead(std::string_view head) {
+    for (const auto& d : kDisposalHeadParents)
+        if (d.head == head) return true;
+    return false;
+}
+
+// The interface the built-in disposal head `head` extends (empty for
+// `IDisposable` itself).
+std::string_view disposalHeadParent(std::string_view head) {
+    for (const auto& d : kDisposalHeadParents)
+        if (d.head == head) return d.parent;
+    return {};
+}
+
+// The LEAF name of a built-in base reference: the AST name's LAST part (the
+// qualified spelling `System.IDisposable` has "System" first, and
+// `TypeRef::headName` reads the FIRST part), falling back to the
+// alias-transparent head for a reference with no AST node (the imported
+// side).
+std::string_view baseLeafName(const TypeRef* b) {
+    if (!b) return {};
+    if (b->astNode && b->astNode->name && !b->astNode->name->parts.empty())
+        return b->astNode->name->parts.back();
+    return b->headName();
+}
+
+// §28.12 / §9.7 (v0.345): the nearest interface in `iface`'s extension
+// closure that is a disposal interface — the built-in `IDisposable` itself,
+// a built-in that extends it, or a user interface that does. Empty when the
+// closure reaches none.
+//
+// The walk is over the USER-base closure (`TypeSymbol::baseTypes`) and, at
+// each level, over the built-in bases the type declares
+// (`nonSymbolBaseRefs`) — so a user interface that extends
+// `IAsyncDisposable` (itself a built-in with no user TypeSymbol and no
+// recorded chain) is reached through the built-in head set above, and a user
+// interface that extends another user interface that extends
+// `IDisposable` is reached through the closure. Cycle-guarded: an
+// inheritance cycle is reported elsewhere but can survive error recovery
+// into this walk.
+std::string_view disposalInterfaceAncestor(const TypeSymbol* iface) {
+    if (!iface) return {};
+    std::vector<const TypeSymbol*> frontier{iface};
+    std::unordered_set<const TypeSymbol*> seen{iface};
+    for (std::size_t i = 0; i < frontier.size(); ++i) {
+        const TypeSymbol* cur = frontier[i];
+        if (!cur) continue;
+        for (const TypeRef* b : nonSymbolBaseRefsOf(cur)) {
+            std::string_view h = baseLeafName(b);
+            if (isBuiltinDisposalInterfaceHead(h)) return h;
+        }
+        for (const TypeSymbol* b : cur->baseTypes)
+            if (b && seen.insert(b).second) frontier.push_back(b);
+    }
+    return {};
+}
+
+// The disposal interface a record / enum / choice lists, and the base it
+// lists it through.
+struct DisposalListing {
+    std::string_view baseName;   // the listed base (empty when none)
+    std::string_view ancestor;   // the disposal interface it reaches
+};
+
+// §28.12 / §9.7 (v0.345): the disposal interface `td`'s base-type list
+// reaches — directly (a built-in disposal interface) or through an interface
+// extending it (a USER interface whose extension chain reaches one). The
+// rule is about the CHAIN, not about a name: `record R: IAsyncDisposable`
+// and `record R: MyDisp` (where `interface MyDisp: IDisposable`) are the
+// same violation, and a name-based test reaches neither.
+//
+// The base list is read from the AST (`ast::TypeDecl::baseTypes`), the same
+// list the pre-fix name-based check read, so the RECORD's own
+// `IDisposable` diagnostic is byte-identical to the one it always emitted.
+DisposalListing disposalListingOf(const ast::TypeDecl* td,
+                                  const SemaContext& ctx) {
+    DisposalListing out;
+    if (!td) return out;
+    for (const auto& bt : td->baseTypes) {
+        if (!bt || !bt->name || bt->name->parts.empty()) continue;
+        const std::string_view baseName = bt->name->parts.back();
+        const TypeRef* br = ctx.resolvedType(*bt);
+        // A base that RESOLVED to a user-declared type (an interface) is
+        // judged by its extension CHAIN; a base with no user declaration is
+        // one of the compiler-provided (built-in) interfaces, whose own head
+        // is the root of the chain.
+        const TypeSymbol* bs =
+            (br && br->kind == TypeRef::Kind::Named) ? br->declaration
+                                                      : nullptr;
+        std::string_view ancestor;
+        if (bs) {
+            ancestor = disposalInterfaceAncestor(bs);
+        } else if (isBuiltinDisposalInterfaceHead(baseName)) {
+            ancestor = baseName;
+        }
+        if (ancestor.empty()) continue;
+        out.baseName = baseName;
+        out.ancestor = ancestor;
+        return out;
+    }
+    return out;
+}
+
+// §28.12 / §8.7 / §9.7 (v0.345): the declaration-site rejection for a
+// record / enum / choice that lists a disposal interface.
+//
+// The chain the base sits on is named so the diagnostic says WHY: a base
+// that IS a disposal interface names the interface it extends; a base that
+// reaches one names the ancestor it reaches.
+void reportDisposalInterfaceListing(SemaContext& ctx, const TypeSymbol* t,
+                                     std::string_view kind,
+                                     const DisposalListing& listing,
+                                     std::string_view cite) {
+    const std::string_view baseName = listing.baseName;
+    const std::string_view ancestor = listing.ancestor;
+    if (baseName == "IDisposable") {
+        // The RECORD's direct-`IDisposable` wording is the one it has ALWAYS
+        // emitted — "record `R` may not implement `IDisposable` (§9.7)" —
+        // and it is pinned as a needle by
+        // tests/lit/sema/sema_record__implements_idisposable_diagnoses.bzl.
+        // It is written here with that source literal INTACT (not assembled
+        // from parts), so the needle cannot go stale: the literal in src/
+        // and the emitted text are the same string. (The enum and the choice
+        // have no such pre-existing wording — the declaration-site ban
+        // reaches them for the first time here — so they take the generic
+        // form.)
+        if (kind == "record") {
+            ctx.diagnostics().report(
+                Severity::Error, t->declLoc,
+                std::string("record `") + std::string(t->name) +
+                "` may not implement `IDisposable` (§9.7)");
+            return;
+        }
+        ctx.diagnostics().report(
+            Severity::Error, t->declLoc,
+            std::string(kind) + " `" + std::string(t->name) +
+            "` may not implement `IDisposable` (" + std::string(cite) + ")");
+        return;
+    }
+    // The interface the base extends: its own parent when the base IS a
+    // disposal interface, else the ancestor it reaches.
+    std::string_view parent =
+        (ancestor == baseName) ? disposalHeadParent(baseName) : ancestor;
+    std::string chain = std::string("`") + std::string(baseName) + "` extends `" +
+                        std::string(parent) + "`";
+    if (parent != "IDisposable") chain += ", which extends `IDisposable`";
+    ctx.diagnostics().report(
+        Severity::Error, t->declLoc,
+        std::string(kind) + " `" + std::string(t->name) +
+        "` may not implement `" + std::string(baseName) + "` — " + chain +
+        " (" + std::string(cite) + ")");
+}
+
+}  // namespace
+
 void Resolver::checkEnumRestrictions() {
     if (!ctx_.module()) return;
     // fix #3601 (§10.4 / §10.5 / §11.6, v0.286): the two module-children-only
@@ -1320,6 +1520,22 @@ void Resolver::checkEnumRestrictions() {
     // module-level enum's violation (this loop already covers depth 0).
     forEachTypeAndNested([&](TypeSymbol* t) {
         if (t->kind != ast::TypeDeclKind::Enum) return;
+        // §28.12 / §8.7 (v0.345): an enum may not implement `IDisposable` —
+        // directly, or through an interface extending it. §8.7: "Static
+        // classes, records, enums, choices, primitives, and inline arrays do
+        // not implement `IDisposable`"; §28.12: "only a class implements it —
+        // a record, enum or choice that lists it, or lists an interface
+        // extending it, is a compile error at the declaration". §10.5's
+        // "Inheritance from another type" ban is about a CLASS base; the
+        // interface list §10 states an enum may carry is not one, and the
+        // disposal interfaces are the ones it may not carry.
+        if (auto* etd = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
+            DisposalListing listing = disposalListingOf(etd, ctx_);
+            if (!listing.baseName.empty()) {
+                reportDisposalInterfaceListing(ctx_, t, "enum", listing,
+                                                "§8.7, §28.12");
+            }
+        }
         for (Symbol* m : t->members) {
             auto bad = [&](std::string_view what) {
                 ctx_.diagnostics().report(
@@ -1879,6 +2095,20 @@ void Resolver::checkChoiceRestrictions() {
     if (!ctx_.module()) return;
     forEachTypeAndNested([&](TypeSymbol* t) {
         if (t->kind != ast::TypeDeclKind::Choice) return;
+        // §28.12 / §8.7 / §35.8 (v0.345): a choice may not implement
+        // `IDisposable` — directly, or through an interface extending it.
+        // §35.8: "A choice may declare interface conformance (interfaces
+        // only, as for records — §9.6)"; and, in the same section, "`Dispose`
+        // stays off the surface everywhere: choices do not implement
+        // `IDisposable` (§8.7)". §28.12 names the choice in the same
+        // declaration-site ban as the record and the enum.
+        if (auto* ctd = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
+            DisposalListing listing = disposalListingOf(ctd, ctx_);
+            if (!listing.baseName.empty()) {
+                reportDisposalInterfaceListing(ctx_, t, "choice", listing,
+                                                "§8.7, §28.12");
+            }
+        }
         for (Symbol* m : t->members) {
             auto bad = [&](std::string_view what) {
                 ctx_.diagnostics().report(
@@ -2834,21 +3064,36 @@ void Resolver::checkRecordRestrictions() {
                     "` (§9.6); records may only implement interfaces");
             }
         }
-        // IDisposable implementation: name-based check on the AST
-        // base-type list (the built-in IDisposable has no user
-        // TypeSymbol to resolve against).
+        // §9.7 / §28.12 (v0.345): a record may not implement `IDisposable` —
+        // DIRECTLY, or through an interface extending it.
+        //
+        // §9.7: "Records cannot have destructors, `owned` fields, or implement
+        // `IDisposable` — directly or through an interface extending it,
+        // `IAsyncDisposable` among them."
+        // §28.12: "`IAsyncDisposable` extends `IDisposable`, so it conforms to
+        // `IDisposable` under §14.2's rule 3 … and only a class implements it —
+        // a record, enum or choice that lists it, or lists an interface
+        // extending it, is a compile error at the declaration, as no value
+        // kind implements `IDisposable`."
+        //
+        // fix #7354 / #7394 (shape 3): the rule is about the INTERFACE CHAIN,
+        // not about a NAME. The pre-fix check matched the spelled name
+        // `IDisposable` only, so `record R: IAsyncDisposable` COMPILED while
+        // `record R: IDisposable` was rejected — the asymmetry the issue
+        // names — and a record listing a USER-DEFINED interface that extends
+        // `IDisposable` (or `IAsyncDisposable`) compiled too. Adding
+        // `"IAsyncDisposable"` to the name test would have fixed the
+        // asymmetry and left the chain broken; the chain is what §28.12
+        // states, so the chain is what is implemented here.
+        //
         // SEAM-ACCESSOR: `t` is drawn from `ctx_.module()->children`
         // (checkRecordRestrictions's own loop) — never an imported type
         // (#3152).
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
-            for (const auto& bt : td->baseTypes) {
-                if (bt && bt->name && !bt->name->parts.empty() &&
-                    bt->name->parts.back() == "IDisposable") {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        std::string("record `") + std::string(t->name) +
-                        "` may not implement `IDisposable` (§9.7)");
-                }
+            DisposalListing listing = disposalListingOf(td, ctx_);
+            if (!listing.baseName.empty()) {
+                reportDisposalInterfaceListing(ctx_, t, "record", listing,
+                                                "§9.7, §28.12");
             }
         }
         // #1272 (§9): a record is a VALUE type stored inline, so a record that
