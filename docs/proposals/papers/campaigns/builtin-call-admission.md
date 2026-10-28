@@ -1659,6 +1659,87 @@ lane, and the L1-DISCRIMINATOR's SIBLING).**
   DIFFERENT FUNCTION (`Emitter::tryLowerBuiltinClassCall`). **THE VERDICT ITSELF HOLDS** (A
   DIFFERENT FUNCTION IS OUT OF SCOPE FOR THAT COMMIT); **ONLY THE FILE ATTRIBUTION WAS WRONG.**
 
+**Lane `r36-c2-b4a-ff` (the B4a FIX-FORWARD — the `AppendLine` VALUE TYPE, and the REORDERED NAMED
+CALL).**
+
+* **SHAs (picked onto staging):** `3ea0c84a` **fix #7420**, `42aa408c` **narrow #7419**. **ONE NEW
+  CLOSURE: #7420. #7419 STAYS OPEN.**
+* **THE TWO FIXES.** **#7420** — `StringBuilder.AppendLine`'s **VALUE TYPE** IS NOW CHECKED AGAINST
+  stdlib §3.1's DECLARED SURFACE, WHICH DECLARES **ONE** VALUE TYPE (`string`) AND **NO** PER-TYPE
+  OVERLOADS — **UNLIKE `Append`, WHICH HAS SEVEN**: `sb.AppendLine(5)`, `sb.AppendLine('c')` AND
+  `sb.AppendLine(true)` ARE NOW REFUSED, **NAMING THE `value` PARAMETER**. **THE `Append` HALF IS
+  UNTOUCHED — ALL SEVEN OVERLOADS ARE STILL ADMITTED (THE CONTROL ROW).** **#7419** — A REORDERED
+  NAMED CALL IS NOW REFUSED WITH THE **§22.5 RULE NAMED** (BOTH PARAMETERS NAMED) INSTEAD OF A §5.1
+  TYPE MISMATCH THAT BLAMED THE WRONG PARAMETER, **AND** THE `StringBuilder.Insert` INSTANCE — **THE
+  ONE THE BACKEND CAN LOWER** — NOW **COMPILES AND RUNS**, BINDING THE VALUE TO THE PARAMETER IT
+  **NAMES**.
+* **THE REVIEWER's VERDICT: **ACCEPT-W-NOTES** (`a8e4de8ac89e77957`).**
+* **THE REVIEWER's SIX FINDINGS — **FOUR ARE PROSE OR COSMETIC, AND **ONE IS **GATE-BLOCKING**:**
+  * **F1 — **THE COMMIT BODY's RATIONALE IS WRONG; ITS CODE IS RIGHT**.** THE BODY DESCRIBES
+    `Debug.Assert(message := "x")` AS "A LEGAL §8.2 CALL — `condition` TAKES ITS DEFAULT". **IT IS
+    **NOT** LEGAL: stdlib §8.2 DECLARES `Assert(condition: bool, message: string := "")` — **THE
+    DEFAULT IS ON `message`, AND `condition` HAS **NO** DEFAULT** — AND SPEC §22.5 SAYS *"**Every
+    parameter that declares no default must be bound**, positionally or by name; leaving one unbound
+    … makes the candidate **inapplicable** (§22.6)"*.** **=> THE COMPILER's REFUSAL OF THAT SPELLING
+    IS **CORRECT**, AND **NO FOLLOW-UP LANE IS TO BE DISPATCHED TO "FIX" IT.** **THE REVIEWER PROVED
+    IT AGAINST THE COMPILER's OWN **USER-METHOD** PATH: A USER METHOD
+    `Assert(condition: bool, message: string := "")` CALLED AS `h.Assert(message := "x")` IS REFUSED
+    WITH *"call to `Assert`: required parameter `condition` is not supplied (§22.5)"*.**
+  * **F2 — **A DIAGNOSTIC COSMETIC**: THE `Assert/1` ROW's `sig` BECAME
+    `Assert(condition: bool, message: string := "")` WHILE THE `Assert/2` ROW KEPT
+    `Assert(condition: bool, message: string)`, SO THE ARITY-0 DIAGNOSTIC NOW PRINTS THE **SAME**
+    §8.2 SIGNATURE **TWICE, SPELLED TWO WAYS**. **=> IT FOLLOWS AN ESTABLISHED TABLE CONVENTION (THE
+    `Math.Round` ROWS 689/690 BOTH CARRY A `:=`-BEARING `sig`), IT IS UNPINNED BY ANY TEST, AND IT
+    IS A FOLLOW-UP, NOT A RE-PICK.**
+  * **F3 — **TWO PROSE SLIPS IN THE `42aa408c` BODY**: IT SAYS THE BASE RENDERED "10" FOR
+    `(255).ToString(format := 16)` (**THE BASE RENDERS `ff`**), AND IT SAYS ADMITTING A REORDERED
+    `int.Parse` "WOULD LOWER `int.Parse(16, "255")`" (**THE LOWERED FORM IS `int.Parse("255", 16)`**).
+    **NEITHER CHANGES A DIAGNOSTIC OR A TEST.**
+  * **F4 — **"RESTORES THE BASE's COMPILER ABORT" IS IMPRECISE**: THE ABORT IS REAL AND CURRENT, BUT IT
+    REPRODUCES ON THE **PRE-#6780** TREE (`7a811ab9`), **NOT** ON THE LANE's BASE (`ad6911e9`, WHERE
+    `83dfd5f2`'s **fix #6780** PUT `Debug` IN THE TABLE AND THE CALL IS REFUSED WITH A §5.1
+    DIAGNOSTIC). **=> ADMITTING THE REORDERED CALLS IN SEMA ALONE **WOULD** RESTORE THE ABORT** — THE
+    `Debug` ARM READS `call.args[0]`/`call.args[1]` WITH NO `builtinCallBinding` CONSULTATION, AND THE
+    INTEGER `Parse` ARM READS POSITIONALLY. **=> THE REMEDY IS A **CODEGEN** CHANGE — MAKE THOSE ARMS
+    CONSUME `ctx_.builtinCallBinding(call)`, AS THE `StringBuilder`/`Insert` ARM ALREADY DOES — **AND
+    IT IS A SEPARATE LANE, NOT PART OF THIS PICK.**
+  * **F5 — **GATE-BLOCKING, AND IT IS **OURS**: THE PRE-EXISTING gtest ROW
+    `generic_method_same_name_tparam_4813.extension_method_spec_26_5` **FAILS ON THE BASE ARM, ON THE
+    LIVE TIP AND ON THE PICK ALIKE** (`--area codegen`: **21605 passed / 1 failed**). **THE ROOT CAUSE
+    IS `7992f795` (**fix #7173**) — **AN ANCESTOR OF THE LANE BASE AND **NOT** ON `origin/main`** — SO
+    **IT IS A REGRESSION INTRODUCED BY THIS BATCH**, NOT A PRE-EXISTING RED.
+    `checkBuiltinStringCallArgs` (`src/sema/ExprTypecheck_Calls.cpp`, AROUND LINE 21152) REJECTS AN
+    EXPLICIT TYPE-ARGUMENT LIST KEYED ON THE **RECEIVER's TYPE** (`string`) **WITHOUT CHECKING THAT
+    THE MEMBER IS A STDLIB §9.6 MEMBER**, SO IT REFUSES A USER EXTENSION METHOD `string.Tag<T>` THAT
+    **DOES** DECLARE A TYPE PARAMETER. **=> THE COORDINATOR RE-MEASURED IT AT THE TIP
+    (`0 passed, 1 failed, 21617 filtered, 21618 total`) AND FILED IT AS **#7454**; IT IS IN THE
+    DISPATCHED **EXTENSION-FAMILY** LANE's ROSTER.**
+  * **F6 — **A NEW DEFECT, PRE-EXISTING ON BOTH ARMS**: `new DateTime(day := 1, month := 2,
+    year := 2024)` **SILENTLY YIELDS `Y=6 M=8 D=17`** (THE POSITIONAL SPELLING CORRECTLY YIELDS
+    `Y=2024 M=2 D=1`) — **A REORDERED NAMED **CONSTRUCTOR** IS BOUND **POSITIONALLY**.** **=> THE
+    CONSTRUCTORS ARE OUTSIDE `builtinInstanceCallee`'s REACH (IT HANDLES ONLY `MemberAccessExpr` AND
+    `NullCondMemberExpr`), SO THE NAMED-ARGUMENT BINDING NEVER RUNS FOR THEM. **=> THE COORDINATOR
+    FILED IT AS **#7455**.**
+* **THE FAIL-WITHOUT IS **MECHANICAL**, ON **BOTH** ARMS, WITH THE **TEST BINARY** REBUILT:
+  `stringbuilder_appendline_value_type_7420` **5 passed / 4 failed** -> **9 / 0**;
+  `builtin_named_arg_binding_7419` **8 passed / 5 failed** -> **13 / 0**; `debug_static_surface_6780`
+  **9 passed / 1 failed** -> **10 / 0**; AND THE CONTROL ARM
+  `stringbuilder_append_value_builtin_6781` IS **7 passed / 0 failed** ON BOTH. **=> THE BASE ARMS
+  ARE `ad6911e9` (FOR `3ea0c84a`) AND **THE DIRECT PARENT OF `42aa408c`** — **NOT** AN OLDER BASE.**
+* **THE LANE MOVES **ZERO** GRID CELLS AND **ZERO** CORPUS VERDICTS ON THE LIVE TIP**: ALL **118**
+  CELLS ARE **BYTE-IDENTICAL** IN CLASS AND DETAIL, AND THE CORPUS IS THE SAME
+  `3693 cases: 3157 ok, 231 known-divergent, 296 unclassified, 0 REGRESSION, 9 UNBANKED` ON THE LIVE
+  TIP, ON THE PICK, **AND ON THE PICK WITH THE LANE's `src/` REMOVED** — **=> THE NINE UNBANKED ARE
+  **PRE-EXISTING** AND THE LANE CONTRIBUTES **ZERO** OF THEM.**
+* **THE FLIPPED ROWS — **THREE, AND EVERY ONE IS NAMED**: (i)
+  `sema_debug_static_surface_6780.assert_string_condition_rejected`'s **NEEDLE** ONLY (THE PROGRAM's
+  VERDICT DOES NOT CHANGE); (ii) `codegen_stringbuilder_append_value_builtin_6781`'s **SEVEN** ROWS'
+  **PROGRAM** HALF (`a.AppendLine(x)` -> `a.AppendLine(x.ToString())` — **THE OLD SPELLING PINNED AN
+  **ILLEGAL** ONE, AND THE `Append` HALF, WHICH #6781 IS ABOUT, IS **UNCHANGED**); AND (iii) **TWO
+  FALSE ACCEPTANCES THAT BECOME COMPILE ERRORS** (`(255).ToString(format := 16)` AND
+  `int.Parse(radix := "x", s := 5)`) PLUS **ONE FALSE REJECTION THAT BECOMES A CORRECTLY-LOWERED
+  CALL** (`sb.Insert(value := "X", index := 0)`). **NO TEST WAS WEAKENED.**
+
 ### Coordinator block — 2026-10-28 (the campaign's integrator steps)
 
 * **THE ANCHOR IS PICKED** (`2250daa52`) — *"fix #6825 #7284 #7290 #7293 #7294 #7295 #7299 #7300
