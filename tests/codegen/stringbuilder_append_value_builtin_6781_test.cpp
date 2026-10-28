@@ -6,9 +6,20 @@
 // DateOnly / TimeOnly / enum argument appended its raw integer (tick count, day
 // number, ms-of-day, ordinal) and a Guid / record argument produced malformed IR.
 //
-// Each row compares Append(x) / AppendLine(x) with Append(x.ToString()) /
-// AppendLine(x.ToString()) inside ONE program, so it does not depend on the text
-// the type renders (#6720 for TimeSpan).
+// Each row compares Append(x) / AppendLine(x.ToString()) with
+// Append(x.ToString()) / AppendLine(x.ToString()) inside ONE program, so it does
+// not depend on the text the type renders (#6720 for TimeSpan).
+//
+// fix #7420 (stdlib §3.1, v0.345): the `AppendLine` half of this program used
+// to pass the VALUE kind itself (`a.AppendLine(x)`). §3.1 declares EXACTLY
+// two `AppendLine` forms — `AppendLine(): StringBuilder` and
+// `AppendLine(value: string): StringBuilder` — so a value kind reaches no
+// declared `AppendLine` form (§22.6) and an `int` reaches a `string` parameter
+// only by an explicit conversion (§5.1). The `AppendLine` calls therefore take
+// the STRING path (`x.ToString()`), which §3.1 declares; the `Append` calls
+// keep the value kind, because §3.1 declares SEVEN `Append` overloads
+// (including `Append(value: Object)`). The `Append` half is what #6781 is
+// about, and it is unchanged.
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -23,7 +34,7 @@ std::string prog(const std::string& prelude, const std::string& init) {
            "  var i := 0; var ok := true; "
            "  while i < 50 do "
            "    var a := new StringBuilder(); "
-           "    a.Append(x); a.AppendLine(x); a.Append(x); "
+           "    a.Append(x); a.AppendLine(x.ToString()); a.Append(x); "
            "    var b := new StringBuilder(); "
            "    b.Append(x.ToString()); b.AppendLine(x.ToString()); b.Append(x.ToString()); "
            "    if a.ToString() <> b.ToString() then ok := false; end; "

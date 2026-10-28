@@ -650,9 +650,24 @@ constexpr std::array<BuiltinParamRow, 305> kBuiltinParams = {{
     // `args: Array<Object>`, and the kind vocabulary has no ARRAY bit, so
     // that one position is checked by the checker itself, keyed by the
     // member.
+    //
+    // fix #7420 (stdlib §3.1, v0.345): `AppendLine`'s VALUE position
+    // carries the declared KIND (`kBPTString`). §3.1 declares EXACTLY TWO
+    // `AppendLine` forms — `AppendLine(): StringBuilder` and
+    // `AppendLine(value: string): StringBuilder` — so there is ONE declared
+    // value type, and NO `AppendLine(value: Object)` and NO per-type
+    // overloads (unlike `Append`, which has seven). The position was
+    // kindless, so `sb.AppendLine(5)`, `sb.AppendLine('c')` and
+    // `sb.AppendLine(true)` reached no declared form and were ADMITTED
+    // (§22.6: a call with no applicable candidate is a compile error; §5.1:
+    // an `int` reaches a `string` parameter only by an explicit
+    // conversion). `Insert`'s VALUE position stays kindless for a different
+    // reason — §3.1 declares exactly one `Insert` form too, but #6807's own
+    // dedicated check already rejects a non-`string` value there, and two
+    // diagnostics for one argument would be noise.
     {"StringBuilder", "Append", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Append(value: string): StringBuilder"},
     {"StringBuilder", "AppendLine", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(): StringBuilder"},
-    {"StringBuilder", "AppendLine", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(value: string): StringBuilder"},
+    {"StringBuilder", "AppendLine", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(value: string): StringBuilder"},
     {"StringBuilder", "AppendFormat", 2, 2, 0x01, {"format", "args", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "AppendFormat(format: string, args: Array<Object>): StringBuilder"},
     {"StringBuilder", "Insert", 2, 2, 0x02, {"index", "value", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Insert(index: int, value: string): StringBuilder"},
     {"StringBuilder", "Remove", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {kBPTInt, kBPTInt, 0, 0, 0, 0, 0, 0}, "Remove(startIndex: int, length: int): StringBuilder"},
