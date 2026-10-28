@@ -23960,11 +23960,11 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
         "no matching overload of `" + callee + "` — " + sec + " declares " +
             decls + ", so " + param + " must be " +
             builtinParamTypePhrase(kind) +
-            // fix #7443 (stdlib §5.1, v0.345): the §-RULE the argument
-            // misses is named here, and not only §22.6's "no candidates
-            // cited" — a §-only assertion is vacuous for this family,
-            // because every refusal of it says §22.6. The clause is
-            // APPENDED (the pinned rows match a prefix or a middle
+            // fix #7443 / #7421 (spec §5.1 *Implicit conversions*, v0.350):
+            // the §-RULE the argument misses is named here, and not only
+            // §22.6's "no candidates cited" — a §-only assertion is vacuous
+            // for this family, because every refusal of it says §22.6. The
+            // clause is APPENDED (the pinned rows match a prefix or a middle
             // substring of this message, never its whole text).
             (why.empty() ? "" : " — " + why + " (\xC2\xA7""5.1)") +
             " — the call is a compile error with no candidates cited "
