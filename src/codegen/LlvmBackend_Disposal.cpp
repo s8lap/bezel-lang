@@ -7933,9 +7933,15 @@ void Emitter::disposeDisplacedOwningChoiceLocal(const ast::Expr* target,
 // `ast::LocalDecl`: that is exactly the set `registerOwningChoiceDisposal`
 // enrolls in the scope-end pass, which is what makes "the target has taken
 // over the disposal obligation" a fact rather than an assumption. A
-// field/index/static target, a parameter at either end, `_ := b;` (§35.10's
-// move-only discard) and §35.5 arm-selection payload transfer are declined
-// here and remain open.
+// field/index/static target, a parameter at the TARGET end, `_ := b;`
+// (§35.10's move-only discard) and §35.5 arm-selection payload transfer are
+// declined here and remain open. The SOURCE end is no longer local-only: a
+// PARAMETER source is admitted (#7415), because §15.3's *Parameter passing*
+// makes a move-only parameter a by-value-MOVE binding and §28.1's clause 1
+// makes `(owned x: V)` identical to `(x: V)` for a move-only V — the copy of a
+// parameter source moves exactly as the copy of a local source does, and the
+// parameter's own scope-end disposal (`registerUnwindOwnedParam`'s owning-
+// choice arm) is exactly the disposal this mark has to suppress.
 void Emitter::markOwningChoiceLocalMovedFrom(const ast::Expr* targetExpr,
                                              const ast::Expr* srcExpr) {
     // THE TARGET must be a plain local — the recipient has to be a location
@@ -8067,32 +8073,70 @@ void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
                     u->operand.get());
     }
     if (!sid) return;
-    auto* sloc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*sid));
-    if (!sloc) return;
-    // `lowerStmt`'s own `LocalConstDecl` arm records why its sibling does not
+    sema::Symbol* ssym = ctx_.exprSymbol(*sid);
+    if (!ssym) return;
+    // THE SOURCE may be a LOCAL or a PARAMETER — the two bindings §28.10's
+    // move-only adoption paragraph and §15.3's *Local-to-local assignment*
+    // name ("Where `x` is a local of move-only value type the unmarked form
+    // adopts ... `x` is left moved-from"). A PARAMETER is one of them: §15.3's
+    // *Parameter passing* makes a move-only parameter a by-value-MOVE (the
+    // callee owns the value), and §28.1's clause 1 makes `(owned x: V)`
+    // identical to `(x: V)` for a move-only V — so the copy of a parameter
+    // source moves exactly as the copy of a local source does. // per §15.3
+    // per §28.10
+    //
+    // The PARAMETER case is what #7415 is: an `owned` owning-choice parameter
+    // whose value the callee copies into a `using var` binding. The parameter
+    // IS enrolled in a scope-end active-case disposal (`registerUnwindOwnedParam`'s
+    // owning-choice arm), and the copy is enrolled in one too — so before this
+    // fix the copy's disposal freed the payload and the parameter's own disposal
+    // then READ the freed block (heap-use-after-free, both the free and the
+    // read inside the callee). The mark below is the §28.10 fix: the copy
+    // MOVES the value, the parameter is left moved-from, and the parameter's
+    // scope-end pass reads the zeroed slot and disposes nothing — the same
+    // zero-store the local case has always used (#4566). // per §15.3
+    //
+    // `lowerStmt`'s own `LocalConstDecl` arm records why the LOCAL arm does not
     // mirror the `registerOwningChoiceDisposal` chain: "A `const` cannot bind
     // an OWNED production (an owning choice, a move-only inline array, a task
     // frame — §21.1)". // per §21.1
-    // LOCALDECL-ONLY: a §21.1 runtime `const` cannot BIND an owning choice, so
-    // it is never enrolled in the scope-end active-case pass and has no
-    // disposal for a moved-from mark to suppress.
-    auto* sld = dynamic_cast<const ast::LocalDecl*>(sloc->decl);
-    if (!sld) return;  // a parameter / §21.1 `const` — neither is enrolled in
-                       // the scope-end pass, so neither has a disposal to
-                       // suppress (§21.1 does not admit an owned production
-                       // at a `const` binding at all).
-    if (targetLd && sld == targetLd)
-        return;  // `b := b;` — §15.3's *Whole-value
-                  // reassignment* bullet makes self-assignment
-                                  // "a no-op"; zeroing here would destroy the
-                                  // value the store just wrote back.
-    // The declared type decides, resolved in the SAME order
-    // `registerOwningChoiceDisposal` uses — the store below and the scope-end
-    // pass must never disagree about which locals are owning choices.
-    const sema::TypeRef* rt =
-        sld->type ? ctx_.resolvedType(*sld->type)
-                  : (sld->initializer ? ctx_.exprType(*sld->initializer)
-                                      : nullptr);
+    const ast::LocalDecl* sld = nullptr;
+    const sema::TypeRef* rt = nullptr;
+    llvm::AllocaInst* slot = nullptr;
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(ssym)) {
+        // PARAMETER source: the declared type is the parameter's own, and the
+        // storage is the parameter's slot (`bindParameters`' alloca), the same
+        // slot `registerUnwindOwnedParam` enrolled in the scope-end pass.
+        rt = ps->declType ? ctx_.resolvedType(*ps->declType)
+                          : ps->resolvedDeclType;
+        auto pit = paramSlots_.find(ps);
+        if (pit == paramSlots_.end() || !pit->second) return;
+        slot = pit->second;
+    } else {
+        auto* sloc = dynamic_cast<sema::LocalSymbol*>(ssym);
+        if (!sloc) return;
+        // LOCALDECL-ONLY: a §21.1 runtime `const` cannot BIND an owning choice,
+        // so it is never enrolled in the scope-end active-case pass and has no
+        // disposal for a moved-from mark to suppress (§21.1 does not admit an
+        // owned production at a `const` binding at all).
+        sld = dynamic_cast<const ast::LocalDecl*>(sloc->decl);
+        if (!sld) return;
+        if (targetLd && sld == targetLd)
+            return;  // `b := b;` — §15.3's *Whole-value
+                      // reassignment* bullet makes self-assignment
+                                      // "a no-op"; zeroing here would destroy the
+                                      // value the store just wrote back.
+        // The declared type decides, resolved in the SAME order
+        // `registerOwningChoiceDisposal` uses — the store below and the
+        // scope-end pass must never disagree about which locals are owning
+        // choices.
+        rt = sld->type ? ctx_.resolvedType(*sld->type)
+                       : (sld->initializer ? ctx_.exprType(*sld->initializer)
+                                           : nullptr);
+        auto lit = locals_.find(sld);
+        if (lit == locals_.end() || !lit->second) return;
+        slot = lit->second;
+    }
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return;
     rt = resolveTypeParamRef(rt);
@@ -8102,9 +8146,6 @@ void Emitter::markOwningChoiceMovedFromCore(const ast::LocalDecl* targetLd,
     // §3.6 rule 2 + §35.4: classification is per-instantiation.
     auto verdict = common::classifyChoiceType(rt, ctx_);
     if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
-    auto it = locals_.find(sld);
-    if (it == locals_.end() || !it->second) return;
-    llvm::AllocaInst* slot = it->second;
     // The expected storage type, derived the way the DISPOSAL derives it:
     // §35.9's `C?` is the ordinary nullable value type `{ i8 hasValue,
     // <choice struct> }` (zeroing it clears `hasValue`, so

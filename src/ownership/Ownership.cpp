@@ -9814,7 +9814,8 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
 //
 // SCOPE. This function checks only the SOURCE (`src`) shape: a bare
 // identifier naming a plain `ast::LocalDecl`-backed local (no field,
-// parameter, index, or §21.1 `const`). The TARGET-shape half of #4566's
+// index, or §21.1 `const`) OR a PARAMETER of an owning-choice type (see
+// below). The TARGET-shape half of #4566's
 // `Emitter::markOwningChoiceLocalMovedFrom` gate (both ends must be such a
 // local) is the CALLER'S responsibility — `handleLocalDecl`'s target is
 // always a fresh local by construction, and `handleAssignment` adds an
@@ -9825,25 +9826,53 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
 // runtime zero-store is unconditional regardless of this compile-time check,
 // so a shape this declines to reject is not newly UB — it just keeps reading
 // the zeroed moved-from value, unchanged from pre-#4587 behaviour).
+//
+// THE PARAMETER SOURCE (#7415). §28.10's move-only adoption paragraph — "Where
+// `x` is a local of move-only value type the unmarked form adopts: ... the
+// plain read moves (§15.3's *Local-to-local assignment* ...) ... and `x` is
+// left moved-from" — reaches a PARAMETER source because §15.3's *Parameter
+// passing* makes a move-only parameter a by-value-MOVE binding (the callee
+// owns the value) and §28.1's clause 1 makes `(owned x: V)` identical to
+// `(x: V)` for a move-only V: the copy of a parameter source moves exactly as
+// the copy of a local source does, and the parameter is left moved-from.
+// §15.3's own rule is the same for any move-only lvalue: "After the move, `x`
+// is in moved-from state and may not be read until reassigned." // per §15.3
+// per §28.10
 void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&src);
     if (!id) return;  // only a WHOLE bare-identifier read is a move; `.f` /
                       // `[i]` / `.M()` are borrows of the receiver, not moves
-    auto* lsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
-    if (!lsym) return;  // not a tracked local (e.g. a parameter — §15.3's
-                        // "Parameter passing" bullet 3 is a separate rule,
-                        // out of scope here, matching #4566's codegen twin)
-    // LOCALDECL-ONLY: mirrors `markOwningChoiceLocalMovedFrom`'s `sld` gate —
-    // a §21.1 `const` local can never BIND an owning-choice production (§21.1
-    // forbids the initializer that would admit it), so it is never enrolled
-    // in the scope-end active-case disposal pass and has no read obligation
-    // for this to protect either way.
-    auto* ld = dynamic_cast<const ast::LocalDecl*>(lsym->decl);
-    if (!ld) return;
+    sema::Symbol* ssym = ctx_.exprSymbol(*id);
+    if (!ssym) return;
     auto verdict = common::classifyChoiceType(ctx_.exprType(src), ctx_);
     if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
     auto* st = lookupStateFor(*id);
-    if (!st) return;
+    if (!st) {
+        // A PARAMETER source is not tracked in `states_` (a parameter is OWNED
+        // at entry by declaration, not by dataflow). Seed it HERE, at this move
+        // site, as a LIVE binding so `markMovedByName` leaves it moved-from and
+        // the standard read/move/dispose checks reject a later whole read of it
+        // — the §15.3 use-after-move error. This mirrors the inline-array
+        // twin's parameter arm (`noteMoveOnlyArrayWholeMoveRead`, #1922) for
+        // the OTHER move-only kind. // per §15.3
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ssym);
+        if (!ps) return;  // not a tracked local and not a parameter source
+        LocalOwnership lo;
+        lo.state = OwnershipState::Borrowed;
+        states_[ps] = lo;
+        st = lookupStateFor(*id);
+        if (!st) return;  // defensive — the insertion above always succeeds
+    } else {
+        // LOCALDECL-ONLY: mirrors `markOwningChoiceLocalMovedFrom`'s `sld` gate —
+        // a §21.1 `const` local can never BIND an owning-choice production (§21.1
+        // forbids the initializer that would admit it), so it is never enrolled
+        // in the scope-end active-case disposal pass and has no read obligation
+        // for this to protect either way.
+        auto* lsym = dynamic_cast<sema::LocalSymbol*>(ssym);
+        if (!lsym) return;
+        auto* ld = dynamic_cast<const ast::LocalDecl*>(lsym->decl);
+        if (!ld) return;
+    }
     // A live source (Owned when a `using var`, Borrowed when a plain `var` —
     // the default bare-identifier producerState, mirroring
     // `noteMoveOnlyArrayWholeMoveRead`'s identical comment for the sibling
