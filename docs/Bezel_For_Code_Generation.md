@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.349. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.350. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -12,7 +12,7 @@ A dense reference for writing correct Bezel without reading the spec. It covers 
 
 **What this is.** Everything needed to emit compiling Bezel: the whole statement and expression grammar, the ownership discipline the compiler enforces, and an index of every standard-library name you are allowed to spell.
 
-**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.349 and `Bezel_Standard_Library.md` v0.349 so any claim here can be re-checked at its source.
+**What this is not.** Normative. Where this document and `Bezel_Language_Spec.md` disagree, the spec wins and this document has a defect. Citations (`§17.2`, `stdlib §4.5`) are to spec v0.350 and `Bezel_Standard_Library.md` v0.350 so any claim here can be re-checked at its source.
 
 **The one rule that matters most.** *If a type or member does not appear in section 5 of this document, look it up in `Bezel_Standard_Library.md` — and if it is not there, it does not exist.* **Never guess an API.** Inventing a plausible standard-library name is the single most common failure mode when writing Bezel: `MemoryStream`, `File.Open(path)`, `List<T>`, `string.Format`, `.ToList()`, `Task.Run`, `Option<T>`, `x.Dispose()` on a borrow — all plausible, all absent. Bezel's library is small and deliberately shaped; the shape is not .NET's.
 
@@ -671,7 +671,7 @@ Two desugaring facts (§29.2): a **fresh** iterable-family source is taken by th
 
 ### 4.6 The diagnostics you will actually hit
 
-Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **non-nullable field or slot `move`d without `with`**; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store error** on a borrowing collection (and on a fresh `OwningDictionary` key); the **terminal-accessor provenance warning**; the **mutation-during-iteration warning** (§4.5); and `_ := someTask;` / `using var _ := someTask;`. One more is opt-in: build with `--report-trust-admissions` (spec §28.3's trust-admission report mode) and every borrow of a parameter, `this` or a field you store in a plain field or a collection, every transfer of a local or `owned` parameter that a collection may still hold a borrow of, and every abandoned task frame draws a warning naming the lifetime you are trusting and the static spelling that would prove it (`scoped`, a `SlotHandle`, `Shared<T>`, the owning family, `await`); a unit that stays silent under the flag holds no trusted lifetime at all.
+Section 7 lists each with its remedy. In frequency order they are: the **must-use warning** on an undischarged plain-`var` owned local; a **mixed owned/borrowed merge** rejected at the join; *"borrow held by `x` would outlive its source `y`"*, reported at the **assignment**; *"this call consumes `x`; write `M(move x)`"* and its inverse (the marker written where the target already announces); *"cannot move out of `using var`"*; a **non-nullable field or slot `move`d without `with`**; a fresh owned value **escaping into a non-owning location** (a borrow field, a getter, a plain return); a **static** method's plain class-typed return, rejected at its declaration; `Dispose()` **on a borrow**; the **consume-site freeze**; the **fresh-store error** on a borrowing collection (and on a fresh `OwningDictionary` key); the **terminal-accessor provenance warning**; the **mutation-during-iteration warning** (§4.5); and `_ := someTask;` / `using var _ := someTask;`. One more is opt-in: build with `--report-trust-admissions` (spec §28.3's trust-admission report mode) and every borrow of a parameter, `this` or a field you store in a plain field or a collection (a method-local collection holding the parameter or `this` itself excepted), every comparer you hand to a hash collection's constructor (stdlib §4: retained as a borrow), every transfer of a local or `owned` parameter that a collection may still hold a borrow of, every transfer of a value you took out of a field with `move … with` while a local read from that field before the `move` is still used after the transfer, and every abandoned task frame draws a warning naming the lifetime you are trusting and the static spelling that would prove it (`scoped`, a `SlotHandle`, `Shared<T>`, the owning family, `await`); a unit that stays silent under the flag holds no trusted lifetime at all, short of the slot-kill residual spec §28.3.9 names (an alias of that local, a borrow read through a member, or a callee's `move`).
 
 <a id="sec-recommended-diagnostic-wordings"></a>
 **Recommended wordings.** The spec fixes what each of these diagnostics names (spec §28.3 *Diagnostics*, §28.10's adoption rule, §30.5's near-miss forms, §35.5); the words below are its recommendations, kept here as teaching text. The compiler's own text may differ: match a diagnostic by what it names, not by its words.
@@ -697,7 +697,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.349 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.350 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 

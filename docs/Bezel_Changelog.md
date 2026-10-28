@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.349 — October 2026**
+**Companion to the Bezel Language Specification, v0.350 — October 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15522,5 +15522,79 @@ The composition step resolved these seams:
 **Migration.** None: doc-only.
 
 **Checks.** `scripts/check_docs.sh` is clean. EXTRACT finds 553 fragments, the same count as v0.348. `scripts/check_proposals.sh`, `build_book.py --check` and `corpus.py lint --strict` are clean.
+
+---
+
+### v0.350 changelog (v0.349 → v0.350)
+
+**The trust-admission report, brought current: one proposal and five editorial or clarifying edits.** On 2026-10-28 the owner commissioned a review of proposal 0131, the trust-admission report (`--report-trust-admissions`), against v0.349 and the r35 release compiler, and approved running its outcome as a small train on a review branch, decided by delegated ruling under the owner's 2026-10-08 direction ("Please resolve and decide all known spec related issues. Do proposals for issues that need them."). **This revision lands on a branch for the owner's review, not on `main`.** The bar for the proposal was the v0.346 train's: **clearly an improvement** — safer or simpler, with negligible measured migration cost, not a taste change.
+
+**The review.** It compiled 53 probe programs and swept 3,864 programs (the 3,622 rule-corpus cases and the 242 `tests/lit/ownership` programs) under the mode. The report emits 50 lines (36 field-held, 13 collection-held, 1 frame-held), about 1.3 % of programs. Seven of the 50 are false, and many shapes the spec names are silent, among them its own §30.1 example. Those are compiler gaps, filed below; the spec's report paragraph itself was current. What had drifted was the text around it, and one obligation the text calls recorded had no report site.
+
+Each decision was classed:
+- **A design change.** [Proposal 0214](proposals/0214-report-a-transfer-of-a-slot-displaced-value.md) graduates here: the report names a transfer of a slot-displaced value ([#7434](https://github.com/s8lap/bezel-lang/issues/7434)'s shape). It is report-only and moves no verdict.
+- **A clarification.** §28.11's report sentence states the purely local collection exception that proposal 0131 §3 traced, for a parameter or `this` itself.
+- **Editorial.** Rationale §5.31 and the code-generation reference §4.6 name the comparer-held clause; proposal 0131's README row and the proposal itself get a dated currency note.
+- **Declined or deferred.** Four alternatives of 0214 are declined and its freeze is deferred. The review's other compile-time candidates — a field-held or temporary dangle certain only in the callee, and any class on by default — stay declined on their recorded grounds (proposal 0132's bar, `DECLINED.md`'s always-on row, whose reopening bar the measured 36 back-reference stores against 12 `scoped` parameters do not meet). No row records them again.
+
+The independent critique accepted the train with fixes. Its substantive findings:
+- **The local-collection exception, as drafted, opened a hole.** It exempted every parameter-, receiver- or field-path-sourced element stored into a method-local collection, on the ground that the scope comparison bounds it. That holds for the element's scope and not for its object: `tmp.Add(_f); var c := move _f with new Q(); Domain.Spawn(W, move c); tmp[0].M();` reads an object another domain owns, and under the drafted text no line would name it. MEASURED with a compilable twin (the `move` in a same-class method): accepted, and the run races (`DisposedAccessException` or exit 0). The exception now covers a parameter that is not `owned`, or `this`, read as the binding itself; an element read through a field path stays reported at its store.
+- **0214's draft did not cover its own example.** Its program read the field through a property and moved it inside a callee, while its rule keys on a direct read and a `move` in one body. The examples now use #7434's one-body program, and the callee form is stated as a residual: in §28.3.9, in K4's enumeration sentence and among the zero-report claim's exclusions. The draft's thesis, that K4's sentence would become true, did not hold for that form.
+- **The draft's measurement was wrong.** It said the callee form "runs to exit 0". Re-run 20 times, it is a race: 10 runs exit 0 and 10 raise `DisposedAccessException`, depending on whether the spawned domain's disposal of the payload sets the flag before the read.
+- **Undefined terms.** "Live" now means used on a path from the transfer. The borrow is exactly §28.7's direct-read local. A `move` standing in a transfer position is itself the site. The owning-collection slot leg, which the draft recommended, is declined for v1.
+- **The landing date.** The mode reached `main` on 2026-10-12 (`cd21669f8`), not on 2026-10-13 as the review said.
+
+**The composition.** The six items share the report paragraph's neighbourhood. The local-collection exception keeps field-path-sourced elements reported precisely so that 0214's residual stays confined to local holders and the cross-body form. The code-generation reference's §4.6 sentence takes the review's comparer clause, the exception and 0214's entry in one edit. Proposal 0131's README row and currency note record v0.350's changes as well as the earlier ones. The 17 edits apply as one sequence, each `old` unique at the base.
+
+- **§28.3.12 (*The trust-admission report*: clause 3, the zero-report claim's exclusions), §28.3.9 (*Scope* clause 1), §28.3.1 (K4 clause 3); rationale §5.31; the code-generation reference §4.6 — the report names a transfer of a slot-displaced value (design change; [proposal 0214](proposals/0214-report-a-transfer-of-a-slot-displaced-value.md); [#7434](https://github.com/s8lap/bezel-lang/issues/7434)).**
+  - **The problem.** §28.3.9 calls the slot kill by move — `move r.f with e` while a borrow of the value it takes survives — a recorded obligation, and K4 says the report enumerates the recorded set at every site. Proposal 0131 excluded the kill on the ground that it is reported at the holder's store. A **local** borrow has no store: `var b := a.f; var c := move a.f with new Q(); Domain.Spawn(W, move c); b.M();` drew no line, although `b` then reads an object another domain owns and no flag catches it. The executable kernel model reaches the shape (6 of 169,632 accepted programs at five statements).
+  - **The rule.** Where a replacing `move` takes an owned field's value after a local was initialized from a direct read of the same path (§28.7's form, the root not assigned between), the transfer of the taken value is reported — at proposal 0157's consume rows (K3.1–K3.4, K3.6, K3.7, K3.12), the `move` itself where it stands in such a position — on a path on which that local is used after the transfer. The kill is never reported, nor a transfer after the local's last use. Another local holder of the displaced value (an alias, a closure, a borrow-bearing record or choice), a borrow read through a member, and a `move` in another body are a stated residual with no line: their source sets name the holder, not the slot's value, and no single body sees both the borrow and the move.
+  - **Why the transfer.** On 0157's ground: the kill alone meets no obligation (a later disposal is K4.2's flag-backstopped fault), and a line at every replacing `move` would list every swap.
+  - **Why not an error.** The certain sub-shape needs K5 to re-source the local to the taker. The model's nearest freeze rejects 552 programs at five statements, 510 of which never fault, because it cannot tell a slot borrow from a holder borrow.
+  - **Declined:** narrowing the claim for every slot kill by move (one body decides this shape, the ground of proposal 0157's option B row); a line at the `move`; the owning-collection slot leg; reaching the residual. **Deferred:** freezing the transfer (#7434's option 2), until the model distinguishes the two borrows ([#7432](https://github.com/s8lap/bezel-lang/issues/7432)) and measures the over-rejection at zero. Four `declined-at-proposal` rows and one `deferred` row.
+  - Kernel: derivation (K4.3's recording rule applied to an admission §28.3.9 already records). Body-locality: local.
+- **§28.11 (*Storing a borrow*, the report sentence) — a store into a method-local collection of a plain parameter or `this` itself is not reported (clarification; proposal 0131 §1.2 and §3).** The sentence named every parameter-, receiver- or field-path-sourced element at its store. Read literally, that reports `using var tmp := new Array<Item>(); tmp.Add(item);`, which proposal 0131 traced as silent, and the compiler reports it today ([#7468](https://github.com/s8lap/bezel-lang/issues/7468)). Such a store is now not reported where the collection is a local of the body that does not escape it and the element is a plain parameter or `this`, read as the binding itself: the scope comparison bounds the element, and the body holds no obligation for its object, so no kill there can transfer it. An element read through a field path stays reported, since the body's own replacing `move` can take the field's value out and transfer it. No verdict changes.
+- **Rationale §5.31; the code-generation reference §4.6 — the comparer-held clause named (editorial).** Both still listed the clauses as field-, collection- and frame-held, although v0.327 added the comparer-held clause to K4 and to the report ([proposal 0138](proposals/0138-compiler-known-sendability.md) §7, [#5604](https://github.com/s8lap/bezel-lang/issues/5604)).
+- **Proposal 0131: a dated currency note, and its README row (editorial).** The proposal body is the v0.306 record and is not rewritten. The note lists what changed since: the comparer-held clause (v0.327), 0157's transfer entry (v0.333), 0169's restatement by clause (v0.334), 0207's error at its fresh-store row (v0.346), the two v0.350 items above, the dead line references, the landing commit, and the measured count its §9 Q1 asked for. The README row gains a *Register changes since* clause.
+
+**Migration.**
+
+  *Ramps:* none.
+
+  *Newly rejected:* nothing.
+
+  *Newly warned, under `--report-trust-admissions` only (spec-ahead-of-impl):* the transfer of a slot-displaced value (0214). Measured reach: 743 slot `move` sites in `tests/` and `docs/`; 10 have a direct-read local of the same path shortly before, and none of them transfers the taken value while that local is used. Zero lines in the tree; the one instance is the research model's own witness.
+
+  *No longer reported, under the mode (doc-side):* a method-local collection's store of a plain parameter or `this` itself. The compiler reports it today, and #7468 already tracks that over-report.
+
+  *Doc-only:* the comparer-held clause in rationale §5.31 and the code-generation reference; proposal 0131's currency note and README row; the statement of the slot kill's residual.
+
+  *Spec-ahead-of-impl (tracking issue filed at landing):*
+  - 0214: (tracker `0214-impl`, filed when this revision merges). Its run probes need the replacing `move` to parse ([#5923](https://github.com/s8lap/bezel-lang/issues/5923)'s note).
+
+  *Owner decisions recorded:*
+  - The owner's 2026-10-28 approval of this train, on a review branch, under the 2026-10-08 delegation.
+  - Proposal 0214 was accepted as a delegated ruling and graduates here. The local-collection exception is a clarification narrower than proposal 0131 §1.2's parenthesis, which named every source.
+
+  *Filed from the same review, before this landing:*
+  - [#7465](https://github.com/s8lap/bezel-lang/issues/7465): the frame-held clause reports only `Task.FireAndForget` over a member-call receiver; the §30.1 example and the other frame forms are silent.
+  - [#7466](https://github.com/s8lap/bezel-lang/issues/7466): §28.14's registration-lifetime and quiescence residuals are never reported.
+  - [#7467](https://github.com/s8lap/bezel-lang/issues/7467): field- and collection-held sources the report misses (a bare field name, a primary-constructor capture or field initializer, a function-value invocation result, the `OwningDictionary` key, `AddRange`).
+  - [#7468](https://github.com/s8lap/bezel-lang/issues/7468): over-reports — enum constants, method references, function-typed and value-typed member reads, static sources and holders, and a purely local collection (7 of the 50 lines).
+  - [#7469](https://github.com/s8lap/bezel-lang/issues/7469): the warning is one fixed sentence that names neither the source, the holder nor the clause's obligation and remedies.
+  - [#7470](https://github.com/s8lap/bezel-lang/issues/7470): 0157's transfer entry is unimplemented, and its cases `s28_3_0162`–`0167` have never been run.
+  - [#7471](https://github.com/s8lap/bezel-lang/issues/7471): the comparer-held clause is unreported, and the comparer constructor itself is unimplemented.
+  - [#7472](https://github.com/s8lap/bezel-lang/issues/7472) (incidental): §28.11 clause 3 admits a top-level local's borrow stored into a collection an `owned` parameter holds; the compiler rejects it.
+  - A comment on [#5702](https://github.com/s8lap/bezel-lang/issues/5702) (incidental): `s28_3_0151`, a receiver-sourced borrow stored into a settable static property, is accepted though the case expects a rejection.
+  - The third correction to the [#4602](https://github.com/s8lap/bezel-lang/issues/4602) ruling (posted 2026-10-28; master plan §4.8): K5's proof that no borrow survives an explicit `Dispose()` sees only local borrows, so freeing in full needs the static proof and the run-time escape set to agree, with every K4.3 admitting site populating that set.
+  - [#7434](https://github.com/s8lap/bezel-lang/issues/7434) stays open for its option 2, the deferred freeze.
+
+  *Guides:* none changed; no pin moves.
+
+  *Corpus:*
+  - No case changes. The sweep by rule text and construct found no case stating either changed sentence: the 13 cases under the mode quote clause 3 and the claim's exclusions only up to text these edits leave in place.
+  - **Coverage gaps not written** (recorded in proposal 0214 §8): 0214's `warn` and `quiet` rows, which need the replacing `move` to parse to be measured; the purely local collection's `quiet` row.
+
+**Checks.** `scripts/check_docs.sh` passes on the composed tree, with this entry, the four version headers and the code-generation reference's three pin lines at v0.350; EXTRACT finds 553 fragments, the same count as v0.349. `scripts/check_proposals.sh` passes (201 ↔ 201; accepted 21, graduated 152). `scripts/check_src_citations.py`, `corpus.py lint --strict` (3,693 cases), `corpus.py check` and `scripts/build_book.py --check` are clean.
 
 ---
