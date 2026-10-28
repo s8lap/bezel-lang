@@ -1787,27 +1787,21 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* count64 = emitSection96CountContract(
                 call.args[cntArgIdx].value.get(), cnt, {},
                 "rep.s64", "rep.z64", "rep.neg");
-        llvm::Value* chI8 = builder_.CreateTrunc(
-            ch->getType()->isIntegerTy(32) ? ch
-                : builder_.CreateSExt(ch, i32()), i32());  // keep i32 for memset
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memsetFn = declareC("memset", ptrTy(), {ptrTy(), i32(), i64()});
-        llvm::Value* dataSz = builder_.CreateAdd(count64, builder_.getInt64(1));
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "rep.data");
-        builder_.CreateCall(memsetFn, {newData, chI8, count64});
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0),
-            builder_.CreateGEP(i8Ty, newData, count64));  // NUL terminator
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* strObj = builder_.CreateCall(
-            mallocFn, {builder_.getInt64(strBytes)}, "rep.obj");
-        builder_.CreateStore(newData,
-            builder_.CreateStructGEP(stringType(), strObj, 0));
-        builder_.CreateStore(count64,
-            builder_.CreateStructGEP(stringType(), strObj, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
-            builder_.CreateStructGEP(stringType(), strObj, 2));
-        initStringRc(strObj);  // #422: producer's reference, rc := 1
-        return strObj;
+        // #7425 (§4.6, v0.345): the repeated code point is a CODE POINT, so
+        // the result is built in the code-point domain by the runtime's
+        // width-aware helper.
+        //
+        // The inline arm this replaces TRUNCATED the char to its low byte and
+        // memset that byte `count` times into a width-1 buffer — so
+        // `string.Repeat('日', 3)` produced "ååå" (three U+00E5) instead of
+        // "日日日". §4.6: "The choice of width is invisible at the language
+        // level; programs observe only the `char` sequence and its length."
+        // A `char` is a code point, and a code point above U+00FF needs a
+        // width-2 or width-4 result.
+        auto* fn = declareC("bz_str_repeat_char", ptrTy(), {i32(), i64()});
+        llvm::Value* chI32 = ch->getType()->isIntegerTy(32) ? ch
+            : builder_.CreateSExt(ch, i32(), "rep.ch");
+        return builder_.CreateCall(fn, {chI32, count64}, "rep.result");
     }
 
     // stdlib §9.2: double / float static FP predicates — all return bool (i1).

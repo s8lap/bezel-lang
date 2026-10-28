@@ -997,6 +997,255 @@ static int8_t bz_cps_width(const uint32_t* cps, int64_t count) {
     return bz_cp_width(maxCp);
 }
 
+// ---------------------------------------------------------------------------
+// #7425 (§4.6, v0.345): the §9.6 transform surface, in the CODE-POINT domain.
+//
+// The codegen arms for these members used to work in the BYTE domain: they
+// allocated `len + 1` BYTES for a string whose data is `len * width` bytes,
+// copied `len` bytes (not `len * width`), compared / folded / trimmed one BYTE
+// at a time, and stored width = 1. On a width-2 or width-4 string that is
+// wrong twice over, and §4.6 (v0.345) is explicit that the width is not
+// observable: "The choice of width is invisible at the language level;
+// programs observe only the `char` sequence and its length."
+//
+//   * `Remove` allocated `resultLen + 1` bytes but wrote `resultLen * width`
+//     of them — an ASan heap-buffer-overflow WRITE ("WRITE of size 1 … 0
+//     bytes after a 2-byte region") on every width >= 2;
+//   * the others produced a string whose CONTENT is the byte sequence, not
+//     the code-point sequence — the wrong text at the right length.
+//
+// The helpers below do the work in the code-point domain, like the width-aware
+// helpers already in this file (bz_str_replace, bz_str_pad, bz_str_substring).
+
+// Build a fresh +1 bz_string from a code-point sequence, packed at the
+// NARROWEST width that fits its largest code point (§4.6 adaptive storage —
+// the same rule bz_str_replace and bz_str_slice_cp use).
+static void* bz_str_pack_cps(const uint32_t* cps, int64_t count) {
+    int8_t w = bz_cps_width(cps, count);
+    void* data = calloc((size_t)(count > 0 ? count : 1) * (size_t)w + (size_t)w,
+                         1);  // + width-sized NUL terminator slot
+    for (int64_t i = 0; i < count; ++i) bz_put_cp(data, i, w, cps[i]);
+    uint8_t* strObj = (uint8_t*)calloc(1, (size_t)BZ_STRING_SIZEOF);
+    memcpy(strObj, &data, sizeof(void*));
+    int64_t n = count;
+    memcpy(strObj + 8, &n, sizeof(int64_t));
+    strObj[16] = (uint8_t)w;
+    bz_string_init_rc(strObj);  // #422: producer's reference, rc := 1
+    return strObj;
+}
+
+// Is this code point an ASCII whitespace code point? The trim contract the
+// inline arm applied (isspace over the BYTE) is the ASCII set; a code point
+// above U+00FF is not in it.
+static inline bool bz_str_cp_is_space(uint32_t cp) {
+    return cp <= 0xFFu && isspace((int)cp) != 0;
+}
+
+// §9.6: Remove(startIndex, length): string — remove `length` CODE POINTS
+// starting at code-point index `startIndex`; a negative `length` means "to the
+// end of the string" (the 1-argument `Remove(startIndex)` spelling).
+//
+// The codegen guard (fix #7168) has already rejected an out-of-range window
+// with IndexOutOfRangeException; the clamps here are the defensive backstop
+// the other width-aware helpers use, so a stray runtime caller can never read
+// out of the source buffer.
+extern "C" void* bz_str_remove(const void* self_p, int64_t start, int64_t count) {
+    const auto* s = (const bz_string_struct*)self_p;
+    int64_t len = s ? s->len : 0;
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    int64_t avail = len - start;
+    if (count < 0 || count > avail) count = avail;
+    int64_t outLen = len - count;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(outLen > 0 ? outLen : 1) * sizeof(uint32_t));
+    for (int64_t i = 0; i < start; ++i) out[i] = bz_str_cp(s, i);
+    for (int64_t i = start + count; i < len; ++i) out[i - count] = bz_str_cp(s, i);
+    void* r = bz_str_pack_cps(out, outLen);
+    free(out);
+    return r;
+}
+
+// §9.6: Replace(oldChar, newChar): string — replace every occurrence of the
+// CODE POINT `oldCp` with the code point `newCp`. The `char` parameters are
+// code points (§4.6), not bytes.
+extern "C" void* bz_str_replace_char(const void* self_p, int32_t oldCp,
+                                     int32_t newCp) {
+    const auto* s = (const bz_string_struct*)self_p;
+    int64_t len = s ? s->len : 0;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(len > 0 ? len : 1) * sizeof(uint32_t));
+    for (int64_t i = 0; i < len; ++i) {
+        uint32_t cp = bz_str_cp(s, i);
+        out[i] = ((int32_t)cp == oldCp) ? (uint32_t)newCp : cp;
+    }
+    void* r = bz_str_pack_cps(out, len);
+    free(out);
+    return r;
+}
+
+// §9.6: ToUpper() / ToLower(): string — the case fold, per CODE POINT.
+//
+// `upper` selects the direction (1 = upper, 0 = lower). For a code point
+// that fits a byte the fold is the one libc applies to that byte — which is
+// exactly what the old BYTE-domain arm applied, so a width-1 string (whose
+// code points ARE its bytes) is UNCHANGED. A code point above U+00FF has no
+// single-byte case mapping and is left alone.
+extern "C" void* bz_str_case(const void* self_p, int32_t upper) {
+    const auto* s = (const bz_string_struct*)self_p;
+    int64_t len = s ? s->len : 0;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(len > 0 ? len : 1) * sizeof(uint32_t));
+    for (int64_t i = 0; i < len; ++i) {
+        uint32_t cp = bz_str_cp(s, i);
+        if (cp <= 0xFFu) {
+            int folded = upper ? toupper((int)cp) : tolower((int)cp);
+            out[i] = (uint32_t)folded;
+        } else {
+            out[i] = cp;
+        }
+    }
+    void* r = bz_str_pack_cps(out, len);
+    free(out);
+    return r;
+}
+
+// §9.6: Trim() / TrimStart() / TrimEnd(): string — strip the ASCII whitespace
+// CODE POINTS at the leading end, the trailing end, or both.
+//
+// `mode`: 0 = Trim (both ends), 1 = TrimStart, 2 = TrimEnd.
+extern "C" void* bz_str_trim_ws(const void* self_p, int32_t mode) {
+    const auto* s = (const bz_string_struct*)self_p;
+    if (!s) return bz_str_pack_cps(nullptr, 0);
+    int64_t start = 0, end = s->len;
+    if (mode == 0 || mode == 1)
+        while (start < end && bz_str_cp_is_space(bz_str_cp(s, start))) ++start;
+    if (mode == 0 || mode == 2)
+        while (end > start && bz_str_cp_is_space(bz_str_cp(s, end - 1))) --end;
+    int64_t count = end - start;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(count > 0 ? count : 1) * sizeof(uint32_t));
+    for (int64_t i = 0; i < count; ++i) out[i] = bz_str_cp(s, start + i);
+    void* r = bz_str_pack_cps(out, count);
+    free(out);
+    return r;
+}
+
+// §9.6: Repeat(unit: string, count: int): string — the `unit` repeated
+// `count` times, in the code-point domain. `count` < 0 is rejected by the
+// codegen guard (fix #7120) before this is called; the clamp here is the
+// defensive backstop.
+extern "C" void* bz_str_repeat(const void* self_p, int64_t count) {
+    const auto* s = (const bz_string_struct*)self_p;
+    int64_t len = s ? s->len : 0;
+    if (count < 0) count = 0;
+    int64_t outLen = len * count;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(outLen > 0 ? outLen : 1) * sizeof(uint32_t));
+    for (int64_t k = 0; k < count; ++k)
+        for (int64_t i = 0; i < len; ++i)
+            out[k * len + i] = bz_str_cp(s, i);
+    void* r = bz_str_pack_cps(out, outLen);
+    free(out);
+    return r;
+}
+
+// §9.6: Repeat(c: char, count: int): string — a `count`-long string of the
+// single code point `c`. The char is a CODE POINT (§4.6), so a code point
+// above U+00FF needs a width-2 or width-4 result — the old BYTE-domain arm
+// truncated it to its low byte.
+extern "C" void* bz_str_repeat_char(int32_t cp, int64_t count) {
+    if (count < 0) count = 0;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(count > 0 ? count : 1) * sizeof(uint32_t));
+    for (int64_t i = 0; i < count; ++i) out[i] = (uint32_t)cp;
+    void* r = bz_str_pack_cps(out, count);
+    free(out);
+    return r;
+}
+
+// §9.6-ext: GetField(delim: char, n: int): string — the n-th (0-based)
+// delimiter-separated field of `self`, or "" when there is no such field.
+//
+// ⚠ GetField is NOT a stdlib §9.6 member (issue #7131 records that the
+// compiler implements three §9.6 members the document does not declare). This
+// helper therefore preserves the COMPILER's existing semantics — the n-th
+// field of a split on `delim`, "" when out of range — and only moves the
+// work from the byte domain into the code-point domain, like the helpers
+// above. The API-existence question stays with #7131.
+extern "C" void* bz_str_getfield(const void* self_p, int32_t delim, int64_t n) {
+    const auto* s = (const bz_string_struct*)self_p;
+    if (!s || n < 0) return bz_str_pack_cps(nullptr, 0);
+    // Walk the fields, remembering where the n-th one starts and where it
+    // ends. A field runs from just after the (n-1)-th delimiter to the next
+    // delimiter or to the end of the string.
+    int64_t start = 0;
+    int64_t field = 0;
+    while (field < n) {
+        int64_t i = start;
+        while (i < s->len && (int32_t)bz_str_cp(s, i) != delim) ++i;
+        if (i >= s->len) { start = s->len; break; }  // no such field
+        start = i + 1;
+        ++field;
+    }
+    int64_t end = start;
+    while (end < s->len && (int32_t)bz_str_cp(s, end) != delim) ++end;
+    int64_t count = end - start;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(count > 0 ? count : 1) * sizeof(uint32_t));
+    for (int64_t i = 0; i < count; ++i) out[i] = bz_str_cp(s, start + i);
+    void* r = bz_str_pack_cps(out, count);
+    free(out);
+    return r;
+}
+
+// §9.6-ext: CountOf(sub: string): int — the number of non-overlapping
+// occurrences of `sub` in `self`.
+//
+// ⚠ CountOf is NOT a stdlib §9.6 member (issue #7131) — the same posture as
+// GetField above: the semantics are the compiler's, moved into the code-point
+// domain. The base used `memmem` over the raw BYTES, which cannot see a
+// code point in a width-2 or width-4 string.
+extern "C" int32_t bz_str_count_of(const void* self_p, const void* sub_p) {
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* sub = (const bz_string_struct*)sub_p;
+    if (!s || !sub || sub->len == 0) return 0;
+    int32_t count = 0;
+    int64_t i = 0;
+    while (i + sub->len <= s->len) {
+        if (bz_str_cp_seq_eq(s, i, sub, 0, sub->len)) {
+            ++count;
+            i += sub->len;
+        } else {
+            ++i;
+        }
+    }
+    return count;
+}
+
+// §9.6: Insert(startIndex: int, value: string): string — insert `value` at
+// code-point index `startIndex`. The two operands may have DIFFERENT storage
+// widths (§4.6: the width is per string), so the result is assembled in the
+// code-point domain and packed at the narrowest width that fits it.
+extern "C" void* bz_str_insert(const void* self_p, int64_t idx,
+                               const void* value_p) {
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* v = (const bz_string_struct*)value_p;
+    int64_t len = s ? s->len : 0;
+    int64_t vlen = v ? v->len : 0;
+    if (idx < 0) idx = 0;
+    if (idx > len) idx = len;
+    int64_t outLen = len + vlen;
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(outLen > 0 ? outLen : 1) * sizeof(uint32_t));
+    for (int64_t i = 0; i < idx; ++i) out[i] = bz_str_cp(s, i);
+    for (int64_t k = 0; k < vlen; ++k) out[idx + k] = bz_str_cp(v, k);
+    for (int64_t i = idx; i < len; ++i) out[idx + vlen + (i - idx)] = bz_str_cp(s, i);
+    void* r = bz_str_pack_cps(out, outLen);
+    free(out);
+    return r;
+}
+
 // The builder's content, flattened in the CODE-POINT domain (spec §4.6).
 //
 // §4.6: a `string` stores each code point in `width` bytes (1, 2 or 4), the

@@ -2407,8 +2407,8 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             at0->primitive == sema::PrimitiveType::Char) {
             // fix #6547: same narrowed-`char?` unwrap as Contains above, on
             // BOTH operands — sema gates each (`oldChar` and `newChar` are
-            // `char` parameters, stdlib §9.6), and the body both compares
-            // `oldCh` against a code point and truncates `newCh` to `i8`.
+            // `char` parameters, stdlib §9.6), and the body compares `oldCh`
+            // against a code point.
             llvm::Value* oldCh = nullptr;
             llvm::Value* newCh = nullptr;
             // §22.5 (v0.343): the supplied argument expressions are evaluated
@@ -2430,65 +2430,32 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                     call.args[oldSrc].value.get());
             }
             if (!oldCh || !newCh) return nullptr;
-            auto* i8Ty  = llvm::Type::getInt8Ty(llvm_);
-            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-            auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-            // Only handle ASCII (width=1) strings for now.
-            llvm::Value* len  = loadStringLen(self);   // i64
-            llvm::Value* data = loadStringData(self);  // ptr
-            // Alloc new buffer: same length.
-            llvm::Value* bufLen = builder_.CreateAdd(len, builder_.getInt64(1));
-            llvm::Value* newBuf = builder_.CreateCall(mallocFn, {bufLen});
-            builder_.CreateCall(memcpyFn, {newBuf, data, len});
-            // Store NUL terminator.
-            builder_.CreateStore(
-                llvm::ConstantInt::get(i8Ty, 0),
-                builder_.CreateGEP(i8Ty, newBuf, len));
-            // Loop: for i in 0..len, if newBuf[i]==oldCh, newBuf[i]=newCh.
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "rcc.cond", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rcc.body", currentFn_);
-            auto* contBB = llvm::BasicBlock::Create(llvm_, "rcc.cont", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "rcc.end",  currentFn_);
-            auto* iSlot  = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), iSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* i = builder_.CreateLoad(i64(), iSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(i, len), bodyBB, endBB);
-            builder_.SetInsertPoint(bodyBB);
-            llvm::Value* i2  = builder_.CreateLoad(i64(), iSlot);
-            llvm::Value* ptr = builder_.CreateGEP(i8Ty, newBuf, i2);
-            llvm::Value* ch  = builder_.CreateLoad(i8Ty, ptr);
-            llvm::Value* ch32 = builder_.CreateZExt(ch, i32());
-            llvm::Value* isOld = builder_.CreateICmpEQ(ch32, oldCh);
-            builder_.CreateCondBr(isOld, contBB, contBB);  // body always falls to cont
-            builder_.SetInsertPoint(contBB);
-            // Re-load i since we're in a new block.
-            llvm::Value* i3  = builder_.CreateLoad(i64(), iSlot);
-            llvm::Value* ptr3 = builder_.CreateGEP(i8Ty, newBuf, i3);
-            llvm::Value* ch3  = builder_.CreateLoad(i8Ty, ptr3);
-            llvm::Value* ch33 = builder_.CreateZExt(ch3, i32());
-            llvm::Value* isOld3 = builder_.CreateICmpEQ(ch33, oldCh);
-            // newCh to i8 (truncate — ASCII only)
-            llvm::Value* newChI8 = builder_.CreateTrunc(newCh, i8Ty);
-            llvm::Value* ch8 = builder_.CreateLoad(i8Ty, ptr3);
-            llvm::Value* selected = builder_.CreateSelect(isOld3, newChI8, ch8);
-            builder_.CreateStore(selected, ptr3);
-            builder_.CreateStore(
-                builder_.CreateAdd(i3, builder_.getInt64(1)), iSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(endBB);
-            // Wrap in bz_string struct.
-            uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-            llvm::Value* newStr2 = builder_.CreateCall(
-                mallocFn, {builder_.getInt64(strBytes)}, "rcc.obj");
-            builder_.CreateStore(newBuf, builder_.CreateStructGEP(stringType(), newStr2, 0));
-            builder_.CreateStore(len, builder_.CreateStructGEP(stringType(), newStr2, 1));
-            builder_.CreateStore(
-                llvm::ConstantInt::get(i8Ty, 1),
-                builder_.CreateStructGEP(stringType(), newStr2, 2));
-                initStringRc(newStr2);  // #422: producer's reference, rc := 1
-            return newStr2;
+            // #7425 (§4.6, v0.345): the replacement is done in the CODE-POINT
+            // domain, by the runtime's width-aware helper.
+            //
+            // The inline arm this replaces allocated `len + 1` BYTES for a
+            // string whose data is `len * width` bytes (§4.6), copied `len`
+            // bytes (not `len * width`), compared one BYTE at a time, and
+            // stored width = 1. On a width-2 string the result's CONTENT was
+            // the byte sequence, not the code-point sequence — the wrong text
+            // at the right length, which a length-only oracle cannot see.
+            // Measured on the base: `"日abc".Replace('a', 'Z')` -> "åeZ"
+            // (expected "日Zbc").
+            //
+            // The two `char` parameters are CODE POINTS (§4.6), so they are
+            // passed as i32 and neither is truncated to a byte.
+            auto* i32Ty = llvm::Type::getInt32Ty(llvm_);
+            if (!oldCh->getType()->isIntegerTy(32))
+                oldCh = oldCh->getType()->getIntegerBitWidth() < 32
+                            ? builder_.CreateZExt(oldCh, i32Ty, "rcc.old")
+                            : builder_.CreateTrunc(oldCh, i32Ty, "rcc.old");
+            if (!newCh->getType()->isIntegerTy(32))
+                newCh = newCh->getType()->getIntegerBitWidth() < 32
+                            ? builder_.CreateZExt(newCh, i32Ty, "rcc.new")
+                            : builder_.CreateTrunc(newCh, i32Ty, "rcc.new");
+            auto* fn = declareC("bz_str_replace_char", ptrTy(),
+                                {ptrTy(), i32(), i32()});
+            return builder_.CreateCall(fn, {self, oldCh, newCh}, "rcc.result");
         }
     }
 
@@ -2523,55 +2490,24 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // §9.6: ToUpper/ToLower — ASCII-only case conversion via toupper/tolower.
     if (method == "ToUpper" || method == "ToLower") {
         if (!call.args.empty()) return nullptr;  // no extra args
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* len = loadStringLen(self);
-        llvm::Value* data = loadStringData(self);
-        // Declare toupper / tolower: int fn(int)
-        const char* fnName = method == "ToUpper" ? "toupper" : "tolower";
-        auto* caseFn = module_->getFunction(fnName);
-        if (!caseFn) {
-            auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-            caseFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fnName, module_.get());
-        }
-        // Allocate new buffer.
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        llvm::Value* bufSz = builder_.CreateAdd(len, builder_.getInt64(1));
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {bufSz}, "tc.data");
-        // Loop: for i in 0..len, newData[i] = fn(data[i])
-        auto* idxSlot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), idxSlot);
-        auto* condBB = llvm::BasicBlock::Create(llvm_, "tc.cond", currentFn_);
-        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "tc.body", currentFn_);
-        auto* endBB  = llvm::BasicBlock::Create(llvm_, "tc.end",  currentFn_);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(condBB);
-        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
-        builder_.SetInsertPoint(bodyBB);
-        llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
-        llvm::Value* bytePtr = builder_.CreateGEP(i8Ty, data, idxB);
-        llvm::Value* byte = builder_.CreateLoad(i8Ty, bytePtr);
-        llvm::Value* asI32 = builder_.CreateZExt(byte, i32());
-        llvm::Value* converted = builder_.CreateCall(caseFn, {asI32});
-        llvm::Value* asByte = builder_.CreateTrunc(converted, i8Ty);
-        llvm::Value* dstPtr = builder_.CreateGEP(i8Ty, newData, idxB);
-        builder_.CreateStore(asByte, dstPtr);
-        llvm::Value* next = builder_.CreateAdd(idxB, builder_.getInt64(1));
-        builder_.CreateStore(next, idxSlot);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(endBB);
-        // Null-terminate.
-        llvm::Value* nullPtr = builder_.CreateGEP(i8Ty, newData, len);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nullPtr);
-        // Build result string.
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "tc.obj");
-        builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
-        builder_.CreateStore(len, builder_.CreateStructGEP(stringType(), newStr, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-            builder_.CreateStructGEP(stringType(), newStr, 2));
-            initStringRc(newStr);  // #422: producer's reference, rc := 1
-        return newStr;
+        // #7425 (§4.6, v0.345): the fold is applied per CODE POINT, by the
+        // runtime's width-aware helper.
+        //
+        // The inline arm this replaces allocated `len + 1` BYTES for a string
+        // whose data is `len * width` bytes (§4.6), folded one BYTE at a time
+        // over `len` bytes (not `len` code points), and stored width = 1. On a
+        // width-2 string the result's CONTENT was the byte sequence, not the
+        // code-point sequence — the wrong text at the right length, which a
+        // length-only oracle cannot see. Measured on the base:
+        // `"日abc".ToUpper()` -> "åEA" (expected "日ABC").
+        //
+        // The fold itself is unchanged: for a code point that fits a byte it
+        // is the fold libc applies to that byte, which is what the old arm
+        // applied to a width-1 string's bytes (whose code points ARE its
+        // bytes) — so a width-1 string's result is UNCHANGED.
+        auto* fn = declareC("bz_str_case", ptrTy(), {ptrTy(), i32()});
+        llvm::Value* upper = builder_.getInt32(method == "ToUpper" ? 1 : 0);
+        return builder_.CreateCall(fn, {self, upper}, "tc.result");
     }
 
     // §9.6: Trim/TrimStart/TrimEnd — remove leading/trailing ASCII whitespace.
@@ -2587,99 +2523,23 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             auto* fn = declareC("bz_str_trim_chars", ptrTy(), {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {self, chars}, "trim.chars.result");
         }
-        if (!call.args.empty()) return nullptr;
-        // Implement via stripping bytes that match isspace.
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* len = loadStringLen(self);
-        llvm::Value* data = loadStringData(self);
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        // Declare isspace: int isspace(int)
-        auto* isspaceFn = module_->getFunction("isspace");
-        if (!isspaceFn) {
-            auto* ft = llvm::FunctionType::get(i32(), {i32()}, false);
-            isspaceFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "isspace", module_.get());
-        }
-        // Find start and end indices.
-        auto startSlot = entryAlloca(i64());
-        auto endSlot   = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), startSlot);
-        builder_.CreateStore(len, endSlot);
-        // Simple approach: use memmove-based trimming with loop.
-        // For brevity, reuse Substring logic after computing new bounds.
-        llvm::Value* startV = builder_.getInt64(0);
-        llvm::Value* endV   = len;
-        // Skip leading whitespace (for Trim and TrimStart).
-        if (method == "Trim" || method == "TrimStart") {
-            auto* stBB  = llvm::BasicBlock::Create(llvm_, "trim.s.cond", currentFn_);
-            auto* stBdy = llvm::BasicBlock::Create(llvm_, "trim.s.body", currentFn_);
-            auto* stEnd = llvm::BasicBlock::Create(llvm_, "trim.s.end",  currentFn_);
-            builder_.CreateStore(startV, startSlot);
-            builder_.CreateBr(stBB);
-            builder_.SetInsertPoint(stBB);
-            llvm::Value* si = builder_.CreateLoad(i64(), startSlot);
-            llvm::Value* sLt = builder_.CreateICmpSLT(si, endV);
-            builder_.CreateCondBr(sLt, stBdy, stEnd);
-            builder_.SetInsertPoint(stBdy);
-            llvm::Value* siB = builder_.CreateLoad(i64(), startSlot);
-            llvm::Value* bp  = builder_.CreateGEP(i8Ty, data, siB);
-            llvm::Value* by  = builder_.CreateLoad(i8Ty, bp);
-            llvm::Value* byI = builder_.CreateZExt(by, i32());
-            llvm::Value* isSp = builder_.CreateCall(isspaceFn, {byI});
-            llvm::Value* isSpBool = builder_.CreateICmpNE(isSp, builder_.getInt32(0));
-            auto* nextSBB = llvm::BasicBlock::Create(llvm_, "trim.s.next", currentFn_);
-            builder_.CreateCondBr(isSpBool, nextSBB, stEnd);
-            builder_.SetInsertPoint(nextSBB);
-            llvm::Value* siN = builder_.CreateLoad(i64(), startSlot);
-            builder_.CreateStore(builder_.CreateAdd(siN, builder_.getInt64(1)), startSlot);
-            builder_.CreateBr(stBB);
-            builder_.SetInsertPoint(stEnd);
-            startV = builder_.CreateLoad(i64(), startSlot);
-        }
-        // Skip trailing whitespace (for Trim and TrimEnd).
-        if (method == "Trim" || method == "TrimEnd") {
-            builder_.CreateStore(len, endSlot);
-            auto* etBB  = llvm::BasicBlock::Create(llvm_, "trim.e.cond", currentFn_);
-            auto* etBdy = llvm::BasicBlock::Create(llvm_, "trim.e.body", currentFn_);
-            auto* etEnd = llvm::BasicBlock::Create(llvm_, "trim.e.end",  currentFn_);
-            builder_.CreateBr(etBB);
-            builder_.SetInsertPoint(etBB);
-            llvm::Value* ei = builder_.CreateLoad(i64(), endSlot);
-            llvm::Value* eGt = builder_.CreateICmpSGT(ei, startV);
-            builder_.CreateCondBr(eGt, etBdy, etEnd);
-            builder_.SetInsertPoint(etBdy);
-            llvm::Value* eiB = builder_.CreateLoad(i64(), endSlot);
-            llvm::Value* prev = builder_.CreateSub(eiB, builder_.getInt64(1));
-            llvm::Value* bp  = builder_.CreateGEP(i8Ty, data, prev);
-            llvm::Value* by  = builder_.CreateLoad(i8Ty, bp);
-            llvm::Value* byI = builder_.CreateZExt(by, i32());
-            llvm::Value* isSp = builder_.CreateCall(isspaceFn, {byI});
-            llvm::Value* isSpBool = builder_.CreateICmpNE(isSp, builder_.getInt32(0));
-            auto* nextEBB = llvm::BasicBlock::Create(llvm_, "trim.e.next", currentFn_);
-            builder_.CreateCondBr(isSpBool, nextEBB, etEnd);
-            builder_.SetInsertPoint(nextEBB);
-            llvm::Value* eiN = builder_.CreateLoad(i64(), endSlot);
-            builder_.CreateStore(builder_.CreateSub(eiN, builder_.getInt64(1)), endSlot);
-            builder_.CreateBr(etBB);
-            builder_.SetInsertPoint(etEnd);
-            endV = builder_.CreateLoad(i64(), endSlot);
-        }
-        // Build trimmed string.
-        llvm::Value* trimLen = builder_.CreateSub(endV, startV);
-        llvm::Value* dataSz = builder_.CreateAdd(trimLen, builder_.getInt64(1));
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "trim.data");
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* srcPtr = builder_.CreateGEP(i8Ty, data, startV);
-        builder_.CreateCall(memcpyFn, {newData, srcPtr, trimLen});
-        llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, trimLen);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "trim.obj");
-        builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
-        builder_.CreateStore(trimLen, builder_.CreateStructGEP(stringType(), newStr, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-            builder_.CreateStructGEP(stringType(), newStr, 2));
-            initStringRc(newStr);  // #422: producer's reference, rc := 1
-        return newStr;
+        // #7425 (§4.6, v0.345): the trim is done in the CODE-POINT domain, by
+        // the runtime's width-aware helper.
+        //
+        // The inline arm this replaces allocated `trimLen + 1` BYTES for a
+        // string whose data is `trimLen * width` bytes (§4.6), scanned the
+        // whitespace test one BYTE at a time over `len` bytes (not `len` code
+        // points), and stored width = 1. On a width-2 string the result's
+        // CONTENT was the byte sequence, not the code-point sequence — the
+        // wrong text at the right length, which a length-only oracle cannot
+        // see. Measured on the base: `" 日 ".Trim()` -> "" (expected "日").
+        //
+        // The whitespace SET is unchanged: the ASCII whitespace code points,
+        // which is what the old arm's per-byte `isspace` selected.
+        auto* fn = declareC("bz_str_trim_ws", ptrTy(), {ptrTy(), i32()});
+        llvm::Value* mode = builder_.getInt32(
+            method == "Trim" ? 0 : (method == "TrimStart" ? 1 : 2));
+        return builder_.CreateCall(fn, {self, mode}, "trim.result");
     }
 
     // §9.6 / #1295: PadLeft(totalWidth[, padChar]) / PadRight(totalWidth[, padChar]).
@@ -2778,9 +2638,6 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     if (method == "Repeat" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* nArg = lowerArg(0);
         if (!nArg) return nullptr;
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* selfLen = loadStringLen(self);
-        llvm::Value* selfData = loadStringData(self);
         // fix #7104 (§5.1, v0.343): widen the count to i64 BY THE SOURCE'S
         // SIGNEDNESS. A bare `CreateSExt` read an unsigned `byte` count's high
         // bit as a sign bit, so `byte` 200 arrived as -56: the negative count
@@ -2810,39 +2667,17 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         llvm::Value* n64 = emitSection96CountContract(
                 call.args[0].value.get(), nArg, ownedOnThrow(),
                 "rep.s64", "rep.z64", "rep.neg");
-        llvm::Value* totalLen = builder_.CreateMul(selfLen, n64, "rep.total");
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* dataSz = builder_.CreateAdd(totalLen, builder_.getInt64(1));
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "rep.data");
-        // Loop: copy self n times.
-        auto* idxSlot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), idxSlot);
-        auto* condBB = llvm::BasicBlock::Create(llvm_, "rep.cond", currentFn_);
-        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rep.body", currentFn_);
-        auto* endBB  = llvm::BasicBlock::Create(llvm_, "rep.end",  currentFn_);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(condBB);
-        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, n64), bodyBB, endBB);
-        builder_.SetInsertPoint(bodyBB);
-        llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
-        llvm::Value* off = builder_.CreateMul(idxB, selfLen, "rep.off");
-        llvm::Value* dst = builder_.CreateGEP(i8Ty, newData, off, "rep.dst");
-        builder_.CreateCall(memcpyFn, {dst, selfData, selfLen});
-        builder_.CreateStore(builder_.CreateAdd(idxB, builder_.getInt64(1)), idxSlot);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(endBB);
-        llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, totalLen);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rep.obj");
-        builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), strObj, 0));
-        builder_.CreateStore(totalLen, builder_.CreateStructGEP(stringType(), strObj, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-            builder_.CreateStructGEP(stringType(), strObj, 2));
-            initStringRc(strObj);  // #422: producer's reference, rc := 1
-        return strObj;
+        // #7425 (§4.6, v0.345): the repetition is done in the CODE-POINT
+        // domain, by the runtime's width-aware helper.
+        //
+        // The inline arm this replaces copied `selfLen` BYTES per copy — the
+        // source's data is `selfLen * width` bytes (§4.6) — and stored
+        // width = 1. On a width-2 string the result's CONTENT was the byte
+        // sequence, not the code-point sequence — the wrong text at the right
+        // length, which a length-only oracle cannot see. Measured on the
+        // base: `"日abc".Repeat(2)` -> "åea" (expected "日abc日abc").
+        auto* fn = declareC("bz_str_repeat", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(fn, {self, n64}, "rep.result");
     }
 
     // §9.6-ext: GetField(delim: char, n: int): string
@@ -2853,162 +2688,38 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         llvm::Value* delimArg = lowerArg(0);
         llvm::Value* nArg = lowerArg(1);
         if (!delimArg || !nArg) return nullptr;
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* selfLen = loadStringLen(self);
-        llvm::Value* selfData = loadStringData(self);
-        // Convert delim (char = i32) to i8.
-        llvm::Value* delimByte = builder_.CreateTrunc(delimArg, i8Ty, "gf.delim");
-        // Walk the string counting fields.
-        auto* idxSlot = entryAlloca(i64());  // current scan position
-        auto* fldSlot = entryAlloca(i32());  // current field count
-        auto* staSlot = entryAlloca(i64());  // start of current field
-        builder_.CreateStore(builder_.getInt64(0), idxSlot);
-        builder_.CreateStore(builder_.getInt32(0), fldSlot);
-        builder_.CreateStore(builder_.getInt64(0), staSlot);
-        // Loop: find the n-th field.
-        auto* condBB = llvm::BasicBlock::Create(llvm_, "gf.cond", currentFn_);
-        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "gf.body", currentFn_);
-        auto* endBB  = llvm::BasicBlock::Create(llvm_, "gf.end",  currentFn_);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(condBB);
-        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-        llvm::Value* fld = builder_.CreateLoad(i32(), fldSlot);
-        llvm::Value* inRange = builder_.CreateICmpSLE(idx, selfLen);
-        llvm::Value* notDone = builder_.CreateICmpSLT(fld, nArg);
-        builder_.CreateCondBr(builder_.CreateAnd(inRange, notDone), bodyBB, endBB);
-        builder_.SetInsertPoint(bodyBB);
-        llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
-        // Check if we've reached the end OR found the delimiter.
-        llvm::Value* atEnd = builder_.CreateICmpSGE(idxB, selfLen);
-        auto* delimBB  = llvm::BasicBlock::Create(llvm_, "gf.delim", currentFn_);
-        auto* scanBB   = llvm::BasicBlock::Create(llvm_, "gf.scan",  currentFn_);
-        builder_.CreateCondBr(atEnd, delimBB, scanBB);
-        builder_.SetInsertPoint(scanBB);
-        llvm::Value* bp  = builder_.CreateGEP(i8Ty, selfData, idxB);
-        llvm::Value* by  = builder_.CreateLoad(i8Ty, bp);
-        llvm::Value* isDlm = builder_.CreateICmpEQ(by, delimByte);
-        builder_.CreateCondBr(isDlm, delimBB, delimBB);  // always → delimBB
-        // Merged: either we're at end or found delimiter (or just scanning).
-        // Actually, let's restructure: scan forward to next delimiter.
-        // Simpler: use a while-char-loop, exit when delimiter or end.
-        builder_.SetInsertPoint(delimBB);
-        // If at delimiter: advance field count, update start, advance pos.
-        llvm::Value* idxC = builder_.CreateLoad(i64(), idxSlot);
-        llvm::Value* byC = builder_.CreateSelect(
-            builder_.CreateICmpSGE(idxC, selfLen),
-            llvm::ConstantInt::get(i8Ty, 0),
-            builder_.CreateLoad(i8Ty, builder_.CreateGEP(i8Ty, selfData, idxC)));
-        llvm::Value* atDlm = builder_.CreateICmpEQ(byC, delimByte);
-        llvm::Value* atEnd2 = builder_.CreateICmpSGE(idxC, selfLen);
-        llvm::Value* shouldNext = builder_.CreateOr(atDlm, atEnd2);
-        auto* nextBB = llvm::BasicBlock::Create(llvm_, "gf.next", currentFn_);
-        auto* stepBB = llvm::BasicBlock::Create(llvm_, "gf.step", currentFn_);
-        builder_.CreateCondBr(shouldNext, nextBB, stepBB);
-        builder_.SetInsertPoint(stepBB);
-        // Just advance position.
-        builder_.CreateStore(builder_.CreateAdd(idxC, builder_.getInt64(1)), idxSlot);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(nextBB);
-        // Advance to next field.
-        llvm::Value* fldC = builder_.CreateLoad(i32(), fldSlot);
-        builder_.CreateStore(builder_.CreateAdd(fldC, builder_.getInt32(1)), fldSlot);
-        // New start = pos+1 (after delimiter). If at end, start stays.
-        llvm::Value* newStart = builder_.CreateSelect(
-            atDlm, builder_.CreateAdd(idxC, builder_.getInt64(1)), idxC);
-        builder_.CreateStore(newStart, staSlot);
-        builder_.CreateStore(newStart, idxSlot);
-        builder_.CreateBr(condBB);
-        // After loop: extract from staSlot to either next delimiter or end.
-        builder_.SetInsertPoint(endBB);
-        llvm::Value* sta = builder_.CreateLoad(i64(), staSlot);
-        // Find end of this field: scan from sta forward to delimiter or end.
-        auto* es = entryAlloca(i64());
-        builder_.CreateStore(sta, es);
-        auto* ecBB = llvm::BasicBlock::Create(llvm_, "gf.ec", currentFn_);
-        auto* ebBB = llvm::BasicBlock::Create(llvm_, "gf.eb", currentFn_);
-        auto* eBB  = llvm::BasicBlock::Create(llvm_, "gf.e",  currentFn_);
-        builder_.CreateBr(ecBB);
-        builder_.SetInsertPoint(ecBB);
-        llvm::Value* ei = builder_.CreateLoad(i64(), es);
-        llvm::Value* eiLt = builder_.CreateICmpSLT(ei, selfLen);
-        builder_.CreateCondBr(eiLt, ebBB, eBB);
-        builder_.SetInsertPoint(ebBB);
-        llvm::Value* eip = builder_.CreateGEP(i8Ty, selfData, ei);
-        llvm::Value* eib = builder_.CreateLoad(i8Ty, eip);
-        llvm::Value* eiDlm = builder_.CreateICmpEQ(eib, delimByte);
-        auto* eincBB = llvm::BasicBlock::Create(llvm_, "gf.einc", currentFn_);
-        builder_.CreateCondBr(eiDlm, eBB, eincBB);
-        builder_.SetInsertPoint(eincBB);
-        llvm::Value* eiL = builder_.CreateLoad(i64(), es);
-        builder_.CreateStore(builder_.CreateAdd(eiL, builder_.getInt64(1)), es);
-        builder_.CreateBr(ecBB);
-        builder_.SetInsertPoint(eBB);
-        llvm::Value* fieldEnd = builder_.CreateLoad(i64(), es);
-        llvm::Value* fieldLen = builder_.CreateSub(fieldEnd, sta);
-        // Create string for the field.
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* dataSz = builder_.CreateAdd(fieldLen, builder_.getInt64(1));
-        llvm::Value* fData = builder_.CreateCall(mallocFn, {dataSz}, "gf.data");
-        llvm::Value* srcPtr = builder_.CreateGEP(i8Ty, selfData, sta, "gf.src");
-        builder_.CreateCall(memcpyFn, {fData, srcPtr, fieldLen});
-        llvm::Value* nul = builder_.CreateGEP(i8Ty, fData, fieldLen);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nul);
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* strObj = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "gf.obj");
-        builder_.CreateStore(fData, builder_.CreateStructGEP(stringType(), strObj, 0));
-        builder_.CreateStore(fieldLen, builder_.CreateStructGEP(stringType(), strObj, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 1),
-            builder_.CreateStructGEP(stringType(), strObj, 2));
-            initStringRc(strObj);  // #422: producer's reference, rc := 1
-        return strObj;
+        // #7425 (§4.6, v0.345): the field is taken in the CODE-POINT domain,
+        // by the runtime's width-aware helper. The inline arm this replaces
+        // scanned for the delimiter one BYTE at a time and copied the field's
+        // BYTES, so on a width-2 string the result was the byte sequence.
+        //
+        // ⚠ GetField is NOT a stdlib §9.6 member (issue #7131) — the helper
+        // keeps the compiler's existing semantics (the n-th 0-based
+        // delimiter-separated field, "" when out of range) and only moves the
+        // work out of the byte domain. The API-existence question is #7131's.
+        auto* i32Ty = llvm::Type::getInt32Ty(llvm_);
+        if (!delimArg->getType()->isIntegerTy(32))
+            delimArg = delimArg->getType()->getIntegerBitWidth() < 32
+                           ? builder_.CreateZExt(delimArg, i32Ty, "gf.delim")
+                           : builder_.CreateTrunc(delimArg, i32Ty, "gf.delim");
+        if (!nArg->getType()->isIntegerTy(64))
+            nArg = nArg->getType()->getIntegerBitWidth() < 64
+                       ? builder_.CreateZExt(nArg, i64(), "gf.n")
+                       : builder_.CreateTrunc(nArg, i64(), "gf.n");
+        auto* fn = declareC("bz_str_getfield", ptrTy(), {ptrTy(), i32(), i64()});
+        return builder_.CreateCall(fn, {self, delimArg, nArg}, "gf.result");
     }
 
     // §9.6-ext: CountOf(sub: string): int — count non-overlapping occurrences.
     if (method == "CountOf" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* sub = getStrArg(0);
         if (!sub) return nullptr;
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* selfLen = loadStringLen(self);
-        llvm::Value* selfData = loadStringData(self);
-        llvm::Value* subLen = loadStringLen(sub);
-        llvm::Value* subData = loadStringData(sub);
-        auto* memmemFn = module_->getFunction("memmem");
-        if (!memmemFn) {
-            auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy(), i64(), ptrTy(), i64()}, false);
-            memmemFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "memmem", module_.get());
-        }
-        auto* cntSlot = entryAlloca(i32());
-        auto* posSlot = entryAlloca(ptrTy());
-        builder_.CreateStore(builder_.getInt32(0), cntSlot);
-        builder_.CreateStore(selfData, posSlot);
-        llvm::Value* endPtr = builder_.CreateGEP(i8Ty, selfData, selfLen);
-        auto* condBB = llvm::BasicBlock::Create(llvm_, "cnt.cond", currentFn_);
-        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "cnt.body", currentFn_);
-        auto* endBB  = llvm::BasicBlock::Create(llvm_, "cnt.end",  currentFn_);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(condBB);
-        llvm::Value* pos = builder_.CreateLoad(ptrTy(), posSlot);
-        llvm::Value* rem = builder_.CreatePtrDiff(i8Ty, endPtr, pos);
-        llvm::Value* canSearch = builder_.CreateICmpSGE(rem, subLen);
-        builder_.CreateCondBr(canSearch, bodyBB, endBB);
-        builder_.SetInsertPoint(bodyBB);
-        llvm::Value* posB = builder_.CreateLoad(ptrTy(), posSlot);
-        llvm::Value* remB = builder_.CreatePtrDiff(i8Ty, endPtr, posB);
-        llvm::Value* found = builder_.CreateCall(memmemFn, {posB, remB, subData, subLen});
-        auto* nullPtr = llvm::ConstantPointerNull::get(ptrTy());
-        llvm::Value* notFound = builder_.CreateICmpEQ(found, nullPtr);
-        auto* incBB = llvm::BasicBlock::Create(llvm_, "cnt.inc", currentFn_);
-        builder_.CreateCondBr(notFound, endBB, incBB);
-        builder_.SetInsertPoint(incBB);
-        // Increment count, advance past found occurrence.
-        llvm::Value* cnt = builder_.CreateLoad(i32(), cntSlot);
-        builder_.CreateStore(builder_.CreateAdd(cnt, builder_.getInt32(1)), cntSlot);
-        llvm::Value* afterFound = builder_.CreateGEP(i8Ty, found, subLen);
-        builder_.CreateStore(afterFound, posSlot);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(endBB);
-        return builder_.CreateLoad(i32(), cntSlot, "countof.result");
+        // #7425 (§4.6, v0.345): the occurrences are counted in the CODE-POINT
+        // domain, by the runtime's width-aware helper. The inline arm this
+        // replaces used `memmem` over the raw BYTES, which cannot see a code
+        // point in a width-2 or width-4 string.
+        auto* fn = declareC("bz_str_count_of", i32(), {ptrTy(), ptrTy()});
+        return builder_.CreateCall(fn, {self, sub}, "countof.result");
     }
 
     // §9.6: Insert(index, value): string — insert value at code-point position index.
@@ -3034,9 +2745,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
             idxV = getIntArg(idxSrc);
         }
         if (!idxV || !ins) return nullptr;
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen = loadStringLen(self);
-        llvm::Value* insLen  = loadStringLen(ins);
         // fix #7102 (§5.1, §9.6, v0.343): the `int` startIndex is widened by
         // the SOURCE's signedness (widenIntParam above). A `byte` 200 is the
         // `int` 200; the bare CreateSExt read it as -56, and the arm's clamp
@@ -3078,43 +2787,22 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // caller's full-expression boundary (§28.3 K8.1), which is unchanged
         // by this guard.
         guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
-        llvm::Value* resultLen = builder_.CreateAdd(selfLen, insLen, "ins.reslen");
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        // Width handling: use self's width (assume same width for ins for simplicity).
-        llvm::Value* wid = builder_.CreateZExt(loadStringWidth(self), i64());
-        llvm::Value* dataSz = builder_.CreateAdd(
-            builder_.CreateMul(resultLen, wid), builder_.getInt64(1));
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "ins.data");
-        llvm::Value* selfData = loadStringData(self);
-        llvm::Value* insData  = loadStringData(ins);
-        // Copy prefix: self[0..idx)
-        llvm::Value* prefBytes = builder_.CreateMul(idx64, wid);
-        builder_.CreateCall(memcpyFn, {newData, selfData, prefBytes});
-        // Copy insertion: ins[0..insLen)
-        llvm::Value* insBytes  = builder_.CreateMul(insLen, wid);
-        llvm::Value* midDst = builder_.CreateGEP(i8Ty, newData, prefBytes);
-        builder_.CreateCall(memcpyFn, {midDst, insData, insBytes});
-        // Copy suffix: self[idx..selfLen)
-        llvm::Value* suffOff = builder_.CreateMul(idx64, wid);
-        llvm::Value* suffSrc = builder_.CreateGEP(i8Ty, selfData, suffOff);
-        llvm::Value* suffDst = builder_.CreateGEP(i8Ty, newData,
-            builder_.CreateAdd(prefBytes, insBytes));
-        llvm::Value* suffBytes = builder_.CreateMul(
-            builder_.CreateSub(selfLen, idx64), wid);
-        builder_.CreateCall(memcpyFn, {suffDst, suffSrc, suffBytes});
-        // Null-terminate.
-        llvm::Value* resultBytes = builder_.CreateMul(resultLen, wid);
-        llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, resultBytes);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-        llvm::Value* maxW8 = builder_.CreateTrunc(loadStringWidth(self), i8Ty);
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "ins.obj");
-        builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
-        builder_.CreateStore(resultLen, builder_.CreateStructGEP(stringType(), newStr, 1));
-        builder_.CreateStore(maxW8, builder_.CreateStructGEP(stringType(), newStr, 2));
-        initStringRc(newStr);  // #422: producer's reference, rc := 1
-        return newStr;
+        // #7425 (§4.6, v0.345): the insertion is done in the CODE-POINT
+        // domain, by the runtime's width-aware helper.
+        //
+        // The inline arm this replaces sized the INSERTED value with the
+        // RECEIVER's width (`insBytes = insLen * wid`, `wid` = self's width)
+        // and copied that many bytes out of the value's own buffer. §4.6
+        // makes the width PER STRING, so the two operands may differ: a
+        // width-1 value inserted into a width-2 receiver was copied as two
+        // bytes per code point (reading past the value's buffer and folding
+        // its terminator into the text), and a width-2 value inserted into a
+        // width-1 receiver was copied one byte per code point (the low half
+        // of each code point). Measured on the base: `"abc".Insert(1, "日")`
+        // -> "aåbc" (expected "a日bc"); `"日abc".Insert(1, "XY")` -> "日奘"
+        // (expected "日XYabc").
+        auto* fn = declareC("bz_str_insert", ptrTy(), {ptrTy(), i64(), ptrTy()});
+        return builder_.CreateCall(fn, {self, idx64, ins}, "ins.result");
     }
 
     // §9.6: Remove(start): string — remove from start to end.
@@ -3139,9 +2827,7 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         }
         llvm::Value* startV = getIntArg(startArgIdx);
         if (!startV) return nullptr;
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
         llvm::Value* selfLen  = loadStringLen(self);
-        llvm::Value* selfData = loadStringData(self);
         // fix #7102 (§5.1, §9.6, v0.343): BOTH `int` parameters of Remove are
         // widened by the SOURCE's signedness (widenIntParam above). A `byte`
         // 200 is the `int` 200; the bare CreateSExt read it as -56, so the
@@ -3188,11 +2874,14 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         llvm::Value* oor = builder_.CreateOr(startNeg, startBig, "rm.soor");
         // end = start + count (if given), else = selfLen
         llvm::Value* end64;
+        // The COUNT, lowered ONCE: the argument expression is evaluated in
+        // call-site textual order (§22.5), so it must not be lowered twice.
+        llvm::Value* cnt64 = nullptr;
         if (call.args.size() >= 2 && call.args[1].value) {
             llvm::Value* cntV = lowerArg(countArgIdx);
             if (!cntV) return nullptr;
-            llvm::Value* cnt64 = widenIntParam(call.args[countArgIdx].value.get(),
-                                                cntV, "rm.cnt", "rm.zcnt");
+            cnt64 = widenIntParam(call.args[countArgIdx].value.get(),
+                                  cntV, "rm.cnt", "rm.zcnt");
             // The WINDOW: `length` must be >= 0 and the window must lie
             // inside the receiver (§3.1's StringBuilder `Remove` contract; the
             // `Substring(startIndex, length)` window beside it).
@@ -3211,36 +2900,26 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         // on the throw edge (§28.9 — the #6979 idiom; see
         // `emitGuardThrowReleasingString`).
         guardThrowReleasingSelf(oor, "IndexOutOfRangeException");
-        // Result length = start + (selfLen - end)
-        llvm::Value* tailLen = builder_.CreateSub(selfLen, end64, "rm.tail");
-        llvm::Value* resultLen = builder_.CreateAdd(start64, tailLen, "rm.reslen");
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        // Byte sizes (width=1 for now — simple byte operations).
-        llvm::Value* dataSz = builder_.CreateAdd(resultLen, builder_.getInt64(1));
-        llvm::Value* newData = builder_.CreateCall(mallocFn, {dataSz}, "rm.data");
-        // Copy prefix (0..start).
-        llvm::Value* wid = builder_.CreateZExt(loadStringWidth(self), i64());
-        llvm::Value* prefBytes = builder_.CreateMul(start64, wid);
-        builder_.CreateCall(memcpyFn, {newData, selfData, prefBytes});
-        // Copy suffix (end..selfLen).
-        llvm::Value* tailSrcOff = builder_.CreateMul(end64, wid);
-        llvm::Value* tailSrc = builder_.CreateGEP(i8Ty, selfData, tailSrcOff);
-        llvm::Value* tailDst = builder_.CreateGEP(i8Ty, newData, prefBytes);
-        llvm::Value* tailBytes = builder_.CreateMul(tailLen, wid);
-        builder_.CreateCall(memcpyFn, {tailDst, tailSrc, tailBytes});
-        // Null-terminate.
-        llvm::Value* resultBytes = builder_.CreateMul(resultLen, wid);
-        llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, newData, resultBytes);
-        llvm::Value* maxW8 = builder_.CreateTrunc(loadStringWidth(self), llvm::Type::getInt8Ty(llvm_));
-        builder_.CreateStore(llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0), nulPtr);
-        uint64_t strBytes = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* newStr = builder_.CreateCall(mallocFn, {builder_.getInt64(strBytes)}, "rm.obj");
-        builder_.CreateStore(newData, builder_.CreateStructGEP(stringType(), newStr, 0));
-        builder_.CreateStore(resultLen, builder_.CreateStructGEP(stringType(), newStr, 1));
-        builder_.CreateStore(maxW8, builder_.CreateStructGEP(stringType(), newStr, 2));
-        initStringRc(newStr);  // #422: producer's reference, rc := 1
-        return newStr;
+        // #7425 (§4.6, v0.345): the result is built in the CODE-POINT domain,
+        // by the runtime's width-aware helper.
+        //
+        // The inline arm this replaces allocated `resultLen + 1` BYTES for a
+        // string whose data is `resultLen * width` bytes (§4.6: a string
+        // stores each code point in `width` bytes, 1, 2 or 4), and then wrote
+        // `resultLen * width` bytes into it — an out-of-bounds WRITE on every
+        // width >= 2. Measured on the base (ASan): `"日abc".Remove(0, 1)`
+        // -> "heap-buffer-overflow … WRITE of size 6 … 0 bytes after a
+        // 4-byte region"; `"日".Remove(1)` -> "WRITE of size 1 … 0 bytes
+        // after a 2-byte region". It is a WRITE, so it can corrupt the heap.
+        //
+        // §4.6: "The choice of width is invisible at the language level;
+        // programs observe only the `char` sequence and its length." — so the
+        // result is the source's code-point sequence with the window removed,
+        // at whatever width fits it. A negative count is the 1-argument
+        // `Remove(startIndex)` spelling ("to the end of the string").
+        auto* rmFn = declareC("bz_str_remove", ptrTy(), {ptrTy(), i64(), i64()});
+        llvm::Value* cntArg = cnt64 ? cnt64 : builder_.getInt64(-1);
+        return builder_.CreateCall(rmFn, {self, start64, cntArg}, "rm.result");
     }
 
     // §9.6 / #535: Split — two overloads lowered here, both now width-aware.
