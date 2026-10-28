@@ -878,8 +878,8 @@ exercises the same head kind and the same binding form):
 | **#3493** | **RULED, owner-approved 2026-10-27** (verified in the issue's comments). *"Ruling: dispatch on the run-time object, through a `DisposeAsync` dispatch-table slot (this issue's option 2)."* The issue's own words: *"A trailing `DisposeAsync` dispatch entry covers this issue, #5653 (a `Base` that does not implement `IAsyncDisposable`) and #3483's interface shape, with one path instead of three static special cases."* **What it rules:** the *mechanism* of the run-time dispatch — a trailing `DisposeAsync` entry on the `IAsyncDisposable` itab (the #2506 shape), not a per-site static special case. **What it leaves open:** (a) the physical-reclamation half stays with **#3515**, whose two routes (a synthetic vtable slot `DisposeAsync$reclaim` vs a trailing itab entry) are recorded in that issue and are NOT chosen by the ruling; (b) the abstract-class head **#3516** stays gated on #3515; (c) **#7339** (a run-time STRING in an `Object`-typed slot) is not named by the ruling — it is a *value* dispatch, not a `DisposeAsync` dispatch, and needs its own answer; (d) the class-typed head's `DisposeAsync` is already dispatched through the vtable slot (MEASURED on this tree: the program prints `DER_DA` — see the anchor's section above; the fixing commit cannot be named from this tree's history), so the ruling's itab route is for the heads that have no vtable. | 2026-10-27 (already ruled) |
 
 **No other ruling is needed for the campaign.** U1 (the anchor's static half) needs
-none: §28.9 (v0.345) already says which values have no `Dispose()`, and §28.10
-(v0.345) says the `using var` disposal at scope end is a no-op for them.
+none: §28.9 (v0.350) already says which values have no `Dispose()`, and §28.10
+(v0.350) says the `using var` disposal at scope end is a no-op for them.
 **The campaign therefore does not need an owner ruling before U1 can land.**
 
 **Two dependencies on campaign 0** (master plan §3's campaign-0 list, as amended
@@ -1040,7 +1040,7 @@ PLACES THAT CURRENTLY DISAGREE):
 | # | the defect | the §-citation | where it came from |
 |---|---|---|---|
 | **#7456** | **THE §28.10 VACUITY LINT OVER-FIRES ON AN `IDisposable`/`IAsyncDisposable`/`IOwningCollection<T>`/`IOwningList<T>`-DECLARED BINDING WHOSE OBJECT **HAS** A DESTRUCTOR — THE WARNING CLAIMS "NO DISPOSAL OBLIGATION (§28.9)" WHILE THE SCOPE-END DISPOSAL **DOES** RUN. **THE FIVE SIBLING HEADS (`IEnumerator`, `IOwningEnumerator`, `IOwningEnumerable`, `IAsyncEnumerator`, `IOwningAsyncEnumerator`) DO **NOT** WARN — SO THE TWO TABLES DISAGREE ABOUT EXACTLY THE HEADS THE #7424 LANE TOUCHED** | §28.9, §28.10, §28.12, §8.7, stdlib §2.10, stdlib §4.2 (v0.345) | the U4 fix-forward's reviewer |
-| **#7457** | **A `where` BOUND NAMING `IEnumerator<T>`/`IAsyncEnumerator<T>` **ADMITS A RECORD** TYPE ARGUMENT — THE BOUND CHECK NAMES **ONLY** `IDisposable` AND `IAsyncDisposable`, **THE SAME TWO-HEAD NARROWING THE CHAIN TABLE JUST FIXED, IN A SECOND FILE** | §9.7, §14.2 rule 3, stdlib §2.10 (v0.345) | the U4 fix-forward's reviewer |
+| **#7457** | **A `where` BOUND NAMING `IEnumerator<T>`/`IAsyncEnumerator<T>` **ADMITS A RECORD** TYPE ARGUMENT — THE BOUND CHECK NAMES **ONLY** `IDisposable` AND `IAsyncDisposable`, **A HAND-MAINTAINED TWO-HEAD LIST, THE SAME KIND OF DEFECT THE CHAIN-TABLE LANE FIXED — BUT IN A SECOND FILE: THE CHAIN TABLE WAS NEVER TWO-HEAD (IT HAD **TEN** HEADS, EIGHT BEFORE #7424's LANE)** | §9.7, §14.2 rule 3, stdlib §2.10 (v0.345) | the U4 fix-forward's reviewer |
 
 | # | defect | minimal repro | §-citation | campaign |
 |---|---|---|---|---|
@@ -1332,7 +1332,7 @@ ISSUE ON PURPOSE). **=> PICKED (2026-10-28): `cdf348ec` -> `e239820b2c`, `fc09c0
   SYNC `isVtableBackedIEnumerableType` IS DELIBERATELY **NOT** WIDENED, IT DRIVES THE §29.2 `for`
   DESUGARING) AND THE **EXISTING** slot-1 DISPATCH FREES THE FRAME.
 * **#6194 — THE `using var` / `await using var` OF A STORED-TASK SOURCE's `Task` PROPERTY **HUNG**
-  UNDER AOT.** §30.11 (v0.345): *"The **source owns the task object** its `Task` property exposes. A
+  UNDER AOT.** §30.11 (v0.350): *"The **source owns the task object** its `Task` property exposes. A
   read of the property is a **borrow** of the task … there is no first-read ownership transfer"*;
   *"the source's disposal is the task's single disposal."* **THE DEFECT: THE `using var` SPELLING
   REGISTERED A SCOPE-END DISPOSAL (THE PLAIN-`var` TWIN DOES NOT), THAT DISPOSAL FIRE-AND-FORGOT AND
@@ -1393,7 +1393,7 @@ ISSUE ON PURPOSE). **=> PICKED (2026-10-28): `cdf348ec` -> `e239820b2c`, `fc09c0
   (**ACCEPT-W-NOTES**). **THE PICKED SHAs ON STAGING: `a37947ec` (`narrow #7326 fix #7396`) ·
   `dc0fd710` (`narrow #7354 fix #7394`) · `70e7d059` (`narrow #7424`) · `5794390c`
   (`narrow #7354`) · `f5d9ef22` (`narrow #7326`) · `431fed95` (`narrow #7424`).**
-* **=> TWO **TRUE** CLOSURES: **#7394** AND **#7396**. **AT THE PICK, **THREE** ISSUES STAY OPEN: **#7326**, **#7354** AND **#7424** (THEIR SUBJECTS CARRY `narrow`, WHICH IS NOT A CLOSING KEYWORD). **=> **CORRECTION (THE COORDINATOR, 2026-10-28 22:40): **#7326 IS **NO LONGER PARTIAL** — ITS RESIDUAL (THE §28.10 VACUITY LINT's OVER-FIRE, **#7456**) IS **FIXED** BY THE DISPOSAL-FAMILY LANE (`19fd5710`), WHICH IS AN ANCESTOR OF STAGING — **SO #7326 IS **WHOLE**, AND **TWO** ISSUES (NOT THREE) REMAIN OPEN.** **=> **CORRECTION (THE COORDINATOR, 2026-10-28 23:45): **#7354 IS **NOW WHOLE** AS WELL — ITS RESIDUAL (THE **NESTED-RECORD REACH GAP**: `Resolver::checkRecordRestrictions` ITERATING `ctx_.module()->children` — **MODULE-LEVEL ONLY**) IS **THE **VERY** DEFECT #7490's LANE FIXED** (`0c562e95`, PICKED AS `32ca5cf3f1`): THE CHECK NOW WALKS THE MODULE's OWN DECLARATION TREE WITH `forEachTypeAndNested` (#3574, §11.6), SO A `record` **INSIDE A `class`** NO LONGER ESCAPES ANY §9.6/§9.7 RECORD RESTRICTION — AND THE REACH IS **RECURSIVE** (A `record` AT DEPTH TWO IS REACHED TOO).  **=> **ONE** ISSUE (NOT TWO) REMAINS OPEN: **#7424** (THE CHAIN TABLE's MECHANICAL DERIVATION).** **=> **CORRECTION (THE COORDINATOR, 2026-10-29 00:20): **#7424 IS **NOW WHOLE** AS WELL — ITS RESIDUAL (THE **MECHANICAL DERIVATION** OF THE DISPOSAL-INTERFACE CHAIN TABLE INTO `src/common/BuiltinRegistry.*`) IS **NOW MECHANICALLY GUARANTEED** BY THE CHAIN-TABLE LANE's COMMIT `251e575d`: THE NEW RATCHET `scripts/check_disposal_family_chain.py` **PARSES THE STDLIB DOCUMENT**, **TAKES THE TRANSITIVE CLOSURE** OF THE EXTENSION GRAPH FROM `IDisposable`, AND **COMPARES THE DERIVATION AGAINST THREE TRANSCRIPTIONS** OF THE SAME FACT (THE MACHINE-READABLE CODE TABLE, THE `std::array<..., N>` SIZE, AND THE HAND-WRITTEN COMMENT BLOCK) — IT **FAILS CLOSED**, AND IT IS WIRED INTO `scripts/gate_full_cycle.sh`, SO THE GATE's RATCHET SWEEP **DISCOVERS** IT.  **=> **NO** ISSUE REMAINS OPEN IN THIS FAMILY: **#7354** AND **#7424** ARE BOTH **WHOLE**.**
+* **=> TWO **TRUE** CLOSURES: **#7394** AND **#7396**. **NO ISSUE IN THIS FAMILY REMAINS OPEN **AS A DEFECT**. **=> **CORRECTION (THE COORDINATOR, 2026-10-28 22:40): **#7326 IS **NO LONGER PARTIAL** — ITS RESIDUAL (THE §28.10 VACUITY LINT's OVER-FIRE, **#7456**) IS **FIXED** BY THE DISPOSAL-FAMILY LANE (`19fd5710`), WHICH IS AN ANCESTOR OF STAGING — **SO #7326 IS **WHOLE**, AND **TWO** ISSUES (NOT THREE) REMAIN OPEN.** **=> **CORRECTION (THE COORDINATOR, 2026-10-28 23:45): **#7354 IS **NOW WHOLE** AS WELL — ITS RESIDUAL (THE **NESTED-RECORD REACH GAP**: `Resolver::checkRecordRestrictions` ITERATING `ctx_.module()->children` — **MODULE-LEVEL ONLY**) IS **THE **VERY** DEFECT #7490's LANE FIXED** (`0c562e95`, PICKED AS `32ca5cf3f1`): THE CHECK NOW WALKS THE MODULE's OWN DECLARATION TREE WITH `forEachTypeAndNested` (#3574, §11.6), SO A `record` **INSIDE A `class`** NO LONGER ESCAPES ANY §9.6/§9.7 RECORD RESTRICTION — AND THE REACH IS **RECURSIVE** (A `record` AT DEPTH TWO IS REACHED TOO).  **=> **ONE** ISSUE (NOT TWO) REMAINS OPEN: **#7424** (THE CHAIN TABLE's MECHANICAL DERIVATION).** **=> **CORRECTION (THE COORDINATOR, 2026-10-29 00:20): **#7424 IS **NOW WHOLE** AS WELL — ITS RESIDUAL (THE **MECHANICAL DERIVATION** OF THE DISPOSAL-INTERFACE CHAIN TABLE INTO `src/common/BuiltinRegistry.*`) IS **NOW MECHANICALLY GUARANTEED** BY THE CHAIN-TABLE LANE's COMMIT `251e575d`: THE NEW RATCHET `scripts/check_disposal_family_chain.py` **PARSES THE STDLIB DOCUMENT**, **TAKES THE TRANSITIVE CLOSURE** OF THE EXTENSION GRAPH FROM `IDisposable`, AND **COMPARES THE DERIVATION AGAINST THREE TRANSCRIPTIONS** OF THE SAME FACT (THE MACHINE-READABLE CODE TABLE, THE `std::array<..., N>` SIZE, AND THE HAND-WRITTEN COMMENT BLOCK) — IT **FAILS CLOSED**, AND IT IS WIRED INTO `scripts/gate_full_cycle.sh`, SO THE GATE's RATCHET SWEEP **DISCOVERS** IT.  **=> **NO** ISSUE REMAINS OPEN IN THIS FAMILY: **#7354** AND **#7424** ARE BOTH **WHOLE**.**
 
 **THE COORDINATOR's SUBJECT AMENDMENT (2026-10-28) — THE REVIEWER's FIRST NOTE, DISCHARGED.**
 
@@ -1714,7 +1714,7 @@ or a commit) or **HYPOTHESIS**.*
 SECOND AS *"A GENERIC METHOD WITH `where T: IDisposable` **COMPILES**"*.** **THAT SECOND HALF IS
 **WRONG**, AND IT IS **STRUCK IN PLACE**:**
 
-* **§28.12 (v0.345), `docs/Bezel_Language_Spec.md:7475`, QUOTED:** *"`where T: IDisposable` **admits
+* **§28.12 (v0.350), `docs/Bezel_Language_Spec.md:8368` (line 7475 at v0.345), QUOTED:** *"`where T: IDisposable` **admits
   it and every interface extending it** (`IAsyncEnumerator<T>` among them)."*
 * **#7354's OWN ISSUE BODY SAYS SO: ITS SHAPE 1 IS *"required: admitted"*.**
 * **=> THE BOUND ADMITTING `IAsyncDisposable` (AND `IAsyncEnumerator<int>`) IS THE **SPECIFIED**
@@ -1893,32 +1893,32 @@ the record should date it as a timestamp rather than as "LIVE".**
   Owner-approved 2026-10-27 ✓, and the record's account of what it leaves open (the reclamation
   half with #3515, #3516 gated on it, #7339 not named) matches the issue's text ✓. #3493 is OPEN
   ✓, as the record says.
-* **§28.9 (v0.345), line 7158 — VERBATIM, neighbours included.** The record quotes "None of them
+* **§28.9 (v0.350), line 8051 — VERBATIM, neighbours included.** The record quotes "None of them
   is a class, and none has a `Dispose()` member: `x.Dispose()` over a value of one of these types
   is a compile error" ✓ and the neighbouring clause "the type's lifetime is managed by the runtime
   without user involvement" ✓ (the record cites it for new-11), and "`string` — the list's FIRST
   ENTRY" ✓ (the record's #7273 answer says so; MEASURED: `string` is the first bullet, `Type` the
   second — which also settles the record's question 4's premise that "§28.9 lists `Type`
   explicitly" ✓).
-* **§28.12 (v0.345), line 7506 — VERBATIM**: "`await using` selects the logical-disposal path by
+* **§28.12 (v0.350), line 8399 — VERBATIM**: "`await using` selects the logical-disposal path by
   the class of the object the binding **holds** … **never by the binding's static type**" ✓, and
   the record's reading of it (the static type decides only what is known before run time) is the
   sentence's own next clause ✓.
-* **§28.12 (v0.345), line 7504 — VERBATIM**: "`await using var` takes §28.10's admission
+* **§28.12 (v0.350), line 8397 — VERBATIM**: "`await using var` takes §28.10's admission
   unchanged" ✓, and the neighbour sentence the record's question 1 depends on is there too ("Over a
   borrow right-hand side … the binding assumes no obligation, so scope exit disposes nothing").
-* **§28.10 (v0.345), line 7276 — VERBATIM**: "the disposal at scope end is a no-op … and the only
+* **§28.10 (v0.350), line 8169 — VERBATIM**: "the disposal at scope end is a no-op … and the only
   effect is the reassignability restriction" ✓.
-* **§28.10 (v0.345), the borrow paragraph — VERBATIM**: "the `using var` does **not** assume a
+* **§28.10 (v0.350), the borrow paragraph — VERBATIM**: "the `using var` does **not** assume a
   disposal obligation …: at scope end, no `Dispose()` is called, because the value is not owned by
   this scope" ✓ (the record's new-10 citation is exact).
-* **§8.7 (v0.345), line 1182 — VERBATIM**: "`DisposeAsync()` is a member only of a type that
+* **§8.7 (v0.350), line 1260 — VERBATIM**: "`DisposeAsync()` is a member only of a type that
   declares or inherits it" ✓, **and the neighbour the record's question 3 leans on is there**:
   "the diagnostic naming the discharge points" ✓.
-* **§28.12 (v0.345), line 7475 — VERBATIM**: "only a class implements it — a record, enum or
+* **§28.12 (v0.350), line 8368 — VERBATIM**: "only a class implements it — a record, enum or
   choice that lists it, or lists an interface extending it, is a compile error at the declaration"
   ✓ (the record's new-6).
-* **§28.12 (v0.345), line 7502 — VERBATIM**: "`await using` is valid only inside an async method
+* **§28.12 (v0.350), line 8395 — VERBATIM**: "`await using` is valid only inside an async method
   or async lambda" ✓.
 * **=> FINDING 7 (MEDIUM): three of the record's "quoted" §-sentences are PARAPHRASES presented as
   quotations.** (a) new-1's **§28.2** "the free there is logical disposal followed by reclamation:
@@ -1964,13 +1964,13 @@ the record should date it as a timestamp rather than as "LIVE".**
   pre-lane tree and GREEN on the post-lane tree.
 * **RE-MEASURED (the members I named for the next lane):** **#7326 REPRODUCES** — `await using
   var t := o.ToString();` in a non-async `static method Main()` **compiles** (rc = 0), with only the
-  §28.9 vacuity warning, against §28.12 (v0.345): "`await using` is valid only inside an async
+  §28.9 vacuity warning, against §28.12 (v0.350): "`await using` is valid only inside an async
   method or async lambda". **#7354 REPRODUCES in **ONE** of its four shapes** — a `record` declaring
   `IAsyncDisposable` **compiles** (against §28.12: "a record, enum or choice that lists it … is a
   compile error at the declaration").
   **⚠ CORRECTED 2026-10-28 BY THE U4 LANE's REVIEWER (its §4): **THE SECOND HALF OF THIS SENTENCE
   — "a generic method with `where T: IDisposable` **compiles**" — WAS **NOT** A REPRODUCTION, AND IT
-  IS **STRUCK**.** **§28.12 (v0.345, `docs/Bezel_Language_Spec.md:7475`) SAYS THE BOUND **ADMITS**
+  IS **STRUCK**.** **§28.12 (v0.350, `docs/Bezel_Language_Spec.md:8368`) SAYS THE BOUND **ADMITS**
   THE INTERFACE AND EVERY INTERFACE EXTENDING IT: *"where T: IDisposable` admits it and every
   interface extending it (`IAsyncEnumerator<T>` among them)"* — **AND #7354's OWN ISSUE BODY SAYS
   SO: ITS SHAPE 1 IS *"required: admitted"*.** **=> THE BOUND ADMITTING `IAsyncDisposable` IS THE
