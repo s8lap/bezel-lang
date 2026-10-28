@@ -791,8 +791,20 @@ Six members are spec-questions and are **held out** of the lanes:
 
 ## Siblings filed during the campaign
 
-None. This lane filed no issue (lanes may not file); every defect found is reported to the coordinator
-in the hand-back with a minimal repro and a §-citation (see *Lane records*).
+**The ENTRY lane filed no issue (lanes may not file); every defect it found is reported to the
+coordinator in the hand-back with a minimal repro and a §-citation (see *Lane records*).**
+
+**=> BUT THE **COORDINATOR** HAS FILED **FOUR** SINCE — **EACH WITH EXACTLY ONE
+`campaign:builtin-call-admission` LABEL, EACH FROM A **REVIEWER's MEASUREMENT** (NOT FROM A LANE's
+WORD), AND EACH WITH A MINIMAL REPRO AND A §-CITATION IN ITS BODY:**
+
+| # | the defect | the §-citation | where it came from |
+|---|---|---|---|
+| **#7419** | **A REORDERED NAMED CALL ON `Debug.Assert` IS REFUSED BY THE **POSITIONAL** SHARED RESOLVER, AND THE DIAGNOSTIC NAMES THE **WRONG** PARAMETER** — a LANE-INTRODUCED false rejection of a legal §22.5 program | §22.5, §8.2, §22.6 (v0.345) | the B4a lane's reviewer |
+| **#7420** | **`StringBuilder.AppendLine`'s VALUE TYPE IS NOT CHECKED AGAINST stdlib §3.1's DECLARED SURFACE** — `AppendLine(5)`, `AppendLine('c')` and `AppendLine(true)` all compile and append | §22.6, §5.1, stdlib §3.1 (v0.345) | the B4a lane's reviewer |
+| **#7421** | **THE §9.6 ARGUMENT-TYPE FAMILY AT `Trim` / `Equals` / `IsNullOrWhiteSpace` — TWO OF THEM **ABORT THE COMPILER** AND `Trim(null)` IS A **SILENT ACCEPTANCE** THAT PRINTS `abc`** | §9.6, §7.3, §22.6 (v0.345) | the B4a lane's reviewer |
+| **#7425** | **THE WIDTH-2 `string` SURFACE **WRITES OUT OF BOUNDS** — AN ASAN HEAP-BUFFER-OVERFLOW **WRITE** — AND THE DEFECT REACHES **BEYOND `Remove`**, SO A **LENGTH-ONLY ORACLE MISSES IT** | §4.6 (v0.345) | the B4a lane's reviewer |
+
 
 ## Lane records
 

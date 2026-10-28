@@ -1017,6 +1017,20 @@ before being filed, and the repros below are the GRID'S OWN CELLS, generated
 from `scripts/using_heads_grid.py` so the repro is the campaign's and not a
 paraphrase.)*
 
+**=> AND THE **COORDINATOR** HAS FILED **THREE MORE** SINCE THE ENTRY LANE's THIRTEEN — **EACH WITH
+EXACTLY ONE `campaign:using-heads` LABEL, EACH FROM A **REVIEWER's MEASUREMENT**, AND EACH WITH A
+MINIMAL REPRO AND A §-CITATION IN ITS BODY:**
+
+| # | the defect | the §-citation | where it came from |
+|---|---|---|---|
+| **#7422** | **THE `owned`-FIELD DISPOSAL PREDICATE COVERS THE ITERATOR-FORMAT HEADS IN A **CROSS**, NOT A SQUARE — `owned IEnumerator<int>?` AND `owned IAsyncEnumerable<int>?` **STILL LEAK THE FRAME**, AND THE ASYNC ONE **ALSO SKIPS THE §29.7 `finally` CHAIN** — **SO IT IS #2623's OWN DEFECT CLASS, ONE HEAD OVER** | §28.5 rule 1, §29.7, §30.7 (v0.345) | the U2/U3 lane's reviewer |
+| **#7423** | **A `using var` OVER A **NULL-CONDITIONAL** `?.` READ OF A `Task` — **THE COMPILER CRASHES** (MALFORMED IR: A DEGRADED SLOT LOADED AS `i32` AND PASSED TO A POINTER PARAMETER) **AND WITH A NULLABLE RECEIVER THE PROGRAM **OVERFLOWS THE STACK** AT RUN TIME** | §30.11, §28.10, §30.2 (v0.345) | the U2/U3 lane's reviewer |
+| **#7424** | **THE DISPOSAL-INTERFACE CHAIN TABLE OMITS `IOwningCollection<T>` AND `IOwningList<T>` (stdlib §4.2), WHICH EXTEND `IDisposable`, SO §28.12's DECLARATION-SITE BAN DOES NOT REACH THEM** — **AND IT IS NOT A COMPILER LIMITATION: THE COMPILER CAN SEE THE EDGE (`where T: IDisposable` ADMITS `IOwningCollection<Res>`)** | §28.12 (v0.345, spec:7475), stdlib §4.2 | the U4 lane's reviewer |
+
+**(#7422's ASYNC SELF-DISPOSAL RESIDUAL IS A **SECOND, DISTINCT** DEFECT AND IS RECORDED AS A COMMENT
+ON #7422 ITSELF; **AND THE **SYNC** SELF-DISPOSE TWIN IS **NOT** A SECOND DEFECT — IT IS #7422's OWN
+PREDICATE GAP WEARING THE SELF-DISPOSE COSTUME, **SO IT IS **NOT** FILED TWICE.**)
+
 | # | defect | minimal repro | §-citation | campaign |
 |---|---|---|---|---|
 | new-1 | a direct `DisposeAsync()` on a plain-`var` local leaks the receiver's block | `var x := new AsyncRes(); await x.DisposeAsync();` → `16 byte(s) leaked in 1 allocation(s)`; the `using var` spelling of the same program is clean | §28.12 step 2 (spec lines 7480 / 7482, **quoted**: *"The cascade and the chain are the same regardless of which logical-disposal path ran"* and *"Asynchronous cleanup runs only where the program wrote `await using` … or awaited a direct `DisposeAsync()` call"*), §28.2 (spec lines 6230 / 6244, **quoted**: *"`Dispose()` on any class instance is idempotent: the first call performs the disposal; subsequent calls are no-ops"* and *"**The compiler-inserted free.**"*) — **THE EARLIER WORDING OF BOTH WAS A PARAPHRASE, NOT A QUOTATION; THE HOUSE RULE IS THAT A QUOTED §-SENTENCE IS EVIDENCE AND A PARAPHRASE IS A CLAIM, SO THE SPEC's OWN WORDS ARE GIVEN HERE** | using-heads (U2d, with #1531) |
