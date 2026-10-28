@@ -496,3 +496,130 @@ BEZEL_TEST(disposal_interface_chain_7354,
     });
     expectCompiles(p);
 }
+
+// The ENUM half of the "a non-disposal interface is still admitted" control:
+// the check keys on the disposal CHAIN, not on "the enum lists an interface".
+BEZEL_TEST(disposal_interface_chain_7354,
+           enum_listing_a_non_disposal_interface_is_still_admitted_spec_9_7) {
+    const std::string p = prog({
+        "module Conf;",
+        "public interface IFoo method Bar(): int; end IFoo;",
+        "public enum E: IFoo A, B; end E;",
+        "public class Program",
+        "  public static method Main()",
+        "    Console.WriteLine(\"hi\");",
+        "  end Main;",
+        "end Program;",
+    });
+    expectCompiles(p);
+}
+
+// The CHOICE half of the same control.
+BEZEL_TEST(disposal_interface_chain_7354,
+           choice_listing_a_non_disposal_interface_is_still_admitted_spec_9_7) {
+    const std::string p = prog({
+        "module Conf;",
+        "public interface IFoo method Bar(): int; end IFoo;",
+        "public choice C: IFoo A, B; end C;",
+        "public class Program",
+        "  public static method Main()",
+        "    Console.WriteLine(\"hi\");",
+        "  end Main;",
+        "end Program;",
+    });
+    expectCompiles(p);
+}
+
+// A NESTED enum is reached by the declaration-site ban too (§28.12 names the
+// enum, at whatever nesting depth it is declared).
+BEZEL_TEST(disposal_interface_chain_7354,
+           nested_enum_listing_i_async_disposable_is_rejected_spec_28_12) {
+    const std::string p = prog({
+        "module Conf;",
+        "public class Outer",
+        "  public enum E: IAsyncDisposable A, B; end E;",
+        "end Outer;",
+    });
+    BEZEL_EXPECT_TRUE(rejectedAt(
+        p, 3, 10,
+        "enum `E` may not implement `IAsyncDisposable` — "
+        "`IAsyncDisposable` extends `IDisposable` (§8.7, §28.12)"));
+}
+
+// The CHOICE half of the nested row.
+BEZEL_TEST(disposal_interface_chain_7354,
+           nested_choice_listing_i_async_disposable_is_rejected_spec_28_12) {
+    const std::string p = prog({
+        "module Conf;",
+        "public class Outer",
+        "  public choice C: IAsyncDisposable A, B; end C;",
+        "end Outer;",
+    });
+    BEZEL_EXPECT_TRUE(rejectedAt(
+        p, 3, 10,
+        "choice `C` may not implement `IAsyncDisposable` — "
+        "`IAsyncDisposable` extends `IDisposable` (§8.7, §28.12)"));
+}
+
+// The nested enum's "a non-disposal interface is still admitted" control.
+BEZEL_TEST(disposal_interface_chain_7354,
+           nested_enum_listing_a_non_disposal_interface_is_still_admitted_spec_9_7) {
+    const std::string p = prog({
+        "module Conf;",
+        "public interface IFoo method Bar(): int; end IFoo;",
+        "public class Outer",
+        "  public enum E: IFoo A, B; end E;",
+        "end Outer;",
+        "public class Program",
+        "  public static method Main()",
+        "    Console.WriteLine(\"hi\");",
+        "  end Main;",
+        "end Program;",
+    });
+    expectCompiles(p);
+}
+
+// The nested choice's "a non-disposal interface is still admitted" control.
+BEZEL_TEST(disposal_interface_chain_7354,
+           nested_choice_listing_a_non_disposal_interface_is_still_admitted_spec_9_7) {
+    const std::string p = prog({
+        "module Conf;",
+        "public interface IFoo method Bar(): int; end IFoo;",
+        "public class Outer",
+        "  public choice C: IFoo A, B; end C;",
+        "end Outer;",
+        "public class Program",
+        "  public static method Main()",
+        "    Console.WriteLine(\"hi\");",
+        "  end Main;",
+        "end Program;",
+    });
+    expectCompiles(p);
+}
+
+// A USER interface that SHADOWS the built-in `IDisposable` is not the
+// built-in one: §2.3 lets a current-module declaration shadow an
+// auto-imported name (only `Object` and `Type` are barred), and §9.7's ban is
+// on the BUILT-IN `IDisposable` — "Records cannot have … or implement
+// `IDisposable` — directly or through an interface extending it". The user's
+// interface extends nothing, so the record implements no disposal interface
+// and is ADMITTED.
+//
+// This row pins the flip: the pre-fix check was NAME-BASED
+// (`bt->name->parts.back() == "IDisposable"`), so it REJECTED this program on
+// the strength of the SPELLING alone. The chain-based check admits it, which
+// is the correct behaviour (fix #7354).
+BEZEL_TEST(disposal_interface_chain_7354,
+           record_listing_a_shadowing_user_idisposable_is_still_admitted_spec_9_7) {
+    const std::string p = prog({
+        "module Conf;",
+        "public interface IDisposable end IDisposable;",
+        "public record R: IDisposable public _x: int := 0; end R;",
+        "public class Program",
+        "  public static method Main()",
+        "    Console.WriteLine(\"hi\");",
+        "  end Main;",
+        "end Program;",
+    });
+    expectCompiles(p);
+}
