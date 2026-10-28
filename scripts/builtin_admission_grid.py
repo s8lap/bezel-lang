@@ -79,6 +79,10 @@ CONTEXT_FREE = frozenset({
     "expects `Array<string>`",
     "is ambiguous: an imported public from",
     "shadows the always-available type",
+    # §2.18/§18.5: the format-spec rule names the RECEIVER TYPE, not the call.
+    "a format spec requires an intrinsically-formattable",
+    # §14.2: the constraint rule names the type ARGUMENT, not the call.
+    "does not satisfy the constraint `where T: INumber<T>`",
 })
 
 
@@ -194,6 +198,50 @@ def F_initializer(subject, var):
     return ["the initializer for",
             f"the initializer for `{var}` has a type that is not implicitly "
             f"convertible to the target type"]
+
+
+def F_pos0_param(member, role):
+    """stdlib §9.6 + §5.1 (v0.345): the POSITION-0 parameter of a §9.6 string
+    member takes its <role> as a `char` (or a `string`, or an `Array<char>`);
+    the argument's type converts to none of them.
+
+    THE WORDING VARIES IN THREE PLACES, so one fixed string misses one of
+    them: the ROLE (`search value` vs `separator` vs `replacement value`), the
+    LIST of accepted types (char-only vs char-or-string vs char-or-string-or-
+    Array<char>) and the TAIL (`converts to neither` vs `converts to
+    none of them`).  The family therefore carries the role-specific wording
+    AND the member-named PREFIX, which survives a reword of the role, of the
+    list and of the tail alike (`_needle_hit` is a plain substring test, so
+    the prefix is the fragment that must not be a fixed string)."""
+    return [f"`string.{member}` takes its {role} at position 0",
+            f"`string.{member}` takes its"]
+
+
+def F_formattable_receiver():
+    """§2.18 + §18.5 (v0.345): a format spec requires an intrinsically-
+    formattable receiver (a numeric/temporal/Guid) or one implementing
+    `IFormattable`.
+
+    The wording names the RECEIVER TYPE (`bool`, `char`, `string`), not the
+    member, so a fixed string would work for one type only.  The family
+    carries the type-agnostic PREFIX instead, plus the `operand` spelling the
+    interpolation path (§18.5) uses for the same rule."""
+    return ["a format spec requires an intrinsically-formattable receiver "
+            "(a numeric/temporal/Guid) or one implementing `IFormattable`",
+            "a format spec requires an intrinsically-formattable",
+            "a format spec requires an intrinsically-formattable operand"]
+
+
+def F_typearg_constraint(subject, constraint="INumber<T>"):
+    """§14.2 + stdlib §2.2/§2.19 (v0.345): the type argument does not satisfy
+    the callee's constraint.
+
+    The wording NAMES THE OFFENDING TYPE (`bool`, `string`, ...), so a fixed
+    string works for one type only.  The family carries a fragment that
+    EXCLUDES the type name — the constraint phrase — and a member-named one
+    (the callee's own requirement), so it matches ANY type argument."""
+    return [f"does not satisfy the constraint `where T: {constraint}`",
+            f"`{subject}` requires an argument type that conforms to `{constraint}`"]
 
 
 CELLS = []
@@ -523,9 +571,11 @@ C("int_tostring_format_d", 'Console.WriteLine((255).ToString("D"));', ("value", 
 C("int_tostring_format_x", 'Console.WriteLine((255).ToString("x"));', ("value", "ff\n"))
 C("int_tostring_format_X", 'Console.WriteLine((255).ToString("X"));', ("value", "FF\n"))
 C("bool_tostring_format", 'Console.WriteLine((true).ToString("F4"));',
-  ("reject", R(F_overload("bool.ToString"))), subject="bool.ToString")
+  ("reject", R(F_overload("bool.ToString"), F_formattable_receiver())),
+  subject="bool.ToString")
 C("char_tostring_format", "Console.WriteLine(('a').ToString(\"F4\"));",
-  ("reject", R(F_overload("char.ToString"))), subject="char.ToString")
+  ("reject", R(F_overload("char.ToString"), F_formattable_receiver())),
+  subject="char.ToString")
 C("double_tostring_format_c", 'Console.WriteLine((1.5).ToString("C"));', ("fault", "FormatException"))
 C("double_tostring_format_d", 'Console.WriteLine((3.5).ToString("D"));', ("fault", "FormatException"))
 C("double_tostring_format_bad", 'Console.WriteLine((1.5).ToString("Q"));', ("fault", "FormatException"))
@@ -590,9 +640,11 @@ C("math_floor_narrowed",
   'if d <> null then Console.WriteLine(Math.Floor(d)); end if;',
   ("value", "2\n"), pre="var d: double? := 2.5;", campaign="5")
 C("math_sign_string", 'Console.WriteLine(Math.Sign("x"));',
-  ("reject", R(F_overload("Math.Sign"), F_convertible("Math.Sign"))), subject="Math.Sign")
+  ("reject", R(F_overload("Math.Sign"), F_convertible("Math.Sign"),
+               F_typearg_constraint("Math.Sign"))), subject="Math.Sign")
 C("math_sign_bool", 'Console.WriteLine(Math.Sign(true));',
-  ("reject", R(F_overload("Math.Sign"), F_convertible("Math.Sign"))), subject="Math.Sign")
+  ("reject", R(F_overload("Math.Sign"), F_convertible("Math.Sign"),
+               F_typearg_constraint("Math.Sign"))), subject="Math.Sign")
 C("math_sign_double", 'Console.WriteLine(Math.Sign(-1.5));', ("value", "-1\n"))
 C("math_max_mixed", 'Console.WriteLine(Math.Max(1, 2L));',
   ("reject", R(F_inference("Math.Max"))), subject="Math.Max")
@@ -625,21 +677,26 @@ C("sb_appendformat_string", '_ := sb.AppendFormat("x", a);', ("noabort", None),
   pre="var sb := new StringBuilder();\nusing var a := new Array<Object>();")
 C("string_contains_int", 'Console.WriteLine("abc".Contains(1));',
   ("reject", R(F_overload("String.Contains"), F_convertible("String.Contains"),
-               F_dispatch("String.Contains"))), subject="String.Contains")
+               F_dispatch("String.Contains"),
+               F_pos0_param("Contains", "search value"))), subject="String.Contains")
 C("string_contains_string", 'Console.WriteLine("abc".Contains("b"));', ("value", "True\n"))
 C("string_contains_object", 'Console.WriteLine("abc".Contains(o));',
   ("reject", R(F_overload("String.Contains"), F_convertible("String.Contains"),
-               F_dispatch("String.Contains"))),
+               F_dispatch("String.Contains"),
+               F_pos0_param("Contains", "search value"))),
   pre="var o: Object := \"b\";", subject="String.Contains")
 C("string_split_int", 'Console.WriteLine("abc".Split(1));',
   ("reject", R(F_overload("String.Split"), F_convertible("String.Split"),
-               F_dispatch("String.Split"))), subject="String.Split")
+               F_dispatch("String.Split"),
+               F_pos0_param("Split", "separator"))), subject="String.Split")
 C("string_lastindexof_int", 'Console.WriteLine("abc".LastIndexOf(1));',
   ("reject", R(F_overload("String.LastIndexOf"), F_convertible("String.LastIndexOf"),
-               F_dispatch("String.LastIndexOf"))), subject="String.LastIndexOf")
+               F_dispatch("String.LastIndexOf"),
+               F_pos0_param("LastIndexOf", "search value"))), subject="String.LastIndexOf")
 C("string_replace_object", 'Console.WriteLine("abc".Replace(o, "x"));',
   ("reject", R(F_overload("String.Replace"), F_convertible("String.Replace"),
-               F_dispatch("String.Replace"))),
+               F_dispatch("String.Replace"),
+               F_pos0_param("Replace", "search value"))),
   pre="var o: Object := \"b\";", subject="String.Replace")
 C("string_repeat_char", "Console.WriteLine(string.Repeat('a', 3));", ("value", "aaa\n"))
 # RULING R3 (coordinator, 2026-10-28): stdlib §9.6 declares BOTH overloads side by side —

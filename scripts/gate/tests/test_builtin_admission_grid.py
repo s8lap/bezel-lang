@@ -31,6 +31,13 @@ What is asserted:
   * the reject cell set is PINNED exactly (count and names), so a cell whose
     expectation KIND changes turns this suite RED (A2);
   * a `fault` cell is OK only when the fault text appears;
+  * for the NINE cells whose compiler fix landed with a NEW, more specific
+    diagnostic, the PRE-FIX wording is still accepted (a family that LOSES an
+    old wording stops accepting a legitimate diagnostic and the grid calls a
+    correct compiler wrong), the new wording is accepted, a wording from
+    ANOTHER rule is NOT, and each family tolerates the variations of its own
+    rule (the role, the accepted-type list, the tail, the receiver type, the
+    type argument);
   * generation is deterministic, and the TSV's program path is CELL-RELATIVE,
     so two runs into different --out directories produce the same bytes.
 """
@@ -170,6 +177,180 @@ REJECT_CELLS = [
     'string_lastindexof_int', 'string_replace_object', 'string_split_int',
     'string_tostring_format_bad', 'uint_parse_null',
 ]
+
+
+# The nine cells whose compiler fix has landed with a NEW, MORE SPECIFIC diagnostic.
+# The campaign-2 record's rule -- *The reject needles are FAMILIES, not one guessed
+# wording* -- says a family GROWS: the new wording is ADDED and the PRE-FIX wording
+# is KEPT, because the compiler still emits the pre-fix wording ELSEWHERE (measured:
+# `string member `.Nope` is not yet supported in codegen` for the dispatch family,
+# `no matching overload of `bool.ToString` -- the call supplies 2 argument(s)` for the
+# overload family, `the argument to `string.PadLeft` has a type that is not implicitly
+# convertible to the target type` for the convertible family) and a family that loses one
+# stops accepting a legitimate diagnostic -- the grid then calls a correct compiler
+# wrong, which is the failure mode these rows exist to prevent.
+#
+# These are the wordings the nine cells required BEFORE the new families were added;
+# they are PINNED as literals so a later edit that drops one turns this suite RED.
+PRE_FIX_WORDINGS = {
+    'string_contains_int': [
+        'no matching overload of `String.Contains`',
+        'no applicable overload of `String.Contains`',
+        'no matching overload for `String.Contains`',
+        'not implicitly convertible to the target type',
+        'the argument to `String.Contains` has a type that is not implicitly convertible to the target type',
+        'cannot dispatch member \'Contains\'',
+        'codegen cannot dispatch member \'Contains\' on receiver of type',
+        'member `Contains` on `string` is not yet supported in codegen',
+        'string member `.Contains` is not yet supported in codegen',
+    ],
+    'string_contains_object': [
+        'no matching overload of `String.Contains`',
+        'no applicable overload of `String.Contains`',
+        'no matching overload for `String.Contains`',
+        'not implicitly convertible to the target type',
+        'the argument to `String.Contains` has a type that is not implicitly convertible to the target type',
+        'cannot dispatch member \'Contains\'',
+        'codegen cannot dispatch member \'Contains\' on receiver of type',
+        'member `Contains` on `string` is not yet supported in codegen',
+        'string member `.Contains` is not yet supported in codegen',
+    ],
+    'string_lastindexof_int': [
+        'no matching overload of `String.LastIndexOf`',
+        'no applicable overload of `String.LastIndexOf`',
+        'no matching overload for `String.LastIndexOf`',
+        'not implicitly convertible to the target type',
+        'the argument to `String.LastIndexOf` has a type that is not implicitly convertible to the target type',
+        'cannot dispatch member \'LastIndexOf\'',
+        'codegen cannot dispatch member \'LastIndexOf\' on receiver of type',
+        'member `LastIndexOf` on `string` is not yet supported in codegen',
+        'string member `.LastIndexOf` is not yet supported in codegen',
+    ],
+    'string_replace_object': [
+        'no matching overload of `String.Replace`',
+        'no applicable overload of `String.Replace`',
+        'no matching overload for `String.Replace`',
+        'not implicitly convertible to the target type',
+        'the argument to `String.Replace` has a type that is not implicitly convertible to the target type',
+        'cannot dispatch member \'Replace\'',
+        'codegen cannot dispatch member \'Replace\' on receiver of type',
+        'member `Replace` on `string` is not yet supported in codegen',
+        'string member `.Replace` is not yet supported in codegen',
+    ],
+    'string_split_int': [
+        'no matching overload of `String.Split`',
+        'no applicable overload of `String.Split`',
+        'no matching overload for `String.Split`',
+        'not implicitly convertible to the target type',
+        'the argument to `String.Split` has a type that is not implicitly convertible to the target type',
+        'cannot dispatch member \'Split\'',
+        'codegen cannot dispatch member \'Split\' on receiver of type',
+        'member `Split` on `string` is not yet supported in codegen',
+        'string member `.Split` is not yet supported in codegen',
+    ],
+    'bool_tostring_format': [
+        'no matching overload of `bool.ToString`',
+        'no applicable overload of `bool.ToString`',
+        'no matching overload for `bool.ToString`',
+    ],
+    'char_tostring_format': [
+        'no matching overload of `char.ToString`',
+        'no applicable overload of `char.ToString`',
+        'no matching overload for `char.ToString`',
+    ],
+    'math_sign_string': [
+        'no matching overload of `Math.Sign`',
+        'no applicable overload of `Math.Sign`',
+        'no matching overload for `Math.Sign`',
+        'not implicitly convertible to the target type',
+        'the argument to `Math.Sign` has a type that is not implicitly convertible to the target type',
+    ],
+    'math_sign_bool': [
+        'no matching overload of `Math.Sign`',
+        'no applicable overload of `Math.Sign`',
+        'no matching overload for `Math.Sign`',
+        'not implicitly convertible to the target type',
+        'the argument to `Math.Sign` has a type that is not implicitly convertible to the target type',
+    ],
+}
+
+
+# The wording the compiler NOW emits for each of the nine cells (measured on
+# the tip's own build; the grid's TSV `detail` column).
+NEW_WORDINGS = {
+    'string_contains_int': "`string.Contains` takes its search value at position 0 as a `char` or a `string` (stdlib \u00a79.6); the argument's type converts to neither (\u00a75.1)",
+    'string_contains_object': "`string.Contains` takes its search value at position 0 as a `char` or a `string` (stdlib \u00a79.6); the argument's type converts to neither (\u00a75.1)",
+    'string_lastindexof_int': "`string.LastIndexOf` takes its search value at position 0 as a `char` or a `string` (stdlib \u00a79.6); the argument's type converts to neither (\u00a75.1)",
+    'string_replace_object': "`string.Replace` takes its search value at position 0 as a `char` or a `string` (stdlib \u00a79.6); the argument's type converts to neither (\u00a75.1)",
+    'string_split_int': "`string.Split` takes its separator at position 0 as a `char`, a `string` or an `Array<char>` (stdlib \u00a79.6); the argument's type converts to none of them (\u00a75.1)",
+    'bool_tostring_format': "a format spec requires an intrinsically-formattable receiver (a numeric/temporal/Guid) or one implementing `IFormattable`; `bool` is neither (\u00a72.18; \u00a718.5)",
+    'char_tostring_format': "a format spec requires an intrinsically-formattable receiver (a numeric/temporal/Guid) or one implementing `IFormattable`; `char` is neither (\u00a72.18; \u00a718.5)",
+    'math_sign_string': "type argument `string` does not satisfy the constraint `where T: INumber<T>` \u2014 `Math.Sign` requires an argument type that conforms to `INumber<T>` (\u00a714.2, stdlib \u00a72.2, stdlib \u00a72.19)",
+    'math_sign_bool': "type argument `bool` does not satisfy the constraint `where T: INumber<T>` \u2014 `Math.Sign` requires an argument type that conforms to `INumber<T>` (\u00a714.2, stdlib \u00a72.2, stdlib \u00a72.19)",
+}
+
+# A family is a SET OF ALTERNATIVE WORDINGS OF ONE RULE.  These rows feed each
+# family a wording the compiler has NOT emitted for these cells -- the same
+# rule, a different ROLE / TYPE LIST / TAIL / TYPE NAME -- and require the cell
+# to accept it.  A fixed string would fail these rows.
+#
+# The position-0 family varies in the ROLE (`search value` vs `separator`), in
+# the LIST of accepted types and in the TAIL (`converts to neither` vs
+# `converts to none of them`) -- each row below changes one of the three
+# relative to the wording the compiler emits today.
+POSITION_0_VARIANTS = {
+    # a `char` only (a shorter accepted-type list) and the other tail
+    'string_split_int': "`string.Split` takes its separator at position 0 as a `char` (stdlib \u00a79.6); the argument's type converts to neither (\u00a75.1)",
+    # the longer accepted-type list and the other tail
+    'string_contains_int': "`string.Contains` takes its search value at position 0 as a `char`, a `string` or an `Array<char>` (stdlib \u00a79.6); the argument's type converts to none of them (\u00a75.1)",
+    # the replacement-value role, on the member that declares it
+    'string_replace_object': "`string.Replace` takes its replacement value at position 0 as a `char`, a `string` or an `Array<char>` (stdlib \u00a79.6); the argument's type converts to none of them (\u00a75.1)",
+}
+
+# The format family names the RECEIVER TYPE, so a fixed string would work for
+# one type only; these rows feed it a third type and the `operand` spelling
+# the interpolation path uses for the same rule.
+FORMAT_VARIANTS = {
+    'bool_tostring_format': "a format spec requires an intrinsically-formattable receiver (a numeric/temporal/Guid) or one implementing `IFormattable`; `decimal` is neither (\u00a72.18; \u00a718.5)",
+    'char_tostring_format': "a format spec requires an intrinsically-formattable operand (a numeric/temporal/Guid) or one implementing `IFormattable`; `string` is neither (\u00a718.5)",
+}
+
+# The constraint family names the OFFENDING TYPE, so a fixed string would work
+# for one type only; this row uses a THIRD type name.
+CONSTRAINT_ANY_TYPE = (
+    "type argument `decimal` does not satisfy the constraint `where T: INumber<T>` \u2014 "
+    "`Math.Sign` requires an argument type that conforms to `INumber<T>` "
+    "(\u00a714.2, stdlib \u00a72.2, stdlib \u00a72.19)")
+
+# THE NEGATIVES: a wording from A DIFFERENT RULE must NOT match.  A family that
+# matches anything is a vacuous oracle.
+NEGATIVE_WORDINGS = {}
+for _c in ('string_contains_int', 'string_contains_object', 'string_lastindexof_int',
+           'string_replace_object', 'string_split_int'):
+    NEGATIVE_WORDINGS[_c] = [NEW_WORDINGS['bool_tostring_format'],
+                             NEW_WORDINGS['math_sign_bool']]
+for _c in ('bool_tostring_format', 'char_tostring_format'):
+    NEGATIVE_WORDINGS[_c] = [NEW_WORDINGS['string_contains_int'],
+                             NEW_WORDINGS['math_sign_bool']]
+for _c in ('math_sign_bool', 'math_sign_string'):
+    NEGATIVE_WORDINGS[_c] = [NEW_WORDINGS['bool_tostring_format'],
+                             NEW_WORDINGS['string_contains_int']]
+
+# The set of cells each new diagnostic satisfies is PINNED: the two `Contains`
+# cells share the member and the rule, the two `ToString` cells share the
+# rule, the two `Math.Sign` cells share the member and the rule -- and NO
+# other cell of the 118 may accept it.
+EXPECTED_SATISFIED = {
+    'string_contains_int': ['string_contains_int', 'string_contains_object'],
+    'string_contains_object': ['string_contains_int', 'string_contains_object'],
+    'string_lastindexof_int': ['string_lastindexof_int'],
+    'string_replace_object': ['string_replace_object'],
+    'string_split_int': ['string_split_int'],
+    'bool_tostring_format': ['bool_tostring_format', 'char_tostring_format'],
+    'char_tostring_format': ['bool_tostring_format', 'char_tostring_format'],
+    'math_sign_bool': ['math_sign_bool', 'math_sign_string'],
+    'math_sign_string': ['math_sign_bool', 'math_sign_string'],
+}
 
 
 class BuiltinAdmissionGridTest(unittest.TestCase):
@@ -406,6 +587,111 @@ class BuiltinAdmissionGridTest(unittest.TestCase):
         self.assertFalse(os.path.isabs(row[8]), row[8])
         self.assertTrue(row[8].startswith('programs/'), row[8])
 
+
+    # ---------------------------------------- the three new needle families
+    def _grid_cell(self, name):
+        for c in g.CELLS:
+            if c[0] == name:
+                return c
+        self.fail(f'no cell named {name!r}')
+
+    def _classify_cell_msg(self, msg, name):
+        """Classify `msg` as the diagnostic for the grid's OWN cell `name`."""
+        c = self._grid_cell(name)
+        with tempfile.TemporaryDirectory() as d:
+            bezelc = _fake_compiler(d)
+            os.environ['FAKE_MODE'] = 'reject_msg'
+            os.environ['FAKE_MSG'] = msg
+            try:
+                row = g.classify_one(bezelc, os.path.join(d, 'programs'),
+                                     os.path.join(d, 'cells'), c, False, 30, 30)
+            finally:
+                os.environ.pop('FAKE_MODE', None)
+                os.environ.pop('FAKE_MSG', None)
+        return row
+
+    def test_each_new_family_is_a_set_of_alternative_wordings(self):
+        """A family is a SET of alternative wordings of one rule, not one
+        guessed string -- so each of the three carries more than one."""
+        self.assertGreaterEqual(len(g.F_pos0_param('Contains', 'search value')), 2)
+        self.assertGreaterEqual(len(g.F_formattable_receiver()), 2)
+        self.assertGreaterEqual(len(g.F_typearg_constraint('Math.Sign')), 2)
+
+    def test_the_pre_fix_wording_is_still_accepted_for_every_nine_cell(self):
+        """THE SAFETY PROPERTY: a family that LOSES an old wording stops
+        accepting a legitimate diagnostic (the compiler still emits the old
+        wording elsewhere) and the grid then calls a correct compiler wrong.
+        Every pre-fix wording is still in the cell's family AND still turns
+        the cell OK."""
+        for name, olds in PRE_FIX_WORDINGS.items():
+            want = _needles(self._grid_cell(name)[4])
+            for old in olds:
+                self.assertIn(old, want,
+                              f'{name}: the pre-fix wording {old!r} was REMOVED')
+                row = self._classify_cell_msg(old, name)
+                self.assertEqual(row[6], 'OK',
+                                 f'{name}: the pre-fix wording {old!r} no longer '
+                                 f'matches ({row[7]})')
+
+    def test_the_new_wording_is_accepted_for_each_of_the_nine_cells(self):
+        """The nine cells' compiler fix has landed with a NEW, more specific
+        diagnostic; the family must contain it."""
+        for name, msg in NEW_WORDINGS.items():
+            row = self._classify_cell_msg(msg, name)
+            self.assertEqual(row[6], 'OK',
+                             f'{name}: the new wording is not in the family ({row[7]})')
+
+    def test_the_position_0_family_tolerates_the_role_the_list_and_the_tail(self):
+        """The position-0 wording varies in the ROLE, in the LIST of accepted
+        types and in the TAIL -- a fixed string would miss one of them."""
+        for name, variant in POSITION_0_VARIANTS.items():
+            row = self._classify_cell_msg(variant, name)
+            self.assertEqual(row[6], 'OK',
+                             f'{name}: the position-0 variant {variant!r} is not in '
+                             f'the family ({row[7]})')
+
+    def test_the_formattable_family_tolerates_the_receiver_type_and_the_operand_spelling(self):
+        """The format wording names the RECEIVER TYPE, so the family must not
+        be pinned to one type -- nor to the `receiver` spelling alone."""
+        for name, variant in FORMAT_VARIANTS.items():
+            row = self._classify_cell_msg(variant, name)
+            self.assertEqual(row[6], 'OK',
+                             f'{name}: the format variant {variant!r} is not in the '
+                             f'family ({row[7]})')
+
+    def test_the_constraint_family_matches_any_type_argument(self):
+        """The constraint wording names the OFFENDING TYPE, so the family must
+        match ANY type argument -- `decimal` here, neither `bool` nor
+        `string`."""
+        for name in ('math_sign_bool', 'math_sign_string'):
+            row = self._classify_cell_msg(CONSTRAINT_ANY_TYPE, name)
+            self.assertEqual(row[6], 'OK',
+                             f'{name}: the constraint family does not match an '
+                             f'arbitrary type argument ({row[7]})')
+
+    def test_a_wording_from_a_different_rule_does_not_match(self):
+        """THE NEGATIVE: a wording from ANOTHER rule must not satisfy the cell
+        -- a family that matches anything is a vacuous oracle."""
+        for name, negs in NEGATIVE_WORDINGS.items():
+            for neg in negs:
+                row = self._classify_cell_msg(neg, name)
+                self.assertEqual(row[6], 'REJECTED',
+                                 f'{name}: the other-rule wording {neg!r} satisfied '
+                                 f'the cell ({row[7]})')
+
+    def test_the_new_diagnostics_satisfy_only_the_cells_of_their_own_member(self):
+        """A new diagnostic must not leak into a cell about a DIFFERENT member
+        -- the family is a family of ONE rule, and the cells that share the
+        member share the rule (the two `Contains` cells, the two `ToString`
+        cells, the two `Math.Sign` cells).  The satisfied set is PINNED."""
+        for name, expected in EXPECTED_SATISFIED.items():
+            msg = NEW_WORDINGS[name]
+            satisfied = sorted(c[0] for c in g.CELLS
+                               if c[4][0] == 'reject'
+                               and any(n in msg for n in _needles(c[4])))
+            self.assertEqual(satisfied, sorted(expected),
+                             f'{name}: the new wording satisfies {satisfied}, '
+                             f'not {sorted(expected)}')
 
 if __name__ == '__main__':
     unittest.main()
