@@ -3605,6 +3605,53 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     // narrowed one is what reaches codegen.
                                     radix = unwrapNarrowedNullableOperand(
                                         radix, argTy);
+                                    // fix #7268 (stdlib §9.1, v0.345): the
+                                    // ADMITTED radix set — §9.1's
+                                    // "`ToString(radix)` … takes the same radix
+                                    // set, raising `ArgumentException` for any
+                                    // other", and the `Parse(s, radix)`
+                                    // declaration's own note ("radix in
+                                    // {2, 8, 10, 16}; any other radix raises
+                                    // ArgumentException — a caller bug, not
+                                    // input failure").
+                                    //
+                                    // THE CHECK IS A RUNTIME CHECK, FOR A
+                                    // CONSTANT RADIX TOO. §9.1's words are
+                                    // "raising `ArgumentException`", and an
+                                    // `ArgumentException` is a RUNTIME
+                                    // exception: the conformance case
+                                    // `l9_1_0006` (stdlib §9.1) is `expect:
+                                    // run` and catches it at RUN TIME for the
+                                    // LITERAL radix 7, and `l2_3_0003`
+                                    // (stdlib §2.3) is `expect: run` for the
+                                    // literal `toBase` 3. A compile-time
+                                    // rejection of a constant radix would
+                                    // contradict both, and would make a
+                                    // program that §9.1 says RUN a program
+                                    // that does not compile. So the constant
+                                    // case is decided here too, and decided
+                                    // the same way: the value reaches the
+                                    // guard and the guard raises.
+                                    //
+                                    // The unadmitted radix used to render the
+                                    // DECIMAL text — a silently wrong answer
+                                    // in a program that compiles (the
+                                    // "decimal fallback" below). The four
+                                    // radix sites share ONE admitted set
+                                    // (`kAdmittedRadices`, in
+                                    // LlvmBackend_impl.hpp), so they agree.
+                                    llvm::Value* radixAdmitted = nullptr;
+                                    if (foldedRadix) {
+                                        radixAdmitted = builder_.getInt1(
+                                            radixIsAdmitted(*foldedRadix));
+                                    } else {
+                                        radixAdmitted =
+                                            radixAdmittedIR(builder_, radix);
+                                    }
+                                    emitGuardThrow(
+                                        builder_.CreateNot(radixAdmitted,
+                                                           "rts.badbase"),
+                                        "ArgumentException");
                                     // fix #7258 (stdlib §9.1, v0.344): the radix
                                     // rendering shows the receiver's OWN value.
                                     // §9.1: "`ToString(radix)` emits the
@@ -3656,10 +3703,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                     // compiler folds (`8u + 8u`) nor of a
                                     // runtime `int` radix — so an ADMITTED
                                     // radix rendered the DECIMAL text.
-                                    // An unadmitted radix keeps the decimal
-                                    // fallback (the §9.1 ArgumentException is a
-                                    // BANKED divergence — corpus l2_3_0003).
-                                    const char* fmt = "%s%llu";  // fallback: decimal
+                                    // An unadmitted radix NEVER REACHES
+                                    // HERE: the guard above raises
+                                    // `ArgumentException` for it (stdlib §9.1),
+                                    // so the decimal fallback below is the
+                                    // ADMITTED radix 10's own rendering, not
+                                    // an unadmitted radix's substitute.
+                                    const char* fmt = "%s%llu";  // the admitted radix 10
                                     bool isBinary = false;  // the compile-time radix 2
                                     llvm::Value* rtIsBinary = nullptr;  // the runtime radix 2
                                     llvm::Value* rtFmt = nullptr;       // the runtime format

@@ -12,6 +12,7 @@
 // in separately-compiled units.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -171,6 +172,60 @@ inline bool indexerElementCannotAliasIndex(const sema::TypeRef* t) {
         default:
             return false;
     }
+}
+
+// fix #7268 (stdlib §9.1 / §2.3, v0.345): the ADMITTED radix set — the only
+// radices the stdlib's radix-taking members accept.
+//
+// stdlib §9.1 declares `Parse(s: string, radix: int): int` with the note
+// "radix in {2, 8, 10, 16}; any other radix raises ArgumentException — a
+// caller bug, not input failure", and its "radix alphabet" paragraph says
+// `ToString(radix)` "takes the same radix set, raising `ArgumentException`
+// for any other"; §2.3's `ToString(value: int, toBase: int): string` carries
+// the same note ("bases 2, 8, 10, 16; ArgumentException otherwise").
+//
+// ONE DEFINITION, FOUR CONSUMERS — the same discipline the predicates above
+// follow, and for the same reason: the four lowering sites MUST AGREE on the
+// set, or the same radix would be admitted at one site and refused at
+// another. The consumers are the primitive receiver's `ToString(radix)`
+// (LlvmBackend_Exprs.cpp), `Convert.ToString(value, toBase)`
+// (LlvmBackend_Calls.cpp) and the `Parse(s, radix)` /
+// `TryParse(s, radix, out result)` pair (LlvmBackend_Calls2.cpp).
+//
+// WHY IT LIVES HERE AND NOT IN `src/common/BuiltinRegistry.*`: the tables in
+// that file are NAME-keyed registries of built-in HEAD NAMES, read by SEMANTIC
+// analysis to decide which member a call names; this is a VALUE-domain
+// predicate over the stdlib's radix set, read by CODEGEN at the lowering
+// sites, and it belongs to the codegen component that owns them. It names no
+// member and no head, so it is not a mirror of any of those tables — it is
+// not a table at all, and putting it beside them would make it look like one.
+inline constexpr std::array<int64_t, 4> kAdmittedRadices = {2, 8, 10, 16};
+
+// The COMPILE-TIME spelling: is this folded radix value an admitted one?
+inline bool radixIsAdmitted(int64_t radix) {
+    for (int64_t r : kAdmittedRadices)
+        if (radix == r) return true;
+    return false;
+}
+
+// The RUNTIME spelling: the i1 "this radix is an admitted one". `radix` is an
+// integer of any width; it is widened to 64 bits SIGNED, which is exact for
+// the `int` the parameter declares (§5.1) and gives the same verdict under
+// the other widenings — a `uint` radix above `int`'s range is not admitted
+// either way. A value that is not an integer admits no radix (fail closed).
+inline llvm::Value* radixAdmittedIR(llvm::IRBuilder<>& b, llvm::Value* radix) {
+    if (!radix || !radix->getType()->isIntegerTy()) return b.getInt1(false);
+    llvm::Value* r = radix;
+    if (!r->getType()->isIntegerTy(64))
+        r = b.CreateSExt(r, llvm::Type::getInt64Ty(b.getContext()), "rts.radw");
+    llvm::Value* admitted =
+        b.CreateICmpEQ(r, b.getInt64(kAdmittedRadices[0]), "rts.radm");
+    for (std::size_t i = 1; i < kAdmittedRadices.size(); ++i)
+        admitted = b.CreateOr(admitted,
+                              b.CreateICmpEQ(r, b.getInt64(kAdmittedRadices[i]),
+                                             "rts.radm"),
+                              "rts.radm");
+    return admitted;
 }
 
 // fix #3897 / §4.8 / §4.17: is `rt` the builtin `bz_dict_t*`-backed

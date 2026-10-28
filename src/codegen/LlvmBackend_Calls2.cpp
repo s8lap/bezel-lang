@@ -2400,6 +2400,45 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         }
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
+        // The radix, CONVERTED to the `int` the parameter declares (§5.1) —
+        // the same conversion the `Parse(s, radix)` site performs.
+        //
+        // fix #7268 (stdlib §9.1, v0.345): the radix is lowered and CHECKED
+        // HERE, before anything materializes a value, so a rejected radix
+        // leaves nothing to release: the window materialization and the
+        // `out` slot's accessor bracket both sit BELOW the guard. The order
+        // is §22.5's — the first argument's expression runs first, the
+        // radix's second.
+        llvm::Value* radix = nullptr;
+        if (rb.value) {
+            radix = builder_.getInt32(static_cast<int32_t>(*rb.value));
+        } else {
+            radix = lowerExpr(*call.args[1].value);
+            if (!radix) return nullptr;
+            if (radix->getType()->isIntegerTy() &&
+                radix->getType()->getIntegerBitWidth() < 32)
+                radix = rb.signedArg ? builder_.CreateSExt(radix, i32())
+                                     : builder_.CreateZExt(radix, i32());
+        }
+        // fix #7268 (stdlib §9.1, v0.345): the ADMITTED radix set. §9.1
+        // declares `TryParse(s: string, radix: int, out result: int): bool`
+        // with the note "an invalid radix raises ArgumentException from both
+        // forms", and the `Parse(s, radix)` declaration's own note reads
+        // "radix in {2, 8, 10, 16}; any other radix raises ArgumentException
+        // — a caller bug, not input failure".
+        //
+        // THE CHECK IS A RUNTIME CHECK, FOR A CONSTANT RADIX TOO: the
+        // conformance case `l9_1_0016` (stdlib §9.1) is `expect: run` and
+        // catches the `ArgumentException` at RUN TIME for the LITERAL radix
+        // 3, so a compile-time rejection would contradict it.
+        //
+        // This is also what removes the SEGFAULT: an unadmitted radix used to
+        // reach `strtoll`, which leaves its `endptr` UNWRITTEN for a base
+        // outside 2..36, and the lowering then dereferenced that uninitialized
+        // pointer.
+        emitGuardThrow(
+            builder_.CreateNot(radixAdmittedIR(builder_, radix), "tryp.badbase"),
+            "ArgumentException");
         auto win = parseWindow(strVal);
         llvm::Value* strData = win.data;
         // The `out` slot — §22.3 (see the 2-argument TryParse arm above for
@@ -2413,19 +2452,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
             return nullptr;
         }
-        // The radix, CONVERTED to the `int` the parameter declares (§5.1) —
-        // the same conversion the `Parse(s, radix)` site performs.
-        llvm::Value* radix = nullptr;
-        if (rb.value) {
-            radix = builder_.getInt32(static_cast<int32_t>(*rb.value));
-        } else {
-            radix = lowerExpr(*call.args[1].value);
-            if (!radix) return nullptr;
-            if (radix->getType()->isIntegerTy() &&
-                radix->getType()->getIntegerBitWidth() < 32)
-                radix = rb.signedArg ? builder_.CreateSExt(radix, i32())
-                                     : builder_.CreateZExt(radix, i32());
-        }
+        // The radix was lowered and CHECKED above (fix #7268): an unadmitted
+        // radix raises `ArgumentException` there, before the parse.
         // strtoll/strtoull(data, &endptr, radix) — the value and the end
         // pointer, for the format guard below.
         const bool isULongR = (pt == P::ULong);
@@ -2713,6 +2741,24 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                     radix = rb.signedArg ? builder_.CreateSExt(radix, i32())
                                          : builder_.CreateZExt(radix, i32());
             }
+            // fix #7268 (stdlib §9.1, v0.345): the ADMITTED radix set. §9.1
+            // declares `Parse(s: string, radix: int): int` with the note
+            // "radix in {2, 8, 10, 16}; any other radix raises
+            // ArgumentException — a caller bug, not input failure".
+            //
+            // THE CHECK IS A RUNTIME CHECK, FOR A CONSTANT RADIX TOO: the
+            // conformance case `l9_1_0006` (stdlib §9.1) is `expect: run` and
+            // catches the `ArgumentException` at RUN TIME for the LITERAL
+            // radix 7, so a compile-time rejection would contradict it.
+            //
+            // This is also what removes the SEGFAULT: an unadmitted radix used
+            // to reach `strtoll`, which leaves its `endptr` UNWRITTEN for a
+            // base outside 2..36, and the lowering then dereferenced that
+            // uninitialized pointer (measured: `int.Parse("ff", 'a')` and
+            // `int.Parse("11", 37)` exited 139).
+            emitGuardThrow(
+                builder_.CreateNot(radixAdmittedIR(builder_, radix), "parse.badbase"),
+                "ArgumentException");
             // strtoull for the unsigned 64-bit width (so the full magnitude is
             // captured); strtoll for everything else, range-checked below.
             bool isULongR = (pt == P::ULong);

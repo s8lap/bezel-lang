@@ -14159,6 +14159,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // A NO-OP for every ordinary scalar radix.
             radix = unwrapNarrowedNullableOperand(
                 radix, ctx_.exprType(*call.args[baseSrc].value));
+            // fix #7268 (stdlib §2.3 / §9.1, v0.345): the ADMITTED radix set.
+            // §2.3's `ToString(value: int, toBase: int): string` carries the
+            // note "bases 2, 8, 10, 16; ArgumentException otherwise", and
+            // §9.1 says `Convert.ToString(value, toBase)` "emits the same text
+            // as `ToString(radix)`" — whose radix set is {2, 8, 10, 16} and
+            // which "raises `ArgumentException` for any other".
+            //
+            // THE CHECK IS A RUNTIME CHECK, FOR A CONSTANT `toBase` TOO: the
+            // conformance case `l2_3_0003` (stdlib §2.3) is `expect: run` and
+            // catches the `ArgumentException` at RUN TIME for the LITERAL
+            // `toBase` 3, so a compile-time rejection would contradict it.
+            //
+            // The unadmitted radix used to keep the DECIMAL fallback below —
+            // a silently wrong answer in a program that compiles. The four
+            // radix sites share ONE admitted set (`kAdmittedRadices`, in
+            // LlvmBackend_impl.hpp), so they agree.
+            llvm::Value* radixAdmitted =
+                radixAdmittedIR(builder_, radix);
+            emitGuardThrow(
+                builder_.CreateNot(radixAdmitted, "rts.badbase"),
+                "ArgumentException");
             // fix #7258 (stdlib §9.1, v0.344): `Convert.ToString(value, toBase)`
             // "returns the text `value.ToString(toBase)` returns" (stdlib §2.3),
             // and §9.1's text is the value's OWN digits — "T.Parse(n.ToString
@@ -14222,10 +14243,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 // fallback is the shape this arm took before.
                 radixVal = builder_.getInt64(10);
             }
-            // The ADMITTED radix forms render their own digits; every other
-            // radix keeps the DECIMAL fallback (the §9.1 ArgumentException for
-            // an unadmitted radix is a BANKED divergence — corpus l2_3_0003;
-            // issue #7268 owns that rule).
+            // The ADMITTED radix forms render their own digits;
+            // the DECIMAL fallback is the ADMITTED radix 10's own rendering
+            // (fix #7268: an unadmitted radix never reaches here — the guard
+            // above raises `ArgumentException` for it, per stdlib §9.1).
             llvm::Value* isRadixForm = builder_.CreateOr(
                 builder_.CreateOr(
                     builder_.CreateICmpEQ(radixVal, builder_.getInt64(2)),

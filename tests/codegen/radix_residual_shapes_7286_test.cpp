@@ -679,12 +679,31 @@ BEZEL_TEST(radix_residual_shapes_7286, runtime_radix_ten_still_renders_decimal) 
                     std::string("255\n"));
 }
 
-// An UNADMITTED radix keeps the decimal fallback (the §9.1 ArgumentException
-// is a BANKED divergence — corpus l2_3_0003).
-BEZEL_TEST(radix_residual_shapes_7286, runtime_unadmitted_radix_keeps_the_decimal_fallback) {
-    BEZEL_EXPECT_EQ(runAot(progWithArg(
-        "", "    var radix: int := 3;\n", "radix")).stdoutText,
-                    std::string("255\n"));
+// An UNADMITTED radix RAISES `ArgumentException` (stdlib §9.1: "`ToString(radix)`
+// … takes the same radix set, raising `ArgumentException` for any other").
+//
+// BEHAVIOUR FLIP (fix #7268, v0.345): this row used to pin the OLD behaviour
+// — the radix 3 kept the DECIMAL fallback and the program printed "255".
+// The §9.1 rule is now implemented, so the program raises instead, and the
+// row says so. The catch arm is TYPED, so the row also pins the exception
+// TYPE: an exception of any other type would not match it and would
+// propagate (the program would then exit 70, not 1).
+BEZEL_TEST(radix_residual_shapes_7286, runtime_unadmitted_radix_raises_argument_exception) {
+    JitResult r = runAot(
+        "module M;\n"
+        "class C\n"
+        "  public static method Main(): int\n"
+        "    var radix: int := 3;\n"
+        "    try\n"
+        "      Console.WriteLine((255).ToString(radix));\n"
+        "      return 0;\n"
+        "    catch\n"
+        "      ArgumentException => return 1;\n"
+        "    end;\n"
+        "  end Main;\n"
+        "end C;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
 // A `const` local's value is a §17.14 constant, so its radix renders the
