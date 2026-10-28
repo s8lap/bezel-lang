@@ -1249,6 +1249,109 @@ history (one run, before and after the flip: 2562 passed); the ASan leg of the w
 was measured under the plain oracle, with the harness's ASan leg run over the seven filters); and the
 `src/codegen/**` and `src/runtime/**` behaviour (untouched).
 
+**Lane `r36-c2-l1-discriminator` (the receiver's SYMBOL, not its NAME — the campaign's FIRST
+discriminator lane).**
+
+* **SHA (picked onto staging):** `9961f766` **fix #7217 #6845**. **TWO CLOSURES: #7217, #6845.**
+* **ONE CAUSE, TWO SYMPTOMS.** The codegen decided *"is this receiver the builtin `StringBuilder`?"*
+  by **HEAD NAME**, so a USER-DECLARED class named `StringBuilder` was claimed by the builtin's arm:
+  the user's own method was then either **SILENTLY DROPPED** (#7217 — the program printed only
+  "after" and exited 0) or run through the builtin's `bz_sb_*` runtime on a foreign object and
+  **SEGV'd** (#6845, in `bz_sb_content_cps … bz_sb_replace` / `… bz_sb_insert`).
+* **THE TWO SITES, BOTH NOW KEYED ON THE RECEIVER's SYMBOL:** `Emitter::tryLowerCollectionInstanceCall`'s
+  `isStrBld` (the whole builtin `Append`/`AppendLine`/`Insert`/`Remove`/`Replace`/`Clear` arm — it
+  had **NO** declaration check at all: `recvTy->headName() == "StringBuilder"`) and
+  `Emitter::lowerExprInner`'s `isSB` (the `StringBuilder.Length` parts-list sum, which had a
+  `!tt->declaration` guard but still keyed the identity on the head name). **BOTH NOW READ
+  `builtinTypeName(...) == "StringBuilder"`** — the ONE predicate the codebase already computes for
+  this question. It is empty for a user type (a same-module user class carries a real
+  `ast::TypeDecl`) and for an IMPORTED user type (a populated `moduleName` — the #2997
+  discriminator); it is preferred over a bare `!rt->declaration` guard because it reads **BOTH**
+  TypeRef shapes a builtin reaches codegen in, sees through a transparent type alias (#1462 /
+  §27.8's `aliasResolvedHead`), and keeps the #5390 / §2.3 `Buffer` → `__Buffer` intrinsic rename.
+* **THE GOVERNING TEXT:** spec §2.3 (v0.345)'s always-available-names table lists `StringBuilder`
+  (stdlib §3.1) as **SHADOWABLE**, and §2.2 makes a current-module declaration shadow an
+  auto-imported name — so a user's own `class StringBuilder` is a DISTINCT type whose own members
+  resolve, and the built-in stays reachable under its qualified spelling.
+* **THE REVIEW WAS ACCEPT-W-NOTES AND THE COMMIT IS PICKED.**
+
+**Lane `r36-c2-l5a` (the `StringBuilder` / `string` RUNTIME lane — Opus, high effort).**
+
+* **SHAs (picked onto staging):** `35ce8f04` **fix #7245**, `62735ebc` **narrow #7167, fix #7189
+  #7198**, `e44ba7aa` **narrow #7244**. **THREE CLOSURES: #7245, #7189, #7198.**
+* **#7245 — `String.IsAscii` ANSWERED FROM THE STORAGE WIDTH, NOT THE CONTENT.** stdlib §9.6
+  (v0.344) defines the property by the value (*"true iff every code point < 128 (O(1))"*), and spec
+  §4.6 makes the per-string width invisible at the language level (*"The choice of width is
+  invisible at the language level; programs observe only the `char` sequence and its length"*).
+  `bz_string_is_ascii` answered `if (s->width != 1) return 0;`, so any value stored at width 2 or 4
+  answered FALSE even when every code point was ASCII — **REACHABLE FROM ORDINARY CODE, because a
+  RANGE SLICE PRESERVES THE SOURCE's WIDTH**: `("a" + "日")[0..<1].IsAscii` answered `False` and
+  must answer `True`. THE FIX READS EACH CODE POINT IN THE **CODE-POINT DOMAIN** (through the
+  width-aware `bz_str_cp` helper that already exists) AND REPORTS A CODE POINT ≥ 128. **THE
+  STDLIB's "(O(1))" NOTE PRESUMES THE WIDTH IS ALWAYS THE NARROWEST THAT FITS THE VALUE, WHICH THE
+  RANGE SLICE REFUTES — SO THE ANSWER IS COMPUTED FROM THE CONTENT, AND THE PRE-FIX WIDTH-1 PATH WAS
+  ALREADY A SCAN, SO THE ASCII COMMON CASE DOES NOT REGRESS.**
+* **#7167 (narrowed), #7189, #7198 — `string.Join`'s ITEMS SLOT WAS NEVER GATED.** stdlib §9.6
+  (v0.345) declares `public static method Join(separator: string, items: IEnumerable<string>): string;`
+  and the compiler gated the **SEPARATOR** (#7150's gate) but never the **ITEMS**. **MEASURED ON THE
+  BASE, FOUR SHAPES COMPILED CLEANLY:** `string.Join(",", Array<int>)` printed the empty string (the
+  drain copied 8 bytes out of a 4-byte element slot — **the ASan heap-buffer-overflow READ of size 8
+  #7167 measured**); `string.Join(",", "ab")` compiled (a `string`'s elements are `char`s, 4 bytes —
+  the same 8-byte drain read past the end); `string.Join(",", Array<RS>)` printed `hello`, the first
+  8 bytes of a 16-byte inline record (**#7189's truncated-element read**); `string.Join(",",
+  Array<[3]int>)` **SIGSEGVed** (#7189's 12-byte inline-array element). **THE FIX IS A §5.1
+  ASSIGNABILITY CHECK AGAINST THE DECLARED PARAMETER TYPE, IN SEMA, AT THE CALL**, and it must
+  refuse all four. **#7167 IS `narrow` BECAUSE THE FAMILY THAT STAYS OPEN IS NAMED IN THE BODY.**
+* **#7244 (narrowed) — `AppendFormat`'s FORMAT AND ARGUMENTS WERE RENDERED IN THE **BYTE** DOMAIN
+  INSTEAD OF THE **CODE-POINT** DOMAIN.** spec §4.6 (v0.345): *"A string's DATA is not its TEXT …
+  the width is an implementation detail of the STORAGE and never of the TEXT."* stdlib §3.1
+  (v0.345) declares `AppendFormat(format: string, args: Array<Object>): StringBuilder` and says
+  *"each hole optionally carrying a format spec after a colon"*. **MEASURED ON THE BASE:**
+  `AppendFormat("x{0}y", <"日">)` gave Length 4 and the text `x` + U+00E5 + U+0065 + `y`;
+  `AppendFormat("x{0}y", <"😀">)` gave Length 6 with the four raw bytes of U+1F600; and
+  `AppendFormat("日{0}", 7)` gave Length 8 and the format's eight raw bytes. **THIS COMMIT FIXES
+  THE WIDTH HALF — THE ONE THAT LIVES IN THIS LANE's FILE — AND LEAVES THE **VTABLE HALF** OPEN;
+  THE FAMILY THAT STAYS OPEN IS NAMED AT THE END OF THE COMMIT BODY.**
+* **THE THREE COMMITS WERE REVIEWED ACCEPT-W-NOTES AND ARE PICKED.**
+
+**Lane `r36-c2-b3a` (the `Math` / `Convert` HEADS — the campaign's SECOND instance lane).**
+
+* **SHAs (picked onto staging):** `68d5cbe3` **fix #7418, narrow #7218, narrow #7232, narrow #7297,
+  narrow #6647**; `b32b7add` **narrow #7227 narrow #7218**; `b19567b1` **narrow #7232**. **ONE
+  CLOSURE: #7418. FIVE `narrow`s, EVERY FAMILY NAMED IN ITS OWN COMMIT BODY.**
+* **#7418 — THE `Math` / `Convert` POSITIONS WERE NEVER CLAIMED BY THE §7 NULLABILITY GATE.** The
+  `Math` / `Convert` built-ins had their **OWN** 34-row parameter-type table
+  (`builtinMathConvertSurface`) BESIDE the campaign-2 anchor's ONE declared-signature table
+  (`common::kBuiltinParams`), so the `Math` positions were not in the gate at all.
+  **MEASURED ON THE BASE `33a3912c`:** `Math.Abs(null)`, `Math.Floor(d)` at a `double?` and
+  `Math.Abs(n)` at a `decimal?` each reached codegen and **ABORTED THE COMPILER** with malformed IR
+  (*"IR verification failed"*, *"Both operands to ICmp instruction are not of the same type!"*,
+  *"Call parameter type does not match function signature!"*). **THE FIX FOLDS THE SURFACE INTO THE
+  ONE TABLE**, one row per **DECLARED FORM** (`Abs`'s four, `Floor`'s two, `ToString`'s six), each row
+  carrying the form's parameter NAME (§22.5), declared TYPE (§5.1) and declared NULLABILITY (§7.3)
+  **TOGETHER, so the three facts of a form cannot disagree**; the `Math` / `Convert` part of the ONE
+  table goes from 27 rows to 40, and the parallel table is **DELETED**. **THE FOUR
+  `mathConvert*` HELPERS SURVIVE, RETYPED TO THE BIT-SET KIND — THEY ARE NOW PURE SPELLINGS OVER
+  `common::kBPT*` AND CARRY NO KIND OF THEIR OWN, SO THEY ARE NOT A SECOND SOURCE OF TRUTH.**
+* **THE REVIEW WAS **"REJECT — NARROWLY, ON THE CLOSURE SCOPING ONLY"**: THE CODE IS SOUND (THE FOLD
+  IS REAL AND COMPLETE, THE EARLY RETURN INSIDE THE TYPE-CHECKING ARM **CANNOT** TURN A REJECTION
+  INTO AN ACCEPTANCE, NO PRE-EXISTING TEST ROW CHANGED VERDICT, THE LIT TRACK IS GREEN ON BOTH ARMS,
+  AND THE CORPUS DID NOT MOVE A ROW) — **BUT `fix #7227 fix #7218` WERE FALSE CLOSURES**, BECAUSE THE
+  `Math.Sign` CONSTRAINT IS **HALF**-ENFORCED: A **NON-PRIMITIVE CONFORMER** (A RECORD OR CLASS
+  DECLARING `INumber<Self>`) STILL **ABORTS THE COMPILER**, AND THE **EXPLICIT-TYPE-ARGUMENT**
+  SPELLING (`Math.Sign<string>("x")` ABORTS; `Math.Sign<int>(true)` COMPILES AND PRINTS `-1`)
+  **BYPASSES THE CHECK ENTIRELY**. **THE TWO SUBJECTS ARE NOW `narrow #7227 narrow #7218`, WITH
+  BOTH RESIDUAL FAMILIES NAMED IN THE BODY.**
+* **THE THREE `narrow`s ON THE FOLD COMMIT NAME THEIR OWN FAMILIES:** #7232's OTHER HALF IS **NOT**
+  THIS GATE's — **A §7.4-NARROWED NULLABLE IS LEGAL AT A `double` PARAMETER, SO IT MUST COMPILE AND
+  RUN, AND THE `Math` / `Convert` LOWERING LOADS THE WHOLE NULLABLE BOX INSTEAD OF EXTRACTING THE
+  PAYLOAD** (that is `src/codegen`, another lane's file); #7297 face (b) is **THE SAME** NARROWED
+  CASE; #6647's `Math.Abs(decimal?)` half is **THE SAME NARROWED CASE AT A `decimal` PAYLOAD**, so
+  the `double` REMEDY DOES NOT GENERALISE TO IT.
+* **THE `narrow #7232` FIX-FORWARD (`b19567b1`) REACHED THE **NAMED** SPELLING:** `(255).ToString(radix
+  := null)` IS NOW REFUSED BY THE §7 GATE, LIKE THE POSITIONAL SPELLING #7296's ROW ALREADY PINNED
+  FOR THE `int` HEAD.
+
 ### Coordinator block — 2026-10-28 (the campaign's integrator steps)
 
 * **THE ANCHOR IS PICKED** (`2250daa52`) — *"fix #6825 #7284 #7290 #7293 #7294 #7295 #7299 #7300
