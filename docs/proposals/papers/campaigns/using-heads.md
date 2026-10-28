@@ -1031,6 +1031,16 @@ MINIMAL REPRO AND A §-CITATION IN ITS BODY:**
 ON #7422 ITSELF; **AND THE **SYNC** SELF-DISPOSE TWIN IS **NOT** A SECOND DEFECT — IT IS #7422's OWN
 PREDICATE GAP WEARING THE SELF-DISPOSE COSTUME, **SO IT IS **NOT** FILED TWICE.**)
 
+**=> AND THE COORDINATOR HAS FILED **TWO MORE** ON 2026-10-28, BOTH FROM THE **U4 FIX-FORWARD's
+REVIEWER's** MEASUREMENTS, BOTH WITH EXACTLY ONE `campaign:using-heads` LABEL, AND **BOTH ARE THE
+**SAME** MECHANICAL DERIVATION #7424's RESIDUAL NAMES** (ONE TABLE OF DISPOSAL HEADS, READ BY THREE
+PLACES THAT CURRENTLY DISAGREE):
+
+| # | the defect | the §-citation | where it came from |
+|---|---|---|---|
+| **#7456** | **THE §28.10 VACUITY LINT OVER-FIRES ON AN `IDisposable`/`IAsyncDisposable`/`IOwningCollection<T>`/`IOwningList<T>`-DECLARED BINDING WHOSE OBJECT **HAS** A DESTRUCTOR — THE WARNING CLAIMS "NO DISPOSAL OBLIGATION (§28.9)" WHILE THE SCOPE-END DISPOSAL **DOES** RUN. **THE FIVE SIBLING HEADS (`IEnumerator`, `IOwningEnumerator`, `IOwningEnumerable`, `IAsyncEnumerator`, `IOwningAsyncEnumerator`) DO **NOT** WARN — SO THE TWO TABLES DISAGREE ABOUT EXACTLY THE HEADS THE #7424 LANE TOUCHED** | §28.9, §28.10, §28.12, §8.7, stdlib §2.10, stdlib §4.2 (v0.345) | the U4 fix-forward's reviewer |
+| **#7457** | **A `where` BOUND NAMING `IEnumerator<T>`/`IAsyncEnumerator<T>` **ADMITS A RECORD** TYPE ARGUMENT — THE BOUND CHECK NAMES **ONLY** `IDisposable` AND `IAsyncDisposable`, **THE SAME TWO-HEAD NARROWING THE CHAIN TABLE JUST FIXED, IN A SECOND FILE** | §9.7, §14.2 rule 3, stdlib §2.10 (v0.345) | the U4 fix-forward's reviewer |
+
 | # | defect | minimal repro | §-citation | campaign |
 |---|---|---|---|---|
 | new-1 | a direct `DisposeAsync()` on a plain-`var` local leaks the receiver's block | `var x := new AsyncRes(); await x.DisposeAsync();` → `16 byte(s) leaked in 1 allocation(s)`; the `using var` spelling of the same program is clean | §28.12 step 2 (spec lines 7480 / 7482, **quoted**: *"The cascade and the chain are the same regardless of which logical-disposal path ran"* and *"Asynchronous cleanup runs only where the program wrote `await using` … or awaited a direct `DisposeAsync()` call"*), §28.2 (spec lines 6230 / 6244, **quoted**: *"`Dispose()` on any class instance is idempotent: the first call performs the disposal; subsequent calls are no-ops"* and *"**The compiler-inserted free.**"*) — **THE EARLIER WORDING OF BOTH WAS A PARAPHRASE, NOT A QUOTATION; THE HOUSE RULE IS THAT A QUOTED §-SENTENCE IS EVIDENCE AND A PARAPHRASE IS A CLAIM, SO THE SPEC's OWN WORDS ARE GIVEN HERE** | using-heads (U2d, with #1531) |
@@ -1374,6 +1384,176 @@ ISSUE ON PURPOSE). **=> PICKED (2026-10-28): `cdf348ec` -> `e239820b2c`, `fc09c0
     `LlvmBackend_Calls2.cpp` (`lowerCall` ~8740, `lowerCallDispatch` ~8833) — **NEITHER
     `LlvmBackend_Exprs.cpp` NOR `LlvmBackend_Calls.cpp` CONTAINS `DisposeAsync` LOWERING CODE.** THE
     CONCLUSION ("NOT THIS LANE's") HOLDS; **ONLY THE FILE NAMES ARE WRONG.**
+
+### Fix-forward lane `r36-c1-u4` — 2026-10-28 (the U4 FIX-FORWARD — **PICKED**, TWO CLOSURES, THREE NARROWED)
+
+* **THE LANE's SIX COMMITS, `r36-c1-u4`, base `b19567b1`, reviewed by `abe853d95982e5a07`
+  (**ACCEPT-W-NOTES**). **THE PICKED SHAs ON STAGING: `a37947ec` (`narrow #7326 fix #7396`) ·
+  `dc0fd710` (`narrow #7354 fix #7394`) · `70e7d059` (`narrow #7424`) · `5794390c`
+  (`narrow #7354`) · `f5d9ef22` (`narrow #7326`) · `431fed95` (`narrow #7424`).**
+* **=> TWO **TRUE** CLOSURES: **#7394** AND **#7396**. **THREE ISSUES STAY OPEN: **#7326**, **#7354**
+  AND **#7424** (THEIR SUBJECTS CARRY `narrow`, WHICH IS NOT A CLOSING KEYWORD).**
+
+**THE COORDINATOR's SUBJECT AMENDMENT (2026-10-28) — THE REVIEWER's FIRST NOTE, DISCHARGED.**
+
+**THE PROBLEM MEASURED BY THE REVIEWER: `scripts/pick_issues.sh` READS THE **SUBJECT LINE ONLY**, AND
+THE LEDGER's `--infer-kind` HEURISTIC CLASSIFIES `narrow` AS `fix` — **SO THE TOOLING CANNOT
+DISTINGUISH A FULL CLOSE FROM A PARTIAL ONE. THE ONLY THING THAT KEEPS `narrow` FROM CLOSING IS THE
+HUMAN's READING OF THE WORD.** **=> A `fix #N` IN A SUBJECT THAT A LATER COMMIT IN THE SAME BRANCH
+CALLS `narrow #N` IS A **FALSE CLOSURE** — AND IT IS THE **WORSE** OF THE TWO ERRORS.**
+
+* **THE REVIEWER's OWN LATER COMMITS SAID `narrow #7354`, `narrow #7326` AND `narrow #7424` — SO THE
+  EARLIER `fix` SUBJECTS OVERCLAIMED AGAINST THE LANE's OWN WORD.**
+* **=> THE COORDINATOR AMENDED THE **THREE** `fix` SUBJECTS **BY REBASE** (A MESSAGE AMENDMENT — **THE
+  PATCHES ARE BYTE-IDENTICAL: ALL SIX `git patch-id --stable` VALUES ARE UNCHANGED**, AND
+  `check_commit_trailers.py --range b19567b1..r36-c1-u4` IS **CLEAN (6 commit(s))**). THE THREE
+  NEW SUBJECTS ARE:**
+  * `narrow #7326 fix #7396: an `await using` outside an async method or async lambda is not rejected (§28.12, v0.345)`
+  * `narrow #7354 fix #7394: the disposal-interface declaration-site rejection follows the INTERFACE CHAIN, not a name (§28.12, §9.7, §8.7, v0.345)`
+  * `narrow #7424: the built-in disposal chain omitted `IOwningCollection<T>` and `IOwningList<T>`, so a record listing either was admitted (§28.12, v0.345)`
+* **=> AND **EACH AMENDED BODY NAMES THE RESIDUAL THAT STAYS OPEN** (MASTER PLAN §4.2's RULE), SO THE
+  RECORD IS IN THE COMMIT ITSELF AND NOT ONLY IN THIS BLOCK.
+* **=> THE COORDINATOR PICKED ALL SIX WITH `--kind fix`, **THE HOUSE PRACTICE FOR `narrow`
+  COMMITS** (SEE `afc0147d1a` `narrow #7316`, `cc7d985553` `narrow #7333`, `b19567b1` `narrow
+  #7232`) — **THE REVIEWER HAD ASKED FOR THREE OF THEM TO BE `--kind test`; THE COORDINATOR DEVIATED,
+  AND THE REASON IS MEASURED: `5e357660` **REMOVES A REJECTION** (A SHADOWING USER `IDisposable` IS
+  NOW ADMITTED WHERE IT WAS REFUSED — THE REVIEWER's F6) AND `428a2dd7` ADDS A CHAIN ROW, SO **NEITHER
+  IS TEST-ONLY**, AND **THE LEDGER CREDITS BY SUBJECT, NOT BY KIND** — SO A `--kind test` ON THEM
+  WOULD NOT HAVE CHANGED THE CREDITED SET ANYWAY.**
+
+**THE POST-PICK STATE OF THE FIVE ISSUES (THIS IS THE AUTHORITATIVE STATUS; THE "Members at entry"
+TABLE ABOVE IS THE **ENTRY** MEASUREMENT, DATED `d9f11d15`, AND IS **NOT** REWRITTEN — A PICK DOES NOT
+RE-MEASURE THE ENTRY CHECK).**
+
+| # | post-pick state | what stays open |
+|---|---|---|
+| **#7396** | **CLOSED** — an `await using` outside an async method or async lambda is now **REFUSED** (§28.12), with the diagnostic at a real location | — |
+| **#7394** | **CLOSED** — a `record`/`enum`/`choice` declaring `IAsyncDisposable` is now **REFUSED AT THE DECLARATION**, with the **INTERFACE CHAIN** named (not a name test) | — |
+| **#7326** | **PARTIAL** — the §28.12 rejection lands and is pinned (four rows), but the §28.10 **VACUITY LINT** over-fires on an `IDisposable`/`IAsyncDisposable`/`IOwningCollection<T>`/`IOwningList<T>`-declared binding | the lint's over-fire — **#7456** |
+| **#7354** | **PARTIAL** — the **declaration-site** rejection follows the chain, and the enum/choice/nested controls are added, but the **NESTED-RECORD reach gap** is not fixed | `Resolver::checkRecordRestrictions` iterates `ctx_.module()->children` — **MODULE-LEVEL ONLY** — so a `record` **inside a `class`** escapes every §9.6/§9.7 record restriction. **ALREADY TRACKED AS THE COORDINATOR's RESIDUAL COMMENT ON #7354 (2026-10-27)** |
+| **#7424** | **PARTIAL** — the two missing heads are added and their rows pass, but the **MECHANICAL DERIVATION** into `src/common/BuiltinRegistry.*` is deferred to that file's owner | the derivation — **AND IT IS MEASURED TO MATTER: #7456 AND #7457 ARE ITS TWO SYMPTOMS** |
+
+**THE REVIEWER's SEVEN FINDINGS — FIVE CONFIRMED FIXED, ONE AN ACCEPTED DEFERRAL, ONE STILL OPEN AND
+ALREADY TRACKED.**
+
+* **F1 — THE CHAIN TABLE IS **COMPLETE**: **CONFIRMED FIXED.** THE REVIEWER ENUMERATED THE STDLIB's
+  DISPOSAL FAMILY **HIMSELF** (v0.345, **34** `public interface` DECLARATIONS IN THE WHOLE DOCUMENT,
+  OF WHICH **TEN** ARE THE FAMILY) AND THE TABLE `kDisposalHeadParents`
+  (`src/sema/TypeResolution_Checks.cpp`) NOW LISTS **ALL TEN** WITH THE RIGHT PARENTS — **THE
+  DIFFERENCE IS ZERO, NO HEAD IS MISSING.** **THE OTHER **24** STDLIB INTERFACES DO NOT EXTEND
+  `IDisposable` — EACH WAS CHECKED.**
+* **F2 — THE DUPLICATION WITH `src/common/DisposalKind.cpp` — **ACCEPTED DEFERRAL**, WITH A NEW
+  INCONSISTENCY IT LEAVES BEHIND.** THE DEFERRAL IS RECORDED WHERE THE BRIEF ASKED (a cited source
+  comment beside the table). **THE REVIEWER MEASURED THE TIP's RULE AS **CORRECT**: `await using` OVER
+  AN `IAsyncDisposable` PRINTS `RES-ASYNC-DISPOSE`; THE SYNC SPELLING PRINTS `RES-SYNC-DISPOSE` — THE
+  CHAIN REACHES THE ASYNC PATH EVEN THOUGH `DisposalKind.cpp` NAMES ONLY `IAsyncDisposable`.** **BUT
+  THE DEFERRAL LEAVES A **FALSE §28.10 VACUITY WARNING** ON **EXACTLY THE TWO HEADS THE LANE JUST
+  ADDED** (`IOwningCollection`, `IOwningList`) **AND ON `IDisposable`/`IAsyncDisposable` — WHILE THE
+  SIX SIBLING HEADS DO **NOT** WARN — **AND THE WARNING IS DEMONSTRABLY FALSE (THE PROGRAM STILL
+  PRINTS `RES-DISPOSED`).** **=> THE COORDINATOR FILED IT AS **#7456**.**
+* **F3 — THE NESTED-RECORD REACH GAP — **NOT FIXED, AND IT IS **NOT** THE LANE's.** MEASURED
+  INDEPENDENTLY ON BOTH ARMS: A NESTED `record` IS **ADMITTED** ON THE TIP **AND** ON THE BASE; A
+  NESTED `enum` IS **ADMITTED ON THE BASE** AND **REJECTED ON THE TIP**. **=> §28.12's SINGLE SENTENCE
+  IS NOW APPLIED AT THREE DIFFERENT DEPTHS. **=> IT IS ALREADY TRACKED** (THE COORDINATOR's RESIDUAL
+  COMMENT ON #7354, 2026-10-27, WITH THE SAME MECHANISM AND THE SAME FIVE-ROW TABLE), **SO #7354 STAYS
+  OPEN AND THE LANE IS RIGHT TO LEAVE IT.**
+* **F4 — THE `#7322` ROW WAS VACUOUS — **CONFIRMED FIXED** (BOTH ARMS MEASURED). THE HELPER
+  `expectNoMemorySafetyDefect` IS **REMOVED** (A COMMENT RECORDS WHY), THE BINDING MOVED INTO AN
+  **`async` LAMBDA INSIDE A PLAIN `Main`** (THE CONTEXT §28.12 ADMITS), AND THE ORACLE IS NOW THE FULL
+  `expectRunsClean(…, "[1]\n")`. **THE ROW WAS ALSO **RENAMED** — A DIAGNOSTIC-TEXT RENAME IS A
+  BEHAVIOUR FLIP, SO THE REVIEWER CHECKED IT:** OLD
+  `the_vacuous_await_using_outside_an_async_method_reads_no_out_of_bounds_spec_28_12` → NEW
+  `the_vacuous_await_using_in_an_async_lambda_in_a_plain_main_reads_no_out_of_bounds_spec_28_12`.
+  **ARM C (the pre-#7322 backend, the NEW test file): "3 passed, 7 failed"** — the re-spelled row
+  FAILS with `AddressSanitizer`/`heap-buffer-overflow`. **ARM D (the same backend, the OLD test file):
+  "4 passed, 6 failed"**, **AND THE OLD ROW **PASSES** THERE — **THE VACUITY, MEASURED: ON THE
+  PRE-#7322 BACKEND THE OLD ROW WAS GREEN *BECAUSE ITS PROGRAM WAS REJECTED*.**
+* **F5 — THE WRONG `stdlib §2.18` CITATION — **CONFIRMED FIXED.** THE SOURCE COMMENT NOW READS
+  **`stdlib §2.10`** (`docs/Bezel_Standard_Library.md:525` IS `### 2.10 'IDisposable' and
+  'IAsyncDisposable'`; `:532` IS `public interface IAsyncDisposable: IDisposable`; **§2.18 (`:1136`)
+  IS `IFormattable`** — WHICH THE OLD CITATION POINTED AT). **=> `check_src_citations.py` PRINTED
+  "clean" BOTH BEFORE AND AFTER — IT PROVES **RESOLVABILITY**, NOT WORDING.**
+* **F6 — THE UNNAMED ACCEPTANCE FLIP — **CONFIRMED FIXED (THE FLIP IS REAL, CORRECT, AND NAMED).**
+  **§9.7 (spec:1409) BANS THE **BUILT-IN** `IDisposable`; §2.3's Disposal-interfaces ROW IS
+  **shadowable = Yes**, AND THE TEXT AT SPEC:161 SAYS *"Only the first row's names cannot be shadowed
+  … every other always-available name may be shadowed by local declarations."* **=> A USER's OWN
+  `IDisposable` EXTENDS NOTHING, SO THE RECORD IMPLEMENTS NO DISPOSAL INTERFACE.** **THE FLIP IS
+  NAMED IN `5e357660`'s BODY WITH THE OLD AND NEW EXPECTATIONS SPELLED OUT, AND PINNED BY THE NEW ROW
+  `record_listing_a_shadowing_user_idisposable_is_still_admitted_spec_9_7`.**
+* **F7 — THE MISSING ENUM/CHOICE CONTROLS — **CONFIRMED FIXED (ALL SIX ROWS).** **ARM B (the source
+  REVERTED TO THE NAME-BASED CHECK, THE TEST BINARY REBUILT): "13 passed, 15 failed"**, INCLUDING
+  `nested_enum_listing_i_async_disposable_is_rejected_spec_28_12` AND
+  `nested_choice_listing_i_async_disposable_is_rejected_spec_28_12`. **THE FOUR ADDED **CONTROL** ROWS
+  ARE `[  OK  ]` ON **BOTH** ARMS.**
+
+**THE FAIL-WITHOUT — MECHANICAL, BOTH ARMS, WITH THE **TEST BINARY** REBUILT EVERY TIME.**
+
+| arm | the reverted file | filter | result |
+|---|---|---|---|
+| **A** | `src/sema/TypeResolution_Checks.cpp` → `af244910^` (the 8-head table) | `--area sema disposal_interface_chain_7354` | **22 passed, 6 failed** — **EXACTLY** the six #7424 REJECT rows |
+| **B** | the same file → `d31cd5aa` (the name-based check) | the same | **13 passed, 15 failed** — including the two F7 nested rows; **the four F7 CONTROLS ARE `[  OK  ]`** |
+| **C** | `src/codegen/LlvmBackend_Setup.cpp` → `9bb9387f^` (pre-#7322), the NEW test file | `--area codegen await_using_vacuous_rhs_7322` | **3 passed, 7 failed** |
+| **D** | the same backend, the OLD test file | the same | **4 passed, 6 failed** — **THE OLD ROW PASSES (THE VACUITY, MEASURED)** |
+
+**EVERY REVERTED FILE WAS RESTORED, AND `git status --short` WAS **CLEAN** AFTER EACH ARM AND AT THE
+END.**
+
+**THE CORPUS — READ-ONLY, AGAINST A COPY. **THE PICK: `3693 cases: 3157 ok, 233 known-divergent, 296
+unclassified, 0 REGRESSION, 7 UNBANKED`. THE BASE `b19567b1`: `3693 cases: 3157 ok, 234
+known-divergent, 296 unclassified, 0 REGRESSION, 6 UNBANKED`.** **=> 0 REGRESSION ON BOTH ARMS, AND
+THE UNBANKED SET DIFFERS BY **EXACTLY ONE ROW**: `s28_12_0015` — **BANKED `fail`, AND IT NOW PASSES**,
+MOVED BY THE LANE's OWN `d31cd5aa` (ITS CORPUS ROW IS "await using outside an async method is a
+compile error"). **=> THAT IS THE EXPECTED CONSEQUENCE OF THE FIX, AND THE COORDINATOR RE-BANKS
+`baseline.tsv` **LAST**, BEFORE THE GATE. THE OTHER SIX ARE **PRE-EXISTING** ON THE BASE ARM.**
+
+**THE ASan LEG: `BEZEL_AOT_FORCE_SANITIZE=address scripts/agent_check.sh --area codegen
+await_using_vacuous_rhs_7322` → `10 passed, 0 failed`, `NATIVE SANITIZER: 0 check(s) skipped`,
+`NATIVE SANITIZER INFRA: 0 build/link/exec break(s)`, `CHECKED TOOLCHAIN: 0 skip(s)`.** (THE VERDICT IS
+THE **NUMERAL**; THE PARENTHETICAL IS AN ALWAYS-PRINTED LEGEND.) **`scripts/agent_check.sh --lit` →
+`Passed: 2562 (100.00%)`.** **`scripts/check_src_citations.py` → clean** (RESOLVABILITY ONLY). **THE
+OTHER TARGETED FILTERS, ALL 0 FAILED: `--area sema record_idisposable_constraint_4755` (5),
+`sema_record` (30), `sema_enum_restrictions_nested_3601` (4), `choice_restrictions_3869` (19),
+`--area ownership disposal` (22), `--area ownership using_var_choice_copy_7316` (11).**
+
+**THE ADMITTING-TWIN MATRIX — **CONSISTENT, 12/12 CELLS. `await` AND `await using` **AGREE IN EVERY
+CELL**:** A PLAIN METHOD (BOTH REJECTED) · AN ASYNC METHOD (BOTH ADMITTED) · A NON-ASYNC LAMBDA IN A
+PLAIN METHOD (BOTH REJECTED) · A NON-ASYNC LAMBDA IN AN ASYNC METHOD (BOTH REJECTED) · AN ASYNC LAMBDA
+IN A PLAIN METHOD (BOTH ADMITTED) · AN ASYNC LAMBDA IN AN ASYNC METHOD (BOTH ADMITTED) · A NESTED CLASS
+METHOD (BOTH REJECTED) · A CONSTRUCTOR (BOTH REJECTED) · A STATIC CONSTRUCTOR (BOTH REJECTED) · A
+NON-ASYNC LAMBDA INSIDE AN ASYNC LAMBDA (BOTH REJECTED) · AN ASYNC LAMBDA INSIDE A NON-ASYNC LAMBDA
+(BOTH ADMITTED) · A LEGAL `await using` INSIDE `for`/`try`/`finally` IN AN ASYNC METHOD (**STILL
+ADMITTED — NO REGRESSION**).
+
+**THE ONE PRE-EXISTING ROW WHOSE **PROGRAM** CHANGED: `ownership_using_var_choice_copy_7316.
+await_using_var_choice_copy_is_unchanged` — THE PROGRAM MOVED TO `public static async method Main():
+Task` (THE OLD ONE IS NOW REJECTED BY §28.12), **ITS EXPECTATION IS UNCHANGED** (COMPILES, RUNS, EXITS
+0, PRINTS `done`), **AND ITS NAME IS UNCHANGED.** NAMED IN `d31cd5aa`'s BODY WITH THE ⚠ MARKER. **THE
+NEEDLE `record `R` may not implement `IDisposable`` + `(§9.7)` IS **PRESERVED BYTE-IDENTICALLY** IN THE
+SOURCE FOR THE DIRECT CASE — AND **IT IS NOT A VACUOUS `CHECK-NOT`**: THE LIT TRACK IS **2562 (100.00%)**
+AND THE gtest ROW `record_listing_idisposable_is_rejected_spec_9_7` PINS THE SAME TEXT AT A REAL
+LOCATION (2,8).**
+
+**THE TWO NEW DEFECTS THE REVIEWER MEASURED — **THE COORDINATOR FILED BOTH ON 2026-10-28** (LANES MAY
+NOT FILE).**
+
+| # | the one-line mechanism | where |
+|---|---|---|
+| **#7456** | **THE §28.10 VACUITY LINT OVER-FIRES ON AN `IDisposable`/`IAsyncDisposable`/`IOwningCollection<T>`/`IOwningList<T>`-DECLARED BINDING WHOSE OBJECT HAS A DESTRUCTOR — THE WARNING CLAIMS "NO DISPOSAL OBLIGATION (§28.9)" WHILE THE SCOPE-END DISPOSAL **DOES** RUN** | `src/common/BuiltinRegistry.cpp`'s `kDisposableBuiltinHeadNames` (42 names) IS **MISSING** FOUR HEADS; `common::classifyDisposal` ANSWERS "no obligation"; `MethodOwnership::rhsIsDisposableClassType` (`src/ownership/Ownership.cpp`) BELIEVES IT |
+| **#7457** | **A `where` BOUND NAMING `IEnumerator<T>`/`IAsyncEnumerator<T>` **ADMITS A RECORD** TYPE ARGUMENT — THE BOUND CHECK DOES NOT CONSULT THE TRANSITIVE CLOSURE** | `src/sema/TypeRef.hpp`'s `primitiveNeverConformsToBuiltinIface` NAMES **ONLY** `IDisposable` AND `IAsyncDisposable` — **THE SAME TWO-HEAD NARROWING THE CHAIN TABLE JUST FIXED, IN A SECOND FILE** |
+
+**=> BOTH ARE **PRE-EXISTING** (IDENTICAL ON THE BASE ARM) AND **BOTH ARE THE **SAME
+MECHANICAL DERIVATION** #7424's RESIDUAL NAMES. **=> THE COORDINATOR DISPATCHED A **CAMPAIGN-1
+DISPOSAL-FAMILY LANE** (`r36-c1-disposal-family`, base `431fed95`) TO CLOSE BOTH.**
+
+**THE REVIEWER's OWN NAMED GAPS (RECORDED, NOT HIDDEN):** IT DID **NOT** RUN THE FULL SUITE (THE
+COORDINATOR's GATE); IT DID **NOT** RUN `runner.py --update`/`--classify` (THE CORPUS IS READ-ONLY FOR
+A REVIEWER); IT DID **NOT** SWEEP THE OTHER **33** STDLIB INTERFACES' §14.2 CONFORMANCE; IT DID **NOT**
+TOUCH `src/codegen/**` BEYOND THE F4 MEASUREMENT ARM (AND THE FILE WAS RESTORED); **IT DID **NOT**
+RE-RUN `scripts/using_heads_grid.py` ON BOTH ARMS — **THAT IS THE COORDINATOR's INSTRUMENT, AND THE
+COORDINATOR RE-MEASURES IT**; IT DID **NOT** MEASURE THE CORPUS ON THE PICK **CHERRY-PICKED ONTO THE
+LIVE TIP**; IT DID **NOT** FILE ANY ISSUE; IT DID **NOT** AMEND ANY `docs/` FILE; IT DID **NOT** VERIFY
+THE `s28_12_0015` RE-BANK (THAT IS THE COORDINATOR's LAST STEP). **ITS PROBE DIRECTORY IS LEFT IN PLACE
+AT `/var/tmp/bezel-scratch/r36-rev-u4-ff/probes/` FOR THE HARVEST LANE.**
 
 ## Exit review
 
