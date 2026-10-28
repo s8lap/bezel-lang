@@ -1026,6 +1026,7 @@ MINIMAL REPRO AND A §-CITATION IN ITS BODY:**
 | **#7422** | **THE `owned`-FIELD DISPOSAL PREDICATE COVERS THE ITERATOR-FORMAT HEADS IN A **CROSS**, NOT A SQUARE — `owned IEnumerator<int>?` AND `owned IAsyncEnumerable<int>?` **STILL LEAK THE FRAME**, AND THE ASYNC ONE **ALSO SKIPS THE §29.7 `finally` CHAIN** — **SO IT IS #2623's OWN DEFECT CLASS, ONE HEAD OVER** | §28.5 rule 1, §29.7, §30.7 (v0.345) | the U2/U3 lane's reviewer |
 | **#7423** | **A `using var` OVER A **NULL-CONDITIONAL** `?.` READ OF A `Task` — **THE COMPILER CRASHES** (MALFORMED IR: A DEGRADED SLOT LOADED AS `i32` AND PASSED TO A POINTER PARAMETER) **AND WITH A NULLABLE RECEIVER THE PROGRAM **OVERFLOWS THE STACK** AT RUN TIME** | §30.11, §28.10, §30.2 (v0.345) | the U2/U3 lane's reviewer |
 | **#7424** | **THE DISPOSAL-INTERFACE CHAIN TABLE OMITS `IOwningCollection<T>` AND `IOwningList<T>` (stdlib §4.2), WHICH EXTEND `IDisposable`, SO §28.12's DECLARATION-SITE BAN DOES NOT REACH THEM** — **AND IT IS NOT A COMPILER LIMITATION: THE COMPILER CAN SEE THE EDGE (`where T: IDisposable` ADMITS `IOwningCollection<Res>`)** | §28.12 (v0.345, spec:7475), stdlib §4.2 | the U4 lane's reviewer |
+| **#7463** | **AN `owned` VALUE HELD IN A **LOCAL** SLOT TYPED AT `IOwningCollection<T>`/`IOwningList<T>` IS **NEVER DISPOSED** — THE DESTRUCTOR NEVER RUNS (ASan `11200 byte(s) leaked in 150 allocation(s)`), WHILE THE `IDisposable` TWIN DISPOSES CORRECTLY** — **AND IT IS **PRE-EXISTING** (THE REVIEWER MEASURED THE **IDENTICAL** NUMBERS ON THE BASE ARM) | §28.12, §28.10, §28.9, stdlib §4.2 (v0.345) | the **DISPOSAL-FAMILY** lane's measurement, CONFIRMED BY ITS REVIEWER |
 
 **(#7422's ASYNC SELF-DISPOSAL RESIDUAL IS A **SECOND, DISTINCT** DEFECT AND IS RECORDED AS A COMMENT
 ON #7422 ITSELF; **AND THE **SYNC** SELF-DISPOSE TWIN IS **NOT** A SECOND DEFECT — IT IS #7422's OWN
@@ -1554,6 +1555,93 @@ COORDINATOR RE-MEASURES IT**; IT DID **NOT** MEASURE THE CORPUS ON THE PICK **CH
 LIVE TIP**; IT DID **NOT** FILE ANY ISSUE; IT DID **NOT** AMEND ANY `docs/` FILE; IT DID **NOT** VERIFY
 THE `s28_12_0015` RE-BANK (THAT IS THE COORDINATOR's LAST STEP). **ITS PROBE DIRECTORY IS LEFT IN PLACE
 AT `/var/tmp/bezel-scratch/r36-rev-u4-ff/probes/` FOR THE HARVEST LANE.**
+
+**Lane `r36-c1-disposal-family` (the DISPOSAL-FAMILY DERIVATION — ONE SHARED TABLE FOR THE
+TEN DISPOSAL HEADS).**
+
+* **SHAs (picked onto staging):** `2bd38c79` **fix #7456** -> `19fd5710a0`, `d443ff14` **fix #7457**
+  -> `5e57953d68`. **TWO NEW CLOSURES: #7456, #7457.**
+* **WHAT IT DID.** **THE LANE DELETED THE LOCAL `kDisposalHeadParents` COPY IN
+  `src/sema/TypeResolution_Checks.cpp` AND MADE **ONE** SHARED TABLE IN `src/common/BuiltinRegistry.*`
+  (`constexpr std::array<BuiltinDisposalFamilyHead, 10> kBuiltinDisposalFamilyHeads`) THE **SINGLE
+  HAND-WRITTEN SOURCE OF TRUTH**, READ BY **THREE** PLACES: **THE §28.10 VACUITY LINT**, **THE `where`
+  BOUND CHECK**, AND **THE DECLARATION-SITE CHAIN**. **=> ONE TABLE, **TEN** HEADS, INSTEAD OF TWO
+  NAMES IN ONE PLACE AND A CHAIN IN ANOTHER.**
+* **THE REVIEWER's VERDICT: **ACCEPT-W-NOTES** (`a739babe5503ae460`) — **NO BLOCKING DEFECTS.** **THE
+  REVIEWER's CHECKS, ALL MEASURED:**
+  * **THE TABLE MOVE IS FAITHFUL.** **ALL **TEN** HEADS' PARENTS WERE CHECKED AGAINST
+    `docs/Bezel_Standard_Library.md` **v0.345** — `IDisposable` (§2.10 L528) ·
+    `IAsyncDisposable -> IDisposable` (L532) · `IOwningCollection -> IDisposable` (§4.2 L1603) ·
+    `IOwningList -> IOwningCollection` (L1612) · `IEnumerator -> IDisposable` (§4.12 L2486) ·
+    `IAsyncEnumerator -> IAsyncDisposable` (L2503) · `IOwningEnumerable`/`IOwningEnumerator ->
+    IDisposable` (§4.13 L2513/L2517) · `IOwningAsyncEnumerable`/`IOwningAsyncEnumerator ->
+    IAsyncDisposable` (L2532/L2536). **=> AND #7424's OWN FILTER `disposal_interface_chain_7354`
+    GIVES **28 passed / 0 failed** ON **BOTH** THE BASE ARM AND THE PICK, **IDENTICAL PER ROW** — **SO
+    THE DECLARATION-SITE CHAIN's BEHAVIOUR IS UNCHANGED.**
+  * **THE "**TWO CALLERS**" CLAIM IS CONFIRMED, AND **STRONGER** THAN THE LANE STATED.**
+    `grep -rn classifyDisposal src/` GIVES EXACTLY **TWO** CALL SITES — `src/ownership/Ownership.cpp`
+    (THE LINT) AND `src/codegen/LlvmBackend_Setup.cpp` (THE `await using` SLOT CLASSIFICATION). **AND
+    `kind` AND `cls` HAVE **NO** READER ANYWHERE OUTSIDE `src/common/DisposalKind.cpp`; THE CODEGEN
+    SITE READS **`mayHoldClass` ONLY**, AND `mayHoldClass` IS **TRUE** IN **EVERY** DECLARATION-LESS ARM
+    — **=> THE `await using` PATH IS CODEGEN-NEUTRAL, AND **NO SOUNDNESS CHANGE** FOLLOWS.**
+  * **THE EXISTING TEST FILE EDIT IS **ADDITIVE**, NOT A FLIP.** `tests/support/
+    builtin_registry_snapshot_test.cpp` IS **+11 / −0**: **FOUR** NAMES ARE ADDED TO THE **IN**-LIST OF
+    `builtin_registry_snapshot.disposable_builtin_head_name_set_spec_28_3_28_9`, **NOTHING** IS
+    REMOVED, AND **BOTH OUT-LISTS ARE UNTOUCHED AND CONTAIN **NO** FAMILY HEAD.** **=> OLD -> NEW:
+    `isDisposableBuiltinHeadName("IDisposable" / "IAsyncDisposable" / "IOwningCollection" /
+    "IOwningList")` WENT FROM **UNASSERTED AND FALSE** TO **ASSERTED TRUE** — **A STRENGTHENING.**
+    (`32 passed / 0 failed`.)**
+  * **THE FAIL-WITHOUT IS MECHANICAL ON **BOTH** ARMS, WITH THE **TEST BINARY** REBUILT EACH TIME.**
+    **ARM A** (the five `src/` files reverted to `431fed95`): `disposal_family_vacuity_lint_7456`
+    **9 passed / 4 failed**, `disposal_family_bound_record_7457` **6 passed / 9 failed** — **ALL
+    **THIRTEEN** FAILING ROWS ARE THE LANE's OWN NEW ROWS, AND **NO** PRE-EXISTING ROW STARTS FAILING.**
+    **ARM B** (ONLY `src/sema/TypeRef.hpp` REVERTED): THE SAME NINE FAIL, AND THE 7456 FILTER STAYS
+    **13/0** — **=> THE TWO ISSUES ARE **INDEPENDENTLY** PINNED.**
+  * **THE ASan LEG OVER THE LANE's OWN ROWS — WHICH THE LANE DID **NOT** RUN — WAS RUN BY THE
+    REVIEWER: **13/0** AND **15/0** WITH **`NATIVE SANITIZER: 0 check(s) skipped`** AND **`CHECKED
+    TOOLCHAIN: 0 skip(s)`** ON BOTH.**
+  * **THE CORPUS: **0 REGRESSION**, AND THE PICK's REPORT AND THE BASE's REPORT DIFFER IN **NO** ROW's
+    VERDICT.** **BOTH GRIDS UNCHANGED** (c2 **118 cells, 10 wrong**; c1 **153 cells, 96 ok, 31 wrong,
+    8 mismatch, 9 n/a, 9 quarantined**, **DONE blocked by 39**) **AND THE c1 GRID's PER-CELL CLASS
+    COLUMN DIFFS **EMPTY** BETWEEN THE BASE ARM AND THE PICK.**
+  * **THE PRE-EXISTING FAILURE IS CONFIRMED PRE-EXISTING** —
+    `generic_method_same_name_tparam_4813.extension_method_spec_26_5` FAILS ON **BOTH** ARMS.
+* **THE REVIEWER's **FIVE** NOTES — **THE COORDINATOR's ACTIONS:**
+  * **N1 — **#7463's BODY NEEDED A **THIRD** CORRECTION, AND NOW HAS IT.** THE BODY CLAIMED THAT THE
+    §28.10 LINT WAS "THE ONLY SIGNAL A USER GOT ON A PROGRAM THAT LEAKS" **FOR THE `owned`-FACTORY
+    REPRO IT PRINTS** — **AND THAT IS **FALSE**: `handleLocalDecl`'s **CASE-A** GUARD CARRIES
+    `!ld.initializerHasOwnedMarker` (`src/ownership/Ownership.cpp:8192`), **SO THAT REPRO IS **SILENT
+    ON **BOTH** ARMS.** **THE CLAIM HOLDS **ONLY** FOR THE **NON-`owned`** FACTORY TWIN, **WHICH
+    WARNS ON THE BASE, IS SILENT ON THE PICK, AND LEAKS THE **IDENTICAL** `11200 B / 150 allocs` ON
+    **BOTH** ARMS.** **=> #7463's BODY NOW PRINTS **BOTH** SHAPES IN A TABLE, AND #7456's CONSEQUENCE
+    PARAGRAPH CARRIES THE SAME CORRECTION.**
+  * **N2 — **THE **SPLICED §-QUOTE** IN `src/ownership/Ownership.cpp` IS **FIXED** BY THIS COMMIT.** THE
+    LANE's COMMENT PRESENTED *"§28.12: the disposal dispatches 'through any interface — `IDisposable`
+    or one deriving from it'"* — **BUT THE SPEC's WORDS AT `:7506` ARE *"through any interface —
+    **`IAsyncDisposable`** or one deriving from it … or another such as **`IDisposable`**, which every
+    class implements"*, SO THE QUOTED PHRASE **DOES NOT EXIST** IN THE SPEC.** **=> THE COMMENT NOW
+    QUOTES §28.12's **SYNCHRONOUS** HALF VERBATIM — *"as the synchronous path selects the destructor
+    chain it runs (§28.4) — never by the binding's static type"* — **WHICH IS THE PASSAGE THAT
+    GOVERNS THIS DECISION ANYWAY.**
+  * **N3 — **THE LANE's OWN GAP (iii) OVERSTATED ITSELF: **A **USER** INTERFACE EXTENDING `IDisposable`
+    USED AS A `where` BOUND IS **NOT** UNFIXED — **THE REVIEWER MEASURED IT **REJECTED ON BOTH
+    ARMS** (A **RECORD** ARGUMENT AND A **PRIMITIVE** ARGUMENT BOTH REFUSED WITH THE §14.2 MESSAGE),
+    **SO THE COORDINATOR DID **NOT** FILE IT AS A DEFECT.** **THE REAL GAP IS ONLY THAT **NO ROW PINS
+    IT**.**
+  * **N4 — **THE `await using` COVERAGE GAP FOR THE **FOUR NEWLY-DERIVED** HEADS **STANDS**: **THE
+    CODEGEN-NEUTRALITY ARGUMENT IS CORRECT BUT **UNPINNED**.**
+  * **N5 — **THE "§14.4" ATTRIBUTION FOR THE OWNING HEADS' CLASS-ONLY RULE IS **LOOSE**: **THE RULE
+    THAT ACTUALLY REJECTS A RECORD ELEMENT IS **THE STDLIB's OWN `where T: class`** ON THOSE HEADS
+    (stdlib §4.2 :1603/:1612, §4.13 :2513/:2517/:2532/:2536), **APPLIED AT THE INSTANTIATION SITE
+    THROUGH §14.2.** **=> #7457's BODY IS AMENDED.**
+* **THE COORDINATOR FILED **#7463** — **THE HARD LEAK** THE LANE MEASURED (AN `owned` VALUE IN A LOCAL
+  SLOT TYPED AT `IOwningCollection<T>`/`IOwningList<T>` IS **NEVER DISPOSED**; ASan `11200 B in 150
+  allocs`; THE DESTRUCTOR NEVER RUNS) — **AND #7463's BODY NOW RECORDS **THE CORRECTED CAUSAL
+  STORY** AND THE REVIEWER's RULING THAT **THE LINT WAS SIMPLY **WRONG** ABOUT THE OBLIGATION, **BUT
+  THAT A WARNING OF A **DIFFERENT KIND** OVER THE LEAKING SHAPE **WOULD HAVE BEEN **DEFENSIBLE**.**
+* **THE REVIEWER's NAMED GAPS, **OWED**: **THE `codegen`/`frontend`/`module` AREAS WERE **NOT** RUN
+  EXHAUSTIVELY**, **AND THE **lit** TRACK WAS **NOT** RUN.** (§28.9, §28.10, §28.12, §9.7, §14.2, §8.7;
+  stdlib §2.10/§4.2/§4.12/§4.13, **v0.345**.)
 
 ## Exit review
 

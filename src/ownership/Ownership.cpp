@@ -8547,8 +8547,9 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     // vacuous.
     //
     // §8.7: "The compiler generates `IDisposable` on every non-static class."
-    // §28.12: the disposal dispatches "through any interface — `IDisposable`
-    // or one deriving from it" to the runtime class. So a value held at
+    // §28.12: the disposal selects the run-time object's chain, "as the
+    // synchronous path selects the destructor chain it runs (§28.4) — never by
+    // the binding's static type". So a value held at
     // `IDisposable` / `IAsyncDisposable` / `IEnumerator<T>` /
     // `IAsyncEnumerator<T>` / `IOwningCollection<T>` / `IOwningList<T>` /
     // the four `IOwning*` iteration interfaces is disposed at scope end, and
