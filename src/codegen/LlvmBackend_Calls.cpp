@@ -13306,7 +13306,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
-    // fix #7297 / #7232 (spec §7.4 / §22.6, v0.345): the PAYLOAD of a
+    // fix #7297 / #7232 / #6647 (spec §7.4 / §22.6, v0.345): the PAYLOAD of a
     // §7.4-NARROWED nullable read at a `Math` / `Convert` PARAMETER.
     //
     // §22.6 (v0.345): "The argument's static type is its type at the call: a
@@ -13353,6 +13353,42 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // scalar operand (no `{i8, T}` carrier), so only a narrowed read of a
         // nullable VALUE type is affected.
         return unwrapNarrowedNullableOperand(v, argE);
+    };
+
+    // fix #6647 (stdlib §2.2, §5.1, v0.345): a `decimal` is a STRUCT, and a
+    // `decimal` RESULT can only be CONSUMED as a `decimal` — §5.1: "a decimal
+    // is never implicitly converted to a binary float", and there is no
+    // implicit `decimal` -> integer conversion either. So when the call's
+    // recorded result type is not `decimal`, the `decimal` payload this
+    // lowering produces is read by its consumer as ANOTHER primitive: the
+    // consumer took the decimal's low word as an `int` (measured: `Math.Abs`
+    // over a narrowed `decimal?` of 2.5m printed 25, the decimal's scaled
+    // mantissa, not 2.5) or passed the struct to a `double` parameter (the
+    // LLVM verifier aborted the compiler).
+    //
+    // The remedy is NOT here: the call's result type is the SEMANTIC layer's
+    // (src/sema/ExprTypecheck_Calls.cpp's polymorphic-refinement block copies
+    // the operand's NULLABLE type to the result, and its #6297 decimal block
+    // requires a non-nullable `decimal` operand, so a §7.4-narrowed `decimal?`
+    // operand keeps the `int` placeholder). Until that is fixed the codegen
+    // must FAIL CLOSED with a located diagnostic rather than emit a value the
+    // consumer will read as another type — the same shape as #2786's
+    // `rejectNonNumericMathOperand` guard in this arm.
+    auto mathDecimalResultIsTyped = [&]() -> bool {
+        const sema::TypeRef* rt = ctx_.exprType(call);
+        return rt && !rt->nullable &&
+               rt->kind == sema::TypeRef::Kind::Primitive &&
+               rt->primitive == sema::PrimitiveType::Decimal;
+    };
+    auto rejectNonDecimalMathResult = [&](std::string_view member) -> bool {
+        ctx_.diagnostics().report(
+            Severity::Error, call.span.begin,
+            "`Math." + std::string(member) + "` at a `decimal` operand must "
+            "produce a `decimal` (stdlib §2.2), but this call is not typed "
+            "`decimal`: a `decimal` is never implicitly converted to another "
+            "primitive (§5.1), so the operand's value cannot be carried by "
+            "the call's result type. (#6647)");
+        return true;
     };
 
     if (cls == "Convert") {
@@ -14980,7 +15016,7 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (call.args.size() == 1 && call.args[0].value) {
             llvm::Value* arg = lowerExpr(*call.args[0].value);
             if (!arg) return nullptr;
-            // fix #7297 / #7232 (spec §7.4 / §22.6, v0.345): a
+            // fix #7297 / #7232 / #6647 (spec §7.4 / §22.6, v0.345): a
             // §7.4-NARROWED nullable read at a `Math` PARAMETER is the value
             // it denotes, not the `{i8 hasValue; T}` carrier the read still
             // loads (§22.6: "a read of a binding §7.4 has narrowed non-null is
@@ -14988,27 +15024,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // UN-narrowed form at every position this reaches, so the carrier
             // that arrives here is a narrowed read's. A NO-OP for every
             // ordinary scalar operand.
-            //
-            // #6647's `decimal` positions are EXCLUDED here: a `decimal` is a
-            // STRUCT (stdlib §4.4) and a `decimal` RESULT can only be
-            // CONSUMED as a `decimal` (§5.1 — a `decimal` is never implicitly
-            // converted to another primitive), but the call's RESULT TYPE is
-            // the semantic layer's and it is not `decimal` at a narrowed
-            // `decimal?` operand. Extracting the payload before that is
-            // settled would make the consumer read the `decimal`'s low word
-            // as an `int` — a SILENT WRONG VALUE (measured: 225, the raw
-            // mantissa of 2.5m). #6647's own fix lands the extraction and a
-            // fail-closed guard together.
-            {
-                const sema::TypeRef* aTy = ctx_.exprType(*call.args[0].value);
-                const bool decimalOperand =
-                    aTy && aTy->nullable &&
-                    aTy->kind == sema::TypeRef::Kind::Primitive &&
-                    aTy->primitive == sema::PrimitiveType::Decimal;
-                if (!decimalOperand)
-                    arg = builtinNarrowedPayload("Math", m, 1, 0, arg,
-                                                  call.args[0].value.get());
-            }
+            arg = builtinNarrowedPayload("Math", m, 1, 0, arg,
+                                         call.args[0].value.get());
             if (m == "Abs") {
                 if (arg->getType()->isFloatingPointTy()) {
                     // Abs for float/double — use fabs intrinsic.
@@ -15024,6 +15041,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 // the helper unary `-` already uses, and it cannot overflow:
                 // decimal's range is symmetric about zero (stdlib §9.3).
                 if (arg->getType() == decimalStructType()) {
+                    // fix #6647 (stdlib §2.2, §5.1, v0.345): the `decimal`
+                    // payload can only be consumed as a `decimal`; fail closed
+                    // rather than emit a struct the consumer reads as another
+                    // primitive (see `rejectNonDecimalMathResult`).
+                    if (!mathDecimalResultIsTyped()) {
+                        rejectNonDecimalMathResult("Abs");
+                        return nullptr;
+                    }
                     llvm::Value* cmp = emitDecCmp(
                         arg, llvm::Constant::getNullValue(arg->getType()));
                     if (!cmp) return nullptr;
@@ -15156,6 +15181,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 // are integral).
                 if (arg->getType() == decimalStructType() &&
                     (m == "Floor" || m == "Ceiling" || m == "Truncate")) {
+                    // fix #6647 (stdlib §2.2, §5.1, v0.345): the `decimal`
+                    // payload can only be consumed as a `decimal`; fail closed
+                    // rather than emit a struct the consumer reads as another
+                    // primitive (see `rejectNonDecimalMathResult`).
+                    if (!mathDecimalResultIsTyped()) {
+                        rejectNonDecimalMathResult(m);
+                        return nullptr;
+                    }
                     const char* fnName =
                         m == "Floor"   ? "bz_decimal_floor" :
                         m == "Ceiling" ? "bz_decimal_ceiling" :
