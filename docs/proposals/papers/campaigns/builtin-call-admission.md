@@ -1354,11 +1354,11 @@ discriminator lane).**
   ASSIGNABILITY CHECK AGAINST THE DECLARED PARAMETER TYPE, IN SEMA, AT THE CALL**, and it must
   refuse all four. **#7167 IS `narrow` BECAUSE THE FAMILY THAT STAYS OPEN IS NAMED IN THE BODY.**
 * **#7244 (narrowed) — `AppendFormat`'s FORMAT AND ARGUMENTS WERE RENDERED IN THE **BYTE** DOMAIN
-  INSTEAD OF THE **CODE-POINT** DOMAIN.** spec §4.6 (v0.345, `docs/Bezel_Language_Spec.md:593`)
+  INSTEAD OF THE **CODE-POINT** DOMAIN.** spec §4.6 (v0.350, `docs/Bezel_Language_Spec.md:671` — LINE 593 AT v0.345)
   makes the per-string width invisible at the language level (*"The choice of width is invisible at
   the language level; programs observe only the `char` sequence and its length"*), and the same
   section fixes the code-point model (*"The user-visible model is \"a sequence of code points
-  indexed in O(1).\""*, `docs/Bezel_Language_Spec.md:593`). stdlib §3.1
+  indexed in O(1).\""*, `docs/Bezel_Language_Spec.md:671` AT v0.350 — LINE 593 AT v0.345). stdlib §3.1
   (v0.345) declares `AppendFormat(format: string, args: Array<Object>): StringBuilder` and says
   *"each hole optionally carrying a format spec after a colon"*. **MEASURED ON THE BASE:**
   `AppendFormat("x{0}y", <"日">)` gave Length 4 and the text `x` + U+00E5 + U+0065 + `y`;
