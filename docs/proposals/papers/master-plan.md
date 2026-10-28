@@ -508,7 +508,11 @@ campaign is what is left after they run.
      model's trace oracle** (`bzcore` L1): free in full only where the disposed binding itself is also
      dead after the call (a §28.2-warned later use retains until proposal 0205 lands), a slot borrowed
      through a field counts as a surviving borrow, and the exception-unwind edge is a fourth flag
-     reader treated like scope end. Check elision is a later campaign, after
+     reader treated like scope end. **Corrected again
+     (2026-10-28, the proposal-0131 review):** K5 sees only local borrows, so a borrow a callee kept on
+     a K4.3 trust clause is invisible to it; free in full only when the static proof **and** the
+     run-time escape set (`bz_cd_may_free`) agree, every K4.3 admitting site populates that set, and
+     the conservative escape marking is never narrowed to the trust report's emission points. Check elision is a later campaign, after
      the soundness model checks its premise.
    - **#6358**: the dictionary records at construction that its keys are strings, and every free path
      (`bz_dict_free`, `Remove`, `Clear`, overwrite) releases them; no per-site emission.
