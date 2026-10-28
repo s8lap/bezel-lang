@@ -1352,6 +1352,119 @@ discriminator lane).**
   := null)` IS NOW REFUSED BY THE §7 GATE, LIKE THE POSITIONAL SPELLING #7296's ROW ALREADY PINNED
   FOR THE `int` HEAD.
 
+**Lane `r36-c2-b4a` (the `string` / `StringBuilder` / `Debug` HEADS — the campaign's FOURTH instance
+lane).**
+
+* **SHAs (picked onto staging):** `ebe6182c` **fix #6635**, `4900aed9` **fix #6636**, `7a811ab9` **fix
+  #6826**, `6b6b0ff4` **fix #6780**, `54952bef` **fix #7173**, `a01f4547` **fix #7207**. **SIX
+  CLOSURES.**
+* **THE LANE WAS TOLD TO REBASE ONTO THE ANCHOR **AND** B3a** (it owns the same two `src/` files),
+  **TO RE-DERIVE THE `constexpr std::array<BuiltinParamRow, N>` ROW COUNT FROM THE REBASED FILE**
+  (**THE COUNTS ARE **NOT** ADDITIVE**), AND TO RE-BASE ITS OWN FAIL-WITHOUT.
+* **#6635 — AN `int` AT A §9.6 SEARCH-VALUE POSITION REACHED NO DECLARED OVERLOAD AND THE COMPILER
+  ABORTED.** stdlib §9.6 declares `Contains(value: string)` and `Contains(value: char)`; the arm
+  passed an `int` straight through to the runtime helper's `ptr` parameter. **THE SCOPE IS EXACTLY
+  THE TITLE's THREE POSITION-0 MEMBERS** (`Contains` / `LastIndexOf` / `Replace`), and **THE SAME
+  DECLARED SHAPE AT `Replace`'s SECOND POSITION (the replacement value) IS THE SAME DEFECT** — the
+  value was silently dropped and the program printed "bc" — so **it is closed here as a family
+  member.** `Split`'s separator is #6636's scope and `Object` arguments are #6826's.
+* **#6636 — `string.Split(int)` WAS SILENTLY ACCEPTED AND PRINTED NOTHING.** stdlib §9.6 declares
+  `Split(separator: char)` / the `string` separator form; an `int` separator is neither.
+* **#6826 — A `string` MEMBER ACCEPTED AN `Object` ARGUMENT.** stdlib §9.6's declared overload set
+  does not name `Object`, and the compiler's §9.6 gate asked an **integer-specific** question
+  instead. **THE FIX ASKS THE DECLARED QUESTION** — *"is this argument's type one the declared
+  overload set names?"* — so it closes the WHOLE residual, not a list of types: `bool` (which
+  ABORTED the compiler in the LLVM verifier — "Call parameter type does not match function
+  signature!", an `i1` handed to a `ptr` parameter), `float`, `double` and `decimal` behave like the
+  `Object` case, and a §7.4-narrowed `Object?` read is of its non-nullable `Object` type, which
+  the declared set does not name either.
+* **#6780 — A `Debug` CALL WAS ADMITTED WHATEVER IT WAS GIVEN, BECAUSE THE CLASS WAS IN NO
+  TABLE.** stdlib §8.2 declares the whole surface of `Debug` — it is a pure-static utility class
+  with exactly two members, `Assert(condition: bool, message: string := "")` and `WriteLine(message:
+  string)` — and `Debug` has **NO USER DECLARATION**, so that listing IS its surface, and §22.6
+  makes a call that matches no declared form a compile error with no candidates cited.
+  **MEASURED ON THE PRE-FIX TREE:** `Debug.WriteLine(sb)` COMPILED and wrote an EMPTY LINE (a
+  `StringBuilder` is not a `string` — §5.1 has no conversion); `Debug.WriteLine(5)` printed "Call
+  parameter type does not match function signature!" AND "IR verification failed" — an `i32`
+  handed to the runtime helper's `ptr` parameter, so **THE COMPILER ABORTED**; `Debug.WriteLine()`
+  and `Debug.WriteLine("a","b")` COMPILED and wrote an EMPTY LINE — **the surplus argument was
+  DROPPED.**
+* **#7173 — AN EXPLICIT TYPE-ARGUMENT LIST ON A BUILT-IN MEMBER WAS ACCEPTED AND IGNORED.** spec
+  §14.5 (v0.345) "Explicit lists are all-or-nothing": *"An explicit type-argument list
+  (`obj.Method<int>(args)`) binds the declared type parameters in declaration order and must supply
+  exactly as many arguments as the method declares type parameters. A shorter or a longer list is a
+  compile error; there are no partial lists."* **EVERY MEMBER OF stdlib §9.6, §3.1 AND §8.2 DECLARES
+  NO TYPE PARAMETER, SO ANY EXPLICIT LIST AT ONE OF THEM IS A COMPILE ERROR.** **MEASURED ON THE
+  PRE-FIX TREE, ALL SIX COMPILED AND RAN WITH THE LIST SILENTLY IGNORED:** `Debug.WriteLine<int>("x")`,
+  `Debug.Assert<int>(true)`, `"a,b".Split<int>(',')`, `"abc".Contains<int>('b')`,
+  `string.Join<int>(",", xs)`, `new StringBuilder().Append<int>(5)`. **THE CAUSE: THE COMPILER's OWN
+  §14.5 CHECK READS THE CALLEE's DECLARED TYPE-PARAMETER COUNT OFF ITS `MethodSymbol`, AND A
+  BUILT-IN MEMBER HAS **NO** `MethodSymbol` — ITS MEMBERS ARE TYPED BY NAME ALONE.** THE `Math` HEAD
+  ALREADY REPORTED THIS SHAPE (#5814's fix); THIS COMMIT GIVES THE `string`, `StringBuilder` AND
+  `Debug` HEADS THE SAME REJECTION, **WITH THE SAME SENTENCE**, AT FOUR CALL SITES.
+* **#7207 — THE §3.1 `StringBuilder` SURFACE NOW LIVES IN THE ONE DECLARED-SIGNATURE TABLE.** THE
+  LANE'S FIRST TASK WAS TO MOVE `builtinStringBuilderSurface` (8 rows) INTO `common::kBuiltinParams`
+  SO A `StringBuilder` CALL IS ADMITTED BY THE SAME TABLE AS EVERY OTHER HEAD, AND TO MAKE THE
+  `StringBuilder` HEAD GO THROUGH `ExprTC::checkBuiltinCallAdmission`. **THE LANE DECLINED TO ROUTE
+  THE HEAD THROUGH THE SHARED RESOLVER**, FOR THREE MEASURED REASONS, **AND SAID SO IN ITS
+  HAND-BACK** — THAT DECLINE IS THE ONE JUDGEMENT IN THE LANE, AND **THE REVIEWER RULED ON IT.**
+* **THE RESIDUAL HEADS THE LANE REPORTED AND DID NOT FIX** (each is another lane's head): `Console`
+  (stdlib §2.1), `Path` / `File` / `Directory` (stdlib §7.3 / §7.4), the numeric primitives' statics
+  (`int.Parse<int>("5")`), `Domain.Spawn` (stdlib §6.8), `Json.Parse` / `Binary.Parse`. **`Task`'s
+  GENERIC MEMBERS (`Task.FromResult<int>(1)`) DECLARE THEIR TYPE PARAMETER AND ARE CORRECT.**
+  **THE COORDINATOR HAS MEASURED THIS RESIDUAL ON THE TIP (`Console.WriteLine<int>("x")`,
+  `int.Parse<int>("5")`, `Path.Combine<int>("a","b")`, `File.ReadAllText<int>("a")` ALL COMPILE AND
+  RUN) AND POSTED IT AS A COMMENT ON #7173.**
+* **THE §9.6 RESIDUAL THE LANE REPORTED** (`s.Trim(5)`, `s.Equals(5)`, `string.IsNullOrWhiteSpace(5)`
+  — THREE COMPILER ABORTS — AND `s.Trim(null)`, WHICH COMPILES AND RUNS) **IS POSTED AS A COMMENT ON
+  #6826, MEASURED BY THE COORDINATOR AT THE TIP AND AT THE LANE's OWN TIP.**
+
+* **THE REVIEW WAS **ACCEPT-W-NOTES**, AND ITS TWO FINDINGS ARE **RECORDED, NOT PAPERED OVER**:
+  * **FINDING 1 IS **LANE-INTRODUCED** AND HAS ITS **OWN ISSUE: **#7419**** — *a reordered named
+    call on `Debug.Assert` is refused by the **POSITIONAL** shared resolver, and the diagnostic names
+    the **WRONG** parameter.* **THE LANE ADDED `head == "Debug"` TO `isBuiltinValueParamHead`, SO
+    `Debug` NOW REACHES `ExprTC::checkBuiltinCallAdmission`, WHICH READS ARGUMENTS
+    **POSITIONALLY** (`builtinArgAdmittedAt(ce, p, f.kinds[p])`) — **BUT `Debug` IS **NOT** IN
+    `kBuiltinNamedArgTableHeads`, SO `checkBuiltinNamedArgs` NEVER PUBLISHES A §22.5 BINDING FOR
+    IT.** **=> `Debug.Assert(message := "a message", condition := true)` IS REFUSED, AND THE
+    DIAGNOSTIC BLAMES THE `condition` ARGUMENT FOR A STRING THAT IS REALLY THE MESSAGE.**
+    **THIS IS **EXACTLY** THE MECHANISM THE SAME LANE CITED AS REASON 1 FOR **DECLINING** TO ROUTE
+    `StringBuilder` THROUGH THE SHARED RESOLVER — **APPLIED TO A DIFFERENT HEAD IN THE SAME LANE.**
+    **ON THE BASE THAT CALL **ABORTED THE COMPILER**, SO THE TIP IS NOT A REGRESSION FROM A WORKING
+    PROGRAM; IT TRADES A CRASH FOR A FALSE REJECTION. **THE FIX LANE IS DISPATCHED (see the
+    coordinator's block below).**
+  * **FINDING 2 LEAVES PART OF #7207's OWN SUBJECT OPEN** — *`StringBuilder.AppendLine`'s **VALUE
+    TYPE** IS STILL UNCHECKED.* **stdlib §3.1 DECLARES **ONE** VALUE TYPE
+    (`AppendLine(value: string)`) AND **NO** PER-TYPE OVERLOADS (UNLIKE `Append`, WHICH HAS SEVEN),
+    **AND YET `b.AppendLine(5)`, `b.AppendLine('c')` AND `b.AppendLine(true)` ALL COMPILE CLEAN AND
+    APPEND.** **=> THE FOLD's OWN HEADLINE INVARIANT — *"the SURFACE, the NAMES and the KINDS cannot
+    disagree"* — IS **FALSE AT `AppendLine/1`**, AND THE KIND VOCABULARY **CAN** EXPRESS IT (ONE BIT,
+    `kBPTString`), WHICH IS WHY THE FOLD GAVE A RATIONALE FOR LEAVING `Append`'s POSITION KINDLESS
+    AND `AppendFormat`'s SECOND POSITION KINDLESS **AND NONE AT ALL FOR `AppendLine`'s**.**
+  * **ONE STALE COUNT:** `6b6b0ff4`'s BODY SAYS *"the table's fixed size goes **287 → 290**"*; **ITS
+    ACTUAL DIFF ON THIS TREE IS **300 → 303**.** **THE FOLD's OWN COUNT (**303 → 305**) IS CORRECT
+    AND IT LABELS ITS PRE-REBASE NUMBERS AS NOT APPLICABLE.**
+  * **THE DECLINE IS **RATIFIED** — ALL THREE OF THE LANE's REASONS WERE MEASURED TRUE BY THE
+    REVIEWER: THE SHARED RESOLVER **DOES** BIND POSITIONALLY (`int.Parse(radix := 16, s := "255")`
+    IS REFUSED **ON THE BASE** AND NAMES THE WRONG PARAMETER); THE KIND VOCABULARY HAS **NO ARRAY
+    BIT** (SO `AppendFormat`'s SECOND POSITION WOULD BECOME UNCHECKED); AND THE SHARED RESOLVER's
+    DIAGNOSTIC TEXT **DIFFERS** FROM #7207's 42-ROW TEST. **THE FOLD's "NO BEHAVIOUR CHANGE" CLAIM IS
+    TRUE.** **=> THE FOLD IS **BEHAVIOUR-NEUTRAL**, SO IT HAS **NO FAIL-WITHOUT ROW OF ITS OWN** —
+    #7207's CLOSURE RESTS ON THE PRE-EXISTING PARALLEL CHECKER THE FOLD RELOCATED, **AND #7207 WAS
+    ALREADY CLOSED IN `origin/main` BY `fa4c09fe`**, SO THE FOLD's `fix #7207` IS A **RE-CLAIM**, NOT
+    A NEW CLOSURE.
+
+* **THE B4a LANE IS PICKED** (`ebe6182c` `4900aed9` `7a811ab9` `6b6b0ff4` `54952bef` `a01f4547`,
+  AS `24f37ca4b` `c333b5306a` `f6a57ee97e` `83dfd5f299` `7992f79500` `d82448f8f0`) — **THE REVIEW WAS
+  **ACCEPT-W-NOTES** (`a2a5198f65e4936eb`), AND THE PICK IS **SIX COMMITS, ZERO CONFLICTS**.**
+  **=> FIVE NEW CLOSURES: #6635 #6636 #6826 #6780 #7173. **#7207 IS A **RE-CLAIM**: IT WAS ALREADY
+  CLOSED IN `origin/main` BY `fa4c09fe` ("fix #7207: a StringBuilder member call is checked by NAME
+  only"), SO IT IS **NOT** A NEW CLOSURE FOR THIS RUN — **SAID HERE SO THE LEDGER IS NOT READ AS
+  SIX.** **THE REVIEWER's TWO FINDINGS ARE **TRACKED, NOT PAPERED OVER**: **FINDING 1 IS
+  **LANE-INTRODUCED** AND NOW HAS ITS **OWN ISSUE, #7419** (A REORDERED NAMED CALL ON `Debug` IS
+  REFUSED BY THE POSITIONAL SHARED RESOLVER, AND THE DIAGNOSTIC NAMES THE WRONG PARAMETER), AND
+  **FINDING 2 LEAVES `StringBuilder.AppendLine`'s **VALUE TYPE** UNCHECKED** — **BOTH ARE IN THE
+  DISPATCHED FIX-FORWARD's ROSTER, AND NEITHER IS PICKED AS A CLOSURE.**
 ### Coordinator block — 2026-10-28 (the campaign's integrator steps)
 
 * **THE ANCHOR IS PICKED** (`2250daa52`) — *"fix #6825 #7284 #7290 #7293 #7294 #7295 #7299 #7300
