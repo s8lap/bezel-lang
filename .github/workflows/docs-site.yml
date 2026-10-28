@@ -11,8 +11,13 @@ name: Docs site
 on:
   push:
     branches: [main]
+    # Only what the site is built from: the documents scripts/build_book.py
+    # lists (all named docs/Bezel_*.md) and its config, theme and intro pages
+    # in docs/book/. Proposals, papers, research and the master plan are
+    # linked to on GitHub rather than built, so editing them needs no rebuild.
     paths:
-      - 'docs/**'
+      - 'docs/Bezel_*.md'
+      - 'docs/book/**'
       - 'scripts/build_book.py'
       - '.github/workflows/docs-site.yml'
   workflow_dispatch:
