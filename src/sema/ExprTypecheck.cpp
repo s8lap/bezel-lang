@@ -23353,6 +23353,30 @@ void ExprTC::checkEventHandlerArgument(const ast::Expr* value,
 void ExprTC::visitStmt(const ast::Stmt& s) {
     factUseLoc_ = s.span.begin;   // #6114
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        // fix #7326 (§28.12, v0.345): "`await using` is valid only inside an
+        // async method or async lambda." The §30.2 gate on the `await`
+        // EXPRESSION never sees this form: `await using var x := …;` is a
+        // LocalDecl carrying `isAwaitUsing` (the parser's one-token
+        // lookahead production, Parser_Stmts.cpp) and never a UnaryExpr, so
+        // the unary gate has no node to fire on — the form escaped the
+        // §30.2 context gate entirely and compiled in a plain method.
+        //
+        // `inAsyncContext_` is the SAME flag the §30.2 gate consults: it is
+        // set for an `async` method body (the `async` modifier arm of the
+        // method visitor) and re-set per lambda (`inAsyncContext_ =
+        // lam->isAsync`), so it answers the same question here — an
+        // `await using` is admitted exactly where an `await` is.
+        //
+        // The citation is §28.12, NOT §30.2: §28.12 states the rule for
+        // `await using` in its own words ("`await using` is valid only inside
+        // an async method or async lambda"), and §30.2's sentence governs
+        // the `await` EXPRESSION, which this form is not.
+        if (ld->isAwaitUsing && !inAsyncContext_) {
+            ctx_.diagnostics().report(
+                Severity::Error, ld->span.begin,
+                "`await using` is valid only inside an `async` method or "
+                "`async` lambda (§28.12)");
+        }
         // Initializer evaluates BEFORE the local comes into scope.
         // §5 / issue #184: if the variable has an explicit wider integer
         // type, pass it as a hint so unsuffixed int literals can be

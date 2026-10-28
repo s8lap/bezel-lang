@@ -314,15 +314,26 @@ const char* kUsingVarClassChoiceCopy =
 // 35-byte leak (measured; see the commit body and the hand-back), which
 // belongs to #7306 and is NOT pinned here — pinning it would freeze a defect
 // in this file, and asserting its absence would fail on both arms.
+//
+// ⚠ RE-SPELLED (fix #7326 / #7396, §28.12 v0.345). The program used to place
+// the `await using var` binding in a PLAIN `Main` — and §28.12 says
+// "`await using` is valid only inside an async method or async lambda", so
+// that program is an INVALID program and is now rejected at the declaration
+// (the compiler enforced §30.2's twin for the `await` EXPRESSION but never
+// §28.12's sentence for the `await using` BINDING). The control's INTENT —
+// "the `await using var` spelling is unaffected by the #7316 copy fix" — is
+// preserved by moving the binding into the ONE context §28.12 admits, an
+// `async Main`: the spelling, the copy, and the printed output are the same,
+// and the row still says "the program compiles, runs, exits 0 and prints
+// 'done'". What changed is only the enclosing method's async-ness.
 const char* kAwaitUsingVarChoiceCopy =
     "module M7316i; "
     "choice Msg Note(text: string), Empty; end Msg; "
     "public class Program "
-    "  public static method Main(): int "
+    "  public static async method Main(): Task "
     "    var a := Msg.Note(\"a\" + \"b\"); "
     "    await using var b := a; "
     "    Console.WriteLine(\"done\"); "
-    "    return 0; "
     "  end Main; "
     "end Program; ";
 
@@ -501,6 +512,12 @@ BEZEL_TEST(ownership_using_var_choice_copy_7316,
 // printed "done" — and deliberately asserts NO leak verdict for it (see the
 // program's comment: that spelling carries a PRE-EXISTING leak that belongs
 // to #7306). Green on BOTH arms.
+//
+// ⚠ The program was RE-SPELLED into an `async Main` by fix #7326 / #7396
+// (§28.12, v0.345) — the `await using var` binding is now enforced to sit in
+// an async context, so the control had to move there to stay a legal
+// program. The row's EXPECTATIONS are unchanged: the program compiles, runs,
+// exits 0 and prints "done".
 // ===========================================================================
 BEZEL_TEST(ownership_using_var_choice_copy_7316,
            await_using_var_choice_copy_is_unchanged) {
