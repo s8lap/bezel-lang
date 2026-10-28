@@ -13306,6 +13306,55 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
     }
 
+    // fix #7297 / #7232 (spec §7.4 / §22.6, v0.345): the PAYLOAD of a
+    // §7.4-NARROWED nullable read at a `Math` / `Convert` PARAMETER.
+    //
+    // §22.6 (v0.345): "The argument's static type is its type at the call: a
+    // read of a binding §7.4 has narrowed non-null is of its non-nullable
+    // type". So a narrowed read is the `double` it denotes — NOT the
+    // `{i8 hasValue; double}` carrier the read still loads (sema keeps the
+    // read's `exprType` at the declared `T?`; see SemaContext.hpp's
+    // `markNarrowedValueRead`). The `Math` / `Convert` call lowerings loaded
+    // the WHOLE carrier and passed it where a SCALAR is expected, so the
+    // compiler ABORTED in the LLVM verifier on a LEGAL program:
+    //
+    //   var d: double? := 2.5;
+    //   Console.WriteLine(Math.Floor(d));
+    //     "Call parameter type does not match function signature!
+    //       %1 = load { i8, double }, ptr %0, align 8"
+    //     "bezelc: codegen error: IR verification failed (malformed IR
+    //       emitted)"                                        -> rc=1 (a CRASH)
+    //
+    // THE POSITION IS THE §7 GATE'S OWN CLAIM, so the extraction is SOUND
+    // exactly where the gate refuses the un-narrowed form.
+    // `common::builtinParamIsNonNullable` is the ONE predicate the §7
+    // nullability gate reads (src/sema/ExprTypecheck_Calls.cpp's
+    // `checkBuiltinNullableArgs`, and the named-argument spelling in
+    // `checkBuiltinMathConvertCallArgs`), so the positions it claims are
+    // exactly the positions where an UN-narrowed nullable is REFUSED with the
+    // house §7 diagnostic ("the argument to `Math.Floor` is nullable but the
+    // target type is non-nullable (§7)"). At those positions the only carrier
+    // that can arrive is a narrowed read's, so the payload is the value.
+    //
+    // At a position the gate does NOT claim — the generic `Math.Min` / `Max` /
+    // `Clamp` / `DivRem` forms, whose parameter type comes from INFERENCE and
+    // not from a declaration — an un-narrowed nullable DOES reach codegen, so
+    // no extraction happens there and the argument keeps its carrier (the
+    // lowering's own fail-closed diagnostic then reports it).
+    auto builtinNarrowedPayload = [&](const char* head,
+                                       std::string_view member,
+                                       std::size_t arity, std::size_t pos,
+                                       llvm::Value* v,
+                                       const ast::Expr* argE) -> llvm::Value* {
+        if (!v || !argE) return v;
+        if (!common::builtinParamIsNonNullable(head, member, arity, pos))
+            return v;
+        // `unwrapNarrowedNullableOperand` is a NO-OP for every ordinary
+        // scalar operand (no `{i8, T}` carrier), so only a narrowed read of a
+        // nullable VALUE type is affected.
+        return unwrapNarrowedNullableOperand(v, argE);
+    };
+
     if (cls == "Convert") {
         // stdlib §9.2 (v0.344, #7310/#7324): the non-finite spellings stand
         // OUTSIDE the numeric grammar and are matched EXACTLY - the whole
@@ -13662,6 +13711,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (m == "ToString") {
                 llvm::Value* arg = lowerExpr(*call.args[0].value);
                 if (!arg) return nullptr;
+                // fix #7297 / #7232 (spec §7.4 / §22.6, v0.345): the VALUE
+                // position of `Convert.ToString` declares `int` / `long` /
+                // `float` / `double` / `decimal` / `bool` (stdlib §2.3), so a
+                // §7.4-NARROWED nullable read there is the value it denotes,
+                // not the `{i8 hasValue; T}` carrier the read still loads.
+                arg = builtinNarrowedPayload("Convert", m, 1, 0, arg,
+                                              call.args[0].value.get());
                 auto* argTy = ctx_.exprType(*call.args[0].value);
                 if (argTy && argTy->kind == sema::TypeRef::Kind::Primitive)
                     return emitPrimitiveToString(arg, argTy->primitive);
@@ -14045,6 +14101,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 arg = lowerExpr(*call.args[valSrc].value);
             }
             if (!arg || !radix) return nullptr;
+            // fix #7297 / #7232 (spec §7.4 / §22.6, v0.345): the VALUE
+            // position of `Convert.ToString(value, toBase)` declares `int` /
+            // `long` (stdlib §2.3), so a §7.4-NARROWED nullable read there is
+            // the value it denotes, not the `{i8 hasValue; T}` carrier the
+            // read still loads — the same payload extraction the `toBase`
+            // position below already does, and for the same reason (the §7
+            // gate refuses the UN-narrowed form).
+            arg = builtinNarrowedPayload("Convert", m, 2, 0, arg,
+                                          call.args[valSrc].value.get());
             // fix #7286 (§7.4 / §22.6, v0.344): a `toBase` argument that is a
             // NULLABLE `int?` is a read of a binding §7.4 has narrowed
             // non-null — "a read of a binding §7.4 has narrowed non-null is of
@@ -14915,6 +14980,35 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (call.args.size() == 1 && call.args[0].value) {
             llvm::Value* arg = lowerExpr(*call.args[0].value);
             if (!arg) return nullptr;
+            // fix #7297 / #7232 (spec §7.4 / §22.6, v0.345): a
+            // §7.4-NARROWED nullable read at a `Math` PARAMETER is the value
+            // it denotes, not the `{i8 hasValue; T}` carrier the read still
+            // loads (§22.6: "a read of a binding §7.4 has narrowed non-null is
+            // of its non-nullable type"). The §7 nullability gate refuses the
+            // UN-narrowed form at every position this reaches, so the carrier
+            // that arrives here is a narrowed read's. A NO-OP for every
+            // ordinary scalar operand.
+            //
+            // #6647's `decimal` positions are EXCLUDED here: a `decimal` is a
+            // STRUCT (stdlib §4.4) and a `decimal` RESULT can only be
+            // CONSUMED as a `decimal` (§5.1 — a `decimal` is never implicitly
+            // converted to another primitive), but the call's RESULT TYPE is
+            // the semantic layer's and it is not `decimal` at a narrowed
+            // `decimal?` operand. Extracting the payload before that is
+            // settled would make the consumer read the `decimal`'s low word
+            // as an `int` — a SILENT WRONG VALUE (measured: 225, the raw
+            // mantissa of 2.5m). #6647's own fix lands the extraction and a
+            // fail-closed guard together.
+            {
+                const sema::TypeRef* aTy = ctx_.exprType(*call.args[0].value);
+                const bool decimalOperand =
+                    aTy && aTy->nullable &&
+                    aTy->kind == sema::TypeRef::Kind::Primitive &&
+                    aTy->primitive == sema::PrimitiveType::Decimal;
+                if (!decimalOperand)
+                    arg = builtinNarrowedPayload("Math", m, 1, 0, arg,
+                                                  call.args[0].value.get());
+            }
             if (m == "Abs") {
                 if (arg->getType()->isFloatingPointTy()) {
                     // Abs for float/double — use fabs intrinsic.
@@ -15127,6 +15221,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 a = lowerExpr(*call.args[aSrc].value);
             }
             if (!a || !b) return nullptr;
+            // fix #7297 / #7232 (spec §7.4 / §22.6, v0.345): a §7.4-NARROWED
+            // nullable read at a `Math` PARAMETER is the value it denotes, not
+            // the `{i8 hasValue; T}` carrier the read still loads. The §7 gate
+            // refuses the UN-narrowed form at every position this reaches (the
+            // `Pow` / `Round` / `Fmod` / `IEEERemainder` forms declare
+            // non-nullable parameters; the generic `Min` / `Max` forms do not,
+            // and there the carrier is left alone). A NO-OP for every ordinary
+            // scalar operand.
+            a = builtinNarrowedPayload("Math", m, 2, 0, a,
+                                        call.args[aSrc].value.get());
+            b = builtinNarrowedPayload("Math", m, 2, 1, b,
+                                        call.args[bSrc].value.get());
             a = mathConvertToT(a, call.args[aSrc].value.get());   // #6948
             b = mathConvertToT(b, call.args[bSrc].value.get());
             if (m == "Min") {
@@ -15411,6 +15517,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 a = lowerExpr(*call.args[xSrc].value);
             }
             if (!a || !b) return nullptr;
+            // fix #7297 (spec §7.4 / §22.6, v0.345): a §7.4-NARROWED nullable
+            // read at a `Math` PARAMETER is the value it denotes, not the
+            // `{i8 hasValue; T}` carrier the read still loads. The §7 gate
+            // refuses the UN-narrowed form at these positions (`Fmod` /
+            // `IEEERemainder` declare non-nullable `double` parameters).
+            a = builtinNarrowedPayload("Math", m, 2, 0, a,
+                                        call.args[xSrc].value.get());
+            b = builtinNarrowedPayload("Math", m, 2, 1, b,
+                                        call.args[ySrc].value.get());
             auto* dbl = llvm::Type::getDoubleTy(llvm_);
             a = mathToDouble(a, call.args[xSrc].value.get());
             b = mathToDouble(b, call.args[ySrc].value.get());
