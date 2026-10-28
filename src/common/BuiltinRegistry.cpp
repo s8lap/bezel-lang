@@ -592,43 +592,86 @@ struct BuiltinParamRow {
 };
 
 constexpr std::array<BuiltinParamRow, 305> kBuiltinParams = {{
+    // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
+    // DECLARED PARAMETER TYPES, transcribed from the standard library's own
+    // listing.
+    //
+    // The `kinds` column is the §5.1 admission question's own vocabulary —
+    // one bit per DECLARED type, so a position whose declared overload set is
+    // `char` OR `string` carries both — and the `nonNullable` column is the
+    // §7.3 nullability of the position, bit `p` set meaning "declared
+    // non-nullable in every overload of this argument count". The `sig` column
+    // is the DECLARED FORM the diagnostic quotes, in the standard library's own
+    // words (" / " separates two overloads of the same argument count).
+    //
+    // WHY THIS TABLE AND NOT ANOTHER ONE. This is the ONE built-in parameter
+    // table (`kBuiltinParams`): the §9.6 gate, the §7.3 nullability gate and
+    // the §5.1 admission gate all read THIS row, so the parameter NAME
+    // (§22.5), the parameter TYPE (§5.1) and the parameter NULLABILITY (§7.3)
+    // of a form cannot disagree. It is not a sixth hand-maintained mirror: the
+    // §3.1 `StringBuilder` surface, the §2.2 / §2.3 `Math` / `Convert` surface
+    // and the §2.5 temporal surface were folded into it before this change.
+    //
+    // THE DERIVATION IS MECHANICAL AND IS CHECKED IN:
+    // `scripts/check_builtin_declared_params.py` parses stdlib §9.6 out of
+    // `docs/Bezel_Standard_Library.md` and asserts that every declared form's
+    // parameter TYPES and NULLABILITY are the ones transcribed here — a
+    // BUILD-FREE SOURCE ratchet, wired into `scripts/gate_full_cycle.sh`
+    // beside `check_string_arity_table.py` and `check_string_mint_methods.py`.
+    // A change to §9.6's listing therefore fails the gate until this table is
+    // brought back into step with the document.
+    //
+    // A position with NO type opinion (`kBPTAny`, the zero value) is the
+    // fail-safe direction: a miss costs a rejection that does not fire, never
+    // a false one. `From`'s one-argument form is such a position — stdlib
+    // §9.6 declares `From(value: char)`, `From(value: CString)` and
+    // `From(value: WString)` at that argument count, and the FFI types have no
+    // bit in the vocabulary (the compiler's own `String.From` gate owns that
+    // form's argument type).
     {"string", "From", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "From", 3, 3, 0x00, {"buffer", "start", "length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"string", "From", 3, 3, 0x07, {"buffer", "start", "length", "", "", "", "", ""}, {kBPTArrayChar, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, "From(buffer: Array<char>, start: int, length: int): string"},
     {"string", "FromCStringPointer", 1, 1, 0x00, {"p", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"string", "FromWStringPointer", 1, 1, 0x00, {"p", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Join", 2, 2, 0x00, {"separator", "items", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Repeat", 2, 2, 0x00, {"c", "count", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Repeat", 2, 2, 0x00, {"unit", "count", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "IsNullOrWhiteSpace", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Contains", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "StartsWith", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "EndsWith", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "IndexOf", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "IndexOf", 2, 2, 0x00, {"value", "startIndex", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "LastIndexOf", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Substring", 1, 1, 0x00, {"startIndex", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Substring", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "AsSpan", 1, 1, 0x00, {"start", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "AsSpan", 1, 1, 0x00, {"r", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "AsSpan", 2, 2, 0x00, {"start", "length", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Trim", 1, 1, 0x00, {"chars", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "PadLeft", 1, 1, 0x00, {"totalWidth", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "PadLeft", 2, 2, 0x00, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "PadRight", 1, 1, 0x00, {"totalWidth", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "PadRight", 2, 2, 0x00, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "PadCenter", 1, 1, 0x00, {"totalWidth", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "PadCenter", 2, 2, 0x00, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Insert", 2, 2, 0x00, {"startIndex", "value", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Remove", 1, 1, 0x00, {"startIndex", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Remove", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Replace", 2, 2, 0x00, {"oldChar", "newChar", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Replace", 2, 2, 0x00, {"oldValue", "newValue", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Split", 1, 1, 0x00, {"separator", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Split", 1, 1, 0x00, {"separators", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "CompareTo", 1, 1, 0x00, {"other", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "CompareTo", 2, 2, 0x00, {"other", "ignoreCase", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Equals", 1, 1, 0x00, {"other", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"string", "Equals", 2, 2, 0x00, {"other", "ignoreCase", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // The `Join` positions carry NO type opinion: the dedicated `string.Join`
+    // gate (fix #7150 / #7167 / #7191) already asks the §5.1 question against
+    // the DECLARED `separator: string` and `items: IEnumerable<string>`, with
+    // the full §5.1 / §12.9 machinery (an `IEnumerable<string>`-typed
+    // argument is admitted there, and the covariance rules decide it). A
+    // second, weaker test here would REFUSE a legal argument the dedicated
+    // gate admits, so the position is left to its owner.
+    {"string", "Join", 2, 2, 0x03, {"separator", "items", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Join(separator: string, items: IEnumerable<string>): string"},
+    {"string", "Repeat", 2, 2, 0x03, {"c", "count", "", "", "", "", "", ""}, {kBPTChar, kBPTInt, 0, 0, 0, 0, 0, 0}, "Repeat(c: char, count: int): string"},
+    {"string", "Repeat", 2, 2, 0x03, {"unit", "count", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Repeat(unit: string, count: int): string"},
+    {"string", "IsNullOrWhiteSpace", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "IsNullOrWhiteSpace(value: string?): bool"},
+    {"string", "Contains", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTChar | kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Contains(value: char): bool / Contains(value: string): bool"},
+    {"string", "StartsWith", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "StartsWith(value: string): bool"},
+    {"string", "EndsWith", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "EndsWith(value: string): bool"},
+    {"string", "IndexOf", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTChar | kBPTString, 0, 0, 0, 0, 0, 0, 0}, "IndexOf(value: char, startIndex: int := 0): int / IndexOf(value: string, startIndex: int := 0): int"},
+    {"string", "IndexOf", 2, 2, 0x03, {"value", "startIndex", "", "", "", "", "", ""}, {kBPTChar | kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "IndexOf(value: char, startIndex: int := 0): int / IndexOf(value: string, startIndex: int := 0): int"},
+    {"string", "LastIndexOf", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTChar | kBPTString, 0, 0, 0, 0, 0, 0, 0}, "LastIndexOf(value: char): int / LastIndexOf(value: string): int"},
+    {"string", "Substring", 1, 1, 0x01, {"startIndex", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Substring(startIndex: int): string"},
+    {"string", "Substring", 2, 2, 0x03, {"startIndex", "length", "", "", "", "", "", ""}, {kBPTInt, kBPTInt, 0, 0, 0, 0, 0, 0}, "Substring(startIndex: int, length: int): string"},
+    {"string", "AsSpan", 1, 1, 0x01, {"start", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "AsSpan(start: int): ReadOnlyStringSpan"},
+    {"string", "AsSpan", 1, 1, 0x01, {"r", "", "", "", "", "", "", ""}, {kBPTRangeInt, 0, 0, 0, 0, 0, 0, 0}, "AsSpan(r: Range<int>): ReadOnlyStringSpan"},
+    {"string", "AsSpan", 2, 2, 0x03, {"start", "length", "", "", "", "", "", ""}, {kBPTInt, kBPTInt, 0, 0, 0, 0, 0, 0}, "AsSpan(start: int, length: int): ReadOnlyStringSpan"},
+    {"string", "Trim", 1, 1, 0x01, {"chars", "", "", "", "", "", "", ""}, {kBPTEnumerableChar, 0, 0, 0, 0, 0, 0, 0}, "Trim(chars: IEnumerable<char>): string"},
+    {"string", "PadLeft", 1, 1, 0x01, {"totalWidth", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "PadLeft(totalWidth: int, paddingChar: char := ' '): string"},
+    {"string", "PadLeft", 2, 2, 0x03, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {kBPTInt, kBPTChar, 0, 0, 0, 0, 0, 0}, "PadLeft(totalWidth: int, paddingChar: char := ' '): string"},
+    {"string", "PadRight", 1, 1, 0x01, {"totalWidth", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "PadRight(totalWidth: int, paddingChar: char := ' '): string"},
+    {"string", "PadRight", 2, 2, 0x03, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {kBPTInt, kBPTChar, 0, 0, 0, 0, 0, 0}, "PadRight(totalWidth: int, paddingChar: char := ' '): string"},
+    {"string", "PadCenter", 1, 1, 0x01, {"totalWidth", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "PadCenter(totalWidth: int, paddingChar: char := ' '): string"},
+    {"string", "PadCenter", 2, 2, 0x03, {"totalWidth", "paddingChar", "", "", "", "", "", ""}, {kBPTInt, kBPTChar, 0, 0, 0, 0, 0, 0}, "PadCenter(totalWidth: int, paddingChar: char := ' '): string"},
+    {"string", "Insert", 2, 2, 0x03, {"startIndex", "value", "", "", "", "", "", ""}, {kBPTInt, kBPTString, 0, 0, 0, 0, 0, 0}, "Insert(startIndex: int, value: string): string"},
+    {"string", "Remove", 1, 1, 0x01, {"startIndex", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Remove(startIndex: int): string"},
+    {"string", "Remove", 2, 2, 0x03, {"startIndex", "length", "", "", "", "", "", ""}, {kBPTInt, kBPTInt, 0, 0, 0, 0, 0, 0}, "Remove(startIndex: int, length: int): string"},
+    {"string", "Replace", 2, 2, 0x03, {"oldChar", "newChar", "", "", "", "", "", ""}, {kBPTChar, kBPTChar, 0, 0, 0, 0, 0, 0}, "Replace(oldChar: char, newChar: char): string"},
+    {"string", "Replace", 2, 2, 0x03, {"oldValue", "newValue", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, "Replace(oldValue: string, newValue: string): string"},
+    {"string", "Split", 1, 1, 0x01, {"separator", "", "", "", "", "", "", ""}, {kBPTChar | kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Split(separator: char): owned Array<string> / Split(separator: string): owned Array<string>"},
+    {"string", "Split", 1, 1, 0x01, {"separators", "", "", "", "", "", "", ""}, {kBPTArrayChar, 0, 0, 0, 0, 0, 0, 0}, "Split(separators: Array<char>): owned Array<string>"},
+    {"string", "CompareTo", 1, 1, 0x01, {"other", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "CompareTo(other: string): int"},
+    {"string", "CompareTo", 2, 2, 0x03, {"other", "ignoreCase", "", "", "", "", "", ""}, {kBPTString, kBPTBool, 0, 0, 0, 0, 0, 0}, "CompareTo(other: string, ignoreCase: bool): int"},
+    {"string", "Equals", 1, 1, 0x00, {"other", "", "", "", "", "", "", ""}, {kBPTString | kBPTObject, 0, 0, 0, 0, 0, 0, 0}, "Equals(other: string): bool"},
+    {"string", "Equals", 2, 2, 0x02, {"other", "ignoreCase", "", "", "", "", "", ""}, {kBPTString | kBPTObject, kBPTBool, 0, 0, 0, 0, 0, 0}, "Equals(other: string?, ignoreCase: bool): bool"},
     {"Encoding", "GetBytes", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Encoding", "GetBytes", 2, 2, 0x00, {"s", "destination", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Encoding", "GetString", 1, 1, 0x00, {"bytes", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
@@ -2073,6 +2116,15 @@ bool builtinParamIsNonNullable(std::string_view typeHead,
     // head; fix #7296 (§9.1, v0.344) extended that to the other integer
     // keywords — "SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64".
     const std::string_view head = normaliseBuiltinParamHead(typeHead);
+    // fix #7421 (stdlib §9.6, §7.3, v0.345): the §9.6 `String` head's
+    // nullability is asked by the §9.6 DECLARED-PARAMETER pass
+    // (`ExprTC::checkBuiltinStringDeclaredParams`), which reads the SAME
+    // rows' `nonNullable` column — so this query stands down for that head.
+    // It is the one-diagnostic-per-call discipline: the §7 nullability GATE
+    // must not add a second diagnostic to a `string.Join` / `string.Repeat`
+    // call whose dedicated gate has already refused the argument, and the
+    // §9.6 pass reports the nullability with the §7.3 rule named.
+    if (head == "string") return false;
     for (const auto& r : kBuiltinParams) {
         if (r.head != head || r.member != member) continue;
         if (r.total != argCount) continue;

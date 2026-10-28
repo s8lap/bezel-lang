@@ -1159,7 +1159,7 @@ run_string_ratchet() {
     say "  and the compiler's hand-maintained transcription of it — a member"
     say "  §9.6 declares that the compiler does not know about. See"
     say "  $LOGDIR/${TAG}_${_sm_name}.log"
-    sed -n '/check_string_/,$p' "$LOGDIR/${TAG}_${_sm_name}.log" \
+    sed -n '/check_/,$p' "$LOGDIR/${TAG}_${_sm_name}.log" \
       2>/dev/null | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
     exit 1
   fi
@@ -1167,6 +1167,15 @@ run_string_ratchet() {
 }
 run_string_ratchet check_string_mint_methods scripts/check_string_mint_methods.py
 run_string_ratchet check_string_arity_table scripts/check_string_arity_table.py
+# fix #7421 (stdlib §9.6, §2.5, v0.345): the DECLARED PARAMETER TYPES of the
+# ONE built-in parameter table (`common::kBuiltinParams`) — the §9.6 `String`
+# rows and the §2.5 `DateTime` / `TimeSpan` rows. The table carries the
+# parameter NAME (§22.5), the parameter TYPE (§5.1) and the parameter
+# NULLABILITY (§7.3) of every declared form, and this ratchet DERIVES the
+# expected types and nullabilities from the document and checks the
+# transcription against them — so a change to §9.6's or §2.5's listing fails
+# the gate until the table is brought back into step with it.
+run_string_ratchet check_builtin_declared_params scripts/check_builtin_declared_params.py
 
 # ── §7.4 NULLABLE-RECEIVER / STRING-PRODUCER GUARD PHASE (#7139) ───────────
 # `Emitter::isPlusOneStringProducer` classifies a §9.6 string-producing

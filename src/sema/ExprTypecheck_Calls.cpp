@@ -18745,6 +18745,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // assignability check the user-method path runs so an un-narrowed
     // `string?` argument is rejected instead of silently accepted.
     checkBuiltinStringCallArgs(ce);
+    // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): THE DECLARED PARAMETER
+    // TYPES of the §9.6 head — the declared question, asked of EVERY member
+    // and EVERY parameter position, from the ONE built-in parameter table.
+    // It runs AFTER the §9.6 gate above, which owns the positions it phrases.
+    checkBuiltinStringDeclaredParams(ce);
 
     // fix #7207 (stdlib §3.1, v0.343): the built-in `StringBuilder` has no
     // user declaration, so its member surface is EXACTLY §3.1's listing —
@@ -22964,6 +22969,12 @@ std::string builtinParamTypePhrase(std::uint32_t kind) {
     if (kind & common::kBPTBool) return "a `bool`";
     if (kind & common::kBPTChar) return "a `char`";
     if (kind & common::kBPTObject) return "an `Object`";
+    // fix #7421 (stdlib §9.6, v0.345): the NAMED types §9.6 declares at a
+    // parameter position.
+    if (kind & common::kBPTEnumerableChar) return "an `IEnumerable<char>`";
+    if (kind & common::kBPTArrayChar) return "an `Array<char>`";
+    if (kind & common::kBPTEnumerableString) return "an `IEnumerable<string>`";
+    if (kind & common::kBPTRangeInt) return "a `Range<int>`";
     return "the declared type";
 }
 
@@ -22986,6 +22997,12 @@ std::string builtinParamTypeSpelling(std::uint32_t kind) {
     if (kind & common::kBPTChar) return "char";
     if (kind & common::kBPTObject) return "Object";
     if (kind & common::kBPTOut) return "out";
+    // fix #7421 (stdlib §9.6, v0.345): the NAMED types §9.6 declares at a
+    // parameter position.
+    if (kind & common::kBPTEnumerableChar) return "IEnumerable<char>";
+    if (kind & common::kBPTArrayChar) return "Array<char>";
+    if (kind & common::kBPTEnumerableString) return "IEnumerable<string>";
+    if (kind & common::kBPTRangeInt) return "Range<int>";
     return "the declared type";
 }
 
@@ -23237,6 +23254,449 @@ bool ExprTC::builtinFormApplicable(const ast::CallExpr& ce,
         if (admitted && !*admitted) return false;
     }
     return true;
+}
+
+namespace {
+
+// fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the DECLARED TYPE a
+// `BuiltinParamType` bit names, in the standard library's own spelling.
+//
+// The bits above `kBPTOut` name the NAMED types stdlib §9.6 declares at a
+// parameter position (`Trim(chars: IEnumerable<char>)`,
+// `Split(separators: Array<char>)`, `Join(separator: string, items:
+// IEnumerable<string>)`, `AsSpan(r: Range<int>)`); the bits below name the
+// SCALAR and reference kinds.
+const char* builtinDeclaredKindName(std::uint32_t bit) {
+    switch (bit) {
+        case common::kBPTString:  return "string";
+        case common::kBPTSpan:    return "ReadOnlyStringSpan";
+        case common::kBPTInt:     return "int";
+        case common::kBPTLong:    return "long";
+        case common::kBPTUInt:    return "uint";
+        case common::kBPTULong:   return "ulong";
+        case common::kBPTByte:    return "byte";
+        case common::kBPTSByte:   return "sbyte";
+        case common::kBPTShort:   return "short";
+        case common::kBPTUShort:  return "ushort";
+        case common::kBPTFloat:   return "float";
+        case common::kBPTDouble:  return "double";
+        case common::kBPTDecimal: return "decimal";
+        case common::kBPTBool:    return "bool";
+        case common::kBPTChar:    return "char";
+        case common::kBPTObject:  return "Object";
+        case common::kBPTEnumerableChar:   return "IEnumerable<char>";
+        case common::kBPTArrayChar:        return "Array<char>";
+        case common::kBPTEnumerableString: return "IEnumerable<string>";
+        case common::kBPTRangeInt:         return "Range<int>";
+        default: return nullptr;
+    }
+}
+
+// Is this bit one of the NAMED types (the ones the shared §5.1 admission
+// test cannot answer, because it asks "is the argument's primitive type this
+// primitive type?").
+bool builtinDeclaredKindIsNamed(std::uint32_t bit) {
+    return bit == common::kBPTEnumerableChar ||
+           bit == common::kBPTArrayChar ||
+           bit == common::kBPTEnumerableString ||
+           bit == common::kBPTRangeInt;
+}
+
+// The DECLARED types a position admits, as the standard library's own words
+// with their articles: "a `char` or a `string`", "an `int`", "an
+// `IEnumerable<char>`".
+std::string builtinDeclaredKindPhrase(std::uint32_t kinds) {
+    std::string out;
+    std::size_t n = 0;
+    for (std::uint32_t bit = 1; bit; bit <<= 1) {
+        if (!(kinds & bit)) continue;
+        const char* name = builtinDeclaredKindName(bit);
+        if (!name) continue;
+        // The article follows the FIRST LETTER's sound, in either case: the
+        // declared type names are lower-case ("int", "string", "bool") and
+        // capitalised ("Object", "IEnumerable<char>"), and the house's own
+        // §2.2 / §2.3 wording says "an `int`" — so the check reads both
+        // cases.
+        const char first = static_cast<char>(
+            (name[0] >= 'A' && name[0] <= 'Z') ? name[0] + 32 : name[0]);
+        const bool vowel = first == 'a' || first == 'e' || first == 'i' ||
+                           first == 'o' || first == 'u';
+        if (n) out += (n == 1) ? " or " : ", ";
+        out += vowel ? "an `" : "a `";
+        out += name;
+        out += "`";
+        ++n;
+    }
+    if (!out.empty() && n > 1) {
+        // "a `char`, a `string` or a `bool`" — the last separator is "or".
+        const std::size_t last = out.rfind(", ");
+        if (last != std::string::npos) out.replace(last, 2, " or ");
+    }
+    return out;
+}
+
+// The DECLARED FORMS of a §9.6 member at this argument count, quoted in the
+// standard library's own words — "`Trim(chars: IEnumerable<char>): string`",
+// and "`Contains(value: char): bool` / `Contains(value: string): bool`" where
+// the standard library declares two overloads of that argument count.
+std::string builtinStringDeclaredForms(
+    std::string_view member,
+    const std::vector<common::BuiltinParamForm>& forms) {
+    std::string out;
+    for (const auto& f : forms) {
+        const std::string decl =
+            f.sig.empty() ? builtinParamFormDecl(member, f) : std::string(f.sig);
+        std::size_t pos = 0;
+        while (pos <= decl.size()) {
+            const std::size_t nxt = decl.find(" / ", pos);
+            const std::string one = decl.substr(
+                pos, nxt == std::string::npos ? std::string::npos : nxt - pos);
+            if (!one.empty()) {
+                if (!out.empty()) out += " / ";
+                out += "`" + one + "`";
+            }
+            if (nxt == std::string::npos) break;
+            pos = nxt + 3;
+        }
+    }
+    return out;
+}
+
+// Is the argument's type an `Array<T>` with the element type `elem`?
+bool builtinArgIsArrayOf(TypeRef* argTy, PrimitiveType elem) {
+    if (!argTy || argTy->kind != TypeRef::Kind::Named) return false;
+    if (argTy->headName() != "Array") return false;
+    if (argTy->genericArgs.size() != 1 || !argTy->genericArgs[0]) return false;
+    const TypeRef* e = argTy->genericArgs[0];
+    return e->kind == TypeRef::Kind::Primitive && e->primitive == elem &&
+           !e->nullable;
+}
+
+// Is the argument's type a `Range<T>` with the element type `elem`?
+//
+// The Range is the compiler's own (§16.3 / stdlib §9.8): its TypeSymbol
+// carries the builtin-range stamp (`TypeSymbol::isBuiltinRangeSym`), and a
+// RANGE LITERAL's type does not always carry the element type — the literal
+// `1..3` is a `Range` whose element the compiler knows is an integer
+// (§16.3 restricts a range's element to the integer types and `char`), so an
+// ABSENT element type is admitted rather than refused. A DECLARED
+// `Range<char>` carries its element and is refused here, because §9.6's
+// declared form is `Range<int>`.
+bool builtinArgIsRangeOf(TypeRef* argTy, PrimitiveType elem) {
+    if (!argTy || argTy->kind != TypeRef::Kind::Named) return false;
+    const bool isRange =
+        (argTy->declaration && argTy->declaration->isBuiltinRangeSym()) ||
+        argTy->headName() == "Range";
+    if (!isRange) return false;
+    if (argTy->genericArgs.empty()) return true;  // the element is not carried
+    if (argTy->genericArgs.size() != 1 || !argTy->genericArgs[0]) return false;
+    const TypeRef* e = argTy->genericArgs[0];
+    return e->kind == TypeRef::Kind::Primitive && e->primitive == elem &&
+           !e->nullable;
+}
+
+// §5.1's reference conversions, asked of the NAMED declared types stdlib
+// §9.6 declares: "a type to an interface it implements or conforms to"
+// (§5.1, v0.345) and identity.
+//
+// The conformance the standard library itself declares:
+//   * `string` implements `IEnumerable<char>` (stdlib §9.6's class
+//     declaration: `public class String: IEnumerable<char>, ...`);
+//   * `Array<char>` implements `IEnumerable<char>` (stdlib §4.4);
+//   * `Array<string>` implements `IEnumerable<string>` (stdlib §4.4);
+//   * `Range<int>` IS `Range<int>`.
+//
+// A USER type that conforms to `IEnumerable<char>` is NOT admitted here: the
+// compiler has no way to ask the question, and the member's lowering reads
+// the argument as the standard library's own `Array<char>`, so a user type
+// would reach it unlowered. That is a residual of the §9.6 surface, named in
+// the hand-back — it costs a rejection that does not fire, never a false
+// acceptance.
+bool builtinArgAdmitsNamedKind(TypeRef* argTy, std::uint32_t namedKinds) {
+    if (!argTy) return false;
+    for (std::uint32_t bit = 1; bit; bit <<= 1) {
+        if (!(namedKinds & bit)) continue;
+        switch (bit) {
+            case common::kBPTEnumerableChar:
+                if (argTy->kind == TypeRef::Kind::Primitive &&
+                    argTy->primitive == PrimitiveType::String)
+                    return true;
+                if (builtinArgIsArrayOf(argTy, PrimitiveType::Char))
+                    return true;
+                break;
+            case common::kBPTArrayChar:
+                if (builtinArgIsArrayOf(argTy, PrimitiveType::Char))
+                    return true;
+                break;
+            case common::kBPTEnumerableString:
+                if (builtinArgIsArrayOf(argTy, PrimitiveType::String))
+                    return true;
+                break;
+            case common::kBPTRangeInt:
+                if (builtinArgIsRangeOf(argTy, PrimitiveType::Int))
+                    return true;
+                break;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+// fix #7421 (stdlib §9.6, §5.1, §7.3, §22.6, v0.345): THE DECLARED
+// PARAMETER TYPES of a §9.6 `String` member.
+//
+// THE DEFECT. stdlib §9.6 declares every `String` member's parameters, and
+// §5.1's implicit conversions decide whether an argument reaches one of
+// them. Nothing asked that question for the positions the §9.6 gate does not
+// know, and the argument reached codegen unchecked. MEASURED pre-fix (on
+// 7626bb4d4e), each row = the call, the observed behaviour:
+//
+//   s.Trim(5)                    -> "Call parameter type does not match
+//                                   function signature!" + "IR verification
+//                                   failed" — the compiler ABORTED;
+//   s.Trim('a')                  -> the same abort (a `char` is not an
+//                                   `IEnumerable<char>`);
+//   s.Trim(null)                 -> SILENTLY ACCEPTED, printed "abc" — §7.3
+//                                   makes `null` at a non-nullable target a
+//                                   compile error;
+//   s.Trim(arrInt)               -> SILENTLY ACCEPTED, printed "abc" — an
+//                                   `Array<int>` is not an
+//                                   `IEnumerable<char>`;
+//   string.IsNullOrWhiteSpace(5) -> "Both operands to ICmp instruction are
+//                                   not of the same type!" — the compiler
+//                                   ABORTED;
+//   s.Equals(5)                  -> the same abort;
+//   s.Equals(true)               -> the same abort;
+//   s.CompareTo("x", 5)          -> SILENTLY ACCEPTED, printed "-1" — the
+//                                   `ignoreCase` parameter is declared
+//                                   `bool`.
+//
+// THE FIX. THE DECLARED QUESTION, asked of EVERY member and EVERY parameter
+// position of the head: "is this argument's type one the declared overload
+// set names?" — answered from the ONE built-in parameter table
+// (`common::kBuiltinParams`), whose §9.6 rows carry the declared TYPE (§5.1)
+// and the declared NULLABILITY (§7.3) of every position. This is not a
+// second transcription of §9.6: the table is the same one the §3.1
+// `StringBuilder` surface, the §2.2 / §2.3 `Math` / `Convert` surface and
+// the §9.1-§9.5 primitive surface are read from, and
+// `scripts/check_builtin_declared_params.py` checks its §9.6 rows against
+// the document on every gate.
+//
+// ONE DIAGNOSTIC PER CALL. The §9.6 gate above, the `string.Join` /
+// `string.Repeat` gates and the §22.5 binder all report at a location
+// INSIDE this call's span, and they own the positions they phrase. A call
+// they have already spoken about is not spoken about again — the same
+// discipline `checkBuiltinCallAdmission` applies.
+void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt || member.empty()) return;
+    // THE HEAD: the §9.6 `String` — an instance receiver of the primitive
+    // `string` type, or the STATIC spelling whose target is the `string` /
+    // `String` type name. A user type named `String` has a declaration and
+    // is checked by the ordinary user-method machinery.
+    bool isStringHead = false;
+    if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
+        if (recvTy->kind == TypeRef::Kind::Primitive &&
+            recvTy->primitive == PrimitiveType::String)
+            isStringHead = true;
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+        // The STATIC spelling. `string` is the primitive keyword, so it names
+        // the §9.6 class and nothing else; `String` is its alias, and it
+        // names the §9.6 class only when it carries no user declaration.
+        if (id->name == "string") {
+            isStringHead = true;
+        } else if (id->name == "String") {
+            auto* ts = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tgt));
+            if (ts && ts->decl == nullptr) isStringHead = true;
+        }
+    }
+    if (!isStringHead) return;
+    // ONE diagnostic per call: a check that already spoke about THIS call
+    // has the first word.
+    for (const auto& d : ctx_.diagnostics().diagnostics()) {
+        if (d.severity != Severity::Error) continue;
+        if (d.location.line != ce.span.begin.line) continue;
+        if (d.location.offset < ce.span.begin.offset) continue;
+        if (d.location.offset > ce.span.end.offset) continue;
+        return;
+    }
+    // THE DECLARED FORMS of this member at this argument count, read out of
+    // the ONE built-in parameter table. A member the table declares no form
+    // for at this arity is not this check's question (the §9.6 arity rule
+    // owns it).
+    const std::vector<common::BuiltinParamForm> forms =
+        common::builtinParamForms("string", member, ce.args.size());
+    if (forms.empty()) return;
+    // THE §22.5 BINDING: a named argument binds to the parameter it NAMES,
+    // so the parameter an argument supplies is read through the binder, not
+    // by position. The published binding is not available here (it is
+    // published at the END of `typeCall`), so the binding is established
+    // LOCALLY over the registry's declared names — the same construction
+    // #7207 uses for `StringBuilder` — so no second name table is
+    // introduced. A call that binds no candidate keeps the POSITIONAL
+    // reading: `checkBuiltinNamedArgs` reports the §22.5 violation, and the
+    // arguments must still be type-checked here.
+    std::vector<int> paramToArg;
+    std::vector<std::string_view> paramNames;
+    for (const auto& cand : common::builtinParamNameCandidates(
+             "string", member, ce.args.size())) {
+        BindResult br = bindArgsToParams(
+            sema::FormalsView::ofNames(cand.names, cand.required), ce.args,
+            ce.span.begin,
+            "call to built-in `string." + std::string(member) + "`",
+            /*emit=*/false);
+        if (!br.ok) continue;
+        paramToArg = br.paramToArg;
+        paramNames = cand.names;
+        break;
+    }
+    if (paramToArg.empty()) {
+        for (std::size_t i = 0; i < ce.args.size(); ++i)
+            paramToArg.push_back(static_cast<int>(i));
+    }
+    const std::string callee = "string." + std::string(member);
+    const std::string declaredForms = builtinStringDeclaredForms(member, forms);
+    for (std::size_t p = 0; p < paramToArg.size(); ++p) {
+        const int ai = paramToArg[p];
+        if (ai < 0 || static_cast<std::size_t>(ai) >= ce.args.size()) continue;
+        const auto& arg = ce.args[static_cast<std::size_t>(ai)];
+        if (!arg.value || arg.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule; skip.
+        if (!arg.modifier.empty()) continue;
+        // THE DECLARED TYPES at this position: the union over the declared
+        // overloads of this argument count — §22.6's candidate set.
+        std::uint32_t kinds = 0;
+        for (const auto& f : forms)
+            if (p < f.kinds.size()) kinds |= f.kinds[p];
+        if (kinds == 0) continue;  // no type opinion at this position
+        // THE DECLARED NULLABILITY at this position: non-nullable when EVERY
+        // declared overload of this argument count declares it non-nullable.
+        bool nonNullable = !forms.empty();
+        for (const auto& f : forms)
+            if (p >= f.total || !(f.nonNullable & (1u << p)))
+                nonNullable = false;
+        TypeRef* argTy = ctx_.exprType(*arg.value);
+        if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+        // §7.3: the `null` LITERAL reaches a non-nullable parameter nowhere.
+        // A nullable position admits it (stdlib §9.6's
+        // `IsNullOrWhiteSpace(value: string?)` and the `Equals` slot's
+        // `other: string?` are exactly those).
+        const bool isNullLiteral =
+            dynamic_cast<const ast::NullLiteralExpr*>(arg.value.get()) != nullptr;
+        if (isNullLiteral) {
+            if (!nonNullable) continue;  // admitted: the parameter is `T?`
+            ctx_.diagnostics().report(
+                Severity::Error, arg.value->span.begin,
+                "the argument to `" + callee +
+                    "` is nullable but the target type is non-nullable "
+                    "(\xC2\xA7""7.3) — stdlib §9.6 declares " + declaredForms +
+                    ", whose parameter is not nullable");
+            return;
+        }
+        // §7.4: a read §7.4 has narrowed non-null is of its non-nullable
+        // type.
+        TypeRef* effTy = argTy;
+        if (argTy->nullable) {
+            // §7.3: a still-nullable value reaches a NON-NULLABLE parameter
+            // nowhere. A NULLABLE parameter takes it — §5.1's nullable
+            // lifting converts `S` to `T?` whenever `S` converts to `T`, and
+            // `null` to `null` — so stdlib §9.6's `Equals(other: string?)`
+            // slot and its `IsNullOrWhiteSpace(value: string?)` parameter
+            // admit a nullable argument, and the member answers it.
+            if (!isNarrowedNonNullRead(arg.value.get())) {
+                if (!nonNullable) continue;  // admitted: the parameter is `T?`
+                ctx_.diagnostics().report(
+                    Severity::Error, arg.value->span.begin,
+                    "the argument to `" + callee +
+                        "` is nullable but the target type is non-nullable "
+                        "(\xC2\xA7""7.3) — stdlib §9.6 declares " +
+                        declaredForms + ", whose parameter is not nullable");
+                return;
+            }
+            effTy = scrutineeTypeAfterNarrowing(arg.value.get(), argTy);
+            if (!effTy) continue;
+            if (effTy->nullable) {
+                if (!nonNullable) continue;  // admitted: the parameter is `T?`
+                ctx_.diagnostics().report(
+                    Severity::Error, arg.value->span.begin,
+                    "the argument to `" + callee +
+                        "` is nullable but the target type is non-nullable "
+                        "(\xC2\xA7""7.3) — stdlib §9.6 declares " +
+                        declaredForms + ", whose parameter is not nullable");
+                return;
+            }
+        }
+        // §5.1: the SCALAR declared types, through the shared admission test
+        // (identity, the widening table, and the constant narrowing).
+        std::uint32_t scalarKinds = 0;
+        std::uint32_t namedKinds = 0;
+        for (std::uint32_t bit = 1; bit; bit <<= 1) {
+            if (!(kinds & bit)) continue;
+            if (builtinDeclaredKindIsNamed(bit)) namedKinds |= bit;
+            else scalarKinds |= bit;
+        }
+        bool admitted = false;
+        if (scalarKinds) {
+            auto a = builtinArgAdmittedAt(ce, static_cast<std::size_t>(ai),
+                                          scalarKinds);
+            if (!a) continue;  // no opinion (a discard, a modifier, an error)
+            admitted = *a;
+        }
+        // §5.1's reference conversions, for the NAMED declared types.
+        if (!admitted && namedKinds)
+            admitted = builtinArgAdmitsNamedKind(effTy, namedKinds);
+        if (admitted) continue;
+        // THE REFUSAL. The diagnostic names the DECLARED FORMS (stdlib §9.6's
+        // own words), the PARAMETER (§22.5's declared name), the DECLARED
+        // TYPE at that position, the argument's OWN type, and the §-rule the
+        // argument misses (§5.1) — a §-only assertion would be vacuous here,
+        // because every refusal of this family says §22.6.
+        // THE PARAMETER NAME (§22.5). Two declared overloads of one argument
+        // count may name their position differently (stdlib §9.6's
+        // `AsSpan(start: int)` / `AsSpan(r: Range<int>)`), so the name is
+        // quoted when the overloads AGREE on it; where they do not, the
+        // overload with the most declared types at this position names it,
+        // and the position is given as well.
+        std::string nameAt;
+        bool namesAgree = true;
+        for (const auto& f : forms) {
+            if (p >= f.names.size() || f.names[p].empty()) continue;
+            if (nameAt.empty()) nameAt = std::string(f.names[p]);
+            else if (nameAt != f.names[p]) namesAgree = false;
+        }
+        if (namesAgree && nameAt.empty() && p < paramNames.size() &&
+            !paramNames[p].empty())
+            nameAt = std::string(paramNames[p]);
+        if (!namesAgree) {
+            std::size_t best = 0;
+            for (const auto& f : forms) {
+                const std::size_t n =
+                    (p < f.kinds.size())
+                        ? static_cast<std::size_t>(__builtin_popcount(f.kinds[p]))
+                        : 0;
+                if (n > best) {
+                    best = n;
+                    if (p < f.names.size()) nameAt = std::string(f.names[p]);
+                }
+            }
+        }
+        const std::string param =
+            !nameAt.empty()
+                ? "the `" + nameAt + "` argument"
+                : "the argument at position " + std::to_string(p);
+        ctx_.diagnostics().report(
+            Severity::Error, arg.value->span.begin,
+            "no matching overload of `" + callee + "` — stdlib §9.6 declares " +
+                declaredForms + ", so " + param + " must be " +
+                builtinDeclaredKindPhrase(kinds) +
+                " — the argument has type `" + spellTypeRefForDiag(effTy) +
+                "`, which is never implicitly convertible to it (\xC2\xA7""5.1)");
+        return;
+    }
 }
 
 void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
@@ -23499,7 +23959,14 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
         Severity::Error, ce.span.begin,
         "no matching overload of `" + callee + "` — " + sec + " declares " +
             decls + ", so " + param + " must be " +
-            builtinParamTypePhrase(kind) + (why.empty() ? "" : " — " + why) +
+            builtinParamTypePhrase(kind) +
+            // fix #7443 (stdlib §5.1, v0.345): the §-RULE the argument
+            // misses is named here, and not only §22.6's "no candidates
+            // cited" — a §-only assertion is vacuous for this family,
+            // because every refusal of it says §22.6. The clause is
+            // APPENDED (the pinned rows match a prefix or a middle
+            // substring of this message, never its whole text).
+            (why.empty() ? "" : " — " + why + " (\xC2\xA7""5.1)") +
             " — the call is a compile error with no candidates cited "
             "(§22.6)");
 }

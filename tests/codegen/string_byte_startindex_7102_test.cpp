@@ -210,21 +210,46 @@ BEZEL_TEST(string_byte_startindex_7102,
     BEZEL_EXPECT_EQ(r.stdoutText, "40000\n");
 }
 
-// A byte-BACKED ENUM is the other unsigned source that reaches an `int`
-// parameter: an enum is represented by its underlying integer (§10.3), so a
-// `byte`-backed enum's 200 is an unsigned 200 and must widen to `int` 200.
+// A byte-BACKED ENUM at the `int` parameter is REFUSED.
 //
-// Pre-fix this raised an uncaught IndexOutOfRangeException (exit 70): the
-// sign-extended start was -56.
+// ⚠ THIS ROW'S EXPECTATION CHANGED (fix #7421). It used to assert that the
+// enum's underlying 200 reaches the `int` parameter and the program prints
+// "52" — it pinned the HOLE, not the rule. The §9.6 `String` surface had no
+// argument-type check at all before fix #7421, so the enum reached the arm
+// unchecked; every other built-in surface already refuses it:
+//
+//   * `Convert.ToString(e)` — stdlib §2.3's surface — is a compile error;
+//   * `Math.Abs(e)` — stdlib §2.2's surface — is a compile error.
+//
+// The rule those surfaces apply is §5.1's: the conversion table has NO row
+// from an enum, and the never-implicit list names "Between an enum and its
+// underlying integer". spec §10 (v0.345) says the same in its own words —
+// "An enum is not implicitly convertible to or from its underlying integer
+// type" — and §10.5's own idiom for an enum's integer is the EXPLICIT cast
+// ("comparing the underlying values explicitly (`int(a) < int(b)`)"). So the
+// `E` at `Substring(startIndex: int)` is a compile error, and the row now
+// asserts that refusal with the §5.1 rule named.
+//
+// The `byte` / `ushort` rows above are UNCHANGED: they pin the §5.1 widening
+// that #7102 is about (an unsigned 200 is the `int` 200), and an unsigned
+// PRIMITIVE does convert to `int`.
 BEZEL_TEST(string_byte_startindex_7102,
            byte_backed_enum_startindex_substring_spec_10_3) {
     auto r = runAot(progWithByteEnum(
         std::string(kLong252) +
         "    var e: E := E.A;\n"
         "    Console.WriteLine(s.Substring(e).Length.ToString());\n"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_EQ(r.stdoutText, "52\n");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool refused = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("no matching overload of `string.Substring`") !=
+                std::string::npos &&
+            d.message.find(
+                "the `startIndex` argument must be an `int`") !=
+                std::string::npos)
+            refused = true;
+    BEZEL_EXPECT_TRUE(refused);
 }
 
 // ===========================================================================

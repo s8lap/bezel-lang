@@ -4664,6 +4664,26 @@ private:
     // covers the INSTANCE-receiver path only) — its former sibling
     // `IsNullOrEmpty` was retired entirely (fix #3854, stdlib §9.6, v0.290).
     void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
+    // fix #7421 (stdlib §9.6, §5.1, §7.3, §22.6, v0.345): THE DECLARED
+    // PARAMETER TYPES of a §9.6 `String` member — the §9.6 gate's OWN
+    // question, asked of EVERY member and EVERY parameter position of the
+    // head.
+    //
+    // §9.6 declares each member's parameters, and §5.1's implicit
+    // conversions decide whether an argument reaches one of them. The §9.6
+    // gate above answers that question for the positions whose DECLARED TYPE
+    // it knows; the positions it does not know — `Trim(chars:
+    // IEnumerable<char>)`, `Equals(other: string)`, the static
+    // `IsNullOrWhiteSpace(value: string?)`, `CompareTo`'s `ignoreCase` — were
+    // NOT checked at all, and an argument of a type the declared overload set
+    // does not name reached codegen: two of them ABORTED the compiler and one
+    // (`Trim(null)`) was SILENTLY ACCEPTED, which §7.3 forbids.
+    //
+    // THE AUTHORITY is the ONE built-in parameter table
+    // (`common::kBuiltinParams`), whose §9.6 rows carry the declared TYPE
+    // (§5.1) and the declared NULLABILITY (§7.3) of every position — the
+    // same rows the §7.3 nullability gate and the §5.1 admission gate read.
+    void checkBuiltinStringDeclaredParams(const ast::CallExpr& ce);
     // fix #7207 (stdlib §3.1, v0.343): the DECLARED SURFACE of the built-in
     // `StringBuilder` — the ARITY and the ARGUMENT TYPES of a member call.
     //

@@ -731,6 +731,20 @@ enum BuiltinParamType : std::uint32_t {
     kBPTChar   = 1u << 14,
     kBPTObject = 1u << 15,  // `Object` (every type reaches it by boxing)
     kBPTOut    = 1u << 16,  // an `out` slot: positional-only, no type opinion
+    // The NAMED types stdlib §9.6 declares at a parameter position. The
+    // vocabulary above names the SCALAR and reference kinds only; §9.6's
+    // `Trim(chars: IEnumerable<char>)`, `Split(separators: Array<char>)`,
+    // `Join(separator: string, items: IEnumerable<string>)` and
+    // `AsSpan(r: Range<int>)` declare a NAMED type at those positions, and a
+    // §5.1 admission test needs to know WHICH one.
+    //
+    // fix #7421 (stdlib §9.6, §5.1, v0.345): the §9.6 head's declared
+    // parameter types are read out of the ONE table (the `kinds` column), so
+    // a position whose declared type is a named type needs a bit for it.
+    kBPTEnumerableChar   = 1u << 17,  // `IEnumerable<char>`
+    kBPTArrayChar        = 1u << 18,  // `Array<char>`
+    kBPTEnumerableString = 1u << 19,  // `IEnumerable<string>`
+    kBPTRangeInt         = 1u << 20,  // `Range<int>`
 };
 
 // ONE declared form of a built-in member or constructor, read out of the ONE
