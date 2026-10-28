@@ -725,7 +725,18 @@ constexpr std::array<BuiltinParamRow, 305> kBuiltinParams = {{
     // not match function signature!"), `Debug.WriteLine("a", "b")` DROPPED the
     // surplus argument, and `Debug.Assert(<a string>)` aborted it too.
     {"Debug", "WriteLine", 1, 1, 0x01, {"message", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "WriteLine(message: string)"},
-    {"Debug", "Assert", 1, 1, 0x01, {"condition", "", "", "", "", "", "", ""}, {kBPTBool, 0, 0, 0, 0, 0, 0, 0}, "Assert(condition: bool)"},
+    // fix #7419 (stdlib §8.2, v0.345): the ONE-argument `Assert` row quoted
+    // `Assert(condition: bool)` — a TRUNCATED declared signature. stdlib §8.2
+    // declares ONE signature, `Assert(condition: bool, message: string := "")`
+    // (docs/Bezel_Standard_Library.md:5123, and stdlib §1's "Optional trailing
+    // argument" rule: "an optional trailing argument with a nameable default
+    // ... is one signature carrying a `:=` default, not an overload pair
+    // (... `Debug.Assert(condition, message := "")`)"), so the diagnostic told
+    // the reader that §8.2 declares a ONE-parameter `Assert`. The row is
+    // keyed on the ARGUMENT COUNT (the table's shape), so the two rows are
+    // the two CALL FORMS of that one signature; the one-argument form now
+    // quotes the declared signature it is a call form of.
+    {"Debug", "Assert", 1, 1, 0x01, {"condition", "", "", "", "", "", "", ""}, {kBPTBool, 0, 0, 0, 0, 0, 0, 0}, "Assert(condition: bool, message: string := \"\")"},
     {"Debug", "Assert", 2, 2, 0x03, {"condition", "message", "", "", "", "", "", ""}, {kBPTBool, kBPTString, 0, 0, 0, 0, 0, 0}, "Assert(condition: bool, message: string)"},
     {"DateTime", "", 3, 3, 0x00, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"DateTime", "", 8, 6, 0x00, {"year", "month", "day", "hour", "minute", "second", "millisecond", "kind"}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},

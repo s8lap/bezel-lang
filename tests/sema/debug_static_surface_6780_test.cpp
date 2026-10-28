@@ -101,7 +101,8 @@ const char kWriteLineArity[] =
 
 const char kAssertConditionType[] =
     "no matching overload of `Debug.Assert` — stdlib §8.2 declares "
-    "`Assert(condition: bool)`, so the `condition` argument must be a `bool`";
+    "`Assert(condition: bool, message: string := \"\")`, so the `condition` "
+    "argument must be a `bool`";
 
 const char kAssertMessageType[] =
     "no matching overload of `Debug.Assert` — stdlib §8.2 declares "

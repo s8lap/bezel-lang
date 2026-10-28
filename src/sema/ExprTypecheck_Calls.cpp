@@ -14800,22 +14800,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // non-string value is a located rejection; it used to reach
                     // codegen and die as "IR verification failed" on the
                     // `bz_sb_insert` parameter type.
+                    //
+                    // fix #7419 (spec §22.5, v0.345): the VALUE argument is
+                    // read at the parameter it BINDS, not at the position it
+                    // is written at. §22.5: "Named arguments may appear in
+                    // any order after positional arguments. Each supplied
+                    // argument binds exactly one parameter ..." — so
+                    // `sb.Insert(value := "X", index := 0)` supplies the
+                    // VALUE first, and this check used to read
+                    // `ce.args[1]` (the INDEX) as the value and refuse the
+                    // call with "the value must be a `string`" — a false
+                    // rejection of a legal §22.5 call, whose diagnostic
+                    // blamed the wrong argument. The `StringBuilder` head
+                    // HONOURS argument names (it is one of the six heads
+                    // `checkBuiltinNamedArgs` claims), so the argument that
+                    // NAMES `value` is the one that binds the `value`
+                    // parameter; a positional call binds it at its own
+                    // position.
                     if (colName == "StringBuilder" && m == "Insert" &&
-                        ce.args.size() == 2 && ce.args[1].value &&
-                        !ce.args[1].isDiscard) {
-                        TypeRef* vt = ctx_.exprType(*ce.args[1].value);
-                        if (vt && vt->kind != TypeRef::Kind::Error &&
-                            !(vt->kind == TypeRef::Kind::Primitive &&
-                              (vt->primitive == P::String ||
-                               vt->primitive == P::None))) {
-                            ctx_.diagnostics().report(
-                                Severity::Error,
-                                ce.args[1].value->span.begin,
-                                "no matching overload of `StringBuilder."
-                                "Insert` — the only overload is `Insert(index: "
-                                "int, value: string)`, so the value must be a "
-                                "`string`; render a non-string value with "
-                                "`.ToString()` first (stdlib §3.1)");
+                        ce.args.size() == 2) {
+                        std::size_t valueArg = 1;
+                        for (std::size_t i = 0; i < ce.args.size(); ++i) {
+                            if (ce.args[i].name == "value") { valueArg = i; break; }
+                        }
+                        if (ce.args[valueArg].value &&
+                            !ce.args[valueArg].isDiscard) {
+                            TypeRef* vt = ctx_.exprType(*ce.args[valueArg].value);
+                            if (vt && vt->kind != TypeRef::Kind::Error &&
+                                !(vt->kind == TypeRef::Kind::Primitive &&
+                                  (vt->primitive == P::String ||
+                                   vt->primitive == P::None))) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error,
+                                    ce.args[valueArg].value->span.begin,
+                                    "no matching overload of `StringBuilder."
+                                    "Insert` — the only overload is `Insert(index: "
+                                    "int, value: string)`, so the value must be a "
+                                    "`string`; render a non-string value with "
+                                    "`.ToString()` first (stdlib §3.1)");
+                            }
                         }
                     }
                     // fix #6920 (v0.340): builtin byte-buffer parameters are
@@ -23258,6 +23281,110 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
                 " declares " + decls +
                 " — the call is a compile error with no candidates cited "
                 "(§22.6)");
+        return;
+    }
+    // fix #7419 (spec §22.5 "Optional parameters and named arguments",
+    // v0.345): THE §22.5 BINDING, PART 1 — THE CANDIDATE SET. A named
+    // argument binds to the parameter it NAMES, so a declared form whose
+    // parameters do not include the name written at the call is not a
+    // candidate at all: §22.5's binding precedes §22.6's applicability, and
+    // a form the name does not reach cannot be applied. Read positionally,
+    // the WRONG form was chosen: `(255).ToString(format := 16)` names the
+    // `format` parameter of `ToString(format: string)`, but the `radix`
+    // form was the one the positional reading fitted, so the call was
+    // ADMITTED and rendered "10" — the radix — a SILENT WRONG ANSWER for a
+    // call §22.5/§5.1 refuse.
+    //
+    // A name NO declared form declares is not this resolver's business: the
+    // §22.5 binder (`checkBuiltinNamedArgs`) reports the names no form
+    // declares for the heads it claims, and this resolver's heads it does
+    // not claim. The unfiltered set is kept for those, so their behaviour
+    // is unchanged.
+    {
+        std::vector<common::BuiltinParamForm> nameForms;
+        for (const auto& f : forms) {
+            bool admits = true;
+            for (std::size_t p = 0; p < ce.args.size() && p < f.total; ++p) {
+                const std::string_view an = ce.args[p].name;
+                if (an.empty()) continue;
+                bool found = false;
+                for (std::size_t k = 0; k < f.total; ++k)
+                    if (f.names[k] == an) { found = true; break; }
+                if (!found) { admits = false; break; }
+            }
+            if (admits) nameForms.push_back(f);
+        }
+        if (!nameForms.empty()) forms = nameForms;
+    }
+    // fix #7419 (spec §22.5 "Optional parameters and named arguments",
+    // v0.345): THE §22.5 BINDING. A named argument binds to the parameter it
+    // NAMES — "Named arguments may appear in any order after positional
+    // arguments. Each supplied argument binds exactly one parameter and each
+    // parameter is bound by at most one supplied argument" — and this
+    // resolver reads its arguments POSITIONALLY.
+    //
+    // The heads this resolver owns are NOT among the heads
+    // `checkBuiltinNamedArgs` claims (the `string` / `StringBuilder` /
+    // `Math` / `Convert` / `Encoding` family), so no §22.5 binding is
+    // published for them and codegen lowers their arguments BY POSITION. A
+    // call whose named argument binds to a parameter OTHER than the one at
+    // its own position is therefore a call this compiler CANNOT LOWER, and
+    // it is refused HERE — with the §22.5 rule named — instead of being
+    // read positionally. Read positionally:
+    //
+    //   * `Debug.Assert(message := "a message", condition := true)` was
+    //     refused with a §5.1 type diagnostic that blamed the `condition`
+    //     parameter for a `string` that is really the MESSAGE (both
+    //     arguments are correctly typed — the refusal named the WRONG
+    //     parameter), and
+    //   * `int.Parse(radix := "x", s := 5)` was SILENTLY ADMITTED, because
+    //     the positional reading happens to fit.
+    //
+    // A call that binds IN ORDER is unaffected: there the positional
+    // reading and the named reading are the same argument.
+    std::string reorderArg, reorderParam;
+    for (const auto& f : forms) {
+        for (std::size_t p = 0; p < ce.args.size() && p < f.total; ++p) {
+            const std::string_view an = ce.args[p].name;
+            if (an.empty()) continue;
+            std::size_t q = f.total;
+            for (std::size_t k = 0; k < f.total; ++k)
+                if (f.names[k] == an) { q = k; break; }
+            // A name this form does not declare is not this form's business:
+            // another form may declare it, and the §22.5 binder reports the
+            // names no form declares.
+            if (q == f.total) continue;
+            if (q == p) continue;  // in declaration order
+            reorderArg = std::string(an);
+            reorderParam = std::string(f.names[q]);
+            break;
+        }
+        if (!reorderArg.empty()) break;
+    }
+    // fix #7419 (§22.5, v0.345): the §22.5 refusal. The call binds a named
+    // argument to a parameter other than the one at its own position, and
+    // this built-in's arguments are lowered by POSITION, so the compiler
+    // cannot lower the call. The diagnostic names BOTH parameters — the one
+    // the argument NAMES and the one it is written at — which the old
+    // diagnostic conflated (it named only the latter, and blamed the
+    // argument for a type mismatch it does not have).
+    if (!reorderArg.empty()) {
+        std::string rdecls;
+        for (const auto& f : forms) {
+            if (!rdecls.empty()) rdecls += " / ";
+            rdecls += builtinParamFormDecl(member, f);
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            "no matching overload of `" + callee + "` — " + sec + " declares " +
+                rdecls + ", and the argument named `" + reorderArg +
+                "` binds by §22.5 to the `" + reorderParam +
+                "` parameter of that form, not to the parameter it is written "
+                "at — a named argument that binds to a parameter other than "
+                "its own position is not supported on this built-in member "
+                "(§22.5, #3398); pass the arguments in declaration order, or "
+                "positionally — the call is a compile error with no "
+                "candidates cited (§22.6)");
         return;
     }
     // APPLICABILITY: a candidate is applicable when every bound argument
