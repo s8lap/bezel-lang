@@ -9,6 +9,7 @@
 //! cites: 28.12
 //! expect: reject
 //! diagnostic: async
+//! issue: 7396
 module Conf;
 
 public class Program

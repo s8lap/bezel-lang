@@ -7,6 +7,7 @@
 //! cites: 9.1
 //! expect: run
 //! stdout: caught
+//! issue: 7268
 module Conf;
 
 public class Program

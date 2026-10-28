@@ -6,6 +6,7 @@
 //!   raising ArgumentException otherwise.
 //! expect: run
 //! stdout: threw
+//! issue: 7268
 module Conf;
 
 public class Program

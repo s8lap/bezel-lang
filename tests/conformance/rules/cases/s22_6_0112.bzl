@@ -11,6 +11,7 @@
 //! cites: 22.6, 9.4, 5.1
 //! expect: reject
 //! diagnostic: no matching overload
+//! issue: 7299
 module Conf;
 
 public class Program
