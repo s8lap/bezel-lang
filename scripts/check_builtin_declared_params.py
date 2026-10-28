@@ -107,6 +107,8 @@ BLOCKS = [
     # (the class declaration that opens the block, the CLASS name the block
     # ends with, the head the table is keyed by)
     ("public class String:", "String", "string"),
+    ("public record DateTime:", "DateTime", "DateTime"),
+    ("public record TimeSpan:", "TimeSpan", "TimeSpan"),
 ]
 
 # ── the ONE built-in parameter table ───────────────────────────────────────

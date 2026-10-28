@@ -591,7 +591,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 305> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 321> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -973,6 +973,49 @@ constexpr std::array<BuiltinParamRow, 305> kBuiltinParams = {{
     {"TimeOnly", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
     {"TimeSpan", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
     {"TimeSpan", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    // fix #7443 (stdlib §2.5, §5.1, v0.345): the §2.5 CLASS-SPELLING static
+    // members' DECLARED PARAMETER TYPES.
+    //
+    // THE DEFECT. `TimeSpan.FromTicks`, `DateTime.FromTicks`,
+    // `DateTime.FromUnixTimeSeconds`, the `TimeSpan.From*` family and the
+    // `DateTime.Add*` family are BUILT-IN CLASS calls: they have no
+    // MethodSymbol, so §22.5's per-argument check never bound their
+    // arguments, and the ONE parameter table carried NO row for them — so the
+    // §5.1 admission gate (`ExprTC::checkBuiltinCallAdmission`) had no
+    // declared form to admit against and stood down. An argument the
+    // standard library does not declare therefore reached the lowering:
+    //
+    //   TimeSpan.FromTicks(vul)          -> ADMITTED and SILENTLY WRAPPED
+    //                                        (-446744073709551616) — a
+    //                                        `ulong` at a `long` parameter is
+    //                                        never an implicit conversion
+    //                                        (§5.1's "between signed and
+    //                                        unsigned types of the same or
+    //                                        narrower width");
+    //   TimeSpan.FromTicks(1.5)          -> the compiler ABORTED
+    //                                        ("SExt only operates on
+    //                                        integer" — MALFORMED IR);
+    //   DateTime.FromTicks(1.5)          -> the same abort;
+    //   DateTime.FromUnixTimeSeconds(vul) -> ADMITTED and silently wrapped.
+    //
+    // With the rows below the SAME admission gate the §9.1-§9.5 primitive
+    // heads are admitted by answers the §5.1 question for these members too.
+    {"DateTime", "FromTicks", 1, 1, 0x01, {"ticks", "", "", "", "", "", "", ""}, {kBPTLong, 0, 0, 0, 0, 0, 0, 0}, "FromTicks(ticks: long, kind: DateTimeKind := DateTimeKind.Unspecified): DateTime"},
+    {"DateTime", "FromTicks", 2, 1, 0x01, {"ticks", "kind", "", "", "", "", "", ""}, {kBPTLong, 0, 0, 0, 0, 0, 0, 0}, "FromTicks(ticks: long, kind: DateTimeKind := DateTimeKind.Unspecified): DateTime"},
+    {"DateTime", "FromUnixTimeSeconds", 1, 1, 0x01, {"seconds", "", "", "", "", "", "", ""}, {kBPTLong, 0, 0, 0, 0, 0, 0, 0}, "FromUnixTimeSeconds(seconds: long): DateTime"},
+    {"DateTime", "AddYears", 1, 1, 0x01, {"years", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "AddYears(years: int): DateTime"},
+    {"DateTime", "AddMonths", 1, 1, 0x01, {"months", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "AddMonths(months: int): DateTime"},
+    {"DateTime", "AddDays", 1, 1, 0x01, {"days", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "AddDays(days: double): DateTime"},
+    {"DateTime", "AddHours", 1, 1, 0x01, {"hours", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "AddHours(hours: double): DateTime"},
+    {"DateTime", "AddMinutes", 1, 1, 0x01, {"minutes", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "AddMinutes(minutes: double): DateTime"},
+    {"DateTime", "AddSeconds", 1, 1, 0x01, {"seconds", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "AddSeconds(seconds: double): DateTime"},
+    {"DateTime", "AddMilliseconds", 1, 1, 0x01, {"ms", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "AddMilliseconds(ms: double): DateTime"},
+    {"TimeSpan", "FromTicks", 1, 1, 0x01, {"ticks", "", "", "", "", "", "", ""}, {kBPTLong, 0, 0, 0, 0, 0, 0, 0}, "FromTicks(ticks: long): TimeSpan"},
+    {"TimeSpan", "FromDays", 1, 1, 0x01, {"days", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "FromDays(days: double): TimeSpan"},
+    {"TimeSpan", "FromHours", 1, 1, 0x01, {"hours", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "FromHours(hours: double): TimeSpan"},
+    {"TimeSpan", "FromMinutes", 1, 1, 0x01, {"minutes", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "FromMinutes(minutes: double): TimeSpan"},
+    {"TimeSpan", "FromSeconds", 1, 1, 0x01, {"seconds", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "FromSeconds(seconds: double): TimeSpan"},
+    {"TimeSpan", "FromMilliseconds", 1, 1, 0x01, {"ms", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "FromMilliseconds(ms: double): TimeSpan"},
     // fix #6812 (stdlib §7.3, v0.344): the ASYNC text members. Their
     // `token` parameter is declared `token: CancellationToken :=
     // CancellationToken.None` — OPTIONAL — so the two-argument form requires
