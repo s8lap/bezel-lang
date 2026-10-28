@@ -467,13 +467,44 @@ three no-such-member families are accepted **only** by `string_isascii` — whos
 PROPERTY really has no member. For the other 62 the member exists, so the plausible families are the
 overload / conversion / nullability / arity ones, and those are what the cells accept.
 
-**THE RESIDUAL RISK, STATED.** A dozen family phrases carry **no member name** (the compiler's own
+**THE RESIDUAL RISK, STATED.** Fourteen family phrases carry **no member name** (the compiler's own
 wording for them has none) — they are listed in `CONTEXT_FREE` in the grid and are the only
 alternatives that are not anchored to the cell's subject. **They are safe here because each cell's
 program has exactly one call under test and its only other call is a `Console.WriteLine` of that
 call's own result** — a type the stdlib fixes, so no §5.1 or §7 diagnostic can arise at the outer
 call. The self-test proves the complementary half mechanically: **no anchored alternative of any cell
 is satisfied by a diagnostic about another call in the same program.**
+
+**THE TWO PHRASES THE GRID-NEEDLES LANE ADDED (2026-10-28 12:40) — AND WHY THEY ARE SAFE HERE
+TOO.** The lane `r36-c2-gridneedles` (commit `9d1f3f64`, `kind: infra`, **no issue closed**) added
+three needle families to the grid: `F_pos0_param(member, role)`, `F_formattable_receiver()` and
+`F_typearg_constraint(subject, constraint)`. **The first is ANCHORED** (it names the cell's member:
+`` `string.Contains` takes its ``). **The other TWO carry a CONTEXT-FREE phrase each** — "a format
+spec requires an intrinsically-formattable receiver (a numeric/temporal/Guid) or one implementing
+`IFormattable`" and "does not satisfy the constraint `where T: INumber<T>`" — **because the
+compiler's wording for them names the RECEIVER TYPE or the OFFENDING TYPE, not the member.**
+
+**=> THE SAME ARGUMENT THAT MAKES THE EXISTING CONTEXT-FREE PHRASES SAFE MAKES THESE TWO SAFE: EACH
+AFFECTED CELL's PROGRAM HAS EXACTLY ONE CALL UNDER TEST AND ITS ONLY OTHER CALL IS A
+`Console.WriteLine` OF THAT CALL's OWN RESULT — A TYPE THE STDLIB FIXES, SO NO §2.18 FORMAT-SPEC
+DIAGNOSTIC AND NO §14.2 CONSTRAINT DIAGNOSTIC CAN ARISE AT THE OUTER CALL.** THE FOUR AFFECTED
+CELLS ARE `bool_tostring_format` AND `char_tostring_format` (THE FORMAT PREFIX) AND `math_sign_bool`
+AND `math_sign_string` (THE CONSTRAINT PHRASE).
+
+**=> AND THE GRID's OWN SELF-TEST PROVES THE COMPLEMENTARY HALF MECHANICALLY — `8` ROWS WERE ADDED
+TO `scripts/gate/tests/test_builtin_admission_grid.py`, INCLUDING
+`test_a_wording_from_a_different_rule_does_not_match` AND
+`test_the_new_diagnostics_satisfy_only_the_cells_of_their_own_member` (WHICH PINS THE SET OF CELLS
+EACH NEW DIAGNOSTIC MAY SATISFY AND REQUIRES **NO OTHER CELL OF THE 118** TO ACCEPT IT).**
+
+**=> AND THE "**NEVER REMOVE**" PROPERTY IS PROVEN MECHANICALLY BY THE COORDINATOR: **LOADING THE
+GRID MODULE AT `9d1f3f64^` AND AT `9d1f3f64` AND COMPARING ALL **118** CELLS' `want` LISTS GIVES
+**ZERO** CELLS THAT LOST A NEEDDLE (336 NEEDLES BEFORE → 356 AFTER; **20 ADDED, NONE REMOVED**).**
+**THE GRID's WRONG-CELL COUNT AT THE TIP `f76f2b9f` GOES **19 → 10**, AND **EXACTLY NINE** CELLS
+CHANGE CLASS, ALL `REJECTED → OK`; **NO** CELL GOES THE OTHER WAY. **THE TEN THAT REMAIN INCLUDE
+**BOTH RULED** DEFECTS — `string_repeat_string` (THE R3 RULING) AND
+`string_compareto_named_reordered` (§22.5's NAMED BINDING) — **WHICH **MUST** STAY WRONG: A GRID
+THAT HAD "FIXED" THEM WOULD BE MASKING TWO RULED DEFECTS.**
 
 ### The cross-module face (N5)
 
