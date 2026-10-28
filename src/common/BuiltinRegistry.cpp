@@ -1438,6 +1438,18 @@ bool isBuiltinInterfaceHead(std::string_view n) {
 // data-only registry (beside `kBuiltinExceptionHierarchy`, the exactly-
 // analogous built-in hierarchy table), read by all three sites.
 //
+// THE CORRECTNESS OF THIS TABLE IS MECHANICALLY GUARANTEED (#7424's
+// RESIDUAL). It is still hand-written, but a ratchet derives the family from
+// `docs/Bezel_Standard_Library.md` — every `public interface` that extends
+// `IDisposable` directly or transitively — and compares the derivation
+// against THIS table, against the `std::array<..., N>` size below, and
+// against the comment block below. It fails CLOSED: a stdlib interface
+// extending `IDisposable` that is missing here, a chain parent that
+// disagrees, or a wrong stdlib section attribution all turn the gate RED
+// before a program can reach the compiler. See
+// `scripts/check_disposal_family_chain.py` (wired into
+// `scripts/gate_full_cycle.sh`).
+//
 // THE MEMBERS, AND WHERE EACH IS DECLARED (stdlib §2.10 / §4.2 / §4.12 /
 // §4.13, v0.345):
 //

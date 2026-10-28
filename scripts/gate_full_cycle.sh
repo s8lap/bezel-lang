@@ -1117,6 +1117,43 @@ if ! python3 scripts/check_seam_accessor_conformance.py --strict \
 fi
 say "seam-accessor-conformance phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seamaccessor.log"))"
 
+# ── DISPOSAL-FAMILY CHAIN PHASE (#7424's residual) ───────────────────────────
+# `kBuiltinDisposalFamilyHeads` (src/common/BuiltinRegistry.cpp) enumerates
+# the standard-library interfaces that extend `IDisposable` directly or
+# transitively (stdlib §2.10, §4.2, §4.12, §4.13; spec §9.7, §14.2 rule 3,
+# §28.12, v0.345). It is a HAND-WRITTEN transcription of the stdlib document,
+# and a hand-maintained mirror of a document drifts: a FUTURE stdlib interface
+# extending `IDisposable` would silently miss, so a record/enum/choice listing
+# it would be admitted where §28.12 requires a rejection — exactly the defect
+# #7424 was filed for.
+#
+# This ratchet DERIVES the expected family from `docs/Bezel_Standard_Library.md`
+# and compares it against the code table, the `std::array<..., N>` size and the
+# hand-written comment block above the table. It fails CLOSED (exit 2) when it
+# cannot parse its inputs, so a broken checker never reads as a pass.
+#
+# BUILD-FREE SOURCE ratchet: it reads the document and the source only.
+say "disposal-family-chain phase: detector self-test + stdlib-derived ratchet (#7424)"
+if ! python3 scripts/check_disposal_family_chain.py --self-test \
+      > "$LOGDIR/${TAG}_disposalfamily.log" 2>&1; then
+  say "CYCLE FAILURE: check_disposal_family_chain SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_disposalfamily.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_disposalfamily.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_disposal_family_chain.py --strict \
+      >> "$LOGDIR/${TAG}_disposalfamily.log" 2>&1; then
+  say "CYCLE FAILURE: kBuiltinDisposalFamilyHeads disagrees with the standard"
+  say "  library — a stdlib interface extending IDisposable is missing from the"
+  say "  chain table, or a chain parent or a § attribution differs. See"
+  say "  $LOGDIR/${TAG}_disposalfamily.log"
+  sed -n '/check_disposal_family_chain:/,$p' "$LOGDIR/${TAG}_disposalfamily.log" \
+    2>/dev/null | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "disposal-family-chain phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_disposalfamily.log"))"
+
 # ── §9.6 STRING-MEMBER TRANSCRIPTION PHASE (R35, the #7144 reviewer's R and S) ─
 # Two tables in the compiler transcribe stdlib §9.6's `String` member list by
 # hand: `kMintMethods` (src/ownership/Ownership_Checks.cpp) and the arity
