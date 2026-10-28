@@ -303,6 +303,26 @@ BEZEL_TEST(disposal_interface_chain_7354,
         "`IOwningCollection`, which extends `IDisposable` (§9.7, §28.12)"));
 }
 
+// THE SAME CHAIN, ONE LINK FURTHER: a USER interface that extends
+// `IOwningList<T>` — which reaches `IDisposable` through
+// `IOwningCollection<T>` (stdlib §4.2). The diagnostic names the head the
+// user interface extends and then the `IDisposable` it reaches through it.
+BEZEL_TEST(disposal_interface_chain_7354,
+           record_listing_a_user_interface_extending_i_owning_list_is_rejected_spec_28_12) {
+    const std::string p = prog({
+        "module Conf;",
+        "public class Res",
+        "  public constructor() end constructor;",
+        "end Res;",
+        "public interface MyDisp: IOwningList<Res> end MyDisp;",
+        "public record R: MyDisp public _x: int := 0; end R;",
+    });
+    BEZEL_EXPECT_TRUE(rejectedAt(
+        p, 6, 8,
+        "record `R` may not implement `MyDisp` — `MyDisp` extends "
+        "`IOwningList`, which extends `IDisposable` (§9.7, §28.12)"));
+}
+
 // §28.12 names the enum in the same declaration-site ban.
 BEZEL_TEST(disposal_interface_chain_7354,
            enum_listing_i_owning_collection_is_rejected_spec_28_12) {
