@@ -459,6 +459,9 @@ use — built by the family helpers in `scripts/builtin_admission_grid.py`:
 | `F_generic_ref(subject)` | `is a reference to a generic method`, `` `X` is a reference to a generic method``, `` `X` names no type argument`` | `ExprTypecheck_Calls.cpp` |
 | `F_initializer(subject, v)` | `the initializer for`, ``the initializer for `v` has a type that is not implicitly convertible to the target type`` | `ExprTypecheck.cpp` |
 | `F_ambiguous_name(subject)` | ``bare name `M` is ambiguous``, `is ambiguous: an imported public from`, `shadows the always-available type` | `ExprTypecheck_Calls.cpp` (§2.3) |
+| `F_pos0_param(member, role)` | the **ROLE-SPECIFIC** wording (`` `string.M` takes its search value at position 0``), the **MEMBER-NAMED PREFIX** (`` `string.M` takes its``), and the type-agnostic tails the compiler varies (`converts to neither` / `converts to none of them`) | `ExprTypecheck_Calls.cpp` (stdlib §9.6's POSITION-0 parameter, §5.1) |
+| `F_formattable_receiver()` | the type-agnostic PREFIX (`a format spec requires an intrinsically-formattable receiver (a numeric/temporal/Guid) or one implementing `IFormattable``), its shorter form, and the `operand` spelling the interpolation path (§18.5) uses for the same rule | `ExprTypecheck_Calls.cpp` (§2.18 + §18.5) |
+| `F_typearg_constraint(subject, constraint)` | the **CONSTRAINT PHRASE** — WHICH **EXCLUDES** THE OFFENDING TYPE's NAME — and the **CALLEE-NAMED** requirement (`` `M` requires an argument type that conforms to `INumber<T>` ``), so it matches ANY type argument | `ExprTypecheck_Calls.cpp` (§14.2 + stdlib §2.2/§2.19) |
 
 **WHERE THE "NO SUCH MEMBER" FAMILIES ARE AND ARE NOT ACCEPTED — and why.** A fix can only say "no
 such member" where the called FORM has no member at all. **MEASURED on HEAD: not one of the 63 reject
@@ -467,7 +470,7 @@ three no-such-member families are accepted **only** by `string_isascii` — whos
 PROPERTY really has no member. For the other 62 the member exists, so the plausible families are the
 overload / conversion / nullability / arity ones, and those are what the cells accept.
 
-**THE RESIDUAL RISK, STATED.** Fourteen family phrases carry **no member name** (the compiler's own
+**THE RESIDUAL RISK, STATED.** Fifteen family phrases carry **no member name** (the compiler's own
 wording for them has none) — they are listed in `CONTEXT_FREE` in the grid and are the only
 alternatives that are not anchored to the cell's subject. **They are safe here because each cell's
 program has exactly one call under test and its only other call is a `Console.WriteLine` of that
@@ -836,7 +839,7 @@ WORD), AND EACH WITH A MINIMAL REPRO AND A §-CITATION IN ITS BODY:**
 | **#7421** | **THE §9.6 ARGUMENT-TYPE FAMILY AT `Trim` / `Equals` / `IsNullOrWhiteSpace` — THREE OF THEM **ABORT THE COMPILER** (`s.Trim(5)`, `s.Equals(5)`, `string.IsNullOrWhiteSpace(5)`) AND `s.Trim(null)` IS A **SILENT ACCEPTANCE** THAT PRINTS `abc`** | §9.6, §7.3, §22.6 (v0.345) | the B4a lane's reviewer |
 | **#7425** | **THE WIDTH-2 `string` SURFACE **WRITES OUT OF BOUNDS** — AN ASAN HEAP-BUFFER-OVERFLOW **WRITE** — AND THE DEFECT REACHES **BEYOND `Remove`**, SO A **LENGTH-ONLY ORACLE MISSES IT** | §4.6 (v0.345) | the B4a lane's reviewer |
 | **#7446** | **SEMA CONSULTS A USER's EXTENSION FOR A MEMBER THE RECEIVER **INHERITS**, AND TYPES THE CALL BY IT — SO THE PROGRAM STORES THE BUILT-IN's `int` IN A `string`-TYPED LOCAL** (the two spellings disagree: the `string` one is admitted and yields an `int`, the `int` one is refused). **SOUNDNESS.** | §26.5 rule 1, §5.1 (v0.345); stdlib §4.1, "Block-by-name" (v0.345) | the L1 lane's reviewer |
-| **#7447** | **A USER EXTENSION NAMED `Length` OVER `Array<T>` IS **REFUSED** — *"no member `Length` on `Array<T>`: use `Count`"* — THOUGH `Array<T>` DECLARES NO `Length` AND §26.5 RULE 2 REQUIRES THE EXTENSION BLOCKS TO BE CONSULTED** | §26.5 rule 2 (v0.345); stdlib §4.4, "Count vs Length" (v0.345) | the L1 lane's reviewer |
+| **#7447** | **A USER EXTENSION NAMED `Length` OVER `Array<T>` IS **REFUSED** — *"no member `Length` on `Array<T>`: use `Count`"* — THOUGH `Array<T>` DECLARES NO `Length` AND §26.5 RULE 2 REQUIRES THE EXTENSION BLOCKS TO BE CONSULTED** | §26.5 rule 2 (v0.345); stdlib §1, "Count vs Length" (v0.345) | the L1 lane's reviewer |
 | **#7448** | **A USER EXTENSION NAMED `Sum` OVER `Array<T>` IS **SILENTLY DROPPED** — THE PROGRAM PRINTS THE BUILT-IN's `6`, NOT THE EXTENSION's `77`** — the SAME MECHANISM AS #6159, ONE NAME OVER, so the built-in's arm claims the name for a name the receiver does not declare | §26.5 rules 2 and 3 (v0.345); stdlib §4.4, §5 (v0.345) | the L1 lane's reviewer |
 | **#7449** | **A METHOD REFERENCE TO AN `IList<T>` MEMBER UNDER A SAME-NAMED USER EXTENSION **SEGFAULTS** — ASan stack-buffer-overflow — AND WITHOUT THE EXTENSION THE SAME PROGRAM MERELY DEGRADES** | §27.6, §26.5 (v0.345); stdlib §4.1 (v0.345) | the L1 lane's reviewer |
 
@@ -1354,8 +1357,8 @@ discriminator lane).**
   INSTEAD OF THE **CODE-POINT** DOMAIN.** spec §4.6 (v0.345, `docs/Bezel_Language_Spec.md:593`)
   makes the per-string width invisible at the language level (*"The choice of width is invisible at
   the language level; programs observe only the `char` sequence and its length"*), and the same
-  section fixes the code-point model (*"The user-visible model is 'a sequence of code points indexed
-  in O(1)'"*, `docs/Bezel_Language_Spec.md:593`). stdlib §3.1
+  section fixes the code-point model (*"The user-visible model is \"a sequence of code points
+  indexed in O(1).\""*, `docs/Bezel_Language_Spec.md:593`). stdlib §3.1
   (v0.345) declares `AppendFormat(format: string, args: Array<Object>): StringBuilder` and says
   *"each hole optionally carrying a format spec after a colon"*. **MEASURED ON THE BASE:**
   `AppendFormat("x{0}y", <"日">)` gave Length 4 and the text `x` + U+00E5 + U+0065 + `y`;
@@ -1548,7 +1551,7 @@ the runtime-format vocabulary).**
   NEVER AFFECTED** — it has its own arm above the split and already reached the decimal formatter at
   BOTH spellings.
 * **THE FOURTEEN RE-MEASURED ISSUES INCLUDE **FOUR THAT WERE **ALREADY FIXED** BY EARLIER COMMITS**
-  (#7258 by `c9dfae6c`, #7271 by `87132ca9`, #7287 by `275fab52`, #7253 by `d181b547`) **AND THE
+  (#7258 by `c9dfae6c`, #7271 by `87132ca9`, #7287 by `275fab52` — **WHOSE SUBJECT NAMES **#7329**, NOT #7287** — and #7253 by `d181b547`) **AND THE **AND THE
   LANE RE-MEASURED EACH ON THE FINAL TREE RATHER THAN ASSUMING IT** — **SO THE LANE's CLOSURE SET IS
   THE ELEVEN ABOVE, NOT THE FOURTEEN.**
 * **THE FLIPPED ROWS — **FOUR PRE-EXISTING FILES, AND EVERY ONE IS NAMED HERE** (the coordinator's
@@ -1610,7 +1613,7 @@ lane, and the L1-DISCRIMINATOR's SIBLING).**
   selected extension's `MethodSymbol` on the member-access callee — the same symbol the extension
   lowering in `LlvmBackend_Calls2.cpp` reads) **PLUS** the receiver's **DECLARED SURFACE**:
   `Length` — stdlib §3.1 `StringBuilder`, §4.14 `OwningBuffer` and §4.19 `FrozenArray` declare it,
-  and **no collection head does** (§4.4's "Count vs Length" convention: *"A type declares one or the
+  and **no collection head does** (stdlib §1's "Count vs Length" convention: *"A type declares one or the
   other, never both"*); `Count` — stdlib §4.4–§4.11 and §4.17–§4.18 declare or inherit it, the six
   collection interfaces inherit it from `IReadOnlyCollection<T>` (stdlib §4.1), and **an inherited
   member commits rule 1 too** (the stdlib's "Block-by-name" convention). **THE DECLINE HAPPENS

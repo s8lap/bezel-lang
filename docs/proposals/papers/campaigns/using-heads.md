@@ -1378,7 +1378,8 @@ ISSUE ON PURPOSE). **=> PICKED (2026-10-28): `cdf348ec` -> `e239820b2c`, `fc09c0
     BASE RUNS IT PASSED 3× AND FAILED 11× — **AND THE COMMIT BODY's CHARACTERISATION OF THE BASE's
     THIRD FAILURE AS A THIRD TIMEOUT IS THEREFORE WRONG.** **=> AND **THE BASE ARM MUST BE MEASURED
     **PER ROW**, BECAUSE THE HANG SHORT-CIRCUITS THE AGGREGATE FILTER** (*"ran 0 of 5 matching tests
-    — the run was CUT SHORT"*).
+    — the run was CUT SHORT …" **— THE HARNESS LINE CONTINUES "(crash/abort); not
+    trustworthy."**, SO THE QUOTATION IS **TRUNCATED**"*).
   * **THE #1531 / #1603 **FILE ATTRIBUTION** IN THE LANE's OWN COMMIT BODY IS **IMPRECISE**: THE
     `DisposeAsync` LOWERING LIVES IN `src/codegen/LlvmBackend_Async.cpp` (`emitAsyncDisposeAwaitAndFree`,
     ~6175) AND `LlvmBackend_Disposal.cpp`, AND THE GENERIC `CallExpr` PATH IS
