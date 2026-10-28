@@ -8,8 +8,10 @@
 //! cites: 9.1
 //! expect: run
 //! stdout: FORMAT
-//! notes: the compiler admits "0x1F" at radix 16 and answers 31 — a class 1 divergence; no
-//!   tracker yet, the coordinator to file one for the 0x/0b-prefix acceptance.
+//! issue: 7491
+//! notes: the compiler admits "0x1F" at radix 16 and answers 31 — a class 1 divergence, tracked
+//!   as #7491 (the coordinator filed it on 2026-10-28; the radix parse lowers to C's strtoll,
+//!   which accepts an optional 0x/0X prefix at base 16).
 module Conf;
 
 public class Program

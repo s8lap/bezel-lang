@@ -5,7 +5,9 @@
 //! rule: stdlib §2.10 (v0.345): "The constraint `where T: IDisposable` admits every class … and
 //!   the interfaces that extend `IDisposable` directly or transitively — including
 //!   `IAsyncDisposable`, `IEnumerator<T>`, `IAsyncEnumerator<T>`, and **user-defined interfaces
-//!   that list `IDisposable` in their extension clause**."
+//!   that list `IDisposable` in their extension clause**."  The argument here is bound at the
+//!   INTERFACE's static type, so it is the interfaces clause — not the "every class" clause — that
+//!   decides this call.
 //! cites: 2.10, 14.2
 //! expect: run
 //! stdout: used
@@ -21,7 +23,8 @@ public class Program
   end Use;
 
   public static method Main()
-    Use(new Impl());
+    var i: IFoo := new Impl();
+    Use(i);
   end Main;
 
   public class Impl: IFoo
