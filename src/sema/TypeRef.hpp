@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"  // isBuiltinDisposalFamilyHead — fix #7457
 
 namespace bezel::sema {
 
@@ -215,8 +216,36 @@ inline PrimBuiltinIfaceConformance primitiveConformsToBuiltinInstanceIface(
 // interfaces resolve to a Named TypeRef WITHOUT a synthesized declaration, so a
 // primitive tested against such a bound would otherwise fall through to a silent
 // defer. True when a primitive against `head` provably cannot conform.
+//
+// fix #7457 (§9.7 / §14.2 / §28.12; stdlib §2.10 / §4.2 / §4.12 / §4.13,
+// v0.345): the question is asked of the WHOLE built-in DISPOSAL FAMILY, not
+// of two names.
+//
+// §9.7: "Records cannot have destructors, `owned` fields, or implement
+// `IDisposable` — directly or through an interface extending it,
+// `IAsyncDisposable` among them." §14.2's worked example names the closure
+// the rule 3 conformance rule reads: "an interface conforms exactly when it
+// extends `IDisposable` (rule 3): `IAsyncDisposable`, `IEnumerator<T>`,
+// `IAsyncEnumerator<T>`, and any user-defined interface that lists
+// `IDisposable` in its extension clause"; stdlib §2.10 states it for the
+// bound: "the interfaces that extend `IDisposable` directly or transitively".
+//
+// So a RECORD (and an enum, and a primitive) can never satisfy a bound
+// naming ANY of the family's heads — `IDisposable`, `IAsyncDisposable`,
+// `IEnumerator<T>`, `IAsyncEnumerator<T>`, `IOwningCollection<T>`,
+// `IOwningList<T>`, and the four `IOwning*` iteration interfaces. The
+// two-name answer admitted `where T: IEnumerator<R>` and
+// `where T: IAsyncEnumerator<R>` with a RECORD type argument (#7457).
+//
+// The family is ONE table — `common::isBuiltinDisposalFamilyHead`
+// (src/common/BuiltinRegistry.cpp) — read here and by the §28.10 vacuity
+// lint (`MethodOwnership::rhsIsDisposableClassType`,
+// src/ownership/Ownership.cpp) and by the declaration-site chain table
+// (`src/sema/TypeResolution_Checks.cpp`), so the three views cannot
+// disagree again.
+// per §14.2 clause 5 / §9.7 / §28.2 / §28.12, fix #1867, fix #7457
 inline bool primitiveNeverConformsToBuiltinIface(std::string_view head) {
-    return head == "IDisposable" || head == "IAsyncDisposable";
+    return common::isBuiltinDisposalFamilyHead(head);
 }
 
 // fix #3434 (spec §4.7 *The unit type* / §21.7 *The `return` statement*,
