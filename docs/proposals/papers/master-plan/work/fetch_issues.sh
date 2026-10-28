@@ -11,16 +11,18 @@ mkdir -p "$out/pages"
 states="${1:-all}"
 if [ "$states" = all ]; then states="open closed"; fi
 for state in $states; do
+  # Never reuse a cached page (fix #7398): a stale page under-reports the count, and a stale short
+  # page would end the loop early. Drop this state's old pages, then refetch every page.
+  rm -f "$out/pages/$state-"*.json
   page=1
   while :; do
     f="$out/pages/$state-$page.json"
-    if [ ! -s "$f" ]; then
-      gh api "repos/s8lap/bezel-lang/issues?state=$state&per_page=100&page=$page&sort=created&direction=asc" > "$f.tmp"
-      mv "$f.tmp" "$f"
-    fi
+    gh api "repos/s8lap/bezel-lang/issues?state=$state&per_page=100&page=$page&sort=created&direction=asc" > "$f.tmp"
+    mv "$f.tmp" "$f"
     n=$(python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$f")
     echo "$state page $page: $n" >&2
-    [ "$n" -lt 100 ] && break
+    # Stop on an empty page, not on a short one: a short page is not proof of the last page.
+    [ "$n" -eq 0 ] && break
     page=$((page+1))
   done
   python3 -I - "$out" "$state" <<'PY'
