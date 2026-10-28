@@ -1477,6 +1477,74 @@ lane).**
   REFUSED BY THE POSITIONAL SHARED RESOLVER, AND THE DIAGNOSTIC NAMES THE WRONG PARAMETER), AND
   **FINDING 2 LEAVES `StringBuilder.AppendLine`'s **VALUE TYPE** UNCHECKED** — **BOTH ARE IN THE
   DISPATCHED FIX-FORWARD's ROSTER, AND NEITHER IS PICKED AS A CLOSURE.**
+**Lane `r36-c2-l5b` (the FORMAT/RADIX RENDERING CONTRACT — the `ToString(format)` member arm and
+the runtime-format vocabulary).**
+
+* **SHAs (picked onto staging):** `9b94de4b` **fix #7311 #7359 #7265 #7303 #7362 #7358**,
+  `2b77209f` **fix #7336**, `0585bb01` **fix #7361**, `9ec7f3e0` **fix #7249**, `eb698157` **fix
+  #7252**, `f85f4a4d` **fix #7334**. **ELEVEN CLOSURES.**
+* **#7311's OWN DISPATCH INSTRUCTION IS THE LANE's CHARTER:** *"FIND THE SHARED FORMATTING ROUTINE
+  AND MAKE BOTH PATHS USE IT … **Two call sites producing two answers is the defect; fixing one of
+  them is not a fix**."* **SO THE FIRST COMMIT NAMES SIX ISSUES DELIBERATELY: THEY ARE SIX VIEWS OF
+  ONE DEFECT — THE MEMBER-CALL ARM OF `ToString(format: string)` CARRIED ITS **OWN PARTIAL COPY** OF
+  stdlib §2.18's SPECIFIER TABLE INSTEAD OF THE SHARED ROUTINE.** **SPLITTING IT INTO SIX COMMITS
+  WOULD YIELD SIX COMMITS THAT EACH FAIL THE SUITE, SO IT IS ONE COMMIT.**
+* **THE MEASURED DEFECTS (all re-measured by the lane on the base `9961f766`, all reproduced, all
+  fixed):** #7265 — no `B` at all, and the lower-case `x` rendered UPPER-case; #7303 — an
+  unrecognized LITERAL specifier rendered the plain text; #7311 — the member spelling and the
+  interpolation spelling gave **two answers**; #7358 — a malformed suffix on a narrow receiver
+  emitted **invalid IR** (a compiler abort); #7359 — `x` rendered `FF`; #7361 — a runtime `X` on a
+  narrow SIGNED receiver gave the 32-bit pattern; #7362 — `D` on a floating receiver truncated;
+  #7336 — a runtime format on a bool/char receiver printed the plain text; #7249 and #7252 — an
+  unsigned operand at `TimeSpan.FromTicks` / `DateTime.FromTicks` printed **-294967296**; #7334 — a
+  runtime format on a `double`/`float` receiver rendered the PLAIN text.
+* **#7334's ROOT CAUSE, MEASURED:** in `Emitter::lowerExprInner` (`src/codegen/LlvmBackend_Exprs.cpp`)
+  the runtime-format dispatch was gated on an **INTEGER** receiver (`isIntRecv`), so a `double` /
+  `float` receiver never reached it and fell out to the plain rendering. **THE `decimal` RECEIVER WAS
+  NEVER AFFECTED** — it has its own arm above the split and already reached the decimal formatter at
+  BOTH spellings.
+* **THE FOURTEEN RE-MEASURED ISSUES INCLUDE **FOUR THAT WERE **ALREADY FIXED** BY EARLIER COMMITS**
+  (#7258 by `c9dfae6c`, #7271 by `87132ca9`, #7287 by `275fab52`, #7253 by `d181b547`) **AND THE
+  LANE RE-MEASURED EACH ON THE FINAL TREE RATHER THAN ASSUMING IT** — **SO THE LANE's CLOSURE SET IS
+  THE ELEVEN ABOVE, NOT THE FOURTEEN.**
+* **THE FLIPPED ROWS — **FOUR PRE-EXISTING FILES, AND EVERY ONE IS NAMED HERE** (the coordinator's
+  behaviour-flip grep was run on all four):
+  * `tests/codegen/int_format_dx_width_7329_test.cpp` — **seven** `x`-spelling rows now render
+    **lower-case** (`byte` "c8", `sbyte` "fb", `short` "fed4", `ushort` "fde8", `uint` "ee6b2800",
+    `long` "12a05f200", `ulong` "f9ccd8a1c5080000"); `stdlib_2_18_double_d_control` is **RENAMED**
+    `stdlib_2_18_double_d_raises_format_exception` and now expects the caught `FormatException`
+    (**"11"**, was "3"); `stdlib_2_18_byte_b_binary_control` is **RENAMED**
+    `stdlib_2_18_byte_b_binary` and now expects **"11001000"** (was "200");
+    `stdlib_2_18_malformed_suffix_control` is **RENAMED**
+    `stdlib_2_18_malformed_suffix_raises_format_exception` and now expects **"11"** (was "00ffd").
+  * `tests/codegen/nonfinite_rendering_7301_test.cpp` — `control_finite_renderings_are_unchanged`:
+    the two member-spelling rows now render **"3.333333E-01\n0.333333"** (was "3.33e-01\n0.33");
+    **THE ROW's OTHER NINE LINES ARE UNCHANGED.**
+  * `tests/sema/format_spec_receiver_vocabulary_7333_test.cpp` —
+    `a_double_receiver_with_an_E_spec_still_compiles_2_18` now expects **"5.000000E+00"** (was
+    "5.00e+00"); and, in `2b77209f`, `a_bool_receiver_with_a_runtime_format_still_compiles_7336` and
+    `a_char_receiver_with_a_runtime_format_still_compiles_7336` are **BOTH RENAMED** to
+    `..._raises_format_exception_7336` and now expect **"11"**.
+  * `tests/codegen/radix_residual_shapes_7286_test.cpp` — in `0585bb01`,
+    `runtime_format_string_unrecognized_specifier` is **RENAMED**
+    `runtime_format_string_unrecognized_specifier_raises_format_exception` and now expects **"11"**
+    (was "255").
+* **THE CORPUS ROWS THE FIX FLIPS (the baseline is NOT edited — the coordinator re-banks):
+  `l2_18_0012` banked fail -> observes pass; `l2_18_0017` banked fail -> observes pass;
+  `l2_18_0027` banked fail -> observes pass; `l2_18_0019` banked pass -> UNCHANGED.** THE LANE's
+  OWN READ-ONLY MEASUREMENT: **3693 cases, 3157 ok, 237 known-divergent, 296 unclassified,
+  0 REGRESSION, 3 UNBANKED** — **THE THREE UNBANKED ARE EXACTLY ITS OWN THREE ROWS, AND THEY WERE
+  UNBANKED BEFORE THE COMMIT TOO.**
+* **THE OPEN SPEC QUESTION IS **RULED, NOT DECIDED**:** *"ARE stdlib §2.18's **FLOATING-row**
+  SPECIFIERS RECOGNIZED ON AN **INTEGER** RECEIVER?"* — **THE ROW PINS THE **AGREEMENT**, NOT THE
+  CHOICE OF ANSWER; THE COMPILER DOES NOT CHANGE ITS ANSWER IN THIS BATCH; THE QUESTION IS ROUTED TO
+  THE NEXT TRAIN, AND IT IS CARRIED AS A ONE-LINE COMMENT **ON THE AGREEMENT ROW ITSELF** (folded
+  into the tree of `0585bb01` onwards, so the commit that introduced the row also carries the
+  qualifying comment and no later commit shows it added or removed).**
+* **THE LANE DECLARED ITS FILE OWNERSHIP IN WRITING:** `tryLowerCollectionInstanceCall` and
+  `builtinTypeName` are **UNTOUCHED** — the lane's `Calls.cpp` hunks are in
+  `tryLowerBuiltinClassCall` **ONLY**.
+
 ### Coordinator block — 2026-10-28 (the campaign's integrator steps)
 
 * **THE ANCHOR IS PICKED** (`2250daa52`) — *"fix #6825 #7284 #7290 #7293 #7294 #7295 #7299 #7300
