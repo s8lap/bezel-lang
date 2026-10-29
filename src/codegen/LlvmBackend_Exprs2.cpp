@@ -790,6 +790,10 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // locals are already covered by loc->isUsing above.
                 // per §28.8.1, §28.10, §30.5, v0.350
                 const bool isOwnedTaskLocalMove = [&]() -> bool {
+                    // A `const` alias still reaches this site through `move`
+                    // of a borrow alias (`const y := x; move y`), the open
+                    // #7403 hole: the source still disposes the frame, so
+                    // handling the const here could not fix it.
                     // LOCALDECL-ONLY: a §21.1 `const` local never owns a Task
                     // frame: a Task-family call initializer and a `move` are
                     // both rejected (an owned production), so the only Task
