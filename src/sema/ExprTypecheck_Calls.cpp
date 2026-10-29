@@ -10859,9 +10859,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         !argTy->astNode->name->parts.empty() &&
                         argTy->headName() == colName &&
                         !argTy->genericArgs.empty()) {
-                        TypeRef unitTy;
-                        unitTy.kind = TypeRef::Kind::Unit;
-                        ctx_.setExprType(&ce, &unitTy);
+                        // fix #7662 (§7.4 sugar, v0.350): `setExprType` stores the
+                        // POINTER, so the Unit TypeRef must live in the
+                        // context's arena. A stack-local `TypeRef unitTy` here
+                        // left `exprType(ce)` dangling once this scope exited,
+                        // and the codegen ExprStmt arm's read of it
+                        // (`freeUnboundOwnedBorrowingArrayTemp` ->
+                        // `builtinTypeName`) segfaulted, flakily.
+                        auto* unitTy = ctx_.makeTypeRef();
+                        unitTy->kind = TypeRef::Kind::Unit;
+                        ctx_.setExprType(&ce, unitTy);
                         return;
                     }
                 }
