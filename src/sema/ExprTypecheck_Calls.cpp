@@ -30863,6 +30863,49 @@ std::string ExprTC::bareStructuralOperatorReject(const TypeRef* receiver,
     return bareStructuralMemberReference(recv, name);
 }
 
+std::string_view taskFamilyHeadName(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named) return {};
+    std::string_view tn;
+    if (!rt->declaration) {
+        if (rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty())
+            tn = rt->headName();
+    } else if (!rt->declaration->decl) {
+        tn = rt->declaration->name;
+    }
+    return (tn == "Task" || tn == "OwningTask") ? tn : std::string_view{};
+}
+
+// fix #7731 / #7782 (spec §30.3, §17.1, v0.350): the closed-surface
+// diagnostic for a read of a member a task type does not declare, shared by
+// the `.` and `?.` spellings.
+static std::string taskClosedSurfaceMessage(std::string_view tn,
+                                            std::string_view mbr) {
+    return "`" + std::string(tn) + "` has no member `" + std::string(mbr) +
+           "` (\xC2\xA7""30.3): its properties are "
+           "IsCompleted, IsFaulted, IsCancelled and Result. "
+           "`await` binds looser than member access, so "
+           "`await t.M` awaits the value of `t.M`; to read a "
+           "member of the awaited result write "
+           "`(await t).M`";
+}
+
+// fix #7782 (spec §27.6, v0.350): "No method reference to `Dispose` or
+// `DisposeAsync`" -- a bound reference naming `Dispose` (a task is a class,
+// §30.3, whose generated `Dispose` the call `t.Dispose();` reaches) is a
+// compile error at the formation, whatever the receiver. The diagnostic names
+// the spellings that announce the kill.
+static std::string taskDisposeReferenceMessage() {
+    return "a method reference to `Dispose` is a compile error at its "
+           "formation (\xC2\xA7""27.6): explicit disposal is a "
+           "site-announced kill of an owned binding that an invocation "
+           "through a function value would perform where no liveness can "
+           "see it. Write the call `t.Dispose();`, the discard `_ := t;`, "
+           "or a lambda that disposes a value it receives as an `owned` "
+           "parameter (`lambda(owned x: Task) => x.Dispose()`, invoked with "
+           "`move t`)";
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // §16.3 / stdlib §9.8 (#6798): `Range<T>.Start` and `.End` are `T?`
     // ("a `null` endpoint indicates the range is open-ended on that side").
@@ -34564,19 +34607,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         //                                                   OwningTask consumes via await)
         if (ma.target) {
             auto* tt = ctx_.exprType(*ma.target);
-            auto taskTypeNameFn = [](const TypeRef* rt) -> std::string_view {
-                if (!rt || rt->kind != TypeRef::Kind::Named) return {};
-                if (!rt->declaration) {
-                    if (rt->astNode && rt->astNode->name &&
-                        !rt->astNode->name->parts.empty())
-                        return rt->headName();
-                    return {};
-                }
-                if (!rt->declaration->decl) return rt->declaration->name;
-                return {};
-            };
-            std::string_view tn = taskTypeNameFn(tt);
-            bool isAnyTask = (tn == "Task" || tn == "OwningTask");
+            std::string_view tn = taskFamilyHeadName(tt);
+            bool isAnyTask = !tn.empty();
             if (isAnyTask) {
                 const auto& mbr = ma.member;
                 // §30.3: IsCompleted / IsFaulted / IsCancelled are bool properties
@@ -34639,14 +34671,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                            /*reportAmbiguity=*/false)) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
-                        "`" + std::string(tn) + "` has no member `" + std::string(mbr) +
-                            "` (\xC2\xA7""30.3): its properties are "
-                            "IsCompleted, IsFaulted, IsCancelled and Result. "
-                            "`await` binds looser than member access, so "
-                            "`await t.M` awaits the value of `t.M`; to read a "
-                            "member of the awaited result write "
-                            "`(await t).M`");
+                        taskClosedSurfaceMessage(tn, mbr));
                 }
+                // fix #7782 (spec §27.6, v0.350): a bound method reference
+                // to `Dispose` (`var f := t.Dispose;`) is a compile error;
+                // the call `t.Dispose()` is the callee, exempt above.
+                if (&ma != calleeOfCallCtx_ && mbr == "Dispose")
+                    ctx_.diagnostics().report(Severity::Error, ma.span.begin,
+                                              taskDisposeReferenceMessage());
             }
         }
         // §6.6 / issue #974: TaskCompletionSource<T> / OwningTaskCompletionSource<T>
@@ -39492,6 +39524,63 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 member = lookupExtensionMember(
                     recvTy, nm.member, nullptr, nm.span.begin,
                     /*reportAmbiguity=*/true, currentCallArity_);
+            }
+        }
+        // fix #7782 (spec §30.3, §7.5, §27.6, v0.350): the `?.` twin of the
+        // `.` form's Task block (fix #1175 / #7731 in resolveMemberAccess).
+        // None of `Task` / `Task<T>` / `OwningTask<T>` has a user TypeSymbol,
+        // so this arm never typed their properties and never applied the
+        // closed surface: `t?.Bogus` was accepted untyped (#2434 degrade,
+        // exit 0), and so was the valid `t?.IsCompleted`. A declared
+        // extension member (§26.5) was found above and never reaches here.
+        // §7.5: the result is always nullable.
+        if (!member && recvTy) {
+            std::string_view tn = taskFamilyHeadName(recvTy);
+            if (!tn.empty()) {
+                SourceLocation loc = nm.span.begin;
+                if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+                const std::string_view mbr = nm.member;
+                auto nullableOf = [&](const TypeRef* t) {
+                    if (t->nullable) return const_cast<TypeRef*>(t);
+                    TypeRef* nn = ctx_.makeTypeRef(*t);
+                    nn->nullable = true;
+                    return nn;
+                };
+                if (mbr == "IsCompleted" || mbr == "IsFaulted" ||
+                    mbr == "IsCancelled") {
+                    ctx_.setExprType(
+                        &nm, ctx_.primitiveTypeRef(PrimitiveType::Bool,
+                                                  /*nullable=*/true));
+                    return;
+                }
+                if (mbr == "Result" && !recvTy->genericArgs.empty() &&
+                    recvTy->genericArgs[0]) {
+                    // §30.3: a blocking wait is rejected lexically in async code.
+                    if (inAsyncContext_) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            "use `await t` — blocking waits are not "
+                            "available in async code (§30.3)");
+                    }
+                    ctx_.setExprType(&nm, nullableOf(recvTy->genericArgs[0]));
+                    return;
+                }
+                if (&nm != calleeOfCallCtx_) {
+                    if (mbr == "Dispose") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            taskDisposeReferenceMessage());
+                        return;
+                    }
+                    if (mbr != "Wait" && mbr != "DisposeAsync" &&
+                        mbr != "ToString" && mbr != "Equals" &&
+                        mbr != "GetHashCode") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            taskClosedSurfaceMessage(tn, mbr));
+                        return;
+                    }
+                }
             }
         }
         // §7.5 / #751: a string/primitive built-in member (e.g. `Length`) has

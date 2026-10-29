@@ -46,6 +46,14 @@ namespace bezel::sema {
 bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
 
+// fix #7731 / #7782 (spec §30.3, v0.350): the head name ("Task" or
+// "OwningTask") of a `Task` / `Task<T>` / `OwningTask<T>` receiver type, empty
+// for any other type. None of the task types has a user TypeSymbol, so the
+// head is read from the annotation (declaration-less) or the builtin class
+// symbol -- the detection of codegen's isTaskTypeName (LlvmBackend_Setup.cpp).
+// Defined in ExprTypecheck_Calls.cpp.
+std::string_view taskFamilyHeadName(const TypeRef* rt);
+
 // fix #5194 (§4.3/§5.2, v0.312): parse a `float` literal text to its correctly-
 // rounded IEEE-754 value.  A `float` literal must be rounded once, to nearest
 // with ties to even (not double-rounded through a `double` intermediate).

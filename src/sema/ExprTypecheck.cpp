@@ -10474,7 +10474,40 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         // so the diagnostic names the construct instead.
         if (ps) propName.clear();
     }
-    if (!ps) return;
+    // fix #7782 (spec §30.3, §23.1, §17.6, v0.350): `Task`'s properties
+    // (`IsCompleted`, `IsFaulted`, `IsCancelled`) and the `Result` of
+    // `Task<T>` / `OwningTask<T>` are declared `readonly property` in §30.3.
+    // They have no PropertySymbol (a task type has no user TypeSymbol), so the
+    // symbol-keyed checks below never saw the write: `t.Result := 3` was
+    // accepted and the store dropped in codegen (internal #4045 warning,
+    // exit 0). §23.1: a `readonly` auto-property "may be assigned only in a
+    // field initializer or in a constructor" of its declaring type, and
+    // neither exists for the runtime-provided task classes.
+    if (!ps) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
+            ma && ma->target &&
+            (ma->member == "IsCompleted" || ma->member == "IsFaulted" ||
+             ma->member == "IsCancelled" || ma->member == "Result")) {
+            const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+            if (rt && rt->kind == sema::TypeRef::Kind::Named) {
+                const std::string_view tn = taskFamilyHeadName(rt);
+                if (!tn.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("cannot ") +
+                            (incOp ? "increment/decrement " : "assign to ") +
+                            "readonly property `" + std::string(ma->member) +
+                            "` of `" + std::string(tn) + "` (" +
+                            (incOp ? "\xC2\xA7""17.6 / " : "") +
+                            "\xC2\xA7""23.1, \xC2\xA7""30.3): a `readonly` property is "
+                            "assignable only in a field initializer or "
+                            "constructor of its declaring type, and a task "
+                            "is produced by the runtime");
+                }
+            }
+        }
+        return;
+    }
     // #2868: the verb and citation differ between the two callers; the rule
     // and every branch below do not.
     const std::string verb = incOp ? "increment/decrement " : "assign to ";
