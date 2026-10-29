@@ -5253,6 +5253,19 @@ private:
     // move-only field meet, and the `??` spelling has no branch at all.
     bool usingVarMeetArmsAreStorageReads(const ast::Expr& init) const;
 
+    // fix #7687 (K8.4 / §28.10, v0.350): when `init` — a `using var`
+    // initializer — is a field or borrow-property read (any spelling
+    // usingVarStorageReadCore peels, through a chain of such reads) of a
+    // BORROW-CARRYING type (a class or interface, or a move-only value) whose
+    // ROOT receiver is an unbound owned temporary (a `new` expression or a
+    // call producing an owned value), or a meet with such an arm, returns
+    // that outermost read; nullptr otherwise. K8.4: "A temporary is an
+    // admissible borrow source only within its boundary; a borrow or frame
+    // that would escape it is **rejected, never lifetime-extended** … among
+    // them a binding" — the `using var` pin is such a binding, and the
+    // temporary is disposed at the declaration's statement end.
+    const ast::Expr* usingVarTemporaryRootedBorrowRead(const ast::Expr& init);
+
     // §28.10 *Adopting a named owned binding* (v0.350, derives K3.4): an
     // UNMARKED `using var y := x;` (and the anonymous `using var _ := x;`, and
     // `await using var y := x;`, §28.12) whose right-hand side is a named

@@ -7471,6 +7471,87 @@ bool MethodOwnership::usingVarMeetArmsAreStorageReads(
     return classify(init) == Arm::Read;
 }
 
+// fix #7687 (K8.4 / §28.10, v0.350): see the header.
+const ast::Expr* MethodOwnership::usingVarTemporaryRootedBorrowRead(
+        const ast::Expr& init) {
+    const ast::Expr* p = &init;
+    while (const auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(p)) {
+        if (!bang->operand) return nullptr;
+        p = bang->operand.get();
+    }
+    // A meet: any arm that is such a read makes the pin's source union hold
+    // a temporary (§28.10: "a borrow-pin of the union of sources").
+    if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(p)) {
+        if (ce->thenValue)
+            if (auto* r = usingVarTemporaryRootedBorrowRead(*ce->thenValue))
+                return r;
+        if (ce->elseValue)
+            if (auto* r = usingVarTemporaryRootedBorrowRead(*ce->elseValue))
+                return r;
+        return nullptr;
+    }
+    if (const auto* be = dynamic_cast<const ast::BinaryExpr*>(p)) {
+        if (be->op != "??") return nullptr;
+        if (be->left)
+            if (auto* r = usingVarTemporaryRootedBorrowRead(*be->left))
+                return r;
+        if (be->right)
+            if (auto* r = usingVarTemporaryRootedBorrowRead(*be->right))
+                return r;
+        return nullptr;
+    }
+    if (const auto* cs = dynamic_cast<const ast::CaseExpr*>(p)) {
+        for (const auto& arm : cs->arms)
+            if (arm.bodyKind == ast::CaseArmBodyKind::Expression &&
+                arm.exprBody)
+                if (auto* r = usingVarTemporaryRootedBorrowRead(*arm.exprBody))
+                    return r;
+        return nullptr;
+    }
+    // The read itself must carry a borrow: a value-typed or runtime-managed
+    // field read is a copy (§28.10 admits it and disposes nothing), so no
+    // borrow of the temporary escapes through it.
+    const sema::TypeRef* rt = ctx_.exprType(*p);
+    if (!rt) return nullptr;
+    const char* moKind = nullptr;
+    const bool carriesBorrow =
+        (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+         isBorrowableType(rt)) ||
+        common::isMoveOnlyValueType(rt, ctx_, moKind);
+    if (!carriesBorrow) return nullptr;
+    // Walk the receiver chain `root.a.b!.c` / `root?.a`: every link must be a
+    // field or borrow-property read.
+    const ast::Expr* cur = p;
+    bool sawRead = false;
+    for (;;) {
+        while (const auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(cur)) {
+            if (!bang->operand) return nullptr;
+            cur = bang->operand.get();
+        }
+        const ast::Expr* tgt = nullptr;
+        if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(cur))
+            tgt = ma->target.get();
+        else if (const auto* nm =
+                     dynamic_cast<const ast::NullCondMemberExpr*>(cur))
+            tgt = nm->target.get();
+        if (!tgt) break;
+        const bool isRead =
+            dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*cur)) ||
+            propertyReadIsRecognizedBorrow(*cur);
+        if (!isRead) return nullptr;
+        sawRead = true;
+        cur = tgt;
+    }
+    if (!sawRead) return nullptr;
+    // The root: a `new` expression or a call producing an OWNED value — the
+    // §28.3 unbound owned temporary. A call without an `owned` return is a
+    // borrow of some other source, not a temporary, and stays a pin.
+    if (isUnboundProducerExpr(*cur) &&
+        producerState(*cur) == OwnershipState::Owned)
+        return p;
+    return nullptr;
+}
+
 // §28.10 "using var initialized from a borrow" (v0.180+, #2128). See the header
 // for the full contract: the borrow shapes a `using var` initializer can take —
 // beyond the bare-id / arm-meet / bind-atom / bare-T-call shapes handled inline
@@ -7886,6 +7967,34 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
             // ever CLEARS the flag. // per §28.10, #2128
             if (usingVarInitIsRecognizedBorrow(*init))
                 const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
+            // fix #7687 (K8.4 / §28.10, v0.350): a pin of a TEMPORARY's field
+            // — `using var x := MkH().F;`, `(new H()).C`, `MkH().G!`,
+            // `MkHN()?.F`, `MkO().B.F`, a meet arm of one — binds a borrow
+            // whose source is disposed at this statement's end. K8.4 rejects
+            // the binding ("rejected, never lifetime-extended"); it was
+            // accepted, leaking the temporary receiver (and, once the pin
+            // flag reached the move-only registrations, its payload too).
+            if (const ast::Expr* tr = usingVarTemporaryRootedBorrowRead(*init)) {
+                std::string member;
+                if (const auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(tr))
+                    member = std::string(ma->member);
+                else if (const auto* nm =
+                             dynamic_cast<const ast::NullCondMemberExpr*>(tr))
+                    member = std::string(nm->member);
+                const std::string kw =
+                    ld.isAwaitUsing ? "await using var " : "using var ";
+                report(Severity::Error, ld.span.begin,
+                       "`" + kw + std::string(ld.name) +
+                           "` over a field or property read of an unbound "
+                           "owned temporary binds a borrow that escapes the "
+                           "temporary's full-expression boundary: the receiver "
+                           "is disposed at the end of this statement (K8.4: "
+                           "rejected, never lifetime-extended; §28.10" +
+                           std::string(ld.isAwaitUsing ? ", §28.12" : "") +
+                           "); bind the receiver to a name first (`" + kw +
+                           "h := <producer>;`, then `" + kw +
+                           std::string(ld.name) + " := h." + member + ";`)");
+            }
             // §28.10 v0.350 (*Adopting a named owned binding*, issue #7481): the
             // unmarked `using var y := x;` over a NAMED OWNED class or interface
             // binding is a compile error (reported above), so the bare-id arm
