@@ -8602,6 +8602,19 @@ void Emitter::markFreshStringBuilderChainRoot(const ast::Expr* chainTop) {
         }
         auto* call = dynamic_cast<const ast::CallExpr*>(e);
         if (!call || !isSbType(call)) return;
+        // fix #7733 (§28.3 *Unbound owned temporaries* / K8.1, v0.350): a call
+        // to a method declared to return `owned StringBuilder` hands the caller
+        // a fresh +1 the caller solely owns (§28.1: an `owned` return transfers
+        // ownership), exactly like `new StringBuilder(...)`: it is the chain's
+        // ROOT. Only the declared-`owned` marker qualifies
+        // (`common::calleeReturnsOwned`, the same discriminator
+        // `isFreshOwnedClassProducer` uses for heap classes): a call WITHOUT it
+        // returns a borrow (`return this.field`, a parameter passed through),
+        // and disposing that would free a builder owned elsewhere.
+        if (common::calleeReturnsOwned(*call, ctx_)) {
+            freshSbRoots_.insert(e);
+            return;
+        }
         // Descend only through a BUILT-IN member that returns its receiver
         // (an allow-list, not an extension deny-list). Any other
         // StringBuilder-returning call, a user extension above all, receives
