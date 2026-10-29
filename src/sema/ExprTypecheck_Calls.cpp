@@ -38630,8 +38630,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // §2.2) is read here exactly as at a call with the
                         // same list (the call-side check is in typeCall).
                         bool admitted = true;
-                        if (ta && ta->kind == TypeRef::Kind::Named &&
-                            ta->declaration) {
+                        if (ta && !mathOrderedTimeValueHead(ta).empty()) {
+                            // fix #7911 (stdlib §2.2, §2.5, §14.2, v0.350):
+                            // `DateTime` / `TimeSpan` / `DateOnly` /
+                            // `TimeOnly` declare `IComparable<Self>`; either
+                            // TypeRef shape (declaration-ful or the
+                            // annotation shape) is admitted. A nullable
+                            // argument is refused below.
+                            admitted = !ta->nullable;
+                        } else if (ta && ta->kind == TypeRef::Kind::Named &&
+                                   ta->declaration) {
                             TypeSymbol* icmp =
                                 ctx_.builtinInterfaceSym("IComparable");
                             admitted = !ta->nullable && icmp &&
