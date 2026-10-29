@@ -17127,6 +17127,17 @@ private:
     // synchronous emitDisposeAndReclaim; present ⇒ await its `DisposeAsync`,
     // then its §28.12 step 2 reclamation on both edges of the await.
     void emitRunTimeAsyncDisposeAwaitAndFree(llvm::Value* obj);
+    // fix #3483 (§28.12 step 2, v0.350): the synchronous half of the fault
+    // edge, shared by both arms. Emitted between the `DisposeAsync` call and
+    // its await: if the call raised (the in-flight slot now holds an exception
+    // other than `excBefore`, the value snapshotted before the call), a
+    // non-`async` implementation threw synchronously and returned no task —
+    // run `emitPhysicalReclamation` (the arm's own reclamation lambda), the
+    // unwind pass, and branch to the unwind target, exactly as the `await.fault`
+    // edge does; otherwise continue to the await.
+    void emitDisposeAsyncSyncThrowEdge(
+        llvm::Value* excBefore,
+        const std::function<void()>& emitPhysicalReclamation);
 
     // fix #3483 / #7417 (§28.12, v0.350, the #3493 ruling): the itmap KEY of
     // the built-in `IAsyncDisposable` dispatch entry. `IAsyncDisposable` has no

@@ -6170,6 +6170,54 @@ void Emitter::emitFreeSpillArea(llvm::Value* self) {
 // path (emitDisposals passes null when isUnwind is true), because awaiting
 // across an already-active unwind is a deferred increment.
 //
+// fix #3483 (§28.12 step 2, v0.350): the SYNCHRONOUS half of the fault edge,
+// shared by the static arm (emitAsyncDisposeAwaitAndFree) and the run-time arm
+// (emitRunTimeAsyncDisposeAwaitAndFree). Step 2's sentence — "when
+// `DisposeAsync` completes by throwing, logical disposal is over — the runtime
+// runs the cascade and the chain, then the exception propagates from the
+// await" — names two ways a `DisposeAsync` completes by throwing. An `async`
+// body's throw becomes a FAULTED TASK, and `emitAwaitSuspend`'s `await.fault`
+// block (its `onFault` hook) is that edge. But the interface member is
+// `method DisposeAsync(): Task;` with `async` an implementation-side modifier
+// (§28.12), so a NON-`async` implementation can throw synchronously: it sets
+// the in-flight slot and returns NO task. Both arms then handed that null to
+// `emitAwaitSuspend`, whose `bz_task_is_done(null)` read 0x10 (MEASURED: SEGV
+// at an `IAsyncDisposable`, `IDisposable`, `Object` and static `new N()` head
+// alike, review probes /var/tmp/bezel-scratch/r37-rev-l4b/p/t2h_*.bzl), while
+// the ordinary call path — `await n.DisposeAsync()` — was fine, because
+// emitMethodCall runs emitPendingCheck after every call.
+//
+// So, between the call and the await: did THIS call raise? The test is
+// `emitDisposalFaultCheck`'s bracket, not a plain non-null (#1878 / #1882): a
+// disposal pass can be reached with somebody else's exception already in the
+// slot, and firing on it would branch out of the pass. On the fault edge the
+// obligation is the `await.fault` block's exactly — the SAME reclamation
+// lambda the arm emits on the task edges (fix #3494's one-lambda discipline,
+// now three edges), then the unwind pass and the branch to the unwind target
+// (catch.dispatch inside a `try`, else the async.fault boundary). The caller
+// nulled the slot before the call, so the unwind pass does not reclaim the
+// object a second time, and no task exists to free.
+void Emitter::emitDisposeAsyncSyncThrowEdge(
+    llvm::Value* excBefore,
+    const std::function<void()>& emitPhysicalReclamation) {
+    llvm::Value* after =
+        builder_.CreateLoad(ptrTy(), emitExcSlot(), "dispasync.postexc");
+    llvm::Value* inFlight = builder_.CreateICmpNE(
+        after, llvm::ConstantPointerNull::get(ptrTy()));
+    llvm::Value* isNew = builder_.CreateICmpNE(after, excBefore);
+    auto* faultBB =
+        llvm::BasicBlock::Create(llvm_, "dispasync.syncfault", currentFn_);
+    auto* contBB =
+        llvm::BasicBlock::Create(llvm_, "dispasync.synccont", currentFn_);
+    builder_.CreateCondBr(builder_.CreateAnd(inFlight, isNew), faultBB, contBB);
+    builder_.SetInsertPoint(faultBB);
+    emitPhysicalReclamation();
+    emitUnwindDisposals();
+    builder_.CreateBr(unwindBB());
+    builder_.SetInsertPoint(contBB);
+}
+
+
 // `obj` is assumed NON-NULL here (the caller null-guards before branching).
 // DisposeAsync's function type is: ptr(ptr) — takes `this`, returns Task*.
 void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
@@ -6301,8 +6349,13 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
             "dispasync.slot");
         callee = builder_.CreateLoad(ptrTy(), slotPtr, "dispasync.fn");
     }
+    llvm::Value* excBefore = snapshotInFlightExc();
     llvm::Value* task = builder_.CreateCall(
         dispAsyncTy, callee, {obj}, "dispasync.task");
+    // fix #3483 (§28.12 step 2, v0.350): a non-`async` `DisposeAsync` that
+    // threw synchronously returned no task — reclaim and propagate here, never
+    // await the null (see emitDisposeAsyncSyncThrowEdge).
+    emitDisposeAsyncSyncThrowEdge(excBefore, emitPhysicalReclamation);
 
     // Await the Task returned by DisposeAsync() — a proper suspend point
     // inside the enclosing async method's Resume function. emitAwaitSuspend
@@ -6411,8 +6464,12 @@ void Emitter::emitRunTimeAsyncDisposeAwaitAndFree(llvm::Value* obj) {
                                kAsyncDisposableItabDisposeAsync)}),
         "dispasync.rt.fn");
     auto* dispAsyncTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* excBefore = snapshotInFlightExc();
     llvm::Value* task =
         builder_.CreateCall(dispAsyncTy, callee, {obj}, "dispasync.rt.task");
+    // fix #3483 (§28.12 step 2, v0.350): the synchronous half of the fault
+    // edge, as in the static arm (see emitDisposeAsyncSyncThrowEdge).
+    emitDisposeAsyncSyncThrowEdge(excBefore, emitPhysicalReclamation);
     emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true,
                      /*takeResultAfter=*/false, /*markSpentAfter=*/false,
                      /*deferTaskFree=*/false, /*freeOnFault=*/false,
