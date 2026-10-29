@@ -591,7 +591,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 321> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 345> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -920,6 +920,23 @@ constexpr std::array<BuiltinParamRow, 321> kBuiltinParams = {{
     {"Float", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: ReadOnlyStringSpan, out result: float): bool"},
     {"Float", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
     {"Float", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    // fix #7546 (stdlib §9.2, spec §5.1, v0.350): the static FP predicates and
+    // equality variants were declared by no row, so no §5.1 argument check ran
+    // (`Float.IeeeEquals(d, d)` over a `double` was admitted).
+    {"Double", "IsNaN", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "IsNaN(value: double): bool"},
+    {"Double", "IsInfinity", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "IsInfinity(value: double): bool"},
+    {"Double", "IsPositiveInfinity", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "IsPositiveInfinity(value: double): bool"},
+    {"Double", "IsNegativeInfinity", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "IsNegativeInfinity(value: double): bool"},
+    {"Double", "IsFinite", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTDouble, 0, 0, 0, 0, 0, 0, 0}, "IsFinite(value: double): bool"},
+    {"Double", "IeeeEquals", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {kBPTDouble, kBPTDouble, 0, 0, 0, 0, 0, 0}, "IeeeEquals(a: double, b: double): bool"},
+    {"Double", "BitwiseEquals", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {kBPTDouble, kBPTDouble, 0, 0, 0, 0, 0, 0}, "BitwiseEquals(a: double, b: double): bool"},
+    {"Float", "IsNaN", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTFloat, 0, 0, 0, 0, 0, 0, 0}, "IsNaN(value: float): bool"},
+    {"Float", "IsInfinity", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTFloat, 0, 0, 0, 0, 0, 0, 0}, "IsInfinity(value: float): bool"},
+    {"Float", "IsPositiveInfinity", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTFloat, 0, 0, 0, 0, 0, 0, 0}, "IsPositiveInfinity(value: float): bool"},
+    {"Float", "IsNegativeInfinity", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTFloat, 0, 0, 0, 0, 0, 0, 0}, "IsNegativeInfinity(value: float): bool"},
+    {"Float", "IsFinite", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTFloat, 0, 0, 0, 0, 0, 0, 0}, "IsFinite(value: float): bool"},
+    {"Float", "IeeeEquals", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {kBPTFloat, kBPTFloat, 0, 0, 0, 0, 0, 0}, "IeeeEquals(a: float, b: float): bool"},
+    {"Float", "BitwiseEquals", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {kBPTFloat, kBPTFloat, 0, 0, 0, 0, 0, 0}, "BitwiseEquals(a: float, b: float): bool"},
     {"Decimal", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): decimal"},
     {"Decimal", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): decimal"},
     {"Decimal", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): decimal?"},
@@ -951,6 +968,18 @@ constexpr std::array<BuiltinParamRow, 321> kBuiltinParams = {{
     // fix #7333 / #7336 (stdlib §2.18, v0.345): the `char` twin of the
     // `Boolean` row above — the form is declared, the vocabulary is empty.
     {"Char", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    // fix #7546 (stdlib §9.5, spec §5.1, v0.350): the `char` static classification
+    // and case-mapping members, which no row declared.
+    {"Char", "IsDigit", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "IsDigit(c: char): bool"},
+    {"Char", "IsLetter", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "IsLetter(c: char): bool"},
+    {"Char", "IsLetterOrDigit", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "IsLetterOrDigit(c: char): bool"},
+    {"Char", "IsWhiteSpace", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "IsWhiteSpace(c: char): bool"},
+    {"Char", "IsUpper", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "IsUpper(c: char): bool"},
+    {"Char", "IsLower", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "IsLower(c: char): bool"},
+    {"Char", "IsControl", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "IsControl(c: char): bool"},
+    {"Char", "IsPunctuation", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "IsPunctuation(c: char): bool"},
+    {"Char", "ToUpper", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "ToUpper(c: char): char"},
+    {"Char", "ToLower", 1, 1, 0x01, {"c", "", "", "", "", "", "", ""}, {kBPTChar, 0, 0, 0, 0, 0, 0, 0}, "ToLower(c: char): char"},
     {"Guid", "Parse", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): Guid"},
     {"Guid", "ParseOrNull", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ParseOrNull(s: string): Guid?"},
     {"Guid", "TryParse", 2, 2, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, kBPTOut, 0, 0, 0, 0, 0, 0}, "TryParse(s: string, out result: Guid): bool"},
