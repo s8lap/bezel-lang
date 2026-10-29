@@ -37341,6 +37341,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         } else if (ta && ta->kind != TypeRef::Kind::Primitive) {
                             admitted = false;
                         }
+                        // per §14.2 / §27.6 (v0.350, #6295 part 3): a
+                        // NULLABLE type argument never satisfies an interface
+                        // constraint ("nullable types do not implement
+                        // interface constraints"); `Math.Max<int?>` used to
+                        // pass for a nullable primitive and die in codegen
+                        // ("could not lower a comparison", at 0:0).
+                        if (ta && ta->nullable) admitted = false;
                         if (ta && !admitted) {
                             ctx_.diagnostics().report(
                                 Severity::Error, ma.span.begin,
