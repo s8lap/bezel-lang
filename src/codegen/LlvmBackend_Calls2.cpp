@@ -9263,6 +9263,21 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // §22.5's evaluation order is honoured: expressions run once, in source
     // order. The binding tells the builtin arm which source argument feeds
     // which parameter slot.
+    // fix #7548 (§22.5, v0.350): the pre-pass PINS each argument's value so
+    // the arm's own `lowerExpr` returns it instead of evaluating the argument a
+    // second time. It used to lower each argument and DISCARD the value, so a
+    // reordered named call evaluated every side-effecting argument twice
+    // (`Math.Pow(y := F(), x := G())` ran F G F G; `Math.Fmod` ran it three
+    // times). §22.5: arguments are evaluated exactly once, in written order.
+    // The pins belong to THIS lowering of `call` and are dropped when the
+    // function returns, whichever arm returns, so a second lowering of the same
+    // node (a monomorphized clone) never sees a stale value. Same mechanism as
+    // the constructor twin in `lowerNew` (#7498).
+    struct CallArgPins {
+        std::unordered_map<const ast::Expr*, llvm::Value*>& map;
+        std::vector<const ast::Expr*> pins;
+        ~CallArgPins() { for (const ast::Expr* e : pins) map.erase(e); }
+    } callArgPins{exprValueOverride_, {}};
     if (const auto* bnd = ctx_.builtinCallBinding(call)) {
         // Check for non-identity (a reorder is pending).
         bool isNonIdentity = false;
@@ -9279,18 +9294,13 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     // modifiers, discards). These are positional-only and always
                     // sit in the identity prefix of any binding.
                     if (arg.isDiscard || !arg.modifier.empty()) continue;
-                    (void)lowerExpr(*arg.value);
-                    // If lowerExpr returned nullptr, the builtin arm will also
-                    // return nullptr; leave the partial pins in place (they
-                    // belong to this call and no other call's expressions can
-                    // collide with them).
+                    if (exprValueOverride_.count(arg.value.get())) continue;
+                    if (llvm::Value* pv = lowerExpr(*arg.value)) {
+                        exprValueOverride_[arg.value.get()] = pv;
+                        callArgPins.pins.push_back(arg.value.get());
+                    }
                 }
             }
-            // The pinned values are in exprValueOverride_; the builtin arm's
-            // lowerExpr calls will find them and use the pre-computed values.
-            // exprValueOverride_ is not cleared here — entries from a single
-            // call's pre-pass do not collide with later calls (each call has
-            // unique expression pointers).
         }
     }
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
