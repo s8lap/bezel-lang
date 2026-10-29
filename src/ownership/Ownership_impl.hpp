@@ -2418,6 +2418,17 @@ private:
     // A missed borrow for T=class is acceptable at this stage (§14).
     static bool isBorrowableType(const sema::TypeRef* rt);
 
+    // §28.3 row 4 (v0.350), #7825: `isBorrowableType` plus the declaration-less
+    // builtin CLASSES (`StringBuilder`, `Random`, the plain/owning collections)
+    // whose Named TypeRef carries no `TypeDecl`. The owned-sink classifier
+    // (`ownedArgSourceIsBorrow`) gates its field / indexer / property reads on
+    // this, so a borrow of such a builtin flowing into an `owned` sink (an
+    // `owned` return, argument or field store) is rejected exactly as the
+    // user-class twin is. Deliberately NOT folded into `isBorrowableType`
+    // itself: its ~35 other callers (escape/lifetime checks) keep their
+    // classification.
+    static bool isBorrowableOwnedSinkType(const sema::TypeRef* rt);
+
     // §28.3 borrow-escape gate: true when the returned expression could
     // be a borrow aliasing into its identifier root (so it must be checked
     // against `using var` scope). False when the returned value is a

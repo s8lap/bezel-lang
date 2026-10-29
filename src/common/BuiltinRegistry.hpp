@@ -50,6 +50,17 @@ bool isOwningTypeHead(std::string_view head);
 // an unmarked return of one (#5123, v0.313).
 bool isPlainBuiltinCollectionHead(std::string_view head);
 
+// The declaration-less builtin CLASS heads whose instance is a heap reference a
+// place read BORROWS (§28.3 row 4, v0.350): the plain builtin collections
+// (`isPlainBuiltinCollectionHead`), the owning collections
+// (`isOwningCollectionHead`), and the trivial-dispose stdlib classes
+// `StringBuilder` and `Random` (§28.9). Like a user class they carry no
+// `ast::TypeDecl`, so `isBorrowableType` (which reads `declaration->kind`) cannot
+// see them; the owned-sink classifier (`ownedArgSourceIsBorrow`) asks this
+// predicate for them. Excludes the value builtins, the Task family and the
+// owning wrappers, whose sink contracts differ. // per §28.3 row 4, §28.9, #7825
+bool isBorrowBearingBuiltinClassHead(std::string_view head);
+
 // The Task-family type heads — `Task` and `OwningTask` (§28.3 "Task-family
 // calls produce owned frames", v0.190, SB-01). A pre-substitution, name-keyed
 // test used by the ownership pass to recognize a `Task`/`Task<T>` return whose

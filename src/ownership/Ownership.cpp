@@ -5321,7 +5321,10 @@ static bool isArrayOrClassOrInterfaceForMeet(const sema::TypeRef* rt) {
         return false;
     if (rt->astNode && rt->astNode->name &&
         rt->astNode->name->parts.size() == 1) {
-        if (rt->headName() == "Array")
+        // §28.3 row 4 (v0.350), #7825: every declaration-less borrow-bearing
+        // builtin class (StringBuilder, Random, the collections), not `Array`
+        // alone -- `s ?? new StringBuilder(..)` is the same mixed meet.
+        if (common::isBorrowBearingBuiltinClassHead(rt->headName()))
             return true;
     }
     return false;

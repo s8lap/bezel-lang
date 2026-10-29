@@ -3987,6 +3987,17 @@ bool MethodOwnership::isBorrowableType(const sema::TypeRef* rt) {
     }
 }
 
+// §28.3 row 4 (v0.350), #7825: see the header. A declaration-less builtin class
+// (`StringBuilder`, `Random`, a plain/owning collection) is a heap class
+// reference like a user class; `isBorrowableType` cannot see it because it reads
+// `declaration->kind`. // per §28.3 row 4, §28.9
+bool MethodOwnership::isBorrowableOwnedSinkType(const sema::TypeRef* rt) {
+    if (isBorrowableType(rt)) return true;
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    return common::isBorrowBearingBuiltinClassHead(rt->headName());
+}
+
 // §28.3: decide whether a returned expression could carry a borrow that
 // aliases into its identifier root. A *value-typed* return (the spec's
 // "value-typed returns") is a copy and can never outlive its source, so
@@ -17977,7 +17988,7 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
             // "not over-rejected" semantics — T erases to a by-value
             // boundary and the conservative answer is to NOT classify as
             // borrow (mirrors #1985's own generic-param carve-out).
-            if (!isBorrowableType(ctx_.exprType(*e))) return false;
+            if (!isBorrowableOwnedSinkType(ctx_.exprType(*e))) return false;
             // Fall through to the place-read branches below — same code path
             // as the bare-identifier / bare-field cases. // per §17.8
         } else {
@@ -18037,8 +18048,26 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // `isBorrowableType` is conservative (unknown → borrowable), and no legal
     // owned producer is a bare IndexExpr, so flagging an untyped one is sound.
     // // per §28.3, §28.8.1, §28.11
-    if (!unwrappedMove && dynamic_cast<const ast::IndexExpr*>(e)) {
-        return isBorrowableType(ctx_.exprType(*e));
+    if (!unwrappedMove) {
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            // §15.6 / §28.3 (#7825): a RANGE index (`xs[0..1]`, `xs[r]`) is a
+            // slice -- a FRESH copy, never a slot borrow. A declared class never
+            // reached this point for a builtin slice (declaration-less result
+            // types were not borrowable before the builtin-class widening), so
+            // the exemption is scoped to a declaration-less result.
+            const sema::TypeRef* rt = ctx_.exprType(*e);
+            if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                !rt->declaration && !ix->indices.empty() &&
+                ix->indices[0].value) {
+                const ast::Expr* idx = ix->indices[0].value.get();
+                if (dynamic_cast<const ast::RangeExpr*>(idx)) return false;
+                const sema::TypeRef* idxTy = ctx_.exprType(*idx);
+                if (idxTy && idxTy->kind == sema::TypeRef::Kind::Named &&
+                    idxTy->declaration && idxTy->declaration->isBuiltinRangeSym())
+                    return false;
+            }
+            return isBorrowableOwnedSinkType(rt);
+        }
     }
     // §28.3 (issue #407): a *bare* read of ANY class-typed field `obj.f` — owned
     // OR non-owned — is Borrowed ("Field access `obj.f` where `f` is not `owned`
@@ -18056,12 +18085,12 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
             if (sema::Symbol* msym = ctx_.exprSymbol(*ma)) {
                 if (dynamic_cast<sema::FieldSymbol*>(msym))
-                    return isBorrowableType(ctx_.exprType(*e));
+                    return isBorrowableOwnedSinkType(ctx_.exprType(*e));
                 // fix #5236 (A4, §28.8, v0.313): "Accessor read faces are
                 // lend-only ... every accessor read classifies as a borrow" —
                 // a property read `obj.P` is a borrow, never an owned producer.
                 if (dynamic_cast<sema::PropertySymbol*>(msym))
-                    return isBorrowableType(ctx_.exprType(*e));
+                    return isBorrowableOwnedSinkType(ctx_.exprType(*e));
             }
         }
     }
@@ -18194,7 +18223,7 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     // (implicit-`this` accessor read) is a borrow — accessor read faces are
     // lend-only. The type gate excludes value-typed properties.
     if (!unwrappedMove && dynamic_cast<sema::PropertySymbol*>(sym))
-        return isBorrowableType(ctx_.exprType(*id));
+        return isBorrowableOwnedSinkType(ctx_.exprType(*id));
     // A bare identifier resolving to a non-`owned` parameter is a borrowed
     // parameter (source: the caller's frame, §28.3 producers "Parameter `p`
     // (no modifier) | Borrowed (source: caller)") — handing it to an `owned`
@@ -18230,7 +18259,7 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
         // instance-only, so accepting it double-frees, #2021). // per §28.8.1, §28.6, §28.3, §22.13
         if (unwrappedMove && exprIsOwnedFieldRead(*id))
             return ownedFieldMoveReceiverIsBorrow(*id);
-        return isBorrowableType(ctx_.exprType(*id));
+        return isBorrowableOwnedSinkType(ctx_.exprType(*id));
     }
     // §19.3 / §28.8 (#1280): a record-DESTRUCTURING pattern binding (`case b
     // Box(a) => Prog.Sink(a)`) is a non-destructive BORROW of the matched field —
@@ -18255,7 +18284,7 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
     if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
         if (loc->decl && dynamic_cast<const ast::ForStmt*>(loc->decl)) {
             const sema::TypeRef* et = ctx_.exprType(*id);
-            if (isBorrowableType(et)) return true;
+            if (isBorrowableOwnedSinkType(et)) return true;
             // A declaration-less builtin collection element (`Array<int>` in
             // `Array<Array<int>>`) is a class instance too (§28.3 row 4,
             // v0.313), which isBorrowableType leaves unclassified.
@@ -18287,7 +18316,7 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
             // #4617's mark, so the owned sink is the ONLY disposer.
             // // per §35.5, §28.8, §28.3 K3.4, v0.307
             if (isOwningMatchTransferredArmBinding(loc)) return false;
-            return isBorrowableType(ctx_.exprType(*id));
+            return isBorrowableOwnedSinkType(ctx_.exprType(*id));
         }
     }
     // Anything else we cannot positively classify as a borrow: conservatively
@@ -18506,7 +18535,36 @@ void MethodOwnership::checkOwnedReturnDirectBorrow(const ast::Expr& e) {
         }
     }
     if (isUnassignedHeapCollectionLiteralLocal(e)) return;  // #5278
-    if (!ownedArgSourceIsBorrow(e)) return;
+    // §28.3 row 4 (v0.350), §21.9 / §28.6 *Methods returning `this`*, #7825: a
+    // BUILTIN StringBuilder fluent member (`Append`, `Insert`, `Replace`, ...:
+    // declared `: StringBuilder`, no `owned`) returns its receiver under another
+    // name -- "a borrow of the receiver". `return s.Append("x")` therefore returns
+    // exactly what `return s` does, and is a borrow iff the chain's ROOT is. Peel
+    // the chain and classify the root with the same predicate; a root that is a
+    // producer (`new StringBuilder()`, a call returning `owned`) is not a place
+    // read, so the unbound-temporary chain stays accepted.
+    const ast::Expr* classified = &e;
+    {
+        const ast::Expr* root = &e;
+        while (auto* ce = dynamic_cast<const ast::CallExpr*>(root)) {
+            auto* ma = ce->callee
+                           ? dynamic_cast<const ast::MemberAccessExpr*>(
+                                 ce->callee.get())
+                           : nullptr;
+            if (!ma || !ma->target) break;
+            auto isBareSb = [&](const ast::Expr& x) {
+                const sema::TypeRef* t = ctx_.exprType(x);
+                return t && t->kind == sema::TypeRef::Kind::Named &&
+                       !t->declaration && t->headName() == "StringBuilder";
+            };
+            if (!isBareSb(*ce) || !isBareSb(*ma->target)) break;
+            // A user extension method on StringBuilder is an ordinary call.
+            if (dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ma))) break;
+            root = ma->target.get();
+        }
+        classified = root;
+    }
+    if (!ownedArgSourceIsBorrow(*classified)) return;
     report(
         Severity::Error, e.span.begin,
         "a borrow cannot be returned as an `owned` value: the declared "

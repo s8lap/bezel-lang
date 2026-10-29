@@ -1304,6 +1304,11 @@ bool isPlainBuiltinCollectionHead(std::string_view head) {
     return contains(kPlainBuiltinCollectionHeads, head);
 }  // per §28.3 row 4 (v0.313) — plain builtin collection class heads
 
+bool isBorrowBearingBuiltinClassHead(std::string_view head) {
+    return isPlainBuiltinCollectionHead(head) || isOwningCollectionHead(head) ||
+           head == "StringBuilder" || head == "Random";
+}  // per §28.3 row 4 (v0.350), §28.9 — declaration-less borrow-bearing builtin classes
+
 bool isOwningTypeHead(std::string_view head) {
     return contains(kOwningTypeHeads, head);
 }  // per §28.3 / §5.11 — owning-type heads (collections + wrappers)
