@@ -1737,6 +1737,7 @@ void*   bz_str_pad(const void* self, int64_t totalWidth,
                    int32_t padChar, int8_t align);
 // Replace(old, new): fresh string with all occurrences of `old` replaced.
 void*   bz_str_replace(const void* self, const void* old_str, const void* new_str);
+void*   bz_str_join(const void* sep, void* arr);   // #7485: code-point-domain string.Join (borrows both; fresh +1)
 // Split(sep: char): fresh Array<string> split at every code point equal to sep.
 void*   bz_str_split_cp(const void* self, int32_t sep);
 // Split(sep: string): fresh Array<string> split at every occurrence of sep.

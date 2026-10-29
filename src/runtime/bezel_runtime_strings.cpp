@@ -1092,6 +1092,38 @@ extern "C" void* bz_str_remove(const void* self_p, int64_t start, int64_t count)
     return r;
 }
 
+// §9.6: string.Join(separator, items): string -- the elements of `items` (a
+// `bz_array_t*` of `bz_string*`, 8 bytes each) with `separator` between
+// consecutive ones, built in the CODE-POINT domain (fix #7485, spec §4.6: "The
+// choice of width is invisible at the language level; programs observe only the
+// `char` sequence and its length"). Each operand is read at ITS OWN width and
+// the result is packed at the narrowest width that fits it (bz_str_pack_cps).
+// Borrows `sep` and every element; returns a fresh +1 string.
+extern "C" void* bz_str_join(const void* sep_p, void* arr) {
+    const auto* sep = (const bz_string_struct*)sep_p;
+    int64_t n = arr ? bz_array_len(arr) : 0;
+    int64_t sepLen = sep ? sep->len : 0;
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const auto* e = *(const bz_string_struct* const*)bz_array_ptr_at(arr, i, 8);
+        if (i > 0) total += sepLen;
+        if (e) total += e->len;
+    }
+    uint32_t* out =
+        (uint32_t*)malloc((size_t)(total > 0 ? total : 1) * sizeof(uint32_t));
+    int64_t off = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (i > 0)
+            for (int64_t k = 0; k < sepLen; ++k) out[off++] = bz_str_cp(sep, k);
+        const auto* e = *(const bz_string_struct* const*)bz_array_ptr_at(arr, i, 8);
+        if (e)
+            for (int64_t k = 0; k < e->len; ++k) out[off++] = bz_str_cp(e, k);
+    }
+    void* r = bz_str_pack_cps(out, off);
+    free(out);
+    return r;
+}
+
 // §9.6: Replace(oldChar, newChar): string — replace every occurrence of the
 // CODE POINT `oldCp` with the code point `newCp`. The `char` parameters are
 // code points (§4.6), not bytes.

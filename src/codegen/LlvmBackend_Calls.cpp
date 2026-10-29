@@ -14498,98 +14498,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (!lowerSeparator()) return nullptr;
         }
         if (!arr) return nullptr;
-        // Emit inline join: iterate parts, concat sep+part (skip sep before first)
-        auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-        auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
-        llvm::Value* len = builder_.CreateCall(lenFn, {arr});
-        // Compute total output length
-        auto* totSlot = entryAlloca(i64());
-        auto* idxSlot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), totSlot);
-        builder_.CreateStore(builder_.getInt64(0), idxSlot);
-        auto* condBB = llvm::BasicBlock::Create(llvm_, "jn.lc", currentFn_);
-        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "jn.lb", currentFn_);
-        auto* doneL  = llvm::BasicBlock::Create(llvm_, "jn.ld", currentFn_);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(condBB);
-        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-        builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, doneL);
-        builder_.SetInsertPoint(bodyBB);
-        llvm::Value* ep = builder_.CreateCall(ptrFn, {arr, idx, builder_.getInt64(8)});
-        llvm::Value* elem = builder_.CreateLoad(ptrTy(), ep);
-        llvm::Value* elen = loadStringLen(elem);
-        llvm::Value* tot = builder_.CreateLoad(i64(), totSlot);
-        // Add sep length for all except first element
-        llvm::Value* notFirst = builder_.CreateICmpSGT(idx, builder_.getInt64(0));
-        llvm::Value* sepLen = loadStringLen(sep);
-        llvm::Value* addSep = builder_.CreateSelect(notFirst, sepLen, builder_.getInt64(0));
-        builder_.CreateStore(builder_.CreateAdd(tot, builder_.CreateAdd(elen, addSep)), totSlot);
-        builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
-        builder_.CreateBr(condBB);
-        builder_.SetInsertPoint(doneL);
-        // Allocate output buffer and fill
-        llvm::Value* total = builder_.CreateLoad(i64(), totSlot);
-        auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-        auto* memcpyFn = declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
-        llvm::Value* outBuf = builder_.CreateCall(mallocFn, {
-            builder_.CreateAdd(total, builder_.getInt64(1))});
-        auto* offSlot = entryAlloca(i64());
-        auto* idx2Slot = entryAlloca(i64());
-        builder_.CreateStore(builder_.getInt64(0), offSlot);
-        builder_.CreateStore(builder_.getInt64(0), idx2Slot);
-        auto* condBB2 = llvm::BasicBlock::Create(llvm_, "jn.wc", currentFn_);
-        auto* bodyBB2 = llvm::BasicBlock::Create(llvm_, "jn.wb", currentFn_);
-        auto* doneL2  = llvm::BasicBlock::Create(llvm_, "jn.wd", currentFn_);
-        builder_.CreateBr(condBB2);
-        builder_.SetInsertPoint(condBB2);
-        llvm::Value* idx2 = builder_.CreateLoad(i64(), idx2Slot);
-        builder_.CreateCondBr(builder_.CreateICmpSLT(idx2, len), bodyBB2, doneL2);
-        builder_.SetInsertPoint(bodyBB2);
-        llvm::Value* off = builder_.CreateLoad(i64(), offSlot);
-        // Copy separator if not first
-        auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-        llvm::Value* notFirst2 = builder_.CreateICmpSGT(idx2, builder_.getInt64(0));
-        auto* sepCopyBB = llvm::BasicBlock::Create(llvm_, "jn.sc", currentFn_);
-        auto* partBB = llvm::BasicBlock::Create(llvm_, "jn.pc", currentFn_);
-        builder_.CreateCondBr(notFirst2, sepCopyBB, partBB);
-        builder_.SetInsertPoint(sepCopyBB);
-        llvm::Value* sepData = loadStringData(sep);
-        llvm::Value* sepLen2 = loadStringLen(sep);
-        llvm::Value* dstSep = builder_.CreateGEP(i8Ty, outBuf, off);
-        builder_.CreateCall(memcpyFn, {dstSep, sepData, sepLen2});
-        llvm::Value* off2 = builder_.CreateAdd(off, sepLen2);
-        builder_.CreateBr(partBB);
-        builder_.SetInsertPoint(partBB);
-        auto* phi = builder_.CreatePHI(i64(), 2);
-        phi->addIncoming(off, bodyBB2);   // no-sep path (false branch from bodyBB2)
-        phi->addIncoming(off2, sepCopyBB); // sep-copied path
-        // Actually need the right predecessor — rebuild using simpler pattern
-        // Copy element
-        llvm::Value* ep2 = builder_.CreateCall(ptrFn, {arr, idx2, builder_.getInt64(8)});
-        llvm::Value* elem2 = builder_.CreateLoad(ptrTy(), ep2);
-        llvm::Value* edata = loadStringData(elem2);
-        llvm::Value* elen2 = loadStringLen(elem2);
-        llvm::Value* dstElem = builder_.CreateGEP(i8Ty, outBuf, phi);
-        builder_.CreateCall(memcpyFn, {dstElem, edata, elen2});
-        llvm::Value* newOff = builder_.CreateAdd(phi, elen2);
-        builder_.CreateStore(newOff, offSlot);
-        builder_.CreateStore(builder_.CreateAdd(idx2, builder_.getInt64(1)), idx2Slot);
-        builder_.CreateBr(condBB2);
-        builder_.SetInsertPoint(doneL2);
-        // NUL terminate
-        llvm::Value* finalOff = builder_.CreateLoad(i64(), offSlot);
-        llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, outBuf, finalOff);
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-        // Wrap in bz.string
-        auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
-        uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
-        llvm::Value* strObj = builder_.CreateCall(callocFn2,
-            {builder_.getInt64(1), builder_.getInt64(strSz)});
-        builder_.CreateStore(outBuf, builder_.CreateStructGEP(stringType(), strObj, 0));
-        builder_.CreateStore(total, builder_.CreateStructGEP(stringType(), strObj, 1));
-        builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
-            builder_.CreateStructGEP(stringType(), strObj, 2));
-            initStringRc(strObj);  // #422: producer's reference, rc := 1
+        // fix #7485 (spec §4.6, stdlib §9.6, v0.350): the join is built by the
+        // runtime, in the CODE-POINT domain. The inline loop this replaces
+        // allocated `total + 1` BYTES, `memcpy`'d each separator / element's
+        // code-point COUNT (`loadStringLen`) as a BYTE count, and stored width =
+        // 1 in the result -- so a width-2 element (`"日"`) rendered as its low
+        // byte and a width-4 one as garbage, though §4.6 says "The choice of
+        // width is invisible at the language level; programs observe only the
+        // `char` sequence and its length". `bz_str_join` reads every code point
+        // of the separator and of each element at that string's own width and
+        // packs the result at the narrowest width that fits (the same shape the
+        // #7425 transform helpers use), returning a fresh rc := 1 `bz.string`.
+        // The elements and the separator are only READ (the join borrows them),
+        // as before.
+        auto* joinFn = declareC("bz_str_join", ptrTy(), {ptrTy(), ptrTy()});
+        llvm::Value* strObj = builder_.CreateCall(joinFn, {sep, arr}, "join.str");
         // per stdlib §9.6 (#1182): reclaim the materialized snapshot AFTER the
         // joined string is fully built. NULL element disposer: the join borrowed
         // the element strings (copied their bytes) — frees only the snapshot's
