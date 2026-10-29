@@ -123,6 +123,23 @@ const char kIoPreludeSource[] =
     "  Read, Write, ReadWrite;\n"
     "end FileAccess;\n";
 
+// stdlib §2.5 (v0.350, issue #7536): the System.DateTime enums. Same mechanism
+// as the System.IO enums above: pure Bezel declarations spelled VERBATIM from
+// stdlib §2.5, so every user-enum rule applies unchanged and a user top-level
+// type of the same name shadows them (injectOnePrelude). Declaration order
+// fixes the ordinals: DayOfWeek Sunday = 0 ... Saturday = 6 (the value
+// bz_datetime_day_of_week returns) and DateTimeKind Unspecified = 0, Utc = 1,
+// Local = 2.
+const char kTimePreludeSource[] =
+    "module __bezel_prelude_time__;\n"
+    "public enum DayOfWeek: byte\n"
+    "  Sunday, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday;\n"
+    "end DayOfWeek;\n"
+    "\n"
+    "public enum DateTimeKind: byte\n"
+    "  Unspecified, Utc, Local;\n"
+    "end DateTimeKind;\n";
+
 // Parse ONE auto-imported stdlib prelude source and PREPEND its top-level
 // declarations to `unit`. The prelude sources are program-lifetime constants,
 // so the AST string_views into them stay valid for the whole compilation;
@@ -181,6 +198,8 @@ void injectStdlibPrelude(ast::SourceFile& unit) {
     static const std::string ioSrc(kIoPreludeSource);
     injectOnePrelude(unit, resultSrc);   // stdlib §2.20 Result<T, E>
     injectOnePrelude(unit, ioSrc);       // stdlib §7.1/§7.2 System.IO enums
+    static const std::string timeSrc(kTimePreludeSource);
+    injectOnePrelude(unit, timeSrc);     // stdlib §2.5 DayOfWeek / DateTimeKind
 }
 
 // Proposal 0082 §3 stage-1 PROTOTYPE (#3048), reached only when
@@ -282,6 +301,8 @@ std::string Driver::preludeSourceFingerprint() {
     s += kResultPreludeSource;   // stdlib §2.20 Result<T, E>
     s += '\0';
     s += kIoPreludeSource;       // stdlib §7.1/§7.2 System.IO enums
+    s += '\0';
+    s += kTimePreludeSource;     // stdlib §2.5 DayOfWeek / DateTimeKind
     return s;
 }
 
