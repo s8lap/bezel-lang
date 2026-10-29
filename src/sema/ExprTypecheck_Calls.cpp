@@ -230,8 +230,8 @@ void checkCallSiteInlineArrayArg(
 // builtin carries (annotation `astNode`, `builtinClassSym` declaration, and the
 // IMPORTED `importedName`), and never matches a user type that shadows the name
 // (a user declaration carries a non-null `decl`).
-static bool isBuiltinTimeValueRecord(const TypeRef* t) {
-    if (!t || t->kind != TypeRef::Kind::Named) return false;
+static std::string_view builtinTimeValueHead(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return {};
     std::string_view h;
     if (!t->declaration) {
         if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
@@ -241,8 +241,32 @@ static bool isBuiltinTimeValueRecord(const TypeRef* t) {
     } else if (!t->declaration->decl) {
         h = t->declaration->name;
     }
-    return h == "DateTime" || h == "TimeSpan" || h == "DateOnly" ||
-           h == "TimeOnly" || h == "Guid";
+    if (h == "DateTime" || h == "TimeSpan" || h == "DateOnly" ||
+        h == "TimeOnly" || h == "Guid")
+        return h;
+    return {};
+}
+
+static bool isBuiltinTimeValueRecord(const TypeRef* t) {
+    return !builtinTimeValueHead(t).empty();
+}
+
+// fix #7900 (stdlib §2.2, §2.5, spec §14.2, v0.350): `Math.Min` / `Max` /
+// `Clamp<T>` are declared `where T: IComparable<T>`, and stdlib §2.5 declares
+// `IComparable<Self>` on `DateTime`, `TimeSpan`, `DateOnly` and `TimeOnly`
+// (each a plain scalar word the Math lowering compares). `Guid` also declares
+// it (stdlib §2.5) but is not a scalar word and keeps its pre-existing
+// refusal here. Returns the head name, or empty.
+//
+// An IMPORTED user type of the same name also has `declaration->decl == nullptr`
+// and is told from the builtin only by `moduleName` (isUserDeclaredTypeSym); it
+// declares no IComparable, so it is NOT matched here and keeps the constraint
+// refusal. (builtinTimeValueHead is shared with member-read typing, which
+// keeps its old behaviour.)
+static std::string_view mathOrderedTimeValueHead(const TypeRef* t) {
+    if (t && t->declaration && !t->declaration->moduleName.empty()) return {};
+    std::string_view h = builtinTimeValueHead(t);
+    return h == "Guid" ? std::string_view{} : h;
 }
 
 const char* classificationName(common::ChoiceClassification c) {
@@ -18985,8 +19009,71 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     "to `string` before calling `Math." +
                                     std::string(ma->member) + "` (stdlib §2.2)");
                             }
+                        // fix #7900 (stdlib §2.2, §2.5, spec §14.2, v0.350):
+                        // `DateTime` / `TimeSpan` / `DateOnly` / `TimeOnly`
+                        // declare `IComparable<Self>` (stdlib §2.5), so they
+                        // satisfy §2.2's `where T: IComparable<T>`. The value
+                        // produced by a stdlib CALL (`TimeSpan.FromSeconds`,
+                        // `DateTime.AddDays`) carries the `builtinClassSym`
+                        // declaration, a Class with no base list, which the
+                        // block below refused as "not an IComparable". It is
+                        // admitted here and the call is typed T. An un-narrowed
+                        // nullable is still refused (§14.2).
+                        TypeRef* timeProbe = nullptr;
+                        if (mathNarrowedOk) {
+                            const TypeRef* probe = mathArgType(*ce.args[0].value);
+                            if (probe && probe->declaration &&
+                                !mathOrderedTimeValueHead(probe).empty())
+                                timeProbe = const_cast<TypeRef*>(probe);
+                        }
+                        if (timeProbe) {
+                            const std::string_view head =
+                                mathOrderedTimeValueHead(timeProbe);
+                            bool ok = true;
+                            if (timeProbe->nullable) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "nullable type `" + std::string(head) +
+                                    "?` does not satisfy the `where T: "
+                                    "IComparable<T>` constraint — nullable "
+                                    "types do not implement interface "
+                                    "constraints (§14.2)");
+                                ok = false;
+                            }
+                            for (const auto& arg : ce.args) {
+                                if (!ok) break;
+                                if (!arg.value) continue;
+                                const TypeRef* at = mathArgType(*arg.value);
+                                if (!at) continue;
+                                if (at->nullable) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, arg.value->span.begin,
+                                        "nullable type `" +
+                                        std::string(head) + "?` does not "
+                                        "satisfy the `where T: "
+                                        "IComparable<T>` constraint — "
+                                        "nullable types do not implement "
+                                        "interface constraints (§14.2)");
+                                    ok = false;
+                                } else if (mathOrderedTimeValueHead(at) !=
+                                           head) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, arg.value->span.begin,
+                                        "inconsistent type-argument inference: "
+                                        "type parameter `T` of `Math." +
+                                        std::string(ma->member) +
+                                        "` is `" + std::string(head) +
+                                        "`, but this argument is not (§14.5, "
+                                        "stdlib §2.2); all arguments for a "
+                                        "type parameter must agree");
+                                    ok = false;
+                                }
+                            }
+                            if (ok) ctx_.setExprType(&ce, timeProbe);
+                        }
                         if (auto* argTy = ctx_.exprType(*ce.args[0].value))
-                            if (argTy->kind == TypeRef::Kind::Named &&
+                            if (!timeProbe &&
+                                argTy->kind == TypeRef::Kind::Named &&
                                 argTy->declaration &&
                                 (argTy->declaration->kind ==
                                      ast::TypeDeclKind::Record ||
