@@ -690,6 +690,7 @@ inline TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
     sym->visibility = td.visibility;
     sym->modifiers = td.modifiers;
     sym->decl = &td;
+    sym->isSynthesizedPrelude = td.isSynthesizedPrelude;
     sym->moduleName = moduleDottedName(ctx.module());
     sym->declLoc = td.span.begin;
     sym->scope = parentScope;

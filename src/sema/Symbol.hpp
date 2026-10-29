@@ -140,6 +140,11 @@ struct SerializedPolyCase {
 
 struct TypeSymbol : Symbol {
     ast::TypeDeclKind kind = ast::TypeDeclKind::Class;
+    // True for a type the Driver injected from a stdlib prelude source (e.g.
+    // the §2.5 `DayOfWeek` enum) rather than one the user declared. Copied
+    // from `ast::TypeDecl::isSynthesizedPrelude` at collection so sema reads
+    // the fact off the symbol, not the AST (#3152 imported-symbol seam).
+    bool isSynthesizedPrelude = false;
     ast::Visibility visibility = ast::Visibility::None;
     // A.3 `Modifier` (v0.242): "abstract", "closed", "sealed", "static".
     // Read through the predicates below, not by hand — see their comment.

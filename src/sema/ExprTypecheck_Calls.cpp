@@ -34053,9 +34053,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     if (ctx_.module()) {
                         for (Symbol* child : ctx_.module()->children) {
                             auto* ts = dynamic_cast<TypeSymbol*>(child);
-                            auto* td = ts ? dynamic_cast<const ast::TypeDecl*>(ts->decl)
-                                          : nullptr;
-                            if (td && td->isSynthesizedPrelude &&
+                            if (ts && ts->isSynthesizedPrelude &&
                                 ts->name == "DayOfWeek") {
                                 dow = ts;
                                 break;
