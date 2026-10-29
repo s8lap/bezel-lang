@@ -20104,6 +20104,31 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                     continue;
                 }
             }
+            // fix #7912 (§26.3, v0.350): "No member named `Dispose` or
+            // `DisposeAsync`: the names are the disposal surface (§8.7),
+            // which an extension cannot supply ... so the declaration is a
+            // compile error, the posture §28.2 takes for a class or record."
+            {
+                std::string_view memberName;
+                SourceLocation loc{};
+                if (auto* md = dynamic_cast<const ast::MethodDecl*>(m.get())) {
+                    memberName = md->name; loc = md->span.begin;
+                } else if (auto* pd =
+                               dynamic_cast<const ast::PropertyDecl*>(m.get())) {
+                    memberName = pd->name; loc = pd->span.begin;
+                }
+                if (memberName == "Dispose" || memberName == "DisposeAsync") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "an extension block may not declare a member named `" +
+                        std::string(memberName) + "` \xe2\x80\x94 the names "
+                        "`Dispose` and `DisposeAsync` are the disposal surface "
+                        "(\xc2\xa7""8.7), which an extension cannot supply: its "
+                        "receiver is a borrow it may not dispose "
+                        "(\xc2\xa7""26.7) (\xc2\xa7""26.3, v0.350)");
+                    continue;
+                }
+            }
             // §26.3 (#1346, v0.160): extension members must be `public` or
             // `internal`; `protected` and `private` are compile errors — an
             // extension block has no declaring class and no inheritance, so
