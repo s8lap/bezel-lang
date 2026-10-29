@@ -5934,11 +5934,13 @@ static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
 // helper (below), but `typeCall` — which is earlier in this file — uses it.
 static void checkBuiltinStringCallArity(SemaContext& ctx,
                                          const ast::CallExpr& ce);
-// fix #7810 / #7850 (stdlib §4, v0.350): the built-in collection members'
-// ARITY gate; defined beside the collection argument check (below), used by
-// `typeCall` (earlier in this file).
+// fix #7810 / #7850 / #7864 (stdlib §4, §7.4, v0.350): the built-in collection
+// members' and `Path` statics' ARITY gates; defined beside the collection
+// argument check (below), used by `typeCall` (earlier in this file).
 static void checkBuiltinCollectionCallArity(SemaContext& ctx,
                                              const ast::CallExpr& ce);
+static void checkBuiltinPathCallArity(SemaContext& ctx, const ast::CallExpr& ce,
+                                       Symbol* calleeSym);
 
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
@@ -19188,6 +19190,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // assertion, exit 134). Run the §7 check against the instantiated
     // element/key type so the builtin path agrees with the user-method path.
     checkBuiltinCollectionCallArity(ctx_, ce);
+    checkBuiltinPathCallArity(ctx_, ce, calleeSym);
     checkBuiltinCollectionCallArgs(ce);
 
     // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin — a builtin
@@ -24753,6 +24756,43 @@ static void checkBuiltinCollectionCallArity(SemaContext& ctx,
             ", so the call is a compile error with no candidates cited "
             "(§22.6; instance members block by name at any arity, "
             "§26.5 rule 1)");
+}
+
+// fix #7864 (stdlib §7.4, §22.6, v0.350): the ARITY of a `Path` static. The
+// ONE built-in parameter table carries a row per declared form of every
+// `Path` member (`Combine(a, b)`, `GetFileName(path)`, ...), but only the
+// value built-ins' admission gate read it; a `Path` call at a count no row
+// takes reached no lowering and degraded to the #3079 warning, emitting
+// nothing. A call whose count no declared form takes is a compile error.
+static void checkBuiltinPathCallArity(SemaContext& ctx, const ast::CallExpr& ce,
+                                       Symbol* calleeSym) {
+    // A resolved callee is a user static class named `Path`, bound by
+    // `checkCallArity`.
+    if (calleeSym) return;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || !ma->target) return;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id || id->name != "Path" || ctx.exprType(*ma->target)) return;
+    const std::vector<common::BuiltinParamForm> forms =
+        common::builtinParamForms("Path", ma->member, common::kBuiltinAnyArity);
+    if (forms.empty()) return;  // not a §7.4 member: the surface check's
+    const std::size_t argc = ce.args.size();
+    std::string expectation;
+    std::size_t count = 0;
+    for (const auto& f : forms) {
+        if (f.required <= argc && argc <= f.total) return;  // a form takes it
+        if (count++) expectation += " or ";
+        expectation += std::to_string(f.total);
+    }
+    ctx.diagnostics().report(
+        Severity::Error, ce.span.begin,
+        "the call to `Path." + std::string(ma->member) + "` supplies " +
+            std::to_string(argc) + " argument(s) but stdlib §7.4 declares `" +
+            std::string(ma->member) + "` with " +
+            (forms.size() == 1 ? "exactly " : "") + expectation +
+            " argument(s) — no overload takes " + std::to_string(argc) +
+            ", so the call is a compile error with no candidates cited "
+            "(§22.6)");
 }
 
 // §7 / stdlib §4.x (#2582) + §4.14/§4.15 (#2600) + §6.4 (#2602) + §6.6
