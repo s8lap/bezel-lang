@@ -21951,6 +21951,37 @@ void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {
     // member set the handler reads. (No behaviour depends on it beyond the
     // annotation, so the approximation does not affect diagnostics.)
     suspendLocalDecls_.clear();
+    // §28.12 (v0.350): `await using var` over a BORROW right-hand side "assumes
+    // no obligation, so scope exit disposes nothing and awaits nothing" -- the
+    // form is the same compile-time pin as `using var`. Its CFG await site (the
+    // LocalDecl node, `recordStmtAwaits`) is therefore NOT a suspension: an
+    // owned local the pin merely reads (`var s: Object := new Res();
+    // await using var x: Object := s;`) does not cross an `await`, and must
+    // not draw the §28.3 suspend-local reject (issue #7390). The borrow shapes
+    // are the bare-identifier read of a named binding (peeling `x!`; a class
+    // or interface owned binding is rejected on its own ground, §28.10, and
+    // every other named binding is a pin) and `usingVarInitIsRecognizedBorrow`'s
+    // field / indexer / borrow-returning-call shapes. An OWNED right-hand side
+    // (`new`, an owned call, a marked `move x`) still awaits. // per §28.12,
+    // §28.10, §28.3, v0.350
+    auto isBorrowPinAwaitUsingSite = [this](const ast::Node* n) {
+        const auto* ld = dynamic_cast<const ast::LocalDecl*>(n);
+        if (!ld || !ld->isAwaitUsing || !ld->initializer ||
+            ld->initializerHasOwnedMarker)
+            return false;
+        const ast::Expr* init = ld->initializer.get();
+        while (const auto* bang =
+                   dynamic_cast<const ast::PostfixBangExpr*>(init))
+            init = bang->operand.get();
+        if (!init) return false;
+        if (dynamic_cast<const ast::IdentifierExpr*>(init)) return true;
+        return usingVarInitIsRecognizedBorrow(*init);
+    };
+    auto blockSuspends = [&](const flow::CFGBlock* b) {
+        for (const ast::Node* n : b->awaitSites)
+            if (!isBorrowPinAwaitUsingSite(n)) return true;
+        return false;
+    };
     bool sawAwait = false;
     // Walk blocks in allocation order; a LocalDecl encountered before the first
     // await-bearing position is potentially live across it. We collect decls in
@@ -21959,7 +21990,7 @@ void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {
     // an await-bearing block is a suspend-local candidate.
     // First pass: find whether the body has any await at all.
     for (const auto& bp : cfg.blocks())
-        if (flow::CFG::hasAwaitSites(bp.get())) { sawAwait = true; break; }
+        if (blockSuspends(bp.get())) { sawAwait = true; break; }
     if (!sawAwait) return;  // no suspend points → no suspend-locals
     // Collect, per block, the LocalDecls it declares; then for each await-
     // bearing block, every local declared in a block that can reach it is a
@@ -21969,7 +22000,7 @@ void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {
     std::vector<const flow::CFGBlock*> order;
     for (const auto& bp : cfg.blocks()) order.push_back(bp.get());
     for (idx = 0; idx < order.size(); ++idx)
-        if (flow::CFG::hasAwaitSites(order[idx])) lastAwaitIdx = idx;
+        if (blockSuspends(order[idx])) lastAwaitIdx = idx;
     for (idx = 0; idx <= lastAwaitIdx && idx < order.size(); ++idx) {
         for (const ast::Stmt* st : order[idx]->stmts) {
             // #3591 tested: suspendLocalDecls_ feeds ONLY handleLocalDecl's
