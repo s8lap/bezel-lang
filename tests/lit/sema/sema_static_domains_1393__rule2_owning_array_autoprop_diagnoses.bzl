@@ -8,5 +8,5 @@
 
 module M; class Cell public n: int := 0; end Cell; class App public static property Pool: [2 owned]Cell?; public static method Main(): int => 0; end App;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static property `Pool` has inline-array type `[2 owned]Cell?`; §22.12 rule 2 admits inline-array-typed mutable statics for FIELDS only (forms (iii)/(iv)) — an inline-array-typed auto-property is not admitted
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static property `Pool` has inline-array type `[2 owned]Cell?`; §22.12 rule 2 admits inline-array-typed mutable statics for FIELDS only (form (iii), plain heap-free element types) — an inline-array-typed auto-property is not admitted
 // CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

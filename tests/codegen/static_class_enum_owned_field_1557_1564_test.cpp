@@ -191,7 +191,7 @@ const char* kStaticClassOwnedInlineArray =
     "  destructor Slot.n := Slot.n + 1; end destructor; "
     "end Slot; "
     "static class Globals "
-    "  public static _arr: [2 owned]Slot? := [new Slot(), new Slot()]; "
+    "  public static readonly _arr: [2 owned]Slot? := [new Slot(), new Slot()]; "
     "  public static method Main(): int => Slot.n; "
     "end Globals;";
 

@@ -18260,10 +18260,11 @@ static bool isBareEnclosingTypeParam(const TypeSymbol* t,
 }
 
 // ---------------------------------------------------------------------------
-// §22.12 rule 2 forms (iii)/(iv) and the residual error categories (#1393
-// warned-admission ruling, spec v0.221 -> v0.228 text unchanged): the
-// primitive/enum/plain-inline-array warned admission, the owning-inline-array
-// static FIELD warned admission, and the compile-error residual (`string`,
+// §22.12 rule 2 form (iii) and the residual error categories (#1393
+// warned-admission ruling, spec v0.221; v0.350: form (iv) is now the bare
+// generic parameter and an owning-inline-array mutable static is the
+// "error (iii)-closed" row): the primitive/enum/plain-inline-array warned
+// admission and the compile-error residual (`string`,
 // records, choices, value builtins, function types, generic-parameter types,
 // disqualified inline arrays, and inline-array-typed auto-properties). This
 // governs every mutable static NOT already handled by the class/interface
@@ -18877,18 +18878,17 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             "own internal synchronization (§22.12 rule 4 residual, v0.265, "
             "#3273 / #3290)");
     };
-    // §22.12 rule 2 forms (iii)/(iv) + residual (#1393 warned-admission
-    // ruling): a mutable static NOT governed by the class/interface path
-    // above (isRule2GovernedReference) is a primitive/enum/plain-inline-array
-    // (form iii, WARNING), an owning-inline-array FIELD (form iv, WARNING),
-    // or one of the residual categories the ruling declined to admit
-    // (`string`, records, choices, value builtins, function types,
-    // generic-parameter types, disqualified inline arrays, and any
-    // inline-array-typed auto-property) — a compile ERROR naming rule 2.
-    // `isField` distinguishes the FIELDS-only admission of (iii)'s
-    // inline-array leg and all of (iv) from the auto-property case, where
-    // every inline-array shape is a residual error regardless of element
-    // type or `owned`-ness.
+    // §22.12 rule 2 form (iii) + residual (#1393 warned-admission ruling):
+    // a mutable static NOT governed by the class/interface path above
+    // (isRule2GovernedReference) is a primitive/enum/plain-inline-array
+    // (form iii, WARNING), or one of the residual categories the ruling
+    // declined to admit (`string`, records, choices, value builtins,
+    // function types, generic-parameter types, disqualified inline arrays,
+    // an owning inline array (note (h), v0.350), and any inline-array-typed
+    // auto-property) — a compile ERROR naming rule 2. `isField`
+    // distinguishes the FIELDS-only admission of (iii)'s inline-array leg
+    // from the auto-property case, where every inline-array shape is a
+    // residual error regardless of element type or `owned`-ness.
     auto reportValueStatic = [&](const TypeRef* rt, std::string_view name,
                                  std::string_view what, SourceLocation loc,
                                  bool isField) {
@@ -18925,9 +18925,10 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             return;
         }
 
-        // Inline-array-typed statics: (iii)'s array leg and all of (iv) are
-        // FIELDS only — an inline-array-typed auto-property is a residual
-        // error regardless of element type or `owned`-ness.
+        // Inline-array-typed statics: (iii)'s array leg is FIELDS only — an
+        // inline-array-typed auto-property is a residual error regardless of
+        // element type or `owned`-ness; an owning-inline-array FIELD is an
+        // error too (table row, note (h)).
         if (rt->kind == TypeRef::Kind::InlineArray) {
             if (!isField) {
                 ctx_.diagnostics().report(
@@ -18936,24 +18937,33 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
                     " `" + std::string(name) + "` has inline-array type `" +
                     describeStaticValueType(rt) + "`; §22.12 rule 2 admits "
                     "inline-array-typed mutable statics for FIELDS only "
-                    "(forms (iii)/(iv)) — an inline-array-typed auto-"
+                    "(form (iii), plain heap-free element types) — an "
+                    "inline-array-typed auto-"
                     "property is not admitted (§22.12 rule 2, v0.221, "
                     "#1393)");
                 return;
             }
             if (rt->arrayOwned) {
+                // §22.12 rule 2 table row "owning inline array `[N owned]T?`
+                // / `[N owned]T` field": mutable = "error (iii)-closed", and
+                // note (h): "a mutable one is rule 2's closing error"
+                // (v0.350). Form (iv) is now the bare generic parameter; the
+                // owning-inline-array warned admission (#1393) is retired.
                 ctx_.diagnostics().report(
-                    Severity::Warning, loc,
+                    Severity::Error, loc,
                     std::string("mutable static ") + std::string(what) +
                     " `" + std::string(name) +
                     "` has owning-inline-array type `" +
-                    describeStaticValueType(rt) + "` — admitted with a "
-                    "declaration-site warning (§22.12 rule 2 form (iv)): "
-                    "the array's owned instances are reachable from every "
-                    "domain and its slots are mutable; confine every slot "
-                    "read/write, `move arr[j]`, and whole-field "
-                    "reassignment to one domain, or restructure behind a "
-                    "`Locked<T>` registry (§22.12 rule 2, v0.221, #1393)");
+                    describeStaticValueType(rt) + "`, which §22.12 rule 2 "
+                    "does not admit as a mutable static (rule 2's closing "
+                    "sentence; note (h): the one admitted static of "
+                    "owning-inline-array type is `static readonly`, whose "
+                    "slots are fixed and which the program-exit pass "
+                    "disposes, §22.13) — declare it `static readonly`, or "
+                    "spell a process-global pool whose slots are replaced as "
+                    "a `static owned readonly` `OwningArray<T>` or behind a "
+                    "`Locked<T>` registry (§30.12) (§22.12 rule 2, v0.350, "
+                    "#1393)");
                 return;
             }
             if (isForm3EligiblePlainInlineArray(rt)) {
@@ -19008,7 +19018,7 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
                      "category set";
         else
             reason = "the admitted category set (primitive/enum value "
-                     "statics, owning-inline-array fields, or the "
+                     "statics, plain heap-free inline-array fields, or the "
                      "form-(i)/(ii) synchronized-handle/task-cache "
                      "reference forms) does not include this type";
         ctx_.diagnostics().report(

@@ -28,7 +28,7 @@ public class Connection
 end Connection;
 
 public class Registry
-  public static Pool: [2 owned]Connection := [new Connection("first"), new Connection("second")];
+  public static readonly Pool: [2 owned]Connection := [new Connection("first"), new Connection("second")];
 end Registry;
 
 public class Program
