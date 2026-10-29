@@ -541,6 +541,84 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
     return {};
 }
 
+// fix #7661 (stdlib §2.5, §2.6, §2.7, §3.1, v0.350; language spec §8.1,
+// §26.5): the CLOSED member surfaces of the by-name built-in value records and
+// classes whose members sema types by NAME rather than from a declaration —
+// `DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly` (§2.5), `Guid` (§2.6),
+// `Random` (§2.7) and `StringBuilder` (§3.1). Each is stdlib-declared with a
+// fixed member list, so a name outside it is no member of the type: it must be
+// a compile error, not an untyped access that codegen's #2434 / #3079
+// degradation turns into a zero value behind exit 0 (`DateTime.AddTicks`,
+// `Random.Shared` — the silent-acceptance inversion the issue measured).
+//
+// The lists are the stdlib declaration blocks transcribed mechanically (every
+// `method|property <Name>` under the block's head; operators are not named
+// members). Always admitted, and so never answered here: §8.1's universal
+// members (`ToString`, `Equals`, `GetHashCode`, `GetType`, `ReferenceEquals`)
+// and `Dispose` — on the two classes it is §8.7's generated member (§2.7 names
+// `Random`'s no-op `Dispose`), and on the records codegen's own "`Dispose` on
+// built-in type ... produced no value" reject already answers it.
+//
+// Returns the diagnostic text when `mbr` is outside `head`'s surface, or an
+// empty string when `head` is not one of these built-ins or `mbr` is on it.
+// The caller decides that the receiver IS the built-in (never a user type
+// that shadows the name) and that no §26.5 extension declares `mbr`.
+std::string builtinRecordSurfaceReason(std::string_view head,
+                                       std::string_view mbr) {
+    if (mbr == "ToString" || mbr == "Equals" || mbr == "GetHashCode" ||
+        mbr == "GetType" || mbr == "ReferenceEquals" || mbr == "Dispose")
+        return {};
+    struct Surface {
+        std::string_view head;
+        std::string_view section;
+        std::vector<std::string_view> members;
+    };
+    static const Surface kSurfaces[] = {
+        {"DateTime", "2.5",
+         {"CompareTo", "Ticks", "FromTicks", "ToUnixTimeSeconds",
+          "FromUnixTimeSeconds", "Year", "Month", "Day", "Hour", "Minute",
+          "Second", "Millisecond", "DayOfWeek", "DayOfYear", "Kind", "Date",
+          "TimeOfDay", "Now", "UtcNow", "Today", "MinValue", "MaxValue",
+          "AddYears", "AddMonths", "AddDays", "AddHours", "AddMinutes",
+          "AddSeconds", "AddMilliseconds", "Add", "Subtract", "ToUtc",
+          "ToLocal", "Parse", "TryParse", "ParseOrNull"}},
+        {"TimeSpan", "2.5",
+         {"CompareTo", "Ticks", "FromTicks", "Days", "Hours", "Minutes",
+          "Seconds", "Milliseconds", "TotalDays", "TotalHours", "TotalMinutes",
+          "TotalSeconds", "TotalMilliseconds", "FromDays", "FromHours",
+          "FromMinutes", "FromSeconds", "FromMilliseconds", "Zero", "MinValue",
+          "MaxValue"}},
+        {"DateOnly", "2.5",
+         {"Year", "Month", "Day", "CompareTo", "ToDateTime", "Parse",
+          "TryParse", "ParseOrNull"}},
+        {"TimeOnly", "2.5",
+         {"Hour", "Minute", "Second", "Millisecond", "CompareTo", "Parse",
+          "TryParse", "ParseOrNull"}},
+        {"Guid", "2.6",
+         {"CompareTo", "FromByteArray", "Empty", "NewGuid", "Parse",
+          "TryParse", "ParseOrNull", "ToByteArray"}},
+        {"Random", "2.7",
+         {"Next", "NextInt64", "NextDouble", "NextBytes", "NextBoolean"}},
+        {"StringBuilder", "3.1",
+         {"Length", "Capacity", "Append", "AppendLine", "AppendFormat",
+          "Insert", "Remove", "Replace", "Clear"}},
+    };
+    for (const Surface& s : kSurfaces) {
+        if (s.head != head) continue;
+        for (std::string_view n : s.members)
+            if (n == mbr) return {};
+        const std::string h(head), m(mbr);
+        return "no member `" + m + "` on built-in type `" + h +
+               "`: stdlib \xC2\xA7" + std::string(s.section) +
+               " (v0.350) declares `" + h + "` with a closed member "
+               "surface and `" + m + "` is not on it, no \xC2\xA7""26.5 "
+               "extension declares a member named `" + m + "`, and the "
+               "universal `ToString`/`Equals`/`GetHashCode`/`GetType` "
+               "(\xC2\xA7""8.1) are its only other members";
+    }
+    return {};
+}
+
 // fix #4724 (§5.2 / §4.3 / §4.4 / Appendix A.1, v0.307): the constant-operand
 // fold of a float/double/decimal literal operand of an explicit conversion to
 // an integer (or `char`) target. §5.2: "Floating-point to integer truncates
@@ -27923,6 +28001,124 @@ TypeSymbol* ExprTC::memberTargetType(const ast::Expr* target) {
 // the event's payload type (the `: T` annotation, or unit when omitted). The
 // callee's MemberAccess target carries the EventSymbol (set when the target was
 // visited). Null otherwise.
+// fix #7661 (stdlib §2.5, §2.6, §2.7, §3.1, v0.350): the head name of the
+// by-name built-in a member-access receiver denotes — `DateTime`, `TimeSpan`,
+// `DateOnly`, `TimeOnly`, `Guid`, `Random`, `StringBuilder` — or empty. Every
+// receiver spelling is read here, so the check is independent of which arm of
+// resolveMemberAccess the access took (the rejected #7661 attempt sat in ONE
+// arm and missed the rest):
+//   * a VALUE (any expression with a type): the TypeRef shapes a built-in
+//     carries — `declaration == null` with the source name in `astNode` (an
+//     annotation, a parameter, `new DateTime(...)`, an element type), the
+//     IMPORTED `importedName`, and `declaration == builtinClassSym(name)` (the
+//     result of a by-name call, `d.AddDays(1.0)`, `DateTime.Now`);
+//   * a TYPE NAME (static access, `DateTime.X`): the target's symbol is the
+//     built-in's own `builtinClassSym`, directly or through a `type` alias.
+// A user declaration that shadows the name (§2.3) carries its own TypeSymbol,
+// so the identity tests never match it, local or imported.
+std::string_view ExprTC::builtinClosedRecordHead(const ast::Expr* target) {
+    static constexpr std::string_view kHeads[] = {
+        "DateTime", "TimeSpan", "DateOnly", "TimeOnly",
+        "Guid", "Random", "StringBuilder"};
+    auto inSet = [](std::string_view h) -> std::string_view {
+        for (std::string_view k : kHeads)
+            if (k == h) return k;
+        return {};
+    };
+    auto headOfType = [&](const TypeRef* t) -> std::string_view {
+        if (!t || t->kind != TypeRef::Kind::Named || !t->genericArgs.empty())
+            return {};
+        if (!t->declaration) {
+            if (t->astNode && t->astNode->name &&
+                !t->astNode->name->parts.empty())
+                return inSet(t->headName());
+            if (!t->astNode && !t->importedName.empty())
+                return inSet(t->importedName);
+            return {};
+        }
+        std::string_view h = inSet(t->declaration->name);
+        if (!h.empty() && t->declaration == builtinClassSym(h)) return h;
+        return {};
+    };
+    if (!target) return {};
+    if (const TypeRef* t = ctx_.exprType(*target)) return headOfType(t);
+    Symbol* sym = ctx_.exprSymbol(*target);
+    if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
+        std::string_view h = inSet(ts->name);
+        if (!h.empty() && ts == builtinClassSym(h)) return h;
+        return {};
+    }
+    if (auto* as = dynamic_cast<TypeAliasSymbol*>(sym)) {
+        if (const auto* ad = dynamic_cast<const ast::TypeAlias*>(as->decl))
+            if (ad->aliasedType)
+                return headOfType(ctx_.resolvedType(*ad->aliasedType));
+    }
+    return {};
+}
+
+// fix #7661 (§26.5, v0.350): does ANY extension block in scope (this module's,
+// or one an import carries) declare a member named `name`? Deliberately
+// coarser than §26.5's applicability: the closed-surface check below must
+// never claim "no §26.5 extension declares it" about a name some block does
+// declare, whatever that block's target — an `extension TimeSpan` or
+// `extension Object` member is not dispatched on every built-in receiver
+// today, and that gap is not this check's to turn into a "no member" error.
+bool ExprTC::anyExtensionDeclaresMemberNamed(std::string_view name) {
+    auto declares = [&](const ExtensionSymbol* e) {
+        for (const Symbol* m : e->members)
+            if (m && m->name == name) return true;
+        return false;
+    };
+    if (ctx_.module())
+        for (Symbol* c : ctx_.module()->children)
+            if (auto* e = dynamic_cast<ExtensionSymbol*>(c))
+                if (declares(e)) return true;
+    for (const ExtensionSymbol* e : importedExtensions_)
+        if (e && declares(e)) return true;
+    return false;
+}
+
+// fix #7661: the reason a member access on a by-name built-in receiver names
+// no member (empty when the receiver is not one, the name is declared, or an
+// extension declares the name). Shared by the `.` and `?.` forms.
+std::string ExprTC::builtinClosedRecordMemberReason(const ast::Expr* target,
+                                                    std::string_view mbr) {
+    const std::string_view head = builtinClosedRecordHead(target);
+    if (head.empty()) return {};
+    // `StringBuilder.Capacity` IS declared (stdlib §3.1: `public pure readonly
+    // property Capacity: int`) but has no lowering: the runtime StringBuilder
+    // is a parts array with no character capacity, and stdlib states no value
+    // for the property beyond its type, so this lane does not pick one (the
+    // open question is reported with #7661). Until it is implemented, a read
+    // is refused here rather than degraded to a zero value behind exit 0 --
+    // the #2337 posture for a declared-but-unimplemented built-in member.
+    if (head == "StringBuilder" && mbr == "Capacity")
+        return "member `Capacity` on `StringBuilder` is declared (stdlib "
+               "§3.1, v0.350) but is not yet implemented by this "
+               "compiler, so a read is refused rather than degraded to a "
+               "zero value";
+    std::string reason = builtinRecordSurfaceReason(head, mbr);
+    if (reason.empty() || anyExtensionDeclaresMemberNamed(mbr)) return {};
+    return reason;
+}
+
+// fix #7661: the `.` form's check, asked by the expression visitor AFTER
+// resolveMemberAccess returns — whichever arm the access took — for an access
+// it left unresolved (no type, no symbol) and reported nothing about.
+void ExprTC::checkBuiltinClosedRecordMember(const ast::MemberAccessExpr& ma,
+                                            std::size_t errorsBefore) {
+    if (!ma.target || ctx_.exprType(ma) || ctx_.exprSymbol(ma)) return;
+    if (ctx_.diagnostics().errorCount() != errorsBefore) return;
+    const std::string reason =
+        builtinClosedRecordMemberReason(ma.target.get(), ma.member);
+    if (reason.empty()) return;
+    // The MemberAccessExpr span is degenerate (line 0) when the access is a
+    // call callee (`x.M()`); fall back to the receiver's span.
+    auto loc = ma.span.begin;
+    if (loc.line == 0) loc = ma.target->span.begin;
+    ctx_.diagnostics().report(Severity::Error, loc, reason);
+}
+
 TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
     if (!ma || !ma->target) return nullptr;
@@ -40318,6 +40514,15 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         TypeRef* twinTy = ctx_.exprType(*dotted);
         const bool clean = ctx_.diagnostics().errorCount() == errsBefore;
         ctx_.diagnostics().rollbackTo(mark);
+        // fix #7661: the twin is RETAINED whether or not it typed, as the
+        // call-form twin's `nullCondBuiltinSynth_` always is. The context's
+        // expression maps are keyed by node address, so freeing an unused
+        // twin let the NEXT twin's `dotted` land on the freed placeholder's
+        // address and read back that placeholder's receiver type as its own
+        // `exprType` -- MEASURED: of three consecutive `b?.BogusN` reads on a
+        // `TimeSpan?` receiver, the second was typed `TimeSpan?` and accepted
+        // while the first and third were rejected.
+        nullCondBuiltinMemberSynth_.push_back(std::move(dotted));
         if (clean && twinTy && twinTy->kind != TypeRef::Kind::Function) {
             if (twinTy->nullable) {
                 ctx_.setExprType(&nm, twinTy);
@@ -40326,7 +40531,6 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 nn->nullable = true;
                 ctx_.setExprType(&nm, nn);
             }
-            nullCondBuiltinMemberSynth_.push_back(std::move(dotted));
             return;
         }
     }
@@ -40597,6 +40801,18 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             {
                 const std::string reason =
                     closedValueSurfaceMemberReason(recvTyForDiag, mbr);
+                if (!reason.empty()) {
+                    ctx_.diagnostics().report(Severity::Error, nmLoc, reason);
+                    return;
+                }
+            }
+            // fix #7661 (stdlib §2.5-§2.7, §3.1, v0.350): the `?.` twin of
+            // the `.` form's closed-surface check for the by-name built-ins
+            // (`checkBuiltinClosedRecordMember`, asked after
+            // resolveMemberAccess). Same predicate, same message.
+            {
+                const std::string reason =
+                    builtinClosedRecordMemberReason(nm.target.get(), mbr);
                 if (!reason.empty()) {
                     ctx_.diagnostics().report(Severity::Error, nmLoc, reason);
                     return;

@@ -5009,6 +5009,15 @@ private:
     TypeSymbol* memberTargetType(const ast::Expr* target);
 
     void resolveMemberAccess(const ast::MemberAccessExpr& ma);
+    // fix #7661 (stdlib §2.5-§2.7, §3.1, v0.350): the closed member surface
+    // of the by-name built-ins (DateTime, TimeSpan, DateOnly, TimeOnly, Guid,
+    // Random, StringBuilder), asked for every receiver spelling.
+    std::string_view builtinClosedRecordHead(const ast::Expr* target);
+    bool anyExtensionDeclaresMemberNamed(std::string_view name);
+    std::string builtinClosedRecordMemberReason(const ast::Expr* target,
+                                                std::string_view mbr);
+    void checkBuiltinClosedRecordMember(const ast::MemberAccessExpr& ma,
+                                        std::size_t errorsBefore);
     // per §27.6 (v0.338; #5814): a method reference's explicit type-argument
     // list substituted into the formed function type.
     TypeRef* applyMethodRefTypeArgs(const ast::MemberAccessExpr& ma,

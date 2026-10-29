@@ -125,10 +125,11 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // pinned, on the half this gate cannot see: see
     // `unit_returning_builtin_bound_to_local_rejected_without_claiming_the_member_is_absent`
     // below, where `Send` DOES emit and the local demand is what rejects it.
+    // #7661 (stdlib §2.7, v0.350): sema now refuses the undeclared member
+    // itself, before any dispatch arm runs, naming `Random`'s closed surface.
     BEZEL_EXPECT_TRUE(hasError(program,
-                               "`NextInt` on built-in type `Random` produced "
-                               "no value, and no dispatch arm emitted any code "
-                               "for this call"));
+                               "no member `NextInt` on built-in type `Random`: "
+                               "stdlib §2.7"));
 }
 
 // ── The rest of the MEASURED population, including the two the issue missed ──
@@ -173,11 +174,11 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     const std::string program =
         "module M; import System.Diagnostics; "
         "class C "
-        "  public static method Get(r: Random): int "
+        "  public static method Get(r: Stopwatch): int "
         "    return r.TotallyBogusMember(1, 2); "
         "  end Get; "
         "  public static method Main(): int "
-        "    using var rr := new Random(); "
+        "    using var rr := new Stopwatch(); "
         "    return C.Get(rr); "
         "  end Main; "
         "end C;";
@@ -186,8 +187,10 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
     // rejection and its location are unchanged, the trailing clause names the
     // cause. §21.7 remains why the RETURN-site gate exists at all; it still
     // owns the shape where an arm emitted code and produced no value.
+    // #7661 (stdlib §2.7, v0.350): on `Random` sema now refuses the member
+    // first, so this codegen return-position row uses `Stopwatch` (§8.1).
     BEZEL_EXPECT_TRUE(hasError(program, "`TotallyBogusMember` on built-in type "
-                                        "`Random` produced no value, and no "
+                                        "`Stopwatch` produced no value, and no "
                                         "dispatch arm emitted any code for "
                                         "this call"));
 }

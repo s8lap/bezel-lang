@@ -138,15 +138,17 @@ BEZEL_TEST(builtin_member_chain_2976,
     // #2935's own repro is the SAME predicate with nothing applied to the
     // failing hop. Its message must not grow a clause about a member that does
     // not exist in the program — pinned so the parenthetical stays conditional.
+    // #7661 (stdlib §2.7, v0.350): sema now refuses an undeclared member on
+    // `Random` before this codegen site, so the row uses `Stopwatch` (§8.1).
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
-        "  using var r := new Random(); "
+        "  using var r := new Stopwatch(); "
         "  var v := r.NextInt(1, 3); "
         "  return v; "
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(hasError(program,
-                               "`NextInt` on built-in type `Random` produced "
+                               "`NextInt` on built-in type `Stopwatch` produced "
                                "no value, and no dispatch arm emitted any code "
                                "for this call"));  // #2966's site — see above
     auto r = runAot(program);

@@ -69,9 +69,16 @@ bool hasError(const std::string& program, const std::string& keyword) {
 // family wording verbatim; the clause after it is what this site can say that
 // #2935's could not — that NOTHING was emitted, which excludes the
 // "documented but yields nothing here" reading those sites had to leave open.
+//
+// #7661 (stdlib §2.5-§2.7, §3.1, v0.350): an undeclared member on `Random`
+// is now refused by SEMA ("no member `X` on built-in type `Random`") before
+// it reaches this codegen gate, so the per-position rows below use
+// `Stopwatch` (stdlib §8.1), a built-in whose undeclared members still reach
+// it. The `Random` spelling is pinned at the sema site in
+// tests/codegen/builtin_member_degrade_7661_test.cpp.
 const std::string kMsg =
-    "on built-in type `Random` produced no value, and no dispatch arm emitted "
-    "any code for this call";
+    "on built-in type `Stopwatch` produced no value, and no dispatch arm "
+    "emitted any code for this call";
 
 }  // namespace
 
@@ -80,9 +87,9 @@ const std::string kMsg =
 BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
            bogus_member_in_a_bare_statement_is_rejected_stdlib_2_7) {
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
-        "  using var r := new Random(); "
+        "  using var r := new Stopwatch(); "
         "  r.TotallyBogusMember(1, 2); "
         "  Console.WriteLine(\"compiled\"); "
         "  return 0; "
@@ -102,11 +109,11 @@ BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
     // `ci.returnType` test: the callable declares NO return type, so nothing
     // demands a value here — and the typo is still a typo.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
-        "  public static method Poke(r: Random) => r.TotallyBogusMember(1, 2); "
+        "  public static method Poke(r: Stopwatch) => r.TotallyBogusMember(1, 2); "
         "  public static method Main(): int "
-        "    using var rr := new Random(); "
+        "    using var rr := new Stopwatch(); "
         "    C.Poke(rr); "
         "    return 0; "
         "  end Main; "
@@ -119,12 +126,12 @@ BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
     // The same face with a DECLARED return type — the one #2966 proposed
     // gating on. It must reject too, and through the same one gate.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C "
-        "  public static method Roll(r: Random): int "
+        "  public static method Roll(r: Stopwatch): int "
         "      => r.TotallyBogusMember(1, 2); "
         "  public static method Main(): int "
-        "    using var rr := new Random(); "
+        "    using var rr := new Stopwatch(); "
         "    return C.Roll(rr); "
         "  end Main; "
         "end C;";
@@ -139,10 +146,10 @@ BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
     // lowered to nothing is unambiguously broken. Before this it took the
     // silent zero/null degrade behind the fourth copy of the #2491 note.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class Holder "
-        "  public owned _r: Random; "
-        "  public constructor() _r := new Random(); end constructor; "
+        "  public owned _r: Stopwatch; "
+        "  public constructor() _r := new Stopwatch(); end constructor; "
         "  public property Roll: int => _r.TotallyBogusMember(1, 2); "
         "  destructor end destructor; "
         "end Holder; "
@@ -162,9 +169,9 @@ BEZEL_TEST(builtin_unlowered_member_all_positions_2966,
     // there: an enumeration of consumers is a positive list, and a positive
     // list missing a name fails by accepting.
     const std::string program =
-        "module M; "
+        "module M; import System.Diagnostics; "
         "class C public static method Main(): int "
-        "  using var r := new Random(); "
+        "  using var r := new Stopwatch(); "
         "  Console.WriteLine(r.TotallyBogusMember(1, 2)); "
         "  return 0; "
         "end Main; end C;";

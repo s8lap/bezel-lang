@@ -5933,7 +5933,11 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // on the target's TypeSymbol, and annotates the access with the
     // resolved member symbol and field/property type.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        const std::size_t errorsBeforeMa = ctx_.diagnostics().errorCount();
         resolveMemberAccess(*ma);
+        // fix #7661 (stdlib §2.5-§2.7, §3.1, v0.350): a member outside a
+        // by-name built-in's closed surface, whatever arm resolved it.
+        checkBuiltinClosedRecordMember(*ma, errorsBeforeMa);
         // per §7.4 (v0.182, #1593): a named-property access whose accessor can
         // run user code (a user-defined getter/setter, or a virtual/abstract
         // dispatch) is an "accessor call" — the control transfer may reach a
