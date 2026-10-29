@@ -22512,7 +22512,27 @@ private:
     // owning-classified choice. Driven off the formal, not the argument (§22.6).
     // Called from `lowerCall` AFTER `lowerCallDispatch`, so the value each call
     // read out of its argument slot is already in the callee's frame.
-    void markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call);
+    // `atCallSite` (fix #7538): the same sweep at the "call about to run" point
+    // of a user-method call, after every argument is evaluated and before the
+    // call instruction, so the store dominates the callee's throw edge too.
+    // That form is handed `callee`, the symbol `emitMethodCall` is about to be
+    // handed (after lowerCallDispatch's §11.8 witness redirect), and the
+    // call's `baseQualified` flag, so it decides on the function the call
+    // EMITS; it zero-stores only when that target is statically bound (see
+    // `methodCallDispatchesDynamically`).
+    void markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call,
+                                         bool atCallSite = false,
+                                         sema::MethodSymbol* callee = nullptr,
+                                         bool baseQualified = false);
+
+    // Does `emitMethodCall(ms, …, baseQualified, …)` reach its runtime target
+    // through a vtable or itable slot (so the function that runs is whichever
+    // override / implementation the receiver carries), rather than calling
+    // `ms`'s own body directly? THE gate emitMethodCall's `canDispatch` arm
+    // uses, factored so a caller-side decision that must hold for every
+    // runtime target (fix #7538's call-site zero-store) reads the same answer.
+    bool methodCallDispatchesDynamically(sema::MethodSymbol* ms,
+                                         bool baseQualified) const;
 
     // fix #4552 / §35.5 *The owning match* (v0.306): is `e`, of static type
     // `rt`, an UNBOUND owned temporary of owning-choice type — §35.5's

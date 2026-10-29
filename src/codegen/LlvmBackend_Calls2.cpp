@@ -8776,7 +8776,43 @@ static bool importedMemberTypeAdmitsClosureDispatch(
 // `var b := Bundle.Ready(new Resource("b")); var d := Host.Pass(b);`:
 // `moved` / `dispose b` / then SIGSEGV, and `AddressSanitizer:
 // heap-use-after-free ... READ of size 8` under `--sanitize=address`.
-void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call) {
+//
+// fix #7538 (§28 *each heap object is disposed exactly once*, §28.3
+// *Exception-path discharge*, §15.3 *Parameter passing*, v0.350): the
+// `atCallSite` form. The sweep above runs AFTER `lowerCallDispatch`, i.e. in the
+// pending check's normal-return block, so a callee that THREW left the caller's
+// argument slot populated: the callee's own unwind edge disposed its `owned`
+// parameter (`registerUnwindOwnedParam`'s owning-choice arm), then the caller's
+// scope-end pass disposed the same payload again (heap-use-after-free, measured
+// on `try Take(move src); catch ...` at r30-c1 342da591). The user-method arms
+// therefore call it a second time with `atCallSite` set, right before
+// `emitMethodCall`: every argument is evaluated by then (a LATER argument that
+// throws unwinds with the slot still live, as #1918's owned-class nulling in
+// `buildOrderedArgs` does), and the value is already in `args`, since an owning
+// choice is passed by value. The post-dispatch run then re-stores zero, which
+// is idempotent. Only a formal whose callee disposes it on the throw edge is
+// swept here: the `owned` spelling, the one `registerUnwindOwnedParam` enrolls.
+//
+// The call-site form is sound only when EVERY function the call can reach at
+// run time takes the value onto its own unwind edge before anything in it can
+// throw. The caller cannot know that about a function it does not see, so the
+// form is an allow-list (`calleeEntryMayThrow` below): the call must be
+// statically bound to a local block-bodied method whose entry cannot throw
+// once its static initialization is hoisted here. Everything else keeps the
+// post-dispatch sweep alone, which is the pre-#7538 behaviour for that shape.
+// Two measured consequences of deciding on anything other than the emitted
+// target (both r37-rev-l3d, base clean, fix 3200 bytes leaked in 200
+// allocations): a §11.8 `T.Take(move s)` whose witness is an arrow body or
+// whose type's initializer fails (the AST symbol is the interface's abstract
+// member, the emitted target is the witness), and an interface call whose
+// arrow-bodied implementation lives in a module that imports this one. The
+// design that makes the zero-store unconditional is callee-side, every body
+// enrolling its `owned` parameters at entry (issue #7707 for arrow bodies);
+// this allow-list is what is sound until then.
+void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call,
+                                              bool atCallSite,
+                                              sema::MethodSymbol* callee,
+                                              bool baseQualified) {
     if (!call.callee) return;
     // fix #6182 (§35.3 + §15.3 *Parameter passing*, v0.338): a CASE
     // CONSTRUCTION is a parameter passing too. §35.3: "a move-only value
@@ -8800,12 +8836,194 @@ void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call) {
     // `AddressSanitizer: heap-use-after-free` (READ of size 8), and SIGSEGV
     // without the sanitizer: `w1`'s pass disposed the `Disp`, then `w0`'s did.
     if (dynamic_cast<sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*call.callee))) {
+        if (atCallSite) return;  // a case construction does not throw
         for (const ast::CallArgument& a : call.args)
             if (a.value) markOwningChoiceArgMovedFrom(a.value.get());
         return;
     }
-    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+    // The call-site form decides on the symbol `emitMethodCall` is handed, not
+    // on the AST's: lowerCallDispatch redirects a §11.8 `T.Member(...)` from
+    // the interface's static member to the concrete witness, and only the
+    // witness has a body kind, a `requires` list and a static initializer.
+    auto* ms = (atCallSite && callee)
+                   ? callee
+                   : dynamic_cast<sema::MethodSymbol*>(
+                         ctx_.exprSymbol(*call.callee));
     if (!ms || ms->params.empty()) return;
+    // `atCallSite` only: a callee whose ENTRY can throw before its root scope
+    // enrolls the parameter (`lowerScopedBlock` registers
+    // `pendingOwnedParams_`): the §22.16 `requires` prologue (own or
+    // inherited), the checked-contracts entry invariant and the
+    // checked-disposal receiver guard, all emitted ahead of the body. On that
+    // throw nothing in the callee disposes the parameter, so the caller must
+    // keep its value and dispose it on the unwind edge, which the
+    // post-dispatch sweep leaves it free to do. MEASURED at r30-c1 342da591:
+    // `Take(owned src: OChoice, n: int) requires(n > 5)` called with `n = 1`
+    // under `try` is clean only while the caller still holds the value (the
+    // owned CLASS twin, zeroed early by `buildOrderedArgs`, leaks 200 of 200
+    // there). An IMPORTED callee carries no `ast::MethodDecl` whose clauses
+    // could be read here, so it keeps the post-dispatch sweep alone. Evaluated
+    // lazily, once, on the first argument the sweep would mark.
+    int entryMayThrow = -1;
+    bool hoistStaticInit = false;  // set by calleeEntryMayThrow, see there
+    auto calleeEntryMayThrow = [&]() -> bool {
+        if (entryMayThrow >= 0) return entryMayThrow != 0;
+        entryMayThrow = 1;
+        // A call that DISPATCHES (an interface member, or a `virtual` /
+        // `override` / `abstract` class member, reached through a slot) runs
+        // whichever implementation the receiver carries at run time. Whether
+        // that body enrolls `src` on its throw edge depends on the body (a
+        // block body does, an arrow body does not: #7707) and on its own
+        // prologue, and the set of bodies is open: a module that imports this
+        // one can implement the interface or override the member. So the
+        // caller keeps its value and the post-dispatch sweep alone. MEASURED
+        // (r37-rev-l3d, `in/xmod`): module L calling `t.Take(move s)` through
+        // its interface, module M implementing it with a throwing arrow body,
+        // base clean, call-site zero-store 3200 bytes leaked in 200
+        // allocations. The predicate is the one `emitMethodCall` routes by.
+        if (methodCallDispatchesDynamically(ms, baseQualified)) return true;
+        // An IMPORTED callee's prologue was compiled by its own module and is
+        // not readable here (#7617 is the imported shape of this issue).
+        if (ctx_.isImported(ms)) return true;
+        if (!ms->inheritedRequiresClauses.empty()) return true;
+        // SEAM-ACCESSOR: the null arm IS the imported answer (no clauses to
+        // read, so the entry is assumed to throw and the caller keeps its
+        // disposal); a local callee's clauses are read off its declaration.
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md) return true;
+        for (const auto& c : md->contractClauses)
+            if (c.kind == ast::ContractClause::Kind::Requires) return true;
+        // Only a BLOCK body enrolls its `owned` parameters for unwind
+        // disposal (its root scope, `lowerScopedBlock`). An expression body
+        // (`Take(owned src: OChoice): int => Boom()`) never does (#7707), so
+        // on a throw from it nothing in the callee disposes `src`, the same
+        // position as an entry throw. MEASURED: static, instance, `?.` and
+        // §11.8-witness arrow bodies that throw each went from clean to 3200
+        // bytes leaked in 200 allocations with the call-site zero-store.
+        if (md->bodyKind != ast::MethodBodyKind::Block) return true;
+        // fix #7538 (§22.13, v0.350: "Once initialization begins for a type,
+        // all of its static fields are initialized before any of its methods
+        // can run on behalf of an outside observer"): a STATIC callee's entry
+        // runs its declaring type's lazy
+        // `ensureinit` (emitFunctionBody's `emitEnsureStaticInit(ms->parent)`,
+        // and the async entry's twin), ahead of the root scope, and a failed
+        // initializer raises TypeInitializationException there, before the
+        // parameter is enrolled. MEASURED: `K.Take(move src)` with `static
+        // readonly X: int := K.Boom()` went from clean to a 200-of-200 leak
+        // with the call-site zero-store. For a synchronous callee the caller
+        // runs that same `ensureinit` itself, right here, ahead of the
+        // zero-store (`hoistStaticInit`): every argument is already
+        // evaluated, so a call to that function runs the initialization at
+        // the point its entry would have, and the callee's own call then
+        // finds the type initialized (§22.13's once-per-type state machine)
+        // and cannot throw. A generic static METHOD of a non-generic type
+        // (`K.Take<U>`) is called through its `$spec`, which runs no
+        // `ensureinit` at its entry (#7684), so before #7538 K's initializer
+        // did not run there at all; the hoist now runs it first, which is
+        // the direction §22.13 requires. A raise therefore unwinds the
+        // CALLER with its slots still populated, and a callee that throws
+        // later, from its body, keeps the call-site form. An ASYNC callee
+        // runs the same `ensureinit` in its task entry (LlvmBackend_Async.cpp),
+        // whose exception routing this hoist does not reproduce, so it is
+        // treated as entry-throwing instead and keeps the post-dispatch sweep
+        // alone, the pre-#7538 behaviour.
+        //
+        // Only a type whose initialization can RAISE is considered: one with
+        // a static constructor, or a static field / auto-property initializer
+        // that is not a constant literal (the shapes
+        // `isConstantLiteralStaticInit` admits, in LlvmBackend_Setup.cpp). A
+        // literal-only initializer, e.g. a `static _n: int := 0` counter, runs
+        // no code and cannot throw, so no call is emitted for it.
+        //
+        // For a GENERIC declaring type the question is which function the
+        // call EMITS, because only one of the two runs `ensureinit` at its
+        // entry. `emitMethodCall` monomorphizes the call (its
+        // `parentIsGeneric` arm, `emitInlineGenericMethod`) exactly when a
+        // substitution is live and the declaring type has generic
+        // parameters, the predicate mirrored below. That specialized callee
+        // (`G$Take$spec`) runs no `ensureinit` at its entry (#7684), so the
+        // call-site zero-store is already safe there, and hoisting the
+        // erased template's `ensureinit` (a state separate from the
+        // per-instantiation initialization, §2.8.3 rule 4) would run the
+        // type's static initializer a second time, against §22.12 rule 1,
+        // v0.350 ("a type's static initializer runs exactly once
+        // process-wide"). MEASURED: `G<string>.Take(move s)` then a read of
+        // `G<string>._c` printed `init run 1|body|init run 2` with the hoist,
+        // `body|init run 1` without it. With NO live substitution the call
+        // goes to the erased template `bz$M.G$Take`, whose entry DOES run
+        // `G$ensureinit` (the alias spelling `type GS := G<string>;
+        // GS.Take(move s)`, see #7683 for its second initialization). That
+        // call is hoisted like a non-generic one: it is the same function the
+        // template's entry would call, so it adds no initialization. MEASURED:
+        // skipping the hoist there but keeping the zero-store went from clean
+        // to 3200 bytes leaked in 200 allocations (`_c := Tr.Boom()`, and a
+        // throwing static constructor). When #7684 gives `$spec` an entry
+        // `ensureinit`, the specialized arm here must hoist that
+        // per-instantiation initialization (or treat the entry as throwing).
+        const bool specializedTarget =
+            !genericSubst_.empty() && sema::genericParamCount(ms->parent) != 0;
+        if (isStaticMethod(ms) && ms->parent && !specializedTarget &&
+            ensureInitFns_.count(ms->parent)) {
+            bool initMayRaise = cctorFnOf_.count(ms->parent) != 0;
+            if (!initMayRaise && sfinitFnOf_.count(ms->parent)) {
+                auto literal = [](const ast::Expr* e) {
+                    return dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+                           dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+                           dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+                           dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+                           dynamic_cast<const ast::VerbatimStringExpr*>(e);
+                };
+                for (const sema::Symbol* m : ms->parent->members) {
+                    if (initMayRaise) break;
+                    if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m)) {
+                        if (std::find(fs->modifiers.begin(), fs->modifiers.end(),
+                                      std::string_view("static")) ==
+                            fs->modifiers.end())
+                            continue;
+                        // SEAM-ACCESSOR: `ensureInitFns_` holds LOCAL types
+                        // only (emitEnsureInitFns skips an imported one), so
+                        // this member's `decl` is its local declaration.
+                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                        if (fd && fd->initializer &&
+                            !literal(fd->initializer.get()))
+                            initMayRaise = true;
+                    } else if (isStaticAutoProperty(m)) {
+                        auto* ps = static_cast<const sema::PropertySymbol*>(m);
+                        // SEAM-ACCESSOR: local type, as for the field arm.
+                        auto* pd = dynamic_cast<const ast::PropertyDecl*>(
+                            ps->decl);
+                        if (pd && pd->autoInitializer &&
+                            !literal(pd->autoInitializer.get()))
+                            initMayRaise = true;
+                    }
+                }
+            }
+            if (initMayRaise) {
+                if (isAsyncMethod(ms)) return true;
+                hoistStaticInit = true;
+            }
+        }
+        if (!isStaticMethod(ms)) {
+            // The checked-disposal guard fires on any instance entry. The
+            // checked-contracts entry invariant (§22.16) is evaluated by
+            // `emitInvariantCheck(this, ms->parent)` in emitFunctionBody: the
+            // declaring class's static chain AND the dynamic arms (derived
+            // classes' invariants behind an is-a test), because "an external
+            // call through a base-typed reference evaluates the full dynamic
+            // class invariant — base and derived conjunction" (§22.16,
+            // v0.350). `hasClassInvariant` asks the same question as that
+            // emitter, so a non-virtual method on an invariant-less base
+            // called on a derived instance whose invariant fails is covered.
+            // An `invariant` on an unrelated class is not asked.
+            if (checkedDisposal_) return true;
+            if (checkedContracts_ && ms->parent &&
+                ms->parent->kind == ast::TypeDeclKind::Class &&
+                hasClassInvariant(ms->parent))
+                return true;
+        }
+        entryMayThrow = 0;
+        return false;
+    };
     for (std::size_t i = 0; i < call.args.size(); ++i) {
         const ast::CallArgument& a = call.args[i];
         if (!a.value) continue;
@@ -8829,12 +9047,24 @@ void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call) {
         if (ps->modifier == "ref" || ps->modifier == "out" ||
             ps->modifier == "out owned" || ps->modifier == "scoped")
             continue;
+        if (atCallSite && ps->modifier != "owned") continue;
         const sema::TypeRef* pt = ps->resolvedDeclType;
         if (!pt && ps->declType) pt = ctx_.resolvedType(*ps->declType);
         if (!pt) continue;
         // SEAM-ACCESSOR: symbol-side `resolvedDeclType` is read first, the AST
         // cast is the local-path fallback when it was not populated — the same
         // two-step `refFormalWriteVerdict` uses for an imported callee.
+        // fix #7538: the `atCallSite` form runs while the callee's generic
+        // substitution is installed (`applyMethodGenericSubst`), so a formal
+        // declared as a bare type parameter `T` resolves to the argument's
+        // choice below, although the callee's `registerUnwindOwnedParam`
+        // enrolls only a formal DECLARED with a choice type. Mirror that gate:
+        // marking here would leave `Take<T>(src: T)` with no disposal at all
+        // (MEASURED: 200 of 200 leaked with `T = OChoice`).
+        if (atCallSite &&
+            (pt->kind != sema::TypeRef::Kind::Named || !pt->declaration ||
+             pt->declaration->kind != ast::TypeDeclKind::Choice))
+            continue;
         pt = resolveTypeParamRef(pt);
         if (!pt || pt->kind != sema::TypeRef::Kind::Named || !pt->declaration)
             continue;
@@ -8856,6 +9086,11 @@ void Emitter::markMoveOnlyChoiceArgsMovedFrom(const ast::CallExpr& call) {
         // caller-side disposal of `Take((if c then w else E))` into that
         // leak. It follows #6168's callee half.
         if (dynamic_cast<const ast::ConditionalExpr*>(a.value.get())) continue;
+        if (atCallSite && calleeEntryMayThrow()) return;
+        if (hoistStaticInit) {
+            emitEnsureStaticInit(ms->parent);
+            hoistStaticInit = false;  // once, ahead of the first zero-store
+        }
         markOwningChoiceArgMovedFrom(a.value.get());
     }
 }
@@ -17366,6 +17601,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // `savedClArgUnwind` immediately after the call either way.
     if (!stringPinArgs.empty())
         unwindTarget_ = stringPinArgUnwindCleanup(stringPinArgs);
+    // fix #7538: the caller's owning-choice argument slots are zeroed HERE, at
+    // the "call about to run" point, so the store dominates the callee's throw
+    // edge (see `markMoveOnlyChoiceArgsMovedFrom`). Handed the `ms` the call
+    // below is handed (the §11.8 redirect above may have replaced the AST's),
+    // and `baseQualified`, so it decides on the function the call emits.
+    if (!diverged_)
+        markMoveOnlyChoiceArgsMovedFrom(call, /*atCallSite=*/true, ms,
+                                        baseQualified);
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
                                          call.span.begin, thisReceiver);
     unwindTarget_ = savedClArgUnwind;
@@ -19085,6 +19328,21 @@ bool Emitter::rejectNonIntPlaceholderTypeArg6779(
     return false;
 }
 
+// CG35-itable (§13) / §12.5: an instance call reaches its runtime target
+// through the receiver exactly when it is not `base.`-qualified and the
+// declaring member has a slot: an interface member's `ifaceMethodIndex_`
+// entry, or a `virtual` / `override` / `abstract` class member's
+// `vtableSlot_` entry (assigned in emitVtables for `isVirtual` members only).
+// Everything else (a static, a non-virtual instance member, a record method,
+// an extension, a `base.` call) calls `ms`'s own body directly.
+bool Emitter::methodCallDispatchesDynamically(sema::MethodSymbol* ms,
+                                              bool baseQualified) const {
+    if (!ms || baseQualified || isStaticMethod(ms)) return false;
+    if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface)
+        return ifaceMethodIndex_.count(ms) != 0;
+    return vtableSlot_.count(ms) != 0;
+}
+
 llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             std::vector<llvm::Value*>& args,
                             bool baseQualified,
@@ -19386,19 +19644,12 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // an interface (CG35-itable, §13).
     bool isIfaceMethod = ms->parent &&
                          ms->parent->kind == ast::TypeDeclKind::Interface;
-    bool canDispatch = !baseQualified && !isStaticMethod(ms);
+    // fix #7538: the gate is `methodCallDispatchesDynamically`, shared with
+    // the caller-side owning-choice zero-store, which must refuse exactly the
+    // calls this arm routes through a slot.
+    bool canDispatch = methodCallDispatchesDynamically(ms, baseQualified);
     unsigned vtSlot = 0;  // used only for class-virtual dispatch
-    if (canDispatch) {
-        if (isIfaceMethod) {
-            // Interface dispatch: ifaceMethodIndex_ must have an entry.
-            auto ifIt = ifaceMethodIndex_.find(ms);
-            if (ifIt == ifaceMethodIndex_.end()) canDispatch = false;
-        } else {
-            auto slotIt = vtableSlot_.find(ms);
-            if (slotIt != vtableSlot_.end()) vtSlot = slotIt->second;
-            else canDispatch = false;
-        }
-    }
+    if (canDispatch && !isIfaceMethod) vtSlot = vtableSlot_.find(ms)->second;
     if (canDispatch) {
         // fix #580 / §14.1 / §14.2 / §12 / §13: a VIRTUAL generic method (its own
         // `<T>` params bound in the active substitution) cannot dispatch through
@@ -24010,6 +24261,28 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     auto savedNcSemaTy = genericSubstSemaTy_;
     applyMethodGenericSubst(call, ms);
     pendingMethodCallExpr_ = &call;  // fix #6779: see lowerCall
+    // fix #7538: the `?.` twin of lowerCallDispatch's call-site zero-store
+    // (see `markMoveOnlyChoiceArgsMovedFrom`); this block runs on the
+    // non-null-receiver path only. NOT when the call's result is itself an
+    // OWNING CHOICE: that result is lifted through the `nullableReturn` arm
+    // above as if the callee's bare choice struct were already `{i8, C}`, and
+    // the binding's scope-end pass then reads the choice's tag as `hasValue`,
+    // so a returned `src` is never disposed by its taker and only the
+    // caller's still-populated slot disposes it. MEASURED: `var z :=
+    // p?.Pass(move src)` with `Pass` returning `src` went from clean to a
+    // 200-of-200 leak with the zero-store, so that shape keeps the pre-#7538
+    // behaviour: no zero-store on this path at all.
+    bool ncOwningChoiceResult = false;
+    if (callTy && callTy->kind == sema::TypeRef::Kind::Named &&
+        callTy->declaration &&
+        callTy->declaration->kind == ast::TypeDeclKind::Choice) {
+        auto verdict = common::classifyChoiceType(callTy, ctx_);
+        ncOwningChoiceResult =
+            verdict && *verdict == common::ChoiceClassification::Owning;
+    }
+    if (!diverged_ && !ncOwningChoiceResult)
+        markMoveOnlyChoiceArgsMovedFrom(call, /*atCallSite=*/true, ms,
+                                        /*baseQualified=*/false);
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs,
                                     call.span.begin);
     genericSubst_ = std::move(savedNcSubst);
