@@ -10119,6 +10119,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.exprType(*ce.args[0].value),
                             ctx_.primitiveTypeRef(PrimitiveType::Object),
                             ce.args[0].value->span.begin);
+                        // fix #7694 (§35.8, §8.6, §15.3, v0.350): the `Object`
+                        // overload is a boxing position, and an owning
+                        // choice / owning inline array "cannot be boxed".
+                        // These builtins carry no MethodSymbol, so the
+                        // conversion-site check never ran and the call
+                        // compiled and printed an empty line. Reuse that
+                        // check, for a move-only argument only.
+                        const char* moveOnlyKind7694 = nullptr;
+                        TypeRef* argTy7694 = ctx_.exprType(*ce.args[0].value);
+                        if (argTy7694 &&
+                            common::isMoveOnlyValueType(argTy7694, ctx_,
+                                                        moveOnlyKind7694)) {
+                            checkAssignable(
+                                argTy7694,
+                                ctx_.primitiveTypeRef(PrimitiveType::Object),
+                                ce.args[0].value->span.begin,
+                                std::string("argument to `Console.") +
+                                    std::string(mbr) + "`",
+                                ce.args[0].value.get());
+                        }
                     }
                     // fix #6778 (§7.1, §5.1, §22.6, v0.340; stdlib §2.1,
                     // §7.4): every one-argument overload of these members is
