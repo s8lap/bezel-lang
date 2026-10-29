@@ -30766,6 +30766,60 @@ static bool builtinConcreteCollectionDeclaresMember(const TypeRef* recvTy,
     return isDocumentedConcreteCollectionMember(recvTy->headName(), member);
 }
 
+// fix #7775 (§26.5 rule 1, §8.1, v0.350; stdlib §3.1): the INSTANCE members
+// the built-in `StringBuilder` declares, counting its `Object` base.
+//
+// stdlib §3.1 declares `Length`, `Capacity`, `Append`, `AppendLine`,
+// `AppendFormat`, `Insert`, `Remove`, `Replace`, `Clear` and `ToString`;
+// `Object` (§8.1), its base, declares the instance members `ToString`,
+// `Equals`, `GetHashCode` and `GetType`. Spec §26.5 rule 1 (v0.350): "If
+// `x`'s declared type (or any base type) *declares* any instance member
+// named `Foo` — of any arity, applicability, or accessibility — instance
+// resolution is committed and extension blocks are **never consulted** for
+// that name on that receiver." The receiver must be the declaration-less
+// built-in head, not a user class that reuses the name (#7217).
+static bool builtinStringBuilderDeclaresMember(const TypeRef* recvTy,
+                                               std::string_view member) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return false;
+    if (recvTy->headName() != "StringBuilder") return false;
+    return member == "Length" || member == "Capacity" || member == "Append" ||
+           member == "AppendLine" || member == "AppendFormat" ||
+           member == "Insert" || member == "Remove" || member == "Replace" ||
+           member == "Clear" || member == "ToString" || member == "Equals" ||
+           member == "GetHashCode" || member == "GetType";
+}
+
+// fix #7775 (§26.5 rule 1, §8.1, v0.350): `Object` is a BASE type of every
+// head builtinHeadReachesObjectExtension admits, and `Object` declares the
+// instance members `ToString`, `Equals`, `GetHashCode` and `GetType` (§8.1),
+// so rule 1 ("If `x`'s declared type (or any base type) *declares* any
+// instance member named `Foo` ...") commits those names on such a receiver
+// too. The collection rows of concreteCollectionSurfaces() list only what
+// the stdlib §4.x class block declares, so they do not answer for these.
+static bool builtinObjectBaseDeclaresMember(const TypeRef* recvTy,
+                                            std::string_view member) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return false;
+    if (!builtinHeadReachesObjectExtension(recvTy->headName())) return false;
+    return member == "ToString" || member == "Equals" ||
+           member == "GetHashCode" || member == "GetType";
+}
+
+bool builtinHeadReachesObjectExtension(std::string_view head) {
+    // The heads whose declared surface is decided by name above
+    // (builtinStringBuilderDeclaresMember, concreteCollectionSurfaces) AND
+    // whose value already behaves as an `Object` in an extension body
+    // (`this.ToString()` / `GetHashCode()` / `Equals(this)`). The dictionary,
+    // set and linked-list families and the collection interface heads (which
+    // may hold one of them) are left out: their `Object` view reads freed or
+    // foreign memory (#7822), so admitting them would turn today's compile
+    // error into a run-time fault.
+    return head == "StringBuilder" || head == "Array" ||
+           head == "OwningArray" || head == "Stack" || head == "OwningStack" ||
+           head == "Queue" || head == "OwningQueue";
+}
+
 // fix #7373 (§26.5 rule 1, §27.1, §27.7, v0.350; stdlib §9.6): the NAMED
 // PROPERTIES of the built-in `string` head, with their declared types.
 // stdlib §9.6 declares exactly three — `Length: int`, `IsEmpty: bool` and
@@ -37485,6 +37539,45 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // built-in's own signature (stdlib §4.x), so a program
                     // that stores the declared `bool` of `a.Contains(2)` in
                     // the extension's `string` is rejected.
+                } else if (builtinStringBuilderDeclaresMember(recvTy,
+                                                              ma.member) ||
+                           builtinObjectBaseDeclaresMember(recvTy,
+                                                           ma.member)) {
+                    // fix #7775 (§26.5 rule 1, v0.350; stdlib §3.1): the same
+                    // commitment for the built-in `StringBuilder`. An
+                    // `extension Object` block is reachable from a
+                    // StringBuilder receiver (§8.1: `Object` is its base;
+                    // rule 2), so a same-named `Object` member (`Append`,
+                    // `Clear`, ...) must not shadow the declared one; nor
+                    // may one of `Object`'s own instance members (§8.1) on
+                    // the collection heads that reach the block.
+                    //
+                    // `Length` and `Capacity` are arity-0 PROPERTIES (stdlib
+                    // §3.1), so a CALL with arguments (`sb.Length(1)`) is
+                    // rule 1's "instance lookup commits, then fails" case: a
+                    // compile error, never the built-in's value nor a
+                    // same-named extension. Same refusal as the collection
+                    // `Count` (#7597, above).
+                    if (recvTy->headName() == "StringBuilder" &&
+                        (ma.member == "Length" || ma.member == "Capacity") &&
+                        &ma == calleeOfCallCtx_ && currentCallArity_ > 0) {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("`") + std::string(ma.member) +
+                            "` on `StringBuilder` is an instance member of "
+                            "the receiver's declared type; an extension of "
+                            "the same name is unreachable (spec §26.5 rule 1: "
+                            "instance members block same-named extensions of "
+                            "any arity, applicability, or accessibility). The "
+                            "instance member is a property that takes no "
+                            "arguments (stdlib §3.1), but this call supplies " +
+                            std::to_string(currentCallArity_) + ". " +
+                            extensionNameBlockedNote(recvTy, ma.member));
+                        return;
+                    }
                 } else {
                 // §26.5 (#714): pass outBinding to capture the free-var
                 // binding when a generic extension matched via ancestor lookup.
@@ -40186,8 +40279,12 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             // `Set<T>?`, ...): a name its stdlib §4.x block declares commits
             // the lookup, so `n?.Contains(2)` is the instance member, never
             // a same-named user extension.
+            // fix #7775 (§26.5 rule 1, §8.1, v0.350; stdlib §3.1): and the
+            // `?.` twin of the `.` form's `StringBuilder` / `Object`-base gate.
             if (!builtinCollectionSurfaceDeclaresMember(recvTy, nm.member) &&
-                !builtinConcreteCollectionDeclaresMember(recvTy, nm.member)) {
+                !builtinConcreteCollectionDeclaresMember(recvTy, nm.member) &&
+                !builtinStringBuilderDeclaresMember(recvTy, nm.member) &&
+                !builtinObjectBaseDeclaresMember(recvTy, nm.member)) {
                 member = lookupExtensionMember(
                     recvTy, nm.member, nullptr, nm.span.begin,
                     /*reportAmbiguity=*/true, currentCallArity_);

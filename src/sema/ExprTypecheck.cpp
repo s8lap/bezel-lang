@@ -13319,6 +13319,23 @@ static const TypeRef* extensionFindMatchingAncestor(
             // §30.3, v0.350): `Task` / `Task<T>` / `OwningTask<T>` are
             // classes (§30.3), so `Object` is their base like any class's.
             return target;
+        } else if (recv->kind == TypeRef::Kind::Named && !recv->declaration &&
+                   builtinHeadReachesObjectExtension(
+                       namedTypeSimpleName(recv))) {
+            // fix #7775 (§26.5 rule 2, §8.1, v0.350): `Object` is the base of
+            // the built-in `StringBuilder` and the built-in collections
+            // ("every type derives from Object"), and rule 2 searches the
+            // blocks on "`x`'s type, base types, or implemented interfaces".
+            // These heads carry no TypeDecl, so the arm above never saw them:
+            // an `extension Object` member stayed unresolved on such a
+            // receiver and codegen dropped the call.
+            //
+            // The arm is confined to the heads whose DECLARED surface sema
+            // answers by name (builtinHeadReachesObjectExtension): rule 1
+            // ("instance members win — by name") is decided for them before
+            // the extension blocks are consulted (resolveMemberAccess), so a
+            // same-named `Object` member never shadows a declared one.
+            return target;
         } else if (recv->kind == TypeRef::Kind::Primitive) {
             // Value-typed primitives (numeric, bool, char) are not string/Object;
             // they box to Object (§8.6). The receiver's `extensionThisType` will
@@ -14390,6 +14407,14 @@ Symbol* ExprTC::lookupExtensionMember(
     // free (extensionTargetMatchesReceiver's exact-match branch returns true
     // both ways when the heads are structurally equal).
     auto subtypeOrEq = [&](const TypeRef* sub, const TypeRef* base) -> bool {
+        // fix #7775 (§26.5.1, §8.1, v0.350): `Object` is a supertype of every
+        // type ("every type derives from Object"), so `extension Object` is
+        // the LEAST specific candidate for any receiver -- including a
+        // built-in interface head (`IEnumerable<int>`), which the ancestor
+        // walk below cannot relate to `Object`.
+        if (base && base->kind == TypeRef::Kind::Primitive &&
+            base->primitive == PrimitiveType::Object)
+            return true;
         return extensionFindMatchingAncestor(
                    base, sub, std::unordered_set<std::string_view>{},
                    ownedAncs) != nullptr;
@@ -14412,6 +14437,13 @@ Symbol* ExprTC::lookupExtensionMember(
     }
     if (maximal.size() == 1) {
         const ExtCandidate& winner = found[maximal[0]];
+        // fix #7775 (§26.5 rule 3, §26.5.1, v0.350): the auto-imported stdlib
+        // §5 block is the most specific candidate (its `IEnumerable<T>` head
+        // beats a user `extension Object`), so the call is the §5 operator.
+        // The candidate carries no member symbol of its own: report no
+        // extension, and the call takes typeCall's §5 path, as it does when
+        // no user block names the member.
+        if (winner.isStandardLibraryLinq) return nullptr;
         if (winner.shapeOnly) reportShapeOnlyCandidate(winner);
         else if (winner.genericMember) reportGenericMemberCandidate(winner);
         if (outBinding) *outBinding = winner.binding;

@@ -278,6 +278,16 @@ bool valueTypeMismatchForCasePattern(const TypeRef* scrutDecl,
 // Diagnostic text for the above, shared by every case-pattern site.
 std::string otherValueTypePatternMessage(std::string_view patName);
 
+// fix #7775 (§26.5 rules 1-2, §8.1, v0.350): the declaration-less built-in
+// heads an `extension Object` block reaches (§8.1: `Object` is their base;
+// rule 2 searches the blocks on the receiver's base types). Each is a head
+// whose DECLARED instance surface sema answers by NAME, so rule 1's by-name
+// commitment is decided before the extension blocks are consulted:
+// `StringBuilder` (stdlib §3.1) and the array-, stack- and queue-backed
+// collections (stdlib §4.4, §4.5, §4.11). Definition and the heads left
+// out: ExprTypecheck_Calls.cpp.
+bool builtinHeadReachesObjectExtension(std::string_view head);
+
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}
