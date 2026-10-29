@@ -10649,14 +10649,37 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             // Pass the direct function pointer; null means sync fallback.
             // On the unwind path, always use sync fallback (pass null).
-            // fix #7629 (§31.2, v0.350): the fault edges of this disposal
-            // supersede a caught exception the same way every synchronous
-            // raise does (emitAsyncDisposeFaultTail).
+            // fix #7629 + #7630 (§31.2 / §28.4 / §28.2, v0.350): the fault
+            // edges of this disposal leave the pass in the MIDDLE of this
+            // scope. The entries declared before this one (`scope` indices
+            // below it) are still undischarged and the unwind must dispose
+            // them; those declared after it were already discharged and must
+            // not be touched again (emitAsyncDisposeFaultTail).
             std::function<void(llvm::Value*)> faultTail;
-            if (!isUnwind)
-                faultTail = [this](llvm::Value* newExc) {
-                    emitAsyncDisposeFaultTail(newExc, {}, kAllLiveScopes);
+            if (!isUnwind) {
+                std::size_t hi = kAllLiveScopes;
+                for (std::size_t i = 0; i < disposeStack_.size(); ++i)
+                    if (&disposeStack_[i] == &scope) { hi = i; break; }
+                const auto idx = static_cast<std::size_t>(
+                    (it + 1).base() - scope.begin());
+                std::vector<Disposal> pending(scope.begin(),
+                                              scope.begin() + idx);
+                // A scope BELOW unwindScopeDepth_ lies outside the enclosing
+                // try, so this fault is raised by a return / break exit that
+                // is leaving that try. Exits run innermost-first: the
+                // try-body scopes (index >= unwindScopeDepth_) were already
+                // discharged by the exit, and this scope's remaining entries
+                // are not this unwind's to dispose (the exception is routed
+                // to the try's handler and the entries are still used
+                // afterwards; the wrong catch is issue #7708). So dispose
+                // nothing here: `pending` is cleared and `hi` stays below
+                // unwindScopeDepth_, which makes the unwind range empty.
+                if (hi != kAllLiveScopes && hi < unwindScopeDepth_)
+                    pending.clear();
+                faultTail = [this, pending, hi](llvm::Value* newExc) {
+                    emitAsyncDisposeFaultTail(newExc, pending, hi);
                 };
+            }
             emitAsyncDisposeAwaitAndFree(
                 obj, isUnwind ? nullptr : it->disposeAsyncFn,
                 isUnwind ? nullptr : it->asyncDisposeCls,

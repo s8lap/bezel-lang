@@ -165,6 +165,61 @@ end Program;
     return src;
 }
 
+// The `newExc != caught` guard: an awaited task's fault is RE-RAISED with the
+// task's own error object, so a bound task that `finally` awaited (E1 caught,
+// in flight) and an `await using` whose DisposeAsync re-awaits the SAME task
+// raise E1 again. The new exception IS the caught one, so the supersede must
+// NOT dispose it (it stays the live in-flight exception); removing the guard
+// frees it and the catch reads freed memory (heap-use-after-free, MEASURED on
+// the review's guard-less build, probes p01/p02 of r37-rev-l18). `runtime`
+// routes the binding through a run-time `IAsyncDisposable` return (itab arm).
+std::string buildSharedTask(const char* tag, bool runtime) {
+    std::string src = kPrelude;
+    std::size_t p = src.find("public class Program");
+    src.insert(p, R"BZ(public class W: IAsyncDisposable
+  public owned _t: Task;
+  public constructor(owned t: Task) _t := t; end constructor;
+  public async method DisposeAsync(): Task
+    await this._t;
+  end DisposeAsync;
+end W;
+)BZ");
+    src += R"BZ(
+  public static method MkW(owned w: W): owned IAsyncDisposable return w; end MkW;
+  public static async method Boom(): Task
+    throw new InvalidOperationException("E1");
+  end Boom;
+  public static async method R(): Task
+    var w := new W(Program.Boom());
+    try
+      await w._t;
+    finally
+      do
+        await using var d := )BZ";
+    src += runtime ? "Program.MkW(move w)" : "move w";
+    src += R"BZ(;
+      end;
+    end;
+  end R;
+  public static async method Main(): Task
+    for var i in 0..<100 do
+      try
+        await Program.R();
+      catch var e: InvalidOperationException =>
+        Program.Tally(e.Message, "E1");
+      catch var e: ArgumentException =>
+        K.outer := K.outer + 1;
+      end;
+    end for;
+    Console.WriteLine($")BZ";
+    src += tag;
+    src += R"BZ(: ok={K.ok} bad={K.bad} outer={K.outer} cells={Cell.n}");
+  end Main;
+end Program;
+)BZ";
+    return src;
+}
+
 void expectClean(const std::string& src, const char* tag) {
     bezel::test::JitResult r = runAotChecked(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -247,4 +302,17 @@ BEZEL_TEST(await_using_fault_tail_supersede,
 BEZEL_TEST(await_using_fault_tail_supersede,
            return_slot_runtime_head_faulted_task_disposes_the_returned_local_spec_28_3_7629) {
     expectClean(buildReturnSlot("far", "Program.MkAI()", "aboom"), "far");
+}
+
+// fix #7629 (§31.2, v0.350): pins the load-bearing `newExc != caught` guard.
+// The faulted task shared with `finally` is re-raised as the SAME object, static head.
+BEZEL_TEST(await_using_fault_tail_supersede,
+           shared_faulted_task_reraise_is_not_superseded_static_head_spec_31_2_7629) {
+    expectClean(buildSharedTask("sh", false), "sh");
+}
+
+// Same, run-time head (itab arm).
+BEZEL_TEST(await_using_fault_tail_supersede,
+           shared_faulted_task_reraise_is_not_superseded_runtime_head_spec_31_2_7629) {
+    expectClean(buildSharedTask("shr", true), "shr");
 }
