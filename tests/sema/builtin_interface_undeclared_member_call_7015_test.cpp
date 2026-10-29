@@ -292,15 +292,17 @@ BEZEL_TEST(builtin_interface_undeclared_member_call_7015,
         "1\n");
 }
 
-// CONTROL 11 — the documented property read through the `?.` spelling. The
-// `?.` property read on a list interface does not lower to a value (the
-// pre-existing #3079 degradation, unrelated to this fix), so this row pins
-// the ACCEPTANCE only: the `?.` call-form reject must not fire on a name the
-// head declares.
+// CONTROL 11 — the documented property read through the `?.` spelling. This
+// row pins the ACCEPTANCE: the `?.` call-form reject must not fire on a name
+// the head declares. Since fix #7016 (§7.5, v0.350) `ro?.Count` is typed
+// `int?`, so the read is consumed through `??` (spec §7.7) as for any `?.`
+// result; the bare `Console.WriteLine(ro?.Count)` it replaced was accepted
+// only because the access was untyped, and a typed nullable argument to a
+// non-nullable parameter is rejected exactly as for `s?.Length` (§7.5).
 BEZEL_TEST(builtin_interface_undeclared_member_call_7015,
            ireadonlylist_null_conditional_count_read_still_compiles_spec_4_1) {
     expectCompiles(mainWith("var ro: IReadOnlyList<int> := a; ",
-                            "Console.WriteLine(ro?.Count); "));
+                            "Console.WriteLine(ro?.Count ?? -1); "));
 }
 
 // CONTROL 12 — `Dispose` on a borrowing collection interface head. The

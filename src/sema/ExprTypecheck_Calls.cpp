@@ -39011,6 +39011,26 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 return;
             }
         }
+        // fix #7016 (§7.5, stdlib §4.1, v0.350): `il?.Contains(x)` on an
+        // `IList<T>?`. stdlib §4.1 declares `ICollection<T>.Contains(item: T):
+        // bool`, inherited by `IList<T>`; the `.` form types and lowers it, but
+        // the `?.` call over a declaration-less interface head reached no typing
+        // arm (the twin in typeCall covers only the §5 operators), so the call
+        // stayed untyped and codegen dropped the enclosing statement (#2434 /
+        // #3079). Type the access `bool` here when it is the callee of a
+        // one-argument call; typeCall copies a callee's type to the call and
+        // lifts it to `bool?` (§7.5: the result is always nullable).
+        if (!member && recvTy && &nm == calleeOfCallCtx_ &&
+            currentCallArity_ == 1 && nm.member == "Contains" &&
+            recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            recvTy->headName() == "IList") {
+            ctx_.setExprType(
+                &nm, ctx_.primitiveTypeRef(PrimitiveType::Bool,
+                                          /*nullable=*/true));
+            return;
+        }
         // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
         // collection/string head. The `.` form types these `int` in
         // resolveMemberAccess; the `?.` form left them untyped (every
@@ -39033,7 +39053,15 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                     : (common::isBuiltinIntCountPropertyHead(cn) ||
                        common::isPlainBuiltinCollectionHead(cn) ||
                        common::isOwningCollectionHead(cn) ||
-                       cn == "OwningBuffer");
+                       cn == "OwningBuffer" ||
+                       // fix #7016 (§7.5, stdlib §4.1, v0.350): the
+                       // array-backed borrowing list interfaces declare
+                       // `Count` (IReadOnlyList<T> inherits it from
+                       // IReadOnlyCollection<T>; IList<T> from both), and
+                       // the `.` form lowers it. The polymorphic
+                       // ICollection / IReadOnlyCollection heads stay out:
+                       // the `.` form rejects `.Count` on them (#853).
+                       cn == "IList" || cn == "IReadOnlyList");
             if (isIntProperty) {
                 ctx_.setExprType(
                     &nm, ctx_.primitiveTypeRef(PrimitiveType::Int,
