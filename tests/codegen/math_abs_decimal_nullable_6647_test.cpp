@@ -50,19 +50,21 @@
 // diagnostic instead of emitting a value the consumer will read as another
 // primitive (and instead of aborting the compiler).
 //
-// THE REMEDY ITSELF IS NOT IN THIS FILE. The call's result type is the
-// SEMANTIC layer's (src/sema/ExprTypecheck_Calls.cpp): its polymorphic-
-// refinement block copies the operand's NULLABLE type to the result, and its
-// #6297 `decimal` block requires a NON-nullable `decimal` operand — so a
-// narrowed `decimal?` operand keeps the `int` placeholder. When that is
-// fixed, the guard below stands down and the program compiles and prints
-// 2.5 — and the row below MUST then be updated (a behaviour flip must
-// update the tests that pinned the old behaviour).
+// THE REMEDY WAS NOT IN THIS FILE, AND IT HAS NOW LANDED (#7460, v0.350).
+// The call's result type is the SEMANTIC layer's
+// (src/sema/ExprTypecheck_Calls.cpp): its polymorphic-refinement block copied
+// the operand's NULLABLE type to the result, and its #6297 `decimal` block
+// required a NON-nullable `decimal` operand, so a narrowed `decimal?` operand
+// kept the `int` placeholder. Both now read the operand's static type AT THE
+// CALL (spec §22.6: a narrowed read is of its non-nullable type), the call is
+// typed `decimal`, the fail-closed guard stands down, and the two narrowed
+// rows below flipped from "refused" to the `decimal` the call denotes.
 //
 // The rows below pin: (a) the `decimal` payload is never read as another
 // primitive, (b) the compiler never aborts on these shapes, (c) the LEGAL
 // `decimal` forms still compute the `decimal` they declare, and (d) the
-// UN-narrowed spelling is still refused by §7.
+// UN-narrowed spelling is still refused by §7. (The fail-closed guard itself
+// stays in the `Math` lowering for any other call it types non-`decimal`.)
 
 #include <string>
 
@@ -88,51 +90,34 @@ std::string prog(const std::string& body) {
            "end C;";
 }
 
-// The fail-closed guard: the program did not run, the driver rejected it at a
-// REAL source location (never a crash / signal / timeout / ASan report), and
-// the diagnostic names the `decimal` result type and §5.1.
-void expectDecimalResultRefused(const JitResult& r, const char* member) {
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(
-        r, (std::string("`Math.") + member +
-            "` at a `decimal` operand must produce a `decimal`")
-                .c_str()));
-    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "§5.1"));
-    // The pre-fix symptoms: the compiler ABORTED inside the LLVM verifier,
-    // and (once the payload was extracted) the consumer read the `decimal`
-    // struct as an `int` and printed its low word.
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "IR verification failed"));
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "compiler CRASHED"));
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "terminated by signal"));
-    BEZEL_EXPECT_FALSE(diagnosticMessageContains(r, "Both operands to ICmp"));
-}
-
 }  // namespace
 
 // ===========================================================================
-// The NARROWED `decimal?` operand. REFUSED with a located diagnostic — never
-// a compiler abort, and never a value read as another primitive.
+// The NARROWED `decimal?` operand. ADMITTED (spec §22.6: a narrowed read is of
+// its non-nullable type), typed `decimal`, and it prints the `decimal` — never
+// a compiler abort, and never a value read as another primitive. (These two
+// rows pinned a located REFUSAL until #7460 fixed the result type; they flipped
+// with it.)
 // ===========================================================================
 
 BEZEL_TEST(math_abs_decimal_nullable_6647,
-           narrowed_decimal_abs_is_refused_not_a_wrong_value_2_2_5_1) {
-    auto r = runAot(prog(
-        "    var m: decimal? := 2.5m; "
-        "    Console.WriteLine(Math.Abs(m));"));
-    expectDecimalResultRefused(r, "Abs");
+           narrowed_decimal_abs_computes_the_decimal_2_2_5_1) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+                        "    var m: decimal? := 2.5m; "
+                        "    Console.WriteLine(Math.Abs(m));")),
+                    "2.5");
 }
 
 // The same at the `Floor` position — the family that declares a `decimal`
-// form too (stdlib §2.2 `Floor(x: decimal): decimal`).
+// form too (stdlib §2.2 `Floor(x: decimal): decimal`): 2.5m floors to 2.
 BEZEL_TEST(math_abs_decimal_nullable_6647,
-           narrowed_decimal_floor_is_refused_not_a_crash_2_2_5_1) {
-    auto r = runAot(prog(
-        "    var m: decimal? := 2.5m; "
-        "    if m <> null then "
-        "      Console.WriteLine(Math.Floor(m)); "
-        "    end;"));
-    expectDecimalResultRefused(r, "Floor");
+           narrowed_decimal_floor_computes_the_decimal_2_2_5_1) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+                        "    var m: decimal? := 2.5m; "
+                        "    if m <> null then "
+                        "      Console.WriteLine(Math.Floor(m)); "
+                        "    end;")),
+                    "2");
 }
 
 // ===========================================================================

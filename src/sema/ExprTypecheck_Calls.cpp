@@ -18152,6 +18152,35 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // fix #7461 / #7460 (§7.4, §22.6, v0.350; stdlib §2.2): the STATIC
+        // TYPE of a `Math` operand is its type AT THE CALL — §22.6: "a read of
+        // a binding §7.4 has narrowed non-null is of its non-nullable type".
+        // Sema keeps a narrowed read's exprType at the DECLARED `T?`
+        // (SemaContext::markNarrowedValueRead), so the refinements below that
+        // type the call from its operands copied the nullable type to the
+        // result (#7460: `var r: double := Math.Abs(d)` over a narrowed
+        // `d: double?` was refused as nullable although the value is the
+        // payload), and the generic `Min` / `Max` / `Clamp` / `DivRem` forms,
+        // whose `T` comes from INFERENCE and so has no declared position for
+        // the §7 gate to claim, reached codegen with the `{i8, T}` carrier and
+        // were refused by its fail-closed comparison guard (#7461). An
+        // UN-narrowed nullable keeps its declared type (and its refusal): only
+        // `isNarrowedNonNullRead` drops the nullable flag.
+        bool mathNarrowedOk = false;
+        if (auto* nma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            if (auto* ntid =
+                    dynamic_cast<const ast::IdentifierExpr*>(nma->target.get()))
+                if (ntid->name == "Math")
+                    if (auto* nts =
+                            dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*ntid)))
+                        mathNarrowedOk = nts->decl == nullptr;
+        auto mathArgType = [&](const ast::Expr& a) -> TypeRef* {
+            TypeRef* t = ctx_.exprType(a);
+            if (!mathNarrowedOk || !t || !t->nullable ||
+                t->kind != TypeRef::Kind::Primitive)
+                return t;
+            return operandStaticTypeAt(&a, t);
+        };
         // fix #6955 (stdlib §2.2, §22.6, §5.1, v0.340): `Math.Abs` declares
         // exactly four overloads (int, long, double, decimal). An operand whose
         // type is none of those converts to several of them, and §22.6 ranks
@@ -18209,7 +18238,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 rt->primitive == PrimitiveType::Int &&
                 !ce.args.empty() && ce.args[0].value) {
                 const ast::Expr& argE = *ce.args[0].value;
-                if (auto* argTy = ctx_.exprType(argE)) {
+                if (auto* argTy = mathArgType(argE)) {
                     if (argTy->kind == TypeRef::Kind::Primitive &&
                         (argTy->primitive == PrimitiveType::Double ||
                          argTy->primitive == PrimitiveType::Float ||
@@ -18261,7 +18290,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         bool allDecimal = true;
                         for (const auto& arg : ce.args) {
                             const TypeRef* at =
-                                arg.value ? ctx_.exprType(*arg.value) : nullptr;
+                                arg.value ? mathArgType(*arg.value) : nullptr;
                             if (!at || at->nullable ||
                                 at->kind != TypeRef::Kind::Primitive ||
                                 at->primitive != PrimitiveType::Decimal)
@@ -18308,7 +18337,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             const TypeRef* clash = nullptr;
                             for (const auto& arg : ce.args) {
                                 const TypeRef* at =
-                                    arg.value ? ctx_.exprType(*arg.value) : nullptr;
+                                    arg.value ? mathArgType(*arg.value) : nullptr;
                                 if (!at || at->nullable ||
                                     at->kind != TypeRef::Kind::Primitive ||
                                     at->primitive == PrimitiveType::None) {
@@ -18447,7 +18476,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         bool same = true;
                         for (const auto& arg : ce.args) {
                             const TypeRef* at =
-                                arg.value ? ctx_.exprType(*arg.value) : nullptr;
+                                arg.value ? mathArgType(*arg.value) : nullptr;
                             if (!at || at->nullable ||
                                 at->kind != TypeRef::Kind::Primitive) {
                                 same = false;
