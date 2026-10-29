@@ -10173,6 +10173,19 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
 }
 
 
+// fix #7526 (§29.2 / §29.7, v0.350): `for var x in h.F!` iterates the SAME
+// source `h.F` does — `!` (§16.5 null assertion) only asserts non-null and
+// yields the operand's value, so every source-SHAPE classification (array vs
+// vtable protocol, named-binding vs fresh temporary) must look through it.
+// Peel only postfix `!` layers (never `as`, whose result is a borrow, §17.4).
+static const ast::Expr* peelForInSourceBang(const ast::Expr* e) {
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        if (!pb->operand) break;
+        e = pb->operand.get();
+    }
+    return e;
+}
+
 // fix #3468 / §29.2 / §29.7 / stdlib §4.12–§4.13 (v0.286): the ONE
 // classification of a builtin-enumerable `for-in` source — see the header
 // comment on `BuiltinForInSource` for why answering it twice was a leak
@@ -10241,11 +10254,12 @@ Emitter::classifyBuiltinForInSource(const ast::ForStmt& fs) {
     // already holds a proper vtable-backed wrapper and slot 4 (GetEnumerator)
     // is always valid — no longer limited to yield-iterator results.
     bool isArrayBacked = true;  // default: array protocol
-    if (dynamic_cast<const ast::CallExpr*>(fs.iterable.get())) {
+    const ast::Expr* srcCore = peelForInSourceBang(fs.iterable.get());
+    if (dynamic_cast<const ast::CallExpr*>(srcCore)) {
         isArrayBacked = false;  // iterator method call → vtable
-    } else if (dynamic_cast<const ast::NewExpr*>(fs.iterable.get())) {
+    } else if (dynamic_cast<const ast::NewExpr*>(srcCore)) {
         isArrayBacked = false;  // new C() → vtable
-    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(srcCore)) {
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         // Helper: is `rt` a concrete user class (has a declaration pointer)?
         auto checkNamed = [&](sema::TypeRef* rt) {
@@ -10311,17 +10325,17 @@ Emitter::classifyBuiltinForInSource(const ast::ForStmt& fs) {
             if (common::isSyncIterFormatEnumerableHead(n))
                 isArrayBacked = false;
         }
-    } else if (dynamic_cast<const ast::MemberAccessExpr*>(fs.iterable.get())) {
+    } else if (dynamic_cast<const ast::MemberAccessExpr*>(srcCore)) {
         // §29.2 / §28.5 (#1642): an explicit `this.seq` / `obj.seq` field or
         // property read — the same object-owned, vtable-backed iterator source as
         // the bare-identifier field/property case above (exprSymbol resolves the
         // member access to its FieldSymbol / PropertySymbol).
-        sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable);
+        sema::Symbol* sym = ctx_.exprSymbol(*srcCore);
         if ((dynamic_cast<sema::FieldSymbol*>(sym) ||
              dynamic_cast<sema::PropertySymbol*>(sym)) &&
             common::isSyncIterFormatEnumerableHead(n))
             isArrayBacked = false;
-    } else if (dynamic_cast<const ast::IndexExpr*>(fs.iterable.get())) {
+    } else if (dynamic_cast<const ast::IndexExpr*>(srcCore)) {
         // fix #3356 / §29.2 / §23.4 (v0.278): an INDEXER read `obj[i]` whose
         // declared return type is `IEnumerable<T>` / `IOwningEnumerable<T>` —
         // the EXPRESSION-BODIED indexer inline path (LlvmBackend_Assign.cpp
@@ -10569,7 +10583,8 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // decl-based check first (byte-for-byte unchanged), wire-carried fallback
     // for a decl-null imported Property.
     bool sourceIsNamedLocal = false;
-    if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
+    if (sema::Symbol* sym =
+            ctx_.exprSymbol(*peelForInSourceBang(fs.iterable.get()))) {
         if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
             dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
