@@ -3298,6 +3298,40 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // The decline happens here, BEFORE any receiver IR is emitted, so the
     // receiver expression is evaluated exactly once (the extension lowering
     // lowers it again).
+    // fix #7448 (§26.5 rules 1-3 and §26.5.1, v0.350; stdlib §5): the
+    // decline is not limited to `Length` / `Count`.  The stdlib §5 operators
+    // that only `extension IEnumerable<T>` supplies (Sum / Min / Max / First /
+    // ... — `common::isBuiltinCollectionLinqOperatorName`) are claimed below
+    // by NAME too, so a user `extension Array<int>` Sum, which §26.5 rule 3
+    // and §26.5.1 select over the stdlib block, was dropped (the program
+    // printed the built-in's 6, not the extension's 77).
+    //
+    // The bound symbol alone is NOT the discriminator: sema consults the
+    // extension blocks for a concrete built-in collection head even on a
+    // name the head DECLARES (`Contains`, `IndexOf`, `Reverse`, `Add`, ...),
+    // which §26.5 rule 1 forbids ("extension blocks are never consulted for
+    // that name on that receiver"), so for those names the built-in below is
+    // the instance member rule 1 commits to and must keep answering.  The
+    // decline therefore asks the receiver's declared surface, as the
+    // Length / Count arm does, and is confined to the §5-only names.  Of
+    // those, a built-in collection head declares exactly these (stdlib
+    // §4.4 / §4.19 `ToArray`; §4.6 / §4.7 / §4.18 the `First` / `Last`
+    // properties); no §4.1 / §4.2 / §4.12 / §4.13 interface declares any.
+    {
+        auto* ms0 =
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+        if (isExtensionMethod(ms0) &&
+            common::isBuiltinCollectionLinqOperatorName(m)) {
+            const std::string_view head = builtinTypeName(recvTy);
+            const bool declaresName =
+                (m == "ToArray" &&
+                 (head == "Array" || head == "FrozenArray")) ||
+                ((m == "First" || m == "Last") &&
+                 (head == "LinkedList" || head == "OwningLinkedList" ||
+                  head == "SortedSet"));
+            if (!declaresName) return nullptr;
+        }
+    }
     if (m == "Length" || m == "Count") {
         auto* ms =
             dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
