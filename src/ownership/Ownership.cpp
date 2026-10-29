@@ -6024,6 +6024,20 @@ bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
 }
 
 OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
+    // fix #7678 (§17.8 / §28.3, v0.350): a postfix null-forgiving `E!` is
+    // classified by its position EXACTLY as the bare `E` is -- "if `x` is
+    // owned ... `x!` is owned; if borrowed, `x!` is borrowed with the same
+    // source", and `!` "is purely a type-system assertion" that mints and
+    // consumes nothing. So `var e := h.Mk()!;` over an `owned` mint is an
+    // OWNED producer exactly as `var e := h.Mk();` is (it may be `move`d,
+    // and a reassignment `e := h.Mk()!;` drops the displaced owned value),
+    // while `x!` / `this.f!` / `p!` over a named place keep the borrow the
+    // bare read has (the recursion lands on the same IdentifierExpr /
+    // MemberAccessExpr fallthrough). Nested `E!!` peels every layer. The
+    // codegen twin is `peelForInSourceBang` (fix #7594).
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        if (pb->operand) return producerState(*pb->operand);
+    }
     // §17.15 / §28.3 producers row (v0.216, #2098): a binding atom's
     // classification is its BODY's, transparently — the atom is not a join
     // (clauses and body evaluate unconditionally; no K7 meet arises). Peel
