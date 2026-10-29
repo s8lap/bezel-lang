@@ -4278,6 +4278,41 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (lit != locals_.end()) retSlot = lit->second;
                 }
             }
+            // fix #7537 (§15.3 *Return* + *Parameter passing*, §28.1 clause 1,
+            // §35.4, v0.350): `return p;` where `p` is a by-value-move
+            // PARAMETER of an owning-classified choice. §15.3: "returning a
+            // move-only value transfers it to the caller", and a move-only
+            // parameter is a by-value-move binding the callee owns, so the
+            // returned value leaves the parameter moved-from. The lookup above
+            // sees a LocalSymbol only, so the parameter kept its scope-end
+            // active-case disposal (`registerUnwindOwnedParam`'s owning-choice
+            // arm) and freed the payload before `ret`: the caller then read and
+            // disposed a freed block (heap-use-after-free, measured on the
+            // `owned` spelling at r30-c1 342da591).
+            //
+            // The parameter is zero-stored rather than erased from
+            // `disposeStack_`: the store runs on THIS return's path only, so a
+            // sibling path that does not return the parameter still disposes
+            // it, and the null-guarded pass reads the zeroed slot and disposes
+            // nothing here. The value `v` was read out of the slot above. The
+            // core declines every non-owning-choice parameter (an owned class
+            // parameter keeps its own unwind-only discharge), and also takes
+            // `return move p;` and an if-expression whose selected branch is
+            // `p` (§20 *Ownership*: the selected branch moves, under the
+            // selection flag `lowerConditional` recorded).
+            auto namesParam = [&](auto&& self, const ast::Expr* e) -> bool {
+                if (!e) return false;
+                if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e))
+                    return u->op == "move" && self(self, u->operand.get());
+                if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(e))
+                    return self(self, ce->thenValue.get()) ||
+                           self(self, ce->elseValue.get());
+                auto* pid = dynamic_cast<const ast::IdentifierExpr*>(e);
+                return pid && dynamic_cast<sema::ParameterSymbol*>(
+                                  ctx_.exprSymbol(*pid)) != nullptr;
+            };
+            if (namesParam(namesParam, retCore))
+                markOwningChoiceArgMovedFrom(retCore);
         }
         if (retSlot) {
             for (auto& scope : disposeStack_) {
