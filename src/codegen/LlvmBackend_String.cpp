@@ -2534,7 +2534,19 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                                            "trim.chars.str.result");
             }
             auto* fn = declareC("bz_str_trim_chars", ptrTy(), {ptrTy(), ptrTy()});
-            return builder_.CreateCall(fn, {self, chars}, "trim.chars.result");
+            llvm::Value* res =
+                builder_.CreateCall(fn, {self, chars}, "trim.chars.result");
+            // fix #7522 (stdlib §9.6, §28.3 *Unbound owned temporaries*,
+            // §28.9, v0.350): an `owned Array<char>` call result passed as
+            // `chars` is an unbound +1 temporary that the helper only READS;
+            // nothing bound it, so nothing released it (leak, 80 B per call).
+            // Release it after the result is built. The helper is a no-op for
+            // any shape that is not a fresh owned temporary (a named local,
+            // a field, a parameter), so a borrowed set is never freed.
+            freeUnboundOwnedBorrowingArrayTemp(
+                call.args[0].value.get(), chars,
+                ctx_.exprType(*call.args[0].value));
+            return res;
         }
         // #7425 (§4.6, v0.345): the trim is done in the CODE-POINT domain, by
         // the runtime's width-aware helper.
