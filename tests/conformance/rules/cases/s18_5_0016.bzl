@@ -10,6 +10,7 @@
 //! output: null|null|null|null|null|null|null
 //!   null|null|null|null|null|null|null
 module Conf;
+import System.Threading;
 
 public class Program
   public static method Main()

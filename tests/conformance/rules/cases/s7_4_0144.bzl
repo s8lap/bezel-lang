@@ -6,11 +6,11 @@
 //! cites: 7.1, 7.4
 //! expect: reject
 //! diagnostic: nullable
-module M; import System; import System.Text; import System.Threading.Tasks;
+module M; import System; import System.Text;
 class C
   public static method Main(): int
     var d: double? := 1.5;
-    if Environment.GetCommandLineArgs().Length > 5 then d := null; end;
+    if Environment.ProcessorCount > 100000 then d := null; end;
     Console.WriteLine(Double.IsNaN(d));
     return 0;
   end Main;

@@ -10,6 +10,7 @@
 //! output: mm|pp
 //!   tm
 module Conf;
+import System.Threading;
 
 public class Program
   public static method Main()
