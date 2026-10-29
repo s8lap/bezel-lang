@@ -87,7 +87,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    using var box := new Box(); "
         "    C.Sink(move box.f!); "
@@ -110,7 +110,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    var box: Box := new Box(); "
         "    C.Sink(move box.f!); "
@@ -134,7 +134,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Take(owned b: Box) C.Sink(move b.f!); end Take; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -156,7 +156,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Take(b: Box) C.Sink(move b.f!); end Take; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -181,7 +181,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  destructor end destructor; "
         "end Holder; "
         "class C "
-        "  public static method Consume(owned h: Holder) using var k := h; end Consume; "
+        "  public static method Consume(owned h: Holder) using var k := move h; end Consume; "
         "  public static method Use() "
         "    using var box := new Box(); "
         "    C.Consume(new Holder(move box.f!)); "
@@ -203,7 +203,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    using var box := new Box(); "
         "    C.Sink(move box.f); "
@@ -232,7 +232,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  public method Give() C.Sink(move this.f!); end Give; "
         "  destructor end destructor; "
         "end Box; "
-        "class C public static method Sink(owned c: Cell) using var k := c; end Sink; end C;");
+        "class C public static method Sink(owned c: Cell) using var k := move c; end Sink; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(errorSays(r, "left in moved-from state at method exit"));
 }
@@ -262,7 +262,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    using var box := new Box(); "
         "    C.Sink(box.Take()!); "
@@ -283,7 +283,7 @@ BEZEL_TEST(move_field_nonthis_owned_sink_1999,
     std::string src =
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() var x: Cell? := new Cell(); C.Sink(move x!); end Use; "
         "  public static method Main(): int C.Use(); return Cell.live; end Main; "
         "end C;";

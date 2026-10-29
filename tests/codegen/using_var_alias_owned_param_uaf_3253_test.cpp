@@ -112,7 +112,8 @@ BEZEL_TEST(using_var_alias_owned_param_uaf_3253,
     const std::string src = prog(
         "class Q "
         "  public static method Throw(r: owned R) "
-        "    using var alias := r; "        // §28.10 borrow-pin
+        "    var rv := r; "                 // borrowing alias (spec v0.350 §28.10 rejects the unmarked owned `r`)
+        "    using var alias := rv; "       // §28.10 borrow-pin
         "    _ := alias; "                  // discard — must NOT consume alias
         "    throw new E(); "               // K3.15 unwind edge
         "  end Throw; "
@@ -136,7 +137,8 @@ BEZEL_TEST(using_var_alias_owned_param_uaf_3253,
     const std::string src = prog(
         "class Q "
         "  public static method Consume(r: owned R): int "
-        "    using var alias := r; "       // §28.10 borrow-pin
+        "    var rv := r; "                // borrowing alias (spec v0.350 §28.10 rejects the unmarked owned `r`)
+        "    using var alias := rv; "      // §28.10 borrow-pin
         "    _ := alias; "                  // discard — must NOT consume alias
         "    return 0; "
         "  end Consume; "

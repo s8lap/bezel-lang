@@ -58,7 +58,7 @@ std::string wrap(const std::string& body) {
         "end Res; "
         "class Sink "
         "  public method Take(owned t: Res) "
-        "    using var h: Res := t; "
+        "    using var h: Res := move t; "
         "  end Take; "
         "end Sink; "
         "class Program "

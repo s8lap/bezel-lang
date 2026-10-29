@@ -84,12 +84,14 @@ BEZEL_TEST(using_var_producerstate_funnel_2072, using_var_new_owned_disposes_onc
 }
 
 // ===========================================================================
-// Pair 2 — a bare-id read of a named OWNED local is a BORROW under BOTH binding
-// forms. `var x := src` borrows (§28.3 local-read row); `using var x := src`
-// borrow-pins (§28.10). Either way the SOURCE `src` retains the sole obligation
-// and disposes exactly once — the pin/borrow disposes nothing (no double-free).
-// This is the #2071 shape: the two forms must classify the bare-id identically.
-// // per §28.3, §28.10, #2071
+// Pair 2 — a bare-id read of a named OWNED local is a BORROW under `var`
+// (`var x := src` borrows, §28.3 local-read row): the SOURCE `src` retains the
+// sole obligation and disposes exactly once. The `using var` twin over an
+// owned local is a COMPILE ERROR since spec v0.350 (§28.10 *Adopting a named
+// owned binding*), so its row reads a BORROW-STATE source instead: a plain
+// parameter `b` bound to the caller's owned `src`. The pin disposes nothing,
+// `src` disposes once (no double-free). This is the #2071 shape.
+// // per §28.3, §28.10, v0.350, #2071
 // ===========================================================================
 BEZEL_TEST(using_var_producerstate_funnel_2072, var_bareid_borrow_source_disposes_once_spec_28_3) {
     expectDisposedOnce(
@@ -100,12 +102,16 @@ BEZEL_TEST(using_var_producerstate_funnel_2072, var_bareid_borrow_source_dispose
 }
 BEZEL_TEST(using_var_producerstate_funnel_2072, using_var_bareid_borrow_source_disposes_once_spec_28_10) {
     expectDisposedOnce(
-        "class P public static method Main(): int "
-        "  do using var src := new R(); using var x := src; var p := x.Ping(); end; "
-        "  return R.live; "                       // 0 — src disposes once, x pins
-        "end Main; end P;");
+        "class P "
+        "  public static method View(b: R) using var x := b; var p := x.Ping(); end View; "
+        "  public static method Main(): int "
+        "    do using var src := new R(); P.View(src); end; "
+        "    return R.live; "                     // 0 — src disposes once, x pins the borrow
+        "  end Main; "
+        "end P;");
 }
 
+// ===========================================================================
 // ===========================================================================
 // Pair 3 — an OWNED-returning static factory CALL is an OWNED producer under
 // BOTH binding forms (§28.3 "Factory methods and sourceless returns" / #1499).
@@ -128,16 +134,18 @@ BEZEL_TEST(using_var_producerstate_funnel_2072, using_var_owned_call_disposes_on
 }
 
 // ===========================================================================
-// Pair 4 — an unmarked bare-id read of an OWNED PARAMETER is a BORROW under both
-// forms (§28.10 v0.180 / #2071: unmarked does NOT adopt). The parameter retains
-// the obligation and is disposed once by the frame; the pin disposes nothing.
-// // per §28.10 v0.180, #2071
+// Pair 4 — a bare-id read of an OWNED PARAMETER is a BORROW under `var` (the
+// parameter retains the obligation and is disposed once by the frame). The
+// unmarked `using var x := p;` is a COMPILE ERROR since spec v0.350 (§28.10
+// *Adopting a named owned binding*; it named neither adopt nor view), so the
+// row binds the view with `var`, the remedy the rule names.
+// // per §28.10 v0.350, #2071
 // ===========================================================================
 BEZEL_TEST(using_var_producerstate_funnel_2072, using_var_owned_param_bareid_borrow_pin_spec_28_10) {
     expectDisposedOnce(
         "class P "
         "  public static method Take(owned p: R): int "
-        "    using var x := p; var n := x.Ping(); return 0; "  // borrow-pin; p disposes
+        "    var x := p; var n := x.Ping(); return 0; "  // view; p disposes
         "  end Take; "
         "  public static method Main(): int "
         "    var w := new R(); var r := P.Take(move w); "
@@ -146,6 +154,7 @@ BEZEL_TEST(using_var_producerstate_funnel_2072, using_var_owned_param_bareid_bor
         "end P;");
 }
 
+// ===========================================================================
 // ===========================================================================
 // Pair 8 (F1 graft pin, landed with #2072) — a binding ATOM (§17.15 v0.216,
 // #2098) whose BODY is a borrow classifies as a BORROW under both binding

@@ -1198,7 +1198,7 @@ const char* kArrTryPopFirstTransfer =
     "    a.Add(move (new R())); a.Add(move (new R())); "
     "    var got: R? := null; var ok := a.TryPopFirst(out got); "
     "    if ok then if got <> null then "
-    "      do using var _ := got; end; end; end; "
+    "      do using var _ := move got; end; end; end; "
     "  end; "
     "  return R.count; "                  // 2
     "  end Main; "
@@ -1219,7 +1219,7 @@ const char* kLListTryPopFirstTransfer =
     "    l.AddLast(move (new R())); l.AddLast(move (new R())); "
     "    var got: R? := null; var ok := l.TryPopFirst(out got); "
     "    if ok then if got <> null then "
-    "      do using var _ := got; end; end; end; "
+    "      do using var _ := move got; end; end; end; "
     "  end; "
     "  return R.count; "                  // 2
     "  end Main; "
@@ -1241,7 +1241,7 @@ const char* kDictTryPopValueTransfer =
     "    d.Add(\"a\", move (new R())); d.Add(\"b\", move (new R())); "
     "    var v: R? := null; var hit := d.TryPopValue(\"a\", out v); "
     "    if hit then if v <> null then "
-    "      do using var _ := v; end; end; end; "
+    "      do using var _ := move v; end; end; end; "
     "  end; "
     "  return R.count; "                  // 2
     "  end Main; "

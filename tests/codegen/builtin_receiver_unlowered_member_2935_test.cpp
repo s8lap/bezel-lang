@@ -371,7 +371,7 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
         "  arr.Add(move (new R())); "
         "  var d := arr.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "  end; "
         "  return R._n; "
         "end Main; end C;";

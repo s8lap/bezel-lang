@@ -93,7 +93,7 @@ BEZEL_TEST(move_field_nonthis_owned_local_decl_2002,
     std::string src =
         std::string(kCell) + kBox +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    using var box := new Box(); "
         "    var t: Cell? := move box.f!; "
@@ -116,7 +116,7 @@ BEZEL_TEST(move_field_nonthis_owned_local_decl_2002,
     std::string src =
         std::string(kCell) + kBox +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    using var box := new Box(); "
         "    var t: Cell? := move box.f!; "
@@ -138,10 +138,10 @@ BEZEL_TEST(move_field_nonthis_owned_local_decl_2002,
     std::string src =
         std::string(kCell) + kBox +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Take(owned b: Box) "
         "    var t: Cell? := move b.f!; "
-        "    using var keep := b; "
+        "    using var keep := move b; "
         "    C.Sink(move t!); "
         "  end Take; "
         "  public static method Make(): owned Box return new Box(); end Make; "
@@ -170,7 +170,7 @@ BEZEL_TEST(move_field_nonthis_owned_local_decl_2002,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    using var box := new Box<long>(1234567890123L); "
         "    var t: Cell? := move box.f!; "
@@ -206,7 +206,7 @@ BEZEL_TEST(move_field_nonthis_owned_local_decl_2002,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() using var box := new Box(); box.Give(); end Use; "
         "  public static method Main(): int C.Use(); return Cell.live; end Main; "
         "end C;";
@@ -250,7 +250,7 @@ BEZEL_TEST(move_field_nonthis_owned_local_decl_2002,
     auto r = parseAndCheckOwnership(
         std::string(kCell) + kBox +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    using var box := new Box(); "
         "    C.Sink(move box.f!); "

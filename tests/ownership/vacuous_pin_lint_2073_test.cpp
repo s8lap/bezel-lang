@@ -443,7 +443,8 @@ BEZEL_TEST(vacuous_pin_lint_2073,
         "class C "
         "  public method M(): int "
         "    var ch := new Channel<Report>(); "
-        "    using var inbox := ch; "
+        "    var v := ch; "                // a borrowing alias: v0.350 §28.10 rejects the owned `ch`
+        "    using var inbox := v; "
         "    return 0; "
         "  end M; "
         "  public static method Main(): int return 0; end Main; "
@@ -1046,8 +1047,9 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     for (std::size_t i = 0; i < std::size(cases); ++i) {
         // `src` is the owned binding; `names[i]` is the vacuous pin over it.
         std::string source =
-            std::string("module M; class C public method M(): int var src := new ") +
-            cases[i] + "(); using var " + names[i] + " := src; return 0; end M; "
+            std::string("module M; class C public method M(): int var o := new ") +
+            cases[i] + "(); var src := o; "  // src: a borrowing alias (v0.350 §28.10)
+            "using var " + names[i] + " := src; return 0; end M; "
             "public static method Main(): int return 0; end Main; end C;";
         auto r = parseAndCheckOwnership(source);
         BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -1150,7 +1152,8 @@ BEZEL_TEST(vacuous_pin_lint_2073,
         "  public static method M(): int "
         "    using var a := new Array<int>(); "
         "    a.Add(1); a.Add(2); "
-        "    using var seq: IEnumerable<int> := a; "
+        "    var v := a; "                 // a borrowing alias: v0.350 §28.10 rejects the owned `a`
+        "    using var seq: IEnumerable<int> := v; "
         "    return 0; "
         "  end M; "
         "  public static method Main(): int return 0; end Main; "
@@ -1234,7 +1237,8 @@ BEZEL_TEST(vacuous_pin_lint_2073,
         "class C "
         "  public static method M(): int "
         "    using var a := new Array<int>(); "
-        "    using var seq: IList<int> := a; "
+        "    var v := a; "                 // a borrowing alias: v0.350 §28.10 rejects the owned `a`
+        "    using var seq: IList<int> := v; "
         "    return 0; "
         "  end M; "
         "  public static method Main(): int return 0; end Main; "

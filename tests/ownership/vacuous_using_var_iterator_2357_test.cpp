@@ -297,7 +297,8 @@ BEZEL_TEST(vacuous_using_var_iterator_2357,
         "class C "
         "  public static method M(): int "
         "    using var a := new Array<int>(); "
-        "    using var seq: IList<int> := a; "
+        "    var v := a; "  // a borrowing alias: spec v0.350 §28.10 rejects the owned `a`
+        "    using var seq: IList<int> := v; "
         "    return 0; "
         "  end M; "
         "  public static method Main(): int return 0; end Main; "
@@ -321,7 +322,8 @@ BEZEL_TEST(vacuous_using_var_iterator_2357,
         "class C "
         "  public static method M(): int "
         "    using var a := new Array<int>(); "
-        "    using var seq: IReadOnlyCollection<int> := a; "
+        "    var v := a; "  // a borrowing alias: spec v0.350 §28.10 rejects the owned `a`
+        "    using var seq: IReadOnlyCollection<int> := v; "
         "    return 0; "
         "  end M; "
         "  public static method Main(): int return 0; end Main; "

@@ -153,6 +153,21 @@ std::string factoryProgBody(const std::string& head,
            "end C;";
 }
 
+// The "bound-then-pinned" alias. Through spec v0.345 these rows pinned the
+// owned local itself (`var src := new <ty>(); using var p := src;`); spec
+// v0.350 §28.10 *Adopting a named owned binding* makes that unmarked read of
+// an owned local a compile error. The pinned source is now a BORROWING ALIAS
+// of it (`var src := o;` borrows, §28.3), the borrow-state binding the rule
+// leaves a borrow-pin.
+std::string aliasProg(const std::string& ty) {
+    return "module M; class C "
+           "  public static method M(): int "
+           "    var o := new " + ty + "(); var src := o; "
+           "    using var p := src; return 0; end M; "
+           "  public static method Main(): int return 0; end Main; "
+           "end C;";
+}
+
 }  // namespace
 
 // =====================================================================
@@ -305,9 +320,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
         "__Buffer<int>",
     };
     for (const char* ty : cases) {
-        auto alias = parseAndCheckOwnership(prog(
-            std::string("var src := new ") + ty + "(); "
-            "using var p := src;"));
+        auto alias = parseAndCheckOwnership(aliasProg(ty));
         BEZEL_EXPECT_FALSE(alias.diagnostics.hasErrors());
         BEZEL_EXPECT_TRUE(hasInertRhsWarning(alias, "p"));
     }

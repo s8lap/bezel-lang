@@ -144,7 +144,7 @@ BEZEL_TEST(iowningenumerable_callee_owned_bound_6544,
            partially_iterated_disposes_the_unyielded_remainder_28_11) {
     std::string src = program(
         "OwningArray",
-        binding("for var e in d do using var u := e; break; end;"), 3);
+        binding("for var e in d do using var u := move e; break; end;"), 3);
     BEZEL_EXPECT_EQ(checkedStdout(src), "3\n");
 }
 
@@ -152,7 +152,7 @@ BEZEL_TEST(iowningenumerable_callee_owned_bound_6544,
            partially_iterated_list_twin_disposes_the_unyielded_remainder_28_11) {
     std::string src = program(
         "OwningLinkedList",
-        binding("for var e in d do using var u := e; break; end;"), 3);
+        binding("for var e in d do using var u := move e; break; end;"), 3);
     BEZEL_EXPECT_EQ(checkedStdout(src), "3\n");
 }
 
@@ -167,7 +167,7 @@ BEZEL_TEST(iowningenumerable_callee_owned_bound_6544,
            fully_iterated_disposes_each_element_once_28_11) {
     std::string src = program(
         "OwningArray",
-        binding("for var e in d do using var u := e; end;"), 3);
+        binding("for var e in d do using var u := move e; end;"), 3);
     BEZEL_EXPECT_EQ(checkedStdout(src), "3\n");
 }
 
@@ -175,7 +175,7 @@ BEZEL_TEST(iowningenumerable_callee_owned_bound_6544,
            fully_iterated_list_twin_disposes_each_element_once_28_11) {
     std::string src = program(
         "OwningLinkedList",
-        binding("for var e in d do using var u := e; end;"), 3);
+        binding("for var e in d do using var u := move e; end;"), 3);
     BEZEL_EXPECT_EQ(checkedStdout(src), "3\n");
 }
 
@@ -192,8 +192,8 @@ BEZEL_TEST(iowningenumerable_callee_owned_bound_6544,
            second_enumeration_drains_the_remainder_and_replays_nothing_4_13) {
     std::string src = program(
         "OwningArray",
-        binding("for var e in d do using var u := e; end;"
-                "for var e2 in d do using var u2 := e2; end;"), 3);
+        binding("for var e in d do using var u := move e; end;"
+                "for var e2 in d do using var u2 := move e2; end;"), 3);
     BEZEL_EXPECT_EQ(checkedStdout(src), "3\n");
 }
 
@@ -296,7 +296,7 @@ BEZEL_TEST(iowningenumerable_callee_owned_bound_6544,
         "  public static method Inner(): int "
         "    using var d := C.Build(); "
         "    for var e in d do "
-        "      using var u := e; "
+        "      using var u := move e; "
         "      Console.WriteLine(u.V); "
         "    end; "
         "    Console.WriteLine(Item._n); "
@@ -336,7 +336,7 @@ BEZEL_TEST(iowningenumerable_callee_owned_bound_6544,
         "  public static method Inner(): int "
         "    using var d := C.Build(); "
         "    for var e in d do "
-        "      using var u := e; "
+        "      using var u := move e; "
         "      Console.WriteLine(u.V); "
         "    end; "
         "    Console.WriteLine(Item._n); "

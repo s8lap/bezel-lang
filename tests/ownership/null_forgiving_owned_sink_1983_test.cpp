@@ -128,7 +128,7 @@ BEZEL_TEST(null_forgiving_owned_sink_1983,
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() var x: Cell? := new Cell(); C.Sink(x!); end Use; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -215,7 +215,7 @@ BEZEL_TEST(null_forgiving_owned_sink_1983,
     std::string src =
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() C.Sink(new Cell()); end Use; "
         "  public static method Main(): int C.Use(); return Cell.live; end Main; "
         "end C;";

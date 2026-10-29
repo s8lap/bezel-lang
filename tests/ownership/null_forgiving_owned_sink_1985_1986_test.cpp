@@ -137,7 +137,7 @@ BEZEL_TEST(null_forgiving_owned_sink_1985,
     auto r = parseAndCheckOwnership(
         "module M; "
         "class C "
-        "  public static method Sink(owned e: Exception) using var k := e; end Sink; "
+        "  public static method Sink(owned e: Exception) using var k := move e; end Sink; "
         "  public static method Use() "
         "    var x: Exception? := new InvalidOperationException(\"boom\"); "
         "    C.Sink(x!); "
@@ -233,7 +233,7 @@ BEZEL_TEST(null_forgiving_owned_sink_1986,
     std::string src =
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() var x: Cell? := new Cell(); C.Sink(move x!); end Use; "
         "  public static method Main(): int C.Use(); return Cell.live; end Main; "
         "end C;";
@@ -281,7 +281,7 @@ BEZEL_TEST(null_forgiving_owned_sink_1986,
         "  destructor end destructor; "
         "end Holder; "
         "class C "
-        "  public static method Consume(owned h: Holder) using var k := h; end Consume; "
+        "  public static method Consume(owned h: Holder) using var k := move h; end Consume; "
         "  public static method Use() "
         "    var x: Cell? := new Cell(); C.Consume(new Holder(move x!)); "
         "  end Use; "
@@ -301,7 +301,7 @@ BEZEL_TEST(null_forgiving_owned_sink_1986,
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() "
         "    var x: Cell? := new Cell(); "
         "    C.Sink(move x!); "

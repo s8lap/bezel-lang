@@ -29,6 +29,12 @@
 //
 // FAIL-WITHOUT: 16-byte LSan leak (one Cell allocation never reclaimed).
 // PASS-WITH: Cell.live == 0, ASan/LSan-clean.
+//
+// v0.350 NOTE (issue #7481, §28.10 *Adopting a named owned binding*): an
+// UNMARKED `using var y := x;` over a named owned class or interface binding is
+// now a COMPILE ERROR (the adoption is spelled `move x`). The rows below that
+// pinned the unmarked adoption therefore spell it `using var y := move x;`: the
+// dynamic-dispose classifier they exercise is the same (the marked, bare-id arm).
 
 #include <string>
 
@@ -71,7 +77,7 @@ BEZEL_TEST(using_var_interface_owned_1972, unmarked_param_adopts_interface_28_6)
         std::string(kCell) +
         "class Program "
         "  public static method Take(owned x: IThing): int "
-        "    using var y := x; "          // unmarked, unannotated; per §28.6 must dispose
+        "    using var y := move x; "     // v0.350 §28.10: the unmarked form is a compile error (#7481); adopt with `move`
         "    var p := y.Ping(); "
         "    return 0; "
         "  end Take; "
@@ -104,7 +110,7 @@ BEZEL_TEST(using_var_interface_owned_1972, unmarked_local_adopts_interface_28_6)
         "  public static method Main(): int "
         "    do "
         "      var x: IThing := new Cell(); "   // x owns an IThing (concrete Cell)
-        "      using var y := x; "               // unmarked, unannotated; adopt x
+        "      using var y := move x; "          // v0.350 §28.10: the unmarked form is a compile error (#7481); adopt with `move`
         "      var p := y.Ping(); "
         "      _ := p; "
         "    end; "
@@ -128,7 +134,7 @@ BEZEL_TEST(using_var_interface_owned_1972, annotated_param_control_28_6) {
         std::string(kCell) +
         "class Program "
         "  public static method Take(owned x: IThing): int "
-        "    using var y: IThing := x; "  // annotated; works via (a) branch
+        "    using var y: IThing := move x; "  // annotated, marked (the unmarked annotated form is a compile error, v0.350 §28.10)
         "    var p := y.Ping(); "
         "    return 0; "
         "  end Take; "
@@ -180,7 +186,7 @@ BEZEL_TEST(using_var_interface_owned_1972, exactly_once_no_double_dispose_28_6) 
         std::string(kCell) +
         "class Program "
         "  public static method Take(owned x: IThing): int "
-        "    using var y := x; "
+        "    using var y := move x; "
         "    var p := y.Ping(); "
         "    return p; "
         "  end Take; "

@@ -394,7 +394,7 @@ BEZEL_TEST(codegen_generic_usingvar_disposal_28_3_14_2,
         "  destructor Widget.D := Widget.D + 1; end destructor; end Widget; "
         "public static class Prog "
         "  public static method Main(): int "
-        "    do var o := new Widget(); using var c := o; end; "
+        "    do var o := new Widget(); using var c := move o; end; "
         "    return Widget.D; end Main; "
         "end Prog;");
     if (rc == -1) return;

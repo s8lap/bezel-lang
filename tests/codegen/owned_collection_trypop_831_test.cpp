@@ -122,7 +122,7 @@ BEZEL_TEST(owned_collection_trypop_831, dict_try_pop_value_hit) {
         "    d.Add(\"a\", move (new R())); var v: R? := null; "
         "    var hit := d.TryPopValue(\"a\", out v); "
         "    if hit then if v <> null then "
-        "      do using var _ := v; end; return 1; end; return 2; end; "
+        "      do using var _ := move v; end; return 1; end; return 2; end; "
         "    return 3; end; return 0; "
         "end Main; end C;"), 1);
 }

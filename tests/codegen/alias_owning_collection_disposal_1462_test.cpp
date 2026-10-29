@@ -159,7 +159,7 @@ BEZEL_TEST(codegen_alias_owning_disposal_1462, aliased_drain_for_in_disposes_all
         "class C "
         "  static method f() using var a: OA := new OwningArray<R>(); "
         "    a.Add(new R()); a.Add(new R()); a.Add(new R()); "
-        "    for var e in a.Drain() do using var _ := e; end; end f; "
+        "    for var e in a.Drain() do using var _ := move e; end; end f; "
         "  public static method Main(): int f(); return R._n; end Main; end C;";
     BEZEL_EXPECT_EQ(run(src), 3);
     int lsan = runUnderLeakSanitizer(src);

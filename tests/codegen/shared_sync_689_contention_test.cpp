@@ -174,7 +174,7 @@ BEZEL_TEST(shared_sync_689_contention,
         "class Churn "
         // Takes h (owned), clones 100 times, releases all clones + h on scope exit.
         "  public static method Clone100(owned h: Shared<Inner>) "
-        "    using var handle := h; "
+        "    using var handle := move h; "
         "    var i := 0; "
         "    while i < 100 do "
         "      using var tmp := handle.Clone(); "
@@ -276,7 +276,7 @@ BEZEL_TEST(shared_sync_689_contention,
         // the mutex is free (Main awaits it before touching the mutex), so no
         // acquisition ever has to park a pool worker.
         "  public static method AcquireN(owned h: Shared<Mutex>): int "
-        "    using var handle := h; "
+        "    using var handle := move h; "
         "    var count := 0; "
         "    while count < 5 do "
         "      using var guard := handle.Get().Acquire(); "

@@ -126,18 +126,20 @@ std::string declaredTypeFor(const std::string& head) {
 // The alias form the issue measures: a destructor-bearing `Res` inside an
 // `OwningArray`, bound at the given disposal head.
 //
-// `using var c: <head> := src;` — the UNMARKED read of a named owned binding
-// — is a compile error per `spec §28.10` (v0.345) ("An unmarked
-// `using var y := x;` is a compile error when its right-hand side is a named
-// owned binding whose declared type, nullability stripped, is a class or
-// interface type"); the compiler still admits it (issue #5582, a KNOWN
-// divergence the corpus row `s28_10_0015` carries). That divergence is NOT
-// this lane's business: what this lane pins is that the §28.10 VACUITY
-// warning — a claim that the RHS carries NO disposal obligation — is not
-// drawn over a disposal-interface binding whose object HAS a destructor.
+// `using var c: <head> := src;` — the UNMARKED read of a named binding. Over a
+// named OWNED class or interface binding that spelling is a compile error per
+// `spec §28.10` v0.350 (*Adopting a named owned binding*), so `src` here is a
+// BORROWING ALIAS of the owner (`var src := owner;`, §28.3): the unmarked read
+// of a borrow-state binding is the borrow-pin the vacuity lint talks about. (Through v0.345 this program bound a LOCAL and
+// the compiler admitted it, issue #5582, the divergence corpus row
+// `s28_10_0015` carried; issue #7481 closed it, so the source moved to a
+// borrowing alias to keep the lint question this lane pins askable.) What this
+// lane pins is that the §28.10 VACUITY warning — a claim that the RHS
+// carries NO disposal obligation — is not drawn over a disposal-interface
+// binding whose object HAS a destructor.
 //
 // The element type is `Res`, a CLASS with a destructor, so the obligation the
-// lint denies is real and is discharged.
+// lint denies is real and is discharged (by the owner of `src`).
 std::string aliasProgram(const std::string& head) {
     return
         "module M; "
@@ -147,8 +149,9 @@ std::string aliasProgram(const std::string& head) {
         "end Res; "
         "public class Program "
         "  public static method Main() "
-        "    var src := new OwningArray<Res>(); "
-        "    src.Add(new Res()); "
+        "    using var owner := new OwningArray<Res>(); "
+        "    owner.Add(new Res()); "
+        "    var src := owner; "
         "    using var c: " + declaredTypeFor(head) + " := src; "
         "    Console.WriteLine(\"in-scope\"); "
         "  end Main; "

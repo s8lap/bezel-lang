@@ -240,7 +240,7 @@ const char* kOwnedArrayTransfer =
     "  public constructor(v: int) V := v; end constructor; end N; "
     "class C "
     "  public static method Take(owned a: OwningArray<N>): int "
-    "    using var local: OwningArray<N> := a; return local.Count; "
+    "    using var local: OwningArray<N> := move a; return local.Count; "
     "  end Take; "
     "  public static method Main(): int "
     "    return C.Take([new N(1), new N(2), new N(3)]); "

@@ -195,7 +195,7 @@ BEZEL_TEST(async_enumerator_take_after_exhaustion_2627,
         "  end Gen; "
         "  public static async method Main(): Task<int> "
         "    await for var r in Gen() do "
-        "      using var u := r; "
+        "      using var u := move r; "
         "    end; "
         "    return R._n * 10 + 1; "
         "  end Main; end C;"), 31);

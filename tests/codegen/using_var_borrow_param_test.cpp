@@ -154,9 +154,11 @@ end Program;
 // fix #7387 (§28.10, v0.345): the OWNED parameter — the CONTROL that says the
 // fix is a CLASSIFICATION fix. §28.3's K1 gives an `owned` parameter an OWNED
 // classification, so the value is discharged exactly ONCE — by the parameter's
-// own §28.3 K3.14 auto-drop (the `using var` alias is the ownership pass's
-// #3253 borrow-pin, so it disposes nothing). The observable is therefore
-// exactly ONE `DTOR`.
+// own §28.3 K3.14 auto-drop. Since §28.10 v0.350 the unmarked
+// `using var x := src;` directly over an `owned` parameter is a compile error
+// (#7481), so the pin is taken through a borrowing alias `var sv := src;`
+// (§28.3): `x` is then the borrow-pin of a borrow-state binding and disposes
+// nothing. The observable is therefore exactly ONE `DTOR`.
 //
 // A fix that disposed NOTHING would leave this `DTOR` unprinted and the object
 // leaked; a fix that disposed TWICE would print it twice.
@@ -169,7 +171,8 @@ public class Res
 end Res;
 public class Program
   public static method Take(owned src: IAsyncDisposable)
-    using var x := src;
+    var sv := src;
+    using var x := sv;
   end Take;
   public static async method Main(): Task
     var src: IAsyncDisposable := new Res();

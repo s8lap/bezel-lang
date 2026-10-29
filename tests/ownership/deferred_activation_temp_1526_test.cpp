@@ -376,9 +376,12 @@ BEZEL_TEST(deferred_activation_temp, spawn_owned_arg_clean) {
 // above. That row only asserts the deferred-activation DIAGNOSTIC does not
 // fire; it never ran the program, so the runtime behaviour it exercises —
 // an owned `Mutex` argument auto-dropped at the end of a `Domain.Spawn`
-// entry via an unmarked `using var s := m;` borrow-pin (§28.10: a
-// borrow-pin assumes no obligation, so `m` stays undischarged and the
-// release comes from THIS auto-drop) — went unasserted (#4666's census).
+// entry via a view binding `var s := m;` (§21.1: a plain alias is a borrow,
+// so `m` stays undischarged and the release comes from THIS auto-drop) —
+// went unasserted (#4666's census). The binding was written as an unmarked
+// `using var s := m;` until spec v0.350, whose §28.10 *Adopting a named
+// owned binding* makes that spelling a compile error (it names neither
+// adopt nor view); the `var` spelling is the view the rule's remedy offers.
 //
 // PRE-FIX: `registerUnwindOwnedParam` (LlvmBackend_Setup.cpp) registered
 // the §28.3 auto-drop for `ChannelSender`/`Channel`/`Shared` and the
@@ -399,7 +402,7 @@ BEZEL_TEST(deferred_activation_temp, spawn_owned_arg_no_leak_100) {
         "module M; "
         "class Worker "
         "  public static method Run(owned m: Mutex) "
-        "    using var s := m; "
+        "    var s := m; "
         "  end Run; "
         "end Worker; "
         "class Program "

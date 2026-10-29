@@ -94,7 +94,7 @@ BEZEL_TEST(generic_using_var_owned_return, using_var_of_owned_param_still_dispos
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kCell +
         "class Prog "
-        "  public static method Take(owned x: Cell) using var c := x; end Take; "
+        "  public static method Take(owned x: Cell) using var c := move x; end Take; "
         "  public static method Use(): int "
         "    do Prog.Take(new Cell()); end; "  // transfer → Take's using var disposes once
         "    return Cell.n; "                   // 0

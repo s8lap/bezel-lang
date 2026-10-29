@@ -147,7 +147,7 @@ BEZEL_TEST(move_borrow_owned_sink_local_decl_2010_2016,
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell): int using var k := c; return 0; end Sink; "
+        "  public static method Sink(owned c: Cell): int using var k := move c; return 0; end Sink; "
         "  public static method Borrow(b: Cell?) var r := C.Sink(move b!); end Borrow; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -167,7 +167,7 @@ BEZEL_TEST(move_borrow_owned_sink_local_decl_2010_2016,
     auto r = parseAndCheckOwnership(
         std::string(kCell) + kBox + "end Box; " +
         "class C "
-        "  public static method Sink(owned c: Cell): int using var k := c; return 0; end Sink; "
+        "  public static method Sink(owned c: Cell): int using var k := move c; return 0; end Sink; "
         "  public static method Borrow(box: Box) var r := C.Sink(move box.f!); end Borrow; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -210,7 +210,7 @@ BEZEL_TEST(move_borrow_owned_sink_local_decl_2010_2016,
         "  destructor end destructor; "
         "end Outer; "
         "class C "
-        "  public static method Sink(owned c: Cell): int using var k := c; return 0; end Sink; "
+        "  public static method Sink(owned c: Cell): int using var k := move c; return 0; end Sink; "
         "  public static method Steal(o: Outer) var r := C.Sink(move o.inner.f!); end Steal; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -293,7 +293,7 @@ BEZEL_TEST(move_borrow_owned_sink_local_decl_2010_2016,
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell): int using var k := c; return 0; end Sink; "
+        "  public static method Sink(owned c: Cell): int using var k := move c; return 0; end Sink; "
         "end C; "
         "class Box "
         "  public owned f: Cell? := null; "

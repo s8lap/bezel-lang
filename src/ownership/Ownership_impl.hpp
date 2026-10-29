@@ -5218,6 +5218,35 @@ private:
     //     #2137, #2146
     bool usingVarInitIsRecognizedBorrow(const ast::Expr& init) const;
 
+    // §28.10 *Adopting a named owned binding* (v0.350, derives K3.4): an
+    // UNMARKED `using var y := x;` (and the anonymous `using var _ := x;`, and
+    // `await using var y := x;`, §28.12) whose right-hand side is a named
+    // owned binding of class or interface type is a COMPILE ERROR: the
+    // spelling does not say whether `y` adopts `x` or views it, and the
+    // compiler does not choose. `x!` and `(x)` are the bare `x`; an if / `??` /
+    // expression-`case` whose every arm (null and `throw` arms set aside) is
+    // such a read is rejected on the same ground. Returns the first covered
+    // read when the right-hand side is rejected, else null. A MIXED meet (any
+    // arm that is not a covered named owned binding) is not covered here: it
+    // stays the §28.10 borrow-pin of the union of sources.
+    const ast::IdentifierExpr* usingVarUnmarkedNamedOwnedRead(
+        const ast::Expr& init, bool fromLambdaBody) const;
+    // True when `id` names a NAMED OWNED BINDING of class or interface type
+    // (nullability stripped) at this program point: a local whose state is
+    // Owned (a `var` / `using var` local, an owned iteration variable, an
+    // `out owned` recipient, an owning-match arm binding) or an `owned`
+    // parameter. A field read, a captured binding in a closure and a
+    // borrow-state binding are not. // per §28.10, v0.350
+    // `fromLambdaBody`: the read is inside a lambda body, where a captured
+    // binding is in borrow state (§28.3 *Captured owned bindings*) and so is
+    // not covered; the pre-pass seeds captured locals into `states_` as their
+    // declaring frame saw them, recorded in `lambdaCapturedSyms_` so they can
+    // be told from the body's own locals. A lambda body's PARAMETERS are not
+    // considered (a miss, never an over-reject).
+    bool isNamedOwnedClassOrInterfaceBinding(const ast::IdentifierExpr& id,
+                                             bool fromLambdaBody) const;
+    std::unordered_set<const sema::Symbol*> lambdaCapturedSyms_;
+
     // §28.8: report the owned-sink violation for `argValue` (at `loc`) when
     // `ownedArgSourceIsBorrow` holds. Returns true when it reported (the
     // caller then skips the bogus `markMovedByName` that would silently treat

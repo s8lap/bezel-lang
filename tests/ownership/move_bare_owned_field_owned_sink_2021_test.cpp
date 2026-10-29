@@ -91,11 +91,11 @@ const char* kCell =
 // sink for the local-decl-initializer path.
 const char* kSink =
     "class Sink "
-    "  public static method Take(owned c: Cell) using var k := c; end Take; "
-    "  public static method TakeR(owned c: Cell): int using var k := c; return 0; end TakeR; "
+    "  public static method Take(owned c: Cell) using var k := move c; end Take; "
+    "  public static method TakeR(owned c: Cell): int using var k := move c; return 0; end TakeR; "
     "end Sink; "
     "class Holder "
-    "  public constructor(owned c: Cell) using var k := c; end constructor; "
+    "  public constructor(owned c: Cell) using var k := move c; end constructor; "
     "  destructor end destructor; "
     "end Holder; ";
 

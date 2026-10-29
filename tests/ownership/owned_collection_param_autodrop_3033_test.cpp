@@ -94,8 +94,12 @@ const char* kCell =
 }  // namespace
 
 // ===========================================================================
-// (1) The issue's OWN repro — `using var src := elements;` over an
-//     `owned OwningArray<Cell>` parameter, drained to empty.
+// (1) The issue's OWN repro — a view binding `var src := elements;` over an
+//     `owned OwningArray<Cell>` parameter, drained to empty. (The issue wrote
+//     the binding `using var src := elements;`; spec v0.350 §28.10 *Adopting
+//     a named owned binding* makes that spelling a compile error, so the view
+//     spelling the rule's remedy offers keeps the auto-drop under test; the
+//     rejected spelling is pinned in section (7) below.)
 // ===========================================================================
 
 // #3033's verbatim repro shape. The drain empties the array, so ONLY the
@@ -109,7 +113,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "  public Total: int; "
         "  public constructor(t: int) Total := t; end constructor; "
         "  public static method Consume(elements: owned OwningArray<Cell>): owned Bag "
-        "    using var src := elements; "
+        "    var src := elements; "
         "    var s := 0; "
         "    while src.Count > 0 do "
         "      using var c := src.PopFirst(); "
@@ -424,10 +428,12 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
 // (7) The DIAGNOSTIC half of #3033 — right to fire, wrong in what it said.
 // ===========================================================================
 
-// The auto-drop warning must still FIRE on the issue's repro: per §28.10 the
-// unmarked `using var src := elements;` is a borrow-pin, so `elements` really
-// does retain the obligation. #3033 asked for this warning to be silenced;
-// that request is REFUTED by the spec and this cell pins the refusal.
+// The auto-drop warning must still FIRE on the issue's repro shape: a view
+// binding `var src := elements;` leaves the obligation with `elements`, so it
+// really is implicitly disposed. #3033 asked for this warning to be silenced;
+// that request is REFUTED by the spec and this cell pins the refusal. (The
+// issue spelled the view `using var src := elements;`; v0.350 §28.10 makes
+// that an error, the next cell.)
 BEZEL_TEST(owned_collection_param_autodrop_3033,
            unmarked_using_var_rebind_still_warns_spec_28_10) {
     auto r = parseAndCheckOwnership(
@@ -439,7 +445,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
         "end Cell; "
         "class C "
         "  public static method Consume(elements: owned OwningArray<Cell>): int "
-        "    using var src := elements; "
+        "    var src := elements; "
         "    return src.Count; "
         "  end Consume; "
         "end C;");
@@ -461,6 +467,36 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
             d.message.find("§28.3 must-use / auto-drop") != std::string::npos)
             warned = true;
     BEZEL_EXPECT_TRUE(warned);
+}
+
+// §28.10 v0.350 *Adopting a named owned binding*: the issue's literal
+// spelling, `using var src := elements;` over an `owned` parameter of a
+// builtin collection type, is a COMPILE ERROR -- it says neither that `src`
+// adopts `elements` nor that it views it. The diagnostic names the remedies.
+BEZEL_TEST(owned_collection_param_autodrop_3033,
+           unmarked_using_var_rebind_of_owned_param_is_rejected_spec_28_10) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell "
+        "  public V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "  destructor end destructor; "
+        "end Cell; "
+        "class C "
+        "  public static method Consume(elements: owned OwningArray<Cell>): int "
+        "    using var src := elements; "
+        "    return src.Count; "
+        "  end Consume; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("`elements`") != std::string::npos &&
+            d.message.find("move elements") != std::string::npos &&
+            d.message.find("§28.10") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
 }
 
 // ...and its remedy list must name the MARKED adoption. §28.10 verbatim: "An
@@ -492,7 +528,7 @@ BEZEL_TEST(owned_collection_param_autodrop_3033,
     BEZEL_EXPECT_TRUE(msg.find("using var elements2 := move elements;") !=
                       std::string::npos);
     // ...and says why the marker is required, citing §28.10.
-    BEZEL_EXPECT_TRUE(msg.find("borrow-pin") != std::string::npos);
+    BEZEL_EXPECT_TRUE(msg.find("is rejected") != std::string::npos);
     BEZEL_EXPECT_TRUE(msg.find("§28.10") != std::string::npos);
     // The three other §28.3 remedies survive.
     BEZEL_EXPECT_TRUE(msg.find("`move`") != std::string::npos);

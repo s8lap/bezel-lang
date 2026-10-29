@@ -145,7 +145,7 @@ BEZEL_TEST(iowningenumerable_explicit_dispose_6553,
 BEZEL_TEST(iowningenumerable_explicit_dispose_6553,
            explicit_dispose_after_partial_read_pays_the_remainder_28_11) {
     std::string src = program(
-        binding("for var e in d do using var u := e; break; end;"
+        binding("for var e in d do using var u := move e; break; end;"
                 "d.Dispose();"), 3);
     BEZEL_EXPECT_EQ(checkedStdout(src), "3\n");
 }
@@ -162,7 +162,7 @@ BEZEL_TEST(iowningenumerable_explicit_dispose_6553,
 BEZEL_TEST(iowningenumerable_explicit_dispose_6553,
            explicit_dispose_after_full_read_disposes_nothing_twice_28_11) {
     std::string src = program(
-        binding("for var e in d do using var u := e; end;"
+        binding("for var e in d do using var u := move e; end;"
                 "d.Dispose();"), 3);
     BEZEL_EXPECT_EQ(checkedStdout(src), "3\n");
 }

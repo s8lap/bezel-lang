@@ -90,7 +90,7 @@ std::string makeGenericProgram(const std::string& collType,
         "  destructor end destructor; "
         "  public method Add(owned c: T) _items." + addCall + "(move c); end Add; "
         "  public method DrainAll() "
-        "    for var item in _items.Drain() do using var _ := item; end; "
+        "    for var item in _items.Drain() do using var _ := move item; end; "
         "  end DrainAll; "
         "end Wrapper; "
         "class C public static method Main(): int "
@@ -98,7 +98,7 @@ std::string makeGenericProgram(const std::string& collType,
         "  w.Add(new R()); "
         "  w.Add(new R()); "
         "  w.DrainAll(); "
-        "  using var _ := w; "
+        "  using var _ := move w; "
         "  return R._n; "  // 0 when both drained elements disposed exactly once
         "end Main; end C;";
 }
@@ -157,7 +157,7 @@ BEZEL_TEST(generic_owned_drain_990, generic_drain_element_value_usable_spec_4_5)
         "  b.Add(new Val(30)); "
         "  var sum := 0; "
         "  for var item in b._items.Drain() do "
-        "    using var it := item; "
+        "    using var it := move item; "
         "    sum := sum + it.N; "
         "  end; "
         "  return sum; "  // 60
@@ -185,7 +185,7 @@ BEZEL_TEST(generic_owned_drain_990, nongeneric_ownedarray_drain_disposes_once_sp
         "  destructor end destructor; "
         "  public method Add(owned c: R) _items.Add(move c); end Add; "
         "  public method DrainAll() "
-        "    for var item in _items.Drain() do using var _ := item; end; "
+        "    for var item in _items.Drain() do using var _ := move item; end; "
         "  end DrainAll; "
         "end Wrapper; "
         "class C public static method Main(): int "
@@ -193,7 +193,7 @@ BEZEL_TEST(generic_owned_drain_990, nongeneric_ownedarray_drain_disposes_once_sp
         "  w.Add(new R()); "
         "  w.Add(new R()); "
         "  w.DrainAll(); "
-        "  using var _ := w; "
+        "  using var _ := move w; "
         "  return R._n; "  // 0
         "end Main; end C;"), 0);
 }

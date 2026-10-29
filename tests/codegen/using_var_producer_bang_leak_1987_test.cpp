@@ -187,7 +187,8 @@ BEZEL_TEST(using_var_producer_bang_leak_1987,
         "  do "
         "    var x: Cell? := new Cell(); "
         "    do "
-        "      using var c := x!; "   // place `E!` — borrow; x still owns
+        "      var xv := x!; "        // borrowing alias of the owned `x` (spec v0.350 §28.10: `using var c := x!` is rejected)
+        "      using var c := xv; "   // borrow; x still owns
         "    end; "                   // c disposes nothing here
         "  end; "                     // x auto-drops here -> Cell.live == 0
         "  return Cell.live; ");      // 0

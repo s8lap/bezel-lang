@@ -68,7 +68,7 @@ BEZEL_TEST(owned_set_drain_1475, empty_set_drain_compiles_and_runs_spec_4_10) {
         "public static method Main(): int "
         "  using var s := new OwningSet<Cc>(); "
         "  for var x in s.Drain() do "
-        "    using var _ := x; "
+        "    using var _ := move x; "
         "  end; "
         "  return 0; "
         "end Main; end Cc;"), 0);
@@ -82,7 +82,7 @@ BEZEL_TEST(owned_set_drain_1475, full_drain_disposes_all_spec_4_10) {
         "s.Add(move (new R())); "
         "s.Add(move (new R())); "
         "for var item in s.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return R._n;"  // 3
     )), 3);
@@ -95,7 +95,7 @@ BEZEL_TEST(owned_set_drain_1475, full_drain_empties_set_spec_4_10) {
         "s.Add(move (new R())); "
         "s.Add(move (new R())); "
         "for var item in s.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return s.Count;"  // 0
     )), 0);
@@ -118,7 +118,7 @@ BEZEL_TEST(owned_set_drain_1475, drain_visits_every_element_once_spec_4_10) {
         "  var seen := 0; "
         "  var sum := 0; "
         "  for var item in s.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    seen := seen + 1; "
         "    sum := sum + u.N; "
         "  end; "
@@ -141,7 +141,7 @@ BEZEL_TEST(owned_set_drain_1475, partial_drain_break_remainder_disposed_spec_4_1
         "  s.Add(move (new R())); "
         "  s.Add(move (new R())); "
         "  for var item in s.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "  afterBreak := R._n; "  // 1 disposed so far
@@ -156,7 +156,7 @@ BEZEL_TEST(owned_set_drain_1475, empty_set_drain_no_iterations_spec_4_10) {
         "using var s := new OwningSet<R>(); "
         "var count := 0; "
         "for var item in s.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "  count := count + 1; "
         "end; "
         "return count;"  // 0
@@ -170,7 +170,7 @@ BEZEL_TEST(owned_set_drain_1475, reusable_after_full_drain_spec_4_10) {
         "s.Add(move (new R())); "
         "s.Add(move (new R())); "
         "for var item in s.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "s.Add(move (new R())); "  // add after drain
         "return s.Count;"  // 1 — reusable

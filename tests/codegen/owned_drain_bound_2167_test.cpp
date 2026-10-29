@@ -114,7 +114,7 @@ BEZEL_TEST(owned_drain_bound_2167, ownedarray_full_drain_disposes_all_spec_4_5) 
         "arr.Add(move (new R())); "
         "var d := arr.Drain(); "            // bound Drain view
         "for var item in d do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return R._n;"  // 3
     )), 3);
@@ -129,7 +129,7 @@ BEZEL_TEST(owned_drain_bound_2167, ownedarray_full_drain_empties_array_spec_4_5)
         "arr.Add(move (new R())); "
         "var d := arr.Drain(); "
         "for var item in d do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return arr.Count;"  // 0 — alias per §28.10
     )), 0);
@@ -154,7 +154,7 @@ BEZEL_TEST(owned_drain_bound_2167, ownedarray_drain_order_front_to_back_spec_4_5
         "  var first := -1; "
         "  var last := -1; "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
@@ -179,7 +179,7 @@ BEZEL_TEST(owned_drain_bound_2167, ownedarray_partial_drain_break_spec_4_5) {
         "  arr.Add(move (new R())); "
         "  var d := arr.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "  afterBreak := R._n; "  // 1 disposed (drained element)
@@ -195,7 +195,7 @@ BEZEL_TEST(owned_drain_bound_2167, ownedarray_empty_drain_no_iterations_spec_4_5
         "var d := arr.Drain(); "
         "var n := 0; "
         "for var item in d do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "  n := n + 1; "
         "end; "
         "return n;"  // 0
@@ -215,7 +215,7 @@ BEZEL_TEST(owned_drain_bound_2167, ownedarray_bound_drain_annotated_spec_4_5) {
         "var d: IOwningEnumerable<R> := arr.Drain(); "  // annotated
         "var n := 0; "
         "for var item in d do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "  n := n + 1; "
         "end; "
         "return R._n * 10 + n;"  // 3*10 + 3 = 33
@@ -245,7 +245,7 @@ BEZEL_TEST(owned_drain_bound_2167, owningstack_full_drain_lifo_spec_4_7) {
         "  var first := -1; "
         "  var last := -1; "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
@@ -275,7 +275,7 @@ BEZEL_TEST(owned_drain_bound_2167, owningqueue_full_drain_fifo_spec_4_11) {
         "  var first := -1; "
         "  var last := -1; "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
@@ -307,7 +307,7 @@ BEZEL_TEST(owned_drain_bound_2167, owninglinkedlist_full_drain_spec_4_6) {
         "  var first := -1; "
         "  var last := -1; "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
@@ -331,7 +331,7 @@ BEZEL_TEST(owned_drain_bound_2167, owningset_full_drain_disposes_all_spec_4_10) 
         "s.Add(move (new R())); "
         "var d := s.Drain(); "
         "for var item in d do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return R._n;"  // 3
     )), 3);
@@ -355,7 +355,7 @@ BEZEL_TEST(owned_drain_bound_2167, aliasing_no_double_dispose_spec_28_10_2146) {
         "  arr.Add(move (new R())); "
         "  var d := arr.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "  end; "
         "  afterDrain := R._n; "  // 3 disposed by drain
         "end; "
@@ -381,7 +381,7 @@ BEZEL_TEST(owned_drain_bound_2167, asan_ownedarray_full_drain_no_crash_spec_4_5)
         "  arr.Add(move (new R())); "
         "  var d := arr.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "  end; "
         "end; "
         "return 0;"));
@@ -400,7 +400,7 @@ BEZEL_TEST(owned_drain_bound_2167, asan_owningstack_full_drain_no_crash_spec_4_7
         "  stk.Push(move (new R())); "
         "  var d := stk.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "  end; "
         "end; "
         "return 0;"));
@@ -418,7 +418,7 @@ BEZEL_TEST(owned_drain_bound_2167, asan_owningqueue_full_drain_no_crash_spec_4_1
         "  q.Enqueue(move (new R())); "
         "  var d := q.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "  end; "
         "end; "
         "return 0;"));
@@ -437,7 +437,7 @@ BEZEL_TEST(owned_drain_bound_2167, asan_owninglinkedlist_full_drain_no_crash_spe
         "  ll.AddLast(move (new R())); "
         "  var d := ll.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "  end; "
         "end; "
         "return 0;"));
@@ -455,7 +455,7 @@ BEZEL_TEST(owned_drain_bound_2167, asan_owningset_full_drain_no_crash_spec_4_10)
         "  s.Add(move (new R())); "
         "  var d := s.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "  end; "
         "end; "
         "return 0;"));
@@ -475,7 +475,7 @@ BEZEL_TEST(owned_drain_bound_2167, asan_ownedarray_partial_drain_break_no_crash_
         "  arr.Add(move (new R())); "
         "  var d := arr.Drain(); "
         "  for var item in d do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "end; "

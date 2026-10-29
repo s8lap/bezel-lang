@@ -151,7 +151,7 @@ BEZEL_TEST(channel_634_uaf, p3_sender_outlives_channel_domain_send_raises_cce_30
         // Worker: receives a ChannelSender, sends one item, catches CCE.
         "class Worker "
         "  public static method TrySend(owned tx: ChannelSender<Token>): int "
-        "    using var sender := tx; "
+        "    using var sender := move tx; "
         "    var raised := false; "
         "    try "
         "      sender.Send(new Token(7)); "

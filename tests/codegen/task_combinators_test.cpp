@@ -356,7 +356,7 @@ BEZEL_TEST(task_combinators_6_7, when_all_with_delays_cross_thread) {
     const std::string src =
         "module M; import System.Threading; class C "
         "  public static method Signal2(owned tx: ChannelSender<int>) "
-        "    using var s := tx; s.Send(1); s.Send(2); "
+        "    using var s := move tx; s.Send(1); s.Send(2); "
         "  end Signal2; "
         "  public static async method Main(): Task<int> "
         "    using var ch := new Channel<int>(); "
@@ -431,7 +431,7 @@ BEZEL_TEST(task_combinators_6_7, when_any_with_delay_cross_thread) {
         "module M; import System.Threading; class C "
         "  public static method Signal2("
         "      owned tx1: ChannelSender<int>, owned tx2: ChannelSender<int>) "
-        "    using var s1 := tx1; using var s2 := tx2; s1.Send(1); s2.Send(2); "
+        "    using var s1 := move tx1; using var s2 := move tx2; s1.Send(1); s2.Send(2); "
         "  end Signal2; "
         "  public static async method Main(): Task<int> "
         "    using var ch1 := new Channel<int>(); "
@@ -465,7 +465,7 @@ BEZEL_TEST(task_combinators_6_7, when_any_delay_race_winner_index) {
     const std::string src =
         "module M; import System.Threading; class C "
         "  public static method Signal1(owned tx: ChannelSender<int>) "
-        "    using var s := tx; s.Send(1); "
+        "    using var s := move tx; s.Send(1); "
         "  end Signal1; "
         "  public static async method Main(): Task<int> "
         "    using var ch0 := new Channel<int>(); "
@@ -885,7 +885,7 @@ BEZEL_TEST(task_combinators_443, when_all_delay_then_fault_cross_thread) {
     const std::string src =
         "module M; import System.Threading; class C "
         "  public static method CloseChan(owned tx: ChannelSender<int>) "
-        "    using var s := tx; "
+        "    using var s := move tx; "
         "  end CloseChan; "
         "  public static async method Main(): Task<int> "
         "    using var ch := new Channel<int>(); "

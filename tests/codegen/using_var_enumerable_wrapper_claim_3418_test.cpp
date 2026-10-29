@@ -130,7 +130,8 @@ std::string wrapLoop(const std::string& kw, const std::string& head) {
         "    a.Add(new Item(9)); "
         "    var i := 0; "
         "    while i < 50 do "
-        "      " + kw + " e: " + head + "<Item> := a; "
+        "      var e_v := a; "  // borrowing alias: spec v0.350 §28.10 rejects the unmarked owned `a`
+        "      " + kw + " e: " + head + "<Item> := e_v; "
         "      i := i + 1; "
         "    end while; "
         "    return 9; "
@@ -153,7 +154,8 @@ std::string srcLoop(const std::string& kw, const std::string& ctor,
         "    " + add + " "
         "    var i := 0; "
         "    while i < 50 do "
-        "      " + kw + " e: IEnumerable<int> := s; "
+        "      var e_v := s; "  // borrowing alias: spec v0.350 §28.10 rejects the unmarked owned `s`
+        "      " + kw + " e: IEnumerable<int> := e_v; "
         "      i := i + 1; "
         "    end while; "
         "    return 9; "
@@ -271,7 +273,8 @@ BEZEL_TEST(using_var_enumerable_wrapper_claim_3418,
         "    var total := 0; "
         "    var i := 0; "
         "    while i < 40 do "
-        "      using var e: IEnumerable<Item> := a; "
+        "      var e_v := a; "  // borrowing alias (spec v0.350 §28.10)
+        "      using var e: IEnumerable<Item> := e_v; "
         "      for var it in e do "
         "        total := total + it.V; "
         "      end for; "
@@ -302,8 +305,10 @@ BEZEL_TEST(using_var_enumerable_wrapper_claim_3418,
         "    using var a := new Array<int>(); "
         "    a.Add(3); "
         "    a.Add(4); "
-        "    using var e: IEnumerable<int> := a; "
-        "    using var b := e; "
+        "    var e_v := a; "  // borrowing alias (spec v0.350 §28.10)
+        "    using var e: IEnumerable<int> := e_v; "
+        "    var b_v := e; "  // borrowing alias (spec v0.350 §28.10)
+        "    using var b := b_v; "
         "    var t := 0; "
         "    for var x in b do "
         "      t := t + x; "
@@ -341,7 +346,8 @@ BEZEL_TEST(using_var_enumerable_wrapper_claim_3418,
         "    var i := 0; "
         "    while i < 50 do "
         "      using var src := new MyRange(3); "
-        "      using var e: IEnumerable<int> := src; "
+        "      var e_v := src; "  // borrowing alias (spec v0.350 §28.10)
+        "      using var e: IEnumerable<int> := e_v; "
         "      i := i + 1; "
         "    end while; "
         "    return 9; "

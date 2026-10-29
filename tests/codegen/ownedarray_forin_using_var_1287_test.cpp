@@ -271,7 +271,7 @@ BEZEL_TEST(ownedarray_forin_using_var_1287,
         "  arr.Add(new R()); "
         "  arr.Add(new R()); "
         "  for var item in arr.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "  end; "
     )), 2);
 }

@@ -201,15 +201,18 @@ std::string twinFull3277() {
 }
 
 // The T3 (Named local source — control) full program. The BoxEnum3267 is
-// bound to a Named local `r` first; the wrapper around `r` does NOT own
-// the source (the local keeps the ownership). exit 0 with no leak on
+// bound to a Named local `r` first; the wrapper around it (reached through
+// the borrowing alias `v` of `r`: spec v0.350 §28.10 made the unmarked
+// `using var e: IEnumerable<int> := r;` over the owned `r` a compile error)
+// does NOT own the source (the local keeps the ownership). exit 0 with no leak on
 // either pre-fix or post-fix.
 std::string twinNamedLocalControl3277() {
     return std::string("module VSingle3267; ") + kBoxBody3277 +
         "public class C "
         "  public static method Main(): int "
         "    using var r := BoxEnum3267.FromSeed(3); "
-        "    using var e: IEnumerable<int> := r; "
+        "    var v := r; "  // borrowing alias: v0.350 §28.10 rejects the unmarked read of the owned `r`
+        "    using var e: IEnumerable<int> := v; "
         "    var s := 0; "
         "    for var x in e do "
         "      s := s + x; "

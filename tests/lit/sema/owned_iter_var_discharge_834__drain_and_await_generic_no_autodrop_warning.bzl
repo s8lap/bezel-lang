@@ -26,7 +26,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; class C public static async method WhenAllOwned<T>( owned tasks: OwningArray<OwningTask<T>> ): OwningTask<OwningArray<T>> where T: class using var taskArray := tasks; var results := new OwningArray<T>(capacity := taskArray.Count); for var task in taskArray.Drain() do results.Add(await task); end; return results; end WhenAllOwned; public static method Main(): int return 0; end Main; end C;
+module M; class C public static async method WhenAllOwned<T>( owned tasks: OwningArray<OwningTask<T>> ): OwningTask<OwningArray<T>> where T: class using var taskArray := move tasks; var results := new OwningArray<T>(capacity := taskArray.Count); for var task in taskArray.Drain() do results.Add(await task); end; return results; end WhenAllOwned; public static method Main(): int return 0; end Main; end C;
 
 // The await discharges the drained `task` — no auto-drop warning, no error.
 // NODIAG-NOT: implicitly disposed at the end of each loop iteration

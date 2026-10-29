@@ -448,15 +448,16 @@ BEZEL_TEST(ownership_dispose_aliased_collection_4236,
     if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
-// The plain-`var` sibling row's exact control, spelled `using var`: an alias
-// that is declared but NEVER explicitly disposed must still compile (this
-// check only ever fires AT a `.Dispose()`/`?.Dispose()` call site) — and per
-// §28.10's "using var initialized from a borrow", `b`'s own scope end calls
-// NO `Dispose()` at all (it never assumed the obligation), so `a`'s scope-end
-// auto-drop is the ONLY free, exactly once, every iteration.
+// The plain-`var` sibling row's control, spelled `using var`, WAS accepted
+// through spec v0.345 ("an alias that is declared but NEVER explicitly
+// disposed must still compile"). Spec v0.350 §28.10 *Adopting a named owned
+// binding* makes the unmarked `using var b: Array<int> := a;` over the owned
+// local `a` a COMPILE ERROR (it says neither adopt nor view), so the row now
+// pins the rejection and names the view remedy; the view spelling `var`
+// is the sibling row above.
 BEZEL_TEST(ownership_dispose_aliased_collection_4236,
            using_var_alias_never_disposed_frees_exactly_once_28_10) {
-    auto r = runAotChecked(prog(
+    auto r = runAot(prog(
         "var i := 0; "
         "while i < 200 do "
         "  var a := new Array<int>(2); a.Add(1); "
@@ -466,8 +467,9 @@ BEZEL_TEST(ownership_dispose_aliased_collection_4236,
         "  i := i + 1; "
         "end; "
         "return 0;"));
-    BEZEL_EXPECT_TRUE(r.ran);
-    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagContains(r, "move a"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§28.10"));
 }
 
 // UNAFFECTED — the pre-existing, documented, out-of-scope "call-result" gap

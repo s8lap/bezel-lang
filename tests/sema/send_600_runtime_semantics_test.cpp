@@ -53,7 +53,7 @@ BEZEL_TEST(send_600_runtime,
         "end Payload; "
         "class Producer "
         "  public static method SendOne(owned tx: ChannelSender<Payload>) "
-        "    using var sender := tx; "
+        "    using var sender := move tx; "
         "    sender.Send(new Payload(99)); "
         "  end SendOne; "
         "end Producer; "

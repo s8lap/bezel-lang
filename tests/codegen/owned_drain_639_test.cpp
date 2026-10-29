@@ -102,7 +102,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_full_drain_disposes_all_spec_4_5) {
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "for var item in arr.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return R._n;"  // 3
     )), 3);
@@ -115,7 +115,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_full_drain_empties_array_spec_4_5) {
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "for var item in arr.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return arr.Count;"  // 0
     )), 0);
@@ -140,7 +140,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_drain_order_front_to_back_spec_4_5) {
         "  var first := -1; "
         "  var last := -1; "
         "  for var item in arr.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
@@ -162,7 +162,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_partial_drain_break_remainder_disposed_sp
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "  for var item in arr.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "  afterBreak := R._n; "  // 1 disposed so far
@@ -177,7 +177,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_empty_drain_no_iterations_spec_4_5) {
         "using var arr := new OwningArray<R>(); "
         "var count := 0; "
         "for var item in arr.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "  count := count + 1; "
         "end; "
         "return count;"  // 0
@@ -191,7 +191,7 @@ BEZEL_TEST(owned_drain_639, ownedarray_reusable_after_full_drain_spec_4_5) {
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "for var item in arr.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "arr.Add(move (new R())); "  // add after drain
         "return arr.Count;"  // 1 — reusable
@@ -210,7 +210,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_full_drain_disposes_all_spec_4_7) {
         "ll.AddLast(move (new R())); "
         "ll.AddLast(move (new R())); "
         "for var item in ll.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return R._n;"  // 3
     )), 3);
@@ -223,7 +223,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_full_drain_empties_list_spec_4_7) {
         "ll.AddLast(move (new R())); "
         "ll.AddLast(move (new R())); "
         "for var item in ll.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return ll.Count;"  // 0
     )), 0);
@@ -246,7 +246,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_drain_order_head_to_tail_spec_4_7) {
         "  var first := -1; "
         "  var last := -1; "
         "  for var item in ll.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
@@ -266,7 +266,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_partial_drain_break_remainder_dispos
         "  ll.AddLast(move (new R())); "
         "  ll.AddLast(move (new R())); "
         "  for var item in ll.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "  afterBreak := R._n; "  // 1 disposed so far
@@ -281,7 +281,7 @@ BEZEL_TEST(owned_drain_639, ownedlinkedlist_empty_drain_no_iterations_spec_4_7) 
         "using var ll := new OwningLinkedList<R>(); "
         "var count := 0; "
         "for var item in ll.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "  count := count + 1; "
         "end; "
         "return count;"  // 0
@@ -300,7 +300,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_full_drain_disposes_all_spec_4_11) {
         "s.Push(move (new R())); "
         "s.Push(move (new R())); "
         "for var item in s.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return R._n;"  // 3
     )), 3);
@@ -313,7 +313,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_full_drain_empties_stack_spec_4_11) {
         "s.Push(move (new R())); "
         "s.Push(move (new R())); "
         "for var item in s.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return s.Count;"  // 0
     )), 0);
@@ -337,7 +337,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_drain_order_lifo_spec_4_11) {
         "  var first := -1; "
         "  var last := -1; "
         "  for var item in s.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
@@ -355,7 +355,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_partial_drain_break_remainder_disposed_sp
         "  s.Push(move (new R())); "
         "  s.Push(move (new R())); "
         "  for var item in s.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "  afterBreak := R._n; "  // 1 disposed so far
@@ -370,7 +370,7 @@ BEZEL_TEST(owned_drain_639, ownedstack_empty_drain_no_iterations_spec_4_11) {
         "using var s := new OwningStack<R>(); "
         "var count := 0; "
         "for var item in s.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "  count := count + 1; "
         "end; "
         "return count;"  // 0
@@ -389,7 +389,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_full_drain_disposes_all_spec_4_11) {
         "q.Enqueue(move (new R())); "
         "q.Enqueue(move (new R())); "
         "for var item in q.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return R._n;"  // 3
     )), 3);
@@ -402,7 +402,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_full_drain_empties_queue_spec_4_11) {
         "q.Enqueue(move (new R())); "
         "q.Enqueue(move (new R())); "
         "for var item in q.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return q.Count;"  // 0
     )), 0);
@@ -425,7 +425,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_drain_order_fifo_spec_4_11) {
         "  var first := -1; "
         "  var last := -1; "
         "  for var item in q.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    if first = -1 then first := u.N; end; "
         "    last := u.N; "
         "  end; "
@@ -445,7 +445,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_partial_drain_break_remainder_disposed_sp
         "  q.Enqueue(move (new R())); "
         "  q.Enqueue(move (new R())); "
         "  for var item in q.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "  afterBreak := R._n; "  // 1 disposed so far
@@ -460,7 +460,7 @@ BEZEL_TEST(owned_drain_639, ownedqueue_empty_drain_no_iterations_spec_4_11) {
         "using var q := new OwningQueue<R>(); "
         "var count := 0; "
         "for var item in q.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "  count := count + 1; "
         "end; "
         "return count;"  // 0
@@ -488,7 +488,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25b_ownedarray_drain) {
         "    arr.Add(new Val(30)); "
         "    var sum := 0; "
         "    for var item in arr.Drain() do "
-        "      using var it := item; "
+        "      using var it := move item; "
         "      sum := sum + it.N; "
         "    end; "
         "    return (if sum = 60 then 42 else 91); "
@@ -514,7 +514,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25c_ownedlinkedlist_drain) {
         "    ll.AddLast(new Val(10)); "
         "    var sum := 0; "
         "    for var item in ll.Drain() do "
-        "      using var it := item; "
+        "      using var it := move item; "
         "      sum := sum + it.N; "
         "    end; "
         "    return (if sum = 15 then 42 else 91); "
@@ -540,7 +540,7 @@ BEZEL_TEST(owned_drain_639, r27_repro_r25d_ownedstack_drain) {
         "    s.Push(new Val(10)); "
         "    var sum := 0; "
         "    for var item in s.Drain() do "
-        "      using var it := item; "
+        "      using var it := move item; "
         "      sum := sum + it.N; "
         "    end; "
         "    return (if sum = 15 then 42 else 91); "
@@ -561,7 +561,7 @@ BEZEL_TEST(owned_drain_639, asan_ownedarray_full_drain_no_leak) {
         "arr.Add(move (new R())); "
         "arr.Add(move (new R())); "
         "for var item in arr.Drain() do "
-        "  using var u := item; "
+        "  using var u := move item; "
         "end; "
         "return 0;"
     ));
@@ -579,7 +579,7 @@ BEZEL_TEST(owned_drain_639, asan_ownedarray_partial_drain_no_leak) {
         "  arr.Add(move (new R())); "
         "  arr.Add(move (new R())); "
         "  for var item in arr.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "end; "
@@ -599,7 +599,7 @@ BEZEL_TEST(owned_drain_639, asan_ownedstack_partial_drain_no_leak) {
         "  s.Push(move (new R())); "
         "  s.Push(move (new R())); "
         "  for var item in s.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "end; "
@@ -619,7 +619,7 @@ BEZEL_TEST(owned_drain_639, asan_ownedqueue_partial_drain_no_leak) {
         "  q.Enqueue(move (new R())); "
         "  q.Enqueue(move (new R())); "
         "  for var item in q.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "end; "
@@ -639,7 +639,7 @@ BEZEL_TEST(owned_drain_639, asan_ownedlinkedlist_partial_drain_no_leak) {
         "  ll.AddLast(move (new R())); "
         "  ll.AddLast(move (new R())); "
         "  for var item in ll.Drain() do "
-        "    using var u := item; "
+        "    using var u := move item; "
         "    break; "
         "  end; "
         "end; "

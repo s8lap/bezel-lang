@@ -359,7 +359,7 @@ const char* kUsingVarOfOwnedTypeParamParam =
     "end Res; "
     "class Util "
     "  public static method Use<T>(owned item: T): int where T: class "
-    "    using var x := item; "                 // plain-id init of an owned-T param
+    "    using var x := move item; "                 // plain-id init of an owned-T param
     "    return 0; "
     "  end Use; "
     "end Util; "

@@ -175,7 +175,10 @@ std::string sumTwo(const std::string& kw, const std::string& head,
         "class C "
         "  public static async method Run(): Task<int> "
         "    " + pre +
-        "    " + kw + " e: " + head + "<int> := " + src + "; "
+        // A NAMED source is read through a borrowing alias: spec v0.350 §28.10
+        // rejects the unmarked `using var e: ... := a;` over the owned `a`.
+        (pre.empty() ? std::string() : "    var e_v := " + src + "; ") +
+        "    " + kw + " e: " + head + "<int> := " + (pre.empty() ? src : std::string("e_v")) + "; "
         "    var n := 0; "
         "    for var v in e do n := n + v; end; "
         "    return n; "
@@ -201,7 +204,8 @@ std::string owningArrayLoop(const std::string& kw, const std::string& head) {
         "    using var a := new OwningArray<Item>(); "
         "    a.Add(new Item(4)); "
         "    a.Add(new Item(5)); "
-        "    " + kw + " e: " + head + "<Item> := a; "
+        "    var e_v := a; "  // borrowing alias: spec v0.350 §28.10 rejects the unmarked owned `a`
+        "    " + kw + " e: " + head + "<Item> := e_v; "
         "    var n := 0; "
         "    for var it in e do n := n + it.V; end; "
         "    return n; "

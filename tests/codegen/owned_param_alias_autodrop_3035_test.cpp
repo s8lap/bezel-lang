@@ -135,7 +135,8 @@ BEZEL_TEST(owned_param_alias_autodrop_3035,
     const std::string src = prog(
         "class Q "
         "  public static method WithUsingAlias(r: owned R): int "
-        "    using var alias := r; "
+        "    var rv := r; "  // borrowing alias (spec v0.350 §28.10 rejects the unmarked owned `r`)
+        "    using var alias := rv; "
         "    return alias.V; "
         "  end WithUsingAlias; "
         "end Q; ",

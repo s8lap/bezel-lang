@@ -412,7 +412,8 @@ BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
         "    l.AddLast(new Item(1)); "
         "    l.AddLast(new Item(2)); "
         "    var order := 0; "
-        "    using var e: IOwningEnumerable<Item> := l; "
+        "    var lv := l; "  // borrowing alias (spec v0.350 §28.10)
+        "    using var e: IOwningEnumerable<Item> := lv; "
         "    for var x in e do "
         "      using var y := owned x; "
         "      order := order * 10 + y.V; "

@@ -164,7 +164,7 @@ BEZEL_TEST(move_borrow_receiver_owned_field_2011,
     auto r = parseAndCheckOwnership(
         std::string(kCell) + kBox + "end Box; " +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Take(b: Box) C.Sink(move b.f!); end Take; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -237,7 +237,7 @@ BEZEL_TEST(move_borrow_receiver_owned_field_2011,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Main(): int "
         "    do using var b := new Box(); b.Give(); end; return Cell.live; "
         "  end Main; "

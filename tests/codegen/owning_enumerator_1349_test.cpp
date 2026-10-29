@@ -310,7 +310,7 @@ BEZEL_TEST(owning_enumerator_1349, for_loop_desugaring_correct_spec_29_2) {
         "  end Gen; "
         "  public static method Main(): int "
         "    for var item in Gen() do "
-        "      using var u := item; "
+        "      using var u := move item; "
         "    end; "
         "    return R._n; "  // 3 = each destructor ran once
         "  end Main; end C;"), 3);

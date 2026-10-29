@@ -208,7 +208,7 @@ BEZEL_TEST(IOwningEnumerableSlotInit_4750, every_head_plain_var_view_frame_claim
             "    var view := pool.Drain(); "
             "    var n := 0; "
             "    for var x in view do "
-            "      using var y := x; "
+            "      using var y := move x; "
             "      n := n + y.Id; "
             "    end; "
             "    return n + pool.Count; "

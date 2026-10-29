@@ -196,7 +196,8 @@ BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
     BEZEL_EXPECT_EQ(
         out(prog("using var a := new Array<int>(2); "
                  "a.Add(10); a.Add(20); "
-                 "using var e: IList<int> := a; "
+                 "var av := a; "  // borrowing alias (spec v0.350 §28.10 rejects the unmarked owned `a`)
+                 "using var e: IList<int> := av; "
                  "Console.WriteLine($\"val={e}\");")),
         std::string("val=System.Collections.Generic.Array<int>"));   // #3119
 }

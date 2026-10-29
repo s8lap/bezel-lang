@@ -1308,13 +1308,14 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             ? ctx_.resolvedType(*ps->declType)
                             : ps->resolvedDeclType;
                         if (!typeIsProvablyTrivialDisposeClass(pt)) {
-                            // fix #3033 / §28.10 (v0.240): the fourth remedy used to
-                            // read "rebind it with `using var`", naming a spelling
-                            // that is NOT a discharge. §28.10 *Adopting a named owned
-                            // binding*, verbatim: "An **unmarked** `using var y := x;`
-                            // where `x` is a named owned binding does *not* adopt: it
-                            // is a borrow, pinned per the subsection below, and `x`
-                            // retains the obligation." Only the MARKED form adopts —
+                            // fix #3033 / §28.10 (v0.240, restated at v0.350, issue
+                            // #7481): the fourth remedy used to read "rebind it with
+                            // `using var`", naming a spelling that is NOT a discharge.
+                            // At v0.240 §28.10 *Adopting a named owned binding* said
+                            // an unmarked `using var y := x;` "does *not* adopt: it is
+                            // a borrow ... and `x` retains the obligation"; at v0.350
+                            // that shape is a compile error for a class or interface
+                            // binding. Either way only the MARKED form adopts —
                             // "`using var y := owned x;` transfers a named owned local
                             // or `owned` parameter into a scope-bound binding: `y`
                             // takes over the disposal obligation". So a user who
@@ -1331,7 +1332,8 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             std::string(sym->name) + "2 := move " +
                             std::string(sym->name) +
                             ";` (the `move` marker is required — an unmarked "
-                            "`using var` rebind is a borrow-pin, §28.10), to "
+                            "`using var` rebind of an owned class or interface "
+                            "binding is rejected, §28.10), to "
                             "discharge it explicitly");
                         }
                         continue;
@@ -7302,6 +7304,102 @@ bool MethodOwnership::propertyReadIsRecognizedBorrow(
     return interfaceDispatched || inheritedVirtual;
 }
 
+// §28.10 *Adopting a named owned binding* (v0.350, derives K3.4): see the
+// header for the contract. The class-or-interface test is the declared type of
+// the read (nullability stripped, `TypeRef::nullable` is a flag): a declared
+// class or interface, a builtin collection head (the standard collections are
+// class types, §28.11), a bare type parameter or other declaration-less
+// builtin class. NOT covered, by the spec's own text: `string` and the other
+// runtime-managed values (§28.9), records, enums, function values, and the
+// `Task` family (axiom A6 governs it). `Object` is also excluded FOR NOW: the
+// spec does not say whether an `Object`-declared binding is a "class or
+// interface type" for this rule, and that is open spec-question issue #7568;
+// until it is ruled, the simplest reading (excluded: the form stays a
+// borrow-pin, matching the #7390 await twin) is what is implemented. A MOVE-ONLY value source adopts, it is not rejected (the spec's last
+// paragraph before *The anonymous binding*), so an owning inline array / an
+// owning-classified choice never reaches here: their TypeRefs are not Named
+// classes. // per §28.10, §28.12, §28.9, §15.3, v0.350
+bool MethodOwnership::isNamedOwnedClassOrInterfaceBinding(
+    const ast::IdentifierExpr& id, bool fromLambdaBody) const {
+    sema::Symbol* sym = ctx_.exprSymbol(id);
+    if (!sym) return false;
+    bool owned = false;
+    // A captured owned binding inside a closure is in BORROW state (§28.3
+    // *Captured owned bindings*): not a named owned binding for this rule.
+    if (fromLambdaBody && lambdaCapturedSyms_.count(sym)) return false;
+    if (const auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+        if (fromLambdaBody || ps->modifier != "owned") return false;
+        auto it = states_.find(sym);
+        // An `owned` parameter is Owned at entry; a seeded entry that has left
+        // the Owned state (moved, disposed) is not a live binding to adopt.
+        owned = it == states_.end() ||
+                it->second.state == OwnershipState::Owned;
+    } else if (dynamic_cast<const sema::LocalSymbol*>(sym)) {
+        auto it = states_.find(sym);
+        owned = it != states_.end() &&
+                it->second.state == OwnershipState::Owned;
+    }
+    if (!owned) return false;
+    const sema::TypeRef* rt = ctx_.exprType(id);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    if (rt->declaration) return isClassOrInterfaceResult(rt);
+    // Declaration-less Named: a builtin collection or builtin class, an
+    // unsubstituted bare type parameter, or a value / Task-family builtin.
+    if (isValueSubstitutionErased(rt)) return false;
+    if (common::isTaskFamilyHead(rt->headName())) return false;
+    return true;
+}
+
+const ast::IdentifierExpr* MethodOwnership::usingVarUnmarkedNamedOwnedRead(
+    const ast::Expr& init, bool fromLambdaBody) const {
+    // Arm classification: Covered (an unmarked read of a named owned binding of
+    // class / interface type), Absorbing (a `null` literal or `throw` arm,
+    // set aside, K7.5), Other (anything else: a fresh producer, a marked
+    // `move` arm, a call, a field, a borrow-state binding). One Other arm makes
+    // the meet not covered; the meet is covered when at least one arm is.
+    enum class Arm { Covered, Absorbing, Other };
+    const ast::IdentifierExpr* first = nullptr;
+    std::function<Arm(const ast::Expr&)> classify =
+        [&](const ast::Expr& e) -> Arm {
+        if (const auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(&e))
+            return bang->operand ? classify(*bang->operand) : Arm::Other;
+        if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
+            if (!isNamedOwnedClassOrInterfaceBinding(*id, fromLambdaBody))
+                return Arm::Other;
+            if (!first) first = id;
+            return Arm::Covered;
+        }
+        if (dynamic_cast<const ast::NullLiteralExpr*>(&e) ||
+            dynamic_cast<const ast::ThrowExpr*>(&e))
+            return Arm::Absorbing;
+        auto join = [](Arm a, Arm b) {
+            if (a == Arm::Other || b == Arm::Other) return Arm::Other;
+            if (a == Arm::Covered || b == Arm::Covered) return Arm::Covered;
+            return Arm::Absorbing;
+        };
+        if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+            if (!ce->thenValue || !ce->elseValue) return Arm::Other;
+            return join(classify(*ce->thenValue), classify(*ce->elseValue));
+        }
+        if (const auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+            if (be->op != "??" || !be->left || !be->right) return Arm::Other;
+            return join(classify(*be->left), classify(*be->right));
+        }
+        if (const auto* cs = dynamic_cast<const ast::CaseExpr*>(&e)) {
+            Arm acc = Arm::Absorbing;
+            for (const auto& arm : cs->arms) {
+                if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
+                    !arm.exprBody)
+                    return Arm::Other;
+                acc = join(acc, classify(*arm.exprBody));
+            }
+            return acc;
+        }
+        return Arm::Other;
+    };
+    return classify(init) == Arm::Covered ? first : nullptr;
+}
+
 // §28.10 "using var initialized from a borrow" (v0.180+, #2128). See the header
 // for the full contract: the borrow shapes a `using var` initializer can take —
 // beyond the bare-id / arm-meet / bind-atom / bare-T-call shapes handled inline
@@ -7650,6 +7748,48 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
         // layered difference (codegen skips the pin's disposal). // per §28.10, §28.3
         if (ld.isUsing) {
             const ast::Expr* init = ld.initializer.get();
+            // §28.10 *Adopting a named owned binding* (v0.350, K3.4): an
+            // UNMARKED `using var y := x;` over a named owned binding of class
+            // or interface type is a COMPILE ERROR -- the spelling does not say
+            // whether `y` adopts `x` or views it, and the compiler does not
+            // choose. The covered spellings: the bare read, `x!`, `(x)`, the
+            // anonymous `using var _ := x;`, `await using var y := x;`
+            // (§28.12 takes §28.10's admission unchanged), and an if / `??` /
+            // `case` whose every arm is such a read. The binding is still
+            // recorded as the pin below, so the error does not cascade.
+            // The older reading (an unmarked rebind is a silent borrow-pin)
+            // was retired by the v0.350 spec. // per §28.10, §28.12, v0.350
+            if (const ast::IdentifierExpr* adopted =
+                    usingVarUnmarkedNamedOwnedRead(*init, fromLambdaBody)) {
+                const bool usingSource = [&] {
+                    auto it = states_.find(ctx_.exprSymbol(*adopted));
+                    return it != states_.end() && it->second.implicitDischarge;
+                }();
+                const bool anon = ld.name == "_";
+                std::string msg = std::string("an unmarked `") +
+                    (ld.isAwaitUsing ? "await using var " : "using var ") +
+                    std::string(ld.name) + " := " +
+                    std::string(adopted->name) +
+                    ";` over the owned binding `" +
+                    std::string(adopted->name) +
+                    "` is ambiguous: it does not say whether `" +
+                    std::string(ld.name) + "` adopts `" +
+                    std::string(adopted->name) + "` or views it (§28.10" +
+                    (ld.isAwaitUsing ? ", §28.12" : "") + "); ";
+                if (usingSource) {
+                    msg += "`" + std::string(adopted->name) +
+                           "` is a `using var` and is never movable out "
+                           "(axiom A5), so ";
+                    msg += anon ? "delete the declaration"
+                                : "bind a view with `var` or `const`";
+                } else {
+                    msg += "write `move " + std::string(adopted->name) +
+                           "` to adopt";
+                    msg += anon ? ", or delete the declaration"
+                                : ", or bind a view with `var` or `const`";
+                }
+                report(Severity::Error, ld.span.begin, std::move(msg));
+            }
             // §28.10 "using var initialized from a borrow" (#2128): positive
             // recognition of the spec-listed borrow shapes — field read, indexer
             // access, concrete borrow-returning call (§28.10, spec producers row).
@@ -7657,6 +7797,16 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
             // ever CLEARS the flag. // per §28.10, #2128
             if (usingVarInitIsRecognizedBorrow(*init))
                 const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
+            // §28.10 v0.350 (*Adopting a named owned binding*, issue #7481): the
+            // unmarked `using var y := x;` over a NAMED OWNED class or interface
+            // binding is a compile error (reported above), so the bare-id arm
+            // below classifies as a borrow-pin only what v0.350 still admits as one:
+            // a BORROW-state source (a plain parameter, a borrowing alias or loop
+            // variable, a captured owned binding in a closure). The Owned arms of
+            // the older "unmarked read of an owned binding is a borrow-pin" reading
+            // (#1285/#2071/#3253/#4268) survive only as the error-recovery path, so
+            // one rejected declaration does not cascade into further diagnostics.
+            // // per §28.10, v0.350
             if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(init)) {
                 // Bare-id: pin a tracked owned/borrow binding (#1285/#2071) or a
                 // borrowing for-loop element (#1287). A tracked Owned source keeps its
@@ -7923,24 +8073,22 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
             //
             // #4268: this used to also require `!ld.isUsing`, reasoned (see
             // the removed comment above) as "a `using var` is itself Owned,
-            // not a re-borrow". §28.10's own dedicated subsection ("using var
-            // initialized from a borrow") contradicts that reasoning by name
-            // for exactly this RHS shape: "[when the RHS is] an *unmarked*
-            // read of a named owned binding[, ...] the `using var` does NOT
-            // assume a disposal obligation ... the value is not owned by
-            // this scope" — and §28.10's *Adopting a named owned binding*
-            // bullet states the SAME thing from the adopt side: "An
-            // unmarked `using var y := x;` where `x` is a named owned
-            // binding does *not* adopt: it is a borrow, pinned per the
-            // subsection below, and `x` retains the obligation." That is the
-            // identical K3.13 "marker economy" rule a plain `var`/`const`
-            // alias is already held to ("An unmarked read of a class-typed
-            // binding never consumes") — `using var` carries no exemption
-            // from it. So a `using var` over a bare identifier read of a
-            // still-owned local is a BORROW exactly like the plain-`var`
-            // case fix #4236 already rejects, and per §28.6 "Who may call
-            // Dispose()" ("Dispose() through a borrow is a compile error")
-            // its explicit `.Dispose()` must be rejected identically. The
+            // not a re-borrow". (Superseded reading, kept for the history of
+            // this guard: the v0.298 text of §28.10 called the unmarked
+            // `using var y := x;` over a named owned binding "a borrow, pinned
+            // per the subsection below, and `x` retains the obligation".
+            // §28.10 v0.350 (*Adopting a named owned binding*, issue #7481)
+            // replaced it: that shape is now a COMPILE ERROR for a class- or
+            // interface-typed binding, reported at the declaration. The guard
+            // below still applies to the recovered declaration, and to the
+            // borrowing-alias spelling `var v := x; using var y := v;`, where
+            // the identical K3.13 "marker economy" rule holds — an unmarked
+            // read of a class-typed binding never consumes.) A `using var`
+            // over a bare identifier read of a still-owned local is therefore
+            // a BORROW exactly like the plain-`var` case fix #4236 already
+            // rejects, and per §28.6 "Who may call Dispose()" ("Dispose()
+            // through a borrow is a compile error") its explicit `.Dispose()`
+            // must be rejected identically. The
             // `!ld.isUsing` exclusion was therefore the wrong classification,
             // not a deliberate narrowing — it is what let `.Dispose()`
             // double-free through the alias (issue #4268).
@@ -12597,6 +12745,9 @@ void MethodOwnership::seedCapturedLocalFromDecl(sema::LocalSymbol* ls) {
     // Skip if the local is already seeded (e.g. by a previous iteration
     // over the same identifier-references list).
     if (states_.count(ls)) return;
+    // §28.10 (v0.350): remember it is a CAPTURE, so the adoption rule can
+    // tell it from the lambda body's own locals. // per §28.3, §28.10
+    lambdaCapturedSyms_.insert(ls);
     LocalOwnership lo;
     lo.obligationOrigin = ld;
     // §28.3 binding-position `owned` marker (`var y := owned x;`) — the
@@ -13860,6 +14011,8 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
     // v0.298, #4271
     states_.clear();
     fieldMovedFrom_.clear();
+    auto savedCaptured = std::move(lambdaCapturedSyms_);
+    lambdaCapturedSyms_.clear();
     seedCapturedOuterLocals(lam, savedStates);
     if (lam.exprBody) {
         std::vector<const ast::LambdaExpr*> nestedLambdas;
@@ -13871,6 +14024,7 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
         if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
     states_ = std::move(savedStates);
     fieldMovedFrom_ = std::move(savedFieldMovedFrom);
+    lambdaCapturedSyms_ = std::move(savedCaptured);
 }
 
 

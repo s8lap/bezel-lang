@@ -135,7 +135,7 @@ BEZEL_TEST(iterator_owned_param_945, moved_out_param_not_double_disposed) {
         std::string("module M; ") + kCell +
         "class P "
         "  public static method UseCell(owned c: Cell): IEnumerable<int> "
-        "    using var local := c; "
+        "    using var local := move c; "
         "    yield return 1; yield return 2; "
         "  end UseCell; "
         "  public static method Main(): int "
@@ -260,7 +260,7 @@ BEZEL_TEST(iterator_owned_param_945, owned_param_consumed_in_yield_operand) {
         std::string("module M; ") + kCell +
         "class P "
         "  private static method Consume(owned x: Cell): int "
-        "    using var u := x; return 1; "
+        "    using var u := move x; return 1; "
         "  end Consume; "
         "  public static method UseCell(owned c: Cell): IEnumerable<int> "
         "    yield return Consume(move c); "  // §22.3 v0.169: named owned binding

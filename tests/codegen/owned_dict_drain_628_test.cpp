@@ -135,7 +135,7 @@ BEZEL_TEST(owned_dict_drain_628, full_drain_string_key_disposes_all_values) {
         "d.Add(\"b\", move (new R())); "
         "d.Add(\"c\", move (new R())); "
         "for var entry in d.Drain() do "
-        "  using var e := entry; "
+        "  using var e := move entry; "
         "end; "
         "return R._n;"   // all 3 disposed inside loop
     )), 3);
@@ -148,7 +148,7 @@ BEZEL_TEST(owned_dict_drain_628, full_drain_empties_the_dict) {
         "d.Add(\"x\", move (new R())); "
         "d.Add(\"y\", move (new R())); "
         "for var entry in d.Drain() do "
-        "  using var e := entry; "
+        "  using var e := move entry; "
         "end; "
         "return d.Count;"   // expect 0
     )), 0);
@@ -163,7 +163,7 @@ BEZEL_TEST(owned_dict_drain_628, entry_key_is_readable) {
         "d.Add(\"cde\", move (new R())); "
         "var total := 0; "
         "for var entry in d.Drain() do "
-        "  using var e := entry; "
+        "  using var e := move entry; "
         "  total := total + e.Key.Length; "
         "end; "
         "return total;"   // 2 + 3 = 5
@@ -176,7 +176,7 @@ BEZEL_TEST(owned_dict_drain_628, entry_value_is_owned_and_disposed) {
         "using var d := new OwningDictionary<string, R>(); "
         "d.Add(\"k\", move (new R())); "
         "for var entry in d.Drain() do "
-        "  using var e := entry; "
+        "  using var e := move entry; "
         "end; "
         "return R._n;"   // 1 — value disposed at end of loop body
     )), 1);
@@ -195,7 +195,7 @@ BEZEL_TEST(owned_dict_drain_628, partial_drain_break_remainder_in_dict) {
         "  d.Add(\"b\", move (new R())); "
         "  d.Add(\"c\", move (new R())); "
         "  for var entry in d.Drain() do "
-        "    using var e := entry; "
+        "    using var e := move entry; "
         "    break; "
         "  end; "
         "  afterBreak := R._n; "   // 1 disposed so far
@@ -210,7 +210,7 @@ BEZEL_TEST(owned_dict_drain_628, empty_dict_drain_no_iterations) {
         "using var d := new OwningDictionary<string, R>(); "
         "var count := 0; "
         "for var entry in d.Drain() do "
-        "  using var e := entry; "
+        "  using var e := move entry; "
         "  count := count + 1; "
         "end; "
         "return count;"   // 0 — no iterations
@@ -227,7 +227,7 @@ BEZEL_TEST(owned_dict_drain_628, drain_iterates_all_entries) {
         "d.Add(\"d\", move (new R())); "
         "var count := 0; "
         "for var entry in d.Drain() do "
-        "  using var e := entry; "
+        "  using var e := move entry; "
         "  count := count + 1; "
         "end; "
         "return count;"   // 4
@@ -251,7 +251,7 @@ BEZEL_TEST(owned_dict_drain_628, full_drain_int_key_disposes_all_values) {
         "  d.Add(1, move (new R())); "
         "  d.Add(2, move (new R())); "
         "  for var entry in d.Drain() do "
-        "    using var e := entry; "
+        "    using var e := move entry; "
         "  end; "
         "  return R._n; "   // 2
         "end Main; end C;"
@@ -272,7 +272,7 @@ BEZEL_TEST(owned_dict_drain_628, int_key_entry_key_is_readable) {
         "  d.Add(20, move (new R())); "
         "  var total := 0; "
         "  for var entry in d.Drain() do "
-        "    using var e := entry; "
+        "    using var e := move entry; "
         "    total := total + e.Key; "
         "  end; "
         "  return total; "   // 10 + 20 = 30
@@ -295,7 +295,7 @@ BEZEL_TEST(owned_dict_drain_628, partial_drain_int_key_remainder_disposed_by_dic
         "    d.Add(1, move (new R())); "
         "    d.Add(2, move (new R())); "
         "    for var entry in d.Drain() do "
-        "      using var e := entry; "
+        "      using var e := move entry; "
         "      break; "
         "    end; "
         "    afterBreak := R._n; "   // 1
@@ -324,7 +324,7 @@ BEZEL_TEST(owned_dict_drain_628, drain_loop_compiles_and_runs) {
         "    d.Add(\"x\", move (new R())); "
         "    var count := 0; "
         "    for var entry in d.Drain() do "
-        "      using var e := entry; "
+        "      using var e := move entry; "
         "      count := count + 1; "
         "    end; "
         "    return count; "
@@ -345,7 +345,7 @@ BEZEL_TEST(owned_dict_drain_628, lsan_full_drain_no_leak) {
         "d.Add(\"a\", move (new R())); "
         "d.Add(\"b\", move (new R())); "
         "for var entry in d.Drain() do "
-        "  using var e := entry; "
+        "  using var e := move entry; "
         "end; "
         "return 0;"
     ));
@@ -361,7 +361,7 @@ BEZEL_TEST(owned_dict_drain_628, lsan_partial_drain_no_leak) {
         "  d.Add(\"b\", move (new R())); "
         "  d.Add(\"c\", move (new R())); "
         "  for var entry in d.Drain() do "
-        "    using var e := entry; "
+        "    using var e := move entry; "
         "    break; "
         "  end; "
         "end; "

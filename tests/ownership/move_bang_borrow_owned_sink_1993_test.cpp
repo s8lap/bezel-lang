@@ -81,7 +81,7 @@ BEZEL_TEST(move_bang_borrow_owned_sink_1993,
     auto r = parseAndCheckOwnership(
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Take(b: Cell?) C.Sink(move b!); end Take; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -101,7 +101,7 @@ BEZEL_TEST(move_bang_borrow_owned_sink_1993,
         "  destructor end destructor; "
         "end Holder; "
         "class C "
-        "  public static method Consume(owned h: Holder) using var k := h; end Consume; "
+        "  public static method Consume(owned h: Holder) using var k := move h; end Consume; "
         "  public static method Take(b: Cell?) C.Consume(new Holder(move b!)); end Take; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
@@ -146,7 +146,7 @@ BEZEL_TEST(move_bang_borrow_owned_sink_1993,
     auto r = parseAndCheckOwnership(
         "module M; "
         "class C "
-        "  public static method Sink(owned e: Exception) using var k := e; end Sink; "
+        "  public static method Sink(owned e: Exception) using var k := move e; end Sink; "
         "  public static method Boom() throw new InvalidOperationException(\"x\"); end Boom; "
         "  public static method Use() "
         "    try C.Boom(); catch var ex: Exception => C.Sink(move ex!); end; "
@@ -169,7 +169,7 @@ BEZEL_TEST(move_bang_borrow_owned_sink_1993,
     std::string src =
         std::string(kCell) +
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Use() var x: Cell? := new Cell(); C.Sink(move x!); end Use; "
         "  public static method Main(): int C.Use(); return Cell.live; end Main; "
         "end C;";
@@ -194,7 +194,7 @@ BEZEL_TEST(move_bang_borrow_owned_sink_1993,
         "  destructor end destructor; "
         "end Box; "
         "class C "
-        "  public static method Sink(owned c: Cell) using var k := c; end Sink; "
+        "  public static method Sink(owned c: Cell) using var k := move c; end Sink; "
         "  public static method Main(): int "
         "    do using var b := new Box(); b.Give(); end; "
         "    return Cell.live; "

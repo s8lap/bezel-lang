@@ -168,7 +168,8 @@ const char* kBorrowingBackedLocal =
     "    var tmp := new Array<Cell>(); "
     "    tmp.Add(c); "
     "    tmp.Add(c); "
-    "    using var v: IReadOnlyList<Cell> := tmp; "
+    "    var tv := tmp; "  // borrowing alias (spec v0.350 §28.10)
+    "    using var v: IReadOnlyList<Cell> := tv; "
     "    return v.Count; "
     "  end Run; "
     "  public static method Main(): int "
@@ -261,7 +262,8 @@ const char* kStringElementRelease =
     "      var arr := new Array<string>(); "
     "      arr.Add(\"abc\"); "
     "      arr.Add(\"abc\"); "
-    "      using var v: IReadOnlyList<string> := arr; "
+    "      var av := arr; "  // borrowing alias (spec v0.350 §28.10)
+    "      using var v: IReadOnlyList<string> := av; "
     "      sink := sink + v[0].Length; "
     "      i := i + 1; "
     "    end; "

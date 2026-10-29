@@ -1,5 +1,15 @@
+// SUPERSEDED READING (spec v0.350). The v0.180..v0.345 ruling below made an
+// unmarked `using var y := x;` over a named owned class or interface binding
+// a silent BORROW-PIN. Spec v0.350 §28.10 *Adopting a named owned binding*
+// replaced it: that spelling is a COMPILE ERROR (it says neither adopt nor
+// view). Cells (1) and (2) therefore bind the view with `var` -- the remedy
+// the rule names, which keeps what they pin (exactly-once disposal by the
+// source, borrow reads of the source stay legal) -- and cells (1r) and (2r)
+// pin the rejection. Cell (4)'s `using var view := fs;` line is likewise
+// rejected now; it still passes because its oracle accepts any reject.
+//
 // fix #2071 / §28.10 (v0.180, current v0.214): unmarked `using var y := x;`
-// over a named owned binding (local or parameter) is a BORROW-PIN, NOT an
+// over a named owned binding (local or parameter) was a BORROW-PIN, NOT an
 // adoption. Per spec §28.10 "Adopting a named owned binding (v0.180)":
 //
 //   `using var y := owned x;` transfers a named owned local or `owned`
@@ -39,9 +49,16 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
+
+bool diagContains(const JitResult& r, const char* sub) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(sub) != std::string::npos) return true;
+    return false;
+}
 
 // Shared resources for the disposal-tracking cases: a class whose static
 // `live` counter increments on construction and decrements on destruction,
@@ -67,14 +84,14 @@ const char* kConn =
 // the borrowed borrow). // per §28.10 v0.180 #2071
 // ===========================================================================
 BEZEL_TEST(using_var_unmarked_borrow_pin_2071,
-           unmarked_local_borrow_pin_compiles_and_disposes_via_source_spec_28_10) {
+           view_binding_over_owned_local_compiles_and_disposes_via_source_spec_28_10) {
     JitResult r = runAotChecked(
         std::string(kConn) +
         "class P "
         "  public static method Main(): int "
         "    do "
         "      using var fs := new Conn(); "  // owned local (auto-dispose at end)
-        "      using var view := fs; "         // UNMARKED — spec: borrow-pin
+        "      var view := fs; "               // view (v0.350: `using var` is an error)
         "      fs.Touch(); "                   // spec-legal borrow read of fs
         "    end; "
         "    return Conn.live; "               // 0 — disposed exactly once (by fs)
@@ -100,12 +117,12 @@ BEZEL_TEST(using_var_unmarked_borrow_pin_2071,
 // // per §28.10 v0.180
 // ===========================================================================
 BEZEL_TEST(using_var_unmarked_borrow_pin_2071,
-           unmarked_param_borrow_pin_compiles_and_disposes_via_source_spec_28_10) {
+           view_binding_over_owned_param_compiles_and_disposes_via_source_spec_28_10) {
     JitResult r = runAotChecked(
         std::string(kConn) +
         "class P "
         "  public static method Take(owned fs: Conn): int "
-        "    using var view := fs; "           // UNMARKED — spec: borrow-pin
+        "    var view := fs; "                 // view (v0.350: `using var` is an error)
         "    fs.Touch(); "                     // spec-legal borrow read
         "    return 0; "
         "  end Take; "
@@ -120,6 +137,56 @@ BEZEL_TEST(using_var_unmarked_borrow_pin_2071,
         return;
     }
     BEZEL_EXPECT_EQ(r.exitCode, 0);    // Conn.live == 0 ⇒ exactly-once disposal
+}
+
+// ===========================================================================
+// (1r) / (2r) §28.10 v0.350 *Adopting a named owned binding* REJECT -- the
+// unmarked spellings cells (1) and (2) used to accept, over an owned local and
+// over an `owned` parameter. The error names the source and both remedies.
+// // per §28.10 v0.350, #7481
+// ===========================================================================
+BEZEL_TEST(using_var_unmarked_borrow_pin_2071,
+           unmarked_using_var_over_owned_local_is_rejected_spec_28_10) {
+    JitResult r = runAot(
+        std::string(kConn) +
+        "class P "
+        "  public static method Main(): int "
+        "    do "
+        "      var fs := new Conn(); "
+        "      using var view := fs; "
+        "      fs.Touch(); "
+        "    end; "
+        "    return Conn.live; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "`fs`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "move fs"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§28.10"));
+}
+
+BEZEL_TEST(using_var_unmarked_borrow_pin_2071,
+           unmarked_using_var_over_owned_param_is_rejected_spec_28_10) {
+    JitResult r = runAot(
+        std::string(kConn) +
+        "class P "
+        "  public static method Take(owned fs: Conn): int "
+        "    using var view := fs; "
+        "    fs.Touch(); "
+        "    return 0; "
+        "  end Take; "
+        "  public static method Main(): int "
+        "    var w := new Conn(); "
+        "    var n := P.Take(move w); "
+        "    return Conn.live; "
+        "  end Main; "
+        "end P;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "`fs`"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "move fs"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§28.10"));
 }
 
 // ===========================================================================
