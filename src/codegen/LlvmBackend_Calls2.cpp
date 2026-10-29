@@ -49,6 +49,37 @@ const char* parseRadixTypeName(sema::PrimitiveType p) {
     return "<unresolved>";
 }
 
+// fix #7491 (stdlib §9.1, v0.350): the radix parse's input grammar is "an
+// optional leading `+` or `-`, then one or more digits of that radix, and
+// nothing else; no whitespace, no `0x`/`0b` prefix". C's strtoll/strtoull
+// accept an optional `0x`/`0X` prefix at base 16 and leave `endptr` at the
+// NUL, so the endptr guard cannot see it. This answers the i1 "the string
+// (NUL-terminated at `data`) starts with [sign] `0x`/`0X`". At every other
+// admitted radix the prefix already fails the endptr guard (`x` is no digit).
+// The second probe index is only read when the first digit is `0`, so a
+// string like "+" never reads past its NUL.
+llvm::Value* radixPrefixPresentIR(llvm::IRBuilder<>& b, llvm::Value* data) {
+    auto* i8 = llvm::Type::getInt8Ty(b.getContext());
+    auto* i64t = llvm::Type::getInt64Ty(b.getContext());
+    llvm::Value* c0 = b.CreateLoad(i8, data, "rdx.c0");
+    llvm::Value* hasSign = b.CreateOr(
+        b.CreateICmpEQ(c0, llvm::ConstantInt::get(i8, '+')),
+        b.CreateICmpEQ(c0, llvm::ConstantInt::get(i8, '-')), "rdx.sign");
+    llvm::Value* off = b.CreateZExt(hasSign, i64t, "rdx.off");
+    llvm::Value* d0 = b.CreateLoad(
+        i8, b.CreateGEP(i8, data, off), "rdx.d0");
+    llvm::Value* zeroLead = b.CreateICmpEQ(d0, llvm::ConstantInt::get(i8, '0'),
+                                           "rdx.zero");
+    llvm::Value* off2 = b.CreateSelect(zeroLead, b.CreateAdd(off, b.getInt64(1)),
+                                       off, "rdx.off2");
+    llvm::Value* d1 = b.CreateLoad(
+        i8, b.CreateGEP(i8, data, off2), "rdx.d1");
+    llvm::Value* isX = b.CreateOr(
+        b.CreateICmpEQ(d1, llvm::ConstantInt::get(i8, 'x')),
+        b.CreateICmpEQ(d1, llvm::ConstantInt::get(i8, 'X')), "rdx.x");
+    return b.CreateAnd(zeroLead, isX, "rdx.prefix");
+}
+
 // The §17.14 constant-expression nodes inside `e` — the forms the shared
 // folder resolves BY NAME (a `const` reference, a member-access constant).
 void collectParseRadixConstNodes(const ast::Expr& e,
@@ -2482,6 +2513,11 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* ok = builder_.CreateAnd(
             builder_.CreateNot(fcWsR),
             builder_.CreateAnd(advR, atNulR), "tryp.ok");
+        // §9.1 (fix #7491): no `0x`/`0X` prefix, which strtoll accepts at
+        // base 16 (the check is a no-op at the other radices: see helper).
+        ok = builder_.CreateAnd(
+            ok, builder_.CreateNot(radixPrefixPresentIR(builder_, strData)),
+            "tryp.okP");
         // ulong additionally rejects a leading '-' (strtoull silently
         // negates it) — the 2-argument TryParse arm's rule.
         if (isULongR) {
@@ -2790,6 +2826,12 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             llvm::Value* validFmtR = builder_.CreateAnd(
                 builder_.CreateNot(fcWsR),
                 builder_.CreateAnd(advR, atNulR), "parse.vfmtR");
+            // §9.1 (fix #7491): no `0x`/`0X` prefix, which strtoll accepts at
+            // base 16 (see radixPrefixPresentIR).
+            validFmtR = builder_.CreateAnd(
+                validFmtR,
+                builder_.CreateNot(radixPrefixPresentIR(builder_, data)),
+                "parse.vfmtRp");
             // ulong additionally rejects a leading '-' (strtoull silently
             // negates it, which would let `ulong.Parse("-1", 10)` return a
             // huge positive value instead of faulting).
