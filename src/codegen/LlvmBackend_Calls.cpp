@@ -11853,10 +11853,26 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // boundary (§28.3 K8.1), which this guard does not change. The
             // builder's own disposal is the caller's `using var`, and the
             // unwind disposes it (CG21).
-            emitGuardThrow(oor, "IndexOutOfRangeException");
+            //
+            // fix #7748 (§28.3 / §28.9, v0.350): the one exception is a `value`
+            // that is itself a fresh +1 string PRODUCER (`"X" + "Y"`, an
+            // interpolation, a string-returning call): `bz_sb_insert` COPIES the
+            // text into the builder's flattened part and never keeps `value`, so
+            // the caller's +1 is released once the helper returns, and on the
+            // throw edge too (a raise branches to the unwind block, past the
+            // post-call release).
+            llvm::Value* ownedVal =
+                isPlusOneStringProducer(call.args[valArgIdx].value.get()) ? val
+                                                                          : nullptr;
+            if (ownedVal)
+                emitGuardThrowReleasingString(oor, "IndexOutOfRangeException",
+                                              {ownedVal});
+            else
+                emitGuardThrow(oor, "IndexOutOfRangeException");
             auto* fn = declareC("bz_sb_insert", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), i64(), ptrTy()});
             builder_.CreateCall(fn, {recv, idx64, val});
+            if (ownedVal) emitStringRelease(ownedVal);
             return recv;
         }
         // §3.1: Remove(startIndex: int, length: int): StringBuilder.
@@ -11944,13 +11960,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // helper no-ops on an empty oldValue, so the guard lives here, as
             // the Insert/Remove guards do. `oldValue` is a BORROW parameter, so
             // there is no caller-owned +1 producer to release on the throw edge.
-            emitGuardThrow(builder_.CreateICmpEQ(loadStringLen(oldV),
-                                                 builder_.getInt64(0),
-                                                 "sb.rep.empty"),
-                           "ArgumentException");
+            //
+            // fix #7748 (§28.3 / §28.9, v0.350): an `oldValue` / `newValue` that
+            // is a fresh +1 string PRODUCER is released once `bz_sb_replace` has
+            // read it (the helper copies; it keeps neither), and on the throw
+            // edge, which skips the post-call release.
+            llvm::SmallVector<llvm::Value*, 2> ownedRep;
+            if (isPlusOneStringProducer(call.args[oldArgIdx].value.get()))
+                ownedRep.push_back(oldV);
+            if (isPlusOneStringProducer(call.args[newArgIdx].value.get()))
+                ownedRep.push_back(newV);
+            emitGuardThrowReleasingString(
+                builder_.CreateICmpEQ(loadStringLen(oldV), builder_.getInt64(0),
+                                      "sb.rep.empty"),
+                "ArgumentException", ownedRep);
             auto* fn = declareC("bz_sb_replace", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {recv, oldV, newV});
+            for (llvm::Value* o : ownedRep) emitStringRelease(o);
             return recv;
         }
         // §3.1 AppendFormat(format: string, args: Array<Object>): StringBuilder.
@@ -11971,6 +11998,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* fn = declareC("bz_sb_append_format", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {recv, fmtV, argsV});
+            // fix #7748 (§28.3 / §28.9, v0.350): `bz_sb_append_format` reads the
+            // format's code points and keeps none of it (the builder's new part
+            // is a fresh string), so a `format` that is itself a fresh +1
+            // string PRODUCER is released here, after its sole use.
+            if (isPlusOneStringProducer(call.args[fmtArgIdx].value.get()))
+                emitStringRelease(fmtV);
             return recv;  // allow chaining
         }
         if (m == "Length" || m == "Count") {
