@@ -13279,6 +13279,13 @@ static const TypeRef* extensionFindMatchingAncestor(
                 k == ast::TypeDeclKind::Record ||
                 k == ast::TypeDeclKind::Enum)
                 return target;
+        } else if (recv->kind == TypeRef::Kind::Named && !recv->declaration &&
+                   (namedTypeSimpleName(recv) == "Task" ||
+                    namedTypeSimpleName(recv) == "OwningTask")) {
+            // fix #7763 (§26.2 "Classes (including `Object`)", §26.5 rule 2,
+            // §30.3, v0.350): `Task` / `Task<T>` / `OwningTask<T>` are
+            // classes (§30.3), so `Object` is their base like any class's.
+            return target;
         } else if (recv->kind == TypeRef::Kind::Primitive) {
             // Value-typed primitives (numeric, bool, char) are not string/Object;
             // they box to Object (§8.6). The receiver's `extensionThisType` will
@@ -13334,6 +13341,29 @@ static const TypeRef* extensionFindMatchingAncestor(
             if (anc->kind == TypeRef::Kind::Named && anc->declaration)
                 for (const TypeRef* b : anc->declaration->baseTypeRefs)
                     if (b) frontier.push_back(b);
+        }
+    }
+    // fix #7763 (§26.5 rule 2, §26.2, §30.3, v0.350): `Task<T>` and
+    // `OwningTask<T>` DERIVE from the bare class `Task` (spec §30.3:
+    // `public class Task<T>: Task`, `public class OwningTask<T>: Task`), and
+    // §26.2 lists "Classes" as extendable, so `extension Task` is a block on
+    // a BASE TYPE of a `Task<T>` / `OwningTask<T>` receiver, which §26.5
+    // rule 2 searches ("extension blocks on `x`'s type, base types, or
+    // implemented interfaces"). The builtin interface table below models
+    // only arity-1 interface chains, so the `Task` base is synthesised here
+    // as the bare (argument-less) null-declaration `Task`.
+    if (recv->kind == TypeRef::Kind::Named && !recv->declaration &&
+        recv->genericArgs.size() == 1) {
+        std::string_view rn = namedTypeSimpleName(recv);
+        if (rn == "Task" || rn == "OwningTask") {
+            auto base = std::make_unique<TypeRef>();
+            base->kind = TypeRef::Kind::Named;
+            base->declaration = nullptr;
+            base->importedName = "Task";  // string literal: static lifetime
+            const TypeRef* baseRaw = base.get();
+            owned.push_back(std::move(base));
+            if (extensionTargetMatchesReceiver(target, baseRaw, freeVars))
+                return baseRaw;
         }
     }
     // Walk builtin (null-declaration) receiver's conceptual interface chain.
