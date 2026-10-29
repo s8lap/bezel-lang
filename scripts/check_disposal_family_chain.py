@@ -71,6 +71,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 STDLIB = os.path.join(REPO, "docs", "Bezel_Standard_Library.md")
 SRC = os.path.join(REPO, "src", "common", "BuiltinRegistry.cpp")
+HPP = os.path.join(REPO, "src", "common", "BuiltinRegistry.hpp")
 
 ROOT = "IDisposable"
 
@@ -101,6 +102,15 @@ CMT_HEADER_RE = re.compile(r"^\s*//\s+interface\s+extends\s+stdlib\s*$")
 
 # A comment line carrying a trailing § attribution.
 CMT_ROW_RE = re.compile(r"^\s*//(?P<body>.*?)\s+§(?P<sec>\d+(?:\.\d+)*)\s*$")
+
+# The header's family rows (#7496): `//   Name<..>   (root)   §2.10` or
+# `//   Name<..>   extends Parent<..>   §4.2`, three spaces of indent.
+HPP_ROW_RE = re.compile(
+    r"^//   (?P<name>[A-Za-z_][A-Za-z0-9_]*(?:<[^<>]*>)?)\s+"
+    r"(?:\(root\)|extends\s+(?P<parent>[A-Za-z_][A-Za-z0-9_]*(?:<[^<>]*>)?))"
+    r"\s+§(?P<sec>\d+(?:\.\d+)*)\s*$"
+)
+HPP_ANCHOR = "The family, and where each member is declared"
 
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -401,7 +411,79 @@ def row_owner(body, spellings):
     return best
 
 
-def compare(doc_text, src_text):
+def header_rows(text):
+    """The header comment's family rows: (name, parent-or-None, section).
+
+    The block in src/common/BuiltinRegistry.hpp is a SECOND hand-written
+    transcription of the family, in a different style from the .cpp block
+    (#7496). It starts at the anchor sentence and is the run of `//` lines
+    that follows; rows are the ones HPP_ROW_RE reads.
+    """
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if HPP_ANCHOR in line:
+            start = i
+            break
+    if start is None:
+        die("no `%s` anchor in src/common/BuiltinRegistry.hpp — FAIL CLOSED"
+            % HPP_ANCHOR)
+    rows = []
+    for line in lines[start + 1:]:
+        if not line.startswith("//"):
+            break
+        m = HPP_ROW_RE.match(line)
+        if m:
+            rows.append((m.group("name"), m.group("parent"), m.group("sec")))
+    if not rows:
+        die("the family block in src/common/BuiltinRegistry.hpp lists no "
+            "rows — FAIL CLOSED")
+    return rows
+
+
+def compare_header(spellings, parents, sections, hpp_text):
+    """Compare the .hpp family block against the derived family."""
+    problems = []
+    seen = {}
+    for name, parent, sec in header_rows(hpp_text):
+        bare = IDENT_RE.match(name).group(0)
+        if bare in seen:
+            problems.append("the BuiltinRegistry.hpp family block lists `%s` "
+                            "twice" % bare)
+        seen[bare] = (name, parent, sec)
+    for bare in sorted(parents):
+        if bare not in seen:
+            problems.append(
+                "`%s` is in the disposal family but is MISSING from the "
+                "family block in src/common/BuiltinRegistry.hpp"
+                % spellings[bare])
+            continue
+        name, parent, sec = seen[bare]
+        if name != spellings[bare]:
+            problems.append(
+                "the BuiltinRegistry.hpp family block spells `%s` as `%s`"
+                % (spellings[bare], name))
+        want_parent = parents[bare]
+        got_parent = IDENT_RE.match(parent).group(0) if parent else ""
+        if got_parent != want_parent:
+            problems.append(
+                "the BuiltinRegistry.hpp family block gives `%s` the parent "
+                "`%s` but the stdlib document says `%s`"
+                % (spellings[bare], got_parent or "(root)",
+                   want_parent or "(root)"))
+        if sec != sections[bare]:
+            problems.append(
+                "the BuiltinRegistry.hpp family block attributes `%s` to §%s "
+                "but the stdlib document declares it in §%s"
+                % (spellings[bare], sec, sections[bare]))
+    for bare in sorted(set(seen) - set(parents)):
+        problems.append(
+            "the BuiltinRegistry.hpp family block lists `%s`, which does not "
+            "extend `IDisposable` in the stdlib document" % bare)
+    return problems
+
+
+def compare(doc_text, src_text, hpp_text=None):
     """The whole comparison. Returns a list of problem strings (empty = clean)."""
     problems = []
     decls = parse_declarations(doc_text)
@@ -462,6 +544,10 @@ def compare(doc_text, src_text):
                 "document declares it in §%s"
                 % (spellings[name], "/".join(sorted(observed[name])),
                    sections[name]))
+    # 4: the header's block is a third hand-written transcription (#7496).
+    if hpp_text is not None:
+        problems.extend(compare_header(spellings, parents, sections,
+                                       hpp_text))
     return problems
 
 
@@ -469,7 +555,8 @@ def self_test():
     """Prove the checker FIRES on mutated inputs."""
     doc = read(STDLIB)
     src = read(SRC)
-    problems = compare(doc, src)
+    hpp = read(HPP)
+    problems = compare(doc, src, hpp)
     if problems:
         die("SELF-TEST FAILED: the real document and the real source already "
             "disagree:\n  " + "\n  ".join(problems))
@@ -582,24 +669,48 @@ def self_test():
     else:
         die("SELF-TEST FAILED: an interface whose header the parser cannot "
             "read was silently accepted")
-    print("check_disposal_family_chain --self-test: OK (a removed member, a "
+    # (g) the .hpp family block (#7496): a row deleted, a parent changed and a
+    # § attribution changed must each be detected.
+    hrows = header_rows(hpp)
+    hv = [r for r in hrows if r[1] is not None]
+    name, parent, sec = hv[0]
+    vline = [ln for ln in hpp.splitlines(True)
+             if HPP_ROW_RE.match(ln.rstrip("\n")) and
+             ln.startswith("//   " + name)][0]
+    hmut = {
+        "a deleted row": hpp.replace(vline, "", 1),
+        "a changed parent": hpp.replace(vline, vline.replace(
+            "extends " + parent, "extends IDisposableX"), 1),
+        "a changed section": hpp.replace(vline, vline.replace(
+            "§" + sec, "§9.9"), 1),
+    }
+    for label, mutated in hmut.items():
+        if mutated == hpp:
+            die("SELF-TEST FAILED: could not apply the .hpp mutation (%s)"
+                % label)
+        if not compare(doc, src, mutated):
+            die("SELF-TEST FAILED: %s in the BuiltinRegistry.hpp family "
+                "block was NOT detected" % label)
+    print("check_disposal_family_chain --self-test: OK (the .hpp family block "
+          "is compared too: %d rows read; a removed member, a "
           "changed parent, a deleted comment row and a wrong § attribution "
           "are each detected; %d declaration-header fixtures (continuation "
           "line, split base list, split generic list) are parsed and "
           "detected, and an unreadable header fails closed; the real "
           "document and the real source agree on %d family members out of "
-          "%d parsed interfaces)" % (len(fixtures), len(parents), base_n))
+          "%d parsed interfaces)" % (len(hrows), len(fixtures), len(parents),
+                                     base_n))
     return 0
 
 
 def main():
     if "--self-test" in sys.argv:
         return self_test()
-    problems = compare(read(STDLIB), read(SRC))
+    problems = compare(read(STDLIB), read(SRC), read(HPP))
     if problems:
         out = ["check_disposal_family_chain: MISMATCH between "
                "docs/Bezel_Standard_Library.md and "
-               "src/common/BuiltinRegistry.cpp"]
+               "src/common/BuiltinRegistry.cpp / .hpp"]
         out.extend("  " + p for p in problems)
         sys.stderr.write("\n".join(out) + "\n")
         return 1
@@ -609,8 +720,8 @@ def main():
           "declarations in the stdlib document; %d of them extend "
           "`IDisposable` directly or transitively and agree with "
           "`kBuiltinDisposalFamilyHeads` on every head and every chain "
-          "parent)"
-          % (len(decls), len(parents)))
+          "parent; the %d-row family block in BuiltinRegistry.hpp agrees "
+          "too)" % (len(decls), len(parents), len(header_rows(read(HPP)))))
     return 0
 
 
