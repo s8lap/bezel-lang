@@ -2659,16 +2659,19 @@ void Emitter::declareFunctions() {
         // emitted a bare `free(obj)` and stranded the whole owned subtree.
         //
         // POPULATION, deliberately narrow and keyed on the SAME fact the
-        // disposal site keys on: `findMethodByName(ts, "DisposeAsync")` is
-        // exactly the lookup `registerUsingDisposal` performs to resolve
-        // `d.disposeAsyncFn`, so a class gets a reclaim function iff an `await
-        // using` on it can reach the async arm. A generic class is excluded —
-        // its owned-field classification is per-instantiation (the #816/#2019
+        // disposal site keys on: `asyncDisposableDisposeAsyncOf(ts)` (fix
+        // #7531, §28.12 / §14.2 rule 1, v0.350 — formerly the name-only
+        // `findMethodByName(ts, "DisposeAsync")`) is exactly the lookup
+        // `registerUsingDisposal` performs to resolve `d.disposeAsyncFn` and
+        // declareVtables Pass D performs for the run-time entry, so a class
+        // gets a reclaim function iff an `await using` on it can reach the
+        // async arm. A generic class is excluded — its owned-field
+        // classification is per-instantiation (the #816/#2019
         // specialized-disposer machinery), so the shared template body would be
         // wrong; such a head degrades to the full synchronous reclamation at
         // the disposal site. INTERNAL linkage: this is not part of the §2.5
         // cross-module surface (an imported head degrades the same way).
-        if (ts->genericParams.empty() && findMethodByName(ts, "DisposeAsync")) {
+        if (ts->genericParams.empty() && asyncDisposableDisposeAsyncOf(ts)) {
             auto* reclaimFn = llvm::Function::Create(
                 fnType, llvm::Function::InternalLinkage,
                 "bz$" + mangledTypeName(ts) + "$DisposeReclaim", module_.get());
@@ -6087,7 +6090,7 @@ void Emitter::declareVtables() {
         // this pair is that itable, keyed by `asyncDisposableItabKey()`.
         //
         // POPULATION is the static arm's own predicate, asked of the run-time
-        // class: `findMethodByName(ts, "DisposeAsync")` (a body to await —
+        // class: `asyncDisposableDisposeAsyncOf(ts)` (a body to await —
         // registerUsingDisposal's resolution) and `disposerReclaimFns_[ts]`
         // (populated by that same lookup, non-generic classes only). Both
         // entries are keyed on the SAME class, so the awaited `DisposeAsync`
@@ -21557,7 +21560,19 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             cls = repTy->declaration;
         if (!cls) cls = classOfLocal(d);
         if (cls && cls->kind == ast::TypeDeclKind::Class) {
-            sema::MethodSymbol* dams = findMethodByName(cls, "DisposeAsync");
+            // fix #7531 (§28.12 / §14.2 rule 1, v0.350): the awaited member
+            // is the ONE predicate's answer — the interface's `DisposeAsync`
+            // on a class that nominally implements `IAsyncDisposable` — the
+            // same answer the reclaim population and the run-time entry
+            // (declareVtables Pass D) key on. The name-only
+            // `findMethodByName(cls, "DisposeAsync")` this replaces awaited
+            // `DisposeAsync(): int` (SEGV at 0x17) and a wrong-arity overload
+            // of a conforming class, and awaited a well-formed `DisposeAsync`
+            // on a class that does not implement the interface, which §28.12
+            // says "takes the synchronous disposal". Null here ⇒ the slot is
+            // marked for the run-time dispatch below, whose entry such a
+            // class also lacks ⇒ synchronous.
+            sema::MethodSymbol* dams = asyncDisposableDisposeAsyncOf(cls);
             if (dams) {
                 auto fnIt = methodFns_.find(dams);
                 if (fnIt != methodFns_.end()) {
