@@ -3242,13 +3242,25 @@ void Resolver::checkUserDeclaredDispose() {
     // carry a destructor (§9.7): a user who accidentally writes a Dispose
     // method on a record also gets a clear diagnostic rather than a silent
     // no-op (the destructor restriction is a separate, earlier check).
+    //
+    // fix #7493 (§28.2, v0.350): THE REACH. §28.2's rule has no depth
+    // qualifier — "a **class** or a **record**" at "that declaration" — so a
+    // class or record nested inside another type is reached exactly as a
+    // module-level one is. This walk used to iterate `ctx_.module()->children`
+    // (module-level only), so `public class Outer / public record R / public
+    // method Dispose()` was ADMITTED while its module-level twin was refused.
+    // It now uses the SAME recursive walker as its sibling check
+    // `checkRecordRestrictions` (fix #7490, `forEachTypeAndNested`, §11.6).
+    // Only the reach changed: the predicate (Class/Record kind, member named
+    // `Dispose`), the diagnostic text and the diagnostic site are untouched,
+    // so every module-level verdict and its position are unchanged. An
+    // interface declaring `method Dispose();` is still not visited (kind
+    // filter), as §28.2 requires ("Interfaces are unaffected").
     if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
+    forEachTypeAndNested([&](TypeSymbol* t) {
         if (t->kind != ast::TypeDeclKind::Class &&
             t->kind != ast::TypeDeclKind::Record)
-            continue;
+            return;
         for (Symbol* m : t->members) {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
             if (!ms || ms->name != "Dispose") continue;
@@ -3262,7 +3274,7 @@ void Resolver::checkUserDeclaredDispose() {
                 "ownership machinery.  Use a `destructor` for cleanup logic "
                 "and `owned` fields for resource fields instead.");
         }
-    }
+    });
 }
 
 void Resolver::checkTopLevelVisibility() {
