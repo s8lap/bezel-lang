@@ -3399,6 +3399,31 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!declaresName) return nullptr;
         }
     }
+    // fix #7703 (§26.5 rules 1-2, §22.5, §26.7, v0.350; stdlib §3.1): the
+    // same decline for the rest of a `StringBuilder` receiver's surface.  The
+    // StringBuilder arm below lowers its receiver and, for a member it does
+    // not answer, falls out of this function with `nullptr`; the user
+    // extension's own lowering then lowered the receiver a SECOND time
+    // (§22.5: an operand is evaluated once; §26.7: the receiver is evaluated
+    // once, as a borrow).  A call bound to a user extension whose name the
+    // built-in does NOT declare (§26.5 rule 1 commits only a declared name to
+    // the built-in; rule 2 selects the extension otherwise) is declined here,
+    // BEFORE any receiver IR is emitted, exactly as `Length` / `Count` are.
+    // The declared surface is stdlib §3.1's member list plus the §8.1
+    // universal members; a declared name keeps its built-in arm.
+    if (isStrBld) {
+        auto* msSb =
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+        if (isExtensionMethod(msSb)) {
+            const bool declaresName =
+                m == "Append" || m == "AppendLine" || m == "AppendFormat" ||
+                m == "Insert" || m == "Remove" || m == "Replace" ||
+                m == "Clear" || m == "ToString" || m == "Length" ||
+                m == "Capacity" || m == "Equals" || m == "GetHashCode" ||
+                m == "GetType" || m == "Dispose";
+            if (!declaresName) return nullptr;
+        }
+    }
     if (m == "Length" || m == "Count") {
         auto* ms =
             dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
