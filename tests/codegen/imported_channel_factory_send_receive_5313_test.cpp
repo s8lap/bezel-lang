@@ -521,4 +521,118 @@ BEZEL_TEST(imported_channel_factory_send_receive_5313,
     BEZEL_EXPECT_TRUE(rr.out.find("leaked") == std::string::npos);
 }
 
+// ── SITE 5 PIN, IMPORTED PARAMETER SHAPE (#5355) ─────────────────────────────
+//
+// §30.15 (v0.350): "Disposing the last sender closes the channel", and §28.3
+// (v0.350) makes an `owned` parameter's disposal part of every exit, the
+// exception edge included.
+//
+// The row above takes its callee from a plain imported class. These rows drive
+// the unwind arm through a callee that is a member of an imported GENERIC class
+// instantiated in the importing module (`GHub<string>.ConsumeCh`), for both the
+// `Channel<int>` and the `ChannelSender<int>` owned parameter: the callee throws
+// through the frame holding the owned parameter, 200 times, under
+// generated-code ASan + LSan.
+//
+// MEASURED (lane r37-c1-t5355): emulating the pre-#5313 gate (`astNode`
+// required) at this arm does NOT fail these rows, so the owned parameter's
+// TypeRef is still shape (a) here and no reachable callee shape was found that
+// puts shape (c) at this arm. What the rows do pin is the arm itself: with the
+// builtin arm disabled outright all three unwind rows leak.
+const std::string kGenThrowLibSrc =
+    "module Lib; "
+    "import System.Threading; "
+    "public class E: Exception "
+    "  public constructor() base(\"boom\"); end constructor; "
+    "end E; "
+    "public class GHub<T> "
+    "  public static method ConsumeCh(owned ch: Channel<int>) "
+    "    throw new E(); "
+    "  end ConsumeCh; "
+    "  public static method ConsumeTx(owned tx: ChannelSender<int>) "
+    "    throw new E(); "
+    "  end ConsumeTx; "
+    "end GHub; ";
+
+const std::string kGenThrowChAppSrc =
+    "module App; "
+    "import Lib; "
+    "class C "
+    "  public static method Main(): int "
+    "    var i := 0; "
+    "    var caught := 0; "
+    "    while i < 200 do "
+    "      var inbox := new Channel<int>(); "
+    "      using var tx := inbox.NewSender(); "
+    "      tx.Send(i); "
+    "      try "
+    "        GHub<string>.ConsumeCh(move inbox); "
+    "      catch E => do "
+    "        caught := caught + 1; "
+    "      end "
+    "      end try; "
+    "      i := i + 1; "
+    "    end; "
+    "    Console.WriteLine($\"{caught}\"); "
+    "    return 0; "
+    "  end Main; "
+    "end C; ";
+
+const std::string kGenThrowTxAppSrc =
+    "module App; "
+    "import Lib; "
+    "class C "
+    "  public static method Main(): int "
+    "    var i := 0; "
+    "    var caught := 0; "
+    "    while i < 200 do "
+    "      using var inbox := new Channel<int>(); "
+    "      try "
+    "        GHub<string>.ConsumeTx(inbox.NewSender()); "
+    "      catch E => do "
+    "        caught := caught + 1; "
+    "      end "
+    "      end try; "
+    "      i := i + 1; "
+    "    end; "
+    "    Console.WriteLine($\"{caught}\"); "
+    "    return 0; "
+    "  end Main; "
+    "end C; ";
+
+BEZEL_TEST(imported_channel_factory_send_receive_5313,
+           imported_generic_owned_channel_param_throws_unwind_site_5_5355) {
+    auto dir = wtDir5313();
+    LibHandle libH = buildLib(dir, kGenThrowLibSrc);
+    BEZEL_EXPECT_TRUE(libH.ok);
+    if (!libH.ok) return;
+    AppHandle appH = buildApp(dir, libH.objPath, kGenThrowChAppSrc,
+                              /*sanitize=*/true);
+    BEZEL_EXPECT_TRUE(appH.ok);
+    if (!appH.ok) return;
+    RunResult rr = runCapture(appH.exePath);
+    BEZEL_EXPECT_EQ(rr.code, 0);
+    // Every pass threw and was caught (load-bearing: the unwind path ran).
+    BEZEL_EXPECT_EQ(rr.out, std::string("200\n"));
+    BEZEL_EXPECT_TRUE(rr.out.find("LeakSanitizer") == std::string::npos);
+    BEZEL_EXPECT_TRUE(rr.out.find("leaked") == std::string::npos);
+}
+
+BEZEL_TEST(imported_channel_factory_send_receive_5313,
+           imported_generic_owned_sender_param_throws_unwind_site_5_5355) {
+    auto dir = wtDir5313();
+    LibHandle libH = buildLib(dir, kGenThrowLibSrc);
+    BEZEL_EXPECT_TRUE(libH.ok);
+    if (!libH.ok) return;
+    AppHandle appH = buildApp(dir, libH.objPath, kGenThrowTxAppSrc,
+                              /*sanitize=*/true);
+    BEZEL_EXPECT_TRUE(appH.ok);
+    if (!appH.ok) return;
+    RunResult rr = runCapture(appH.exePath);
+    BEZEL_EXPECT_EQ(rr.code, 0);
+    BEZEL_EXPECT_EQ(rr.out, std::string("200\n"));
+    BEZEL_EXPECT_TRUE(rr.out.find("LeakSanitizer") == std::string::npos);
+    BEZEL_EXPECT_TRUE(rr.out.find("leaked") == std::string::npos);
+}
+
 }  // namespace bezel::codegen
