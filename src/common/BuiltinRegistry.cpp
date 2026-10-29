@@ -591,7 +591,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 353> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -1093,28 +1093,33 @@ constexpr std::array<BuiltinParamRow, 353> kBuiltinParams = {{
     // (`Environment.Set("A", null)` stays legal).
     {"Environment", "Get", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Environment", "Set", 2, 2, 0x01, {"name", "value", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #7933 (stdlib §2.4, v0.350): the two remaining `Environment` METHODS,
+    // so the static class's arity surface is closed by the table:
+    // `Variables(): owned Dictionary<string, string>` and `Exit(exitCode: int)`.
+    {"Environment", "Variables", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "Exit", 1, 1, 0x00, {"exitCode", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     // fix #6812 (§7.3, v0.340; stdlib §10.1 / §10.2 v0.344): the FFI-boundary
     // string factories. `CString.From(s: string): owned CString` and
     // `WString.From(s: string): owned WString` declare their parameter
     // non-nullable, so `CString.From(null)` reaches no candidate (§7.3).
     {"CString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"WString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllText", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllText", 2, 0, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllBytes", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllBytes", 2, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllLines", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllLines", 2, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Exists", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Delete", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Copy", 3, 0, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Move", 2, 0, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Exists", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "CreateDirectory", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Delete", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Delete", 2, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "GetFiles", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "GetDirectories", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllText", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllText", 2, 2, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllBytes", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllBytes", 2, 2, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllLines", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllLines", 2, 2, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Exists", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Delete", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Copy", 3, 3, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Move", 2, 2, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Exists", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "CreateDirectory", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Delete", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Delete", 2, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "GetFiles", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "GetDirectories", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Path", "Combine", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Path", "GetFileName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Path", "GetExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},

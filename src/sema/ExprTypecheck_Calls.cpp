@@ -24946,24 +24946,31 @@ static void checkBuiltinCollectionCallArity(SemaContext& ctx,
             "§26.5 rule 1)");
 }
 
-// fix #7864 (stdlib §7.4, §22.6, v0.350): the ARITY of a `Path` static. The
-// ONE built-in parameter table carries a row per declared form of every
-// `Path` member (`Combine(a, b)`, `GetFileName(path)`, ...), but only the
-// value built-ins' admission gate read it; a `Path` call at a count no row
-// takes reached no lowering and degraded to the #3079 warning, emitting
-// nothing. A call whose count no declared form takes is a compile error.
+// fix #7864 / #7933 (stdlib §2.4, §7.3, §7.4, §22.6, v0.350): the ARITY of a
+// static member of `Path`, `File`, `Directory` or `Environment`. The ONE
+// built-in parameter table carries a row per declared form of every member of
+// those classes (`Combine(a, b)`, `GetFileName(path)`, `File.Exists(path)`,
+// `Directory.Delete(path, recursive := false)`, ...), but only the value
+// built-ins' admission gate read it; a call at a count no row takes reached no
+// lowering and degraded to the #3079 warning, emitting nothing. A call whose
+// count no declared form takes is a compile error.
 static void checkBuiltinPathCallArity(SemaContext& ctx, const ast::CallExpr& ce,
                                        Symbol* calleeSym) {
-    // A resolved callee is a user static class named `Path`, bound by
+    // A resolved callee is a user static class of the same name, bound by
     // `checkCallArity`.
     if (calleeSym) return;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
     if (!ma || !ma->target) return;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    if (!id || id->name != "Path" || ctx.exprType(*ma->target)) return;
-    const std::vector<common::BuiltinParamForm> forms =
-        common::builtinParamForms("Path", ma->member, common::kBuiltinAnyArity);
-    if (forms.empty()) return;  // not a §7.4 member: the surface check's
+    if (!id || ctx.exprType(*ma->target)) return;
+    const char* section = nullptr;  // the stdlib section declaring the class
+    if (id->name == "Path" || id->name == "Directory") section = "7.4";
+    else if (id->name == "File") section = "7.3";
+    else if (id->name == "Environment") section = "2.4";
+    else return;
+    const std::vector<common::BuiltinParamForm> forms = common::builtinParamForms(
+        id->name, ma->member, common::kBuiltinAnyArity);
+    if (forms.empty()) return;  // not a declared method: the surface check's
     const std::size_t argc = ce.args.size();
     std::string expectation;
     std::size_t count = 0;
@@ -24974,9 +24981,9 @@ static void checkBuiltinPathCallArity(SemaContext& ctx, const ast::CallExpr& ce,
     }
     ctx.diagnostics().report(
         Severity::Error, ce.span.begin,
-        "the call to `Path." + std::string(ma->member) + "` supplies " +
-            std::to_string(argc) + " argument(s) but stdlib §7.4 declares `" +
-            std::string(ma->member) + "` with " +
+        "the call to `" + std::string(id->name) + "." + std::string(ma->member) +
+            "` supplies " + std::to_string(argc) + " argument(s) but stdlib §" +
+            section + " declares `" + std::string(ma->member) + "` with " +
             (forms.size() == 1 ? "exactly " : "") + expectation +
             " argument(s) — no overload takes " + std::to_string(argc) +
             ", so the call is a compile error with no candidates cited "
