@@ -39432,7 +39432,14 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             // `Count` from `IReadOnlyCollection<T>` (stdlib §4.1), so a
             // same-named extension over an `IList<T>` receiver is unreachable
             // here too.
-            if (!builtinCollectionSurfaceDeclaresMember(recvTy, nm.member)) {
+            //
+            // fix #7789 (§26.5 rule 1, v0.350): the `?.` twin of #7700's
+            // gate for a CONCRETE built-in collection head (`Array<int>?`,
+            // `Set<T>?`, ...): a name its stdlib §4.x block declares commits
+            // the lookup, so `n?.Contains(2)` is the instance member, never
+            // a same-named user extension.
+            if (!builtinCollectionSurfaceDeclaresMember(recvTy, nm.member) &&
+                !builtinConcreteCollectionDeclaresMember(recvTy, nm.member)) {
                 member = lookupExtensionMember(
                     recvTy, nm.member, nullptr, nm.span.begin,
                     /*reportAmbiguity=*/true, currentCallArity_);
