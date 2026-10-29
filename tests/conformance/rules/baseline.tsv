@@ -407,6 +407,9 @@ s7_5_0014	pass
 s7_5_0016	pass	
 s7_5_0017	pass	
 s7_5_0018	fail	#7130: the `?.` spelling of a string instance method is rejected in codegen, though §7.5 defines it
+s7_5_0019	pass	
+s7_5_0020	pass	
+s7_5_0021	pass	
 s7_6_0001	pass	
 s7_6_0002	pass	
 s7_7_0001	pass	
@@ -522,6 +525,9 @@ s8_4_0008	pass
 s8_5_0001	pass	
 s8_5_0002	pass	
 s8_5_0003	fail	divergence
+s8_5_0014	pass	
+s8_5_0015	pass	
+s8_5_0016	pass	
 s8_6_0001	pass	
 s8_6_0002	pass	
 s8_6_0003	pass	
@@ -1214,6 +1220,12 @@ s17_8_0001	pass
 s17_8_0002	pass	
 s17_8_0003	pass	
 s17_8_0004	pass	
+s17_8_0015	pass	
+s17_8_0016	pass	
+s17_8_0017	pass	
+s17_8_0018	pass	
+s17_8_0019	pass	
+s17_8_0020	pass	
 s17_9_0001	pass	
 s17_9_0002	pass	
 s17_9_0004	pass	
@@ -1835,6 +1847,17 @@ s26_3_0007	pass
 s26_4_0001	pass	
 s26_4_0002	pass	
 s26_4_0003	pass	
+s26_4_0006	pass	
+s26_4_0007	pass	
+s26_4_0008	pass	
+s26_4_0009	pass	
+s26_4_0010	pass	
+s26_4_0011	pass	
+s26_4_0012	pass	
+s26_4_0013	pass	
+s26_4_0014	pass	
+s26_4_0015	pass	
+s26_4_0016	pass	
 s26_5_0001	pass	
 s26_5_0002	pass	
 s26_5_0003	pass	
@@ -1849,6 +1872,17 @@ s26_5_0017	pass
 s26_5_0018	pass	
 s26_5_0019	pass	
 s26_5_0020	pass	
+s26_5_0029	pass	
+s26_5_0030	pass	
+s26_5_0031	pass	
+s26_5_0032	pass	
+s26_5_0033	pass	
+s26_5_0034	pass	
+s26_5_0035	pass	
+s26_5_0036	pass	
+s26_5_0037	pass	
+s26_5_0038	pass	
+s26_5_0039	pass	
 s26_5_1_0001	pass	
 s26_5_1_0002	pass	
 s26_5_1_0003	pass	
@@ -2116,6 +2150,36 @@ s28_3_0225	fail	#7125: the function-value path's discharge gate requires a class
 s28_3_0226	pass	
 s28_3_0227	fail	#7187: a while condition's unbound owned temporary accumulates across evaluations (K8.2) instead of being disposed at each evaluation's full-expression boundary
 s28_3_0228	pass	
+s28_3_0271	pass	
+s28_3_0272	pass	
+s28_3_0273	pass	
+s28_3_0274	pass	
+s28_3_0275	pass	
+s28_3_0276	pass	
+s28_3_0277	pass	
+s28_3_0278	pass	
+s28_3_0279	pass	
+s28_3_0280	pass	
+s28_3_0281	pass	
+s28_3_0282	pass	
+s28_3_0283	pass	
+s28_3_0284	pass	
+s28_3_0285	pass	
+s28_3_0286	pass	
+s28_3_0287	pass	
+s28_3_0288	pass	
+s28_3_0289	pass	
+s28_3_0290	pass	
+s28_3_0291	pass	
+s28_3_0292	pass	
+s28_3_0293	pass	
+s28_3_0294	pass	
+s28_3_0295	pass	
+s28_3_0296	pass	
+s28_3_0297	pass	
+s28_3_0298	pass	
+s28_3_0299	pass	
+s28_3_0300	pass	
 s28_4_0001	pass	
 s28_4_0002	pass	
 s28_4_0003	pass	
@@ -2271,6 +2335,25 @@ s28_10_0014	pass
 s28_10_0015	fail	#5582
 s28_10_0016	fail	#7092
 s28_10_0017	pass	
+s28_10_0050	pass	
+s28_10_0051	pass	
+s28_10_0052	pass	
+s28_10_0053	pass	
+s28_10_0054	pass	
+s28_10_0055	pass	
+s28_10_0056	pass	
+s28_10_0057	pass	
+s28_10_0058	pass	
+s28_10_0059	pass	
+s28_10_0060	pass	
+s28_10_0063	fail	#7728
+s28_10_0066	pass	
+s28_10_0067	pass	
+s28_10_0068	pass	
+s28_10_0069	pass	
+s28_10_0071	pass	
+s28_10_0072	fail	#7482
+s28_10_0073	fail	#7482
 s28_11_0001	pass	
 s28_11_0002	pass	
 s28_11_0003	pass	
@@ -2300,6 +2383,15 @@ s28_12_0010	pass
 s28_12_0011	pass	
 s28_12_0012	pass	
 s28_12_0015	pass	#7396
+s28_12_0078	fail	#7705
+s28_12_0079	fail	#7705
+s28_12_0080	fail	#7705
+s28_12_0081	fail	#7705
+s28_12_0082	fail	#7705
+s28_12_0083	fail	#7705
+s28_12_0084	fail	#7705
+s28_12_0085	fail	#7705
+s28_12_0086	fail	#7705
 s28_13_0001	pass	
 s28_13_0002	pass	
 s28_13_0003	pass	
@@ -2447,6 +2539,11 @@ s30_3_0006	pass
 s30_3_0007	pass	
 s30_3_0008	pass	
 s30_3_0009	pass	
+s30_3_0010	pass	
+s30_3_0011	pass	
+s30_3_0012	pass	
+s30_3_0013	pass	
+s30_3_0014	pass	
 s30_4_0001	pass	
 s30_4_0002	pass	
 s30_4_0003	pass	
