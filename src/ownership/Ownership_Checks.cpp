@@ -1400,6 +1400,13 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             const std::size_t boundPos =
                 ctorParams.valid() ? boundParamIndex(ne->args, pos, ctorParams)
                                    : pos;
+            // issue #6233 (see #7541): the ctor twin of recordMovesInArgs' plain
+            // move-only field-read rejection. // per §15.3, §28.8.1
+            if (ctorParams.valid() && boundPos < ctorParams.size() &&
+                rejectMoveOnlyFieldReadArg(
+                    a, nullptr, ctorParams.modifier(boundPos) == "owned")) {
+                ++pos; continue;
+            }
             const bool ctorOwnedSink =
                 ctorParams.valid() && boundPos < ctorParams.size() &&
                 ctorParams.modifier(boundPos) == "owned";
@@ -1771,6 +1778,16 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         // parameter NAMED `name`, so a reordered owned/borrow call maps correctly.
         const std::size_t boundPos =
             formals.valid() ? boundParamIndex(args, pos, formals) : pos;
+        // issue #6233 (see #7541): a plain read of a move-only field passed to a
+        // by-value-move formal (either spelling) or a move-only payload slot
+        // lends and is rejected at the argument (§15.3, v0.350). Reported, the
+        // argument is not classified further (no bogus move is recorded).
+        // // per §15.3, §28.8.1
+        if (formals.valid() && boundPos < formals.size() &&
+            rejectMoveOnlyFieldReadArg(a, callee,
+                                       formals.modifier(boundPos) == "owned")) {
+            ++pos; continue;
+        }
         bool userOwned = formals.valid() && boundPos < formals.size() &&
                          formals.modifier(boundPos) == "owned";
         // §28.1 per-instantiation erasure (#2047): an `owned` marker on a CHOICE
@@ -2308,6 +2325,17 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // AssignmentStmt) takes — recordMovesInArgs' twin call covers
             // the LocalDecl-initializer / assignment-RHS forms instead.
             checkRefOutOwnedOperand(a);
+            // issue #6233 (see #7541): the bare-statement twin of
+            // recordMovesInArgs' plain move-only field-read rejection.
+            // // per §15.3, §28.8.1
+            if (discFormals.valid() &&
+                boundParamIndex(call->args, pos, discFormals) <
+                    discFormals.size() &&
+                rejectMoveOnlyFieldReadArg(
+                    a, call->callee.get(),
+                    boundModifier(call->args, pos, discFormals) == "owned")) {
+                ++pos; continue;
+            }
             bool consumed = false;
             // §22.3 (v0.169, #1348): call-site `owned` marker validation. This
             // is SURFACE-ONLY — it does not change which arguments are consumed
@@ -2829,6 +2857,17 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // §22.3 (v0.184, #1682): the owned-state half of the ref/out
             // operand-category rule — see recordMovesInArgs' twin call.
             checkRefOutOwnedOperand(a);
+            // issue #6233 (see #7541): the bare-statement twin of
+            // recordMovesInArgs' plain move-only field-read rejection.
+            // // per §15.3, §28.8.1
+            if (ctorParams.valid() &&
+                boundParamIndex(ne->args, pos, ctorParams) <
+                    ctorParams.size() &&
+                rejectMoveOnlyFieldReadArg(
+                    a, nullptr,
+                    boundModifier(ne->args, pos, ctorParams) == "owned")) {
+                ++pos; continue;
+            }
             bool consumed = false;
             // §22.3 (v0.169, #1348): call-site `owned` marker validation for a
             // constructor call, mirroring the CallExpr path above — surface-only,
@@ -9809,6 +9848,59 @@ static bool moveOnlyArgIsConsumed(const ast::Expr* callee,
     if (!a.modifier.empty() && a.modifier != "owned") return false;
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
         if (ma->member == "Equals") return false;
+    return true;
+}
+
+// issue #6233 (see #7541): see the declaration in Ownership_impl.hpp. §15.3
+// *Whole-value reassignment* (v0.350): "a move-only field is never moved-from
+// (Appendix C.3) — so at a field the plain read `_arr` lends (K1.5): … and
+// `_arr := f(_arr);` is rejected at the argument, a by-value-move parameter
+// requiring the spelled transfer `f(move _arr with fresh)`"; K9 consequence 1:
+// "every plain read of an owned field lends (K1.5); the only owned read of an
+// owned field or an owning slot is the replacing `move`". §15.3 *Parameter
+// passing* makes every plain or `owned` parameter of a move-only V by
+// value-move, and `(owned x: V)` "identical to plain `(x: V)`", so both
+// spellings take the same rejection (the `owned` spelling already drew the
+// §28.8 borrow-into-owned-sink error through `checkOwnedArgSource`, but only
+// for an `owned`-modified field — an owning inline array field carries no
+// modifier). A case-payload slot of move-only type is the same marker-free
+// store into an owning location (K3.12; §15.3 *Field placement*).
+//
+// The gate is the ARGUMENT's type, so a generic formal `(x: T)` instantiated
+// at a move-only type is covered (§15.3: "a move-only parameter at every
+// instantiation whose substitution makes that type move-only"). Only calls
+// whose formals resolve reach here (a builtin callee with no formal list is
+// not classified), and `moveOnlyArgIsConsumed` exempts `ref` / `out` and the
+// `Equals(T)` borrow (§25.2). // per §15.3, §28.8.1
+bool MethodOwnership::rejectMoveOnlyFieldReadArg(const ast::CallArgument& a,
+                                                 const ast::Expr* callee,
+                                                 bool formalIsOwned) {
+    if (!a.value || !moveOnlyArgIsConsumed(callee, a)) return false;
+    // An `owned` formal fed a bare `owned`-modified field read already draws
+    // the §28.8 borrow-into-owned-sink error (`checkOwnedArgSource`, #398);
+    // leave that diagnostic in place.
+    if (formalIsOwned && exprIsOwnedFieldRead(*a.value)) return false;
+    const ast::Expr* v = lookThroughForceUnwrap(a.value.get());
+    if (!v) return false;
+    const bool fieldShape = dynamic_cast<const ast::MemberAccessExpr*>(v) ||
+                            dynamic_cast<const ast::NullCondMemberExpr*>(v) ||
+                            dynamic_cast<const ast::IdentifierExpr*>(v);
+    if (!fieldShape) return false;
+    auto* fs = dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*v));
+    if (!fs) return false;
+    const char* moveOnlyKind = nullptr;
+    if (!common::isMoveOnlyValueType(ctx_.exprType(*a.value), ctx_,
+                                     moveOnlyKind))
+        return false;
+    report(Severity::Error, a.value->span.begin,
+           std::string("cannot pass the field `") + std::string(fs->name) +
+               "` to a parameter that takes ownership: its type is " +
+               (moveOnlyKind ? moveOnlyKind : "a move-only value type") +
+               ", passed by value-move (\xc2\xa7""15.3 *Parameter passing*), "
+               "but a move-only field is never moved-from, so a plain read of "
+               "it lends (K1.5) and the field's owner would dispose the value "
+               "a second time; take it with the replacing `move <field> with "
+               "<replacement>` (\xc2\xa7""28.8.1, \xc2\xa7""15.3, v0.350)");
     return true;
 }
 

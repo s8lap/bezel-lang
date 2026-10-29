@@ -5253,6 +5253,20 @@ private:
     // the borrow as consumed). // per §28.8
     bool checkOwnedArgSource(const ast::Expr& argValue, SourceLocation loc);
 
+    // issue #6233, see #7541 (§15.3 *Parameter passing* / *Whole-value reassignment*,
+    // v0.350): report a plain read of a move-only FIELD (`h.f`, `h?.f`,
+    // `this.f`, an implicit-`this` `f`, `a.b.f`, each optionally `!`-peeled)
+    // passed as a call argument the callee consumes — a by-value-move
+    // parameter at either spelling, or a move-only choice-case payload slot.
+    // "a move-only field is never moved-from … so at a field the plain read
+    // `_arr` lends (K1.5): … `_arr := f(_arr);` is rejected at the argument, a
+    // by-value-move parameter requiring the spelled transfer
+    // `f(move _arr with fresh)`." Returns true when it reported. `callee` is
+    // null for a `new` argument. // per §15.3, §28.8.1
+    bool rejectMoveOnlyFieldReadArg(const ast::CallArgument& a,
+                                    const ast::Expr* callee,
+                                    bool formalIsOwned);
+
     // §28.6 / §28.8 / §28.8.1 (issue #1995): reject `return move b` / `return
     // move b!` (and the `=>` expression-body form) of a BORROW returned through
     // an `owned` return type. The return position never ran the §28.8 owned-
