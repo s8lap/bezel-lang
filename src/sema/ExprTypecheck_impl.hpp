@@ -614,6 +614,10 @@ private:
     // type a built-in / LINQ `?.` call (their exprType entries are keyed on the
     // node addresses, which must outlive the pass).
     std::vector<std::unique_ptr<ast::CallExpr>> nullCondBuiltinSynth_;
+    // fix #7778: the same keep-alive for the synthetic `.` accesses
+    // resolveNullCondMember builds to type a bare `?.` property read on a
+    // builtin time value record (`DateTime?`.Year, ...).
+    std::vector<std::unique_ptr<ast::MemberAccessExpr>> nullCondBuiltinMemberSynth_;
     // §11.8: one synthesized GenericParamSymbol marker per type-parameter
     // name, attached as the exprSymbol of a `T` member-access receiver so
     // resolveMemberAccess (and codegen) can identify the receiver kind.

@@ -33108,8 +33108,26 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // DateTime property arms below must see both shapes, otherwise
     // `d.AddDays(3).DayOfWeek` stays untyped and the enum-typed argument is
     // lowered without its i8 width.
+    // The same factory shape reaches the other builtin time value records
+    // (`dt.Date` is a `DateOnly`, `dt.TimeOfDay` a `TimeOnly`, `a - b` a
+    // `TimeSpan`): the arms below are keyed on the head name and serve both
+    // shapes, so the receiver gate must admit them too (#7778: a `?.` read over
+    // a `var d := a?.Date` local otherwise stayed untyped).
+    //
+    // PROPERTY READS ONLY for the widened heads: a CALL whose callee is a
+    // property (`d.Year(1)`, `o.Hour(1)`, `t.Days(1)` on a factory-shaped
+    // value) must keep the base verdict -- the "`Year` on built-in type
+    // `DateOnly` produced no value" error (#2457) -- instead of being typed
+    // here and accepted as a #605 warning. DateTime keeps its pre-existing
+    // (#7536) gate unchanged.
     const bool builtinDateTimeRecv =
-        targetType && targetType == builtinClassSym("DateTime");
+        targetType &&
+        (targetType == builtinClassSym("DateTime") ||
+         (&ma != calleeOfCallCtx_ &&
+          (targetType == builtinClassSym("TimeSpan") ||
+           targetType == builtinClassSym("DateOnly") ||
+           targetType == builtinClassSym("TimeOnly") ||
+           targetType == builtinClassSym("Guid"))));
     if (!targetType || builtinDateTimeRecv) {
         // §31 / #600 phase c: `e.Message` where `e` is typed as a PURE built-in
         // exception (declaration==nullptr, no user TypeSymbol — e.g. a caught
@@ -39960,6 +39978,51 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             !lookupExtensionMember(recvTyForDiag, nm.member, nullptr, loc,
                                    /*reportAmbiguity=*/false)) {
             ctx_.diagnostics().report(Severity::Error, loc, msg);
+            return;
+        }
+    }
+    // fix #7778 (§7.5, stdlib §2.5, v0.350): `a?.Year` / `a?.Ticks` /
+    // `t?.TotalDays` / `d?.Month` / `o?.Hour` on a `DateTime?` / `TimeSpan?` /
+    // `DateOnly?` / `TimeOnly?` receiver. The bare property read of these
+    // builtin value records is typed by the `.` form's arms in
+    // resolveMemberAccess, which are keyed on a MemberAccessExpr; a
+    // NullCondMemberExpr is a distinct node, so the access stayed UNTYPED
+    // (and codegen lowered it to nothing). §7.5: the result is the `.` form's
+    // result lifted to nullable. Type the `.` TWIN, as typeCall's #6529 arm does
+    // for a `?.` call: a synthetic `.` access over a placeholder carrying the
+    // receiver's non-nullable type, speculative (anything it reports is
+    // discarded; a twin that reports an error leaves the node untyped, as
+    // before), then lift. Only the builtin time value records are admitted: the
+    // member set is whatever the `.` form types, so the two spellings cannot
+    // drift apart.
+    if (!member && &nm != calleeOfCallCtx_ && recvTyForDiag &&
+        recvTyForDiag->nullable && !ctx_.exprType(nm) &&
+        isBuiltinTimeValueRecord(recvTyForDiag)) {
+        const std::size_t mark = ctx_.diagnostics().diagnostics().size();
+        const std::size_t errsBefore = ctx_.diagnostics().errorCount();
+        TypeRef* rcvTy = ctx_.makeTypeRef(*recvTyForDiag);
+        rcvTy->nullable = false;
+        auto ph = std::make_unique<ast::IdentifierExpr>();
+        ph->name = "<nullcond-receiver>";  // unspellable: must not alias a user local (#6681)
+        ph->span = nm.target->span;
+        ctx_.setExprType(ph.get(), rcvTy);
+        auto dotted = std::make_unique<ast::MemberAccessExpr>();
+        dotted->span = nm.span;
+        dotted->member = nm.member;
+        dotted->target = std::move(ph);
+        resolveMemberAccess(*dotted);
+        TypeRef* twinTy = ctx_.exprType(*dotted);
+        const bool clean = ctx_.diagnostics().errorCount() == errsBefore;
+        ctx_.diagnostics().rollbackTo(mark);
+        if (clean && twinTy && twinTy->kind != TypeRef::Kind::Function) {
+            if (twinTy->nullable) {
+                ctx_.setExprType(&nm, twinTy);
+            } else {
+                TypeRef* nn = ctx_.makeTypeRef(*twinTy);
+                nn->nullable = true;
+                ctx_.setExprType(&nm, nn);
+            }
+            nullCondBuiltinMemberSynth_.push_back(std::move(dotted));
             return;
         }
     }

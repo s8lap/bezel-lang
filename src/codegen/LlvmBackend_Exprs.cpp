@@ -4683,6 +4683,72 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // method `?.` are deferred.
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (!nm->target) return nullptr;
+        // fix #7778 (stdlib §2.5, §7.5, v0.350): `a?.Year` / `a?.Ticks` /
+        // `t?.TotalDays` / `d?.Month` / `o?.Hour` on a `DateTime?` /
+        // `TimeSpan?` / `DateOnly?` / `TimeOnly?` receiver. The `.` form reads
+        // these through the MemberAccessExpr arm ("§2.5: DateTime and TimeSpan
+        // instance property reads"); a NullCondMemberExpr is a distinct node,
+        // so that arm never ran and the access lowered to nothing (#3079).
+        // Lower the receiver ONCE; a null receiver yields null, otherwise run the
+        // `.` form's own lowering over a synthetic `.` node whose target is a
+        // pinned placeholder carrying the unwrapped payload (the #6024 pattern),
+        // typed as the NON-nullable receiver, and lift to the §7.5 result. sema
+        // (resolveNullCondMember) typed the node `T?` from the same `.` twin.
+        if (const sema::TypeRef* tvRcvTy = ctx_.exprType(*nm->target);
+            tvRcvTy && isNullableValueTy(tvRcvTy)) {
+            const std::string_view tvHead = builtinTypeName(tvRcvTy);
+            const sema::TypeRef* tvResTy = ctx_.exprType(e);
+            if ((tvHead == "DateTime" || tvHead == "TimeSpan" ||
+                 tvHead == "DateOnly" || tvHead == "TimeOnly") &&
+                tvResTy && tvResTy->nullable && isNullableValueTy(tvResTy)) {
+                llvm::Value* tvRcv = lowerExpr(*nm->target);
+                if (!tvRcv || !tvRcv->getType()->isStructTy()) return nullptr;
+                auto* tvEntryBB = builder_.GetInsertBlock();
+                auto* tvAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "nctv.access", currentFn_);
+                auto* tvEndBB = llvm::BasicBlock::Create(
+                    llvm_, "nctv.end", currentFn_);
+                llvm::Value* tvPayload = nullablePrimValue(tvRcv);
+                builder_.CreateCondBr(nullablePrimHasValue(tvRcv),
+                                      tvAccessBB, tvEndBB);
+                builder_.SetInsertPoint(tvAccessBB);
+                sema::TypeRef* tvInnerRcvTy = ctx_.makeTypeRef(*tvRcvTy);
+                tvInnerRcvTy->nullable = false;
+                auto tvPlaceholder = std::make_unique<ast::IdentifierExpr>();
+                tvPlaceholder->name = "<nullcond-receiver>";  // unspellable (#6681)
+                ctx_.setExprType(tvPlaceholder.get(), tvInnerRcvTy);
+                exprValueOverride_[tvPlaceholder.get()] = tvPayload;
+                auto tvDotted = std::make_unique<ast::MemberAccessExpr>();
+                tvDotted->span = e.span;
+                tvDotted->member = nm->member;
+                tvDotted->target = std::move(tvPlaceholder);
+                const ast::Expr* tvPlaceholderKey = tvDotted->target.get();
+                sema::TypeRef* tvInnerResTy = ctx_.makeTypeRef(*tvResTy);
+                tvInnerResTy->nullable = false;
+                ctx_.setExprType(tvDotted.get(), tvInnerResTy);
+                llvm::Value* tvInner = lowerExpr(*tvDotted);
+                exprValueOverride_.erase(tvPlaceholderKey);
+                nullCondCountSynth_.push_back(std::move(tvDotted));
+                if (!tvInner || tvInner->getType()->isPointerTy() ||
+                    tvInner->getType()->isVoidTy()) {
+                    // Unrecognised shape: close the CFG validly and keep the old
+                    // "lowered to nothing" result (the #3079 backstop reports it).
+                    builder_.CreateBr(tvEndBB);
+                    builder_.SetInsertPoint(tvEndBB);
+                    return nullptr;
+                }
+                llvm::Value* tvWrapped = wrapNullableValue(tvResTy, tvInner);
+                auto* tvAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(tvEndBB);
+                builder_.SetInsertPoint(tvEndBB);
+                auto* tvPhi = builder_.CreatePHI(tvWrapped->getType(), 2);
+                tvPhi->addIncoming(
+                    llvm::ConstantAggregateZero::get(tvWrapped->getType()),
+                    tvEntryBB);
+                tvPhi->addIncoming(tvWrapped, tvAccessEnd);
+                return tvPhi;
+            }
+        }
         // §7.5 / issue #416: `b?.V` on a (NULLABLE) RECORD. The target lowers to
         // either the tagged {i8 hasValue; <record payload>} struct (nullable,
         // #416) or the bare by-value payload (non-nullable, #3210). The
