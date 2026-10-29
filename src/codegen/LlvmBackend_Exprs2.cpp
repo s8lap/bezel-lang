@@ -7001,15 +7001,25 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // widening and must be EXTENDED by its own signedness — the old
             // unconditional `CreateTrunc` was an invalid `trunc i8 to i32`
             // (an IR-verifier abort).  A wider integer keeps the truncation.
+            // fix #7863 / #7784 (§5.1, v0.350): the same extension to ANY
+            // integer width `to`, shared by every built-in constructor arm
+            // that receives an integer parameter (`Semaphore`, `Channel<T>`,
+            // `Array<T>` / `Set<T>` / `Dictionary<K,V>` capacities, `Span`
+            // windows, `Random`'s `seed: long`, ...).  Extension follows the
+            // ARGUMENT's own signedness, so `byte` 200 reads 200 (not -56).
+            auto ctorIntTo = [&](llvm::Value* v, const ast::Expr& argExpr,
+                                 llvm::Type* to) -> llvm::Value* {
+                llvm::Type* vt = v->getType();
+                if (!vt->isIntegerTy() || vt == to) return v;
+                if (vt->getIntegerBitWidth() < to->getIntegerBitWidth())
+                    return typeRefIsUnsigned(ctx_.exprType(argExpr))
+                               ? builder_.CreateZExt(v, to)
+                               : builder_.CreateSExt(v, to);
+                return builder_.CreateTrunc(v, to);
+            };
             auto ctorIntToI32 = [&](llvm::Value* v,
                                     const ast::Expr& argExpr) -> llvm::Value* {
-                llvm::Type* vt = v->getType();
-                if (!vt->isIntegerTy() || vt->isIntegerTy(32)) return v;
-                if (vt->getIntegerBitWidth() < 32)
-                    return typeRefIsUnsigned(ctx_.exprType(argExpr))
-                               ? builder_.CreateZExt(v, i32())
-                               : builder_.CreateSExt(v, i32());
-                return builder_.CreateTrunc(v, i32());
+                return ctorIntTo(v, argExpr, i32());
             };
             // fix #7819 (stdlib §2.5, v0.350): the OR of "component `v` lies
             // outside [lo, hi]" over the listed i32 components -- one unsigned
@@ -7085,10 +7095,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* start = lowerExpr(*ctorArgFor(1)->value);
                 llvm::Value* len   = lowerExpr(*ctorArgFor(2)->value);
                 if (!start || !len) return nullptr;
-                if (!start->getType()->isIntegerTy(32))
-                    start = builder_.CreateTrunc(start, i32(), "span.ctor.st");
-                if (!len->getType()->isIntegerTy(32))
-                    len = builder_.CreateTrunc(len, i32(), "span.ctor.len");
+                start = ctorIntToI32(start, *ctorArgFor(1)->value);
+                len   = ctorIntToI32(len, *ctorArgFor(2)->value);
                 return buildArraySpan(src, start, len);
             }
             // fix #3098 (language spec §17.7 "Standard-library builtins have
@@ -7178,10 +7186,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // to, never when it runs" — and place each result in its
                         // own field slot.
                         llvm::Value* vals[3] = {nullptr, nullptr, nullptr};
+                        const ast::Expr* valExprs[3] = {nullptr, nullptr, nullptr};
                         for (std::size_t ai = 0; ai < 3; ++ai) {
                             llvm::Value* av = lowerExpr(*ne.args[ai].value);
                             if (!av) { ok = false; break; }
                             vals[slotOf[ai]] = av;
+                            valExprs[slotOf[ai]] = &*ne.args[ai].value;
                         }
                         if (ok && vals[0] && vals[1] && vals[2]) {
                             if (isEI) {
@@ -7199,10 +7209,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             // span-ctor arm above does.
                             llvm::Value* st0 = vals[1];
                             llvm::Value* ln0 = vals[2];
-                            if (!st0->getType()->isIntegerTy(32))
-                                st0 = builder_.CreateTrunc(st0, i32(), "ross.st");
-                            if (!ln0->getType()->isIntegerTy(32))
-                                ln0 = builder_.CreateTrunc(ln0, i32(), "ross.len");
+                            st0 = ctorIntToI32(st0, *valExprs[1]);
+                            ln0 = ctorIntToI32(ln0, *valExprs[2]);
                             return buildArraySpan(vals[0], st0, ln0);
                         }
                     }
@@ -7656,8 +7664,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (colName == "OwningBuffer" && obLength && obLength->value) {
                     llvm::Value* nArg = lowerExpr(*obLength->value);
                     if (!nArg) return nullptr;
-                    if (!nArg->getType()->isIntegerTy(64))
-                        nArg = builder_.CreateSExt(nArg, i64());
+                    nArg = ctorIntTo(nArg, *obLength->value, i64());
                     // stdlib §1/§4.4 (v0.183, #1396): OwningBuffer<T>(length) and
                     // its (length, init) overload both fault on negative length
                     // rather than silently allocating an empty buffer.
@@ -7774,8 +7781,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     std::size_t fillArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
                     llvm::Value* sizeArg = lowerExpr(*ne.args[sizeArgIdx].value);
                     if (!sizeArg) return nullptr;
-                    if (!sizeArg->getType()->isIntegerTy(64))
-                        sizeArg = builder_.CreateSExt(sizeArg, i64());
+                    sizeArg = ctorIntTo(sizeArg, *ne.args[sizeArgIdx].value, i64());
                     // stdlib §1/§4.4 (v0.183, #1396): Array<T>(size, fill) faults
                     // on a negative size rather than silently building an
                     // empty array.
@@ -7868,8 +7874,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* capArg = lowerExpr(*ne.args[0].value);
                     if (capArg) {
-                        if (!capArg->getType()->isIntegerTy(64))
-                            capArg = builder_.CreateSExt(capArg, i64());
+                        capArg = ctorIntTo(capArg, *ne.args[0].value, i64());
                         // stdlib §1/§4.4 (v0.183, #1396): Array<T>(capacity) /
                         // OwningArray<T>(capacity) (and the Set<T>/OwningSet<T>
                         // capacity forms that fall through to this shared
@@ -8061,8 +8066,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // the outcome (assigned a never-read local), so a wider
                     // `i32` value was passed where `i64` was expected and the
                     // LLVM module verifier rejected the call.
-                    if (sv && !sv->getType()->isIntegerTy(64))
-                        sv = builder_.CreateSExt(sv, i64());
+                    // fix #7863 (§5.1, v0.350): extend by the ARGUMENT's own
+                    // signedness, so a `uint` seed zero-extends.
+                    if (sv)
+                        sv = ctorIntTo(sv, *ne.args[0].value, i64());
                     auto* allocFn = declareC("bz_random_alloc", ptrTy(), {i64()});
                     return builder_.CreateCall(allocFn, {sv ? sv : builder_.getInt64(0)});
                 }
@@ -8188,9 +8195,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* cap = lowerExpr(*ne.args[0].value);
                     if (cap) {
-                        if (!cap->getType()->isIntegerTy(32))
-                            cap = builder_.CreateIntCast(cap, i32(),
-                                                         /*isSigned=*/true, "cap.i32");
+                        cap = ctorIntToI32(cap, *ne.args[0].value);
                         // capacity < 1 → ArgumentException (thrown before we
                         // allocate, so no channel leaks on the guard path).
                         emitGuardThrow(
@@ -8226,9 +8231,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (semInit && semInit->value) {
                     llvm::Value* v = lowerExpr(*semInit->value);
                     if (v) {
-                        if (!v->getType()->isIntegerTy(32))
-                            v = builder_.CreateTrunc(v, i32());
-                        initCount = v;
+                        initCount = ctorIntToI32(v, *semInit->value);
                     }
                 }
                 // Evaluate maxCount (arg 1); default = INT_MAX if not provided.
@@ -8237,9 +8240,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (semMax && semMax->value) {
                     llvm::Value* v = lowerExpr(*semMax->value);
                     if (v) {
-                        if (!v->getType()->isIntegerTy(32))
-                            v = builder_.CreateTrunc(v, i32());
-                        maxCount = v;
+                        maxCount = ctorIntToI32(v, *semMax->value);
                         // fix #4445 (stdlib §6.3, v0.302): guard the two-arg
                         // constructor's ArgumentException contract —
                         //   max < 1 → ArgumentException
@@ -8475,7 +8476,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         if (raw->getType()->isIntegerTy(64))
                             lenVal = raw;
                         else if (raw->getType()->isIntegerTy())
-                            lenVal = builder_.CreateSExt(raw, i64(), "buf.len64");
+                            lenVal = ctorIntTo(raw, *ne.args[0].value, i64());
                     }
                 }
                 auto* allocFn = declareC("bz_buffer_new", ptrTy(), {i64(), i64()});
@@ -8743,7 +8744,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (ne.args.size() >= 2 && ne.args[1].value) {
                     llvm::Value* a = lowerExpr(*ne.args[1].value);
                     // Bezel `int` literals lower as i64; truncate to i32 for struct field.
-                    if (a) indentW = builder_.CreateTrunc(a, i32(), "jopt.iw32");
+                    if (a) indentW = ctorIntToI32(a, *ne.args[1].value);
                 }
                 if (ne.args.size() >= 3 && ne.args[2].value) {
                     llvm::Value* a = lowerExpr(*ne.args[2].value);
@@ -8756,7 +8757,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (ne.args.size() >= 5 && ne.args[4].value) {
                     llvm::Value* a = lowerExpr(*ne.args[4].value);
                     // Bezel `int` literals lower as i64; truncate to i32 for struct field.
-                    if (a) maxDepth = builder_.CreateTrunc(a, i32(), "jopt.md32");
+                    if (a) maxDepth = ctorIntToI32(a, *ne.args[4].value);
                 }
                 v = builder_.CreateInsertValue(v, indented,   {0u});
                 v = builder_.CreateInsertValue(v, indentW,    {1u});
