@@ -1551,6 +1551,21 @@ std::string_view builtinDisposalFamilyParent(std::string_view head) {
     return {};
 }
 
+// per §28.12 ("through any interface — `IAsyncDisposable` or one deriving
+// from it"), fix #7497. The ONLY name here is the spec-named async root; every
+// descendant is found by walking the chain table.
+bool builtinDisposalFamilyIsAsync(std::string_view head) {
+    // The walk is bounded by the table size, so a (malformed) cyclic table
+    // terminates rather than hangs.
+    for (std::size_t hops = 0;
+         hops <= kBuiltinDisposalFamilyHeads.size() && !head.empty(); ++hops) {
+        if (!isBuiltinDisposalFamilyHead(head)) return false;
+        if (head == "IAsyncDisposable") return true;
+        head = builtinDisposalFamilyParent(head);
+    }
+    return false;
+}
+
 // fix #2992 (§28.3 / §28.9 / §28.10, v0.240): the built-in type heads whose
 // `using var` carries a REAL §28.10 disposal obligation — the set the §28.10
 // vacuity lint (rhsIsDisposableClassType Path 2) uses to decide a `using var`

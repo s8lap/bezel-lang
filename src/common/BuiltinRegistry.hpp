@@ -533,6 +533,15 @@ bool isBuiltinDisposalFamilyHead(std::string_view head);
 // per §9.7 / §14.2 / §28.12, fix #7456, fix #7457
 std::string_view builtinDisposalFamilyParent(std::string_view head);
 
+// Does the built-in disposal-family head `head` reach `IAsyncDisposable` along
+// its chain (`IAsyncDisposable` itself, `IAsyncEnumerator<T>`, the
+// `IOwningAsync*` interfaces)? DERIVED from the chain table above, so a
+// future stdlib descendant of `IAsyncDisposable` follows automatically once
+// the table matches the stdlib (scripts/check_disposal_family_chain.py). A
+// head outside the family is not async. per §28.12, stdlib §2.10 / §4.12 /
+// §4.13, fix #7497
+bool builtinDisposalFamilyIsAsync(std::string_view head);
+
 // fix #3017 (§28.3 / §28.9 / §28.10, v0.240): the 13 built-in class heads
 // the codegen auto-drop chain (registerUsingDisposal, LlvmBackend_Setup.cpp)
 // claims disposal for but that are DELIBERATELY ABSENT from

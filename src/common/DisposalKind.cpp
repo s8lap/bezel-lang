@@ -168,21 +168,22 @@ DisposalVerdict classifyDisposal(const sema::TypeRef* t, sema::SemaContext& ctx)
     const sema::TypeSymbol* d = t->declaration;
     if (!d) {
         // A DECLARATION-LESS head: a type parameter, a builtin collection
-        // head, or one of the built-in INTERFACE heads (`IDisposable` /
-        // `IAsyncDisposable`), which have no TypeSymbol at all.
+        // head, or one of the built-in INTERFACE heads (the disposal family),
+        // which have no TypeSymbol at all.
         const std::string_view head = t->headName();
-        if (head == "IAsyncDisposable") {
-            // §28.12: "through any interface — `IAsyncDisposable` or one
-            // deriving from it".
-            v.kind = DisposalKind::ClassAsync;
+        if (isBuiltinDisposalFamilyHead(head)) {
+            // §28.12: the disposal selects the run-time object's chain —
+            // "through any interface — `IAsyncDisposable` or one deriving
+            // from it" is the awaited path; every other family member
+            // ("another such as `IDisposable`, which every class implements")
+            // is the synchronous one. The async-vs-sync split is DERIVED from
+            // the family chain table (fix #7497), the one list the stdlib
+            // ratchet checks, not re-listed here by name.
+            v.kind = builtinDisposalFamilyIsAsync(head)
+                         ? DisposalKind::ClassAsync
+                         : DisposalKind::ClassSync;
             v.mayHoldClass = true;
-            return v;
-        }
-        if (head == "IDisposable") {
-            // §28.12: "or another such as `IDisposable`, which every class
-            // implements" — the synchronous path.
-            v.kind = DisposalKind::ClassSync;
-            v.mayHoldClass = true;
+            v.carriesObligation = true;
             return v;
         }
         if (isDisposableBuiltinHeadName(head)) {

@@ -291,6 +291,43 @@ BEZEL_TEST(using_disposal_anchor, type_token_is_runtime_managed_spec_28_9_7338) 
     BEZEL_EXPECT_FALSE(vp.mayHoldClass);
 }
 
+// fix #7497 (§28.12, v0.350; stdlib §2.10 / §4.12 / §4.13): the async-vs-sync
+// verdict on a DECLARATION-LESS built-in disposal head is DERIVED from the
+// family chain table, not from a by-name list. §28.12: "through any interface
+// -- `IAsyncDisposable` or one deriving from it" is the awaited path, so every
+// descendant of `IAsyncDisposable` (`IAsyncEnumerator<T>`, the
+// `IOwningAsync*` interfaces) classifies ClassAsync; the rest of the family
+// (`IDisposable`, `IEnumerator<T>`, `IOwningCollection<T>`, ...) ClassSync.
+// Before the fix only the literal `IAsyncDisposable` answered ClassAsync.
+BEZEL_TEST(using_disposal_anchor, family_head_async_verdict_derived_from_chain_spec_28_12_7497) {
+    bezel::DiagnosticEngine diags;
+    bezel::sema::SemaContext ctx(diags);
+    struct Row { const char* head; bool async; };
+    const Row rows[] = {
+        {"IDisposable", false},          {"IAsyncDisposable", true},
+        {"IOwningCollection", false},    {"IOwningList", false},
+        {"IEnumerator", false},          {"IAsyncEnumerator", true},
+        {"IOwningEnumerable", false},    {"IOwningEnumerator", false},
+        {"IOwningAsyncEnumerable", true}, {"IOwningAsyncEnumerator", true},
+    };
+    for (const Row& r : rows) {
+        bezel::sema::TypeRef ref;
+        ref.kind = bezel::sema::TypeRef::Kind::Named;
+        ref.aliasResolvedHead = r.head;
+        auto v = bezel::common::classifyDisposal(&ref, ctx);
+        BEZEL_EXPECT_TRUE(v.kind == (r.async ? bezel::common::DisposalKind::ClassAsync
+                                             : bezel::common::DisposalKind::ClassSync));
+        BEZEL_EXPECT_TRUE(v.mayHoldClass);
+    }
+    // A head outside the family is not decided by this arm.
+    bezel::sema::TypeRef other;
+    other.kind = bezel::sema::TypeRef::Kind::Named;
+    other.aliasResolvedHead = "ISomethingElse";
+    auto vo = bezel::common::classifyDisposal(&other, ctx);
+    BEZEL_EXPECT_TRUE(vo.kind == bezel::common::DisposalKind::None);
+    BEZEL_EXPECT_TRUE(vo.mayHoldClass);
+}
+
 // fix #3482 (§28.9 / §28.12, v0.345): the monomorphization-aware head must
 // also name a CLASS-constrained instantiation, so the plain `using var` twin
 // registers the disposal it always meant to. `T = Res` (a class with a
