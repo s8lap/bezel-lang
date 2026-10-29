@@ -10434,6 +10434,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // #7927 (§8.7, v0.350): the `x?.Dispose()` spelling on a nullable enum
+        // or choice (the `x.Dispose()` arm is below, #7913 / §35.8).
+        if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                ce.callee.get())) {
+            if (ncm->member == "Dispose" && ncm->target) {
+                auto* recvTy = ctx_.exprType(*ncm->target);
+                if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                    recvTy->declaration &&
+                    (recvTy->declaration->kind == ast::TypeDeclKind::Enum ||
+                     recvTy->declaration->kind == ast::TypeDeclKind::Choice)) {
+                    bool isEnum =
+                        recvTy->declaration->kind == ast::TypeDeclKind::Enum;
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        isEnum
+                            ? "`Dispose` is not admitted on an enum value "
+                              "\xe2\x80\x94 enums do not implement "
+                              "IDisposable (\xc2\xa7""8.7, v0.350)"
+                            : "`Dispose` is not admitted on a choice value "
+                              "\xe2\x80\x94 choices do not implement "
+                              "IDisposable; an owning choice\xe2\x80\x99s "
+                              "disposal obligation is discharged by its "
+                              "holder, never by calling Dispose() on it "
+                              "(\xc2\xa7""35.8, v0.334; \xc2\xa7""8.7, v0.350)");
+                }
+            }
+        }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             if (ma->target) {
                 auto* recvTy = ctx_.exprType(*ma->target);
@@ -10675,6 +10702,49 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "member (§14.2)");
                             return;
                         }
+                    }
+                }
+                // #7927 (§8.7, v0.350): "a call in any spelling (`x.Dispose()`,
+                // `x?.Dispose()`, `x!.Dispose()`)" on a type that is not a
+                // class is a compile error; so is the type-name call
+                // `E.Dispose()` (enums and choices have no `Dispose` member).
+                // The `x.Dispose()` / `x!.Dispose()` spelling is the arm
+                // below; this arm adds the `?.` receiver and the type name.
+                if (ma->member == "Dispose" && ma->target) {
+                    const ast::Expr* tgt = ma->target.get();
+                    ast::TypeDeclKind k = ast::TypeDeclKind::Class;
+                    bool hit = false;
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+                        auto* tSym = ctx_.exprSymbol(*tgt);
+                        auto* ts = dynamic_cast<sema::TypeSymbol*>(tSym);
+                        if (!ts) {
+                            if (auto* al = dynamic_cast<sema::TypeAliasSymbol*>(tSym))
+                                ts = resolveAliasToTypeSymbol(al);
+                        }
+                        (void)id;
+                        if (ts && (ts->kind == ast::TypeDeclKind::Enum ||
+                                   ts->kind == ast::TypeDeclKind::Choice)) {
+                            bool declared = false;
+                            for (auto* m : ts->members)
+                                if (m && m->name == "Dispose") declared = true;
+                            if (!declared) {
+                                k = ts->kind;
+                                hit = true;
+                            }
+                        }
+                    }
+                    if (hit) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            k == ast::TypeDeclKind::Enum
+                                ? "`Dispose` is not admitted on an enum value "
+                                  "\xe2\x80\x94 enums do not implement "
+                                  "IDisposable; the type name has no `Dispose` "
+                                  "member (\xc2\xa7""8.7, v0.350)"
+                                : "`Dispose` is not admitted on a choice value "
+                                  "\xe2\x80\x94 choices do not implement "
+                                  "IDisposable; the type name has no `Dispose` "
+                                  "member (\xc2\xa7""8.7, v0.350)");
                     }
                 }
                 // §35.8, v0.334: reject `Dispose()` on a choice value.
