@@ -17533,8 +17533,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "GetFullPath") return make1arg("bz_path_absolute");
         if (m == "Combine" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* a = lowerExpr(*call.args[0].value);
-            llvm::Value* b = lowerExpr(*call.args[1].value);
+            // fix #7732 (§22.5, v0.350): `a` / `b` are DECLARED names
+            // (stdlib §7.4); parameter p receives call.args[paramToArg[p]],
+            // and the supplied expressions run in TEXTUAL order.
+            const auto* bnd = ctx_.builtinCallBinding(call);
+            std::size_t aIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
+            std::size_t bIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+            llvm::Value* a = nullptr;
+            llvm::Value* b = nullptr;
+            if (aIdx <= bIdx) {
+                a = lowerExpr(*call.args[aIdx].value);
+                b = lowerExpr(*call.args[bIdx].value);
+            } else {
+                b = lowerExpr(*call.args[bIdx].value);
+                a = lowerExpr(*call.args[aIdx].value);
+            }
             if (!a || !b) return nullptr;
             auto* fn = declareC("bz_path_combine", ptrTy(), {ptrTy(), ptrTy()});
             llvm::Value* result = builder_.CreateCall(fn, {strToPath(a), strToPath(b)});

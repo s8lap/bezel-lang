@@ -1115,12 +1115,12 @@ constexpr std::array<BuiltinParamRow, 353> kBuiltinParams = {{
     {"Directory", "Delete", 2, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Directory", "GetFiles", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Directory", "GetDirectories", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "Combine", 2, 0, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetFileName", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetExtension", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetFileNameWithoutExtension", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetDirectoryName", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetFullPath", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "Combine", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFileName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFileNameWithoutExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetDirectoryName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFullPath", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"TextWriter", "Write", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"TextWriter", "WriteLine", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
 }};
@@ -1143,8 +1143,11 @@ constexpr std::array<std::string_view, 3> kBuiltinCtorSurfaceClosedByRowsHeads =
 // The heads `kStringParamNames` / `kEncodingParamNames` /
 // `kStringBuilderParamNames` answer for. See the header for the two roles this
 // predicate plays at the call site.
-constexpr std::array<std::string_view, 6> kBuiltinNamedArgTableHeads = {
+constexpr std::array<std::string_view, 7> kBuiltinNamedArgTableHeads = {
     "string", "String", "Encoding", "StringBuilder", "Math", "Convert",
+    // fix #7732 (§22.5, v0.350; stdlib §7.4 `Path`): `Combine(a, b)` and the
+    // `path` parameter of the other members are DECLARED names.
+    "Path",
 };
 
 // fix #3589 (stdlib §5 / §9.6): see the header — the string-receiver LINQ
