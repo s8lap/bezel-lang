@@ -21487,8 +21487,43 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
             return PT::Char;
         return PT::None;
     };
-    for (std::size_t i = 0; i < ce.args.size(); ++i) {
-        const auto& a = ce.args[i];
+    // fix #7674 (§22.5, v0.350): "naming an argument changes which parameter
+    // it binds to", so the declared parameter an argument is checked against
+    // is the one its NAME binds, not the one at its source index. `paramPos[i]`
+    // is that PARAMETER position for source argument `i`. The binding is
+    // established locally over the registry's declared names, exactly as
+    // `checkBuiltinStringDeclaredParams` does (the published binding is not
+    // yet available here). A positional-only call, or a call that binds no
+    // candidate (`checkBuiltinNamedArgs` reports that), keeps the identity
+    // reading.
+    std::vector<std::size_t> paramPos(ce.args.size());
+    for (std::size_t i = 0; i < paramPos.size(); ++i) paramPos[i] = i;
+    {
+        bool anyNamed = false;
+        for (const auto& a : ce.args)
+            if (!a.name.empty()) { anyNamed = true; break; }
+        if (anyNamed) {
+            for (const auto& cand : common::builtinParamNameCandidates(
+                     "string", m, ce.args.size())) {
+                BindResult br = bindArgsToParams(
+                    sema::FormalsView::ofNames(cand.names, cand.required),
+                    ce.args, ce.span.begin,
+                    "call to built-in `string." + std::string(m) + "`",
+                    /*emit=*/false);
+                if (!br.ok) continue;
+                for (std::size_t p = 0; p < br.paramToArg.size(); ++p) {
+                    const int ai = br.paramToArg[p];
+                    if (ai >= 0 && static_cast<std::size_t>(ai) < paramPos.size())
+                        paramPos[static_cast<std::size_t>(ai)] = p;
+                }
+                break;
+            }
+        }
+    }
+    for (std::size_t srcIdx = 0; srcIdx < ce.args.size(); ++srcIdx) {
+        const auto& a = ce.args[srcIdx];
+        // The PARAMETER position this argument supplies (fix #7674).
+        const std::size_t i = paramPos[srcIdx];
         if (!a.value || a.isDiscard) continue;
         // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
         // the caller slot under its own rule and is not a §7 nullable->non-
