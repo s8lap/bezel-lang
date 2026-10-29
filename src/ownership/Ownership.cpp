@@ -8064,7 +8064,35 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
             // (#1285/#2071/#3253/#4268) survive only as the error-recovery path, so
             // one rejected declaration does not cascade into further diagnostics.
             // // per §28.10, v0.350
-            if (auto* aid = dynamic_cast<const ast::IdentifierExpr*>(init)) {
+            //
+            // fix #7586 (§17.8, §28.10, v0.350): the null-forgiving read
+            // `using var p := b!;` takes this arm too. §17.8: "if `x` is
+            // borrowed, `x!` is borrowed with the same source", and "Over a
+            // named owned binding, `x!` is therefore classified by its
+            // position exactly as the bare read `x` is"; §28.10 names `x!`
+            // among the spellings of the unmarked read. So `p` pins `b`'s
+            // source exactly as `using var p := b;` does, and the consume-site
+            // freeze (whose root-finder already peels `!`) rejects a consume
+            // of that source under the pin. Without the peel the pin flag
+            // stayed clear and `var b := a; using var p := b!; R.Take(move a);`
+            // was accepted. A move-only value binding is excluded: its
+            // unmarked read moves and is an owned right-hand side (§28.10's
+            // borrow paragraph; §15.3), never a pin. // per §17.8, §28.10
+            const ast::IdentifierExpr* bangPinId = nullptr;
+            if (dynamic_cast<const ast::PostfixBangExpr*>(init)) {
+                const ast::Expr* core = init;
+                while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core))
+                    core = pb->operand.get();
+                if (auto* bid = dynamic_cast<const ast::IdentifierExpr*>(core)) {
+                    const char* moKind = nullptr;
+                    if (!common::isMoveOnlyValueType(ctx_.exprType(*bid), ctx_,
+                                                     moKind))
+                        bangPinId = bid;
+                }
+            }
+            if (auto* aid = bangPinId
+                                ? bangPinId
+                                : dynamic_cast<const ast::IdentifierExpr*>(init)) {
                 // Bare-id: pin a tracked owned/borrow binding (#1285/#2071) or a
                 // borrowing for-loop element (#1287). A tracked Owned source keeps its
                 // own obligation (auto-drop at scope end); the pin disposes nothing. A
