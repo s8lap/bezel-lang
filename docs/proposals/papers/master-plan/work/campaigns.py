@@ -44,7 +44,7 @@ CAMPAIGNS = [
      "§22.6, §5.1, §7.4, stdlib §2, §3, §9",
      r"Parse\b|TryParse|ToString|AppendFormat|StringBuilder|Convert\.|Math\.|string\.(Join|Remove|Equals|Contains|Split|Replace|IndexOf|LastIndexOf)|Encoding|format[- ]specifier|radix|non-string first argument|malformed IR|IR verif|aborts? the compiler|ICE\b|builtin|built-in (non-string|collection interface|static|member)|name-keyed|by (HEAD )?name|head name|isStrBld|nullable .*(Math|argument|box)|§7\.4-narrowed|narrowed.*(carrier|unwrap)|carrier",
      r"stdlib|compiler-crash",
-     [7244, 7285, 7290, 7291, 7293, 7294, 7299, 7300, 7239, 7265, 7284, 7358, 6809, 7180, 6635, 6636, 7217, 6845, 7154, 7274, 7297, 7232, 6823, 6255, 6957, 6648, 6864, 6865, 6782, 7108, 7189, 7210, 7229, 6637, 2625, 2642, 7004, 7089, 7066, 6659, 6677, 6084, 6116, 6126, 2620, 6254, 6750, 6751, 6942, 6295]),
+     [7244, 7285, 7290, 7291, 7293, 7294, 7299, 7300, 7239, 7265, 7284, 7358, 6809, 7180, 6635, 6636, 7217, 6845, 7154, 7274, 7297, 7232, 6823, 6255, 6957, 6648, 6864, 6865, 6782, 7108, 7189, 7210, 7229, 6637, 2625, 2642, 7004, 7089, 6659, 6677, 6116, 6126, 2620, 6254, 6750, 6751, 6942, 6295]),
     ("closures-cells", "Closures and capture cells, second pass",
      "§27.5, §28.9, §28.14, §28.3 sink rule",
      r"closure|lambda|captur|envdtor|capture cell|\bcell\b|method reference|function[- ]typed|function value|§27\.5|§28\.14|sink rule|call-bounded|scoped callback",
@@ -60,49 +60,55 @@ CAMPAIGNS = [
      "§7.4, §7.5, §7.7, §7.10, §5.1, §12.7, §19.5",
      r"nullable|narrow|\?\?|\?\.|null-?conditional|\bT\?|int\?|double\?|§7\.(4|5|7|10)|§12\.7|§19\.5|null\b",
      r"$^",
-     [6072, 6073, 6225, 6859, 6482, 6505, 5903, 5522, 6731, 6723, 6724, 7350, 7353, 6772]),
+     [6072, 6073, 6225, 6859, 6482, 6505, 5903, 5522, 6731, 6723, 6724, 7350, 7353, 6772, 6084]),
     ("generic-boundaries", "Generic instantiation boundaries",
      "§14.1, §14.2, §14.5, §3.6, §12.9, §28.3 bare-type-parameter rules",
      r"generic|instantiat|substitut|type parameter|type argument|bare[- ]T\b|\bT\b.*(template|placeholder)|monomorph|erased|template|§14\.|§3\.6|where T",
      r"$^",
-     [7021, 7056, 6792, 6931, 6932, 6927, 6257, 6254, 6232, 6112, 6021, 4861, 4862, 2289, 2291, 3348, 3378, 3524, 3655, 7062, 7066, 6866, 6747, 6315, 4980, 5417, 6392, 6443, 6407,
-      710, 2020, 2220, 2650, 2861, 3526, 3659, 2580, 3474, 3485, 3486, 3495, 3501, 3514, 3525, 2735, 2736, 4567, 4568, 6295, 2755, 3566]),
+     [7021, 7056, 6792, 6931, 6932, 6927, 6257, 6232, 6112, 6021, 4861, 4862, 2289, 2291, 3348, 3378, 3524, 3655, 7062, 7066, 6866, 6747, 6315, 4980, 5417, 6392, 6443, 710, 2020, 2220, 2650, 2861, 3526, 3659, 2580, 3474, 3485, 3486, 3495, 3501, 3514, 3525, 2735, 2736, 4567, 4568, 2755, 3566]),
     ("borrow-provenance", "Borrow provenance and the sink rule: ownership-pass catch-up",
      "§28.3 provenance/consume-site/freeze, §28.14, §9.7, §28.2, §28.6, §28.7, §30.5",
      r"borrow|provenance|holds-borrows|borrow-bearing|escape|alias|lifetime|§9\.7|§28\.(2|3|6|7|14)|§30\.5|consume|freeze|checkRead|markMoved|Disposed|moved-from|transfer window|drop-on-overwrite|displace|reassign",
      r"ownership",
-     [7107, 7097, 7240, 7092, 6886, 5973, 5974, 5845, 6136, 6616, 6708, 6737, 7087, 7075, 6848, 3967, 4102, 4122, 4124, 3979, 3959, 3999, 4055, 4450, 4023, 4428, 3827, 3520, 3569, 2215, 2255, 4429, 4231, 3709, 2745, 2749, 4053, 3873, 4262, 4215, 1772,
-      4301, 4277, 4274, 4291, 4360, 2615, 2636, 2705, 2690, 1933, 2577, 2569, 2551, 2570, 3632, 2671, 2740, 6977, 7009, 6288, 5880, 5855, 6153, 4774, 6867]),
+     [7107, 7097, 6886, 5973, 5974, 5845, 6136, 6616, 6708, 6737, 7087, 7075, 6848, 3967, 4102, 4122, 4124, 3979, 3959, 3999, 4055, 4450, 4023, 4428, 3827, 3520, 3569, 2215, 2255, 4429, 4231, 3709, 2745, 2749, 4053, 3873, 4262, 4215, 1772, 4301, 4277, 4274, 4291, 4360, 2615, 2636, 2705, 2690, 1933, 2577, 2569, 2551, 2570, 3632, 2671, 2740, 6977, 7009, 6288, 5880, 5855, 6153, 4774, 6867]),
     ("choice-payloads", "Choice payload lifetime and layout",
      "§35, §19.3, §15.3, §9.4",
      r"\bchoice\b|owning match|payload|match arm|§35|Result<|case this",
      r"$^",
-     [7316, 7357, 7305, 7047, 6738, 6170, 6233, 5912, 5992, 6014, 6168, 6167, 5453, 5153, 4804, 4684, 4634, 6164, 6165, 6084, 6232, 6478, 3905, 2220, 6034, 6043, 6638, 6640, 4816, 4883, 3939, 2571]),
+     [7047, 6738, 6170, 6233, 5912, 5992, 6014, 6168, 6167, 5453, 5153, 4804, 4684, 4634, 6164, 6165, 6478, 6034, 6043, 6638, 6640, 4816, 4883, 3939, 2571]),
     ("async-frames", "Async return slot and frame-carried locals",
      "§30.5, §30.1, §30.9, §30.10, stdlib §6",
      r"\basync|await|\bTask\b|OwningTask|TaskScope|Channel|Cancellation|\$Resume|suspension|continuation",
      r"async",
-     [6097, 6098, 6099, 6051, 5949, 5311, 5280, 5276, 5410, 5982, 5981, 6194, 6211, 6245, 4883, 5015, 3460, 1422, 6173, 6446, 5831, 5699, 5704, 5719, 5722, 5657, 5900]),
+     [6097, 6098, 6099, 6051, 5949, 5311, 5280, 5276, 5410, 5982, 5981, 6211, 5015, 3460, 1422, 6173, 6446, 5831, 5699, 5704, 5719, 5722, 5657, 5900]),
     ("cross-module", "Cross-module parity: retire AST-gated symbol reads",
      "§2.5, §2.8, §22.10 (imported), check_imported_symbol_reads",
      r"cross-module|\bimport|imported|\bmodule\b|artifact|--import|xmod",
      r"cross-module",
-     [7223, 7062, 7078, 6943, 6944, 6991, 6994, 7008, 6743, 6833, 6918, 6927, 6932, 6364, 6360, 6206, 6257, 6289, 6043, 5214, 3671, 3655, 3378, 3357, 3350, 2861, 2648, 2650, 2735, 2291, 1425, 7281, 2590]),
+     [7223, 7078, 6944, 6991, 7008, 6743, 6833, 6918, 6206, 6289, 5214, 3671, 3350, 1425, 7281, 2590]),
     ("records-statics-misc", "Records, statics, contracts, exceptions and the remainder",
      "§8.4, §9.x, §21, §22.8, §22.16, §31",
      r"record|static|readonly|invariant|requires|ensures|contract|\bpure\b|exception|\bthrow|catch|finally|§31|§21|§22\.(8|16)|§8\.4|§9\.",
      r"$^",
-     [6204, 6206, 6497, 6498, 4645, 6856, 6857, 6858, 7057, 2295, 2114, 3966, 1882, 1878]),
+     [6204, 6497, 6498, 4645, 6856, 6858, 7057, 2295, 2114, 3966, 1882, 1878]),
     ("spec-trains", "Spec-tracking trackers not yet claimed by a campaign (triage at each train)",
      "per tracker", r"$^", r"spec-tracking", []),
     ("features-proposals", "Feature and proposal trackers (not defects)",
      "docs/proposals", r"\[proposal|^Proposal|Windows build|release artifact|ecosystem", r"enhancement|RFC|design-review|ecosystem|documentation", []),
 ]
 
+# A number seeded in two campaigns is a disagreement, never resolved by list order (fix #7400):
+# the tracker's exactly-one `campaign:<slug>` label (master plan §1.4) needs one owner per issue.
 seed_index = {}
+seed_owners = collections.defaultdict(list)
 for slug, *_, seeds in [(c[0],) + c[1:] for c in CAMPAIGNS]:
     for s in seeds:
+        seed_owners[s].append(slug)
         seed_index.setdefault(s, slug)
+doubles = {n: o for n, o in seed_owners.items() if len(o) > 1}
+if doubles:
+    sys.exit(f"campaigns.py: {len(doubles)} issue number(s) seeded more than once; name each in ONE campaign:\n"
+             + "\n".join(f"  #{n}: {', '.join(o)}" for n, o in sorted(doubles.items())))
 
 def assign(i):
     if i["number"] in seed_index:
