@@ -10758,6 +10758,44 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;
     }
+    // A.7 MoveExpr `"move" PrimaryExpr ("with" Expression)?` / §28.8.1 *The
+    // replacing `move`* (v0.350): the `with` clause is admitted at a field or an
+    // owning slot only. At alternative (c) — a bare identifier naming a local
+    // binding or `owned` parameter — "a `with` clause is a compile error".
+    if (op == "move" && ue.operand && ue.replacement) {
+        const ast::Expr* loc = ue.operand.get();
+        while (const auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(loc))
+            loc = pb->operand.get();
+        const auto* id = dynamic_cast<const ast::IdentifierExpr*>(loc);
+        sema::Symbol* idSym = id ? ctx_.exprSymbol(*id) : nullptr;
+        const bool atBinding =
+            idSym && (dynamic_cast<sema::LocalSymbol*>(idSym) ||
+                      dynamic_cast<sema::ParameterSymbol*>(idSym));
+        if (atBinding) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                std::string("a `with` clause is not admitted on the `move` of "
+                            "the local binding or parameter `") +
+                std::string(id->name) +
+                "`: the replacing `move` (`move loc with e`) exchanges the "
+                "value of an owned field or an owning collection slot, and "
+                "`move x` at a named binding is the K3.4 transfer marker "
+                "(\xc2\xa7""28.8.1 *The replacing `move`*, Appendix A.7 "
+                "MoveExpr alternative (c), v0.350)");
+        } else {
+            // The clause parses (issue #7567) but the exchange itself is not
+            // lowered yet: the ownership pass still models a field `move` as
+            // the restoration window that section 28.8.1 (v0.336+) deletes, and the
+            // replacement's ownership transfer has no consume row. Reject
+            // precisely rather than lower a different semantics (rule 4).
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                "the replacing `move` (`move loc with e`, \xc2\xa7""28.8.1 *The "
+                "replacing `move`*, v0.350) is not yet supported by this "
+                "compiler: the `with` clause is recognized but the exchange "
+                "of the field or slot is not lowered (tracker: issue #5923)");
+        }
+    }
     // §28.8.1 / §28.11 (issue #423): `move coll[i]` is admitted only on the
     // enumerated CONCRETE owning receivers (§28.11). A `move` through an
     // INTERFACE-typed indexer slot (`IOwningList<T>`, `IList<T>`,
@@ -11382,6 +11420,9 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         }
     } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
         if (ue->operand) visitExpr(*ue->operand);
+        // A.7 MoveExpr's `with` clause (§28.8.1, v0.350): the replacement is a
+        // sub-expression of the move, typed like any other.
+        if (ue->replacement) visitExpr(*ue->replacement);
         // §35.5, v0.334: reject `move` on a fresh-producer scrutinee.
         // An unmarked read never silently consumes, and a fresh producer
         // needs no marker.

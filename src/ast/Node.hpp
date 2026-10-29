@@ -1272,6 +1272,14 @@ struct BinaryExpr : Expr {
 struct UnaryExpr : Expr {
     std::string_view op;
     std::unique_ptr<Expr> operand;
+    // A.7 `MoveExpr ::= "move" PrimaryExpr ("with" Expression)?` (§28.8.1,
+    // v0.350): the replacement of the REPLACING `move` (`move loc with e`).
+    // Non-null only for `op == "move"` written with a `with` clause; null for
+    // every other unary and for the bare `move`. Sema is the sole consumer
+    // today (it rejects the clause: at a local/parameter operand by A.7's
+    // alternative (c), at a field/slot operand as not yet lowered, issue
+    // #5923); no other pass reads it.
+    std::unique_ptr<Expr> replacement;
 };
 
 // §17.4: `is`, `is not`, `as` — relational-level keyword operators whose

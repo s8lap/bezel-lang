@@ -544,6 +544,11 @@ inline std::string exprToString(const ast::Expr& e) {
         out += std::string(u->op);
         if (needsSpace) out += ' ';
         out += u->operand ? exprToString(*u->operand) : std::string("<null>");
+        if (u->replacement) {
+            // A.7 MoveExpr's replacing form (§28.8.1): `(move loc with e)`.
+            out += " with ";
+            out += exprToString(*u->replacement);
+        }
         out += ')';
         return out;
     }

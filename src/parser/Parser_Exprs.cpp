@@ -632,7 +632,25 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         advance();
         auto m = std::make_unique<ast::UnaryExpr>();
         m->op = "move";
+        // §28.8.1 / §9.5 (v0.350): the replacing `move`'s `with` clause
+        // follows the operand. §9.5's tie-break reads it: `with` followed by
+        // `(` and `Identifier :=` is the record-update suffix and binds to the
+        // operand (`move r with(X := 1)` is `move (r with(X := 1))`); any other
+        // `with` opens the replacement clause. So parse the operand with the
+        // postfix `with` suffix restricted to exactly that lookahead (the same
+        // restriction an `await for` header applies, which leaves every other
+        // `with` for the caller), then take the clause here.
+        const bool prevDisable = disableWithSuffix_;
+        disableWithSuffix_ = true;
         m->operand = parsePostfix(parsePrimaryExpression());
+        disableWithSuffix_ = prevDisable;
+        // In a `for`/`await for` header (`prevDisable`), a `with` after the
+        // operand is the header's cancellation clause, not ours: a replacing
+        // `move` used as the source is parenthesized (§30.7, A.7 MoveExpr).
+        if (!prevDisable && isKeyword("with")) {
+            advance();  // past `with`
+            m->replacement = parseExpression();
+        }
         return std::unique_ptr<ast::Expr>(m.release());
     }
 
@@ -861,7 +879,14 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         }
         // No ParenExpr node: source-level parens only group the parse; the
         // resulting tree shape encodes the grouping directly. See Node.hpp.
+        // A parenthesized sub-expression of a `for`/`await for` header is
+        // outside the header's own `with` position, so a replacing `move`
+        // inside it keeps its clause (§30.7 / A.7 MoveExpr: the source is
+        // parenthesized).
+        const bool prevDisableParen = disableWithSuffix_;
+        disableWithSuffix_ = false;
         auto inner = parseExpression();
+        disableWithSuffix_ = prevDisableParen;
         if (!consumePunctuator(")")) {
             // v0.217 cutover (§27.3, #2101): a multi-parameter or type-
             // ascribed head of the RETIRED lambda spelling reaches here as a

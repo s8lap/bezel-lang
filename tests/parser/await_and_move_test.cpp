@@ -65,3 +65,86 @@ BEZEL_TEST(parser_await_move, move_field) {
     BEZEL_EXPECT_EQ(parseInitText("move this.conn"),
                     std::string("(move this.conn)"));
 }
+
+// --- the replacing `move` (§28.8.1 *The replacing `move`*, A.7 MoveExpr, v0.350;
+//     issue #7567) ----------------------------------------------------------
+//
+// A.7: `MoveExpr ::= "move" PrimaryExpr ("with" Expression)?`. Before the fix the
+// `with` after the operand was read as the record-update suffix and failed with
+// the retired-spelling diagnostic, so none of these parsed.
+
+// §28.8.1 spec example `Replace`: the implicit-`this` field spelling.
+BEZEL_TEST(parser_await_move, replacing_move_bare_field) {
+    BEZEL_EXPECT_EQ(parseInitText("move _resource with new FileStream(_path)"),
+                    std::string("(move _resource with new FileStream(_path))"));
+}
+
+// §28.8.1: the qualified field spelling, `move obj.f with e`.
+BEZEL_TEST(parser_await_move, replacing_move_qualified_field) {
+    BEZEL_EXPECT_EQ(parseInitText("move h.F with null"),
+                    std::string("(move h.F with null)"));
+}
+
+// §28.8.1: the owning-collection slot spelling, `move coll[i] with e`.
+BEZEL_TEST(parser_await_move, replacing_move_slot) {
+    BEZEL_EXPECT_EQ(parseInitText("move arr[i] with fresh"),
+                    std::string("(move arr[i] with fresh)"));
+}
+
+// A.7 MoveExpr: a trailing `!` on the operand is transparent, and the
+// replacement is a full Expression (here a binary expression).
+BEZEL_TEST(parser_await_move, replacing_move_bang_operand_and_full_expression) {
+    BEZEL_EXPECT_EQ(parseInitText("move x.f! with a + b"),
+                    std::string("(move x.f! with (a + b))"));
+}
+
+// A bare `move` still takes no clause (no regression).
+BEZEL_TEST(parser_await_move, bare_move_has_no_replacement) {
+    BEZEL_EXPECT_EQ(parseInitText("move h.F"), std::string("(move h.F)"));
+}
+
+// §9.5's tie-break: `with` followed by `(` and `Identifier :=` is the
+// record-update suffix on the operand - `move r with(X := 1)` is
+// `move (r with(X := 1))` - while `with (e)` with any other parenthesized
+// content opens the replacement clause.
+BEZEL_TEST(parser_await_move, replacing_move_tie_break_record_update) {
+    BEZEL_EXPECT_EQ(parseInitText("move r with(X := 1)"),
+                    std::string("(move r with(X := 1))"));
+    BEZEL_EXPECT_EQ(parseInitText("move h.F with (OC.Empty)"),
+                    std::string("(move h.F with OC.Empty)"));
+}
+
+// The clause is in the `using var` initializer position too (issue #7689's
+// repro shape).
+BEZEL_TEST(parser_await_move, replacing_move_in_using_var_initializer) {
+    auto r = parseAll(
+        "module M; class C public method M() "
+        "using var x := move h.F with OC.Empty; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §9.5 / §30.7 / A.7 MoveExpr: in an `await for` header a `with` after a move
+// source is the cancellation clause (the replacing form is parenthesized).
+BEZEL_TEST(parser_await_move, await_for_move_source_with_is_cancellation) {
+    auto r = parseAll(
+        "module M; class C public method M() "
+        "await for var x in move h.F with token do _ := x; end; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    const auto ms = memberSummaries(r);
+    BEZEL_EXPECT_EQ(ms.size(), static_cast<std::size_t>(1));
+    BEZEL_EXPECT_TRUE(ms[0].find("in (move h.F) with token do") !=
+                      std::string::npos);
+}
+
+// ... and the parenthesized replacing `move` keeps its clause inside the header.
+BEZEL_TEST(parser_await_move, await_for_parenthesized_replacing_move_source) {
+    auto r = parseAll(
+        "module M; class C public method M() "
+        "await for var x in (move h.F with fresh) with token do _ := x; end; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    const auto ms = memberSummaries(r);
+    BEZEL_EXPECT_EQ(ms.size(), static_cast<std::size_t>(1));
+    BEZEL_EXPECT_TRUE(ms[0].find("in (move h.F with fresh) with token do") !=
+                      std::string::npos);
+}
