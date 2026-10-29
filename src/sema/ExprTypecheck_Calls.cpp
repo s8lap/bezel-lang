@@ -36464,6 +36464,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // family — a method reference to an `IList<T>` member).
                     // Typing that here would change a shape #7090 owns, so
                     // the typing is confined to the CALL spelling.
+                    // fix #7597 (§26.5 rule 1, v0.350; stdlib §1
+                    // "Block-by-name"): the committed instance member is
+                    // the arity-0 property, so a CALL with arguments
+                    // (`l.Count(pred)`) is the "instance lookup commits,
+                    // then fails" case, not the §5 predicate count. Same
+                    // refusal as the concrete heads' (#3342, above).
+                    if (ma.member == "Count" && &ma == calleeOfCallCtx_ &&
+                        currentCallArity_ > 0) {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("`") + std::string(ma.member) +
+                            "` on `" + std::string(recvTy->headName()) +
+                            "` is an instance member of the receiver's "
+                            "declared type; an extension of the same name "
+                            "is unreachable (spec §26.5 rule 1: instance "
+                            "members block same-named extensions of any "
+                            "arity, applicability, or accessibility). The "
+                            "instance member takes no arguments, but this "
+                            "call supplies " +
+                            std::to_string(currentCallArity_) + ". " +
+                            extensionNameBlockedNote(recvTy, ma.member));
+                        return;
+                    }
                     if (ma.member == "Count" && &ma == calleeOfCallCtx_) {
                         ctx_.setExprType(
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
