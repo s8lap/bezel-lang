@@ -22901,6 +22901,13 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     synth->span = call.span;
     synth->callee = std::move(dotted);
     ctx_.setExprType(synth.get(), innerTy);
+    // fix #7730 (§22.5, v0.350): sema publishes a named-argument binding
+    // (`checkBuiltinNamedArgs` -> setBuiltinCallBinding) keyed on the CallExpr
+    // it checked, i.e. `call`. The `.` twin is a fresh node, so without this the
+    // built-in arms read no binding and lowered `x?.Insert(value := V, index :=
+    // I)` in parameter order against swapped argument slots (malformed IR).
+    if (const auto* bnd = ctx_.builtinCallBinding(call))
+        ctx_.setBuiltinCallBinding(synth.get(), *bnd);
     auto& mutCall = const_cast<ast::CallExpr&>(call);
     synth->args = std::move(mutCall.args);
     llvm::Value* inner = lowerExpr(*synth);
