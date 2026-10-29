@@ -5229,7 +5229,29 @@ private:
     //     receiver — stdlib §4.5 v0.195: the view IS the receiver; its owner
     //     keeps the one container obligation (#2146). // per §28.10, #2128,
     //     #2137, #2146
+    //   - the `!` (§17.8) and `?.` (§7.5) spellings of the field and property
+    //     reads — `h.G!`, `h?.F` — which read the same storage (#7688).
     bool usingVarInitIsRecognizedBorrow(const ast::Expr& init) const;
+
+    // fix #7688 (§28.10 / §17.8 / §7.5, v0.350): the STORAGE-READ core of a
+    // `using var` initializer — `init` with its postfix `!` layers peeled,
+    // when what remains is a member read (`recv.m` / `recv?.m`) or a bare
+    // identifier; nullptr for any other shape (a call, an indexer, a meet).
+    // Whether the core is a field or a borrow property read is the caller's
+    // question (the node's symbol).
+    static const ast::Expr* usingVarStorageReadCore(const ast::Expr& init);
+
+    // fix #7688 (§28.10, v0.350): true when `init` is a meet — an
+    // if-expression, an expression-position `case`, or a `??` — whose every
+    // value arm is a field or borrow-property read (any spelling
+    // usingVarStorageReadCore peels), `null` / `throw` arms absorbing (K7.5)
+    // and nested meets examined by their own arms, with at least one such
+    // arm. §28.10: "A meet with any **other** borrow arm — a call without an
+    // owned return, a field, an indexer, a borrow-state binding — … the
+    // `using var` is a borrow-pin of the union of sources". The flag the
+    // arm-meet branch otherwise derives from producerState is not set for a
+    // move-only field meet, and the `??` spelling has no branch at all.
+    bool usingVarMeetArmsAreStorageReads(const ast::Expr& init) const;
 
     // §28.10 *Adopting a named owned binding* (v0.350, derives K3.4): an
     // UNMARKED `using var y := x;` (and the anonymous `using var _ := x;`, and

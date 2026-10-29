@@ -7400,6 +7400,77 @@ const ast::IdentifierExpr* MethodOwnership::usingVarUnmarkedNamedOwnedRead(
     return classify(init) == Arm::Covered ? first : nullptr;
 }
 
+// fix #7688 (§28.10 / §17.8 / §7.5, v0.350): see the header. Peels postfix
+// `!` layers; answers the peeled node when it is a member read (`.` or `?.`)
+// or a bare identifier, or nullptr for any other shape.
+const ast::Expr* MethodOwnership::usingVarStorageReadCore(
+        const ast::Expr& init) {
+    const ast::Expr* e = &init;
+    while (const auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        if (!bang->operand) return nullptr;
+        e = bang->operand.get();
+    }
+    if (dynamic_cast<const ast::MemberAccessExpr*>(e) ||
+        dynamic_cast<const ast::NullCondMemberExpr*>(e) ||
+        dynamic_cast<const ast::IdentifierExpr*>(e))
+        return e;
+    return nullptr;
+}
+
+// fix #7688 (§28.10, v0.350): see the header. A meet (an if-expression, an
+// expression-position `case`, a `??`) whose every value arm is a field or
+// property read — `null` / `throw` arms absorbing (K7.5), `!` peeled (§17.8),
+// nested meets examined by their own arms — and at least one arm is.
+bool MethodOwnership::usingVarMeetArmsAreStorageReads(
+        const ast::Expr& init) const {
+    enum class Arm { Read, Absorbing, Other };
+    std::function<Arm(const ast::Expr&)> classify =
+        [&](const ast::Expr& e) -> Arm {
+        const ast::Expr* p = &e;
+        while (const auto* bang = dynamic_cast<const ast::PostfixBangExpr*>(p)) {
+            if (!bang->operand) return Arm::Other;
+            p = bang->operand.get();
+        }
+        if (dynamic_cast<const ast::NullLiteralExpr*>(p) ||
+            dynamic_cast<const ast::ThrowExpr*>(p))
+            return Arm::Absorbing;
+        auto join = [](Arm a, Arm b) {
+            if (a == Arm::Other || b == Arm::Other) return Arm::Other;
+            if (a == Arm::Read || b == Arm::Read) return Arm::Read;
+            return Arm::Absorbing;
+        };
+        if (const auto* ce = dynamic_cast<const ast::ConditionalExpr*>(p)) {
+            if (!ce->thenValue || !ce->elseValue) return Arm::Other;
+            return join(classify(*ce->thenValue), classify(*ce->elseValue));
+        }
+        if (const auto* be = dynamic_cast<const ast::BinaryExpr*>(p)) {
+            if (be->op != "??" || !be->left || !be->right) return Arm::Other;
+            return join(classify(*be->left), classify(*be->right));
+        }
+        if (const auto* cs = dynamic_cast<const ast::CaseExpr*>(p)) {
+            Arm acc = Arm::Absorbing;
+            for (const auto& arm : cs->arms) {
+                if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
+                    !arm.exprBody)
+                    return Arm::Other;
+                acc = join(acc, classify(*arm.exprBody));
+            }
+            return acc;
+        }
+        const ast::Expr* core = usingVarStorageReadCore(*p);
+        if (!core) return Arm::Other;
+        if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*core)))
+            return Arm::Read;
+        if (propertyReadIsRecognizedBorrow(*core)) return Arm::Read;
+        return Arm::Other;
+    };
+    if (!dynamic_cast<const ast::ConditionalExpr*>(&init) &&
+        !dynamic_cast<const ast::CaseExpr*>(&init) &&
+        !dynamic_cast<const ast::BinaryExpr*>(&init))
+        return false;
+    return classify(init) == Arm::Read;
+}
+
 // §28.10 "using var initialized from a borrow" (v0.180+, #2128). See the header
 // for the full contract: the borrow shapes a `using var` initializer can take —
 // beyond the bare-id / arm-meet / bind-atom / bare-T-call shapes handled inline
@@ -7438,6 +7509,24 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
         // — SHARED with §28.6's dispose-receiver rule, which reads the same
         // borrow-ness fact — so the two rules cannot drift apart.
         if (propertyReadIsRecognizedBorrow(init)) return true;
+    }
+    // fix #7688 (§28.10 / §17.8 / §7.5, v0.350): the `!` and `?.` spellings
+    // of the field and property reads above. `h.G!` is "classified by its
+    // position exactly as the bare read" (§17.8: `!` "is purely a type-system
+    // assertion" that mints and consumes nothing), and `h?.F` reads the same
+    // storage as `h.F` with a `null` path, which §28.3's `null` row admits on
+    // either side, so both are "a field read" under §28.10 and the `using var`
+    // over them is the same borrow-pin. Codegen's move-only registrations
+    // (usingVarPinsMoveOnlyFieldRead, Setup.cpp) key on this flag; without it `using
+    // var x := h.G!;` / `h?.F` over an owning choice disposed the field's
+    // payload at scope end and the holder disposed it again (a heap-use-
+    // after-free, issue #7688). Only these STORAGE-READ shapes are peeled:
+    // a call or indexer operand of `!` keeps its own arm below, as the bare
+    // spelling does. // per §28.10, §17.8, §7.5, v0.350
+    if (const ast::Expr* core = usingVarStorageReadCore(init)) {
+        if (dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*core)))
+            return true;
+        if (propertyReadIsRecognizedBorrow(*core)) return true;
     }
     // An INDEXER access — a bare `coll[i]` / `arr[i]` (single-element read, NOT
     // the range-slice `arr[r]`; see the carve-out below). The element-slot table
@@ -7857,6 +7946,22 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                             if (ps->modifier == "owned")
                                 const_cast<ast::LocalDecl&>(ld)
                                     .usingVarSourceIsBorrow = true;
+                        // fix #7688 (§28.10 / §19.3 / §35.5, v0.350): a
+                        // BORROWING-match payload binding (`case o of Some(var
+                        // r) => … using var x := r; …`) is "a borrow whose
+                        // source is the scrutinee's source" (§19.3), i.e. the
+                        // "borrowing alias" §28.10 lists among the
+                        // borrow-state bindings a `using var` only pins. The
+                        // dataflow keeps no states_ entry for it, so it fell
+                        // through here unflagged and codegen disposed the
+                        // scrutinee's payload at the pin's scope end (a heap-
+                        // use-after-free). `borrowOnlyArmBindings_` is the
+                        // pre-pass's record of exactly these class/interface-
+                        // typed bindings; an owning match's TRANSFERRING
+                        // binding is seeded Owned and is not in it.
+                        if (borrowOnlyArmBindings_.count(srcSym))
+                            const_cast<ast::LocalDecl&>(ld)
+                                .usingVarSourceIsBorrow = true;
                     }
                 }
             } else if (dynamic_cast<const ast::BindExpr*>(init)) {
@@ -7875,8 +7980,19 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
             } else if (dynamic_cast<const ast::ConditionalExpr*>(init) ||
                        dynamic_cast<const ast::CaseExpr*>(init)) {
                 // Borrowed if/case arm-meet (#1661) — producerState is the authority.
-                if (lo.state != OwnershipState::Owned)
+                // fix #7688 (§28.10, v0.350): OR a meet of field / property
+                // reads, which producerState does not report Borrowed over a
+                // move-only field (`(if c then h.F else h2.F)` over an owning
+                // choice disposed the selected field's payload twice).
+                if (lo.state != OwnershipState::Owned ||
+                    usingVarMeetArmsAreStorageReads(*init))
                     const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
+            } else if (dynamic_cast<const ast::BinaryExpr*>(init) &&
+                       usingVarMeetArmsAreStorageReads(*init)) {
+                // fix #7688 (§28.10, v0.350): the `??` meet of field /
+                // property reads, `using var x := h.G ?? h2.G;` — a borrow-pin
+                // of the union of sources like the if-expression meet above.
+                const_cast<ast::LocalDecl&>(ld).usingVarSourceIsBorrow = true;
             } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(init)) {
                 // Bare-type-parameter argument-source-union borrow (#1801 S4).
                 BareBorrowCallInfo info = analyzeBareBorrowCall(*ce);

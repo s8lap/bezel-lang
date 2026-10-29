@@ -24775,21 +24775,77 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
 // registrations below bypass the using / unwind chain that reads the flag, so
 // they must read it themselves: `using var x := h.F;` over an owning choice or
 // an owning inline array field is a pin, and disposing `x`'s slots as well as
-// `h`'s own field teardown freed the payload twice. Keyed on the field-read
+// `h`'s own field teardown freed the payload twice. Keyed on the storage-read
 // shape too, because the flag is also set over a bare read of a move-only
 // LOCAL, which §28.10 says adopts ("an unmarked read of a **move-only value**
 // binding moves instead and is an owned right-hand side") and so must keep
 // its disposal. The plain `var x := h.F;` twin carries no flag and is not
 // changed here (open spec-question issue #7612). // per §28.10, §28.12, v0.350
+//
+// fix #7688 (§28.10 / §17.8 / §7.5, v0.350): every SPELLING of that storage
+// read is the same pin, so the shape test reads what the spelling denotes,
+// not its outermost node: the `!` spelling `h.G!` ("classified by its position
+// exactly as the bare read", §17.8), the `?.` spelling `h?.F`, a property read
+// `h.P` (a getter lends: "a property or indexer getter may not return a
+// freshly-produced owned value", §28.6 — no move-only type is mint-announcing,
+// and the ownership pass's flag is the authority on the getter, #2137 /
+// #6404), and a meet whose every value arm is such a read (`(if c then h.F
+// else h2.F)`, an expression `case`, `??`; `null` / `throw` arms absorb, K7.5)
+// — "the `using var` is a borrow-pin of the union of sources". Each of them
+// disposed the payload at the pin's scope end and again at the holder's
+// teardown (a heap-use-after-free). A bare identifier still counts only when
+// it resolves to a FIELD or a PROPERTY (the implicit-`this` read), never to a
+// local or parameter.
+static bool usingVarMoveOnlyStorageReadShape(const ast::Expr* e,
+                                             sema::SemaContext& ctx,
+                                             bool& sawRead) {
+    e = peelForInSourceBang(e);
+    if (!e) return false;
+    if (dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+        dynamic_cast<const ast::ThrowExpr*>(e))
+        return true;  // absorbing arm (K7.5)
+    if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e))
+        return usingVarMoveOnlyStorageReadShape(c->thenValue.get(), ctx,
+                                                sawRead) &&
+               usingVarMoveOnlyStorageReadShape(c->elseValue.get(), ctx,
+                                                sawRead);
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        if (be->op != "??") return false;
+        return usingVarMoveOnlyStorageReadShape(be->left.get(), ctx,
+                                                sawRead) &&
+               usingVarMoveOnlyStorageReadShape(be->right.get(), ctx,
+                                                sawRead);
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseExpr*>(e)) {
+        for (const auto& arm : cs->arms) {
+            if (arm.bodyKind != ast::CaseArmBodyKind::Expression ||
+                !arm.exprBody ||
+                !usingVarMoveOnlyStorageReadShape(arm.exprBody.get(), ctx,
+                                                  sawRead))
+                return false;
+        }
+        return true;
+    }
+    if (!dynamic_cast<const ast::MemberAccessExpr*>(e) &&
+        !dynamic_cast<const ast::NullCondMemberExpr*>(e) &&
+        !dynamic_cast<const ast::IdentifierExpr*>(e))
+        return false;
+    sema::Symbol* sym = ctx.exprSymbol(*e);
+    bool read = dynamic_cast<sema::FieldSymbol*>(sym) != nullptr;
+    if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym))
+        read = !ps->isIndexer;
+    if (read) sawRead = true;
+    return read;
+}
+
 static bool usingVarPinsMoveOnlyFieldRead(const ast::LocalDecl* ld,
                                           sema::SemaContext& ctx) {
     if (!ld->isUsing || !ld->usingVarSourceIsBorrow || !ld->initializer)
         return false;
-    const ast::Expr* init = ld->initializer.get();
-    if (!dynamic_cast<const ast::MemberAccessExpr*>(init) &&
-        !dynamic_cast<const ast::IdentifierExpr*>(init))
-        return false;
-    return dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*init)) != nullptr;
+    bool sawRead = false;
+    return usingVarMoveOnlyStorageReadShape(ld->initializer.get(), ctx,
+                                            sawRead) &&
+           sawRead;
 }
 
 bool Emitter::registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld) {
