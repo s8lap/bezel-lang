@@ -773,11 +773,33 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // reason. // per §28.8.1, §28.3, §29.1, v0.307
                 const bool isClaimedIterableSource =
                     iterableSourceClaimedDecls_.count(loc->decl) != 0;
+                // (g) fix #7790 (§28.8.1 / §28.3 / §28.10 / §30.5, v0.350):
+                // a plain-`var` TASK-family local that owns its frame. Its
+                // `d.task` scope-end disposal (lowerStmt's LocalDecl arm,
+                // registered under taskLocalOwnsFrame) is null-guarded
+                // (bz_task_fire_and_forget on the reloaded slot), but nothing
+                // above vacated the slot, so `var u := move t;` /
+                // `using var t2 := move t;` left BOTH bindings holding the one
+                // bz_task_t* and the second fire-and-forget ran on a freed
+                // frame (MEASURED: hang in bz_task_is_error, END printed and
+                // the process never exited). §28.8.1: a moved-from binding is
+                // left moved-from, so the scope-end disposal skips it. The
+                // same predicate registered the disposal, so
+                // `eligible => registered` stays exact (a borrowing alias
+                // registered none and is left untouched). `using var` Task
+                // locals are already covered by loc->isUsing above.
+                // per §28.8.1, §28.10, §30.5, v0.350
+                const bool isOwnedTaskLocalMove = [&]() -> bool {
+                    if (auto* ld =
+                            dynamic_cast<const ast::LocalDecl*>(loc->decl))
+                        return !ld->isUsing && taskLocalOwnsFrame(ld);
+                    return false;
+                }();
                 if (loc->isUsing || isIterVarAutoDrop ||
                     loc->autoDropAtScopeEnd || isArmTransferDischarge ||
                     isPlainVarAutoDropAtScopeEnd ||
                     isOwningMatchTransferConsume ||
-                    isClaimedIterableSource) {
+                    isClaimedIterableSource || isOwnedTaskLocalMove) {
                     if (llvm::AllocaInst* slotAI = localSlot(*id)) {
                         llvm::Type* ety = nullptr;
                         llvm::Value* addr = boxedStorage(slotAI, ety);

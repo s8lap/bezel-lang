@@ -27,11 +27,12 @@
 // and its `move` remedy through the AOT driver (a bare compile failure would
 // not distinguish this rule from any other). The accept rows that run
 // (a view binding, a borrow-state pin) run under ASan/LSan (`runAotChecked`)
-// and pin the printed order. The `move t` adoption rows are pinned at the
-// OWNERSHIP pass (`parseAndCheckOwnership`): running a program that moves a
-// named Task local hangs at scope end, an independent codegen defect reported
-// with this change (it is not this rule), so those rows assert the pass's
-// verdict only.
+// and pin the printed order. The `move t` adoption rows run the same way:
+// they compile, run to END and exit 0 (a program that moved a named Task local
+// used to hang at scope end, issue #7790, fixed separately in
+// tests/codegen/task_local_move_out_scope_end_7790_test.cpp). The one row that
+// moves and then reads the source is an ownership-pass error and is pinned at
+// that pass (`parseAndCheckOwnership`).
 //
 // per §28.10, §28.12, §17.13, §30.3, v0.350
 
@@ -204,24 +205,24 @@ BEZEL_TEST(ownership_using_var_adopt_named_owned_task_7686,
 
 BEZEL_TEST(ownership_using_var_adopt_named_owned_task_7686,
            spec_28_10_marked_adoption_of_an_owned_task_is_accepted) {
-    auto r = parseAndCheckOwnership(asyncMain(
-        "var t := Program.W(); using var t2 := move t; await t2; "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    expectRunOutput(runAotChecked(asyncMain(
+        "var t := Program.W(); using var t2 := move t; await t2; ")),
+        "w\nEND\n");
 }
 
 BEZEL_TEST(ownership_using_var_adopt_named_owned_task_7686,
            spec_28_10_marked_adoption_of_an_owned_task_of_t_is_accepted) {
-    auto r = parseAndCheckOwnership(asyncMain(
-        "var t := Program.WI(); using var t2 := move t; var v := await t2; "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    expectRunOutput(runAotChecked(asyncMain(
+        "var t := Program.WI(); using var t2 := move t; var v := await t2; ")),
+        "wi\nEND\n");
 }
 
 BEZEL_TEST(ownership_using_var_adopt_named_owned_task_7686,
            spec_28_10_marked_adoption_of_an_owned_owningtask_is_accepted) {
-    auto r = parseAndCheckOwnership(asyncMain(
+    expectRunOutput(runAotChecked(asyncMain(
         "var t := Program.WO(); using var t2 := move t; "
-        "using var r := await t2; "));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+        "using var r := await t2; ")),
+        "END\nDTOR\n");
 }
 
 BEZEL_TEST(ownership_using_var_adopt_named_owned_task_7686,
