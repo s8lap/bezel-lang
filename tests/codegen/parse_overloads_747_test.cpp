@@ -169,8 +169,8 @@ BEZEL_TEST(parse_overloads_747, int_parse_trailing_garbage_throws_1227) {
 
 // int.TryParse("123abc", out v): false, v=0 (not the partial value 123).
 BEZEL_TEST(parse_overloads_747, int_tryparse_trailing_garbage_zeroes_out_1227) {
-    // stdlib §9.1/§9.3: TryParse returns false in every case where Parse
-    // would raise; the out parameter receives the default (0).
+    // stdlib §9.1 (shape (c): false, out = 0, where Parse raises) and §1
+    // shape (c): the out parameter receives default(T) = 0 (spec §17.11).
     BEZEL_EXPECT_EQ(run(
         "module M; static class F public static method Main(): int "
         "  var v: int := 99; "
@@ -257,7 +257,8 @@ BEZEL_TEST(parse_overloads_747, double_parse_valid_unaffected_1227) {
 
 // double.TryParse("1.5abc", out v): false, v=0.0 (not 1.5).
 BEZEL_TEST(parse_overloads_747, double_tryparse_trailing_garbage_zeroes_out_1227) {
-    // stdlib §9.2/§9.3: TryParse out param receives 0.0 on failure.
+    // stdlib §9.2 (Double/Float TryParse): the out param receives default(T)
+    // = 0.0 on failure (stdlib §1 shape (c), spec §17.11).
     BEZEL_EXPECT_EQ(run(
         "module M; static class F public static method Main(): int "
         "  var v: double := 99.0; "

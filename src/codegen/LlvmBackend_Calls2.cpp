@@ -1331,7 +1331,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         return builder_.CreateSelect(ok, wrapV, nullV, "chpon.sel");
     }
     // stdlib §9.3 / §2.19: decimal.TryParse(s, out result): bool — routes to
-    // bz_decimal_try_parse (no exception on failure; out gets 0 per §9.3).
+    // bz_decimal_try_parse (no exception on failure; out gets default(T) = 0,
+    // stdlib §1 shape (c) and spec §17.11).
     if (pt == P::Decimal && m == "TryParse" && call.args.size() == 2 &&
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard)) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
@@ -1997,8 +1998,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
 
     // double.TryParse / float.TryParse(s, out result): bool — stdlib §9.2
     // #1227: on failure, out result receives the default (0.0), not the partial
-    // parse value (e.g. 1.5 for "1.5abc"). Per §9.3: "TryParse returns false
-    // in every case where Parse would raise"; the out param gets the default.
+    // parse value (e.g. 1.5 for "1.5abc"). Per §9.2: "TryParse returns false
+    // in every case where Parse would raise"; the out param gets default(T)
+    // = 0.0 (stdlib §1 shape (c) and spec §17.11).
     if (m == "TryParse" && call.args.size() == 2 &&
         call.args[0].value && (call.args[1].value || call.args[1].isDiscard) &&
         (pt == P::Double || pt == P::Float)) {
@@ -2182,7 +2184,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             fmtOkD,
             builder_.CreateNot(emitFloatParseOverflow(strData, valD)),
             "tryp.ok");
-        // Store 0.0 on failure, parsed value on success (§9.3: out = default on false).
+        // Store 0.0 on failure, parsed value on success (stdlib §1 shape (c):
+        // out = default(T) on false, spec §17.11).
         llvm::Value* zeroD = llvm::ConstantFP::get(fpTyT, 0.0);
         llvm::Value* selD = builder_.CreateSelect(okD, valD, zeroD, "tryp.sel");
         // §11.8 / §2.19 (#1470): nullable-companion aware store (generic
@@ -2199,8 +2202,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     // sets result if s is a valid integer in the target type's range; false
     // and sets result to 0 (default) otherwise.
     // #1227: on failure, out result receives 0, not the partial parse value.
-    // Per §9.3: "TryParse returns false in every case where Parse would raise";
-    // the out param gets the default.  No surrounding whitespace is accepted.
+    // Per §9.1 (shape (c): false, out = 0, where Parse raises) and stdlib §1
+    // shape (c) (spec §17.11): the out param gets default(T) = 0.  No
+    // surrounding whitespace is accepted.
     // §2.19 (v0.176, #807): extended from int/long to the whole integer tower
     // (byte…ulong) — IParsable<T>'s compiler-provided conformance needs every
     // tower member; each narrower width range-checks the strtoll result the
@@ -3320,7 +3324,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                     exactNonFinite, "parse.nfok");
                 // stdlib §9.2 (v0.344, #7341): a point with NO digit after it
                 // is a grammar violation, whatever exponent follows it.  The
-                // span form carries the string form's contract (§9.2:5265).
+                // span form carries the string form's contract (§9.2).
                 llvm::Value* pointOk = emitPointFollowedByDigit(win.data);
                 llvm::Value* validF = builder_.CreateAnd(
                     builder_.CreateAnd(

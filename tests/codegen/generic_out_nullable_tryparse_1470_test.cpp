@@ -143,7 +143,8 @@ BEZEL_TEST(generic_out_nullable_tryparse_1470, decimal_value_delivered) {
         "end C;"), 88);
 }
 
-// stdlib §2.19 / §9.3: a FAILING parse returns false and the out reads as null
+// stdlib §2.19 / §1 shape (a): a FAILING parse returns false and the out reads
+// as null
 // (the v0.171 nullable-out convention: hasValue = the success bool).
 BEZEL_TEST(generic_out_nullable_tryparse_1470, failed_parse_is_false_and_null) {
     BEZEL_EXPECT_EQ(run(

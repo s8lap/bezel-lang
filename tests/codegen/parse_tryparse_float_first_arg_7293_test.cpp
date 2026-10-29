@@ -49,7 +49,8 @@
 // The compiler's outcome (the program must compile, link and run, and the
 // compiler must never reach LLVM's IR verifier) AND the program's output.
 // The `out` slot starts at 7, so the two behaviours are distinguishable: a
-// call that RAN and failed writes the failure default (0) into it, and a
+// call that RAN and failed writes the failure default (0: default(T), stdlib
+// §1 shape (c), spec §17.11) into it, and a
 // DROPPED call never writes it, so it keeps 7.
 
 #include <string>
@@ -68,7 +69,8 @@ namespace {
 // A `TryParse(s, out result)` program for the floating-point receivers.
 // `first` is the operand stdlib §9.2 declares as `s: string`; the `out` slot
 // starts at 7 so that a DROPPED call (the slot keeps 7) is distinguishable
-// from a call that ran and failed (the slot receives the default 0).
+// from a call that ran and failed (the slot receives default(T) = 0, stdlib
+// §1 shape (c)).
 std::string tryParseProg(const std::string& receiver, const std::string& slotTy,
                           const std::string& slotInit, const std::string& first,
                           const std::string& decl) {

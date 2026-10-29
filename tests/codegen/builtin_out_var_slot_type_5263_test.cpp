@@ -169,7 +169,7 @@ BEZEL_TEST(builtin_out_var_slot_type_5263, bool_try_parse_inline) {
 
 // #5271: decimal.TryParse — success, negative with trailing zeros (§9.3:
 // scale is not part of the value, `-0.500` renders `-0.5`), zero, and a
-// failure input (out = default 0, §22.3).
+// failure input (out = default(T) = 0, stdlib §1 shape (c), spec §17.11).
 BEZEL_TEST(builtin_out_var_slot_type_5263, decimal_try_parse_inline_5271) {
     expectOut("var ok := decimal.TryParse(\"1.25\", out var a); "
               "Console.WriteLine(ok); Console.WriteLine(a); "
