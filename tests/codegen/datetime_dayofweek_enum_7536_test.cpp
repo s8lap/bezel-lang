@@ -24,9 +24,12 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::runAot;
 
 namespace {
@@ -164,7 +167,10 @@ BEZEL_TEST(datetime_dayofweek_enum_7536, stdlib_2_5_chained_receiver_int_propert
     auto r = runAot(prog("",
         "var sun := new DateTime(2024, 3, 17); "
         "var s: string := sun.AddDays(3).Year; "));
-    BEZEL_EXPECT_FALSE(r.ran);
+    // `!r.ran` alone is ambiguous (crash / signal / timeout also report it);
+    // pin a genuine rejection with a real location and the specific text.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(diagnosticMessageContains(r, "not implicitly convertible to the target type"));
 }
 
 // §2.5 (v0.350): the property stored into a class FIELD of type
