@@ -80,6 +80,9 @@ case "$FAKE_MODE" in
                echo "$src:80:5: owned value in \`src\` would be dropped here without disposal (§28.3 — consider \`using var\`, explicit \`.Dispose()\`, \`move\`, or \`return\`)" >&2; exit 1;;
   vacuous)     echo "$src:80:5: warning: \`using var\` \`x\` is vacuous — the RHS is a value-typed/runtime-managed value with no disposal obligation (§28.9); use \`const x := …;\` for a fixed alias without the disposal hint (§28.10 / §21.1)" >&2
                printf '#!/bin/bash\necho END\n' > "$out"; chmod +x "$out"; exit 0;;
+  vacuous_run) echo "$src:80:5: warning: \`using var\` \`x\` is vacuous — the RHS is a value-typed/runtime-managed value with no disposal obligation (§28.9); use \`const x := …;\` for a fixed alias without the disposal hint (§28.10 / §21.1)" >&2
+               printf '#!/bin/bash\nfor i in $(seq %s); do echo DTOR; done\necho END\n' "$FAKE_N" > "$out"; chmod +x "$out"; exit 0;;
+  clean_run)   printf '#!/bin/bash\nfor i in $(seq %s); do echo DTOR; done\necho END\n' "$FAKE_N" > "$out"; chmod +x "$out"; exit 0;;
   *)           echo "$src:80:5: warning: nothing" >&2;;
 esac
 printf '#!/bin/bash\necho 42\n' > "$out"; chmod +x "$out"
@@ -92,6 +95,23 @@ def _fake_compiler(d, mode='default'):
     p.chmod(0o755)
     os.environ['FAKE_MODE'] = mode
     return str(p)
+
+
+def _one_cell(head, form, mode):
+    """Run ONE cell against the fake compiler in `mode` and return the row.
+    `FAKE_N` is the loop count the fake's program prints its marker for."""
+    with tempfile.TemporaryDirectory() as d:
+        bezelc = _fake_compiler(d, mode)
+        odir = os.path.join(d, 'run')
+        progdir = os.path.join(d, 'programs')
+        os.makedirs(odir)
+        os.makedirs(progdir)
+        os.environ['FAKE_N'] = str(g.LOOP_N)
+        try:
+            return g.run_cell(bezelc, odir, progdir, head, form, 30, 30, {})
+        finally:
+            os.environ.pop('FAKE_MODE', None)
+            os.environ.pop('FAKE_N', None)
 
 
 def _git(*args):
@@ -483,6 +503,35 @@ class UsingHeadsGridTest(unittest.TestCase):
         self.assertEqual(novac[2], 'WRONG',
                          'a NOVAC cell must be red when the §28.9 vacuity '
                          f'warning is emitted (got {novac[2]!r}: {novac[3]!r})')
+
+    def test_object_class_cells_assert_the_vacuity_warning_is_absent(self):
+        """FINDING 11 (exit review): the `object_class` head holds a CLASS
+        instance, so §28.9's vacuity premise ("value-typed/runtime-managed")
+        is false of it (§28.9: the tier is exhaustive and none of it is a
+        class). Its run-family cells must therefore be NOVAC, not RUN -- a
+        plain RUN does not look at the warning, so the false warning was
+        invisible to the DONE verdict. Mutation killed: `object_class` cells
+        reverted to RUN."""
+        run_cells = [(f, e) for (h, f), e in g.EXPECT.items()
+                     if h == 'object_class' and e is not None
+                     and e[0] != 'REJ']
+        self.assertGreaterEqual(len(run_cells), 6, run_cells)
+        for form, e in run_cells:
+            self.assertEqual(e[0], 'NOVAC', f'object_class/{form}')
+
+    def test_an_object_class_cell_is_red_on_the_vacuity_warning(self):
+        """The grid's OWN branch, driven for an `object_class` cell: the
+        compiler emits the §28.9 vacuity warning and the program runs clean
+        and prints the right lines -- the cell must be WRONG, and with the
+        warning absent it must be OK. (With the expectation mutated back to
+        RUN the first assertion fails.)"""
+        for form in ('using_var', 'copy_local_source', 'copy_const_source',
+                     'copy_param_source'):
+            red = _one_cell('object_class', form, 'vacuous_run')
+            self.assertEqual(red[2], 'WRONG', f'{form}: {red!r}')
+            self.assertIn('vacuity warning', red[3], f'{form}: {red!r}')
+            green = _one_cell('object_class', form, 'clean_run')
+            self.assertEqual(green[2], 'OK', f'{form}: {green!r}')
 
     def test_a_correct_section_rejection_makes_the_cell_green(self):
         """The REJ branch's POSITIVE direction: a diagnostic that rejects the

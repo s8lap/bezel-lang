@@ -563,7 +563,18 @@ EXPECT = {
     ('owning_choice', 'field_store'): None,
 
     # -- Object-declared ------------------------------------------------------
-    ('object_class', 'using_var'): ('RUN', ['DTOR']),
+    # EVERY run-family cell of this head is NOVAC, not RUN (the exit review's
+    # FINDING 11, 2026-10-28). The head's runtime value is a CLASS instance
+    # (`new Res()`), and §28.9 says of its exempt set that "None of them is a
+    # class": `Object` is not one of the runtime-managed types
+    # (`string`, `Type`, boxed value types, function values), so the §28.10
+    # lint's premise -- "the RHS is a value-typed/runtime-managed value with no
+    # disposal obligation (§28.9)" -- is false of this binding, and §28.12
+    # selects the disposal by "the class of the object the binding holds ...
+    # never by the binding's static type". A plain RUN does not look at the
+    # warning, so the false §28.9 vacuity warning that the compiler draws here
+    # was invisible to the DONE verdict.
+    ('object_class', 'using_var'): ('NOVAC', ['DTOR']),
     # §28.12: "`await using var` takes §28.10's admission unchanged". §28.10's
     # "Adopting a named owned binding" rejection needs a CLASS or INTERFACE
     # declared type; `s` is declared `Object`, which is neither (§8.7), so the
@@ -571,14 +582,14 @@ EXPECT = {
     # plain `using var` twin of the same program is. The two spellings must
     # agree; today the `await using` spelling REJECTS the program the plain
     # spelling admits.
-    ('object_class', 'await_using_var'): ('RUN', ['DTOR']),
+    ('object_class', 'await_using_var'): ('NOVAC', ['DTOR']),
     # §8.7: "`Dispose()` is class-only ... On `Object` ... the name resolves to no
     # member, so a call in any spelling ... [is a] compile error".
     ('object_class', 'explicit_dispose'): ('REJ', '§8.7'),
     ('object_class', 'explicit_dispose_async'): ('REJ', ['§8.7', '§28.12']),
-    ('object_class', 'copy_local_source'): ('RUN', ['DTOR']),
-    ('object_class', 'copy_const_source'): ('RUN', ['DTOR']),
-    ('object_class', 'copy_param_source'): ('RUN', ['DTOR']),
+    ('object_class', 'copy_local_source'): ('NOVAC', ['DTOR']),
+    ('object_class', 'copy_const_source'): ('NOVAC', ['DTOR']),
+    ('object_class', 'copy_param_source'): ('NOVAC', ['DTOR']),
     ('object_class', 'field_store'): None,
 
     ('object_string', 'using_var'): ('TWIN', []),

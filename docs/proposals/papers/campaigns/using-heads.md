@@ -639,6 +639,13 @@ THE DONE VERDICT: THE GRID'S DONE LINE CAN BE SATISFIED WHILE IT STANDS.** **THE
 CELLS NEED `NOVAC`, NOT `RUN`.** THE GRID SCRIPT IS THE COORDINATOR's FILE; THE CHANGE IS NOT MADE
 BY THIS EDITION AND IS THE NEXT LANE's PROPOSAL.
 
+**⇒ DONE 2026-10-29 (R37 lane C1-L7, spec v0.350): THE `object_class` RUN-FAMILY CELLS NOW EXPECT
+`NOVAC`.** Four cells that were green turned RED on purpose — `object_class/using_var`,
+`/copy_local_source`, `/copy_const_source`, `/copy_param_source` ("a §28.9 vacuity warning was emitted
+where none is due"); `/await_using_var` and `/copy_await_source` were already red for #7390 and will
+meet the same warning when #7390 lands. The warning is the defect the new tracker issue (filed from
+`r37-c1-l7-grid/issue-novac.md`) carries; until it is fixed, those cells are WRONG, not hidden.
+
 **The fail-without / fail-with proof for the grid's new cells.** The grid is
 new, so it has no fail-without of its own; the #7316 fix (`b6053a68`, "narrow
 #7316: a `using var` copy of a value-like choice local releases the payload at
