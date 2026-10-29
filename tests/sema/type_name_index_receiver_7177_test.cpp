@@ -378,9 +378,9 @@ BEZEL_TEST(sema_type_name_index_receiver_7177,
 // The compiler ALREADY answered the same question for the closest sibling,
 // IN THE SAME PREDICATE: `var o: Object := i; o.Dispose();` is REJECTED with
 // "no member `Dispose` on type `Object`: `Dispose()` is class-only (§8.7,
-// v0.340), and `Object` is not a class, so `Dispose` is not one of its
-// members (§28.2)". The two answers must agree, so the function-value arm
-// draws the same shape with the same citations plus §28.9 (#7260).
+// v0.340): `Dispose` is not one of `Object`'s members (§28.2)". The two
+// answers must agree, so the function-value arm draws the same shape with the
+// same citations plus §28.9 (#7260).
 //
 // THIS ROW WAS A CONTROL, NOT A FAIL-WITHOUT ROW: it asserted that
 // `c.Dispose()` COMPILES and exits 0, pinning the compiler's REAL dispose on

@@ -377,17 +377,16 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
                "` is not a member of it. Use a compile-time generic or an "
                "explicit registration instead of reflective discovery.";
     }
-    // fix #6990 (§8.7, v0.340): `Dispose()` is class-only. §8.7: "The compiler
-    // generates `IDisposable` on every non-static class", and `Object` is not a
-    // class, so `Dispose` is not one of its members (§28.2: "`Dispose()` is not
-    // on `Object`; it is class-only"). `Object` is otherwise left open by this
+    // fix #6990 (§8.7, v0.340): `Dispose()` is not on `Object` (§8.7, §28.2:
+    // "`Dispose()` is not on `Object`; it is class-only"), so `Dispose` is not
+    // one of its members. `Object` is otherwise left open by this
     // predicate, so the one `Object` member it names is this one; the §8.1
     // universal members returned above keep their permissive reading.
     if (recvTy->kind == TypeRef::Kind::Primitive &&
         recvTy->primitive == PrimitiveType::Object && m == "Dispose") {
         return "no member `Dispose` on type `Object`: `Dispose()` is class-only "
-               "(\xC2\xA7""8.7, v0.340), and `Object` is not a class, so "
-               "`Dispose` is not one of its members (\xC2\xA7""28.2). To "
+               "(\xC2\xA7""8.7, v0.340): `Dispose` is not one of `Object`'s "
+               "members (\xC2\xA7""28.2). To "
                "discharge an owned `Object` value, discard it with `_ := x;` "
                "(\xC2\xA7""17.13) or bind it with `using var` (\xC2\xA7""28.10).";
     }

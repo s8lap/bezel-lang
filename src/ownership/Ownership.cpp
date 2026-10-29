@@ -7360,14 +7360,16 @@ bool MethodOwnership::propertyReadIsRecognizedBorrow(
 // `Task`-family source the anonymous form is reported under §17.13's rejection
 // (axiom A6) first" -- it does not exclude the named form (issues #7686,
 // #7614); the anonymous form's own report is suppressed in handleLocalDecl so
-// that A6's rejection is the one diagnostic. `Object` is also excluded FOR NOW: the
-// spec does not say whether an `Object`-declared binding is a "class or
-// interface type" for this rule, and that is open spec-question issue #7568;
-// until it is ruled, the simplest reading (excluded: the form stays a
-// borrow-pin, matching the #7390 await twin) is what is implemented. A MOVE-ONLY value source adopts, it is not rejected (the spec's last
+// that A6's rejection is the one diagnostic. `Object` COUNTS: it is a class
+// (§8.1), and §28.10 carries no carve-out for it (the owner ruling on issue
+// #7568, reading (A)), so an `Object`-declared binding in OWNED state is
+// covered like any other class. An `Object` local whose state is not Owned
+// (K1 unclassified: it holds only runtime-managed values, `var o: Object :=
+// 7;`) never reaches here, so over it the unmarked form stays a borrow-pin.
+// A MOVE-ONLY value source adopts, it is not rejected (the spec's last
 // paragraph before *The anonymous binding*), so an owning inline array / an
 // owning-classified choice never reaches here: their TypeRefs are not Named
-// classes. // per §28.10, §28.12, §28.9, §15.3, v0.350
+// classes. // per §28.10, §28.12, §28.9, §15.3, §8.1, v0.350
 bool MethodOwnership::isNamedOwnedClassOrInterfaceBinding(
     const ast::IdentifierExpr& id, bool fromLambdaBody) const {
     sema::Symbol* sym = ctx_.exprSymbol(id);
@@ -7390,6 +7392,10 @@ bool MethodOwnership::isNamedOwnedClassOrInterfaceBinding(
     }
     if (!owned) return false;
     const sema::TypeRef* rt = ctx_.exprType(id);
+    // `Object` is a class (§8.1) and §28.10 does not carve it out (issue #7568,
+    // owner ruling A); the binding's Owned state above already excludes the
+    // K1 unclassified `Object` local. // per §28.10, §8.1, v0.350
+    if (isPlainObjectType(rt)) return true;
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     if (rt->declaration) return isClassOrInterfaceResult(rt);
     // Declaration-less Named: a builtin collection or builtin class, an

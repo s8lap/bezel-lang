@@ -22787,12 +22787,12 @@ void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {
     // no obligation, so scope exit disposes nothing and awaits nothing" -- the
     // form is the same compile-time pin as `using var`. Its CFG await site (the
     // LocalDecl node, `recordStmtAwaits`) is therefore NOT a suspension: an
-    // owned local the pin merely reads (`var s: Object := new Res();
-    // await using var x: Object := s;`) does not cross an `await`, and must
+    // owned local the pin merely reads (`var s := new Res(); var v := s;
+    // await using var x := v;`) does not cross an `await`, and must
     // not draw the §28.3 suspend-local reject (issue #7390). The borrow shapes
-    // are the bare-identifier read of a named binding (peeling `x!`; a class
-    // or interface owned binding is rejected on its own ground, §28.10, and
-    // every other named binding is a pin) and `usingVarInitIsRecognizedBorrow`'s
+    // are the bare-identifier read of a named binding (peeling `x!`; an owned
+    // class, interface or `Object` binding is rejected on its own ground,
+    // §28.10 (issue #7568), and every other named binding is a pin) and `usingVarInitIsRecognizedBorrow`'s
     // field / indexer / borrow-returning-call shapes. An OWNED right-hand side
     // (`new`, an owned call, a marked `move x`) still awaits. // per §28.12,
     // §28.10, §28.3, v0.350

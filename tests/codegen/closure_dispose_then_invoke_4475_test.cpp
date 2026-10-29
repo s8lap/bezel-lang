@@ -37,8 +37,8 @@
 // has no `Dispose()` AT ALL. The compiler already answered the same question
 // for the closest sibling — `var o: Object := i; o.Dispose();` is REJECTED
 // with "no member `Dispose` on type `Object`: `Dispose()` is class-only
-// (§8.7, v0.340), and `Object` is not a class, so `Dispose` is not one of its
-// members (§28.2)" — and the compiler must answer the same question the same
+// (§8.7, v0.340): `Dispose` is not one of `Object`'s members
+// (§28.2)" — and the compiler must answer the same question the same
 // way for the closest sibling (#7260).
 //
 // ⇒⇒⇒⇒⇒ THE TWO ROWS BELOW ARE FLIPPED BY #7260. They used to assert the
