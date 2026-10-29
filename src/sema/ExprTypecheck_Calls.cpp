@@ -385,10 +385,12 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
     if (recvTy->kind == TypeRef::Kind::Primitive &&
         recvTy->primitive == PrimitiveType::Object && m == "Dispose") {
         return "no member `Dispose` on type `Object`: `Dispose()` is class-only "
-               "(\xC2\xA7""8.7, v0.340): `Dispose` is not one of `Object`'s "
+               "(\xC2\xA7""8.7, v0.350): `Dispose` is not one of `Object`'s "
                "members (\xC2\xA7""28.2). To "
                "discharge an owned `Object` value, discard it with `_ := x;` "
-               "(\xC2\xA7""17.13) or bind it with `using var` (\xC2\xA7""28.10).";
+               "(\xC2\xA7""17.13) or adopt it with `using var y := move x;` "
+               "(\xC2\xA7""28.10; the unmarked `using var y := x;` over an "
+               "owned `Object` is a \xC2\xA7""28.10 error, issue #7568).";
     }
     if (recvTy->kind == TypeRef::Kind::Unit) {
         return "no member `" + m +
