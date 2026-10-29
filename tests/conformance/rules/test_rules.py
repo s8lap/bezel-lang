@@ -786,6 +786,72 @@ class TestNamesIndexGaps(unittest.TestCase):
                 "end Program;\n")
         self.assertEqual(self.types(body), (["TWidget"], []))
 
+    def test_a_member_chain_owner_is_not_a_static_use(self):
+        # `gen.Item.DayOfWeek` (l2_5_0039) and `tcs.Task.Result` (s30_3_0013):
+        # `Item` / `Task` follow a `.`, so they are a field and a property read
+        # off a value, not the documented types of those names.
+        body = ("module Conf;\n\n"
+                "public class Program\n"
+                "  public static method Main()\n"
+                "    var d := gen.Item.DayOfWeek;\n"
+                "    var x := tcs.Task.Result;\n"
+                "  end Main;\n"
+                "end Program;\n")
+        self.assertEqual(self.types(body), ([], []))
+
+    def test_a_local_shadowing_a_documented_type_is_not_a_static_use(self):
+        # s22_5_0045: `using var Path := new StringBuilder();` shadows the
+        # static class (§2.7), so `Path.Insert` is a StringBuilder member.
+        body = ("module Conf;\n\n"
+                "public class Program\n"
+                "  public static method Main()\n"
+                "    using var Path := new StringBuilder();\n"
+                "    var a := Path.Insert(0, \"x\");\n"
+                "  end Main;\n"
+                "end Program;\n")
+        self.assertEqual(self.types(body), ([], []))
+
+    def test_an_undeclared_static_use_is_still_reported(self):
+        # The anchor for the two fixes above: a chain-head use of a documented
+        # type with a member it lacks, and no local of that name, is still the
+        # invented API it was (s7_4_0144's `Environment.GetCommandLineArgs`).
+        body = ("module Conf;\n\n"
+                "public class Program\n"
+                "  public static method Main()\n"
+                "    var n := Environment.GetCommandLineArgs();\n"
+                "    var p := Path.Insert(0, \"x\");\n"
+                "  end Main;\n"
+                "end Program;\n")
+        self.assertEqual(self.types(body), (
+            [], ["Environment.GetCommandLineArgs", "Path.Insert"]))
+
+    def test_a_type_declared_after_a_semicolon_is_the_cases_own(self):
+        # s15_3_0019 declares `class Sk` on the same line, after
+        # `end ISink;`; it is the case's own type, not an invented one.
+        body = ("module Conf;\n\n"
+                "interface ISink method Take(x: int); end ISink; "
+                "class Sk: ISink public method Take(x: int) end Take; end Sk;\n"
+                "public class Program\n"
+                "  public static method Main()\n"
+                "    var s := new Sk();\n"
+                "    var w := new Widget();\n"
+                "  end Main;\n"
+                "end Program;\n")
+        self.assertEqual(self.types(body), (["Widget"], []))
+
+    def test_a_class_constraint_is_not_a_reserved_declaration(self):
+        # s26_5_1_0033: `where T: class public method Any()` declares `Any`;
+        # `class` there is a constraint, so `public` is not a declared name.
+        import names
+        body = ("extension OwningArray<T> where T: class public method Any(): "
+                "int => 77; end;\n")
+        self.assertEqual(names.reserved_declarations(body), [])
+        # The anchor: a reserved word in a real declaration position is
+        # still reported.
+        self.assertEqual(names.reserved_declarations(
+            "class Foo public method public(): int => 1; end Foo;\n"),
+            ["public"])
+
     def types(self, body):
         import names
         return names.check_source(body, names.build_index(

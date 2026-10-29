@@ -84,7 +84,12 @@ TYPE_POSITION_RES = (
                r'(?:class|interface|record|enum|choice)\s+\w+\s*'
                r'(?:<[^>]*>)?\s*(?:\([^)]*\))?\s*:\s*([A-Z]\w*)'),
 )
-STATIC_USE_RE = re.compile(r'\b([A-Z]\w*)\.([A-Za-z_]\w*)')
+# The owner must START a chain: in `gen.Item.DayOfWeek` / `tcs.Task.Result` the
+# PascalCase `Item` / `Task` follows a `.`, so it is a member read off a value
+# (a field, a property), never a static use of a documented type of that name.
+# Module qualifiers are stripped before this runs, so `System.Math.Abs` still
+# reaches `Math.Abs`.
+STATIC_USE_RE = re.compile(r'(?<![.\w])([A-Z]\w*)\.([A-Za-z_]\w*)')
 
 
 # The stdlib document is organised as `## N. `Module.Name`` headings, and an
@@ -250,9 +255,12 @@ def declared_in(source):
     """Type names and type parameters the case declares for itself."""
     names = set()
     for line in source.split("\n"):
-        decl = TYPE_DECL_RE.match(line)
-        if decl:
-            names.add(decl.group(2))
+        # A declaration starts a line or follows a `;` on it: a one-line
+        # `interface ISink ... end ISink; class Sk: ISink ...` declares both.
+        for segment in line.split(";"):
+            decl = TYPE_DECL_RE.match(segment)
+            if decl:
+                names.add(decl.group(2))
         alias = ALIAS_RE.match(line)
         if alias:
             names.add(alias.group(1))
@@ -308,11 +316,31 @@ def members_declared_in(source):
     return {m.group(1) for m in MEMBER_DECL_RE.finditer(source) if m.group(1)}
 
 
+def locals_declared_in(source):
+    """Locals and parameters the case declares (`var X`, `using var X`,
+    `const X`, `(X: T)`), by the same patterns the reserved-name check reads."""
+    found = set()
+    for line in source.split("\n"):
+        code = STRING_RE.sub('""', line.split("//")[0])
+        for rx in DECL_RES[:2]:
+            found.update(m.group(1) for m in rx.finditer(code))
+        for group in PARAM_LIST_RE.findall(code):
+            for part in group.split(","):
+                m = PARAM_RE.match(part)
+                if m:
+                    found.add(m.group(1))
+    return found
+
+
 def reserved_declarations(source):
     """Declaration-position identifiers that are unconditionally reserved."""
     found = set()
     for line in source.split("\n"):
         code = STRING_RE.sub('""', line.split("//")[0])
+        # `where T: class` is a constraint, not a declaration: in
+        # `extension Array<T> where T: class public method Any()` the word after
+        # it is the member's modifier, not a declared name.
+        code = re.sub(r':\s*class\b', ':', code)
         for rx in DECL_RES:
             for m in rx.finditer(code):
                 if m.group(1) in RESERVED:
@@ -368,6 +396,10 @@ def check_source(source, index, modules=()):
                         key=len, reverse=True)
     known_types = own_types | PRIMITIVES | LANGUAGE | set(index)
     known_members = UNIVERSAL_MEMBERS | members_declared_in(source)
+    # A local or parameter the case declares under a documented type's name
+    # (`using var Path := new StringBuilder();`) shadows that type (§2.7), so
+    # `Path.Insert(...)` is a member of the local's value, not of `Path`.
+    own_values = locals_declared_in(source)
     unknown_types = set()
     unknown_members = set()
     for line in source.split("\n"):
@@ -402,6 +434,7 @@ def check_source(source, index, modules=()):
             owner, member = m.group(1), m.group(2)
             if owner in index and index[owner] \
                     and owner not in own_types \
+                    and owner not in own_values \
                     and member not in index[owner] \
                     and member not in known_members:
                 unknown_members.add(owner + "." + member)
