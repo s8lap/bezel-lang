@@ -22116,37 +22116,51 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
             const bool isToBasePosition =
                 head == "Convert" && member == "ToString" &&
                 ce.args.size() == 2 && p == 1;
-            if (!isToBasePosition) continue;
-            if (!isNarrowedNonNullRead(arg.value.get())) {
-                const std::string paramName =
-                    p < paramNames.size() ? std::string(paramNames[p])
-                                          : std::string();
-                const std::string what =
-                    paramName.empty()
-                        ? "the argument at position " + std::to_string(p + 1)
-                        : "the `" + paramName + "` argument";
-                ctx_.diagnostics().report(
-                    Severity::Error, arg.value->span.begin,
-                    "no matching overload of `" + std::string(head) + "." +
-                        std::string(member) + "` — " + stdlibCite +
-                        " declares " + decls + ", so " + what + " must be " +
-                        mathConvertTypeList(admitted) + " (" + stdlibCite +
-                        "; §5.1): a `" + spellTypeRefForDiag(argTy) +
-                        "` is never implicitly convertible to an `" +
-                        std::string(mathConvertTypeName(admitted.front())) +
-                        "` (§5.1's nullable lifting converts a `T` to a `T?`, "
-                        "never the other way) — narrow it to non-null first "
-                        "(§7.4)");
-                return;  // ONE diagnostic per call
+            if (!isToBasePosition) {
+                // fix #7459 (§22.6, §5.1, §7.4, v0.350): the §7 gate owns an
+                // UN-narrowed nullable here, but a NARROWED read is of its
+                // non-nullable type (§22.6) and the §7 gate never refuses it —
+                // so it reached codegen UNADJUDICATED against the declared
+                // parameter type, and an illegal call
+                // (`Math.Sqrt(m)` over a narrowed `decimal?`,
+                // `Convert.ToInt32(d)` over a narrowed `double?`) aborted the
+                // compiler in the LLVM verifier. The nullability is a RUNTIME
+                // fact (§7.4), not a reason to skip the admission check: the
+                // probe below reads the type the read denotes.
+                if (!isNarrowedNonNullRead(arg.value.get())) continue;
+                argTy = operandStaticTypeAt(arg.value.get(), argTy);
+            } else {
+                if (!isNarrowedNonNullRead(arg.value.get())) {
+                    const std::string paramName =
+                        p < paramNames.size() ? std::string(paramNames[p])
+                                              : std::string();
+                    const std::string what =
+                        paramName.empty()
+                            ? "the argument at position " + std::to_string(p + 1)
+                            : "the `" + paramName + "` argument";
+                    ctx_.diagnostics().report(
+                        Severity::Error, arg.value->span.begin,
+                        "no matching overload of `" + std::string(head) + "." +
+                            std::string(member) + "` — " + stdlibCite +
+                            " declares " + decls + ", so " + what + " must be " +
+                            mathConvertTypeList(admitted) + " (" + stdlibCite +
+                            "; §5.1): a `" + spellTypeRefForDiag(argTy) +
+                            "` is never implicitly convertible to an `" +
+                            std::string(mathConvertTypeName(admitted.front())) +
+                            "` (§5.1's nullable lifting converts a `T` to a `T?`, "
+                            "never the other way) — narrow it to non-null first "
+                            "(§7.4)");
+                    return;  // ONE diagnostic per call
+                }
+                // A NARROWED read: the argument is read at its non-nullable type
+                // (§22.6), so the probe below sees the `int` it denotes. Publish
+                // the read, so codegen extracts the payload of the
+                // `{i8 hasValue; int}` carrier the read still loads
+                // (`SemaContext::markNarrowedValueRead`; the codegen half is
+                // LlvmBackend_Calls.cpp's `Convert.ToString`).
+                argTy = operandStaticTypeAt(arg.value.get(), argTy);
+                ctx_.markNarrowedValueRead(arg.value.get());
             }
-            // A NARROWED read: the argument is read at its non-nullable type
-            // (§22.6), so the probe below sees the `int` it denotes. Publish
-            // the read, so codegen extracts the payload of the
-            // `{i8 hasValue; int}` carrier the read still loads
-            // (`SemaContext::markNarrowedValueRead`; the codegen half is
-            // LlvmBackend_Calls.cpp's `Convert.ToString`).
-            argTy = operandStaticTypeAt(arg.value.get(), argTy);
-            ctx_.markNarrowedValueRead(arg.value.get());
         }
         bool ok = false;
         for (std::uint32_t k : admitted)
