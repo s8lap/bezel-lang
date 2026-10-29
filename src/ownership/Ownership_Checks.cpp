@@ -2060,6 +2060,9 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // `=> throw ex`); reject a borrowed operand before the discharge
             // walk. // per §31.1
             checkThrowOperandNotBorrowed(*te->operand);
+            // §31.1 / §28.3.7 (A5, issue #7412): a `using var` operand cannot
+            // be moved out of. // per §31.1, A5
+            if (checkThrowOperandNotUsingVar(*te->operand)) return;
             if (const auto* ne =
                     dynamic_cast<const ast::NewExpr*>(te->operand.get())) {
                 checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
@@ -10951,6 +10954,39 @@ void MethodOwnership::checkThrowOperandNotBorrowed(const ast::Expr& operand) {
         "(\xc2\xa7""31.2.4); to propagate a caught exception's information, chain "
         "a fresh instance through its snapshot constructor \xe2\x80\x94 "
         "`throw new Exception(ex.Message, ex)` (\xc2\xa7""31.4)");
+}
+
+// §31.1 / §28.3.7 (axiom A5, v0.350; issue #7412): see the header. The operand
+// is a bare read of a `using var` local (peeling `x!`): such a binding is owned
+// but scope-pinned, "it cannot be moved out of, only borrowed from", and the
+// throw operand "is consumed as an owned value ... so a borrowed ... reference
+// is not a valid operand". The owner ruling on #7412 (reading 1) decides it:
+// `throw` is an obligation-moving kill (post-state moved-from, the obligation
+// passes to the exception machinery), i.e. a move out of the scope, which A5
+// bars; unlike `Dispose()`, which disposes in place. The state is poisoned so
+// one rejected `throw` does not cascade into scope-end diagnostics.
+// // per §31.1, §28.3.7, A5, v0.350
+bool MethodOwnership::checkThrowOperandNotUsingVar(const ast::Expr& operand) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+        lookThroughForceUnwrap(&operand));
+    if (!id || id->name == "this" || id->name == "base") return false;
+    LocalOwnership* st = lookupStateFor(*id);
+    // Owned only: a `using var` PIN over a borrow is reported by
+    // checkThrowOperandNotBorrowed as a borrowed operand already.
+    if (!st || !st->implicitDischarge ||
+        st->state != OwnershipState::Owned)
+        return false;
+    report(
+        Severity::Error, id->span.begin,
+        std::string("cannot throw `using var` `") + std::string(id->name) +
+        "`: the thrown value is consumed as an owned value passed to the "
+        "runtime's exception machinery (\xc2\xa7""31.1), and a `using var` is "
+        "scope-bound \xe2\x80\x94 it cannot be moved out of, only borrowed from "
+        "(\xc2\xa7""28.3.7, axiom A5). Declare the exception with a plain "
+        "`var` instead (`var " + std::string(id->name) +
+        " := new ...; throw " + std::string(id->name) + ";`)");
+    st->state = OwnershipState::Poisoned;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

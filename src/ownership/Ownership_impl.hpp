@@ -4354,6 +4354,19 @@ private:
     // operand's own discharge walk. // per §31.1, §17.12
     void checkThrowOperandNotBorrowed(const ast::Expr& operand);
 
+    // §31.1 / §28.3.7 (axiom A5, v0.350; issue #7412, owner ruling "reading
+    // 1"): the `throw` operand is consumed as an owned value passed to the
+    // runtime's exception machinery -- a move OUT of the binding's scope -- and
+    // "a `using var` ... cannot be moved out of, only borrowed from". So
+    // `throw c;` (and `throw c!;`) over a `using var` binding is a compile
+    // error whose remedy is to declare the exception with a plain `var`.
+    // Returns true when it reported (the caller then skips the operand's
+    // discharge, which would mark the pin disposed). `Dispose()` on a `using
+    // var` is unaffected (it disposes in place, moves nothing, §28.6). Called
+    // beside checkThrowOperandNotBorrowed from the ThrowStmt handler and the
+    // ThrowExpr handler. // per §31.1, §28.3.7, A5
+    bool checkThrowOperandNotUsingVar(const ast::Expr& operand);
+
     // §31.1 (issue #430): scan the constructor arguments of `ne` for a catch
     // borrow in a NON-OWNED parameter position. Returns the first catch-borrow
     // symbol found, or null. Only BARE identifier arguments are examined (value

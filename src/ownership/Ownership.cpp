@@ -5135,6 +5135,10 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             // re-thrown, a borrowed param, a field read, `this`) is rejected
             // here, before the discharge walk classifies it. // per §31.1
             checkThrowOperandNotBorrowed(*th->value);
+            // §31.1 / §28.3.7 (A5, v0.350, issue #7412): a `using var` operand
+            // is scope-bound and cannot be moved out of; reject it before the
+            // discharge walk would mark the pin disposed. // per §31.1, A5
+            if (checkThrowOperandNotUsingVar(*th->value)) return;
             if (const auto* ne =
                     dynamic_cast<const ast::NewExpr*>(th->value.get())) {
                 checkCatchBorrowEscapesViaNewExpr(*ne, ne->span.begin);
