@@ -6249,9 +6249,55 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // twice for one mistake.
             if (recvPt == PrimitiveType::String && mm == "Repeat" &&
                 ce.args.size() == 2) {
-                requireIntLike(0, "first argument");
-                requireIntLike(1, "(int) count");
-                const auto& cntArg = ce.args[1];
+                // fix #7129 (stdlib §9.6, v0.350): `Repeat` declares TWO
+                // static overloads, `Repeat(c: char, count: int)` and
+                // `Repeat(unit: string, count: int)`, so a `string` first
+                // argument is the second overload's `unit` -- not a type error.
+                // This check used to be the `char`-only `requireIntLike`
+                // (#1048), which rejected the declared `string` form with a
+                // message describing the OTHER overload. Only a `string`
+                // skips it; every other known type still goes through the
+                // `char` check, so `Repeat(1.5, 3)` is still refused (and a
+                // `string?` is left to `checkBuiltinCallAdmission`, which
+                // owns the §5.1 nullability question).
+                //
+                // §22.5 (v0.350): a named argument binds the parameter it
+                // NAMES, so `Repeat(count := 2, unit := "ab")` has the count
+                // FIRST. The two argument positions are therefore resolved by
+                // the shared binder over the registry's declared names (the
+                // `string.Join` gate's idiom, above); a call that does not
+                // bind keeps the positional read and `checkBuiltinNamedArgs`
+                // reports the §22.5 violation.
+                std::size_t unitArgIdx = 0;  // parameter 0: `c` / `unit`
+                std::size_t cntArgIdx = 1;   // parameter 1: `count`
+                for (const auto& f : common::builtinParamNameCandidates(
+                         tid->name, "Repeat", ce.args.size())) {
+                    BindResult br = bindArgsToParams(
+                        sema::FormalsView::ofNames(f.names, f.required), ce.args,
+                        ce.span.begin, "call to built-in `string.Repeat`",
+                        /*emit=*/false);
+                    if (!br.ok) continue;  // not this overload's binding
+                    if (br.paramToArg.size() >= 2 && br.paramToArg[0] >= 0 &&
+                        br.paramToArg[1] >= 0) {
+                        unitArgIdx = static_cast<std::size_t>(br.paramToArg[0]);
+                        cntArgIdx = static_cast<std::size_t>(br.paramToArg[1]);
+                    }
+                    break;
+                }
+                {
+                    const auto& unitArg = ce.args[unitArgIdx];
+                    const TypeRef* unitTy =
+                        (unitArg.value && !unitArg.isDiscard)
+                            ? ctx_.exprType(*unitArg.value) : nullptr;
+                    const bool unitIsString =
+                        unitTy && unitTy->kind == TypeRef::Kind::Primitive &&
+                        unitTy->primitive == PrimitiveType::String;
+                    if (!unitIsString)
+                        requireIntLike(unitArgIdx,
+                                       "or `string` first argument");
+                }
+                requireIntLike(cntArgIdx, "(int) count");
+                const auto& cntArg = ce.args[cntArgIdx];
                 if (cntArg.value && !cntArg.isDiscard) {
                     TypeRef* cntTy = ctx_.exprType(*cntArg.value);
                     if (cntTy && cntTy->kind == TypeRef::Kind::Primitive &&

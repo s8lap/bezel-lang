@@ -1770,6 +1770,36 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         std::size_t cArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
         std::size_t cntArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
         llvm::Value* ch  = lowerExpr(*call.args[cArgIdx].value);
+        // fix #7129 (stdlib §9.6, v0.350; campaign builtin-call-admission
+        // ruling R3): the SECOND declared overload,
+        // `Repeat(unit: string, count: int): string` ("same count contract;
+        // Repeat("", n) = ""). A `string` first argument selects it; the
+        // `char` overload below is unchanged. The `unit` argument is a plain
+        // (borrowed) parameter (§28.3.4), so a +1 PRODUCER argument
+        // (`"a" + "b"`, a string-returning call) is the CALLER's to discharge:
+        // the guard's throw edge releases it (the #7159 shape, through
+        // `emitSection96CountContract`'s `ownedOnThrow`), and the normal edge
+        // releases it after the runtime helper has copied the code points.
+        if (isStringExprType(*call.args[cArgIdx].value)) {
+            llvm::Value* cntS = lowerExpr(*call.args[cntArgIdx].value);
+            if (!ch || !cntS) return nullptr;
+            const bool unitOwned =
+                isPlusOneStringProducer(call.args[cArgIdx].value.get());
+            llvm::SmallVector<llvm::Value*, 1> owned;
+            if (unitOwned) owned.push_back(ch);
+            llvm::Value* cnt64 = emitSection96CountContract(
+                    call.args[cntArgIdx].value.get(), cntS, owned,
+                    "reps.s64", "reps.z64", "reps.neg");
+            // §4.6 (v0.350): the repetition is built in the code-point
+            // domain by the runtime's width-aware helper (the SAME one the
+            // instance spelling uses), so a width-2/4 unit is repeated as
+            // code points, not bytes. An empty unit yields "" for any count.
+            auto* fnS = declareC("bz_str_repeat", ptrTy(), {ptrTy(), i64()});
+            llvm::Value* rs =
+                builder_.CreateCall(fnS, {ch, cnt64}, "reps.result");
+            if (unitOwned) emitStringRelease(ch);
+            return rs;
+        }
         llvm::Value* cnt = lowerExpr(*call.args[cntArgIdx].value);
         if (!ch || !cnt) return nullptr;
         auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
