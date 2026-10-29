@@ -747,7 +747,7 @@ QUARANTINE = {
 #          .carriesObligation`, false for the borrowing family -- the predicate
 #          #7241 names. The cell is the BORROW-PIN form (a callee `using var x
 #          := src` over `src: Array<int>`), not #7241's owned-holder literal
-#          repro, so the attribution is CONFIRMED BY CODE READING of the shared
+#          repro, so the attribution is INFERRED (not proven) from the shared
 #          predicate, not by a fix;
 #   #7273  `string` `Dispose()` / `DisposeAsync()` are refused, but the
 #          diagnostic names no §28.9 (the rule the cell asserts).

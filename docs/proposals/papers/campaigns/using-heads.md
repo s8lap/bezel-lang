@@ -590,7 +590,7 @@ not counted wrong.
   #7241's attribution was re-checked: the vacuity lint's guard
   (`!rhsIsDisposableClassType`) answers `classifyDisposal(...).carriesObligation`,
   the same predicate #7241 names, but the cell is the borrow-pin form rather
-  than #7241's owned-holder repro, so it is confirmed by reading the shared
+  than #7241's owned-holder repro, so it is INFERRED (not proven) from the shared
   predicate, not by a fix. `collection_literal/copy_local_source` is NOT in
   the list (the brief's twelve exclude it), though it is likely gated by
   #7092 too.
