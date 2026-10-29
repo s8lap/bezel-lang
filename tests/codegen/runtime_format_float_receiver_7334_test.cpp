@@ -10,9 +10,12 @@
 // the format-specifier table, per KIND:
 //
 //   | Floating (`double`, `float`) | `F`/`Fn` fixed-point (n decimals,
-//     default 2) · `E`/`En` scientific (default 6) · `G`/`Gn` general
-//     (default 6) · `P`/`Pn` percent (×100, `%` suffix, default 2) · `R`
-//     round-trip | … |
+//     default 2) · `E`/`En` scientific · `G`/`Gn` general · `P`/`Pn`
+//     percent (×100, `%` suffix) · `R` round-trip | … |
+//
+// The document fixes a default digit count for `F` only. The `E`/`G`/`P`
+// defaults this test relies on (six, six, two) are the HOUSE's, from the
+// shared routine emitWithFormatSpec; the document says nothing about them.
 //
 //   | `decimal` | `F`/`Fn` · `E`/`En` · `G` · `P`/`Pn` | … |
 //

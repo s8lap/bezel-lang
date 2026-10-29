@@ -7,8 +7,10 @@
 //   - Unrecognized specifiers (e.g. "Z", "QQ") silently degraded to ToString() — must raise FormatException.
 //
 // Stdlib §2.18 decimal specifier vocabulary:
-//   F/Fn — fixed-point (n decimal places, default 2)
-//   E/En — scientific  (n decimal places in significand, default 6; 3-digit exponent; sign always printed)
+//   F/Fn — fixed-point (n decimal places; the house's default 2, which the
+//          §2.18 decimal row does not fix)
+//   E/En — scientific  (n decimal places in significand; the house's default
+//          6, which §2.18 does not fix; 3-digit exponent; sign always printed)
 //   G    — general (exact natural representation — shortest exact decimal form)
 //   P/Pn — percent (×100, fixed-point with n places, default 2, "%" suffix)
 //   Anything else → FormatException (strict-fault, §2.18/§18.5).

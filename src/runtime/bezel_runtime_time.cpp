@@ -381,7 +381,8 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
 // unrecognized or malformed specifier; callers check for nullptr and raise
 // FormatException (§2.18 strict-fault rule).
 //
-// Specifiers (per stdlib §2.18):
+// Specifiers (per stdlib §2.18; its decimal row fixes no digit counts, so the
+// defaults below are the house's, the shared emitWithFormatSpec's):
 //   F/Fn — fixed-point, n decimal places, default 2
 //   E/En — scientific notation, n places in significand, default 6;
 //           3-digit exponent; sign always printed ("exact decimal semantics")
