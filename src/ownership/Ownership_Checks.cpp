@@ -22304,6 +22304,11 @@ void MethodOwnership::annotateSuspendLocals(const flow::CFG& cfg) {
     // (`new`, an owned call, a marked `move x`) still awaits. // per §28.12,
     // §28.10, §28.3, v0.350
     auto isBorrowPinAwaitUsingSite = [this](const ast::Node* n) {
+        // LOCALDECL-ONLY: `await using var` is a LocalDecl-only form (A.6
+        // `LocalDecl` carries `isAwaitUsing`; `LocalConstDecl` has no such
+        // field and §21.1's `const` is never `using`), so a `const` local is
+        // never an await-using site; a `const` as the pin's SOURCE is read
+        // through the IdentifierExpr arm below, independent of its decl kind.
         const auto* ld = dynamic_cast<const ast::LocalDecl*>(n);
         if (!ld || !ld->isAwaitUsing || !ld->initializer ||
             ld->initializerHasOwnedMarker)
@@ -24367,6 +24372,8 @@ void stampUsingPinScopeEnds(
     if (end && end->offset > listEnd.offset) listEnd = *end;
     if (blocks && any) blocks->push_back({listBegin, listEnd.offset});
     for (const auto& s : list)
+        // LOCALDECL-ONLY: only a `using var` is stamped, and `isUsing` exists
+        // on `LocalDecl` alone; §21.1's `const` is never `using` (§28.10).
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get()))
             if (ld->isUsing) out[ld] = listEnd;
 }
