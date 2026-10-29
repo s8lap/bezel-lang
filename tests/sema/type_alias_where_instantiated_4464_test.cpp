@@ -315,7 +315,7 @@ BEZEL_TEST(type_alias_where_instantiated_4464,
         "class ProgramP18p "
         "  public static method Main(): int "
         "    var ok: Maker18p<string> := new Maker18p<string>(\"hello\"); "
-        "    return ok.Value.Length(); "
+        "    return ok.Value.Length; "
         "  end Main; "
         "end ProgramP18p;");
 }

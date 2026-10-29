@@ -257,9 +257,9 @@ BEZEL_TEST(reassignment_of_null_refuted_6346,
         "public class Program\n"
         "  public static method Main(): int\n"
         "    var s: string? := \"hi\";\n"
-        "    Console.WriteLine(s.Length());\n"
+        "    Console.WriteLine(s.Length);\n"
         "    s := null;\n"
-        "    Console.WriteLine(s.Length());\n"
+        "    Console.WriteLine(s.Length);\n"
         "    return 0;\n"
         "  end Main;\n"
         "end Program;\n");

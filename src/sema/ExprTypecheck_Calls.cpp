@@ -29742,6 +29742,40 @@ static bool builtinCollectionSurfaceDeclaresMember(const TypeRef* recvTy,
     return isDocumentedBuiltinCollectionMember(recvTy->headName(), member);
 }
 
+// fix #7373 (§26.5 rule 1, §27.1, §27.7, v0.350; stdlib §9.6): the NAMED
+// PROPERTIES of the built-in `string` head, with their declared types.
+// stdlib §9.6 declares exactly three — `Length: int`, `IsEmpty: bool` and
+// `IsAscii: bool` (the two indexers have no name) — and every other §9.6
+// member is a method. Returns null for a name that is not a §9.6 property.
+static const char* stringDeclaredPropertyType(std::string_view member) {
+    if (member == "Length") return "int";
+    if (member == "IsEmpty" || member == "IsAscii") return "bool";
+    return nullptr;
+}
+
+// fix #7373: the CALL spelling of a §9.6 property (`s.Length()`,
+// `s?.IsAscii()`) has no candidate. §26.5 rule 1 (v0.350): "If `x`'s
+// declared type (or any base type) *declares* any instance member named
+// `Foo` — of any arity, applicability, or accessibility — instance
+// resolution is committed and extension blocks are **never consulted** for
+// that name on that receiver. If the committed instance lookup then fails
+// …, the call is a compile error citing the instance member(s)". The member
+// is a property, so the call is a call THROUGH its value — §27.1 (v0.350)
+// names "a parameter, local, field, or property of function type" as the
+// function-typed callees — and the value is an `int` / `bool`, which §27.7
+// does not let a program call (the compiler's established "only
+// function-typed values are callable (§27.7)" rejection of a non-function
+// local, parameter or field, #3153 / #1138).
+static std::string stringPropertyCallMessage(std::string_view member,
+                                             const char* type) {
+    return "`" + std::string(member) + "` is a property of `string`, not a "
+           "method (stdlib §9.6: `" + std::string(member) + ": " + type +
+           "`), so this call has no candidate: the lookup commits to the "
+           "instance member (§26.5 rule 1), and only a function-typed "
+           "property can be called (§27.1, §27.7) — read it without "
+           "parentheses, `." + std::string(member) + "`";
+}
+
 // fix #7086 (§14.2, v0.340) + stdlib §4.1, §4.2, §4.12, §4.13: the SHAPE of a
 // documented builtin-collection member.
 //
@@ -34205,6 +34239,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             auto* tt = ctx_.exprType(*ma.target);
             if (tt && tt->kind == TypeRef::Kind::Primitive) {
                 if (tt->primitive == PrimitiveType::String) {
+                    // fix #7373 (§26.5 rule 1, §27.7, v0.350): the CALL
+                    // spelling of a §9.6 property is a compile error at the
+                    // member, not a permissive acceptance that codegen then
+                    // degrades to a zero-initialised slot (see
+                    // `stringPropertyCallMessage`). The bare read below is
+                    // unchanged. Typed as the property so nothing cascades.
+                    if (&ma == calleeOfCallCtx_) {
+                        if (const char* pty =
+                                stringDeclaredPropertyType(ma.member)) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0) loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                stringPropertyCallMessage(ma.member, pty));
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(
+                                         ma.member == "Length"
+                                             ? PrimitiveType::Int
+                                             : PrimitiveType::Bool));
+                            return;
+                        }
+                    }
                     if (ma.member == "Length") {
                         // stdlib §9.6: Length: int
                         ctx_.setExprType(
@@ -38876,6 +38932,30 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     // receiver TypeRef (per extensionTargetMatchesReceiver's Primitive branch),
     // so `extension int` matches an `int?` receiver, matching §26.5 semantics
     // (extension resolution uses the unwrapped base type).
+    //
+    // fix #7373 (§26.5 rule 1, §27.7, v0.350): the `?.` twin of the `.`
+    // form's §9.6-property call rejection (`s?.Length()`). It runs BEFORE
+    // the extension lookup below: `string` declares the name, so §26.5 rule
+    // 1 commits the lookup and no extension block is consulted for it.
+    if (!member && nm.target && &nm == calleeOfCallCtx_) {
+        const TypeRef* recvTy = ctx_.exprType(*nm.target);
+        if (recvTy && recvTy->kind == TypeRef::Kind::Primitive &&
+            recvTy->primitive == PrimitiveType::String) {
+            if (const char* pty = stringDeclaredPropertyType(nm.member)) {
+                SourceLocation loc = nm.span.begin;
+                if (loc.line == 0) loc = nm.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    stringPropertyCallMessage(nm.member, pty));
+                ctx_.setExprType(
+                    &nm, ctx_.primitiveTypeRef(nm.member == "Length"
+                                                   ? PrimitiveType::Int
+                                                   : PrimitiveType::Bool,
+                                               /*nullable=*/true));
+                return;
+            }
+        }
+    }
     if (!member) {
         const TypeRef* recvTy = nm.target ? ctx_.exprType(*nm.target) : nullptr;
         if (recvTy) {
