@@ -14981,6 +14981,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ctx_.exprType(*ce.args[0].value),
                                 ctx_.primitiveTypeRef(P::Object),
                                 ce.args[0].value->span.begin);
+                            // fix #7712 (§35.8, §8.6, v0.350): the `Object`
+                            // overload is a boxing position; an owning
+                            // choice / owning inline array "cannot be
+                            // boxed". Same move-only check as the #7694
+                            // Console arm (no MethodSymbol on builtins).
+                            const char* moveOnlyKind7712 = nullptr;
+                            TypeRef* argTy7712 = ctx_.exprType(*ce.args[0].value);
+                            if (argTy7712 &&
+                                common::isMoveOnlyValueType(argTy7712, ctx_,
+                                                            moveOnlyKind7712)) {
+                                checkAssignable(
+                                    argTy7712,
+                                    ctx_.primitiveTypeRef(P::Object),
+                                    ce.args[0].value->span.begin,
+                                    "argument to `StringBuilder.Append`",
+                                    ce.args[0].value.get());
+                            }
                         }
                     }
                     // fix #6807 (stdlib §3.1, v0.340): `Insert` has exactly one
