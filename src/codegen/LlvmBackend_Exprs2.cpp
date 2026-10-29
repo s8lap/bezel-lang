@@ -6781,6 +6781,19 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // calls lowerExpr on any ne.args[i].value expression, it hits the pin
         // and receives the already-computed value. §22.5 evaluation order is
         // honoured: expressions run once, in source order.
+        // fix #7498 (§22.5, v0.350): the pre-pass below PINS each argument's
+        // value so the arm's own lowerExpr returns it instead of evaluating
+        // the argument a second time (it used to discard the result:
+        // `new Semaphore(maxCount := F(), initialCount := G())` ran F, G, G, F
+        // and a reordered lambda argument leaked its first closure cell).
+        // The pins belong to THIS lowering of `ne` and are dropped when the
+        // block exits, whichever return the arm takes, so a second lowering of
+        // the same node (a monomorphized clone) never sees a stale value.
+        struct CtorArgPins {
+            std::unordered_map<const ast::Expr*, llvm::Value*>& map;
+            std::vector<const ast::Expr*> pins;
+            ~CtorArgPins() { for (const ast::Expr* e : pins) map.erase(e); }
+        } ctorArgPins{exprValueOverride_, {}};
         if (const auto* bnd = ctx_.builtinCallBinding(ne)) {
             bool isNonIdentity = false;
             for (std::size_t j = 0; j < bnd->size(); ++j) {
@@ -6790,7 +6803,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 for (const auto& arg : ne.args) {
                     if (arg.value) {
                         if (arg.isDiscard || !arg.modifier.empty()) continue;
-                        (void)lowerExpr(*arg.value);
+                        if (exprValueOverride_.count(arg.value.get())) continue;
+                        if (llvm::Value* pv = lowerExpr(*arg.value)) {
+                            exprValueOverride_[arg.value.get()] = pv;
+                            ctorArgPins.pins.push_back(arg.value.get());
+                        }
                     }
                 }
             }
@@ -6995,11 +7012,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if ((colName == "Span" || colName == "ReadOnlySpan" ||
                  colName == "ArraySpan" || colName == "ReadOnlyArraySpan") &&
                 ne.args.size() == 3 &&
-                ne.args[0].value && ne.args[1].value && ne.args[2].value) {
-                llvm::Value* src = lowerExpr(*ne.args[0].value);  // → bz_array_t*
+                ctorArgFor(0) && ctorArgFor(0)->value &&
+                ctorArgFor(1) && ctorArgFor(1)->value &&
+                ctorArgFor(2) && ctorArgFor(2)->value) {
+                // fix #7498 (§22.5, v0.350): the three parameters bind BY
+                // NAME (ctorArgFor), not by argument position.
+                llvm::Value* src = lowerExpr(*ctorArgFor(0)->value);  // → bz_array_t*
                 if (!src) return nullptr;
-                llvm::Value* start = lowerExpr(*ne.args[1].value);
-                llvm::Value* len   = lowerExpr(*ne.args[2].value);
+                llvm::Value* start = lowerExpr(*ctorArgFor(1)->value);
+                llvm::Value* len   = lowerExpr(*ctorArgFor(2)->value);
                 if (!start || !len) return nullptr;
                 if (!start->getType()->isIntegerTy(32))
                     start = builder_.CreateTrunc(start, i32(), "span.ctor.st");
@@ -7563,8 +7584,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 colName == "Set" || colName == "OwningSet") {
                 // For OwningBuffer<T>(n): the arg is the capacity / initial count.
                 // Pre-allocate n slots AND set count=n so index-assignment is valid.
-                if (colName == "OwningBuffer" && !ne.args.empty() && ne.args[0].value) {
-                    llvm::Value* nArg = lowerExpr(*ne.args[0].value);
+                // fix #7498 (§22.5, v0.350): `length` and `init` bind BY NAME
+                // (ctorArgFor), not by argument position.
+                const ast::CallArgument* obLength =
+                    colName == "OwningBuffer" ? ctorArgFor(0) : nullptr;
+                const ast::CallArgument* obInit =
+                    colName == "OwningBuffer" ? ctorArgFor(1) : nullptr;
+                if (colName == "OwningBuffer" && obLength && obLength->value) {
+                    llvm::Value* nArg = lowerExpr(*obLength->value);
                     if (!nArg) return nullptr;
                     if (!nArg->getType()->isIntegerTy(64))
                         nArg = builder_.CreateSExt(nArg, i64());
@@ -7587,7 +7614,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // T — the buffer's destructor then disposes the owned slots).
                     // Previously the init lambda was ignored and every slot stayed
                     // zero / null.
-                    if (ne.args.size() >= 2 && ne.args[1].value) {
+                    if (obInit && obInit->value) {
                         llvm::Type* elemTy = i32();
                         if (!rt->genericArgs.empty() && rt->genericArgs[0])
                             if (auto* et = lowerTypeRef(rt->genericArgs[0]))
@@ -7603,7 +7630,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         funcRef->funcParams.push_back(fp);
                         const sema::TypeRef* savedExpected = expectedFunctionType_;
                         expectedFunctionType_ = funcRef;
-                        llvm::Value* initClosure = lowerExpr(*ne.args[1].value);
+                        llvm::Value* initClosure = lowerExpr(*obInit->value);
                         expectedFunctionType_ = savedExpected;
                         if (initClosure) {
                             // for i in 0..<length: slot[i] := init(i)
@@ -8128,8 +8155,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             if (colName == "Semaphore") {
                 // Evaluate initialCount (arg 0).
                 llvm::Value* initCount = builder_.getInt32(0);
-                if (!ne.args.empty() && ne.args[0].value) {
-                    llvm::Value* v = lowerExpr(*ne.args[0].value);
+                // fix #7498 (§22.5, v0.350): `initialCount` / `maxCount` bind
+                // BY NAME (ctorArgFor), so `new Semaphore(maxCount := 5,
+                // initialCount := 2)` builds initialCount 2 / maxCount 5.
+                const ast::CallArgument* semInit = ctorArgFor(0);
+                const ast::CallArgument* semMax = ctorArgFor(1);
+                if (semInit && semInit->value) {
+                    llvm::Value* v = lowerExpr(*semInit->value);
                     if (v) {
                         if (!v->getType()->isIntegerTy(32))
                             v = builder_.CreateTrunc(v, i32());
@@ -8139,8 +8171,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // Evaluate maxCount (arg 1); default = INT_MAX if not provided.
                 llvm::Value* maxCount = builder_.getInt32(
                     std::numeric_limits<int>::max());
-                if (ne.args.size() >= 2 && ne.args[1].value) {
-                    llvm::Value* v = lowerExpr(*ne.args[1].value);
+                if (semMax && semMax->value) {
+                    llvm::Value* v = lowerExpr(*semMax->value);
                     if (v) {
                         if (!v->getType()->isIntegerTy(32))
                             v = builder_.CreateTrunc(v, i32());
@@ -8423,10 +8455,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // make five of the six modes unusable through the short form. The
             // spec gap is filed separately; a later ruling changes only this
             // constant.
+            // fix #7498 (§22.5, v0.350): `path` / `mode` / `access` bind BY
+            // NAME (ctorArgFor).
+            const ast::CallArgument* fsPath =
+                colName == "FileStream" ? ctorArgFor(0) : nullptr;
+            const ast::CallArgument* fsMode =
+                colName == "FileStream" ? ctorArgFor(1) : nullptr;
+            const ast::CallArgument* fsAccess =
+                colName == "FileStream" ? ctorArgFor(2) : nullptr;
             if (colName == "FileStream" &&
                 (ne.args.size() == 2 || ne.args.size() == 3) &&
-                ne.args[0].value && ne.args[1].value) {
-                llvm::Value* pathStr = lowerExpr(*ne.args[0].value);
+                fsPath && fsPath->value && fsMode && fsMode->value) {
+                llvm::Value* pathStr = lowerExpr(*fsPath->value);
                 if (!pathStr) return nullptr;
                 llvm::Value* pathData = loadStringData(pathStr);
                 llvm::Value* pathLen  = loadStringLen(pathStr);
@@ -8437,11 +8477,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         return builder_.CreateZExt(v, i32());
                     return nullptr;
                 };
-                llvm::Value* mode = toI32(lowerExpr(*ne.args[1].value));
+                llvm::Value* mode = toI32(lowerExpr(*fsMode->value));
                 if (!mode) return nullptr;
                 llvm::Value* access = builder_.getInt32(2);  // FileAccess.ReadWrite
-                if (ne.args.size() == 3 && ne.args[2].value) {
-                    access = toI32(lowerExpr(*ne.args[2].value));
+                if (fsAccess && fsAccess->value) {
+                    access = toI32(lowerExpr(*fsAccess->value));
                     if (!access) return nullptr;
                 }
                 auto* openFn = declareC("bz_filestream_open", ptrTy(),
@@ -8665,9 +8705,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // new BinaryDeserializer(span, ignoreUnknownFields: bool)
             // The span arg is an { ptr, i32, i32 } struct value; we extract
             // the backing data pointer and byte count.
-            if (colName == "BinaryDeserializer" && !ne.args.empty()) {
-                if (!ne.args[0].value) return nullptr;
-                llvm::Value* spanVal = lowerExpr(*ne.args[0].value);
+            // fix #7498 (§22.5, v0.350): `input` / `ignoreUnknownFields` bind
+            // BY NAME (ctorArgFor).
+            const ast::CallArgument* bdInput =
+                colName == "BinaryDeserializer" ? ctorArgFor(0) : nullptr;
+            const ast::CallArgument* bdIgnore =
+                colName == "BinaryDeserializer" ? ctorArgFor(1) : nullptr;
+            if (colName == "BinaryDeserializer" && bdInput) {
+                if (!bdInput->value) return nullptr;
+                llvm::Value* spanVal = lowerExpr(*bdInput->value);
                 if (!spanVal) return nullptr;
                 // Extract source ptr (field 0) and length i32 (field 2) from the span.
                 llvm::Value* dataPtr = spanSource(spanVal);  // ptr to raw bytes
@@ -8697,8 +8743,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     llvm::Type::getInt8Ty(llvm_), arrData, startI64, "bindeser.bdata");
                 // ignoreUnknownFields: second arg if present (bool, default 0)
                 llvm::Value* ignoreFld = builder_.getInt8(0);
-                if (ne.args.size() >= 2 && ne.args[1].value) {
-                    llvm::Value* bv = lowerExpr(*ne.args[1].value);
+                if (bdIgnore && bdIgnore->value) {
+                    llvm::Value* bv = lowerExpr(*bdIgnore->value);
                     if (bv)
                         ignoreFld = builder_.CreateZExt(bv, i8(), "deser.ign");
                 }
@@ -8711,9 +8757,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // new JsonDeserializer(input: string) or
             // new JsonDeserializer(input: ReadOnlySpan<byte>, options: JsonOptions)
             // fix #687: extract JsonOptions from second arg when present.
-            if (colName == "JsonDeserializer" && !ne.args.empty() && ne.args[0].value) {
+            // fix #7498 (§22.5, v0.350): `input` / `options` bind BY NAME
+            // (ctorArgFor).
+            const ast::CallArgument* jdInput =
+                colName == "JsonDeserializer" ? ctorArgFor(0) : nullptr;
+            const ast::CallArgument* jdOptions =
+                colName == "JsonDeserializer" ? ctorArgFor(1) : nullptr;
+            if (colName == "JsonDeserializer" && jdInput && jdInput->value) {
                 // Check the first argument type to determine span vs string.
-                auto* argTy = ctx_.exprType(*ne.args[0].value);
+                auto* argTy = ctx_.exprType(*jdInput->value);
                 bool isString = argTy &&
                     argTy->kind == sema::TypeRef::Kind::Primitive &&
                     argTy->primitive == sema::PrimitiveType::String;
@@ -8722,8 +8774,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* ignoreFld   = builder_.getInt8(0);   // IgnoreUnknownFields
                 llvm::Value* allowTrail  = builder_.getInt8(0);   // AllowTrailingCommas
                 llvm::Value* maxDepthVal = builder_.getInt32(64); // MaxDepth
-                if (ne.args.size() >= 2 && ne.args[1].value) {
-                    llvm::Value* optsVal = lowerExpr(*ne.args[1].value);
+                if (jdOptions && jdOptions->value) {
+                    llvm::Value* optsVal = lowerExpr(*jdOptions->value);
                     if (optsVal) {
                         ignoreFld   = jsonOptIgnoreUnknown(optsVal);
                         allowTrail  = jsonOptAllowTrailing(optsVal);
@@ -8732,7 +8784,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 if (isString) {
                     // new JsonDeserializer(string) — string is a bz_string*.
-                    llvm::Value* strPtr = lowerExpr(*ne.args[0].value);
+                    llvm::Value* strPtr = lowerExpr(*jdInput->value);
                     if (!strPtr) return nullptr;
                     auto* utf8zFn = declareC("bz_string_to_utf8z", ptrTy(), {ptrTy()});
                     llvm::Value* utf8z = builder_.CreateCall(utf8zFn, {strPtr}, "jder.utf8z");
@@ -8747,7 +8799,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         "jder.new");
                 } else {
                     // new JsonDeserializer(ReadOnlySpan<byte>[, options]) — unpack span.
-                    llvm::Value* spanVal = lowerExpr(*ne.args[0].value);
+                    llvm::Value* spanVal = lowerExpr(*jdInput->value);
                     if (!spanVal) return nullptr;
                     llvm::Value* dataPtr = spanSource(spanVal);
                     llvm::Value* lenI32  = spanLength(spanVal);

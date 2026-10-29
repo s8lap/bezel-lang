@@ -825,7 +825,7 @@ constexpr std::array<BuiltinParamRow, 321> kBuiltinParams = {{
     {"JsonSerializer", "", 1, 1, 0x00, {"options", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"JsonDeserializer", "", 1, 1, 0x00, {"input", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"JsonDeserializer", "", 2, 2, 0x00, {"input", "options", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"BinaryDeserializer", "", 2, 2, 0x00, {"input", "ignoreUnknownFields", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"BinaryDeserializer", "", 2, 1, 0x00, {"input", "ignoreUnknownFields", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"SByte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): sbyte"},
     {"SByte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): sbyte"},
     {"SByte", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): sbyte"},
