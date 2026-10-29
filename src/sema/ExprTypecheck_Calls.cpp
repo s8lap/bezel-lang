@@ -39578,6 +39578,35 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                                           /*nullable=*/true));
             return;
         }
+        // fix #7670 (§26.5 rule 1, v0.350; stdlib §1 "Block-by-name", §4.4):
+        // the `?.` twin of #3342's / #7597's refusal. The receiver's declared
+        // type declares `Count` as an arity-0 property, so instance resolution
+        // is committed by NAME and the §5 predicate `Count(pred)` is
+        // unreachable; a call that supplies arguments is the "instance lookup
+        // commits, then fails" compile error. Without it the `?.` call was
+        // left untyped and degraded to zero (#2434). The heads are the same
+        // two sources the `.` form commits on: the interface heads (#7446) and
+        // the concrete heads' declared surface (#7700).
+        if (!member && recvTy && &nm == calleeOfCallCtx_ &&
+            currentCallArity_ > 0 && nm.member == "Count" &&
+            (builtinCollectionSurfaceDeclaresMember(recvTy, nm.member) ||
+             builtinConcreteCollectionDeclaresMember(recvTy, nm.member))) {
+            SourceLocation loc = nm.span.begin;
+            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("`") + std::string(nm.member) + "` on `" +
+                    std::string(recvTy->headName()) +
+                    "` is an instance member of the receiver's declared "
+                    "type; an extension of the same name is unreachable "
+                    "(spec §26.5 rule 1: instance members block same-named "
+                    "extensions of any arity, applicability, or "
+                    "accessibility). The instance member takes no "
+                    "arguments, but this call supplies " +
+                    std::to_string(currentCallArity_) + ". " +
+                    extensionNameBlockedNote(recvTy, nm.member));
+            return;
+        }
         // fix #6024 (§7.5, v0.338): `c?.Count` / `c?.Length` on a built-in
         // collection/string head. The `.` form types these `int` in
         // resolveMemberAccess; the `?.` form left them untyped (every
