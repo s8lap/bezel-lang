@@ -27872,6 +27872,36 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #7464 / stdlib §2.3 / spec §28.9 (v0.350): `Convert.ToString(value)`
+    // and `Convert.ToString(value, toBase)`. Every overload of the one-argument
+    // form renders its primitive operand through `emitPrimitiveToString` (a
+    // fresh rc := 1 header + data buffer, or an immortal sentinel for a `bool`),
+    // and the two-argument radix form mints the same rc := 1 `bz.string` inline
+    // (the `rd.obj` / `initStringRc` block of `tryLowerBuiltinClassCall`'s
+    // `Convert` arm). Neither was recognized here, so every consumer treated the
+    // result as a BORROW and never discharged the producer's +1: a plain
+    // `Console.WriteLine(Convert.ToString(7))` leaked 34 bytes in 2 allocations
+    // per call (MEASURED, looped 100x under ASan). A sentinel result is a no-op
+    // under every release. Matched like the `string.Join` / `From` arms above
+    // (a CallExpr on the `Convert` type keyword), but a USER type that merely
+    // spells `Convert` (receiver symbol is a user-declared type, or the callee
+    // resolved to a MethodSymbol) is NOT this builtin.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if ((call->args.size() == 1 || call->args.size() == 2) && call->callee &&
+            !calleeResolvedBySema(*call, ctx_)) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target &&
+                    !sema::isUserDeclaredTypeSym(ctx_.exprSymbol(*ma->target))) {
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get())) {
+                        if (tid->name == "Convert")
+                            return true;  // emitPrimitiveToString / rd.obj → rc=1
+                    }
+                }
+            }
+        }
+    }
     // #2199 / stdlib §9.6 / §4.6 / §28.9 (v0.220): the stdlib `string` INSTANCE
     // methods that transform self into a fresh heap `bz.string` at rc := 1. Each
     // lowers (in tryLowerStringMethod, LlvmBackend_String.cpp) to either an inline
