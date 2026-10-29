@@ -3258,15 +3258,27 @@ void Resolver::checkUserDeclaredDispose() {
     // filter), as §28.2 requires ("Interfaces are unaffected").
     if (!ctx_.module()) return;
     forEachTypeAndNested([&](TypeSymbol* t) {
-        if (t->kind != ast::TypeDeclKind::Class &&
-            t->kind != ast::TypeDeclKind::Record)
-            return;
+        // fix #7517 (§8.7, §28.2, v0.350; owner ruling (b)): §8.7 makes
+        // `Dispose()` a member of a class, of an IDisposable interface, and
+        // "of nothing else"; enums and choices "do not implement
+        // `IDisposable`". A user `Dispose` on an enum or a choice (value-like
+        // or owning) would give such a type a member §8.7 says it lacks, and
+        // on an owning choice would collide with the compiler-generated
+        // disposal. Same diagnostic as class / record; interfaces stay out.
+        const char* kindWord = nullptr;
+        switch (t->kind) {
+        case ast::TypeDeclKind::Class: kindWord = "class"; break;
+        case ast::TypeDeclKind::Record: kindWord = "record"; break;
+        case ast::TypeDeclKind::Enum: kindWord = "enum"; break;
+        case ast::TypeDeclKind::Choice: kindWord = "choice"; break;
+        default: return;
+        }
         for (Symbol* m : t->members) {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
             if (!ms || ms->name != "Dispose") continue;
             ctx_.diagnostics().report(
                 Severity::Error, ms->declLoc,
-                std::string(t->kind == ast::TypeDeclKind::Record ? "record" : "class") +
+                std::string(kindWord) +
                 " `" + std::string(t->name) +
                 "` may not declare a `Dispose` method directly (§28.2): "
                 "the compiler synthesises `Dispose()` from the `destructor`; "
