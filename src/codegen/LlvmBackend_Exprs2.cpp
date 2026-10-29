@@ -6964,6 +6964,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     return nullptr;
                 return &ne.args[static_cast<std::size_t>(argIdx)];
             };
+            // fix #7784 (§5.1, §22.6, stdlib §2.5, v0.350): an `int`
+            // parameter of the DateTime / DateOnly / TimeOnly constructors is
+            // passed to the runtime as i32.  An argument of a NARROWER integer
+            // type (`byte`, `sbyte`, `short`, `ushort`) is a legal §5.1
+            // widening and must be EXTENDED by its own signedness — the old
+            // unconditional `CreateTrunc` was an invalid `trunc i8 to i32`
+            // (an IR-verifier abort).  A wider integer keeps the truncation.
+            auto ctorIntToI32 = [&](llvm::Value* v,
+                                    const ast::Expr& argExpr) -> llvm::Value* {
+                llvm::Type* vt = v->getType();
+                if (!vt->isIntegerTy() || vt->isIntegerTy(32)) return v;
+                if (vt->getIntegerBitWidth() < 32)
+                    return typeRefIsUnsigned(ctx_.exprType(argExpr))
+                               ? builder_.CreateZExt(v, i32())
+                               : builder_.CreateSExt(v, i32());
+                return builder_.CreateTrunc(v, i32());
+            };
             // Determine element size from the first generic arg (if present).
             // For pointer-typed elements (class, string) → sizeof(ptr) = 8.
             // For int → 4, long → 8, double → 8, bool → 1, etc.
@@ -8545,9 +8562,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         return builder_.getInt32(0);
                     llvm::Value* v = lowerExpr(*a->value);
                     if (!v) return builder_.getInt32(0);
-                    if (!v->getType()->isIntegerTy(32))
-                        v = builder_.CreateTrunc(v, i32());
-                    return v;
+                    return ctorIntToI32(v, *a->value);
                 };
                 llvm::Value* yr  = getI32(0);
                 llvm::Value* mo  = getI32(1);
@@ -8582,9 +8597,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         return builder_.getInt32(1);
                     llvm::Value* v = lowerExpr(*a->value);
                     if (!v) return builder_.getInt32(1);
-                    if (!v->getType()->isIntegerTy(32))
-                        v = builder_.CreateTrunc(v, i32());
-                    return v;
+                    return ctorIntToI32(v, *a->value);
                 };
                 llvm::Value* yr  = getI32do(0);
                 llvm::Value* mo  = getI32do(1);
@@ -8610,9 +8623,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         return builder_.getInt32(0);
                     llvm::Value* v = lowerExpr(*a->value);
                     if (!v) return builder_.getInt32(0);
-                    if (!v->getType()->isIntegerTy(32))
-                        v = builder_.CreateTrunc(v, i32());
-                    return v;
+                    return ctorIntToI32(v, *a->value);
                 };
                 llvm::Value* hr  = getI32to(0);
                 llvm::Value* mn  = getI32to(1);
