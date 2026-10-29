@@ -12590,7 +12590,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 "each element out first (`Drain()`, the `Pop*` "
                                 "family, or `move coll[i]`) into an owned binding");
                         } else {
-                        auto allowedNonOwningMethod = [](std::string_view mm) -> bool {
+                        auto allowedNonOwningMethod = [colName](std::string_view mm) -> bool {
                             return
                                 // §4.x native non-owning surface (union over
                                 // Array/Stack/Queue/Set/LinkedList/Dictionary).
@@ -12601,7 +12601,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "RemoveFirst" || mm == "RemoveLast" ||
                                 mm == "RemoveNode" || mm == "Clear" ||
                                 mm == "Contains" || mm == "ContainsKey" ||
-                                mm == "IndexOf" || mm == "Find" || mm == "Sort" ||
+                                mm == "IndexOf" || (mm == "LastIndexOf" && colName == "Array") ||
+                                mm == "Find" || mm == "Sort" ||
                                 mm == "Reverse" || mm == "Push" || mm == "Pop" ||
                                 mm == "Peek" || mm == "TryPop" || mm == "TryPeek" ||
                                 mm == "Enqueue" || mm == "Dequeue" ||
@@ -13043,6 +13044,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     "use `Contains`, and for an index on an "
                                     "ordered source materialize it as "
                                     "`s.ToArray()` first");
+                            }
+                        }
+                        // fix #7671 (stdlib §4.4, v0.350): `Array<T>` declares
+                        // `public method LastIndexOf(item: T): int;` ("last
+                        // occurrence, or -1"). `OwningArray<T>` (§4.5) does
+                        // not, and none of the other isArrLike heads do.
+                        else if (m == "LastIndexOf") {
+                            if (colName == "Array" && ce.args.size() == 1) {
+                                ctx_.setExprType(&ce,
+                                                 ctx_.primitiveTypeRef(P::Int));
+                            } else if (colName == "Array") {
+                                // §4.4 gives `LastIndexOf` exactly one
+                                // parameter; any other arity is no member.
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "no member `LastIndexOf` taking " +
+                                    std::to_string(ce.args.size()) +
+                                    " argument(s) on `Array<T>` (stdlib "
+                                    "§4.4): `LastIndexOf` takes exactly one "
+                                    "argument, `item: T`");
+                            } else {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("no member `LastIndexOf` on `") +
+                                    std::string(colName) +
+                                    "<T>` (stdlib §22.5 / §4.x) — "
+                                    "`LastIndexOf` is declared only by "
+                                    "`Array<T>` (§4.4)");
                             }
                         }
                         // per §5 LINQ: Any/All → bool, Count(pred) → int

@@ -12,9 +12,10 @@
 // must see the body run use an `Equals` that prints; the data-reading rows use
 // `X mod 10`, so 5 / 15 / 25 / 35 are one key and 16 / 26 another.
 //
-// Not covered here, by design: `LastIndexOf` is not implemented by the compiler
-// at all (#2242), and `.Contains` / `.Remove` through `ICollection<T>` /
-// `IList<T>` is refused in codegen (#853); neither is this lowering.
+// Not covered here, by design: `Array<T>.LastIndexOf` has its own tests
+// (array_lastindexof_7671), and `.Contains` / `.Remove` through
+// `ICollection<T>` / `IList<T>` is refused in codegen (#853); neither is this
+// lowering.
 
 #include <string>
 

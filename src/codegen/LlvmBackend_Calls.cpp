@@ -7707,7 +7707,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // `!arrIsOwning` is the `Array<T>`-only gate. An `OwningArray` receiver
         // with two arguments keeps its existing behaviour rather than gaining
         // surface the document does not declare.
-        if (m == "IndexOf" &&
+        // fix #7671 (stdlib §4.4, v0.350): `Array<T>.LastIndexOf(item: T): int`
+        // — "last occurrence, or -1. Equality is Equals for both, as IndexOf".
+        // It shares this arm: the same query materialization and element
+        // equality, scanned from `Count - 1` down to 0. Only the `Array` head
+        // declares it: `OwningArray<T>` (§4.5), `FrozenArray<T>` (§4.19) and the
+        // other array-backed heads do not, so none of them takes this arm.
+        const bool isLastIndexOf = m == "LastIndexOf" && call.args.size() == 1 &&
+                                   recvTy && recvTy->headName() == "Array";
+        if ((isLastIndexOf || m == "IndexOf") &&
             (call.args.size() == 1 ||
              (call.args.size() == 2 && call.args[1].value && !arrIsOwning)) &&
             call.args[0].value) {
@@ -7750,6 +7758,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 startIdx = s;
             }
             auto* idxSlot = entryAlloca(i64());
+            if (isLastIndexOf)
+                startIdx = builder_.CreateSub(len, builder_.getInt64(1), "iof.last");
             builder_.CreateStore(startIdx, idxSlot);
             auto* condBB  = llvm::BasicBlock::Create(llvm_, "iof.c", currentFn_);
             auto* bodyBB  = llvm::BasicBlock::Create(llvm_, "iof.b", currentFn_);
@@ -7759,7 +7769,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(condBB);
             llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
+            builder_.CreateCondBr(isLastIndexOf
+                                       ? builder_.CreateICmpSGE(idx, builder_.getInt64(0))
+                                       : builder_.CreateICmpSLT(idx, len), bodyBB, endBB);
             builder_.SetInsertPoint(bodyBB);
             auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             llvm::Value* ep = builder_.CreateCall(ptrFn, {recv, idx, builder_.getInt64(esz)});
@@ -7772,7 +7784,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* result64 = idx;
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(nextBB);
-            builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateStore(isLastIndexOf
+                                       ? builder_.CreateSub(idx, builder_.getInt64(1))
+                                       : builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
             auto* phiIdx = builder_.CreatePHI(i64(), 2, "iof.r");
