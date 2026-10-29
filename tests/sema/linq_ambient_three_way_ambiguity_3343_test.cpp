@@ -49,6 +49,8 @@
 #include "sema/ExprTypecheck.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_result_asserts.hpp"
+#include "support/aot_support.hpp"
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
 
@@ -284,10 +286,15 @@ BEZEL_TEST(sema_lin_q_ambient_three_way_ambiguity_3343,
         "extension IEnumerable<T> public method Contains(value: T): bool => false; end; "
         "extension IEnumerable<int> public method Contains(value: int): bool => false; end; "
         "class C public static method Main(): int "
-        "  using var xs := new Array<int>(); "
+        "  return 0; "
+        "end Main; "
+        // `IEnumerable<int>` declares only `GetEnumerator` (stdlib, System.Collections), so
+        // no instance `Contains` commits resolution (§26.5 rule 1, v0.350):
+        // an `Array<int>` receiver would, since `Array<T>` declares it.
+        "public static method F(xs: IEnumerable<int>): int "
         "  if xs.Contains(5) then return 1; end; "
         "  return 0; "
-        "end Main; end C;");
+        "end F; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     std::string msg;
     BEZEL_EXPECT_TRUE(findAmbiguity(r, &msg));
@@ -306,4 +313,25 @@ BEZEL_TEST(sema_lin_q_ambient_three_way_ambiguity_3343,
     // uniformly to stdlib and user candidates.
     BEZEL_EXPECT_TRUE(msg.find("where T: hashable") != std::string::npos);
     BEZEL_EXPECT_TRUE(msg.find("narrow the import") == std::string::npos);
+}
+// ============================================================================
+// Companion to the row above: with the SAME two user `Contains` extensions,
+// an `Array<int>` receiver commits to `Array<T>.Contains` (stdlib §4.4
+// declares it), so extension blocks are never consulted for the name and no
+// ambiguity arises (§26.5 rule 1, v0.350). The call compiles and prints the
+// instance result (`true` for a present element), not the extensions' `false`.
+// ============================================================================
+BEZEL_TEST(sema_lin_q_ambient_three_way_ambiguity_3343,
+           contains_on_array_receiver_commits_to_instance_member) {
+    auto r = bezel::test::runAot(
+        "module M;\n"
+        "extension IEnumerable<T> public method Contains(value: T): bool => false; end;\n"
+        "extension IEnumerable<int> public method Contains(value: int): bool => false; end;\n"
+        "class C public static method Main(): int\n"
+        "  var xs: Array<int> := [1, 2, 3];\n"
+        "  Console.WriteLine(xs.Contains(2));\n"
+        "  return 0;\n"
+        "end Main; end C;\n");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, "True\n");
 }

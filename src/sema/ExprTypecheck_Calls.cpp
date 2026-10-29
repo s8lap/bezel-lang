@@ -29935,6 +29935,133 @@ static bool builtinCollectionSurfaceDeclaresMember(const TypeRef* recvTy,
     return isDocumentedBuiltinCollectionMember(recvTy->headName(), member);
 }
 
+// fix #7700 (§26.5 rule 1, v0.350; stdlib §4.4-§4.11, §4.17-§4.19): the
+// INSTANCE members a CONCRETE built-in collection head declares, counting the
+// interfaces it conforms to.
+//
+// Spec §26.5 rule 1 (v0.350): "If `x`'s declared type (or any base type)
+// *declares* any instance member named `Foo` — of any arity, applicability,
+// or accessibility — instance resolution is committed and extension blocks
+// are **never consulted** for that name on that receiver."
+//
+// `isDocumentedBuiltinCollectionMember` answers this for the eight collection
+// INTERFACE heads only; the concrete heads (`Array`, `Set`, `Dictionary`, ...)
+// carry no TypeSymbol either, so the ordinary `lookupMember` walk cannot ask
+// the question for them, and the extension fallthrough in resolveMemberAccess
+// typed `a.Contains(2)` by a user `extension Array<int>` member — with the
+// built-in's `bool` in whatever the extension's return type said (#7700).
+//
+// ONE row per head, each the head's OWN members (stdlib §4.x class block)
+// plus the members it INHERITS from the interfaces its `class` line names
+// (`Array<T>: IList<T>` brings `Count`, `IsReadOnly`, `Add`, `Clear`,
+// `Contains`, `Remove`, `Insert`, `GetEnumerator`; `OwningArray<T>:
+// IOwningList<T>, IOwningEnumerable<T>` additionally `Dispose` and
+// `GetOwningEnumerator`; `Stack<T>`/`Queue<T>` and their owning forms
+// conform to `IReadOnlyCollection<T>` ONLY, so no `Add`/`Remove`/`IsReadOnly`
+// — stdlib §4.11 *Surface coherence*; `Dictionary<K, V>:
+// ICollection<DictionaryEntry<K, V>>`, `OwningDictionary<K, V>: IDisposable`
+// alone). Static members (`FromCollectionLiteral`, `FrozenArray.From`) are
+// not instance members and are not listed. The universal `Object` members
+// (spec §8.1) are not listed either, as in the interface table: they are
+// not what the stdlib §4 listing declares.
+//
+namespace {
+struct ConcreteCollectionSurface {
+    std::string_view head;
+    std::vector<std::string_view> members;
+};
+}  // namespace
+
+static const std::vector<ConcreteCollectionSurface>&
+concreteCollectionSurfaces() {
+    // The owning forms' shared IOwningCollection<T> / IDisposable members are
+    // spelled out in each row so a row reads as the stdlib's own declaration.
+    static const std::vector<ConcreteCollectionSurface> kRows = {
+        {"Array",
+         {"Add", "AddRange", "AsReadOnlySpan", "AsSpan", "Capacity", "Clear",
+          "Contains", "Count", "GetEnumerator", "IndexOf", "Insert",
+          "IsReadOnly", "LastIndexOf", "Remove", "RemoveAt", "Reverse",
+          "Reversed", "Slice", "Sort", "Sorted", "ToArray"}},
+        {"Dictionary",
+         {"Add", "Clear", "Contains", "ContainsKey", "Count", "GetEnumerator",
+          "GetOrAdd", "GetOrNull", "IsReadOnly", "Keys", "Remove", "TryAdd",
+          "TryGetValue", "Values"}},
+        {"FrozenArray", {"GetEnumerator", "Length", "ToArray"}},
+        {"LinkedList",
+         {"Add", "AddAfter", "AddBefore", "AddFirst", "AddLast", "Clear",
+          "Contains", "Count", "Find", "First", "FirstNode", "GetEnumerator",
+          "IsReadOnly", "Last", "LastNode", "Remove", "RemoveFirst",
+          "RemoveLast", "RemoveNode"}},
+        {"OwningArray",
+         {"Add", "AddRange", "Capacity", "Clear", "Contains", "Count", "Dispose",
+          "Drain", "GetEnumerator", "GetOwningEnumerator", "IndexOf", "Insert",
+          "IsReadOnly", "PopAt", "PopFirst", "PopLast", "Remove", "RemoveAt",
+          "Reverse", "Sort", "TryPopFirst", "TryPopLast"}},
+        {"OwningDictionary",
+         {"Add", "Clear", "Contains", "ContainsKey", "Count", "Dispose", "Drain",
+          "GetOrAdd", "GetOrNull", "Keys", "PopValue", "Remove", "TryAdd",
+          "TryGetValue", "TryPopValue", "Values"}},
+        {"OwningLinkedList",
+         {"Add", "AddAfter", "AddBefore", "AddFirst", "AddLast", "Clear",
+          "Contains", "Count", "Dispose", "Drain", "Find", "First", "FirstNode",
+          "GetEnumerator", "IsReadOnly", "Last", "LastNode", "PopFirst",
+          "PopLast", "Remove", "RemoveFirst", "RemoveLast", "RemoveNode",
+          "TryPopFirst", "TryPopLast"}},
+        {"OwningQueue",
+         {"Clear", "Contains", "Count", "Dequeue", "Drain", "Enqueue",
+          "GetEnumerator", "Peek", "TryDequeue", "TryPeek"}},
+        {"OwningSet",
+         {"Add", "Clear", "Contains", "Count", "Dispose", "Drain", "ExceptWith",
+          "GetEnumerator", "IntersectWith", "IsReadOnly", "IsSubsetOf",
+          "IsSupersetOf", "Pop", "Remove", "TryAdd", "TryPop", "UnionWith"}},
+        {"OwningStack",
+         {"Clear", "Contains", "Count", "Drain", "GetEnumerator", "Peek", "Pop",
+          "Push", "TryPeek", "TryPop"}},
+        {"Queue",
+         {"Clear", "Contains", "Count", "Dequeue", "Enqueue", "GetEnumerator",
+          "Peek", "TryDequeue", "TryPeek"}},
+        {"Set",
+         {"Add", "Clear", "Contains", "Count", "ExceptWith", "GetEnumerator",
+          "IntersectWith", "IsReadOnly", "IsSubsetOf", "IsSupersetOf", "Remove",
+          "TryAdd", "UnionWith"}},
+        {"SortedDictionary",
+         {"Add", "Clear", "Contains", "ContainsKey", "Count", "FirstKey",
+          "GetEnumerator", "GetOrNull", "LastKey", "Remove", "TryAdd",
+          "TryGetValue"}},
+        {"SortedSet",
+         {"Add", "Clear", "Contains", "Count", "First", "GetEnumerator", "Last",
+          "Remove", "TryAdd"}},
+        {"Stack",
+         {"Clear", "Contains", "Count", "GetEnumerator", "Peek", "Pop", "Push",
+          "TryPeek", "TryPop"}},
+    };
+    return kRows;
+}
+
+// True when `head` is a concrete built-in collection head whose declared
+// instance surface (stdlib §4.4-§4.11, §4.17-§4.19) names `member`.
+static bool isDocumentedConcreteCollectionMember(std::string_view head,
+                                                 std::string_view member) {
+    for (const auto& row : concreteCollectionSurfaces()) {
+        if (row.head != head) continue;
+        return std::find(row.members.begin(), row.members.end(), member) !=
+               row.members.end();
+    }
+    return false;
+}
+
+// fix #7700 (§26.5 rule 1, v0.350): the receiver is a concrete built-in
+// collection and its declared surface names `member`, so instance resolution
+// is committed by NAME and the extension blocks are never consulted. Like
+// `builtinCollectionSurfaceDeclaresMember`, the receiver must be the
+// declaration-less built-in head, not a user type that reuses the name.
+static bool builtinConcreteCollectionDeclaresMember(const TypeRef* recvTy,
+                                                    std::string_view member) {
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return false;
+    return isDocumentedConcreteCollectionMember(recvTy->headName(), member);
+}
+
 // fix #7373 (§26.5 rule 1, §27.1, §27.7, v0.350; stdlib §9.6): the NAMED
 // PROPERTIES of the built-in `string` head, with their declared types.
 // stdlib §9.6 declares exactly three — `Length: int`, `IsEmpty: bool` and
@@ -36548,6 +36675,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // Any other committed member: the extension blocks are
                     // not consulted, and the member's own typing (where the
                     // compiler has one) stands as it is.
+                } else if (builtinConcreteCollectionDeclaresMember(
+                               recvTy, ma.member)) {
+                    // fix #7700 (§26.5 rule 1, v0.350): the same commitment
+                    // for a CONCRETE built-in collection head (`Array`,
+                    // `Set`, `Dictionary`, ...). The extension blocks are
+                    // not consulted for a name the head declares, whatever
+                    // the extension's arity; the call is typed by the
+                    // built-in's own signature (stdlib §4.x), so a program
+                    // that stores the declared `bool` of `a.Contains(2)` in
+                    // the extension's `string` is rejected.
                 } else {
                 // §26.5 (#714): pass outBinding to capture the free-var
                 // binding when a generic extension matched via ancestor lookup.
