@@ -2116,8 +2116,18 @@ void ExprTC::checkBuiltinCtorNamedArgs(const ast::NewExpr& ne,
             if (!a.value || a.isDiscard || !a.modifier.empty() ||
                 a.name.empty())
                 continue;
+            // fix #7783 (§22.5, §7.3, v0.350): the query's `argCount` is the
+            // count of the DECLARATION the call selects, not the count of
+            // arguments written — a named argument may bind a parameter PAST
+            // the written count (`new DateTime(2020,1,1,1,1,1, kind := k)`
+            // writes 7 arguments and binds position 7; `new TimeOnly(1, 2,
+            // millisecond := m)` writes 3 and binds position 3), where the
+            // query's `position < argCount` clause answered "not claimed" and
+            // the null reached the parameter unchecked. The bound position
+            // itself is the least count that reaches it.
+            const std::size_t selCount = std::max(ne.args.size(), j + 1);
             if (!common::builtinParamIsNonNullable(head, /*member=*/"",
-                                                   ne.args.size(), j))
+                                                   selCount, j))
                 continue;
             reportBuiltinArgIfNullable(a.value.get(), what);
             publishNarrowedBuiltinArg(a.value.get());
