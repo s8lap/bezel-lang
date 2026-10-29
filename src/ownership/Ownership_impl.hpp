@@ -502,6 +502,19 @@ public:
                                const ast::TypeDecl* enclosingType = nullptr);
     void checkAutoPropertyInitializer(const ast::PropertyDecl& pd);
 
+    // issue #7693 (see #6233, #7541; §15.3 *Parameter passing* / *Whole-value
+    // reassignment*, v0.350): the argument-position field-read checks
+    // (`rejectMoveOnlyFieldReadArg` and the owned-sink field-read leg of
+    // `checkOwnedArgSource`) are state-free, so one structural walk drives them
+    // at EVERY call / constructor argument inside a member — an `if` / `elif` /
+    // `while` condition, a `case` scrutinee or guard, a `throw` operand, an
+    // expression body, a field initializer, a property accessor, a lambda
+    // body — instead of only at the positions the dataflow's binding /
+    // discharge walks happen to route through `recordMovesIn`. Run after the
+    // dataflow, so a diagnostic it already reported is not repeated
+    // (`reportOnce`). // per §15.3, §28.8.1
+    void scanMemberForFieldReadArgs(const ast::Member& m);
+
     // §28.3 SB01-B (v0.190, #1919/#1926): the callee-side borrow-return
     // prohibition on a plain (non-`async`) `Task`-family return applies to
     // LAMBDA / function-value bodies wherever they appear — the spec is explicit
@@ -5266,6 +5279,25 @@ private:
     bool rejectMoveOnlyFieldReadArg(const ast::CallArgument& a,
                                     const ast::Expr* callee,
                                     bool formalIsOwned);
+
+    // issue #7693: the structural-walk half (see `scanMemberForFieldReadArgs`).
+    // `scanFieldReadArgsInCall` classifies one call's arguments against the
+    // callee's formals (a resolved method / constructor / choice case, or the
+    // parameter list of a FUNCTION-TYPED value callee) and drives the two
+    // field-read recorders; the Stmt / Expr walkers reach every sub-expression,
+    // lambda bodies included. // per §15.3, §28.8.1
+    void scanFieldReadArgsInStmt(const ast::Stmt& s);
+    void scanFieldReadArgsInStmts(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void scanFieldReadArgsInExpr(const ast::Expr& e);
+    void scanFieldReadArgsInArgs(const std::vector<ast::CallArgument>& args);
+    void scanFieldReadArgsInCall(const ast::Expr* callee,
+                                 const std::vector<ast::CallArgument>& args,
+                                 const ast::NewExpr* ctor);
+    // `report`, but a no-op when the engine already holds the same diagnostic
+    // at the same place (the dataflow and the structural walk both reach many
+    // arguments).
+    void reportOnce(Severity sev, SourceLocation loc, const std::string& msg);
 
     // §28.6 / §28.8 / §28.8.1 (issue #1995): reject `return move b` / `return
     // move b!` (and the `=>` expression-body form) of a BORROW returned through

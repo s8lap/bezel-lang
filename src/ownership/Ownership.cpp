@@ -17322,7 +17322,13 @@ static sema::TypeSymbol* receiverTypeSymbolOf(const ast::TypeDecl* td,
 
 void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                  const ast::TypeDecl* enclosingType = nullptr,
-                 const ast::ExtensionDecl* enclosingExtension = nullptr) {
+                 const ast::ExtensionDecl* enclosingExtension = nullptr);
+
+// The per-member dataflow (and structural) checks; `checkMember` below adds the
+// state-free structural scan on top.
+static void checkMemberFlow(const ast::Member& m, sema::SemaContext& ctx,
+                            const ast::TypeDecl* enclosingType,
+                            const ast::ExtensionDecl* enclosingExtension) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): assemble the
         // generic context the callee-side check keys on — this method's generic
@@ -17687,6 +17693,21 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
             }
         }
     }
+}
+
+// issue #7693 (see #6233, #7541; §15.3, v0.350): the flow checks, then the
+// structural scan that gives the argument-position field-read checks every
+// expression position of the member (conditions, guards, throw operands,
+// expression bodies, initializers, accessors, lambda bodies) rather than only
+// the ones the dataflow's binding / discharge walks route through. The scan
+// runs second so a diagnostic the dataflow already reported is not repeated
+// (`MethodOwnership::reportOnce`). // per §15.3, §28.8.1
+void checkMember(const ast::Member& m, sema::SemaContext& ctx,
+                 const ast::TypeDecl* enclosingType,
+                 const ast::ExtensionDecl* enclosingExtension) {
+    checkMemberFlow(m, ctx, enclosingType, enclosingExtension);
+    MethodOwnership mo(ctx);
+    mo.scanMemberForFieldReadArgs(m);
 }
 
 // ---------- Slice O9: owned-field definite-assignment (§7.9) --------

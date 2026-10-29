@@ -9892,7 +9892,7 @@ bool MethodOwnership::rejectMoveOnlyFieldReadArg(const ast::CallArgument& a,
     if (!common::isMoveOnlyValueType(ctx_.exprType(*a.value), ctx_,
                                      moveOnlyKind))
         return false;
-    report(Severity::Error, a.value->span.begin,
+    reportOnce(Severity::Error, a.value->span.begin,
            std::string("cannot pass the field `") + std::string(fs->name) +
                "` to a parameter that takes ownership: its type is " +
                (moveOnlyKind ? moveOnlyKind : "a move-only value type") +
@@ -9902,6 +9902,349 @@ bool MethodOwnership::rejectMoveOnlyFieldReadArg(const ast::CallArgument& a,
                "a second time; take it with the replacing `move <field> with "
                "<replacement>` (\xc2\xa7""28.8.1, \xc2\xa7""15.3, v0.350)");
     return true;
+}
+
+void MethodOwnership::reportOnce(Severity sev, SourceLocation loc,
+                                 const std::string& msg) {
+    if (suppressDiag_) return;
+    for (const auto& d : ctx_.diagnostics().diagnostics())
+        if (d.severity == sev && d.location.offset == loc.offset &&
+            d.location.line == loc.line && d.location.column == loc.column &&
+            d.message == msg)
+            return;
+    report(sev, loc, msg);
+}
+
+// issue #7693 (see #6233, #7541): the type of a FUNCTION-TYPED VALUE callee —
+// a local, parameter, field or property of function type, a lambda literal, or
+// the function-typed result of a call / index — whose parameter list is the
+// function type's own (`TypeRef::funcParams`). A callee that names a method
+// group (a MethodSymbol, or a builtin member with no symbol) is NOT a value
+// here: its formals come from `calleeOrChainFormals`. // per §15.3
+static const sema::TypeRef* functionValueCalleeType(
+    const ast::Expr* callee, const sema::SemaContext& ctx) {
+    if (!callee) return nullptr;
+    const sema::TypeRef* t = ctx.exprType(*callee);
+    if (!t || t->kind != sema::TypeRef::Kind::Function) return nullptr;
+    if (sema::Symbol* sym = ctx.exprSymbol(*callee)) {
+        if (dynamic_cast<sema::LocalSymbol*>(sym) ||
+            dynamic_cast<sema::ParameterSymbol*>(sym) ||
+            dynamic_cast<sema::FieldSymbol*>(sym) ||
+            dynamic_cast<sema::PropertySymbol*>(sym))
+            return t;
+        return nullptr;
+    }
+    if (dynamic_cast<const ast::LambdaExpr*>(callee) ||
+        dynamic_cast<const ast::CallExpr*>(callee) ||
+        dynamic_cast<const ast::NullCondCallExpr*>(callee) ||
+        dynamic_cast<const ast::IndexExpr*>(callee))
+        return t;
+    return nullptr;
+}
+
+// issue #7693 (see #6233, #7541; §15.3 *Parameter passing* / *Whole-value
+// reassignment*, v0.350): classify one call's (or `new`'s) arguments against
+// the formals the callee declares and drive the two state-free field-read
+// recorders — `rejectMoveOnlyFieldReadArg` (a plain read of a move-only field
+// at a by-value-move formal) and the owned-field leg of `checkOwnedArgSource`
+// (a plain read of an `owned` field at an `owned` formal) — at each. The
+// in-flow walks (`recordMovesInArgs`, `handleDischarge`) reach these only for
+// the call shapes that route through them, so a call nested in an `if` /
+// `while` condition, a lambda body, an expression body or a field initializer
+// was never classified. Locals are deliberately NOT classified here (their
+// source state needs the dataflow); only field reads, whose verdict is a pure
+// function of the field's declaration.
+//
+// The formals are the resolved method / constructor / choice-case parameter
+// list, or — for a function-typed VALUE callee — the function type's own
+// parameter list: §15.3 makes a plain parameter of a move-only type
+// by-value-move whatever declares it, a function type included; its `ref` /
+// `out` entries pass a location and are skipped. // per §15.3, §28.8
+void MethodOwnership::scanFieldReadArgsInCall(
+        const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
+        const ast::NewExpr* ctor) {
+    const CalleeFormals formals =
+        ctor ? resolveCtorParams(*ctor, ctx_) : calleeOrChainFormals(callee, args);
+    const sema::TypeRef* fnTy =
+        (!ctor && !formals.valid()) ? functionValueCalleeType(callee, ctx_)
+                                    : nullptr;
+    if (!formals.valid() && !fnTy) return;
+    std::size_t pos = 0;
+    for (const auto& a : args) {
+        const std::size_t at = pos++;
+        if (!a.value) continue;
+        bool owned = false;
+        if (formals.valid()) {
+            const std::size_t bp = boundParamIndex(args, at, formals);
+            if (bp >= formals.size()) continue;
+            owned = formals.modifier(bp) == "owned";
+        } else {
+            if (at >= fnTy->funcParams.size()) continue;
+            const std::string_view mod = fnTy->funcParams[at].modifier;
+            if (!mod.empty() && mod != "owned") continue;
+            owned = mod == "owned";
+        }
+        if (rejectMoveOnlyFieldReadArg(a, callee, owned)) continue;
+        if (!owned) continue;
+        // The owned-sink leg, restricted to the state-free shape: a bare read
+        // of an `owned` field (a borrow, §28.3 / §28.8.1, #398).
+        const ast::Expr* argValue = lookThroughForceUnwrap(a.value.get());
+        if (dynamic_cast<const ast::IdentifierExpr*>(argValue)) {
+            if (exprIsOwnedFieldRead(*argValue))
+                checkOwnedArgSource(*argValue, argValue->span.begin);
+        } else if (exprIsOwnedFieldRead(*a.value)) {
+            checkOwnedArgSource(*a.value, a.value->span.begin);
+        }
+    }
+}
+
+void MethodOwnership::scanFieldReadArgsInArgs(
+        const std::vector<ast::CallArgument>& args) {
+    for (const auto& a : args)
+        if (a.value) scanFieldReadArgsInExpr(*a.value);
+}
+
+// Every sub-expression of `e`, a lambda literal's body included, classifying
+// an inner call before the outer call that consumes it. The shape mirrors
+// `collectBodyLambdasExpr`, plus the atoms it omits that carry sub-expressions
+// (`BindExpr`, a call's callee).
+void MethodOwnership::scanFieldReadArgsInExpr(const ast::Expr& e) {
+    auto sub = [this](const std::unique_ptr<ast::Expr>& p) {
+        if (p) scanFieldReadArgsInExpr(*p);
+    };
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        sub(call->callee);
+        scanFieldReadArgsInArgs(call->args);
+        scanFieldReadArgsInCall(call->callee.get(), call->args, nullptr);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+        sub(nc->callee);
+        scanFieldReadArgsInArgs(nc->args);
+        scanFieldReadArgsInCall(nc->callee.get(), nc->args, nullptr);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        scanFieldReadArgsInArgs(ne->args);
+        scanFieldReadArgsInCall(nullptr, ne->args, ne);
+        return;
+    }
+    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
+        sub(lam->exprBody);
+        scanFieldReadArgsInStmts(lam->stmts);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        sub(ma->target);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
+        sub(nm->target);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+        sub(ix->target);
+        scanFieldReadArgsInArgs(ix->indices);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        sub(be->left);
+        sub(be->right);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        sub(un->operand);
+        return;
+    }
+    if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
+        sub(pb->operand);
+        return;
+    }
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
+        sub(tt->operand);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
+        sub(cd->condition);
+        sub(cd->thenValue);
+        sub(cd->elseValue);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
+        sub(th->operand);
+        return;
+    }
+    if (auto* rg = dynamic_cast<const ast::RangeExpr*>(&e)) {
+        sub(rg->lo);
+        sub(rg->hi);
+        sub(rg->step);
+        return;
+    }
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(&e)) {
+        sub(we->source);
+        for (const auto& ia : we->assigns) sub(ia.value);
+        return;
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+        for (const auto& k : cl->keys) sub(k);
+        for (const auto& el : cl->elements) sub(el);
+        return;
+    }
+    if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(&e)) {
+        for (const auto& part : isx->parts) sub(part.expr);
+        return;
+    }
+    if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
+        sub(cx->scrutinee);
+        for (const auto& arm : cx->arms) {
+            sub(arm.guard);
+            sub(arm.exprBody);
+            scanFieldReadArgsInStmts(arm.stmts);
+        }
+        return;
+    }
+    if (auto* bx = dynamic_cast<const ast::BindExpr*>(&e)) {
+        for (const auto& cl : bx->clauses)
+            if (cl) sub(cl->initializer);
+        sub(bx->body);
+        return;
+    }
+    // Literals / identifiers / typeof / nameof / default / unit / the marked
+    // transfer atom: no sub-expressions.
+}
+
+void MethodOwnership::scanFieldReadArgsInStmts(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    for (const auto& s : body)
+        if (s) scanFieldReadArgsInStmt(*s);
+}
+
+void MethodOwnership::scanFieldReadArgsInStmt(const ast::Stmt& s) {
+    auto ex = [this](const std::unique_ptr<ast::Expr>& p) {
+        if (p) scanFieldReadArgsInExpr(*p);
+    };
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        ex(ld->initializer);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        ex(lc->value);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        ex(rs->value);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        ex(es->expr);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        ex(as->target);
+        ex(as->value);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        ex(ts->value);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        ex(ifs->ifBranch.condition);
+        scanFieldReadArgsInStmts(ifs->ifBranch.body);
+        for (const auto& el : ifs->elifBranches) {
+            ex(el.condition);
+            scanFieldReadArgsInStmts(el.body);
+        }
+        scanFieldReadArgsInStmts(ifs->elseBody);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        ex(ws->condition);
+        scanFieldReadArgsInStmts(ws->body);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        ex(fs->iterable);
+        ex(fs->withExpr);
+        scanFieldReadArgsInStmts(fs->body);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        scanFieldReadArgsInStmts(db->body);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        ex(is->target);
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        ex(ds->value);
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        ex(ys->value);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        scanFieldReadArgsInStmts(trys->body);
+        for (const auto& arm : trys->catches) {
+            ex(arm.guard);
+            if (arm.body) scanFieldReadArgsInStmt(*arm.body);
+        }
+        scanFieldReadArgsInStmts(trys->finallyBody);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        ex(cs->scrutinee);
+        for (const auto& arm : cs->arms) {
+            ex(arm.guard);
+            ex(arm.exprBody);
+            scanFieldReadArgsInStmts(arm.stmts);
+        }
+        return;
+    }
+    // Break / Continue / LocalTypeDecl: no expressions.
+}
+
+// issue #7693: the member-level driver — every executable expression position
+// a member carries. Called once per member by `checkMember`, after the
+// dataflow, so the in-flow diagnostics are already in the engine and
+// `reportOnce` folds the repeats.
+void MethodOwnership::scanMemberForFieldReadArgs(const ast::Member& m) {
+    auto ex = [this](const std::unique_ptr<ast::Expr>& p) {
+        if (p) scanFieldReadArgsInExpr(*p);
+    };
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
+        ex(md->exprBody);
+        scanFieldReadArgsInStmts(md->stmts);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
+        scanFieldReadArgsInStmts(cd->body);
+        return;
+    }
+    if (auto* dd = dynamic_cast<const ast::DestructorDecl*>(&m)) {
+        scanFieldReadArgsInStmts(dd->body);
+        return;
+    }
+    if (auto* od = dynamic_cast<const ast::OperatorDecl*>(&m)) {
+        ex(od->exprBody);
+        scanFieldReadArgsInStmts(od->stmts);
+        return;
+    }
+    if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
+        ex(fd->initializer);
+        return;
+    }
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(&m)) {
+        ex(pd->exprBody);
+        ex(pd->autoInitializer);
+        for (const auto& acc : pd->accessors) {
+            ex(acc.exprBody);
+            scanFieldReadArgsInStmts(acc.stmts);
+        }
+        return;
+    }
 }
 
 // fix #4803: see the declaration in Ownership_impl.hpp. MEASURED on the
@@ -17955,7 +18298,7 @@ bool MethodOwnership::ownedArgSourceIsBorrow(const ast::Expr& argValue) {
 bool MethodOwnership::checkOwnedArgSource(const ast::Expr& argValue,
                                           SourceLocation loc) {
     if (!ownedArgSourceIsBorrow(argValue)) return false;
-    report(
+    reportOnce(
         Severity::Error, loc,
         "a borrow cannot be passed where an `owned` value is required: "
         "an `owned` sink takes responsibility for disposing the value, but a "
