@@ -593,6 +593,21 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             strPtr = emitValueToString(arg, argTy);
             if (!strPtr) return false;
             releaseRender = true;   // a fresh +1 concat accumulator
+        } else if (argTy->kind == sema::TypeRef::Kind::InlineArray &&
+                   !argTy->nullable && !arg->getType()->isPointerTy()) {
+            // fix #7715 (§8.6 *Boxing of inline arrays* / §8.5, v0.350): a
+            // non-owning inline array (`[N]T`, `[N]T?`) boxes by the general
+            // rule at `Console.Write(Line)(value: Object)`, and §8.5 renders it
+            // as its type name (`"[3]int"`). The lowered value is an LLVM array
+            // aggregate that no arm above or below accepted, so it reached
+            // `bz_string_to_utf8z` as if it were a `%bz.string` (IR verify
+            // failure). The one renderer `a.ToString()` and the §18.5 hole use
+            // answers; the result is a literal sentinel (release is a no-op).
+            // Owning inline arrays never arrive: sema rejects the move-only
+            // boxing (#7694).
+            strPtr = emitValueToString(arg, argTy);
+            if (!strPtr) return false;
+            releaseRender = true;
         } else if (argTy->kind == sema::TypeRef::Kind::Function &&
                    !argTy->nullable && arg->getType()->isPointerTy()) {
             // fix #5943 (§27.7.1 / §8.5, v0.338): a function value prints its
