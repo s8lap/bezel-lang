@@ -1966,7 +1966,14 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // sign and every signed result is bit-for-bit what it was.
         auto ieeeToFp = [&](llvm::Value* v, const ast::Expr* srcE,
                             const char* nm) -> llvm::Value* {
-            if (v->getType()->isFloatingPointTy()) return v;
+            // fix #7274 (stdlib §9.2, spec §5.1/§5.2, v0.350): a floating
+            // operand of the OTHER width converts by VALUE to the member's
+            // own parameter width (`float` widens to `double` at a `Double`
+            // member, §5.1), so the fcmp / bitcast below always sees one
+            // matching type. (A `double` at a `Float` member is not a legal
+            // implicit conversion; sema's gap there is a separate issue.)
+            if (v->getType()->isFloatingPointTy())
+                return builder_.CreateFPCast(v, fty, std::string(nm) + ".fpcast");
             if (srcE && isUnsignedTargetExpr(*srcE))
                 return builder_.CreateUIToFP(v, fty, std::string(nm) + ".uitofp");
             return builder_.CreateSIToFP(v, fty, std::string(nm) + ".sitofp");
