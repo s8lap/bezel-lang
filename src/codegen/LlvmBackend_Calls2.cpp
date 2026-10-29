@@ -23093,8 +23093,25 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     // nothing to lift to (void / untyped) and the old nullptr result stands.
     if (!callTy || !callTy->nullable || !rcvTy) return nullptr;
     // A nullable VALUE receiver (`int?`, record?) is a tagged struct and is not
-    // this fix's population.
-    if (isNullableValueTy(rcvTy)) return nullptr;
+    // this fix's population -- except the builtin time/Guid value records.
+    //
+    // fix #7854 / #7778 (stdlib §2.5/§2.6, §7.5, v0.350): `g?.ToByteArray()`,
+    // `a?.AddDays(1.0)`, `g?.CompareTo(h)` on a `Guid?` / `DateTime?` /
+    // `TimeSpan?` / `DateOnly?` / `TimeOnly?` receiver. These builtin value
+    // records carry no MethodSymbol (`ms` is null), so this function is the only
+    // `?.` lowering that can reach the `.` form's builtin arms for them; it
+    // refused every nullable VALUE receiver, so the call lowered to nothing and
+    // the enclosing store was dropped (#2434 / #3079 backstop, exit 0). The
+    // receiver is the tagged {i8 hasValue; T} struct: the null edge tests
+    // hasValue, and the `.` twin gets the unwrapped payload through the same
+    // placeholder, typed as the NON-nullable receiver.
+    const bool nullableValueRcv = isNullableValueTy(rcvTy);
+    if (nullableValueRcv) {
+        const std::string_view rh = builtinTypeName(rcvTy);
+        if (!(rh == "DateTime" || rh == "TimeSpan" || rh == "DateOnly" ||
+              rh == "TimeOnly" || rh == "Guid"))
+            return nullptr;
+    }
     const bool valueResult = isNullableValueTy(callTy);
     sema::TypeRef* innerTy = ctx_.makeTypeRef(*callTy);
     innerTy->nullable = false;
@@ -23116,6 +23133,9 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
         rcv = lowerExpr(*nm.target);
         if (!rcv) return nullptr;
     }
+    if (nullableValueRcv && !rcv->getType()->isStructTy()) return nullptr;
+    // The unwrapped payload the `.` twin sees (a nullable value receiver only).
+    llvm::Value* rcvPayload = nullptr;
     const bool rcvIsPtr = rcv && rcv->getType()->isPointerTy();
     auto* entryBB = builder_.GetInsertBlock();
     auto* accessBB = llvm::BasicBlock::Create(llvm_, "ncbi.access", currentFn_);
@@ -23125,7 +23145,10 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
         builder_.CreateCondBr(
             builder_.CreateICmpEQ(rcv, llvm::ConstantPointerNull::get(ptrTy())),
             endBB, accessBB);
-    else
+    else if (nullableValueRcv) {
+        rcvPayload = nullablePrimValue(rcv);
+        builder_.CreateCondBr(nullablePrimHasValue(rcv), accessBB, endBB);
+    } else
         builder_.CreateBr(accessBB);
     builder_.SetInsertPoint(accessBB);
 
@@ -23139,7 +23162,14 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     } else {
         auto placeholder = std::make_unique<ast::IdentifierExpr>();
         placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
-        ctx_.setExprType(placeholder.get(), const_cast<sema::TypeRef*>(rcvTy));
+        sema::TypeRef* placeholderTy = const_cast<sema::TypeRef*>(rcvTy);
+        if (nullableValueRcv) {
+            // The twin sees the PRESENT value: a non-nullable receiver whose
+            // lowered form is the bare payload.
+            placeholderTy = ctx_.makeTypeRef(*rcvTy);
+            placeholderTy->nullable = false;
+        }
+        ctx_.setExprType(placeholder.get(), placeholderTy);
         // fix #7458 (§7.5, §28.2, v0.350): the placeholder STANDS FOR the real
         // `?.` target, so it carries the target's symbol. The `.` twin's
         // downstream ownership classifiers (materializeVtableIEnumerableToArray's
@@ -23151,7 +23181,8 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
         // the dispose-the-temporary behaviour.
         if (sema::Symbol* targetSym = ctx_.exprSymbol(*nm.target))
             ctx_.setExprSymbol(placeholder.get(), targetSym);
-        exprValueOverride_[placeholder.get()] = rcv;
+        exprValueOverride_[placeholder.get()] =
+            nullableValueRcv ? rcvPayload : rcv;
         placeholderKey = placeholder.get();
         dotted->target = std::move(placeholder);
     }
@@ -23196,7 +23227,7 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
     auto* accessEnd = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
     builder_.SetInsertPoint(endBB);
-    if (!rcvIsPtr) return wrapped;
+    if (!rcvIsPtr && !nullableValueRcv) return wrapped;
     auto* phi = builder_.CreatePHI(nullTy, 2);
     phi->addIncoming(valueResult
                          ? static_cast<llvm::Value*>(

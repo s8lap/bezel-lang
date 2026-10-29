@@ -224,6 +224,27 @@ void checkCallSiteInlineArrayArg(
     }
 }
 
+// fix #7778 (§7.5, stdlib §2.5, v0.350): is `t` one of the builtin time value
+// records (or `Guid`) whose bare property reads / methods (`Year`, `Ticks`, `TotalDays`, `Hour`, ...)
+// resolveMemberAccess types for the `.` form? Reads all three TypeRef shapes a
+// builtin carries (annotation `astNode`, `builtinClassSym` declaration, and the
+// IMPORTED `importedName`), and never matches a user type that shadows the name
+// (a user declaration carries a non-null `decl`).
+static bool isBuiltinTimeValueRecord(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    std::string_view h;
+    if (!t->declaration) {
+        if (t->astNode && t->astNode->name && !t->astNode->name->parts.empty())
+            h = t->headName();
+        else if (!t->astNode && !t->importedName.empty())
+            h = t->importedName;
+    } else if (!t->declaration->decl) {
+        h = t->declaration->name;
+    }
+    return h == "DateTime" || h == "TimeSpan" || h == "DateOnly" ||
+           h == "TimeOnly" || h == "Guid";
+}
+
 const char* classificationName(common::ChoiceClassification c) {
     switch (c) {
         case common::ChoiceClassification::ValueLike:     return "value-like";
@@ -19290,8 +19311,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         if (!ctx_.exprType(ce) && !calleeSym && ncm->target &&
             ncm->typeArgs.empty() && ncm->member != "Drain") {
             if (TypeRef* rt = ctx_.exprType(*ncm->target)) {
+                // fix #7778/#7854: a builtin time/Guid value record built by
+                // `builtinClassSym` (a chain's `a?.AddDays(1.0)?.Year` receiver)
+                // carries a declaration with no decl; it is the same builtin.
                 const bool builtinHead =
                     (rt->kind == TypeRef::Kind::Named && !rt->declaration) ||
+                    isBuiltinTimeValueRecord(rt) ||
                     (rt->kind == TypeRef::Kind::Primitive &&
                      rt->primitive == PrimitiveType::String);
                 if (builtinHead) {
