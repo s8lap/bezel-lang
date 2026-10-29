@@ -2359,6 +2359,21 @@ const sema::TypeSymbol* Emitter::indexAccessReceiverDecl(
     // binds. A specialization binds `T`, so the same access failing to recover
     // inside one still announces.
     bool deadGenericExtTemplateBody = false;
+    // fix #7561 (§26.5, §26.1, v0.350): the same false alarm fires inside a
+    // SPECIALIZATION (currentSpecMethodSymbol_ set, `T` bound) of an extension
+    // on a BUILTIN generic target (`extension Array<T>`) once a second element
+    // type is instantiated.  The receiver is a builtin collection whose
+    // TypeRef has no TypeSymbol, so the recovery above cannot succeed by
+    // construction there either; the access is lowered by the collection
+    // indexer path and the program's value is correct (the #4160 template
+    // suppression assumed the specialization recovered the receiver).
+    if (id && id->name == "this" && currentSpecMethodSymbol_ &&
+        isExtensionMethod(currentSpecMethodSymbol_) &&
+        currentSpecMethodSymbol_->extensionDecl->targetType) {
+        const sema::TypeRef* t = ctx_.resolvedType(
+            *currentSpecMethodSymbol_->extensionDecl->targetType);
+        if (t && !t->declaration) deadGenericExtTemplateBody = true;
+    }
     if (id && id->name == "this" && currentFn_ && !currentSpecMethodSymbol_) {
         for (const auto& [ms, fn] : methodFns_) {
             if (fn != currentFn_) continue;
