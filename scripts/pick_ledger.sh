@@ -41,6 +41,9 @@
 # cross-references). A subject without one counts 0. The KIND column is the
 # note's recorded kind; with no recorded kind it is inferred from the subject
 # (pick_issues.sh --infer-kind) and shown with a trailing `*`.
+# The summary also prints, separately, how many distinct issues GitHub's own
+# one-keyword-one-reference rule would close over subject AND body
+# (pick_issues.sh --github, #7512): "named" is not "closed".
 # Read-only. Works from any worktree (notes live in the common git dir).
 set -uo pipefail
 
@@ -51,7 +54,7 @@ REF=bezel-picks
 shas="$(git rev-list --reverse "$RANGE" 2>/dev/null)" || {
   echo "pick_ledger: cannot list '$RANGE'" >&2; exit 1; }
 
-declare -A COMMITS=() FIXES=() CREDIT=() ALL=() PID_CANDS=() PID_OF=() SUBJ=()
+declare -A COMMITS=() FIXES=() CREDIT=() ALL=() GH=() PID_CANDS=() PID_OF=() SUBJ=()
 unattr=0 ambiguous=0 total=0 inferred_fix_issues=0 recovered=0
 
 patch_ids() { # SHAs on stdin -> "patchid sha" lines (merges and empty commits give none)
@@ -121,6 +124,7 @@ for sha in $shas; do
   if [ -z "$kind" ]; then kind="$("$HERE/pick_issues.sh" --infer-kind "$sha")"; shown="$kind*"; fi
   COMMITS[$pool]=$(( ${COMMITS[$pool]:-0} + 1 ))
   for i in $issues; do ALL[$i]=1; done
+  for i in $("$HERE/pick_issues.sh" --github "$sha"); do GH[$i]=1; done
   if [ "$kind" = fix ]; then
     for i in $issues; do
       [ -n "${CREDIT[$i]:-}" ] && continue   # earliest FIX commit in the range wins
@@ -150,6 +154,7 @@ done < <(printf '%s\n' "${!COMMITS[@]}" | sort)
 set +f
 echo "distinct fix issues: ${#CREDIT[@]} ($inferred_fix_issues from inferred kinds)"
 echo "distinct issues named (all kinds): ${#ALL[@]}"
+echo "distinct issues GitHub would close (keyword rule, subject+body, any kind): ${#GH[@]}"
 if [ "$unattr" -gt 0 ]; then
   echo "UNATTRIBUTED: $unattr commit(s): no refs/notes/$REF note found by SHA or patch-id" \
        "($ambiguous ambiguous: a patch-id shared by noted commits, none or several with the same subject)"

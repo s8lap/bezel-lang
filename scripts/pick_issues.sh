@@ -23,9 +23,22 @@
 #         bank / test / lit / regression pin;
 #   other otherwise.
 #
+# --github. The ISSUES rule above says which issues a commit MENTIONS. It is
+# not what GitHub closes. With --github the script prints the issues GitHub
+# WOULD CLOSE, by GitHub's measured rule (#7512): a closing keyword (close /
+# closes / closed / fix / fixes / fixed / resolve / resolves / resolved, case-
+# insensitive, as a whole word) closes exactly the ONE reference immediately
+# following it (only whitespace and an optional `:` between), in the SUBJECT
+# OR the BODY. So `fix #A #B` closes only #A, a body line `Fixes #C` closes
+# #C, `narrow #D` and `issue #G` close nothing, and a prose "if a lane closes
+# #F" DOES close #F (quoting gives no protection). Same #NNN (3+ digits)
+# shape, order and de-duplication as the default mode. The default output is
+# unchanged; the two are reported side by side by pick_ledger.sh.
+#
 # Usage:  <commit message> | scripts/pick_issues.sh     # prints "#A #B" or ""
 #         scripts/pick_issues.sh <rev>                  # same, for a commit
 #         scripts/pick_issues.sh --infer-kind [<rev>]   # prints fix | other
+#         scripts/pick_issues.sh --github [<rev>]       # issues GitHub would close
 set -uo pipefail
 
 subject() { if [ -n "${1:-}" ]; then git log -1 --format=%s "$1"; else head -n 1; fi; }
@@ -41,6 +54,13 @@ if [ "${1:-}" = --infer-kind ]; then
   else
     echo other
   fi
+  exit 0
+fi
+
+if [ "${1:-}" = --github ]; then
+  if [ -n "${2:-}" ]; then git log -1 --format=%B "$2"; else cat; fi \
+    | grep -oiP '(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)[ \t]*:?[ \t]*\K#[0-9]{3,}' \
+    | awk '!seen[$0]++' | paste -sd' '
   exit 0
 fi
 

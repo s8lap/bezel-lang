@@ -146,6 +146,52 @@ class SubjectOnlyIssueRuleTest(_Base):
 
 
 
+class GithubClosingRuleTest(_Base):
+    """scripts/pick_issues.sh --github: GitHub's one-keyword-one-reference rule
+    over subject AND body (#7512). The default mode stays subject-only."""
+
+    CASES = [
+        ("fix #1001 #1002: pair\n\nbody\n", "#1001"),
+        ("lane work\n\nFixes #1003\n", "#1003"),
+        ("narrow #1004: partial\n\nsee #1004\n", ""),
+        ("fixes: #1005 stop it\n", "#1005"),
+        ("bank\n\nNote: if a lane closes #1006, re-bank this row\n", "#1006"),
+        ("issue #1007: prose only\n\nrelated to issue #1007\n", ""),
+        ("Prefix #1008 and refix #1009\n", ""),
+        ("RESOLVED   #1010/#1011 and closed #1010\n", "#1010"),
+        ("fix #1012: a\n\nCloses #1013\nresolves: #1012\n", "#1012 #1013"),
+        ("fix #77: too short\n", ""),
+    ]
+
+    def run_stdin(self, msg, *args):
+        import subprocess
+        from orch_tools_support import SCRIPTS
+        return subprocess.run([str(SCRIPTS / "pick_issues.sh"), *args], input=msg,
+                              capture_output=True, text=True).stdout.strip()
+
+    def test_cases(self):
+        for msg, want in self.CASES:
+            self.assertEqual(self.run_stdin(msg, "--github"), want, msg)
+
+    def test_default_mode_is_unchanged_subject_only(self):
+        self.assertEqual(self.run_stdin("fix #1001 #1002: pair\n\nFixes #1003\n"), "#1001 #1002")
+
+    def test_rev_form_reads_the_whole_message(self):
+        c = self.repo.change("gh", "fix #1001 #1002: pair\n\nFixes #1003\nsee #1004\n\n" + WANT)
+        import subprocess
+        from orch_tools_support import SCRIPTS
+        r = subprocess.run([str(SCRIPTS / "pick_issues.sh"), "--github", c],
+                           capture_output=True, text=True, cwd=self.repo.root)
+        self.assertEqual(r.stdout.strip(), "#1001 #1003")
+
+    def test_ledger_reports_mentioned_and_would_close(self):
+        self.repo.change("l1", "fix #1001 #1002: pair\n\nFixes #1003\n\n" + WANT)
+        r = run("pick_ledger.sh", "main..HEAD", cwd=self.repo.root, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("distinct issues named (all kinds): 2\n", r.stdout)
+        self.assertIn("distinct issues GitHub would close (keyword rule, subject+body, any kind): 2\n", r.stdout)
+
+
 class KindTest(_Base):
     """--kind is recorded by pick_stage; only kind=fix commits count as banked."""
 
