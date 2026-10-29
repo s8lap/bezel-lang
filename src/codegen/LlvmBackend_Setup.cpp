@@ -41966,6 +41966,42 @@ void Emitter::collectSafeViewAliases(
         if (!s) return;
         {
             LocalDeclInitView v = localDeclInitView(s);
+            // fix #7666 (§28.3.1 K1.5 / K3.13, v0.350): the SAME-COLLECTION
+            // alias with an explicit annotation — `var n: Array<int>? := a;`,
+            // the nullable spelling of the source's own head (or the identical
+            // non-nullable one). An unmarked read of an owned class-typed
+            // binding is a BORROW and never consumes (K3.13), so the alias holds
+            // no obligation and does not extend the backing's lifetime; the
+            // source stays the sole owner and reclaims at ITS scope end. It is
+            // admitted to `views` only so the per-view escape walk below proves
+            // the alias itself never escapes (a return / store / capture /
+            // owned-arg of the alias keeps tainting the source: the
+            // leak-not-UAF direction). Before this, the scan below admitted only
+            // an IEnumerable / Object / interface annotation, so this alias read
+            // as an escape of `a` and the array's backing leaked on every pass.
+            if (v.init && !v.isUsing && v.type) {
+                if (auto* id =
+                        dynamic_cast<const ast::IdentifierExpr*>(v.init)) {
+                    auto* loc =
+                        dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+                    if (loc && loc->decl &&
+                        static_cast<const void*>(loc->decl) ==
+                            static_cast<const void*>(arrLd)) {
+                        const sema::TypeRef* src = ctx_.exprType(*id);
+                        const sema::TypeRef* dt = ctx_.resolvedType(*v.type);
+                        if (src && dt &&
+                            src->kind == sema::TypeRef::Kind::Named &&
+                            dt->kind == sema::TypeRef::Kind::Named &&
+                            !src->declaration && !dt->declaration &&
+                            !src->headName().empty() &&
+                            src->headName() == dt->headName() &&
+                            src->genericArgs.size() == dt->genericArgs.size() &&
+                            (isCollectionTypeName(src) ||
+                             isDictTypeName(src)))
+                            views.push_back(s);
+                    }
+                }
+            }
             if (v.init && !v.isUsing && v.type) {
                 if (auto* id =
                         dynamic_cast<const ast::IdentifierExpr*>(v.init)) {
