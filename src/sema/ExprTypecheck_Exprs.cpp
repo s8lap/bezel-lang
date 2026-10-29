@@ -10844,6 +10844,31 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "sits behind a `Locked<T>` registry (\xc2\xa7""30.12)");
         }
     }
+    // §28.11 (v0.350): "`move coll[i]` is admitted on exactly these receivers
+    // ... a slot of either owning inline-array form, `[N owned]T?` or
+    // `[N owned]T` ... No other receiver admits it." A PLAIN inline array
+    // `[N]T` (no `owned` slot marker) is not among them: its slots are copies
+    // or borrows, so `move arr[j]` through one -- a local, an instance field
+    // or a `static readonly` field -- is a compile error (issue #7932).
+    if (op == "move" && ue.operand) {
+        const ast::Expr* mloc = ue.operand.get();
+        while (const auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(mloc))
+            mloc = pb->operand.get();
+        const auto* mix = dynamic_cast<const ast::IndexExpr*>(mloc);
+        const TypeRef* mtt =
+            (mix && mix->target) ? ctx_.exprType(*mix->target) : nullptr;
+        if (mtt && mtt->kind == TypeRef::Kind::InlineArray && !mtt->arrayOwned) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                "`move` is not admitted on a plain inline array's slot: the "
+                "slots of an inline array without the `owned` slot marker are "
+                "not owned (copies or borrows), so there is no ownership to "
+                "transfer (\xc2\xa7""28.11, \xc2\xa7""15.1.1, v0.350). "
+                "`move arr[i]` is admitted only on a slot of an owning inline "
+                "array (`[N owned]T?` / `[N owned]T`) or of an owning "
+                "collection; read the slot plainly instead");
+        }
+    }
     // §28.8.1 *The `with` clause beside the other two uses of `with`* / §9.5
     // (v0.350): a `with` followed by `(` and `Identifier :=` after a `move`
     // operand is the record-update suffix and binds to the operand, so
