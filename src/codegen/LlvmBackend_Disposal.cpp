@@ -8575,6 +8575,15 @@ void Emitter::registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
     // unwind registration documents: a disposal pass can be reached on a path
     // that never executed the production store.
     llvm::AllocaInst* slot = entryAllocaNullPtr();
+    // fix #7799 / §28.3 K8.1, §30.13 (v0.350): in a state-machine body (async
+    // or iterator) the flush can run after a suspension in the same full
+    // expression (`t + await Af(Mk(i).Name())`), i.e. in a later `$Resume`
+    // activation whose stack does not hold this alloca's value; and
+    // entryAllocaNullPtr skips the entry-block null store there, leaving the
+    // slot undefined on a path that never ran the store. Keep the slot in the
+    // frame, which calloc zeroes, as registerFreshBuiltinNewReceiverTempK8 and
+    // deferUnboundOwnedTempToK8 (#5286) do.
+    if (smStateStruct_) asyncHandlerSpillSlots_.push_back(slot);
     builder_.CreateStore(recvPtr, slot);
     Disposal d{slot, nullptr};
     d.unwindOnly = true;      // the normal edge is the K8 flush below
