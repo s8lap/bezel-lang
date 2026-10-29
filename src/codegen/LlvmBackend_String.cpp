@@ -2520,6 +2520,19 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
         if (method == "Trim" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* chars = lowerArg(0);
             if (!chars) return nullptr;
+            // fix #7492 (stdlib §9.6, v0.350): a `string` IS an
+            // `IEnumerable<char>`, and sema admits it, but its representation
+            // is a `bz_string_struct`, not the `bz_array_t` of code points
+            // `bz_str_trim_chars` reads -- the helper read a string's header
+            // as an array count and ran off the end (SIGSEGV). The helper is
+            // selected by the argument's STATIC type; the set string is
+            // walked in the code-point domain (§4.6).
+            if (isStringExprType(*call.args[0].value)) {
+                auto* fnS = declareC("bz_str_trim_chars_str", ptrTy(),
+                                     {ptrTy(), ptrTy()});
+                return builder_.CreateCall(fnS, {self, chars},
+                                           "trim.chars.str.result");
+            }
             auto* fn = declareC("bz_str_trim_chars", ptrTy(), {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {self, chars}, "trim.chars.result");
         }

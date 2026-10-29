@@ -908,6 +908,32 @@ extern "C" void* bz_str_trim_chars(const void* self_p, const void* chars_p) {
     return bz_str_slice_cp(s, start, end - start);
 }
 
+// stdlib §9.6 (#7492): Trim(chars: IEnumerable<char>) where the `chars` argument
+// is a `string`. A `string` is an `IEnumerable<char>` (stdlib §9.6), so
+// `s.Trim("ab")` strips the code points 'a' and 'b'. `bz_str_trim_chars` above
+// reads its set as a `bz_array_t` (an `Array<char>` of i32 code points); a
+// `string` is a `bz_string_struct` -- `set->count` read a field that is not a
+// count and the trim loop ran off the end of the string. The codegen therefore
+// selects THIS entry by the argument's static type. The set is walked in the
+// CODE-POINT domain (`bz_str_cp`), so the set string's own storage width
+// (§4.6: 1/2/4 bytes per code point) is never observable.
+extern "C" void* bz_str_trim_chars_str(const void* self_p, const void* set_p) {
+    const auto* s = (const bz_string_struct*)self_p;
+    const auto* set = (const bz_string_struct*)set_p;
+    if (!s) return bz_str_substring(nullptr, 0, 0);
+    int64_t start = 0, end = s->len;
+    auto inSet = [&](uint32_t cp) {
+        for (int64_t i = 0; i < set->len; ++i)
+            if (bz_str_cp(set, i) == cp) return true;
+        return false;
+    };
+    if (set && set->len > 0) {
+        while (start < end && inSet(bz_str_cp(s, start))) ++start;
+        while (end > start && inSet(bz_str_cp(s, end - 1))) --end;
+    }
+    return bz_str_slice_cp(s, start, end - start);
+}
+
 // §9.6 / issue #654: string.ToCharArray(): owned Array<char>.
 // Returns a fresh bz_array_t* with elem_size=4 (char = i32 code point).
 // Each element is the i32 Unicode code point at the corresponding position.
