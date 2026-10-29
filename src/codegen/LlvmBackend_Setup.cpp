@@ -24765,6 +24765,33 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
 }
 
 
+// fix #7480 / §28.10 *`using var` initialized from a borrow* (v0.350): "When
+// the right-hand side of a `using var` declaration is a borrow rather than an
+// owned value (… an indexer access, a field read, …) the `using var` does
+// **not** assume a disposal obligation … at scope end, no `Dispose()` is
+// called, because the value is not owned by this scope." The ownership pass
+// records that verdict as `usingVarSourceIsBorrow` (its field-read arm,
+// MethodOwnership::usingVarInitIsRecognizedBorrow). The move-only local
+// registrations below bypass the using / unwind chain that reads the flag, so
+// they must read it themselves: `using var x := h.F;` over an owning choice or
+// an owning inline array field is a pin, and disposing `x`'s slots as well as
+// `h`'s own field teardown freed the payload twice. Keyed on the field-read
+// shape too, because the flag is also set over a bare read of a move-only
+// LOCAL, which §28.10 says adopts ("an unmarked read of a **move-only value**
+// binding moves instead and is an owned right-hand side") and so must keep
+// its disposal. The plain `var x := h.F;` twin carries no flag and is not
+// changed here (open spec-question issue #7612). // per §28.10, §28.12, v0.350
+static bool usingVarPinsMoveOnlyFieldRead(const ast::LocalDecl* ld,
+                                          sema::SemaContext& ctx) {
+    if (!ld->isUsing || !ld->usingVarSourceIsBorrow || !ld->initializer)
+        return false;
+    const ast::Expr* init = ld->initializer.get();
+    if (!dynamic_cast<const ast::MemberAccessExpr*>(init) &&
+        !dynamic_cast<const ast::IdentifierExpr*>(init))
+        return false;
+    return dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*init)) != nullptr;
+}
+
 bool Emitter::registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld) {
     // §15.3 / §15.1.1 (#747): a move-only OWNING inline-array local
     // ([N owned]T? / [N owned]T) auto-disposes its non-null slots at scope end.
@@ -24778,6 +24805,9 @@ bool Emitter::registerInlineOwnedArrayDisposal(const ast::LocalDecl* ld) {
     // has no disposal effect on a move-only array; the auto-dispose below runs
     // regardless). Whether we actually register disposal depends on transfer.
     if (emittingDisposerBody_) return true;
+    // §28.10 (v0.350, issue #7480): a `using var` pin over a field read owns
+    // no slots — the field's holder disposes them. // per §28.10
+    if (usingVarPinsMoveOnlyFieldRead(ld, ctx_)) return true;
     // Only register when the transfer analysis covers the current body; a
     // lambda/thunk body lowered mid-function inherits a stale set, so skip
     // (a safe leak, never a double-free).
@@ -24845,6 +24875,9 @@ bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
     }
     if (disposeStack_.empty()) return true;
     if (emittingDisposerBody_) return true;  // class disposer walks fields directly
+    // §28.10 (v0.350, issue #7480): a `using var` pin over a field read owns
+    // no payload — the field's holder disposes it. // per §28.10
+    if (usingVarPinsMoveOnlyFieldRead(ld, ctx_)) return true;
     auto it = locals_.find(ld);
     if (it == locals_.end() || !it->second) return true;
     Disposal d{it->second, nullptr};
