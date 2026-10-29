@@ -693,14 +693,19 @@ KNOWN_RED = {
     ('value_choice', 'copy_const_source'): ('#7316', 'LEAK', 'b6053a68'),
 }
 
-# Cells QUARANTINED from the DONE count. The `task` row is unstable: #6194's
-# hang makes the same program on the SAME compiler hang on one run and
-# complete on the next (the reviewer's C11(d) measured 100 ok / 39 wrong on
-# one run and 99 ok / 40 wrong on the next, the flipping cell being
+# Cells QUARANTINED from the DONE count. The `task` row hangs RUN-TO-RUN on the
+# SAME build: this is a REAL RUNTIME RACE in the compiled program (issue #7395;
+# measured 2 of 30 runs under ASan and 4 of 30 plain runs hang, the Task
+# scope-end disposal of #6194), NOT a flaky oracle. The grid's runner and
+# its program are deterministic; the same executable completes on one run and
+# hangs on the next (the reviewer's C11(d) measured 100 ok / 39 wrong on one
+# run and 99 ok / 40 wrong on the next, the flipping cell being
 # `task/await_using_var`). A DONE instrument whose verdict flips run-to-run
 # is not an instrument, so the row is counted separately and REPORTED as its
-# own line until #6194 lands. A quarantined cell never makes the DONE verdict
-# worse and never makes it better.
+# own line until the race is fixed (#6194 / #7395). A quarantined cell never
+# makes the DONE verdict worse and never makes it better. The race is a
+# DEFECT to fix, not noise to filter: do not raise the timeout or re-run
+# until green.
 QUARANTINE = {
     # (head, form) -> the issue whose landing lifts the quarantine
     ('task', 'using_var'): '#6194',

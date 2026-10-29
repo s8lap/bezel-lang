@@ -536,9 +536,12 @@ not counted wrong.
   issue has no fixing commit yet is a WRONG cell; the record carries the
   attribution.) The KNOWN-RED rows today are the two `value_choice` copy
   cells that #7316's fix (`b6053a68`) covers — see the table below.
-* **The `task` row is QUARANTINED out of the DONE count** until #6194 lands.
-  #6194's hang makes the same program on the SAME compiler hang on one run
-  and complete on the next, so a DONE verdict that included the row would
+* **The `task` row is QUARANTINED out of the DONE count** until #6194 /
+  #7395 land. This is a **real runtime race in the compiled program**
+  (#7395: 2 of 30 runs hang under ASan, 4 of 30 plain), **not a flaky
+  oracle**: the grid and its program are deterministic, and the same
+  executable completes on one run and hangs on the next (#6194's hang,
+  the `Task` scope-end disposal). A DONE verdict that included the row would
   flip run-to-run. The quarantined cells are counted separately and reported
   on their own line; they never make the verdict better and never make it
   worse.
