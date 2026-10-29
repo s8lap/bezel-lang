@@ -37245,6 +37245,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ft->funcReturn = fp.type;
                     ctx_.setExprType(&ma, ft);
                 }
+                else if (m=="Sign" && &ma != calleeOfCallCtx_ &&
+                         ma.typeArgs.empty()) {
+                    // per §27.6 / §14.5 (v0.350, #6942): `Sign` declares only
+                    // the generic `Sign<T>` (stdlib §2.2), so a bare reference
+                    // has no candidate: typing it `int` (the callee result
+                    // type) made `var g := Math.Sign;` compile to a zero slot.
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "the method reference `Math.Sign` is a reference to a "
+                        "generic method and names no type arguments: write "
+                        "`Math.Sign<T>` with the type argument supplied "
+                        "\xE2\x80\x94 no inference binds it from the target "
+                        "(\xC2\xA7""27.6, \xC2\xA7""14.5, v0.350)");
+                }
                 else if (m=="Abs"||m=="Sign") setInt();
                 else if (m=="Sqrt"||m=="Pow"||
                          m=="Ceiling"||m=="Floor"||m=="Round"||m=="Truncate"||
