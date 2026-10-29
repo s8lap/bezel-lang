@@ -11611,6 +11611,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     }
                     return false;
                 };
+                // fix #7544 (stdlib §5 `Contains(value: T): bool`, §4.1
+                // `ICollection<T>.Contains`, v0.350): `Contains` is a §5
+                // operator that `typeLinqOperator` gates (hashable) but never
+                // typed, so on the lazy sentinel / `IEnumerable<T>` / the
+                // borrowing collection interfaces the call stayed UNTYPED —
+                // a `?.` call then could not lift it to `bool?` and its
+                // enclosing `??` failed to lower (#2491). Type it `bool` here
+                // when the hashable gate (inside `typeLinqOperator`) did not
+                // reject the call.
+                auto typeLinqOrContains = [&](TypeRef* srcElem) -> bool {
+                    const std::size_t errsBefore =
+                        ctx_.diagnostics().errorCount();
+                    if (typeLinqOperator(srcElem)) return true;
+                    if (m == "Contains" && ce.args.size() == 1 &&
+                        ctx_.diagnostics().errorCount() == errsBefore) {
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        return true;
+                    }
+                    return false;
+                };
                 // stdlib §5: chained LINQ on a lazy IEnumerable<T> receiver.
                 // The receiver carries no declaration/astNode (the lazy
                 // sentinel) but does carry the element type as genericArgs[0].
@@ -11885,7 +11905,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // in-place). Only typed here, where the receiver is already lazy.
                     else if (m == "Reverse" && ce.args.empty())
                         ctx_.setExprType(&ce, makeLazyEnumerable(srcElem));
-                    else if (typeLinqOperator(srcElem)) { /* typed */ }
+                    else if (typeLinqOrContains(srcElem)) { /* typed */ }
                 }
                 // §26.4 / fix #699: a method call on an `IEnumerable<T>`
                 // receiver that is NOT the lazy LINQ sentinel — e.g.
@@ -11911,12 +11931,32 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // It is equally correct for any future per-call-site
                 // monomorphization, where the receiver carries the same
                 // IEnumerable<concreteT> shape.
+                //
+                // fix #7544 (stdlib §5 / §4.1, §7.5, v0.350): `IList<T>` and
+                // `IReadOnlyList<T>` inherit `IEnumerable<T>` (stdlib §4.1), so
+                // the §5 operators apply to them with the element type at
+                // genericArgs[0]. Their results were left UNTYPED in BOTH
+                // spellings — the `.` call survived only because codegen lowers
+                // the value without a sema type — but a `?.` call needs the type
+                // to lift to `T?` for the enclosing `??`, and `.ToArray().Count`
+                // needs the Array<T> result. Typing them HERE (the one arm both
+                // spellings reach, the `?.` twin re-enters it through its `.`
+                // placeholder) keeps the two from drifting. A user-declared
+                // interface of the same name carries a `declaration` and is
+                // excluded. `ICollection<T>` / `IReadOnlyCollection<T>` are
+                // deliberately NOT admitted: their runtime representation is
+                // erased (codegen rejects §5 operators on them loudly, #853),
+                // and typing the call would turn that loud rejection into a
+                // silent drop.
                 bool ienumRecv =
                     recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     !recvTy->genericArgs.empty() && recvTy->astNode &&
                     recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
-                    recvTy->headName() == "IEnumerable";
+                    (recvTy->headName() == "IEnumerable" ||
+                     (!recvTy->declaration &&
+                      (recvTy->headName() == "IList" ||
+                       recvTy->headName() == "IReadOnlyList")));
                 if (ienumRecv) {
                     TypeRef* srcElem2 = recvTy->genericArgs[0];
                     // fix #3331 (C5, stdlib §5 + proposal 0116 D9): the
@@ -12012,7 +12052,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // codegen's materialize-then-run path (lowerToLazyEnumerator's
                     // vtable bridge) drives the iterator vtable once into an
                     // Array<T> that the lazy operator then enumerates.
-                    else if (typeLinqOperator(srcElem2)) { /* typed */ }
+                    else if (typeLinqOrContains(srcElem2)) { /* typed */ }
                 }
                 // fix #1220 / §5 / §9.6: string is IEnumerable<char> — LINQ
                 // operators resolve with char as the source element type, using

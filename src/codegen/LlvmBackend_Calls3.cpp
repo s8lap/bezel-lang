@@ -2892,7 +2892,18 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // bz_array_t*-backed.  Do NOT fall through for an unrecognised receiver type
     // (e.g. the i32(0) produced by in-place Array.Reverse()) — that would pass
     // garbage as a pointer to bz_lazy_from_array, causing SIGABRT.
-    if (!isCollectionTypeName(recvTy)) return nullptr;
+    // fix #7544 (stdlib §5 / §4.1, v0.350): a BORROWING list interface
+    // (`IList<T>` / `IReadOnlyList<T>`) is array-backed — its runtime value is
+    // the same bz_array_t* as `Array<T>` (isListInterfaceName) — so it wraps as
+    // the same borrowing lazy ARRAY source. The owning `IOwningList` is
+    // excluded (its disposal semantics are not this wrap's).
+    {
+        bool listIfaceOwning = false;
+        const bool borrowingListIface =
+            isListInterfaceName(recvTy, &listIfaceOwning) && !listIfaceOwning;
+        if (!isCollectionTypeName(recvTy) && !borrowingListIface)
+            return nullptr;
+    }
     // Concrete collection (Array<T> family): wrap it as a lazy ARRAY source.
     int64_t esz = collectionElemSize(recvTy);
     auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
@@ -2940,6 +2951,17 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         return nullptr;
 
     bool collRecv = isCollectionTypeName(recvTy);
+    // fix #7544 (stdlib §5 `ToArray(): owned Array<T>`, §4.1, v0.350): the
+    // borrowing list interfaces are array-backed IEnumerable<T> sources, but
+    // only the materializer is admitted here — `ToArray` on `IList<T>` /
+    // `IReadOnlyList<T>` produced no value (#2457) in both the `.` and `?.`
+    // spellings, while their other §5 operators lower through
+    // tryLowerCollectionInstanceCall's list-interface bridge and stay there.
+    if (!collRecv && m == "ToArray") {
+        bool listIfaceOwning = false;
+        collRecv = isListInterfaceName(recvTy, &listIfaceOwning) &&
+                   !listIfaceOwning;
+    }
     bool lazyRecv = isLazyEnumerableType(recvTy);
     // fix #454 / §5 / §4.6: LinkedList<T> implements IEnumerable<T> but is
     // bz_llist_t*-backed, not bz_array_t*-backed.  lowerToLazyEnumerator already
