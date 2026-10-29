@@ -43,7 +43,11 @@ EXIT CODES:
   0  the document and the source agree
   1  they disagree (a member is missing, extra, or has a different parent;
      a § attribution is wrong)
-  2  the checker could not parse its inputs (FAIL CLOSED — never a green)
+  2  the checker could not parse its inputs (FAIL CLOSED — never a green).
+     That includes a declaration the parser cannot see: the number of
+     `interface` declarations a LOOSE detector counts must equal the number
+     the parser read (#7504); a declaration header is joined across its
+     continuation lines (Appendix A.3's `Inheritance` is not line-bounded).
 
 Usage: scripts/check_disposal_family_chain.py [--strict] [--self-test]
 
@@ -57,6 +61,8 @@ Usage: scripts/check_disposal_family_chain.py [--strict] [--self-test]
               nothing when it reports a match.
 """
 
+import contextlib
+import io
 import os
 import re
 import sys
@@ -129,12 +135,50 @@ def split_top_level(text, sep=","):
     return out
 
 
+# A LOOSE declaration detector, independent of IFACE_RE: any line that opens
+# with optional modifiers and `interface Name`. It exists only to CROSS-CHECK
+# the parser's count (#7504) — a declaration the strict parser did not see is a
+# FAIL-CLOSED error, never a silent skip.
+LOOSE_IFACE_RE = re.compile(
+    r"^\s*(?:(?:public|private|internal|sealed|abstract)\s+)*interface"
+    r"(?:\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:<|:|where\b|$)|\s*$)"
+)
+
+
+def _unbalanced(text):
+    return text.count("<") > text.count(">")
+
+
+def header_continues(header, nxt):
+    """Does the declaration header `header` continue on the line `nxt`?
+
+    Spec Appendix A.3: `Inheritance ::= ":" InheritItem ("," InheritItem)*
+    ","?` is NOT line-bounded, so the extension clause may start on a
+    continuation line (`:` first on the line), the base list may be split
+    after a `,`, and a generic parameter list may span lines (#7504).
+    """
+    h = header.rstrip()
+    s = nxt.strip()
+    if not s:
+        return False
+    if _unbalanced(h):
+        return True
+    if h.endswith(",") or h.endswith(":"):
+        return True
+    if s.startswith(":"):
+        return True
+    return False
+
+
 def parse_declarations(text):
     """Every `public interface` declaration in the document.
 
     Returns a list of dicts: name (bare), spelling (as declared), bases
     (bare names of the EXTENSION CLAUSE), section (the § it is declared
-    under), line (1-based).
+    under), line (1-based). A declaration HEADER is joined across its
+    continuation lines before it is parsed (#7504), and the number of
+    declarations found is cross-checked against a looser detector so a shape
+    the parser cannot see FAILS CLOSED instead of being skipped.
     """
     lines = text.splitlines()
     decls = []
@@ -149,6 +193,14 @@ def parse_declarations(text):
         if not dm:
             i += 1
             continue
+        j = i + 1
+        # Rebuild the header across its continuation lines. The first line is
+        # re-matched after joining so a generic list split over lines works.
+        joined = line
+        while j < len(lines) and header_continues(joined, lines[j]):
+            joined = joined.rstrip() + " " + lines[j].strip()
+            j += 1
+        dm = IFACE_RE.match(joined)
         name = dm.group(1)
         params = dm.group(2) or ""
         rest = dm.group(3)
@@ -156,7 +208,6 @@ def parse_declarations(text):
         # A `where` clause may continue on the following lines; it is a
         # CONSTRAINT, not an extension clause, so it is dropped — but it must
         # be consumed so that a `where T: X` line is never mistaken for one.
-        j = i + 1
         while j < len(lines) and WHERE_CONT_RE.match(lines[j]):
             j += 1
         header = rest
@@ -186,6 +237,11 @@ def parse_declarations(text):
             "line": i + 1,
         })
         i = j
+    loose = sum(1 for ln in lines if LOOSE_IFACE_RE.match(ln))
+    if loose != len(decls):
+        die("the loose interface detector sees %d declarations but the "
+            "parser read %d — a declaration shape the parser cannot see "
+            "(stdlib document) — FAIL CLOSED" % (loose, len(decls)))
     return decls
 
 
@@ -473,10 +529,66 @@ def self_test():
     if not compare(doc, moved):
         die("SELF-TEST FAILED: a wrong § attribution for `%s` was NOT "
             "detected" % sp)
+    # (e) PARSER FIXTURES (#7504): legal Bezel spellings of a declaration
+    # header that a line-bounded parser MISSES. Each fixture is appended to
+    # the real document as a NEW interface extending `IDisposable`; the
+    # comparison must report it as absent from the code table. A parser that
+    # skips the shape reports agreement — the exact fail-open #7504 measured.
+    fixtures = {
+        "G1 extension clause on a continuation line":
+            "public interface IFakeProbe\n  : IDisposable\n"
+            "  method Dispose();\nend IFakeProbe;\n",
+        "G4 base list split after a comma":
+            "public interface IFakeProbe: IReadOnlyCollection<int>,\n"
+            "    IDisposable\n  method Dispose();\nend IFakeProbe;\n",
+        "G5 trailing comma then a continuation":
+            "public interface IFakeProbe: IDisposable,\n    IEquatable<int>\n"
+            "  method Dispose();\nend IFakeProbe;\n",
+        "G6 generic parameter list split over two lines":
+            "public interface IFakeProbe<out T,\n    U>: IDisposable\n"
+            "  method Dispose();\nend IFakeProbe;\n",
+        "G7 single line (control)":
+            "public interface IFakeProbe: IDisposable\n"
+            "  method Dispose();\nend IFakeProbe;\n",
+    }
+    base_n = len(decls)
+    for label, snippet in fixtures.items():
+        mutated = doc.rstrip("\n") + "\n\n" + snippet
+        try:
+            got = parse_declarations(mutated)
+        except SystemExit:
+            die("SELF-TEST FAILED: fixture %s made the parser die instead of "
+                "parsing it" % label)
+        if len(got) != base_n + 1:
+            die("SELF-TEST FAILED: fixture %s parsed %d declarations, "
+                "expected %d" % (label, len(got), base_n + 1))
+        try:
+            found = compare(mutated, src)
+        except SystemExit:
+            die("SELF-TEST FAILED: fixture %s made the comparison die" % label)
+        if not any("IFakeProbe" in p for p in found):
+            die("SELF-TEST FAILED: fixture %s (a new interface extending "
+                "`IDisposable`) was NOT detected" % label)
+    # (f) a header shape the parser cannot read must FAIL CLOSED (rc=2), not
+    # be skipped: the name on one line, the whole declaration unreadable.
+    blind = doc.rstrip("\n") + "\n\npublic interface\n  IFakeProbe: IDisposable\n"
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parse_declarations(blind)
+    except SystemExit as exc:
+        if exc.code != 2:
+            die("SELF-TEST FAILED: an unreadable header exited %r, not 2"
+                % (exc.code,))
+    else:
+        die("SELF-TEST FAILED: an interface whose header the parser cannot "
+            "read was silently accepted")
     print("check_disposal_family_chain --self-test: OK (a removed member, a "
           "changed parent, a deleted comment row and a wrong § attribution "
-          "are each detected; the real document and the real source agree "
-          "on %d family members)" % len(parents))
+          "are each detected; %d declaration-header fixtures (continuation "
+          "line, split base list, split generic list) are parsed and "
+          "detected, and an unreadable header fails closed; the real "
+          "document and the real source agree on %d family members out of "
+          "%d parsed interfaces)" % (len(fixtures), len(parents), base_n))
     return 0
 
 
