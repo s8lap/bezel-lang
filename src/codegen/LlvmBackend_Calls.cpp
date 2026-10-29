@@ -12605,6 +12605,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* recvVal = lowerExpr(*ma->target);
             if (!recvVal) return nullptr;
 
+            // fix #7342 (spec §7.4 / §22.6, stdlib §2.6, v0.350): a
+            // §7.4-NARROWED `Guid?` receiver is of its NON-NULLABLE type
+            // (§22.6: "a read of a binding §7.4 has narrowed non-null is of its
+            // non-nullable type"), but the read still loads the declared
+            // `{i8 hasValue; Guid}` carrier. Stored into the `Guid`-sized slot
+            // below as if it were the payload, the carrier wrote 20 bytes into a
+            // 16-byte slot (ASan stack-buffer-overflow), and the runtime call
+            // then read the flag byte as part of the Guid. Extract the payload
+            // first. The extraction is sound here because §7.4's member-access
+            // gate (ExprTC::resolveMemberAccess) is the ONE gate that refuses an
+            // UN-narrowed nullable receiver for every member, so a `Guid?`
+            // receiver that reaches this arm is a narrowed read.
+            if (isNullableValueTy(recvTy)) {
+                llvm::StructType* carrier = nullableValueStructTy(recvTy);
+                if (recvVal->getType()->isPointerTy())
+                    recvVal = builder_.CreateLoad(carrier, recvVal, "guid.nn.load");
+                if (recvVal->getType() == carrier)
+                    recvVal = nullablePrimValue(recvVal);
+            }
+
             // Ensure we have a ptr to the Guid struct for the runtime call.
             llvm::AllocaInst* slot = entryAlloca(gst);
             if (recvVal->getType()->isPointerTy())
