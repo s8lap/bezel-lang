@@ -413,10 +413,10 @@ DONE verdict: a cell whose program hung the compiler is UNMEASURED, and a
 DONE instrument must not print YES with an unmeasured cell.
 
 **Where it is WIRED (the reviewer's M2).** The grid itself is **not** at the
-gate: it compiles 153 programs and runs them under ASan, which is far too
+gate: it compiles 182 programs and runs them under ASan, which is far too
 slow for a gate cycle, and its DONE verdict is the campaign's, not the
 repository's. What IS at the gate is the grid's **classifier**:
-`scripts/gate/tests/test_using_heads_grid.py` (30 tests) is discovered by
+`scripts/gate/tests/test_using_heads_grid.py` (48 tests) is discovered by
 `scripts/pregate.sh` (it runs `python3 -m unittest discover -s
 scripts/gate/tests`), so a change to the grid's needles, its KNOWN-RED
 mechanism, its quarantine, its agreement check or its report writer fails the
@@ -494,6 +494,35 @@ collapsed dimension is a silently unpinned variant:
 head — e.g. `owned` is inadmissible on an `Object` field, §28.1), so **144
 runnable cells** — of which the 9 `task` cells are QUARANTINED (see the
 oracle discipline below), leaving **135** cells the DONE verdict covers.
+
+**The EXTENDED cells (R37 lane C1-L7, spec v0.350): 29 more cells, 182 in all.**
+The product grid has no axis for the shapes the campaign's open members live
+in, so seven cell kinds were added as hand-written programs (`EXTRA` in the
+script), each expectation read off a quoted spec sentence and never off the
+compiler; each has a CONTROL (the same program minus the offending line, or
+the corrected spelling) that must RUN, which is what shows the program is a
+valid one:
+
+| kind (head) | cells | members | spec sentence the expectation is read off |
+|---|---|---|---|
+| owned-returning call as the head (`call_rhs_class`, `_class_async`, `_interface`, `_derived_base`) | `using_var`, `await_using_var` x4 | #3483, #7417 | §28.10: an owned-returning call is an owned production, so the `using var` disposes; §28.12: the path is chosen "by the class of the object the binding holds ... never by the binding's static type", so the expectation is the `new` head's |
+| adopting an `owned` parameter (`owned_param`) | `adopt_unmarked`, `adopt_unmarked_await` (REJ §28.10); `adopt_move`, `adopt_move_await` (RUN, control) | #7481 | §28.10 "Adopting a named owned binding": the unmarked `using var y := x;` over a named owned binding (an `owned` parameter among them) of class type is a compile error; `move x` adopts |
+| the nullable owning-choice parameter (`owned_param_nullable`, with `owned_param_choice` as the #7415 control) | `using_var_param` x2 | #7486 | §28.10 + §15.3: an unmarked read of a move-only binding moves and is an owned right-hand side, "its nullable wrapper `C?` included" |
+| pin and move-out (`pin_move_out`) | `pin_then_transfer`, `move_out_of_using_var`, `move_out_after_dispose` (REJ); `pin_no_transfer`, `move_out_of_var` (RUN, controls) | #7406, #7405 | §28.10 "initialized from a borrow": the pin freezes the source, "the frozen kills (a move, a transfer ...) are compile errors"; axiom A5: a `using var` is "never movable out" |
+| per-level reclamation (`per_level_reclaim`) | `await_using_virtual_base`, `await_using_plain_base`, `using_var_virtual_base` | #3515 | §28.12 step 2: "owned fields are disposed ... and the base class's reclamation chains, once, immediately after logical disposal has completed" |
+| `IOwningCollection<T>` local (`owning_collection_local`) | `using_var_interface`, `using_var_concrete` (control) | #7463 | stdlib 4.2: an owning collection's `Dispose()` "cascades through their elements"; stdlib 4.1: an owned value at an interface type is disposed at `using var` "by dispatch to the runtime type" |
+| iterator-frame heads (`async_enumerator`, `sync_enumerator`, `async_enumerable`) | `using_var`, `await_using_var`, `field_store` | #2623, #7422 | §29.7: the disposal of a frame advanced into a `try` "runs the pending cleanup actions ... `finally` clauses"; §28.5: an owned field's value is disposed by its owner |
+
+The cells that are red on the staging compiler today are the ones for the open
+members: `call_rhs_interface/await_using_var` (#3483), `call_rhs_derived_base/
+await_using_var` (#7417), `owned_param/adopt_unmarked` and `_await` (#7481),
+`pin_move_out/pin_then_transfer` (#7406), `pin_move_out/move_out_after_dispose`
+(#7405), `per_level_reclaim/await_using_virtual_base` (#3515),
+`owning_collection_local/using_var_interface` (#7463), and the two
+`sync_enumerator` / `async_enumerable` field cells (#7422). The nullable
+parameter cell (#7486) is green: that issue is a coverage gap, not a live bug,
+and the cell is what keeps it covered. The agreement check covers these heads
+too.
 
 **Expectation kinds.** `REJ:<needle>` (must be rejected with a diagnostic
 holding the needle), `RUN:<markers>` (must compile, run clean under ASan, and

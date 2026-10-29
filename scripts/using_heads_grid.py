@@ -918,9 +918,338 @@ def _generic_param_program(head):
             'end Program;\n')
 
 
+# ---------------------------------------------------------------------------
+# The EXTENDED cells (R37 lane C1-L7, spec v0.350).
+#
+# The 153-cell grid is HEADS x FORMS. The cells below are the SHAPES the
+# campaign's open members live in that the product grid has no axis for:
+# an owned-RETURNING CALL as the head (#3483, #7417), the ADOPTION of an
+# `owned` parameter (#7481), the nullable owning-choice parameter (#7486), the
+# pin / move-out consume-site rules (#7405, #7406), the PER-LEVEL reclamation
+# of a hierarchy (#3515), an `IOwningCollection<T>` local (#7463) and the
+# iterator-frame heads (#2623, #7422). Each is one (head, form) cell with a
+# hand-written program (`EXTRA`), listed in the table next to the 153.
+#
+# EVERY expectation here is read off a QUOTED spec sentence (v0.350), never
+# off what the compiler does today; the compiler's present behaviour is only
+# used to check that the PROGRAM is a valid one (a CONTROL cell -- the same
+# program minus the offending line, or the corrected spelling -- must RUN).
+#
+# EXTRA[(head, form)] = (decls, members, setup, lines, expectation)
+#   decls    declarations after PRELUDE
+#   members  extra members of `Program` (static helpers)
+#   setup    lines run before the binding, INSIDE the loop
+#   lines    the binding lines under test
+# ---------------------------------------------------------------------------
+
+EXTRA_HEADS = {
+    'call_rhs_class': 'owned-returning call head: Make(): owned Res',
+    'call_rhs_class_async':
+        'owned-returning call head: Make(): owned AsyncRes',
+    'call_rhs_interface':
+        'owned-returning call head: Make(): owned IAsyncDisposable (#3483)',
+    'call_rhs_derived_base':
+        'owned-returning call head: Make(): owned Base over Der (#7417)',
+    'owned_param': '`owned` class parameter adopted by a using var (#7481)',
+    'owned_param_choice':
+        '`owned` owning-choice parameter (#7415 control for #7486)',
+    'owned_param_nullable':
+        '`owned` NULLABLE owning-choice parameter (#7486)',
+    'pin_move_out':
+        'pin and move-out of a using var (#7405, #7406; consume-site freeze)',
+    'per_level_reclaim':
+        'per-level reclamation chain, owned field in a derived level (#3515)',
+    'owning_collection_local':
+        'IOwningCollection<T> local from an owned-returning call (#7463)',
+    'async_enumerator': 'IAsyncEnumerator<int> frame with a finally (#2623)',
+    'sync_enumerator': 'IEnumerator<int> frame in an owned field (#7422)',
+    'async_enumerable': 'IAsyncEnumerable<int> in an owned field (#7422)',
+}
+
+
+def _call_rhs(ret, body):
+    """The four owned-returning-call heads share one shape: a static
+    `Make(): owned T` and the `using var` / `await using var` over its call.
+
+    §28.10: the right-hand side of a `using var` that is a method call WITHOUT
+    an `owned` return is a borrow (the pin case); a call WITH an `owned`
+    return is an owned production, so the `using var` takes over the
+    disposal, exactly as it does for a `new` expression. And §28.12: "`await
+    using` selects the logical-disposal path by the class of the object the
+    binding holds ... never by the binding's static type" -- so the producer
+    (a `new` or a call) decides nothing about which cleanup runs, and the
+    expectation is the `new` head's.
+    """
+    return (f'  public static method Make(): owned {ret}\n'
+            f'    return {body};\n'
+            '  end Make;\n')
+
+
+EXTRA = {}
+
+
+def _x(head, form, expect, lines, decls='', members='', setup=''):
+    EXTRA[(head, form)] = (decls, members, setup, lines, expect)
+    EXPECT[(head, form)] = expect
+
+
+for _head, _ret, _body, _um, _am in (
+        ('call_rhs_class', 'Res', 'new Res()', ['DTOR'], ['DTOR']),
+        # §28.12 step 1: "the awaited `DisposeAsync()` performs whatever
+        # asynchronous cleanup the class defines; the destructor body (if any)
+        # is not also run, because `DisposeAsync` supersedes it".
+        ('call_rhs_class_async', 'AsyncRes', 'new AsyncRes()',
+         ['DTOR'], ['DA']),
+        # §28.12: "through any interface -- `IAsyncDisposable` ... whose
+        # `DisposeAsync` dispatches as any interface member does" (#3483:
+        # the residual is the CALL producer; the `new` producer is OK).
+        ('call_rhs_interface', 'IAsyncDisposable', 'new AsyncRes()',
+         ['DTOR'], ['DA']),
+        # §28.12: "`await using var b: Base := new Der();` with `class Der:
+        # Base, IAsyncDisposable` awaits `Der.DisposeAsync`, skips `Der`'s
+        # destructor and runs `Base`'s" (#7417: the same through a CALL).
+        ('call_rhs_derived_base', 'Base', 'new Der()',
+         ['DER_DTOR', 'BASE_DTOR'], ['DA', 'BASE_DTOR'])):
+    _m = _call_rhs(_ret, _body)
+    _x(_head, 'using_var', ('RUN', _um), ['    using var x := Program.Make();'],
+       members=_m)
+    _x(_head, 'await_using_var', ('RUN', _am),
+       ['    await using var x := Program.Make();'], members=_m)
+
+# -- #7481: adopting an `owned` parameter ------------------------------------
+# §28.10 "Adopting a named owned binding": "An unmarked `using var y := x;` is
+# a compile error when its right-hand side is a named owned binding whose
+# declared type, nullability stripped, is a class or interface type", and a
+# named owned binding is, among others, "an `owned` parameter". "`using var y
+# := move x;` transfers a named owned local or `owned` parameter into a
+# scope-bound binding". §28.12 covers `await using var y := x;` the same way.
+_OP_CALL = ['    Take(new Res());']
+_x('owned_param', 'adopt_unmarked', ('REJ', '§28.10'), _OP_CALL,
+   members='  public static method Take(owned src: Res)\n'
+           '    using var x := src;\n'
+           '  end Take;\n')
+_x('owned_param', 'adopt_unmarked_await', ('REJ', ['§28.10', '§28.12']),
+   ['    await Take(new Res());'],
+   members='  public static async method Take(owned src: Res): Task\n'
+           '    await using var x := src;\n'
+           '  end Take;\n')
+# The corrected spelling is the CONTROL: `move` adopts and `y` carries the
+# obligation, so the destructor runs once, in the callee.
+_x('owned_param', 'adopt_move', ('RUN', ['DTOR']), _OP_CALL,
+   members='  public static method Take(owned src: Res)\n'
+           '    using var x := move src;\n'
+           '  end Take;\n')
+
+# §28.12: "`await using` takes §28.10's admission unchanged", and a class that
+# does not implement `IAsyncDisposable` takes the synchronous disposal.
+_x('owned_param', 'adopt_move_await', ('RUN', ['DTOR']),
+   ['    await Take(new Res());'],
+   members='  public static async method Take(owned src: Res): Task\n'
+           '    await using var x := move src;\n'
+           '  end Take;\n')
+
+# -- #7486 / #7415: an owned move-only parameter's `using var` copy ----------
+# §28.10: "Where `x` is a local of move-only value type (§15.3) the unmarked
+# form adopts: a move-only binding has no borrow reading to disambiguate, so
+# the plain read moves" and "an unmarked read of a move-only value binding
+# moves instead and is an owned right-hand side"; §15.3: the move-only kinds
+# are the owning choice, "its nullable wrapper `C?` included (§35.9)". So the
+# callee owns the payload, `x` disposes it once at scope end, and the caller's
+# `Take(move src)` leaves nothing to dispose (the destructor runs ONCE).
+_OC_CALL = ['    var src := OChoice.Text(new Res());', '    Take(move src);']
+_x('owned_param_choice', 'using_var_param', ('RUN', ['DTOR']), _OC_CALL,
+   members='  public static method Take(owned src: OChoice)\n'
+           '    using var x := src;\n'
+           '  end Take;\n')
+_x('owned_param_nullable', 'using_var_param', ('RUN', ['DTOR']),
+   ['    var src: OChoice? := OChoice.Text(new Res());', '    Take(move src);'],
+   members='  public static method Take(owned src: OChoice?)\n'
+           '    using var x := src;\n'
+           '  end Take;\n')
+
+# -- #7405 / #7406: the pin and the move-out ---------------------------------
+# §28.10 "`using var` initialized from a borrow": the `using var` "still pins
+# the borrow's source for the duration of the scope ... the consume-site
+# freeze then governs every consume of the source in that range -- the frozen
+# kills (a move, a transfer, a reassignment of the binding) are compile
+# errors". And axiom A5: "`using var` is a scope pin: non-reassignable, never
+# movable out" (§28.3: "it cannot be moved out of, only borrowed from"); the
+# site-announced kill (`a.Dispose()`) stays permitted, but the later `move a`
+# is still a move OUT of a `using var`.
+_PIN_DECLS = ('public class RC\n'
+              '  public constructor() end constructor;\n'
+              '  destructor Console.WriteLine("DTOR"); end destructor;\n'
+              '  public method Use() Console.WriteLine("U"); end Use;\n'
+              '  public static method Take(owned r: RC)\n'
+              '    using var k := move r;\n'
+              '  end Take;\n'
+              'end RC;\n')
+_x('pin_move_out', 'pin_then_transfer', ('REJ', ['§28.10', '§28.3']),
+   ['    var a := new RC();', '    var b := a;', '    using var p := b;',
+    '    RC.Take(move a);', '    p.Use();'], decls=_PIN_DECLS)
+# CONTROL: the same program minus the transfer. The pin is a borrow-pin, the
+# source `a` keeps the obligation and disposes at scope end.
+_x('pin_move_out', 'pin_no_transfer', ('RUN', ['U', 'DTOR']),
+   ['    var a := new RC();', '    var b := a;', '    using var p := b;',
+    '    p.Use();'], decls=_PIN_DECLS)
+_x('pin_move_out', 'move_out_of_using_var', ('REJ', ['§28.3', '§28.10']),
+   ['    using var a := new RC();', '    RC.Take(move a);'], decls=_PIN_DECLS)
+_x('pin_move_out', 'move_out_after_dispose', ('REJ', ['§28.3', '§28.10']),
+   ['    using var a := new RC();', '    a.Dispose();', '    RC.Take(move a);'],
+   decls=_PIN_DECLS)
+# CONTROL: a plain `var` owned local IS movable (§28.3.7).
+_x('pin_move_out', 'move_out_of_var', ('RUN', ['DTOR']),
+   ['    var a := new RC();', '    RC.Take(move a);'], decls=_PIN_DECLS)
+
+# -- #3515: per-level reclamation --------------------------------------------
+# §28.12 step 2: "Physical reclamation completes the disposal: owned fields
+# are disposed in reverse declaration order and the base class's reclamation
+# chains, once, immediately after logical disposal has completed, whichever
+# path ran ... at each level of the reclamation chain the destructor body is
+# skipped if that level declares or overrides a non-`abstract`
+# `DisposeAsync`". So the derived level's OWNED FIELD must be disposed
+# after `Der.DisposeAsync` even though the static type is the base.
+_PL_DECLS = (
+    'public class BaseV: IAsyncDisposable\n'
+    '  public constructor() end constructor;\n'
+    '  public async virtual method DisposeAsync(): Task\n'
+    '    Console.WriteLine("BDA");\n'
+    '  end DisposeAsync;\n'
+    'end BaseV;\n'
+    'public class DerV: BaseV\n'
+    '  public owned _d: Res;\n'
+    '  public constructor()\n'
+    '    _d := new Res();\n'
+    '  end constructor;\n'
+    '  public async override method DisposeAsync(): Task\n'
+    '    await Task.Delay(0);\n'
+    '    Console.WriteLine("DA");\n'
+    '  end DisposeAsync;\n'
+    'end DerV;\n'
+    'public class DerF: Base, IAsyncDisposable\n'
+    '  public owned _d: Res;\n'
+    '  public constructor()\n'
+    '    _d := new Res();\n'
+    '  end constructor;\n'
+    '  public async method DisposeAsync(): Task\n'
+    '    await Task.Delay(0);\n'
+    '    Console.WriteLine("DA");\n'
+    '  end DisposeAsync;\n'
+    'end DerF;\n')
+_x('per_level_reclaim', 'await_using_virtual_base',
+   ('RUN', ['DA', 'DTOR']),
+   ['    await using var u: BaseV := new DerV();'], decls=_PL_DECLS)
+# the base level (`Base`) declares no DisposeAsync, so its destructor body
+# runs (step 2's per-level rule) AFTER the derived level's owned field
+# (the generated Dispose: destructor, owned fields in reverse, then base).
+_x('per_level_reclaim', 'await_using_plain_base',
+   ('RUN', ['DA', 'DTOR', 'BASE_DTOR']),
+   ['    await using var u: Base := new DerF();'], decls=_PL_DECLS)
+# §28.12 "If a class implements `IAsyncDisposable` but has no destructor,
+# synchronous `Dispose()` performs only physical reclamation (owned-field
+# disposal and base chaining)".
+_x('per_level_reclaim', 'using_var_virtual_base', ('RUN', ['DTOR']),
+   ['    using var u: BaseV := new DerV();'], decls=_PL_DECLS)
+
+# -- #7463: an IOwningCollection<T> local ------------------------------------
+# stdlib 4.2: "owning collections are themselves owned objects (their
+# `Dispose()` cascades through their elements)"; and (stdlib 4.1) an owned
+# value held at an interface type "is disposed at its discharge points --
+# scope end, `using var`, the discard -- by dispatch to the runtime type
+# (spec §17.13)". So the `using var` over the owned call result disposes the
+# OwningArray and each element: the element's destructor runs once.
+_x('owning_collection_local', 'using_var_interface', ('RUN', ['DTOR']),
+   ['    using var c: IOwningCollection<Res> := Program.Make();'],
+   members='  public static method Make(): owned IOwningCollection<Res>\n'
+           '    var a := new OwningArray<Res>();\n'
+           '    a.Add(new Res());\n'
+           '    return a;\n'
+           '  end Make;\n')
+_x('owning_collection_local', 'using_var_concrete', ('RUN', ['DTOR']),
+   ['    using var c := new OwningArray<Res>();', '    c.Add(new Res());'])
+
+# -- the iterator-frame heads (#2623, #7422) ---------------------------------
+# §29.7: "When a consumer stops iterating early -- `break`, exception, or
+# `using var` ending before exhaustion -- the iterator is disposed", and the
+# state machine "runs the pending cleanup actions active at the point of
+# suspension -- `using var` disposals ... and `finally` clauses". The frame
+# is advanced into the `try`, so disposal must print the `finally` line once.
+# §28.5: an owned field's value is disposed by the owner's disposal.
+_AE_GEN = ('  public static async method Gen(): IAsyncEnumerator<int>\n'
+           '    try\n'
+           '      yield return 1;\n'
+           '      yield return 2;\n'
+           '    finally\n'
+           '      Console.WriteLine("FIN");\n'
+           '    end;\n'
+           '  end Gen;\n')
+_x('async_enumerator', 'using_var', ('RUN', ['FIN']),
+   ['    using var e := Program.Gen();', '    var more := await e.MoveNextAsync();'],
+   members=_AE_GEN)
+_x('async_enumerator', 'await_using_var', ('RUN', ['FIN']),
+   ['    await using var e := Program.Gen();',
+    '    var more := await e.MoveNextAsync();'], members=_AE_GEN)
+_x('async_enumerator', 'field_store', ('RUN', ['FIN']),
+   ['    using var h := new Holder();', '    h.F := Program.Gen();',
+    '    var more := await h.F!.MoveNextAsync();'], members=_AE_GEN,
+   decls='public class Holder\n'
+         '  public owned F: IAsyncEnumerator<int>? := null;\n'
+         '  public constructor() end constructor;\n'
+         'end Holder;\n')
+_x('sync_enumerator', 'field_store', ('RUN', ['FIN']),
+   ['    using var h := new Holder();', '    h.F := Program.Gen();',
+    '    var more := h.F!.MoveNext();'],
+   members='  public static method Gen(): IEnumerator<int>\n'
+           '    try\n'
+           '      yield return 1;\n'
+           '      yield return 2;\n'
+           '    finally\n'
+           '      Console.WriteLine("FIN");\n'
+           '    end;\n'
+           '  end Gen;\n',
+   decls='public class Holder\n'
+         '  public owned F: IEnumerator<int>? := null;\n'
+         '  public constructor() end constructor;\n'
+         'end Holder;\n')
+# the enumerable is never advanced, so its `finally` never runs; the cell is
+# the frame's reclamation (the loop leak oracle).
+_x('async_enumerable', 'field_store', ('RUN', []),
+   ['    using var h := new Holder();', '    h.F := Program.Gen();'],
+   members='  public static async method Gen(): IAsyncEnumerable<int>\n'
+           '    try\n'
+           '      yield return 1;\n'
+           '      yield return 2;\n'
+           '    finally\n'
+           '      Console.WriteLine("FIN");\n'
+           '    end;\n'
+           '  end Gen;\n',
+   decls='public class Holder\n'
+         '  public owned F: IAsyncEnumerable<int>? := null;\n'
+         '  public constructor() end constructor;\n'
+         'end Holder;\n')
+
+
+def build_extra(head, form):
+    """-> (source, expectation) for an EXTRA cell."""
+    decls, members, setup, lines, expect = EXTRA[(head, form)]
+    if expect[0] == 'REJ':
+        body = list(lines)
+    else:
+        body = _loop_body(setup, lines)
+    body.append('    Console.WriteLine("END");')
+    return ('module ' + modname(head, form) + ';\n' + PRELUDE + decls +
+            'public class Program\n' + members +
+            '  public static async method Main(): Task\n' +
+            '\n'.join(body) + '\n'
+            '  end Main;\n'
+            'end Program;\n'), expect
+
+
 def build(head, form):
     """-> (source, expectation) for a cell, or None when the cell is not
     applicable (the form does not exist for that head)."""
+    if (head, form) in EXTRA:
+        return build_extra(head, form)
     if (head, form) not in EXPECT:
         return None
     if form == 'field_store' and head not in FIELD_HOLDER:
@@ -1039,6 +1368,11 @@ def all_cells(filt=None):
                                 for t in toks):
                 continue
             out.append((h, f))
+    # The EXTENDED cells (see `EXTRA`), in declaration order.
+    for (h, f) in EXTRA:
+        if toks and not any(t in f'{h} {f} {EXTRA_HEADS[h]}' for t in toks):
+            continue
+        out.append((h, f))
     return out
 
 
@@ -1345,7 +1679,7 @@ def check_agreement(rows, expectations=None):
     if expectations is None:
         expectations = EXPECT
     out = []
-    for head in HEADS:
+    for head in list(HEADS) + list(EXTRA_HEADS):
         for plain_form, await_form in AGREEMENT_PAIRS:
             p = _row(rows, head, plain_form)
             a = _row(rows, head, await_form)

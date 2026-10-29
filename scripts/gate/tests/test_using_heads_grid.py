@@ -82,6 +82,8 @@ case "$FAKE_MODE" in
                printf '#!/bin/bash\necho END\n' > "$out"; chmod +x "$out"; exit 0;;
   vacuous_run) echo "$src:80:5: warning: \`using var\` \`x\` is vacuous — the RHS is a value-typed/runtime-managed value with no disposal obligation (§28.9); use \`const x := …;\` for a fixed alias without the disposal hint (§28.10 / §21.1)" >&2
                printf '#!/bin/bash\nfor i in $(seq %s); do echo DTOR; done\necho END\n' "$FAKE_N" > "$out"; chmod +x "$out"; exit 0;;
+  markers_run) printf '#!/bin/bash\nfor i in $(seq %s); do for m in %s; do echo $m; done; done\necho END\n' "$FAKE_N" "$FAKE_MARKERS" > "$out"; chmod +x "$out"; exit 0;;
+  reject_needle) echo "$src:80:5: error: the rule this cell names ($FAKE_NEEDLE)" >&2; exit 1;;
   clean_run)   printf '#!/bin/bash\nfor i in $(seq %s); do echo DTOR; done\necho END\n' "$FAKE_N" > "$out"; chmod +x "$out"; exit 0;;
   *)           echo "$src:80:5: warning: nothing" >&2;;
 esac
@@ -97,9 +99,10 @@ def _fake_compiler(d, mode='default'):
     return str(p)
 
 
-def _one_cell(head, form, mode):
+def _one_cell(head, form, mode, **env):
     """Run ONE cell against the fake compiler in `mode` and return the row.
-    `FAKE_N` is the loop count the fake's program prints its marker for."""
+    `FAKE_N` is the loop count the fake's program prints its marker for; any
+    other `FAKE_<NAME>` the fake reads comes in as a keyword."""
     with tempfile.TemporaryDirectory() as d:
         bezelc = _fake_compiler(d, mode)
         odir = os.path.join(d, 'run')
@@ -107,11 +110,15 @@ def _one_cell(head, form, mode):
         os.makedirs(odir)
         os.makedirs(progdir)
         os.environ['FAKE_N'] = str(g.LOOP_N)
+        for k, v in env.items():
+            os.environ['FAKE_' + k.upper()] = v
         try:
             return g.run_cell(bezelc, odir, progdir, head, form, 30, 30, {})
         finally:
             os.environ.pop('FAKE_MODE', None)
             os.environ.pop('FAKE_N', None)
+            for k in env:
+                os.environ.pop('FAKE_' + k.upper(), None)
 
 
 def _git(*args):
@@ -611,6 +618,206 @@ class UsingHeadsGridTest(unittest.TestCase):
             green = _one_cell('object_class', form, 'clean_run')
             self.assertEqual(green[2], 'OK', f'{form}: {green!r}')
 
+    # --------------------------------------------------------- extended cells
+    # The R37 additions (`EXTRA`): every new cell KIND has a killer. A killer
+    # is verified by actually mutating `using_heads_grid.py` (see the commit
+    # body); each test names the mutation it kills.
+    def _src(self, head, form):
+        return g.build(head, form)[0]
+
+    def test_the_extended_cells_are_in_the_table_with_a_spec_expectation(self):
+        self.assertEqual(len(g.EXTRA), 29)
+        base = {(h, f) for h in g.HEADS for f, _ in g.FORMS}
+        cells = g.all_cells()
+        self.assertEqual(len(cells), 153 + 29)
+        for key, (decls, members, setup, lines, expect) in g.EXTRA.items():
+            self.assertIn(key, cells)
+            self.assertNotIn(key, base)
+            self.assertIs(g.EXPECT[key], expect, key)
+            self.assertIn(key[0], g.EXTRA_HEADS)
+            self.assertIn(expect[0], ('RUN', 'REJ'), key)
+            src, ex = g.build(*key)
+            self.assertIn('public class Program', src, key)
+            self.assertIn('Console.WriteLine("END");', src, key)
+            self.assertIs(ex, expect)
+
+    def test_every_extended_cell_is_judged_by_the_grids_own_branches(self):
+        """Each extended cell is DRIVEN through the grid's judge: a program
+        that prints exactly the expectation is OK and one that prints
+        something else is WRONG; a rejection under the named rule is OK and a
+        compile that succeeds is WRONG. Mutation killed: an expectation or a
+        cell dropped, or a cell whose judge never reaches the markers."""
+        for key, (_d, _m, _s, _l, expect) in g.EXTRA.items():
+            head, form = key
+            if expect[0] == 'REJ':
+                needle = expect[1] if isinstance(expect[1], str) \
+                    else expect[1][0]
+                ok = _one_cell(head, form, 'reject_needle', needle=needle)
+                self.assertEqual(ok[2], 'OK', f'{key}: {ok!r}')
+                bad = _one_cell(head, form, 'default')
+                self.assertEqual(bad[2], 'WRONG', f'{key}: {bad!r}')
+            else:
+                ok = _one_cell(head, form, 'markers_run',
+                               markers=' '.join(expect[1]))
+                self.assertEqual(ok[2], 'OK', f'{key}: {ok!r}')
+                if expect[1]:
+                    bad = _one_cell(head, form, 'markers_run',
+                                    markers=' '.join(expect[1][:-1]))
+                    self.assertEqual(bad[2], 'WRONG', f'{key}: {bad!r}')
+
+    def test_call_rhs_cells_bind_an_owned_returning_call_not_a_new(self):
+        """#3483/#7417 (§28.10, §28.12): the head is the CALL's result.
+        Mutation killed: the call replaced by `new`, which is the product
+        grid's already-green head and measures nothing new."""
+        for head in ('call_rhs_class', 'call_rhs_class_async',
+                     'call_rhs_interface', 'call_rhs_derived_base'):
+            for form in ('using_var', 'await_using_var'):
+                src = self._src(head, form)
+                self.assertIn('using var x := Program.Make();', src)
+                self.assertIn('method Make(): owned ', src)
+                self.assertNotIn('using var x := new ', src)
+        # the expectation is the `new` head's, per §28.12's "never by the
+        # binding's static type": the await cell of a base-typed or
+        # interface-typed head is NOT the using_var cell's markers.
+        for call, new in (('call_rhs_derived_base', 'derived_base'),
+                          ('call_rhs_interface', 'interface'),
+                          ('call_rhs_class_async', 'class_async')):
+            for form in ('using_var', 'await_using_var'):
+                self.assertEqual(g.EXPECT[(call, form)],
+                                 g.EXPECT[(new, form)], (call, form))
+        self.assertNotEqual(g.EXPECT[('call_rhs_derived_base', 'using_var')],
+                            g.EXPECT[('call_rhs_derived_base',
+                                      'await_using_var')])
+
+    def test_owned_param_adoption_pairs_a_rejection_with_its_control(self):
+        """#7481 (§28.10 "Adopting a named owned binding"): the unmarked
+        adoption of an `owned` PARAMETER is a compile error in both
+        spellings; the `move` spelling is the control that must RUN.
+        Mutation killed: the REJ flipped to RUN (copying the compiler), the
+        `move` slipped into the rejected program, or the parameter made a
+        plain (borrow) one."""
+        for form, kw in (('adopt_unmarked', 'using var'),
+                         ('adopt_unmarked_await', 'await using var')):
+            self.assertEqual(g.EXPECT[('owned_param', form)][0], 'REJ')
+            src = self._src('owned_param', form)
+            self.assertIn('(owned src: Res)', src)
+            self.assertIn(f'{kw} x := src;', src)
+            self.assertNotIn('move src', src)
+        for form in ('adopt_move', 'adopt_move_await'):
+            self.assertEqual(g.EXPECT[('owned_param', form)],
+                             ('RUN', ['DTOR']))
+            self.assertIn('x := move src;', self._src('owned_param', form))
+        self.assertIn('§28.10', g.EXPECT[('owned_param', 'adopt_unmarked')][1])
+
+    def test_the_nullable_owned_param_cell_is_a_nullable_param(self):
+        """#7486: the nullable wrapper is the point. Mutation killed: the
+        parameter or the caller's local declared non-nullable (that is the
+        #7415 control cell), which would leave the second codegen branch
+        unmeasured."""
+        src = self._src('owned_param_nullable', 'using_var_param')
+        self.assertIn('Take(owned src: OChoice?)', src)
+        self.assertIn('var src: OChoice? := OChoice.Text(', src)
+        ctl = self._src('owned_param_choice', 'using_var_param')
+        self.assertIn('Take(owned src: OChoice)', ctl)
+        self.assertNotIn('OChoice?', ctl.split('public class Program')[1])
+        self.assertEqual(g.EXPECT[('owned_param_nullable', 'using_var_param')],
+                         ('RUN', ['DTOR']))
+
+    def test_pin_and_move_out_cells_keep_the_later_use_and_the_controls(self):
+        """#7405/#7406 (§28.10 pin; axiom A5): the freeze is about a LIVE
+        borrow, so the rejected program must read through the pin AFTER the
+        transfer. Mutation killed: the `p.Use()` dropped (nothing is live, the
+        program is legal), the transfer dropped from the rejected cell, or
+        the control cells turned into rejections."""
+        src = self._src('pin_move_out', 'pin_then_transfer')
+        body = src.split('public static async method Main')[1]
+        self.assertLess(body.index('using var p := b;'),
+                        body.index('RC.Take(move a);'))
+        self.assertLess(body.index('RC.Take(move a);'),
+                        body.index('p.Use();'))
+        self.assertEqual(g.EXPECT[('pin_move_out', 'pin_then_transfer')][0],
+                         'REJ')
+        ctl = self._src('pin_move_out', 'pin_no_transfer')
+        self.assertNotIn('RC.Take', ctl.split('public static async method Main')[1])
+        self.assertEqual(g.EXPECT[('pin_move_out', 'pin_no_transfer')][0],
+                         'RUN')
+        for form in ('move_out_of_using_var', 'move_out_after_dispose'):
+            self.assertEqual(g.EXPECT[('pin_move_out', form)][0], 'REJ')
+            b = self._src('pin_move_out', form).split(
+                'public static async method Main')[1]
+            self.assertIn('using var a := new RC();', b)
+            self.assertIn('RC.Take(move a);', b)
+        self.assertIn('a.Dispose();', self._src('pin_move_out',
+                                                'move_out_after_dispose'))
+        self.assertEqual(g.EXPECT[('pin_move_out', 'move_out_of_var')][0],
+                         'RUN')
+
+    def test_per_level_cell_needs_an_owned_field_in_the_derived_level(self):
+        """#3515 (§28.12 step 2): the stranded thing is the DERIVED level's
+        owned field behind a base-typed `await using`. Mutation killed: the
+        field removed (nothing to strand), the static type made the derived
+        class, or the DTOR marker dropped from the expectation."""
+        src = self._src('per_level_reclaim', 'await_using_virtual_base')
+        derv = src.split('public class DerV: BaseV')[1].split('end DerV;')[0]
+        self.assertIn('public owned _d: Res;', derv)
+        self.assertIn('async override method DisposeAsync', derv)
+        self.assertIn('await using var u: BaseV := new DerV();', src)
+        self.assertEqual(
+            g.EXPECT[('per_level_reclaim', 'await_using_virtual_base')],
+            ('RUN', ['DA', 'DTOR']))
+        # the field is disposed BEFORE the base level's destructor (the
+        # generated Dispose: destructor, owned fields in reverse, base chain)
+        self.assertEqual(
+            g.EXPECT[('per_level_reclaim', 'await_using_plain_base')][1],
+            ['DA', 'DTOR', 'BASE_DTOR'])
+
+    def test_owning_collection_cell_binds_the_interface_typed_owned_call(self):
+        """#7463 (stdlib 4.2: an owning collection's `Dispose()` cascades
+        through its elements). Mutation killed: the local declared with the
+        concrete type (the control) or the `owned` return dropped."""
+        src = self._src('owning_collection_local', 'using_var_interface')
+        self.assertIn('using var c: IOwningCollection<Res> := Program.Make();',
+                      src)
+        self.assertIn('Make(): owned IOwningCollection<Res>', src)
+        self.assertIn('a.Add(new Res());', src)
+        self.assertEqual(
+            g.EXPECT[('owning_collection_local', 'using_var_interface')],
+            ('RUN', ['DTOR']))
+
+    def test_iterator_frame_cells_advance_the_frame_into_the_try(self):
+        """#2623/#7422 (§29.7): the `finally` runs only if the frame was
+        advanced INTO the `try`. Mutation killed: the advance dropped from a
+        cell that expects `FIN`."""
+        for key, call in (
+                (('async_enumerator', 'using_var'), 'await e.MoveNextAsync()'),
+                (('async_enumerator', 'await_using_var'),
+                 'await e.MoveNextAsync()'),
+                (('async_enumerator', 'field_store'),
+                 'await h.F!.MoveNextAsync()'),
+                (('sync_enumerator', 'field_store'), 'h.F!.MoveNext()')):
+            self.assertEqual(g.EXPECT[key], ('RUN', ['FIN']), key)
+            self.assertIn(call, self._src(*key), key)
+            self.assertIn('finally', self._src(*key), key)
+        # the owned FIELD cells hold the frame in an `owned` field
+        self.assertIn('public owned F: IAsyncEnumerator<int>? := null;',
+                      self._src('async_enumerator', 'field_store'))
+        self.assertIn('public owned F: IEnumerator<int>? := null;',
+                      self._src('sync_enumerator', 'field_store'))
+        self.assertIn('public owned F: IAsyncEnumerable<int>? := null;',
+                      self._src('async_enumerable', 'field_store'))
+
+    def test_the_agreement_check_sees_the_extended_heads(self):
+        """§28.12's "takes §28.10's admission unchanged" for the call heads:
+        mutation killed: `check_agreement` iterating only `HEADS`."""
+        rows = [('call_rhs_interface', 'using_var', 'OK', 'clean, output []',
+                 ''),
+                ('call_rhs_interface', 'await_using_var', 'WRONG',
+                 'rejected, expected a run', '')]
+        out = g.check_agreement(rows)
+        self.assertEqual([(o[0], o[1], o[2]) for o in out],
+                         [('call_rhs_interface', 'await_using_var',
+                           'MISMATCH')])
+
     def test_a_correct_section_rejection_makes_the_cell_green(self):
         """The REJ branch's POSITIVE direction: a diagnostic that rejects the
         program under the rule the cell names makes the cell GREEN. The
@@ -697,7 +904,9 @@ class UsingHeadsGridTest(unittest.TestCase):
         self.assertTrue(g.all_cells('class'))
 
     def test_the_cell_count_is_the_documented_one(self):
-        self.assertEqual(len(g.all_cells()), 153)
+        # 17 heads x 9 forms = 153 product cells, plus the 29 EXTENDED cells
+        self.assertEqual(len(g.HEADS) * len(g.FORMS), 153)
+        self.assertEqual(len(g.all_cells()), 182)
 
 
 if __name__ == '__main__':
