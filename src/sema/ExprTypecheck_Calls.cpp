@@ -31579,6 +31579,23 @@ static std::string taskClosedSurfaceMessage(std::string_view tn,
            "`(await t).M`";
 }
 
+// fix #7869 (spec §30.3, §26.5 rule 1, v0.350): the closed CALL surface of a
+// task type. `Task` declares `Wait()` with no parameters. Returns the
+// diagnostic text for a call of `mbr` with `arity` arguments that this surface
+// does not admit, else empty. `arity` < 0 (unknown) never rejects a declared
+// name.
+static std::string taskClosedCallMessage(std::string_view tn,
+                                         std::string_view mbr,
+                                         std::ptrdiff_t arity) {
+    if (mbr == "Wait" && arity > 0)
+        return "`Wait` of `" + std::string(tn) + "` takes no arguments, "
+               "but the call passes " + std::to_string(arity) + " (\xC2\xA7""30.3: "
+               "`public method Wait();`); an instance member the receiver "
+               "declares commits the lookup by name, so no same-named "
+               "extension is consulted (\xC2\xA7""26.5 rule 1)";
+    return {};
+}
+
 // fix #7782 (spec §27.6, v0.350): "No method reference to `Dispose` or
 // `DisposeAsync`" -- a bound reference naming `Dispose` (a task is a class,
 // §30.3, whose generated `Dispose` the call `t.Dispose();` reaches) is a
@@ -35385,6 +35402,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         taskClosedSurfaceMessage(tn, mbr));
+                }
+                // fix #7869 (spec §30.3, v0.350): the call surface.
+                if (&ma == calleeOfCallCtx_ &&
+                    (mbr == "Wait" ||
+                     !lookupExtensionMember(tt, ma.member, nullptr,
+                                            ma.span.begin,
+                                            /*reportAmbiguity=*/false,
+                                            currentCallArity_))) {
+                    std::string cm =
+                        taskClosedCallMessage(tn, mbr, currentCallArity_);
+                    if (!cm.empty())
+                        ctx_.diagnostics().report(Severity::Error,
+                                                  ma.span.begin, cm);
                 }
                 // fix #7782 (spec §27.6, v0.350): a bound method reference
                 // to `Dispose` (`var f := t.Dispose;`) is a compile error;
@@ -40328,6 +40358,17 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                     }
                     ctx_.setExprType(&nm, nullableOf(recvTy->genericArgs[0]));
                     return;
+                }
+                if (&nm == calleeOfCallCtx_) {
+                    // fix #7869 (spec §30.3, v0.350): the `?.` twin of
+                    // the `.` form's closed call surface. A declared extension
+                    // member was found above and never reaches here.
+                    std::string cm =
+                        taskClosedCallMessage(tn, mbr, currentCallArity_);
+                    if (!cm.empty()) {
+                        ctx_.diagnostics().report(Severity::Error, loc, cm);
+                        return;
+                    }
                 }
                 if (&nm != calleeOfCallCtx_) {
                     if (mbr == "Dispose") {

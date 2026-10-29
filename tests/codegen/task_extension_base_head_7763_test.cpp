@@ -236,9 +236,8 @@ BEZEL_TEST(task_extension_base_head_7763, object_extension_never_shadows_declare
 
 // Same rule for a METHOD name: `Wait` is declared by `Task` (arity 0), so a
 // `Wait(k: int)` extension is not a fallback for `a.Wait(3)`; the extension's
-// result (3) must never be produced. (Today the arity-mismatched `Wait(3)` call
-// is itself not diagnosed -- a sibling defect reported with the commit -- so
-// the row pins only that the extension did not bind.)
+// result (3) must never be produced, and the arity-mismatched call is rejected
+// (issue #7869, spec §30.3).
 BEZEL_TEST(task_extension_base_head_7763, object_extension_method_never_shadows_declared_wait) {
     auto r = runAot(
         "module M; import System; "
@@ -253,4 +252,11 @@ BEZEL_TEST(task_extension_base_head_7763, object_extension_method_never_shadows_
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.stdoutText.find("3") == std::string::npos);
+    bool rejected = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("`Wait` of `Task` takes no arguments") !=
+                std::string::npos)
+            rejected = true;
+    BEZEL_EXPECT_TRUE(rejected);
 }
