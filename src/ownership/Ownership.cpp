@@ -7323,9 +7323,15 @@ bool MethodOwnership::propertyReadIsRecognizedBorrow(
 // the read (nullability stripped, `TypeRef::nullable` is a flag): a declared
 // class or interface, a builtin collection head (the standard collections are
 // class types, §28.11), a bare type parameter or other declaration-less
-// builtin class. NOT covered, by the spec's own text: `string` and the other
-// runtime-managed values (§28.9), records, enums, function values, and the
-// `Task` family (axiom A6 governs it). `Object` is also excluded FOR NOW: the
+// builtin class, and a `Task`-family head (`Task`, `Task<T>`, `OwningTask<T>`;
+// the stdlib declares `Task` a class, and the rule keys on the declared type
+// alone). NOT covered, by the spec's own text: `string` and the other
+// runtime-managed values (§28.9), records, enums and function values. The
+// spec's one `Task` sentence in this rule only ORDERS the diagnostics: "Over a
+// `Task`-family source the anonymous form is reported under §17.13's rejection
+// (axiom A6) first" -- it does not exclude the named form (issues #7686,
+// #7614); the anonymous form's own report is suppressed in handleLocalDecl so
+// that A6's rejection is the one diagnostic. `Object` is also excluded FOR NOW: the
 // spec does not say whether an `Object`-declared binding is a "class or
 // interface type" for this rule, and that is open spec-question issue #7568;
 // until it is ruled, the simplest reading (excluded: the form stays a
@@ -7360,7 +7366,6 @@ bool MethodOwnership::isNamedOwnedClassOrInterfaceBinding(
     // Declaration-less Named: a builtin collection or builtin class, an
     // unsubstituted bare type parameter, or a value / Task-family builtin.
     if (isValueSubstitutionErased(rt)) return false;
-    if (common::isTaskFamilyHead(rt->headName())) return false;
     return true;
 }
 
@@ -7950,6 +7955,19 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                     return it != states_.end() && it->second.implicitDischarge;
                 }();
                 const bool anon = ld.name == "_";
+                // §28.10: "Over a `Task`-family source the anonymous form is
+                // reported under §17.13's rejection (axiom A6) first, and
+                // `using var _ := move x;` is never offered as its remedy" --
+                // A6's diagnostic is the one report for `using var _ := t;`
+                // over a Task-family `t`, so this ambiguity report (whose
+                // remedy would offer `move`) is not issued. The NAMED form is
+                // reported below (issues #7686, #7614). // per §28.10, A6
+                const sema::TypeRef* adoptedTy = ctx_.exprType(*adopted);
+                const bool anonTaskFamily =
+                    anon && adoptedTy &&
+                    adoptedTy->kind == sema::TypeRef::Kind::Named &&
+                    common::isTaskFamilyHead(adoptedTy->headName());
+                if (!anonTaskFamily) {
                 std::string msg = std::string("an unmarked `") +
                     (ld.isAwaitUsing ? "await using var " : "using var ") +
                     std::string(ld.name) + " := " +
@@ -7973,6 +7991,7 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld,
                                 : ", or bind a view with `var` or `const`";
                 }
                 report(Severity::Error, ld.span.begin, std::move(msg));
+                }
             }
             // §28.10 "using var initialized from a borrow" (#2128): positive
             // recognition of the spec-listed borrow shapes — field read, indexer

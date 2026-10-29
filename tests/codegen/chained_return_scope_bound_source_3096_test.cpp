@@ -193,9 +193,14 @@ const char* kPlainOwnedLocalSource =
 // return taking the OWNER. `taskLocalOwnsFrame` must say yes to `task` and no to
 // `t2`: the owner's disposal is deferred to the outer teardown, and the pin —
 // which registers no disposal at all — must neither be chained nor disturb that.
+// (Respelled at v0.350: the pin's source is the borrowing alias `view`; the
+// unmarked `using var t2 := task;` over the owned `task` is the §28.10
+// *Adopting a named owned binding* compile error, issues #7686/#7614. A
+// borrowing alias is the spec's borrow-state source, which still pins.)
 const char* kPinBesideOwnedSource =
     "  using var task := C.P(42); "
-    "  using var t2 := task; "
+    "  var view := task; "
+    "  using var t2 := view; "
     "  return await task; ";
 
 // CONTROL — the anonymous `CallExpr` source, the only shape the pre-fix gate
