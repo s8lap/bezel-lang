@@ -397,51 +397,9 @@ BEZEL_TEST(string_width_surface_7425,
                      "zzz");
 }
 
-// ===========================================================================
-// 13/17 — the §9.6-EXT `GetField(delim, n)`: the CONTENT.
-//
-// ⚠ GetField is NOT a stdlib §9.6 member — issue #7131 records that the
-// compiler implements three §9.6 members the document does not declare. The
-// row is here because the member was BYTE-domain (the same root cause as the
-// rows above), and because its semantics are the COMPILER's, so this row
-// pins the semantics the compiler already had — the n-th 0-based
-// delimiter-separated field, "" when there is no such field.
-//
-// PRE-FIX (measured): "åea" and "" (the byte-domain scan never found the
-// delimiter code point, and the field was copied as BYTES).
-// POST-FIX: "日abc" and "日".
-// ===========================================================================
-BEZEL_TEST(string_width_surface_7425,
-           getfield_content_spec_4_6) {
-    Outcome o = run(prog(
-        "    Console.WriteLine(\"日abc\".GetField(' ', 0));\n"
-        "    Console.WriteLine(\"a 日 b\".GetField(' ', 1));\n"));
-    BEZEL_EXPECT_TRUE(o.ran);
-    BEZEL_EXPECT_FALSE(o.errored);
-    BEZEL_EXPECT_EQ(o.out, "日abc\n日");
-}
-
-// ===========================================================================
-// 14/17 — the §9.6-EXT `CountOf(sub)`: the COUNT.
-//
-// ⚠ CountOf is NOT a stdlib §9.6 member (issue #7131) — the same posture as
-// GetField above. The base counted the occurrences with `memmem` over the raw
-// BYTES, which cannot see a code point in a width-2 or width-4 string.
-//
-// PRE-FIX (measured): "日bc".CountOf("bc") -> 0 (the byte sequence of "日bc"
-// does not contain the byte sequence "bc" at any aligned offset), and
-// "日日".CountOf("日") -> 1. POST-FIX: 1 and 2.
-// ===========================================================================
-BEZEL_TEST(string_width_surface_7425,
-           countof_content_spec_4_6) {
-    Outcome o = run(prog(
-        "    Console.WriteLine(\"日bc\".CountOf(\"bc\"));\n"
-        "    Console.WriteLine(\"日日\".CountOf(\"日\"));\n"
-        "    Console.WriteLine(\"abc\".CountOf(\"bc\"));\n"));
-    BEZEL_EXPECT_TRUE(o.ran);
-    BEZEL_EXPECT_FALSE(o.errored);
-    BEZEL_EXPECT_EQ(o.out, "1\n2\n1");
-}
+// 13/17 and 14/17 (instance `GetField` / `CountOf` content rows) removed by
+// fix #7746 (stdlib §9.6, v0.350; #7131 ruling): neither is a §9.6 member and
+// both are rejected (tests/sema/string_instance_getfield_countof_rejected_7746).
 
 // ===========================================================================
 // 15/17 — the LEAK oracle, LOOPED.

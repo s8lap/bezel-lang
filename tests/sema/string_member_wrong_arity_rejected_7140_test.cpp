@@ -60,16 +60,9 @@
 // to guess which shape the document defines.
 //
 // THE THREE MEMBERS §9.6 DOES NOT DECLARE. The INSTANCE `Repeat(count)`,
-// `GetField(delim, n)` and `CountOf(sub)` are implemented by the compiler but
-// are NOT declared in stdlib §9.6 — issue #7131 records that gap and asks
-// whether they belong in the document and at which arity, and a document
-// amendment is a coordinator decision, not this lane's. They are NOT deleted
-// here (deleting a member the compiler has shipped is a behaviour flip this
-// lane does not own), but they are not left crashing either: their arity is
-// pinned to the arity the compiler LOWERS them at, and the diagnostic says so
-// — "the compiler lowers `GetField` only at exactly 2 argument(s); stdlib §9.6
-// declares no such member at all (issue #7131 …)" — so the reader is never
-// told a declaration that does not exist.
+// `GetField(delim, n)` and `CountOf(sub)` are not declared in stdlib §9.6;
+// fixes #7706 / #7746 (the #7131 ruling) withdrew the compiler's acceptance,
+// so the rows below now expect the non-member rejection, at any arity.
 //
 // THE CONTROLS ARE THE POINT. This is a gate ADDED to a member, so the live
 // risk is over-rejection of the arities §9.6 *does* declare. Every control
@@ -161,10 +154,7 @@ BEZEL_TEST(sema_string_member_wrong_arity_7140,
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(arityRejected(
         r,
-        "the call to `GetField` on `string` supplies 3 argument(s) but the "
-        "compiler lowers `GetField` only at exactly 2 argument(s); stdlib "
-        "§9.6 declares no such member at all (issue #7131 asks whether the "
-        "member belongs in §9.6 and at which arity)"));
+        "string member `.GetField` is not yet supported in codegen"));
 }
 
 // `CountOf` at TWO arguments — the third member stdlib §9.6 does not declare
@@ -179,10 +169,7 @@ BEZEL_TEST(sema_string_member_wrong_arity_7140,
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(arityRejected(
         r,
-        "the call to `CountOf` on `string` supplies 2 argument(s) but the "
-        "compiler lowers `CountOf` only at exactly 1 argument(s); stdlib §9.6 "
-        "declares no such member at all (issue #7131 asks whether the member "
-        "belongs in §9.6 and at which arity)"));
+        "string member `.CountOf` is not yet supported in codegen"));
 }
 
 // `Substring` at THREE arguments — §9.6 declares one and two. MEASURED
@@ -648,7 +635,6 @@ BEZEL_TEST(sema_string_member_wrong_arity_7140,
         "    Console.WriteLine(\"[\" + \"abcdef\".Remove(1) + \"]\");\n"
         "    Console.WriteLine(\"[\" + \"abcdef\".Remove(1, 2) + \"]\");\n"
         "    Console.WriteLine(\"[\" + String.Repeat(\"x\", 3) + \"]\");\n"
-        "    Console.WriteLine(\"[\" + \"a,b,c\".GetField(',', 1) + \"]\");\n"
         "    return 0;");
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -656,7 +642,7 @@ BEZEL_TEST(sema_string_member_wrong_arity_7140,
     BEZEL_EXPECT_EQ(
         r.stdoutText,
         "[bcdef]\n[bc]\n[ab]\n[  ab  ]\n[ab]\n[ab]\n[AB]\n[ab]\n[bb]\n[bb]\n"
-        "[  ab]\n[--ab]\n[ab  ]\n[ab--]\n[aXb]\n[a]\n[adef]\n[xxx]\n[b]\n");
+        "[  ab]\n[--ab]\n[ab  ]\n[ab--]\n[aXb]\n[a]\n[adef]\n[xxx]\n");
 }
 
 // The bool- and int-returning INSTANCE members.
@@ -672,13 +658,12 @@ BEZEL_TEST(sema_string_member_wrong_arity_7140,
         "    Console.WriteLine(\"ab\".LastIndexOf(\"a\"));\n"
         "    Console.WriteLine(\"ab\".CompareTo(\"ab\"));\n"
         "    Console.WriteLine(\"ab\".CompareTo(\"ab\", true));\n"
-        "    Console.WriteLine(\"aXbXc\".CountOf(\"X\"));\n"
         "    return 0;");
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText,
-                    "True\nTrue\nTrue\nTrue\n0\n0\n0\n0\n0\n2\n");
+                    "True\nTrue\nTrue\nTrue\n0\n0\n0\n0\n0\n");
 }
 
 // The collection- and span-returning INSTANCE members.

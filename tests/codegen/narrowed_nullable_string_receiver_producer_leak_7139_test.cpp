@@ -224,8 +224,7 @@ BEZEL_TEST(narrowed_nullable_string_receiver_producer_leak_7139,
          {"s.Replace('a','z')", 5},
          {"s.PadLeft(6)", 6},
          {"s.Insert(0,\"z\")", 6},
-         {"s.Remove(0,1)", 4},
-         {"s.GetField(',',1)", 1}}));
+         {"s.Remove(0,1)", 4}}));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
@@ -326,7 +325,7 @@ BEZEL_TEST(narrowed_nullable_string_receiver_producer_leak_7139,
 
 // =====================================================================
 // (J) CONTROL — an `int`-result member on the SAME narrowed receiver.
-// `CountOf` mints no `string`, so it is not a producer at all; the widened
+// `IndexOf` mints no `string`, so it is not a producer at all; the widened
 // guard must not have made it one (stdlib §9.6).
 // =====================================================================
 BEZEL_TEST(narrowed_nullable_string_receiver_producer_leak_7139,
@@ -338,7 +337,7 @@ BEZEL_TEST(narrowed_nullable_string_receiver_producer_leak_7139,
         "    var count := 0; "
         "    var i := 0; "
         "    while i < 40 do "
-        "      var t: int := s.CountOf(\"x\"); "
+        "      var t: int := s.IndexOf(\"x\") + 1; "
         "      if t = 1 then count := count + 1; end; "
         "      i := i + 1; "
         "    end; "

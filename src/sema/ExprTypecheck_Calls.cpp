@@ -22696,15 +22696,9 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
 // because a member that takes no parameter can take no named argument).
 //
 // THE THREE MEMBERS §9.6 DOES NOT DECLARE. The INSTANCE `Repeat(count)`,
-// `GetField(delim, n)` and `CountOf(sub)` are implemented by the compiler but
-// are NOT declared in stdlib §9.6 — issue #7131 records that gap and asks
-// whether they belong in the document and at which arity, and a document
-// amendment is a coordinator decision, not this lane's. They are therefore
-// NOT deleted here (deleting a member the compiler has shipped is a
-// behaviour flip this lane does not own), but they are not left crashing
-// either: their arity is pinned to the arity the compiler LOWERS them at, so
-// a call the lowering cannot dispatch is rejected with a diagnostic that says
-// so and points at #7131.
+// `GetField(delim, n)` and `CountOf(sub)` are not declared in stdlib §9.6;
+// the #7131 ruling withdrew the compiler's acceptance (fix #7706, #7746), so
+// they have no row here and are rejected as non-members.
 //
 // THE SCOPE. The rows cover the members the four built-in `string` arms in
 // `resolveMemberAccess` accept (the `string`-returning, `bool`-returning,
@@ -22831,21 +22825,6 @@ static const std::vector<BuiltinStringArityRow>& builtinStringStaticArities() {
     return kRows;
 }
 
-// The built-in `string` members stdlib §9.6 does NOT declare (issue #7131):
-// `GetField(delim, n)` and `CountOf(sub)`. The arity below is the one the
-// compiler LOWERS them at, not a declared one — the diagnostic says so, so the
-// reader is never told a declaration that does not exist. (The INSTANCE
-// `Repeat(count)` was the third; fix #7706 stopped admitting it, so it has no
-// row: the call is rejected as a non-member before any arity question.)
-static const std::vector<BuiltinStringArityRow>&
-builtinStringUndeclaredArities() {
-    static const std::vector<BuiltinStringArityRow> kRows = {
-        {"GetField", {2}, "`GetField(delimiter: char, n: int): string`"},
-        {"CountOf", {1}, "`CountOf(substring: string): int`"},
-    };
-    return kRows;
-}
-
 static const BuiltinStringArityRow* findBuiltinStringArity(
     const std::vector<BuiltinStringArityRow>& rows, std::string_view member) {
     for (const auto& r : rows)
@@ -22884,7 +22863,6 @@ static void checkBuiltinStringCallArity(SemaContext& ctx,
     }
     if (!target) return;
     const BuiltinStringArityRow* spec = nullptr;
-    bool declared = true;   // does stdlib §9.6 declare this member at all?
     bool isStatic = false;
     // The STATIC spelling: the callee's target is the TYPE NAME `string`,
     // which carries no value exprType. This is the same shape
@@ -22912,12 +22890,7 @@ static void checkBuiltinStringCallArity(SemaContext& ctx,
             recv->primitive != PrimitiveType::String)
             return;
         spec = findBuiltinStringArity(builtinStringInstanceArities(), member);
-        if (!spec) {
-            spec = findBuiltinStringArity(builtinStringUndeclaredArities(),
-                                          member);
-            declared = false;
-        }
-        if (!spec) return;
+        if (!spec) return;   // not a §9.6 member: rejected as a non-member
         // The null-conditional spelling `s?.M(..)`: the `?.` mirror of the
         // string-member gate REJECTS every built-in `string` member it cannot
         // lower ("string member `?.M` is not yet supported in codegen"), so
@@ -22937,25 +22910,12 @@ static void checkBuiltinStringCallArity(SemaContext& ctx,
         isStatic ? ("`string." + std::string(member) + "`")
                  : ("`" + std::string(member) + "` on `string`");
     const std::string expectation = builtinStringArityExpectation(*spec);
-    if (declared) {
-        ctx.diagnostics().report(
-            Severity::Error, ce.span.begin,
-            "the call to " + callee + " supplies " + std::to_string(argc) +
-                " argument(s) but stdlib §9.6 declares " +
-                std::string(spec->decl) + " — " + expectation +
-                " (§22.5; §9.6)");
-        return;
-    }
-    // A member stdlib §9.6 does not declare: the arity below is the one the
-    // compiler LOWERS it at, so name that, and point at the issue that
-    // records the gap in the document.
     ctx.diagnostics().report(
         Severity::Error, ce.span.begin,
         "the call to " + callee + " supplies " + std::to_string(argc) +
-            " argument(s) but the compiler lowers `" + std::string(member) +
-            "` only at " + expectation +
-            "; stdlib §9.6 declares no such member at all (issue #7131 asks "
-            "whether the member belongs in §9.6 and at which arity)");
+            " argument(s) but stdlib §9.6 declares " +
+            std::string(spec->decl) + " — " + expectation +
+            " (§22.5; §9.6)");
 }
 
 // fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
@@ -34762,7 +34722,6 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     if (ma.member == "CompareTo" ||
                         ma.member == "IndexOf" ||
                         ma.member == "LastIndexOf" ||
-                        ma.member == "CountOf" ||
                         ma.member == "ToInt32" || ma.member == "ToUInt32" ||
                         ma.member == "GetHashCode") {  // stdlib §9.6, #882
                         ctx_.setExprType(
@@ -34799,8 +34758,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // and then to the catch-all rejection every other
                         // static-only name (`Join`, `From`, ...) draws.
                         ma.member == "Remove" ||
-                        ma.member == "Insert" ||
-                        ma.member == "GetField") {
+                        // fix #7746 (stdlib §9.6, v0.350, #7131 ruling):
+                        // `GetField` / `CountOf` are NOT in this list or the
+                        // int list above; they are not §9.6 members.
+                        ma.member == "Insert") {
                         ctx_.setExprType(
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;

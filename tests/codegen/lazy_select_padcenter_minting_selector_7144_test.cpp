@@ -48,10 +48,8 @@
 // `isStdlibStringMintingCall` (a user override may return a borrow) is what
 // keeps the last of those admitted, and it must survive this change.
 //
-// Scope (recorded): `GetField` is implemented by the compiler but is NOT
-// declared by stdlib §9.6 — that is #7131 (a `spec-defect` issue), and its
-// place in the mint set is #7131's decision. This commit does NOT change it:
-// `Select(x => x.GetField(',', 0))` is still ACCEPTED here, exactly as before.
+// Scope (recorded): `GetField` is NOT declared by stdlib §9.6; fix #7746
+// (v0.350, #7131 ruling) stopped admitting the instance spelling at all.
 // The INSTANCE spelling `x.Repeat(3)` is no longer accepted at all: stdlib
 // §9.6 (v0.350) declares `Repeat` static-only, so #7706 rejects the instance
 // spelling before the minting-selector gate is reached.

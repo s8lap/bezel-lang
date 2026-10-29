@@ -28143,19 +28143,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         // `Repeat(count)` arm. It is not a §9.6 member; a call
                         // spelled that way is a user extension's, whose result
                         // is classified by the extension-call path.
-                        // fix #7119 / §9.6-ext / §28.9 (v0.343): `GetField(
-                        // delim, n)` — the §9.6-ext member that returns the
-                        // n-th 0-indexed field of SELF split by `delim` — also
-                        // mints a fresh +1 string (tryLowerStringMethod's
-                        // `method == "GetField" && call.args.size() == 2` arm
-                        // ends in the same initStringRc). MEASURED before this
-                        // fix: 34 B in 2 allocations. The comment above used to
-                        // list `GetField` among the members that "don't go
-                        // through tryLowerStringMethod's rc=1 path"; that was
-                        // false — GetField does return a `string` and does mint
-                        // at rc := 1, so it belonged here.
-                        if (m == "GetField" && argc == 2)
-                            return true;
+                        // fix #7746 (stdlib §9.6, v0.350): no `GetField` arm; not a §9.6 member.
                     }
                     // stdlib §3.3 / #971: `span.ToString()` on a
                     // ReadOnlyStringSpan materializes the span's code points

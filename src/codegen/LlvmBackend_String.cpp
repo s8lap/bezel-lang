@@ -2672,47 +2672,8 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     // that name is therefore the extension's: it must fall through to the
     // extension lowering, not be answered by the built-in.
 
-    // §9.6-ext: GetField(delim: char, n: int): string
-    // Returns the n-th 0-indexed field when splitting self by delim.
-    // Returns empty string if n is out of range.
-    if (method == "GetField" && call.args.size() == 2 &&
-        call.args[0].value && call.args[1].value) {
-        llvm::Value* delimArg = lowerArg(0);
-        llvm::Value* nArg = lowerArg(1);
-        if (!delimArg || !nArg) return nullptr;
-        // #7425 (§4.6, v0.345): the field is taken in the CODE-POINT domain,
-        // by the runtime's width-aware helper. The inline arm this replaces
-        // scanned for the delimiter one BYTE at a time and copied the field's
-        // BYTES, so on a width-2 string the result was the byte sequence.
-        //
-        // ⚠ GetField is NOT a stdlib §9.6 member (issue #7131) — the helper
-        // keeps the compiler's existing semantics (the n-th 0-based
-        // delimiter-separated field, "" when out of range) and only moves the
-        // work out of the byte domain. The API-existence question is #7131's.
-        auto* i32Ty = llvm::Type::getInt32Ty(llvm_);
-        if (!delimArg->getType()->isIntegerTy(32))
-            delimArg = delimArg->getType()->getIntegerBitWidth() < 32
-                           ? builder_.CreateZExt(delimArg, i32Ty, "gf.delim")
-                           : builder_.CreateTrunc(delimArg, i32Ty, "gf.delim");
-        if (!nArg->getType()->isIntegerTy(64))
-            nArg = nArg->getType()->getIntegerBitWidth() < 64
-                       ? builder_.CreateZExt(nArg, i64(), "gf.n")
-                       : builder_.CreateTrunc(nArg, i64(), "gf.n");
-        auto* fn = declareC("bz_str_getfield", ptrTy(), {ptrTy(), i32(), i64()});
-        return builder_.CreateCall(fn, {self, delimArg, nArg}, "gf.result");
-    }
-
-    // §9.6-ext: CountOf(sub: string): int — count non-overlapping occurrences.
-    if (method == "CountOf" && call.args.size() == 1 && call.args[0].value) {
-        llvm::Value* sub = getStrArg(0);
-        if (!sub) return nullptr;
-        // #7425 (§4.6, v0.345): the occurrences are counted in the CODE-POINT
-        // domain, by the runtime's width-aware helper. The inline arm this
-        // replaces used `memmem` over the raw BYTES, which cannot see a code
-        // point in a width-2 or width-4 string.
-        auto* fn = declareC("bz_str_count_of", i32(), {ptrTy(), ptrTy()});
-        return builder_.CreateCall(fn, {self, sub}, "countof.result");
-    }
+    // fix #7746 (stdlib §9.6, v0.350, #7131 ruling): no `GetField` / `CountOf`
+    // arm. Neither is a §9.6 member; sema rejects the instance spelling.
 
     // §9.6: Insert(index, value): string — insert value at code-point position index.
     if (method == "Insert" && call.args.size() == 2 &&

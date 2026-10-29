@@ -246,19 +246,8 @@ BEZEL_TEST(string_instance_repeat_producer_leak_7119,
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
 
-// =====================================================================
-// (H) The §9.6-ext sibling: `GetField(delim, n)` returns the n-th field of
-// SELF split by `delim` — a fresh +1 string. Pre-fix: 34 B in 2 allocations.
-// =====================================================================
-BEZEL_TEST(string_instance_repeat_producer_leak_7119,
-           instance_getfield_lsan_clean_stdlib_9_6) {
-    JitResult r = runAotChecked(loopCount(
-        "var src := \"a,b,c\"; ",
-        "src.GetField(',', 1)", 1));
-    BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 40);
-}
+// (H) removed by fix #7746 (stdlib §9.6, v0.350): the instance `GetField`
+// is not a §9.6 member and is rejected, so it has no producer to leak.
 
 // =====================================================================
 // (I) The slicing property `[r: Range<int>]: string` in its Range-VALUE
