@@ -164,9 +164,17 @@ int consoleWriterLocalStdFdOf(const sema::SemaContext& ctx,
         return 0;
     auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(id));
     if (!loc || !loc->decl) return 0;
-    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
-    if (!ld || !ld->initializer) return 0;
-    auto* init = dynamic_cast<const ast::MemberAccessExpr*>(ld->initializer.get());
+    // A §21.1 runtime `const` local (`const w := Console.Out;`, a borrow, so an
+    // admitted initializer) is an `ast::LocalConstDecl`, whose initializer is
+    // `value`; reading only `ast::LocalDecl` left it on the #2457 reject.
+    // per §21.1, v0.350
+    const ast::Expr* initExpr = nullptr;
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl))
+        initExpr = ld->initializer.get();
+    else if (auto* cd = dynamic_cast<const ast::LocalConstDecl*>(loc->decl))
+        initExpr = cd->value.get();
+    if (!initExpr) return 0;
+    auto* init = dynamic_cast<const ast::MemberAccessExpr*>(initExpr);
     if (!init || !init->target) return 0;
     auto* cid = dynamic_cast<const ast::IdentifierExpr*>(init->target.get());
     if (!cid || cid->name != "Console") return 0;
@@ -179,7 +187,14 @@ int Emitter::textWriterLocalStdFd(const ast::IdentifierExpr& id) {
     const int fd = consoleWriterLocalStdFdOf(ctx_, id);
     if (fd == 0) return 0;
     auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(id));
+    // A §21.1 `const` local is not an assignable location (assignment,
+    // compound assignment, `++`/`--` and `ref`/`out` binding are compile
+    // errors, and a lambda captures it by read only), so its slot is never
+    // written after its declaration: the unwritten proof holds by
+    // construction. per §21.1, v0.350
+    if (dynamic_cast<const ast::LocalConstDecl*>(loc->decl)) return fd;
     auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld) return 0;
     if (reassignedOpaqueLocals_.count(ld)) return 0;
     if (!opaqueLocalProvablyUnwritten(ld)) return 0;
     return fd;

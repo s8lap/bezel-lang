@@ -105,6 +105,36 @@ BEZEL_TEST(textwriter_local_writeline_7713, loop_no_leak) {
     BEZEL_EXPECT_EQ(r.stdoutText.size(), std::size_t(200 * 5 + 3));
 }
 
+// pregate fix-forward (spec §21.1, v0.350): a runtime `const` local bound to
+// `Console.Out` / `Console.Error` is a borrow, an admitted initializer ("a
+// runtime const ... borrows"), and it is never written again by construction
+// ("A `const` local ... is not an assignable location"). It is an
+// `ast::LocalConstDecl`, not an `ast::LocalDecl`, so the #7713 lowering skipped
+// it and `w.WriteLine(x)` kept the #2457 "no dispatch arm" reject.
+BEZEL_TEST(textwriter_local_writeline_7713, const_local_writes_like_var_local) {
+    auto r = runAot(std::string(kPre) +
+        "const w: TextWriter := Console.Out; const e: TextWriter := Console.Error; "
+        "var o: Object := 7; "
+        "w.WriteLine(5); w.Write(\"s\"); w.WriteLine(o); w.WriteLine(); "
+        "e.WriteLine(\"to-err\"); e.Flush(); w.Flush(); w.WriteLine(new Cls()); "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("5\ns7\n\ncls\n"));
+}
+
+// The `const` twin of loop_no_leak: the Object / string argument of a `const`
+// writer is the same call-bounded borrow, released once at its scope end.
+BEZEL_TEST(textwriter_local_writeline_7713, const_local_loop_no_leak) {
+    auto r = runAot(std::string(kPre) +
+        "const w: TextWriter := Console.Out; var o: Object := 7; "
+        "var s := \"a\" + 5.ToString(); "
+        "for var i in 0..<200 do w.Write(o); w.Write(s); w.WriteLine(o); end for; "
+        "w.WriteLine(s); "
+        "end Main; end P;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.stdoutText.size(), std::size_t(200 * 5 + 3));
+}
+
 // The issue's repro (probe rej_tw.bzl): an owning choice is a boxing at the
 // `Object` overload, rejected exactly as for Console (spec §35.8, #7694).
 BEZEL_TEST(textwriter_local_writeline_7713, owning_choice_field_rejected) {

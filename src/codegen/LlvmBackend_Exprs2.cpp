@@ -790,8 +790,12 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
                 // locals are already covered by loc->isUsing above.
                 // per §28.8.1, §28.10, §30.5, v0.350
                 const bool isOwnedTaskLocalMove = [&]() -> bool {
-                    if (auto* ld =
-                            dynamic_cast<const ast::LocalDecl*>(loc->decl))
+                    // LOCALDECL-ONLY: a §21.1 `const` local never owns a Task
+                    // frame: a Task-family call initializer and a `move` are
+                    // both rejected (an owned production), so the only Task
+                    // `const` is a borrow alias, which registered no `d.task`
+                    // disposal for this gate to vacate. per §21.1, v0.350
+                    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl))
                         return !ld->isUsing && taskLocalOwnsFrame(ld);
                     return false;
                 }();
