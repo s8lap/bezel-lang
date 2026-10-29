@@ -34524,6 +34524,37 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                 }
+                // fix #7731 (spec §30.3, §17.1 precedence, v0.350): the closed
+                // property surface of `Task` / `Task<T>` / `OwningTask<T>` is
+                // IsCompleted / IsFaulted / IsCancelled / Result (plus the
+                // `Wait()` method and the object members). A bare READ of any
+                // other member (`await SlowS(..).Length` parses as
+                // `await (SlowS(..).Length)`, spec §17.1: "primary access binds
+                // tighter than unary `await`") named nothing and was accepted
+                // untyped, so codegen degraded the initializer (#2434 / #2961
+                // internal warning, exit 0) and the cascade surfaced as a
+                // location-less `+` error. A call's callee is exempt: the
+                // closed call surface is checked at the call.
+                if (&ma != calleeOfCallCtx_ && mbr != "Wait" &&
+                    mbr != "Dispose" && mbr != "DisposeAsync" &&
+                    mbr != "ToString" && mbr != "Equals" &&
+                    mbr != "GetHashCode" &&
+                    // A declared extension property (§26.5) on `Task<T>` /
+                    // `OwningTask<T>` binds the read, exactly as the
+                    // `OwningBuffer<T>.Count` reject above keeps a same-named
+                    // extension.
+                    !lookupExtensionMember(tt, ma.member, nullptr, ma.span.begin,
+                                           /*reportAmbiguity=*/false)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`" + std::string(tn) + "` has no member `" + std::string(mbr) +
+                            "` (\xC2\xA7""30.3): its properties are "
+                            "IsCompleted, IsFaulted, IsCancelled and Result. "
+                            "`await` binds looser than member access, so "
+                            "`await t.M` awaits the value of `t.M`; to read a "
+                            "member of the awaited result write "
+                            "`(await t).M`");
+                }
             }
         }
         // §6.6 / issue #974: TaskCompletionSource<T> / OwningTaskCompletionSource<T>
