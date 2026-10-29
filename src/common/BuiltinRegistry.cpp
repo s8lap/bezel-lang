@@ -1077,6 +1077,12 @@ constexpr std::array<std::string_view, 2> kBuiltinCtorLoweredByNameHeads = {
     "ExceptionInfo", "ReadOnlyStringSpan",
 };
 
+// fix #7502: the heads whose constructor rows are the complete §2.5
+// constructor surface (DateTime, DateOnly, TimeOnly). See the header.
+constexpr std::array<std::string_view, 3> kBuiltinCtorSurfaceClosedByRowsHeads = {
+    "DateTime", "DateOnly", "TimeOnly",
+};
+
 // The heads `kStringParamNames` / `kEncodingParamNames` /
 // `kStringBuilderParamNames` answer for. See the header for the two roles this
 // predicate plays at the call site.
@@ -2222,6 +2228,10 @@ std::vector<BuiltinParamForm> builtinParamForms(std::string_view typeHead,
 bool isBuiltinCtorLoweredByName(std::string_view head) {
     return contains(kBuiltinCtorLoweredByNameHeads, head);
 }  // per §22.5 / §17.7, fix #3425 (the #3098 `lowerNew` arm)
+
+bool isBuiltinCtorSurfaceClosedByRows(std::string_view head) {
+    return contains(kBuiltinCtorSurfaceClosedByRowsHeads, head);
+}  // per §22.5 / §17.7, stdlib §2.5, fix #7502
 
 bool isBuiltinNamedArgTableHead(std::string_view head) {
     return contains(kBuiltinNamedArgTableHeads, head);

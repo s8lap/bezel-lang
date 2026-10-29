@@ -854,6 +854,16 @@ bool builtinParamIsNonNullable(std::string_view typeHead,
 // same limitation). // per §22.5 / §17.7, fix #3425
 bool isBuiltinCtorLoweredByName(std::string_view head);
 
+// fix #7502 (spec §22.5 "Every parameter that declares no default must be
+// bound" and §17.7 "closed constructor surface", v0.350; stdlib §2.5): the
+// built-in heads whose COMPLETE constructor surface the parameter table
+// carries, so an argument list that no row admits is a construction the
+// standard library does not declare (`new DateOnly(2024)`, `new DateTime(2024,
+// 3, 4, 5)`). Partial on purpose: a head is listed only once its rows are the
+// whole of what the stdlib declares, because a MISS here costs a missed
+// rejection, never a false one.
+bool isBuiltinCtorSurfaceClosedByRows(std::string_view head);
+
 // fix #3398: is `head` one of the built-in type heads
 // `builtinParamNameCandidates` carries MEMBER rows for?
 //

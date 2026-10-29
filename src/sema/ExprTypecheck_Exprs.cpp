@@ -1884,6 +1884,76 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
         }
     }
 
+    // fix #7502 (spec §22.5 "Every parameter that declares no default must be
+    // bound" and §17.7, v0.350; stdlib §2.5): the §2.5 date/time constructors
+    // are DECLARED with exact arities — `DateOnly(year, month, day)`,
+    // `TimeOnly(hour, minute, second := 0, millisecond := 0)`, `DateTime(year,
+    // month, day)` and `DateTime(year, month, day, hour, minute, second,
+    // millisecond := 0, kind := …)` — and their `lowerNew` arms fill any
+    // parameter they receive no argument for with a constant (`new
+    // DateOnly(2024)` printed 2024-01-01; `new DateTime(2024, 3, 4, 5)` was
+    // 2024-03-04T05:00:00). A construction whose argument count no declared
+    // form admits is rejected here, with the unsupplied REQUIRED parameter
+    // named when the list is merely too short. One diagnostic per `new`.
+    if (common::isBuiltinCtorSurfaceClosedByRows(n)) {
+        const auto forms = common::builtinParamForms(
+            n, /*member=*/"", common::kBuiltinAnyArity);
+        const std::size_t argc = ne.args.size();
+        bool admitted = false;
+        std::size_t minRequired = static_cast<std::size_t>(-1);
+        std::string declared;
+        for (const auto& f : forms) {
+            if (argc >= f.required && argc <= f.total) admitted = true;
+            if (f.required < minRequired) minRequired = f.required;
+            if (!declared.empty()) declared += " or ";
+            declared += n + "(";
+            for (std::size_t i = 0; i < f.names.size(); ++i) {
+                if (i == f.required) declared += i ? "[, " : "[";
+                else if (i) declared += ", ";
+                declared += std::string(f.names[i]);
+            }
+            if (f.required < f.names.size()) declared += "]";
+            declared += ")";
+        }
+        if (!forms.empty() && !admitted) {
+            std::string detail;
+            if (argc < minRequired) {
+                // The parameter the list leaves unbound: the first required
+                // one (in the shortest form) that no positional argument
+                // reaches and no named argument names.
+                std::size_t positional = 0;
+                std::set<std::string> named;
+                for (const auto& a : ne.args) {
+                    if (a.name.empty()) ++positional;
+                    else named.insert(std::string(a.name));
+                }
+                for (const auto& f : forms) {
+                    if (f.required != minRequired) continue;
+                    for (std::size_t i = positional; i < f.required; ++i) {
+                        if (!named.count(std::string(f.names[i]))) {
+                            detail = "required parameter `" +
+                                     std::string(f.names[i]) +
+                                     "` is not supplied (\xC2\xA7""22.5: every "
+                                     "parameter that declares no default must "
+                                     "be bound). ";
+                            break;
+                        }
+                    }
+                    if (!detail.empty()) break;
+                }
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                "`new " + n + "(...)` with " + std::to_string(argc) +
+                (argc == 1 ? " argument" : " arguments") +
+                " matches no constructor the standard library declares for `" +
+                n + "`: " + detail + "declared: " + declared +
+                " (\xC2\xA7""17.7 closed constructor surface, \xC2\xA7""22.5, "
+                "stdlib \xC2\xA7""2.5, #7502)");
+            return;
+        }
+    }
+
     // fix #5821 (§14.2 two-presentation paragraph, v0.338; stdlib §4.14): the
     // VALUE-typed `OwningBuffer<T>` presentation's single-argument constructor
     // initializes every slot to `default(T)`, so it requires `T` to be
