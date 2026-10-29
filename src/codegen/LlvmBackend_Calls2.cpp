@@ -8953,8 +8953,90 @@ static std::unordered_set<std::string_view> calleeOwnerTypeParamNames(
     return names;
 }
 
+// fix #7600 (§22.5, v0.350): is `e` a TYPE PATH (`string`, `Math`,
+// `System.Math`, a type alias or type parameter) rather than a value? A type
+// path is not evaluated, so it has no place in the call's evaluation order. An
+// identifier with no recorded symbol is a built-in type name (`Math`,
+// `Convert`, a primitive keyword): sema records a symbol for every local,
+// parameter and member a name can denote as a value.
+static bool isTypePathExpr(const sema::SemaContext& ctx, const ast::Expr& e) {
+    const sema::Symbol* s = ctx.exprSymbol(e);
+    if (s) {
+        return dynamic_cast<const sema::TypeSymbol*>(s) ||
+               dynamic_cast<const sema::ModuleSymbol*>(s) ||
+               dynamic_cast<const sema::TypeAliasSymbol*>(s) ||
+               dynamic_cast<const sema::GenericParamSymbol*>(s) ||
+               dynamic_cast<const sema::NestedTypeSymbol*>(s);
+    }
+    if (dynamic_cast<const ast::IdentifierExpr*>(&e)) return true;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e))
+        return ma->target && isTypePathExpr(ctx, *ma->target);
+    return false;
+}
+
+Emitter::CallArgPins::CallArgPins(Emitter& e, const ast::CallExpr& call,
+                                  bool pinReceiver)
+    : em(e) {
+    const auto* bnd = e.ctx_.builtinCallBinding(call);
+    if (!bnd) return;
+    // Check for non-identity (a reorder is pending).
+    bool isNonIdentity = false;
+    for (std::size_t j = 0; j < bnd->size(); ++j) {
+        if ((*bnd)[j] != static_cast<int>(j)) { isNonIdentity = true; break; }
+    }
+    if (!isNonIdentity) return;
+    // fix #7600 (§22.5, v0.350): the RECEIVER precedes the argument list in
+    // the text, so it is evaluated first. Most built-in instance arms
+    // (`StringBuilder` Insert / Remove / Replace, the collection arms) lower
+    // the receiver INSIDE the arm, i.e. after the pins below; pinning it here
+    // first makes the arm's own `lowerExpr(*ma.target)` return this value, so
+    // the receiver still runs exactly once. A type-path receiver
+    // (`string.Repeat`, `Math.Max`) is not a value and is skipped; a
+    // null-conditional `?.` callee is a `NullCondMemberExpr`, not a
+    // `MemberAccessExpr`, and is not touched (a null receiver must run no
+    // argument). The string arm lowers its receiver BEFORE entering this
+    // scope and passes `pinReceiver = false`, so it is never lowered twice.
+    if (auto* ma = pinReceiver
+            ? dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())
+            : nullptr) {
+        const ast::Expr* recv = ma->target.get();
+        if (recv && !e.exprValueOverride_.count(recv) &&
+            !isTypePathExpr(e.ctx_, *recv)) {
+            if (llvm::Value* rv = e.lowerExpr(*recv)) {
+                e.exprValueOverride_[recv] = rv;
+                pins.push_back(recv);
+            }
+        }
+    }
+    // Pre-evaluate every supplied argument expression in textual order,
+    // pinning each result. Lowering is best-effort: if any argument fails to
+    // lower, the builtin arm will see nullptr and return.
+    for (const auto& arg : call.args) {
+        if (!arg.value) continue;
+        // Skip args that are not plain value expressions (ref/out modifiers,
+        // discards). These are positional-only and always sit in the identity
+        // prefix of any binding.
+        if (arg.isDiscard || !arg.modifier.empty()) continue;
+        if (e.exprValueOverride_.count(arg.value.get())) continue;
+        if (llvm::Value* pv = e.lowerExpr(*arg.value)) {
+            e.exprValueOverride_[arg.value.get()] = pv;
+            pins.push_back(arg.value.get());
+        }
+    }
+}
+
+Emitter::CallArgPins::~CallArgPins() {
+    for (const ast::Expr* e : pins) em.exprValueOverride_.erase(e);
+}
+
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
+    // fix #7600 (§22.5, v0.350): the written-order pre-pass runs BEFORE every
+    // arm. Several built-in arms (static `string.Repeat`, `StringBuilder`
+    // Insert / Remove / Replace) sit above the old position of this pre-pass
+    // and read their arguments in PARAMETER order. The pins belong to THIS
+    // lowering of `call` and are dropped when the function returns.
+    CallArgPins callArgPins(*this, call);
     // fix #4342 (§9.7 / §28.3 / §28.9, v0.298): capture the
     // `recordCallResultInitOutermost_` flag at entry. The flag is set true
     // by `lowerLocalDecl` ONLY when lowering the initializer of a record-
@@ -9263,7 +9345,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // §22.5's evaluation order is honoured: expressions run once, in source
     // order. The binding tells the builtin arm which source argument feeds
     // which parameter slot.
-    // fix #7548 (§22.5, v0.350): the pre-pass PINS each argument's value so
+    // fix #7548 (§22.5, v0.350): the pre-pass (now `CallArgPins`, entered at the
+    // top of this function by fix #7600) PINS each argument's value so
     // the arm's own `lowerExpr` returns it instead of evaluating the argument a
     // second time. It used to lower each argument and DISCARD the value, so a
     // reordered named call evaluated every side-effecting argument twice
@@ -9273,36 +9356,6 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // function returns, whichever arm returns, so a second lowering of the same
     // node (a monomorphized clone) never sees a stale value. Same mechanism as
     // the constructor twin in `lowerNew` (#7498).
-    struct CallArgPins {
-        std::unordered_map<const ast::Expr*, llvm::Value*>& map;
-        std::vector<const ast::Expr*> pins;
-        ~CallArgPins() { for (const ast::Expr* e : pins) map.erase(e); }
-    } callArgPins{exprValueOverride_, {}};
-    if (const auto* bnd = ctx_.builtinCallBinding(call)) {
-        // Check for non-identity (a reorder is pending).
-        bool isNonIdentity = false;
-        for (std::size_t j = 0; j < bnd->size(); ++j) {
-            if ((*bnd)[j] != static_cast<int>(j)) { isNonIdentity = true; break; }
-        }
-        if (isNonIdentity) {
-            // Pre-evaluate every supplied argument expression in textual order,
-            // pinning each result. Lowering is best-effort: if any argument
-            // fails to lower, the builtin arm will see nullptr and return.
-            for (const auto& arg : call.args) {
-                if (arg.value) {
-                    // Skip args that are not plain value expressions (ref/out
-                    // modifiers, discards). These are positional-only and always
-                    // sit in the identity prefix of any binding.
-                    if (arg.isDiscard || !arg.modifier.empty()) continue;
-                    if (exprValueOverride_.count(arg.value.get())) continue;
-                    if (llvm::Value* pv = lowerExpr(*arg.value)) {
-                        exprValueOverride_[arg.value.get()] = pv;
-                        callArgPins.pins.push_back(arg.value.get());
-                    }
-                }
-            }
-        }
-    }
     // Built-in class methods: Convert.ToInt32, Math.Abs, etc.
     if (auto* v = tryLowerBuiltinClassCall(call)) return v;
     // CG44: explicit conversion `int(x)` (§5.2) — a callee that is a

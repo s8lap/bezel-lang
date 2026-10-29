@@ -1489,6 +1489,11 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     llvm::Value* callerOwnedSelf = self;
     if (!self) self = lowerExpr(*ma.target);
     if (!self) return nullptr;
+    // fix #7600 (§22.5, v0.350): receiver first, then the supplied arguments in
+    // written order, each exactly once; the arms below read them by PARAMETER
+    // position through the pinned values (`Remove(length := A, startIndex := B)`
+    // ran B A). A no-op for a positional or in-order call.
+    CallArgPins callArgPins(*this, call, /*pinReceiver=*/false);
 
     // A range guard that raises, releasing the caller-owned producer receiver
     // on the throw edge FIRST (§28.9 — the exception unwinds past the

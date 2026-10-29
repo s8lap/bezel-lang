@@ -25415,6 +25415,25 @@ private:
     llvm::Value* lowerCall(const ast::CallExpr& call);
     // The body of `lowerCall`; see the wrapper for why they are two functions.
     llvm::Value* lowerCallDispatch(const ast::CallExpr& call);
+    // fix #7600 (§22.5, v0.350): the written-order pre-pass for a built-in
+    // member call whose named arguments are reordered (#3423 / #7548). An RAII
+    // scope: construction lowers the value receiver, then every supplied
+    // argument, once each, in textual order, and pins each value in
+    // `exprValueOverride_`; destruction drops the pins. It is entered at
+    // EVERY entry that can reach a built-in arm (`lowerExprInner`'s string
+    // arm, `lowerCallDispatch`); a nested scope on the same call finds the
+    // pins in place and adds none.
+    struct CallArgPins {
+        Emitter& em;
+        std::vector<const ast::Expr*> pins;
+        // `pinReceiver`: also lower and pin a value receiver FIRST (it
+        // precedes the arguments in the text); false where the caller has
+        // already lowered the receiver (the string arm).
+        CallArgPins(Emitter& e, const ast::CallExpr& call, bool pinReceiver = true);
+        ~CallArgPins();
+        CallArgPins(const CallArgPins&) = delete;
+        CallArgPins& operator=(const CallArgPins&) = delete;
+    };
 
     // fix #2963 (spec §21.7 / §4.7, v0.240): is an ARROW BODY (`=> expr`) that
     // produced no lowered value legitimately valueless, rather than degraded?
