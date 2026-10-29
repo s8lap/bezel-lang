@@ -22160,6 +22160,7 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
                     std::string(member) + "`");
             if (ctx_.diagnostics().diagnostics().size() > diagsBefore)
                 return;  // ONE diagnostic per call
+            publishNarrowedBuiltinArg(arg.value.get());  // #7621
         }
         // §7: the nullability gate (#6782) owns a NULLABLE argument at a
         // non-nullable parameter — this check is about the argument's TYPE,
@@ -22920,6 +22921,29 @@ void ExprTC::reportBuiltinArgIfNullable(const ast::Expr* arg,
             " is nullable but the target type is non-nullable (\xC2\xA7""7)");
 }
 
+// fix #7621 (§7.4, §22.6, v0.350): "a read of a binding §7.4 has narrowed
+// non-null is of its non-nullable type". `reportBuiltinArgIfNullable` lets a
+// narrowed read through at a declared non-nullable built-in position, but the
+// read still loads the `{i8 hasValue; T}` carrier, which the lowering of
+// `Double.IsNaN`, `Char.IsDigit`, `TimeSpan.FromSeconds`, `DateTime.AddDays`,
+// `StringBuilder.Append`, ... passed where a bare `T` is expected (LLVM
+// verifier abort on a LEGAL program). Publish the read
+// (`SemaContext::markNarrowedValueRead`), so `Emitter::lowerExpr` extracts the
+// payload once. Only a nullable VALUE primitive is published (a reference
+// type has no carrier; `string`/`Object` are references), and only at a
+// position the caller already knows is declared non-nullable, so the
+// extraction is sound: an un-narrowed nullable was reported above.
+void ExprTC::publishNarrowedBuiltinArg(const ast::Expr* arg) {
+    if (!arg) return;
+    TypeRef* argTy = ctx_.exprType(*arg);
+    if (!argTy || !argTy->nullable || argTy->kind != TypeRef::Kind::Primitive)
+        return;
+    if (argTy->primitive == PrimitiveType::String ||
+        argTy->primitive == PrimitiveType::Object)
+        return;
+    if (isNarrowedNonNullRead(arg)) ctx_.markNarrowedValueRead(arg);
+}
+
 // fix #7296 (§7 / §22.5, v0.344): the receiver head of a built-in call, and
 // whether the compiler HONOURS a parameter NAME there.
 //
@@ -23071,6 +23095,7 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
                                                i))
             continue;
         reportBuiltinArgIfNullable(a.value.get(), what);
+        publishNarrowedBuiltinArg(a.value.get());
     }
 }
 

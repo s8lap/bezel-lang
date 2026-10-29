@@ -4750,6 +4750,9 @@ private:
     // share: `arg` is the `null` literal or nullable after §7.4 narrowing
     // (readonly fields included). Never a type check.
     void reportBuiltinArgIfNullable(const ast::Expr* arg, const std::string& what);
+    // fix #7621 (§7.4, §22.6, v0.350): publish a narrowed nullable-value read at
+    // a declared non-nullable built-in position so codegen extracts the payload.
+    void publishNarrowedBuiltinArg(const ast::Expr* arg);
 
     // The BUILTIN CALL ADMISSION GATE — the anchor's ONE resolver (campaign 2,
     // `builtin-call-admission`). A call to a built-in member is resolved
