@@ -11593,6 +11593,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 narrowedRt.nullable = false;
                 rt = &narrowedRt;
             }
+            // fix #7787 (stdlib §3.1, v0.350): "Append(value: ReadOnlyStringSpan)
+            // ... copies the span's code points; = Append(value.ToString())
+            // without the intermediate string". A `ReadOnlyStringSpan` lowers to
+            // the {ptr,i32,i32} %bz.arrayspan VALUE (Source, Start, Length; §3.3),
+            // not a string pointer, so the fallbacks below rendered it as the
+            // empty string. Copy its code-point window into a fresh +1 string
+            // (bz_str_substring, as the Encoding span-source overloads do): the
+            // builder takes that +1 as its part (rendered => transfer, #1185).
+            if (isStringSpanValue(v)) {
+                auto* sub = declareC("bz_str_substring", ptrTy(),
+                                     {ptrTy(), i64(), i64()});
+                llvm::Value* src = builder_.CreateExtractValue(v, {0u}, "sb.ss.src");
+                llvm::Value* st = builder_.CreateExtractValue(v, {1u}, "sb.ss.st");
+                llvm::Value* ln = builder_.CreateExtractValue(v, {2u}, "sb.ss.len");
+                if (rendered) *rendered = true;
+                return builder_.CreateCall(
+                    sub, {src, builder_.CreateSExt(st, i64()),
+                          builder_.CreateSExt(ln, i64())}, "sb.ss.str");
+            }
             // fix #6753 (stdlib §3.1 / §8.1, v0.340): an Object-typed LOCAL narrows
             // through its initializer exactly as the console does (see
             // `tryLowerConsoleCall`). Every other Object value keeps the dynamic
