@@ -8033,9 +8033,43 @@ void Emitter::markOwningChoiceLocalMovedFrom(const ast::Expr* targetExpr,
 // The shared core, reached from the `:=` overload above and directly from the
 // `var c := b;` declaration site (a LocalDecl has no target EXPRESSION — the
 // binding itself is the target).
+//
+// fix #7725 / #7726 (§17.8, §28.10, v0.350): the null-forgiving read is the
+// same local-to-local transfer. §17.8: "The null-forgiving operator preserves
+// ownership ... it does not move, copy, or borrow beyond what reading `x`
+// already does", and "Over a named owned binding, `x!` is therefore
+// classified by its position exactly as the bare read `x` is"; at a marked
+// position "the transfer is spelled `move x!`, the `!` being transparent to
+// the marker". So `var c := b!;`, `using var c := move b!;` and
+// `using var c := (move b)!;` over an owning-choice `b: C?` all leave `b`
+// moved-from, as `var c := b;` does. The `!` and `move` layers, in either
+// order, are peeled to the identifier the core marks; before this the core's
+// bare cast declined every `!` spelling and both scope-end active-case passes
+// disposed the one payload (heap-use-after-free). The peel is HERE, at the
+// local-target entry (declaration and `:=` to a plain local), matching the
+// ownership pass's `noteOwningChoiceWholeMoveRead` callers that see the `!`
+// spelling; the argument and field-store callers of the core keep their
+// existing shapes. // per §17.8, §28.10
 void Emitter::markOwningChoiceLocalMovedFrom(const ast::LocalDecl* targetLd,
                                              const ast::Expr* srcExpr) {
     if (!targetLd || !srcExpr) return;
+    const ast::Expr* core = srcExpr;
+    bool peeledBang = false;
+    while (core) {
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+            core = pb->operand.get();
+            peeledBang = true;
+            continue;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(core))
+            if (u->op == "move") {
+                core = u->operand.get();
+                continue;
+            }
+        break;
+    }
+    if (peeledBang && dynamic_cast<const ast::IdentifierExpr*>(core))
+        srcExpr = core;
     markOwningChoiceMovedFromCore(targetLd, srcExpr);
 }
 

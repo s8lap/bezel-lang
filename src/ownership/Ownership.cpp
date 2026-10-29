@@ -10271,13 +10271,27 @@ void MethodOwnership::noteMoveOnlyArrayWholeMoveRead(const ast::Expr& src) {
 // §15.3's own rule is the same for any move-only lvalue: "After the move, `x`
 // is in moved-from state and may not be read until reassigned." // per §15.3
 // per §28.10
+//
+// THE NULL-FORGIVING READ (fix #7725). §17.8: "Over a named owned binding,
+// `x!` is therefore classified by its position exactly as the bare read `x`
+// is", and §28.10 lists `x!` among the spellings of the unmarked read. So
+// `using var y := o!;` / `var y := o!;` over an owning-choice `o: C?` moves
+// `o` exactly as `using var y := o;` does; the `!` layers are peeled before
+// the bare-identifier test. Without the peel `o` stayed live, a later read of
+// it was accepted, and codegen's twin (`markOwningChoiceMovedFromCore`) left
+// both slots holding the one payload (heap-use-after-free). // per §17.8
 void MethodOwnership::noteOwningChoiceWholeMoveRead(const ast::Expr& src) {
-    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&src);
+    const ast::Expr* core = &src;
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(core)) {
+        if (!pb->operand) return;
+        core = pb->operand.get();
+    }
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(core);
     if (!id) return;  // only a WHOLE bare-identifier read is a move; `.f` /
                       // `[i]` / `.M()` are borrows of the receiver, not moves
     sema::Symbol* ssym = ctx_.exprSymbol(*id);
     if (!ssym) return;
-    auto verdict = common::classifyChoiceType(ctx_.exprType(src), ctx_);
+    auto verdict = common::classifyChoiceType(ctx_.exprType(*id), ctx_);
     if (!verdict || *verdict != common::ChoiceClassification::Owning) return;
     auto* st = lookupStateFor(*id);
     if (!st) {
