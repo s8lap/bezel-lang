@@ -3673,6 +3673,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     smParkedStateGEP_ = nullptr;  // fix #3531
     smStateBBs_.clear();
     smDoneBB_ = nullptr;
+    smResumeSwitch_ = nullptr;  // fix #7527
     smNextSuspendState_ = 0;
     smLocalFields_.clear();
     smAllocaToField_.clear();

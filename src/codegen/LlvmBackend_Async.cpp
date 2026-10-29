@@ -5263,10 +5263,29 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
     // Allocate the next state block — both the already-done fast path and the
     // resumed continuation converge here to read the result (§30.2).
     unsigned nextState = ++smNextSuspendState_;
-    llvm::BasicBlock* resumeBB = (nextState < smStateBBs_.size())
-                                     ? smStateBBs_[nextState]
-                                     : llvm::BasicBlock::Create(
-                                           llvm_, "await.resume", currentFn_);
+    llvm::BasicBlock* resumeBB = nullptr;
+    if (nextState < smStateBBs_.size()) {
+        resumeBB = smStateBBs_[nextState];
+    } else {
+        resumeBB = llvm::BasicBlock::Create(llvm_, "await.resume", currentFn_);
+        // fix #7527 (§28.12 / §30.2, v0.350): countAwaits pre-allocates ONE
+        // state per `await using var` (and per `await`), but an `await using`
+        // scope-end `await DisposeAsync()` is lowered once per EXIT EDGE of the
+        // scope (each `return`, then the fall-off), so a body with an untaken
+        // early `return` allocates one more state than was counted. The block
+        // made here had no case in the resume switch, so a continuation
+        // registered for that state landed on the switch default and the task
+        // never completed (the hang after both DisposeAsync calls). Give every
+        // state allocated past the counted ones its case, so the dispatch
+        // cannot be out of step with the emission count.
+        if (smResumeSwitch_ &&
+            smResumeSwitch_->getFunction() == currentFn_ &&
+            nextState == smStateBBs_.size()) {
+            smResumeSwitch_->addCase(builder_.getInt32((int)nextState),
+                                     resumeBB);
+            smStateBBs_.push_back(resumeBB);
+        }
+    }
 
     // Fast path test: bz_task_is_done(task)?
     auto* isDoneFn = declareC("bz_task_is_done", i1(), {ptrTy()});

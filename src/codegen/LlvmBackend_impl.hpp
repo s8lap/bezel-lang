@@ -17368,6 +17368,7 @@ private:
     X(llvm::Value*,           smParkedStateGEP_,         nullptr) /* #3531 */ \
     X(SmFrameBlockVec,        smStateBBs_,               {})                   \
     X(llvm::BasicBlock*,      smDoneBB_,                 nullptr)              \
+    X(llvm::SwitchInst*,      smResumeSwitch_,           nullptr) /* #7527 */ \
     X(unsigned,               smNextSuspendState_,       0)                    \
     X(SmFrameNodeFieldMap,    smLocalFields_,            {})                   \
     X(SmFrameNodeFieldMap,    smForInSrcFields_,         {}) /* §29.7 (#944) */ \
@@ -17927,6 +17928,10 @@ private:
     llvm::Value* smParkedStateGEP_ = nullptr;
     std::vector<llvm::BasicBlock*> smStateBBs_;
     llvm::BasicBlock* smDoneBB_ = nullptr;
+    // fix #7527: the resume dispatch switch emitResumeDispatch built, kept so a
+    // suspend state allocated beyond the statically counted ones can be given
+    // its case (emitAwaitSuspend).
+    llvm::SwitchInst* smResumeSwitch_ = nullptr;
     unsigned smNextSuspendState_ = 0;
     // Maps LocalDecl/ForStmt AST node → frame field index for suspend-locals.
     std::unordered_map<const ast::Node*, unsigned> smLocalFields_;

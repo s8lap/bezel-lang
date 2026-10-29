@@ -21200,6 +21200,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     smStateGEP_ = nullptr;
     smParkedStateGEP_ = nullptr;  // fix #3531
     smDoneBB_ = nullptr;
+    smResumeSwitch_ = nullptr;  // fix #7527
     smNextSuspendState_ = 0;
     iterCurrentValField_ = 0;
     iterElemTy_ = nullptr;

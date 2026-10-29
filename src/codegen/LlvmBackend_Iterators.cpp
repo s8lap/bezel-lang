@@ -1095,6 +1095,7 @@ std::vector<llvm::BasicBlock*> Emitter::emitResumeDispatch(
     smStateGEP_ = stateGEP;
     smStateBBs_ = stateBBs;
     smDoneBB_ = doneBB;
+    smResumeSwitch_ = sw;
     smNextSuspendState_ = 0;
     smLocalFields_ = frame.localFields;
     smForInSrcFields_ = frame.forInSrcFields;  // §29.7 (#944)
