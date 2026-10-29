@@ -129,3 +129,53 @@ BEZEL_TEST(timespan_mul_div_7562, div_by_zero_raises_dividebyzero) {
         "try var c := a / 0.0; Console.WriteLine($\"no raise {c}\"); ") + kCatch)),
         "DIV0");
 }
+
+// ---- #7563: undeclared TimeSpan Add / Subtract / Negate (stdlib §2.5) ------
+// Rejection rows use runAot's failed-compile reporting; the control row keeps
+// DateTime.Add(TimeSpan) (declared, stdlib §2.5) working.
+BEZEL_TEST(timespan_undeclared_members_7563, datetime_add_timespan_control) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+        "var d := new DateTime(2024, 1, 1); "
+        "var r := d.Add(TimeSpan.FromDays(10.0)); "
+        "Console.WriteLine($\"{r.Year}-{r.Month}-{r.Day}\"); ")),
+        "2024-1-11");
+}
+
+BEZEL_TEST(timespan_undeclared_members_7563, timespan_add_is_hard_error) {
+    auto r = bezel::test::runAot(prog(
+        "var a := TimeSpan.FromTicks(5L); "
+        "var c := a.Add(TimeSpan.FromTicks(7L)); "
+        "Console.WriteLine($\"{c}\"); "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`Add` on built-in type `TimeSpan`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+}
+
+BEZEL_TEST(timespan_undeclared_members_7563, timespan_subtract_is_hard_error) {
+    auto r = bezel::test::runAot(prog(
+        "var a := TimeSpan.FromTicks(5L); "
+        "var c := a.Subtract(TimeSpan.FromTicks(7L)); "
+        "Console.WriteLine($\"{c}\"); "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`Subtract` on built-in type `TimeSpan`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+}
+
+BEZEL_TEST(timespan_undeclared_members_7563, timespan_negate_is_hard_error) {
+    auto r = bezel::test::runAot(prog(
+        "var a := TimeSpan.FromTicks(5L); "
+        "var c := a.Negate(); "
+        "Console.WriteLine($\"{c}\"); "));
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("`Negate` on built-in type `TimeSpan`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+}

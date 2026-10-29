@@ -16258,16 +16258,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         subTy->astNode = kSubNode;
                         ctx_.setExprType(&ce, subTy);
                     }
-                    // TimeSpan arithmetic methods return TimeSpan (fallback if
-                    // the operator desugaring lands here rather than BinaryExpr).
+                    // stdlib §2.5 (v0.350, #7563): TimeSpan declares NO `Add` /
+                    // `Subtract` / `Negate` member (the arithmetic is the
+                    // operators `+`, `-`, unary `-`); typing them here made
+                    // the call look sema-typed and sent it to the #605
+                    // permissive path instead of the hard "not on that
+                    // surface" error.
                     if (rcn == "TimeSpan") {
-                        auto* tsTy = ctx_.makeTypeRef();
-                        tsTy->kind = TypeRef::Kind::Named;
-                        tsTy->declaration = builtinClassSym("TimeSpan");
-                        if (m == "Add" || m == "Subtract" || m == "Negate")
-                            ctx_.setExprType(&ce, tsTy);
                         // per §2.5 / #1357: CompareTo(other: TimeSpan): int.
-                        else if (m == "CompareTo")
+                        if (m == "CompareTo")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         // per §2.5 / #1357: ToString(): string.
                         else if (m == "ToString")
