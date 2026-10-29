@@ -20241,6 +20241,21 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                     }
                 }
             }
+            // fix #7668 (§26.4 / §14.1, v0.350): the extension-block twin of
+            // the method-level check above. A member of `extension Array<T>`
+            // whose SIGNATURE never names `T` (`Swap01()`, `Copy01()`) has
+            // matching arg and return LLVM types at every instantiation, yet
+            // its compiled template body was lowered against the i32
+            // placeholder: `this[0]`/`this[1]` moved 4-byte elements, so at
+            // `string` (8-byte slots) the swap tore the pointers and a later
+            // read crashed in bz_string_to_utf8z. Force the per-instantiation
+            // body whenever an extension-block type variable is bound.
+            if (!typesMismatch && !ms->parent && ms->extensionDecl) {
+                for (std::string_view nm : calleeOwnerTypeParamNames(ctx_, ms))
+                    if (genericSubst_.count(nm)) {
+                        typesMismatch = true; break;
+                    }
+            }
         }
         if (typesMismatch) {
             // Inline the method body with the current generic substitution.
