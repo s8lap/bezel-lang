@@ -251,12 +251,12 @@ static bool isBuiltinTimeValueRecord(const TypeRef* t) {
     return !builtinTimeValueHead(t).empty();
 }
 
-// fix #7900 (stdlib §2.2, §2.5, spec §14.2, v0.350): `Math.Min` / `Max` /
-// `Clamp<T>` are declared `where T: IComparable<T>`, and stdlib §2.5 declares
-// `IComparable<Self>` on `DateTime`, `TimeSpan`, `DateOnly` and `TimeOnly`
-// (each a plain scalar word the Math lowering compares). `Guid` also declares
-// it (stdlib §2.5) but is not a scalar word and keeps its pre-existing
-// refusal here. Returns the head name, or empty.
+// fix #7900 / #7902 / #7911 (stdlib §2.2, §2.5, spec §14.2, v0.350): `Math.Min`
+// / `Max` / `Clamp<T>` are declared `where T: IComparable<T>`, and stdlib §2.5
+// declares `IComparable<Self>` on `DateTime`, `TimeSpan`, `DateOnly` and
+// `TimeOnly` (each a plain scalar word the Math lowering compares). `Guid`
+// also declares it (stdlib §2.5) but is not a scalar word and keeps its
+// pre-existing refusal here. Returns the head name, or empty.
 //
 // An IMPORTED user type of the same name also has `declaration->decl == nullptr`
 // and is told from the builtin only by `moduleName` (isUserDeclaredTypeSym); it
@@ -18584,6 +18584,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         mathNarrowedOk = nts->decl == nullptr;
         auto mathArgType = [&](const ast::Expr& a) -> TypeRef* {
             TypeRef* t = ctx_.exprType(a);
+            if (mathNarrowedOk && t && t->nullable &&
+                !mathOrderedTimeValueHead(t).empty()) {
+                // fix #7902 (§7.4, §22.6, stdlib §2.2, §2.5, v0.350): a
+                // narrowed `DateTime?` / `TimeSpan?` read is of its
+                // non-nullable type at the call.
+                if (!isNarrowedNonNullRead(&a)) return t;
+                TypeRef* nonnull = ctx_.makeTypeRef();
+                *nonnull = *t;
+                nonnull->nullable = false;
+                return nonnull;
+            }
             if (!mathNarrowedOk || !t || !t->nullable ||
                 t->kind != TypeRef::Kind::Primitive)
                 return t;
@@ -18601,7 +18612,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 TypeRef* t = ctx_.exprType(*a.value);
                 // Publish the read, so codegen extracts the payload of the
                 // `{i8 hasValue; T}` carrier it still loads.
-                if (t && t->nullable && t->kind == TypeRef::Kind::Primitive &&
+                if (t && t->nullable &&
+                    (t->kind == TypeRef::Kind::Primitive ||
+                     (generic && !mathOrderedTimeValueHead(t).empty())) &&
                     isNarrowedNonNullRead(a.value.get()))
                     ctx_.markNarrowedValueRead(a.value.get());
             }
@@ -19009,21 +19022,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     "to `string` before calling `Math." +
                                     std::string(ma->member) + "` (stdlib §2.2)");
                             }
-                        // fix #7900 (stdlib §2.2, §2.5, spec §14.2, v0.350):
-                        // `DateTime` / `TimeSpan` / `DateOnly` / `TimeOnly`
-                        // declare `IComparable<Self>` (stdlib §2.5), so they
-                        // satisfy §2.2's `where T: IComparable<T>`. The value
-                        // produced by a stdlib CALL (`TimeSpan.FromSeconds`,
-                        // `DateTime.AddDays`) carries the `builtinClassSym`
-                        // declaration, a Class with no base list, which the
-                        // block below refused as "not an IComparable". It is
-                        // admitted here and the call is typed T. An un-narrowed
-                        // nullable is still refused (§14.2).
+                        // fix #7900 / #7902 (stdlib §2.2, §2.5, spec §14.2,
+                        // §22.6, v0.350): `DateTime` / `TimeSpan` / `DateOnly`
+                        // / `TimeOnly` declare `IComparable<Self>` (stdlib
+                        // §2.5), so they satisfy §2.2's `where T:
+                        // IComparable<T>`, and the call is typed T. Two TypeRef
+                        // shapes reach here. The `builtinClassSym` shape of a
+                        // stdlib CALL's result (a Class with no base list) was
+                        // refused by the block below (#7900). The annotation /
+                        // constructor shape (`declaration == nullptr`) skipped
+                        // the block below and left the call mistyped `int`: a
+                        // `Console.WriteLine(Math.Min(a, b))` printed the raw
+                        // scalar word and a member read on the result failed
+                        // to lower (#7902). A narrowed `T?` read is a `T` at
+                        // the call (§7.4, §22.6); an un-narrowed one is
+                        // refused (§14.2). An explicit list `Math.Max<T>` binds
+                        // T and types the call T.
                         TypeRef* timeProbe = nullptr;
                         if (mathNarrowedOk) {
-                            const TypeRef* probe = mathArgType(*ce.args[0].value);
-                            if (probe && probe->declaration &&
-                                !mathOrderedTimeValueHead(probe).empty())
+                            const TypeRef* explicitT = nullptr;
+                            if (ma->typeArgs.size() == 1 && ma->typeArgs[0])
+                                explicitT = ctx_.resolvedType(*ma->typeArgs[0]);
+                            const TypeRef* probe =
+                                explicitT ? explicitT
+                                          : mathArgType(*ce.args[0].value);
+                            if (probe && !mathOrderedTimeValueHead(probe).empty())
                                 timeProbe = const_cast<TypeRef*>(probe);
                         }
                         if (timeProbe) {
