@@ -6495,6 +6495,25 @@ llvm::Value* Emitter::lowerExceptionInfoField(const ast::Expr& target,
 }
 
 
+// fix #7929 (stdlib §1/§4.4/§4.8/§3.1, §5.1, v0.350): the integral primitives
+// that §5.1 implicitly widens to the `capacity: int` parameter -- the shared
+// "is this a capacity argument" test of the comparer-form discriminator
+// (`rejectUnimplementedComparerCtor`) and of the negative-capacity guards in
+// `lowerNew` (`Set` / `Dictionary` / `StringBuilder`).
+static bool isCapacityPrimitive(sema::PrimitiveType p) {
+    switch (p) {
+        case sema::PrimitiveType::SByte:
+        case sema::PrimitiveType::Byte:
+        case sema::PrimitiveType::Short:
+        case sema::PrimitiveType::UShort:
+        case sema::PrimitiveType::Char:
+        case sema::PrimitiveType::Int:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // fix #2722 / stdlib §4.8/§4.9/§4.10 (v0.240).
 //
 // WHY A DIAGNOSTIC AND NOT AN IMPLEMENTATION. The comparer overloads ARE
@@ -6620,19 +6639,6 @@ bool Emitter::rejectUnimplementedComparerCtor(const ast::NewExpr& ne,
     // not. The pre-existing negative-capacity guards keep their own `!nullable`
     // test, which is theirs to keep: they must LOWER the argument, and a
     // tagged-optional slot is not an i64.
-    auto isCapacityPrimitive = [](sema::PrimitiveType p) {
-        switch (p) {
-            case sema::PrimitiveType::SByte:
-            case sema::PrimitiveType::Byte:
-            case sema::PrimitiveType::Short:
-            case sema::PrimitiveType::UShort:
-            case sema::PrimitiveType::Char:
-            case sema::PrimitiveType::Int:
-                return true;
-            default:
-                return false;
-        }
-    };
     bool comparerForm = ne.args.size() >= 2;
     if (!comparerForm) {
         const sema::TypeRef* a0ty = ctx_.exprType(*ne.args[0].value);
@@ -7268,12 +7274,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!ne.args.empty() && ne.args[0].value) {
                     const sema::TypeRef* a0ty = ctx_.exprType(*ne.args[0].value);
                     if (a0ty && a0ty->kind == sema::TypeRef::Kind::Primitive &&
-                        a0ty->primitive == sema::PrimitiveType::Int &&
+                        isCapacityPrimitive(a0ty->primitive) &&
                         !a0ty->nullable) {
                         llvm::Value* capArg = lowerExpr(*ne.args[0].value);
                         if (capArg) {
-                            if (!capArg->getType()->isIntegerTy(64))
-                                capArg = builder_.CreateSExt(capArg, i64());
+                            capArg = ctorIntTo(capArg, *ne.args[0].value, i64());
                             emitGuardThrow(
                                 builder_.CreateICmpSLT(capArg,
                                                        builder_.getInt64(0)),
@@ -7933,12 +7938,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!ne.args.empty() && ne.args[0].value) {
                     const sema::TypeRef* a0ty = ctx_.exprType(*ne.args[0].value);
                     if (a0ty && a0ty->kind == sema::TypeRef::Kind::Primitive &&
-                        a0ty->primitive == sema::PrimitiveType::Int &&
+                        isCapacityPrimitive(a0ty->primitive) &&
                         !a0ty->nullable) {
                         llvm::Value* capArg = lowerExpr(*ne.args[0].value);
                         if (capArg) {
-                            if (!capArg->getType()->isIntegerTy(64))
-                                capArg = builder_.CreateSExt(capArg, i64());
+                            capArg = ctorIntTo(capArg, *ne.args[0].value, i64());
                             emitGuardThrow(
                                 builder_.CreateICmpSLT(capArg,
                                                        builder_.getInt64(0)),
@@ -8003,7 +8007,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         argTy->primitive == sema::PrimitiveType::String;
                     if (!isStrArg && argTy &&
                         argTy->kind == sema::TypeRef::Kind::Primitive &&
-                        argTy->primitive == sema::PrimitiveType::Int &&
+                        isCapacityPrimitive(argTy->primitive) &&
                         !argTy->nullable) {
                         // stdlib §1/§3.1 (v0.183, #1396): StringBuilder(capacity)
                         // faults on a negative capacity. The capacity value is
@@ -8011,8 +8015,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // (a fixed 64-slot reservation) — only the fault matters.
                         llvm::Value* capArg = lowerExpr(*ne.args[0].value);
                         if (capArg) {
-                            if (!capArg->getType()->isIntegerTy(64))
-                                capArg = builder_.CreateSExt(capArg, i64());
+                            capArg = ctorIntTo(capArg, *ne.args[0].value, i64());
                             emitGuardThrow(
                                 builder_.CreateICmpSLT(capArg,
                                                        builder_.getInt64(0)),
