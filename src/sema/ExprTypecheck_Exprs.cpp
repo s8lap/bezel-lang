@@ -9726,7 +9726,17 @@ void ExprTC::typeBinaryRules(const ast::BinaryExpr& be,
         if (lt && lt->kind == TypeRef::Kind::Named &&
             lt->declaration && !lt->declaration->decl &&
             lt->declaration->name == "TimeSpan" &&
-            (op == "+" || op == "-")) {
+            (op == "+" || op == "-" ||
+             // stdlib §2.5 (v0.350): `operator *(a: TimeSpan, factor:
+             // double)` and `operator /(a: TimeSpan, divisor: double)` --
+             // a `double` right operand only (TimeSpan * TimeSpan and
+             // every other right type stay on the §25 reject below).
+             ((op == "*" || op == "/") && be.right &&
+              [&] {
+                  TypeRef* rr = ctx_.exprType(*be.right);
+                  return rr && rr->kind == TypeRef::Kind::Primitive &&
+                         rr->primitive == PrimitiveType::Double;
+              }()))) {
             auto* tsTy = ctx_.makeTypeRef();
             tsTy->kind = TypeRef::Kind::Named;
             tsTy->declaration = builtinClassSym("TimeSpan");

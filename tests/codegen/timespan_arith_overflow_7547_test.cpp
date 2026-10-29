@@ -81,3 +81,51 @@ BEZEL_TEST(timespan_arith_overflow_7547, in_range_arithmetic_is_exact) {
         "Console.WriteLine($\"{d.Ticks} {e.Ticks}\"); ")),
         "10 0");
 }
+
+// ---- #7562: TimeSpan `*` / `/` with a double factor (stdlib §2.5, v0.350) --
+// Rounding of the product is NOT pinned (the `*` operator's own contract does
+// not say; see handback).
+namespace {
+std::string tsProg7562(const std::string& body) { return prog(body); }
+const char* kCatch =
+    "catch OverflowException => Console.WriteLine(\"OVF\"); "
+    "catch DivideByZeroException => Console.WriteLine(\"DIV0\"); "
+    "catch Exception => Console.WriteLine(\"OTHER\"); end; ";
+}  // namespace
+
+BEZEL_TEST(timespan_mul_div_7562, mul_exact_values) {
+    BEZEL_EXPECT_EQ(runAotOut(tsProg7562(
+        "var a := TimeSpan.FromTicks(100L); "
+        "var m := a * 3.0; var d := a / 4.0; var n := a * -2.0; "
+        "Console.WriteLine($\"{m.Ticks} {d.Ticks} {n.Ticks}\"); ")),
+        "300 25 -200");
+}
+
+BEZEL_TEST(timespan_mul_div_7562, mul_out_of_range_raises_overflow) {
+    BEZEL_EXPECT_EQ(runAotOut(tsProg7562(
+        std::string("var a := TimeSpan.FromTicks(long.MaxValue); "
+        "try var c := a * 2.0; Console.WriteLine($\"no raise {c}\"); ") + kCatch)),
+        "OVF");
+}
+
+BEZEL_TEST(timespan_mul_div_7562, div_out_of_range_raises_overflow) {
+    BEZEL_EXPECT_EQ(runAotOut(tsProg7562(
+        std::string("var a := TimeSpan.FromTicks(long.MaxValue); "
+        "try var c := a / 0.5; Console.WriteLine($\"no raise {c}\"); ") + kCatch)),
+        "OVF");
+}
+
+BEZEL_TEST(timespan_mul_div_7562, nan_factor_raises_overflow) {
+    BEZEL_EXPECT_EQ(runAotOut(tsProg7562(
+        std::string("var a := TimeSpan.FromTicks(100L); "
+        "var nan := 0.0 / 0.0; "
+        "try var c := a * nan; Console.WriteLine($\"no raise {c}\"); ") + kCatch)),
+        "OVF");
+}
+
+BEZEL_TEST(timespan_mul_div_7562, div_by_zero_raises_dividebyzero) {
+    BEZEL_EXPECT_EQ(runAotOut(tsProg7562(
+        std::string("var a := TimeSpan.FromTicks(100L); "
+        "try var c := a / 0.0; Console.WriteLine($\"no raise {c}\"); ") + kCatch)),
+        "DIV0");
+}

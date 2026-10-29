@@ -11355,6 +11355,45 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     sema::MethodSymbol* opm =
         dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(bin));
     if (opm && !opm->isOperator) opm = nullptr;
+    // stdlib §2.5 (v0.350, #7562): TimeSpan `*` / `/` with a `double`
+    // factor. TimeSpan is a scalar i64 tick count; the product/quotient is
+    // computed over the ticks in double, an out-of-range result or a NaN
+    // operand raises OverflowException, `/` by 0.0 raises
+    // DivideByZeroException. The result is truncated toward zero (the
+    // `From<Unit>` computation model the stdlib points at).
+    if (!opm && (bin.op == "*" || bin.op == "/")) {
+        const sema::TypeRef* ltTs = ctx_.exprType(*bin.left);
+        const sema::TypeRef* rtTs = ctx_.exprType(*bin.right);
+        if (ltTs && builtinTypeName(ltTs) == "TimeSpan" && rtTs &&
+            rtTs->kind == sema::TypeRef::Kind::Primitive &&
+            rtTs->primitive == sema::PrimitiveType::Double) {
+            llvm::Value* tv = lowerExpr(*bin.left);
+            llvm::Value* fv = lowerExpr(*bin.right);
+            if (!tv || !fv) return nullptr;
+            llvm::Type* dTy = llvm::Type::getDoubleTy(llvm_);
+            llvm::Value* td = builder_.CreateSIToFP(tv, dTy, "ts.ticksd");
+            // NaN operand: the factor/divisor (ticks are never NaN).
+            emitGuardThrow(builder_.CreateFCmpUNO(fv, fv, "ts.nan"),
+                           "OverflowException");
+            llvm::Value* res;
+            if (bin.op == "*") {
+                res = builder_.CreateFMul(td, fv, "ts.mul");
+            } else {
+                emitGuardThrow(
+                    builder_.CreateFCmpOEQ(
+                        fv, llvm::ConstantFP::get(dTy, 0.0), "ts.div0"),
+                    "DivideByZeroException");
+                res = builder_.CreateFDiv(td, fv, "ts.div");
+            }
+            // Range: [-2^63, 2^63) -- NaN/inf/out-of-range all raise.
+            llvm::Value* lo = llvm::ConstantFP::get(dTy, -9223372036854775808.0);
+            llvm::Value* hi = llvm::ConstantFP::get(dTy, 9223372036854775808.0);
+            llvm::Value* inRange = builder_.CreateAnd(
+                builder_.CreateFCmpOGE(res, lo), builder_.CreateFCmpOLT(res, hi));
+            emitGuardThrow(builder_.CreateNot(inRange), "OverflowException");
+            return builder_.CreateFPToSI(res, i64(), "ts.res");
+        }
+    }
     // §11.8 (v0.176, #807): constraint-operator dispatch — sema resolved this
     // binary expression to a STATIC INTERFACE operator member through a
     // `where T: I<T>` constraint (the operands are T-typed). At this
