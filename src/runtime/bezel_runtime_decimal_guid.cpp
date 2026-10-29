@@ -1461,10 +1461,22 @@ static int32_t guid_parse_str(const char* s, int64_t len, bz_guid_t* out) {
     return 0;  // §2.6: any other length → FormatException
 }
 
+// fix #7320 (stdlib §1 Try convention, shape (c), v0.350): `TryParse(s, out
+// result: Guid): bool` is a `bool` + non-nullable value-typed out, so its false
+// path assigns `default(T)` (spec §22.3) -- "a real value distinguished only by
+// the `bool`". The failure paths used to return 0 WITHOUT touching `out`, so the
+// caller's pre-set value survived a parse that RAN and FAILED. Its siblings
+// (`bz_guid_parse` below, and the DateTime/DateOnly/TimeOnly try-parsers) write
+// the failure default; this one now does too, on every failure path (a null or
+// data-less string included). The ONLY caller is the `Guid.TryParse` lowering
+// (plus `bz_guid_parse`, which zeroes on failure anyway), so no caller relied on
+// the slot being left alone; a call the compiler DROPS (a non-parseable first
+// operand, #7313) never reaches this function and so writes nothing.
 int32_t bz_guid_try_parse(const void* str, bz_guid_t* out) {
     const bz_string_hdr* s = (const bz_string_hdr*)str;
-    if (!s || !s->data) return 0;
-    return guid_parse_str(s->data, s->len, out);
+    int32_t ok = (!s || !s->data) ? 0 : guid_parse_str(s->data, s->len, out);
+    if (!ok) memset(out, 0, sizeof(*out));
+    return ok;
 }
 
 int32_t bz_guid_parse(const void* str, bz_guid_t* out) {

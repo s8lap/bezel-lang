@@ -64,22 +64,11 @@
 // The rows pre-set the slot to a distinguishable value, so the fixed arm
 // prints that value where a call that ran and failed printed the default.
 //
-// ⚠ THE `default(T)` HALF OF THAT RULE IS NOT UNIVERSAL: `Guid` IS THE
-// EXCEPTION. `bz_guid_try_parse` returns 0 WITHOUT writing the `out` slot on
-// failure — `guid_parse_str` copies its output only on success, and the
-// sibling `bz_guid_parse` memsets its output on failure where the try form
-// does not (src/runtime/bezel_runtime_decimal_guid.cpp) — so a `Guid`
-// `TryParse` that ran and failed ALSO leaves the slot untouched, rather than
-// writing `default(Guid)`. That is the open defect #7320, not a property of
-// this file's remedy. It is why there is no `Guid.TryParse` class-instance
-// row here (see the comment block on the absent class-instance row below):
-// for `Guid` the pre-fix and post-fix outputs would be byte-identical, and
-// the row would pin nothing.
-//
-// SO: the failure default is written on the false path for DateTime,
-// DateOnly and TimeOnly (their runtimes assign it), and NOT for Guid. The
-// DISCRIMINATOR every row here relies on is the DROPPED-call half, which
-// holds for all four receivers without exception.
+// The `default(T)` half of that rule holds for all four receivers (issue #7320
+// made `bz_guid_try_parse` write `default(Guid)` on a failed parse, as the
+// DateTime / DateOnly / TimeOnly runtimes do; pinned by
+// guid_tryparse_false_path_default_7320). The DISCRIMINATOR every row here
+// relies on is the DROPPED-call half, which holds for all four receivers.
 
 #include <string>
 
