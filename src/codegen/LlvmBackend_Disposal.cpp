@@ -3067,6 +3067,88 @@ void Emitter::emitPendingCheck(std::size_t unwindDisposeHi) {
     emitPendingCheckIf(pending, unwindDisposeHi);
 }
 
+// #1216 / fix #7629 (§31.2, v0.350): the caught-exception SUPERSEDE, shared by
+// every edge that leaves a catch arm or an exception-entered finally with a NEW
+// exception. §31.2: "the superseded exception is disposed by the runtime exactly
+// once". The caller is on the unwind block of the edge, E2 is in flight, and E1
+// is `currentCaughtExc_`: dispose it here, because the arm's own caught-exception
+// disposal is skipped on an unwind. `throwLeavesArm` (the #397/#866 logic of
+// emitThrowValue) restricts it to an unwind target that is the arm's own outer
+// boundary: a throw caught by an INNER try inside the arm leaves E1 in flight.
+//
+// `newExc`, when given, is the new exception's object. A call-propagated
+// exception is never the same heap object as E1 (emitPendingCheckIf passes
+// null), but an awaited task's fault is RE-RAISED with the task's own error
+// object, which a bound task shares with every other awaiter; so the
+// await-using fault edges guard on `newExc != E1` rather than assume it.
+void Emitter::emitSupersedeCaughtExc(llvm::Value* newExc) {
+    bool throwLeavesArm =
+        caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
+    if (!currentCaughtExc_ || !throwLeavesArm) return;
+    llvm::BasicBlock* contBB = nullptr;
+    if (newExc) {
+        auto* supBB =
+            llvm::BasicBlock::Create(llvm_, "supersede.dispose", currentFn_);
+        contBB = llvm::BasicBlock::Create(llvm_, "supersede.cont", currentFn_);
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(newExc, currentCaughtExc_), supBB, contBB);
+        builder_.SetInsertPoint(supBB);
+    }
+    // §30.9 (v0.179): if E1 is a task-owned fault whose disposal was deferred
+    // (its owning task was disposed while E1 was in flight, #1288), its
+    // handling ends HERE via the supersede — the catch-arm's handling-
+    // completion drain will not fire on this unwind edge — so clear the
+    // deferred record before disposing to keep the single dispose here and
+    // leave no stale pointer in the deferred set. A no-op for a handler-owned
+    // E1 (the common #1216 case).
+    builder_.CreateCall(
+        declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy()}),
+        {currentCaughtExc_});
+    emitDisposeAndReclaim(currentCaughtExc_);
+    if (contBB) {
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+    }
+}
+
+
+// fix #7629 + #7630 (§31.2 / §28.4 / §28.2, v0.350): the tail of an `await
+// using` fault edge, shared by the `await.fault` block and the synchronous-throw
+// edge (emitDisposeAsyncSyncThrowEdge). `newExc` is the NEW exception, already in
+// the in-flight slot. The tail is emitPendingCheckIf's unwind block, with the one
+// difference the mid-pass position forces:
+//   * the caught-exception supersede (#1216), which these edges lacked — a
+//     faulting `DisposeAsync` inside a catch arm, or a finally entered on an
+//     exception edge, leaked the superseded caught exception;
+//   * the discharge of what the pass has NOT yet reached. The fault leaves the
+//     `await using` entry in the MIDDLE of its scope's pass (entries run in
+//     reverse declaration order), so the entries declared BEFORE it (`pending`)
+//     are still live and are disposed here, while the entries declared AFTER it
+//     were already discharged by the pass and must not be disposed again — a
+//     plain string release is exactly such an entry (#7630: released twice,
+//     "refcount over-release"). `emitUnwindDisposals()` re-ran the WHOLE scope,
+//     which is why this edge needs its own range instead of emitPendingCheckIf's
+//     end-of-pass "exclude the whole scope" `hi`.
+// `hi` is the scope's index on disposeStack_ (kAllLiveScopes for a free-standing
+// vector that is not on it), as in emitDisposalFaultCheck.
+void Emitter::emitAsyncDisposeFaultTail(llvm::Value* newExc,
+                                        const std::vector<Disposal>& pending,
+                                        std::size_t hi) {
+    emitSupersedeCaughtExc(newExc);
+    // fix #6052 (§28.3 *The return slot*, v0.338): see emitPendingCheckIf.
+    if (asyncReturnEdgeSlot_ &&
+        asyncReturnEdgeSlot_->getFunction() == currentFn_)
+        emitAsyncReturnSlotUnwind(asyncReturnEdgeSlot_);
+    if (!pending.empty()) emitDisposals(pending, /*isUnwind=*/true);
+    if (hi == kAllLiveScopes)
+        emitUnwindDisposals();
+    else
+        emitUnwindDisposalsInRange(unwindScopeDepth_, hi);
+    builder_.CreateBr(unwindBB());
+}
+
+
 // #792 / §22.13: the shared route block for a conditional pending check. Branch
 // to the unwind target (disposing unwound using-vars first, with the #1216
 // supersede of a captured in-flight exception) iff `cond` is true, else
@@ -3093,22 +3175,7 @@ void Emitter::emitPendingCheckIf(llvm::Value* cond,
     // the finally continues and E1 stays in flight). No isDirectRethrow guard
     // is needed: a call-propagated exception (bz$exc set by the callee) is
     // never the same object as currentCaughtExc_; they are distinct heap objects.
-    bool throwLeavesArm =
-        caughtExcArmTarget_ && unwindBB() == caughtExcArmTarget_;
-    if (currentCaughtExc_ && throwLeavesArm) {
-        // §30.9 (v0.179): if E1 is a task-owned fault whose disposal was deferred
-        // (its owning task was disposed while E1 was in flight, #1288), its
-        // handling ends HERE via the supersede — the catch-arm's handling-
-        // completion drain will not fire on this unwind edge — so clear the
-        // deferred record before disposing to keep the single dispose here and
-        // leave no stale pointer in the deferred set. A no-op for a handler-owned
-        // E1 (the common #1216 case).
-        builder_.CreateCall(
-            declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
-                     {ptrTy()}),
-            {currentCaughtExc_});
-        emitDisposeAndReclaim(currentCaughtExc_);
-    }
+    emitSupersedeCaughtExc();
     // fix #1882 (§28.4, v0.306): kAllLiveScopes is every pre-existing caller's
     // meaning and keeps emitUnwindDisposals' behaviour bit-for-bit. A SCOPE-END
     // disposal pass passes its own scope's index instead: that scope's entries
@@ -10582,10 +10649,18 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             // Pass the direct function pointer; null means sync fallback.
             // On the unwind path, always use sync fallback (pass null).
+            // fix #7629 (§31.2, v0.350): the fault edges of this disposal
+            // supersede a caught exception the same way every synchronous
+            // raise does (emitAsyncDisposeFaultTail).
+            std::function<void(llvm::Value*)> faultTail;
+            if (!isUnwind)
+                faultTail = [this](llvm::Value* newExc) {
+                    emitAsyncDisposeFaultTail(newExc, {}, kAllLiveScopes);
+                };
             emitAsyncDisposeAwaitAndFree(
                 obj, isUnwind ? nullptr : it->disposeAsyncFn,
                 isUnwind ? nullptr : it->asyncDisposeCls,
-                isUnwind ? -1 : it->disposeAsyncVSlot);
+                isUnwind ? -1 : it->disposeAsyncVSlot, faultTail);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

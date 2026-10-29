@@ -5233,7 +5233,9 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        const std::function<void()>& onFault,
                                        bool deferToScopeOnly,
                                        bool drainChainOnTake,
-                                       const sema::TypeRef* resultBoxedTy) {
+                                       const sema::TypeRef* resultBoxedTy,
+                                       const std::function<void(llvm::Value*)>&
+                                           faultTail) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -5467,12 +5469,20 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         // use it (the runtime frees the scope on the fault edge and the slot is
         // already nulled). // per §28.12 step 2, #3494
         if (onFault) onFault();
+        if (faultTail) {
+            // fix #7629 + #7630 (§31.2 / §28.2, v0.350): an `await using`
+            // disposal's fault edge — the caught-exception supersede and the
+            // pass-position-aware unwind (emitAsyncDisposeFaultTail), which
+            // also branches to the unwind target.
+            faultTail(excObj);
+        } else {
         // §28.3 / CG21: dispose the using-vars unwound between here and the
         // handler (a caught-exception entry is skipped — it stays in flight), the
         // same as emitThrowValue's synchronous-throw path, then branch to the
         // unwind target (catch.dispatch inside a try, or async.fault otherwise).
         emitUnwindDisposals();
         builder_.CreateBr(unwindBB());
+        }
 
         builder_.SetInsertPoint(okBB);
     }
@@ -6199,7 +6209,8 @@ void Emitter::emitFreeSpillArea(llvm::Value* self) {
 // object a second time, and no task exists to free.
 void Emitter::emitDisposeAsyncSyncThrowEdge(
     llvm::Value* excBefore,
-    const std::function<void()>& emitPhysicalReclamation) {
+    const std::function<void()>& emitPhysicalReclamation,
+    const std::function<void(llvm::Value*)>& faultTail) {
     llvm::Value* after =
         builder_.CreateLoad(ptrTy(), emitExcSlot(), "dispasync.postexc");
     llvm::Value* inFlight = builder_.CreateICmpNE(
@@ -6212,8 +6223,13 @@ void Emitter::emitDisposeAsyncSyncThrowEdge(
     builder_.CreateCondBr(builder_.CreateAnd(inFlight, isNew), faultBB, contBB);
     builder_.SetInsertPoint(faultBB);
     emitPhysicalReclamation();
-    emitUnwindDisposals();
-    builder_.CreateBr(unwindBB());
+    if (faultTail) {
+        // fix #7629 + #7630 (v0.350): the same tail as the `await.fault` edge.
+        faultTail(after);
+    } else {
+        emitUnwindDisposals();
+        builder_.CreateBr(unwindBB());
+    }
     builder_.SetInsertPoint(contBB);
 }
 
@@ -6223,13 +6239,15 @@ void Emitter::emitDisposeAsyncSyncThrowEdge(
 void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
                                            llvm::Function* disposeAsyncFn,
                                            const sema::TypeSymbol* cls,
-                                           int disposeAsyncVSlot) {
+                                           int disposeAsyncVSlot,
+                                           const std::function<void(llvm::Value*)>&
+                                               faultTail) {
     bool inAsyncSM = (smKind_ == SuspendKind::Await ||
                       smKind_ == SuspendKind::AsyncYield) &&
                      smStateStruct_ && smSelf_ && asyncResumeFn_;
     if (!disposeAsyncFn && inAsyncSM &&
         disposeAsyncVSlot == kDisposeAsyncRunTimeDispatch) {
-        emitRunTimeAsyncDisposeAwaitAndFree(obj);
+        emitRunTimeAsyncDisposeAwaitAndFree(obj, faultTail);
         return;
     }
     if (!disposeAsyncFn || !inAsyncSM) {
@@ -6355,7 +6373,8 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
     // fix #3483 (§28.12 step 2, v0.350): a non-`async` `DisposeAsync` that
     // threw synchronously returned no task — reclaim and propagate here, never
     // await the null (see emitDisposeAsyncSyncThrowEdge).
-    emitDisposeAsyncSyncThrowEdge(excBefore, emitPhysicalReclamation);
+    emitDisposeAsyncSyncThrowEdge(excBefore, emitPhysicalReclamation,
+                                  faultTail);
 
     // Await the Task returned by DisposeAsync() — a proper suspend point
     // inside the enclosing async method's Resume function. emitAwaitSuspend
@@ -6376,7 +6395,9 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
     emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true,
                      /*takeResultAfter=*/false, /*markSpentAfter=*/false,
                      /*deferTaskFree=*/false, /*freeOnFault=*/false,
-                     /*onFault=*/emitPhysicalReclamation);
+                     /*onFault=*/emitPhysicalReclamation,
+                     /*deferToScopeOnly=*/false, /*drainChainOnTake=*/false,
+                     /*resultBoxedTy=*/nullptr, faultTail);
 
     emitPhysicalReclamation();
 }
@@ -6414,7 +6435,8 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
 // pointers, so the iterator format (isIterVtableSelfReferenced, the one
 // discriminator) is routed straight to the synchronous arm — the disposal that
 // slot got before, unchanged by this function.
-void Emitter::emitRunTimeAsyncDisposeAwaitAndFree(llvm::Value* obj) {
+void Emitter::emitRunTimeAsyncDisposeAwaitAndFree(
+    llvm::Value* obj, const std::function<void(llvm::Value*)>& faultTail) {
     auto* lookupFn =
         declareC("bz_itable_lookup", ptrTy(), {ptrTy(), ptrTy()});
     auto* syncBB =
@@ -6469,11 +6491,14 @@ void Emitter::emitRunTimeAsyncDisposeAwaitAndFree(llvm::Value* obj) {
         builder_.CreateCall(dispAsyncTy, callee, {obj}, "dispasync.rt.task");
     // fix #3483 (§28.12 step 2, v0.350): the synchronous half of the fault
     // edge, as in the static arm (see emitDisposeAsyncSyncThrowEdge).
-    emitDisposeAsyncSyncThrowEdge(excBefore, emitPhysicalReclamation);
+    emitDisposeAsyncSyncThrowEdge(excBefore, emitPhysicalReclamation,
+                                  faultTail);
     emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true,
                      /*takeResultAfter=*/false, /*markSpentAfter=*/false,
                      /*deferTaskFree=*/false, /*freeOnFault=*/false,
-                     /*onFault=*/emitPhysicalReclamation);
+                     /*onFault=*/emitPhysicalReclamation,
+                     /*deferToScopeOnly=*/false, /*drainChainOnTake=*/false,
+                     /*resultBoxedTy=*/nullptr, faultTail);
     emitPhysicalReclamation();
     builder_.CreateBr(joinBB);
 

@@ -14171,6 +14171,25 @@ private:
     void emitPendingCheckIf(llvm::Value* cond,
                             std::size_t unwindDisposeHi = kAllLiveScopes);
 
+    // #1216 / fix #7629 (§31.2, v0.350): dispose the caught exception E1
+    // (`currentCaughtExc_`) that a NEW exception supersedes on an edge leaving a
+    // catch arm / exception-entered finally — "exactly once". emitPendingCheckIf
+    // shares it; `newExc` non-null adds a runtime `newExc != E1` guard (the
+    // await-using fault edges, where the new exception may be a task's shared
+    // error object).
+    void emitSupersedeCaughtExc(llvm::Value* newExc = nullptr);
+
+    // fix #7629 + #7630 (§31.2 / §28.4 / §28.2, v0.350): the tail of an `await
+    // using` fault edge (the `await.fault` block and the synchronous-throw
+    // edge): the #1216 supersede, then the unwind of exactly what the pass has
+    // not yet discharged — `pending` (the entries of the pass's own scope
+    // declared BEFORE the faulting one) and the scopes outside it, up to the
+    // scope index `hi`. Terminates the block with the branch to the unwind
+    // target.
+    void emitAsyncDisposeFaultTail(llvm::Value* newExc,
+                                   const std::vector<Disposal>& pending,
+                                   std::size_t hi);
+
     // §22.9 / §28.3 (FINDING [4]): the new-expression variant of emitPendingCheck.
     // When the constructor of an in-flight `new T(...)` throws, the freshly-
     // calloc'd instance `obj` is never bound to a `using var`/scope, so the
@@ -17070,7 +17089,16 @@ private:
                                   // (rather than loading `resultTy` bytes out of
                                   // the result buffer). See
                                   // decodeChannelItemWord.
-                                  const sema::TypeRef* resultBoxedTy = nullptr);
+                                  const sema::TypeRef* resultBoxedTy = nullptr,
+                                  // fix #7629 + #7630 (v0.350): when set, the
+                                  // `await.fault` block ends with this (it takes
+                                  // the re-raised exception object and must
+                                  // terminate the block with the branch to the
+                                  // unwind target) instead of the plain
+                                  // `emitUnwindDisposals()` + branch. See
+                                  // emitAsyncDisposeFaultTail.
+                                  const std::function<void(llvm::Value*)>&
+                                      faultTail = {});
 
     // #5305 / §30.14 (v0.313) / §30.15 / #5305-ff2: the element TypeRef T of an
     // `await`-able `Channel<T>.Receive()` whose element T is an AGGREGATE
@@ -17135,16 +17163,18 @@ private:
     // object's own `IAsyncDisposable` dispatch entry decides — see
     // `asyncDisposableItabKey`. The unwind pass passes -1, so it keeps the
     // synchronous fallback.
-    void emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
-                                      llvm::Function* disposeAsyncFn,
-                                      const sema::TypeSymbol* cls = nullptr,
-                                      int disposeAsyncVSlot = -1);
+    void emitAsyncDisposeAwaitAndFree(
+        llvm::Value* obj, llvm::Function* disposeAsyncFn,
+        const sema::TypeSymbol* cls = nullptr, int disposeAsyncVSlot = -1,
+        const std::function<void(llvm::Value*)>& faultTail = {});
     static constexpr int kDisposeAsyncRunTimeDispatch = -2;
     // The run-time arm itself (normal exit of an active async state machine;
     // `obj` non-null): look up the object's `IAsyncDisposable` entry; absent ⇒
     // synchronous emitDisposeAndReclaim; present ⇒ await its `DisposeAsync`,
     // then its §28.12 step 2 reclamation on both edges of the await.
-    void emitRunTimeAsyncDisposeAwaitAndFree(llvm::Value* obj);
+    void emitRunTimeAsyncDisposeAwaitAndFree(
+        llvm::Value* obj,
+        const std::function<void(llvm::Value*)>& faultTail = {});
     // fix #3483 (§28.12 step 2, v0.350): the synchronous half of the fault
     // edge, shared by both arms. Emitted between the `DisposeAsync` call and
     // its await: if the call raised (the in-flight slot now holds an exception
@@ -17155,7 +17185,8 @@ private:
     // edge does; otherwise continue to the await.
     void emitDisposeAsyncSyncThrowEdge(
         llvm::Value* excBefore,
-        const std::function<void()>& emitPhysicalReclamation);
+        const std::function<void()>& emitPhysicalReclamation,
+        const std::function<void(llvm::Value*)>& faultTail = {});
 
     // fix #3483 / #7417 (§28.12, v0.350, the #3493 ruling): the itmap KEY of
     // the built-in `IAsyncDisposable` dispatch entry. `IAsyncDisposable` has no
