@@ -9285,6 +9285,17 @@ private:
     // change any builtin's rendering either.
     static std::string spec85QualifiedTypeName(const sema::TypeSymbol* ts) {
         if (!ts) return "";
+        // per §8.5 / stdlib §2.13 rule 1 (v0.350, issue #7680): a stdlib enum the
+        // driver injects as a prelude declaration (DayOfWeek / DateTimeKind in
+        // stdlib §2.5 `System`; SeekOrigin / FileMode / FileAccess in §7 `System.IO`)
+        // is parsed INTO the user's module, so `moduleName` is the user's
+        // module ("M.DayOfWeek"). Its qualified name is its stdlib module's.
+        if (ts->isSynthesizedPrelude && ts->kind == ast::TypeDeclKind::Enum) {
+            bool io = ts->name == "SeekOrigin" || ts->name == "FileMode" ||
+                      ts->name == "FileAccess";
+            return std::string(io ? "System.IO." : "System.") +
+                   ts->qualifiedTypeName();
+        }
         if (ts->moduleName.empty()) {
             // Synthetic builtin population — the table lookup fills the
             // module path for a reserved built-in class; everything else
