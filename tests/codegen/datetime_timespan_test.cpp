@@ -118,7 +118,7 @@ BEZEL_TEST(codegen_datetime_2_5, ctor_second) {
 BEZEL_TEST(codegen_datetime_2_5, ctor_day_of_week_friday) {
     BEZEL_EXPECT_EQ(run(prog(
         "var dt := new DateTime(2024, 3, 15); "
-        "return dt.DayOfWeek; ")), 5);
+        "return int(byte(dt.DayOfWeek)); ")), 5);
 }
 
 // stdlib §2.5: DayOfYear for 2024-03-15.

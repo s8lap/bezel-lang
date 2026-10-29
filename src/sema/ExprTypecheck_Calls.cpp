@@ -32785,7 +32785,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             }
         }
     }
-    if (!targetType) {
+    // per stdlib §2.5 (v0.350, #7536): a `DateTime` produced by a call
+    // (`d.AddDays(3)`) carries `declaration = builtinClassSym("DateTime")`
+    // (a symbol with no `decl`), so `targetType` is non-null here, unlike the
+    // annotation / `new DateTime(...)` shape (declaration null). The builtin
+    // DateTime property arms below must see both shapes, otherwise
+    // `d.AddDays(3).DayOfWeek` stays untyped and the enum-typed argument is
+    // lowered without its i8 width.
+    const bool builtinDateTimeRecv =
+        targetType && targetType == builtinClassSym("DateTime");
+    if (!targetType || builtinDateTimeRecv) {
         // §31 / #600 phase c: `e.Message` where `e` is typed as a PURE built-in
         // exception (declaration==nullptr, no user TypeSymbol — e.g. a caught
         // `DomainFaultedException e` or `ChannelClosedException e`).  The user-
@@ -33978,9 +33987,37 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                     return;
                 }
-                // DayOfWeek → int (codegen treats enum as i32).
+                // per stdlib §2.5 (v0.350, #7536): `DayOfWeek` is typed as the
+                // §2.5 `DayOfWeek` enum — the one the stdlib prelude injects
+                // (Driver.cpp kTimePreludeSource), recognised by its
+                // isSynthesizedPrelude marker so a USER type named `DayOfWeek`
+                // is never mistaken for it. Codegen lowers the property through
+                // bz_datetime_day_of_week, whose 0 = Sunday ... 6 = Saturday
+                // result is the enum's ordinal. When the user's own top-level
+                // `DayOfWeek` shadows the prelude (§2.3) no stdlib enum exists in
+                // this module, and the property keeps the ordinal as `int`.
                 if (mbr == "DayOfWeek") {
-                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    TypeSymbol* dow = nullptr;
+                    if (ctx_.module()) {
+                        for (Symbol* child : ctx_.module()->children) {
+                            auto* ts = dynamic_cast<TypeSymbol*>(child);
+                            auto* td = ts ? dynamic_cast<const ast::TypeDecl*>(ts->decl)
+                                          : nullptr;
+                            if (td && td->isSynthesizedPrelude &&
+                                ts->name == "DayOfWeek") {
+                                dow = ts;
+                                break;
+                            }
+                        }
+                    }
+                    if (dow) {
+                        auto* dowTy = ctx_.makeTypeRef();
+                        dowTy->kind = TypeRef::Kind::Named;
+                        dowTy->declaration = dow;
+                        ctx_.setExprType(&ma, dowTy);
+                    } else {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    }
                     return;
                 }
                 // Ticks → long (the raw i64 tick count).

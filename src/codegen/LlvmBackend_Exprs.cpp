@@ -6523,7 +6523,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 else if (mbr == "DayOfYear")   fnName = "bz_datetime_day_of_year";
                 if (fnName) {
                     auto* fn = declareC(fnName, i32(), {i64()});
-                    return builder_.CreateCall(fn, {ticks}, llvm::Twine(mbr));
+                    llvm::Value* v = builder_.CreateCall(fn, {ticks}, llvm::Twine(mbr));
+                    // per stdlib §2.5 (#7536): `DayOfWeek` is the byte-backed
+                    // enum, laid out at its underlying width (i8), not the
+                    // runtime helper's i32 ordinal.
+                    if (mbr == "DayOfWeek") {
+                        if (auto* want = lowerTypeRef(ctx_.exprType(*ma));
+                            want && want->isIntegerTy() &&
+                            want->getIntegerBitWidth() < 32)
+                            v = builder_.CreateTrunc(v, want, "dow.enum");
+                    }
+                    return v;
                 }
                 // Ticks property — return the raw i64.
                 if (mbr == "Ticks") return ticks;
