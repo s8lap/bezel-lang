@@ -5934,6 +5934,11 @@ static TypeRef* builtinCollectionConstraintPropertyType(SemaContext& ctx,
 // helper (below), but `typeCall` — which is earlier in this file — uses it.
 static void checkBuiltinStringCallArity(SemaContext& ctx,
                                          const ast::CallExpr& ce);
+// fix #7810 / #7850 (stdlib §4, v0.350): the built-in collection members'
+// ARITY gate; defined beside the collection argument check (below), used by
+// `typeCall` (earlier in this file).
+static void checkBuiltinCollectionCallArity(SemaContext& ctx,
+                                             const ast::CallExpr& ce);
 
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
@@ -19182,6 +19187,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // `item`/`query`/`key` argument reach codegen and ICE it (LLVM ICmpInst
     // assertion, exit 134). Run the §7 check against the instantiated
     // element/key type so the builtin path agrees with the user-method path.
+    checkBuiltinCollectionCallArity(ctx_, ce);
     checkBuiltinCollectionCallArgs(ce);
 
     // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin — a builtin
@@ -24572,6 +24578,181 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
         // applied so each parameter receives the correct source argument value.
         ctx_.setBuiltinCallBinding(&ce, b.paramToArg);
     }
+}
+
+// fix #7810 / #7850 (stdlib §4.4-§4.11, §4.17, §4.18, §22.6, v0.350): the
+// ARITY of a built-in collection member.
+//
+// A built-in collection has no MethodSymbol, so `checkCallArity` never ran
+// for its members and the member was typed by NAME alone. The lowerings key
+// on name AND arity: a call at an arity the stdlib declares no overload for
+// either matched no lowering (the #3079 / #2434 warning backstops, or the
+// #2457 codegen error, depending on the position the call sat in) or — where
+// the lowering ignores surplus arguments (`q.Peek(1)`, `st.Peek(1)`) —
+// compiled and DROPPED the argument.
+//
+// stdlib §26.5 rule 1 (block-by-name) makes the instance member the only
+// candidate "by name — any arity, applicability, or accessibility", so a call
+// whose argument count no declared overload takes has no candidate and is a
+// compile error (§22.6).
+//
+// THE TABLE is transcribed from the stdlib class blocks, one row per METHOD
+// of a concrete collection head: bit `n` of `arities` is set iff some
+// declared overload takes `n` parameters, counting an optional parameter at
+// both its arities (`Array<T>.IndexOf(item, startIndex := 0)` takes 1 or 2).
+// Properties (`Count`, `Keys`, ...) are not calls and are not listed. A
+// member the table does not list has no opinion here (the surface check and
+// the codegen backstop keep that path): a missed row costs a rejection that
+// does not fire, never a false one.
+namespace {
+constexpr unsigned kAr0 = 1u << 0, kAr1 = 1u << 1, kAr2 = 1u << 2;
+struct CollectionMemberArity {
+    std::string_view member;
+    unsigned arities;
+};
+struct CollectionArityHead {
+    std::string_view head;
+    std::string_view section;  // the stdlib section that declares the head
+    std::vector<CollectionMemberArity> members;
+};
+}  // namespace
+
+static const std::vector<CollectionArityHead>& collectionMemberArities() {
+    static const std::vector<CollectionArityHead> kRows = {
+        {"Array", "stdlib §4.4",
+         {{"Add", kAr1}, {"AddRange", kAr1}, {"Insert", kAr2},
+          {"RemoveAt", kAr1}, {"Remove", kAr1}, {"Clear", kAr0},
+          {"Contains", kAr1}, {"IndexOf", kAr1 | kAr2}, {"LastIndexOf", kAr1},
+          {"Sort", kAr0 | kAr1}, {"Sorted", kAr0 | kAr1}, {"Reverse", kAr0},
+          {"Reversed", kAr0}, {"ToArray", kAr0}, {"Slice", kAr1},
+          {"AsSpan", kAr0 | kAr1 | kAr2},
+          {"AsReadOnlySpan", kAr0 | kAr1 | kAr2}}},
+        {"OwningArray", "stdlib §4.5",
+         {{"Add", kAr1}, {"AddRange", kAr1}, {"Insert", kAr2},
+          {"RemoveAt", kAr1}, {"Remove", kAr1}, {"Clear", kAr0},
+          {"Contains", kAr1}, {"IndexOf", kAr1}, {"Sort", kAr0 | kAr1},
+          {"Reverse", kAr0}, {"PopAt", kAr1}, {"PopFirst", kAr0},
+          {"PopLast", kAr0}, {"TryPopFirst", kAr1}, {"TryPopLast", kAr1},
+          {"Drain", kAr0}}},
+        {"LinkedList", "stdlib §4.6",
+         {{"Add", kAr1}, {"AddFirst", kAr1}, {"AddLast", kAr1},
+          {"AddBefore", kAr2}, {"AddAfter", kAr2}, {"RemoveFirst", kAr0},
+          {"RemoveLast", kAr0}, {"RemoveNode", kAr1}, {"Find", kAr1},
+          {"Contains", kAr1}, {"Remove", kAr1}, {"Clear", kAr0}}},
+        {"OwningLinkedList", "stdlib §4.7",
+         {{"Add", kAr1}, {"AddFirst", kAr1}, {"AddLast", kAr1},
+          {"AddBefore", kAr2}, {"AddAfter", kAr2}, {"RemoveFirst", kAr0},
+          {"RemoveLast", kAr0}, {"RemoveNode", kAr1}, {"Find", kAr1},
+          {"Contains", kAr1}, {"Remove", kAr1}, {"Clear", kAr0},
+          {"PopFirst", kAr0}, {"PopLast", kAr0}, {"TryPopFirst", kAr1},
+          {"TryPopLast", kAr1}, {"Drain", kAr0}}},
+        // `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>` (§4.8): the
+        // entry forms `Add(entry)`, `Contains(entry)`, `Remove(entry)` take
+        // ONE parameter beside the keyed forms.
+        {"Dictionary", "stdlib §4.8",
+         {{"Add", kAr1 | kAr2}, {"TryAdd", kAr2}, {"ContainsKey", kAr1},
+          {"Contains", kAr1}, {"Remove", kAr1}, {"TryGetValue", kAr2},
+          {"GetOrNull", kAr1}, {"GetOrAdd", kAr2}, {"Clear", kAr0}}},
+        {"OwningDictionary", "stdlib §4.9",
+         {{"Add", kAr2}, {"TryAdd", kAr2}, {"ContainsKey", kAr1},
+          {"Contains", kAr1}, {"Remove", kAr1}, {"TryGetValue", kAr2},
+          {"GetOrNull", kAr1}, {"GetOrAdd", kAr2}, {"PopValue", kAr1},
+          {"TryPopValue", kAr2}, {"Drain", kAr0}, {"Clear", kAr0}}},
+        {"Set", "stdlib §4.10",
+         {{"Add", kAr1}, {"TryAdd", kAr1}, {"Contains", kAr1},
+          {"Remove", kAr1}, {"Clear", kAr0}, {"UnionWith", kAr1},
+          {"IntersectWith", kAr1}, {"ExceptWith", kAr1},
+          {"IsSubsetOf", kAr1}, {"IsSupersetOf", kAr1}}},
+        {"OwningSet", "stdlib §4.10",
+         {{"Add", kAr1}, {"TryAdd", kAr1}, {"Contains", kAr1},
+          {"Remove", kAr1}, {"Clear", kAr0}, {"Pop", kAr1}, {"TryPop", kAr2},
+          {"Drain", kAr0}, {"UnionWith", kAr1}, {"IntersectWith", kAr1},
+          {"ExceptWith", kAr1}, {"IsSubsetOf", kAr1}, {"IsSupersetOf", kAr1}}},
+        {"Stack", "stdlib §4.11",
+         {{"Push", kAr1}, {"Contains", kAr1}, {"Pop", kAr0}, {"Peek", kAr0},
+          {"TryPop", kAr1}, {"TryPeek", kAr1}, {"Clear", kAr0}}},
+        {"OwningStack", "stdlib §4.11",
+         {{"Push", kAr1}, {"Contains", kAr1}, {"Pop", kAr0}, {"Peek", kAr0},
+          {"TryPop", kAr1}, {"TryPeek", kAr1}, {"Clear", kAr0},
+          {"Drain", kAr0}}},
+        {"Queue", "stdlib §4.11",
+         {{"Enqueue", kAr1}, {"Dequeue", kAr0}, {"Peek", kAr0},
+          {"Contains", kAr1}, {"TryDequeue", kAr1}, {"TryPeek", kAr1},
+          {"Clear", kAr0}}},
+        {"OwningQueue", "stdlib §4.11",
+         {{"Enqueue", kAr1}, {"Dequeue", kAr0}, {"Peek", kAr0},
+          {"Contains", kAr1}, {"TryDequeue", kAr1}, {"TryPeek", kAr1},
+          {"Clear", kAr0}, {"Drain", kAr0}}},
+        {"SortedDictionary", "stdlib §4.17",
+         {{"Add", kAr2}, {"TryAdd", kAr2}, {"ContainsKey", kAr1},
+          {"Contains", kAr1}, {"TryGetValue", kAr2}, {"GetOrNull", kAr1},
+          {"Remove", kAr1}, {"Clear", kAr0}}},
+        {"SortedSet", "stdlib §4.18",
+         {{"Add", kAr1}, {"TryAdd", kAr1}, {"Contains", kAr1},
+          {"Remove", kAr1}, {"Clear", kAr0}}},
+    };
+    return kRows;
+}
+
+// "exactly 1 argument(s)" / "0 or 1 argument(s)" / "0, 1 or 2 argument(s)".
+static std::string collectionArityExpectation(unsigned arities) {
+    std::vector<unsigned> ns;
+    for (unsigned n = 0; n < 3; ++n)
+        if (arities & (1u << n)) ns.push_back(n);
+    if (ns.size() == 1) return "exactly " + std::to_string(ns[0]) + " argument(s)";
+    std::string out;
+    for (std::size_t i = 0; i < ns.size(); ++i) {
+        if (i) out += (i + 1 == ns.size()) ? " or " : ", ";
+        out += std::to_string(ns[i]);
+    }
+    return out + " argument(s)";
+}
+
+static void checkBuiltinCollectionCallArity(SemaContext& ctx,
+                                             const ast::CallExpr& ce) {
+    auto [recvExpr, m] = builtinInstanceCallee(ce.callee.get());
+    if (!recvExpr || m.empty()) return;
+    const TypeRef* recvTy = ctx.exprType(*recvExpr);
+    // A user type has a MethodSymbol: `checkCallArity` bound the call.
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named || recvTy->declaration)
+        return;
+    // The head, read as `checkBuiltinCollectionCallArgs` reads it: the alias
+    // target wins (`type OA := OwningArray<R>`), else the spelled head.
+    std::string_view colName;
+    if (!recvTy->aliasResolvedHead.empty())
+        colName = recvTy->aliasResolvedHead;
+    else if (recvTy->astNode && recvTy->astNode->name &&
+             !recvTy->astNode->name->parts.empty())
+        colName = recvTy->headName();
+    if (colName.empty()) return;
+    const CollectionArityHead* headRow = nullptr;
+    for (const auto& h : collectionMemberArities())
+        if (h.head == colName) { headRow = &h; break; }
+    if (!headRow) return;
+    const CollectionMemberArity* row = nullptr;
+    for (const auto& r : headRow->members)
+        if (r.member == m) { row = &r; break; }
+    if (!row) return;
+    const std::size_t argc = ce.args.size();
+    if (argc < 32 && (row->arities & (1u << argc))) return;
+    // ONE diagnostic per call: a check that already spoke about THIS call at
+    // its own start (the #7671 `Array<T>.LastIndexOf` arm of `typeCall`) has
+    // the first word.
+    for (const auto& d : ctx.diagnostics().diagnostics())
+        if (d.severity == Severity::Error &&
+            d.location.line == ce.span.begin.line &&
+            d.location.offset == ce.span.begin.offset)
+            return;
+    ctx.diagnostics().report(
+        Severity::Error, ce.span.begin,
+        "the call to `" + std::string(colName) + "." + std::string(m) +
+            "` supplies " + std::to_string(argc) + " argument(s) but " +
+            std::string(headRow->section) + " declares `" + std::string(m) +
+            "` with " + collectionArityExpectation(row->arities) +
+            " — no overload takes " + std::to_string(argc) +
+            ", so the call is a compile error with no candidates cited "
+            "(§22.6; instance members block by name at any arity, "
+            "§26.5 rule 1)");
 }
 
 // §7 / stdlib §4.x (#2582) + §4.14/§4.15 (#2600) + §6.4 (#2602) + §6.6
