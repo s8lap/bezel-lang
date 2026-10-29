@@ -22934,17 +22934,27 @@ void ExprTC::reportBuiltinArgIfNullable(const ast::Expr* arg,
 // verifier abort on a LEGAL program). Publish the read
 // (`SemaContext::markNarrowedValueRead`), so `Emitter::lowerExpr` extracts the
 // payload once. Only a nullable VALUE primitive is published (a reference
-// type has no carrier; `string`/`Object` are references), and only at a
+// type has no carrier; `string`/`Object` are references; a record, enum or
+// choice has one, #7692), and only at a
 // position the caller already knows is declared non-nullable, so the
 // extraction is sound: an un-narrowed nullable was reported above.
 void ExprTC::publishNarrowedBuiltinArg(const ast::Expr* arg) {
     if (!arg) return;
     TypeRef* argTy = ctx_.exprType(*arg);
-    if (!argTy || !argTy->nullable || argTy->kind != TypeRef::Kind::Primitive)
+    if (!argTy || !argTy->nullable) return;
+    if (argTy->kind == TypeRef::Kind::Primitive) {
+        if (argTy->primitive == PrimitiveType::String ||
+            argTy->primitive == PrimitiveType::Object)
+            return;
+    } else if (argTy->kind != TypeRef::Kind::Named) {
         return;
-    if (argTy->primitive == PrimitiveType::String ||
-        argTy->primitive == PrimitiveType::Object)
-        return;
+    }
+    // fix #7692 (§7.4, §22.6, v0.350): a nullable RECORD (`TimeSpan?`,
+    // `DateTime?`), enum or choice has the same `{i8 hasValue; T}` carrier as
+    // a primitive, so `dt.Add(ts)` over a narrowed `ts: TimeSpan?` aborted the
+    // verifier the same way. A nullable CLASS or interface reference has no
+    // carrier: `Emitter::lowerExpr` extracts only the exact carrier of the
+    // read's own type (`isNullableValueTy`), so publishing one is inert.
     if (isNarrowedNonNullRead(arg)) ctx_.markNarrowedValueRead(arg);
 }
 

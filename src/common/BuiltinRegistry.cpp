@@ -591,7 +591,7 @@ struct BuiltinParamRow {
     std::string_view sig;
 };
 
-constexpr std::array<BuiltinParamRow, 345> kBuiltinParams = {{
+constexpr std::array<BuiltinParamRow, 353> kBuiltinParams = {{
     // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the §9.6 `String` head's
     // DECLARED PARAMETER TYPES, transcribed from the standard library's own
     // listing.
@@ -781,10 +781,15 @@ constexpr std::array<BuiltinParamRow, 345> kBuiltinParams = {{
     // quotes the declared signature it is a call form of.
     {"Debug", "Assert", 1, 1, 0x01, {"condition", "", "", "", "", "", "", ""}, {kBPTBool, 0, 0, 0, 0, 0, 0, 0}, "Assert(condition: bool, message: string := \"\")"},
     {"Debug", "Assert", 2, 2, 0x03, {"condition", "message", "", "", "", "", "", ""}, {kBPTBool, kBPTString, 0, 0, 0, 0, 0, 0}, "Assert(condition: bool, message: string)"},
-    {"DateTime", "", 3, 3, 0x00, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"DateTime", "", 8, 6, 0x00, {"year", "month", "day", "hour", "minute", "second", "millisecond", "kind"}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"DateOnly", "", 3, 3, 0x00, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"TimeOnly", "", 4, 2, 0x00, {"hour", "minute", "second", "millisecond", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #7692 (stdlib §2.5, §7.3, v0.350): every parameter of the DateTime /
+    // DateOnly / TimeOnly constructors is declared non-nullable (`int`,
+    // `DateTimeKind`), so the mask covers each position. It was 0, so a
+    // nullable argument (narrowed or not) reached codegen as the `{i8, i32}`
+    // carrier and aborted the verifier.
+    {"DateTime", "", 3, 3, 0x07, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"DateTime", "", 8, 6, 0xFF, {"year", "month", "day", "hour", "minute", "second", "millisecond", "kind"}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"DateOnly", "", 3, 3, 0x07, {"year", "month", "day", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"TimeOnly", "", 4, 2, 0x0F, {"hour", "minute", "second", "millisecond", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"StringBuilder", "", 1, 1, 0x01, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"StringBuilder", "", 1, 1, 0x01, {"initial", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"ReadOnlyStringSpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
@@ -1002,6 +1007,29 @@ constexpr std::array<BuiltinParamRow, 345> kBuiltinParams = {{
     {"TimeOnly", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
     {"TimeSpan", "ToString", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToString(): string"},
     {"TimeSpan", "ToString", 1, 1, 0x01, {"format", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToString(format: string): string"},
+    // fix #7692 (stdlib §2.5, §7.3, v0.350): the §2.5 members that take a
+    // RECORD value (`TimeSpan`, `DateTime`, `DateOnly`, `TimeOnly`) at a
+    // declared non-nullable parameter. They carry no TYPE opinion (kinds 0:
+    // `kBPTAny`, the table has no record bit), but the NULLABILITY of the
+    // position is declared, so the §7 gate refuses an un-narrowed nullable
+    // there and publishes a narrowed one for payload extraction (it reached
+    // codegen as the `{i8, i64}` carrier and aborted the verifier).
+    //
+    // The rows carry NO parameter NAMES (the `Convert.ToString` rows' form):
+    // a row with names makes `checkBuiltinNamedArgs` honour a named argument
+    // here (§22.5), and the named spelling has neither a TYPE check (no record
+    // bit: `dt.CompareTo(other := "x")` aborted the verifier) nor the §7
+    // extraction (`dt.Add(span := ts)` over a narrowed `ts` aborted it). So
+    // a named argument keeps its loud "carries no parameter names" refusal
+    // (§22.5, #3398) until the table can type a record position.
+    {"DateTime", "Add", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Add(span: TimeSpan): DateTime"},
+    {"DateTime", "Subtract", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Subtract(other: DateTime): TimeSpan"},
+    {"DateTime", "Subtract", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Subtract(span: TimeSpan): DateTime"},
+    {"DateTime", "CompareTo", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "CompareTo(other: DateTime): int"},
+    {"TimeSpan", "CompareTo", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "CompareTo(other: TimeSpan): int"},
+    {"DateOnly", "CompareTo", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "CompareTo(other: DateOnly): int"},
+    {"DateOnly", "ToDateTime", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "ToDateTime(time: TimeOnly): DateTime"},
+    {"TimeOnly", "CompareTo", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "CompareTo(other: TimeOnly): int"},
     // fix #7443 (stdlib §2.5, §5.1, v0.345): the §2.5 CLASS-SPELLING static
     // members' DECLARED PARAMETER TYPES.
     //
@@ -2232,8 +2260,17 @@ bool builtinParamIsNonNullable(std::string_view typeHead,
     if (head == "string") return false;
     for (const auto& r : kBuiltinParams) {
         if (r.head != head || r.member != member) continue;
-        if (r.total != argCount) continue;
-        if (position < r.total && (r.nonNullable & (1u << position)))
+        // fix #7692 (stdlib §2.5, v0.350): a CONSTRUCTOR row that carries a
+        // default (`TimeOnly(hour, minute, second := 0, millisecond := 0)`,
+        // the `DateTime` seven-component form) is ONE declaration that admits
+        // every count from `required` to `total`; its mask holds at each
+        // (the member rows are keyed on the exact count, `Debug.Assert`).
+        const bool countMatches =
+            r.total == argCount ||
+            (member.empty() && argCount >= r.required && argCount < r.total);
+        if (!countMatches) continue;
+        if (position < r.total && position < argCount &&
+            (r.nonNullable & (1u << position)))
             return true;
     }
     return false;

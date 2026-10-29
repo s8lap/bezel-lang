@@ -2047,6 +2047,10 @@ void ExprTC::checkBuiltinNullableCtorArgs(const ast::NewExpr& ne,
                                                ne.args.size(), i))
             continue;
         reportBuiltinArgIfNullable(a.value.get(), what);
+        // fix #7692 (§7.4, §22.6, v0.350): the extraction twin of the member
+        // gate (fix #7621) — a narrowed nullable value is of its non-nullable
+        // type at the constructor parameter, so codegen extracts its payload.
+        publishNarrowedBuiltinArg(a.value.get());
     }
 }
 
@@ -2096,6 +2100,29 @@ void ExprTC::checkBuiltinCtorNamedArgs(const ast::NewExpr& ne,
     BuiltinBind bb;
     if (!bindBuiltinCandidates(cands, ne.args, ne.span.begin, desc, bb))
         return;  // the helper reported; no cascade
+
+    // fix #7692 (§7, §7.3, §7.4, §22.5, v0.350): the §7 null check of the
+    // positional arguments (`checkBuiltinNullableCtorArgs`) skips a NAMED one
+    // because its index is not its parameter. The binding is known here, so
+    // the named arguments are checked (and a narrowed one is published for
+    // payload extraction) at the parameter each NAMES.
+    if (bb.bind.ok) {
+        const std::string what = "argument to `" + head + "` constructor";
+        for (std::size_t j = 0; j < bb.bind.paramToArg.size(); ++j) {
+            const int ai = bb.bind.paramToArg[j];
+            if (ai < 0 || static_cast<std::size_t>(ai) >= ne.args.size())
+                continue;
+            const auto& a = ne.args[static_cast<std::size_t>(ai)];
+            if (!a.value || a.isDiscard || !a.modifier.empty() ||
+                a.name.empty())
+                continue;
+            if (!common::builtinParamIsNonNullable(head, /*member=*/"",
+                                                   ne.args.size(), j))
+                continue;
+            reportBuiltinArgIfNullable(a.value.get(), what);
+            publishNarrowedBuiltinArg(a.value.get());
+        }
+    }
 
     // fix #3423 (§22.5, v0.283): same fix as checkBuiltinNamedArgs. Codegen
     // lowers a builtin construction by argument POSITION (`ne.args[i]`), so a

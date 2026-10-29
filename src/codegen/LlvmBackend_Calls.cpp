@@ -11485,6 +11485,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                          bool* rendered) -> llvm::Value* {
             if (!v) return nullptr;
             auto* rt = expr ? ctx_.exprType(*expr) : nullptr;
+            // fix #7692 (§7.4 / §22.6, v0.350): "a read of a binding §7.4 has
+            // narrowed non-null is of its non-nullable type". Sema published
+            // this read (`SemaContext::markNarrowedValueRead`) and
+            // `Emitter::lowerExpr` already extracted the payload of the
+            // `{i8 hasValue; T}` carrier, so `v` is a bare `T` while the read's
+            // sema type is still the declared `T?`. Render it at the type it
+            // denotes: the nullable arms below (`emitValueToString`'s
+            // tagged-struct arm) read a bare record struct's first FIELD as the
+            // tag (`icmp ne i32 %X, i8 0`, IR verification failed) and a bare
+            // value-like choice's payload as the choice (a compiler SEGV).
+            sema::TypeRef narrowedRt;
+            if (rt && rt->nullable && expr && ctx_.isNarrowedValueRead(*expr)) {
+                narrowedRt = *rt;
+                narrowedRt.nullable = false;
+                rt = &narrowedRt;
+            }
             // fix #6753 (stdlib §3.1 / §8.1, v0.340): an Object-typed LOCAL narrows
             // through its initializer exactly as the console does (see
             // `tryLowerConsoleCall`). Every other Object value keeps the dynamic
