@@ -10812,6 +10812,26 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 "sits behind a `Locked<T>` registry (\xc2\xa7""30.12)");
         }
     }
+    // §28.8.1 *The `with` clause beside the other two uses of `with`* / §9.5
+    // (v0.350): a `with` followed by `(` and `Identifier :=` after a `move`
+    // operand is the record-update suffix and binds to the operand, so
+    // `move r with(X := 1)` is `move (r with(X := 1))` -- a `move` of a record
+    // value, which A.7's operand rule ("No other operand is admitted") rejects.
+    // The diagnostic names the replacing form with its replacement
+    // parenthesized, `move loc with (e)`.
+    if (op == "move" && ue.operand &&
+        dynamic_cast<const ast::WithExpr*>(ue.operand.get())) {
+        ctx_.diagnostics().report(
+            Severity::Error, ue.span.begin,
+            "`move` of a record-update value is not admitted: a `with` followed "
+            "by `(` and `Identifier :=` after a `move` operand is the record-"
+            "update suffix of the operand (`move r with(X := 1)` is `move (r "
+            "with(X := 1))`, \xc2\xa7""9.5 tie-break), and `move` takes a named "
+            "binding, an owned field or an owning slot, never a record-update "
+            "value (\xc2\xa7""28.8.1, Appendix A.7 MoveExpr, v0.350). To exchange "
+            "an owned field or slot with a replacement that is itself a "
+            "record-update, parenthesize the replacement: `move loc with (e)`");
+    }
     // A.7 MoveExpr `"move" PrimaryExpr ("with" Expression)?` / §28.8.1 *The
     // replacing `move`* (v0.350): the `with` clause is admitted at a field or an
     // owning slot only. At alternative (c) — a bare identifier naming a local
