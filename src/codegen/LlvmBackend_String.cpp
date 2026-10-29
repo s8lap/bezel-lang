@@ -3440,7 +3440,17 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
     // as the literal "null" — the same rendering null interpolation uses
     // (LlvmBackend_Exprs.cpp) — instead of dereferencing it (bug A). A non-null
     // field formats by its normal rule below.
-    if (isNullableRefTy(fieldTy) && val->getType()->isPointerTy()) {
+    // fix #6777 (§8.5 / §18.5, v0.350): `isNullableRefTy` admits only DECLARED
+    // classes, so a nullable declaration-less built-in class (`StringBuilder?`)
+    // is a plain pointer with a real null that must take this arm too, else
+    // `emitVtablelessBuiltinToString` renders the null receiver's empty content.
+    const bool nullableDeclLessBuiltin =
+        fieldTy && fieldTy->nullable && !fieldTy->declaration &&
+        val && val->getType()->isPointerTy() &&
+        !builtinTypeName(fieldTy).empty() &&
+        common::isVtableLessBuiltinClassName(builtinTypeName(fieldTy));
+    if ((isNullableRefTy(fieldTy) || nullableDeclLessBuiltin) &&
+        val->getType()->isPointerTy()) {
         llvm::Value* isNull = builder_.CreateICmpEQ(
             val, llvm::ConstantPointerNull::get(ptrTy()), "ts.null");
         auto* liveBB = llvm::BasicBlock::Create(llvm_, "ts.live", currentFn_);
