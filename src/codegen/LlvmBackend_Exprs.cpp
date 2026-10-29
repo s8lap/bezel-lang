@@ -5891,6 +5891,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     const auto& mbr = ma->member;
                     if (mbr == "Zero")
                         return builder_.getInt64(0LL);
+                    // stdlib §2.5 (v0.350, #6742): MinValue / MaxValue are
+                    // FromTicks(long.MinValue / long.MaxValue).
+                    if (mbr == "MinValue")
+                        return llvm::ConstantInt::getSigned(
+                            i64(), (int64_t)(-9223372036854775807LL - 1));
+                    if (mbr == "MaxValue")
+                        return builder_.getInt64(9223372036854775807LL);
                     // TimeSpan.FromX static factories are handled in
                     // tryLowerBuiltinClassCall (CallExpr path); but if accessed
                     // without () (not valid Bezel for factories), return nullptr.

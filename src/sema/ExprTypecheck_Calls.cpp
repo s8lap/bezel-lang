@@ -32155,7 +32155,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
             if (did->name == "TimeSpan") {
-                if (ma.member == "Zero") {
+                if (ma.member == "Zero" || ma.member == "MinValue" ||
+                    ma.member == "MaxValue") {  // stdlib §2.5 (#6742)
                     auto* ts = ctx_.makeTypeRef();
                     ts->kind = TypeRef::Kind::Named;
                     ts->declaration = builtinClassSym("TimeSpan");
@@ -33917,7 +33918,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     }
                 }
                 if (did->name == "TimeSpan") {
-                    if (ma.member == "Zero") {
+                    if (ma.member == "Zero" || ma.member == "MinValue" ||
+                        ma.member == "MaxValue") {  // stdlib §2.5 (#6742)
                         auto* ts = ctx_.makeTypeRef();
                         ts->kind = TypeRef::Kind::Named;
                         ts->declaration = builtinClassSym("TimeSpan");
