@@ -15623,6 +15623,21 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc,
         if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
+    if (st->state == OwnershipState::Disposed && st->implicitDischarge) {
+        // §28.3 (axiom A5, v0.350): "A `using var` ... cannot be moved out
+        // of" is a property of the BINDING, not of its state, so an explicit
+        // `Dispose()` on it does not lift the pin: the move-out is the same
+        // A5 error the not-yet-disposed `using var` draws below. §28.2's
+        // use-after-dispose warning (the arm after this one) governs a
+        // consume of a plain owned local; it does not apply here. #7405
+        report(
+            Severity::Error, loc,
+            std::string("cannot move out of `using var` `") +
+            std::string(name) +
+            "`; `using var` is scope-bound (§28.3)");
+        st->state = OwnershipState::Poisoned;
+        return;
+    }
     if (st->state == OwnershipState::Disposed) {
         // §28.2 (v0.303): under a *dominating* Dispose()/discard, EVERY use
         // — read, borrow, AND consume (a `move`, an `owned` argument, a
