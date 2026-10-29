@@ -13,7 +13,7 @@ module Conf;
 
 public class Program
   public static method Main(): int
-    var s: string := "c" + "x".Repeat(250) + "c";
+    var s: string := "c" + String.Repeat("x", 250) + "c";
     var v: uint := 200;
     Console.WriteLine(s.Substring(v).Length.ToString());
     return 0;

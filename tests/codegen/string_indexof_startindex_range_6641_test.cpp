@@ -196,7 +196,7 @@ BEZEL_TEST(string_indexof_startindex_range_6641,
 BEZEL_TEST(string_indexof_startindex_range_6641,
            byte_startindex_on_long_string_is_in_range) {
     auto r = runAot(prog(
-        "    var s: string := \"c\" + \"x\".Repeat(250) + \"c\";\n"
+        "    var s: string := \"c\" + String.Repeat(\"x\", 250) + \"c\";\n"
         "    var b: byte := 200;\n"
         "    Console.WriteLine(s.IndexOf('c', b).ToString());\n"
         "    Console.WriteLine(s.IndexOf(\"c\", b).ToString());\n"));

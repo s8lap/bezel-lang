@@ -277,10 +277,12 @@ BEZEL_TEST(sema_string_static_empty_7128, accept_string_from_wstring_pointer) {
     BEZEL_EXPECT_EQ(runAotOut(src), "hi");
 }
 
-// stdlib §9.6: the INSTANCE `Repeat` (the compiler's own surface) — pinned
-// so the subtraction above cannot have removed it by accident.
-BEZEL_TEST(sema_string_static_empty_7128, accept_instance_repeat) {
-    const std::string src = prog("    Console.WriteLine(\"x\".Repeat(3));\n    return 0;");
+// stdlib §9.6: the declared STATIC `Repeat(unit: string, count: int)` —
+// pinned so the subtraction above cannot have removed it by accident. (This
+// row pinned the INSTANCE spelling until fix #7706, stdlib §9.6 v0.350, which
+// rejects it: §9.6 declares `Repeat` only as a static member.)
+BEZEL_TEST(sema_string_static_empty_7128, accept_static_repeat_string_unit) {
+    const std::string src = prog("    Console.WriteLine(String.Repeat(\"x\", 3));\n    return 0;");
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);

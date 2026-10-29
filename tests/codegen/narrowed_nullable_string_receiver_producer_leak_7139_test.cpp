@@ -66,7 +66,12 @@
 // pins the VALUE and r.ran pins leak-freedom. Each case FAILS without the
 // fix (LSan reports the leaked strings -> r.ran false) and PASSES with it.
 //
-// NOT IN SCOPE. The `?.` spelling (`s?.Repeat(50)`) is a DIFFERENT AST node
+// Rows (A), (C) and (E) used the INSTANCE `Repeat(count)` until fix #7706
+// (stdlib §9.6, v0.350: `Repeat` is declared only as a static member, so the
+// instance spelling is rejected); they now use the declared instance
+// `PadLeft` / `PadRight`, another §9.6 member that mints a +1 string.
+//
+// NOT IN SCOPE. The `?.` spelling (`s?.PadLeft(50)`) is a DIFFERENT AST node
 // (ast::NullCondMemberExpr) and its own codegen gap is tracked separately
 // (#7130); it is not folded in here.
 
@@ -159,7 +164,7 @@ std::string loopIfGuarded(const char* decl, const char* render, int expectedLen)
 
 // =====================================================================
 // (A) THE #7139 REPRO, exactly: `var s: string? := "x"; var t: string :=
-// s.Repeat(50);` — narrowed by the DECLARATION'S INITIALIZER (§7.4).
+// s.PadLeft(50);` — narrowed by the DECLARATION'S INITIALIZER (§7.4).
 // Pre-fix: 83 B in 2 allocations per iteration (3269 B in 79 allocations
 // over the 40-iteration loop).
 // =====================================================================
@@ -167,7 +172,7 @@ BEZEL_TEST(narrowed_nullable_string_receiver_producer_leak_7139,
            declaration_initializer_narrowing_repeat_lsan_clean_spec_7_4) {
     JitResult r = runAotChecked(loopCount(
         "var s: string? := \"x\"; ",
-        "s.Repeat(50)", 50));
+        "s.PadLeft(50)", 50));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean: the producer's +1 released
     BEZEL_EXPECT_EQ(r.exitCode, 40); // 40 == every render byte-correct
@@ -195,7 +200,7 @@ BEZEL_TEST(narrowed_nullable_string_receiver_producer_leak_7139,
            if_guard_narrowing_repeat_lsan_clean_spec_7_4) {
     JitResult r = runAotChecked(loopIfGuarded(
         "var s: string? := \"x\"; ",
-        "s.Repeat(50)", 50));
+        "s.PadLeft(50)", 50));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
@@ -237,7 +242,7 @@ BEZEL_TEST(narrowed_nullable_string_receiver_producer_leak_7139,
         "module M; class C "
         "  public static method Main(): int "
         "    var s: string? := \"x\"; "
-        "    var t: string := s.Repeat(3); "
+        "    var t: string := s.PadRight(3, 'x'); "
         "    Console.WriteLine(t); "
         "    Console.WriteLine(t.Length); "
         "    return 0; "

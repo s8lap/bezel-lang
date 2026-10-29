@@ -236,7 +236,7 @@ BEZEL_TEST(builtin_narrowed_arg_7621, refuse_unnarrowed_string_members) {
     expectNullableRefused("int?", "    var z := \"abc\".Substring(x);", "string.Substring");
     expectNullableRefused("int?", "    var z := \"abc\".PadLeft(x);", "string.PadLeft");
     expectNullableRefused("char?", "    var z := \"abc\".IndexOf(x);", "string.IndexOf");
-    expectNullableRefused("int?", "    var z := \"abc\".Repeat(x);", "string.Repeat");
+    expectNullableRefused("int?", "    var z := String.Repeat(\"abc\", x);", "string.Repeat");
 }
 
 BEZEL_TEST(builtin_narrowed_arg_7621, refuse_unnarrowed_temporal) {

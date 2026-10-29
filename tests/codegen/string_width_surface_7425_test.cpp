@@ -301,7 +301,7 @@ BEZEL_TEST(string_width_surface_7425,
            repeat_content_spec_4_6) {
     Outcome o = run(prog(
         "    var s := \"日abc\";\n"
-        "    var t := s.Repeat(2);\n"
+        "    var t := String.Repeat(s, 2);\n"
         "    Console.WriteLine(t);\n"));
     BEZEL_EXPECT_TRUE(o.ran);
     BEZEL_EXPECT_FALSE(o.errored);
@@ -381,7 +381,7 @@ BEZEL_TEST(string_width_surface_7425,
         "    Console.WriteLine(s.ToUpper());\n"
         "    Console.WriteLine(s.ToLower());\n"
         "    Console.WriteLine(\" x \".Trim());\n"
-        "    Console.WriteLine(s.Repeat(2));\n"
+        "    Console.WriteLine(String.Repeat(s, 2));\n"
         "    Console.WriteLine(s.Insert(1, \"Y\"));\n"
         "    Console.WriteLine(string.Repeat('z', 3));\n"));
     BEZEL_EXPECT_TRUE(o.ran);
@@ -470,7 +470,8 @@ BEZEL_TEST(string_width_surface_7425,
         "      var c := w.ToUpper();\n"
         "      var d := w.ToLower();\n"
         "      var e := (\" 日 \").Trim();\n"
-        "      var f := w.Repeat(2);\n"
+        "      var f := String.Repeat(\"日abc\", 2);\n"   // static spelling since #7706; a producer-local unit leaks: #7741
+
         "      var g := w.Insert(1, \"XY\");\n"
         "      var h := string.Repeat('日', 3);\n"
         "      if a.Length + b.Length + c.Length + d.Length + e.Length + f.Length + g.Length + h.Length = 33 then n := n + 1; end;\n"

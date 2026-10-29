@@ -143,7 +143,7 @@ std::string inRange() {
 // a LEGAL index (inside 0..252) and the insertion must land at 200 — the
 // value #7102's widening fix established.
 const char* kLong252 =
-    "    var s: string := \"c\" + \"x\".Repeat(250) + \"c\";\n";
+    "    var s: string := \"c\" + String.Repeat(\"x\", 250) + \"c\";\n";
 
 }  // namespace
 

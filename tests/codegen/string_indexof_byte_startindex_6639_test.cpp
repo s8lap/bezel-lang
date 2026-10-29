@@ -62,7 +62,7 @@ std::string prog(const std::string& body) {
 // value that DISTINGUISHES the correct start (200 → 251) from the broken one
 // (a start clamped to 0 → 0, and a start read as -56 → an exception).
 const char* kLong252 =
-    "    var s: string := \"c\" + \"x\".Repeat(250) + \"c\";\n";
+    "    var s: string := \"c\" + String.Repeat(\"x\", 250) + \"c\";\n";
 
 }  // namespace
 
@@ -118,7 +118,7 @@ BEZEL_TEST(string_indexof_byte_startindex_6639,
 BEZEL_TEST(string_indexof_byte_startindex_6639,
            ushort_startindex_above_sign_bit_spec_5_1) {
     auto r = runAot(prog(
-        "    var s: string := \"c\" + \"x\".Repeat(40000) + \"c\";\n"
+        "    var s: string := \"c\" + String.Repeat(\"x\", 40000) + \"c\";\n"
         "    var u: ushort := 35000;\n"
         "    Console.WriteLine(s.IndexOf('c', u).ToString());\n"
         "    Console.WriteLine(s.IndexOf(\"c\", u).ToString());\n"));

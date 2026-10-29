@@ -165,7 +165,7 @@ std::string loopRaising(const std::string& render) {
 // ===========================================================================
 BEZEL_TEST(string_repeat_pad_range_7120,
            instance_repeat_negative_count_raises_argument_out_of_range_stdlib_9_6) {
-    JitResult r = runAot(raising("\"x\".Repeat(-1)"));
+    JitResult r = runAot(raising("String.Repeat(\"x\", -1)"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.exitCode, 42);
@@ -179,7 +179,7 @@ BEZEL_TEST(string_repeat_pad_range_7120,
 // was written through the null pointer (SIGSEGV, rc = 139).
 BEZEL_TEST(string_repeat_pad_range_7120,
            instance_repeat_negative_count_on_a_multi_code_point_receiver_raises_stdlib_9_6) {
-    JitResult r = runAot(raising("\"abcdefghij\".Repeat(-1)"));
+    JitResult r = runAot(raising("String.Repeat(\"abcdefghij\", -1)"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.exitCode, 42);
@@ -208,7 +208,7 @@ BEZEL_TEST(string_repeat_pad_range_7120,
 // ===========================================================================
 BEZEL_TEST(string_repeat_pad_range_7120,
            negative_count_is_catchable_as_argument_exception_in_both_spellings_stdlib_2_5) {
-    JitResult r = runAot(raisingAsBase("\"x\".Repeat(-1)"));
+    JitResult r = runAot(raisingAsBase("String.Repeat(\"x\", -1)"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.exitCode, 43);
@@ -266,9 +266,9 @@ BEZEL_TEST(string_repeat_pad_range_7120,
 BEZEL_TEST(string_repeat_pad_range_7120,
            repeat_zero_count_is_the_empty_string_stdlib_9_6) {
     JitResult r = runAot(prog(
-        "    Console.WriteLine(\"[\" + \"x\".Repeat(0) + \"]\");\n"
+        "    Console.WriteLine(\"[\" + String.Repeat(\"x\", 0) + \"]\");\n"
         "    Console.WriteLine(\"[\" + string.Repeat('x', 0) + \"]\");\n"
-        "    Console.WriteLine(\"[\" + \"xy\".Repeat(0) + \"]\");\n"));
+        "    Console.WriteLine(\"[\" + String.Repeat(\"xy\", 0) + \"]\");\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.stdoutText, "[]\n[]\n[]\n");
@@ -280,8 +280,8 @@ BEZEL_TEST(string_repeat_pad_range_7120,
 BEZEL_TEST(string_repeat_pad_range_7120,
            repeat_positive_count_repeats_the_receiver_stdlib_9_6) {
     JitResult r = runAot(prog(
-        "    Console.WriteLine(\"[\" + \"x\".Repeat(3) + \"]\");\n"
-        "    Console.WriteLine(\"[\" + \"xy\".Repeat(3) + \"]\");\n"
+        "    Console.WriteLine(\"[\" + String.Repeat(\"x\", 3) + \"]\");\n"
+        "    Console.WriteLine(\"[\" + String.Repeat(\"xy\", 3) + \"]\");\n"
         "    Console.WriteLine(\"[\" + string.Repeat('x', 3) + \"]\");\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -324,7 +324,7 @@ BEZEL_TEST(string_repeat_pad_range_7120,
 // ===========================================================================
 BEZEL_TEST(string_repeat_pad_range_7120,
            instance_repeat_negative_count_is_memory_safe_stdlib_9_6) {
-    JitResult r = runAotChecked(raising("\"x\".Repeat(-1)"));
+    JitResult r = runAotChecked(raising("String.Repeat(\"x\", -1)"));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);   // no ASan report, no LSan leak
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -351,7 +351,7 @@ BEZEL_TEST(string_repeat_pad_range_7120,
 // The same shape for the instance `Repeat` raise.
 BEZEL_TEST(string_repeat_pad_range_7120,
            instance_repeat_raise_does_not_leak_the_producer_receiver_stdlib_9_6) {
-    JitResult r = runAotChecked(loopRaising("(\"a\" + \"b\").Repeat(-1)"));
+    JitResult r = runAotChecked(loopRaising("String.Repeat(\"a\" + \"b\", -1)"));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
@@ -377,7 +377,7 @@ BEZEL_TEST(string_repeat_pad_range_7120,
     JitResult r = runAot(prog(
         "    var b: byte := 200;\n"
         "    Console.WriteLine(string.Repeat('x', b).Length);\n"
-        "    Console.WriteLine(\"x\".Repeat(b).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", b).Length);\n"
         "    Console.WriteLine(string.Repeat('x', 200).Length);\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -443,7 +443,7 @@ BEZEL_TEST(string_repeat_pad_range_7120,
            ushort_count_reaches_the_int_parameter_as_65535_instance_spelling_stdlib_5_1) {
     JitResult r = runAot(prog(
         "    var u: ushort := 65535;\n"
-        "    Console.WriteLine(\"x\".Repeat(u).Length);\n"));
+        "    Console.WriteLine(String.Repeat(\"x\", u).Length);\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.stdoutText, "65535\n");

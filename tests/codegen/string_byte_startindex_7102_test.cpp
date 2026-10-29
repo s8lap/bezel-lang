@@ -75,7 +75,7 @@ std::string prog(const std::string& body) {
 // DISTINGUISH the correct index from the broken one (a start read as -56
 // throws, is clamped to 0, or asks malloc for a negative size).
 const char* kLong252 =
-    "    var s: string := \"c\" + \"x\".Repeat(250) + \"c\";\n";
+    "    var s: string := \"c\" + String.Repeat(\"x\", 250) + \"c\";\n";
 
 // The same wrapper, with a module-level `byte`-backed enum: an enum is
 // represented by its underlying integer (§10.3), so `E.A` is an UNSIGNED 200.
@@ -202,7 +202,7 @@ BEZEL_TEST(string_byte_startindex_7102,
 BEZEL_TEST(string_byte_startindex_7102,
            ushort_startindex_remove_spec_5_1) {
     auto r = runAot(prog(
-        "    var s: string := \"c\" + \"x\".Repeat(40000) + \"c\";\n"
+        "    var s: string := \"c\" + String.Repeat(\"x\", 40000) + \"c\";\n"
         "    var u: ushort := 40000;\n"
         "    Console.WriteLine(s.Remove(u).Length.ToString());\n"));
     BEZEL_EXPECT_TRUE(r.ran);

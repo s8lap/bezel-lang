@@ -28139,21 +28139,10 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         // §9.6 Remove(startIndex[, count]) → inline mint.
                         if (m == "Remove" && (argc == 1 || argc == 2))
                             return true;
-                        // fix #7119 / §9.6 / §28.9 (v0.343): the INSTANCE
-                        // `Repeat(count)` — the 1-arg spelling, `"x".Repeat(n)`
-                        // — repeats SELF n times. The 2-arg STATIC spelling
-                        // `string.Repeat(char, count)` is recognized in the
-                        // static-factory arm above; this is the sibling form
-                        // that arm never covered. tryLowerStringMethod's
-                        // `method == "Repeat" && call.args.size() == 1` arm
-                        // mints an inline malloc + initStringRc (rc := 1) ⇒ a
-                        // fresh +1 producer, and the consumer must TRANSFER
-                        // that reference instead of retaining on top of it
-                        // (MEASURED before this fix: 233 B in 2 allocations for
-                        // `"x".Repeat(200)`, 283 B for the shipped #6641
-                        // receiver `"c" + "x".Repeat(250) + "c"`).
-                        if (m == "Repeat" && argc == 1)
-                            return true;
+                        // fix #7706 (stdlib §9.6, v0.350): no INSTANCE
+                        // `Repeat(count)` arm. It is not a §9.6 member; a call
+                        // spelled that way is a user extension's, whose result
+                        // is classified by the extension-call path.
                         // fix #7119 / §9.6-ext / §28.9 (v0.343): `GetField(
                         // delim, n)` — the §9.6-ext member that returns the
                         // n-th 0-indexed field of SELF split by `delim` — also

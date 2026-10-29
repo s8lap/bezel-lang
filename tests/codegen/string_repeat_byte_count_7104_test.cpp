@@ -88,7 +88,7 @@ BEZEL_TEST(string_repeat_byte_count_7104,
            byte_count_repeats_the_string_that_many_times) {
     auto r = runAot(prog(
         "    var b: byte := 200;\n"
-        "    Console.WriteLine(\"x\".Repeat(b).Length);\n"));
+        "    Console.WriteLine(String.Repeat(\"x\", b).Length);\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.stdoutText, "200\n");
@@ -101,8 +101,8 @@ BEZEL_TEST(string_repeat_byte_count_7104,
            byte_count_agrees_with_the_literal_count) {
     auto r = runAot(prog(
         "    var b: byte := 200;\n"
-        "    Console.WriteLine(\"x\".Repeat(b).Length);\n"
-        "    Console.WriteLine(\"x\".Repeat(200).Length);\n"));
+        "    Console.WriteLine(String.Repeat(\"x\", b).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", 200).Length);\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.stdoutText, "200\n200\n");
@@ -117,8 +117,8 @@ BEZEL_TEST(string_repeat_byte_count_7104,
            byte_count_produces_the_same_content_as_the_literal_count) {
     auto r = runAot(prog(
         "    var b: byte := 200;\n"
-        "    var a: string := \"x\".Repeat(b);\n"
-        "    var c: string := \"x\".Repeat(200);\n"
+        "    var a: string := String.Repeat(\"x\", b);\n"
+        "    var c: string := String.Repeat(\"x\", 200);\n"
         "    return (if a = c then 0 else 1);\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
@@ -135,8 +135,8 @@ BEZEL_TEST(string_repeat_byte_count_7104,
            byte_count_below_the_signed_midpoint_is_unchanged) {
     auto r = runAot(prog(
         "    var b: byte := 5;\n"
-        "    Console.WriteLine(\"x\".Repeat(b).Length);\n"
-        "    Console.WriteLine(\"x\".Repeat(5).Length);\n"));
+        "    Console.WriteLine(String.Repeat(\"x\", b).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", 5).Length);\n"));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_EQ(r.stdoutText, "5\n5\n");

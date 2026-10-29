@@ -1,3 +1,11 @@
+// PORTED by fix #7706 (stdlib §9.6, v0.350). This file pinned the INSTANCE
+// `"x".Repeat(count)` spelling's +1 producer accounting. §9.6 declares
+// `Repeat` only as the two STATIC members, so the instance spelling is now
+// rejected (tests/sema/string_instance_repeat_static_only_7706_test.cpp) and
+// every row below uses the declared static `String.Repeat(unit, count)` --
+// the same leak-freedom property (a fresh +1 string released by its consumer)
+// on the spelling that exists. The test names keep "instance_repeat" so the
+// history of the rows stays greppable.
 // Codegen / leak — the INSTANCE `string` producer recognizer missed the
 // 1-argument `Repeat` (and two siblings), so each result's producer
 // reference was never released. Issue #7119.
@@ -109,7 +117,7 @@ BEZEL_TEST(string_instance_repeat_producer_leak_7119,
            instance_repeat_literal_lsan_clean_stdlib_9_6) {
     JitResult r = runAotChecked(loopCount(
         "",
-        "\"x\".Repeat(200)", 200));
+        "String.Repeat(\"x\", 200)", 200));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);        // LSan-clean: the producer's +1 released
     BEZEL_EXPECT_EQ(r.exitCode, 40);
@@ -125,7 +133,7 @@ BEZEL_TEST(string_instance_repeat_producer_leak_7119,
            instance_repeat_count_in_variable_lsan_clean_stdlib_9_6) {
     JitResult r = runAotChecked(loopCount(
         "var n := 200; ",
-        "\"x\".Repeat(n)", 200));
+        "String.Repeat(\"x\", n)", 200));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
@@ -140,7 +148,7 @@ BEZEL_TEST(string_instance_repeat_producer_leak_7119,
            instance_repeat_in_concat_lsan_clean_stdlib_9_6) {
     JitResult r = runAotChecked(loopCount(
         "",
-        "\"c\" + \"x\".Repeat(250) + \"c\"", 252));
+        "\"c\" + String.Repeat(\"x\", 250) + \"c\"", 252));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
@@ -155,7 +163,7 @@ BEZEL_TEST(string_instance_repeat_producer_leak_7119,
            instance_repeat_null_forgiving_receiver_lsan_clean_stdlib_9_6) {
     JitResult r = runAotChecked(loopCount(
         "var src: string? := \"x\"; ",
-        "src!.Repeat(50)", 50));
+        "String.Repeat(src!, 50)", 50));
     BEZEL_EXPECT_FALSE(bezel::test::checkedToolchainSkipped(r));
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 40);
@@ -173,7 +181,7 @@ BEZEL_TEST(string_instance_repeat_producer_leak_7119,
         "  public static method Main(): int "
         "    var i := 0; "
         "    while i < 40 do "
-        "      Console.WriteLine(\"x\".Repeat(50)); "
+        "      Console.WriteLine(String.Repeat(\"x\", 50)); "
         "      i := i + 1; "
         "    end; "
         "    return 0; "
@@ -193,7 +201,7 @@ BEZEL_TEST(string_instance_repeat_producer_leak_7119,
     JitResult r = runAotChecked(
         "module M; class C "
         "  public static method Make(): string "
-        "    return \"x\".Repeat(50); "
+        "    return String.Repeat(\"x\", 50); "
         "  end Make; "
         "  public static method Main(): int "
         "    var count := 0; "
@@ -220,7 +228,7 @@ BEZEL_TEST(string_instance_repeat_producer_leak_7119,
     JitResult r = runAotChecked(
         "module M; class C "
         "  public static method P(p: string?, s: string): string "
-        "    return p ?? s.Repeat(2); "
+        "    return p ?? String.Repeat(s, 2); "
         "  end P; "
         "  public static method Main(): int "
         "    var count := 0; "

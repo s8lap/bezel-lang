@@ -21436,38 +21436,15 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         // is skipped by the Primitive guard in the loop below, so admitting
         // AsSpan here cannot false-reject the Range form.
         //
-        // fix #7132 (§5.1, §9.6, v0.343): the INSTANCE `Repeat(count)`
-        // takes its count as an `int` — the same declared type stdlib §9.6
-        // gives the STATIC `Repeat(c: char, count: int)` — and its count was
-        // NOT in this set, so the count argument was never type-checked at
-        // all. A `uint` count (which §5.1's "never implicit" bullet forbids:
-        // "between signed and unsigned types of the same or narrower width")
-        // was admitted, and after the #7104 byte-widening fix it produced a
-        // SILENT WRONG VALUE where it used to crash loudly: `"x".Repeat(b)`
-        // with `b: uint := 4000000000` compiled and printed `-294967296`.
-        // Adding `Repeat` here puts its count on the SAME
-        // implicitly-convertible check the PAD/SPAN parameters already use
-        // (the `checkAssignable` call in the loop below), so the `uint` count
-        // is rejected at the sibling site with the same §5.1 diagnostic —
-        // and §5.1's constant-narrowing clause still admits a `long`
-        // CONSTANT whose value fits `int`'s range (`const N: long := 3L`),
-        // because `checkAssignable` runs `narrowIntConstantToTarget` first.
-        // (Whether the INSTANCE spelling belongs on stdlib §9.6's `String`
-        // listing at all is a SEPARATE, open question — issue #7131 records
-        // that §9.6 declares only the two STATIC `Repeat` forms; this fix
-        // gates the count of the spelling the compiler implements, and does
-        // not rule on the member's existence.)
-        // NOTE the position: the instance spelling puts the count at
-        // position 0; the STATIC `string.Repeat(c, count)` puts it at
-        // position 1 and is gated at its own site (the static-primitive
-        // argument check in `typeCall`), because the static callee's target
-        // is the TYPE NAME `string` — which carries no value exprType — and
-        // the receiver guard above therefore excludes it by construction.
+        // fix #7132 (§5.1, §9.6, v0.343) gated the count of an INSTANCE
+        // `Repeat(count)` here. fix #7706 (stdlib §9.6, v0.350) stopped
+        // admitting that spelling -- `Repeat` is declared only as a STATIC
+        // member, whose count is gated at its own site (the static-primitive
+        // argument check in `typeCall`, position 1) -- so it has no entry.
         bool intPos =
             (pos == 0 && (m == "Substring" || m == "Remove" || m == "Insert" ||
                           m == "PadLeft" || m == "PadRight" ||
-                          m == "PadCenter" || m == "AsSpan" ||
-                          m == "Repeat")) ||
+                          m == "PadCenter" || m == "AsSpan")) ||
             (pos == 1 && (m == "Substring" || m == "Remove" ||
                           m == "IndexOf" || m == "AsSpan"));
         if (intPos) return PT::Int;
@@ -22761,15 +22738,15 @@ static const std::vector<BuiltinStringArityRow>& builtinStringStaticArities() {
     return kRows;
 }
 
-// The three built-in `string` members stdlib §9.6 does NOT declare (issue
-// #7131): the INSTANCE `Repeat(count)`, `GetField(delim, n)` and
-// `CountOf(sub)`. The arity below is the one the compiler LOWERS them at, not
-// a declared one — the diagnostic says so, so the reader is never told a
-// declaration that does not exist.
+// The built-in `string` members stdlib §9.6 does NOT declare (issue #7131):
+// `GetField(delim, n)` and `CountOf(sub)`. The arity below is the one the
+// compiler LOWERS them at, not a declared one — the diagnostic says so, so the
+// reader is never told a declaration that does not exist. (The INSTANCE
+// `Repeat(count)` was the third; fix #7706 stopped admitting it, so it has no
+// row: the call is rejected as a non-member before any arity question.)
 static const std::vector<BuiltinStringArityRow>&
 builtinStringUndeclaredArities() {
     static const std::vector<BuiltinStringArityRow> kRows = {
-        {"Repeat", {1}, "`Repeat(count: int): string` (the INSTANCE spelling)"},
         {"GetField", {2}, "`GetField(delimiter: char, n: int): string`"},
         {"CountOf", {1}, "`CountOf(substring: string): int`"},
     };
@@ -34679,7 +34656,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "ToUpper" || ma.member == "Replace" ||
                         ma.member == "PadLeft" || ma.member == "PadRight" ||
                         ma.member == "PadCenter" ||
-                        ma.member == "Repeat" || ma.member == "Remove" ||
+                        // fix #7706 (stdlib §9.6, v0.350): `Repeat` is NOT
+                        // in this list. §9.6 declares it only as a STATIC
+                        // member (`Repeat(c: char, count)`, `Repeat(unit:
+                        // string, count)`), so the INSTANCE spelling
+                        // `s.Repeat(n)` is not a member of `string`'s
+                        // surface: it falls to the extension lookup below
+                        // and then to the catch-all rejection every other
+                        // static-only name (`Join`, `From`, ...) draws.
+                        ma.member == "Remove" ||
                         ma.member == "Insert" ||
                         ma.member == "GetField") {
                         ctx_.setExprType(

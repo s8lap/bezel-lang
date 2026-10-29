@@ -131,7 +131,9 @@ bool arityRejected(const JitResult& r, const std::string& needle) {
 
 // The issue's Repro A — `Repeat` at THREE arguments. §9.6 declares only the
 // two STATIC `Repeat` forms, both at two arguments, so the three-argument
-// instance call matches no §9.6 declaration and no lowering.
+// instance call matches no §9.6 declaration and no lowering. Since fix #7706
+// (stdlib §9.6, v0.350) the INSTANCE spelling is rejected as a non-member at
+// EVERY arity, so the diagnostic is the non-member one, not an arity one.
 // MEASURED pre-fix: compiled, and the generated program died with SIGSEGV at
 // fault address 0x8.
 BEZEL_TEST(sema_string_member_wrong_arity_7140,
@@ -143,10 +145,7 @@ BEZEL_TEST(sema_string_member_wrong_arity_7140,
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(arityRejected(
         r,
-        "the call to `Repeat` on `string` supplies 2 argument(s) but the "
-        "compiler lowers `Repeat` only at exactly 1 argument(s); stdlib §9.6 "
-        "declares no such member at all (issue #7131 asks whether the member "
-        "belongs in §9.6 and at which arity)"));
+        "string member `.Repeat` is not yet supported in codegen"));
 }
 
 // The issue's Repro B — `GetField` at THREE arguments. §9.6 declares no
@@ -648,7 +647,7 @@ BEZEL_TEST(sema_string_member_wrong_arity_7140,
         "    Console.WriteLine(\"[\" + \"ab\".Insert(1, \"X\") + \"]\");\n"
         "    Console.WriteLine(\"[\" + \"abcdef\".Remove(1) + \"]\");\n"
         "    Console.WriteLine(\"[\" + \"abcdef\".Remove(1, 2) + \"]\");\n"
-        "    Console.WriteLine(\"[\" + \"x\".Repeat(3) + \"]\");\n"
+        "    Console.WriteLine(\"[\" + String.Repeat(\"x\", 3) + \"]\");\n"
         "    Console.WriteLine(\"[\" + \"a,b,c\".GetField(',', 1) + \"]\");\n"
         "    return 0;");
     auto r = runAot(src);

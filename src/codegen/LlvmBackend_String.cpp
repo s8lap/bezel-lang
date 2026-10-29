@@ -2664,51 +2664,13 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
                                    "pad.result");
     }
 
-    // §9.6: Repeat(n: int): string — repeat self n times.
-    if (method == "Repeat" && call.args.size() == 1 && call.args[0].value) {
-        llvm::Value* nArg = lowerArg(0);
-        if (!nArg) return nullptr;
-        // fix #7104 (§5.1, v0.343): widen the count to i64 BY THE SOURCE'S
-        // SIGNEDNESS. A bare `CreateSExt` read an unsigned `byte` count's high
-        // bit as a sign bit, so `byte` 200 arrived as -56: the negative count
-        // reached the `malloc` below and the process died (SIGSEGV) instead of
-        // repeating the string 200 times. §5.1 admits `byte → int` as a
-        // LOSSLESS conversion, so the two spellings must agree.
-        //
-        // §9.6 (v0.343): the count contract — "count < 0 raises
-        // ArgumentOutOfRangeException; count = 0 is \"\"" — declared on the
-        // static `Repeat(c: char, count: int)` and, by "same count contract",
-        // on `Repeat(unit: string, count: int)`. The instance spelling
-        // repeats the RECEIVER as that unit, so it carries the same count
-        // contract.
-        //
-        // fix #7120 (§9.6, v0.343): the guard must be emitted BEFORE the
-        // `malloc` below. A negative count made `totalLen` negative, so
-        // `malloc` returned a 1-byte buffer and the copy loop wrote past it
-        // (heap-buffer-overflow ⇒ SIGSEGV without a sanitizer). `count = 0`
-        // is NOT an error (§9.6): `totalLen` is 0, the loop does not run and
-        // the result is "".
-        //
-        // fix #7169 (§9.6, v0.343): the widening, the comparison and the
-        // raise are now the SHARED §9.6 count contract
-        // (`emitSection96CountContract`, in the emitter header) — the SAME
-        // function the static `Repeat(c: char, count: int)` arm calls, so
-        // the two spellings cannot drift apart.
-        llvm::Value* n64 = emitSection96CountContract(
-                call.args[0].value.get(), nArg, ownedOnThrow(),
-                "rep.s64", "rep.z64", "rep.neg");
-        // #7425 (§4.6, v0.345): the repetition is done in the CODE-POINT
-        // domain, by the runtime's width-aware helper.
-        //
-        // The inline arm this replaces copied `selfLen` BYTES per copy — the
-        // source's data is `selfLen * width` bytes (§4.6) — and stored
-        // width = 1. On a width-2 string the result's CONTENT was the byte
-        // sequence, not the code-point sequence — the wrong text at the right
-        // length, which a length-only oracle cannot see. Measured on the
-        // base: `"日abc".Repeat(2)` -> "åea" (expected "日abc日abc").
-        auto* fn = declareC("bz_str_repeat", ptrTy(), {ptrTy(), i64()});
-        return builder_.CreateCall(fn, {self, n64}, "rep.result");
-    }
+    // fix #7706 (stdlib §9.6, v0.350): there is NO instance `Repeat` arm
+    // here. §9.6 declares `Repeat` only as the two STATIC members (lowered in
+    // the static-factory arm, via `emitSection96CountContract`), sema rejects
+    // the instance spelling `s.Repeat(n)` unless a user `extension string`
+    // supplies one (§26.5 rule 2), and a call that reaches this function with
+    // that name is therefore the extension's: it must fall through to the
+    // extension lowering, not be answered by the built-in.
 
     // §9.6-ext: GetField(delim: char, n: int): string
     // Returns the n-th 0-indexed field when splitting self by delim.

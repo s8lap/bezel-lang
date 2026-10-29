@@ -48,11 +48,13 @@
 // `isStdlibStringMintingCall` (a user override may return a borrow) is what
 // keeps the last of those admitted, and it must survive this change.
 //
-// Scope (recorded): `GetField` and the INSTANCE `Repeat` are implemented by
-// the compiler but are NOT declared by stdlib §9.6 — that is #7131 (a
-// `spec-defect` issue), and their place in the mint set is #7131's decision.
-// This commit does NOT change them: `Select(x => x.GetField(',', 0))` and
-// `Select(x => x.Repeat(3))` are still ACCEPTED here, exactly as before.
+// Scope (recorded): `GetField` is implemented by the compiler but is NOT
+// declared by stdlib §9.6 — that is #7131 (a `spec-defect` issue), and its
+// place in the mint set is #7131's decision. This commit does NOT change it:
+// `Select(x => x.GetField(',', 0))` is still ACCEPTED here, exactly as before.
+// The INSTANCE spelling `x.Repeat(3)` is no longer accepted at all: stdlib
+// §9.6 (v0.350) declares `Repeat` static-only, so #7706 rejects the instance
+// spelling before the minting-selector gate is reached.
 //
 // Spec: language spec §28.3 *Bare-type-parameter returns* / *Unbound owned
 // temporaries* (v0.194 — laundering a fresh owned value out through a borrow

@@ -17,7 +17,7 @@ module Conf;
 
 public class Program
   public static method Main(): int
-    var s: string := "c" + "x".Repeat(250) + "c";   // 252 characters
+    var s: string := "c" + String.Repeat("x", 250) + "c";   // 252 characters
     var v: byte := 128;
     Console.WriteLine(s.Substring(v).Length.ToString());
     return 0;

@@ -37,6 +37,13 @@
 // compiles, while `2147483648L` (a constant that does NOT fit) and
 // `var n: long := 3` (not a constant at all) are compile errors.
 //
+// PORTED by fix #7706 (stdlib §9.6, v0.350): the INSTANCE spelling no longer
+// exists (`Repeat` is declared only as a static member), so the rows named
+// `*_static_string_unit_*` below drive the declared static
+// `Repeat(unit: string, count: int)` -- the count at position 1, gated at the
+// static site -- with the same counts the instance rows used. Everything
+// below that says "instance" describes the pre-#7706 history of those rows.
+//
 // BOTH SPELLINGS. The instance `"x".Repeat(count)` puts the count at
 // position 0 and is gated in `checkBuiltinStringCallArgs`'s `intPos` set.
 // The static `string.Repeat(c, count)` puts it at position 1 and is gated at
@@ -123,10 +130,10 @@ bool requiresCharCount(const JitResult& r) {
 // ── REJECT — the INSTANCE spelling, `uint` count ──────────────────────────
 // MEASURED pre-fix: compiled, and printed `-294967296` (a silent wrong
 // value). §5.1's never-implicit bullet names `uint → int` as its example.
-BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_instance_uint_count) {
+BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_static_string_unit_uint_count) {
     auto r = runAot(prog(
         "    var b: uint := 4000000000;\n"
-        "    Console.WriteLine(\"x\".Repeat(b).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", b).Length);\n"
         "    return 0;"));
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(notConvertible(r));
@@ -134,10 +141,10 @@ BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_instance_uint_count) {
 }
 
 // ── REJECT — the INSTANCE spelling, `ulong` count ──────────────────────────
-BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_instance_ulong_count) {
+BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_static_string_unit_ulong_count) {
     auto r = runAot(prog(
         "    var b: ulong := 3;\n"
-        "    Console.WriteLine(\"x\".Repeat(b).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", b).Length);\n"
         "    return 0;"));
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(notConvertible(r));
@@ -148,10 +155,10 @@ BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_instance_ulong_count) {
 // §5.1's table has no `long → int` row, and the constant-narrowing clause
 // does not reach a run-time value ("the rule applies to constants only").
 // MEASURED pre-fix: compiled, and printed `3`.
-BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_instance_long_var_count) {
+BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_static_string_unit_long_var_count) {
     auto r = runAot(prog(
         "    var n: long := 3;\n"
-        "    Console.WriteLine(\"x\".Repeat(n).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", n).Length);\n"
         "    return 0;"));
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(notConvertible(r));
@@ -162,26 +169,30 @@ BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_instance_long_var_count) {
 // truncation). §5.1: "A constant whose value does not fit the target's range
 // is a compile error at the conversion site — never a silent truncation."
 BEZEL_TEST(sema_string_repeat_count_gate_7132,
-           reject_instance_out_of_range_constant) {
+           reject_static_string_unit_out_of_range_constant) {
     auto r = runAot(prog(
-        "    Console.WriteLine(\"x\".Repeat(2147483648L).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", 2147483648L).Length);\n"
         "    return 0;"));
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(notConvertible(r));
     BEZEL_EXPECT_TRUE(constantRangeReason(r));
 }
 
-// ── REJECT — the INSTANCE spelling, a `double` count ──────────────────────
-// MEASURED pre-fix: the compiler CRASHED out of codegen ("SExt only
+// ── REJECT — the `string`-unit STATIC spelling, a `double` count ──────────
+// MEASURED pre-fix (INSTANCE spelling `"x".Repeat(d)`, removed by fix #7706,
+// stdlib §9.6 v0.350): the compiler CRASHED out of codegen ("SExt only
 // operates on integer" / "IR verification failed (malformed IR emitted)").
-// The gate turns that into a clean §5.1 rejection.
-BEZEL_TEST(sema_string_repeat_count_gate_7132, reject_instance_double_count) {
+// The row now pins the declared static `Repeat(unit: string, count: int)`
+// with the same non-integer count: a clean rejection by the static site's own
+// wording, never a codegen crash.
+BEZEL_TEST(sema_string_repeat_count_gate_7132,
+           reject_static_string_unit_double_count) {
     auto r = runAot(prog(
         "    var d: double := 3.0;\n"
-        "    Console.WriteLine(\"x\".Repeat(d).Length);\n"
+        "    Console.WriteLine(string.Repeat(\"x\", d).Length);\n"
         "    return 0;"));
     BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(notConvertible(r));
+    BEZEL_EXPECT_TRUE(requiresCharCount(r));
 }
 
 // ── REJECT — the STATIC spelling, `uint` count ────────────────────────────
@@ -255,10 +266,10 @@ BEZEL_TEST(sema_string_repeat_count_gate_7132,
 // `int`'s range converts by VALUE, across signedness. This is the row the
 // clause exists for — the gate must NOT turn it into a rejection.
 BEZEL_TEST(sema_string_repeat_count_gate_7132,
-           accept_instance_const_long_count) {
+           accept_static_string_unit_const_long_count) {
     const std::string src = prog(
         "    const N: long := 3L;\n"
-        "    Console.WriteLine(\"x\".Repeat(N).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", N).Length);\n"
         "    return 0;");
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -280,10 +291,10 @@ BEZEL_TEST(sema_string_repeat_count_gate_7132,
 }
 
 // The plain `int` count — the declared parameter type.
-BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_instance_int_count) {
+BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_static_string_unit_int_count) {
     const std::string src = prog(
         "    var n: int := 3;\n"
-        "    Console.WriteLine(\"x\".Repeat(n).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", n).Length);\n"
         "    return 0;");
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -303,10 +314,10 @@ BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_static_int_count) {
 }
 
 // `byte` and `short` widen to `int` under §5.1's table.
-BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_instance_byte_count) {
+BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_static_string_unit_byte_count) {
     const std::string src = prog(
         "    var b: byte := 3;\n"
-        "    Console.WriteLine(\"x\".Repeat(b).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", b).Length);\n"
         "    return 0;");
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -314,10 +325,10 @@ BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_instance_byte_count) {
     BEZEL_EXPECT_EQ(runAotOut(src), "3");
 }
 
-BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_instance_short_count) {
+BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_static_string_unit_short_count) {
     const std::string src = prog(
         "    var b: short := 3;\n"
-        "    Console.WriteLine(\"x\".Repeat(b).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", b).Length);\n"
         "    return 0;");
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
@@ -338,9 +349,9 @@ BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_static_byte_count) {
 
 // A literal count — §4.2's target-typed integer constant, admitted at an
 // `int` target.
-BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_instance_literal_count) {
+BEZEL_TEST(sema_string_repeat_count_gate_7132, accept_static_string_unit_literal_count) {
     const std::string src = prog(
-        "    Console.WriteLine(\"x\".Repeat(3).Length);\n"
+        "    Console.WriteLine(String.Repeat(\"x\", 3).Length);\n"
         "    return 0;");
     auto r = runAot(src);
     BEZEL_EXPECT_TRUE(r.ran);
