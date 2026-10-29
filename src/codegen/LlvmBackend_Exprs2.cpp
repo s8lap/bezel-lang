@@ -7003,6 +7003,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                : builder_.CreateSExt(v, i32());
                 return builder_.CreateTrunc(v, i32());
             };
+            // fix #7819 (stdlib §2.5, v0.350): the OR of "component `v` lies
+            // outside [lo, hi]" over the listed i32 components -- one unsigned
+            // compare of `v - lo` against `hi - lo` per component.
+            auto dateComponentOutOfRange =
+                [&](std::initializer_list<std::tuple<llvm::Value*, int, int>>
+                        comps) -> llvm::Value* {
+                llvm::Value* bad = builder_.getFalse();
+                for (const auto& [v, lo, hi] : comps) {
+                    llvm::Value* off = builder_.CreateSub(v, builder_.getInt32(lo));
+                    bad = builder_.CreateOr(
+                        bad, builder_.CreateICmpUGT(
+                                 off, builder_.getInt32(hi - lo)));
+                }
+                return bad;
+            };
             // Determine element size from the first generic arg (if present).
             // For pointer-typed elements (class, string) → sizeof(ptr) = 8.
             // For int → 4, long → 8, double → 8, bool → 1, etc.
@@ -8593,6 +8608,24 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* mn  = getI32(4);
                 llvm::Value* sec = getI32(5);
                 llvm::Value* ms  = getI32(6);
+                // fix #7819 (stdlib §2.5, v0.350): "ArgumentOutOfRangeException
+                // on invalid components", the ranges §2.5 states on the
+                // properties the components read back through: Month 1..12,
+                // Day 1..31, Hour 0..23, Minute 0..59, Second 0..59.
+                // Without the guard the C `timegm` normalised the value
+                // (day -1 read back as 30).  Year, Millisecond and the
+                // day-of-month-for-the-month rule state no range in §2.5 and
+                // are NOT checked here (reported as spec questions).
+                // A construction with NO arguments is the generic body's
+                // `new T()` at `T = DateTime` (spec §14.2 `where T: new()`:
+                // for a value type it is `default(T)`); it has no components
+                // to validate.
+                if (!ne.args.empty())
+                    emitGuardThrow(
+                        dateComponentOutOfRange({{mo, 1, 12}, {day, 1, 31},
+                                                 {hr, 0, 23}, {mn, 0, 59},
+                                                 {sec, 0, 59}}),
+                        "ArgumentOutOfRangeException");
                 auto* fn = declareC("bz_datetime_parts_to_ticks", i64(),
                     {i32(), i32(), i32(), i32(), i32(), i32(), i32()});
                 return builder_.CreateCall(fn,
@@ -8624,6 +8657,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* yr  = getI32do(0);
                 llvm::Value* mo  = getI32do(1);
                 llvm::Value* day = getI32do(2);
+                // fix #7819 (stdlib §2.5, v0.350): `DateOnly(year, month, day)`
+                // raises ArgumentOutOfRangeException "on invalid"; the date
+                // components carry the ranges §2.5 states for `DateTime`'s
+                // (`DateTime.Date: DateOnly` is "the date components"):
+                // Month 1..12, Day 1..31.
+                // (No arguments: the §14.2 generic `new T()` at `T = DateOnly`.)
+                if (!ne.args.empty())
+                    emitGuardThrow(
+                        dateComponentOutOfRange({{mo, 1, 12}, {day, 1, 31}}),
+                        "ArgumentOutOfRangeException");
                 auto* fn = declareC("bz_datetime_parts_to_ticks", i64(),
                     {i32(), i32(), i32(), i32(), i32(), i32(), i32()});
                 llvm::Value* ticks = builder_.CreateCall(fn,
