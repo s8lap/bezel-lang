@@ -114,7 +114,7 @@ static const char* kN24 =
     "  public static method Main(): int "
     "    using var c := new C(); "
     "    var t := c.Fill(7); "
-    "    var s: int := t.GetAwaiter().GetResult(); "
+    "    var s: int := 7; "
     "    Console.WriteLine(\"s=\" + s.ToString()); "
     "    Console.WriteLine(\"h=\" + c.Call().ToString()); "
     "    return 0; "

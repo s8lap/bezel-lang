@@ -31579,11 +31579,12 @@ static std::string taskClosedSurfaceMessage(std::string_view tn,
            "`(await t).M`";
 }
 
-// fix #7869 (spec §30.3, §26.5 rule 1, v0.350): the closed CALL surface of a
-// task type. `Task` declares `Wait()` with no parameters. Returns the
-// diagnostic text for a call of `mbr` with `arity` arguments that this surface
-// does not admit, else empty. `arity` < 0 (unknown) never rejects a declared
-// name.
+// fix #7868 / #7869 (spec §30.3, §26.5 rule 1, v0.350): the closed CALL
+// surface of a task type. `Task` declares exactly `Wait()` (no parameters);
+// `Dispose` / `DisposeAsync` / `ToString` / `Equals` / `GetHashCode` /
+// `GetType` are the object members (§8.1). Returns the diagnostic text for a
+// call of `mbr` with `arity` arguments that this surface does not admit, else
+// empty. `arity` < 0 (unknown) never rejects a declared name.
 static std::string taskClosedCallMessage(std::string_view tn,
                                          std::string_view mbr,
                                          std::ptrdiff_t arity) {
@@ -31593,7 +31594,13 @@ static std::string taskClosedCallMessage(std::string_view tn,
                "`public method Wait();`); an instance member the receiver "
                "declares commits the lookup by name, so no same-named "
                "extension is consulted (\xC2\xA7""26.5 rule 1)";
-    return {};
+    if (mbr == "Wait") return {};
+    if (mbr == "Dispose" || mbr == "DisposeAsync" || mbr == "ToString" ||
+        mbr == "Equals" || mbr == "GetHashCode" || mbr == "GetType")
+        return {};
+    return "`" + std::string(tn) + "` has no method `" + std::string(mbr) +
+           "` (\xC2\xA7""30.3): its members are the properties IsCompleted, "
+           "IsFaulted, IsCancelled and Result, and the method Wait()";
 }
 
 // fix #7782 (spec §27.6, v0.350): "No method reference to `Dispose` or
@@ -35403,7 +35410,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         Severity::Error, ma.span.begin,
                         taskClosedSurfaceMessage(tn, mbr));
                 }
-                // fix #7869 (spec §30.3, v0.350): the call surface.
+                // fix #7868 / #7869 (spec §30.3, v0.350): the call surface.
                 if (&ma == calleeOfCallCtx_ &&
                     (mbr == "Wait" ||
                      !lookupExtensionMember(tt, ma.member, nullptr,
@@ -40360,7 +40367,7 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                     return;
                 }
                 if (&nm == calleeOfCallCtx_) {
-                    // fix #7869 (spec §30.3, v0.350): the `?.` twin of
+                    // fix #7868 / #7869 (spec §30.3, v0.350): the `?.` twin of
                     // the `.` form's closed call surface. A declared extension
                     // member was found above and never reaches here.
                     std::string cm =
