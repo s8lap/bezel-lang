@@ -18,6 +18,7 @@
 
 #include "common/AwaitScan.hpp"  // fix #3587: the shared await-site walk
 #include "common/BuiltinRegistry.hpp"  // #1985: isBuiltinExceptionName
+#include "common/DisposalKind.hpp"     // #7406: isRuntimeManagedValue
 #include "common/OwnershipFacts.hpp"  // #1801: bare-type-parameter source set
 #include "common/PatternAResultCollection.hpp"  // fix #3638: the both-sides
                                                 // §30.5 Pattern A
@@ -15569,6 +15570,149 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
                    "(consume-site freeze, §28.3/§28.7/§30.14 v0.180)");
         return;  // one freeze diagnostic per consume site
     }
+    // §28.10 "`using var` initialized from a borrow" (#7406, v0.350): the
+    // `using var` PINS the borrow's source — "the borrow stays live until the
+    // using-var's scope ends, exactly as if it were used at every point up to
+    // that end, and the consume-site freeze then governs every consume of the
+    // source in that range". A borrow-pin never records `LocalOwnership::source`
+    // (handleLocalDecl keeps `source` to a plain `var`/`const`, #4268), so the
+    // holder loop above cannot see it; find it here from the declaration.
+    //
+    // RANGE: [the pin's declaration, the end of its innermost enclosing
+    // statement list) — `usingPinScopeEnd_`, stamped by the scoped pre-scan
+    // for every block form (an `if`/`else` branch, a `try` body, a `catch`
+    // arm, a `case` arm, a loop body, a `do … end`, a method or lambda body).
+    //
+    // TYPE. Only a `using var` whose type HOLDS a borrow pins
+    // (`usingPinTypeHoldsBorrow`): a class or interface reference, a value
+    // type that holds borrows (§3.6), a bare type parameter under §28.1's
+    // class-or-interface assumption. A value-typed or runtime-managed
+    // `using var n := a.Count` copies, and §28.10 says of it "the only
+    // effect is the reassignability restriction" (§28.3.9: a value-typed
+    // read "is no borrow"), so it freezes nothing.
+    //
+    // SOURCE, as it was AT THE PIN (not as the live state names it now — the
+    // root alias may have been rebound since: `var b := c; using var p := b;
+    // b := a;` still pins `c`). The pin's source is the ROOT of its
+    // initializer (`b`, `b!`, `b.F`, `b[i]`, `b.M()`); when that root is a
+    // named alias, every alias-producing rebind of it (its declaration
+    // included, `usingPinAliasRebinds_`) that REACHES the pin
+    // (`usingPinRebindReachesPin`: not killed by a later rebind that
+    // dominates the pin, not in a branch disjoint from the pin) adds its
+    // right-hand root. A bare-type-parameter call pin (`using var p :=
+    // Util.Pick(a, b)`, #1801 S4) pins every source in its own
+    // `recordBorrowLocalSource_` set. From each such start the live
+    // borrow-state links are followed to the owner only through bindings
+    // that are NEVER reassigned (`scopedAssignedSyms_`), so a link read now
+    // is the link at the pin; a reassigned owner counts only while its
+    // current binding (`obligationOrigin`) predates the pin. Anything else is
+    // left unfrozen (no worse than before #7406). // per §28.10, K5.5
+    for (auto& [pin, pst] : states_) {
+        if (pin == consumed || !pst.implicitDischarge) continue;
+        if (pst.state == OwnershipState::MovedFrom ||
+            pst.state == OwnershipState::Disposed ||
+            pst.state == OwnershipState::Poisoned)
+            continue;
+        auto* pls = dynamic_cast<sema::LocalSymbol*>(pin);
+        auto* pld = pls ? dynamic_cast<const ast::LocalDecl*>(pls->decl) : nullptr;
+        if (!pld || !pld->isUsing || !pld->usingVarSourceIsBorrow ||
+            pld->initializerHasOwnedMarker || !pld->initializer)
+            continue;
+        auto endIt = usingPinScopeEnd_.find(pld);
+        if (endIt == usingPinScopeEnd_.end()) continue;
+        if (consumeLoc.offset < pld->span.end.offset ||
+            consumeLoc.offset >= endIt->second.offset)
+            continue;
+        if (!usingPinTypeHoldsBorrow(pls->declType
+                                         ? pls->declType
+                                         : ctx_.exprType(*pld->initializer)))
+            continue;  // a value-typed / runtime-managed pin, §28.10
+        const std::uint32_t pinAt = pld->span.begin.offset;
+        // The owner `s` reaches, or null when a link on the way may postdate
+        // the pin.
+        auto ownerAtPin = [&](const sema::Symbol* s) -> const sema::Symbol* {
+            for (int hops = 0; s && hops < 64; ++hops) {
+                auto sit = states_.find(const_cast<sema::Symbol*>(s));
+                if (sit == states_.end()) return s;
+                const LocalOwnership& so = sit->second;
+                const bool reassigned =
+                    scopedAssignedSyms_.count(const_cast<sema::Symbol*>(s)) != 0;
+                if (so.state == OwnershipState::Borrowed && so.source &&
+                    so.source->sym) {
+                    if (reassigned) return nullptr;
+                    s = so.source->sym;
+                    continue;
+                }
+                if (reassigned &&
+                    (!so.obligationOrigin ||
+                     so.obligationOrigin->span.begin.offset >= pinAt))
+                    return nullptr;
+                return s;
+            }
+            return nullptr;
+        };
+        std::vector<const sema::Symbol*> starts;
+        if (const ast::IdentifierExpr* root =
+                identifierRootThroughCastBang(*pld->initializer)) {
+            if (const sema::Symbol* rs = ctx_.exprSymbol(*root)) {
+                // The root itself: a never-reassigned alias follows its live
+                // link to the owner; an owner is itself.
+                starts.push_back(rs);
+                // Every alias-producing rebind of the root that can be the
+                // one in force at the pin. The root's own declaration is a
+                // rebind at its offset (`var b := c;`), and so dominates and
+                // kills any rebind that only reaches the pin around a loop's
+                // back edge. A self-rebind (`b := b;`) changes nothing and is
+                // neither a source nor a kill.
+                std::vector<std::pair<std::uint32_t, const sema::Symbol*>>
+                    rebinds;
+                if (auto rb = usingPinAliasRebinds_.find(rs);
+                    rb != usingPinAliasRebinds_.end())
+                    for (const auto& e : rb->second)
+                        if (e.second != rs) rebinds.push_back(e);
+                if (auto* rls = dynamic_cast<const sema::LocalSymbol*>(rs)) {
+                    const ast::Expr* init = nullptr;
+                    std::uint32_t declOff = 0;
+                    if (auto* rld =
+                            dynamic_cast<const ast::LocalDecl*>(rls->decl)) {
+                        init = rld->initializer.get();
+                        declOff = rld->span.begin.offset;
+                    } else if (auto* rlc =
+                                   dynamic_cast<const ast::LocalConstDecl*>(
+                                       rls->decl)) {
+                        init = rlc->value.get();
+                        declOff = rlc->span.begin.offset;
+                    }
+                    if (init) {
+                        const sema::Symbol* r0 = usingPinAliasRhsRoot(*init);
+                        rebinds.push_back({declOff, r0 == rs ? nullptr : r0});
+                    }
+                }
+                for (const auto& [off, rhsRoot] : rebinds)
+                    if (rhsRoot && usingPinRebindReachesPin(off, pinAt, rebinds))
+                        starts.push_back(rhsRoot);
+            }
+        }
+        if (auto rit = recordBorrowLocalSource_.find(pin);
+            rit != recordBorrowLocalSource_.end())
+            for (const RecordBorrowSource& e : rit->second)
+                starts.push_back(e.source);
+        bool pinsConsumed = false;
+        for (const sema::Symbol* st0 : starts)
+            if (st0 && ownerAtPin(st0) == consumed) {
+                pinsConsumed = true;
+                break;
+            }
+        if (!pinsConsumed) continue;
+        report(Severity::Error, consumeLoc,
+               std::string("cannot consume `") + std::string(consumedName) +
+                   "` here: the borrow held by `" + std::string(pin->name) +
+                   "` is still live — the `using var` pins its source until "
+                   "its scope ends, so a later read through it would read "
+                   "freed memory (consume-site freeze, §28.10/§28.3 K5.5, "
+                   "v0.350)");
+        return;
+    }
     // §28.3 (v0.186, #1726): a live local of borrow-bearing-record type (a span,
     // canonically) counts as a live local borrow of every carried borrow's
     // source — the rule stdlib §4.19's FrozenArray<T>.From(owned buf)
@@ -15596,6 +15740,201 @@ void MethodOwnership::checkConsumeFreeze(std::string_view consumedName,
                    "(consume-site freeze, §28.3/§28.7/§30.14 v0.180)");
         return;  // one freeze diagnostic per consume site
     }
+}
+
+// #7406 (§28.10, v0.350): the ROOT symbol of an alias-producing right-hand
+// side — a bare identifier, `x!`, a member or null-conditional member read, an
+// index read (`b := a`, `a!`, `a.F`, `a?.F`, `a[i]`), each peeled through
+// casts and `!` by `identifierRootThroughCastBang`. Null for every other
+// shape (a `new`, a call, a literal): those make the alias an owner, or a
+// borrow of something the pin loop does not trace. // per §28.10
+const sema::Symbol* MethodOwnership::usingPinAliasRhsRoot(
+        const ast::Expr& v) {
+    if (!(dynamic_cast<const ast::IdentifierExpr*>(&v) ||
+          dynamic_cast<const ast::PostfixBangExpr*>(&v) ||
+          dynamic_cast<const ast::MemberAccessExpr*>(&v) ||
+          dynamic_cast<const ast::NullCondMemberExpr*>(&v) ||
+          dynamic_cast<const ast::IndexExpr*>(&v)))
+        return nullptr;
+    if (const ast::IdentifierExpr* rid = identifierRootThroughCastBang(v))
+        return ctx_.exprSymbol(*rid);
+    return nullptr;
+}
+
+// #7406 (§28.10, v0.350): see the declaration (`usingPinRebindReachesPin`
+// and the span members it reads). // per §28.10
+void MethodOwnership::noteUsingPinLoopSpan(
+        const ast::Stmt& loop,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::uint32_t end = loop.span.end.offset;
+    for (const auto& bs : body)
+        if (bs && bs->span.end.offset > end) end = bs->span.end.offset;
+    usingPinLoopSpans_.push_back({loop.span.begin.offset, end});
+}
+
+void MethodOwnership::noteUsingPinArmGroup(
+        const std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>&
+            arms) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> group;
+    for (const auto* list : arms) {
+        if (!list) continue;
+        bool any = false;
+        std::uint32_t b = UINT32_MAX, e = 0;
+        for (const auto& st : *list)
+            if (st) {
+                if (!any) b = st->span.begin.offset;
+                any = true;
+                e = st->span.end.offset;
+            }
+        if (any) group.push_back({b, e});
+    }
+    if (group.size() > 1) usingPinArmGroups_.push_back(std::move(group));
+}
+
+bool MethodOwnership::usingPinRebindReachesPin(
+        std::uint32_t rebindOff, std::uint32_t pinAt,
+        const std::vector<std::pair<std::uint32_t, const sema::Symbol*>>&
+            rebinds) const {
+    using Span = std::pair<std::uint32_t, std::uint32_t>;
+    auto contains = [](const Span& sp, std::uint32_t o) {
+        return sp.first <= o && o <= sp.second;
+    };
+    // The smallest span of `spans` containing `o` (spans nest or are
+    // disjoint, so the smallest is the innermost), or null.
+    auto innermost = [&](const std::vector<Span>& spans,
+                         std::uint32_t o) -> const Span* {
+        const Span* best = nullptr;
+        for (const Span& sp : spans)
+            if (contains(sp, o) &&
+                (!best || sp.second - sp.first < best->second - best->first))
+                best = &sp;
+        return best;
+    };
+    const Span* lamPin = innermost(usingPinLambdaSpans_, pinAt);
+    const Span* lamReb = innermost(usingPinLambdaSpans_, rebindOff);
+    // A rebind `k` of the alias KILLS the rebind under test on every path
+    // into the pin from `lo` on when it lies in [lo, pin), directly in the
+    // pin's own function body, and its innermost block contains the pin:
+    // structured control flow enters that block at its start and runs `k`
+    // before anything nested later in it (the pin), or leaves the block
+    // without reaching the pin at all.
+    auto killedFrom = [&](std::uint32_t lo) {
+        for (const auto& [ko, kroot] : rebinds) {
+            (void)kroot;
+            if (ko == rebindOff || ko < lo || ko >= pinAt) continue;
+            if (innermost(usingPinLambdaSpans_, ko) != lamPin) continue;
+            const Span* kb = innermost(usingPinBlockSpans_, ko);
+            if (kb && contains(*kb, pinAt)) return true;
+        }
+        return false;
+    };
+    if (lamPin && !contains(*lamPin, rebindOff)) {
+        // The rebind is outside the lambda holding the pin: whatever its
+        // position, it may run before the lambda is invoked. Only the
+        // lambda's own body rebinding the alias on the way to the pin
+        // overrides it.
+        return !killedFrom(lamPin->first);
+    }
+    // The rebind is in the pin's body, or in a lambda nested in it. A nested
+    // lambda's rebind runs at an unknown time after the lambda's formation,
+    // so it is read at the formation point of the OUTERMOST such lambda, and
+    // no rebind of the body is known to come after it.
+    std::uint32_t eff = rebindOff;
+    const bool sameBody = lamReb == lamPin;
+    if (!sameBody) {
+        const Span* outer = nullptr;
+        for (const Span& l : usingPinLambdaSpans_)
+            if (contains(l, rebindOff) && !contains(l, pinAt) &&
+                (!outer || l.first < outer->first))
+                outer = &l;
+        if (outer) eff = outer->first;
+    }
+    // Textually before the pin AND not in a sibling arm of a construct whose
+    // other arm holds the pin: the straight path from the rebind to the pin.
+    bool forward = eff < pinAt;
+    if (forward)
+        for (const auto& group : usingPinArmGroups_) {
+            const Span* armR = nullptr;
+            const Span* armP = nullptr;
+            for (const Span& sp : group) {
+                if (contains(sp, eff)) armR = &sp;
+                if (contains(sp, pinAt)) armP = &sp;
+            }
+            if (armR && armP && armR != armP) {
+                forward = false;
+                break;
+            }
+        }
+    // The innermost loop holding both: a rebind after the pin, or in a
+    // sibling arm, reaches it around the back edge.
+    const Span* loop = nullptr;
+    for (const Span& l : usingPinLoopSpans_)
+        if (contains(l, eff) && contains(l, pinAt) &&
+            (!loop || l.second - l.first < loop->second - loop->first))
+            loop = &l;
+    if (!forward && !loop) return false;
+    if (!sameBody) return true;
+    // Forward: a kill between the rebind and the pin also cuts the back-edge
+    // path (the loop's start precedes the rebind). Back edge only: a kill
+    // anywhere from the loop's start to the pin.
+    return !killedFrom(forward ? rebindOff : loop->first);
+}
+
+bool MethodOwnership::usingPinTypeHoldsBorrow(const sema::TypeRef* t) const {
+    if (!t) return true;  // unknown: read as holding one
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Error:
+            return true;
+        case sema::TypeRef::Kind::Primitive:
+            // `Object` is a reference to an object someone owns; every other
+            // primitive is a value or, for `string`, runtime-managed (§28.9).
+            return t->primitive == sema::PrimitiveType::Object;
+        case sema::TypeRef::Kind::Unit:
+            return false;
+        case sema::TypeRef::Kind::Function:
+            return false;  // runtime-managed, §28.9
+        case sema::TypeRef::Kind::InlineArray:
+            // `[N owned]T` owns its slots; `[N]T` holds a borrow per slot
+            // when a slot's type does (§15.1.2).
+            return !t->arrayOwned && usingPinTypeHoldsBorrow(t->arrayElement);
+        case sema::TypeRef::Kind::Named:
+            break;
+    }
+    if (common::isRuntimeManagedValue(t)) return false;  // the `Type` token
+    if (!t->declaration) {
+        // A bare type parameter of this body: §28.1 clause 3's
+        // class-or-interface assumption, unless `where T: value` excludes
+        // the class substitutions. Any other declaration-less Named type is
+        // a builtin heap type (a collection, a span, an exception, a builtin
+        // interface) or an imported one: read as holding a borrow.
+        if (t->astNode && t->astNode->name &&
+            t->astNode->name->parts.size() == 1 && genericCtx_) {
+            std::string_view head = t->astNode->name->parts.front();
+            auto inParams = [&](const std::vector<ast::GenericParam>* ps) {
+                if (!ps) return false;
+                for (const ast::GenericParam& g : *ps)
+                    if (g.name == head) return true;
+                return false;
+            };
+            if (inParams(genericCtx_->methodParams) ||
+                inParams(genericCtx_->enclosingParams))
+                return typeParamAdmitsClassOrInterface(head);
+        }
+        return true;
+    }
+    if (t->declaration->isValueBuiltin) return false;
+    switch (t->declaration->kind) {
+        case ast::TypeDeclKind::Class:
+        case ast::TypeDeclKind::Interface:
+            return true;
+        case ast::TypeDeclKind::Record:
+            return isBorrowBearingRecordOrSpan(t);
+        case ast::TypeDeclKind::Choice:
+            return isBorrowBearingChoice(t);
+        case ast::TypeDeclKind::Enum:
+            return false;
+    }
+    return true;
 }
 
 void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc,
@@ -23997,6 +24336,42 @@ bool MethodOwnership::builtinScopedCallbackFormal(const ast::Expr* callee,
 
 // -- pre-scan: declaration order + using-var initializer anchors + admission
 
+namespace {
+// #7406 (§28.10 *`using var` initialized from a borrow*, v0.350): stamp the
+// END of one statement list as the scope end of every `using var` declared
+// DIRECTLY in it (a nested list stamps its own). The end is the last
+// statement's `span.end` — every point of the using-var's lexical scope lies
+// before it, and no point after the list does — or the construct's own end
+// when the caller passes a later one (`do … end`'s `span.end`, past the
+// `end`; a catch-arm `do` block the parser leaves without a `span.end` keeps
+// the last statement's). See `usingPinScopeEnd_`. // per §28.10
+//
+// `blocks`, when given, also records the list's extent [first statement's
+// begin, last statement's end] as a dominance block for the pin loop's
+// reaching-rebind query (`usingPinBlockSpans_`); a `do … end` body passes
+// null, since it always runs and is no dominance boundary. // per §28.10
+void stampUsingPinScopeEnds(
+    const std::vector<std::unique_ptr<ast::Stmt>>& list,
+    std::unordered_map<const ast::Node*, SourceLocation>& out,
+    std::vector<std::pair<std::uint32_t, std::uint32_t>>* blocks,
+    const SourceLocation* end = nullptr) {
+    SourceLocation listEnd{};
+    bool any = false;
+    std::uint32_t listBegin = UINT32_MAX;
+    for (const auto& s : list)
+        if (s) {
+            if (!any) listBegin = s->span.begin.offset;
+            any = true;
+            listEnd = s->span.end;
+        }
+    if (end && end->offset > listEnd.offset) listEnd = *end;
+    if (blocks && any) blocks->push_back({listBegin, listEnd.offset});
+    for (const auto& s : list)
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get()))
+            if (ld->isUsing) out[ld] = listEnd;
+}
+}  // namespace
+
 void MethodOwnership::scopedPreScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     // fix #7025 (follow-up, §27.6 / §28.2, v0.343): the callee-suppression
@@ -24011,6 +24386,14 @@ void MethodOwnership::scopedPreScan(
     scopedLocalScopeEnd_.clear();
     scopedBlockEndStack_.clear();
     scopedLoopEndStack_.clear();
+    usingPinScopeEnd_.clear();
+    usingPinAliasRebinds_.clear();
+    usingPinBlockSpans_.clear();
+    usingPinLambdaSpans_.clear();
+    usingPinLoopSpans_.clear();
+    usingPinArmGroups_.clear();
+    stampUsingPinScopeEnds(body, usingPinScopeEnd_,
+                           &usingPinBlockSpans_);  // per §28.10 (#7406)
     SourceLocation methodBodyEnd{};
     for (const auto& s : body) {
         if (!s) continue;
@@ -24167,8 +24550,18 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         // // per §28.14
         if (auto* tid =
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get())) {
-            if (sema::Symbol* tsym = ctx_.exprSymbol(*tid))
+            if (sema::Symbol* tsym = ctx_.exprSymbol(*tid)) {
                 scopedAssignedSyms_.insert(tsym);
+                // #7406: every rebind of a local, with the root of an
+                // alias-producing right-hand side (`b := a`, `a!`, `a.F`,
+                // `a[i]`), for the pin loop's untracked-rebind fallback —
+                // see usingPinAliasRebinds_. // per §28.10
+                const sema::Symbol* rhsRoot = nullptr;
+                if (as->op == ":=" && as->value)
+                    rhsRoot = usingPinAliasRhsRoot(*as->value);
+                usingPinAliasRebinds_[tsym].push_back(
+                    {tid->span.begin.offset, rhsRoot});
+            }
         }
         // §28.14 form 3 (v0.180, #1541): an owned-return scoped call directly
         // assigned to an `owned` field of `this` (`_sub := ticks.Subscribe(h)`)
@@ -24196,6 +24589,21 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        // #7406: each branch is its own using-var scope. // per §28.10
+        stampUsingPinScopeEnds(ifs->ifBranch.body, usingPinScopeEnd_,
+                               &usingPinBlockSpans_);
+        for (const auto& el : ifs->elifBranches)
+            stampUsingPinScopeEnds(el.body, usingPinScopeEnd_,
+                                   &usingPinBlockSpans_);
+        stampUsingPinScopeEnds(ifs->elseBody, usingPinScopeEnd_,
+                               &usingPinBlockSpans_);
+        {
+            std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*> arms;
+            arms.push_back(&ifs->ifBranch.body);
+            for (const auto& el : ifs->elifBranches) arms.push_back(&el.body);
+            arms.push_back(&ifs->elseBody);
+            noteUsingPinArmGroup(arms);  // #7406, §28.10
+        }
         if (ifs->ifBranch.condition) scopedPreScanExpr(*ifs->ifBranch.condition);
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) scopedPreScanStmt(*bs);
@@ -24217,6 +24625,12 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         // would still see alive). Push onto `scopedLoopEndStack_` before
         // recursing, pop after. // per §28.14 (v0.273, bound 2(b))
         scopedLoopEndStack_.push_back(ws->span.end);
+        // #7406: the loop BODY (one iteration) is the using-var's scope; a
+        // pin's scope ends before the next iteration begins, so §28.14's
+        // bound-2(b) loop widening does not apply to it. // per §28.10
+        stampUsingPinScopeEnds(ws->body, usingPinScopeEnd_,
+                               &usingPinBlockSpans_);
+        noteUsingPinLoopSpan(*ws, ws->body);  // #7406, §28.10
         for (const auto& bs : ws->body)
             if (bs) scopedPreScanStmt(*bs);
         scopedLoopEndStack_.pop_back();
@@ -24231,6 +24645,9 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         // loop's `span.end` for any `using var` declared in the body. // per
         // §28.14 (v0.273, bound 2(b))
         scopedLoopEndStack_.push_back(fs->span.end);
+        stampUsingPinScopeEnds(fs->body, usingPinScopeEnd_,
+                               &usingPinBlockSpans_);  // #7406, §28.10
+        noteUsingPinLoopSpan(*fs, fs->body);           // #7406, §28.10
         for (const auto& bs : fs->body)
             if (bs) scopedPreScanStmt(*bs);
         scopedLoopEndStack_.pop_back();
@@ -24241,6 +24658,8 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         // its scope ending at the block's `span.end` (past the `end`).
         // Push before scanning children, pop after. // per §21.6, §28.14
         scopedBlockEndStack_.push_back(db->span.end);
+        stampUsingPinScopeEnds(db->body, usingPinScopeEnd_, nullptr,
+                               &db->span.end);  // #7406, §28.10
         for (const auto& bs : db->body)
             if (bs) scopedPreScanStmt(*bs);
         scopedBlockEndStack_.pop_back();
@@ -24259,6 +24678,33 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        // #7406: the `try` body, each `catch` arm and the `finally` are
+        // separate using-var scopes. An arm whose body is a single `using
+        // var` statement ends with it (a `do … end` arm body stamps itself).
+        // // per §28.10
+        stampUsingPinScopeEnds(trys->body, usingPinScopeEnd_,
+                               &usingPinBlockSpans_);
+        stampUsingPinScopeEnds(trys->finallyBody, usingPinScopeEnd_,
+                               &usingPinBlockSpans_);
+        for (const auto& arm : trys->catches) {
+            if (auto* ald = dynamic_cast<const ast::LocalDecl*>(arm.body.get());
+                ald && ald->isUsing)
+                usingPinScopeEnd_[ald] = ald->span.end;
+            // The arm's one statement (a `do … end` block, usually) is the
+            // arm's dominance block: it runs only on the arm's path.
+            if (arm.body)
+                usingPinBlockSpans_.push_back(
+                    {arm.body->span.begin.offset, arm.body->span.end.offset});
+        }
+        {
+            // One exception selects one `catch` arm. // #7406, §28.10
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> group;
+            for (const auto& arm : trys->catches)
+                if (arm.body)
+                    group.push_back({arm.body->span.begin.offset,
+                                     arm.body->span.end.offset});
+            if (group.size() > 1) usingPinArmGroups_.push_back(std::move(group));
+        }
         for (const auto& bs : trys->body)
             if (bs) scopedPreScanStmt(*bs);
         for (const auto& arm : trys->catches) {
@@ -24271,7 +24717,14 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
     }
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
         if (cs->scrutinee) scopedPreScanExpr(*cs->scrutinee);
+        {
+            std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*> arms;
+            for (const auto& arm : cs->arms) arms.push_back(&arm.stmts);
+            noteUsingPinArmGroup(arms);  // #7406, §28.10
+        }
         for (const auto& arm : cs->arms) {
+            stampUsingPinScopeEnds(arm.stmts, usingPinScopeEnd_,
+                                   &usingPinBlockSpans_);  // #7406
             if (arm.guard) scopedPreScanExpr(*arm.guard);
             if (arm.exprBody) scopedPreScanExpr(*arm.exprBody);
             for (const auto& bs : arm.stmts)
@@ -24516,13 +24969,31 @@ void MethodOwnership::scopedPreScanExpr(const ast::Expr& e) {
         // admission, and lambda-internal locals need declaration indices so
         // an inner `using var` scope can be a bounding object.
         if (lam->exprBody) scopedPreScanExpr(*lam->exprBody);
+        stampUsingPinScopeEnds(lam->stmts, usingPinScopeEnd_,
+                               &usingPinBlockSpans_);  // #7406
+        {
+            // #7406: the literal's extent, from its formation point to the
+            // end of its last statement. // per §28.10
+            std::uint32_t lamEnd = lam->span.end.offset;
+            for (const auto& bs : lam->stmts)
+                if (bs && bs->span.end.offset > lamEnd)
+                    lamEnd = bs->span.end.offset;
+            usingPinLambdaSpans_.push_back({lam->span.begin.offset, lamEnd});
+        }
         for (const auto& bs : lam->stmts)
             if (bs) scopedPreScanStmt(*bs);
         return;
     }
     if (auto* cx = dynamic_cast<const ast::CaseExpr*>(&e)) {
         if (cx->scrutinee) scopedPreScanExpr(*cx->scrutinee);
+        {
+            std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*> arms;
+            for (const auto& arm : cx->arms) arms.push_back(&arm.stmts);
+            noteUsingPinArmGroup(arms);  // #7406, §28.10
+        }
         for (const auto& arm : cx->arms) {
+            stampUsingPinScopeEnds(arm.stmts, usingPinScopeEnd_,
+                                   &usingPinBlockSpans_);  // #7406
             if (arm.guard) scopedPreScanExpr(*arm.guard);
             if (arm.exprBody) scopedPreScanExpr(*arm.exprBody);
             for (const auto& bs : arm.stmts)

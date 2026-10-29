@@ -6156,6 +6156,94 @@ private:
     // case the freeze interval uses `scopedBlockEndStack_.back()` alone.
     // // per §28.14 (v0.273, bound 2(b))
     std::vector<SourceLocation> scopedLoopEndStack_;
+    // #7406 (§28.10 *`using var` initialized from a borrow*, v0.350): the
+    // end of a `using var`'s INNERMOST enclosing statement list — the
+    // using-var's lexical scope, over which a borrow-pin freezes its source
+    // ("until the using-var's scope ends"). Unlike `scopedLocalScopeEnd_`
+    // (the §28.14 bound, which stamps only `do … end` / loop ends and widens
+    // to the enclosing loop by bound 2(b)), every block form is a scope here:
+    // the method or lambda body, an `if` / `elif` / `else` branch, a `while`
+    // or `for` body, a `do … end`, a `try` body, a `catch` arm, a `finally`
+    // and a `case` arm. Stamped by `scopedPreScan`; read only by
+    // `checkConsumeFreeze`'s pin loop. Keys: the `using var`'s LocalDecl.
+    std::unordered_map<const ast::Node*, SourceLocation> usingPinScopeEnd_;
+    // #7406 (§28.10, v0.350): every `x := …` rebind of a local `x` (any
+    // depth, lambda bodies included), as {target offset, root symbol of an
+    // alias-producing right-hand side or null}. At a pin over the alias `x`
+    // the pin loop reads the rebinds that REACH the pin
+    // (`usingPinRebindReachesPin`): a rebind killed by a later rebind that
+    // dominates the pin, or one in a branch disjoint from the pin, names
+    // nothing the alias can hold at the pin. Stamped by `scopedPreScan`.
+    std::unordered_map<const sema::Symbol*,
+                       std::vector<std::pair<std::uint32_t, const sema::Symbol*>>>
+        usingPinAliasRebinds_;
+    // #7406 (§28.10, v0.350): the structure `usingPinRebindReachesPin` reads
+    // the rebinds against, all as [begin, end] source-offset spans stamped by
+    // `scopedPreScan`:
+    //   * `usingPinBlockSpans_` — every statement list that is a dominance
+    //     boundary: the method body, an `if` / `elif` / `else` branch, a
+    //     loop body, a `try` body, a `catch` arm, a `finally`, a `case` arm
+    //     and a lambda body. A `do … end` body is NOT one: it always runs, so
+    //     a statement in it dominates what follows the block exactly as a
+    //     statement of the enclosing list does. A rebind dominates the pin
+    //     when its innermost block span contains the pin.
+    //   * `usingPinLambdaSpans_` — every lambda literal. A rebind in another
+    //     function body than the pin's runs at an unknown time relative to
+    //     the pin, so it is read at its lambda's formation point when that
+    //     lambda is nested in the pin's body, is never killed, and — when the
+    //     pin is the one inside a lambda — always reaches the pin unless a
+    //     rebind of the pin's own body kills it.
+    //   * `usingPinLoopSpans_` — every `while` / `for` statement. A rebind
+    //     after the pin in a loop body they share reaches the pin around the
+    //     back edge unless a rebind between the loop's start and the pin
+    //     dominates the pin.
+    //   * `usingPinArmGroups_` — the arms of every `if` (each branch), `case`
+    //     statement or expression (each arm) and `try` (each `catch` arm):
+    //     one execution of the construct runs ONE arm, so a rebind in one
+    //     arm and a pin in another are disjoint, and the rebind reaches the
+    //     pin only around an enclosing loop's back edge.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> usingPinBlockSpans_;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> usingPinLambdaSpans_;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> usingPinLoopSpans_;
+    std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>>
+        usingPinArmGroups_;
+    // #7406 (§28.10, v0.350): does a rebind of the pinned alias at `rebindOff`
+    // reach the pin at `pinAt` — can the alias still hold that rebind's
+    // right-hand side when the pin is evaluated? `rebinds` is the alias's
+    // whole rebind list (the kill candidates; the alias's own declaration is
+    // passed in it as a rebind at the declaration's offset). See the span
+    // members above for the rules.
+    bool usingPinRebindReachesPin(
+        std::uint32_t rebindOff, std::uint32_t pinAt,
+        const std::vector<std::pair<std::uint32_t, const sema::Symbol*>>&
+            rebinds) const;
+    // #7406: the root symbol of an alias-producing right-hand side (`a`,
+    // `a!`, `a.F`, `a?.F`, `a[i]`), or null for any other shape. Shared by
+    // the pre-scan's rebind arm and the pin loop's declaration read.
+    const sema::Symbol* usingPinAliasRhsRoot(const ast::Expr& v);
+    // #7406: record a `while` / `for` statement's extent in
+    // `usingPinLoopSpans_`.
+    void noteUsingPinLoopSpan(
+        const ast::Stmt& loop,
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // #7406: record one construct's arms (the extent of each non-empty
+    // statement list) as a group in `usingPinArmGroups_`.
+    void noteUsingPinArmGroup(
+        const std::vector<const std::vector<std::unique_ptr<ast::Stmt>>*>&
+            arms);
+    // #7406 (§28.10 *`using var` initialized from a borrow*, v0.350): does a
+    // `using var` of this type HOLD a borrow of its initializer's source, so
+    // that the pin freezes the source? A class or interface reference does
+    // (a nullable one too, §3.6 *Nullable forms*), as does a value type that
+    // holds borrows (§3.6 holds-borrows: a borrow-bearing record, inline
+    // array or choice) and a bare type parameter the body reads under §28.1's
+    // class-or-interface assumption. A value type that holds none, and a
+    // runtime-managed type (a string, a function value, the `Type` token,
+    // §28.9), hold no borrow: §28.10 "`using var` accepts a value-type or
+    // runtime-managed right-hand side … the only effect is the
+    // reassignability restriction", and §28.3.9 "a value-typed argument read
+    // from it … is no borrow". An unresolved type is read as holding one.
+    bool usingPinTypeHoldsBorrow(const sema::TypeRef* t) const;
 
     // §28.14 verifiable-subset widening (#1420 triage): a local initialized
     // with a LAMBDA LITERAL and never reassigned is a verifiable function
