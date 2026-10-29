@@ -13865,6 +13865,22 @@ Symbol* ExprTC::lookupExtensionMember(
     bool reportAmbiguity,
     std::ptrdiff_t arity) {
     if (!receiver) return nullptr;
+    // fix #7763 (§26.5 rule 1, §30.3, §8.1, v0.350): instance members win BY
+    // NAME. A task type has no TypeSymbol, so the ordinary member walk cannot
+    // tell this lookup that `Task` DECLARES `IsCompleted` / `IsFaulted` /
+    // `IsCancelled` / `Wait()` (and `Task<T>` / `OwningTask<T>` `Result`),
+    // plus the generated `Dispose` and the `Object` members. With
+    // `extension Object` now reaching a task (§26.2, §26.5 rule 2), a
+    // same-named extension member would otherwise bind where rule 1 says
+    // extension blocks are never consulted.
+    if (std::string_view tn = taskFamilyHeadName(receiver); !tn.empty()) {
+        if (name == "IsCompleted" || name == "IsFaulted" ||
+            name == "IsCancelled" || name == "Wait" || name == "Dispose" ||
+            name == "ToString" || name == "Equals" || name == "GetHashCode" ||
+            name == "GetType" ||
+            (name == "Result" && !receiver->genericArgs.empty()))
+            return nullptr;
+    }
     // §26.5 step 2: "the compiler searches the current module AND all imported
     // modules for extension blocks on x's type". The candidate set is this
     // file's own module children plus the blocks reconstructed from each

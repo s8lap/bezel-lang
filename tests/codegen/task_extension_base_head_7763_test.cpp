@@ -18,6 +18,7 @@
 
 #include <string>
 
+#include "support/aot_result_asserts.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
@@ -166,4 +167,90 @@ BEZEL_TEST(task_extension_base_head_7763, task_t_block_does_not_apply_to_owning_
             d.message.find("`OwningTask` has no member `Done`") != std::string::npos)
             found = true;
     BEZEL_EXPECT_TRUE(found);
+}
+
+// §26.5.1: an `extension Object` member never outranks a same-named member of
+// a more specific block (`Task<T>`, or the bare `Task`, both subtypes of
+// `Object`), on a `Task<int>` receiver.
+BEZEL_TEST(task_extension_base_head_7763, object_block_loses_to_task_t_block) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(
+            "module M; import System; "
+            "extension Object "
+            "  public property Hello: string => \"obj\"; "
+            "end extension; "
+            "extension Task<T> "
+            "  public property Hello: string => \"taskT\"; "
+            "end extension; "
+            "class C "
+            "  public static method Main(): int "
+            "    using var a := Task.FromResult(1); "
+            "    Console.WriteLine(a.Hello); "
+            "    return 0; "
+            "  end Main; "
+            "end C;"),
+        std::string("taskT"));
+}
+
+BEZEL_TEST(task_extension_base_head_7763, object_block_loses_to_bare_task_block) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(
+            std::string("module M; import System; "
+                        "extension Object "
+                        "  public property Hello: string => \"obj\"; "
+                        "end extension; "
+                        "extension Task "
+                        "  public property Hello: string => \"task\"; "
+                        "end extension; ") +
+            kHelpers +
+            "  public static method Main(): int "
+            "    using var a := Task.FromResult(1); "
+            "    using var c := P(); "
+            "    c.Wait(); "
+            "    Console.WriteLine(a.Hello + c.Hello); "
+            "    return 0; "
+            "  end Main; "
+            "end C;"),
+        std::string("tasktask"));
+}
+
+// §26.5 rule 1: a member `Task` DECLARES (IsCompleted, spec §30.3) commits
+// instance resolution by name, so an `extension Object` member of that name is
+// never consulted: the read is the task's own (a completed task: True).
+BEZEL_TEST(task_extension_base_head_7763, object_extension_never_shadows_declared_task_member) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(
+            "module M; import System; "
+            "extension Object "
+            "  public property IsCompleted: bool => false; "
+            "end extension; "
+            "class C "
+            "  public static method Main(): int "
+            "    using var a := Task.FromResult(1); "
+            "    Console.WriteLine(a.IsCompleted.ToString()); "
+            "    return 0; "
+            "  end Main; "
+            "end C;"),
+        std::string("True"));
+}
+
+// Same rule for a METHOD name: `Wait` is declared by `Task` (arity 0), so a
+// `Wait(k: int)` extension is not a fallback for `a.Wait(3)`; the extension's
+// result (3) must never be produced. (Today the arity-mismatched `Wait(3)` call
+// is itself not diagnosed -- a sibling defect reported with the commit -- so
+// the row pins only that the extension did not bind.)
+BEZEL_TEST(task_extension_base_head_7763, object_extension_method_never_shadows_declared_wait) {
+    auto r = runAot(
+        "module M; import System; "
+        "extension Object "
+        "  public method Wait(k: int): int => k; "
+        "end extension; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var a := Task.FromResult(1); "
+        "    Console.WriteLine(a.Wait(3).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("3") == std::string::npos);
 }
