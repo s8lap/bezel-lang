@@ -30319,14 +30319,21 @@ void collectPatternBindings(const ast::Pattern* pat,
 // fix #2865 (§8.6/§28.9, v0.240): hoisted out of StringEscapeWalker so the BOX
 // walker uses the SAME definition rather than a second copy — the #2787 lesson
 // (three copies of one predicate drifted, and `decimal` fell out of one).
-bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i) {
+bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i,
+                              const sema::SemaContext* ctx = nullptr) {
     if (i != 0) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
     if (!ma || !ma->target) return false;
     if (ma->member != "Write" && ma->member != "WriteLine") return false;
     // Direct `Console.Write`/`Console.WriteLine`.
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
-        return id->name == "Console";
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+        if (id->name == "Console") return true;
+        // fix #7713 (stdlib §7.4, v0.350): `w.WriteLine(x)` over a `TextWriter`
+        // local bound to `Console.Out`/`Console.Error` lowers through the same
+        // tryLowerConsoleCall arm. A local the arm declines (written again)
+        // is a compile error there, so claiming it here cannot strand a value.
+        return ctx && consoleWriterLocalStdFdOf(*ctx, *id) != 0;
+    }
     // `Console.Out.<m>` / `Console.Error.<m>` — the stdout/stderr TextWriter
     // facets that lower through the same tryLowerConsoleCall stdfd path.
     if (auto* inner =
@@ -31003,7 +31010,7 @@ struct StringEscapeWalker {
     // BoxEscapeWalker — isConsoleNonRetainingArg, above this struct, which
     // carries the structural-matching rationale.
     bool isConsoleNonRetainingStringArg(const ast::Expr* callee, size_t i) {
-        return isConsoleNonRetainingArg(callee, i);
+        return isConsoleNonRetainingArg(callee, i, &ctx);
     }
 
     // Call arguments (#1430): a bare read of the target passed in a PLAIN
@@ -42512,7 +42519,7 @@ struct BoxEscapeWalker {
         noteSlotWrites(args);
         for (std::size_t i = 0; i < args.size(); ++i) {
             bool safe = args[i].name.empty() && args[i].modifier.empty() &&
-                        (isConsoleNonRetainingArg(callee, i) ||
+                        (isConsoleNonRetainingArg(callee, i, &ctx) ||
                          isSequenceEqualSpanNonRetainingArg(callee, i, ctx) ||
                          isNarrowedRead(args[i].value.get()) ||
                          isKnownBoxEqualsArg(callee, args)) &&

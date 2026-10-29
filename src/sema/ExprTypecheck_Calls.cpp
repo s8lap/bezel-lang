@@ -10177,6 +10177,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             " — for composite formatting use string interpolation"
                             " (`$\"{...}\"`) instead");
                     }
+                } else if (ce.args.size() == 1 && ce.args[0].value &&
+                           !ce.args[0].isDiscard &&
+                           ce.args[0].modifier.empty()) {
+                    // fix #7713 (stdlib §7.4, §2.1; §8.6, §9.7, v0.350): the
+                    // one-argument `Write` / `WriteLine` of a `TextWriter`-typed
+                    // receiver (`var w: TextWriter := Console.Out;
+                    // w.WriteLine(x)`) declares the same `Object` parameter as
+                    // `Console`'s, so it is the same boxing position: a
+                    // move-only argument cannot be boxed (§35.8, #7694) and a
+                    // borrow-holding one may not reach it (§9.7, #5659). These
+                    // builtins carry no MethodSymbol, so the check is made
+                    // here, beside the Console arm above.
+                    const TypeRef* recvTy7713 = ctx_.exprType(*consoleMA->target);
+                    if (recvTy7713 && recvTy7713->kind == TypeRef::Kind::Named &&
+                        !recvTy7713->declaration && !recvTy7713->nullable &&
+                        recvTy7713->headName() == "TextWriter") {
+                        checkBorrowErasingPosition(
+                            ctx_.exprType(*ce.args[0].value),
+                            ctx_.primitiveTypeRef(PrimitiveType::Object),
+                            ce.args[0].value->span.begin);
+                        const char* moveOnlyKind7713 = nullptr;
+                        TypeRef* argTy7713 = ctx_.exprType(*ce.args[0].value);
+                        if (argTy7713 &&
+                            common::isMoveOnlyValueType(argTy7713, ctx_,
+                                                        moveOnlyKind7713)) {
+                            checkAssignable(
+                                argTy7713,
+                                ctx_.primitiveTypeRef(PrimitiveType::Object),
+                                ce.args[0].value->span.begin,
+                                std::string("argument to `TextWriter.") +
+                                    std::string(mbr) + "`",
+                                ce.args[0].value.get());
+                        }
+                    }
                 }
             }
         }

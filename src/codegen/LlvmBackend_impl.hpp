@@ -287,6 +287,13 @@ inline llvm::Value* radixAdmittedIR(llvm::IRBuilder<>& b, llvm::Value* radix) {
 // `astNode->name->parts[0]`, then `importedName`, in that order, and this
 // function only reaches a `headName()` read once `!rt->declaration` is
 // already established — the one branch where the two accessors agree.
+// fix #7713 (stdlib §7.4, v0.350): 1 / 2 when `id` names a `TextWriter` local
+// declared with the initializer `Console.Out` / `Console.Error`, else 0. This is
+// the syntactic-and-typed half; `Emitter::textWriterLocalStdFd` adds the proof
+// that the slot is never written again. Defined in LlvmBackend_Calls.cpp.
+int consoleWriterLocalStdFdOf(const sema::SemaContext& ctx,
+                              const ast::IdentifierExpr& id);
+
 inline bool isBuiltinDictionaryTypeRef(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
@@ -12398,6 +12405,10 @@ private:
     llvm::Value* tryOpaqueSlotBuiltinRender(llvm::Value* val,
                                             const sema::TypeRef* frt,
                                             const ast::Expr* src);
+    // fix #7713 (stdlib §7.4, v0.350): the std stream (1 stdout, 2 stderr) a
+    // `TextWriter` local bound once to `Console.Out`/`Console.Error` denotes; 0
+    // when not statically proven. See the definition.
+    int textWriterLocalStdFd(const ast::IdentifierExpr& id);
 
     // §9.6 (#946/#947/#948): emit (once) an Equals thunk `i1(ptr this, ptr other)`
     // for a CLASS — the user `Equals(Object?)` override if present (walking the

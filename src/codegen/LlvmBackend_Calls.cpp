@@ -152,6 +152,39 @@ llvm::Value* Emitter::emitConsoleReadLine() {
 }
 
 
+// fix #7713 (stdlib §7.4, v0.350): the standard stream (1 = stdout, 2 = stderr)
+// a `TextWriter`-typed local denotes, or 0 when that is not statically proven.
+// Proven only for a local declared with an initializer that is exactly
+// `Console.Out` / `Console.Error`, whose slot is provably never written again.
+int consoleWriterLocalStdFdOf(const sema::SemaContext& ctx,
+                              const ast::IdentifierExpr& id) {
+    const sema::TypeRef* ty = ctx.exprType(id);
+    if (!ty || ty->kind != sema::TypeRef::Kind::Named || ty->declaration ||
+        ty->nullable || ty->headName() != "TextWriter")
+        return 0;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(id));
+    if (!loc || !loc->decl) return 0;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld || !ld->initializer) return 0;
+    auto* init = dynamic_cast<const ast::MemberAccessExpr*>(ld->initializer.get());
+    if (!init || !init->target) return 0;
+    auto* cid = dynamic_cast<const ast::IdentifierExpr*>(init->target.get());
+    if (!cid || cid->name != "Console") return 0;
+    if (init->member == "Out") return 1;
+    if (init->member == "Error") return 2;
+    return 0;
+}
+
+int Emitter::textWriterLocalStdFd(const ast::IdentifierExpr& id) {
+    const int fd = consoleWriterLocalStdFdOf(ctx_, id);
+    if (fd == 0) return 0;
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(id));
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (reassignedOpaqueLocals_.count(ld)) return 0;
+    if (!opaqueLocalProvablyUnwritten(ld)) return 0;
+    return fd;
+}
+
 bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     if (!call.callee) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -170,7 +203,26 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             stdfd = (innerMA->member == "Error") ? 2 : 1;
             id = nullptr;  // mark as Error/Out path
         } else return false;
-    } else if (id->name != "Console") return false;
+    } else if (id->name != "Console") {
+        // fix #7713 (stdlib §7.4 / §2.1, v0.350): a `TextWriter`-typed LOCAL
+        // that is bound to `Console.Out` / `Console.Error` and never written
+        // again IS that stream, so `w.WriteLine(x)` is `Console.Out.WriteLine(x)`
+        // (stdlib §7.4: "[§2.1]'s rule, of which `Console.Out` and
+        // `Console.Error` are instances"). The value of `Console.Out` itself
+        // has no runtime representation (it lowers to null), so the stream is
+        // read off the initializer, with the positive unwritten proof
+        // `tryOpaqueSlotBuiltinRender` uses. Any other receiver (a parameter,
+        // a field, a reassigned local, a user subclass) declines and keeps
+        // the #2457 reject.
+        const int fd = textWriterLocalStdFd(*id);
+        if (fd == 0) return false;
+        stdfd = fd;
+        id = nullptr;
+        // `Flush()` (stdlib §7.4's abstract member): the console lowering
+        // writes through write(2) with no user-space buffer, so a flush has
+        // nothing to flush.
+        if (ma->member == "Flush" && call.args.empty()) return true;
+    }
 
     bool isWriteLine = (ma->member == "WriteLine");
     bool isWrite = (ma->member == "Write");
