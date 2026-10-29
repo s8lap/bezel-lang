@@ -10585,6 +10585,12 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
 bool Emitter::isInterfaceDispatchedIteratorRead(
         const ast::Expr* iterable) const {
     if (!iterable) return false;
+    // fix #7594 (§17.8 / §29.2, v0.350): `f.E!` is classified exactly as the
+    // bare read `f.E` — "over a named owned binding, `x!` is therefore
+    // classified by its position exactly as the bare read `x` is", and `!` "is
+    // purely a type-system assertion" that mints and consumes nothing — so the
+    // property read the wrap-creator fires on is the operand of the bang.
+    iterable = peelForInSourceBang(iterable);
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(iterable);
     if (!ma) return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));

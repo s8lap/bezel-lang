@@ -10209,16 +10209,41 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
 
 
 // fix #7526 (§29.2 / §29.7, v0.350): `for var x in h.F!` iterates the SAME
-// source `h.F` does — `!` (§16.5 null assertion) only asserts non-null and
-// yields the operand's value, so every source-SHAPE classification (array vs
-// vtable protocol, named-binding vs fresh temporary) must look through it.
-// Peel only postfix `!` layers (never `as`, whose result is a borrow, §17.4).
-static const ast::Expr* peelForInSourceBang(const ast::Expr* e) {
-    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
-        if (!pb->operand) break;
-        e = pb->operand.get();
+// source `h.F` does — `!` (§17.8 null-forgiving operator) only asserts non-null
+// and yields the operand's value, so every source-SHAPE classification (array
+// vs vtable protocol, named-binding vs fresh temporary) must look through it.
+// The peel itself, `peelForInSourceBang`, lives in LlvmBackend_impl.hpp (fix
+// #7594) because Assign.cpp and Setup.cpp classify the same source.
+
+// fix #7594 (§29.2 / §28.3 arm-meet, v0.350): true when `e` is an if-expression
+// (a ConditionalExpr, an elif chain nesting) every value arm of which -- looking
+// through a postfix `!` (§17.8) -- is a fresh producer (a CallExpr or NewExpr,
+// or a nested such if-expression), `null` / `throw` arms absorbing, with at
+// least one producer. A named place (identifier, member read, index) on any arm
+// is a borrow, so the whole meet is a borrow and answers false (the loop then
+// keeps the named-source behavior and never disposes it). The ownership pass's
+// `common::conditionalCaseArmMeetIsOwned` is the class-typed sibling; it asks
+// `isFreshOwnedClassProducer`, which a declaration-less `IEnumerable<T>`-head
+// call is not, so it cannot answer for an iterable source.
+static bool forInIfExprArmsAreFreshProducers(const ast::Expr* e) {
+    auto* c = dynamic_cast<const ast::ConditionalExpr*>(e);
+    if (!c) return false;
+    bool sawProducer = false;
+    for (const ast::Expr* arm : {c->thenValue.get(), c->elseValue.get()}) {
+        arm = peelForInSourceBang(arm);
+        if (!arm) return false;
+        if (dynamic_cast<const ast::NullLiteralExpr*>(arm) ||
+            dynamic_cast<const ast::ThrowExpr*>(arm))
+            continue;
+        if (dynamic_cast<const ast::CallExpr*>(arm) ||
+            dynamic_cast<const ast::NewExpr*>(arm) ||
+            forInIfExprArmsAreFreshProducers(arm)) {
+            sawProducer = true;
+            continue;
+        }
+        return false;
     }
-    return e;
+    return sawProducer;
 }
 
 // fix #3468 / §29.2 / §29.7 / stdlib §4.12–§4.13 (v0.286): the ONE
@@ -10369,6 +10394,23 @@ Emitter::classifyBuiltinForInSource(const ast::ForStmt& fs) {
         if ((dynamic_cast<sema::FieldSymbol*>(sym) ||
              dynamic_cast<sema::PropertySymbol*>(sym)) &&
             common::isSyncIterFormatEnumerableHead(n))
+            isArrayBacked = false;
+    } else if (dynamic_cast<const ast::ConditionalExpr*>(srcCore)) {
+        // fix #7594 (§29.2 / §28.3 arm-meet / §17.8, v0.350): an if-expression
+        // source every value arm of which is a FRESH producer (a call or a
+        // `new`, `null` and `throw` arms absorbing, at least one producer) is
+        // itself a fresh class-typed expression -- "an iterable-family-
+        // returning call at any callee kind (calls mint, §28.3) ... or a `new`
+        // expression" -- and exactly one arm runs, so its value is a vtable-
+        // backed iterator frame exactly like the bare call. Without this arm
+        // `(if c then h.Mk() else null)!` fell to the bz_array protocol, read
+        // the frame as an array, ran ZERO iterations and leaked the frame.
+        // A named place on ANY arm (borrow meet) keeps the array-backed
+        // default and the named-source borrow: the loop must never dispose it.
+        // The result head must be a sync iterator format head, as for the
+        // indexer arm below.
+        if (common::isSyncIterFormatEnumerableHead(n) &&
+            forInIfExprArmsAreFreshProducers(srcCore))
             isArrayBacked = false;
     } else if (dynamic_cast<const ast::IndexExpr*>(srcCore)) {
         // fix #3356 / §29.2 / §23.4 (v0.278): an INDEXER read `obj[i]` whose
@@ -10713,7 +10755,11 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             if (ps6397 && propBlockGetterReturnKinds_.count(ps6397))
                 gk6397 = propBlockGetterReturnKinds_.at(ps6397);
             bool minted6397 =
-                propReadIterWrappedExprs_.count(fs.iterable.get()) > 0 ||
+                // fix #7594 (§17.8, v0.350): the wrap-creator keys its mint
+                // on the property READ node, which under `f.E!` is the
+                // operand of the bang.
+                propReadIterWrappedExprs_.count(
+                    peelForInSourceBang(fs.iterable.get())) > 0 ||
                 (gk6397 & kPropGetterReturnMint) != 0 ||
                 // fix #6397 follow-up (§28.9 / §29.2, v0.338): the accessor
                 // BODY's own mint, for the face on which the getter is a

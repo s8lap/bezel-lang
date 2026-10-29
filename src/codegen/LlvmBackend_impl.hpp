@@ -113,6 +113,24 @@ void profileRefFormalWrites(
     const ast::Expr* exprBody,
     bool& assigned, bool& onward, bool& captured);
 
+// fix #7526 / #7594 (§17.8 / §29.2 / §29.7, v0.350): `x!` "preserves ownership
+// ... if `x` is borrowed, `x!` is borrowed with the same source", and "over a
+// named owned binding, `x!` is therefore classified by its position exactly as
+// the bare read `x` is". Every for-in SOURCE-SHAPE classification (array vs
+// vtable protocol, named-binding vs fresh producer, fresh-mint vs lend) must
+// therefore look through postfix `!` layers to the operand it asserts. Peel
+// only postfix `!` (never `as`, whose result is a borrow, §17.4). Shared by
+// the for-in classifier (Stmts.cpp), the interface-property predicate
+// (Assign.cpp) and the bound-source claim (Setup.cpp) so the three cannot
+// drift apart.
+inline const ast::Expr* peelForInSourceBang(const ast::Expr* e) {
+    while (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+        if (!pb->operand) break;
+        e = pb->operand.get();
+    }
+    return e;
+}
+
 // fix #2717 / §23.4 / §28.9 (v0.240): can an indexer whose ELEMENT type is `t`
 // yield a value that IS the `string` index argument passed to it?
 //

@@ -20466,7 +20466,16 @@ bool Emitter::registerIterableSourceDisposal(const ast::Node* declNode) {
         dynamic_cast<const ast::LocalDecl*>(declNode);
     (void)dynamic_cast<const ast::LocalConstDecl*>(declNode);
     LocalDeclInitView view = localDeclInitView(declNode);
-    const ast::Expr* init = view.init;
+    // fix #7594 (§17.8 / §29.2, v0.350): the bound spelling of a `!` source.
+    // `var e := h.Mk()!;` / `var e := f.E!;` classify exactly as `var e :=
+    // h.Mk();` / `var e := f.E;` — "over a named owned binding, `x!` is
+    // therefore classified by its position exactly as the bare read `x` is" and
+    // "if `x` is owned ... `x!` is owned" — so the producer / property-read
+    // shape is the operand of the bang. Every `init` read below (isCall /
+    // isNew, the property-read mint keys in `propReadIterWrappedExprs_`, the
+    // interface-dispatch predicate) names the same node the bare spelling
+    // names, which keeps the claim equal to the mint by construction.
+    const ast::Expr* init = peelForInSourceBang(view.init);
     const ast::Type* declType = view.type;
     // §29.11 (#943): only a plain `var` (using-vars are handled by
     // registerUsingDisposal) initialised from an expression. `localDeclInitView`
@@ -22109,9 +22118,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             // advanced-but-untaken pending it owns per §29.1 — never the source
             // backing, so no source binder is double-freed.
             bool wrappedHere = iterFormatWrappedDecls_.count(ld) != 0;
+            // fix #7594 (§17.8, v0.350): `using var e := h.Mk()!;` is the bare
+            // `using var e := h.Mk();` — the producer is the operand of `!`.
             bool ownsSource =
-                dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
-                dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
+                dynamic_cast<const ast::CallExpr*>(
+                    peelForInSourceBang(ld->initializer.get())) ||
+                dynamic_cast<const ast::NewExpr*>(
+                    peelForInSourceBang(ld->initializer.get())) ||
                 wrappedHere;
             // fix #2769 / §29.11 / §23.3 / §28.9: the `using var` twin of
             // registerIterableSourceDisposal's MemberAccessExpr+blockGetterOf
@@ -33334,7 +33347,14 @@ struct StringEscapeWalker {
             // is conservatively treated as an escape here — for-loops iterate
             // at least once in practice (a zero-iteration for is semantically
             // a no-op) and the body typically retains the iterator.
-            if (borrowingArrayMode && isTargetIdent(fs->iterable.get()))
+            // fix #7594 (§17.8 / §29.2, v0.350): `for var x in a!` over a
+            // nullable `Array<T>?` local iterates `a` exactly as the bare
+            // `for var x in a` does ("over a named owned binding, `x!` is
+            // therefore classified by its position exactly as the bare read
+            // `x` is"), so the borrow-read verdict looks through the `!`.
+            // `expr()` forwards the position through a PostfixBangExpr.
+            if (borrowingArrayMode &&
+                isTargetIdent(peelForInSourceBang(fs->iterable.get())))
                 expr(fs->iterable.get(), /*safeRead=*/true);
             else
                 expr(fs->iterable.get(), /*safeRead=*/false);

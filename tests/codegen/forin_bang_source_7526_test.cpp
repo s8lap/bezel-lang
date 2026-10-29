@@ -12,7 +12,8 @@
 // Spec: sec 29.2 (a `for` over a named/owned source BORROWS it; the loop does not
 // assume its disposal obligation), sec 29.7 (the loop's own enumerator is
 // disposed on every exit, running the iterator's `finally`), sec 28.5 (the owned
-// field is disposed once by the holder's cascade), sec 16.5 (`!` null assertion).
+// field is disposed once by the holder's cascade), sec 17.8 (`!` null-forgiving
+// operator).
 // Spec revision v0.350.
 
 #include <string>
