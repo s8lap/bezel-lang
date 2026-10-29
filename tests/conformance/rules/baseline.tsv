@@ -2976,7 +2976,7 @@ l2_21_0004	fail	divergence
 l2_21_0005	fail	divergence
 l3_1_0001	pass	
 l3_1_0002	pass	
-l3_1_0003	fail	divergence
+l3_1_0003	pass	
 l3_1_0004	pass	
 l3_1_0005	fail	divergence
 l3_1_0006	pass	

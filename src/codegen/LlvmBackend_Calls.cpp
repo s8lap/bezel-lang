@@ -11763,6 +11763,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* oldV = lowerExpr(*call.args[oldArgIdx].value);
             llvm::Value* newV = lowerExpr(*call.args[newArgIdx].value);
             if (!oldV || !newV) return nullptr;
+            // fix #7228 (stdlib §3.1, v0.350), Contracts, verbatim: "`Replace`
+            // raises `ArgumentException` when `oldValue` is empty." The runtime
+            // helper no-ops on an empty oldValue, so the guard lives here, as
+            // the Insert/Remove guards do. `oldValue` is a BORROW parameter, so
+            // there is no caller-owned +1 producer to release on the throw edge.
+            emitGuardThrow(builder_.CreateICmpEQ(loadStringLen(oldV),
+                                                 builder_.getInt64(0),
+                                                 "sb.rep.empty"),
+                           "ArgumentException");
             auto* fn = declareC("bz_sb_replace", llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {recv, oldV, newV});

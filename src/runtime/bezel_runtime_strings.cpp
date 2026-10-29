@@ -1525,8 +1525,8 @@ void bz_sb_remove(void* parts_arr, int64_t start_index, int64_t length) {
 // per §3.1 (StringBuilder.Replace(oldValue, newValue)): replace every
 // non-overlapping occurrence of `old_value`'s CODE-POINT sequence in the
 // builder's content with `new_value`'s code points. The §3.1 v0.195 contract
-// raises ArgumentException for an empty oldValue; the runtime short-circuits
-// that case (no-op) — the rejection itself is #7228, not this fix. The
+// raises ArgumentException for an empty oldValue; codegen raises it
+// before the call (#7228), so the runtime short-circuit below is a backstop. The
 // builder resets to one part, releasing the old +1 parts first.
 //
 // The match is over CODE POINTS, not over bytes: a byte-level match could
