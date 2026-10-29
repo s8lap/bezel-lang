@@ -39821,8 +39821,10 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         // plain `var` and `using var` reach parity. No double-free: the substrings are
         // freshly created (no source alias retains them, unlike ToArray's +1 co-owned
         // borrow), so the single release frees each exactly once.
+        // fix #7696 (stdlib §2.6, v0.350): `Guid.ToByteArray()` is a fresh
+        // `owned Array<byte>` the local solely owns, like Split.
         return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
-               mm == "Split";
+               mm == "Split" || mm == "ToByteArray";
     }
     // Branch B (#2753): a §28.3 RANGE SLICE on `Array<T>` — `arr[r]` (the
     // compiler-recognized `Slice(r: Range<int>): owned Array<T>` form, stdlib
@@ -40246,7 +40248,7 @@ bool Emitter::isFreshOwnerlessArrayMaterializerExpr(const ast::Expr* e) const {
     // bz_array_free with the Array<string> string-release disposer (selected by
     // element type at the call site), mirroring the ToArray/Sorted/Reversed temps.
     return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
-           mm == "Split";
+           mm == "Split" || mm == "ToByteArray";
 }
 
 

@@ -12906,6 +12906,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 auto* fn = declareC("bz_guid_compare", i32(), {ptrTy(), ptrTy()});
                 return builder_.CreateCall(fn, {slot, otherSlot}, "guid.cmp");
             }
+            // fix #7696 (stdlib §2.6, v0.350): `public method ToByteArray():
+            // owned Array<byte>;` — the 16 canonical bytes (the same bytes
+            // CompareTo orders and FromByteArray copies back in, so the pair
+            // round-trips), in a fresh owned array (rc=1 producer).
+            if (mname == "ToByteArray" && call.args.empty()) {
+                auto* allocFn = declareC("bz_array_alloc_count_n", ptrTy(),
+                                         {i64(), i64()});
+                llvm::Value* arr = builder_.CreateCall(
+                    allocFn, {builder_.getInt64(1), builder_.getInt64(16)},
+                    "guid.tba");
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                       {ptrTy(), i64(), i64()});
+                llvm::Value* dst = builder_.CreateCall(
+                    ptrFn, {arr, builder_.getInt64(0), builder_.getInt64(1)},
+                    "guid.tba.ptr");
+                builder_.CreateMemCpy(dst, llvm::MaybeAlign(1), slot,
+                                      llvm::MaybeAlign(1), 16);
+                return arr;
+            }
         }
     }
 

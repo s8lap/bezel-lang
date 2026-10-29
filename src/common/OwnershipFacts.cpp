@@ -832,12 +832,14 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
     // excludes BinarySerializer.ToBytes / JsonSerializer.ToBytes (those return
     // `OwningBuffer<byte>`, head `OwningBuffer` — already covered by
     // `isDisposableBuiltinHeadName` and the chain's `OwningBuffer` disposal
-    // arm, #2992). The remaining #2749 items (ToCharArray / ToByteArray /
+    // arm, #2992). fix #7696: `Guid.ToByteArray` (stdlib §2.6) joins too. The
+    // remaining #2749 items (ToCharArray / ToByteArray on Random /
     // CopyToArray / ReadAll* / GetFiles / GetDirectories) keep their
     // measurement-gated philosophy and are filed separately.
     if (mm != "ToArray" && mm != "ToSet" && mm != "ToDictionary" &&
         mm != "Sorted" && mm != "Reversed" && mm != "Slice" &&
-        mm != "Split" && mm != "GetBytes" && mm != "ToBytes")
+        mm != "Split" && mm != "GetBytes" && mm != "ToBytes" &&
+        mm != "ToByteArray")
         return false;
     // BUILTIN only, and the test is "NO symbol at all" — not "no MethodSymbol".
     // The builtin member-call typing path in sema lives entirely inside

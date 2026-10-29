@@ -16423,6 +16423,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "CompareTo")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // fix #7696 (stdlib §2.6, v0.350): `ToByteArray():
+                        // owned Array<byte>` -- same representation as
+                        // CString.ToBytes below, so the inferred local owns it.
+                        else if (m == "ToByteArray" && ce.args.empty())
+                            ctx_.setExprType(
+                                &ce, makeConcreteCollectionResult(
+                                         "Array", ctx_.primitiveTypeRef(P::Byte)));
                     }
                     // per §2.5 / #1357: DateOnly instance methods.
                     if (rcn == "DateOnly") {
