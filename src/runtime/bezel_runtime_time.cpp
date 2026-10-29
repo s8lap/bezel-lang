@@ -11,6 +11,14 @@ static const int64_t POSIX_EPOCH_TICKS = 621355968000000000LL;
 static const int64_t TICKS_PER_SECOND  = 10000000LL;
 static const int64_t TICKS_PER_MS      = 10000LL;
 
+// per stdlib §2.5 (#7716): a DateTime is ONE i64 -- the tick count in bits
+// 0..61 (MaxValue 3155378975999999999 < 2^62) and `Kind` in bits 62..63
+// (Unspecified = 0, Utc = 1, Local = 2), the .NET layout. Every helper that
+// reads a DateTime masks the kind off first; AddYears/AddMonths re-apply it.
+static const int64_t DT_TICKS_MASK = 0x3FFFFFFFFFFFFFFFLL;
+static inline int64_t dtTicks(int64_t v) { return v & DT_TICKS_MASK; }
+static inline int64_t dtKindBits(int64_t v) { return v & ~DT_TICKS_MASK; }
+
 // per stdlib §2.5: DateTime.Now — current local DateTime as .NET ticks.
 // Reads CLOCK_REALTIME (which is UTC); the local-zone offset is applied by the
 // codegen wrapper / caller, not here. Intercept point per stdlib §2.5.
@@ -38,6 +46,7 @@ void bz_datetime_ticks_to_parts(int64_t ticks,
                                  int32_t* year,  int32_t* month,  int32_t* day,
                                  int32_t* hour,  int32_t* minute, int32_t* second,
                                  int32_t* ms) {
+    ticks = dtTicks(ticks);
     int64_t posix_sec = (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
     int64_t rem_ticks = (ticks - POSIX_EPOCH_TICKS) % TICKS_PER_SECOND;
     time_t t = (time_t)posix_sec;
@@ -114,6 +123,7 @@ int32_t bz_datetime_millisecond(int64_t ticks) {
 // DayOfWeek: 0=Sunday...6=Saturday — per §2.5 DayOfWeek enum ordering.
 // Uses gmtime's tm_wday (0=Sunday, which matches the Bezel enum).
 int32_t bz_datetime_day_of_week(int64_t ticks) {
+    ticks = dtTicks(ticks);
     int64_t posix_sec = (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
     time_t t = (time_t)posix_sec;
     struct tm* ti = gmtime(&t);
@@ -122,6 +132,7 @@ int32_t bz_datetime_day_of_week(int64_t ticks) {
 
 // DayOfYear: 1..366 — per §2.5; uses gmtime's tm_yday (0-based) + 1.
 int32_t bz_datetime_day_of_year(int64_t ticks) {
+    ticks = dtTicks(ticks);
     int64_t posix_sec = (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
     time_t t = (time_t)posix_sec;
     struct tm* ti = gmtime(&t);
@@ -139,7 +150,7 @@ int64_t bz_datetime_add_years(int64_t ticks, int32_t years) {
         bool leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
         if (!leap) d = 28;
     }
-    return bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
+    return dtKindBits(ticks) | bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
 }
 
 int64_t bz_datetime_add_months(int64_t ticks, int32_t months) {
@@ -156,12 +167,13 @@ int64_t bz_datetime_add_months(int64_t ticks, int32_t months) {
     bool leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
     int32_t dim = (mo == 2 && leap) ? 29 : days_in_month[mo];
     if (d > dim) d = dim;
-    return bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
+    return dtKindBits(ticks) | bz_datetime_parts_to_ticks(y, mo, d, h, mi, s, ms);
 }
 
 // per stdlib §2.5 / #1357: ToUnixTimeSeconds — convert .NET ticks to POSIX
 // seconds (truncating sub-second precision).
 int64_t bz_datetime_to_unix_seconds(int64_t ticks) {
+    ticks = dtTicks(ticks);
     return (ticks - POSIX_EPOCH_TICKS) / TICKS_PER_SECOND;
 }
 

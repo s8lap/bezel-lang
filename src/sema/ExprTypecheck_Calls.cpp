@@ -34287,13 +34287,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // result is the enum's ordinal. When the user's own top-level
                 // `DayOfWeek` shadows the prelude (§2.3) no stdlib enum exists in
                 // this module, and the property keeps the ordinal as `int`.
-                if (mbr == "DayOfWeek") {
+                // per stdlib §2.5 (v0.350, #7716): `Kind` likewise, as the
+                // prelude's `DateTimeKind` enum (Unspecified 0, Utc 1,
+                // Local 2); codegen reads it off the scalar's top two bits.
+                if (mbr == "DayOfWeek" || mbr == "Kind") {
+                    const std::string_view enumName =
+                        mbr == "Kind" ? std::string_view{"DateTimeKind"}
+                                      : std::string_view{"DayOfWeek"};
                     TypeSymbol* dow = nullptr;
                     if (ctx_.module()) {
                         for (Symbol* child : ctx_.module()->children) {
                             auto* ts = dynamic_cast<TypeSymbol*>(child);
                             if (ts && ts->isSynthesizedPrelude &&
-                                ts->name == "DayOfWeek") {
+                                ts->name == enumName) {
                                 dow = ts;
                                 break;
                             }

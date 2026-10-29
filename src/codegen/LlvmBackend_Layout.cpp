@@ -8929,6 +8929,14 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
 llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
                                         const sema::TypeRef* fieldTy) {
     using K = sema::TypeRef::Kind;
+    // per stdlib §2.5 (#7716; interim decision on #7764): a DateTime compares
+    // by tick count -- the Kind bits (62..63) do not take part, matching
+    // CompareTo's tick order. Reached by a record/choice field, a `DateTime?`
+    // payload (the nullable arm below recurses with the inner type) and every
+    // collection membership scan (emitRemoveElementEquality).
+    if (isDateTimeValueRef(fieldTy) && l->getType()->isIntegerTy(64) &&
+        r->getType()->isIntegerTy(64))
+        return builder_.CreateICmpEQ(dtTicksOf(l), dtTicksOf(r), "dt.eq");
     // per §8.3/§9.1: a NULLABLE REFERENCE field (string?, Object?, nullable
     // class/interface) lowers to a plain `ptr` whose null is a real null
     // pointer. Equality is: both-null → equal; exactly-one-null → not-equal;

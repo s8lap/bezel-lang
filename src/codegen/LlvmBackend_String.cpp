@@ -4639,6 +4639,11 @@ llvm::Value* Emitter::emitRangeToString(llvm::Value* rangeVal,
 llvm::Value* Emitter::emitValueHashCode(llvm::Value* val,
                                         const sema::TypeRef* fieldTy) {
     using K = sema::TypeRef::Kind;
+    // per stdlib §2.5 (#7716; interim decision on #7764): a DateTime hashes
+    // its tick count only, consistent with emitValueEquality's tick equality
+    // (§8.3: equal values hash equally), so the Kind bits are cleared first.
+    if (isDateTimeValueRef(fieldTy) && val->getType()->isIntegerTy(64))
+        val = dtTicksOf(val);
     // Inline array (§8.3 / §9.2 v0.158): "Hash combining element hashes in slot
     // order." Fold each slot's hash (h = h*31 + elemHash), the same order and
     // combiner as the record/positional hash — consistent with the element-wise

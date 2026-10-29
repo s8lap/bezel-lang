@@ -5872,18 +5872,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     const auto& mbr = ma->member;
                     if (mbr == "Now") {
                         auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
-                        return builder_.CreateCall(fn, {}, "dt.now");
+                        // per stdlib §2.5 (#7716): Now is a Local value.
+                        return dtCompose(builder_.CreateCall(fn, {}, "dt.now"),
+                                         dtKindBitsConst(2));
                     }
                     if (mbr == "UtcNow") {
                         auto* fn = declareC("bz_datetime_utcnow_ticks", i64(), {});
-                        return builder_.CreateCall(fn, {}, "dt.utcnow");
+                        // per stdlib §2.5 (#7716): UtcNow is a Utc value.
+                        return dtCompose(builder_.CreateCall(fn, {}, "dt.utcnow"),
+                                         dtKindBitsConst(1));
                     }
                     if (mbr == "Today") {
                         auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
                         llvm::Value* t = builder_.CreateCall(fn, {}, "dt.today.ticks");
                         llvm::Value* tpd = builder_.getInt64(864000000000LL);
                         llvm::Value* d = builder_.CreateSDiv(t, tpd);
-                        return builder_.CreateMul(d, tpd, "dt.today");
+                        // per stdlib §2.5 (#7716): Today is a Local value.
+                        return dtCompose(builder_.CreateMul(d, tpd, "dt.today"),
+                                         dtKindBitsConst(2));
                     }
                     if (mbr == "MinValue")
                         return builder_.getInt64(0LL);
@@ -6535,14 +6541,23 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     }
                     return v;
                 }
-                // Ticks property — return the raw i64.
-                if (mbr == "Ticks") return ticks;
+                // Ticks property -- the tick count, kind bits cleared (#7716).
+                if (mbr == "Ticks") return dtTicksOf(ticks);
+                // per stdlib §2.5 (#7716): Kind -- bits 62..63, laid out at the
+                // byte-backed DateTimeKind enum's underlying width.
+                if (mbr == "Kind") {
+                    llvm::Value* k = builder_.CreateLShr(ticks, 62, "dt.kind");
+                    if (auto* want = lowerTypeRef(ctx_.exprType(*ma));
+                        want && want->isIntegerTy())
+                        return builder_.CreateZExtOrTrunc(k, want, "dt.kind.enum");
+                    return k;
+                }
                 // per §2.5 / #1357: Date → DateOnly (i32 day number from epoch).
                 // TICKS_PER_DAY = 864000000000LL
                 if (mbr == "Date") {
                     llvm::Value* tpd = builder_.getInt64(864000000000LL);
                     return builder_.CreateTrunc(
-                        builder_.CreateSDiv(ticks, tpd, "dt.date.dn"),
+                        builder_.CreateSDiv(dtTicksOf(ticks), tpd, "dt.date.dn"),
                         i32(), "dt.date");
                 }
                 // per §2.5 / #1357: TimeOfDay → TimeOnly (i32 ms from midnight).
@@ -6550,7 +6565,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 if (mbr == "TimeOfDay") {
                     llvm::Value* tpd = builder_.getInt64(864000000000LL);
                     llvm::Value* tpm = builder_.getInt64(10000LL);
-                    llvm::Value* rem = builder_.CreateSRem(ticks, tpd, "dt.tod.rem");
+                    llvm::Value* rem = builder_.CreateSRem(dtTicksOf(ticks), tpd, "dt.tod.rem");
                     return builder_.CreateTrunc(
                         builder_.CreateSDiv(rem, tpm, "dt.tod.ms"),
                         i32(), "dt.tod");
@@ -11413,6 +11428,39 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             return builder_.CreateFPToSI(res, i64(), "ts.res");
         }
     }
+    // stdlib §2.5 (#7716): DateTime `-` DateTime -> TimeSpan, DateTime `+`/`-`
+    // TimeSpan and TimeSpan `+` DateTime -> DateTime. A DateTime scalar carries
+    // its Kind in bits 62..63, so the arithmetic runs over the TICK COUNTS
+    // (neither Kind takes part in a difference) and a DateTime result keeps
+    // the DateTime operand's Kind.
+    if (!opm && (bin.op == "+" || bin.op == "-")) {
+        const sema::TypeRef* ltDt = ctx_.exprType(*bin.left);
+        const sema::TypeRef* rtDt = ctx_.exprType(*bin.right);
+        std::string_view lnDt = ltDt ? builtinTypeName(ltDt) : std::string_view{};
+        std::string_view rnDt = rtDt ? builtinTypeName(rtDt) : std::string_view{};
+        const bool ltNullable = ltDt && ltDt->nullable;
+        const bool rtNullable = rtDt && rtDt->nullable;
+        const bool dtMinusDt = lnDt == "DateTime" && rnDt == "DateTime" && bin.op == "-";
+        const bool dtOpSpan = lnDt == "DateTime" && rnDt == "TimeSpan";
+        const bool spanPlusDt = lnDt == "TimeSpan" && rnDt == "DateTime" && bin.op == "+";
+        if (!ltNullable && !rtNullable && (dtMinusDt || dtOpSpan || spanPlusDt)) {
+            llvm::Value* lv = lowerExpr(*bin.left);
+            llvm::Value* rv = lowerExpr(*bin.right);
+            if (!lv || !rv) return nullptr;
+            if (!lv->getType()->isIntegerTy(64) || !rv->getType()->isIntegerTy(64))
+                return nullptr;
+            if (dtMinusDt)
+                return builder_.CreateSub(dtTicksOf(lv), dtTicksOf(rv), "dt.diff");
+            if (dtOpSpan) {
+                llvm::Value* t = bin.op == "+"
+                    ? builder_.CreateAdd(dtTicksOf(lv), rv, "dt.plus")
+                    : builder_.CreateSub(dtTicksOf(lv), rv, "dt.minus");
+                return dtCompose(t, dtKindBitsOf(lv));
+            }
+            return dtCompose(builder_.CreateAdd(lv, dtTicksOf(rv), "dt.plus"),
+                             dtKindBitsOf(rv));
+        }
+    }
     // §11.8 (v0.176, #807): constraint-operator dispatch — sema resolved this
     // binary expression to a STATIC INTERFACE operator member through a
     // `where T: I<T>` constraint (the operands are T-typed). At this
@@ -13413,6 +13461,16 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 raw, builder_.getInt32(0), "fn.eq");
             return op == "=" ? eq : builder_.CreateNot(eq);
         }
+    }
+    // per stdlib §2.5 (#7716; interim decision on #7764): `=` / `<>` on two
+    // DateTime values compare TICK COUNTS -- the Kind bits (62..63) do not
+    // take part, matching CompareTo's tick order and emitValueEquality.
+    if ((op == "=" || op == "<>") && bin.left && bin.right &&
+        l->getType()->isIntegerTy(64) && r->getType()->isIntegerTy(64) &&
+        isDateTimeValueRef(ctx_.exprType(*bin.left)) &&
+        isDateTimeValueRef(ctx_.exprType(*bin.right))) {
+        llvm::Value* eq = emitValueEquality(l, r, ctx_.exprType(*bin.left));
+        return op == "=" ? eq : builder_.CreateNot(eq);
     }
     // CG4: integer comparisons → i1.
     if (op == "=") return builder_.CreateICmpEQ(l, r);

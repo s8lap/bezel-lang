@@ -15096,6 +15096,29 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return mathExplicitT ? typeRefIsUnsigned(mathExplicitT)
                                  : mathOperandIsUnsigned(firstArg);
         };
+        // fix #7716 (stdlib §2.2 / §2.5, v0.350): a DateTime is one i64 whose
+        // top two bits carry its Kind (dtTicksOf / dtKindBitsOf), and
+        // Min/Max/Clamp order by T's CompareTo, which for DateTime is TICK
+        // order with the Kind not normalized. Comparing the raw word ranked a
+        // Local value (bit 63 set) below every other and a Utc one above every
+        // Unspecified one. So a DateTime operand compares by its ticks, and
+        // the SELECT still picks the ORIGINAL word, so the winner keeps its
+        // own Kind. Only the `mathTIsDateTime` arms call `mathCmpKey`; TimeSpan
+        // is a plain signed tick count and keeps the signed compare.
+        const bool mathTIsDateTime = [&]() -> bool {
+            if ((m != "Min" && m != "Max" && m != "Clamp") || call.args.empty())
+                return false;
+            if (ma->typeArgs.size() == 1 && ma->typeArgs[0])
+                return isDateTimeValueRef(ctx_.resolvedType(*ma->typeArgs[0]));
+            const ast::Expr* e = call.args[0].value.get();
+            const sema::TypeRef* t = e ? resolveTypeParamRef(ctx_.exprType(*e)) : nullptr;
+            if (!t || builtinTypeName(t) != "DateTime") return false;
+            // §7.4 / §22.6: a narrowed `DateTime?` read is of type DateTime.
+            return !t->nullable || ctx_.isNarrowedValueRead(*e);
+        }();
+        auto mathCmpKey = [&](llvm::Value* v) -> llvm::Value* {
+            return v->getType()->isIntegerTy(64) ? dtTicksOf(v) : v;
+        };
         // Fails CLOSED: a null result falls through to #2786's guard, which
         // reports a spec-cited Error, rather than to the aborting SIToFP.
         auto emitDecCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
@@ -15499,6 +15522,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 if (a->getType()->isIntegerTy()) {
                     // per stdlib §2.2 (v0.340): ordering is T's own CompareTo,
                     // so byte/ushort/uint/ulong/char order unsigned (#6864).
+                    if (mathTIsDateTime)   // #7716: `a` when ticks(a) <= ticks(b)
+                        return builder_.CreateSelect(
+                            builder_.CreateICmpSLE(mathCmpKey(a), mathCmpKey(b)),
+                            a, b, "min.dt.result");
                     llvm::Value* cmp = mathUnsignedCmp(call.args[aSrc].value.get())
                         ? builder_.CreateICmpULT(a, b)
                         : builder_.CreateICmpSLT(a, b);
@@ -15545,6 +15572,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
             if (m == "Max") {
                 if (a->getType()->isIntegerTy()) {
+                    if (mathTIsDateTime)   // #7716: `a` when ticks(a) >= ticks(b)
+                        return builder_.CreateSelect(
+                            builder_.CreateICmpSGE(mathCmpKey(a), mathCmpKey(b)),
+                            a, b, "max.dt.result");
                     llvm::Value* cmp = mathUnsignedCmp(call.args[aSrc].value.get())
                         ? builder_.CreateICmpUGT(a, b)
                         : builder_.CreateICmpSGT(a, b);
@@ -15674,6 +15705,17 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* lo  = mathConvertToT(vals[1], call.args[loSrc].value.get());
             llvm::Value* hi  = mathConvertToT(vals[2], call.args[hiSrc].value.get());
             if (val->getType()->isIntegerTy()) {
+                if (mathTIsDateTime) {
+                    // #7716: by ticks, in the stdlib §2.2 form — `low` when
+                    // value < low, `high` when value > high, else `value` —
+                    // and each result is an ORIGINAL word, keeping its Kind.
+                    llvm::Value* kVal = mathCmpKey(val);
+                    llvm::Value* inner = builder_.CreateSelect(
+                        builder_.CreateICmpSGT(kVal, mathCmpKey(hi)), hi, val);
+                    return builder_.CreateSelect(
+                        builder_.CreateICmpSLT(kVal, mathCmpKey(lo)), lo, inner,
+                        "clamp.dt.result");
+                }
                 const bool uns = mathUnsignedCmp(call.args[valSrc].value.get());
                 llvm::Value* clamped = builder_.CreateSelect(
                     uns ? builder_.CreateICmpULT(val, lo)
@@ -17035,11 +17077,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // Static properties: Now / UtcNow / Today.
         if (m == "Now" && call.args.empty()) {
             auto* fn = declareC("bz_datetime_now_ticks", i64(), {});
-            return builder_.CreateCall(fn, {}, "dt.now");
+            // per stdlib §2.5 (#7716): Now is a Local value.
+            return dtCompose(builder_.CreateCall(fn, {}, "dt.now"),
+                             dtKindBitsConst(2));
         }
         if (m == "UtcNow" && call.args.empty()) {
             auto* fn = declareC("bz_datetime_utcnow_ticks", i64(), {});
-            return builder_.CreateCall(fn, {}, "dt.utcnow");
+            // per stdlib §2.5 (#7716): UtcNow is a Utc value.
+            return dtCompose(builder_.CreateCall(fn, {}, "dt.utcnow"),
+                             dtKindBitsConst(1));
         }
         // Today = date part of Now (zero the time components).
         if (m == "Today" && call.args.empty()) {
@@ -17048,7 +17094,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // Truncate to day boundary: t / TICKS_PER_DAY * TICKS_PER_DAY.
             llvm::Value* tpd = builder_.getInt64(864000000000LL);
             llvm::Value* d = builder_.CreateSDiv(t, tpd);
-            return builder_.CreateMul(d, tpd, "dt.today");
+            // per stdlib §2.5 (#7716): Today is a Local value.
+            return dtCompose(builder_.CreateMul(d, tpd, "dt.today"),
+                             dtKindBitsConst(2));
         }
         // MinValue / MaxValue.
         if (m == "MinValue" && call.args.empty())
@@ -17071,14 +17119,33 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // #7242 `double`-parameter converter and the #7253 `Step` widening
         // use — and NOT from the bit width (`int` and `uint` are both 32
         // bits, `long` and `ulong` both 64).
-        if (m == "FromTicks" && call.args.size() == 1 && call.args[0].value) {
+        // per stdlib §2.5 (#7716): `FromTicks(ticks, kind := Unspecified)` --
+        // the optional second argument is the result's Kind.
+        if (m == "FromTicks" &&
+            (call.args.size() == 1 || call.args.size() == 2) &&
+            call.args[0].value && (call.args.size() == 1 || call.args[1].value)) {
             llvm::Value* v = lowerExpr(*call.args[0].value);
             if (!v) return nullptr;
             if (!v->getType()->isIntegerTy(64))
                 v = isUnsignedTargetExpr(*call.args[0].value)
                         ? builder_.CreateZExt(v, i64())
                         : builder_.CreateSExt(v, i64());
-            return v;
+            llvm::Value* kindBits = dtKindBitsConst(0);
+            if (call.args.size() == 2) {
+                llvm::Value* kv = lowerExpr(*call.args[1].value);
+                if (!kv) return nullptr;
+                kindBits = dtKindBitsFromEnum(kv);
+            }
+            // per stdlib §2.5 (#7716, "Parse and range contracts"):
+            // `FromTicks` raises OverflowException when the tick count falls
+            // outside MinValue..MaxValue. The check is also what keeps the
+            // Kind bits (62..63) clean: an unsigned compare against MaxValue
+            // rejects every negative count and every count >= 2^62.
+            emitGuardThrow(
+                builder_.CreateICmpUGT(
+                    v, builder_.getInt64(3155378975999999999LL), "dt.ft.oob"),
+                "OverflowException");
+            return dtCompose(v, kindBits);
         }
         // per §2.5 / #648: DateTime.Parse(s: string): DateTime — accepts the
         // type's own rendered forms (round-trip `yyyy-MM-ddTHH:mm:ss`, an
@@ -17175,7 +17242,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                           ? builder_.CreateZExt(sec, i64())
                           : builder_.CreateSExt(sec, i64());
             auto* fn = declareC("bz_datetime_from_unix_seconds", i64(), {i64()});
-            return builder_.CreateCall(fn, {sec}, "dt.fromux");
+            // per stdlib §2.5 (#7716): FromUnixTimeSeconds produces Kind = Utc.
+            return dtCompose(builder_.CreateCall(fn, {sec}, "dt.fromux"),
+                             dtKindBitsConst(1));
         }
     }
     // ---------------------------------------------------------------------------
@@ -17861,14 +17930,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         llvm::Value* r = llvm::ConstantFP::get(dbl, ratio);
                         llvm::Value* delta = builder_.CreateFPToSI(
                             builder_.CreateFMul(qty, r), i64(), "dt.delta");
-                        return builder_.CreateAdd(ticks, delta, "dt.add");
+                        // per stdlib §2.5 (#7716): the result keeps the
+                        // receiver's Kind.
+                        return dtCompose(
+                            builder_.CreateAdd(dtTicksOf(ticks), delta, "dt.add"),
+                            dtKindBitsOf(ticks));
                     };
 
                     // §2.5: DateTime.Add(span: TimeSpan): DateTime
                     if (mname == "Add" && call.args.size() == 1 && call.args[0].value) {
                         llvm::Value* span = arg0i64();
                         if (!span) return nullptr;
-                        return builder_.CreateAdd(ticks, span, "dt.addspan");
+                        return dtCompose(
+                            builder_.CreateAdd(dtTicksOf(ticks), span, "dt.addspan"),
+                            dtKindBitsOf(ticks));
                     }
                     // §2.5: AddDays/Hours/Minutes/Seconds/Milliseconds(double): DateTime
                     if (mname == "AddDays")         return addDoubleTicks(864000000000.0);
@@ -17901,16 +17976,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         if (!arg) return nullptr;
                         // Subtract(span: TimeSpan): DateTime
                         if (otherIsSpan)
-                            return builder_.CreateSub(ticks, arg, "dt.subspan");
-                        // Subtract(other: DateTime): TimeSpan
-                        return builder_.CreateSub(ticks, arg, "dt.subdt");
+                            return dtCompose(
+                                builder_.CreateSub(dtTicksOf(ticks), arg, "dt.subspan"),
+                                dtKindBitsOf(ticks));
+                        // Subtract(other: DateTime): TimeSpan -- tick
+                        // difference, neither Kind taking part (#7716).
+                        return builder_.CreateSub(dtTicksOf(ticks), dtTicksOf(arg),
+                                                  "dt.subdt");
                     }
-                    // §2.5: ToUtc() / ToLocal() — identity for now.
-                    // The spec defines Kind (Utc/Local/Unspecified) but the runtime
-                    // stores UTC ticks only; Kind is not persisted in the scalar.
-                    // Deferred: full timezone conversion needs platform TZ APIs.
+                    // §2.5: ToUtc() / ToLocal() — the tick count is unchanged
+                    // (no zone-offset arithmetic exists; stdlib §2.5 reads a
+                    // Local value "via ToUtc() first" deterministically) and
+                    // the result's Kind is Utc / Local (#7716).
                     if (mname == "ToUtc" || mname == "ToLocal")
-                        return ticks;
+                        return dtCompose(ticks, dtKindBitsConst(mname == "ToUtc" ? 1 : 2));
                     // per stdlib §2.5 / #1357: CompareTo(other: DateTime): int.
                     // Inline: (a > b) - (a < b) on i64.
                     if (mname == "CompareTo" && call.args.size() == 1 && call.args[0].value) {
@@ -17918,10 +17997,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         if (!other) return nullptr;
                         if (!other->getType()->isIntegerTy(64))
                             other = builder_.CreateSExt(other, i64());
+                        // CompareTo = tick order, Kind not normalized (§2.5).
+                        llvm::Value* ta = dtTicksOf(ticks);
+                        llvm::Value* tb = dtTicksOf(other);
                         llvm::Value* gt = builder_.CreateZExt(
-                            builder_.CreateICmpSGT(ticks, other), i32(), "dt.cmp.gt");
+                            builder_.CreateICmpSGT(ta, tb), i32(), "dt.cmp.gt");
                         llvm::Value* lt = builder_.CreateZExt(
-                            builder_.CreateICmpSLT(ticks, other), i32(), "dt.cmp.lt");
+                            builder_.CreateICmpSLT(ta, tb), i32(), "dt.cmp.lt");
                         return builder_.CreateSub(gt, lt, "dt.cmp");
                     }
                     // per stdlib §2.5 / #1357: ToUnixTimeSeconds(): long.

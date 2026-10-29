@@ -937,6 +937,10 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
         // per §10.5 (v0.183): an enum key compares via a user `Equals(E): bool`
         // if declared, else by underlying-integer equality (§8.3).
         eq = emitEnumEquals(a, b, ty->declaration);
+    else if (isDateTimeValueRef(ty))
+        // per stdlib §2.5 (#7716): tick equality, the Kind bits cleared --
+        // the hash half (emitValueHashCode) clears them too.
+        eq = emitValueEquality(a, b, ty);
     else
         eq = builder_.CreateICmpEQ(a, b);                  // int/bool/char/ptr
     builder_.CreateRet(eq);
@@ -1532,7 +1536,15 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
 
     // Build a unique name per key LLVM type to cache it per module.
     std::string name = "bz$sdcmp$";
-    if (kllvm->isIntegerTy(32))       name += "i32";
+    // per stdlib §2.5 (#7716): a DateTime is an i64 carrying its Kind in bits
+    // 62..63, and its ordering is "CompareTo = tick order (Kind not
+    // normalized)". It must NOT share `bz$sdcmp$i64` with long/TimeSpan: a
+    // signed compare of the raw word ranks every Local value (bit 63 set)
+    // first and every Utc value after every Unspecified one. Its own
+    // comparator masks both sides to the tick count.
+    const bool dtKey = isDateTimeValueRef(keyTy) && kllvm->isIntegerTy(64);
+    if (dtKey)                        name += "datetime";
+    else if (kllvm->isIntegerTy(32))  name += "i32";
     else if (kllvm->isIntegerTy(64))  name += "i64";
     else if (kllvm->isIntegerTy(8))   name += "i8";
     else if (kllvm->isIntegerTy(16))  name += "i16";
@@ -1591,6 +1603,10 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
     llvm::Value* bPtr = fn->getArg(1);
     llvm::Value* av   = builder_.CreateLoad(kllvm, aPtr, "ka");
     llvm::Value* bv   = builder_.CreateLoad(kllvm, bPtr, "kb");
+    if (dtKey) {
+        av = dtTicksOf(av);
+        bv = dtTicksOf(bv);
+    }
     llvm::Value* isLess, *isGreater;
     if (kllvm->isFloatingPointTy()) {
         isLess    = builder_.CreateFCmpOLT(av, bv, "flt");
@@ -1816,6 +1832,10 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
             // type and already owns the inline-array row, so routing through it
             // keeps ONE authority rather than two.
             eq = emitValueEquality(a, b, elemRef);
+        } else if (isDateTimeValueRef(elemRef)) {
+            // per stdlib §2.5 (#7716): a DateTime dedups by tick count; the
+            // hash half (buildLinqHashTrampoline) clears the Kind bits too.
+            eq = emitValueEquality(a, b, elemRef);
         } else {
             eq = builder_.CreateICmpEQ(a, b);  // value equality (int/bool/char)
         }
@@ -2035,7 +2055,9 @@ llvm::Function* Emitter::buildLinqHashTrampoline(llvm::Type* elemTy,
         else
             h = builder_.CreatePtrToInt(v, i64());  // defensive (unreachable)
     } else if (elemTy->isIntegerTy(64)) {
-        h = v;
+        // per stdlib §2.5 (#7716): a DateTime hashes its tick count, matching
+        // the kind-3 equality trampoline's tick equality.
+        h = isDateTimeValueRef(elemRef) ? dtTicksOf(v) : v;
     } else if (elemTy->isIntegerTy(32)) {
         h = builder_.CreateZExt(v, i64());
     } else {

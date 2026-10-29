@@ -130,12 +130,24 @@ BEZEL_TEST(datetime_fromticks_unsigned_7252,
 }
 
 // THE SIGNED CONTROL — a widening that zero-extended INDISCRIMINATELY would
-// break this row: a negative `ticks` must keep its sign.
+// break this row: a negative `ticks` must keep its sign. Since #7716 a DateTime
+// stores `Kind` in the top two bits of its scalar, and stdlib §2.5 ("Parse and
+// range contracts", v0.350) says `FromTicks` raises OverflowException outside
+// MinValue..MaxValue, so a negative count is no longer returned as-is: it
+// RAISES (sign-extended -5 is out of range). A zero-extending widening would
+// turn the `int` -5 into 4294967291, an IN-range tick count that does NOT
+// raise, so the row still tells the two apart.
 BEZEL_TEST(datetime_fromticks_unsigned_7252,
            a_negative_signed_argument_keeps_its_sign_5_1) {
     expectValue(
-        prog("    Console.WriteLine(DateTime.FromTicks(-5L).Ticks);\n"),
-        "-5");
+        prog("    var i: int := -5;\n"
+             "    try\n"
+             "      var d := DateTime.FromTicks(i);\n"
+             "      Console.WriteLine($\"no raise {d.Ticks}\");\n"
+             "    catch OverflowException =>\n"
+             "      Console.WriteLine(\"OVF\");\n"
+             "    end;\n"),
+        "OVF");
 }
 
 // ===========================================================================

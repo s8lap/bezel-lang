@@ -8628,8 +8628,19 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         "ArgumentOutOfRangeException");
                 auto* fn = declareC("bz_datetime_parts_to_ticks", i64(),
                     {i32(), i32(), i32(), i32(), i32(), i32(), i32()});
-                return builder_.CreateCall(fn,
+                llvm::Value* ticks = builder_.CreateCall(fn,
                     {yr, mo, day, hr, mn, sec, ms}, "dt.ctor");
+                // per stdlib §2.5 (#7716): the eighth parameter `kind`
+                // defaults to DateTimeKind.Unspecified (0); the three- and
+                // six-argument spellings leave it at that default.
+                llvm::Value* kindBits = dtKindBitsConst(0);
+                if (const ast::CallArgument* ka = ctorArgFor(7);
+                    ka && ka->value) {
+                    llvm::Value* kv = lowerExpr(*ka->value);
+                    if (!kv) return nullptr;
+                    kindBits = dtKindBitsFromEnum(kv);
+                }
+                return dtCompose(ticks, kindBits);
             }
             // §2.5: new TimeSpan(ticks: long) — construct from raw tick count.
             // No heap allocation — TimeSpan is a scalar i64.

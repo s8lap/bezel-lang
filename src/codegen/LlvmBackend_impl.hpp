@@ -6639,6 +6639,46 @@ private:
     // CG31: is the assignment/increment target an unsigned-typed lvalue?
     bool isUnsignedTargetExpr(const ast::Expr& e);
 
+    // per stdlib §2.5 (#7716): a DateTime is ONE i64 -- ticks in bits 0..61
+    // (MaxValue < 2^62) and `Kind` in bits 62..63 (Unspecified 0, Utc 1,
+    // Local 2; the .NET layout), so Unspecified values are bit-identical to
+    // the plain tick count. These four helpers are the ONLY place the layout
+    // is spelled in codegen.
+    static constexpr std::int64_t kDtTicksMask = 0x3FFFFFFFFFFFFFFFLL;
+    // The tick count with the kind bits cleared.
+    llvm::Value* dtTicksOf(llvm::Value* v) {
+        return builder_.CreateAnd(v, builder_.getInt64(kDtTicksMask), "dt.ticks");
+    }
+    // The kind bits, still in place (bits 62..63).
+    llvm::Value* dtKindBitsOf(llvm::Value* v) {
+        return builder_.CreateAnd(v, builder_.getInt64(~kDtTicksMask), "dt.kindbits");
+    }
+    // Kind bits for the constant kind `k` (0 Unspecified, 1 Utc, 2 Local).
+    llvm::Value* dtKindBitsConst(unsigned k) {
+        return builder_.getInt64(static_cast<std::int64_t>(
+            static_cast<std::uint64_t>(k) << 62));
+    }
+    // Kind bits from a DateTimeKind enum value (any integer width).
+    llvm::Value* dtKindBitsFromEnum(llvm::Value* kindEnum) {
+        llvm::Value* k = builder_.CreateZExtOrTrunc(kindEnum, i64());
+        return builder_.CreateShl(k, 62, "dt.kindbits.enum");
+    }
+    // ticks (already masked) combined with kind bits.
+    llvm::Value* dtCompose(llvm::Value* ticks, llvm::Value* kindBits) {
+        return builder_.CreateOr(dtTicksOf(ticks), kindBits, "dt.compose");
+    }
+    // per stdlib §2.5 ("CompareTo = tick order (Kind not normalized, matching
+    // .NET)"; interim coordinator decision recorded on #7764): DateTime
+    // equality, hashing and ordering run on the TICK COUNT, so the kind bits
+    // never take part. True for a non-nullable DateTime TypeRef, seen through
+    // an active type-parameter binding. Every equality / hash / comparator
+    // builder that would otherwise compare the raw i64 word consults this.
+    bool isDateTimeValueRef(const sema::TypeRef* t) const {
+        if (!t) return false;
+        t = resolveTypeParamRef(t);
+        return t && !t->nullable && builtinTypeName(t) == "DateTime";
+    }
+
     // §6.6/§5.2 (#1961): is the compound-assignment/increment target a `char`
     // lvalue? A `char` LHS desugars `c OP= e` to `c := char(c OP e)`, so the
     // write-back must apply the §5.2 code-point narrowing — emitCompoundOp
