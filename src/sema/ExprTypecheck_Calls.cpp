@@ -34245,6 +34245,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // degrades to a zero-initialised slot (see
                     // `stringPropertyCallMessage`). The bare read below is
                     // unchanged. Typed as the property so nothing cascades.
+                    //
+                    // fix #7477 (§26.5 rule 1, v0.350): a same-named
+                    // extension (`extension string Length()`) is never
+                    // consulted, and "the diagnostic should note a
+                    // same-named extension where one exists".
                     if (&ma == calleeOfCallCtx_) {
                         if (const char* pty =
                                 stringDeclaredPropertyType(ma.member)) {
@@ -34252,7 +34257,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             if (loc.line == 0) loc = ma.target->span.begin;
                             ctx_.diagnostics().report(
                                 Severity::Error, loc,
-                                stringPropertyCallMessage(ma.member, pty));
+                                stringPropertyCallMessage(ma.member, pty) +
+                                    extensionNameBlockedNote(tt, ma.member));
                             ctx_.setExprType(
                                 &ma, ctx_.primitiveTypeRef(
                                          ma.member == "Length"
@@ -38937,6 +38943,8 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     // form's §9.6-property call rejection (`s?.Length()`). It runs BEFORE
     // the extension lookup below: `string` declares the name, so §26.5 rule
     // 1 commits the lookup and no extension block is consulted for it.
+    // fix #7477 (§26.5 rule 1, v0.350): the message notes a same-named
+    // extension where one exists, as rule 1 asks.
     if (!member && nm.target && &nm == calleeOfCallCtx_) {
         const TypeRef* recvTy = ctx_.exprType(*nm.target);
         if (recvTy && recvTy->kind == TypeRef::Kind::Primitive &&
@@ -38946,7 +38954,8 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 if (loc.line == 0) loc = nm.target->span.begin;
                 ctx_.diagnostics().report(
                     Severity::Error, loc,
-                    stringPropertyCallMessage(nm.member, pty));
+                    stringPropertyCallMessage(nm.member, pty) +
+                        extensionNameBlockedNote(recvTy, nm.member));
                 ctx_.setExprType(
                     &nm, ctx_.primitiveTypeRef(nm.member == "Length"
                                                    ? PrimitiveType::Int
