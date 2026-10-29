@@ -714,6 +714,54 @@ QUARANTINE = {
     ('task', 'field_store'): '#6194',
 }
 
+# Cells that are red TODAY because of a defect another CAMPAIGN owns (the R37
+# plan's section 4 ruling; the exit review's rule "a red cell is red, whoever
+# owns it" was written for cells a campaign-1 lane could fix). A FOREIGN cell is
+# SHOWN in the table (its row reads `FOREIGN(#N)` and keeps the underlying
+# verdict in its text) but is held OUT of the DONE count: campaign 1 cannot
+# exit before four other campaigns land otherwise. It never makes the verdict
+# worse; and it never makes it better -- it is reported on its own line.
+#
+# A FOREIGN row is honest only while the cell is red FOR THAT ISSUE:
+#   * a FOREIGN cell that turns OK is reported OK with a note to delete its row;
+#   * `--check-issues` re-promotes a FOREIGN cell whose issue is CLOSED to a
+#     blocking WRONG cell (the issue claims done and the cell disagrees);
+#   * only WRONG / MISMATCH / KNOWN-RED are demoted: a TIMEOUT is UNMEASURED and
+#     keeps blocking.
+#
+# Each entry was checked against the cell's observed text and the issue:
+#   #7288  the function head's four copy cells LEAK (3840B/60 in the loop
+#          oracle): a closure-value ownership defect the issue names, not a
+#          `using var` admission or disposal defect;
+#   #7092  a collection LITERAL is an owned producer (§28.3.4) but the ownership
+#          pass does not see it as one: no must-use warning on the `var src`
+#          holding it (compare the `builtin_collection` twin), the `const`
+#          initializer is not refused (§21.1), and `using var` is called vacuous;
+#   #7241  the vacuity lint's guard `!rhsIsDisposableClassType(rhsTy)`
+#          (MethodOwnership::handleLocalDecl) answers `classifyDisposal(...)
+#          .carriesObligation`, false for the borrowing family -- the predicate
+#          #7241 names. The cell is the BORROW-PIN form (a callee `using var x
+#          := src` over `src: Array<int>`), not #7241's owned-holder literal
+#          repro, so the attribution is CONFIRMED BY CODE READING of the shared
+#          predicate, not by a fix;
+#   #7273  `string` `Dispose()` / `DisposeAsync()` are refused, but the
+#          diagnostic names no §28.9 (the rule the cell asserts).
+FOREIGN = {
+    # (head, form) -> the issue (owned by another campaign) that explains the red
+    ('function', 'copy_local_source'): '#7288',
+    ('function', 'copy_await_source'): '#7288',
+    ('function', 'copy_const_source'): '#7288',
+    ('function', 'copy_param_source'): '#7288',
+    ('collection_literal', 'using_var'): '#7092',
+    ('collection_literal', 'await_using_var'): '#7092',
+    ('collection_literal', 'copy_await_source'): '#7092',
+    ('collection_literal', 'copy_const_source'): '#7092',
+    ('collection_literal', 'copy_param_source'): '#7092',
+    ('builtin_collection', 'copy_param_source'): '#7241',
+    ('string', 'explicit_dispose'): '#7273',
+    ('string', 'explicit_dispose_async'): '#7273',
+}
+
 # §28.12: "`await using var` takes §28.10's admission UNCHANGED". The two
 # spellings of the same program must AGREE on the admission. The grid used to
 # DERIVE the await cell's expectation from the plain cell's, which means a
@@ -1333,14 +1381,24 @@ def blocking_count(jc):
             jc.get('MISMATCH', 0) + jc.get('TIMEOUT', 0))
 
 
-def summary_lines(total, jc, asan_skipped, quarantined, quarantined_verdicts):
+def foreign_rows(rows):
+    """The rows judged FOREIGN(#N), in grid order."""
+    return [r for r in rows if r[2].startswith('FOREIGN(')]
+
+
+def summary_lines(total, jc, asan_skipped, quarantined, quarantined_verdicts,
+                  foreign=None):
     """The summary the grid prints, as LINES (so a test can assert on them).
 
     `asan_skipped` is the count of cells whose ASan check was skipped
     because the ASan RUNTIME was unavailable — its OWN counter (see
     `asan_skipped_count`), never the timeout count. A TIMEOUT is reported in
     the cells line as a TIMEOUT and it BLOCKS the verdict.
+
+    `foreign` is the list of FOREIGN rows (see `FOREIGN`): shown on their own
+    line, with the issue that owns each, and never counted in the DONE number.
     """
+    foreign = foreign or []
     lines = [
         f'{total} cells: {jc.get("OK", 0)} ok, {jc.get("WRONG", 0)} wrong, '
         f'{jc.get("KNOWN-RED", 0)} known-red, {jc.get("MISMATCH", 0)} '
@@ -1353,11 +1411,23 @@ def summary_lines(total, jc, asan_skipped, quarantined, quarantined_verdicts):
             f'count (pending {sorted(set(QUARANTINE.values()))[0]}): '
             + ', '.join(f'{v} {k}' for k, v in
                         sorted(quarantined_verdicts.items())))
+    if foreign:
+        per_issue = {}
+        for r in foreign:
+            tag = r[2][len('FOREIGN('):-1]
+            per_issue[tag] = per_issue.get(tag, 0) + 1
+        lines.append(
+            f'FOREIGN: {len(foreign)} cell(s) shown but held out of the DONE '
+            'count (another campaign owns the defect): '
+            + ', '.join(f'{k} x{v}' for k, v in sorted(per_issue.items())))
     lines.append(f'NATIVE SANITIZER: {asan_skipped} check(s) skipped')
     blocking = blocking_count(jc)
     if blocking:
         lines.append(f'DONE: NO — {blocking} cell(s) block it (wrong + '
                      'known-red + mismatch + timeout)')
+    elif foreign:
+        lines.append('DONE: YES — no cell blocks the verdict '
+                     f'({len(foreign)} FOREIGN cell(s) are outside the count)')
     else:
         lines.append('DONE: YES — no cell blocks the verdict')
     return lines
@@ -1398,12 +1468,26 @@ def judge(results, check_issues=False):
             quarantined_verdicts[verdict] = quarantined_verdicts.get(
                 verdict, 0) + 1
             verdict = 'QUARANTINED'
+        elif (head, form) in FOREIGN:
+            issue = FOREIGN[(head, form)]
+            if verdict in ('WRONG', 'MISMATCH', 'KNOWN-RED'):
+                if check_issues and not issue_is_open(issue):
+                    observed = (f'{observed} [{issue} - the issue is CLOSED, '
+                                'so this is not FOREIGN]')
+                else:
+                    observed = (f'{verdict}: {observed} [{issue}, owned by '
+                                'another campaign]')
+                    verdict = f'FOREIGN({issue})'
+            elif verdict == 'OK':
+                observed = (f'{observed} [{issue} no longer explains a red '
+                            'here: delete the FOREIGN row]')
         rows.append((head, form, verdict, observed, detail))
     counts = {}
     for r in rows:
         counts[r[2]] = counts.get(r[2], 0) + 1
     quarantined = [r for r in rows if r[2] == 'QUARANTINED']
-    judged = [r for r in rows if r[2] != 'QUARANTINED']
+    judged = [r for r in rows
+              if r[2] != 'QUARANTINED' and not r[2].startswith('FOREIGN(')]
     jc = {}
     for r in judged:
         jc[r[2]] = jc.get(r[2], 0) + 1
@@ -1496,7 +1580,8 @@ def main():
     total = len(rows)
     asan_skipped = asan_skipped_count(odir, cells)
     for line in summary_lines(total, jc, asan_skipped, quarantined,
-                              quarantined_verdicts):
+                              quarantined_verdicts,
+                              foreign=foreign_rows(rows)):
         print(line)
 
     if args.twins:

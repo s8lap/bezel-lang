@@ -542,6 +542,26 @@ not counted wrong.
   flip run-to-run. The quarantined cells are counted separately and reported
   on their own line; they never make the verdict better and never make it
   worse.
+* **FOREIGN cells (R37, v0.350): shown, but outside the DONE count.** Twelve
+  cells are red today for a defect another campaign owns, and campaign 1
+  cannot exit before four other campaigns land otherwise. A `FOREIGN(#N)` row
+  is printed in the table with the underlying verdict and the issue in its
+  text, is counted on its own `FOREIGN:` line, and is held out of the
+  verdict: function copy x4 (`copy_local_source`, `copy_await_source`,
+  `copy_const_source`, `copy_param_source`; #7288), `collection_literal` x5
+  (`using_var`, `await_using_var`, `copy_await_source`, `copy_const_source`,
+  `copy_param_source`; #7092), `builtin_collection/copy_param_source` (#7241)
+  and `string/explicit_dispose` + `explicit_dispose_async` (#7273). Only
+  WRONG / MISMATCH / KNOWN-RED are demoted (a TIMEOUT is unmeasured and
+  keeps blocking); a FOREIGN cell that turns OK says to delete its row; and
+  `--check-issues` promotes a cell back to blocking when its issue is closed.
+  #7241's attribution was re-checked: the vacuity lint's guard
+  (`!rhsIsDisposableClassType`) answers `classifyDisposal(...).carriesObligation`,
+  the same predicate #7241 names, but the cell is the borrow-pin form rather
+  than #7241's owned-holder repro, so it is confirmed by reading the shared
+  predicate, not by a fix. `collection_literal/copy_local_source` is NOT in
+  the list (the brief's twelve exclude it), though it is likely gated by
+  #7092 too.
 * **The two spellings of a program must AGREE (§28.12: "`await using var`
   takes §28.10's admission UNCHANGED").** The grid compares each head's
   `using var` and `await using var` cells, and its `copy_local_source` and

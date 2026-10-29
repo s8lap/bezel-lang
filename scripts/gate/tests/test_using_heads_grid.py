@@ -293,6 +293,84 @@ class UsingHeadsGridTest(unittest.TestCase):
         for (head, form), issue in g.QUARANTINE.items():
             self.assertTrue(issue.startswith('#'), f'{head}/{form}')
 
+    # --------------------------------------------------------------- foreign
+    def test_every_foreign_cell_names_the_issue_that_owns_it(self):
+        """The R37 plan's 12 foreign cells: function copy x4 (#7288),
+        collection_literal x5 (#7092), builtin_collection copy_param
+        (#7241), string explicit_dispose x2 (#7273)."""
+        self.assertEqual(len(g.FOREIGN), 12)
+        per_issue = {}
+        for (head, form), issue in g.FOREIGN.items():
+            self.assertRegex(issue, r'^#\d+$', f'{head}/{form}')
+            per_issue[issue] = per_issue.get(issue, 0) + 1
+            self.assertIn((head, form), g.all_cells(), f'{head}/{form}')
+        self.assertEqual(per_issue, {'#7288': 4, '#7092': 5, '#7241': 1,
+                                     '#7273': 2})
+
+    def test_a_foreign_cell_is_shown_but_held_out_of_the_done_count(self):
+        """Mutation killed: a FOREIGN cell counted as blocking (the demotion
+        removed), or hidden from the rows."""
+        results = [('function', 'copy_local_source', 'WRONG',
+                    'LEAK: 3840B/60', ''),
+                   ('class', 'using_var', 'OK', 'clean, output []', '')]
+        rows, _c, jc, _q, done, _qv = g.judge(results)
+        self.assertEqual(rows[0][2], 'FOREIGN(#7288)')
+        self.assertIn('LEAK: 3840B/60', rows[0][3])
+        self.assertIn('#7288', rows[0][3])
+        self.assertEqual(jc.get('WRONG', 0), 0)
+        self.assertEqual(jc, {'OK': 1}, 'FOREIGN is outside the judged counts')
+        self.assertTrue(done, 'a FOREIGN cell must not block the verdict')
+        self.assertEqual(len(g.foreign_rows(rows)), 1)
+
+    def test_a_foreign_cell_that_is_not_red_is_not_demoted(self):
+        """An OK FOREIGN cell stays OK (and says to delete its row); a
+        TIMEOUT is UNMEASURED and keeps blocking. Mutation killed: the
+        demotion applied to every verdict."""
+        ok = g.judge([('function', 'copy_local_source', 'OK', 'clean', '')])
+        self.assertEqual(ok[0][0][2], 'OK')
+        self.assertIn('delete the FOREIGN row', ok[0][0][3])
+        to = g.judge([('function', 'copy_local_source', 'TIMEOUT', 'hang',
+                       '')])
+        self.assertEqual(to[0][0][2], 'TIMEOUT')
+        self.assertFalse(to[4])
+
+    def test_a_non_foreign_cell_with_the_same_failure_still_blocks(self):
+        """Mutation killed: FOREIGN keyed on the failure text or the head
+        alone instead of the (head, form) pair."""
+        _r, _c, jc, _q, done, _qv = g.judge(
+            [('function', 'using_var', 'WRONG', 'LEAK: 3840B/60', '')])
+        self.assertEqual(jc.get('WRONG', 0), 1)
+        self.assertFalse(done)
+
+    def test_a_closed_foreign_issue_is_promoted_back_to_blocking(self):
+        """`--check-issues`: an issue that is CLOSED no longer excuses its
+        cell. Mutation killed: the CLOSED check dropped from the FOREIGN arm."""
+        real = g.issue_is_open
+        g.issue_is_open = lambda n: False
+        try:
+            rows, _c, jc, _q, done, _qv = g.judge(
+                [('function', 'copy_local_source', 'WRONG', 'LEAK', '')],
+                check_issues=True)
+        finally:
+            g.issue_is_open = real
+        self.assertEqual(rows[0][2], 'WRONG')
+        self.assertIn('CLOSED', rows[0][3])
+        self.assertFalse(done)
+
+    def test_the_summary_has_a_foreign_line_and_done_stays_honest(self):
+        foreign = [('function', 'copy_local_source', 'FOREIGN(#7288)', 'x',
+                    '')]
+        lines = g.summary_lines(10, {'OK': 9}, 0, [], {}, foreign=foreign)
+        self.assertTrue(any(l.startswith('FOREIGN: 1 cell(s)')
+                            and '#7288 x1' in l for l in lines), lines)
+        self.assertTrue(lines[-1].startswith('DONE: YES'), lines)
+        self.assertIn('FOREIGN', lines[-1])
+        lines = g.summary_lines(10, {'OK': 8, 'WRONG': 1}, 0, [], {},
+                                foreign=foreign)
+        self.assertTrue(lines[-1].startswith('DONE: NO'), lines)
+        plain = g.summary_lines(10, {'OK': 10}, 0, [], {})
+        self.assertFalse(any(l.startswith('FOREIGN') for l in plain))
+
     # ------------------------------------------------------------ agreement
     def test_the_agreement_check_sees_a_disagreement(self):
         """H2: §28.12's "takes §28.10's admission UNCHANGED" — the two
