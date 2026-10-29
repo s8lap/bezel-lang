@@ -17,7 +17,7 @@
 //
 // THE GOVERNING TEXT (checked in the CURRENT documents, v0.345).
 //
-// Standard library §9.1, docs/Bezel_Standard_Library.md:5161:
+// Standard library §9.1 (docs/Bezel_Standard_Library.md):
 //
 //   public static pure method Parse(s: string, radix: int): int;        // radix
 //   in {2, 8, 10, 16}; any other

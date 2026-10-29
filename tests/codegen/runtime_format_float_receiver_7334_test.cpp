@@ -6,7 +6,7 @@
 //
 // THE GOVERNING TEXT.
 //
-// Standard library §2.18 (docs/Bezel_Standard_Library.md:1136-1156, v0.345),
+// Standard library §2.18 (docs/Bezel_Standard_Library.md, v0.345),
 // the format-specifier table, per KIND:
 //
 //   | Floating (`double`, `float`) | `F`/`Fn` fixed-point (n decimals,

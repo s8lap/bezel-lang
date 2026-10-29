@@ -3,7 +3,7 @@
 // wide.
 //
 // THE GOVERNING TEXT. stdlib §2.18's specifier table (docs/
-// Bezel_Standard_Library.md:1149, v0.344) — the Integers row:
+// Bezel_Standard_Library.md, v0.344) — the Integers row:
 //
 //   | Integers (`int`, `long`, `byte`, …) | `D`/`Dn` decimal (n = min digits,
 //     zero-padded) · `X`/`x` hex (upper/lower, `Xn` pads) · `B` binary | no

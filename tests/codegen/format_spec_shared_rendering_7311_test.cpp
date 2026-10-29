@@ -6,7 +6,7 @@
 // THE GOVERNING TEXT.
 //
 // Standard library §2.18, the specifier table (docs/
-// Bezel_Standard_Library.md:1149-1156, v0.345), the Integers row:
+// Bezel_Standard_Library.md, v0.345), the Integers row:
 //
 //   | Integers (`int`, `long`, `byte`, …) | `D`/`Dn` decimal (n = min digits,
 //     zero-padded) · `X`/`x` hex (upper/lower, `Xn` pads) · `B` binary | no

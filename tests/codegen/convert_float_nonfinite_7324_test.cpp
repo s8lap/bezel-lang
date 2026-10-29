@@ -1,7 +1,7 @@
 // Regression tests for #7324 — the `Convert` float arms (stdlib §2.3, §9.2,
 // v0.344).
 //
-// stdlib §2.3 (docs/Bezel_Standard_Library.md:220, v0.344):
+// stdlib §2.3 (docs/Bezel_Standard_Library.md, v0.344):
 //
 //   "The `To*` methods raise `FormatException` when the string is not a
 //   well-formed representation of the target type and `OverflowException` when
@@ -10,7 +10,7 @@
 //   the cases the throwing forms would raise; the `out` parameter receives the
 //   default value."
 //
-// stdlib §9.2 (docs/Bezel_Standard_Library.md:5263, v0.344):
+// stdlib §9.2 (docs/Bezel_Standard_Library.md, v0.344):
 //
 //   "`Parse` accepts an optional sign (`+` or `-`), then one or more of the
 //   digits `0`–`9`, then optionally a `.` followed by one or more digits ... and

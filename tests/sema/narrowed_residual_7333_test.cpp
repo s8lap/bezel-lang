@@ -13,14 +13,13 @@
 //
 // THE GOVERNING TEXT (checked in the CURRENT documents, v0.345).
 //
-// Standard library §2.18, docs/Bezel_Standard_Library.md:1144:
+// Standard library §2.18 (docs/Bezel_Standard_Library.md):
 //
 //   The primitive and temporal types are **intrinsically formattable** (they
 //   behave as conforming implementations without declaring the interface); a
 //   format spec on any other non-conforming operand is a compile error.
 //
-// and the specifier vocabulary's last row,
-// docs/Bezel_Standard_Library.md:1156:
+// and the specifier vocabulary's last row (same document, §2.18):
 //
 //   | `bool`, `char`, `string` | *(none)* | a format spec on these is a
 //   compile error |
@@ -39,7 +38,7 @@
 // The `string` receiver is the third member of that vocabulary row, and it is
 // refused by the rule that owns it: stdlib §9.6 declares
 // `public pure override method ToString(): string;` (no format parameter),
-// docs/Bezel_Standard_Library.md:5454, so the one-argument form is an arity
+// docs/Bezel_Standard_Library.md, so the one-argument form is an arity
 // error under spec §22.5.
 //
 // THE ORACLE. A rejection is pinned by the diagnostic's TEXT — the whole
@@ -134,7 +133,7 @@ BEZEL_TEST(narrowed_residual_7333,
         "`char` is neither (§2.18; §18.5)");
 }
 
-// stdlib §2.18:1144's own sentence — "a format spec on any other
+// stdlib §2.18's own sentence — "a format spec on any other
 // non-conforming operand is a compile error". An `Object` is in no
 // vocabulary row and implements no `IFormattable`.
 BEZEL_TEST(narrowed_residual_7333, object_receiver_with_a_format_spec_is_refused) {
@@ -158,7 +157,7 @@ BEZEL_TEST(narrowed_residual_7333, hole_with_a_format_spec_on_a_bool_is_refused)
 }
 
 // The `string` receiver: stdlib §9.6 declares `ToString(): string` — no
-// format parameter (docs/Bezel_Standard_Library.md:5454) — so the
+// format parameter (docs/Bezel_Standard_Library.md) — so the
 // one-argument form is an arity error, under spec §22.5's rule that owns it.
 BEZEL_TEST(narrowed_residual_7333, string_receiver_with_a_format_spec_is_refused) {
     auto r = runAot(prog("", "    Console.WriteLine(\"abc\".ToString(\"F4\"));"));

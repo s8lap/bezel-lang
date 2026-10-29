@@ -15,7 +15,7 @@
 //   raise `FormatException`, as does any other input apart from exactly
 //   `"NaN"`, `"Infinity"` and `"-Infinity"`. ..."
 //
-// AND the neighbouring sentence (line 5265):
+// AND the neighbouring sentence:
 //
 //   "`TryParse` returns `false` in every case where `Parse` would raise, and
 //   the span forms carry the string forms' contract."
@@ -85,7 +85,7 @@ JitResult runWith(const std::string& src) { return runAot(src); }
 
 // The parse arms' operand: §9.2 declares both the `string` form and the
 // `ReadOnlyStringSpan` form, and the span form carries the string form's
-// contract ("the span forms carry the string forms' contract", §9.2:5265).
+// contract ("the span forms carry the string forms' contract", §9.2).
 std::string operand(bool span) { return span ? "s.AsSpan()" : "s"; }
 
 // A program that parses each input in turn and prints "<input> -> OK" (the
@@ -286,7 +286,7 @@ BEZEL_TEST(float_parse_signed_bare_point_7325,
     BEZEL_EXPECT_EQ(r.exitCode, kFormat);
 }
 
-// The `TryParse` form — §9.2:5265: "TryParse returns false in every case
+// The `TryParse` form — §9.2: "TryParse returns false in every case
 // where Parse would raise", and the `out` result receives the default.
 BEZEL_TEST(float_parse_signed_bare_point_7325,
            double_try_parse_returns_false_for_a_signed_bare_point_spec_9_2) {
@@ -312,7 +312,7 @@ BEZEL_TEST(float_parse_signed_bare_point_7325,
     BEZEL_EXPECT_EQ(r.exitCode, kFormat);
 }
 
-// The SPAN forms — §9.2:5265: "the span forms carry the string forms'
+// The SPAN forms — §9.2: "the span forms carry the string forms'
 // contract", so the span form must reject exactly what the string form
 // rejects.
 BEZEL_TEST(float_parse_signed_bare_point_7325,

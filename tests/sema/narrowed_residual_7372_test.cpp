@@ -31,15 +31,15 @@
 //
 // The standard library declares the first parameter of every `Parse` /
 // `TryParse` form as a `string`:
-//   - stdlib §9.1 (`int`), docs/Bezel_Standard_Library.md:5152
+//   - stdlib §9.1 (`int`), docs/Bezel_Standard_Library.md
 //     `public static pure method Parse(s: string): int;`
 //     and :5153 `public static method TryParse(s: string, out result: int): bool;`
 //     (the `ReadOnlyStringSpan` forms at :5170-5171);
-//   - stdlib §9.2 (`double`), docs/Bezel_Standard_Library.md:5208-5209;
-//   - stdlib §9.3 (`decimal`), docs/Bezel_Standard_Library.md:5281-5282;
-//   - stdlib §9.4 (`bool`), docs/Bezel_Standard_Library.md:5307-5308;
-//   - stdlib §9.5 (`char`), docs/Bezel_Standard_Library.md:5338-5339;
-//   - stdlib §2.6 (`Guid`), docs/Bezel_Standard_Library.md:459-460.
+//   - stdlib §9.2 (`double`), docs/Bezel_Standard_Library.md;
+//   - stdlib §9.3 (`decimal`), docs/Bezel_Standard_Library.md;
+//   - stdlib §9.4 (`bool`), docs/Bezel_Standard_Library.md;
+//   - stdlib §9.5 (`char`), docs/Bezel_Standard_Library.md;
+//   - stdlib §2.6 (`Guid`), docs/Bezel_Standard_Library.md.
 //
 // So a call that reaches one of those forms with a non-string first argument
 // has NO reachable candidate, and §22.6 makes it a compile error.

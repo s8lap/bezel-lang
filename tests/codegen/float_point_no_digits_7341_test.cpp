@@ -14,12 +14,12 @@
 //   raise `FormatException`, as does any other input apart from exactly
 //   `"NaN"`, `"Infinity"` and `"-Infinity"`. ..."
 //
-// AND the neighbouring sentences (line 5265):
+// AND the neighbouring sentences:
 //
 //   "`TryParse` returns `false` in every case where `Parse` would raise, and
 //   the span forms carry the string forms' contract."
 //
-// AND stdlib §2.3 (line 219) — the mirror the Convert family owes the Parse
+// AND stdlib §2.3 — the mirror the Convert family owes the Parse
 // family:
 //
 //   "The `To*` methods raise `FormatException` when the string is not a
@@ -147,7 +147,7 @@ const std::vector<Case> kControl = {
 
 // The parse arms' operand: §9.2 declares both the `string` form and the
 // `ReadOnlyStringSpan` form, and the span form carries the string form's
-// contract ("the span forms carry the string forms' contract", §9.2:5265).
+// contract ("the span forms carry the string forms' contract", §9.2).
 std::string operand(bool span) { return span ? "s.AsSpan()" : "s"; }
 
 // The initial value of the `out` slot of a Try form.  It is NOT the default,
@@ -405,7 +405,7 @@ int sumOfMirror(const std::vector<Case>& cases) { return 2 * sumOf(cases); }
 // Every family must reject it with a FormatException.
 // ===========================================================================
 
-// stdlib §2.3 (line 219): `Convert.ToDouble` mirrors §9.2's `Parse`.
+// stdlib §2.3: `Convert.ToDouble` mirrors §9.2's `Parse`.
 BEZEL_TEST(float_point_no_digits_7341,
            convert_to_double_rejects_a_point_with_no_digits_spec_2_3) {
     JitResult r = runAot(convertOutcomeProg(inputsOf(kDefect)));
@@ -414,7 +414,7 @@ BEZEL_TEST(float_point_no_digits_7341,
     BEZEL_EXPECT_EQ(r.exitCode, sumOf(kDefect));
 }
 
-// stdlib §2.3 (line 219): "`Try` forms return `false` in exactly the cases
+// stdlib §2.3: "`Try` forms return `false` in exactly the cases
 // the throwing forms would raise; the `out` parameter receives the default
 // value."
 BEZEL_TEST(float_point_no_digits_7341,
@@ -425,7 +425,7 @@ BEZEL_TEST(float_point_no_digits_7341,
     BEZEL_EXPECT_EQ(r.exitCode, sumOfTry(kDefect));
 }
 
-// stdlib §9.2 (line 5263): "optionally a `.` followed by one or more digits".
+// stdlib §9.2: "optionally a `.` followed by one or more digits".
 BEZEL_TEST(float_point_no_digits_7341,
            double_parse_rejects_a_point_with_no_digits_spec_9_2) {
     JitResult r = runAot(parseOutcomeProg("double", inputsOf(kDefect)));
@@ -443,7 +443,7 @@ BEZEL_TEST(float_point_no_digits_7341,
     BEZEL_EXPECT_EQ(r.exitCode, sumOf(kDefect));
 }
 
-// stdlib §9.2 (line 5265): "`TryParse` returns `false` in every case where
+// stdlib §9.2: "`TryParse` returns `false` in every case where
 // `Parse` would raise".
 BEZEL_TEST(float_point_no_digits_7341,
            double_try_parse_returns_false_for_a_point_with_no_digits_spec_9_2) {
@@ -453,7 +453,7 @@ BEZEL_TEST(float_point_no_digits_7341,
     BEZEL_EXPECT_EQ(r.exitCode, sumOfTry(kDefect));
 }
 
-// stdlib §9.2 (line 5265): "the span forms carry the string forms'
+// stdlib §9.2: "the span forms carry the string forms'
 // contract" — the span form must reject exactly what the string form
 // rejects.
 BEZEL_TEST(float_point_no_digits_7341,
@@ -472,7 +472,7 @@ BEZEL_TEST(float_point_no_digits_7341,
     BEZEL_EXPECT_EQ(r.exitCode, sumOfTry(kDefect));
 }
 
-// stdlib §2.15 (line 945): "`ReadFloat` reads a JSON number of any length".
+// stdlib §2.15: "`ReadFloat` reads a JSON number of any length".
 // JSON's number grammar requires at least one digit after the '.', so "1.e3"
 // is not a JSON number.
 BEZEL_TEST(float_point_no_digits_7341,

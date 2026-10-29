@@ -5,7 +5,7 @@
 //
 // THE GOVERNING TEXT.
 //
-// Standard library §2.18 (docs/Bezel_Standard_Library.md:1146-1156, v0.345):
+// Standard library §2.18 (docs/Bezel_Standard_Library.md, v0.345):
 //
 //   "The specifier vocabulary is invariant-culture only — Bezel has no
 //    culture machinery, and formatted output is identical on every platform.
