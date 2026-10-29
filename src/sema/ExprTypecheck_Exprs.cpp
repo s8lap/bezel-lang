@@ -10658,6 +10658,40 @@ std::string ExprTC::moveOnNonOwnedFieldName(const ast::Expr& operand) const {
     return {};
 }
 
+// §28.8.1 / §22.12 note (h) / K9.4 (v0.350): static owned storage -- the slots
+// of a `static readonly` owning inline array -- admits no `move`. The field is
+// the one admitted static of owning-inline-array type (a mutable one is rule 2's
+// closing error), so "static field of owning-inline-array type" names it.
+// Matches `Cls.Pool[j]` / bare `Pool[j]` (and the `!` form); the empty string
+// for any other shape.
+std::string ExprTC::moveThroughStaticOwningArraySlotName(
+    const ast::Expr& operand) const {
+    const ast::Expr* loc = &operand;
+    while (const auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(loc))
+        loc = pb->operand.get();
+    const auto* ix = dynamic_cast<const ast::IndexExpr*>(loc);
+    if (!ix || !ix->target) return {};
+    const auto* fs =
+        dynamic_cast<sema::FieldSymbol*>(ctx_.exprSymbol(*ix->target));
+    if (!fs) return {};
+    bool isStatic = false;
+    for (std::string_view m : fs->modifiers)
+        if (m == "static") { isStatic = true; break; }
+    if (!isStatic) return {};
+    const TypeRef* tt = ctx_.exprType(*ix->target);
+    if (!tt || tt->kind != TypeRef::Kind::InlineArray || !tt->arrayOwned)
+        return {};
+    if (const auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ix->target.get())) {
+        std::string recv = "<expr>";
+        if (const auto* rid =
+                dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+            recv = std::string(rid->name);
+        return recv + "." + std::string(ma->member);
+    }
+    return std::string(fs->name);
+}
+
 void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     const auto& op = ue.op;
     // §25: a user-defined unary operator overload.
@@ -10757,6 +10791,26 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         }
         ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;
+    }
+    // §28.8.1 / §22.12 note (h) / K9.4 (v0.350): a `move arr[j]` (bare or
+    // replacing) through a `static readonly` owning inline array is a compile
+    // error naming K9.4 -- static owned storage is disposed only by the §22.13
+    // exit pass, and no per-method window can cover it.
+    if (op == "move" && ue.operand) {
+        std::string staticSlot = moveThroughStaticOwningArraySlotName(*ue.operand);
+        if (!staticSlot.empty()) {
+            ctx_.diagnostics().report(
+                Severity::Error, ue.span.begin,
+                std::string("`move` is not admitted through a slot of the "
+                            "`static readonly` owning inline array `") +
+                staticSlot +
+                "` (K9.4, \xc2\xa7""28.8.1, \xc2\xa7""22.12 note (h), v0.350): "
+                "static owned storage is the always-live source, disposed only "
+                "by the program-exit pass (\xc2\xa7""22.13), so its slots are "
+                "neither taken nor replaced. A process-global pool whose slots "
+                "are replaced is a `static owned readonly` `OwningArray<T>` or "
+                "sits behind a `Locked<T>` registry (\xc2\xa7""30.12)");
+        }
     }
     // A.7 MoveExpr `"move" PrimaryExpr ("with" Expression)?` / §28.8.1 *The
     // replacing `move`* (v0.350): the `with` clause is admitted at a field or an

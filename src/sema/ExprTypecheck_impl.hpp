@@ -5369,6 +5369,14 @@ private:
     // the #2021 receiver classification.
     std::string moveOnNonOwnedFieldName(const ast::Expr& operand) const;
 
+    // §28.8.1 / §22.12 note (h) / K9.4 (v0.350): `move arr[j]` through a
+    // `static readonly` owning-inline-array field. Static owned storage -- the
+    // slots of such a field -- admits no `move`; only the §22.13 exit pass takes
+    // it. Returns the field's spelling (`Registry.Pool` / `Pool`) when `operand`
+    // (a `!` peeled) is a slot of one, else the empty string.
+    std::string moveThroughStaticOwningArraySlotName(
+        const ast::Expr& operand) const;
+
     // §30.14 / §3.6 (#600): sendability derived-type property.
     // Returns true iff `rt` satisfies the §30.14 sendable table for a
     // Channel<T> element or Domain.Spawn argument/result.
