@@ -392,6 +392,31 @@ static SourceLocation obligationDiagLoc(sema::Symbol* sym,
     }
     return SourceLocation{};
 }
+
+// fix #7791 (§28.3 *Auto-drop (affine)*, §28.10, §17.13, v0.350): the adoption
+// remedy a state-machine `owned` parameter's frame-teardown warning names.
+// The marked adoption is spelled with `move` (`owned` stopped being the
+// binding-position marker at v0.286), and §28.10 *The anonymous binding* says
+// "Adoption composes: `using var _ := move x;` consumes `x` into the anonymous
+// binding" -- EXCEPT over a `Task`-family value, which "may not be bound this
+// way (§17.13, axiom A6)": there the remedy is the NAMED
+// `using var t2 := move t;` (§28.10: "`using var _ := move x;` is never
+// offered as its remedy" over a Task-family source). Nullability is stripped
+// by headName(). The returned text carries its own backticks.
+// // per §28.10, §17.13, A6, v0.350
+static std::string frameParamAdoptionRemedy(const sema::ParameterSymbol& ps,
+                                            std::string_view name,
+                                            sema::SemaContext& ctx) {
+    const sema::TypeRef* pt = ps.declType ? ctx.resolvedType(*ps.declType)
+                                          : ps.resolvedDeclType;
+    const bool taskFamily = pt && pt->kind == sema::TypeRef::Kind::Named &&
+                            common::isTaskFamilyHead(pt->headName());
+    if (taskFamily)
+        return "`using var " + std::string(name) + "2 := move " +
+               std::string(name) + ";` (the anonymous `using var _` is "
+               "rejected for a `Task`, §17.13)";
+    return "`using var _ := move " + std::string(name) + ";`";
+}
 }  // namespace
 
 // §28.1 (v0.196, #1817/#1860): isValueSubstitutionErased is declared in
@@ -947,9 +972,9 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
                             "(§28.3/§29.8/§30.1 must-use / auto-drop); `move` / `return` / "
-                            "`.Dispose()` it, or adopt it with `using var _ := "
-                            "owned " + std::string(sym->name) +
-                            "`, to discharge it explicitly");
+                            "`.Dispose()` it, or adopt it with " +
+                            frameParamAdoptionRemedy(*ps, sym->name, ctx_) +
+                            ", to discharge it explicitly");
                         continue;
                     }
                     // §29.8 / §30.1 (#973a): the CONDITIONALLY-discharged owned
@@ -990,9 +1015,9 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             "` is implicitly disposed by the frame at teardown "
                             "on the path that does not adopt it "
                             "(§28.3/§29.8/§30.1 must-use / auto-drop); adopt it on every "
-                            "path with `using var _ := owned " +
-                            std::string(sym->name) +
-                            "`, to discharge it explicitly");
+                            "path with " +
+                            frameParamAdoptionRemedy(*ps, sym->name, ctx_) +
+                            ", to discharge it explicitly");
                         continue;
                     }
                 }
@@ -1630,8 +1655,9 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 std::string("owned parameter `") + std::string(sym->name) +
                 "` is implicitly disposed by the frame at teardown "
                 "(§28.3/§29.8/§30.1 must-use / auto-drop); `move` / `return` / "
-                "`.Dispose()` it, or adopt it with `using var _ := owned " +
-                std::string(sym->name) + "`, to discharge it explicitly");
+                "`.Dispose()` it, or adopt it with " +
+                frameParamAdoptionRemedy(*ps, sym->name, ctx_) +
+                ", to discharge it explicitly");
         }
     }
     // §28.3 (#1257): a plain-var owned local declared in a NESTED scope that exits
