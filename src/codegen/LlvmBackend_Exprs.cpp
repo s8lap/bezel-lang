@@ -1354,14 +1354,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         pv = emitValueToString(ev, rt);
                     // fix #5943 (§27.7.1 / §18.5, v0.338): a function-typed
                     // hole renders the value's `ToString`.
+                    // fix #7564 (§8.5, v0.350): a NULLABLE function-typed hole
+                    // also lands here; `emitValueToString` renders a null cell
+                    // as `null` with no dispatch.
                     if (!pv && rt &&
-                        rt->kind == sema::TypeRef::Kind::Function &&
-                        !rt->nullable) {
+                        rt->kind == sema::TypeRef::Kind::Function) {
                         // A hole that is itself a forming expression
                         // (`$"{Util.Twice}"`) holds a fresh cell nothing
                         // binds: release it once rendered (the freshness
                         // proof is `lowerFnValObjectMemberCall`'s).
                         const bool fresh =
+                            !rt->nullable &&
                             ev->getType()->isPointerTy() &&
                             ev == static_cast<llvm::Value*>(lastStampedFnCell_);
                         pv = emitValueToString(ev, rt);

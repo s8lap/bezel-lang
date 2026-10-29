@@ -3449,7 +3449,15 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         val && val->getType()->isPointerTy() &&
         !builtinTypeName(fieldTy).empty() &&
         common::isVtableLessBuiltinClassName(builtinTypeName(fieldTy));
-    if ((isNullableRefTy(fieldTy) || nullableDeclLessBuiltin) &&
+    // fix #7564 (§8.5, v0.350): "a `null` value of a nullable-typed hole
+    // renders as the text `null` with no dispatch" — a nullable FUNCTION value
+    // is a plain closure-cell `ptr` with a real null, and the #5943 arm above
+    // (non-nullable only) would otherwise be skipped, leaving the null cell to
+    // be dispatched through (SEGV at offset 8).
+    const bool nullableFn =
+        fieldTy && fieldTy->kind == K::Function && fieldTy->nullable &&
+        val && val->getType()->isPointerTy();
+    if ((isNullableRefTy(fieldTy) || nullableDeclLessBuiltin || nullableFn) &&
         val->getType()->isPointerTy()) {
         llvm::Value* isNull = builder_.CreateICmpEQ(
             val, llvm::ConstantPointerNull::get(ptrTy()), "ts.null");
