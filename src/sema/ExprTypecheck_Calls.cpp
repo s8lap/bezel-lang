@@ -18181,6 +18181,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 return t;
             return operandStaticTypeAt(&a, t);
         };
+        if (mathNarrowedOk) {
+            const auto* nma = static_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+            const bool generic = nma->member == "Min" || nma->member == "Max" ||
+                                 nma->member == "Clamp";
+            const bool divRem = nma->member == "DivRem";
+            for (std::size_t i = 0; i < ce.args.size(); ++i) {
+                const auto& a = ce.args[i];
+                if (!a.value || !a.modifier.empty()) continue;
+                if (!(generic || (divRem && i < 2))) continue;
+                TypeRef* t = ctx_.exprType(*a.value);
+                // Publish the read, so codegen extracts the payload of the
+                // `{i8 hasValue; T}` carrier it still loads.
+                if (t && t->nullable && t->kind == TypeRef::Kind::Primitive &&
+                    isNarrowedNonNullRead(a.value.get()))
+                    ctx_.markNarrowedValueRead(a.value.get());
+            }
+        }
         // fix #6955 (stdlib §2.2, §22.6, §5.1, v0.340): `Math.Abs` declares
         // exactly four overloads (int, long, double, decimal). An operand whose
         // type is none of those converts to several of them, and §22.6 ranks

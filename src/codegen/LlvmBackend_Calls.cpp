@@ -14769,7 +14769,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         auto isDecimalArg = [&](const ast::Expr* e) -> bool {
             if (mathTIsDecimal) return true;
             const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
-            return t && !t->nullable &&
+            // §7.4 / §22.6 (v0.350, #7461): a narrowed read is of its
+            // non-nullable type; sema published it (markNarrowedValueRead) and
+            // `lowerExpr` already extracted the decimal payload.
+            return t && (!t->nullable || ctx_.isNarrowedValueRead(*e)) &&
                    t->kind == sema::TypeRef::Kind::Primitive &&
                    t->primitive == sema::PrimitiveType::Decimal;
         };
