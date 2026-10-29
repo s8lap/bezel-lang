@@ -8746,7 +8746,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 if (ne.args.size() >= 2 && ne.args[1].value) {
                     llvm::Value* a = lowerExpr(*ne.args[1].value);
-                    // Bezel `int` literals lower as i64; truncate to i32 for struct field.
+                    // Sema admits only an int-convertible argument (#7928); bring it to the
+                    // i32 field by its own signedness (ctorIntToI32).
                     if (a) indentW = ctorIntToI32(a, *ne.args[1].value);
                 }
                 if (ne.args.size() >= 3 && ne.args[2].value) {
@@ -8759,7 +8760,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 if (ne.args.size() >= 5 && ne.args[4].value) {
                     llvm::Value* a = lowerExpr(*ne.args[4].value);
-                    // Bezel `int` literals lower as i64; truncate to i32 for struct field.
+                    // Sema admits only an int-convertible argument (#7928); bring it to the
+                    // i32 field by its own signedness (ctorIntToI32).
                     if (a) maxDepth = ctorIntToI32(a, *ne.args[4].value);
                 }
                 v = builder_.CreateInsertValue(v, indented,   {0u});

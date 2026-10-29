@@ -2082,6 +2082,34 @@ void ExprTC::checkBuiltinNullableCtorArgs(const ast::NewExpr& ne,
 void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
                                       const std::string& head) {
     if (ne.args.empty()) return;
+    // fix #7928 (§5.1, stdlib §2.15, v0.350): `JsonOptions(Indented: bool,
+    // IndentWidth: int, AllowTrailingCommas: bool, IgnoreUnknownFields: bool,
+    // MaxDepth: int)` has NO row in the parameter table on purpose -- a row
+    // would admit a named argument, and `lowerNew` binds the five positionally.
+    // Its two `int` components are checked here, positionally, by the same
+    // `checkAssignable` as the table-driven path below.
+    if (head == "JsonOptions") {
+        static constexpr std::pair<std::size_t, const char*> kIntComponents[] = {
+            {1, "IndentWidth"}, {4, "MaxDepth"}};
+        for (const auto& [idx, pname] : kIntComponents) {
+            if (idx >= ne.args.size()) continue;
+            const auto& arg = ne.args[idx];
+            if (!arg.value || arg.isDiscard || !arg.modifier.empty() ||
+                !arg.name.empty())
+                continue;
+            TypeRef* argTy = ctx_.exprType(*arg.value);
+            if (!argTy || argTy->kind == TypeRef::Kind::Error ||
+                argTy->nullable)
+                continue;
+            checkAssignable(
+                argTy, ctx_.primitiveTypeRef(PrimitiveType::Int),
+                arg.value->span.begin,
+                "`" + std::string(pname) + "` argument of the `" + head +
+                    "` constructor",
+                arg.value.get());
+        }
+        return;
+    }
     const std::size_t argc = ne.args.size();
     std::vector<common::BuiltinParamForm> forms;
     for (auto& f : common::builtinParamForms(head, /*member=*/"",
