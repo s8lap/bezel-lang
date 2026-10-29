@@ -30,6 +30,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -141,4 +142,91 @@ BEZEL_TEST(null_cond_linq_iface_7544, null_receiver_skips_argument_spec_7_5) {
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, "False\nTrue\n1\n");
+}
+
+// ---------------------------------------------------------------------------
+// FIX-FORWARD (review findings A and B): the typing above admits ONLY the §5
+// operators codegen lowers on a borrowing list interface. Everything else stays
+// as LOUD as on base — never a degraded #3079 warning, never a runtime
+// InvalidOperationException. runAot synthesizes an Error diagnostic for a
+// runtime crash too, so each row asserts the diagnostic TEXT and that nothing
+// ran.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string listProg(const std::string& body) {
+    return prog("  var a: Array<int> := [5, 3, 8, 1]; "
+                "  var l: IList<int> := a; "
+                "  var r: IReadOnlyList<int> := a; " + body);
+}
+
+bool rejectedWith(const std::string& program, const char* needle) {
+    JitResult r = runAot(program);
+    if (r.ran || !r.stdoutText.empty()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+
+const char* kNoValue = "produced no value, and no dispatch arm emitted any code";
+
+}  // namespace
+
+// stdlib §5 `First` declares arity 0 or 1; three arguments is the #3726 error,
+// not a silent drop (finding A).
+BEZEL_TEST(null_cond_linq_iface_7544, wrong_arity_first_on_ireadonlylist_spec_stdlib_5) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProg("Console.WriteLine(r.First(1, 2, 3)); "),
+        "wrong number of arguments for stdlib §5 LINQ operator `First`"));
+}
+
+BEZEL_TEST(null_cond_linq_iface_7544, wrong_arity_count_on_ilist_spec_stdlib_5) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProg("Console.WriteLine(l.Count(1, 2)); "),
+        "wrong number of arguments for stdlib §5 LINQ operator `Count`"));
+}
+
+BEZEL_TEST(null_cond_linq_iface_7544, wrong_arity_contains_on_ilist_spec_stdlib_5) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProg("Console.WriteLine(l.Contains(1, 2)); "),
+        "wrong number of arguments for stdlib §5 LINQ operator `Contains`"));
+}
+
+BEZEL_TEST(null_cond_linq_iface_7544, wrong_arity_to_array_on_ilist_spec_stdlib_5) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProg("Console.WriteLine(l.ToArray(5).Count); "),
+        "wrong number of arguments for stdlib §5 LINQ operator `ToArray`"));
+}
+
+// Finding A: a deferred operator bound to a declared non-lazy type.
+BEZEL_TEST(null_cond_linq_iface_7544, where_into_int_local_stays_rejected_on_ireadonlylist) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProg("var q: int := r.Where(lambda(x: int) => x > 1); "), kNoValue));
+}
+
+// Finding B: deferred operators on a list interface are NOT lowered; they were
+// a loud "produced no value" on base and must stay one (the review measured a
+// runtime InvalidOperationException on the widened typing).
+BEZEL_TEST(null_cond_linq_iface_7544, where_then_count_stays_rejected_on_ireadonlylist) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProg("var w := r.Where(lambda(x: int) => x > 1); "
+                 "Console.WriteLine(w.Count()); "),
+        kNoValue));
+}
+
+BEZEL_TEST(null_cond_linq_iface_7544, select_then_first_stays_rejected_on_ilist) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProg("var w := l.Select(lambda(x: int) => x * 2); "
+                 "Console.WriteLine(w.First()); "),
+        kNoValue));
+}
+
+// `ToSet` has no list-interface lowering either (the widened typing degraded
+// it to a #3079 warning and `Count` 0).
+BEZEL_TEST(null_cond_linq_iface_7544, to_set_stays_rejected_on_ilist) {
+    BEZEL_EXPECT_TRUE(rejectedWith(
+        listProg("var s := l.ToSet(); Console.WriteLine(s.Count); "), kNoValue));
 }

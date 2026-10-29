@@ -11242,6 +11242,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         "Array", recvTy->genericArgs[0]));
                     return;
                 }
+                // stdlib §5 (#3726): the "wrong number of arguments" diagnostic
+                // for a §5 operator called with an arity `kStdlibLinqOverloads`
+                // does not declare. Shared by `typeLinqOperator`'s arity gate
+                // and the list-interface arm of the `ienumRecv` block (#7544).
+                auto reportLinqArityMismatch = [&]() {
+                    // Collect every admitted arity for `m` so the user
+                    // sees what they SHOULD have written (e.g. "Where:
+                    // 1", "Any: 0 or 1", "Count: 0 or 1") rather than a
+                    // bare "wrong number of arguments".
+                    std::string arityList;
+                    for (const auto& e : bezel::sema::kStdlibLinqOverloads) {
+                        if (e.name != m) continue;
+                        if (!arityList.empty()) arityList += " or ";
+                        arityList += std::to_string(e.arity);
+                    }
+                    if (arityList.empty()) arityList = "(unknown)";
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        std::string("wrong number of arguments for stdlib "
+                                    "§5 LINQ operator `") +
+                            std::string(m) + "` (stdlib §5 "
+                            "`System.Collections.Linq`, v0.286): got " +
+                            std::to_string(ce.args.size()) +
+                            ", expected " + arityList + " (#3726)");
+                };
                 // stdlib §5: type a deferred LINQ operator `m` whose source
                 // element type is `srcElem`. ToArray materializes to Array<T>
                 // (typed as a concrete Array<T> so inferred locals resolve
@@ -11324,26 +11349,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         common::isBuiltinCollectionLinqOperatorName(m) &&
                         !bezel::sema::stdlibLinqMemberMatches(
                             m, ce.args.size())) {
-                        // Collect every admitted arity for `m` so the user
-                        // sees what they SHOULD have written (e.g. "Where:
-                        // 1", "Any: 0 or 1", "Count: 0 or 1") rather than a
-                        // bare "wrong number of arguments".
-                        std::string arityList;
-                        for (const auto& e :
-                             bezel::sema::kStdlibLinqOverloads) {
-                            if (e.name != m) continue;
-                            if (!arityList.empty()) arityList += " or ";
-                            arityList += std::to_string(e.arity);
-                        }
-                        if (arityList.empty()) arityList = "(unknown)";
-                        ctx_.diagnostics().report(
-                            Severity::Error, ce.span.begin,
-                            std::string("wrong number of arguments for stdlib "
-                                        "§5 LINQ operator `") +
-                                std::string(m) + "` (stdlib §5 "
-                                "`System.Collections.Linq`, v0.286): got " +
-                                std::to_string(ce.args.size()) +
-                                ", expected " + arityList + " (#3726)");
+                        reportLinqArityMismatch();
                         return false;
                     }
                     // fix #3670: was four separate hand-spelled `if` arms
@@ -11957,7 +11963,43 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                      (!recvTy->declaration &&
                       (recvTy->headName() == "IList" ||
                        recvTy->headName() == "IReadOnlyList")));
-                if (ienumRecv) {
+                // fix-forward #7544 (silent-acceptance inversion): codegen
+                // lowers only a CLOSED set of §5 operators on a borrowing
+                // `IList<T>` / `IReadOnlyList<T>` receiver (the array-backed
+                // list-interface bridge in `tryLowerCollectionInstanceCall`
+                // plus `tryLowerLazyLinqCall`'s ToArray arm). Admitting the
+                // whole §5 surface here turned the deferred operators
+                // (Where/Select/Take/Distinct/OrderBy/Concat/…), `ToSet`, and
+                // wrong-arity calls — LOUD base rejections — into a degraded
+                // #3079 warning or a runtime InvalidOperationException. So on a
+                // list interface: a §5 operator with an undeclared arity gets
+                // the #3726 diagnostic; an operator outside the lowered set is
+                // left UNTYPED, exactly as on base.
+                const bool listIfaceRecv =
+                    ienumRecv && recvTy->headName() != "IEnumerable";
+                bool listIfaceSkip = false;
+                if (listIfaceRecv) {
+                    static const char* const kLoweredOnListIface[] = {
+                        "ToArray", "Any",  "All", "Count",  "First",
+                        "Last",    "Single", "ElementAt", "Min", "Max",
+                        "Sum",     "Average", "Contains"};
+                    bool lowered = false;
+                    for (const char* n : kLoweredOnListIface)
+                        if (m == n) lowered = true;
+                    // `Count` / `Contains` are not in the collection-family
+                    // name table (a dedicated mechanism intercepts them on
+                    // the concrete collections) but ARE declared §5 rows.
+                    if ((common::isBuiltinCollectionLinqOperatorName(m) ||
+                         m == "Count" || m == "Contains") &&
+                        !bezel::sema::stdlibLinqMemberMatches(
+                            m, ce.args.size())) {
+                        reportLinqArityMismatch();
+                        listIfaceSkip = true;
+                    } else if (!lowered) {
+                        listIfaceSkip = true;
+                    }
+                }
+                if (ienumRecv && !listIfaceSkip) {
                     TypeRef* srcElem2 = recvTy->genericArgs[0];
                     // fix #3331 (C5, stdlib §5 + proposal 0116 D9): the
                     // unspecialized-extension `this`-typed receiver carries
