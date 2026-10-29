@@ -2019,6 +2019,7 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
         }
     }
 
+    const std::size_t diagsAtEntry = ctx_.diagnostics().diagnostics().size();
     // fix #3425 (§22.5 / §17.7, v0.283): §22.5 binding for a NAMED argument on
     // this built-in constructor. Reached with `n` already established as a
     // built-in head that is NOT a user type, NOT a generic type parameter, and
@@ -2027,6 +2028,11 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
     // fix #6782 (§7, §7.3, v0.340): the positional §7 null check for the
     // declared non-nullable parameters of this built-in constructor.
     checkBuiltinNullableCtorArgs(ne, n);
+    // fix #7820 (§5.1, §22.6, v0.350): the TYPE of each argument against the
+    // declared parameter type. Run only when the checks above spoke nothing, so
+    // a call they already rejected draws one diagnostic.
+    if (ctx_.diagnostics().diagnostics().size() == diagsAtEntry)
+        checkBuiltinCtorArgTypes(ne, n);
 }
 
 // fix #6782 (spec §7 "parameter pass" and §7.3 "Assigning `null` to a
@@ -2051,6 +2057,110 @@ void ExprTC::checkBuiltinNullableCtorArgs(const ast::NewExpr& ne,
         // gate (fix #7621) — a narrowed nullable value is of its non-nullable
         // type at the constructor parameter, so codegen extracts its payload.
         publishNarrowedBuiltinArg(a.value.get());
+    }
+}
+
+// fix #7820 (spec §5.1 "Implicit conversions", §22.6 and §17.7, v0.350; stdlib
+// §2.5, §3.1, §4.14, §2.7, §6): the TYPE of each argument of a built-in
+// constructor against the parameter type the standard library declares.
+//
+// §5.1 has no implicit narrowing: a `long`, a `uint` or a `double` is not
+// implicitly convertible to an `int` parameter (an in-range constant is, by
+// §5.1's constant narrowing). The built-in constructors were never compared
+// with their declared parameter types, and `lowerNew` truncated whatever it
+// was handed (`new TimeOnly(1,2,3, 4294967297L)` read a millisecond of 1) or,
+// for a floating argument, emitted a malformed `trunc double to i32`.
+//
+// The declared types are the `kinds` column of the ONE parameter table
+// (`common::builtinParamForms`): a position whose kind is 0 in ANY form that
+// binds is left alone (a `Dictionary(capacity: int)` and a `Dictionary(comparer:
+// IEqualityComparer<K>)` share a position, and the table's vocabulary does not
+// name the comparer), so a missing row costs a rejection that does not fire,
+// never a false one. The arithmetic is `checkAssignable`'s, the very
+// conversion every other typed position uses (as `Array<T>`'s capacity does),
+// so the constant narrowing and the widening table are not restated.
+void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
+                                      const std::string& head) {
+    if (ne.args.empty()) return;
+    const std::size_t argc = ne.args.size();
+    std::vector<common::BuiltinParamForm> forms;
+    for (auto& f : common::builtinParamForms(head, /*member=*/"",
+                                             common::kBuiltinAnyArity))
+        if (argc >= f.required && argc <= f.total && !f.names.empty())
+            forms.push_back(std::move(f));
+    if (forms.empty()) return;
+
+    // The §22.5 binding of each form, established LOCALLY over the registry's
+    // declared names (the published binding is not available yet).
+    struct Bound {
+        const common::BuiltinParamForm* form;
+        std::vector<int> paramToArg;
+    };
+    std::vector<Bound> bound;
+    for (const auto& f : forms) {
+        BindResult br = bindArgsToParams(
+            sema::FormalsView::ofNames(f.names, f.required), ne.args,
+            ne.span.begin, "constructor of built-in `" + head + "`",
+            /*emit=*/false);
+        if (br.ok) bound.push_back({&f, std::move(br.paramToArg)});
+    }
+    if (bound.empty()) return;  // `checkBuiltinCtorNamedArgs` owns the report
+
+    const std::size_t total = bound.front().form->total;
+    for (std::size_t p = 0; p < total; ++p) {
+        // The declared kind at this position across every form that binds.
+        std::vector<std::uint32_t> kinds;
+        bool opinion = true;
+        for (const auto& b : bound) {
+            const std::uint32_t k =
+                p < b.form->kinds.size() ? b.form->kinds[p] : 0u;
+            if (k == 0 || (k & common::kBPTOut)) { opinion = false; break; }
+            if (std::find(kinds.begin(), kinds.end(), k) == kinds.end())
+                kinds.push_back(k);
+        }
+        if (!opinion || kinds.empty()) continue;
+        const auto& map = bound.front().paramToArg;
+        if (p >= map.size() || map[p] < 0 ||
+            static_cast<std::size_t>(map[p]) >= argc)
+            continue;  // the parameter takes its default
+        const auto& arg = ne.args[static_cast<std::size_t>(map[p])];
+        if (!arg.value || arg.isDiscard || !arg.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*arg.value);
+        if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+        // §7: a nullable argument is the nullability gate's (#6782), except a
+        // §7.4-narrowed read, which is of its non-nullable type (§22.6).
+        if (argTy->nullable) {
+            if (!isNarrowedNonNullRead(arg.value.get())) continue;
+            argTy = operandStaticTypeAt(arg.value.get(), argTy);
+            if (!argTy) continue;
+        }
+        // The target: the one declared type, or (`StringBuilder(capacity: int)`
+        // beside `StringBuilder(initial: string)`) the scalar one when the
+        // argument is not the `string` the other overload takes.
+        std::uint32_t kind = kinds.front();
+        if (kinds.size() > 1) {
+            const bool isString = argTy->kind == TypeRef::Kind::Primitive &&
+                                  argTy->primitive == PrimitiveType::String;
+            if (isString) continue;
+            for (std::uint32_t k : kinds)
+                if (k != common::kBPTString) { kind = k; break; }
+        }
+        PrimitiveType target = PrimitiveType::None;
+        switch (kind) {
+            case common::kBPTInt:    target = PrimitiveType::Int; break;
+            case common::kBPTLong:   target = PrimitiveType::Long; break;
+            case common::kBPTString: target = PrimitiveType::String; break;
+            default: break;
+        }
+        if (target == PrimitiveType::None) continue;
+        std::string_view pname = p < bound.front().form->names.size()
+                                     ? bound.front().form->names[p]
+                                     : std::string_view();
+        checkAssignable(
+            argTy, ctx_.primitiveTypeRef(target), arg.value->span.begin,
+            "`" + std::string(pname) + "` argument of the `" + head +
+                "` constructor",
+            arg.value.get());
     }
 }
 

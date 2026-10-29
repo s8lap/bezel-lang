@@ -4141,6 +4141,10 @@ private:
     // below, for the declared non-nullable parameters of `head`.
     void checkBuiltinNullableCtorArgs(const ast::NewExpr& ne,
                                       const std::string& head);
+    // fix #7820 (§5.1, §22.6, v0.350): the argument TYPES of a built-in
+    // constructor against the declared parameter types in the registry rows.
+    void checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
+                                  const std::string& head);
 
     // §5.1: is a value of static type `from` implicitly convertible to
     // `to`? Identity is NOT counted here (that is the "exact" relation,
