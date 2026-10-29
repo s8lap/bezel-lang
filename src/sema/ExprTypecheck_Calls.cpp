@@ -10683,6 +10683,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     auto* recvTy = ctx_.exprType(*ma->target);
                     if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                         recvTy->declaration &&
+                        recvTy->declaration->kind == ast::TypeDeclKind::Enum) {
+                        // #7913 (§8.7, v0.350): "Static classes, records,
+                        // enums, choices, primitives, and inline arrays do not
+                        // implement `IDisposable`".
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "`Dispose` is not admitted on an enum value "
+                            "\xe2\x80\x94 enums do not implement IDisposable "
+                            "(\xc2\xa7""8.7, v0.350)");
+                    }
+                    if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                        recvTy->declaration &&
                         recvTy->declaration->kind == ast::TypeDeclKind::Choice) {
                         ctx_.diagnostics().report(
                             Severity::Error, ce.span.begin,
