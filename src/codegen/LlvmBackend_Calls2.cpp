@@ -9005,6 +9005,14 @@ Emitter::CallArgPins::CallArgPins(Emitter& e, const ast::CallExpr& call,
             if (llvm::Value* rv = e.lowerExpr(*recv)) {
                 e.exprValueOverride_[recv] = rv;
                 pins.push_back(recv);
+                // narrow #7565 (§28 K8.1, v0.350: "on the normal edge as on
+                // the exception edge"): a claimed fresh `new
+                // StringBuilder(...)` root is registered HERE, at its
+                // production, before the arguments below run; a throwing
+                // argument otherwise unwound past a builder the arm had not
+                // registered yet. The arm's own registration is then a no-op
+                // (the claim is consumed once). No-op for any other receiver.
+                e.registerFreshBuiltinNewReceiverTempK8(recv, rv);
             }
         }
     }

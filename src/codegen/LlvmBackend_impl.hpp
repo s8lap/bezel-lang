@@ -22186,6 +22186,10 @@ private:
     struct K8RecvTemp {
         llvm::AllocaInst* slot = nullptr;
         llvm::Function* fn = nullptr;
+        // fix #7565: non-null for a declaration-less, vtable-less built-in
+        // (`StringBuilder`) temporary, whose release is
+        // `emitVtablelessBuiltinRelease(name, obj)`, not a vtable Dispose.
+        const char* vtablelessBuiltin = nullptr;
     };
     std::vector<K8RecvTemp> k8RecvTemps_;
 
@@ -22206,6 +22210,34 @@ private:
     void registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
                                         llvm::Value* recvPtr,
                                         const sema::TypeRef* resultTy);
+    // fix #7565 / §28 K8.1 (v0.350): a `new StringBuilder(...)` used only as
+    // a call or property receiver is an unbound owned temporary of a
+    // declaration-less built-in, which `isFreshOwnedClassProducer` (heap CLASS
+    // declarations only) never recognises.
+    //
+    // THE SOUNDNESS GATE is on the RESULT of the full expression, not the
+    // receiver: `Append` and its siblings return the receiver itself (a borrow
+    // of it, stdlib §3.1), so `var b := new StringBuilder().Append("x");`
+    // hands the builder on as `b`, and disposing it at the boundary would
+    // dangle. Only a chain whose outermost result cannot alias the builder is
+    // claimed: `ToString()` (a fresh string), `Length` (an `int`), or a chain
+    // that is a whole expression statement (its result is discarded).
+    // `markFreshStringBuilderChainRoot` walks the chain down to its root `new`
+    // and records it in `freshSbRoots_` at the terminal; the receiver site
+    // (`registerFreshBuiltinNewReceiverTempK8`) disposes only a recorded root.
+    // Anything else keeps the pre-fix leak, the sound direction.
+    std::set<const ast::Expr*> freshSbRoots_;
+    void markFreshStringBuilderChainRoot(const ast::Expr* chainTop);
+    // The chain walk descends only through a call the built-in itself answers
+    // (not a user extension, §26.7 / §28.3, v0.350) and, for the descent,
+    // only through stdlib §3.1's receiver-returning chaining members.
+    bool isBuiltinSbMemberCall(const ast::CallExpr& call);
+    bool isBuiltinSbReceiverReturningCall(const ast::CallExpr& call);
+    // Registers a recorded root at its production on the same two channels as
+    // registerFreshNewReceiverTempK8: an `unwindOnly` disposeStack_ entry plus
+    // a K8-boundary queue entry.
+    void registerFreshBuiltinNewReceiverTempK8(const ast::Expr* recvExpr,
+                                               llvm::Value* recvPtr);
     // Emit the queued reclaims at a K8 full-expression boundary.
     void flushK8RecvTemps();
     // fix #5297 / §28.3 *Unbound owned temporaries* rule 1, §22.6 (v0.313):

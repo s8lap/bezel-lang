@@ -8584,6 +8584,98 @@ void Emitter::registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
 }
 
 
+void Emitter::markFreshStringBuilderChainRoot(const ast::Expr* chainTop) {
+    // Descend through calls that return a `StringBuilder` (the chained
+    // `Append` / `Insert` / `Remove` / `Replace` ... members, each returning
+    // its receiver) to the receiver they started from; record it when it is a
+    // `new` of the built-in. See the declaration for the soundness gate.
+    const ast::Expr* e = chainTop;
+    auto isSbType = [&](const ast::Expr* x) {
+        const sema::TypeRef* t = x ? ctx_.exprType(*x) : nullptr;
+        return t && t->kind == sema::TypeRef::Kind::Named && !t->declaration &&
+               !t->nullable && builtinTypeName(t) == "StringBuilder";
+    };
+    while (e) {
+        if (dynamic_cast<const ast::NewExpr*>(e)) {
+            if (isSbType(e)) freshSbRoots_.insert(e);
+            return;
+        }
+        auto* call = dynamic_cast<const ast::CallExpr*>(e);
+        if (!call || !isSbType(call)) return;
+        // Descend only through a BUILT-IN member that returns its receiver
+        // (an allow-list, not an extension deny-list). Any other
+        // StringBuilder-returning call, a user extension above all, receives
+        // the builder as a plain borrow (§26.7, v0.350: "The receiver is
+        // always a borrow") and may pass it on to a plain parameter that
+        // stores it (§28.3, v0.350: "A non-`owned` argument position is a
+        // borrowing use whatever the callee's body does with the
+        // parameter"); claiming the root there would dispose a builder the
+        // callee still holds.
+        if (!isBuiltinSbReceiverReturningCall(*call)) return;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+        if (!ma) return;
+        e = ma->target.get();
+    }
+}
+
+
+bool Emitter::isBuiltinSbMemberCall(const ast::CallExpr& call) {
+    // The callee is the built-in's own member exactly when sema did not bind
+    // it to a user extension (§26.5 rule 1 commits a name the built-in
+    // declares to the built-in; rule 2 selects an extension only for a name
+    // it does not declare).
+    if (!call.callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+    return !isExtensionMethod(ms);
+}
+
+
+bool Emitter::isBuiltinSbReceiverReturningCall(const ast::CallExpr& call) {
+    // stdlib §3.1 (v0.350): the chaining members, each declared
+    // `: StringBuilder` ("Methods return `this` to allow chaining").
+    if (!isBuiltinSbMemberCall(call)) return false;
+    auto* ma = static_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    const auto& m = ma->member;
+    return m == "Append" || m == "AppendLine" || m == "AppendFormat" ||
+           m == "Insert" || m == "Remove" || m == "Replace" || m == "Clear";
+}
+
+
+void Emitter::registerFreshBuiltinNewReceiverTempK8(const ast::Expr* recvExpr,
+                                                    llvm::Value* recvPtr) {
+    // §28 K8.1 (v0.350): "Unbound owned temporaries are disposed at their full
+    // expression's end, after their uses". The population is exactly the
+    // `new` expression of the built-in `StringBuilder` (a trivial-dispose
+    // class, stdlib §3.1, whose release is `emitVtablelessBuiltinRelease`).
+    // A chained `Append` returns the receiver itself, so the ROOT `new` is the
+    // only production in `new StringBuilder().Append(a).Append(b).ToString()`;
+    // registering it here (and nowhere on the chain) disposes it once.
+    if (!recvExpr || !recvPtr) return;
+    if (freshSbRoots_.erase(recvExpr) == 0) return;   // not a claimed root
+    const sema::TypeRef* rt = ctx_.exprType(*recvExpr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration ||
+        rt->nullable)
+        return;
+    if (builtinTypeName(rt) != "StringBuilder") return;
+    if (!recvPtr->getType()->isPointerTy()) return;
+    if (llvm::isa<llvm::ConstantPointerNull>(recvPtr)) return;
+    if (disposeStack_.empty() || emittingDisposerBody_ || !currentFn_) return;
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    // A state-machine body may flush after a suspension: keep the slot in the
+    // frame, as deferUnboundOwnedTempToK8 does (#5286).
+    if (smStateStruct_) asyncHandlerSpillSlots_.push_back(slot);
+    builder_.CreateStore(recvPtr, slot);
+    Disposal d{slot, nullptr};
+    d.unwindOnly = true;      // the normal edge is the K8 flush
+    d.dynamicDispose = false;
+    d.vtablelessBuiltin = "StringBuilder";
+    disposeStack_.back().push_back(d);
+    k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_, "StringBuilder"});
+}
+
+
 bool Emitter::deferUnboundOwnedTempToK8(llvm::AllocaInst* slot) {
     if (!slot || !currentFn_ || emittingDisposerBody_) return false;
     if (slot->getAllocatedType() != ptrTy()) return false;
@@ -8640,7 +8732,10 @@ void Emitter::flushK8RecvTemps() {
             llvm::BasicBlock::Create(llvm_, "k8recv.cont", currentFn_);
         builder_.CreateCondBr(isNull, contBB, dispBB);
         builder_.SetInsertPoint(dispBB);
-        emitDisposeAndReclaim(obj);
+        if (t.vtablelessBuiltin)
+            emitVtablelessBuiltinRelease(t.vtablelessBuiltin, obj);
+        else
+            emitDisposeAndReclaim(obj);
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
         // Discharge at RUNTIME (not by erasing the registration): the
@@ -9412,6 +9507,9 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 auto* fn = declareC("bz_weak_release",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(fn, {obj});
+            } else if (it->vtablelessBuiltin) {
+                // fix #7565: a fresh `new StringBuilder(...)` receiver temp.
+                emitVtablelessBuiltinRelease(it->vtablelessBuiltin, obj);
             } else {
                 emitDisposeAndReclaim(obj);
             }

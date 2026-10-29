@@ -4555,6 +4555,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // not when it is discarded entirely).
         {
             if (es->expr) {
+                // fix #7565 / §28 K8.1 (v0.350): a whole-statement
+                // `new StringBuilder(...).Append(...);` discards its result,
+                // so the builder it returns cannot be held past the statement.
+                markFreshStringBuilderChainRoot(es->expr.get());
                 llvm::Value* v = lowerExpr(*es->expr);
                 if (!diverged_ && v) {
                     freeUnboundOwnedBorrowingArrayTemp(

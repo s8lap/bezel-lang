@@ -3700,7 +3700,22 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         auto* elemsFn = declareC("bz_grouping_elements", ptrTy(), {ptrTy()});
         recv = builder_.CreateCall(elemsFn, {grp}, "igrp.elems");
     } else {
+        // fix #7565 / §28 K8.1 (v0.350): a fresh `new StringBuilder(...)`
+        // receiver is an unbound owned temporary; dispose it at the end of the
+        // full expression. The chain is claimed here only when THIS call's
+        // result cannot alias the builder (`ToString()` yields a fresh string;
+        // a chained `Append` yields the builder, so the terminal decides).
+        // The terminal must itself be the built-in's member: a user
+        // extension reached here (#7703's decline-after-lowering path) takes
+        // its receiver as a plain borrow it may store (§26.7, §28.3, v0.350).
+        if (isStrBld && isBuiltinSbMemberCall(call)) {
+            const sema::TypeRef* sbResTy = ctx_.exprType(call);
+            if (sbResTy && (sbResTy->kind == sema::TypeRef::Kind::Primitive ||
+                            sbResTy->kind == sema::TypeRef::Kind::Unit))
+                markFreshStringBuilderChainRoot(effectiveRecvExpr);
+        }
         recv = lowerExpr(*effectiveRecvExpr);
+        if (isStrBld) registerFreshBuiltinNewReceiverTempK8(effectiveRecvExpr, recv);
     }
     if (!recv) return nullptr;
 

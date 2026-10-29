@@ -7514,7 +7514,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // and after).
             bool isSB = (builtinTypeName(tt) == "StringBuilder");
             if (isSB) {
+                // fix #7565 / §28 K8.1 (v0.350): `new StringBuilder(...).Length`
+                // — the `int` result cannot alias the builder, so the chain's
+                // root temporary is disposed at the end of the full expression
+                // (no-op for any other receiver shape).
+                markFreshStringBuilderChainRoot(ma->target.get());
                 llvm::Value* sb = lowerExpr(*ma->target);
+                registerFreshBuiltinNewReceiverTempK8(ma->target.get(), sb);
                 if (sb) {
                     constexpr int64_t SB_ESZ2 = 8;
                     auto* lenFn2 = declareC("bz_array_len", i64(), {ptrTy()});
