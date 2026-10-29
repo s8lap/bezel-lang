@@ -6179,6 +6179,11 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
     bool inAsyncSM = (smKind_ == SuspendKind::Await ||
                       smKind_ == SuspendKind::AsyncYield) &&
                      smStateStruct_ && smSelf_ && asyncResumeFn_;
+    if (!disposeAsyncFn && inAsyncSM &&
+        disposeAsyncVSlot == kDisposeAsyncRunTimeDispatch) {
+        emitRunTimeAsyncDisposeAwaitAndFree(obj);
+        return;
+    }
     if (!disposeAsyncFn || !inAsyncSM) {
         // Sync fallback: synchronous Dispose() + free.
         // per §28.12: the class should have a destructor for the synchronous
@@ -6321,6 +6326,101 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
                      /*onFault=*/emitPhysicalReclamation);
 
     emitPhysicalReclamation();
+}
+
+
+// fix #3483 / #7417 (§28.12, v0.350; the #3493 ruling, option 2): the
+// RUN-TIME `await using` dispatch. The registration could not name the awaited
+// `DisposeAsync` from the slot's static type, and §28.12 forbids letting the
+// static type decide: "`await using` selects the logical-disposal path by the
+// class of the object the binding holds ... never by the binding's static
+// type. Where that class implements `IAsyncDisposable`, scope exit awaits its
+// `DisposeAsync` and reclamation follows as step 2 states ... Only an object
+// whose class does not implement `IAsyncDisposable` takes the synchronous
+// disposal above."
+//
+// So the OBJECT is asked, through its itmap (vtable slot 1), for the
+// `IAsyncDisposable` entry declareVtables Pass D built for its class:
+//   * absent  ⇒ the class does not implement it ⇒ the synchronous disposal
+//               (emitDisposeAndReclaim — exactly what this slot got before);
+//   * present ⇒ await entry[kAsyncDisposableItabDisposeAsync](obj), then run
+//               entry[kAsyncDisposableItabReclaim] — the SAME class's
+//               `bz$<C>$DisposeReclaim` (step 2's cascade and chain with that
+//               level's destructor body skipped, step 1) — followed by the
+//               block release, on BOTH edges of the await: step 2's "when
+//               `DisposeAsync` completes by throwing, logical disposal is over
+//               — the runtime runs the cascade and the chain, then the
+//               exception propagates from the await" (fix #3494's discipline,
+//               one lambda for both edges).
+// The caller (emitDisposals) has already null-guarded `obj` and nulled the
+// slot, as for the static arm.
+//
+// An `IAsyncDisposable` slot can also hold a §29.11 ITERATOR-format object (an
+// `IAsyncEnumerator<T>` is an `IAsyncDisposable`), whose vtable slot 1 is its
+// `Dispose`, not an itmap. Walking that as an itmap reads code bytes as
+// pointers, so the iterator format (isIterVtableSelfReferenced, the one
+// discriminator) is routed straight to the synchronous arm — the disposal that
+// slot got before, unchanged by this function.
+void Emitter::emitRunTimeAsyncDisposeAwaitAndFree(llvm::Value* obj) {
+    auto* lookupFn =
+        declareC("bz_itable_lookup", ptrTy(), {ptrTy(), ptrTy()});
+    auto* syncBB =
+        llvm::BasicBlock::Create(llvm_, "dispasync.rt.sync", currentFn_);
+    auto* lookupBB =
+        llvm::BasicBlock::Create(llvm_, "dispasync.rt.lookup", currentFn_);
+    builder_.CreateCondBr(isIterVtableSelfReferenced(obj, "dispasync.rt.iter"),
+                          syncBB, lookupBB);
+    builder_.SetInsertPoint(lookupBB);
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj, "dispasync.rt.vptr");
+    llvm::Value* itmap = builder_.CreateLoad(
+        ptrTy(), builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}),
+        "dispasync.rt.itmap");
+    llvm::Value* itab = builder_.CreateCall(
+        llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false), lookupFn,
+        {itmap, asyncDisposableItabKey()}, "dispasync.rt.itab");
+    llvm::Value* none = builder_.CreateICmpEQ(
+        itab, llvm::ConstantPointerNull::get(ptrTy()));
+    auto* asyncBB =
+        llvm::BasicBlock::Create(llvm_, "dispasync.rt.async", currentFn_);
+    auto* joinBB =
+        llvm::BasicBlock::Create(llvm_, "dispasync.rt.join", currentFn_);
+    builder_.CreateCondBr(none, syncBB, asyncBB);
+
+    // The class does not implement `IAsyncDisposable` (or the object is in
+    // the iterator format): the synchronous disposal, which awaits nothing.
+    builder_.SetInsertPoint(syncBB);
+    emitDisposeAndReclaim(obj);
+    builder_.CreateBr(joinBB);
+
+    builder_.SetInsertPoint(asyncBB);
+    llvm::Value* reclaimFn = builder_.CreateLoad(
+        ptrTy(),
+        builder_.CreateGEP(ptrTy(), itab,
+                           {builder_.getInt32(kAsyncDisposableItabReclaim)}),
+        "dispasync.rt.reclaim");
+    auto* voidFnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                             {ptrTy()}, false);
+    auto emitPhysicalReclamation = [&]() {
+        builder_.CreateCall(voidFnTy, reclaimFn, {obj});
+        emitReclaimBlock(obj);
+    };
+    llvm::Value* callee = builder_.CreateLoad(
+        ptrTy(),
+        builder_.CreateGEP(ptrTy(), itab,
+                           {builder_.getInt32(
+                               kAsyncDisposableItabDisposeAsync)}),
+        "dispasync.rt.fn");
+    auto* dispAsyncTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* task =
+        builder_.CreateCall(dispAsyncTy, callee, {obj}, "dispasync.rt.task");
+    emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true,
+                     /*takeResultAfter=*/false, /*markSpentAfter=*/false,
+                     /*deferTaskFree=*/false, /*freeOnFault=*/false,
+                     /*onFault=*/emitPhysicalReclamation);
+    emitPhysicalReclamation();
+    builder_.CreateBr(joinBB);
+
+    builder_.SetInsertPoint(joinBB);
 }
 
 

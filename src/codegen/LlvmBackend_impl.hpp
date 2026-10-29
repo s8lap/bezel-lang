@@ -2629,6 +2629,10 @@ private:
         // -1 is not a degrade: §12.2 forbids hiding, so a non-virtual
         // `DisposeAsync` cannot be redeclared in a subclass and the static
         // resolution is already the only implementation reachable.
+        // fix #3483 / #7417 (§28.12, v0.350): `kDisposeAsyncRunTimeDispatch`
+        // with a null `disposeAsyncFn` ⇒ no `DisposeAsync` could be named
+        // from the slot's static type, so the OBJECT's `IAsyncDisposable`
+        // dispatch entry decides at scope exit (emitAsyncDisposeAwaitAndFree).
         int disposeAsyncVSlot = -1;
         // stdlib §6.10 / §28.14 (v0.175, #808): an `await using var` bound to
         // a TaskScope. NORMAL exit: bz_task_scope_dispose_async (cancel the
@@ -17104,10 +17108,57 @@ private:
     // `await using var` runs ITS OWN asynchronous cleanup ("whatever
     // asynchronous cleanup THE CLASS defines"), as every other disposal path in
     // the compiler already does.
+    //
+    // fix #3483 / #7417 (§28.12, v0.350, the #3493 ruling): a null
+    // `disposeAsyncFn` with `disposeAsyncVSlot == kDisposeAsyncRunTimeDispatch`
+    // is the RUN-TIME dispatch: the registration could not name the awaited
+    // `DisposeAsync` from the slot's static type (an interface head, a base
+    // class that does not implement it, a call right-hand side), so the
+    // object's own `IAsyncDisposable` dispatch entry decides — see
+    // `asyncDisposableItabKey`. The unwind pass passes -1, so it keeps the
+    // synchronous fallback.
     void emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
                                       llvm::Function* disposeAsyncFn,
                                       const sema::TypeSymbol* cls = nullptr,
                                       int disposeAsyncVSlot = -1);
+    static constexpr int kDisposeAsyncRunTimeDispatch = -2;
+    // The run-time arm itself (normal exit of an active async state machine;
+    // `obj` non-null): look up the object's `IAsyncDisposable` entry; absent ⇒
+    // synchronous emitDisposeAndReclaim; present ⇒ await its `DisposeAsync`,
+    // then its §28.12 step 2 reclamation on both edges of the await.
+    void emitRunTimeAsyncDisposeAwaitAndFree(llvm::Value* obj);
+
+    // fix #3483 / #7417 (§28.12, v0.350, the #3493 ruling): the itmap KEY of
+    // the built-in `IAsyncDisposable` dispatch entry. `IAsyncDisposable` has no
+    // TypeSymbol and so no `td$` descriptor, so the key is a compiler-provided
+    // LinkOnceODR global — one runtime identity per process, whichever module
+    // built the implementing class's itmap. Every non-generic class with a
+    // `bz$<C>$DisposeReclaim` (declareVtables Pass D) carries the pair
+    // [key, itab$<C>$bz$IAsyncDisposable] in `itmap$<C>`, whose entries are the
+    // two indices below: the run-time class's awaited `DisposeAsync` and its
+    // §28.12 step 2 reclamation. A class without the entry does not implement
+    // `IAsyncDisposable` (or is generic) and takes the synchronous disposal.
+    llvm::GlobalVariable* asyncDisposableItabKey();
+    static constexpr unsigned kAsyncDisposableItabDisposeAsync = 0u;
+    static constexpr unsigned kAsyncDisposableItabReclaim = 1u;
+    // narrow #3483 / fix #7531 (§28.12 and §14.2 rule 1, v0.350): THE ONE
+    // answer to "which `DisposeAsync` does `await using` await on an object of
+    // class `cls`" — the member `IAsyncDisposable` declares (`method
+    // DisposeAsync(): Task;`, §28.12), found on `cls` or its nearest base, and
+    // only when `cls` IMPLEMENTS the interface in §14.2 rule 1's nominal sense
+    // ("lists I (or any interface extending I) in its inheritance clause" or
+    // "inherits from a class which conforms to I"). Null ⇒ the class does not
+    // implement `IAsyncDisposable` ⇒ §28.12's synchronous disposal. The reclaim
+    // population, the static `await using` arm and the run-time dispatch entry
+    // (declareVtables Pass D) all key on this one predicate. The name-only
+    // `findMethodByName(ts, "DisposeAsync")` it replaces awaited an `int`
+    // (SEGV in bz_task_is_done) and a wrong-arity overload.
+    sema::MethodSymbol* asyncDisposableDisposeAsyncOf(
+        const sema::TypeSymbol* cls) const;
+    // Its signature leg: a non-generic, zero-parameter, non-static method whose
+    // return type is exactly the built-in `Task` (§11.2: "Return types must
+    // match exactly (no covariance in this version)" — `Task<T>` is not it).
+    bool isAsyncDisposableDisposeAsyncSignature(sema::MethodSymbol* ms) const;
 
     // §30.7: emit an ASYNC ITERATOR method (declared `async`, contains `yield`,
     // returns IAsyncEnumerable<T> / IAsyncEnumerator<T>). Combines the iterator

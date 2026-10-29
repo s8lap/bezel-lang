@@ -5120,6 +5120,84 @@ llvm::Function* Emitter::emitEventAccessor(const sema::TypeSymbol* cls,
 }
 
 
+// fix #3483 / #7417 (§28.12, v0.350; the #3493 ruling): the itmap key of the
+// built-in `IAsyncDisposable` dispatch entry (see the header comment). Its
+// address is the identity `bz_itable_lookup` compares, so it is LinkOnceODR
+// under one fixed name — fix #2776's linkage for a compiler-provided interface
+// descriptor (§2.8.4 rule 5: one runtime identity per process) — and every
+// module that builds an itmap or performs the lookup agrees on it. It is only
+// ever compared, never read, so its contents are a placeholder.
+llvm::GlobalVariable* Emitter::asyncDisposableItabKey() {
+    static constexpr const char* kName = "td$bz$IAsyncDisposable";
+    if (llvm::GlobalVariable* gv = module_->getNamedGlobal(kName)) return gv;
+    auto* arrTy = llvm::ArrayType::get(ptrTy(), 1);
+    return new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::LinkOnceODRLinkage,
+        llvm::ConstantArray::get(
+            arrTy, {llvm::ConstantPointerNull::get(ptrTy())}),
+        kName);
+}
+
+
+// narrow #3483 / fix #7531 (§28.12 and §14.2 rule 1, v0.350): see the header
+// comment. The interface member is `method DisposeAsync(): Task;` (§28.12), and
+// §11.2 matches an implementing member by name, arity, type-parameter count,
+// parameter types and an EXACTLY equal return type. The return type is read
+// where the method lives: the resolved `ast::MethodDecl` return for a local
+// body, `importedReturnType` for an imported one (there is no `MethodDecl`).
+bool Emitter::isAsyncDisposableDisposeAsyncSignature(
+        sema::MethodSymbol* ms) const {
+    if (!ms || ms->name != "DisposeAsync" || isStaticMethod(ms)) return false;
+    if (!ms->params.empty() || !ms->genericParams.empty()) return false;
+    const sema::TypeRef* rt = nullptr;
+    if (ctx_.isImported(ms)) {
+        rt = ctx_.importedReturnType(ms);
+    } else {
+        // SEAM-ACCESSOR: local-path cast; the imported case returned above.
+        auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+        if (!md || !md->returnType) return false;
+        rt = ctx_.resolvedType(*md->returnType);
+    }
+    // Exactly the built-in `Task`: named, non-nullable, no type arguments
+    // (`Task<T>` is a different named type), and the built-in — either no
+    // declaration at all or the declaration-less builtin class symbol, as
+    // `isTaskTypeName` reads it. A USER type spelled `Task` has a `decl`.
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable ||
+        !rt->genericArgs.empty())
+        return false;
+    if (rt->declaration)
+        return !rt->declaration->decl && rt->declaration->name == "Task";
+    return rt->headName() == "Task";
+}
+
+sema::MethodSymbol* Emitter::asyncDisposableDisposeAsyncOf(
+        const sema::TypeSymbol* cls) const {
+    if (!cls || cls->kind != ast::TypeDeclKind::Class) return nullptr;
+    // §14.2 rule 1, by IDENTITY of the built-in interface (a user interface
+    // that happens to be spelled `IAsyncDisposable` is another type, §2.8.3
+    // rule 3): the class lists it, lists an interface extending it, or
+    // inherits from a class that does — `inheritsBuiltinInterface` is the
+    // cycle-guarded walk over exactly that closure. §28.12: "Only an object
+    // whose class does not implement `IAsyncDisposable` takes the synchronous
+    // disposal" — so a class outside this closure gets null whatever members
+    // it happens to spell `DisposeAsync`.
+    if (!sema::inheritsBuiltinInterface(cls, "IAsyncDisposable")) return nullptr;
+    // The most-derived level first, so an `override` wins over the member it
+    // overrides (the static arm then reads `vtableSlot_` for the dispatch).
+    // `methodFns_` membership: the member has a body this module can call.
+    for (const sema::TypeSymbol* t = cls; t; t = baseClassOf(t)) {
+        for (sema::Symbol* m : t->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+            if (!ms || !isAsyncDisposableDisposeAsyncSignature(ms)) continue;
+            if (!methodFns_.count(ms)) continue;
+            return ms;
+        }
+    }
+    return nullptr;
+}
+
+
 void Emitter::declareVtables() {
     // Pass 0 (CG35-itable): assign each interface method its 0-based position
     // within that interface's non-static method declaration order. This index
@@ -5996,6 +6074,57 @@ void Emitter::declareVtables() {
                     llvm::cast<llvm::Constant>(dit2->second));
                 itmapElems.push_back(
                     llvm::ConstantExpr::getPointerCast(itabGV, ptrTy()));
+            }
+        }
+        // fix #3483 / #7417 (§28.12, v0.350; the #3493 ruling, option 2): the
+        // built-in `IAsyncDisposable` dispatch entry. §28.12: "`await using`
+        // selects the logical-disposal path by the class of the object the
+        // binding holds ... never by the binding's static type", through a
+        // base class that does not implement it and "through any interface".
+        // A slot whose static type cannot name that class (a call right-hand
+        // side at an interface or base-class head) must ask the OBJECT, and
+        // `IAsyncDisposable` has no TypeSymbol and so no itable of its own:
+        // this pair is that itable, keyed by `asyncDisposableItabKey()`.
+        //
+        // POPULATION is the static arm's own predicate, asked of the run-time
+        // class: `findMethodByName(ts, "DisposeAsync")` (a body to await —
+        // registerUsingDisposal's resolution) and `disposerReclaimFns_[ts]`
+        // (populated by that same lookup, non-generic classes only). Both
+        // entries are keyed on the SAME class, so the awaited `DisposeAsync`
+        // and the §28.12 step 2 reclamation that follows it cannot answer
+        // "which class is this" differently. A generic class gets no entry
+        // (its reclamation is per-instantiation) and so keeps the synchronous
+        // fallback it has today.
+        //
+        // narrow #3483 / §14.2 rule 1 (v0.350): the member is
+        // `asyncDisposableDisposeAsyncOf(ts)` — the interface's `DisposeAsync`
+        // on a class that NOMINALLY implements `IAsyncDisposable` — never a
+        // name match. The name-only lookup put `DisposeAsync(): int` and
+        // `DisposeAsync(x: int): int` of a class that does not implement the
+        // interface into this entry (the `int` was then awaited as a task:
+        // SEGV), and a conforming class's wrong-arity overload declared before
+        // the real member. A class outside §14.2's closure gets no entry and
+        // so takes §28.12's synchronous disposal, whatever it spells
+        // `DisposeAsync`.
+        if (ts->genericParams.empty()) {
+            auto rit = disposerReclaimFns_.find(ts);
+            sema::MethodSymbol* dams = asyncDisposableDisposeAsyncOf(ts);
+            auto fit = dams ? methodFns_.find(dams) : methodFns_.end();
+            if (rit != disposerReclaimFns_.end() && fit != methodFns_.end()) {
+                std::vector<llvm::Constant*> adElems(2);
+                adElems[kAsyncDisposableItabDisposeAsync] =
+                    llvm::cast<llvm::Constant>(fit->second);
+                adElems[kAsyncDisposableItabReclaim] =
+                    llvm::cast<llvm::Constant>(rit->second);
+                auto* adTy = llvm::ArrayType::get(ptrTy(), adElems.size());
+                auto* adGV = new llvm::GlobalVariable(
+                    *module_, adTy, /*isConstant=*/true,
+                    llvm::GlobalValue::InternalLinkage,
+                    llvm::ConstantArray::get(adTy, adElems),
+                    "itab$" + mangledTypeName(ts) + "$bz$IAsyncDisposable");
+                itmapElems.push_back(asyncDisposableItabKey());
+                itmapElems.push_back(
+                    llvm::ConstantExpr::getPointerCast(adGV, ptrTy()));
             }
         }
         // Null terminator.
@@ -21488,7 +21617,31 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 }
             }
         }
-        // disposeAsyncFn == null → sync fallback (emitDisposals handles it).
+        // fix #3483 / #7417 (§28.12, v0.350; the #3493 ruling, option 2): no
+        // awaitable `DisposeAsync` could be NAMED from the slot — the head is
+        // an interface (`IAsyncDisposable`, `IDisposable`, a user interface)
+        // or a class that does not implement it, and the right-hand side does
+        // not settle the run-time class (a call, a field, a conditional). That
+        // is not "the object has no `DisposeAsync`": §28.12 "the
+        // `DisposeAsync` awaited is the run-time object's ... never by the
+        // binding's static type", through "a base-class static type that does
+        // not implement `IAsyncDisposable`" and "through any interface". So
+        // the OBJECT decides at scope exit, through its `IAsyncDisposable`
+        // dispatch entry (declareVtables Pass D); only an object whose class
+        // has no entry takes the synchronous disposal — "Only an object whose
+        // class does not implement `IAsyncDisposable` takes the synchronous
+        // disposal above". Every slot reaching here already has its word 0
+        // read as a CLASS vtable by that synchronous fallback
+        // (`emitDisposeAndReclaim`'s slot-2 dispatch), so the lookup's read
+        // of slot 1 (the itmap) assumes nothing the fallback did not.
+        // A statically-named VALUE-kind class (a record) has no vtable word
+        // and is left as it was.
+        if (!dd.disposeAsyncFn &&
+            (!cls || cls->kind == ast::TypeDeclKind::Class ||
+             cls->kind == ast::TypeDeclKind::Interface))
+            dd.disposeAsyncVSlot = kDisposeAsyncRunTimeDispatch;
+        // disposeAsyncFn == null otherwise → sync fallback (emitDisposals
+        // handles it).
         disposeStack_.back().push_back(dd);
     };
 
