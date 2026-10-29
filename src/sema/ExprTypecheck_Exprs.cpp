@@ -2116,22 +2116,6 @@ void ExprTC::checkBuiltinCtorNamedArgs(const ast::NewExpr& ne,
         }
     }
     if (nonIdentity) {
-        // Reject the skip-with-later-arg case: a required parameter is skipped
-        // while a later argument is supplied (codegen has no value for it).
-        for (std::size_t j = 0; j < bb.names.size(); ++j) {
-            if (bb.bind.paramToArg[j] < 0 && j < ne.args.size()) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ne.span.begin,
-                    desc + ": a named argument that binds to a parameter other "
-                           "than its own position is not supported on a built-in "
-                           "constructor — `" + std::string(bb.names[j]) +
-                        "` is parameter " + std::to_string(j + 1) +
-                        " but is left to its default while a later argument is "
-                        "supplied (\xC2\xA7""22.5, #3425). Pass the arguments "
-                        "in declaration order, or positionally.");
-                return;
-            }
-        }
         // Publish the binding: codegen will pre-evaluate args in textual order
         // and pin each result, then dispatch the builtin arm with the binding
         // applied so each parameter receives the correct source argument value.

@@ -270,17 +270,20 @@ BEZEL_TEST(builtin_ctor_named_arg_3425,
                     std::string("102"));
 }
 
-// …but SKIPPING an optional parameter while supplying a later one is a genuine
-// permutation, which the by-position lowering would get wrong. It is rejected
-// with the skipped parameter named.
+// …and SKIPPING an optional parameter while supplying a later one is a
+// permutation the binder resolves (§22.5: a named argument binds the parameter
+// it names; the skipped parameter keeps its declared default). Flipped by
+// #7501 (narrow): it was rejected as "not supported" while codegen had no value
+// for the skipped slot; the TimeOnly lowerNew arm now reads the published
+// binding, so the skipped `second` is 0 and `millisecond` is 5.
 BEZEL_TEST(builtin_ctor_named_arg_3425,
-           rejects_named_arg_that_skips_an_optional_parameter) {
-    JitResult r = runAot(prog(
-        "    var t := new TimeOnly(1, 2, millisecond := 5); "
-        "    Console.WriteLine(t.Minute); "));
-    if (!hasError(r, kReorderDiag)) dumpDiagnostics(r);
-    BEZEL_EXPECT_TRUE(hasError(r, kReorderDiag));
-    BEZEL_EXPECT_TRUE(hasError(r, "`second` is parameter 3"));
+           accepts_named_arg_that_skips_an_optional_parameter) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    var t := new TimeOnly(1, 2, millisecond := 5); "
+            "    Console.WriteLine($\"{t.Hour} {t.Minute} {t.Second} "
+            "{t.Millisecond}\"); ")),
+        std::string("1 2 0 5"));
 }
 
 // ---------------------------------------------------------------------------
