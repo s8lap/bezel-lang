@@ -8907,6 +8907,41 @@ sema::Symbol* MethodOwnership::ownedLocalBorrowSource(const ast::Expr& rhs,
     return nullptr;
 }
 
+// fix #7975 (§28.3, §28.5, v0.350): the borrow SOURCE of a bare read of a
+// field typed at a sync-enumerator head (`h.En`, `h.En!`) that is being
+// stored into a field, when the read's root is an owned scope-bound local
+// (or, the destination being a field, an `owned` parameter).
+// `isBorrowableType` reads every declaration-less builtin head —
+// `IEnumerator<T>` and `IOwningEnumerator<T>` among them — as non-borrowable,
+// so `borrowSourceForExpr`'s member-read leg never names `h` for this shape
+// and `h2.En := h.En!` was admitted, while the class-typed twin
+// `h2.B := h.B!` is rejected. The frame `h.En` holds is owned by `h` (§28.5:
+// released by `h`'s cascade), and a field of the target object outlives `h`
+// — §28.3: "A borrow may be stored in a field of an object only if the
+// borrow's source provably outlives that object." Measured on the admitted
+// program (r37-rev-l5f r08 / r08c): the receiving object's cascade frees the
+// frame a second time. Only the member-read shape through a local root is
+// classified here; a receiver-rooted read (`this.E2 := this.En!`) is the
+// owned-field borrow-store rule's question (`ownedArgSourceIsBorrow`), not
+// this one's. // per §28.3, §28.5
+sema::Symbol* MethodOwnership::ownedEnumeratorFieldReadStoreSource(
+    const ast::Expr& rhs, OwnedSourceKinds kinds) {
+    const ast::Expr* core = peelTopCastBang(&rhs);
+    if (!dynamic_cast<const ast::MemberAccessExpr*>(core)) return nullptr;
+    const sema::TypeRef* t = ctx_.exprType(*core);
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return nullptr;
+    if (!common::isSyncIterFormatEnumeratorHead(t->headName())) return nullptr;
+    const ast::IdentifierExpr* root = identifierRootThroughCastBang(rhs);
+    if (!root) return nullptr;
+    sema::Symbol* sym = ctx_.exprSymbol(*root);
+    if (!sym || !isOwnedTrackedLocal(sym)) return nullptr;
+    if (dynamic_cast<sema::LocalSymbol*>(sym)) return sym;
+    if (kinds == OwnedSourceKinds::LocalOrOwnedParam &&
+        symbolIsOwnedObligation(sym))
+        return sym;
+    return nullptr;
+}
+
 // §9.7 / stdlib §4.14 / §4.15 (v0.307): see the declaration in
 // Ownership_impl.hpp for the contract and the three recognized forms.
 sema::Symbol* MethodOwnership::carriedBorrowSourceOfValueExpr(
@@ -12820,6 +12855,14 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as,
             ? OwnedSourceKinds::LocalOrOwnedParam
             : OwnedSourceKinds::LocalOnly;
     sema::Symbol* src = ownedLocalBorrowSource(*as.value, srcKinds);
+    // fix #7975 (§28.3, §28.5, v0.350): a bare read of a field typed at a
+    // sync-enumerator head (`h2.En := h.En!`, `h.E2 := h.En!`) is a borrow
+    // of `h`'s frame exactly like the class-typed `h2.B := h.B!`, which the
+    // resolver above already names; the enumerator head is a
+    // declaration-less builtin that `isBorrowableType` reads as
+    // non-borrowable, so the same store was admitted. See the helper.
+    if (!src && dest == Dest::Field)
+        src = ownedEnumeratorFieldReadStoreSource(*as.value, srcKinds);
     // fix #3727 (§28.3 *Borrow lifetime rules* / §28.9 / §27.5, v0.286): the
     // query above asked about the CHECKED LAMBDA BODY's frame — `states_` was
     // cleared and re-seeded from that body alone by `checkOneLambdaBodyEscapes`

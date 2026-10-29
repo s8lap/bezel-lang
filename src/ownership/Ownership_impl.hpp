@@ -3369,6 +3369,11 @@ private:
     sema::Symbol* ownedLocalBorrowSource(
         const ast::Expr& rhs,
         OwnedSourceKinds kinds = OwnedSourceKinds::LocalOnly);
+    // fix #7975 (§28.3, §28.5, v0.350): the borrow source of a sync-
+    // enumerator-headed field read that is being stored into a field — see
+    // the definition.
+    sema::Symbol* ownedEnumeratorFieldReadStoreSource(const ast::Expr& rhs,
+                                                      OwnedSourceKinds kinds);
 
     // fix #3706 (§28.3 clause 1 / §28.9 / §28.11 / §29.2 "Iterator yield
     // ownership", v0.294): a TYPE/SHAPE-based recognizer, independent of
