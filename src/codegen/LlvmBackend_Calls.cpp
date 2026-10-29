@@ -15246,7 +15246,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
             }
         }
-        if (call.args.size() == 2 && call.args[0].value && call.args[1].value) {
+        // fix #7219 (§22.5, v0.343): `Fmod` / `IEEERemainder` are NOT members of
+        // this block. They have their own 2-argument arm below, which lowers
+        // `x` / `y` itself; this block lowered the operands too and then fell
+        // through (it has no `Fmod` / `IEEERemainder` arm), so a purely
+        // POSITIONAL `Math.Fmod(f(), g())` ran each operand TWICE. §22.5:
+        // "A call's supplied argument expressions are evaluated in call-site
+        // textual order", i.e. exactly once each.
+        if (call.args.size() == 2 && call.args[0].value && call.args[1].value &&
+            m != "Fmod" && m != "IEEERemainder") {
             // fix #7199 (§22.5, v0.343): the two operands are PARAMETERS
             // (`Min/2` and `Max/2` are {a, b}; `Pow/2` and `Fmod/2` are
             // {x, y}; `Round/2` is {x, digits}), and a named argument binds
