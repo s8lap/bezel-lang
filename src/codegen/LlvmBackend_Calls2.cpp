@@ -22802,6 +22802,17 @@ llvm::Value* Emitter::lowerNullCondBuiltinCall(
         auto placeholder = std::make_unique<ast::IdentifierExpr>();
         placeholder->name = "<nullcond-receiver>";  // unspellable (#6681)
         ctx_.setExprType(placeholder.get(), const_cast<sema::TypeRef*>(rcvTy));
+        // fix #7458 (§7.5, §28.2, v0.350): the placeholder STANDS FOR the real
+        // `?.` target, so it carries the target's symbol. The `.` twin's
+        // downstream ownership classifiers (materializeVtableIEnumerableToArray's
+        // `sourceIsNamed`, the iterator-source arms in lowerCall) key on
+        // exprSymbol of the receiver node: a symbol-less placeholder read as an
+        // unbound TEMPORARY, so a named `IEnumerable<T>?` local was disposed by
+        // the terminal AND again at its own scope end (heap-use-after-free). A
+        // genuinely temporary target (a call result) has no symbol, so it keeps
+        // the dispose-the-temporary behaviour.
+        if (sema::Symbol* targetSym = ctx_.exprSymbol(*nm.target))
+            ctx_.setExprSymbol(placeholder.get(), targetSym);
         exprValueOverride_[placeholder.get()] = rcv;
         placeholderKey = placeholder.get();
         dotted->target = std::move(placeholder);
