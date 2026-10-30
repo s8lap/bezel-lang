@@ -2099,6 +2099,29 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             llvm::Value* cl = builder_.CreateLoad(ptrTy(), fptr, "iter.clcap");
             emitClosureRetain(cl);
         }
+        // fix #7798 (§28.9 / §29.3 / §29.4, v0.350): the string twin of the
+        // closure retain above. A plain `string` parameter (or the `this` of
+        // an `extension string` member) is read by every MoveNext, after the
+        // producing call's full expression has ended and the caller may have
+        // released its argument (a +1 temporary's #429 argument-pass release,
+        // a local's scope end, or a field read whose receiver is disposed at
+        // the K8 boundary). The frame takes its OWN +1 here and its Dispose
+        // drops it (releaseClosureCaptures below); a GetEnumerator clone
+        // takes and drops its own the same way. So each frame's copy is
+        // valid for that frame's whole life. The capture field is
+        // written once, here, and never re-spilled (a body assignment lands
+        // in the restored alloca), so the release drops this same value.
+        for (std::size_t ci = 0; ci < frame.captures.size(); ++ci) {
+            if (!isIteratorFrameStringPinCapture(
+                    ms, frame.captures[ci].first,
+                    frame.captures[ci].second))
+                continue;
+            unsigned fieldIdx = frame.captureStart + (unsigned)ci;
+            llvm::Value* fptr =
+                builder_.CreateStructGEP(frame.structTy, st, fieldIdx);
+            emitStringRetain(
+                builder_.CreateLoad(ptrTy(), fptr, "iter.strcap"));
+        }
         // Return the state struct (as ptr)
         builder_.CreateRet(st);
     }
@@ -2180,6 +2203,25 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                     gb.CreateStructGEP(stateStructTy, self, fieldIdx));
             }
             gb.CreateStore(gb.getInt32(-3), sourceState);
+        }
+        // fix #7798 (§28.9 / §29.4 / §29.11, v0.350): the clone holds its own
+        // +1 on each string capture the memcpy aliased, released by its own
+        // Dispose (releaseClosureCaptures), so it stays valid after the source
+        // frame is disposed. bz_string_retain is null-safe.
+        {
+            auto* strRetainFnGE = declareC("bz_string_retain",
+                                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            for (std::size_t i = 0; i < frame.captures.size(); ++i) {
+                if (!isIteratorFrameStringPinCapture(
+                        ms, frame.captures[i].first,
+                        frame.captures[i].second))
+                    continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    gb.CreateStructGEP(stateStructTy, clone, fieldIdx);
+                gb.CreateCall(strRetainFnGE,
+                              {gb.CreateLoad(ptrTy(), fptr, "iterge.strcap")});
+            }
         }
         // Install the clone vtable. In the narrow owned-capture shape its Dispose
         // also runs the state-keyed §29.8 parameter cleanup.
@@ -3008,8 +3050,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // env block at rc 0. Owned-class params (disposeOwnedParams) and closure
         // params are disjoint sets, so the two loops never touch the same field.
         auto releaseClosureCaptures = [&]() {
-            if (!releaseClosures) return;
-            for (std::size_t i = frame.captures.size(); i-- > 0;) {
+            for (std::size_t i = frame.captures.size();
+                 releaseClosures && i-- > 0;) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
                 if (!ps) continue;
@@ -3020,6 +3062,25 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                     builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
                 llvm::Value* cl = builder_.CreateLoad(ptrTy(), fptr, "itc.cl");
                 emitClosureRelease(cl);   // null-safe
+            }
+            // fix #7798 (§28.9 / §29.4, v0.350): drop THIS frame's +1 on each
+            // string capture. Unlike the closures above this runs for the
+            // source AND for a GetEnumerator clone: each holds its own
+            // reference (the construction retain / the clone retain in
+            // GetEnumerator), because a clone handed out by an explicit
+            // `GetEnumerator()` can outlive its source frame
+            // (`return Gen(s).GetEnumerator();`). bz_string_release is
+            // null-safe.
+            for (std::size_t i = frame.captures.size(); i-- > 0;) {
+                if (!isIteratorFrameStringPinCapture(
+                        ms, frame.captures[i].first,
+                        frame.captures[i].second))
+                    continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
+                emitStringRelease(
+                    builder_.CreateLoad(ptrTy(), fptr, "its.str"));
             }
         };
 

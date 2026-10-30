@@ -3676,6 +3676,23 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                 llvm::Value* cl = gb.CreateLoad(ptrTy(), fptr, "gae.clcap");
                 gb.CreateCall(retainFnGE, {cl});     // null-safe
             }
+            // fix #7798 (§28.9 / §29.4 / §30.7, v0.350): the string twin, for
+            // the same one-vtable reason — the clone's Dispose releases each
+            // string capture, so the clone takes its own +1
+            // on the pointer the memcpy aliased. bz_string_retain is null-safe.
+            auto* strRetainFnGE = declareC("bz_string_retain",
+                                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            for (std::size_t i = 0; i < frame.captures.size(); ++i) {
+                if (!isIteratorFrameStringPinCapture(
+                        ms, frame.captures[i].first,
+                        frame.captures[i].second))
+                    continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    gb.CreateStructGEP(stateStructTy, clone, fieldIdx);
+                gb.CreateCall(strRetainFnGE,
+                              {gb.CreateLoad(ptrTy(), fptr, "gae.strcap")});
+            }
         }
         gb.CreateRet(clone);
     }
@@ -3727,6 +3744,23 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             llvm::Value* cl =
                 builder_.CreateLoad(ptrTy(), fptr, "asynciter.clcap");
             emitClosureRetain(cl);
+        }
+        // fix #7798 (§28.9 / §29.4 / §30.7, v0.350): the string twin of the
+        // closure retain above (the sync iterator's construction retain,
+        // LlvmBackend_Iterators.cpp): every MoveNextAsync reads a plain
+        // `string` parameter (or an `extension string` receiver) after the
+        // caller may have released its argument, so
+        // the SOURCE frame takes its own +1, dropped by its Dispose tail.
+        for (std::size_t ci = 0; ci < frame.captures.size(); ++ci) {
+            if (!isIteratorFrameStringPinCapture(
+                    ms, frame.captures[ci].first,
+                    frame.captures[ci].second))
+                continue;
+            unsigned fieldIdx = frame.captureStart + (unsigned)ci;
+            llvm::Value* fptr =
+                builder_.CreateStructGEP(stateStructTy, st, fieldIdx);
+            emitStringRetain(
+                builder_.CreateLoad(ptrTy(), fptr, "asynciter.strcap"));
         }
         builder_.CreateRet(st);
     }
@@ -4727,6 +4761,20 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                     builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
                 llvm::Value* cl = builder_.CreateLoad(ptrTy(), fptr, "aitc.cl");
                 emitClosureRelease(cl);   // null-safe
+            }
+            // fix #7798 (§28.9 / §29.4 / §30.7, v0.350): drop THIS frame's +1
+            // on each string capture, paired 1:1 with the
+            // two retains (construction entry, GetAsyncEnumerator clone).
+            for (std::size_t i = frame.captures.size(); i-- > 0;) {
+                if (!isIteratorFrameStringPinCapture(
+                        ms, frame.captures[i].first,
+                        frame.captures[i].second))
+                    continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
+                emitStringRelease(
+                    builder_.CreateLoad(ptrTy(), fptr, "aits.str"));
             }
             // Free the spill area first (null-safe: free(null) is a no-op).
             llvm::Value* spillField2 =

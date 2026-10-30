@@ -5419,6 +5419,37 @@ private:
                pty->primitive == sema::PrimitiveType::String;
     }
 
+    // fix #7798 (§28.9 / §29.3 / §29.4 / §9.4, v0.350): is frame capture `cap`
+    // of iterator `ms` a `string` / `string?` the ITERATOR frame (sync or
+    // async) must hold its own reference to? §29.3: an iterator's "arguments
+    // are captured into a heap state-machine frame that outlives the
+    // synchronous call"; §28.9: a string's lifetime is the runtime's, so the
+    // frame's copy must stay valid however the caller's argument is reclaimed
+    // (a +1 temporary is released at the call's end, a local at its scope's
+    // end, a field read's receiver disposed at the full expression's end).
+    // The plain async method's #5262-ff pin is the same hold for a task frame.
+    // Two kinds of capture qualify: a plain (unmodified) parameter, read at
+    // the current substitution so `Gen<string>` qualifies too; and the `this`
+    // capture (`cap == nullptr`) of an `extension string` member — §9.4 /
+    // §30.1: "an async or iterator member holds the fixed receiver value in
+    // its frame". The capture field must be a pointer (a `string?` lowers to
+    // one).
+    bool isIteratorFrameStringPinCapture(const sema::MethodSymbol* ms,
+                                         sema::Symbol* cap,
+                                         llvm::Type* fieldTy) {
+        if (!fieldTy || !fieldTy->isPointerTy()) return false;
+        if (!cap) {
+            if (!ms || !isExtensionMethod(ms) || !ms->extensionDecl ||
+                !ms->extensionDecl->targetType)
+                return false;
+            return isStringPinFormalType(
+                ctx_.resolvedType(*ms->extensionDecl->targetType));
+        }
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(cap);
+        if (!ps || !ps->modifier.empty()) return false;
+        return isStringPinFormalType(resolveTypeParamRef(paramTypeOf(ps)));
+    }
+
     // fix #5244 / #5262 (§4.6 / §28.9, v0.313): the CALLER-SIDE PIN, shared by
     // every call shape that can hand a borrowed by-value string to a callee
     // (#5244's user-method call; #5262's constructor, imported-callee and
