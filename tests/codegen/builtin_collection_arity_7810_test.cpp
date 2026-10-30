@@ -108,11 +108,31 @@ BEZEL_TEST(builtin_collection_arity_7810, array_lastindexof_two_args_draws_one_d
     // per stdlib §4.4 (v0.350) `LastIndexOf(item: T)`
     auto r = runAot(prog("", std::string(kArr) + "    Console.WriteLine(a.LastIndexOf(1, 2));"));
     BEZEL_EXPECT_FALSE(r.ran);
-    // the #7671 arm's own wording, once; the new gate's wording, never
-    BEZEL_EXPECT_EQ(bezel::test::diagnosticMessageCount(
-                        r, "no member `LastIndexOf` taking 2 argument(s)"), 1);
-    BEZEL_EXPECT_EQ(bezel::test::diagnosticMessageCount(
-                        r, "the call to `Array.LastIndexOf`"), 0);
+    // The #7671 arm's own wording, once; the new gate's wording, never.
+    //
+    // The count is over OCCURRENCES inside the message text, not over
+    // diagnostic entries: a rejected program's whole stderr arrives as ONE
+    // diagnostic (tests/support/aot_result_asserts.hpp says so), so counting
+    // entries would read 0 or 1 whatever the compiler emitted. The scan is
+    // spelled out here so the row pins the diagnostic TEXT, not just the
+    // rejection (#3892: a bare `.ran` cannot tell a rejection from a crash).
+    const std::string oldWording = "no member `LastIndexOf` taking 2 argument(s)";
+    const std::string newWording = "the call to `Array.LastIndexOf`";
+    int oldCount = 0, newCount = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        std::size_t pos = 0;
+        while ((pos = d.message.find(oldWording, pos)) != std::string::npos) {
+            ++oldCount;
+            pos += oldWording.size();
+        }
+        pos = 0;
+        while ((pos = d.message.find(newWording, pos)) != std::string::npos) {
+            ++newCount;
+            pos += newWording.size();
+        }
+    }
+    BEZEL_EXPECT_EQ(oldCount, 1);
+    BEZEL_EXPECT_EQ(newCount, 0);
 }
 
 // Every DECLARED Array arity still runs, and reads its data.
