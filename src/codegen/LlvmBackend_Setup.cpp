@@ -27062,6 +27062,10 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         reinterpret_cast<const ast::Expr*>(1);
     if (init == kMultiStmtProducerSentinel) return true;
     if (dynamic_cast<const ast::InterpolatedStringExpr*>(init)) return true;
+    // fix #7728 / §28.3 K8.1 (v0.350): `MkH().S` takes the string's +1 before
+    // it disposes the temporary `MkH()` -- see the field-read arm of
+    // lowerExprInner.
+    if (isFreshTempStringFieldRead(init)) return true;
     // fix #1934 / §19.2 / §28.3 (producers arm-meet, v0.184) / §28.9: an
     // expression-position `case`/`when` whose result is a non-nullable owned
     // `string` is a single +1 producer. lowerCaseExpr normalizes every arm to

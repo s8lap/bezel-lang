@@ -5475,6 +5475,48 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
 }
 
 
+// fix #7728 / §28.3 K8.1 (v0.350): is `t` a value whose copy holds no
+// reference of any kind (no string, Object, class, interface, function or
+// choice anywhere in it)? Such a copy is independent of the receiver it was
+// read from, so the receiver may be disposed once the copy is taken.
+bool Emitter::typeIsRefFreeData(const sema::TypeRef* t, unsigned depth) {
+    if (!t || depth > 8) return false;
+    using K = sema::TypeRef::Kind;
+    if (t->kind == K::Primitive)
+        return t->primitive != sema::PrimitiveType::None &&
+               t->primitive != sema::PrimitiveType::String &&
+               t->primitive != sema::PrimitiveType::Object;
+    if (t->kind == K::InlineArray)
+        return !t->arrayOwned && t->arrayElement &&
+               typeIsRefFreeData(t->arrayElement, depth + 1);
+    if (t->kind != K::Named || !t->declaration) return false;
+    if (t->declaration->kind == ast::TypeDeclKind::Enum) return true;
+    if (t->declaration->kind != ast::TypeDeclKind::Record) return false;
+    RecordSubstGuard guard(this, t);
+    std::vector<const sema::Symbol*> storage;
+    collectRecordStorage(t->declaration, storage);
+    for (const sema::Symbol* m : storage) {
+        const sema::TypeRef* mty = recordMemberTypeResolved(m);
+        if (mty == t || !typeIsRefFreeData(mty, depth + 1)) return false;
+    }
+    return true;
+}
+
+
+// fix #7728 / §28.3 K8.1 (v0.350). See the declaration.
+bool Emitter::isFreshTempStringFieldRead(const ast::Expr* e) const {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || !ma->target) return false;
+    auto* fs = dynamic_cast<const sema::FieldSymbol*>(ctx_.exprSymbol(*ma));
+    if (!fs || isStaticField(fs)) return false;
+    const sema::TypeRef* rt = ctx_.exprType(*ma);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Primitive ||
+        rt->primitive != sema::PrimitiveType::String || rt->nullable)
+        return false;
+    return isFreshOwnedClassProducer(ma->target.get());
+}
+
+
 // fix #4320 (§26.1 / §4.6 / §28.9, v0.298): the STRING-RECEIVER sibling of
 // `disposeFreshNewReceiverTemp` (above). The class-receiver reclaim fires only
 // for a heap-CLASS producer; a `+1` STRING producer reaches CG33b as a plain
@@ -8602,6 +8644,11 @@ void Emitter::registerFreshNewReceiverTempK8(const ast::Expr* recvExpr,
                                              llvm::Value* recvPtr,
                                              const sema::TypeRef* resultTy) {
     if (!freshNewReceiverTempStringResult(recvExpr, recvPtr, resultTy)) return;
+    queueFreshReceiverTempK8(recvPtr);
+}
+
+
+void Emitter::queueFreshReceiverTempK8(llvm::Value* recvPtr) {
     if (disposeStack_.empty()) return;
     if (emittingDisposerBody_) return;
     if (!currentFn_) return;

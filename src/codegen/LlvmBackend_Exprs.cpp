@@ -9790,9 +9790,30 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // and the field result is a primitive/enum/unit value). Guarded by
             // !diverged_ so the disposal's control flow is never emitted into a
             // terminated block.
-            if (!diverged_)
-                disposeFreshNewReceiverTemp(ma->target.get(), recvPtr,
-                                            ctx_.exprType(e));
+            if (!diverged_) {
+                // fix #7728 / §28.3 K8.1 (v0.350): the same reclaim for a
+                // `string` field (its +1 is taken first, so the result is
+                // independent of the receiver; isPlusOneStringProducer says
+                // so to every consumer) and for a reference-free record or
+                // inline-array field (a plain data copy). Queued for the
+                // full expression's end ("after their uses"), like #4552's
+                // string-result receiver, not reclaimed inline.
+                if (isFreshTempStringFieldRead(ma)) {
+                    emitStringRetain(val);
+                    queueFreshReceiverTempK8(recvPtr);
+                } else if (recvPtr && isFreshOwnedClassProducer(ma->target.get()) &&
+                           ctx_.exprType(e) &&
+                           ctx_.exprType(e)->kind !=
+                               sema::TypeRef::Kind::Primitive &&
+                           typeIsRefFreeData(ctx_.exprType(e)) &&
+                           recvPtr->getType()->isPointerTy() &&
+                           !llvm::isa<llvm::ConstantPointerNull>(recvPtr)) {
+                    queueFreshReceiverTempK8(recvPtr);
+                } else {
+                    disposeFreshNewReceiverTemp(ma->target.get(), recvPtr,
+                                                ctx_.exprType(e));
+                }
+            }
             return val;
         }
         // #213: a qualified static-field read `Type.Count` — static

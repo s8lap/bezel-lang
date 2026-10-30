@@ -22336,6 +22336,10 @@ private:
     // a K8-boundary queue entry.
     void registerFreshBuiltinNewReceiverTempK8(const ast::Expr* recvExpr,
                                                llvm::Value* recvPtr);
+    // The unconditional half of the above (no result-type gate): queue the
+    // already-vetted fresh receiver `recvPtr` for the K8 boundary reclaim plus
+    // the exception-edge `unwindOnly` entry. fix #7728 (v0.350).
+    void queueFreshReceiverTempK8(llvm::Value* recvPtr);
     // Emit the queued reclaims at a K8 full-expression boundary.
     void flushK8RecvTemps();
     // fix #5297 / §28.3 *Unbound owned temporaries* rule 1, §22.6 (v0.313):
@@ -23449,6 +23453,19 @@ private:
                                       llvm::Value* recvPtr,
                                       const sema::TypeRef* resultTy,
                                       bool calleeReturnsOwned) const;
+
+    // Is `t` a value whose copy holds no reference of any kind (numeric, bool,
+    // char, decimal, enum, or a record / non-owning inline array made only of
+    // those)? Such a copy outlives its receiver's disposal.
+    bool typeIsRefFreeData(const sema::TypeRef* t, unsigned depth = 0);
+    // `<fresh owned class producer>.F` where F is an instance FIELD of
+    // non-nullable `string` type. The field read takes a +1 of the string and
+    // disposes the receiver, so the read is a +1 string producer
+    // (isPlusOneStringProducer): the two sides share this predicate.
+    // An iterator argument needs no exception: the frame holds its own
+    // reference to a captured string (fix #7798), so releasing the +1 at the
+    // call's end is safe.
+    bool isFreshTempStringFieldRead(const ast::Expr* e) const;
 
     // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): the EXCEPTION-edge
     // half of the #1039 family's unbound-receiver reclaim. §28.3: "every
