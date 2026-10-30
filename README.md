@@ -199,7 +199,7 @@ scripts/check_docs.sh                       # the documentation checks
 
 ## Acknowledgements
 
-Bezel is built with [Claude](https://www.anthropic.com/claude), Anthropic's AI model, which writes most of the specification, compiler and tests.
+Bezel is built with Claude which writes most of the specification, compiler and tests. Significant compiler work has come from MiniMax models. Z.AI models and Grok worked on the repo in the past to improve the compiler and the specification.
 
 ## License
 
