@@ -2061,7 +2061,17 @@ void  bz_task_fire_and_forget_checked(void* tp, void* disposedAccessVtable) {
 // extra runtime-only fields.  v0.173 / #810 adds the two linked-source adjacency
 // lists below; because codegen never GEPs into the cell, growing it is safe.
 
+// fix #7554 (§8.7 / §5.1, v0.350): the source opens with a vtable word
+// (bz_cts_vtable, bezel_runtime_refcounting.cpp), the #6776 Mutex shape, so a
+// CancellationTokenSource held at an `owned … : IDisposable` slot — which
+// §5.1 admits representation-preserved — reaches its real disposal through
+// vtable slot 2 (emitDisposeAndReclaim) instead of calling through the
+// `state` pointer read as a vtable (the issue's SEGV at pc 0). The cell is
+// calloc'd plain data, freed by free(): by bz_cts_dispose on the typed path,
+// or by codegen's reclaim step after bz_cts_obj_dispose on the class path.
 struct bz_cancel_source_t {
+    void* vtable;      // bz_cts_vtable
+    void* type_desc;   // unused (non-generic); keeps the bz_array_t header shape
     bz_cancel_state_t* state;
     bool disposed;
 };
@@ -2285,8 +2295,12 @@ extern "C" void* bz_ctoken_register(void* token, void* closure) {
 }
 
 extern "C" void* bz_cts_alloc(void) {
-    // Use `new` (not calloc) so that std::atomic constructors run.
-    auto* src = new bz_cancel_source_t();
+    // The state cell uses `new` so that std::atomic constructors run; the
+    // source itself is plain data, calloc'd so either release protocol may
+    // free() it (fix #7554).
+    auto* src = (bz_cancel_source_t*)calloc(1, sizeof(bz_cancel_source_t));
+    if (!src) bz_alloc_fail("CancellationTokenSource");
+    src->vtable = (void*)bz_cts_vtable;
     src->state = new bz_cancel_state_t();
     src->state->cancelled.store(0, std::memory_order_relaxed);
     src->state->rc.store(1, std::memory_order_relaxed);  // source holds one reference
@@ -2372,10 +2386,12 @@ extern "C" void bz_cts_cancel_after(void* srcp, int64_t ms) {
     });
 }
 
-extern "C" void bz_cts_dispose(void* srcp) {
+// The disposal itself, shared by both release protocols; false when the
+// source was already disposed (idempotent, §28.2). Leaves the cell allocated.
+static bool bz_cts_teardown(void* srcp) {
     auto* src = (bz_cancel_source_t*)srcp;
-    if (!src) return;
-    if (src->disposed) return;  // idempotent (§28.2)
+    if (!src) return false;
+    if (src->disposed) return false;  // idempotent (§28.2)
     src->disposed = true;
     // Per stdlib §6.1 destructor note: signals cancellation to any tokens
     // still observing.  Outstanding token handles retain the state cell via
@@ -2397,9 +2413,18 @@ extern "C" void bz_cts_dispose(void* srcp) {
         bz_cancel_state_release(src->state);  // drop the source's reference
         src->state = nullptr;
     }
-    // Use `delete` to match the `new` in bz_cts_alloc (#716).
-    delete src;
+    return true;
 }
+
+extern "C" void bz_cts_dispose(void* srcp) {
+    // The typed path frees the cell itself; calloc'd in bz_cts_alloc (#7554).
+    if (bz_cts_teardown(srcp)) free(srcp);
+}
+
+// fix #7554: bz_cts_vtable slot 2 — the class-protocol Dispose. The caller
+// (emitDisposeAndReclaim's reclaim step) frees the cell, so this only tears
+// down. Idempotent like bz_cts_dispose.
+extern "C" void bz_cts_obj_dispose(void* srcp) { (void)bz_cts_teardown(srcp); }
 
 // v0.173 / #810 (stdlib §6.1 / spec §30.8): CancellationTokenSource.CreateLinked
 // / CreateLinkedAll — a linked cancellation source.  The returned child source

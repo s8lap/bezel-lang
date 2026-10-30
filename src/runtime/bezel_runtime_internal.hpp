@@ -258,6 +258,12 @@ extern "C" void* bz_mutex_vtable[6];
 // twin of bz_mutex_dispose — releases the Mutex's core reference and leaves
 // the handle for the caller's reclaim step instead of freeing it itself.
 extern "C" void bz_mutex_obj_dispose(void* mutex);
+// fix #7554: CancellationTokenSource's tag (bezel_runtime_concurrency.cpp's
+// bz_cancel_source_t opens with it) and its class-protocol Dispose slot, the
+// twin of bz_cts_dispose that leaves the cell for the caller's reclaim step.
+extern "C" void* bz_cts_desc[2];
+extern "C" void* bz_cts_vtable[6];
+extern "C" void bz_cts_obj_dispose(void* cts);
 // Either view of a function value -> the cell base. A cell base's word 0 is a
 // code pointer and can never equal the vtable's address.
 static inline void* bz_closure_base(void* c) {

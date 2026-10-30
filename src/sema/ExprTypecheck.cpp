@@ -6649,6 +6649,204 @@ void ExprTC::checkAssignable(
             "`Type` value, or `null` for `Type?` (§7), is assignable to it");
         return;
     }
+    // fix #7554 (§8.7 / §5.1, v0.350; owner ruling, reading (A)): what
+    // converts implicitly to the built-in `IDisposable` is decided by the
+    // source's STATIC type. §8.7: "The compiler generates `IDisposable` on
+    // every non-static class. Static classes, records, enums, choices,
+    // primitives, and inline arrays do not implement `IDisposable`; neither
+    // do the runtime-managed types — `string`, `Type`, boxed values and
+    // function values"; and "`Dispose` is not on `Object`". §5.1's reference
+    // conversions reach an interface only from a type that implements it, or
+    // from an interface extending it. So the admitted sources are a class
+    // (user, exception or stdlib) and an interface that is or extends
+    // `IDisposable` (`IEnumerator<T>`, the owning iteration/collection
+    // interfaces, a user interface extending one of them); a record, enum,
+    // choice, primitive, inline array, unit, function value, `Type`, `Object`
+    // and an interface that does not extend `IDisposable` (`IEnumerable<T>`,
+    // `IList<T>`, a plain user interface) are not. Before this arm every one
+    // of those reached the catch-all accept: `Take(5)` / `Take(new Rec(1))`
+    // into `owned d: IDisposable` aborted the IR verifier, `Take("abc")`,
+    // `Take(new Object())` and `Take(G.Gen())` compiled. Only a DEFINITE "does
+    // not implement" rejects; an unresolved base, a type parameter (§14.2
+    // governs it) and any declaration-less name not recognised below keep
+    // their existing path.
+    auto isBuiltinIDisposableRef = [&](const TypeRef* t) {
+        if (!t || t->kind != TypeRef::Kind::Named || !t->genericArgs.empty())
+            return false;
+        if (t->declaration && isUserDeclaredTypeSym(t->declaration)) return false;
+        const std::string_view head = t->aliasResolvedHead.empty()
+                                          ? namedRefSimpleName(t)
+                                          : t->aliasResolvedHead;
+        if (head != "IDisposable") return false;
+        if (freeTypeParamNames && freeTypeParamNames->count("IDisposable"))
+            return false;
+        return !isInScopeTypeParam("IDisposable");
+    };
+    if (isBuiltinIDisposableRef(to) && from->kind != TypeRef::Kind::Error) {
+        // 1 = reaches `IDisposable`, 0 = definitely does not, -1 = unknown.
+        auto builtinHeadReaches = [](std::string_view h) -> int {
+            for (int hops = 0; hops < 16 && !h.empty(); ++hops) {
+                if (h == "IDisposable") return 1;
+                if (!common::isBuiltinDisposalFamilyHead(h)) break;
+                h = common::builtinDisposalFamilyParent(h);
+            }
+            return common::isBuiltinInterfaceHead(h) ? 0 : -1;
+        };
+        std::function<int(const TypeSymbol*, int)> ifaceReaches =
+            [&](const TypeSymbol* ts, int depth) -> int {
+            if (!ts || depth > 32) return -1;
+            if (ts->isSynthesizedBuiltinInterface)
+                return builtinHeadReaches(ts->name);
+            bool unknown = false;
+            for (const TypeRef* br : nonSymbolBaseRefsOf(ts)) {
+                if (!br || br->kind != TypeRef::Kind::Named) {
+                    unknown = true;
+                    continue;
+                }
+                int r = builtinHeadReaches(br->aliasResolvedHead.empty()
+                                               ? namedRefSimpleName(br)
+                                               : br->aliasResolvedHead);
+                if (r == 1) return 1;
+                if (r < 0) unknown = true;
+            }
+            for (const TypeSymbol* b : ts->baseTypes) {
+                int r = ifaceReaches(b, depth + 1);
+                if (r == 1) return 1;
+                if (r < 0) unknown = true;
+            }
+            return unknown ? -1 : 0;
+        };
+        const bool nullSource =
+            fromExpr ? dynamic_cast<const ast::NullLiteralExpr*>(fromExpr) != nullptr
+                     : (from->kind == TypeRef::Kind::Primitive &&
+                        from->primitive == PrimitiveType::Object &&
+                        from->nullable);
+        auto spellPrim = [](PrimitiveType p) -> const char* {
+            using P = PrimitiveType;
+            switch (p) {
+                case P::Bool: return "bool";     case P::Char: return "char";
+                case P::String: return "string"; case P::Byte: return "byte";
+                case P::SByte: return "sbyte";   case P::Short: return "short";
+                case P::UShort: return "ushort"; case P::Int: return "int";
+                case P::UInt: return "uint";     case P::Long: return "long";
+                case P::ULong: return "ulong";   case P::Float: return "float";
+                case P::Double: return "double"; case P::Decimal: return "decimal";
+                case P::Object: return "Object";
+                default: return "?";
+            }
+        };
+        // `kind` names the population §8.7 excludes; `remedy` is optional.
+        const char* kind = nullptr;
+        const char* remedy = nullptr;
+        std::string spelled;
+        switch (from->kind) {
+        case TypeRef::Kind::Primitive:
+            if (nullSource) break;
+            if (from->primitive == PrimitiveType::Object) {
+                // §12.7: a carrier flow-narrowed by `o is IDisposable` reads
+                // as `IDisposable` inside the controlled block.
+                if (pendingTypeFactAdmits(fromExpr, to)) break;
+                kind = "`Dispose` is not on `Object` (§8.7) — an `Object` "
+                       "value may be a boxed value";
+                remedy = "test the runtime type with `is IDisposable` "
+                         "(§12.7) or convert with `as IDisposable` (§17.4)";
+                spelled = "`Object`";
+            } else if (from->primitive == PrimitiveType::String) {
+                kind = "`string` is a runtime-managed type, not a class (§8.7, "
+                       "§28.9)";
+                spelled = "`string`";
+            } else {
+                kind = "a primitive does not implement `IDisposable` (§8.7)";
+                spelled = std::string("`") + spellPrim(from->primitive) + "`";
+            }
+            break;
+        case TypeRef::Kind::Function:
+            kind = "a function value is runtime-managed, not a class (§8.7, "
+                   "§28.9)";
+            spelled = "a function type";
+            break;
+        case TypeRef::Kind::InlineArray:
+            kind = "an inline array does not implement `IDisposable` (§8.7)";
+            spelled = "an inline array type";
+            break;
+        case TypeRef::Kind::Unit:
+            kind = "the unit type does not implement `IDisposable` (§8.7)";
+            spelled = "`()`";
+            break;
+        case TypeRef::Kind::Named: {
+            spelled = "`" + std::string(namedRefSimpleName(from)) + "`";
+            if (from->declaration) {
+                const TypeSymbol* d = from->declaration;
+                if (d->kind == ast::TypeDeclKind::Record || d->isValueBuiltin)
+                    kind = "a record does not implement `IDisposable` (§8.7)";
+                else if (d->kind == ast::TypeDeclKind::Enum)
+                    kind = "an enum does not implement `IDisposable` (§8.7)";
+                else if (d->kind == ast::TypeDeclKind::Choice)
+                    kind = "a choice does not implement `IDisposable` (§8.7)";
+                else if (d->kind == ast::TypeDeclKind::Interface &&
+                         ifaceReaches(d, 0) == 0 &&
+                         !pendingTypeFactAdmits(fromExpr, to))
+                    kind = "the interface neither is nor extends `IDisposable` "
+                           "(§8.7, §5.1)";
+                break;
+            }
+            const std::string_view head = from->aliasResolvedHead.empty()
+                                              ? namedRefSimpleName(from)
+                                              : from->aliasResolvedHead;
+            if (head.empty() ||
+                (freeTypeParamNames && freeTypeParamNames->count(head)) ||
+                isInScopeTypeParam(head))
+                break;
+            if (isBuiltinTypeRef(from)) {
+                kind = "`Type` is a runtime-managed type, not a class (§8.7, "
+                       "§28.9)";
+                break;
+            }
+            // The stdlib's value records (spans, `Range<T>`, the temporal and
+            // identity values, `CancellationToken`, …) — §8.7's records.
+            static constexpr std::string_view kValueRecordHeads[] = {
+                "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
+                "Range", "ArraySpan", "ReadOnlyArraySpan", "Span",
+                "ReadOnlySpan", "ReadOnlyStringSpan", "JsonOptions",
+                "ExceptionInfo", "CancellationToken", "IntPtr", "UIntPtr",
+                "DictionaryEntry",
+            };
+            for (std::string_view v : kValueRecordHeads)
+                if (head == v) {
+                    kind = "a record does not implement `IDisposable` (§8.7)";
+                    break;
+                }
+            if (!kind && builtinHeadReaches(head) == 0 &&
+                !pendingTypeFactAdmits(fromExpr, to)) {
+                kind = "the interface neither is nor extends `IDisposable` "
+                       "(§8.7; stdlib §4.12)";
+                if (head == "IEnumerable")
+                    remedy = "hold its enumerator instead — `GetEnumerator()` "
+                             "returns an owned `IEnumerator<T>`, which extends "
+                             "`IDisposable` (stdlib §4.12)";
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        if (kind) {
+            std::string msg = std::string("the ") + what + " has " +
+                              (spelled.empty() ? std::string("a type")
+                               : spelled[0] == '`' ? "type " + spelled
+                                                   : spelled) +
+                              ", which does not implicitly convert to "
+                              "`IDisposable` (§5.1): " + kind +
+                              "; only a class, or an interface that is or "
+                              "extends `IDisposable`, converts to it";
+            if (remedy) {
+                msg += "; ";
+                msg += remedy;
+            }
+            ctx_.diagnostics().report(Severity::Error, loc, msg);
+            return;
+        }
+    }
     // §3 / §5.1 / §8.6 / issue #3115, extended by issue #5023 (scope =
     // VALUE-TYPED targets only): an `Object`-typed SOURCE (a class
     // reference or a §8.6 box pointer) admits NO implicit conversion to

@@ -245,6 +245,10 @@ static void* bz_mutex_obj_tostring(void*) {
     static const char name[] = "System.Threading.Mutex";
     return bz_make_string(name, (int64_t)(sizeof(name) - 1));
 }
+static void* bz_cts_obj_tostring(void*) {
+    static const char name[] = "System.Threading.CancellationTokenSource";
+    return bz_make_string(name, (int64_t)(sizeof(name) - 1));
+}
 static bool bz_builtin_obj_equals(void* a, void* b) { return a == b; }
 static int32_t bz_builtin_obj_hash(void* o) { return bz_obj_identity_hash(o); }
 
@@ -267,9 +271,17 @@ extern "C" void* bz_mutex_vtable[6] = {
     (void*)bz_builtin_obj_equals, (void*)bz_builtin_obj_hash,
 };
 
+// fix #7554 (§8.7 / §5.1, v0.350): CancellationTokenSource, the Mutex shape.
+extern "C" void* bz_cts_desc[2] = { (void*)bz_cts_desc, nullptr };
+extern "C" void* bz_cts_vtable[6] = {
+    (void*)bz_cts_desc, (void*)bz_builtin_itmap,
+    (void*)bz_cts_obj_dispose, (void*)bz_cts_obj_tostring,
+    (void*)bz_builtin_obj_equals, (void*)bz_builtin_obj_hash,
+};
+
 static inline bool bz_word0_is_builtin_vtable(void* word0) {
     return word0 == (void*)bz_array_vtable || word0 == (void*)bz_sb_vtable ||
-           word0 == (void*)bz_mutex_vtable;
+           word0 == (void*)bz_mutex_vtable || word0 == (void*)bz_cts_vtable;
 }
 
 // fix #6776: codegen's hooks onto the tags above. `bz_sb_tag` retags the
@@ -336,8 +348,9 @@ extern "C" int32_t bz_obj_is_string(void* obj, void** vtable_table) {
     return 1;                            // not a vtable → a string
 }
 
-// fix #6776: is `obj` one of the three built-ins tagged above (word 0 is
-// bz_array_vtable / bz_sb_vtable / bz_mutex_vtable)? The owned-field and
+// fix #6776: is `obj` one of the built-ins tagged above (word 0 is
+// bz_array_vtable / bz_sb_vtable / bz_mutex_vtable, or since #7554
+// bz_cts_vtable)? The owned-field and
 // collection-interface disposal sites split "user class instance" (slot-2
 // Dispose + reclaim) from "array-backed built-in" (the typed free with the
 // STATIC element policy, which the header's `elem_disposer` does not carry
