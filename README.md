@@ -2,13 +2,13 @@
 
 [![Latest pre-release](https://img.shields.io/github/v/release/s8lap/bezel-lang?include_prereleases&label=pre-release)](https://github.com/s8lap/bezel-lang/releases) [![Documentation](https://img.shields.io/badge/docs-s8lap.github.io%2Fbezel--lang-blue)](https://s8lap.github.io/bezel-lang/) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 
-A compiled language for services and tools, with ownership-based memory management and no garbage collector.
+**A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-Bezel is a programming language offering predictable performance and few surprises. Memory management is where this matters most. When reading well-written code, it is often easy to tell who owns every object and when its memory should be released. Then why do we resort to either handwriting memory control code or accepting the overhead of automatic memory management? Why can't the compiler see what a careful reader sees? Bezel is an attempt at answering this question. It looks like a regular programming language, yet it includes a small number of additional keywords that tell the compiler information that a programmer usually infers from coding conventions: whether a function keeps what it is given or returns something new, whether a particular assignment copies a reference or transfers the object to a new home etc. The compiler works out the rest and inserts every memory release itself.
+Bezel offers predictable performance and few surprises. Memory management is where it matters most. When programmers read well-written code, they find it easy to tell what owns every object and where their memory should be released. Then why can't we teach the compiler to see what we see? Why can't we always write obvious code and exploit it in the compiler?  Bezel attempts to answer these questions. It should look familiar as a language, with a small number of additional keywords that signify what we usually infer from coding conventions: whether a function keeps what it is given or returns something new, whether a particular assignment copies a reference or transfers the object to a new home etc. The compiler works out the rest and inserts every memory release itself.
 
-The result combines what garbage-collected languages and C++ each get right. As in a garbage-collected language, there is no silent memory corruption, there is no use-after-free or double free, and if a stale reference does survive, the default build raises an exception rather than reads freed memory. As with RAII in C++, everything is released at a known point — files, sockets and locks as well as memory — with no collector, no pauses and no hidden reference counting on programmer classes. Unlike RAII, the compiler checks the rules instead of leaving them to discipline, and the guarantees hold across threads. Of course, no language can tell which reachable objects the program still needs: a collection that only ever grows will still grow.
+The result combines what garbage-collected languages and C++ each get right. As in a language with GC, there is no silent memory corruption, no use-after-free or double free, and if a stale reference does survive, the default build raises an exception rather than reads freed memory. As with RAII in C++, everything is released at a known point — files, sockets and locks as well as memory — with no collector, no pauses and no hidden reference counting on user classes. Unlike RAII, the compiler checks the rules instead of leaving them to discipline, and the guarantees hold across threads. Of course, no language can tell which reachable objects are still needed: a collection that only ever grows will still grow.
 
-The same aim runs through the rest of the language. Types are non-nullable unless explicitly declared nullable, integer arithmetic is checked for overflow, arithmetic on a possibly missing value is a compile error, and nothing converts implicitly between user types.
+The same aim runs through the rest of the language. Types are non-nullable by default, integer arithmetic is checked for overflow, arithmetic on a possibly missing value is a compile error, and nothing converts implicitly between user types.
 
 ## Status: experimental, expect things to break
 
@@ -16,7 +16,7 @@ The design is close to settled and written down in full, but the compiler has no
 
 ## A first look
 
-Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#'s, and its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design, built around ownership.
+Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#, and its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design, built around ownership.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-example-dark.svg">
