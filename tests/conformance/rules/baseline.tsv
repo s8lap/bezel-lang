@@ -1094,6 +1094,7 @@ s15_3_0012	pass
 s15_3_0014	pass	
 s15_3_0015	pass	
 s15_3_0018	pass	
+s15_3_0069	pass	
 s15_4_0001	pass	
 s15_4_0002	pass	
 s15_4_0003	pass	
@@ -1544,6 +1545,9 @@ s22_3_0053	pass
 s22_3_0054	pass	
 s22_3_0055	fail	#7086
 s22_3_0056	fail	#7124: §22.3's move call-site marker is not enforced at a function-value invoke
+s22_3_0057	pass	
+s22_3_0058	pass	
+s22_3_0059	pass	
 s22_4_0001	pass	
 s22_4_0002	pass	
 s22_4_0003	pass	
@@ -1808,6 +1812,10 @@ s22_16_0030	pass
 s23_1_0001	pass	
 s23_1_0002	pass	
 s23_1_0003	pass	
+s23_1_0004	pass	
+s23_1_0005	pass	
+s23_1_0006	pass	
+s23_1_0007	pass	
 s23_2_0001	pass	
 s23_2_0002	pass	
 s23_2_0003	pass	
@@ -1911,6 +1919,11 @@ s26_5_0039	pass
 s26_5_0045	pass	
 s26_5_0046	pass	
 s26_5_0047	pass	
+s26_5_0048	pass	
+s26_5_0049	pass	
+s26_5_0050	pass	
+s26_5_0051	pass	
+s26_5_0052	pass	
 s26_5_1_0001	pass	
 s26_5_1_0002	pass	
 s26_5_1_0003	pass	
@@ -2019,6 +2032,7 @@ s27_6_0032	pass
 s27_6_0033	pass	
 s27_6_0034	fail	#7093
 s27_6_0035	pass	
+s27_6_0038	pass	
 s27_7_0001	pass	
 s27_7_0002	pass	
 s27_7_0003	pass	
@@ -2213,6 +2227,25 @@ s28_3_0304	fail	#7728
 s28_3_0305	fail	#7728
 s28_3_0306	pass	
 s28_3_0307	fail	#7728
+s28_3_0308	pass	
+s28_3_0309	pass	
+s28_3_0310	pass	
+s28_3_0311	pass	
+s28_3_0312	pass	
+s28_3_0313	pass	
+s28_3_0314	pass	
+s28_3_0315	pass	
+s28_3_0316	pass	
+s28_3_0317	pass	
+s28_3_0318	pass	
+s28_3_0319	pass	
+s28_3_0320	pass	
+s28_3_0321	pass	
+s28_3_0322	pass	
+s28_3_0323	pass	
+s28_3_0324	pass	
+s28_3_0325	pass	
+s28_3_0326	pass	
 s28_4_0001	pass	
 s28_4_0002	pass	
 s28_4_0003	pass	
@@ -2301,6 +2334,8 @@ s28_6_0066	fail	#7138 residual: §28.6's receiver rule is not read at a §27.6 f
 s28_6_0067	pass	
 s28_6_0068	pass	
 s28_6_0069	pass	
+s28_6_0071	pass	
+s28_6_0072	pass	
 s28_7_0001	pass	
 s28_7_0002	pass	
 s28_7_0003	pass	
@@ -2317,6 +2352,12 @@ s28_8_0001	pass
 s28_8_0002	pass	
 s28_8_0003	pass	
 s28_8_0004	pass	
+s28_8_0005	pass	
+s28_8_0006	pass	
+s28_8_0007	pass	
+s28_8_0008	pass	
+s28_8_0009	pass	
+s28_8_0010	pass	
 s28_8_1_0001	pass	
 s28_8_1_0002	pass	
 s28_8_1_0003	pass	
@@ -2333,6 +2374,9 @@ s28_8_1_0013	pass
 s28_8_1_0014	pass	
 s28_8_1_0015	pass	
 s28_8_1_0016	pass	
+s28_8_1_0031	pass	
+s28_8_1_0032	pass	
+s28_8_1_0033	pass	
 s28_9_0001	pass	
 s28_9_0002	pass	
 s28_9_0003	pass	
@@ -2368,6 +2412,7 @@ s28_10_0014	pass
 s28_10_0015	fail	#5582
 s28_10_0016	fail	#7092
 s28_10_0017	pass	
+s28_10_0041	pass	
 s28_10_0050	pass	
 s28_10_0051	pass	
 s28_10_0052	pass	
@@ -2387,6 +2432,9 @@ s28_10_0069	pass
 s28_10_0071	pass	
 s28_10_0072	fail	#7482
 s28_10_0073	fail	#7482
+s28_10_0074	pass	
+s28_10_0075	pass	
+s28_10_0076	pass	
 s28_11_0001	pass	
 s28_11_0002	pass	
 s28_11_0003	pass	
@@ -2578,6 +2626,7 @@ s30_3_0011	pass
 s30_3_0012	pass	
 s30_3_0013	pass	
 s30_3_0014	pass	
+s30_3_0015	pass	
 s30_4_0001	pass	
 s30_4_0002	pass	
 s30_4_0003	pass	
@@ -2910,6 +2959,7 @@ s35_5_0010	pass
 s35_5_0031	fail	divergence
 s35_5_0032	pass	
 s35_5_0033	pass	
+s35_5_0034	pass	
 s35_6_0001	pass	
 s35_6_0002	pass	
 s35_7_0001	pass	
@@ -3179,6 +3229,8 @@ l4_3_0002	pass
 l4_3_0003	pass	
 l4_3_0004	fail	divergence
 l4_3_0005	pass	
+l4_3_0006	pass	
+l4_3_0007	pass	
 l4_4_0001	pass	
 l4_4_0002	pass	
 l4_4_0003	pass	
@@ -3195,6 +3247,8 @@ l4_4_0013	pass
 l4_4_0044	pass	
 l4_4_0045	pass	
 l4_4_0046	pass	
+l4_4_0049	pass	
+l4_4_0050	pass	
 l4_5_0001	pass	
 l4_5_0002	pass	
 l4_5_0003	pass	
@@ -3209,6 +3263,7 @@ l4_5_0011	pass
 l4_5_0012	pass	
 l4_5_0013	pass	
 l4_5_0044	pass	
+l4_5_0045	pass	
 l4_6_0001	pass	
 l4_6_0002	pass	
 l4_6_0003	pass	
