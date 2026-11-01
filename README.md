@@ -4,15 +4,13 @@
 
 **A compiled language for services and tools, with ownership-based memory management and no garbage collector.**
 
-Bezel offers predictable performance and few surprises. Memory management is where it matters most. When programmers read well-written code, they find it easy to tell what owns every object and where their memory should be released. Then why can't we teach the compiler to see what we see? Why can't we always write obvious code and exploit it in the compiler?  Bezel attempts to answer these questions. It should look familiar as a language, with a small number of additional keywords that signify what we usually infer from coding conventions: whether a function keeps what it is given or returns something new, whether a particular assignment copies a reference or transfers the object to a new home etc. The compiler works out the rest and inserts every memory release itself.
+The distinctive feature of Bezel is its memory management. When programmers read well-written code in other languages, they usually find it easy to tell the lifetimes of every object without explicit annotations to define these lifetimes. Then why can't we teach the compiler to see what we see? Why can't we always write obvious code and exploit this in the compiler? Bezel attempts to answer these questions. It has a small number of additional keywords that communicate what people infer from coding conventions: whether a function keeps what it is given or returns something new, whether a particular assignment copies a reference or transfers the object to a new home etc. The compiler works out the rest and inserts every memory release itself. Bezel's approach is similar to Rust, except it allows for more natural code at the cost of admitting some code shapes on trust rather than proof. A lot of recent work has gone into reducing the trust surface to near zero without pervasive code annotations.
 
-The result combines what garbage-collected languages and C++ each get right. As in a language with GC, there is no silent memory corruption, no use-after-free or double free, and if a stale reference does survive, the default build raises an exception rather than reads freed memory. As with RAII in C++, everything is released at a known point — files, sockets and locks as well as memory — with no collector, no pauses and no hidden reference counting on user classes. Unlike RAII, the compiler checks the rules instead of leaving them to discipline, and the guarantees hold across threads. Of course, no language can tell which reachable objects are still needed: a collection that only ever grows will still grow.
+The result combines what garbage-collected languages and RAII each get right. As in a language with GC, there is no silent memory corruption, no use-after-free or double free, and if a stale reference does survive, the default build raises an exception rather than reads freed memory. As with RAII in C++, everything is released at a known point — files, sockets and locks as well as memory — with no collector, no pauses and no hidden reference counting on user classes. Unlike RAII, the compiler enforces the rules, and the guarantees hold across threads. Of course, logical leaks are still possible: a collection that only ever grows will still grow.
 
-The same aim runs through the rest of the language. Types are non-nullable by default, integer arithmetic is checked for overflow, arithmetic on a possibly missing value is a compile error, and nothing converts implicitly between user types.
+## Status: experimental
 
-## Status: experimental, expect things to break
-
-The design is close to settled and written down in full, but the compiler has not caught up with it yet. **Until it does, expect arbitrary things to break at any moment while you write Bezel code.** Known bugs are tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). The language itself may still change, and there are no stability guarantees. The compiler runs on Linux x86-64 only for now. If something breaks, please [report it](#reporting-a-bug).
+The design is close to settled and written down in full, but the compiler has not caught up with it yet. **Until it does, expect arbitrary things to break at any moment while you write Bezel code.** Known bugs are tracked in the [issue tracker](https://github.com/s8lap/bezel-lang/issues). There are no stability guarantees. The compiler runs on Linux x86-64 only for now. If something breaks and it's not a known bug, please [report it](#reporting-a-bug) here.
 
 ## A first look
 
@@ -199,7 +197,7 @@ scripts/check_docs.sh                       # the documentation checks
 
 ## Acknowledgements
 
-Bezel is built with Claude which writes most of the specification, compiler and tests. Significant compiler work has come from MiniMax models. Z.AI models and Grok worked on the repo in the past to improve the compiler and the specification.
+The Bezel compiler is AI-written. Claude writes most of the specification, compiler and tests. Significant compiler work has come from MiniMax models. Z.AI models and Grok worked on the repo in the past to improve the compiler and the specification.
 
 ## License
 
