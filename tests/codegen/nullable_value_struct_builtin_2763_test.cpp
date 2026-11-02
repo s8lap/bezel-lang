@@ -134,7 +134,7 @@ BEZEL_TEST(nullable_value_struct_builtin_2763, jsonoptions_nullable_round_trip) 
         "module M; import System.Serialization; "
         "class Program "
         "  public static method Main(): int "
-        "    var j := new JsonOptions(); "
+        "    var j := default(JsonOptions); "
         "    var jn: JsonOptions? := j; "
         "    var acc: int := 0; "
         "    if jn <> null then acc := acc + 1; end; "  // present

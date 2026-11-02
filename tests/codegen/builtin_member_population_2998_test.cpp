@@ -278,7 +278,7 @@ const std::vector<BuiltinCase>& registryCases() {
         {"BinaryDeserializer",              "import System.Serialization; import System.Threading; ", "", "BinaryDeserializer"},
         {"JsonSerializer",                  "import System.Serialization; import System.Threading; ", "", "JsonSerializer"},
         {"JsonDeserializer",                "import System.Serialization; import System.Threading; ", "", "JsonDeserializer"},
-        {"JsonOptions",                     "import System.Serialization; import System.Threading; ", "var v := new JsonOptions();", "v"},
+        {"JsonOptions",                     "import System.Serialization; import System.Threading; ", "var v := default(JsonOptions);", "v"},
 
         // ── §5 module-name-as-static-call (#3274) ────────────────────────
         // `Linq` (System.Collections.Linq) is a MODULE of extension methods

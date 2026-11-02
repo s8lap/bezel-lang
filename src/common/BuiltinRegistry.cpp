@@ -804,18 +804,31 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     {"OwningBuffer", "", 1, 1, 0x00, {"length", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"OwningBuffer", "", 2, 2, 0x00, {"length", "init", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"LinkedList", "", 1, 1, 0x00, {"source", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Dictionary", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Dictionary", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Dictionary", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"OwningDictionary", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"OwningDictionary", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"OwningDictionary", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Set", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Set", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Set", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"OwningSet", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"OwningSet", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"OwningSet", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #7958 (§5.1, §22.6, stdlib §4.8/§4.9/§4.10, v0.350): the hash
+    // collections' CAPACITY rows carry their DECLARED TYPE (`capacity: int`).
+    // They carried none (`kBPTAny`), and a position whose kind is 0 in ANY
+    // form that binds carries no type opinion at all — so the §5.1 gate never
+    // reached the capacity, and CODEGEN's own comparer discriminator reported
+    // the WRONG reason for a `uint` / `long` capacity ("the 'Set'
+    // IEqualityComparer constructor is not yet implemented"), which §5.1 does
+    // not convert to `int`. The `comparer` rows are transcribed with the new
+    // `kBPTComparer` (a NAMED interface type, on which the §5.1 gate has no
+    // opinion) so that the shared position keeps an opinion — the two rows
+    // below declare `Set(capacity: int)` beside `Set(comparer:
+    // IEqualityComparer<T>)` (stdlib §4.10), the same pair on `Dictionary`
+    // (§4.8) and `OwningDictionary` (§4.9).
+    {"Dictionary", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Dictionary", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {kBPTComparer, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Dictionary", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {kBPTInt, kBPTComparer, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningDictionary", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningDictionary", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {kBPTComparer, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningDictionary", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {kBPTInt, kBPTComparer, 0, 0, 0, 0, 0, 0}, ""},
+    {"Set", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Set", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {kBPTComparer, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Set", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {kBPTInt, kBPTComparer, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningSet", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningSet", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {kBPTComparer, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"OwningSet", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {kBPTInt, kBPTComparer, 0, 0, 0, 0, 0, 0}, ""},
     {"Shared", "", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Random", "", 1, 1, 0x00, {"seed", "", "", "", "", "", "", ""}, {kBPTLong, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Semaphore", "", 1, 1, 0x00, {"initialCount", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},

@@ -306,13 +306,13 @@ BEZEL_TEST(builtin_named_arg_3424_widen,
 // ---------------------------------------------------------------------------
 // fix #3534 / stdlib §2.15 / §22.5: JsonSerializer(options) — named `options`.
 // The outer call uses a named arg on the JsonSerializer ctor; the inner
-// JsonOptions() is POSITIONAL to avoid triggering JsonOptions' own ctor
-// named-arg path (JsonOptions is not in the constructor named-arg table).
+// `default(JsonOptions)` is POSITIONAL to avoid triggering JsonOptions' own
+// ctor named-arg path (JsonOptions is not in the constructor named-arg table).
 BEZEL_TEST(builtin_named_arg_3424_widen,
            accepts_json_serializer_options_ctor_named_arg) {
     BEZEL_EXPECT_EQ(
         runAotOut(serProg(
-            "    using var js := new JsonSerializer(options := new JsonOptions()); "
+            "    using var js := new JsonSerializer(options := default(JsonOptions)); "
             "    Console.WriteLine(0); ")),
         std::string("0"));
 }

@@ -765,6 +765,19 @@ enum BuiltinParamType : std::uint32_t {
     kBPTArrayChar        = 1u << 18,  // `Array<char>`
     kBPTEnumerableString = 1u << 19,  // `IEnumerable<string>`
     kBPTRangeInt         = 1u << 20,  // `Range<int>`
+    // fix #7958 (stdlib §4.8/§4.9/§4.10, §5.1, v0.350): the
+    // `IEqualityComparer<T>` parameter of the hash collections — a NAMED
+    // interface type, not a primitive. It needs a bit because the
+    // `comparer` parameter SHARES its position with the `capacity: int`
+    // one (stdlib §4.10: `Set(capacity: int)` beside
+    // `Set(comparer: IEqualityComparer<T>)`), and a position whose kind is
+    // 0 in ANY form that binds carries no type opinion at all — so the
+    // `capacity` position could not be transcribed as the `int` it is
+    // declared to be. The §5.1 gate has NO opinion on this kind (a
+    // comparer is a reference type; §5.1's table names no conversion to
+    // it), which is what the `comparer` overload needs: it is diagnosed
+    // by codegen's own deferral (fix #2722), not by the conversion table.
+    kBPTComparer         = 1u << 21,  // `IEqualityComparer<T>`
 };
 
 // ONE declared form of a built-in member or constructor, read out of the ONE

@@ -2073,25 +2073,105 @@ void ExprTC::checkBuiltinNullableCtorArgs(const ast::NewExpr& ne,
 //
 // The declared types are the `kinds` column of the ONE parameter table
 // (`common::builtinParamForms`): a position whose kind is 0 in ANY form that
-// binds is left alone (a `Dictionary(capacity: int)` and a `Dictionary(comparer:
-// IEqualityComparer<K>)` share a position, and the table's vocabulary does not
-// name the comparer), so a missing row costs a rejection that does not fire,
-// never a false one. The arithmetic is `checkAssignable`'s, the very
-// conversion every other typed position uses (as `Array<T>`'s capacity does),
-// so the constant narrowing and the widening table are not restated.
+// binds is left alone (a `Dictionary(comparer: IEqualityComparer<K>)` shares
+// the capacity position with a `Dictionary(capacity: int)`, and the table's
+// vocabulary did not name the comparer -- fix #7958 adds `kBPTComparer` for
+// it, so the position now has an opinion), so a missing row costs a rejection
+// that does not fire, never a false one. The arithmetic is `checkAssignable`'s,
+// the very conversion every other typed position uses (as `Array<T>`'s capacity
+// does), so the constant narrowing and the widening table are not restated.
 void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
                                       const std::string& head) {
-    if (ne.args.empty()) return;
     // fix #7928 (§5.1, stdlib §2.15, v0.350): `JsonOptions(Indented: bool,
     // IndentWidth: int, AllowTrailingCommas: bool, IgnoreUnknownFields: bool,
     // MaxDepth: int)` has NO row in the parameter table on purpose -- a row
     // would admit a named argument, and `lowerNew` binds the five positionally.
-    // Its two `int` components are checked here, positionally, by the same
+    // Its components are checked here, positionally, by the same
     // `checkAssignable` as the table-driven path below. Fix #7957 (§5.1, §7):
     // a nullable argument at ANY of the five positions is refused -- `lowerNew`
     // passed the `{i8 hasValue; T}` carrier to an `insertvalue` of the bare
     // field -- and a §7.4-narrowed read is published for payload extraction.
+    // Fix #7958 (§5.1, §22.5, §22.6, stdlib §2.15): the ARITY (stdlib §2.15
+    // declares exactly five components, all required) and the TYPE of the
+    // three `bool` components (they carried no type check at all: a `long`,
+    // a `uint`, a `string` or even a `double` compiled there, and a `double`
+    // crashed codegen with an LLVM "Cannot select" error).
     if (head == "JsonOptions") {
+        // The ARITY, first: an argument list of any other length resolves
+        // against no declared form. stdlib §2.15: "All five components are
+        // required: a positional record admits no default values (spec A.3
+        // PositionalField), so `new JsonOptions(...)` supplies every one."
+        // §17.7: "the constructor surface is exactly what that document
+        // declares -- `new T(...)` resolves only against a declared
+        // constructor, never against a compiler-supplied fallback", and "For a
+        // builtin record whose only declared constructor is its positional
+        // primary constructor ..., the undeclared parameterless form `new T()`
+        // is rejected the same way -- exactly as for an identically-shaped user
+        // record." `JsonOptions` IS such a record (stdlib §2.15 declares one
+        // constructor, its positional primary constructor).
+        //
+        // The WORDING is the house one for a built-in constructor's arity --
+        // the §17.7 text fix #2994 grew and fix #3136 generalised, which
+        // `ExceptionInfo` (§31.4) and `ReadOnlyStringSpan` (stdlib §3.3) use
+        // ("which takes N positional fields, so the supplied M arguments do
+        // not match it"). The §22.6-shaped wording the File/Directory/
+        // Environment arity gate uses is a STATIC MEMBER's ("the call to
+        // `File.Exists` supplies 2 argument(s) but stdlib §7.3 declares
+        // `Exists` with exactly 1 argument(s)"), and a constructor is not
+        // that.
+        //
+        // MEASURED on the base (r30-c1, 22343a59): `new JsonOptions()`,
+        // `new JsonOptions(true)`, `new JsonOptions(true, 2)`,
+        // `new JsonOptions(true, 2, false)`,
+        // `new JsonOptions(true, 2, false, false)` and the six- and
+        // seven-argument forms ALL COMPILED AND RAN.
+        //
+        // The check lives here, in the positional special case, and NOT in the
+        // parameter table: a `JsonOptions` row would admit a NAMED argument
+        // (the table is the §22.5 name surface) and `lowerNew` binds the five
+        // positionally. A named argument is refused by
+        // `checkBuiltinCtorNamedArgs`, which runs BEFORE this function -- so
+        // the deliberate design (no row, positional binding only) is intact,
+        // and a named argument still draws the §22.5 "named arguments are not
+        // supported on this built-in constructor" diagnostic rather than an
+        // arity one.
+        static constexpr std::size_t kJsonOptionsArity = 5;
+        if (ne.args.size() != kJsonOptionsArity) {
+            if (ne.args.empty()) {
+                // Parameterless: the §17.7 wording fix #2994 introduced, kept
+                // VERBATIM so the house text (and its lit pin) does not drift.
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    "`new " + head +
+                        "()` is not a declared constructor of `" + head +
+                        "` -- its only declared constructor is its positional "
+                        "primary constructor, so the parameterless form is "
+                        "rejected exactly as it would be for an "
+                        "identically-shaped user record; supply every "
+                        "positional field, or obtain the value from the "
+                        "standard-library producer that yields it "
+                        "(\xC2\xA7""17.7)");
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    "`new " + head +
+                        "(...)` is not a declared constructor of `" + head +
+                        "` -- its only declared constructor is its positional "
+                        "primary constructor, which takes 5 positional fields, "
+                        "so the supplied " + std::to_string(ne.args.size()) +
+                        (ne.args.size() == 1 ? " argument does"
+                                             : " arguments do") +
+                        " not match it (rejected exactly as it would be for "
+                        "an identically-shaped user record; supply every "
+                        "positional field, or obtain the value from the "
+                        "standard-library producer that yields it) "
+                        "(\xC2\xA7""17.7)");
+            }
+            return;
+        }
+        // The five components and their DECLARED types (stdlib §2.15):
+        // `Indented: bool`, `IndentWidth: int`, `AllowTrailingCommas: bool`,
+        // `IgnoreUnknownFields: bool`, `MaxDepth: int`.
         static constexpr std::pair<std::size_t, const char*> kComponents[] = {
             {0, "Indented"}, {1, "IndentWidth"}, {2, "AllowTrailingCommas"},
             {3, "IgnoreUnknownFields"}, {4, "MaxDepth"}};
@@ -2104,9 +2184,13 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
             const std::string what = "`" + std::string(pname) +
                                      "` argument of the `" + head +
                                      "` constructor";
+            // §7 FIRST (fix #7957's order, load-bearing): a nullable argument
+            // is refused as nullable, whatever its type -- a `bool?` at a
+            // `bool` component and a `null` literal at any component draw §7's
+            // message, NOT §5.1's. Only a NON-nullable argument reaches the
+            // type check below.
             reportBuiltinArgIfNullable(arg.value.get(), what);
             publishNarrowedBuiltinArg(arg.value.get());
-            if (idx != 1 && idx != 4) continue;
             TypeRef* argTy = ctx_.exprType(*arg.value);
             if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
             if (argTy->nullable) {
@@ -2114,11 +2198,23 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
                 argTy = operandStaticTypeAt(arg.value.get(), argTy);
                 if (!argTy) continue;
             }
-            checkAssignable(argTy, ctx_.primitiveTypeRef(PrimitiveType::Int),
+            // fix #7958 (§5.1): the declared type of THIS component. A `long`
+            // (constant or not), a `uint`, a `string` or a `double` at a
+            // `bool` component is not implicitly convertible to `bool` -- §5.1
+            // lists "Between integers and `bool`" among the conversions that
+            // are NEVER implicit, and its constant-narrowing clause reaches
+            // only an INTEGER target, so a `long` CONSTANT is refused there
+            // too (§5.2: "`bool(n)` remains an error in both the implicit and
+            // explicit forms").
+            const PrimitiveType target = (idx == 1 || idx == 4)
+                                             ? PrimitiveType::Int
+                                             : PrimitiveType::Bool;
+            checkAssignable(argTy, ctx_.primitiveTypeRef(target),
                             arg.value->span.begin, what, arg.value.get());
         }
         return;
     }
+    if (ne.args.empty()) return;
     const std::size_t argc = ne.args.size();
     std::vector<common::BuiltinParamForm> forms;
     for (auto& f : common::builtinParamForms(head, /*member=*/"",
@@ -2186,13 +2282,48 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
         // The target: the one declared type, or (`StringBuilder(capacity: int)`
         // beside `StringBuilder(initial: string)`) the scalar one when the
         // argument is not the `string` the other overload takes.
+        //
+        // fix #7958 (§22.6, §5.1, stdlib §4.8/§4.9/§4.10): the hash
+        // collections' capacity position is SHARED with the
+        // `IEqualityComparer<T>` overload -- `Set(capacity: int)` beside
+        // `Set(comparer: IEqualityComparer<T>)` (stdlib §4.10), the same pair
+        // on `Dictionary` (§4.8) and `OwningDictionary` (§4.9). The two
+        // declared types are now both transcribed (`kBPTInt` and
+        // `kBPTComparer`), so the position has an opinion and the kind that
+        // applies is the one the ARGUMENT selects: a NAMED argument cannot be
+        // a capacity -- it is the comparer, on which the §5.1 gate has no
+        // opinion (that overload is diagnosed by codegen's own deferral,
+        // #2722) -- and a PRIMITIVE argument is the capacity, and IS checked
+        // against `int`. MEASURED on the base (r30-c1, 22343a59): a `uint` or
+        // a `long` capacity was refused with the WRONG reason ("the 'Set'
+        // IEqualityComparer constructor is not yet implemented"), because the
+        // capacity rows carried no type opinion at all and codegen's own
+        // discriminator classified every non-`int` integral as the comparer.
         std::uint32_t kind = kinds.front();
         if (kinds.size() > 1) {
             const bool isString = argTy->kind == TypeRef::Kind::Primitive &&
                                   argTy->primitive == PrimitiveType::String;
             if (isString) continue;
-            for (std::uint32_t k : kinds)
-                if (k != common::kBPTString) { kind = k; break; }
+            bool resolved = false;
+            if (argTy->kind != TypeRef::Kind::Primitive) {
+                for (std::uint32_t k : kinds) {
+                    if (k != common::kBPTComparer) continue;
+                    kind = k;
+                    resolved = true;
+                    break;
+                }
+            }
+            if (!resolved) {
+                for (std::uint32_t k : kinds) {
+                    if (k == common::kBPTComparer) continue;
+                    if (k != common::kBPTString) {
+                        kind = k;
+                        resolved = true;
+                        break;
+                    }
+                }
+            }
+            if (!resolved) continue;  // only the comparer form binds here
         }
         PrimitiveType target = PrimitiveType::None;
         switch (kind) {

@@ -364,11 +364,34 @@ BEZEL_TEST(set_dict_comparer_ctor_2722, narrowed_nullable_capacity_is_not_a_comp
 // `n: long` is not a well-typed call to `constructor(capacity: int)` and must
 // stay on the comparer side rather than being silently widened into a capacity.
 BEZEL_TEST(set_dict_comparer_ctor_2722, long_capacity_is_not_widened_into_a_capacity) {
-    BEZEL_EXPECT_TRUE(rejectsWith(plain(
+    auto r = runAot(plain(
         "  var n: long := 8; "
         "  using var s: Set<int> := new Set<int>(n); "
-        "  return s.Count; "),
-        "the 'Set' IEqualityComparer constructor is not yet implemented"));
+        "  return s.Count; "));
+    // fix #7958 (stdlib §4.10, §5.1, v0.350): the REASON the program is
+    // refused changed, and the row is updated to name the new one. The
+    // capacity rows of the parameter table carried NO type opinion, so the
+    // §5.1 gate never reached the position and CODEGEN's comparer
+    // discriminator reported the wrong reason ("the 'Set' IEqualityComparer
+    // constructor is not yet implemented") -- the program is not a comparer
+    // call at all, it is a `long` where an `int` is declared. With the rows
+    // transcribed (stdlib §4.10's `Set<T>(capacity: int)` beside
+    // `Set<T>(comparer: IEqualityComparer<T>)`), the §5.1 conversion
+    // diagnostic is the one that fires.
+    bool sawConversion = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(
+                "the `capacity` argument of the `Set` constructor has a type "
+                "that is not implicitly convertible to the target type "
+                "(\xC2\xA7""5.1)") != std::string::npos)
+            sawConversion = true;
+    BEZEL_EXPECT_TRUE(sawConversion);
+    // And NOT the comparer deferral: a `long` is neither an `int` capacity
+    // nor an `IEqualityComparer<int>`.
+    for (const auto& d : r.diagnostics.diagnostics())
+        BEZEL_EXPECT_TRUE(
+            d.message.find("IEqualityComparer constructor is not yet implemented")
+            == std::string::npos);
 }
 
 // per stdlib §1/§4.8 (v0.183, #1396), #2722: the negative-capacity fault is
