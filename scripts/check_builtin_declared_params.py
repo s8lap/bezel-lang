@@ -50,6 +50,21 @@ Exit codes:
   0  the table agrees with the standard library over the covered blocks
   1  they disagree
   2  the checker could not parse its inputs (FAIL CLOSED — never a green)
+
+WHAT IT CHECKS, AND WHAT IT DOES NOT (fix #8021, fix #8023).  Two more
+columns and one more kind of claim are now checked.  The §-CITATION of every
+block — the section of the standard library (or of the specification) its
+declaration was transcribed from — used to be PROSE: a trailing comment on
+the `BLOCKS` rows, or a sentence inside a reason.  Nothing could check it,
+and eleven of them were WRONG while the checker printed them as provenance
+in every CI run.  The citation is now DATA (`BLOCK_CITATIONS`), the reasons
+DERIVE their §-numbers from it, and `check_citations` verifies every one of
+them against the documents: the cited section must EXIST, and it must
+DECLARE the block it claims.  The `required` column — the DECLARED MINIMUM
+of an overload, the count of its parameters that declare no default — was
+never compared at all, while the checker's output named it; it is now
+compared, and the rows where the table and the document disagree are
+REPORTED, with the document's own declaration as the provenance.
 """
 
 import os
@@ -168,30 +183,36 @@ def ctor_params(text):
 # declares a block for is here; the heads the table carries but the
 # standard library has no block for are REPORTED as known-uncovered (the
 # `KNOWN-UNCOVERED` list the checker prints), never silently ignored.
+#
+# fix #8021: the §-section each block's declaration comes from is NOT a
+# trailing comment here — a comment cannot be checked, and four of them were
+# WRONG while being printed in this checker's CI output.  The citation lives
+# in `BLOCK_CITATIONS` below, which the checker READS and VERIFIES against
+# the document: the cited section must exist, and it must declare the block.
 BLOCKS = [
     # the §9.6 / §2.5 blocks the checker has always covered
     ("public class String:", "String", "string"),
     ("public record DateTime:", "DateTime", "DateTime"),
     ("public record TimeSpan:", "TimeSpan", "TimeSpan"),
     # fix #8013: the blocks the #8005 commit transcribed
-    ("public static class File", "File", "File"),                  # §7.3
-    ("public static class Directory", "Directory", "Directory"),  # §7.4
-    ("public static class Path", "Path", "Path"),                  # §7.4
-    ("public static class Environment", "Environment", "Environment"),  # §2.4
-    ("public abstract class Encoding", "Encoding", "Encoding"),   # §3.2
-    ("public abstract class TextWriter", "TextWriter", "TextWriter"),  # §7.4
-    ("public static class Math", "Math", "Math"),                  # §2.6
-    ("public class JsonSerializer:", "JsonSerializer", "JsonSerializer"),  # §2.15
+    ("public static class File", "File", "File"),
+    ("public static class Directory", "Directory", "Directory"),
+    ("public static class Path", "Path", "Path"),
+    ("public static class Environment", "Environment", "Environment"),
+    ("public abstract class Encoding", "Encoding", "Encoding"),
+    ("public abstract class TextWriter", "TextWriter", "TextWriter"),
+    ("public static class Math", "Math", "Math"),
+    ("public class JsonSerializer:", "JsonSerializer", "JsonSerializer"),
     ("public class JsonDeserializer:", "JsonDeserializer", "JsonDeserializer"),
     ("public class BinaryDeserializer:", "BinaryDeserializer",
      "BinaryDeserializer"),
-    ("public class StringBuilder", "StringBuilder", "StringBuilder"),  # §3.1
-    ("public class FileStream:", "FileStream", "FileStream"),     # §7.1
-    ("public class CString", "CString", "CString"),               # §10.1
-    ("public class WString", "WString", "WString"),               # §10.2
-    ("public class Array<T>:", "Array", "Array"),                 # §4.4
-    ("public class LinkedList<T>:", "LinkedList", "LinkedList"),  # §4.12
-    ("public class Shared<T>:", "Shared", "Shared"),              # §4.19
+    ("public class StringBuilder", "StringBuilder", "StringBuilder"),
+    ("public class FileStream:", "FileStream", "FileStream"),
+    ("public class CString", "CString", "CString"),
+    ("public class WString", "WString", "WString"),
+    ("public class Array<T>:", "Array", "Array"),
+    ("public class LinkedList<T>:", "LinkedList", "LinkedList"),
+    ("public class Shared<T>:", "Shared", "Shared"),
     ("public class TimeoutException:", "TimeoutException", "TimeoutException"),
     ("public class ArgumentOutOfRangeException:", "ArgumentOutOfRangeException",
      "ArgumentOutOfRangeException"),
@@ -288,31 +309,165 @@ KIND_BITS = {
     "kBPTComparer": "IEqualityComparer<T>",
 }
 
+# ── the §-citations (fix #8021) ────────────────────────────────────────────
+
+# The §-section each block's DECLARATION is transcribed from.
+#
+# fix #8021: the citations used to be PROSE — trailing comments on the
+# `BLOCKS` rows and sentences inside the reasons below — so nothing could
+# check them, and eleven of them were WRONG while the checker printed them
+# as provenance in every CI run.  Here they are DATA, and `check_citations`
+# reads this map against the documents: the cited section must EXIST, and it
+# must contain the declaration it claims.
+#
+#   head -> (document, section number, "declares" | "mentions")
+#
+# "declares" — the section's body carries the type's own declaration.
+# "mentions" — the document has NO block of its own for the type (the §9.1
+#              integer types are declared by ANALOGY to `Int32`), so the
+#              section must at least NAME the type.
+#
+# The UNCOVERED heads are here too: the known-uncovered list PRINTS their
+# §-numbers, so they are citations as much as the covered ones' are.
+BLOCK_CITATIONS = {
+    # the twenty-two standard-library blocks and the three specification ones
+    "string": ("stdlib", "9.6", "declares"),
+    "DateTime": ("stdlib", "2.5", "declares"),
+    "TimeSpan": ("stdlib", "2.5", "declares"),
+    "File": ("stdlib", "7.3", "declares"),
+    "Directory": ("stdlib", "7.4", "declares"),
+    "Path": ("stdlib", "7.4", "declares"),
+    "Environment": ("stdlib", "2.4", "declares"),
+    "Encoding": ("stdlib", "3.2", "declares"),
+    "TextWriter": ("stdlib", "7.4", "declares"),
+    "Math": ("stdlib", "2.2", "declares"),
+    "JsonSerializer": ("stdlib", "2.15", "declares"),
+    "JsonDeserializer": ("stdlib", "2.15", "declares"),
+    "BinaryDeserializer": ("stdlib", "2.15", "declares"),
+    "StringBuilder": ("stdlib", "3.1", "declares"),
+    "FileStream": ("stdlib", "7.2", "declares"),
+    "CString": ("stdlib", "10.1", "declares"),
+    "WString": ("stdlib", "10.2", "declares"),
+    "Array": ("stdlib", "4.4", "declares"),
+    "LinkedList": ("stdlib", "4.6", "declares"),
+    "Shared": ("stdlib", "2.16", "declares"),
+    "TimeoutException": ("stdlib", "6.1", "declares"),
+    "ArgumentOutOfRangeException": ("stdlib", "2.5", "declares"),
+    "Exception": ("spec", "31.4", "declares"),
+    "ArgumentException": ("spec", "31.4", "declares"),
+    "ExceptionInfo": ("spec", "31.4", "declares"),
+    # the heads the checker does NOT cover — their §-numbers are printed too
+    "Boolean": ("stdlib", "9.4", "declares"),
+    "Byte": ("stdlib", "9.1", "mentions"),
+    "Char": ("stdlib", "9.5", "declares"),
+    "Convert": ("stdlib", "2.3", "declares"),
+    "DateOnly": ("stdlib", "2.5", "declares"),
+    "Debug": ("stdlib", "8.2", "declares"),
+    "Decimal": ("stdlib", "9.3", "declares"),
+    "Double": ("stdlib", "9.2", "declares"),
+    "Float": ("stdlib", "9.2", "declares"),
+    "Guid": ("stdlib", "2.6", "declares"),
+    "Int16": ("stdlib", "9.1", "mentions"),
+    "Int32": ("stdlib", "9.1", "declares"),
+    "Int64": ("stdlib", "9.1", "mentions"),
+    "SByte": ("stdlib", "9.1", "mentions"),
+    "TimeOnly": ("stdlib", "2.5", "declares"),
+    "UInt16": ("stdlib", "9.1", "mentions"),
+    "UInt32": ("stdlib", "9.1", "mentions"),
+    "UInt64": ("stdlib", "9.1", "mentions"),
+}
+
+# The name a head's DECLARATION spells — the class name the block ends with.
+HEAD_CLASS = dict(
+    [(b[2], b[1]) for b in BLOCKS] +
+    [(b[2], b[1]) for b in SPEC_BLOCKS] +
+    [(n, n) for n in SPEC_RECORDS])
+
+# The LANGUAGE-SPECIFICATION sections the checker names that are not a
+# head's own block — the RULES it cites beside the declarations.
+#
+#   name -> (document, section number)
+NAMED_CITATIONS = {
+    "exceptions": ("spec", "31.4"),   # the standard exception types
+    "equals_slot": ("spec", "8.3"),   # `Equals` and `GetHashCode`
+    "kind": ("spec", "5.1"),          # the §5.1 admissibility question
+    "nullability": ("spec", "7.3"),   # assigning `null` to a target
+    "out_slot": ("spec", "22.3"),     # parameter modifiers
+    "optional": ("spec", "22.5"),     # optional and named parameters
+    "variance": ("spec", "12.9"),     # variance
+}
+
+
+def sec(head):
+    """A head's own §-citation, as `stdlib §2.2`.
+
+    The reasons below DERIVE their §-numbers from this, so a reason can
+    never name a section the map does not claim: ONE source of truth, and
+    the map is the thing `check_citations` verifies against the document.
+    """
+    doc, number, _kind = BLOCK_CITATIONS[head]
+    return "%s §%s" % (doc, number)
+
+
+def named(name):
+    """A cited language-specification section, as `spec §31.4`."""
+    doc, number = NAMED_CITATIONS[name]
+    return "%s §%s" % (doc, number)
+
+
+def secno(head):
+    """A head's own §-NUMBER, as `§3.1` — for a sentence that already
+    names the document."""
+    return "§%s" % BLOCK_CITATIONS[head][1]
+
+
+def _bind(reasons):
+    """Fill each reason's `{sec}` with the head's OWN §-citation.
+
+    fix #8021: a reason that names a section it cannot check is a pointer
+    that can be wrong without anybody noticing — and eleven of them were,
+    while the checker printed them as provenance.  Every §-number a reason
+    names now comes from `BLOCK_CITATIONS` / `NAMED_CITATIONS`, which
+    `check_citations` verifies against the documents.
+    """
+    out = {}
+    for key, reason in reasons.items():
+        head = key if isinstance(key, str) else key[0]
+        fields = dict((k, named(k)) for k in NAMED_CITATIONS)
+        fields["sec"] = sec(head)
+        fields["secno"] = secno(head)
+        if isinstance(reason, tuple):
+            # a (value, value, reason) entry: only the REASON names a section
+            out[key] = tuple(reason[:-1]) + (reason[-1].format(**fields),)
+        else:
+            out[key] = reason.format(**fields)
+    return out
+
 # The members the standard library declares and the table carries NO row
 # for, each with the reason.  A member that is neither transcribed nor
 # listed here FAILS the ratchet.
-NOT_TRANSCRIBED = {
+NOT_TRANSCRIBED = _bind({
     ("DateTime", "CompareTo"):
-        "stdlib §2.5 declares `other: DateTime`, a RECORD, and the vocabulary "
+        "{sec} declares `other: DateTime`, a RECORD, and the vocabulary "
         "names the scalar and interface kinds only",
     ("DateTime", "Subtract"):
-        "stdlib §2.5 declares `other: DateTime` / `span: TimeSpan`, RECORDS, "
+        "{sec} declares `other: DateTime` / `span: TimeSpan`, RECORDS, "
         "and the vocabulary names the scalar and interface kinds only",
     ("DateTime", "Add"):
-        "stdlib §2.5 declares `span: TimeSpan`, a RECORD, and the vocabulary "
+        "{sec} declares `span: TimeSpan`, a RECORD, and the vocabulary "
         "names the scalar and interface kinds only",
     ("TimeSpan", "CompareTo"):
-        "stdlib §2.5 declares `other: TimeSpan`, a RECORD, and the vocabulary "
+        "{sec} declares `other: TimeSpan`, a RECORD, and the vocabulary "
         "names the scalar and interface kinds only",
     # fix #8013: the §10.1 `CString` block declares `FromBytes(bytes:
     # Array<byte>)` beside `From(s: string)`, and the table carries a row
     # for `From` only — the `FromBytes` surface is the §10.1 factory's own
     # and the compiler's FFI gate owns its argument type.
     ("CString", "FromBytes"):
-        "stdlib §10.1 declares `bytes: Array<byte>`, and the table carries "
+        "{sec} declares `bytes: Array<byte>`, and the table carries "
         "no row for the `FromBytes` factory — the FFI gate owns that "
         "surface's argument type",
-}
+})
 
 # The CONSTRUCTOR forms the standard library declares and the table
 # deliberately carries NO row for, each with the reason.  Spec §31.4: every
@@ -322,199 +477,199 @@ NOT_TRANSCRIBED = {
 # cannot silently lose its named-argument surface.
 #
 #   (head, argument count) -> why the form carries no row
-CTOR_FORMS_NOT_TRANSCRIBED = {
+CTOR_FORMS_NOT_TRANSCRIBED = _bind({
     ("TimeoutException", 1):
-        "spec §31.4 declares `constructor(message: string)` for every "
+        "{exceptions} declares `constructor(message: string)` for every "
         "standard exception type, and the registry answers that one form "
         "from the exception hierarchy rather than from a row per name",
     ("ArgumentOutOfRangeException", 1):
-        "spec §31.4 declares `constructor(message: string)` for every "
+        "{exceptions} declares `constructor(message: string)` for every "
         "standard exception type, and the registry answers that one form "
         "from the exception hierarchy rather than from a row per name",
     ("Exception", 1):
-        "spec §31.4 declares `constructor(message: string)` for every "
+        "{exceptions} declares `constructor(message: string)` for every "
         "standard exception type, and the registry answers that one form "
         "from the exception hierarchy rather than from a row per name",
     ("ArgumentException", 1):
-        "spec §31.4 declares `constructor(message: string)` for every "
+        "{exceptions} declares `constructor(message: string)` for every "
         "standard exception type, and the registry answers that one form "
         "from the exception hierarchy rather than from a row per name",
-}
+})
 
 # The heads whose MEMBER surface the table carries NO row for at all (only
 # the CONSTRUCTOR surface), each with the reason.  The block is still
 # checked — for the CONSTRUCTOR rows the table does carry — but the
 # document's member declarations are not demanded of a table that carries
 # none of them.  Without this the ratchet would report every member of
-# §4.4's `Array` and §4.12's `LinkedList` as "not transcribed", which says
+# §4.4's `Array` and §4.6's `LinkedList` as "not transcribed", which says
 # nothing the table does not already say by carrying no row for them.
-MEMBERS_NOT_TRANSCRIBED = {
+MEMBERS_NOT_TRANSCRIBED = _bind({
     "Array": "the table carries NO member row for this head — only its "
-             "CONSTRUCTOR surface; §4.4's member surface is the collection "
+             "CONSTRUCTOR surface; {sec}'s member surface is the collection "
              "protocol's, not the parameter table's",
     "LinkedList": "the table carries NO member row for this head — only its "
                   "CONSTRUCTOR surface",
-}
+})
 
 # The positions the table DELIBERATELY carries no type opinion for, each with
 # the reason.
-NO_OPINION = {
+NO_OPINION = _bind({
     ("DateTime", "FromTicks", 1):
-        "stdlib §2.5 declares `kind: DateTimeKind`, an ENUM, and the "
+        "{sec} declares `kind: DateTimeKind`, an ENUM, and the "
         "vocabulary names the scalar and interface kinds only",
     ("DateTime", "TryParse", 1):
-        "stdlib §2.5 declares `out result: DateTime`, an `out` SLOT (§22.3); "
+        "{sec} declares `out result: DateTime`, an `out` SLOT ({out_slot}); "
         "the slot's type is the out-variable machinery's, not the "
         "declaration's",
     # fix #8013: the §2.5 `DateTime` CONSTRUCTOR's eighth position — the row
     # the old spelling of the table pattern could not even READ (a
     # constructor row spells its member name EMPTY).
     ("DateTime", "", 7):
-        "stdlib §2.5 declares `kind: DateTimeKind`, an ENUM, and the "
+        "{sec} declares `kind: DateTimeKind`, an ENUM, and the "
         "vocabulary names the scalar and interface kinds only",
     ("string", "From", 0):
-        "stdlib §9.6 declares THREE one-argument forms — `From(value: char)`, "
+        "{sec} declares THREE one-argument forms — `From(value: char)`, "
         "`From(value: CString)` and `From(value: WString)` — and the FFI types "
         "have no bit in the vocabulary; the compiler's own `String.From` gate "
         "owns that form's argument type",
     ("string", "FromCStringPointer", 0):
-        "stdlib §9.6 declares `p: IntPtr` and `IntPtr` has no bit in the "
+        "{sec} declares `p: IntPtr` and `IntPtr` has no bit in the "
         "vocabulary",
     ("string", "FromWStringPointer", 0):
-        "stdlib §9.6 declares `p: IntPtr` and `IntPtr` has no bit in the "
+        "{sec} declares `p: IntPtr` and `IntPtr` has no bit in the "
         "vocabulary",
     ("string", "Join", 0):
-        "the dedicated `string.Join` gate (fix #7150) already asks the §5.1 "
+        "the dedicated `string.Join` gate (fix #7150) already asks the {kind} "
         "question against the DECLARED `separator: string`",
     ("string", "Join", 1):
         "the dedicated `string.Join` gate (fix #7167 / #7191) already asks the "
-        "§5.1 / §12.9 question against the DECLARED `items: "
+        "{kind} / {variance} question against the DECLARED `items: "
         "IEnumerable<string>`, and a weaker second test would refuse a legal "
         "argument that gate admits",
     # ── fix #8013: the positions the #8005 transcription left with NO type
     # opinion.  Each is listed with the reason, so the gap is VISIBLE in the
     # checker's own output instead of silent.
     ("File", "WriteAllBytes", 1):
-        "stdlib §7.3 declares `contents: Array<byte>` AND `contents: "
+        "{sec} declares `contents: Array<byte>` AND `contents: "
         "ReadOnlySpan<byte>` (two overloads), and the vocabulary names the "
         "scalar and the `char` collections only — the two `contents` types "
         "have no bit between them",
     ("File", "ReadAllTextAsync", 1):
-        "stdlib §7.3 declares `token: CancellationToken`, a STRUCT the "
+        "{sec} declares `token: CancellationToken`, a STRUCT the "
         "vocabulary does not name",
     ("File", "WriteAllTextAsync", 2):
-        "stdlib §7.3 declares `token: CancellationToken`, a STRUCT the "
+        "{sec} declares `token: CancellationToken`, a STRUCT the "
         "vocabulary does not name",
     ("Encoding", "GetBytes", 1):
-        "stdlib §3.2 declares `destination: Span<byte>`, and `Span<byte>` has "
+        "{sec} declares `destination: Span<byte>`, and `Span<byte>` has "
         "no bit in the vocabulary",
     ("Encoding", "GetString", 0):
-        "stdlib §3.2 declares `bytes: Array<byte>` / `ReadOnlySpan<byte>` / "
+        "{sec} declares `bytes: Array<byte>` / `ReadOnlySpan<byte>` / "
         "`ReadOnlyArraySpan<byte>` (three overloads), and the byte-span types "
         "have no bit in the vocabulary",
     ("Math", "Min", 0):
-        "stdlib §2.6 declares `a: T` / `b: T`, TYPE PARAMETERS, and the "
+        "{sec} declares `a: T` / `b: T`, TYPE PARAMETERS, and the "
         "vocabulary names the concrete kinds only",
     ("Math", "Min", 1):
-        "stdlib §2.6 declares `a: T` / `b: T`, TYPE PARAMETERS, and the "
+        "{sec} declares `a: T` / `b: T`, TYPE PARAMETERS, and the "
         "vocabulary names the concrete kinds only",
     ("Math", "Max", 0):
-        "stdlib §2.6 declares `a: T` / `b: T`, TYPE PARAMETERS, and the "
+        "{sec} declares `a: T` / `b: T`, TYPE PARAMETERS, and the "
         "vocabulary names the concrete kinds only",
     ("Math", "Max", 1):
-        "stdlib §2.6 declares `a: T` / `b: T`, TYPE PARAMETERS, and the "
+        "{sec} declares `a: T` / `b: T`, TYPE PARAMETERS, and the "
         "vocabulary names the concrete kinds only",
     ("Math", "Clamp", 0):
-        "stdlib §2.6 declares `value: T` / `low: T` / `high: T`, TYPE "
+        "{sec} declares `value: T` / `low: T` / `high: T`, TYPE "
         "PARAMETERS, and the vocabulary names the concrete kinds only",
     ("Math", "Clamp", 1):
-        "stdlib §2.6 declares `value: T` / `low: T` / `high: T`, TYPE "
+        "{sec} declares `value: T` / `low: T` / `high: T`, TYPE "
         "PARAMETERS, and the vocabulary names the concrete kinds only",
     ("Math", "Clamp", 2):
-        "stdlib §2.6 declares `value: T` / `low: T` / `high: T`, TYPE "
+        "{sec} declares `value: T` / `low: T` / `high: T`, TYPE "
         "PARAMETERS, and the vocabulary names the concrete kinds only",
     ("Math", "Sign", 0):
-        "stdlib §2.6 declares `x: T`, a TYPE PARAMETER, and the vocabulary "
+        "{sec} declares `x: T`, a TYPE PARAMETER, and the vocabulary "
         "names the concrete kinds only",
     ("Math", "DivRem", 0):
-        "stdlib §2.6 declares `a: int` / `a: long` (two overloads), and the "
+        "{sec} declares `a: int` / `a: long` (two overloads), and the "
         "overload grid owns the integer width — the position carries no "
         "single declared type",
     ("Math", "DivRem", 1):
-        "stdlib §2.6 declares `b: int` / `b: long` (two overloads), and the "
+        "{sec} declares `b: int` / `b: long` (two overloads), and the "
         "overload grid owns the integer width — the position carries no "
         "single declared type",
     ("Math", "DivRem", 2):
-        "stdlib §2.6 declares `out remainder: int` / `out remainder: long`, "
-        "an `out` SLOT (§22.3) whose type is the out-variable machinery's",
+        "{sec} declares `out remainder: int` / `out remainder: long`, "
+        "an `out` SLOT ({out_slot}) whose type is the out-variable machinery's",
     ("StringBuilder", "Append", 0):
-        "stdlib §3.1 declares SEVEN `Append` overloads (`string` / `char` / "
+        "{sec} declares SEVEN `Append` overloads (`string` / `char` / "
         "`Object` / `bool` / the numeric primitives / `ReadOnlyStringSpan`) "
-        "and the §3.1 member gate can express exactly ONE declared type at a "
+        "and the {secno} member gate can express exactly ONE declared type at a "
         "position — a bit set here would make that gate read `string` and "
         "REFUSE the six other declared overloads",
     ("StringBuilder", "Insert", 1):
-        "stdlib §3.1 declares exactly ONE `Insert` form, but #6807's own "
+        "{sec} declares exactly ONE `Insert` form, but #6807's own "
         "dedicated check already rejects a non-`string` value at that "
         "position — a bit set here would give one argument two diagnostics, "
         "which the table's own comment calls noise",
     ("StringBuilder", "AppendFormat", 1):
-        "stdlib §3.1 declares `args: Array<Object>`, and the object ARRAY has "
+        "{sec} declares `args: Array<Object>`, and the object ARRAY has "
         "no bit in the vocabulary",
     ("FileStream", "", 1):
-        "stdlib §7.1 declares `mode: FileMode`, an ENUM, and the vocabulary "
+        "{sec} declares `mode: FileMode`, an ENUM, and the vocabulary "
         "names the scalar and interface kinds only",
     ("FileStream", "", 2):
-        "stdlib §7.1 declares `access: FileAccess`, an ENUM, and the "
+        "{sec} declares `access: FileAccess`, an ENUM, and the "
         "vocabulary names the scalar and interface kinds only",
     ("JsonDeserializer", "", 0):
-        "stdlib §2.15 declares `input: ReadOnlySpan<byte>` / "
+        "{sec} declares `input: ReadOnlySpan<byte>` / "
         "`ReadOnlyArraySpan<byte>` / `string` (three overloads), and the "
         "byte-span types have no bit in the vocabulary",
     ("BinaryDeserializer", "", 0):
-        "stdlib §2.15 declares `input: ReadOnlySpan<byte>` / "
+        "{sec} declares `input: ReadOnlySpan<byte>` / "
         "`ReadOnlyArraySpan<byte>` (two overloads), and the byte-span types "
         "have no bit in the vocabulary",
     ("LinkedList", "", 0):
-        "stdlib §4.12 declares `source: IEnumerable<T>`, a TYPE PARAMETER, "
+        "{sec} declares `source: IEnumerable<T>`, a TYPE PARAMETER, "
         "and the vocabulary names the concrete kinds only",
     ("Shared", "", 0):
-        "stdlib §4.19 declares `owned value: T`, a TYPE PARAMETER, and the "
+        "{sec} declares `owned value: T`, a TYPE PARAMETER, and the "
         "vocabulary names the concrete kinds only",
     ("TimeoutException", "", 1):
-        "stdlib §2.5 declares `inner: Exception`, a CLASS, and the "
+        "{sec} declares `inner: Exception`, a CLASS, and the "
         "vocabulary names the scalar and interface kinds only",
     ("Exception", "", 1):
-        "spec §31.4 declares `cause: Exception`, a CLASS, and the vocabulary "
+        "{sec} declares `cause: Exception`, a CLASS, and the vocabulary "
         "names the scalar and interface kinds only",
     ("Array", "", 0):
-        "stdlib §4.4 declares `capacity: int`; the capacity form's own "
+        "{sec} declares `capacity: int`; the capacity form's own "
         "admission is owned by #6893's dedicated check, and the table "
         "carries no type opinion there",
     ("Array", "", 1):
-        "stdlib §4.4 declares `fill: T`, a TYPE PARAMETER, and the "
+        "{sec} declares `fill: T`, a TYPE PARAMETER, and the "
         "vocabulary names the concrete kinds only",
-}
+})
 
 # The positions where the table carries a type the standard library does not
 # name, each with the §-sentence that admits it.
-EXTRA_ALLOWED = {
+EXTRA_ALLOWED = _bind({
     ("string", "Equals", 0):
-        "stdlib §9.6's own comment on `Equals(other: string)` — \"a `string?` "
-        "or `Object?` argument reaches it through the slot\" — and spec §8.3's "
+        "{sec}'s own comment on `Equals(other: string)` — \"a `string?` "
+        "or `Object?` argument reaches it through the slot\" — and {equals_slot}'s "
         "Object slot (\"the `Object` slot `Equals` has a second spelling, at "
         "the overriding class's own type\")",
-}
+})
 
 # The positions the table declares NULLABLE where the standard library spells
 # the parameter without `?`, each with the §-sentence that admits it.
-NULLABLE_ALLOWED = {
+NULLABLE_ALLOWED = _bind({
     ("string", "Equals", 0):
-        "stdlib §9.6's own comment on `Equals(other: string)` — \"a `string?` "
+        "{sec}'s own comment on `Equals(other: string)` — \"a `string?` "
         "or `Object?` argument reaches it through the slot\" — so the "
         "one-argument form admits the null the two-argument form spells "
         "`other: string?`",
-}
+})
 
 # The positions where the table's §7.3 NULLABILITY mask and the standard
 # library's spelling DISAGREE, and the checker does NOT fail on them.  The
@@ -527,32 +682,49 @@ NULLABLE_ALLOWED = {
 # The three positions below are §3.1's `StringBuilder.Insert` / `Remove`
 # VALUE-TYPE positions: the document spells them `int` (not `int?`), and the
 # table's mask leaves the bit unasserted.  Spec §7.2 makes `int?` a legal
-# optional value type, so the document's spelling IS a nullability claim —
-# but the §5.1 kind gate (`kBPTInt`) refuses a non-`int` argument at those
-# positions, so no null reaches them and the mask's bit is not what decides
-# the argument.  The mask is nevertheless INCONSISTENT with the rest of the
-# table (every other `int` parameter the table carries asserts its bit), so
-# the disagreement is listed rather than hidden.
-NULLABILITY_DEVIATION = {
+# optional value type, so the document's spelling IS a nullability claim.
+#
+# fix #8023: the GATE that decides these is NOT the §5.1 kind gate — the
+# reason this text gave was WRONG.  `isBuiltinValueParamHead`
+# (`src/sema/ExprTypecheck_Calls.cpp`) does NOT include `StringBuilder`, so
+# the §5.1 kind gate never reaches these positions at all; the DEDICATED
+# `ExprTC::checkBuiltinStringBuilderCall` gate refuses the null itself,
+# through its `checkAssignable` path against the DECLARED `int` (declared
+# non-nullable).  So no null reaches these positions, and the mask's bit is
+# not what decides the argument.  The mask is nevertheless INCONSISTENT with
+# the rest of the table (every other `int` parameter the table carries
+# asserts its bit), so the disagreement is listed rather than hidden.
+NULLABILITY_DEVIATION = _bind({
     ("StringBuilder", "Insert", 0):
-        "the table's §3.1 `Insert` row leaves the `index: int` position's "
-        "§7.3 bit UNASSERTED (the mask is 0x02 — the VALUE position only) "
-        "while stdlib §3.1 spells `index: int` without `?`; the DECLARED "
-        "TYPE there is `int` and the §5.1 kind gate refuses a non-`int` "
-        "argument at that position, so no null reaches it",
-    ("StringBuilder", "Remove", 0):
-        "the table's §3.1 `Remove` row leaves the `startIndex: int` position's "
-        "§7.3 bit UNASSERTED (the mask is 0x00) while stdlib §3.1 spells "
-        "`startIndex: int` without `?`; the DECLARED TYPE there is `int` and "
-        "the §5.1 kind gate refuses a non-`int` argument at that position, "
-        "so no null reaches it",
-    ("StringBuilder", "Remove", 1):
-        "the table's §3.1 `Remove` row leaves the `length: int` position's "
-        "§7.3 bit UNASSERTED (the mask is 0x00) while stdlib §3.1 spells "
-        "`length: int` without `?`; the DECLARED TYPE there is `int` and the "
-        "§5.1 kind gate refuses a non-`int` argument at that position, so "
+        "the table's {sec} `Insert` row leaves the `index: int` position's "
+        "{nullability} bit UNASSERTED (the mask is 0x02 — the VALUE position "
+        "only) while {sec} spells `index: int` without `?`; the DECLARED "
+        "TYPE there is `int` and the DEDICATED "
+        "`ExprTC::checkBuiltinStringBuilderCall` gate refuses the null "
+        "through its `checkAssignable` path against the declared `int` (the "
+        "§5.1 kind gate does NOT include `StringBuilder` in "
+        "`isBuiltinValueParamHead`, so it never reaches this position), so "
         "no null reaches it",
-}
+    ("StringBuilder", "Remove", 0):
+        "the table's {sec} `Remove` row leaves the `startIndex: int` "
+        "position's {nullability} bit UNASSERTED (the mask is 0x00) while "
+        "{sec} spells `startIndex: int` without `?`; the DECLARED TYPE there "
+        "is `int` and the DEDICATED "
+        "`ExprTC::checkBuiltinStringBuilderCall` gate refuses the null "
+        "through its `checkAssignable` path against the declared `int` (the "
+        "§5.1 kind gate does NOT include `StringBuilder` in "
+        "`isBuiltinValueParamHead`, so it never reaches this position), so "
+        "no null reaches it",
+    ("StringBuilder", "Remove", 1):
+        "the table's {sec} `Remove` row leaves the `length: int` position's "
+        "{nullability} bit UNASSERTED (the mask is 0x00) while {sec} spells "
+        "`length: int` without `?`; the DECLARED TYPE there is `int` and the "
+        "DEDICATED `ExprTC::checkBuiltinStringBuilderCall` gate refuses the "
+        "null through its `checkAssignable` path against the declared `int` "
+        "(the §5.1 kind gate does NOT include `StringBuilder` in "
+        "`isBuiltinValueParamHead`, so it never reaches this position), so "
+        "no null reaches it",
+})
 
 # The declared types the document declares in a NOTE BESIDE its listing —
 # stdlib §7.4's \"#1355\": per-type `Write` / `WriteLine` overloads for
@@ -572,65 +744,68 @@ DOC_NOTE_TYPES = {
 
 # The reason each `DOC_NOTE_TYPES` entry exists, for the known-uncovered
 # report.
-DOC_NOTE_REASON = {
+DOC_NOTE_REASON = _bind({
     ("TextWriter", "Write", 0):
-        "stdlib §7.4's #1355 note — \"per-type Write/WriteLine overloads for "
+        "{sec}'s #1355 note — \"per-type Write/WriteLine overloads for "
         "bool and the numeric primitives\"",
     ("TextWriter", "WriteLine", 0):
-        "stdlib §7.4's #1355 note — \"per-type Write/WriteLine overloads for "
+        "{sec}'s #1355 note — \"per-type Write/WriteLine overloads for "
         "bool and the numeric primitives\" (the `char` overload is `Write`'s "
         "alone, and the table agrees)",
-}
+})
 
 # The heads the table keys a row on that the checker does NOT cover, each
 # with the reason it cannot be covered.  fix #8013: the gap is printed, not
 # silent.
-KNOWN_UNCOVERED_HEADS = {
-    "Boolean": "stdlib §9.5's `Boolean` block declares no member whose "
+KNOWN_UNCOVERED_HEADS = _bind({
+    "Boolean": "{sec}'s `Boolean` block declares no member whose "
                "declared parameter type the table carries a row for; the "
-               "primitive heads' rows are the §9.1–§9.5 parse / format "
+               "primitive heads' rows are the parse / format surface "
                "surface, transcribed by #7421 and not yet re-checked here",
-    "Byte": "stdlib §9.1 declares the integer types' shapes by ANALOGY to "
+    "Byte": "{sec} declares the integer types' shapes by ANALOGY to "
             "`Int32` (\"the others have analogous shapes\"), so there is no "
             "`Byte` block to compare a row against",
-    "Char": "stdlib §9.5's `Char` block is not yet in the checker's covered "
+    "Char": "{sec}'s `Char` block is not yet in the checker's covered "
             "set",
-    "Convert": "stdlib §2.3's `Convert` block is not yet in the checker's "
+    "Convert": "{sec}'s `Convert` block is not yet in the checker's "
                "covered set",
-    "DateOnly": "stdlib §2.5's `DateOnly` block is not yet in the checker's "
+    "DateOnly": "{sec}'s `DateOnly` block is not yet in the checker's "
                  "covered set",
-    "Debug": "stdlib §11's `Debug` block is not yet in the checker's covered "
+    "Debug": "{sec}'s `Debug` block is not yet in the checker's covered "
              "set",
-    "Decimal": "stdlib §9.4's `Decimal` block is not yet in the checker's "
+    "Decimal": "{sec}'s `Decimal` block is not yet in the checker's "
                "covered set",
-    "Double": "stdlib §9.3's `Double` block is not yet in the checker's "
+    "Double": "{sec}'s `Double` block is not yet in the checker's "
               "covered set",
-    "ArgumentOutOfRangeException": "stdlib §2.5 declares the block, and it "
-                                   "is not yet in the checker's covered set",
-    "Float": "stdlib §9.3's `Float` block is not yet in the checker's "
+    # fix #8021: the `ArgumentOutOfRangeException` entry that used to be
+    # here said the block "is not yet in the checker's covered set" — it
+    # IS in it (`BLOCKS`: one of the twenty-five covered blocks), so the
+    # entry was DEAD prose that also made a false claim about the covered
+    # set.  Removed.
+    "Float": "{sec}'s `Float` block is not yet in the checker's "
              "covered set",
-    "Guid": "stdlib §2.8's `Guid` block is not yet in the checker's covered "
+    "Guid": "{sec}'s `Guid` block is not yet in the checker's covered "
             "set",
-    "Int16": "stdlib §9.1 declares the integer types' shapes by ANALOGY to "
+    "Int16": "{sec} declares the integer types' shapes by ANALOGY to "
              "`Int32`, so there is no `Int16` block to compare a row against",
-    "Int32": "stdlib §9.1's `Int32` block is not yet in the checker's "
+    "Int32": "{sec}'s `Int32` block is not yet in the checker's "
              "covered set",
-    "Int64": "stdlib §9.1 declares the integer types' shapes by ANALOGY to "
+    "Int64": "{sec} declares the integer types' shapes by ANALOGY to "
              "`Int32`, so there is no `Int64` block to compare a row against",
-    "SByte": "stdlib §9.1 declares the integer types' shapes by ANALOGY to "
+    "SByte": "{sec} declares the integer types' shapes by ANALOGY to "
              "`Int32`, so there is no `SByte` block to compare a row against",
-    "TimeOnly": "stdlib §2.5's `TimeOnly` block is not yet in the checker's "
+    "TimeOnly": "{sec}'s `TimeOnly` block is not yet in the checker's "
                 "covered set",
-    "UInt16": "stdlib §9.1 declares the integer types' shapes by ANALOGY to "
+    "UInt16": "{sec} declares the integer types' shapes by ANALOGY to "
               "`Int32`, so there is no `UInt16` block to compare a row "
               "against",
-    "UInt32": "stdlib §9.1 declares the integer types' shapes by ANALOGY to "
+    "UInt32": "{sec} declares the integer types' shapes by ANALOGY to "
               "`Int32`, so there is no `UInt32` block to compare a row "
               "against",
-    "UInt64": "stdlib §9.1 declares the integer types' shapes by ANALOGY to "
+    "UInt64": "{sec} declares the integer types' shapes by ANALOGY to "
               "`Int32`, so there is no `UInt64` block to compare a row "
               "against",
-}
+})
 
 
 def die(msg, code=2):
@@ -647,6 +822,180 @@ def read(path):
 
 
 # ── the standard library ───────────────────────────────────────────────────
+
+# A document's numbered section heading: `## 2.2 `Math`` and friends.
+SECTION_RE = re.compile(r"^(#{2,4})\s+([0-9]+(?:\.[0-9]+)*)\s+(.*)$")
+
+# A type's own declaration: `public class Foo`, `public record Foo(...)`,
+# `public static class Foo`, `public class Foo<T>`, `public enum Foo`.
+#
+# The `.*?` is LAZY on purpose: a declaration line can carry a comment that
+# mentions the word "class" ("`public class Shared<T>: IDisposable where
+# T: class      // proper class types only;`"), and a greedy match would
+# take the LAST "class" in the line — "types" — instead of the type's own.
+DECL_RE = re.compile(r"^\s*(?:public|internal)\b.*?\b(?:class|record|enum|struct)"
+                     r"\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def parse_sections(text):
+    """The document's numbered sections, as [(number, title, body)].
+
+    The `body` is the section's own text: from its heading up to the next
+    heading, so a declaration that a section OWNS is inside it.
+    """
+    lines = text.splitlines()
+    marks = []
+    for i, line in enumerate(lines):
+        mt = SECTION_RE.match(line)
+        if mt:
+            marks.append((i, mt.group(2), mt.group(3).strip()))
+    out = []
+    for k, (i, num, title) in enumerate(marks):
+        end = marks[k + 1][0] if k + 1 < len(marks) else len(lines)
+        out.append((num, title, "\n".join(lines[i:end])))
+    return out
+
+
+def check_citations(stdlib_text, spec_text, citations=None):
+    """The §-citation of every block must be a section that EXISTS and that
+    DECLARES the block.
+
+    fix #8021: the citations used to be PROSE, so nothing could check them —
+    and eleven of them were WRONG while the checker printed them as
+    provenance in every CI run.  A citation is a pointer to the authority: a
+    pointer that names a section which does not exist, or which does not
+    declare the type, is a wrong pointer, and it is now an ERROR.
+    """
+    errors = []
+    citations = BLOCK_CITATIONS if citations is None else citations
+    documents = {"stdlib": parse_sections(stdlib_text),
+                 "spec": parse_sections(spec_text)}
+
+    def body_of(doc, number):
+        for (num, _title, body) in documents[doc]:
+            if num == number:
+                return body
+        return None
+
+    # (1) every covered block carries a citation.
+    for head in sorted(covered_heads()):
+        if head not in citations:
+            errors.append("the covered block `%s` records no §-citation" % head)
+
+    # (2) every citation names a section that EXISTS.
+    for head in sorted(citations):
+        doc, number, _kind = citations[head]
+        if body_of(doc, number) is None:
+            errors.append("the §-citation of `%s` names %s §%s, which is not "
+                          "a section of that document"
+                          % (head, doc, number))
+
+    # (3) every citation names a section that DECLARES (or, for the types
+    #     the document declares by ANALOGY, MENTIONS) the head.
+    for head in sorted(citations):
+        doc, number, kind = citations[head]
+        body = body_of(doc, number)
+        if body is None:
+            continue
+        name = HEAD_CLASS.get(head, head)
+        if kind == "declares":
+            declared = False
+            for line in body.splitlines():
+                mt = DECL_RE.match(line)
+                if mt and mt.group("name") == name:
+                    declared = True
+                    break
+            if not declared:
+                errors.append("the §-citation of `%s` names %s §%s, but that "
+                              "section declares no `%s`"
+                              % (head, doc, number, name))
+        else:
+            if not re.search(r"\b%s\b" % re.escape(name), body):
+                errors.append("the §-citation of `%s` names %s §%s, but that "
+                              "section does not mention `%s`"
+                              % (head, doc, number, name))
+
+    # (4) every language-specification section the checker names exists.
+    for name in sorted(NAMED_CITATIONS):
+        doc, number = NAMED_CITATIONS[name]
+        if body_of(doc, number) is None:
+            errors.append("the checker cites %s §%s (%s), which is not a "
+                          "section of that document" % (doc, number, name))
+
+    return errors
+
+
+# The rows whose `required` (DECLARED ARITY) column disagrees with the
+# document, and the checker REPORTS them rather than failing on them.
+#
+# fix #8023: the table's `required` column was never compared with the
+# document at all — and it DISAGREES with the document in the rows below.
+# The table's own contract (`src/common/BuiltinRegistry.cpp`) is that
+# "`required` counts the LEADING parameters that declare no default, so one
+# row answers for every admissible argument count of an overload with §22.5
+# optional parameters", and the `File.ReadAllTextAsync` comment spells it
+# out: "The `required` column is the declared MINIMUM, not the arity."
+#
+# The table is the SUBJECT of this ratchet, not its property: correcting a
+# row is an edit to `src/common/BuiltinRegistry.cpp` — a file this lane does
+# not own, and one whose `required` column drives the §22.5 admission
+# window — so the disagreement is REPORTED, with the document's own
+# declaration as the provenance, and the corrected value named.  A row whose
+# `required` is neither the document's value nor the value recorded here is
+# a CORRUPTION and FAILS the ratchet.
+#
+#   (head, member, total) -> (the value the table carries, the value the
+#                            document declares, the reason)
+REQUIRED_DEVIATION = _bind({
+    ("FileStream", "", 3):
+        (3, 2,
+         "the table's `required` column says 3, but {sec} declares "
+         "`public constructor(path: string, mode: FileMode, access: "
+         "FileAccess := FileAccess.ReadWrite);` — `access` is DEFAULTED, so "
+         "the declared MINIMUM is 2, not 3; the row's `required` must "
+         "become 2"),
+    ("Math", "DivRem", 3):
+        (2, 3,
+         "the table's `required` column says 2, but {sec} declares "
+         "`public static method DivRem(a: int, b: int, out remainder: "
+         "int): int;` — an `out` SLOT is an ARGUMENT, so the declared "
+         "MINIMUM is 3, not 2"),
+    ("TextWriter", "Write", 1):
+        (0, 1,
+         "the table's `required` column says 0, but {sec} declares "
+         "`public abstract method Write(value: string);` — one parameter "
+         "and no default, so the declared MINIMUM is 1, not 0"),
+    ("TextWriter", "WriteLine", 1):
+        (0, 1,
+         "the table's `required` column says 0, but {sec} declares "
+         "`public method WriteLine(value: string);` — one parameter and no "
+         "default, so the declared MINIMUM is 1, not 0"),
+    ("string", "IndexOf", 2):
+        (2, 1,
+         "the table's `required` column says 2, but {sec} declares "
+         "`public pure method IndexOf(value: char, startIndex: int := 0): "
+         "int;` — `startIndex` is DEFAULTED, so the declared MINIMUM is 1, "
+         "not 2"),
+    ("string", "PadCenter", 2):
+        (2, 1,
+         "the table's `required` column says 2, but {sec} declares "
+         "`public pure method PadCenter(totalWidth: int, paddingChar: char "
+         ":= ' '): string;` — `paddingChar` is DEFAULTED, so the declared "
+         "MINIMUM is 1, not 2"),
+    ("string", "PadLeft", 2):
+        (2, 1,
+         "the table's `required` column says 2, but {sec} declares "
+         "`public pure method PadLeft(totalWidth: int, paddingChar: char "
+         ":= ' '): string;` — `paddingChar` is DEFAULTED, so the declared "
+         "MINIMUM is 1, not 2"),
+    ("string", "PadRight", 2):
+        (2, 1,
+         "the table's `required` column says 2, but {sec} declares "
+         "`public pure method PadRight(totalWidth: int, paddingChar: char "
+         ":= ' '): string;` — `paddingChar` is DEFAULTED, so the declared "
+         "MINIMUM is 1, not 2"),
+})
+
 
 def parse_params(text):
     """The parameters of one declaration, as (name, type, has_default)."""
@@ -905,6 +1254,29 @@ def covering_rows(table, head, member, arity):
     return out
 
 
+def declared_required(stdlib, head, member, arity):
+    """The document's DECLARED MINIMUM for the form at `arity`.
+
+    The minimum over the document's overloads of `head`/`member` that ADMIT
+    `arity` arguments, of that overload's count of parameters that declare
+    no default.  It is the registry's OWN admission rule read from the
+    document's side: `required <= argCount <= total`.
+
+    An `out` SLOT counts: it is an ARGUMENT (§22.3), so a form that takes
+    one needs that argument.
+    """
+    overloads = stdlib.get((head, member))
+    if not overloads:
+        return None
+    best = None
+    for params in overloads:
+        required = sum(1 for p in params if not p[2])
+        if required <= arity <= len(params):
+            if best is None or required < best:
+                best = required
+    return best
+
+
 def compare(stdlib, table):
     """The disagreements between the standard library and the table."""
     errors = []
@@ -1006,6 +1378,33 @@ def compare(stdlib, table):
                 % (head, ("." + member) if member else "'s constructor",
                    total))
 
+    # 3. The `required` (DECLARED ARITY) column.  fix #8023: this column was
+    #    never compared, and it names itself in the checker's own output.
+    for (head, member, total), rows in sorted(table.items()):
+        if head not in covered_heads():
+            continue
+        if (head, member) in NOT_TRANSCRIBED:
+            continue
+        want = declared_required(stdlib, head, member, total)
+        if want is None:
+            # the document declares no form at this argument count; the
+            # comparison above reports that, and there is no document's
+            # minimum to compare the column against.
+            continue
+        for _idx, (_kinds, _nn, required) in enumerate(rows):
+            if required == want:
+                continue
+            known = REQUIRED_DEVIATION.get((head, member, total))
+            if known is not None and known[0] == required:
+                # the KNOWN disagreement: REPORTED by `known_uncovered`, not
+                # failed on — the table is the subject of this ratchet.
+                continue
+            errors.append(
+                "stdlib declares `%s%s` at %d argument(s) with %d required "
+                "parameter(s), but the table's `required` column says %d"
+                % (head, ("." + member) if member else "'s constructor",
+                   total, want, required))
+
     return errors
 
 
@@ -1092,6 +1491,37 @@ def known_uncovered(stdlib, table):
                     % (head, ("." + member) if member else "'s constructor",
                        i, reason)))
 
+    # (h) the rows whose `required` (DECLARED ARITY) column disagrees with
+    #     the document, which the checker reports rather than fails on.
+    for (head, member, total), (table_value, doc_value, reason) in \
+            sorted(REQUIRED_DEVIATION.items()):
+        if head not in covered:
+            continue
+        rows = table.get((head, member, total))
+        if rows is None:
+            continue
+        current = rows[0][2]
+        if current != table_value:
+            # the table was CORRECTED: the row now carries the document's
+            # value, so the deviation is gone — say so, so the entry can be
+            # deleted.
+            out.append(("required",
+                        "`%s%s` at %d argument(s) — the recorded `required` "
+                        "deviation no longer holds: the table now says %d, "
+                        "which is the document's own value, so this entry can "
+                        "be deleted"
+                        % (head, ("." + member) if member else
+                           "'s constructor", total, current)))
+            continue
+        out.append(("required",
+                    "`%s%s` at %d argument(s) — the table's `required` "
+                    "column and the document's DECLARED MINIMUM DISAGREE, and "
+                    "the checker reports it rather than failing on it (the "
+                    "table is the subject of this ratchet, not its property): "
+                    "%s"
+                    % (head, ("." + member) if member else "'s constructor",
+                       total, reason)))
+
     return out
 
 
@@ -1159,16 +1589,17 @@ SELF_TEST_MUTATIONS = [
 ]
 
 
-def apply_mutation(table, head, member, arity, position, mutation):
+def apply_mutation(table, head, member, arity, position, mutation, index=0):
     """A copy of `table` with one position mutated."""
     mutated = {k: list(v) for k, v in table.items()}
     key = (head, member, arity)
     rows = mutated.get(key)
     if not rows:
         die("the self-test names a row the table does not carry: %r" % (key,))
-    kinds, nn, required = rows[0]
+    kinds, nn, required = rows[index]
     new_kinds = list(kinds)
     new_nn = nn
+    new_required = required
     kind = mutation[0]
     if kind == "extra":
         new_kinds[position] = frozenset([mutation[1]])
@@ -1178,9 +1609,12 @@ def apply_mutation(table, head, member, arity, position, mutation):
         new_nn |= (1 << position)
     elif kind == "nullable":
         new_nn &= ~(1 << position) & 0xFF
+    elif kind == "required":
+        # fix #8023: the DECLARED ARITY column.
+        new_required = mutation[1]
     else:
         die("the self-test names an unknown mutation %r" % (mutation,))
-    rows[0] = (new_kinds, new_nn, required)
+    rows[index] = (new_kinds, new_nn, new_required)
     return mutated
 
 
@@ -1235,8 +1669,70 @@ def self_test():
         die("the covered blocks %s have no self-test mutation — a block with "
             "no mutation can be silently wrong"
             % ", ".join("`%s`" % h for h in sorted(missing)), 1)
+
+    # (5) fix #8021: a WRONG §-citation must be DETECTED.  The citations used
+    #     to be prose, so a wrong one was invisible; now the checker reads
+    #     the citation map and refuses a citation that names a section which
+    #     does not exist, or which does not declare the block.
+    citations = dict(BLOCK_CITATIONS)
+    citations["Math"] = ("stdlib", "2.6", "declares")
+    errors = check_citations(read(STDLIB), read(SPEC), citations)
+    if not errors:
+        die("the checker does not detect a WRONG §-citation", 1)
+    named = [e for e in errors if "`Math`" in e]
+    if not named:
+        die("the checker detects a wrong §-citation but does not NAME the "
+            "block: %s" % "; ".join(errors), 1)
+    # a citation that names a section that does not exist at all.
+    citations = dict(BLOCK_CITATIONS)
+    citations["FileStream"] = ("stdlib", "7.99", "declares")
+    errors = check_citations(read(STDLIB), read(SPEC), citations)
+    if not errors:
+        die("the checker does not detect a §-citation that names a section "
+            "that does not exist", 1)
+    # the real map must be clean.
+    errors = check_citations(read(STDLIB), read(SPEC))
+    if errors:
+        die("the checker reports a wrong §-citation on the tree it lives in: "
+            "%s" % "; ".join(errors), 1)
+
+    # (6) fix #8023: a CORRUPTED `required` count must be DETECTED — for
+    #     EVERY covered block.  The corrupted value is neither the
+    #     document's declared minimum nor the value a KNOWN deviation
+    #     records, so a known deviation cannot HIDE a corruption.
+    for head in sorted(covered):
+        candidates = [(key, idx) for key, rows in table.items()
+                      if key[0] == head for idx in range(len(rows))]
+        if not candidates:
+            continue
+        key, idx = candidates[0]
+        required = table[key][idx][2]
+        want = declared_required(stdlib, key[0], key[1], key[2])
+        known = REQUIRED_DEVIATION.get(key)
+        bad = required + 1
+        if want is not None and bad == want:
+            bad += 1
+        if known is not None and bad == known[0]:
+            bad += 1
+        mutated = apply_mutation(table, key[0], key[1], key[2], 0,
+                                 ("required", bad), index=idx)
+        errors = compare(stdlib, mutated)
+        if not errors:
+            die("the checker does not detect a corrupted `required` count "
+                "(%d) for `%s`" % (bad, head), 1)
+        named = [e for e in errors
+                 if ("`%s.%s`" % (key[0], key[1])) in e or
+                 ("`%s'" % key[0]) in e]
+        if not named:
+            die("the checker detects a corrupted `required` count for `%s` but "
+                "does not NAME the member: %s" % (head, "; ".join(errors)), 1)
+        if not any("`required` column" in e for e in named):
+            die("the checker detects a corrupted `required` count for `%s` but "
+                "does not NAME the column: %s" % (head, "; ".join(errors)), 1)
+
     sys.stdout.write("check_builtin_declared_params: self-test OK "
-                     "(%d mutation(s) over %d block(s))\n"
+                     "(%d mutation(s) over %d block(s); the §-citations and "
+                     "the `required` column are checked too)\n"
                      % (len(SELF_TEST_MUTATIONS), len(covered)))
     return 0
 
@@ -1244,9 +1740,15 @@ def self_test():
 def main(argv):
     if "--self-test" in argv:
         return self_test()
-    stdlib = parse_stdlib(read(STDLIB), read(SPEC))
+    stdlib_text = read(STDLIB)
+    spec_text = read(SPEC)
+    stdlib = parse_stdlib(stdlib_text, spec_text)
     table = parse_table(read(REGISTRY))
     errors = compare(stdlib, table)
+    # fix #8021: the §-citations are CHECKED, not printed as prose — a
+    # citation that names a section which does not exist, or which does not
+    # declare the block, is an error and fails the ratchet.
+    errors += check_citations(stdlib_text, spec_text)
     gaps = known_uncovered(stdlib, table)
     if errors:
         sys.stderr.write("check_builtin_declared_params: %d disagreement(s) "
@@ -1266,13 +1768,19 @@ def main(argv):
     covered_rows = sum(len(rows) for (h, m, t), rows in table.items()
                         if h in covered_heads())
     forms, rows_read = coverage(stdlib, table)
+    deviations = len([1 for kind, _t in gaps if kind == "required"])
     sys.stdout.write("check_builtin_declared_params: the table agrees with "
                      "the standard library over %d standard-library block(s) "
                      "and %d specification block(s), %d declared form(s) and "
-                     "%d row(s) read (%d row(s) sit in the covered blocks); "
-                     "%d known-uncovered item(s) are listed above\n"
+                     "%d row(s) read (%d row(s) sit in the covered blocks) — "
+                     "the parameter TYPE, the §7.3 NULLABILITY and the "
+                     "`required` (DECLARED ARITY) columns are compared, and "
+                     "the §-citation of all %d block(s) is verified against "
+                     "the document; %d known-uncovered item(s) are listed "
+                     "above, %d of them a `required` deviation\n"
                      % (len(BLOCKS), len(SPEC_BLOCKS) + len(SPEC_RECORDS),
-                        forms, rows_read, covered_rows, len(gaps)))
+                        forms, rows_read, covered_rows, len(BLOCK_CITATIONS),
+                        len(gaps), deviations))
     return 0
 
 

@@ -25,7 +25,14 @@ What is asserted here:
     about a table the checker cannot see;
   * the known-uncovered list names the positions whose declared type the
     vocabulary cannot express, and the deviations it reports rather than
-    fails on.
+    fails on;
+  * fix #8021: the §-citation of every block is MACHINE-READABLE and
+    VERIFIED against the document — a citation that names a section which
+    does not exist, or which does not declare the block, is an ERROR;
+  * fix #8023: the `required` (DECLARED ARITY) column is COMPARED with the
+    document — a corrupted arity fails and names the member and the
+    argument count — and the rows where the table and the document disagree
+    are REPORTED with the document's own declaration as the provenance.
 
 The list of the #8005 rows is the #8005 COMMIT's own diff (the `-` lines of
 `git show 92bf3654 -- src/common/BuiltinRegistry.cpp`), transcribed here as
@@ -186,6 +193,155 @@ class BuiltinDeclaredParams(unittest.TestCase):
                                 'the checker reads fewer than 140 table rows; '
                                 'the covered set shrank')
         self.assertGreater(forms, 0, 'the checker compares no declared form')
+
+
+class Citations(unittest.TestCase):
+    """fix #8021: the §-citations are DATA, and they are CHECKED."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stdlib_text = c.read(c.STDLIB)
+        cls.spec_text = c.read(c.SPEC)
+
+    def test_every_covered_block_carries_a_citation(self):
+        for head in sorted(c.covered_heads()):
+            self.assertIn(head, c.BLOCK_CITATIONS,
+                          'the covered block `%s` records no §-citation'
+                          % head)
+
+    def test_every_cited_head_is_cited(self):
+        for head in sorted(c.BLOCK_CITATIONS):
+            self.assertIn(head, c.covered_heads() | set(
+                c.KNOWN_UNCOVERED_HEADS),
+                'the §-citation of `%s` names a head the checker never '
+                'prints' % head)
+
+    def test_the_citations_are_verified_against_the_documents(self):
+        errors = c.check_citations(self.stdlib_text, self.spec_text)
+        self.assertEqual([], errors,
+                         'the checker reports a wrong §-citation on the tree '
+                         'it lives in: %s' % errors)
+
+    def test_a_wrong_citation_is_detected(self):
+        # the citation names a section that exists but declares no `Math`
+        broken = dict(c.BLOCK_CITATIONS)
+        broken["Math"] = ("stdlib", "2.5", "declares")
+        errors = c.check_citations(self.stdlib_text, self.spec_text, broken)
+        self.assertTrue(errors,
+                        'the checker does not detect a WRONG §-citation')
+        self.assertTrue(any("`Math`" in e for e in errors),
+                        'the checker detects a wrong §-citation but does not '
+                        'NAME the block: %s' % errors)
+
+    def test_a_citation_of_a_section_that_does_not_exist_is_detected(self):
+        broken = dict(c.BLOCK_CITATIONS)
+        broken["FileStream"] = ("stdlib", "7.99", "declares")
+        errors = c.check_citations(self.stdlib_text, self.spec_text, broken)
+        self.assertTrue(errors,
+                        'the checker does not detect a §-citation that names '
+                        'a section which does not exist')
+        self.assertTrue(any("`FileStream`" in e for e in errors),
+                        'the checker does not NAME the block: %s' % errors)
+
+    def test_the_reasons_derive_their_sections_from_the_map(self):
+        # a reason that names a section the map does not claim would be a
+        # pointer that can be wrong without anybody noticing.
+        for head, reason in sorted(c.KNOWN_UNCOVERED_HEADS.items()):
+            doc, number, _kind = c.BLOCK_CITATIONS[head]
+            self.assertIn("%s §%s" % (doc, number), reason,
+                          'the reason for `%s` does not name its own §-citation'
+                          % head)
+        for head in ("Math", "FileStream", "LinkedList", "Shared",
+                     "TimeoutException"):
+            reasons = [r for k, r in c.NO_OPINION.items() if k[0] == head]
+            self.assertTrue(reasons, 'the head `%s` has no reason' % head)
+            doc, number, _kind = c.BLOCK_CITATIONS[head]
+            for reason in reasons:
+                self.assertIn("%s §%s" % (doc, number), reason,
+                              'a reason for `%s` names another section' % head)
+
+
+class RequiredColumn(unittest.TestCase):
+    """fix #8023: the `required` (DECLARED ARITY) column is compared."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stdlib = c.parse_stdlib(c.read(c.STDLIB), c.read(c.SPEC))
+        cls.table = c.parse_table(c.read(c.REGISTRY))
+
+    def test_the_declared_minimum_is_read_from_the_document(self):
+        # stdlib §7.2: `access: FileAccess := FileAccess.ReadWrite` is
+        # DEFAULTED, so the FileStream constructor's declared minimum is 2.
+        self.assertEqual(
+            2, c.declared_required(self.stdlib, "FileStream", "", 3),
+            'the FileStream constructor\'s declared minimum is not 2')
+        # stdlib §2.2: `out remainder: int` is an ARGUMENT, so Math.DivRem's
+        # declared minimum is 3.
+        self.assertEqual(
+            3, c.declared_required(self.stdlib, "Math", "DivRem", 3),
+            'Math.DivRem\'s declared minimum is not 3')
+
+    def test_a_corrupted_required_count_is_detected(self):
+        mutated = c.apply_mutation(self.table, "FileStream", "", 3, 0,
+                                   ("required", 1))
+        errors = c.compare(self.stdlib, mutated)
+        self.assertTrue(errors,
+                        'the checker does not detect a corrupted `required` '
+                        'count')
+        named = [e for e in errors if "`FileStream'" in e]
+        self.assertTrue(named,
+                        'the checker detects a corrupted `required` count but '
+                        'does not NAME the member: %s' % errors)
+        self.assertTrue(any("`required` column" in e for e in named),
+                        'the checker detects a corrupted `required` count but '
+                        'does not NAME the column: %s' % errors)
+
+    def test_a_corrupted_required_count_on_a_clean_row_is_detected(self):
+        mutated = c.apply_mutation(self.table, "string", "Contains", 1, 0,
+                                   ("required", 2))
+        errors = c.compare(self.stdlib, mutated)
+        self.assertTrue(errors,
+                        'the checker does not detect a corrupted `required` '
+                        'count on a row with no known deviation')
+        self.assertTrue(any("`string.Contains`" in e for e in errors),
+                        'the checker does not NAME the member: %s' % errors)
+
+    def test_the_known_required_deviations_are_reported(self):
+        gaps = c.known_uncovered(self.stdlib, self.table)
+        required = [text for kind, text in gaps if kind == "required"]
+        self.assertTrue(required,
+                        'the checker reports no `required` deviation; the '
+                        'disagreement must be visible')
+        joined = " ".join(required)
+        for head in ("FileStream", "Math", "TextWriter", "string"):
+            self.assertIn(head, joined,
+                          'the `required` deviation of `%s` is not reported'
+                          % head)
+        self.assertIn("DEFAULTED", joined,
+                      'the `required` deviations do not carry the document\'s '
+                      'own declaration as the provenance')
+
+    def test_a_known_deviation_cannot_hide_a_corruption(self):
+        # the FileStream row records the table's value (3); a corruption to
+        # any OTHER wrong value must fail.
+        for bad in (0, 1, 4, 5):
+            mutated = c.apply_mutation(self.table, "FileStream", "", 3, 0,
+                                       ("required", bad))
+            errors = c.compare(self.stdlib, mutated)
+            self.assertTrue(errors,
+                            'the checker does not detect a `required` count '
+                            'of %d on the FileStream row' % bad)
+
+    def test_the_deviation_text_names_the_gate_that_decides(self):
+        # fix #8023: the §5.1 kind gate does NOT include `StringBuilder`.
+        for (head, member, i), reason in sorted(
+                c.NULLABILITY_DEVIATION.items()):
+            self.assertIn("checkBuiltinStringBuilderCall", reason,
+                          'the deviation for `%s.%s` does not name the gate '
+                          'that decides it' % (head, member))
+            self.assertIn("checkAssignable", reason,
+                          'the deviation for `%s.%s` does not name the '
+                          '`checkAssignable` path' % (head, member))
 
 
 if __name__ == '__main__':
