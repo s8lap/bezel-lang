@@ -100,8 +100,31 @@ probe_jobserver() {
   row jobserver "$st" "$act${line:+ | $line}"
 }
 
+# A single-instant sample of a box that ALTERNATES between building and
+# analysing reads "CLEAN" even while four lanes are mid-run. MEASURED
+# 2026-11-02 23:33:13: the heartbeat saw ZERO build processes while three
+# lanes were between builds and a fourth was linking; five seconds later
+# three were building, and eight seconds after that none were. The GATE
+# PRECONDITION stays instantaneous -- no_builders.sh is unchanged, and "is
+# anything building NOW?" is exactly the question a gate must ask, since a
+# builder that starts a second later is just as disqualifying. But the
+# heartbeat also answers "is the box working?", and that needs a WINDOW. So
+# sample five times at one second and report how many samples saw a builder.
+window_builders() {
+  local i seen=0 max=0 n
+  for i in 1 2 3 4 5; do
+    n="$("$HERE/no_builders.sh" 2>/dev/null |
+         awk '/^  [a-z]+ +[0-9]+$/ {t += $2} END {print t + 0}')"
+    [ -n "$n" ] || n=0
+    [ "$n" -gt "$max" ] && max=$n
+    [ "$n" -gt 0 ] && seen=$((seen + 1))
+    [ "$i" -lt 5 ] && sleep 1
+  done
+  printf '5s window: %s/5 samples saw a builder (max %s proc(s))' "$seen" "$max"
+}
+
 probe_builders() {
-  local st=OK out
+  local st=OK out win
   if [ -x "$HERE/no_builders.sh" ]; then out="$("$HERE/no_builders.sh" -q 2>/dev/null | tail -n 1)"
   else out="n/a"; fi
   case "$out" in *CLEAN*|n/a) ;; *)
@@ -109,7 +132,12 @@ probe_builders() {
       ACTIONS+=("builders: a gate is running WITH builders — its verdict is untrustworthy; stop the builders")
     fi ;;
   esac
-  row builders "$st" "$out"
+  if [ -x "$HERE/no_builders.sh" ]; then
+    win="$(window_builders)"
+    row builders "$st" "$out | $win"
+  else
+    row builders "$st" "$out"
+  fi
 }
 
 probe_memory() {
@@ -164,12 +192,22 @@ probe_staging() {
 }
 
 probe_lanes() {
-  local out n
+  local out n procs heavy
   out="$("$HERE/lane_status.sh" 2>/dev/null)" || true
   if printf '%s' "$out" | grep -q 'no lane worktrees active'; then n=0
   else n="$(printf '%s\n' "$out" | sed -n '2,/^$/p' | grep -c .)"; fi
   local stall; stall="$(printf '%s\n' "$out" | grep -c 'STALL?')"
-  row lanes OK "$n active lane worktree(s), $stall stall candidate(s) (scripts/lane_status.sh for detail)"
+  # The table's 6th column is the live build/test process count rooted in each
+  # lane's tree, and the footer carries the whole-box heavy-process count.
+  # Without these the lanes row says "4 active lane worktree(s)" and nothing
+  # about whether any of them is BUILDING -- which is the question a heartbeat
+  # is really asked. (The "-- box:" footer is excluded by its leading dashes.)
+  procs="$(printf '%s\n' "$out" |
+           awk '!/^--/ && NF >= 6 && $6 ~ /^[0-9]+$/ {s += $6} END {print s + 0}')"
+  heavy="$(printf '%s\n' "$out" | sed -n 's/.*heavy procs: \([0-9]*\).*/\1/p' | head -n 1)"
+  [ -n "$procs" ] || procs=0
+  [ -n "$heavy" ] || heavy=0
+  row lanes OK "$n active lane worktree(s), $procs lane build proc(s) live, $heavy heavy proc(s) box-wide, $stall stall candidate(s) (scripts/lane_status.sh for detail)"
 }
 
 # Stale dev processes and waiters. R27 2026-10-06: a lane's agent can die while
