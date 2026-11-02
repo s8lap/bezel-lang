@@ -25092,7 +25092,31 @@ static void checkBuiltinPathCallArity(
         // module that exports one of them SHADOWS the standard library's —
         // the bare name is not ambiguous and the gate's own arity question
         // is the right one.
-        if (ambiguousHeads.count(std::string(head))) return;
+        //
+        // fix #7996 fix-forward (§2.3, §2.7 rule 2, §22.6, v0.350): the
+        // stand-down is for a head the user spelled BARE. A head that CAME
+        // FROM A QUALIFIED SPELLING is not bare: the qualifier pinned the
+        // entity (§2.7 rule 2 — the remainder resolves against the matched
+        // module's public declarations; §2.2 — the alias is an additional
+        // qualifier, not a rename), so the bare name's ambiguity is beside
+        // the point and the arity question IS the right one. The rewrite
+        // (#7996's head rewrite, and #4698's
+        // `normalizeAliasQualifiedBuiltinHead`) turns such a head into a bare
+        // identifier and stamps it `aliasQualifiedBuiltin` precisely to say
+        // "this names the built-in, whatever the scope says" — so that flag
+        // is what tells the stand-down apart from a genuinely bare head.
+        //
+        // WITHOUT this the stand-down re-opened the §22.6 arity gate for the
+        // qualified spelling of an ALWAYS-AVAILABLE class (`Environment`):
+        // `System.Environment.Get("X", "Y")` and `sys.Environment.Get("X",
+        // "Y")` in a file whose import exports a public `Environment` were
+        // REJECTED with the §22.6 arity error before #7996 and became, after
+        // it, a COMPILED program whose statement emitted NOTHING (the #3079
+        // "failed to lower" degradation) — a base-refused program turned into
+        // a silent drop, which is the direction this campaign exists to stop.
+        if (!id->aliasQualifiedBuiltin &&
+            ambiguousHeads.count(std::string(head)))
+            return;
     } else if (auto* q =
                    dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
         // fix #7983 (stdlib §7.3, §7.4, §22.6, v0.350): the class may be
@@ -28309,8 +28333,17 @@ std::string_view ExprTC::builtinClosedRecordHead(const ast::Expr* target) {
     // fix #7951 (§2.3, v0.309): a bare head the visitor already refused as
     // ambiguous with an imported public (fix #5140) is not "the built-in"; a
     // second "no member" error on the same access would only cascade.
+    //
+    // fix #7996 fix-forward (§2.3, §2.7 rule 2, v0.350): the stand-down is
+    // for a head the user spelled BARE. A head that CAME FROM A QUALIFIED
+    // SPELLING (`aliasQualifiedBuiltin` — the #7996 head rewrite, or #4698's
+    // `normalizeAliasQualifiedBuiltinHead`) is not bare: the qualifier pinned
+    // the entity, so the bare name's ambiguity is beside the point and the
+    // head IS the built-in. Same rule as the §22.6 arity gate's stand-down
+    // (see `checkBuiltinPathCallArity`).
     if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(target))
-        if (ambiguousAlwaysAvailableNames_.count(std::string(id->name)))
+        if (!id->aliasQualifiedBuiltin &&
+            ambiguousAlwaysAvailableNames_.count(std::string(id->name)))
             return {};
     if (const TypeRef* t = ctx_.exprType(*target)) return headOfType(t);
     Symbol* sym = ctx_.exprSymbol(*target);
