@@ -163,6 +163,27 @@ class RunStatusTest(unittest.TestCase):
         self.assertIn("1 live lane(s) of 1", self.row(out, "pool"))
         self.assertNotIn("ACTION: pool", out)
 
+    def test_a_superseded_claim_does_not_keep_a_lane_live(self):
+        # "LAST ROW WINS" IS PER CLAIM, NOT PER LANE. A lane whose only claim
+        # was later marked done is NOT live -- otherwise a finished lane stays
+        # counted forever and the pool row over-reports.
+        c = self.claims(
+            ("#1", "laneA", "b1", "/w/a", "f", "t", "live:producing"),
+            ("#1", "laneA", "b1", "/w/a", "f", "t", "done:cc8d3170"),
+        )
+        out = self.status("--claims", c, "--pool", "7")
+        self.assertIn("0 live lane(s) of 7", self.row(out, "pool"))
+        self.assertNotIn("ACTION: pool", out)
+
+    def test_one_lane_two_issues_counts_once(self):
+        c = self.claims(
+            ("#1", "laneA", "b1", "/w/a", "f", "t", "live:producing"),
+            ("#2", "laneA", "b1", "/w/a", "f", "t", "live:producing"),
+            ("#3", "laneB", "b2", "/w/b", "f", "t", "live:reviewing"),
+        )
+        out = self.status("--claims", c, "--pool", "7")
+        self.assertIn("2 live lane(s) of 7", self.row(out, "pool"))
+
     def test_drained_pool_is_info_not_an_action(self):
         # A drained pool is legitimate -- it is what a gate wants -- so 0
         # lanes must not cry for a refill.

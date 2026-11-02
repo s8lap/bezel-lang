@@ -220,6 +220,11 @@ probe_staging() {
 # a QUEUED claim for a later issue is still live, which is why the live rows
 # are counted and the queued ones ignored rather than one status per lane.
 #
+# "LAST ROW WINS" IS PER CLAIM, NOT PER LANE — a lane that finishes one issue
+# and still has another open is live, and a lane whose only claim was
+# superseded by a later `done` row is not. Keying by (lane, issue) and then
+# counting the lanes is what makes both true.
+#
 # WHY THIS ROW EXISTS. The pool is a firm size, refilled in the same turn a
 # slot frees, and until 2026-11-02 nothing could SEE it: a run left a slot
 # empty for nineteen minutes and no row said so. A drained pool is legitimate
@@ -231,7 +236,11 @@ probe_pool() {
     row pool INFO "n/a (no claims file at $CLAIMS — pass --claims <path>)"
     return 0
   fi
-  lanes="$(awk -F'\t' '$1 != "issue" && $NF ~ /^live/ {c[$2]=1} END {n=0; for (l in c) n++; print n+0}' "$CLAIMS")"
+  lanes="$(awk -F'\t' '
+      $1 != "issue" { st[$2 SUBSEP $1] = $NF }
+      END { for (k in st) { split(k, a, SUBSEP)
+             if (st[k] ~ /^live/ && !(a[1] in seen)) { seen[a[1]] = 1; n++ } }
+           print n + 0 }' "$CLAIMS")"
   [ -n "$lanes" ] || lanes=0
   detail="$lanes live lane(s) of $POOL"
   if [ "$GATE_RUNNING" -eq 1 ]; then
