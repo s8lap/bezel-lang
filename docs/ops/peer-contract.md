@@ -28,7 +28,9 @@ staging (*runbook, Dual-coordinator runs*).
 ## Start of run
 
 1. Read `CLAUDE.md`, this file, [`lane-contract.md`](lane-contract.md) (your lanes follow it) and
-   your brief, in full.
+   your brief, in full. **Read them from `origin/main`, not from the working tree**: a checkout
+   can sit on an old commit, and the copy of `CLAUDE.md` a session is handed at start-up is the
+   one in that checkout. `git show origin/main:CLAUDE.md`, `git show origin/main:docs/ops/…`.
 2. **Your first message to the integrator** acknowledges by listing the eight step names of
    *The work loop* below and the field names of *Handing back to the integrator*. Send it before
    or with your first dispatches; do not wait for a reply. A first review is hours away, so the

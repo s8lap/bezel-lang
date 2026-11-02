@@ -43,6 +43,15 @@ appended one JSON record per run to `/var/tmp/bezel-scratch/gate-timings/`
 since 2026-07-14, with per-phase timings. Read it with `scripts/gate_trend.sh`
 (which also fails a push when a gate's telemetry contradicts its verdict, #3010).
 
+⚠ **"Built target X" is not "X was built".** A `cmake --build` that prints
+`Built target bezelc` may not have relinked it — the gate's staleness
+preflight names the "#2426 unreliable-incremental family", where the build
+reported success and the binary was unchanged. So after any `src/` change, the
+only sound proof that the binary is fresh is a **behavioural probe of the
+change** (does it still reject / still accept?), not the build's exit status
+and not an mtime. And a coordinator-side build runs in the **foreground**: a
+backgrounded build that is killed leaves a tree that certifies a stale binary.
+
 **The suite is several per-area binaries, not one.** `tests/CMakeLists.txt`
 splits the test sources along the existing `tests/<area>/` directories into
 `build/tests/bezel_tests_{codegen,ownership,sema,frontend,module,support}`, so a
@@ -543,6 +552,25 @@ marked `*`, when:
 Recovery computes one patch-id per note in `refs/notes/bezel-picks`, so its
 cost grows with the notes ref; nothing prunes that ref yet.
 
+**A merge of `origin/main` into staging needs BOTH a trailer and a ledger
+note.** The trailer half is enforced (`check_commit_trailers.py` runs over
+`rev-list origin/main..HEAD`, so a merge commit with none is caught); the note
+half is not, and a merge without one shows up as UNATTRIBUTED in the ledger. So
+a merge commit gets a trailer naming the model that wrote it, and a note under
+`refs/notes/bezel-picks` like any other commit. `git commit --amend -F` keeps
+both parents, so the note survives a subject fix — but if the SHA changes, the
+note has to be re-added for the new SHA.
+
+**A checker's verdict is not evidence about the tree you are standing in.**
+Three habits, each of which has cost a wrong conclusion:
+- **Read the instrument's own header before choosing the interpreter and the
+  flags.** `corpus.py --strict` is not a valid invocation and exits 0.
+- **Capture the exit code BEFORE piping.** `cmd | tail; echo $?` reports
+  `tail`'s status, not the tool's.
+- **Print the count, not just the verdict.** An empty revision range is an
+  error, not a result; "0 problems" from a checker that was handed no file is
+  not a pass.
+
 **Amending is where a reviewed commit can lose its content.** Two rules, both
 paid for:
 
@@ -658,6 +686,17 @@ dispose-count/ASan-clean for a double-free.
   works in any worktree with a toolchain. Measured 2026-09-22: 285 lane runs, all
   reporting `NATIVE SANITIZER: 0 check(s) skipped`, with the objects on disk under
   `/var/tmp/bezel-scratch/rtobj/`. A lane-local ASan green IS evidence.
+  ⚠ **Never declare a capability unavailable from a PACKAGE query — measure it.**
+  `rpm -q libasan` says "not installed", and clang still ships its own
+  compiler-rt ASan runtime, so `clang++ -fsanitize=address` links, runs and
+  produces real findings. The general shape: a missing package is not a missing
+  runtime, and a line of output is not a capability. **Read the COUNTER, not the
+  parenthetical** — the harness prints
+  `NATIVE SANITIZER: <counter> check(s) skipped (ASan/TSan runtime unavailable — …)`
+  *whatever* the counter is, so the parenthetical carries no information at all
+  (#7122, quoted from `tests/test_main.cpp:348-364`). Quote the counters, and
+  plant a sentinel that must trip the sanitizer, so a zero leak count on a
+  *disarmed* leg does not read like a clean one.
   The real hazard is narrower and sharper: the `runUnderAsan*` helpers return
   `-1` for **toolchain unavailable, compile failure AND link failure alike**, and
   every caller writes `if (rc == -1) return;`. So a *link* break makes the
@@ -901,6 +940,15 @@ burns budget re-reading state that has not moved.
    in `src/` and fails the cycle on one that resolves nowhere. "Comment-only"
    means token-identical, not byte-identical. After **any** `src/` edit, comment
    or not, re-run `scripts/ratchet_sweep.sh` before the gate.
+   ⚠ **Re-run the sweep after EVERY pick, on the staging tip** — not once at
+   the end, and not on the lane's own tree. A pick is not safe until the sweep
+   is green on the tip it landed on; a sweep run in the lane's worktree is the
+   wrong-tree measurement, and a sweep run before the last pick says nothing
+   about the last pick. ⚠ **A ratchet's verdict is relative to a BASE SHA.** A
+   count measured against a lane's base is not the count on the merged head, so
+   re-measure against the merged tree — the toolchain-skip ratchet's own
+   diagnostic says as much: *re-run --update on the tree that fixed these
+   rows*.
 5. **No untracked `scripts/`** — ratchet #3413 fails the cycle on any `.sh`
    hardcoding an absolute checkout path. Park strays in
    `/var/tmp/bezel-scratch/<run>/parked/`.
