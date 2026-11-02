@@ -295,6 +295,51 @@ std::string parseRadixWhy(const ParseRadixBinding& b) {
     return ": a `" + tn + "` is never implicitly convertible to an `int`";
 }
 
+// fix #7603 (stdlib §3.2, v0.350): the "got" spelling of the
+// `Encoding.GetBytes` DESTINATION argument's static type, for the
+// diagnostic that refuses a destination that is not a span.
+//
+// The spelling follows the one the sema-side diagnostics use
+// (`collectionLiteralTargetSpelling` in ExprTypecheck_Calls.cpp): a
+// primitive renders as its keyword, a named type as its head plus its
+// generic arguments, and an unresolved type says so rather than nothing.
+std::string encodingDestinationSpelling(const sema::TypeRef* t) {
+    if (!t) return "<unresolved>";
+    switch (t->kind) {
+        case sema::TypeRef::Kind::Primitive: {
+            std::string s = std::string(common::primitiveBuiltinSpelling(
+                static_cast<int>(t->primitive)));
+            if (t->nullable) s += "?";
+            return s;
+        }
+        case sema::TypeRef::Kind::Named: {
+            // `headName()` is the alias-transparent read (#1462): an alias
+            // (`type SB := Span<byte>`) names the underlying head.
+            std::string s(t->headName());
+            if (s.empty()) s = "<unresolved>";
+            if (!t->genericArgs.empty()) {
+                s += "<";
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += encodingDestinationSpelling(t->genericArgs[i]);
+                }
+                s += ">";
+            }
+            if (t->nullable) s += "?";
+            return s;
+        }
+        case sema::TypeRef::Kind::Unit:
+            return "()";
+        case sema::TypeRef::Kind::InlineArray:
+            return "[N]";
+        case sema::TypeRef::Kind::Function:
+            return "(fn ...)";
+        case sema::TypeRef::Kind::Error:
+            return "<unresolved>";
+    }
+    return "<unresolved>";
+}
+
 }  // namespace
 
 
@@ -426,9 +471,78 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
         const auto* bnd = ctx_.builtinCallBinding(call);
         std::size_t strArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[0] : 0;
         std::size_t spanArgIdx = (bnd && bnd->size() == 2) ? (*bnd)[1] : 1;
+        // fix #7603 (stdlib §3.2, v0.350): the DESTINATION of this overload
+        // is a `Span<byte>`, and this arm WRITES THROUGH it — it takes the
+        // span's backing pointer and writes the encoded bytes into it. The
+        // arm used to assume the argument IS a span and store it into a
+        // `%bz.arrayspan` slot unconditionally, so an argument that is not a
+        // span (an `Array<byte>`, an `OwningBuffer<byte>`, a `string`) was
+        // written through as if it were one: the slot's `start`/`length`
+        // fields were read out of the wrong value, and the runtime wrote the
+        // encoded bytes through a garbage pointer. MEASURED on the base
+        // (ad048d70): `Encoding.UTF8.GetBytes(s := ..., destination := an
+        // Array<byte>)` compiled clean and then died at run time with
+        // `System.IndexOutOfRangeException` (exit 70) — and under ASan with
+        // a SEGV on a WRITE in `bz_encoding_utf8_write_bytes` (a write
+        // through an arbitrary address), i.e. a memory-safety hole, not a
+        // diagnostic.
+        //
+        // stdlib §3.2 (v0.350), verbatim:
+        //   public abstract method GetBytes(s: string, destination: Span<byte>): int;
+        //                                                                              // returns bytes written;
+        //                                                                              //   IndexOutOfRangeException if too short
+        // so the destination is a SPAN and nothing else. The arm therefore
+        // refuses a destination it cannot lower AS a span, and the refusal
+        // is a compile-time diagnostic (the #2477/#2457 backstop stays quiet:
+        // it is gated on `!hasErrors()`).
+        //
+        // The DISCriminator is the destination argument's STATIC type, the
+        // same rule fix #3889 applied to the `GetString` source in this very
+        // function ("the discriminator MUST be the argument's static TypeRef,
+        // never the lowered LLVM shape alone"): a `Range<int>` or a record
+        // lowers to a struct too, and only the static type says whether the
+        // value IS a span. The lowered SHAPE is checked as well, as the
+        // backstop for a destination whose static type did not settle (an
+        // unresolved type): the span value is the `%bz.arrayspan` struct
+        // `{ptr source, i32 start, i32 length}` (LlvmBackend_impl.hpp
+        // arraySpanStructType), and an argument of another shape cannot be
+        // written through as one.
+        //
+        // The span-LIKE set is the four the compiler already treats as spans
+        // everywhere else (isSpanLikeTypeName): `Span`/`ReadOnlySpan` over an
+        // `OwningBuffer<T>` (§4.14) and `ArraySpan`/`ReadOnlyArraySpan` over
+        // an `Array<T>` (§4.15) — all four share the `bz.arrayspan` layout.
+        // Whether `ArraySpan<byte>` is admissible at a `Span<byte>` parameter
+        // is a §5.1 question for the SEMA-side admission table (the
+        // `Encoding` rows of the built-in parameter table carry no declared
+        // type for that position), NOT this arm's to decide: refusing it
+        // here would reject programs the compiler admits today.
+        const sema::TypeRef* destTy =
+            ctx_.exprType(*call.args[spanArgIdx].value);
+        const bool destTypeKnown =
+            destTy && destTy->kind != sema::TypeRef::Kind::Error;
+        if (destTypeKnown && !isSpanLikeTypeName(destTy)) {
+            ctx_.diagnostics().report(
+                Severity::Error, call.args[spanArgIdx].value->span.begin,
+                "`Encoding.GetBytes` expects a `Span<byte>` destination "
+                "(stdlib \xC2\xA7""3.2); got `" +
+                    encodingDestinationSpelling(destTy) + "` (#7603)");
+            return nullptr;
+        }
         llvm::Value* strPtr  = lowerExpr(*call.args[strArgIdx].value);
         llvm::Value* spanVal = lowerExpr(*call.args[spanArgIdx].value);
         if (!strPtr || !spanVal) return nullptr;
+        if (spanVal->getType() != arraySpanStructType()) {
+            // The static type did not settle (or settled on something this
+            // arm cannot write through): the value is not a `bz.arrayspan`,
+            // so it cannot be a span. Refuse rather than write through it.
+            ctx_.diagnostics().report(
+                Severity::Error, call.args[spanArgIdx].value->span.begin,
+                "`Encoding.GetBytes` expects a `Span<byte>` destination "
+                "(stdlib \xC2\xA7""3.2); got `" +
+                    encodingDestinationSpelling(destTy) + "` (#7603)");
+            return nullptr;
+        }
         strPtr = asEncString(strPtr);
         // Count bytes needed.
         std::string cntFnName = "bz_encoding_" +
