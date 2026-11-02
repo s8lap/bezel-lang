@@ -9283,6 +9283,29 @@ std::string_view ExprTC::namedRefSimpleName(const TypeRef* ref) {
     return {};
 }
 
+// fix #7924 (stdlib §2.1 / §7.4, v0.350): the `TextWriter` a `Console.Out` /
+// `Console.Error` initializer denotes, for an UNANNOTATED local to take as its
+// inferred type (spec §21.1: "type inferred" from the initializer). The
+// property read itself is left untyped by design (the chained
+// `Console.Out.Write` paths are syntactic and a typed receiver would route a
+// narrowed nullable argument through the typed-`TextWriter` path), so the
+// local's type is minted here. Null for any other initializer, and for one
+// that already has a type.
+static TypeRef* consoleStreamInferredType(SemaContext& ctx,
+                                          const ast::Expr& init) {
+    if (ctx.exprType(init)) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&init);
+    if (!ma || !ma->target || (ma->member != "Out" && ma->member != "Error"))
+        return nullptr;
+    auto* cid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!cid || cid->name != "Console") return nullptr;
+    TypeRef* ref = ctx.makeTypeRef();
+    ref->kind = TypeRef::Kind::Named;
+    ref->declaration = nullptr;
+    ref->importedName = "TextWriter";
+    return ref;
+}
+
 // #1621 / §31.2.1: a headless Named TypeRef standing for a built-in
 // exception ancestor name reached only through the built-in exception
 // hierarchy table (no AST node names it directly — e.g. `Exception` reached
@@ -24219,6 +24242,9 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     return;  // early-return: lsym->declType intentionally null
                 }
                 lsym->declType = ctx_.exprType(*ld->initializer);
+                if (!lsym->declType)
+                    lsym->declType =
+                        consoleStreamInferredType(ctx_, *ld->initializer);
                 // §27.6 (issue #4978, v0.307): no-target overload detection.
                 // A `var f := M.On;` declaration (no `f: T` ascription) has
                 // no target function type to disambiguate by, so the
@@ -24426,6 +24452,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         }
         TypeRef* lcInferredTy =
             lc->value ? ctx_.exprType(*lc->value) : nullptr;
+        if (!lcExplicitTy && !lcInferredTy && lc->value)
+            lcInferredTy = consoleStreamInferredType(ctx_, *lc->value);
         TypeRef* lcTy = lcExplicitTy ? lcExplicitTy : lcInferredTy;
         auto typeIsPrimitiveOrString = [](TypeRef* t) -> bool {
             if (!t) return false;
