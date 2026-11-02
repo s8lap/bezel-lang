@@ -2750,7 +2750,16 @@ private:
         // Random()` allocated and returned (MEASURED: 3200 bytes leaked in 200
         // allocations under LSan, 200-iteration loop), while `r.Dispose()`
         // SIGSEGV'd through the vtable that is not there.
-        const char* vtablelessBuiltin = nullptr;
+        //
+        // fix #7906 (§28.3 K8.1, v0.350): the type is `std::string`, not
+        // `const char*`. A built-in's NAME is a `string_view` over the SOURCE
+        // TEXT (`ast::TypeName::parts` holds `std::string_view` lexemes), so it
+        // is NOT NUL-terminated and cannot be stored as a `const char*`. The
+        // #7906 registration site has to carry the name of whichever built-in
+        // it claimed, and only an owning copy of the name is safe to keep.
+        // (`OwnedField::vtablelessBuiltin` has been a `std::string` since
+        // #4290, so this is the same idiom, not a new one.)
+        std::string vtablelessBuiltin = {};
         // #628 / stdlib §4.9 v0.135: a `using var` bound to a DrainedEntry<K,V>
         // obtained from `for var entry in d.Drain() do … end`. The loop variable
         // `entry` is a struct {K key; V* value}; `using var e := entry` transfers
@@ -22287,7 +22296,12 @@ private:
         // fix #7565: non-null for a declaration-less, vtable-less built-in
         // (`StringBuilder`) temporary, whose release is
         // `emitVtablelessBuiltinRelease(name, obj)`, not a vtable Dispose.
-        const char* vtablelessBuiltin = nullptr;
+        // fix #7906 (§28.3 K8.1, v0.350): the type is `std::string` for the
+        // reason `Disposal::vtablelessBuiltin` is — a built-in's name is a
+        // `string_view` over the source text, not a NUL-terminated literal.
+        // (`OwnedField::vtablelessBuiltin` has been a `std::string` since
+        // #4290, so this is the same idiom, not a new one.)
+        std::string vtablelessBuiltin = {};
     };
     std::vector<K8RecvTemp> k8RecvTemps_;
 
@@ -22336,6 +22350,37 @@ private:
     // a K8-boundary queue entry.
     void registerFreshBuiltinNewReceiverTempK8(const ast::Expr* recvExpr,
                                                llvm::Value* recvPtr);
+    // fix #7906 / §28.3 *Unbound owned temporaries* / K8.1 (v0.350): the
+    // GENERAL twin of `freshSbRoots_` above. #7733's set is the
+    // StringBuilder-typed spelling of ONE rule; this one is the whole
+    // declaration-less-builtin population: a FRESH `owned` built-in class
+    // (`Random`, `Mutex`, `Stopwatch`, `FileStream`, ...) used ONLY as the
+    // receiver of a call whose result cannot alias it is an unbound owned
+    // temporary, and §28.3 disposes it at the full expression's end. The
+    // issue's own repro (`Mk2().Next(1)` with `Mk2(): owned Random`) is this
+    // shape: #7733's walk is StringBuilder-TYPED, so it never claimed the
+    // `Random` root, and the receiver site below was StringBuilder-typed too.
+    //
+    // The CLAIM is made at the chain top (in `lowerExpr`, before the receiver
+    // is lowered) and CONSUMED in the receiver's own `lowerExpr` — the two are
+    // adjacent, so a claim can never outlive the lowering that consumes it.
+    std::set<const ast::Expr*> freshVtablelessBuiltinRoots_;
+    // The eligibility predicate for the claim above. `recvExpr` must be a
+    // FRESH producer of a declaration-less built-in class with a KNOWN
+    // release route (`vtablelessBuiltinReleaseIsKnown` — a built-in with no
+    // release arm would be a WILD JUMP, so it keeps the leak, the sound
+    // direction), and `resultTy` — the CALL's own result type — must be a
+    // value that cannot alias the receiver (the same rule
+    // `freshNewReceiverTempEligible` applies to a heap-class receiver).
+    bool freshOwnedVtablelessBuiltinReceiverEligible(
+            const ast::Expr* recvExpr, const sema::TypeRef* resultTy) const;
+    // Registers a CLAIMED receiver at its production on the same two channels
+    // as registerFreshBuiltinNewReceiverTempK8: an `unwindOnly` disposeStack_
+    // entry plus a K8-boundary queue entry — but with the built-in's OWN
+    // name, so the release is the right `emitVtablelessBuiltinRelease` arm
+    // (`bz_random_free` for `Random`), not a vtable Dispose.
+    void registerFreshOwnedVtablelessBuiltinReceiverTempK8(
+            const ast::Expr* recvExpr, llvm::Value* recvPtr);
     // The unconditional half of the above (no result-type gate): queue the
     // already-vetted fresh receiver `recvPtr` for the K8 boundary reclaim plus
     // the exception-edge `unwindOnly` entry. fix #7728 (v0.350).

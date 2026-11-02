@@ -306,7 +306,67 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     ++fullExprDepth_;
     noteFnAtObjectChildren(e);   // #5978: see `fnAtObject_`
     if (checkedDisposal_) noteCdBenignChildren(e);   // #4602
+    // fix #7906 / §28.3 *Unbound owned temporaries* / K8.1 (v0.350): the CLAIM
+    // for a FRESH `owned` DECLARATION-LESS BUILT-IN CLASS (`Random`, `Mutex`,
+    // `Stopwatch`, ...) used ONLY as this call's receiver. Such a receiver is
+    // an unbound owned temporary: §28.3 disposes it at the full expression's
+    // end, after its uses. The issue's own repro is this shape — `Mk2().Next(1)`
+    // with `Mk2(): owned Random` leaked 100 allocations over 100 iterations.
+    //
+    // WHY THE CLAIM IS HERE AND NOT AT THE RECEIVER. The claim must be made
+    // BEFORE the receiver is lowered (the receiver's own `lowerExpr` consumes
+    // it), and the receiver is lowered INSIDE `lowerExprInner` — by the
+    // built-in class arm, which lowers the receiver itself. So the claim is
+    // made here, at the chain top, and consumed by the receiver's own
+    // `lowerExpr` a few lines below; the two are adjacent, so a claim can
+    // never outlive the lowering that consumes it (the erase below drops a
+    // claim whose receiver was never lowered at all).
+    //
+    // WHY THE GATE IS NOT "ANY RECEIVER". A receiver that is not a PRODUCER (a
+    // call not declared `owned`, a variable, a field) is a BORROW, and
+    // disposing it would free a value owned elsewhere; and a result that can
+    // alias the receiver (a `Random`-returning method) must keep the receiver
+    // alive. Both gates live in `freshOwnedVtablelessBuiltinReceiverEligible`.
+    const ast::Expr* claimedVtablelessBuiltinRecv = nullptr;
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call->callee.get())) {
+            const ast::Expr* recv = ma->target.get();
+            // fix #7906 (v0.350): an EXPLICIT `Dispose()` / `DisposeAsync()` on
+            // a fresh temporary is [K3.9]'s CONSUME, not a borrowing use
+            // (§28.3: "an explicit `Dispose()` or direct `DisposeAsync()` on it
+            // is K3.9's consume, not a borrowing use, after which the boundary
+            // reclaims only"). The boundary then reclaims WITHOUT a second
+            // disposal — and for a vtable-less built-in the reclamation is the
+            // built-in's own free (`bz_random_free`), which has no disposed-
+            // flag guard to make a second release a no-op. So the claim is
+            // refused for those two member names, exactly as the heap-class
+            // path refuses them (`ms->name != "Dispose"`, LlvmBackend_Calls2.
+            // cpp:17957) — the SAME guard, read off the AST member name so it
+            // covers a built-in member with no user MethodDecl.
+            const bool isExplicitDispose =
+                ma->member == "Dispose" || ma->member == "DisposeAsync";
+            if (recv && !isExplicitDispose &&
+                freshOwnedVtablelessBuiltinReceiverEligible(
+                    recv, ctx_.exprType(*call))) {
+                freshVtablelessBuiltinRoots_.insert(recv);
+                claimedVtablelessBuiltinRecv = recv;
+            }
+        }
+    }
     llvm::Value* v = lowerExprInner(e);
+    // fix #7906: the receiver's OWN lowering consumed the claim above and
+    // registered the temporary for the K8 boundary; this is the consumption
+    // point (a no-op for every expression that was never claimed).
+    if (!freshVtablelessBuiltinRoots_.empty() && v &&
+        v->getType()->isPointerTy())
+        registerFreshOwnedVtablelessBuiltinReceiverTempK8(&e, v);
+    // A claim whose receiver was never lowered (the call was declined, or the
+    // arm lowered the receiver by another route) is dropped here: a stale
+    // claim could otherwise fire on a later, unrelated lowering of the same
+    // node and dispose a receiver that is not a receiver at all.
+    if (claimedVtablelessBuiltinRecv)
+        freshVtablelessBuiltinRoots_.erase(claimedVtablelessBuiltinRecv);
     // fix #6891 (§8.5, §12.7, v0.340): see stampRuntimeProducedArray.
     if (v && v->getType()->isPointerTy())
         if (dynamic_cast<const ast::CallExpr*>(&e))

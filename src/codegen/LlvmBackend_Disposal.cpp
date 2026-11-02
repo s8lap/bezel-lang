@@ -5103,27 +5103,29 @@ void Emitter::emitInlineArrayStringRetains_impl(
 }
 
 
-bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
-                                           llvm::Value* recvPtr,
-                                           const sema::TypeRef* resultTy,
-                                           bool calleeReturnsOwned) const {
-    // #1039 / #1053 / §28.3: a fresh owned-class producer used ONLY as the
-    // receiver of a member access or method call — never bound to a variable —
-    // is owned by nothing and leaks. Dispose it after the value result has been
-    // extracted, when the receiver is a fresh `new`/`owned`-returning producer
-    // (#1039/#1053-case-2) and the result cannot alias into it.
-    if (!recvExpr || !recvPtr || !resultTy) return false;
-    if (!isFreshOwnedClassProducer(recvExpr)) return false;
-    // The extracted result must be a NON-REFERENCE value — provably free of any
-    // reference or borrow into the receiver: a numeric/bool/char/decimal
-    // primitive, an enum, or unit. EXCLUDED, because each may alias into the
-    // receiver: `string` and `object` (reference-typed primitives — a field /
-    // method result borrows the receiver's refcounted string or sub-object); a
-    // struct (could embed a borrow of a receiver sub-object); any class /
-    // interface result (a reference). Excluding these frees the temporary ONLY
-    // when nothing aliases it. (Bezel's borrow checker guarantees an instance
-    // method cannot escape `this` past the call when its result is such a
-    // value, so post-call disposal is sound — §15.3.)
+// fix #7906 / §28.3 *Unbound owned temporaries* / K8.1 (v0.350): the RESULT
+// half of "the receiver may be disposed at the full expression's end", split
+// out of `freshNewReceiverTempEligible` so the vtable-less-BUILT-IN twin
+// (#7906's `freshOwnedVtablelessBuiltinReceiverEligible`) shares ONE
+// definition of "a result that cannot alias the receiver" instead of a second
+// hand-copy that could drift.
+//
+// It is a free function (not a member) because it reads nothing but the
+// result TypeRef and the `common::` owning-head predicates.
+//
+// The extracted result must be a NON-REFERENCE value — provably free of any
+// reference or borrow into the receiver: a numeric/bool/char/decimal
+// primitive, an enum, or unit. EXCLUDED, because each may alias into the
+// receiver: `string` and `object` (reference-typed primitives — a field /
+// method result borrows the receiver's refcounted string or sub-object); a
+// struct (could embed a borrow of a receiver sub-object); any class /
+// interface result (a reference). Excluding these frees the temporary ONLY
+// when nothing aliases it. (Bezel's borrow checker guarantees an instance
+// method cannot escape `this` past the call when its result is such a
+// value, so post-call disposal is sound — §15.3.)
+static bool freshReceiverResultIsValueLike(const sema::TypeRef* resultTy,
+                                           bool calleeReturnsOwned) {
+    if (!resultTy) return false;
     bool valueResult = false;
     if (resultTy->kind == sema::TypeRef::Kind::Unit) {
         valueResult = true;
@@ -5215,6 +5217,21 @@ bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
         }
     }
     return valueResult;
+}
+
+
+bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
+                                           llvm::Value* recvPtr,
+                                           const sema::TypeRef* resultTy,
+                                           bool calleeReturnsOwned) const {
+    // #1039 / #1053 / §28.3: a fresh owned-class producer used ONLY as the
+    // receiver of a member access or method call — never bound to a variable —
+    // is owned by nothing and leaks. Dispose it after the value result has been
+    // extracted, when the receiver is a fresh `new`/`owned`-returning producer
+    // (#1039/#1053-case-2) and the result cannot alias into it.
+    if (!recvExpr || !recvPtr || !resultTy) return false;
+    if (!isFreshOwnedClassProducer(recvExpr)) return false;
+    return freshReceiverResultIsValueLike(resultTy, calleeReturnsOwned);
 }
 
 
@@ -8779,6 +8796,132 @@ void Emitter::registerFreshBuiltinNewReceiverTempK8(const ast::Expr* recvExpr,
 }
 
 
+// fix #7906 / §28.3 *Unbound owned temporaries* / K8.1 (v0.350): the
+// GENERAL twin of the StringBuilder pair above — the eligibility predicate.
+//
+// THE DEFECT. `Mk2().Next(1)` with `Mk2(): owned Random` leaked the receiver:
+// 100 allocations over 100 iterations (MEASURED under generated-code
+// LeakSanitizer: "SUMMARY: AddressSanitizer: 1600 byte(s) leaked in 100
+// allocation(s)", every one from `bz_random_alloc`). Two SEPARATE reasons,
+// and this predicate is the first:
+//
+//  1. The chain-root CLAIM was StringBuilder-TYPED. `markFreshStringBuilder-
+//     ChainRoot`'s `isSbType` lambda tests `kind == Named && !t->declaration
+//     && !t->nullable && builtinTypeName(t) == "StringBuilder"` — the first
+//     THREE clauses are the DECLARATION-LESS-BUILTIN test, and only the name
+//     clause is StringBuilder-specific. So the walk recognised a `Random` root
+//     as "not a StringBuilder" and stopped before it could be claimed.
+//  2. There was no RECEIVER SITE for a built-in instance call at all, and
+//     `registerFreshBuiltinNewReceiverTempK8` above hard-filters on
+//     "StringBuilder". `Random.Next` is lowered by the built-in class arm
+//     (LlvmBackend_Calls.cpp), which lowers the receiver itself and never
+//     consults the fresh-receiver-temp machinery.
+//
+// THE PREDICATE. `recvExpr` must be a FRESH producer of a DECLARATION-LESS
+// BUILT-IN CLASS, and the CALL's own result must be a value that cannot alias
+// the receiver (the shared `freshReceiverResultIsValueLike` gate).
+//
+// THE SOUNDNESS GATE — a BORROW is never disposed:
+//   * The receiver must be a PRODUCER: a `new` of the built-in, or a call to a
+//     method DECLARED `owned` (§28.1: an `owned` return transfers ownership,
+//     so the caller solely owns the +1). A call WITHOUT the `owned` marker
+//     returns a BORROW — `Mb(r: Random): Random => r` — and disposing that
+//     would free a value owned elsewhere: a heap-use-after-free. `common::
+//     calleeReturnsOwned` is the same both-sources discriminator #7733 uses,
+//     so the borrowed case is untouched by construction.
+//   * The result must not alias the receiver (the shared gate): a `Random`
+//     method returning a `Random` hands back a borrow of the receiver, and
+//     disposing the receiver at the boundary would dangle it.
+//   * The built-in must have a KNOWN release route
+//     (`vtablelessBuiltinReleaseIsKnown`). A declaration-less built-in with no
+//     `emitVtablelessBuiltinRelease` arm (Shared<T>, Weak<T>, the serializer
+//     family, the collections, Task — 29 of the 47 vtable-less names) would
+//     be freed by a WILD JUMP, so it keeps the pre-fix leak: the sound
+//     direction, and exactly the trade `emitVtablelessBuiltinRelease`'s own
+//     declaration documents.
+bool Emitter::freshOwnedVtablelessBuiltinReceiverEligible(
+        const ast::Expr* recvExpr, const sema::TypeRef* resultTy) const {
+    if (!recvExpr || !resultTy) return false;
+    const sema::TypeRef* rt = ctx_.exprType(*recvExpr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    // A USER class (`rt->declaration` non-null) is the heap-class path's
+    // population (`isFreshOwnedClassProducer` → `disposeFreshNewReceiverTemp`),
+    // which reaches a vtable Dispose. It is NOT this path's: admitting it
+    // here would register the same receiver twice.
+    if (rt->declaration) return false;
+    if (rt->nullable) return false;
+    const std::string_view bn = builtinTypeName(rt);
+    if (bn.empty()) return false;
+    if (!vtablelessBuiltinReleaseIsKnown(bn)) return false;
+    // fix #7906 (v0.350): `StringBuilder` is EXCLUDED BY NAME — #7733's path
+    // already owns that population (`markFreshStringBuilderChainRoot` +
+    // `registerFreshBuiltinNewReceiverTempK8`), and admitting it here would
+    // register the SAME receiver root TWICE — a double free. The release table
+    // alone does not separate them (both have a known release route), so the
+    // separation is made here, explicitly, rather than left to an argument
+    // about which members happen to return a value-like type. Nothing is lost:
+    // #7733's path covers the StringBuilder chain-root shape already, and no
+    // StringBuilder member returns a value-like (unit/primitive) result, so
+    // this path would never have fired on one anyway.
+    if (bn == "StringBuilder") return false;
+    // The PRODUCER test — the `owned` marker, not the type.
+    bool producer = false;
+    if (dynamic_cast<const ast::NewExpr*>(recvExpr)) {
+        producer = true;
+    } else if (auto* call = dynamic_cast<const ast::CallExpr*>(recvExpr)) {
+        producer = common::calleeReturnsOwned(*call, ctx_);
+    }
+    if (!producer) return false;
+    // The RESULT gate, shared with the heap-class path.
+    return freshReceiverResultIsValueLike(resultTy, /*calleeReturnsOwned=*/false);
+}
+
+
+// fix #7906 / §28.3 *Unbound owned temporaries* / K8.1 (v0.350): register a
+// CLAIMED declaration-less-builtin receiver at its production — the same two
+// channels `registerFreshBuiltinNewReceiverTempK8` uses for `StringBuilder`
+// (an `unwindOnly` disposeStack_ entry for the EXCEPTION edge plus a
+// K8-boundary queue entry for the NORMAL edge), but with the built-in's OWN
+// name, so the release is the right `emitVtablelessBuiltinRelease` arm
+// (`bz_random_free` for `Random`) and NOT a vtable Dispose — a `Random` has
+// no vtable at word 0, so the slot-2 dispatch would be a wild jump.
+//
+// The claim is consumed here (erased), so a receiver is registered at most
+// once: the claim is made at the chain top and the receiver's own lowering
+// consumes it, and the two are adjacent.
+void Emitter::registerFreshOwnedVtablelessBuiltinReceiverTempK8(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr) {
+    if (!recvExpr || !recvPtr) return;
+    if (freshVtablelessBuiltinRoots_.erase(recvExpr) == 0) return;  // not claimed
+    const sema::TypeRef* rt = ctx_.exprType(*recvExpr);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration ||
+        rt->nullable)
+        return;
+    const std::string_view bn = builtinTypeName(rt);
+    if (bn.empty() || !vtablelessBuiltinReleaseIsKnown(bn)) return;
+    // The SAME `StringBuilder` separation as the predicate's, repeated at the
+    // CONSUMPTION point: a root claimed by any other route cannot be
+    // registered here as well (that would be a double free with #7733's
+    // `registerFreshBuiltinNewReceiverTempK8`).
+    if (bn == "StringBuilder") return;
+    if (!recvPtr->getType()->isPointerTy()) return;
+    if (llvm::isa<llvm::ConstantPointerNull>(recvPtr)) return;
+    if (disposeStack_.empty() || emittingDisposerBody_ || !currentFn_) return;
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    // A state-machine body may flush after a suspension: keep the slot in the
+    // frame, as deferUnboundOwnedTempToK8 does (#5286) and
+    // registerFreshBuiltinNewReceiverTempK8 does.
+    if (smStateStruct_) asyncHandlerSpillSlots_.push_back(slot);
+    builder_.CreateStore(recvPtr, slot);
+    Disposal d{slot, nullptr};
+    d.unwindOnly = true;      // the normal edge is the K8 flush
+    d.dynamicDispose = false;
+    d.vtablelessBuiltin = std::string(bn);
+    disposeStack_.back().push_back(d);
+    k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_, std::string(bn)});
+}
+
+
 bool Emitter::deferUnboundOwnedTempToK8(llvm::AllocaInst* slot) {
     if (!slot || !currentFn_ || emittingDisposerBody_) return false;
     if (slot->getAllocatedType() != ptrTy()) return false;
@@ -8835,7 +8978,7 @@ void Emitter::flushK8RecvTemps() {
             llvm::BasicBlock::Create(llvm_, "k8recv.cont", currentFn_);
         builder_.CreateCondBr(isNull, contBB, dispBB);
         builder_.SetInsertPoint(dispBB);
-        if (t.vtablelessBuiltin)
+        if (!t.vtablelessBuiltin.empty())
             emitVtablelessBuiltinRelease(t.vtablelessBuiltin, obj);
         else
             emitDisposeAndReclaim(obj);
@@ -9610,7 +9753,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 auto* fn = declareC("bz_weak_release",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(fn, {obj});
-            } else if (it->vtablelessBuiltin) {
+            } else if (!it->vtablelessBuiltin.empty()) {
                 // fix #7565: a fresh `new StringBuilder(...)` receiver temp.
                 emitVtablelessBuiltinRelease(it->vtablelessBuiltin, obj);
             } else {
@@ -10408,7 +10551,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // the other. Null-guarded (a ctor that threw before the local was
         // assigned, or a moved-out slot), and the slot is nulled after so a
         // re-entrant / unwind pass is a no-op.
-        if (it->vtablelessBuiltin) {
+        if (!it->vtablelessBuiltin.empty()) {
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr, "vlb.load");
