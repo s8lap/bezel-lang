@@ -7,14 +7,15 @@
 // with only the #3079 "failed to lower ... emits nothing" warning, and an
 // over-arity call was admitted where §22.6 makes it a compile error.
 //
-// WHAT THE LANGUAGE HAS, MEASURED. Neither qualified spelling resolves to
-// the built-in `File` in this compiler: the module-qualified one reports
-// "module `System` has no public type `IO`" and the aliased one degrades to
-// the #3079 warning. That is a PRE-EXISTING gap in the module-path
-// resolution, filed separately; it is NOT what this fix changes. What the
-// fix changes is that the arity question is ASKED of the qualified head too,
-// so the over-arity call is a compile error with the §22.6 diagnostic, and
-// the DECLARED arity is not.
+// WHAT THE LANGUAGE HAS, MEASURED. Neither qualified spelling resolved to
+// the built-in `File` when this fix landed: the module-qualified one
+// reported "module `System` has no public type `IO`" and the aliased one
+// degraded to the #3079 warning. That was a PRE-EXISTING gap in the
+// module-path resolution, filed as #7996 and closed there — since then both
+// spellings resolve to the built-in `File`. What THIS fix changes is that
+// the arity question is ASKED of the qualified head too, so the over-arity
+// call is a compile error with the §22.6 diagnostic, and the DECLARED arity
+// is not.
 //
 // Oracle: runAot. Reject rows assert the specific diagnostic; the control
 // rows assert that the gate stands down at the declared arity.
@@ -95,15 +96,16 @@ BEZEL_TEST(builtin_fs_qualified_7983, aliased_declared_arity_is_admitted) {
 
 BEZEL_TEST(builtin_fs_qualified_7983, fully_qualified_declared_arity_draws_no_arity_error) {
     // control: the module-qualified spelling at the DECLARED arity draws no
-    // arity error. (The qualified spelling does not resolve to the built-in
-    // `File` in this compiler — a pre-existing gap in the module-path
-    // resolution, filed separately — so this spelling reports THAT and
-    // nothing else; the arity question is not asked of it.)
+    // arity error. (Since #7996 the qualified spelling RESOLVES to the
+    // built-in `File` — the module-path resolution gap this row used to pin
+    // is closed — so the call is admitted and ANSWERS; the arity question IS
+    // asked of it and the answer is "a declared form takes it".)
     auto r = runAot(prog("",
         "    Console.WriteLine(System.IO.File.Exists(\"/nonexistent/x\"));"));
-    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_FALSE(hasError(r, "the call to `File.Exists` supplies"));
-    BEZEL_EXPECT_TRUE(hasError(r, "module `System` has no public type `IO`"));
+    BEZEL_EXPECT_FALSE(hasError(r, "has no public type"));
+    BEZEL_EXPECT_EQ(r.stdoutText, "False\n");
 }
 
 BEZEL_TEST(builtin_fs_qualified_7983, bare_head_arity_is_unchanged) {

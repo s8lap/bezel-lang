@@ -25015,6 +25015,45 @@ static void checkBuiltinCollectionCallArity(SemaContext& ctx,
             "§26.5 rule 1)");
 }
 
+// fix #7996 (§2.2, §2.7, stdlib §2.4 / §7.3 / §7.4, v0.350): the BUILT-IN
+// STATIC CLASSES a qualified name may select, and the module each is homed in.
+//
+// §7.3 `File`, §7.4 `Directory` and §7.4 `Path` are `public static class`
+// declarations of the `System.IO` module; §2.4 `Environment` is one of
+// `System`'s.
+//
+// §2.7 rule 2 (the name-resolution order) says: "match the longest dotted
+// prefix of the chain against an imported module's full name (or the current
+// module's). The remainder then resolves against that module's public
+// declarations, continuing as in rule 1." `File` IS one of `System.IO`'s public
+// declarations (stdlib §7.3: `public static class File`), so
+// `System.IO.File.Exists(..)` resolves against it. §2.2's alias rule says the
+// same for the alias spelling: "The alias is an additional *qualifier*, not a
+// rename" — `sio.File` (under `import System.IO as sio;`) names
+// `System.IO`'s `File`, exactly as `System.IO.File` does.
+//
+// The ONE table answers "which module homes this built-in static class", so
+// the module-qualified arm (§2.7 rule 2) and the alias-qualified arm (§2.2)
+// cannot disagree about it. It is deliberately limited to the four classes
+// this fix admits.
+struct BuiltinStaticClassHome {
+    std::string_view name;
+    std::string_view homeModule;
+};
+static constexpr BuiltinStaticClassHome kBuiltinStaticClassHomes[] = {
+    {"File", "System.IO"},       // stdlib §7.3
+    {"Directory", "System.IO"},  // stdlib §7.4
+    {"Path", "System.IO"},       // stdlib §7.4
+    {"Environment", "System"},   // stdlib §2.4
+};
+// The home module of the built-in static class `name`, or "" when `name` is
+// not one of the four.
+static std::string_view builtinStaticClassHomeOf(std::string_view name) {
+    for (const auto& e : kBuiltinStaticClassHomes)
+        if (e.name == name) return e.homeModule;
+    return {};
+}
+
 // fix #7864 / #7933 (stdlib §2.4, §7.3, §7.4, §22.6, v0.350): the ARITY of a
 // static member of `Path`, `File`, `Directory` or `Environment`. The ONE
 // built-in parameter table carries a row per declared form of every member of
@@ -32202,6 +32241,49 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // A further `MemberAccess("Square")` on the resulting TypeRef will find the
     // static method through the normal targetType path.
     if (ma.target) {
+        // fix #7996 (§2.2, §2.7, stdlib §2.4 / §7.3 / §7.4, v0.350): the head
+        // of this access is a QUALIFIED built-in static class that the arms
+        // below admitted — `System.IO.File` (§2.7 rule 2) or `sio.File` (§2.2's
+        // alias rule) — and the arm stamped it with the builtin's TypeSymbol.
+        //
+        // §2.7: a qualified name denotes the SAME entity as the bare one, so
+        // the access must behave EXACTLY like the bare `File.Exists(..)`: the
+        // same member, the same §22.6 arity gate, the same §7 nullability
+        // rule, the same §22.5 named-argument binding, and the same
+        // documented-surface reject.
+        //
+        // The head is REWRITTEN to the bare identifier, so every consumer
+        // downstream reads the BARE spelling: sema's member lookup, the §22.5
+        // named-argument binder, the §7 nullability gate, the closed-surface
+        // reject — and codegen's static-call ladder, which reads the
+        // receiver's IDENTIFIER TEXT (`LlvmBackend_Calls.cpp`'s `cls`). Codegen
+        // has no access to sema's private alias/module-path state, so a head
+        // left qualified would reach it with an empty `cls`, match no builtin
+        // arm, and lower to NOTHING (the #3079 "failed to lower"
+        // degradation). This is the #4698 (`normalizeAliasQualifiedBuiltinHead`)
+        // pattern, applied to the module-qualified spelling.
+        if (auto* q =
+                dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
+            auto* qsym = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*q));
+            // The admitted head carries the builtin's TypeSymbol and NO
+            // exprType — the shape the bare identifier has (a built-in static
+            // class is a NAME, not a value). A head that carries an exprType
+            // resolved to a REAL type (a public the module actually exports)
+            // and is left alone.
+            if (qsym && qsym->decl == nullptr && qsym->moduleName.empty() &&
+                !ctx_.exprType(*q) &&
+                !builtinStaticClassHomeOf(qsym->name).empty()) {
+                auto bare = std::make_unique<ast::IdentifierExpr>();
+                bare->span = q->span;
+                bare->name = qsym->name;
+                // The qualifier is gone from the AST: the head names the
+                // BUILT-IN, so no scope lookup may capture it (§2.2).
+                bare->aliasQualifiedBuiltin = true;
+                ctx_.setExprSymbol(bare.get(), qsym);
+                const_cast<ast::MemberAccessExpr&>(ma).target =
+                    std::move(bare);
+            }
+        }
         // Case (a) + (b): target is a bare identifier (alias or module name).
         if (auto* iid =
                 dynamic_cast<const ast::IdentifierExpr*>(ma.target.get())) {
@@ -32236,12 +32318,55 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         }
                     }
                 }
+                // fix #7996 (§2.2, §2.7, stdlib §2.4 / §7.3 / §7.4, v0.350):
+                // the alias names a MODULE, and the member it selects is a
+                // BUILT-IN STATIC CLASS of that module — `sio.File.Exists(..)`
+                // under `import System.IO as sio;`. §2.2: "The alias is an
+                // additional *qualifier*, not a rename" — so `sio.File` names
+                // `System.IO`'s `File` (stdlib §7.3's `public static class
+                // File`), the SAME entity the bare `File` names, and the call
+                // must behave identically. §2.7 rule 1 resolves the alias and
+                // then "the rest of the chain resolves against that type's
+                // members" — the built-in static class's.
+                //
+                // Pre-fix this arm fell through to a path that typed nothing,
+                // so the call degraded to the #2434 "failed to lower" warning
+                // and the statement emitted NOTHING — a silent drop, the worst
+                // outcome. The stamp below is the one the bare identifier gets
+                // (`ExprTypecheck_Exprs.cpp`'s builtin-class arm), so the
+                // enclosing access resolves the same member.
+                if (builtinStaticClassHomeOf(ma.member) == modName) {
+                    ctx_.setExprSymbol(&ma, builtinClassSym(ma.member));
+                    return;
+                }
                 // Alias known but member is not a public type — fall through.
             }
             // (b) Single-segment module name: `ModuleName.TypeName`
             if (aliasIt == importAliases_.end()) {
                 const std::string name = std::string(iid->name);
-                if (sourceImports_.count(name)) {
+                // fix #7996 (§2.7 rule 2, v0.350): the LONGEST dotted prefix of
+                // the chain is the one it resolves against — "match the longest
+                // dotted prefix of the chain against an imported module's full
+                // name (or the current module's). The remainder then resolves
+                // against that module's public declarations". So when
+                // `name.member` is ITSELF an imported module, this node is a
+                // PREFIX of a longer path, not a `Module.Type` pair, and the
+                // longer prefix is the one that owns the remainder.
+                //
+                // MEASURED on the pre-fix code: with `import System;` AND
+                // `import System.IO;` in the same file, `System.IO.File`
+                // resolved against the ONE-segment prefix `System` and was
+                // rejected with "module `System` has no public type `IO`",
+                // while the SAME spelling in a file that imported only
+                // `System.IO` resolved against `System.IO`. The spelling's
+                // meaning must not depend on an unrelated import — and the
+                // TYPE path already resolves longest-prefix-first
+                // (`Resolver::resolveNamed`'s §2.7 rule 2 arm walks the
+                // prefixes longest-first), so this arm was the outlier.
+                const std::string extendedPath5025b =
+                    name + "." + std::string(ma.member);
+                if (sourceImports_.count(name) &&
+                    !sourceImports_.count(extendedPath5025b)) {
                     if (const auto* exported = ctx_.importedTypesOf(name)) {
                         for (TypeSymbol* ts : *exported) {
                             if (ts->name == ma.member) {
@@ -32276,6 +32401,21 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // module's exported types are reachable through a
                     // module prefix) and the same exemption.
                     const std::string memberStr5025b(ma.member);
+                    // fix #7996 (§2.2, §2.7, stdlib §2.4, v0.350): the
+                    // module-qualified spelling of a BUILT-IN STATIC CLASS of
+                    // the named module — `System.Environment.GetInt(..)` under
+                    // `import System;`. §2.7 rule 2: "The remainder then
+                    // resolves against that module's public declarations";
+                    // §2.4's `Environment` is one of `System`'s. The stamp
+                    // below is the one the bare identifier gets, so the
+                    // enclosing access resolves the same member; the
+                    // enclosing access's own rewrite (above) then makes the
+                    // head the bare spelling, so every consumer downstream
+                    // sees it exactly as it sees `Environment.GetInt(..)`.
+                    if (builtinStaticClassHomeOf(ma.member) == name) {
+                        ctx_.setExprSymbol(&ma, builtinClassSym(ma.member));
+                        return;
+                    }
                     const bool exemptSystemThreadingHead5025 =
                         name == "System.Threading" &&
                         (memberStr5025b == "CancellationToken" ||
@@ -32386,6 +32526,31 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // unless declared public; §2.7 — only the named module's
                 // exported types are reachable through a module prefix).
                 const std::string partialMember5025c(ma.member);
+                // fix #7996 (§2.7 rule 2, stdlib §7.3 / §7.4, v0.350): the
+                // module-qualified spelling of a BUILT-IN STATIC CLASS of the
+                // qualified module — `System.IO.File.Exists(..)` under
+                // `import System.IO;`. §2.7 rule 2: "match the longest dotted
+                // prefix of the chain against an imported module's full name
+                // (or the current module's). The remainder then resolves
+                // against that module's public declarations" — and stdlib §7.3
+                // declares `public static class File` in `System.IO` (§7.4:
+                // `Directory`, `Path`). The built-in static classes are not in
+                // the module's EXPORTED TypeSymbol list (the export list
+                // carries user types only), which is why the lookup above
+                // cannot find them.
+                //
+                // The stamp below is the one the bare identifier gets
+                // (`ExprTypecheck_Exprs.cpp`'s builtin-class arm), so the
+                // enclosing access resolves the same member; the enclosing
+                // access's own rewrite (above) then makes the head the bare
+                // spelling, so every consumer downstream — sema's member
+                // lookup, the §22.5 named-argument binder, the §7 nullability
+                // gate, the closed-surface reject, and codegen's static-call
+                // ladder — sees it exactly as it sees `File.Exists(..)`.
+                if (builtinStaticClassHomeOf(ma.member) == partialMod) {
+                    ctx_.setExprSymbol(&ma, builtinClassSym(ma.member));
+                    return;
+                }
                 const bool exemptSystemThreadingHead5025c =
                     partialMod == "System.Threading" &&
                     (partialMember5025c == "CancellationToken" ||
