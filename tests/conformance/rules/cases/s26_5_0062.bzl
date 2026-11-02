@@ -2,7 +2,14 @@
 //! doc: spec
 //! section: 26.5
 //! title: an extension on Task<T> supplies a method name callable through . and ?.
-//! rule: for extension blocks on `x`'s type, base types, or implemented interfaces
+//! rule: If the receiver's type declares no instance member of that name, the
+//!   compiler searches the current module and all imported modules — which
+//!   always includes the standard library's extension modules over
+//!   always-available types ([§2.3](#sec-always-available-names)'s invariant)
+//!   — for extension blocks on `x`'s type, base types, or implemented
+//!   interfaces, considering only extension members visible at the call site
+//!   ([§26.3](#sec-extension-blocks-restrictions)'s effective-visibility
+//!   rule).
 //! cites: 26.5, 30.3, 7.5
 //! expect: run
 //! output: 4

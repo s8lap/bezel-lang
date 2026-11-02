@@ -2,7 +2,8 @@
 //! doc: spec
 //! section: 8.1
 //! title: ReferenceEquals compares two task values by identity
-//! rule: public static method ReferenceEquals(a: Object?, b: Object?): bool;
+//! rule: `Object.ReferenceEquals(a, b)` compares object identity, ignoring
+//!   any `Equals` override.
 //! cites: 8.1, 8.4, 30.3
 //! expect: run
 //! output: True

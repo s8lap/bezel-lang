@@ -2,12 +2,9 @@
 //! doc: spec
 //! section: 26.5
 //! title: a concrete and a generic extension head with identical substituted heads are ambiguous
-//! rule: In particular, candidates with **identical substituted heads** never
-//!   auto-rank: neither a more-concrete-looking declared head
-//!   (`extension IEnumerable<int>` and `extension IEnumerable<T>` are
-//!   indistinguishable after substitution for an `Array<int>` receiver) nor a
-//!   stronger `where` clause on the same head makes one candidate more specific
-//!   than the other.
+//! rule: If neither candidate's substituted head is a proper subtype of the
+//!   other's, the candidates are equally specific and rule 4 of
+//!   [§26.5](#sec-resolution) produces an ambiguity error.
 //! cites: 26.5.1, 26.5
 //! expect: reject
 //! diagnostic: candidates
