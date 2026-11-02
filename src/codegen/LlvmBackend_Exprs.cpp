@@ -6262,17 +6262,66 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 else if (ma->member == "IgnoreUnknownFields")  idx = 3;
                 else if (ma->member == "MaxDepth")             idx = 4;
                 if (idx != ~0u) {
-                    // Only the bare record value. A nullable `JsonOptions?`
-                    // box ({i8, bz.json_options}) is NOT unwrapped here: sema
-                    // has no gate rejecting an un-narrowed read, so a payload
-                    // extract would turn a possibly-null box into a silent
-                    // wrong value (see `unwrapNarrowedNullableOperand`'s
-                    // soundness precondition). It keeps its prior behavior,
-                    // and the target is not lowered here so nothing is
-                    // evaluated twice on the fall-through.
+                    // The bare record value: `new JsonOptions(...)` builds the
+                    // `bz.json_options` struct itself, so the read is the
+                    // matching `extractvalue` on it.
                     if (tt && !tt->nullable) {
                         llvm::Value* ov = lowerExpr(*ma->target);
                         if (!ov) return nullptr;
+                        return builder_.CreateExtractValue(ov, {idx},
+                                                           "jopt.field");
+                    }
+                    // fix #7993 (stdlib §2.15 / §7.4, v0.350): the NULLABLE
+                    // carrier. A `JsonOptions?` is not the bare record but the
+                    // tagged {i8 hasValue; bz.json_options} box (§7.2's
+                    // optional-value lowering — `isNullableValueStructBuiltinTy`
+                    // puts `JsonOptions` in the value-STRUCT-builtin family),
+                    // so the component read is the PAYLOAD's extractvalue, one
+                    // level in.
+                    //
+                    // SOUNDNESS — the unwrap is safe here, and the gate that
+                    // makes it safe is sema's §7.4 member-access gate
+                    // (`ExprTypecheck_Calls.cpp`'s `resolveMemberAccess`):
+                    // "Member access, method calls, and indexing on a
+                    // nullable value are compile errors unless the compiler has
+                    // narrowed it to non-null" (§7.4). It fires for EVERY
+                    // receiver shape — a simple variable (a local or a
+                    // parameter), a field or property, a member-access or index
+                    // result, and any other expression (a call result, a
+                    // conditional atom, a `??`/`as` result) — and codegen runs
+                    // only when the program carries no errors. So a nullable
+                    // receiver that REACHES codegen is a §7.4-narrowed read:
+                    // `if o <> null then o.IndentWidth`, or the §7.4
+                    // assignment rule's `var o: JsonOptions? := new
+                    // JsonOptions(...)` (whose non-nullable initializer
+                    // narrows the declaration), or a `!`-forced read (whose
+                    // target type is already non-nullable and so never
+                    // reaches this arm). The un-narrowed read cannot reach
+                    // here — it is a compile error, and `unwrapNarrowedNullable`
+                    // states exactly this precondition ("sound ONLY at a site
+                    // where a sema gate already rejects the un-narrowed form").
+                    //
+                    // `unwrapNarrowedNullableOperand` is NOT the helper for
+                    // this family: it is keyed on a NULLABLE PRIMITIVE sema
+                    // type and deliberately excludes a record / value-struct
+                    // builtin ("never a record, choice, enum, or value
+                    // builtin, whose boxes can share the {i8, ...} shape but are
+                    // not this family"), so it would be a no-op here. The
+                    // shape-keyed sibling `unwrapNarrowedNullable` is the
+                    // existing unwrap for the whole nullable-value family.
+                    if (tt && tt->nullable) {
+                        llvm::Value* ov = lowerExpr(*ma->target);
+                        if (!ov) return nullptr;
+                        llvm::Value* payload =
+                            unwrapNarrowedNullable(ov, jsonOptionsStructType());
+                        if (payload != ov) {
+                            ov = payload;   // the tagged box -> its payload
+                        } else if (ov->getType() != jsonOptionsStructType()) {
+                            // Neither the tagged box nor the bare payload —
+                            // decline rather than extract a component out of
+                            // an aggregate this arm does not recognise.
+                            return nullptr;
+                        }
                         return builder_.CreateExtractValue(ov, {idx},
                                                            "jopt.field");
                     }
