@@ -1980,6 +1980,200 @@ CALL).**
   ALLOCATIONS), **PRE-EXISTING** AND **REGRESSION-FREE** (THE PATH IS BYTE-IDENTICAL ON BOTH ARMS).**
 * **§7.4, §22.6, §5.1, stdlib §2.2, stdlib §2.3, §28.9 (v0.345).**
 
+### R38 wave-1 lane `r37-c2-52-twjson` — 2026-11-02 (the `Console.Out`/`JsonOptions` LANE) — #7924, #7925
+
+* **SHAs:** `13cfbb14` (#7924) and `38bfa8a4` (#7952's sibling — **#7925**), branch
+  `r37-c2-52-twjson`, **PICKED AS `4822e702` (#7924) AND `6046e876` (#7925)** ONTO `r30-c1`.
+* **THE REVIEWER:** lane `r38-w1-c252` (a fresh non-author reviewer), report
+  `/var/tmp/bezel-scratch/r38-coord/rev-r38-c252.md`, **VERDICT `ACCEPT-W-NOTES`**. THE BASE FOR EVERY
+  MEASUREMENT WAS THE LIVE STAGING TIP `d3bcbb7e` (IT DID NOT MOVE DURING THE REVIEW).
+* **THE TWO FIXES, IN ONE LINE EACH:**
+  * **#7924** — an unannotated local initialized by `Console.Out` / `Console.Error` took `TextWriter`
+    (stdlib §2.1, §7.4, v0.350).
+  * **#7925** — the five component reads of a built-in `JsonOptions` value (stdlib §2.15, v0.350).
+* **FAIL-WITHOUT, MEASURED PER ROW (THE REVIEWER's OWN ARMS, NOT THE LANE's):** THE `#7924` SUITE
+  **`1 passed, 4 failed` → `5 passed, 0 failed`**; THE `#7925` SUITE **`0 passed, 3 failed` →
+  `3 passed, 0 failed`**. THE `#7924` SUITE'S UNCHANGED CONTROL
+  (`textwriter_inferred_local_7924` alone) WAS **`1 passed, 4 failed` → `5 passed, 0 failed`**.
+* **AREAS (MEASURED):** codegen `22371`, sema `9055`, frontend `1177`, module `2402`, ownership
+  `4136`, support `235` — **ALL GREEN**. THE LIT TRACK **`2567/2567`**. THE ASAN LEG CLEAN. THE
+  CORPUS **`4366 cases, 0 REGRESSION, 0 UNBANKED`**; THE DOC-EXAMPLE CORPUS **`PASS: 255 /
+  FAIL: 0 / SKIP: 414`**.
+* **THE REVIEWER's FOUR NOTES — NONE BLOCKS THE PICK, AND ALL FOUR ARE RECORDED HERE:**
+  * **F1 (TEST-STRENGTH ONLY)** — the `#7925` test's "values that differ per component" comment
+    **OVERSTATES**: `Indented` AND `IgnoreUnknownFields` ARE **BOTH `true`** IN THAT ROW. THE ROW'S
+    DISCRIMINATION IS WEAKER THAN ITS COMMENT CLAIMS; THE FIX ITSELF IS UNAFFECTED.
+  * **F2 (FOLLOW-UP, **NOT** A REGRESSION)** — a NULLABLE `JsonOptions?` COMPONENT READ STILL DOES
+    NOT LOWER. **THE COORDINATOR FILED IT: **#7993**.** IT IS **PRE-EXISTING** AND IDENTICAL ON BASE
+    AND TIP.
+  * **F3 (FOLLOW-UP, **PRE-EXISTING**)** — A `TextWriter` LOCAL THAT IS **COPIED OR REASSIGNED**
+    CANNOT HAVE ITS MEMBERS CALLED; IT STILL GETS **#2457**. PRE-EXISTING, AND THE LANE'S FIX DID
+    NOT CAUSE IT.
+  * **F4 (NOTE)** — the local's RUNTIME SLOT IS STILL A **ZERO-INITIALISED** VALUE WHILE ITS TYPE IS
+    NOW `TextWriter` (THE **#2434** SHAPE).
+  * **F5 (THE BRIEF IS WRONG, NOT THE LANE)** — the review brief's file list named the wrong path.
+* **§2.1, §2.15, §7.4, §7.7, §8.5, §26.5, §30.1 (v0.350).**
+
+### R38 wave-1 lane `r37-c2-54-peekenum` — 2026-11-02 (the EXTENSION-SWALLOW LANE) — #7946
+
+* **SHA:** `79eceabf`, branch `r37-c2-54-peekenum`, **PICKED AS `1f452bf6`** ONTO `r30-c1`.
+* **THE REVIEWER:** lane `r38-w1-c254`, report `/var/tmp/bezel-scratch/r38-coord/rev-r38-c254.md`,
+  **VERDICT `ACCEPT-W-NOTES`**.
+* **THE FIX:** a name-keyed built-in collection arm declines a call sema bound to a user extension
+  (§26.5 rules 1-2, §22.6, v0.350; stdlib §4.4-§4.11). BEFORE IT, `a.Peek(10)` ON AN `Array<int>`
+  PRINTED **0** — THE BUILT-IN'S — INSTEAD OF THE EXTENSION's **7**.
+* **FAIL-WITHOUT, MEASURED PER ROW:** BASE **`11 passed, 5 failed`** → TIP **`16 passed, 0 failed`**.
+  **THE REVIEWER MEASURED EACH OF THE 15 "FIX" ROWS ON THE BASE ARM INDIVIDUALLY** (THE FULL PER-ROW
+  TABLE IS IN THE REPORT).
+* **AREAS (MEASURED):** codegen `22404`, sema `9055` — GREEN; LIT `2567/2567`.
+* **THE REVIEWER's SIX NOTES — NONE BLOCKS THE PICK:**
+  * **N1 (EVIDENCE GAP)** — **10 OF THE 15 "FIX" ROWS IN THE NEW TEST FILE DO NOT FAIL WITHOUT THE
+    FIX**, AND THEIR PER-ROW COMMENTS ASSERT A PRE-FIX BEHAVIOUR THAT MEASUREMENT CONTRADICTS. THEY
+    ARE **CONTROLS**, NOT RED ROWS; THE FIVE THAT ARE RED ARE THE ONES THAT PIN THE DEFECT. **THE
+    REVIEWER MEASURED AND REPORTED THIS; THE FIX'S SUBSTANCE IS UNAFFECTED.**
+  * **N2 (THE ONE THAT NEEDED AN ISSUE) — **#7990**.** THE SAME BUILT-IN ARMS STILL SWALLOW A USER
+    EXTENSION ON A **BORROWING LIST INTERFACE** RECEIVER (`IList<T>`, `IReadOnlyList<T>`) — THE
+    IDENTICAL DEFECT, **ONE HEAD FAMILY OVER**, LEFT UNFIXED AND UNFILED. **THE COORDINATOR FILED IT
+    BEFORE THE PICK** (THE REVIEWER ASKED FOR THIS EXPLICITLY). MEASURED: `C_IList_Peek`,
+    `C_IList_Push`, `C_IList_Enqueue`, `C_IReadOnlyList_Peek`, `C_IReadOnlyList_Push` AND
+    `C_IReadOnlyList_Enqueue` ALL PRINT **0** INSTEAD OF **7** **ON THE BASE AND ON THE TIP** — AND
+    THE `ICollection<T>` / `IEnumerable<T>` HEADS **ALREADY** DISPATCH THE EXTENSION.
+  * **N3 (COMMIT-BODY ACCURACY)** — the commit body's "sema consults extensions for those names too"
+    is **NOT** WHAT THE COMPILER DOES FOR `Stack.Peek`: SEMA REJECTS THE CALL OUTRIGHT (RULE 1, BY
+    ARITY). **THE COMMIT BODY's MODEL OF THE PROBLEM IS PARTLY WRONG; THE FIX IS NOT.**
+  * **N4 (METADATA)** — the commit's TRAILER NAMED `MiniMax-M3.1-Flash-Preview` WHILE THE `Author:`
+    LINE SAID `Claude Opus 5.5`. **THE CHECKER ACCEPTS BOTH SPELLINGS.**
+  * **N6 (FOR THE CAMPAIGN)** — **THE BASE HAD A MEMORY-SAFETY HOLE IN THE SAME FAMILY**, NOT JUST A
+    WRONG ANSWER: ON AN OWNING HEAD THE HIJACKED `Add`/`Push`/`Enqueue` ARM STORED AN `int` INTO A
+    CLASS SLOT → **ASan STACK-BUFFER-OVERFLOW**; ON A `FrozenArray` RECEIVER THE HIJACKED
+    `Peek`/`Push`/`Enqueue` ARM **SEGV**'ED IN THE RUNTIME. **THE FIX REMOVES BOTH.** (THE BASE LEG
+    USED LANE PARENT `2b7e4f20`, BECAUSE A LITERAL `d3bcbb7e` CHECKOUT DOES NOT BUILD IN THAT TREE.)
+* **§22.6, §26.5, §26.5.1, stdlib §4.1-§4.11, §4.19 (v0.350).**
+
+### R38 wave-1 lane `r37-c2-55-extescape` — 2026-11-02 (the §26.5 HEAD-KEYING LANE) — #7951
+
+* **SHA:** `bcd46a34`, branch `r37-c2-55-extescape`, **PICKED AS `7cbb5efa`** ONTO `r30-c1`.
+* **THE REVIEWER:** lane `r38-w1-c255`, report `/var/tmp/bezel-scratch/r38-coord/rev-r38-c255.md`,
+  **VERDICT `ACCEPT-W-NOTES`**. THE FIX IS CORRECT AND COMPLETE FOR **N1** AND **N3**, AND
+  SUBSTANTIVELY CORRECT FOR **N2**.
+* **THE FIX:** KEY `#7661`'s EXTENSION ESCAPE ON THE **§26.5 HEAD**, NOT THE MEMBER NAME, FIX
+  `#7951`.
+* **FAIL-WITHOUT, MEASURED PER ROW:** BASE **`2 passed, 7 failed, 22410 filtered, 22419 total`** →
+  TIP **`9 passed, 0 failed, 22410 filtered, 22419 total`**. **THE COMMIT BODY's "9 ROWS; 7 FAIL
+  WITHOUT THE FIX" IS **EXACT**.** EVERY ONE OF THE NINE ROWS' BASE AND TIP ARMS IS QUOTED
+  INDIVIDUALLY IN THE REPORT.
+* **AREAS (MEASURED):** sema `9055 passed, 0 failed, 9055 total`; codegen `22417 passed, 0 failed,
+  2 filtered, 22419 total` **PLUS THE 2 FILTERED RE-RUN AT `504 passed, 0 failed`**; LIT
+  **`Passed: 2567 (100.00%)`**. CORPUS **`lint: 4366 cases, 0 problems`; `manifest.tsv is up to date
+  (4366 rows)`; `4366 cases: 3264 ok, 230 known-divergent, 872 unclassified, 0 REGRESSION, 0
+  UNBANKED`**.
+* **THE REVIEWER's SIX NOTES — NONE BLOCKS THE PICK, AND EACH IS RECORDED HERE BECAUSE ONE OF THEM
+  IS A REAL DEFECT IN THE **COMMIT BODY**, NOT IN THE CODE:**
+  * **NOTE 1 (MATERIAL)** — the reworded N2 clause is **STILL LITERALLY FALSE** IN THE IMPORTED
+    CASE. THE BASE SAID "no §26.5 extension declares a member named `Tick2`" — FALSE; THE TIP SAYS
+    "no §26.5 extension block **whose head applies to `DateTime`** declares a member named `Tick2`" —
+    **ALSO FALSE IN EXACTLY THE SAME WAY**: THE IMPORTED BLOCK's HEAD *IS* `DateTime`, IT *DOES*
+    APPLY, AND IT *DOES* DECLARE `Tick2`. **THE APPENDED SENTENCE** ("an extension property that an
+    imported module declares on a built-in type is not visible to this compiler, so it cannot be read
+    here") **IS TRUE AND IS THE DISCLOSURE THAT MAKES THE MESSAGE HONEST.** **THE ONE-LINE REMEDY IS
+    IN `builtinRecordSurfaceReason`, `src/sema/ExprTypecheck_Calls.cpp:612-616`.**
+  * **NOTE 2 (A REAL DEFECT, IN A SIBLING FAMILY)** — **EXTENSION MEMBERS ON BUILT-IN VALUE RECEIVERS
+    ARE ADMITTED BY SEMA AND THEN FAIL TO DISPATCH.** THE `extension Object` FORM IS **#6160**. **THIS
+    IS THE FAMILY #7946's FIX ADDRESSES, ONE HEAD OVER.**
+  * **NOTE 3 (DELIBERATE)** — the `IComparable`/`IEquatable` ARM **IGNORES THE TYPE ARGUMENT**,
+    **DELIBERATELY**.
+  * **NOTE 4 (STALE COMMENT)** — `tests/codegen/builtin_member_degrade_7661_test.cpp:9-10` carries a
+    **STALE HEADER COMMENT**.
+  * **NOTE 5 (THE LEDGER's OVER-CREDIT — THE COORDINATOR's RECORD)** — **THE SUBJECT NAMES TWO
+    ISSUES, `#7661` AND `#7951`, AND THE LEDGER CREDITS EVERY `#NNN` IN A SUBJECT — SO THE PICK
+    OVER-CREDITS `#7661` BY ONE. ONLY `#7951` IS ACTUALLY CLOSED** (the closing keyword `fix` binds
+    THE ONE REFERENCE AFTER IT; `#7661`'s OTHER SYMPTOMS REMAIN OPEN). **THE OWNER'S DECISION
+    (2026-11-02, ~23:05) WAS TO PICK AS-IS AND NOTE THE OVER-CREDIT HERE RATHER THAN AMEND THE
+    SUBJECT — AMENDING WOULD CHANGE THE REVIEWED SHA.** **=> THE BATCH-LEVEL COUNT MUST SUBTRACT ONE.**
+  * **NOTE 6 (STALE CITATION)** — the commit cites **§2.3 v0.309** WHERE THE TREE IS **v0.350**.
+* **§2.3, §8.1, §12.7, §22.6, §26.5, §26.5.1, §28.9 (v0.350).**
+
+### R38 coordinator block — 2026-11-02 (the campaign's integrator, wave 1)
+
+* **THE R38 WAVE-1 POOL RAN **5** LANES (THE OWNER's DIRECTIVE: **5**, NOT THE STANDING 6), AND **ALL
+  FIVE LANE ROLES ARE ACCOUNTED FOR BELOW.** THE POOL'S ONLY BINDING SCHEDULING CONSTRAINT WAS
+  **FILE-DISJOINTNESS**: TWO PRODUCERS MAY RUN IN PARALLEL ONLY IF THEIR HOT-FILE SETS ARE DISJOINT.
+* **THE FOUR FIX PICKS LANDED ON `r30-c1`** (`4822e702` #7924, `6046e876` #7925, `1f452bf6` #7946,
+  `7cbb5efa` #7951) — ALL FOUR AT **`ACCEPT-W-NOTES`**, EACH WITH A FRESH NON-AUTHOR REVIEWER
+  (`r38-w1-c252`, `r38-w1-c254`, `r38-w1-c255`). **THE LEDGER CREDITS FIVE FIX ISSUES FOR FOUR
+  CLOSED — THE EXTRA ONE IS THE **#7661 OVER-CREDIT** (SEE c255's NOTE 5). => THE BATCH-LEVEL COUNT
+  MUST SUBTRACT ONE.**
+* **TWO INFRA/DOC PICKS LANDED BESIDE THEM:** `2d33dc90` (kind `infra` — the jobserver routing
+  commit, review lane `r38-w3-infra`, verdict `ACCEPT`) and `8cf23960b1` (kind `bank` — the missing
+  brief templates, reviewer `r38-coord`).
+* **THE THREE R37 LANES THAT CAME BACK **REJECTED** WERE ALL ROUTED INTO FIX-FORWARDS, NONE WAS
+  DROPPED:**
+  * **c256** (R37 lane `r37-c2-56-ctornull`, commits `385ef889` #7957 and `00f2c038` #7958) —
+    **REJECT**: an **UNNAMED DIAGNOSTIC FLIP** on
+    `tests/codegen/set_dict_comparer_ctor_2722_test.cpp:371`, **THREE FURTHER UNNAMED FLIPS**, the
+    **WRONG STDLIB SECTION** (stdlib **§4.4** IS `Array<T>`; THE CORRECT ONES ARE **§4.10 / §4.8 /
+    §4.9**), and a **MISSING `publishNarrowedBuiltinArg`** IN THE `Set` ARM. ROUTED TO LANE
+    `r38-p2-c256ff`.
+  * **c257** (R37 lane `r37-c2-57-objsurf`, commit `7d44f558`) — **REJECT** ON THREE INDEPENDENT,
+    MEASURED GROUNDS: **#7964 IS NOT IMPLEMENTED AT ALL** (the `src/` diff has no disposal change;
+    ASan still reports `Direct leak of 1600 byte(s) in 100 object(s)`; the destructor counter is
+    **0**), **THE COMMIT BREAKS A GATE PHASE** (`gate_rule_corpus_baseline.py --strict` exits **0**
+    at the base and **1** at the tip — corpus row `l6_10_0012` UNBANKED), and **THE NEW ARM
+    OVER-REJECTS A PROGRAM THE SPEC ADMITS** WITH A MISLEADING DIAGNOSTIC (THE §12.7 NARROWING WAS
+    NOT APPLIED). ROUTED TO LANE `r38-p3-c257ff`.
+  * **c258** (R37 lane `r37-c2-58-fsgate`, commit `c7052f6c`, issues #7982/#7985/#7983) —
+    **REJECT**: **2 OF ITS 8 NEW ROWS ARE RED** (`named_declared_forms_run`,
+    `qualified_declared_arity_runs`), **THE §7 NULLABILITY DIAGNOSTIC WAS LOST** FOR NAMED ARGS TO
+    `File`/`Directory` (THE PROGRAM **SEGFAULTS**, EXIT **139**), AND **`File.Copy(destination := DST,
+    source := SRC)` DESTROYS THE SOURCE** — CODEGEN READS `call.args[i]` POSITIONALLY AND NEVER
+    CONSULTS `ctx_.builtinCallBinding(call)`. ROUTED TO LANE `r38-p1-c258ff`.
+* **THE COORDINATOR's OWN SCOPE DECISIONS, MADE AND RECORDED HERE:**
+  * **c257's SUBJECT MUST NOT NAME `#7964`** — THE LEDGER CREDITS EVERY `#NNN` IN A SUBJECT, AND A
+    NAMED ISSUE IS **CLOSED** BY THE PICK; THE DISPOSAL FIX WAS NEVER IMPLEMENTED. **THE #7964 LEAK
+    IS FILED AS A SIBLING ISSUE INSTEAD.**
+  * **c256's `Path` HEAD'S NULLABILITY HOLE IS OUT OF SCOPE** — IT IS **PRE-EXISTING** (FROM
+    #7732), NOT A REGRESSION OF THAT LANE. **FILED AS A SIBLING ISSUE, NOT FIXED.**
+  * **c258's PRE-EXISTING `Path` HEAD'S NULLABILITY HOLE — SAME CALL, SAME OUTCOME.**
+* **THE COORDINATOR's OWN SCHEDULING CORRECTION — THE STAND-DOWN OF `r38-p3-c257ff`:** THE
+  COORDINATOR **INITIALLY DISPATCHED c257ff AND c258ff TOGETHER**, AND **BOTH CLAIMED
+  `src/sema/ExprTypecheck_Calls.cpp` AS EXCLUSIVE** — A **VIOLATION OF THE CAMPAIGN's
+  FILE-DISJOINTNESS RULE**. CAUGHT AND CORRECTED **WITHIN THE RUN**, NOT AT THE GATE: c258ff
+  (THREE ISSUES, INCLUDING A SEGFAULT AND A SOURCE-DESTROYING BUG) **KEPT THE FILE**; c257ff WAS
+  TOLD TO **STAND DOWN**, TO **COMMIT NOTHING**, AND TO **PRESERVE ITS ANALYSIS** IN
+  `FINDINGS.md` — WHICH IT DID — SO THAT THE RE-DISPATCH DOES NOT HAVE TO RE-DERIVE THE DIAGNOSIS.
+  **c257ff IS RE-DISPATCHED AFTER c258ff LANDS; c256ff IS DISPATCHED WITH IT** (THE TWO ARE
+  MUTUALLY FILE-DISJOINT: `ExprTypecheck_Calls.cpp` vs `ExprTypecheck_Exprs.cpp` +
+  `BuiltinRegistry.cpp`).
+* **THE COORDINATOR ALSO FILED A **FOLLOW-UP** ISSUE THAT A REVIEWER ASKED FOR **BEFORE** THE PICK
+  (c254's N2): **#7990** — THE SAME BUILT-IN ARMS STILL SWALLOW A USER EXTENSION ON A **BORROWING
+  LIST INTERFACE** RECEIVER (`IList<T>`, `IReadOnlyList<T>`). **THE COORDINATOR DOES NOT WAIT FOR THE
+  REVIEWER TO ASK; A NOTE THAT NAMES A DEFECT IS A DEFECT THE CAMPAIGN OWNS.**
+* **THE FOUR SIBLING ISSUES FILED THIS WAVE, ALL LABELLED `bug` + `campaign:builtin-call-admission`:
+  **#7990** (THE LIST-INTERFACE EXTENSION SWALLOW), **#7991** (A §12.7-NARROWED `Object` CARRIER MUST
+  REACH THE STDLIB MEMBER), **#7992** (A USER-DECLARED GENERIC `Object<T>` IS REJECTED AS A
+  PRIMITIVE), **#7993** (A NULLABLE `JsonOptions?` COMPONENT READ).**
+* **THE `gh issue create` TRACKER REFUSAL IS WORKED AROUND, NOT A BLOCKER:** THE TRACKER'S
+  AUTO-MODE CLASSIFIER REFUSES `gh issue create` IN THIS REPO, SO **ALL NEW ISSUES GO IN THROUGH
+  `gh api -X POST repos/s8lap/bezel-lang/issues`** WITH `-f labels[]=bug -f
+  labels[]=campaign:builtin-call-admission`. **THE COORDINATOR's OWN `R38` ISSUE-CREATION ROUTE.**
+* **THE BRIEF TEMPLATES WERE A REAL GAP, NOT A NICETY.** `docs/ops/README.md` STATES THE RULE EVERY
+  BRIEF FOLLOWS — *"A brief, for a lane, a reviewer or a peer, carries only what is specific to its
+  assignment and points to its contract for the rest"* — BUT THE REPO HAD TEMPLATES FOR ONLY THE
+  PEER AND THE HARVEST BRIEF, **AND NONE FOR THE TWO LANE KINDS THAT CARRY THE CAMPAIGN's FIXES**.
+  SO EVERY R38 BRIEF RE-STATED `lane-contract.md`'s **23** STANDING RULES AND `review-contract.md`'s
+  **11** CHECKS INLINE. **THAT IS NOT ONLY WASTEFUL — A BRIEF THAT RESTATES A RULE IS A BRIEF THAT
+  CAN RESTATE IT WRONG, AND THEN THE LANE CHECKS AGAINST THE BRIEF INSTEAD OF THE CONTRACT.**
+  `docs/ops/templates/fix-brief.md` AND `docs/ops/templates/review-brief.md` NOW EXIST (COMMIT
+  `318de55d`, PICKED AS `8cf23960b1`), AND `docs/ops/README.md` INDEXES ALL FOUR TEMPLATES UNDER A
+  NEW **"## The templates"** SECTION.
+* **THE MASTER-PLAN **§6** CAMPAIGN DASHBOARD IS **NOT** REFRESHED HERE — **THE R37 BATCH LEFT IT
+  STALE, AND IT IS **BATCH-LEVEL** WORK: IT MUST COUNT THE WHOLE BATCH, NOT ONE WAVE. => **§6 IS
+  DEFERRED TO THE BATCH CLOSE-OUT, AND THE BATCH-LEVEL FIX-ISSUE COUNT MUST SUBTRACT THE **#7661**
+  OVER-CREDIT.**
+* **THE GATE IS NOT RUNNABLE YET** — THE POOL IS NOT DRAINED. THE GATE RUNS **ONCE**, AT THE END,
+  **ON A FROZEN TREE**, WITH THE BASELINE RE-BANKED **IN PLACE** (NEVER `runner.py --update`, NEVER
+  `--classify`) AND `check_toolchain_skip_surface` BANKED — **THAT IS ALSO BATCH-LEVEL WORK.**
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
