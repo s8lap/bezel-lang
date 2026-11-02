@@ -935,6 +935,20 @@ being picked unreviewed, and it was exactly the kind of change that needed one.
 the fixed tree and "0 gtest FAIL" on the base. Rows that pass on the buggy base do not pin the
 bug. The aggregate hid it, and the integrator rejected the review.
 
+**An admitting twin is GREEN on BOTH arms, and a brief that says otherwise is
+wrong.** R35, #7172: a fix shipped a raise row and its admitting twin — the
+same shape with a legal value, one character apart (`"ab".Insert(999,"z")`
+raises, `"ab".Insert(2,"z")` stays admitted). The brief to the producer said
+*"the two new rows must be mechanically RED on the base arm"*. The reviewer
+corrected it: the twin is green on the base and on the tip, because the base
+compiler admitting the legal value is **correct behaviour**, not a bug. Only
+the raise row is red on base. So: when a brief pairs a raise row with an
+admitting twin, say so — *the raise row must be RED on base, the twin must be
+GREEN on both arms* — and treat the twin's green-on-base as the positive
+control it is, showing the shape is genuinely admitted rather than rejected
+for an unrelated reason. A reviewer who is handed such a brief must not reject
+the lane because the twin stayed green.
+
 **Run the accept rows the base rejected.** Cycle 25: two rows of
 `ctor_chain_self_reference_4791_test.cpp` (`9c00771a`, #4791) asserted that invalid programs are
 accepted and run. Row 1 printed `hello/0` (a silent zero-fill) and row 5 crashed with SIGSEGV.

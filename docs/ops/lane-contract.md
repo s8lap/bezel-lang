@@ -101,7 +101,12 @@ SPECIFIC to its assignment.*
     now returns a wrong answer where it used to be right. Before handing back, generate a matrix
     around the fix (the spellings, positions, type kinds and declaration orders next to yours),
     run it on the base and on your tip, and report every program whose verdict or output changed.
-    A change you did not intend is a defect in the fix, not a note.
+    A change you did not intend is a defect in the fix, not a note. When the matrix pairs a raise
+    row with an **admitting twin** — the same shape with a legal value — the twin is green on the
+    BASE arm and on your tip, and only the raise row is red on base. The twin's green-on-base is a
+    positive control: it shows the shape is genuinely admitted rather than rejected for an unrelated
+    reason. Do not "fix" the twin to be red; if your brief told you both rows must be red on base,
+    say so in the handback — the brief is what is wrong.
 19b. **A fix that adds a rejection, removes one, or renames a diagnostic sweeps embedded test
     programs too.** Most test programs are C++ string literals inside `tests/**/*.cpp`, often
     split across lines, so a sweep over tracked `.bzl` files and a line grep both miss them. List

@@ -36,7 +36,11 @@ Run every check that applies, and quote what each one printed.
    rebuild would not. Then restore with `git checkout <sha> -- <those src files>`, run again, and
    confirm `git status --short` is clean. Never `git stash`. Report each row: the fix rows must
    fail on the base, and any control rows pass in both legs. An aggregate like "4/4 PASS" hides
-   a row that never failed.
+   a row that never failed. A control row that stays green on the base is doing its job: an
+   **admitting twin** — the same shape with a legal value — is meant to be green on BOTH arms,
+   because the base admitting the legal value is correct behaviour. If a brief told the lane that
+   both rows must be red on base, the brief is what is wrong; say so rather than rejecting a
+   correct fix (runbook, *Review and dispatch*).
 3. **Run every accept row whose program the base rejected.** Check what it prints, not only its
    exit code: a silent zero-fill exits 0, and so does wrong code that happens not to crash.
 4. **Deleted or weakened existing rows are a REJECT,** whatever the fix's merit. Diff every
