@@ -295,6 +295,9 @@ KIND_BITS = {
     "kBPTArrayChar": "Array<char>",
     "kBPTEnumerableString": "IEnumerable<string>",
     "kBPTRangeInt": "Range<int>",
+    # fix #7999 (stdlib §3.2, §4.14, §5.1, v0.350): the byte span —
+    # `Span<byte>`, stdlib §3.2's `Encoding.GetBytes` destination.
+    "kBPTSpanByte": "Span<byte>",
     # fix #8005 (stdlib §2.15, §5.1, v0.350): the JSON agents' `options`
     # parameter — a NAMED (record) type.  The bit is a vocabulary EXTENSION
     # (one more declared type the table can name); it relaxes nothing the

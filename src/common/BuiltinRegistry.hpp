@@ -792,6 +792,29 @@ enum BuiltinParamType : std::uint32_t {
     // positions (stdlib `DateTime.Add(span: TimeSpan)` and the rest) are
     // therefore NOT transcribed with a bit — see the table's own comment.
     kBPTJsonOptions      = 1u << 22,  // `JsonOptions`
+    // fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): a BYTE SPAN —
+    // stdlib §3.2's `destination: Span<byte>`, the span over `byte`.
+    //
+    // The vocabulary had `kBPTSpan` = `ReadOnlyStringSpan` — a span over
+    // CODE POINTS, not over BYTES — and no bit for `Span<byte>` at all, so
+    // the `Encoding.GetBytes` destination position carried NO type opinion
+    // and the §5.1 admission gate could not fire there: an `Array<byte>`, a
+    // `string`, an `int` or a `Span<char>` was ADMITTED, and only the
+    // codegen arm (#7603) refused it later — a codegen refusal, not a
+    // §5.1 one.
+    //
+    // The bit names the DECLARED TYPE, exactly as stdlib §3.2 spells it:
+    // `Span<byte>`. The byte-span FAMILY the §5.1 gate admits at it is
+    // §4.14's `Span<byte>` / `ReadOnlySpan<byte>` and §4.15's
+    // `ArraySpan<byte>` / `ReadOnlyArraySpan<byte>` — the four span views
+    // over `byte` the standard library declares, and the family the corpus
+    // already admits at this position (`Array<byte>.AsSpan()` is §4.15's
+    // `ArraySpan<byte>`).
+    //
+    // Bits 0..22 were in use (`kBPTJsonOptions` is 1<<22); the enum is a
+    // `std::uint32_t` and the `kinds` column is a `std::uint32_t` too, so
+    // the vocabulary has room for 32.
+    kBPTSpanByte        = 1u << 23,  // `Span<byte>`
 };
 
 // ONE declared form of a built-in member or constructor, read out of the ONE

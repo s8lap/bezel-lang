@@ -673,7 +673,16 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     {"string", "Equals", 1, 1, 0x00, {"other", "", "", "", "", "", "", ""}, {kBPTString | kBPTObject, 0, 0, 0, 0, 0, 0, 0}, "Equals(other: string): bool"},
     {"string", "Equals", 2, 2, 0x02, {"other", "ignoreCase", "", "", "", "", "", ""}, {kBPTString | kBPTObject, kBPTBool, 0, 0, 0, 0, 0, 0}, "Equals(other: string?, ignoreCase: bool): bool"},
     {"Encoding", "GetBytes", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString | kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Encoding", "GetBytes", 2, 2, 0x03, {"s", "destination", "", "", "", "", "", ""}, {kBPTString | kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #7999 (stdlib §3.2, §5.1, v0.350): the two-argument `GetBytes` —
+    // `GetBytes(s: string, destination: Span<byte>): int` and
+    // `GetBytes(s: ReadOnlyStringSpan, destination: Span<byte>): int` — so
+    // the FIRST position declares `string` OR `ReadOnlyStringSpan` (the two
+    // declared overloads, one bit each) and the SECOND declares
+    // `Span<byte>`, the byte span.  The second position carried NO type
+    // opinion before this fix, so the §5.1 admission gate could not fire
+    // there at all: an `Array<byte>`, a `string`, an `int` or a `Span<char>`
+    // was admitted and only the codegen arm (#7603) refused it later.
+    {"Encoding", "GetBytes", 2, 2, 0x03, {"s", "destination", "", "", "", "", "", ""}, {kBPTString | kBPTSpan, kBPTSpanByte, 0, 0, 0, 0, 0, 0}, ""},
     {"Encoding", "GetString", 1, 1, 0x01, {"bytes", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Encoding", "GetByteCount", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString | kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, ""},
     // fix #7207-fold (stdlib §3.1, v0.345): the §3.1 `StringBuilder`

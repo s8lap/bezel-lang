@@ -4793,6 +4793,15 @@ private:
     // call.
     // per §22.6 / §5.1 / §7.3 / §22.5, stdlib §9.1-§9.5, §2.5, §2.6
     void checkBuiltinCallAdmission(const ast::CallExpr& ce);
+    // fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): the §5.1
+    // admission gate for a built-in member whose declared parameter is a
+    // BYTE SPAN — stdlib §3.2's `Encoding.GetBytes(s, destination:
+    // Span<byte>)`. The declared type is read out of the ONE built-in
+    // parameter table (the `kinds` column) and the shared admission test
+    // (`builtinArgAdmitsKind`) answers the §5.1 question at that position.
+    // The reach is this one row-family: the `Encoding` head and the
+    // two-argument `GetBytes`.
+    void checkBuiltinByteSpanArgAdmission(const ast::CallExpr& ce);
     // Is the argument at `p` admissible at a parameter whose DECLARED type
     // is `kind`? `std::nullopt` means "this position is not the admission
     // question" (an untyped argument, a discard, a `ref`/`out` slot).

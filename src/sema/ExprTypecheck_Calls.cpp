@@ -1487,6 +1487,35 @@ static bool byteBufferArgRejected(const TypeRef* t, bool allowSpan) {
     }
 }
 
+// fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): is `t` a BYTE SPAN —
+// a span over `byte`?
+//
+// The four span families the standard library declares: §4.14's `Span<T>` /
+// `ReadOnlySpan<T>` (over an `OwningBuffer<T>`) and §4.15's `ArraySpan<T>` /
+// `ReadOnlyArraySpan<T>` (over an `Array<T>`).  A span over a DIFFERENT
+// element type (`Span<char>`) is not a byte span, and an `Array<byte>` is an
+// ARRAY (§4.4), not a span — stdlib §3.2 declares the `destination`
+// parameter as `Span<byte>`, and §5.1's table admits no conversion from an
+// array to a span.
+//
+// An element type the compiler did not settle is admitted: this test answers
+// "is it DEFINITELY not a byte span?", so a type it cannot judge is left to
+// the caller's own gate (the same fail-safe direction
+// `byteBufferArgRejected` takes).
+static bool isByteSpanType(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    const std::string_view h = t->headName();
+    if (h != "Span" && h != "ReadOnlySpan" &&
+        h != "ArraySpan" && h != "ReadOnlyArraySpan")
+        return false;
+    if (t->genericArgs.empty() || !t->genericArgs[0])
+        return true;  // the element type is not carried: no opinion
+    const TypeRef* el = t->genericArgs[0];
+    if (el->kind == TypeRef::Kind::Error) return true;  // unresolved
+    return el->kind == TypeRef::Kind::Primitive &&
+           el->primitive == PrimitiveType::Byte;
+}
+
 static const ast::Expr* callReceiverTarget(const ast::CallExpr& ce) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
         return ma->target.get();
@@ -19400,6 +19429,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // per §22.6 / §5.1 / §7.3 / §22.5, stdlib §9.1-§9.5, §2.5, §2.6
     checkBuiltinCallAdmission(ce);
 
+    // fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): the §5.1 gate for
+    // the ONE built-in member whose declared parameter is a BYTE SPAN —
+    // `Encoding.GetBytes(s, destination: Span<byte>)`. The anchor's gate
+    // reaches the VALUE built-ins only, and the `Encoding` head is not one
+    // of them (its arguments are lowered by BINDING, so the anchor's §22.5
+    // reorder refusal does not apply to it), so the byte-span destination
+    // has a gate of its own.
+    checkBuiltinByteSpanArgAdmission(ce);
+
     // §7.5 / FINDING [3] ADDENDUM: a null-conditional call `x?.M(args)` is
     // ALWAYS nullable — it returns null when the receiver is null. The callee is
     // a NullCondMemberExpr; lift the (raw) return type recorded above to its
@@ -23657,6 +23695,9 @@ std::string builtinParamTypePhrase(std::uint32_t kind) {
     if (kind & common::kBPTArrayChar) return "an `Array<char>`";
     if (kind & common::kBPTEnumerableString) return "an `IEnumerable<string>`";
     if (kind & common::kBPTRangeInt) return "a `Range<int>`";
+    // fix #7999 (stdlib §3.2, §4.14, §5.1, v0.350): the byte span — the
+    // `destination` stdlib §3.2 declares as `Span<byte>`.
+    if (kind & common::kBPTSpanByte) return "a `Span<byte>`";
     return "the declared type";
 }
 
@@ -23685,6 +23726,8 @@ std::string builtinParamTypeSpelling(std::uint32_t kind) {
     if (kind & common::kBPTArrayChar) return "Array<char>";
     if (kind & common::kBPTEnumerableString) return "IEnumerable<string>";
     if (kind & common::kBPTRangeInt) return "Range<int>";
+    // fix #7999 (stdlib §3.2, §4.14, §5.1, v0.350): the byte span.
+    if (kind & common::kBPTSpanByte) return "Span<byte>";
     return "the declared type";
 }
 
@@ -23851,6 +23894,13 @@ bool ExprTC::builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
             if (bit == common::kBPTSpan && argTy->kind == TypeRef::Kind::Named &&
                 argTy->headName() == "ReadOnlyStringSpan")
                 return true;
+            // fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): a BYTE
+            // SPAN is not a primitive either — it is §4.14's `Span<byte>` /
+            // `ReadOnlySpan<byte>` and §4.15's `ArraySpan<byte>` /
+            // `ReadOnlyArraySpan<byte>`, the span views over `byte`.  The
+            // element type decides: a `Span<char>` is not a byte span.
+            if (bit == common::kBPTSpanByte && isByteSpanType(argTy))
+                return true;
             continue;
         }
         if (argTy->kind == TypeRef::Kind::Primitive) {
@@ -23943,11 +23993,12 @@ namespace {
 // fix #7421 (stdlib §9.6, §5.1, §7.3, v0.345): the DECLARED TYPE a
 // `BuiltinParamType` bit names, in the standard library's own spelling.
 //
-// The bits above `kBPTOut` name the NAMED types stdlib §9.6 declares at a
-// parameter position (`Trim(chars: IEnumerable<char>)`,
+// The bits above `kBPTOut` name the NAMED types the standard library declares
+// at a parameter position: stdlib §9.6's `Trim(chars: IEnumerable<char>)`,
 // `Split(separators: Array<char>)`, `Join(separator: string, items:
-// IEnumerable<string>)`, `AsSpan(r: Range<int>)`); the bits below name the
-// SCALAR and reference kinds.
+// IEnumerable<string>)`, `AsSpan(r: Range<int>)` — and, since fix #7999,
+// stdlib §3.2's `destination: Span<byte>` (the byte span, §4.14/§4.15); the
+// bits below name the SCALAR and reference kinds.
 const char* builtinDeclaredKindName(std::uint32_t bit) {
     switch (bit) {
         case common::kBPTString:  return "string";
@@ -23970,6 +24021,8 @@ const char* builtinDeclaredKindName(std::uint32_t bit) {
         case common::kBPTArrayChar:        return "Array<char>";
         case common::kBPTEnumerableString: return "IEnumerable<string>";
         case common::kBPTRangeInt:         return "Range<int>";
+        // fix #7999 (stdlib §3.2, §4.14, §5.1, v0.350): the byte span.
+        case common::kBPTSpanByte:         return "Span<byte>";
         default: return nullptr;
     }
 }
@@ -23981,7 +24034,10 @@ bool builtinDeclaredKindIsNamed(std::uint32_t bit) {
     return bit == common::kBPTEnumerableChar ||
            bit == common::kBPTArrayChar ||
            bit == common::kBPTEnumerableString ||
-           bit == common::kBPTRangeInt;
+           bit == common::kBPTRangeInt ||
+           // fix #7999 (stdlib §3.2, §4.14, §5.1, v0.350): the byte span is
+           // a named (generic) type too.
+           bit == common::kBPTSpanByte;
 }
 
 // The DECLARED types a position admits, as the standard library's own words
@@ -24651,6 +24707,141 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
             (why.empty() ? "" : " — " + why + " (\xC2\xA7""5.1)") +
             " — the call is a compile error with no candidates cited "
             "(§22.6)");
+}
+
+// fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): the §5.1 ADMISSION
+// GATE for a built-in member whose declared parameter is a BYTE SPAN.
+//
+// stdlib §3.2 declares, verbatim:
+//   public abstract method GetBytes(s: string, destination: Span<byte>): int;
+// so the second parameter is a `Span<byte>` — a span over `byte` (stdlib
+// §4.14's `Span<T>` / `ReadOnlySpan<T>`, §4.15's `ArraySpan<T>` /
+// `ReadOnlyArraySpan<T>`) — and nothing else.
+//
+// The `Encoding` rows of the ONE built-in parameter table carried NO type
+// opinion at that position, so the §5.1 admission gate had nothing to say
+// and EVERY argument was ADMITTED: an `Array<byte>`, a `string`, an `int` and
+// even a `Span<char>` (a span over the WRONG element) all reached the call,
+// and only the codegen arm (#7603, `src/codegen/LlvmBackend_Calls2.cpp`)
+// refused the non-spans LATER — a codegen refusal, not a §5.1 one.  This
+// gate asks the §5.1 question at that position: the DECLARED type is read
+// from the ONE table (the `kinds` column) and the shared admission test
+// (`builtinArgAdmitsKind`) answers it.
+//
+// The REACH is this ONE row-family — the `Encoding` head and the
+// `GetBytes` member at the two-argument arity — for the same reason the
+// §9.6 `string` head has a gate of its own (`checkBuiltinStringDeclaredParams`)
+// and the value built-ins have the anchor's (`checkBuiltinCallAdmission`):
+// a head the anchor does not own needs its own gate, and each head's gate
+// owns its own argument-type question.  The `Encoding` head is NOT in the
+// anchor's reach (`isBuiltinValueParamHead`), and it must not be added to
+// it: the anchor's §22.5 REORDER refusal is justified only for a head whose
+// arguments codegen lowers BY POSITION, and `Encoding`'s are lowered BY
+// BINDING (`ctx_.builtinCallBinding`) — the reordered named spelling
+// `Encoding.GetBytes(destination := dst, s := "ab")` is legal and the
+// #7603 suite pins it.
+//
+// The DIAGNOSTIC quotes the §3.2 rule in the codegen arm's own words
+// ("`Encoding.GetBytes` expects a `Span<byte>` destination (stdlib §3.2); got
+// `X`"), so the two refusals of this one defect read alike, and then adds the
+// §5.1 REASON the codegen arm cannot state: the argument's type is never
+// implicitly convertible to the declared one.
+void ExprTC::checkBuiltinByteSpanArgAdmission(const ast::CallExpr& ce) {
+    // ONE diagnostic per call: a check that already spoke about THIS call has
+    // the first word (the §7.3 nullability gate, the §5.1 type gate, the
+    // §22.5 binder and the #6957 `Encoding` SOURCE check all report at a
+    // location inside this call's span).
+    for (const auto& d : ctx_.diagnostics().diagnostics()) {
+        if (d.severity != Severity::Error) continue;
+        if (d.location.line != ce.span.begin.line) continue;
+        if (d.location.offset < ce.span.begin.offset) continue;
+        if (d.location.offset > ce.span.end.offset) continue;
+        return;
+    }
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt || member != "GetBytes") return;
+    if (ce.args.size() != 2) return;
+    // THE HEAD: the `Encoding` singleton's own type (stdlib §3.2).  A user
+    // class named `Encoding` is not it (fix #3022's own discriminator).
+    TypeRef* recvTy = ctx_.exprType(*tgt);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named) return;
+    if (!recvTy->declaration ||
+        recvTy->declaration->name != "Encoding" ||
+        !recvTy->declaration->moduleName.empty())
+        return;
+    // THE DECLARED FORM, read out of the ONE built-in parameter table: the
+    // two-argument `GetBytes`, whose second parameter stdlib §3.2 declares
+    // as `Span<byte>`.
+    const std::vector<common::BuiltinParamForm> forms =
+        common::builtinParamForms("Encoding", "GetBytes", 2);
+    if (forms.empty()) return;
+    const common::BuiltinParamForm& form = forms[0];
+    if (form.kinds.size() < 2) return;
+    const std::uint32_t kinds = form.kinds[1];
+    if (kinds == 0) return;  // no type opinion at that position: nothing to say
+    // THE DESTINATION ARGUMENT: the one §22.5 binds to the `destination`
+    // parameter — the argument NAMED `destination`, or the second argument
+    // positionally (the #6957 source check's own construction).
+    const ast::CallArgument* dst = nullptr;
+    for (const auto& a : ce.args) {
+        if (!a.value) continue;
+        if (a.name == "destination" ||
+            (a.name.empty() && &a == &ce.args[1])) {
+            dst = &a;
+            break;
+        }
+    }
+    if (!dst) return;
+    TypeRef* argTy = ctx_.exprType(*dst->value);
+    if (!argTy || argTy->kind == TypeRef::Kind::Error) return;
+    // §7.4: a read §7.4 has narrowed non-null is of its non-nullable type.
+    TypeRef* effTy = argTy;
+    if (argTy->nullable) {
+        if (!isNarrowedNonNullRead(dst->value.get())) {
+            // §5.1's nullable lifting: `S?` converts to `T?` and never to
+            // `T`, so a still-nullable value reaches no non-nullable
+            // parameter (§7.3).
+            ctx_.diagnostics().report(
+                Severity::Error, dst->value->span.begin,
+                "`Encoding.GetBytes` expects " + builtinParamTypePhrase(kinds) +
+                    " destination (stdlib \xC2\xA7""3.2); got `" +
+                    collectionLiteralTargetSpelling(argTy) +
+                    "` — a nullable value reaches no non-nullable parameter "
+                    "(\xC2\xA7""7.3) (#7999)");
+            return;
+        }
+        effTy = scrutineeTypeAfterNarrowing(dst->value.get(), argTy);
+        if (!effTy) return;
+    }
+    if (effTy->nullable) {
+        ctx_.diagnostics().report(
+            Severity::Error, dst->value->span.begin,
+            "`Encoding.GetBytes` expects " + builtinParamTypePhrase(kinds) +
+                " destination (stdlib \xC2\xA7""3.2); got `" +
+                collectionLiteralTargetSpelling(effTy) +
+                "` — a nullable value reaches no non-nullable parameter "
+                "(\xC2\xA7""7.3) (#7999)");
+        return;
+    }
+    // §5.1: is the argument admissible at a parameter whose DECLARED type is
+    // `kinds`?  The shared admission test answers it, and the new
+    // `kBPTSpanByte` bit is what it reads the byte span by.
+    if (builtinArgAdmitsKind(dst->value.get(), effTy, kinds)) return;
+    // THE REFUSAL.  The first clause is the codegen arm's (#7603) own
+    // wording — the two refusals of this one defect read alike — and the
+    // §5.1 clause is the REASON the codegen arm cannot state: the argument's
+    // type is never implicitly convertible to the DECLARED one.  The
+    // argument's type is spelled with its generic arguments (the codegen
+    // arm's `encodingDestinationSpelling` reads the same way), so a
+    // `Span<char>` is not reported as a bare `Span`.
+    ctx_.diagnostics().report(
+        Severity::Error, dst->value->span.begin,
+        "`Encoding.GetBytes` expects " + builtinParamTypePhrase(kinds) +
+            " destination (stdlib \xC2\xA7""3.2); got `" +
+            collectionLiteralTargetSpelling(effTy) + "` — `" +
+            collectionLiteralTargetSpelling(effTy) +
+            "` is never implicitly convertible to " +
+            builtinParamTypeSpelling(kinds) + " (\xC2\xA7""5.1) (#7999)");
 }
 
 // fix #3424 / #3425 (§22.5 "Optional parameters and named arguments",
