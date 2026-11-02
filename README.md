@@ -16,7 +16,7 @@ The development of Bezel started in April 2026. It is developed specification-fi
 
 ## A first look
 
-Bezel's syntax comes from the Pascal family: blocks close with `end`, assignment is `:=` and equality is `=`. Its type system is close to C#. Its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design.
+Bezel's syntax comes from the Pascal family. Its type system is close to C#. Its standard library borrows many .NET names, but the resemblance is on the surface: the library is its own design.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-example-dark.svg">
