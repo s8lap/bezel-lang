@@ -2087,26 +2087,35 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
     // MaxDepth: int)` has NO row in the parameter table on purpose -- a row
     // would admit a named argument, and `lowerNew` binds the five positionally.
     // Its two `int` components are checked here, positionally, by the same
-    // `checkAssignable` as the table-driven path below.
+    // `checkAssignable` as the table-driven path below. Fix #7957 (§5.1, §7):
+    // a nullable argument at ANY of the five positions is refused -- `lowerNew`
+    // passed the `{i8 hasValue; T}` carrier to an `insertvalue` of the bare
+    // field -- and a §7.4-narrowed read is published for payload extraction.
     if (head == "JsonOptions") {
-        static constexpr std::pair<std::size_t, const char*> kIntComponents[] = {
-            {1, "IndentWidth"}, {4, "MaxDepth"}};
-        for (const auto& [idx, pname] : kIntComponents) {
+        static constexpr std::pair<std::size_t, const char*> kComponents[] = {
+            {0, "Indented"}, {1, "IndentWidth"}, {2, "AllowTrailingCommas"},
+            {3, "IgnoreUnknownFields"}, {4, "MaxDepth"}};
+        for (const auto& [idx, pname] : kComponents) {
             if (idx >= ne.args.size()) continue;
             const auto& arg = ne.args[idx];
             if (!arg.value || arg.isDiscard || !arg.modifier.empty() ||
                 !arg.name.empty())
                 continue;
+            const std::string what = "`" + std::string(pname) +
+                                     "` argument of the `" + head +
+                                     "` constructor";
+            reportBuiltinArgIfNullable(arg.value.get(), what);
+            publishNarrowedBuiltinArg(arg.value.get());
+            if (idx != 1 && idx != 4) continue;
             TypeRef* argTy = ctx_.exprType(*arg.value);
-            if (!argTy || argTy->kind == TypeRef::Kind::Error ||
-                argTy->nullable)
-                continue;
-            checkAssignable(
-                argTy, ctx_.primitiveTypeRef(PrimitiveType::Int),
-                arg.value->span.begin,
-                "`" + std::string(pname) + "` argument of the `" + head +
-                    "` constructor",
-                arg.value.get());
+            if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
+            if (argTy->nullable) {
+                if (!isNarrowedNonNullRead(arg.value.get())) continue;
+                argTy = operandStaticTypeAt(arg.value.get(), argTy);
+                if (!argTy) continue;
+            }
+            checkAssignable(argTy, ctx_.primitiveTypeRef(PrimitiveType::Int),
+                            arg.value->span.begin, what, arg.value.get());
         }
         return;
     }
@@ -2155,12 +2164,24 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
         if (!arg.value || arg.isDiscard || !arg.modifier.empty()) continue;
         TypeRef* argTy = ctx_.exprType(*arg.value);
         if (!argTy || argTy->kind == TypeRef::Kind::Error) continue;
-        // §7: a nullable argument is the nullability gate's (#6782), except a
-        // §7.4-narrowed read, which is of its non-nullable type (§22.6).
+        // §7: a §7.4-narrowed read is of its non-nullable type (§22.6). Any
+        // other nullable argument is the nullability gate's (#6782) WHERE the
+        // row's `nonNullable` mask names the position; at an `int` / `long`
+        // position that mask does not name (the Span windows, OwningArray,
+        // OwningBuffer, Random, Semaphore, Channel) nothing else refuses it
+        // and `lowerNew` read the `{i8 hasValue; T}` carrier as a bare integer
+        // (fix #7957, §5.1, §7: there is no implicit `T?` to `T` conversion).
+        // `reportBuiltinArgIfNullable` below reports §7's "is nullable but the
+        // target type is non-nullable" with the position (`checkAssignable`
+        // compares the primitive and leaves nullability to its callers).
+        bool nullableUnnarrowed = false;
         if (argTy->nullable) {
-            if (!isNarrowedNonNullRead(arg.value.get())) continue;
-            argTy = operandStaticTypeAt(arg.value.get(), argTy);
-            if (!argTy) continue;
+            if (isNarrowedNonNullRead(arg.value.get())) {
+                argTy = operandStaticTypeAt(arg.value.get(), argTy);
+                if (!argTy) continue;
+            } else {
+                nullableUnnarrowed = true;
+            }
         }
         // The target: the one declared type, or (`StringBuilder(capacity: int)`
         // beside `StringBuilder(initial: string)`) the scalar one when the
@@ -2184,6 +2205,19 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
         std::string_view pname = p < bound.front().form->names.size()
                                      ? bound.front().form->names[p]
                                      : std::string_view();
+        // A nullable `string` stays the gate's: only the `int` / `long`
+        // positions have no other taker (fix #7957).
+        if (nullableUnnarrowed) {
+            if (target != PrimitiveType::String)
+                reportBuiltinArgIfNullable(
+                    arg.value.get(), "`" + std::string(pname) +
+                                         "` argument of the `" + head +
+                                         "` constructor");
+            continue;
+        }
+        // The narrowed read's payload must be extracted by codegen, as at the
+        // gate's own positions (fix #7621 / #7692, §22.6).
+        publishNarrowedBuiltinArg(arg.value.get());
         checkAssignable(
             argTy, ctx_.primitiveTypeRef(target), arg.value->span.begin,
             "`" + std::string(pname) + "` argument of the `" + head +
