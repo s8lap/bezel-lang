@@ -28008,6 +28008,78 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #7865 (stdlib §7.4 / §4.6 / §28.3 / §28.9, v0.350): the six §7.4
+    // `Path` static methods are +1 string PRODUCERS.
+    //
+    // WHY IT IS A PRODUCER. stdlib §7.4 declares `Path` a `public static
+    // class` whose members all return `string`:
+    //
+    //   public static method Combine(a: string, b: string): string;
+    //   public static method GetFileName(path: string): string;
+    //   public static method GetExtension(path: string): string;
+    //   public static method GetFileNameWithoutExtension(path: string): string;
+    //   public static method GetDirectoryName(path: string): string;
+    //   public static method GetFullPath(path: string): string;
+    //
+    // There is no `Path` VALUE type: a `Path` call produces a `string`, and
+    // `string` is runtime-managed (§4.6: "its memory is reclaimed
+    // automatically") over a reference-counted leaf (§28.9). The `Path` arm of
+    // `tryLowerBuiltinClassCall` (LlvmBackend_Calls.cpp) mints that result
+    // with `ptrToStr` — a `calloc`'d header with rc := 1 (`initStringRc`) whose
+    // data field is the `bz_path_*` entry point's malloc'd buffer — so the
+    // CALLER owns exactly ONE reference to it: §28.3's producers arm, "Fresh
+    // productions are owned".
+    //
+    // WITHOUT THIS ARM every consumer treated the result as a BORROW and
+    // RETAINED on top of the producer's +1 (rc 1 -> 2), so the scope-end
+    // release dropped only the consumer's own share (rc 2 -> 1) and the
+    // producer's reference was never discharged: the 32-byte header AND its
+    // data buffer leaked on every call. MEASURED (issue #7865): a
+    // 100-iteration loop of `var r := Path.Combine("xxx", "yyy")` leaked 400
+    // allocations under LeakSanitizer — 100 headers, 100 payloads and the
+    // 200 `strToPath` C-string copies; and `Console.WriteLine(Path.Combine(
+    // "x", "y"))` in the same loop leaked the header on every iteration. The
+    // SAME gap as #2228 (`string.From` / `string.Repeat`) and #7464
+    // (`Convert.ToString`), which this arm mirrors.
+    //
+    // A bound local TRANSFERS the single reference (no extra retain) and the
+    // scope-end release drops rc 1->0 exactly once; a call argument and the
+    // `Console.Write` #1031 arm discharge it at the end of the full
+    // expression. No double free: an ESCAPING local is excluded from the
+    // scope-end release by the escape walk (its +1 then leaks — the safe
+    // direction).
+    //
+    // Matched like the `Convert.ToString` arm above (a CallExpr on the `Path`
+    // type keyword, the callee NOT resolved by sema, the receiver NOT a
+    // user-declared type), so a USER type that merely spells `Path` — or a
+    // user extension of it — is NOT this builtin.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->callee && !calleeResolvedBySema(*call, ctx_)) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->target &&
+                    !sema::isUserDeclaredTypeSym(ctx_.exprSymbol(*ma->target))) {
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get())) {
+                        if (tid->name == "Path") {
+                            const std::size_t argc = call->args.size();
+                            // §7.4 `Combine(a: string, b: string): string`.
+                            if (ma->member == "Combine" && argc == 2)
+                                return true;  // ptrToStr → rc=1
+                            // §7.4's five one-argument members.
+                            if (argc == 1 &&
+                                (ma->member == "GetFileName" ||
+                                 ma->member == "GetExtension" ||
+                                 ma->member == "GetFileNameWithoutExtension" ||
+                                 ma->member == "GetDirectoryName" ||
+                                 ma->member == "GetFullPath"))
+                                return true;  // ptrToStr → rc=1
+                        }
+                    }
+                }
+            }
+        }
+    }
     // #2199 / stdlib §9.6 / §4.6 / §28.9 (v0.220): the stdlib `string` INSTANCE
     // methods that transform self into a fresh heap `bz.string` at rc := 1. Each
     // lowers (in tryLowerStringMethod, LlvmBackend_String.cpp) to either an inline

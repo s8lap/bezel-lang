@@ -17745,6 +17745,43 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "GetDirectories") return makeFilesList("bz_dir_get_dirs");
     }
     if (cls == "Path") {
+        // fix #7865 (stdlib §7.4 / §4.6 / §28.3 / §28.9, v0.350): every
+        // `Path.*` call leaked its C-string argument copy AND its result.
+        //
+        // (A) THE C-STRING COPY. `strToPath` above mallocs a NUL-terminated
+        // COPY of the argument's bytes so the runtime can take a `const
+        // char*`. Every `bz_path_*` entry point COPIES its input into a fresh
+        // buffer (`bz_path_combine` memcpy's, the rest `strdup`/`malloc`+copy),
+        // so the copy is the CALLER's to release — and nobody released it: the
+        // malloc'd buffer was unreachable the moment the call returned. The
+        // issue's own repro measured it: `Path.Combine("x","y")` leaked exactly
+        // 2 allocations, the two copies (4 bytes). `free()` them right after
+        // the call — the runtime has already consumed them.
+        //
+        // (B) THE PRODUCER ARGUMENT. §28.3: a non-`owned` argument position is
+        // a BORROWING use whatever the callee's body does with the parameter,
+        // so an argument that is a +1 producer (`String.Repeat("x", 3)`) is
+        // still an unbound owned temporary: §28.3 K8.1 disposes it at the end
+        // of the full expression, after its uses. The general call path does
+        // exactly that (the post-call `emitStringRelease` per producer
+        // argument, `LlvmBackend_Calls2.cpp`'s argument loop) and `Console.
+        // Write`'s #1031 arm does it too; the `Path` arm did NEITHER, so the
+        // argument's +1 survived the call. Discharge it here, in REVERSE
+        // PRODUCTION order (§28.3 K8.1: "in reverse production order"), i.e.
+        // the later-produced argument first. A BORROW argument (a named local
+        // read) is not a producer and is left alone — releasing it would drop
+        // the owner's only reference.
+        auto freeCStr = [&](llvm::Value* p) {
+            if (!p) return;
+            auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy()});
+            builder_.CreateCall(freeFn, {p});
+        };
+        auto releaseProducerArg = [&](const ast::Expr* e, llvm::Value* v) {
+            if (!e || !v || !v->getType()->isPointerTy()) return;
+            if (!isPlusOneStringProducer(e)) return;
+            emitStringRelease(v);
+        };
         auto make1arg = [&](const char* fnName) -> llvm::Value* {
             if (call.args.size() != 1 || !call.args[0].value) return nullptr;
             llvm::Value* s = lowerExpr(*call.args[0].value);
@@ -17752,9 +17789,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* p = strToPath(s);
             auto* fn = declareC(fnName, ptrTy(), {ptrTy()});
             llvm::Value* result = builder_.CreateCall(fn, {p});
+            // (A) the C-string copy is ours: the runtime copied out of it.
+            freeCStr(p);
+            // (B) the argument's own +1, if it was a producer.
+            releaseProducerArg(call.args[0].value.get(), s);
             // result is a malloc'd C string; compute its length via strlen
             auto* strl = declareC("strlen", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(strl, {result});
+            // The result becomes the string's DATA buffer (ptrToStr stores it
+            // in field 0), so the string OWNS it and `bz_string_release` frees
+            // it with the header — no separate free here.
             return ptrToStr(result, len);
         };
         if (m == "GetFileName") return make1arg("bz_path_filename");
@@ -17780,10 +17824,29 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 a = lowerExpr(*call.args[aIdx].value);
             }
             if (!a || !b) return nullptr;
+            llvm::Value* pa = strToPath(a);
+            llvm::Value* pb = strToPath(b);
             auto* fn = declareC("bz_path_combine", ptrTy(), {ptrTy(), ptrTy()});
-            llvm::Value* result = builder_.CreateCall(fn, {strToPath(a), strToPath(b)});
+            llvm::Value* result = builder_.CreateCall(fn, {pa, pb});
+            // (A) both C-string copies are ours.
+            freeCStr(pa);
+            freeCStr(pb);
+            // (B) the arguments' own +1s, in REVERSE PRODUCTION order: the
+            // later-produced (the higher source index) first. §28.3 K8.1.
+            const ast::Expr* aE = call.args[aIdx].value.get();
+            const ast::Expr* bE = call.args[bIdx].value.get();
+            if (aIdx <= bIdx) {
+                releaseProducerArg(bE, b);
+                releaseProducerArg(aE, a);
+            } else {
+                releaseProducerArg(aE, a);
+                releaseProducerArg(bE, b);
+            }
             auto* strl = declareC("strlen", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(strl, {result});
+            // The result becomes the string's DATA buffer (ptrToStr stores it
+            // in field 0), so the string OWNS it and `bz_string_release` frees
+            // it with the header — no separate free here.
             return ptrToStr(result, len);
         }
     }
