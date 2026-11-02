@@ -3439,6 +3439,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (!declaresName) return nullptr;
         }
     }
+    // fix #7946 (§26.5 rules 1-2, §22.6, v0.350; stdlib §4.4-§4.11): the
+    // name-keyed arms below (Peek, Pop, Push, Enqueue, ...) answer by NAME.
+    // A call sema bound to a user extension on a declaration-less concrete
+    // collection head whose declared surface does not name `m` (rule 1 did
+    // not commit; rule 2 selected the extension) is declined before any
+    // receiver IR, so the extension lowering runs. A declared name keeps its
+    // built-in arm (sema also consults extensions for those names).
+    {
+        auto* msX =
+            dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+        if (isExtensionMethod(msX) && recvTy && !recvTy->declaration) {
+            const std::string_view headX = builtinTypeName(recvTy);
+            if (common::isConcreteCollectionSurfaceHead(headX) &&
+                !common::concreteCollectionHeadDeclares(headX, m))
+                return nullptr;
+        }
+    }
     if (m == "Length" || m == "Count") {
         auto* ms =
             dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));

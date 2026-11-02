@@ -41571,3 +41571,17 @@ bool ExprTC::stmtCaptures(const ast::Stmt& s, const CaptureScope& scope) const {
 }
 
 } // namespace bezel::sema
+
+// fix #7946 (§26.5 rule 1, v0.350): export of the concrete-collection surface
+// table to codegen (declared in common/BuiltinRegistry.hpp).
+namespace bezel::common {
+bool isConcreteCollectionSurfaceHead(std::string_view head) {
+    for (const auto& row : sema::concreteCollectionSurfaces())
+        if (row.head == head) return true;
+    return false;
+}
+bool concreteCollectionHeadDeclares(std::string_view head,
+                                    std::string_view member) {
+    return sema::isDocumentedConcreteCollectionMember(head, member);
+}
+}  // namespace bezel::common

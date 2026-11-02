@@ -962,6 +962,17 @@ bool isStringLinqOperatorMemberName(std::string_view n);
 // per §5, fix #3589
 bool isBuiltinCollectionLinqOperatorName(std::string_view n);
 
+// fix #7946 (§26.5 rule 1, v0.350; stdlib §4.4-§4.11, §4.17-§4.19): the
+// concrete built-in collection heads' declared instance surface, owned by
+// sema (`concreteCollectionSurfaces`). `isConcreteCollectionSurfaceHead`
+// says the head has a row; `concreteCollectionHeadDeclares` says the row
+// names `member`. Codegen asks both so a name-keyed built-in arm (Peek,
+// Pop, ...) declines a call that sema bound to a user extension on a head
+// that does not declare the name.
+bool isConcreteCollectionSurfaceHead(std::string_view head);
+bool concreteCollectionHeadDeclares(std::string_view head,
+                                    std::string_view member);
+
 // fix #3670 (stdlib §5, v0.286): does `m` take a single lambda argument
 // `(T) -> …` seeded with the LINQ receiver's own source element type T, so an
 // un-annotated lambda parameter (`(p) => p.x`) can be typed as T (§27.4's
