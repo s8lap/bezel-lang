@@ -2451,6 +2451,59 @@ CREATED AND DELETED), **SO THE NEXT ISSUES WERE FILED THE ORDINARY WAY.**
    DANGEROUS PLACE TO DIE, BECAUSE ITS CONCLUSION WAS NEVER WRITTEN DOWN**). **THE RETRY BRIEF NOW
    REQUIRES THE REPORT'S FIRST 20 LINES TO BE WRITTEN BEFORE ANYTHING IS RUN.**
 
+### R38 coordinator block — 2026-11-03 ~06:55 → 07:40 (the gate cadence RESTATED, and the heartbeat that REKINDLES the pool)
+
+Three owner directives, recorded here because they change how the rest of the run is
+governed. **None of them changes what the campaign fixes; all three change how it is run.**
+
+**1. THE GATE CADENCE, RESTATED (owner directive 2026-11-03).** *"gate 100 at a time at
+least, just do one gate near the end of the run."* This **supersedes** the master-plan's
+60–100 floor (2026-10-28) with a floor of **100** and fixes the **count** to **one**. The
+haul is ACCUMULATED; it is not gated in pieces. **⇒ DO NOT DRAIN THE POOL TO GATE.** A run
+that is going to gate once anyway must not spend a ~50-minute cycle on a haul of 20 — at
+the moment of writing the banked figure was **20 of 100**, so a gate now would close a
+fifth of what the one gate is for. The pool is held at its target until the run ends.
+
+**2. THE POOL IS REFILLED EVERY TIME THE AGENT COUNT GOES DOWN (owner directive 2026-11-03).
+** *"CONTINUE with a pool of 7. refill the pool every time the agent count goes down."* **A
+slot that frees is refilled in that SAME turn** — a lane that handed back counts, and **a
+lane that DIED counts**. A dead lane produces no report, so the brief requires the report's
+first 20 lines to be written BEFORE anything runs; the ledger's `live:` row is what says a
+slot is occupied, and a row whose `start`/`status` are swapped is invisible to the pool
+count (a defect that made the pool read 4, then 2, then 1 when the truth was 5, 3, 2).
+
+**3. THE HEARTBEAT REKINDLES (owner directive 2026-11-03).** *"MAKE YOUR HEARTBEAT
+INSTRUCTIONS … REKINDLE THE POOL TO 7."* **MEASURED, and it is the reason:** the pool fell
+to **1 live lane of 7** and STAYED there across two heartbeats. The old heartbeat prompt
+said *"If the table shows a problem (… a partial pool), report it and stop."* — so it
+reported the partial pool and stopped, and twenty minutes later reported the same thing
+again, while the box sat **completely idle** (0 lane build processes, 0 heavy processes
+box-wide, `builders: CLEAN`) with six of seven lane slots empty and the banked count
+pinned at 20. **A heartbeat that only observes a stalled pool watches the stall.** The
+heartbeat's standing rule is now: **STATUS, then REFILL TO 7 in the same turn, then PICK the
+landed commits whose non-author review has recorded a verdict** — and still never launch a
+gate, never push, never edit the staging worktree. The contract and the VERBATIM
+recreation recipe (there is no `schedule_update`; a change is delete-then-create, back to
+back) are committed at **`docs/ops/heartbeat.md`**, because a heartbeat is a session
+artifact and dies with the session — that file is what makes the NEXT run inherit the new
+behaviour instead of the old report-and-stop one.
+
+**THE POOL, REFILLED TO 7 IN ONE TURN (2026-11-03 ~07:30).** Six slots went out together:
+`r38-w23-7899` (review of #7899's `5503d8bb`), `r38-w24-8005` (review of #8005's
+`8feb6bb2`), `r38-p18-7998ff` (the #7998 fix-forward — the use-after-free), `r38-p19-7996`
+(the qualified static call), `r38-h3-harvest` (the rule-corpus harvest) and
+`r38-i1-jobserver` (the jobserver's token accounting), alongside the finishing
+`r38-p16-8005`. **File-disjointness held**: the two reviews touch nothing, the fix-forward
+owns `LlvmBackend_Calls2.cpp` / `LlvmBackend_Assign.cpp` / `LlvmBackend_impl.hpp`, #7996
+owns `TypeResolution_Names.cpp` / `TypeResolution.cpp` / `ExprTypecheck_Calls.cpp`, and the
+jobserver owns `scripts/` — no two on one hot dispatch function.
+
+**AND THE BOX WAS RECLAIMED WHILE THE POOL SAT EMPTY.** 91 dead lane worktrees (every one
+whose commits were already contained in the staging branch, plus the superseded `cc8d3170`
+anchor copies) were removed: `/mnt/fast/worktrees` went **234 GB → 23.6 GB**, and the disk
+from **82 % → 51 %** (42 G → 106 G free). Six lanes need six build trees; a 42 G free disk
+with 234 GB of dead worktrees on it was the other half of the stall.
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*

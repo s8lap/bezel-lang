@@ -879,9 +879,25 @@ Two mechanisms, and they are not interchangeable:
 
 ⚠ A heartbeat is a **backstop, not a scheduler**. Cycle 9 lost ~12 h of a run when a
 misfiring cron hit the hard-stop early and left the ASan oracle INCOMPLETE — so the
-heartbeat must only *prompt a status check*, never take an action (never launch a gate,
-never push, never dispatch). Keep its interval coarse (tens of minutes); a tight interval
-burns budget re-reading state that has not moved.
+heartbeat must never launch a gate and never push. Keep its interval coarse (tens of
+minutes); a tight interval burns budget re-reading state that has not moved.
+
+⚠ **BUT A HEARTBEAT THAT ONLY OBSERVES A STALLED POOL WATCHES THE STALL.** The heartbeat's
+standing rule was amended on 2026-11-03 (owner directive, *"REKINDLE THE POOL TO 7"*) and
+is now: **the heartbeat STATUSES and then REKINDLES — a partial pool is a REFILL, not a
+report-and-stop.** Measured on the R38 run: the pool fell to 1 live lane of 7 and stayed
+there, because the old prompt said *"report it and stop"* — so the heartbeat reported the
+partial pool and stopped, twenty minutes later reported the same thing again, while the box
+sat **completely idle** (0 lane build processes, 0 heavy processes box-wide) with six of
+seven slots empty. It also PICKs landed commits whose non-author review has recorded a
+verdict, so the banked count keeps rising between heartbeats. It still never launches a
+gate, never pushes, never edits the staging worktree.
+
+**The heartbeat's contract and the VERBATIM recipe that recreates the schedule (there is no
+`schedule_update` — a change means delete-then-create, back to back) live in
+[`docs/ops/heartbeat.md`](docs/ops/heartbeat.md).** A heartbeat is a session artifact and
+dies with the session, so that file is what makes the next run inherit the new behaviour.
+
 
 ### Gate protocol
 
