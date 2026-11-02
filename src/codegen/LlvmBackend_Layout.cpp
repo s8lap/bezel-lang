@@ -3856,6 +3856,42 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                 " (a value type reaching an Object/interface location must be "
                 "boxed, §8.6) — #2775");
     };
+    // fix #8000 (§12.7 / §19.3 / §8.2, v0.350): the SAME #2775 silence
+    // amplifier, specialized to a declaration-less BUILT-IN CLASS target.
+    //
+    // WHY A SEPARATE REPORTER. `reportDroppedTest`'s text explains the drop
+    // as a §8.6 BOXING omission ("a value type reaching an Object/interface
+    // location must be boxed") — which is a different defect from this one: a
+    // built-in CLASS is not a value type, boxing it would not help, and the
+    // real cause is that the class has NO RUNTIME TYPE TAG (its runtime value
+    // is a plain C struct whose word 0 is data, so there is no descriptor
+    // chain for `emitIsA` to walk). Reusing the §8.6 sentence would send the
+    // reader looking for a missing box that is not missing.
+    //
+    // WHY A WARNING, not an Error. #2775's rule is "report its own
+    // diagnostic", and the established surface for "this type test was
+    // DROPPED" in this compiler is exactly this `internal:` WARNING (see
+    // tests/lit/type_test_covariant_interface_carrier_warns_5077.bzl, the
+    // same shape for a covariant interface carrier). Promoting it to an Error
+    // would REJECT programs that compile today — including #7991's own
+    // regression row (`if o is not Stopwatch then … else … end` at an `Object`
+    // carrier, which must keep printing "False"), and §12.7's `is not`
+    // spelling is answered by the same dropped test. The defect this fix
+    // closes is the SILENCE, not the drop.
+    auto reportDroppedClassTest = [&](std::string_view builtinName) {
+        if (ctx_.diagnostics().hasErrors()) return;
+        SourceLocation at = te.span.begin;
+        if (at.line == 0 && te.operand) at = te.operand->span.begin;
+        if (at.line == 0 && te.testType) at = te.testType->span.begin;
+        ctx_.diagnostics().report(
+            Severity::Warning, at,
+            "internal: this type test was DROPPED and reads as false — the "
+            "built-in class `" + std::string(builtinName) +
+                "` has no runtime type tag (a vtable-less built-in class "
+                "carries no Bezel vtable at word 0, so behind an "
+                "`Object`/interface erasure the runtime cannot answer the "
+                "test) — #8000");
+    };
     // fix #3090 (§12.7 / §8.6, v0.252): the operand's type AS LOWERED HERE. The
     // suppression above lowered a §12.7-narrowed identifier as its §8.6 box /
     // declared reference, so every classification below must read the DECLARED
@@ -4368,9 +4404,70 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             rt->kind == sema::TypeRef::Kind::InlineArray ||
             (rt->kind == sema::TypeRef::Kind::Named && rt->declaration) ||
             targetArgsConcrete;  // narrow #4926 — see the header above
+        // fix #8000 (§12.7 / §19.3 / §8.2, v0.350): the OTHER unanswerable
+        // shape — a declaration-less BUILT-IN CLASS target. `concreteTarget`
+        // admits a Named target only when it carries a user `declaration` (or
+        // is a constructed builtin-generic with concrete arguments), so a
+        // BUILT-IN CLASS — `Stopwatch`, `FileStream`, `Random`, `TaskScope`,
+        // `Lock`, `Semaphore`, `SemaphoreToken`, … — fell through the bail
+        // SILENTLY: the test was dropped, `lowerIf` branched PAST the body,
+        // and the controlled block never ran with NO diagnostic at all.
+        //
+        // §12.7 (v0.350): "`is T` tests whether a value is an instance of `T`
+        // and produces `bool`." §19.3 (v0.350) is the type-pattern rule that
+        // a type test must be ANSWERABLE at run time. A vtable-less built-in
+        // class has no runtime type tag (its runtime value is a plain C
+        // struct — `common::isVtableLessBuiltinClassName`'s contract — so
+        // word 0 is DATA, not a vtable), so behind an `Object`/interface
+        // erasure the runtime cannot answer the test. That is a COMPILER
+        // limitation, not a program error, so the answer is a diagnostic
+        // (#2775's rule: "every producer that can return null for a condition
+        // expression must report its own diagnostic before doing so"), not a
+        // silent constant-`false`.
+        //
+        // THE PREDICATE. `common::isVtableLessBuiltinClassName` is the
+        // registry's own name for "the reserved built-in CLASSES" (every
+        // reserved built-in name that is not an interface head), and it is
+        // exactly the population whose runtime value carries NO Bezel vtable
+        // at word 0 — the population `emitIsA` cannot walk. It is CONJOINED
+        // with `common::isHeapPointerReferenceBuiltin` because the registry
+        // DERIVES "a vtable-less built-in class" as "reserved minus the
+        // interface heads", which also sweeps in the reserved VALUE builtins
+        // (`DateTime`, `TimeSpan`, `Guid`, `IntPtr`, `ReadOnlyStringSpan`, …)
+        // — those are RECORDS, not classes, and their runtime value is a
+        // value, not a heap reference. The five boxable ones (`DateTime` /
+        // `TimeSpan` / `DateOnly` / `TimeOnly` / `Guid`) never reach this bail
+        // at all — §8.6 boxes them and `boxDescriptorFor` resolves the box
+        // descriptor — but a NON-boxable value builtin (`ReadOnlyStringSpan`,
+        // `IntPtr`) does, and calling it a "class" would be wrong: its defect
+        // is the missing §8.6 BOX, not a missing type tag.
+        //
+        // The three exclusions that remain:
+        //   * a BARE TYPE PARAMETER (`v is T` in an unspecialized generic
+        //     body) is not a reserved name, so it is excluded — warning there
+        //     would fire on code that never runs (#490 / #2775's own
+        //     exclusion);
+        //   * a CONSTRUCTED builtin-generic target (`o is Array<Dog>`) is
+        //     excluded by the `genericArgs.empty()` clause: its own
+        //     `concreteTarget` arm above already reports it when its
+        //     arguments are concrete (narrow #4926), and when they are not
+        //     (a still-open type parameter) the target is the dead
+        //     bare-type-parameter shape;
+        //   * a builtin INTERFACE head (`IDisposable`, `IEnumerable<char>`)
+        //     is excluded by the registry derivation: an interface test is
+        //     answered through the class's interface MAP, not through a
+        //     descriptor chain, so it is a different (still open) question.
+        const std::string_view builtinClassName = builtinTypeName(rt);
+        const bool builtinClassTarget =
+            targetIsVtablelessBuiltin && rt->genericArgs.empty() &&
+            !builtinClassName.empty() &&
+            common::isVtableLessBuiltinClassName(builtinClassName) &&
+            common::isHeapPointerReferenceBuiltin(builtinClassName);
         if (concreteTarget)
             reportDroppedTest("no runtime descriptor resolved for the target "
                               "type");
+        else if (builtinClassTarget)
+            reportDroppedClassTest(builtinClassName);
         return nullptr;
     }
     // §12.7 / §7 / issues #447 + #448: a nullable VALUE type operand is a
@@ -4718,11 +4815,30 @@ llvm::Value* Emitter::emitIsA(llvm::Value* obj, llvm::GlobalVariable* targetDesc
 // `bz_mutex_desc[2]` in bezel_runtime_refcounting.cpp; this module only
 // references them (getOrInsertGlobal), exactly as the fnval arm references
 // bz_fnval_vtable, so the address every module compares is the runtime's one.
+//
+// fix #8000 (§12.7 / §8.7 / §19.3, v0.350): the THIRD runtime-owned
+// descriptor, `bz_cts_desc`, was defined and exported by the runtime
+// (bezel_runtime_refcounting.cpp — fix #7554, §8.7 / §5.1, v0.350: the
+// CancellationTokenSource source opens with a vtable word, `bz_cts_vtable`,
+// the #6776 Mutex shape) but was NOT in this map. So `o is
+// CancellationTokenSource` at an `Object` carrier fell to the !targetDesc
+// bail below and was DROPPED — the test read as `false` for a value that IS
+// a CancellationTokenSource. The runtime tag existed; only the map was
+// missing, so this is a pure omission, not a new mechanism.
+//
+// WHY IT IS SAFE TO MAP IT. `bz_cts_alloc` (bezel_runtime_concurrency.cpp)
+// stamps `src->vtable = (void*)bz_cts_vtable` at allocation, so word 0 of a
+// CancellationTokenSource IS a vtable pointer; `bz_cts_vtable[0]` is
+// `bz_cts_desc`; `bz_cts_desc[0]` is `bz_cts_desc` itself. That is exactly
+// the chain `emitIsA` walks (obj[0] -> vtable[0] -> desc[0..]), so the
+// ordinary walk answers it by address — the same shape `bz_sb_desc` /
+// `bz_mutex_desc` already answer.
 llvm::GlobalVariable* Emitter::runtimeBuiltinDescriptorFor(
         std::string_view head) {
     const char* sym = nullptr;
     if (head == "StringBuilder") sym = "bz_sb_desc";
     else if (head == "Mutex") sym = "bz_mutex_desc";
+    else if (head == "CancellationTokenSource") sym = "bz_cts_desc";  // #8000
     else return nullptr;
     auto* ty = llvm::ArrayType::get(ptrTy(), 2);
     return llvm::cast<llvm::GlobalVariable>(module_->getOrInsertGlobal(sym, ty));
