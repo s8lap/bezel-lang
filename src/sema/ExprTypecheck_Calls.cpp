@@ -23497,11 +23497,20 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
     // replacement: the same `reportBuiltinArgIfNullable`, asked at the
     // parameter the name binds to.
     //
-    // `Path` carries the SAME hole from #7732 (its head is in the named-arg
-    // table and no bound-position check exists for it). That is a PRE-EXISTING
-    // gap, filed separately; it is deliberately NOT widened here.
+    // `Path` carried the SAME hole from #7732 (its head has been in the
+    // named-arg table since then, and no bound-position check existed for it)
+    // — fix #7995 (§7 / §7.3 / §22.5, v0.350) widened the check to it: the
+    // named spelling `Path.Combine(a := null, b := "x")` compiled clean where
+    // the positional spelling `Path.Combine(null, "x")` is refused, and the
+    // `null` reached the runtime unchecked and the program SEGFAULTED (exit
+    // 139). stdlib §7.4 declares every `Path` parameter a NON-nullable
+    // `string`, so the check below now covers the `Path` head as well; the
+    // registry rows (`Path.Combine` mask 0x03, the `path` parameter of
+    // `GetFileName` / `GetExtension` / `GetFileNameWithoutExtension` /
+    // `GetDirectoryName` / `GetFullPath` mask 0x01) already carried the
+    // declared names and the non-nullable positions this reads.
     const bool boundPositionNullability =
-        (head == "File" || head == "Directory");
+        (head == "File" || head == "Directory" || head == "Path");
     // The §22.5 BINDING, established LOCALLY over the registry's declared
     // names (the published binding is not available here — it is published at
     // the END of `typeCall`), exactly as `checkBuiltinMathConvertCallArgs`
