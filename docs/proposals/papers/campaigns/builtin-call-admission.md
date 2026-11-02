@@ -2320,6 +2320,20 @@ CALL).**
   (NEEDS `src/codegen/LlvmBackend_Calls.cpp`). **ALL SIX WAIT ON `r38-p1-c258ff` OR
   `r38-p6-narrow`, WHICH IS WHY THE POOL IS FILLED WITH WORK THAT DOES NOT NEED THEM.**
 
+* **A LEDGER OVER-MENTION TO NOTE, AND WHY IT IS NOT THE #7661 CASE.** THE WAVE-2 RECORD COMMIT's
+  SUBJECT NAMES **#7992** ("… the pool is 7, and the #7992 review"), SO THE LEDGER's `ISSUES`
+  COLUMN SHOWS `#7992` ON THAT COMMIT. **THE LEDGER's ISSUES FIELD IS THE *MENTION* SET — THE
+  SUBJECT's `#NNN`s — NOT THE CLOSURE SET**, AND THE TWO ARE DISTINCT: `scripts/pick_issues.sh
+  --github` (GitHub's OWN measured rule: a closing keyword closes the ONE reference immediately
+  following it, in the subject OR the body) **DOES NOT INCLUDE #7992**, SO **#7992 IS NOT CLOSED
+  BY THIS PICK** — IT IS OPEN, AND ITS REVIEW WAS **REJECT**. **AND A `kind=bank` COMMIT CREDITS NO
+  FIX ISSUE AT ALL**, SO THE BATCH-LEVEL FIGURES ARE UNCHANGED: `distinct fix issues: 5` (r37's
+  FOUR PICKS, WITH THE #7661 OVER-CREDIT) **AND `distinct issues GitHub would close: 4`**. **THIS IS
+  NOT THE #7661 CASE** — THERE, A `kind=fix` SUBJECT OVER-CREDITED A FIX ISSUE AND INFLATED THE
+  COUNT; HERE, A `kind=bank` SUBJECT OVER-MENTIONS AN ISSUE AND INFLATES ONLY A DISPLAY FIGURE.
+  **IT IS RECORDED RATHER THAN CHURNED: AMENDING A PICKED COMMIT WOULD RESET THE STAGING BRANCH AND
+  RE-PICK TWELVE COMMITS' WORTH OF STATE FOR A FIGURE NOTHING ACTS ON.**
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
