@@ -4657,6 +4657,67 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         if (dynamic_cast<TypeAliasSymbol*>(cand)) return true;
         return false;
     };
+    // fix #8008 (§8.1, §2.7, §2.3, v0.350): §8.1's SHADOWING RULE — "a
+    // nested type or a type parameter named `Object` shadows the root under
+    // §2.7 as any declaration shadows an always-available name, and
+    // `System.Object` still reaches it". §2.3's "Core types" row says the
+    // same of the always-available name: "a nested type or type parameter
+    // named `Object` shadows it, and `System.Object` still reaches it".
+    //
+    // TWO declarations shadow the root: a TYPE PARAMETER and a NESTED TYPE.
+    // Neither did, because the bare-name primitive arm below claims the root
+    // BEFORE the scope chain is walked — so a type parameter named `Object`
+    // and a nested type named `Object` never got the chance to shadow it.
+    //
+    // The scope chain is asked exactly what the ordinary path below asks it,
+    // through `lookupBareTypeName` — the same function, the same scope, the
+    // same reference node — so the answer is the SAME candidate the ordinary
+    // resolution path would bind:
+    //   * a NESTED TYPE is a `NestedTypeSymbol` (declared or inherited);
+    //   * a TYPE PARAMETER is the generic-parameter MARKER (`nullptr`),
+    //     which `lookupBareTypeName` returns as a null symbol — the walk
+    //     below distinguishes that marker from "nothing is bound at all",
+    //     because a marker is a scope's `names` entry whose value is null.
+    //
+    // It is deliberately NARROWER than `bindsTypeDeclaration` above: §8.1
+    // names exactly these two shapes. A module-level user type of that name
+    // is NOT one of them — §8.1 BANS it ("User code cannot redeclare or
+    // replace `Object`"), and the ban is reported on the DECLARATION, so
+    // claiming the root at the reference keeps that diagnostic standing.
+    //
+    // §2.2's arity rule governs the SHADOWING rule too ("For this collision
+    // rule and the shadowing rule below, names are compared together with
+    // their generic arity"): the root `Object` (arity 0) and a declaration
+    // of arity 1 are TWO names, "neither colliding with nor shadowing the
+    // other". So the shadowing declaration must carry the arity THIS
+    // reference fixes — a nested `Object<T>` (arity 1) does not shadow the
+    // root for a BARE reference, and a type parameter (arity 0) does not
+    // shadow it for `Object<int>`.
+    auto shadowsRootObject = [&](std::string_view name) -> bool {
+        const std::size_t refArity = t.genericArgs.size();
+        TypeSymbol* stoppedAt = nullptr;
+        Symbol* cand = lookupBareTypeName(name, scope, &stoppedAt, &t);
+        // §2.7's stop: the ordinary path reports that shape itself (a bare
+        // name's search ends at the first enclosing type that has it), so
+        // this is not a shadowing declaration here either.
+        if (stoppedAt) return false;
+        if (cand) {
+            // A NESTED TYPE shadows the root — at its own arity.
+            auto* nts = dynamic_cast<NestedTypeSymbol*>(cand);
+            if (!nts || !nts->type) return false;
+            return nts->type->genericParams.size() == refArity;
+        }
+        // A null candidate is the generic-parameter MARKER (a TYPE PARAMETER,
+        // whose arity is 0) or nothing at all. The marker is the FIRST
+        // scope's `names` entry for the name, with a null value — the very
+        // binding `lookupBareTypeName` returned.
+        for (Scope* s = scope; s; s = s->parent) {
+            auto it = s->names.find(name);
+            if (it == s->names.end()) continue;
+            return it->second == nullptr && refArity == 0;
+        }
+        return false;
+    };
     // Primitive check first.
     if (t.name->parts.size() == 1) {
         PrimitiveType prim = primitiveFromName(first);
@@ -4680,7 +4741,27 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         const bool userDeclaredObject =
             prim == PrimitiveType::Object && !qualifiedBuiltin &&
             !t.genericArgs.empty() && bindsTypeDeclaration(first);
-        if (prim != PrimitiveType::None && !userDeclaredObject) {
+        // fix #8008 (§8.1, §2.7, §2.3, v0.350): §8.1's SHADOWING RULE — "a
+        // nested type or a type parameter named `Object` shadows the root
+        // under §2.7 as any declaration shadows an always-available name, and
+        // `System.Object` still reaches it". A TYPE PARAMETER named `Object`
+        // and a NESTED TYPE named `Object` each shadow the root, so a bare
+        // `Object` in a type position must NOT be claimed as the root
+        // primitive: the reference falls through to the ordinary
+        // name-resolution path below, which binds the shadowing declaration
+        // and applies the ordinary rules to it (a type parameter's §5.1
+        // conversion rule, a nested type's §11.6/§22.12 member rules).
+        //
+        // The predicate is asked only of the `Object` primitive, and never of
+        // a name reached by its HOME module's qualified name (`System.Object`,
+        // `import System as S; S.Object`) — §2.3's row and §8.1's "and
+        // `System.Object` still reaches it" make the qualified spelling name
+        // the ROOT by definition.
+        const bool shadowedObject =
+            prim == PrimitiveType::Object && !qualifiedBuiltin &&
+            shadowsRootObject(first);
+        if (prim != PrimitiveType::None && !userDeclaredObject &&
+            !shadowedObject) {
             ref.kind = TypeRef::Kind::Primitive;
             ref.primitive = prim;
             // Primitives shouldn't have generic args (sema enforces);
