@@ -2325,19 +2325,72 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
             }
             if (!resolved) continue;  // only the comparer form binds here
         }
-        PrimitiveType target = PrimitiveType::None;
-        switch (kind) {
-            case common::kBPTInt:    target = PrimitiveType::Int; break;
-            case common::kBPTLong:   target = PrimitiveType::Long; break;
-            case common::kBPTString: target = PrimitiveType::String; break;
-            default: break;
+        // fix #8005 (§5.1, §7.3, stdlib §2.15, v0.350): the DECLARED TYPES
+        // this position admits. The `kinds` column is a BIT SET (one bit per
+        // DECLARED type), and this gate used to understand only THREE of them
+        // — `int`, `long` and `string` — so every other declared type (a
+        // `bool`, a `char`, a `uint`, the `JsonOptions` record) was refused
+        // by the TABLE'S OWN RULE ("a position whose kind is 0 in ANY form
+        // that binds carries no type opinion at all") before it ever reached
+        // this switch: the kind was 0, so the position was SKIPPED, and
+        // nothing checked the argument's type at all.
+        //
+        // The vocabulary's named types are the NAMED (record / interface)
+        // ones the standard library declares at a parameter position. A
+        // declared type this gate has no target for (`ReadOnlyStringSpan`, an
+        // `out` slot, a comparer) is left alone — it has no other taker, and
+        // the §7 nullability gate (the `nonNullable` mask) owns the
+        // nullability half of the position either way.
+        std::vector<PrimitiveType> primTargets;
+        const char* namedTarget = nullptr;
+        for (std::uint32_t bit = 1; bit; bit <<= 1) {
+            if (!(kind & bit)) continue;
+            switch (bit) {
+                case common::kBPTString:  primTargets.push_back(PrimitiveType::String);  break;
+                case common::kBPTInt:     primTargets.push_back(PrimitiveType::Int);     break;
+                case common::kBPTLong:    primTargets.push_back(PrimitiveType::Long);    break;
+                case common::kBPTUInt:    primTargets.push_back(PrimitiveType::UInt);    break;
+                case common::kBPTULong:   primTargets.push_back(PrimitiveType::ULong);   break;
+                case common::kBPTByte:    primTargets.push_back(PrimitiveType::Byte);    break;
+                case common::kBPTSByte:   primTargets.push_back(PrimitiveType::SByte);   break;
+                case common::kBPTShort:   primTargets.push_back(PrimitiveType::Short);   break;
+                case common::kBPTUShort:  primTargets.push_back(PrimitiveType::UShort);  break;
+                case common::kBPTFloat:   primTargets.push_back(PrimitiveType::Float);   break;
+                case common::kBPTDouble:  primTargets.push_back(PrimitiveType::Double);  break;
+                case common::kBPTDecimal: primTargets.push_back(PrimitiveType::Decimal); break;
+                case common::kBPTBool:    primTargets.push_back(PrimitiveType::Bool);    break;
+                case common::kBPTChar:    primTargets.push_back(PrimitiveType::Char);    break;
+                case common::kBPTObject:  primTargets.push_back(PrimitiveType::Object);  break;
+                // fix #8005 (stdlib §2.15): the JSON agents' `options`
+                // parameter — a NAMED (record) type, so it has no primitive.
+                case common::kBPTJsonOptions: namedTarget = "JsonOptions"; break;
+                default: break;
+            }
         }
-        if (target == PrimitiveType::None) continue;
+        if (primTargets.empty() && namedTarget == nullptr) continue;
+        // The declared type the ARGUMENT reaches: the IDENTITY match first
+        // (stdlib §9.6 declares `Contains(value: char)` beside
+        // `Contains(value: string)`), then the first declared type — the
+        // widening and the constant narrowing are `checkAssignable`'s own
+        // (§5.1), not this gate's.
+        PrimitiveType target = PrimitiveType::None;
+        for (PrimitiveType t : primTargets) {
+            if (argTy->kind == TypeRef::Kind::Primitive &&
+                argTy->primitive == t) {
+                target = t;
+                break;
+            }
+        }
+        if (target == PrimitiveType::None && !primTargets.empty())
+            target = primTargets.front();
         std::string_view pname = p < bound.front().form->names.size()
                                      ? bound.front().form->names[p]
                                      : std::string_view();
         // A nullable `string` stays the gate's: only the `int` / `long`
-        // positions have no other taker (fix #7957).
+        // positions have no other taker (fix #7957). A NAMED position
+        // (stdlib §2.15's `JsonOptions`) has no other taker either, and the
+        // §7 gate (the `nonNullable` mask) speaks for it — so the §7 message
+        // is the one that fires, never §5.1's.
         if (nullableUnnarrowed) {
             if (target != PrimitiveType::String)
                 reportBuiltinArgIfNullable(
@@ -2349,6 +2402,22 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
         // The narrowed read's payload must be extracted by codegen, as at the
         // gate's own positions (fix #7621 / #7692, §22.6).
         publishNarrowedBuiltinArg(arg.value.get());
+        if (target == PrimitiveType::None) {
+            // A NAMED declared type: the argument reaches it when its own
+            // type IS that type (§5.1's reference conversions are the
+            // subtyping ones, and the declared type here is a record the
+            // standard library names).
+            if (argTy->kind == TypeRef::Kind::Named &&
+                argTy->headName() == namedTarget)
+                continue;  // admitted
+            ctx_.diagnostics().report(
+                Severity::Error, arg.value->span.begin,
+                "the `" + std::string(pname) + "` argument of the `" + head +
+                    "` constructor has a type that is not implicitly "
+                    "convertible to the target type (\xC2\xA7""5.1): the "
+                    "declared type is a `" + std::string(namedTarget) + "`");
+            continue;
+        }
         checkAssignable(
             argTy, ctx_.primitiveTypeRef(target), arg.value->span.begin,
             "`" + std::string(pname) + "` argument of the `" + head +

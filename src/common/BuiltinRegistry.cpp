@@ -672,10 +672,10 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     {"string", "CompareTo", 2, 2, 0x03, {"other", "ignoreCase", "", "", "", "", "", ""}, {kBPTString, kBPTBool, 0, 0, 0, 0, 0, 0}, "CompareTo(other: string, ignoreCase: bool): int"},
     {"string", "Equals", 1, 1, 0x00, {"other", "", "", "", "", "", "", ""}, {kBPTString | kBPTObject, 0, 0, 0, 0, 0, 0, 0}, "Equals(other: string): bool"},
     {"string", "Equals", 2, 2, 0x02, {"other", "ignoreCase", "", "", "", "", "", ""}, {kBPTString | kBPTObject, kBPTBool, 0, 0, 0, 0, 0, 0}, "Equals(other: string?, ignoreCase: bool): bool"},
-    {"Encoding", "GetBytes", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Encoding", "GetBytes", 2, 2, 0x00, {"s", "destination", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Encoding", "GetString", 1, 1, 0x00, {"bytes", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Encoding", "GetByteCount", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Encoding", "GetBytes", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString | kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Encoding", "GetBytes", 2, 2, 0x03, {"s", "destination", "", "", "", "", "", ""}, {kBPTString | kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Encoding", "GetString", 1, 1, 0x01, {"bytes", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Encoding", "GetByteCount", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString | kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, ""},
     // fix #7207-fold (stdlib §3.1, v0.345): the §3.1 `StringBuilder`
     // surface lives HERE — in the ONE declared-signature table — and not in
     // a second parallel table. Before the fold these six rows carried only
@@ -708,6 +708,21 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     // reason — §3.1 declares exactly one `Insert` form too, but #6807's own
     // dedicated check already rejects a non-`string` value there, and two
     // diagnostics for one argument would be noise.
+    // fix #8005 (stdlib §3.1, v0.350): `Append`'s VALUE position keeps NO
+    // type opinion, for a reason of its own: stdlib §3.1 declares SEVEN
+    // `Append` overloads (`string` / `char` / `Object` / `bool` / the
+    // numeric primitives / `ReadOnlyStringSpan`), and the §3.1 member gate
+    // (`ExprTC::checkBuiltinStringBuilderCall`, src/sema/ExprTypecheck_Calls.cpp)
+    // can express exactly ONE declared type at a position (its own reading
+    // is "the kind is `int` -> `int`, anything else -> `string`"). A bit set
+    // here would make that gate read `string` and REFUSE the six other
+    // declared overloads -- measured on this tip: `sb.Append(5)`,
+    // `sb.Append('c')` and `sb.Append(true)` became compile errors, and
+    // the project's own regression test (fix #7420,
+    // tests/sema/stringbuilder_appendline_value_type_7420_test.cpp) requires
+    // every one of them to stay ADMITTED. The position's NULLABILITY is
+    // transcribed (0x01 — stdlib §3.1 declares `value: string`, not
+    // `string?`), which is what the §7 gate reads.
     {"StringBuilder", "Append", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Append(value: string): StringBuilder"},
     {"StringBuilder", "AppendLine", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(): StringBuilder"},
     {"StringBuilder", "AppendLine", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(value: string): StringBuilder"},
@@ -736,8 +751,8 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     {"Math", "Sign", 1, 1, 0x01, {"x", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Math", "Fmod", 2, 2, 0x03, {"x", "y", "", "", "", "", "", ""}, {kBPTDouble, kBPTDouble, 0, 0, 0, 0, 0, 0}, "Fmod(x: double, y: double): double"},
     {"Math", "IEEERemainder", 2, 2, 0x03, {"x", "y", "", "", "", "", "", ""}, {kBPTDouble, kBPTDouble, 0, 0, 0, 0, 0, 0}, "IEEERemainder(x: double, y: double): double"},
-    {"Math", "DivRem", 3, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Math", "DivRem", 3, 2, 0x00, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "DivRem", 3, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Math", "DivRem", 3, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Convert", "ToInt32", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToInt32(value: string): int"},
     {"Convert", "ToInt64", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToInt64(value: string): long"},
     {"Convert", "ToDouble", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "ToDouble(value: string): double"},
@@ -793,17 +808,22 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     {"StringBuilder", "", 1, 1, 0x01, {"capacity", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"StringBuilder", "", 1, 1, 0x01, {"initial", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"ReadOnlyStringSpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
-    {"ExceptionInfo", "", 3, 3, 0x00, {"TypeName", "Message", "StackTrace", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ExceptionInfo", "", 3, 3, 0x07, {"TypeName", "Message", "StackTrace", "", "", "", "", ""}, {kBPTString, kBPTString, kBPTString, 0, 0, 0, 0, 0}, ""},
     {"Span", "", 3, 3, 0x00, {"Buffer", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
     {"ReadOnlySpan", "", 3, 3, 0x00, {"Buffer", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
     {"ArraySpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
     {"ReadOnlyArraySpan", "", 3, 3, 0x00, {"Source", "Start", "Length", "", "", "", "", ""}, {0, kBPTInt, kBPTInt, 0, 0, 0, 0, 0}, ""},
+    // fix #6893 (stdlib §4.4, v0.340): the `Array<T>` capacity position is
+    // checked by the DEDICATED `Array<T>` constructor check (the one that
+    // compares the argument with `int`), so this row keeps NO type opinion:
+    // a second, table-driven test would draw a SECOND diagnostic for the
+    // same argument ("one diagnostic per call" — §17.7's discipline).
     {"Array", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Array", "", 2, 2, 0x00, {"size", "fill", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"OwningArray", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"OwningBuffer", "", 1, 1, 0x00, {"length", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"OwningBuffer", "", 2, 2, 0x00, {"length", "init", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"LinkedList", "", 1, 1, 0x00, {"source", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"LinkedList", "", 1, 1, 0x01, {"source", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     // fix #7958 (§5.1, §22.6, stdlib §4.8/§4.9/§4.10, v0.350): the hash
     // collections' CAPACITY rows carry their DECLARED TYPE (`capacity: int`).
     // They carried none (`kBPTAny`), and a position whose kind is 0 in ANY
@@ -829,21 +849,21 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     {"OwningSet", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"OwningSet", "", 1, 1, 0x00, {"comparer", "", "", "", "", "", "", ""}, {kBPTComparer, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"OwningSet", "", 2, 2, 0x00, {"capacity", "comparer", "", "", "", "", "", ""}, {kBPTInt, kBPTComparer, 0, 0, 0, 0, 0, 0}, ""},
-    {"Shared", "", 1, 1, 0x00, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Shared", "", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Random", "", 1, 1, 0x00, {"seed", "", "", "", "", "", "", ""}, {kBPTLong, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Semaphore", "", 1, 1, 0x00, {"initialCount", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Semaphore", "", 2, 2, 0x00, {"initialCount", "maxCount", "", "", "", "", "", ""}, {kBPTInt, kBPTInt, 0, 0, 0, 0, 0, 0}, ""},
     {"Channel", "", 1, 1, 0x00, {"capacity", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Exception", "", 2, 2, 0x00, {"message", "cause", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"ArgumentException", "", 2, 2, 0x00, {"message", "paramName", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"ArgumentOutOfRangeException", "", 2, 2, 0x00, {"message", "paramName", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"TimeoutException", "", 2, 2, 0x00, {"message", "inner", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"FileStream", "", 2, 2, 0x00, {"path", "mode", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"FileStream", "", 3, 3, 0x00, {"path", "mode", "access", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"JsonSerializer", "", 1, 1, 0x00, {"options", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"JsonDeserializer", "", 1, 1, 0x00, {"input", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"JsonDeserializer", "", 2, 2, 0x00, {"input", "options", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"BinaryDeserializer", "", 2, 1, 0x00, {"input", "ignoreUnknownFields", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Exception", "", 2, 2, 0x03, {"message", "cause", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"ArgumentException", "", 2, 2, 0x03, {"message", "paramName", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, ""},
+    {"ArgumentOutOfRangeException", "", 2, 2, 0x03, {"message", "paramName", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, ""},
+    {"TimeoutException", "", 2, 2, 0x03, {"message", "inner", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"FileStream", "", 2, 2, 0x03, {"path", "mode", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"FileStream", "", 3, 3, 0x07, {"path", "mode", "access", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"JsonSerializer", "", 1, 1, 0x01, {"options", "", "", "", "", "", "", ""}, {kBPTJsonOptions, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"JsonDeserializer", "", 1, 1, 0x01, {"input", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"JsonDeserializer", "", 2, 2, 0x03, {"input", "options", "", "", "", "", "", ""}, {0, kBPTJsonOptions, 0, 0, 0, 0, 0, 0}, ""},
+    {"BinaryDeserializer", "", 2, 1, 0x03, {"input", "ignoreUnknownFields", "", "", "", "", "", ""}, {0, kBPTBool, 0, 0, 0, 0, 0, 0}, ""},
     {"SByte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: string): sbyte"},
     {"SByte", "Parse", 1, 1, 0x00, {"s", "", "", "", "", "", "", ""}, {kBPTSpan, 0, 0, 0, 0, 0, 0, 0}, "Parse(s: ReadOnlyStringSpan): sbyte"},
     {"SByte", "Parse", 2, 2, 0x00, {"s", "radix", "", "", "", "", "", ""}, {kBPTString, kBPTInt, 0, 0, 0, 0, 0, 0}, "Parse(s: string, radix: int): sbyte"},
@@ -1091,12 +1111,12 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     // CancellationToken.None` — OPTIONAL — so the two-argument form requires
     // ONE argument and the three-argument form requires TWO. The `required`
     // column is the declared MINIMUM, not the arity.
-    {"File", "ReadAllTextAsync", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllTextAsync", 2, 1, 0x01, {"path", "token", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllTextAsync", 2, 2, 0x03, {"path", "contents", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllTextAsync", 3, 2, 0x03, {"path", "contents", "token", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Environment", "GetInt", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Environment", "GetBool", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllTextAsync", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllTextAsync", 2, 1, 0x03, {"path", "token", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllTextAsync", 2, 2, 0x03, {"path", "contents", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllTextAsync", 3, 2, 0x07, {"path", "contents", "token", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "GetInt", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "GetBool", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
     // fix #6812 (§7.3, v0.340; stdlib §2.4 v0.344): the REST of stdlib §2.4's
     // `Environment` surface. `Get(name: string): string?` and
     // `Set(name: string, value: string?)` declare their FIRST parameter
@@ -1104,19 +1124,19 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     // reaches no candidate there either (§7.3). `Set`'s SECOND parameter is
     // declared `string?` — nullable — so only position 0 is non-nullable
     // (`Environment.Set("A", null)` stays legal).
-    {"Environment", "Get", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Environment", "Set", 2, 2, 0x01, {"name", "value", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "Get", 1, 1, 0x01, {"name", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "Set", 2, 2, 0x01, {"name", "value", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, ""},
     // fix #7933 (stdlib §2.4, v0.350): the two remaining `Environment` METHODS,
     // so the static class's arity surface is closed by the table:
     // `Variables(): owned Dictionary<string, string>` and `Exit(exitCode: int)`.
     {"Environment", "Variables", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Environment", "Exit", 1, 1, 0x00, {"exitCode", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Environment", "Exit", 1, 1, 0x01, {"exitCode", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, ""},
     // fix #6812 (§7.3, v0.340; stdlib §10.1 / §10.2 v0.344): the FFI-boundary
     // string factories. `CString.From(s: string): owned CString` and
     // `WString.From(s: string): owned WString` declare their parameter
     // non-nullable, so `CString.From(null)` reaches no candidate (§7.3).
-    {"CString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"WString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"CString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"WString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
     // fix #7982 (stdlib §7.3, §7.4, §22.5, v0.350): the DECLARED PARAMETER
     // NAMES of the SYNCHRONOUS `File` / `Directory` members, transcribed from
     // the standard library's own listing:
@@ -1147,30 +1167,30 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     // compiler cannot lower (the async arms do not lower at all today), so
     // they keep the loud "named arguments are not supported on this built-in
     // member" refusal.
-    {"File", "ReadAllText", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllText", 2, 2, 0x03, {"path", "contents", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllBytes", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllBytes", 2, 2, 0x01, {"path", "contents", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllLines", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllLines", 2, 2, 0x01, {"path", "lines", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Exists", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Delete", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Copy", 3, 3, 0x03, {"source", "destination", "overwrite", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Move", 2, 2, 0x03, {"source", "destination", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Exists", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "CreateDirectory", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Delete", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Delete", 2, 1, 0x01, {"path", "recursive", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "GetFiles", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "GetDirectories", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "Combine", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetFileName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetFileNameWithoutExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetDirectoryName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Path", "GetFullPath", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"TextWriter", "Write", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"TextWriter", "WriteLine", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllText", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllText", 2, 2, 0x03, {"path", "contents", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllBytes", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllBytes", 2, 2, 0x03, {"path", "contents", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllLines", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllLines", 2, 2, 0x03, {"path", "lines", "", "", "", "", "", ""}, {kBPTString, kBPTEnumerableString, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Exists", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Delete", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Copy", 3, 3, 0x07, {"source", "destination", "overwrite", "", "", "", "", ""}, {kBPTString, kBPTString, kBPTBool, 0, 0, 0, 0, 0}, ""},
+    {"File", "Move", 2, 2, 0x03, {"source", "destination", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Exists", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "CreateDirectory", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Delete", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Delete", 2, 1, 0x03, {"path", "recursive", "", "", "", "", "", ""}, {kBPTString, kBPTBool, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "GetFiles", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "GetDirectories", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "Combine", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFileName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFileNameWithoutExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetDirectoryName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Path", "GetFullPath", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"TextWriter", "Write", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTString | kBPTChar | kBPTObject | kBPTBool | kBPTInt | kBPTByte | kBPTSByte | kBPTShort | kBPTUShort | kBPTUInt | kBPTLong | kBPTULong | kBPTFloat | kBPTDouble | kBPTDecimal, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"TextWriter", "WriteLine", 1, 0, 0x01, {"", "", "", "", "", "", "", ""}, {kBPTString | kBPTObject | kBPTBool | kBPTInt | kBPTByte | kBPTSByte | kBPTShort | kBPTUShort | kBPTUInt | kBPTLong | kBPTULong | kBPTFloat | kBPTDouble | kBPTDecimal, 0, 0, 0, 0, 0, 0, 0}, ""},
 }};
 
 

@@ -778,6 +778,20 @@ enum BuiltinParamType : std::uint32_t {
     // it), which is what the `comparer` overload needs: it is diagnosed
     // by codegen's own deferral (fix #2722), not by the conversion table.
     kBPTComparer         = 1u << 21,  // `IEqualityComparer<T>`
+    // fix #8005 (stdlib §2.15, §5.1, v0.350): the `JsonOptions` record of
+    // the JSON agents' constructor surface — a NAMED (record) type, and the
+    // only bit the vocabulary needed for the `JsonSerializer` /
+    // `JsonDeserializer` constructors' `options` position.
+    //
+    // The bit is safe WHERE IT IS USED: on a CONSTRUCTOR row of a head the
+    // §5.1 admission gate (`ExprTC::checkBuiltinCtorArgTypes`) owns. The
+    // MEMBER admission gate (`ExprTC::builtinArgAdmitsKind`, in
+    // `ExprTypecheck_Calls.cpp`) reads the same bit set and admits a bit it
+    // does not know by NAME only, so a new bit on a MEMBER row would REFUSE
+    // every legal argument at that position. The §2.5 temporal records' MEMBER
+    // positions (stdlib `DateTime.Add(span: TimeSpan)` and the rest) are
+    // therefore NOT transcribed with a bit — see the table's own comment.
+    kBPTJsonOptions      = 1u << 22,  // `JsonOptions`
 };
 
 // ONE declared form of a built-in member or constructor, read out of the ONE
