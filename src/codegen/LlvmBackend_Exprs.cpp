@@ -6247,6 +6247,37 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     return builder_.CreateCall(fn, {cts}, "cts.token.prop");
                 }
             }
+            // fix #7925 (stdlib §2.15, v0.350): the five component reads of the
+            // built-in `JsonOptions` value record (`o.Indented`, `o.IndentWidth`,
+            // `o.AllowTrailingCommas`, `o.IgnoreUnknownFields`, `o.MaxDepth`).
+            // The value is the `bz.json_options` struct `new JsonOptions(...)`
+            // builds ({i1, i32, i1, i1, i32}, field order = declaration order);
+            // a read is the matching `extractvalue`. No read was lowered, so
+            // `Console.WriteLine(o.IndentWidth)` failed to lower (#3079).
+            if (cn == "JsonOptions") {
+                unsigned idx = ~0u;
+                if      (ma->member == "Indented")             idx = 0;
+                else if (ma->member == "IndentWidth")          idx = 1;
+                else if (ma->member == "AllowTrailingCommas")  idx = 2;
+                else if (ma->member == "IgnoreUnknownFields")  idx = 3;
+                else if (ma->member == "MaxDepth")             idx = 4;
+                if (idx != ~0u) {
+                    // Only the bare record value. A nullable `JsonOptions?`
+                    // box ({i8, bz.json_options}) is NOT unwrapped here: sema
+                    // has no gate rejecting an un-narrowed read, so a payload
+                    // extract would turn a possibly-null box into a silent
+                    // wrong value (see `unwrapNarrowedNullableOperand`'s
+                    // soundness precondition). It keeps its prior behavior,
+                    // and the target is not lowered here so nothing is
+                    // evaluated twice on the fall-through.
+                    if (tt && !tt->nullable) {
+                        llvm::Value* ov = lowerExpr(*ma->target);
+                        if (!ov) return nullptr;
+                        return builder_.CreateExtractValue(ov, {idx},
+                                                           "jopt.field");
+                    }
+                }
+            }
             // stdlib §6.10 (v0.175, #808): TaskScope.Token property read —
             // the scope's internal CancellationToken (borrowed cell pointer).
             if (cn == "TaskScope" && ma->member == "Token") {
