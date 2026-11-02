@@ -10,6 +10,7 @@ normative for the language. `CLAUDE.md` holds the rules and wins over every file
 | [`peer-contract.md`](peer-contract.md) | a peer coordinator, before its first dispatch | the work loop, handback fields, messaging, gate drain and limits for a pool run under an integrator |
 | [`coordinator-runbook.md`](coordinator-runbook.md) | the integrator before a gate or a pool; anyone who needs a rule's reason | the procedures, and the incident evidence behind each rule |
 | [`templates/peer-brief.md`](templates/peer-brief.md) | the integrator, when briefing a peer | the run-specific slots of a peer brief; everything else is in `peer-contract.md` |
+| [`templates/harvest-brief.md`](templates/harvest-brief.md) | the integrator, when briefing a harvest lane | the slots of a harvest brief and the eight-point per-case self-check; everything else is in the runbook |
 
 A brief, for a lane, a reviewer or a peer, carries only what is specific to its assignment and points to its
 contract for the rest. When a rule is learned during a run, add it to the contract it belongs in,

@@ -947,7 +947,9 @@ including detached children.
 
 ### Harvest review probes into the corpus
 
-*Added 2026-10-21 (R34), at the owner's request, after the same lapse happened twice.*
+*Added 2026-10-21 (R34), at the owner's request, after the same lapse happened twice. Revised
+2026-11-02: the R37 per-case self-check, the effort tier and the 60-case cap, after R37's H9 and
+H10 were both rejected.*
 
 Reviewers and producers write dozens of probe programs per fix: base/tip matrices,
 over-rejection sweeps, looped ASan shapes. Left in a scratch directory, they guard nothing.
@@ -958,9 +960,21 @@ Turned into conformance cases, they run at every gate. The owner asked for this 
   directories (the reviewer's harvest list and the producer's handback name them; both live under
   `/var/tmp/bezel-scratch/`) to `harvest.tsv`, beside the run's `claims.tsv`, in the same turn as
   the pick. A peer does the same when it hands an ACCEPT to the integrator. Once the queue holds
-  4–6 picks, and always before the gate, dispatch a harvest lane: a producer at the run's default
-  tier, taking a pool slot, with scope `tests/conformance/rules/cases/` plus the derived
+  4–6 picks, and always before the gate, dispatch a harvest lane: a producer at **Sonnet with
+  effort HIGH**, taking a pool slot, with scope `tests/conformance/rules/cases/` plus the derived
   `manifest.tsv`.
+- **The harvest list is a file, not a paragraph.** The reviewer writes a structured `harvest.tsv`
+  row per probe — probe, kind, expected, §, quoted sentence, SHA — and the harvest lane globs
+  those files for the picked SHAs. A prose list in the handback is a transcription step, and the
+  R34 handbacks carried prose lists: between 05:41 and 15:20 on 2026-10-22, about 27 picks went
+  by with nothing queued. Reviewers do NOT author corpus rows themselves: those rows would be
+  unreviewed, and many writers to `baseline.tsv` and `manifest.tsv` collide.
+- **Size and effort.** Dispatch a harvest lane at **Sonnet with effort HIGH**. A harvest lane
+  ordinarily writes **60 cases or fewer**, and the coordinator may set a higher number for a lane
+  when a review has turned up a genuinely under-tested area and the probes show it — say so in the
+  brief. What the size guards against is a batch large enough that one bad helper class silently
+  poisons dozens of cases: in H10, one bad helper class reached 32. Raise the number deliberately,
+  never by default.
 - **Verdicts come from the spec.** Each case quotes the sentence that decides it, with section and
   revision. Write the case from the document and triage any disagreement with the compiler as
   `tests/conformance/rules/README.md` *What to do with the divergences* says: class 1 (the
@@ -970,6 +984,16 @@ Turned into conformance cases, they run at every gate. The owner asked for this 
   Run `corpus.py audit` on the base and on the branch: the branch adds no twin group the base
   lacks. `corpus.py lint` reports 0 problems. A matrix of 1000+ cells is not harvested as cases;
   open an issue proposing a generator instead.
+- **Every case passes a per-case self-check before the lane commits.** The eight points are in
+  [`templates/harvest-brief.md`](templates/harvest-brief.md): the `rule:` is a verbatim excerpt
+  (grep it, record the line number); the verdict is hand-traced against the cited sentence and
+  never copied from a compiler run; every helper is spec-legal on its own, so the case has no
+  second error ground; no host-defined behaviour is asserted; the case is not vacuous; a RED row's
+  issue is OPEN and describes that exact divergence; only stdlib names that exist are used; and a
+  reject fires at the single intended site, with its accepting twin compiling. The lane records the
+  checks per case in a `selfcheck.txt` under its scratch directory and quotes that path in the
+  handback. Effort is not a substitute for the checks: R37's H9 and H10 were both REJECTED, H10
+  with 45 of 116 cases bad, and both were dispatched at Sonnet with default effort.
 - **Manifest and baseline.** The harvest commit carries its regenerated `manifest.tsv`
   (`corpus.py build`, as `AUTHORING.md` says), so `corpus.py check` passes on the branch. Two
   harvest lanes are never in flight at once, so the derived file cannot conflict. Banking
@@ -980,7 +1004,13 @@ Turned into conformance cases, they run at every gate. The owner asked for this 
 
 **Lapses.** R30 (2026-10-15): about 20 reviewed fixes were picked without one harvest lane, and the
 owner had to ask. R34 (2026-10-21): 4 picks again went without one, and the owner asked again. In
-both runs the rule lived only in a memory file, so this section and CLAUDE.md now state it.
+both runs the rule lived only in a memory file, so this section and CLAUDE.md now state it. R37
+(2026-10-29): the rule was now in the repo, and the harvests still failed — H9 and H10 were both
+REJECTED, H10 with 45 of its 116 cases bad. The rule said what to harvest; it did not say how to
+write a case, so the defects were authoring defects: an invented `rule:`, an expected output
+copied from a rejected fix's tip, a spec-illegal shared fixture, a host-defined stdout order, a
+vacuous shadowing case, a RED row citing the wrong issue. Hence the self-check, the effort tier
+and the cap, and hence the brief's committed copy rather than a scratch one.
 
 ### Commits
 
