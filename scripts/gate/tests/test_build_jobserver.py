@@ -17,6 +17,7 @@ Everything runs in a TemporaryDirectory; nothing touches the production pool.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -222,19 +223,55 @@ class StatusCommandTest(DaemonTestBase):
     status's first line is) must report `held` and a freshly-measured
     `clang` count on the SAME line, so an orchestrator heartbeat can compare
     the two at a glance instead of correlating held against a possibly-stale
-    samples.tsv column."""
+    samples.tsv column.
 
-    def test_live_daemon_reports_held_and_clang_on_one_line(self):
+    r38-i1-jobserver: `held` is now the OBSERVED count (the pool size minus
+    the FIFO occupancy), so the field lost its `~` -- the old `held~` was a
+    guess about how many tokens a make held, and it was wrong whenever a
+    build was not running at its peak concurrency. The field was RENAMED and
+    the line gained the launcher split (`tok_held`/`tok_wait`), the joined
+    build count (`builds`) and the effective cap (`jobs`); the assertion below
+    was updated to the new names and STRENGTHENED with the invariant
+    available + held == tokens."""
+
+    def _status_line(self):
         r = subprocess.run([sys.executable, SCRIPT, "status", "--dir", self.dir],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertRegex(r.stdout, r"held~\d+")
-        self.assertRegex(r.stdout, r"clang=\d+")
+        return next(l for l in r.stdout.splitlines()
+                    if l.startswith("build_jobserver:"))
+
+    def test_live_daemon_reports_held_and_clang_on_one_line(self):
+        line = self._status_line()
+        self.assertRegex(line, r"held=\d+")
+        self.assertRegex(line, r"clang=\d+")
         # Both fields on the SAME line — not one in "held" and the other only
         # reachable via a separate samples.tsv row.
-        line = next(l for l in r.stdout.splitlines() if l.startswith("build_jobserver:"))
-        self.assertRegex(line, r"held~\d+")
         self.assertRegex(line, r"clang=\d+")
+
+    def test_held_is_the_observed_difference_not_a_guess(self):
+        line = self._status_line()
+        fields = dict(re.findall(r"(\w+)=(\S+)", line))
+        avail = int(fields["available"])
+        held = int(fields["held"])
+        tokens = int(fields["tokens"])
+        self.assertEqual(avail + held, tokens,
+                         "held must be the observed pool size minus the FIFO "
+                         "occupancy")
+        # The old guess field must be gone: `held~` was an estimate, and the
+        # tilde is what made it read as "roughly this many".
+        self.assertNotIn("held~", line)
+
+    def test_reports_the_launcher_split_and_the_build_cap(self):
+        line = self._status_line()
+        self.assertRegex(line, r"tok_held=\d+")
+        self.assertRegex(line, r"tok_wait=\d+")
+        self.assertRegex(line, r"builds=\d+")
+        fields = dict(re.findall(r"(\w+)=(\S+)", line))
+        self.assertEqual(int(fields["jobs"]),
+                         int(fields["tokens"]) + int(fields["builds"]),
+                         "the box-wide cap is N tokens + one implicit slot "
+                         "per joined build")
 
     def test_no_daemon_reports_no_live_daemon_and_fails(self):
         with tempfile.TemporaryDirectory() as empty:

@@ -16,6 +16,15 @@
 #
 # Match on `ps -eo comm=` with fixed strings instead: a name is a name.
 #
+# THIS COUNTS PROCESSES; THE JOBSERVER ROW COUNTS TOKENS. The two are not
+# evidence of each other (r38-i1-jobserver). A lane's test-suite run shows
+# many "builders" here (bezel_tests, bezelc) while the jobserver row shows 20
+# available tokens at the same time, and that is CORRECT: a suite run holds no
+# tokens, only compiles and links do. Conversely a build wave can hold 20
+# tokens while this script counts the compile processes it can see. Read the
+# two rows as "are processes running" and "is the token pool drained", never
+# as one contradicting the other.
+#
 # A RUNNING GATE'S OWN PROCESSES ARE NOT INTRUDERS. run_status.sh (and every
 # heartbeat) calls this while a gate runs, to catch a lane building DURING the
 # gate. Counting the gate's own suite binaries and ASan links there flagged

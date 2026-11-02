@@ -37,9 +37,26 @@
 #
 # Why 20 tokens: the heavy slice has ~18 cores, and every joined build keeps
 # one implicit job on top of the shared tokens, so 20 tokens with a handful of
-# concurrent builds runs ~22–26 compiles: enough to keep the cores busy, far
+# concurrent builds runs ~22-26 compiles: enough to keep the cores busy, far
 # below the 100+ that throttled the box in R20. Lower it if MemAvailable
 # still dips under ~6G; raising it buys little (the cores are the ceiling).
+#
+# The status line is the operator's window into the pool, and every field on
+# it is OBSERVED (r38-i1-jobserver):
+#   available  the tokens physically in the FIFO (FIONREAD) — the pool's
+#              occupancy, and the ground truth.
+#   held       pool size minus that occupancy: the tokens checked OUT. It was
+#              a guess before ("held~": a joined make with k children was
+#              assumed to hold k-1 tokens), which was wrong whenever a build
+#              was not running at its peak concurrency and made the daemon
+#              mint a token that was really held.
+#   tok_held   launcher processes holding one token each (a job with a slot).
+#   tok_wait   launcher processes QUEUED for a token (a job waiting for one).
+#   builds     joined make/ninja holders; each keeps one implicit job slot.
+#   jobs       the box-wide cap: N tokens + one implicit slot per build.
+# So "the pool is drained and the excess is queued" is visible as
+# available=0 tok_held=20 tok_wait=10, and a build that is running only its
+# implicit slot is visible as available=20 held=0 builds=1 jobs=21.
 #
 # With no daemon running, dev_heavy.sh builds exactly as before (private -jN);
 # gate.sh always opts out (BEZEL_JOBSERVER=off). Stopping the daemon while
@@ -133,7 +150,7 @@ case "${1:-status}" in
   status)
     python3 "$js" status --dir "$dir" || exit 1
     if [ -f "$dir/samples.tsv" ]; then
-      echo "last audits (epoch available held makes clang mem_avail_mb repaired launchers):"
+      echo "last audits (epoch available held tok_held tok_wait builds build_jobs clang mem_avail_mb repaired):"
       tail -n 5 "$dir/samples.tsv"
     fi
     ;;

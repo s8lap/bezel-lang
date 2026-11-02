@@ -168,6 +168,15 @@ MemAvailable ≥11G where uncapped fell to 4.9G, but took ~40% longer each).
 Lanes must build through `dev_heavy.sh`/`agent_check.sh` and must NOT add their
 own "wait until fewer than K builds" gate on top: a hand-rolled gate that other
 lanes ignore starved one lane for 70 min in R20.
+**The cap is `N + #builds`, not `N`** (r38-i1-jobserver): every joined build
+keeps ONE implicit job slot — the slot its first job runs in, without taking
+a token — so the box can run 20 tokens PLUS one job per joined build. That is
+why a one-TU relink never queues behind a cold build, and it is why the
+coordinator caps COLD builds at TWO: two cold builds plus 20 tokens is already
+22 concurrent compiles, and every extra cold build adds another implicit slot
+on top of the same cores. A CMake build nests several `make` levels and each
+level keeps its own implicit slot, so `builds` in the status line counts make
+PROCESSES (a nested CMake build shows 4–9), not build PROJECTS.
 Two layers enforce this since 2026-09-30, when a coordinator's lane briefs said
 `cmake --build build --target bezel_tests_sema -j` (unlimited `make -j`, outside
 `dev_heavy.sh`): 499 clang, and the OOM killer took three Claude sessions and
@@ -207,6 +216,45 @@ hook, re-copy it to BOTH `~/.claude/hooks/bezel_build_guard.py` and
 `/mnt/fast/wt-jobserver21`) needs `BEZEL_JOBSERVER_ALLOW_WORKTREE=1`. The unit name is
 `bezel-jobserver` for the default token dir, and `bezel-jobserver-<hash8>` for any other
 `BEZEL_JOBSERVER_DIR` (override with `BEZEL_JOBSERVER_UNIT`, #4990).
+
+**Reading the jobserver status line** (r38-i1-jobserver). Every field is
+OBSERVED — the daemon used to report a GUESS (`held~`: "a joined make with k
+children holds k-1 tokens"), which was wrong whenever a build was not running
+at its peak concurrency: a build running its LAST job holds one token with one
+child, the guess read that as zero, and the daemon minted a token that was
+really held (the pool went to 21, one compile over the cap) and then drained
+the surplus again. Measured on the production pool, `samples.tsv` rows 9961-9963:
+`available` 19 → 21 → 21, `repaired` +1 then -1, with a compile in flight the
+whole time. The line now reads:
+
+```
+build_jobserver: available=0 held=20 tok_held=20 tok_wait=10 builds=1 jobs=21 clang=25 tokens=20 pid=… fifo=…
+```
+
+| field | meaning |
+|---|---|
+| `available` | tokens physically in the FIFO (`FIONREAD`) — the pool's occupancy, the ground truth |
+| `held` | pool size − `available`: the tokens checked OUT (negative ⇒ the FIFO holds more than the pool: a surplus) |
+| `tok_held` | launcher processes holding one token each (a job that HAS a slot) |
+| `tok_wait` | launcher processes QUEUED for a token (a job waiting for one) |
+| `builds` | joined `make`/`ninja` processes holding the FIFO; each keeps one implicit job slot |
+| `jobs` | the box-wide cap: `N + builds` |
+| `clang` | live compiler processes, measured at the same instant (a `clang` far above `held`+`builds` is the leak signature) |
+
+So "the tokens are actually being used" is VISIBLE: 30 concurrent compile jobs
+read as `available=0 tok_held=20 tok_wait=10` — the pool drained and the
+excess queued — and a build running only its implicit slot reads as
+`available=20 held=0 builds=1 jobs=21` (the pool is idle, but a build is
+running; those are different facts and the line now says which). The audit
+re-mints a token only when the shortfall is PROVABLE — nobody can be holding
+it: no launcher holds it and no joined build could be holding it — and drains
+one only when the FIFO itself holds more than the whole pool. The regression
+test is `scripts/gate/tests/test_build_jobserver_accounting.py`; it fails
+against the pre-fix daemon (`BEZEL_JOBSERVER_SCRIPT=<pre-fix copy>` proves it).
+⚠ The daemon is a long-running systemd unit started from the MAIN checkout:
+after a change to `scripts/build_jobserver.py` lands there, the coordinator
+must `systemctl --user restart bezel-jobserver` — the running daemon keeps
+executing the code it was started with.
 
 **Producer/fix lanes: build+test your change with `scripts/agent_check.sh`.** It
 is the single, opinionated entry-point that encodes the correct lane protocol so

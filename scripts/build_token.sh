@@ -43,6 +43,12 @@
 # like a token lost by a killed make. The FIFO and slot descriptors are closed
 # for the job itself, so no compiler ever holds a token.
 #
+# Those two states are what the daemon's status line reports (r38-i1-jobserver):
+# `tok_held` counts the jobs that HOLD a token and `tok_wait` the jobs QUEUED
+# for one, so a wave of compiles reads as "the pool is drained and the excess
+# is queued" (available=0 tok_held=20 tok_wait=10) instead of a single
+# undifferentiated launcher count.
+#
 # Cost: covered jobs (case 2) exec straight through after a few /proc reads
 # with no fork; cases 3 and 4 add one bash process per running or queued job.
 set -u
@@ -134,8 +140,19 @@ if _daemon_ok; then
   if [ -n "${_fd:-}" ]; then
     _release() {
       if [ -n "${_fd:-}" ]; then
-        _set_comm bzl-tok-done
+        # Put the token BACK before flipping the comm (r38-i1-jobserver).
+        # The daemon reads the pool as "tokens in the FIFO" minus "tokens the
+        # launchers hold", so the order of these two steps decides which way a
+        # transient reads. Flipping the comm first left a window in which the
+        # token was out of the FIFO and no launcher was counted as holding it:
+        # a deficit nobody could account for, which the daemon answered by
+        # minting a token that was really held (the pool went to N+1, one
+        # compile more than the cap). Writing the token back first makes the
+        # window read the other way -- the launcher is briefly counted as
+        # holding a token that is already back in the pool -- which costs
+        # nothing and can never inflate the pool.
         printf '%s' "$_tok" >&"$_fd" 2>/dev/null
+        _set_comm bzl-tok-done
         exec {_fd}>&-
         _fd=
       fi

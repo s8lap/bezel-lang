@@ -21,27 +21,60 @@ GNU make >= 4.4 joins an existing FIFO jobserver through
 line makes it start a private pool instead, which is why `dev_heavy.sh` strips
 -j when it routes a build here). Ninja >= 1.13 honours the same variable.
 
-Two properties the FIFO needs that plain `mkfifo` does not give:
-  * A pipe's buffered tokens are destroyed when the last descriptor closes, so a
-    holder process must keep it open -> `serve` holds it O_RDWR for its lifetime.
+THE ACCOUNTING (r38-i1-jobserver, 2026-11-03).  Two properties the FIFO needs
+that plain `mkfifo` does not give:
+
+  * A pipe's buffered tokens are destroyed when the last descriptor closes, so
+    a holder process must keep it open -> `serve` holds it O_RDWR for its
+    lifetime.
   * make returns tokens on a normal exit but NOT when it is SIGKILLed (a lane
     stopped mid-build, a cage OOM-kill). Lost tokens would shrink the pool
-    forever -> `serve` audits every --interval seconds: for each process holding
-    the FIFO, a make with k running children holds k-1 tokens; if the pool is
-    short of N minus that sum on --confirm consecutive audits, it writes the
-    difference back. It never tops the pool above N.
+    forever -> `serve` audits every --interval seconds and re-mints the
+    difference. It never tops the pool above N.
   * Jobs of a build that did NOT join (a bare `make -j`, `ninja -j64`) take
     their token through scripts/build_token.sh, the compile/link launcher
     CMakeLists.txt installs. That launcher holds the FIFO open under the comm
-    `bzl-tok-held` while it holds one token (`bzl-tok-wait` / `bzl-tok-done`
-    while it holds none); the audit counts it, and a pool with only launchers
-    in it is busy, not idle. `serve` publishes `features` ("launcher1 <pid>")
-    so the launcher can tell this daemon from an older one that would re-mint
-    launcher-held tokens as a leak.
+    `bzl-tok-held` while it holds one token (`bzl-tok-wait` while it waits,
+    `bzl-tok-done` while it hands it back); the audit counts it, and a pool
+    with only launchers in it is busy, not idle. `serve` publishes `features`
+    ("launcher1 <pid>") so the launcher can tell this daemon from an older
+    one that would re-mint launcher-held tokens as a leak.
+
+Everything the daemon reports is now an OBSERVED quantity, never a guess:
+
+  available  the tokens physically in the FIFO (FIONREAD). THE ground truth
+             for "how many tokens are in the pool".
+  held       tokens - available: the tokens checked OUT of the pool. Every
+             token is either in the FIFO or in somebody's hand, so the
+             difference is exact. THIS USED TO BE A GUESS: the daemon assumed
+             a joined make holding k children holds k-1 tokens, which is only
+             true while the build runs at its peak concurrency. A build
+             running its LAST job holds ONE token with ONE child, which the
+             guess read as zero, so the daemon saw a deficit, minted a token
+             that was really held (the pool went to N+1) and then drained the
+             surplus again. Measured on the production pool: audit rows
+             9961-9963 of samples.tsv (available 19 -> 21 -> 21, repaired +1
+             then -1) with a compile in flight (clang=1).
+  tok_held   launcher processes that hold one token each (comm `bzl-tok-held`).
+  tok_wait   launcher processes queued for a token (comm `bzl-tok-wait`).
+  builds     joined make/ninja processes holding the FIFO. Each keeps ONE
+             implicit job slot, so the box-wide cap is N + builds. A CMake
+             build nests several make levels and each level has its own
+             implicit slot; a plain `make` build has one.
+  build_jobs the running jobs under the joined builds.
+
+The audit re-mints a token only when the deficit is PROVABLE: the pool is
+short by more than the launchers hold AND more than any joined build could be
+holding (one token per running job, plus one per build for the window in
+which a build has read a token and not yet forked its child). Otherwise the
+shortfall belongs to a build that is still running, and minting on it is
+exactly the bug this rewrite removes. The audit drains a token only when the
+FIFO itself holds MORE than the whole pool (available > N), which is a fact
+about the FIFO rather than a guess about holders.
 
 Subcommands:
   serve [--tokens N] [--dir D] [--interval S] [--confirm K]
-  status [--dir D]            one line: tokens, holders, estimate, daemon pid
+  status [--dir D]            one line: pool state, holder census, daemon pid
   alive  [--dir D]            exit 0 iff a live daemon serves D (dev_heavy uses it)
   rewrite-args -- ARGS...     print ARGS minus -j/--parallel forms, NUL-separated
 
@@ -61,6 +94,7 @@ import stat
 import sys
 import termios
 import time
+from typing import NamedTuple
 
 DEFAULT_DIR = os.environ.get("BEZEL_JOBSERVER_DIR", "/var/tmp/bezel-scratch/jobserver")
 TOKEN = b"+"
@@ -69,8 +103,10 @@ FEATURES = "launcher1"
 BUILD_TOOLS = ("make", "gmake", "ninja", "ninja-build")
 LAUNCHER_PREFIX = "bzl-tok-"
 LAUNCHER_HOLDING = "bzl-tok-held"
-SAMPLES_HEADER = ("epoch\tavailable\texpected_held\tmakes\tclang\t"
-                  "mem_avail_mb\trepaired\tlaunchers\n")
+LAUNCHER_WAITING = "bzl-tok-wait"
+LAUNCHER_DONE = "bzl-tok-done"
+SAMPLES_HEADER = ("epoch\tavailable\theld\ttok_held\ttok_wait\tbuilds\t"
+                  "build_jobs\tclang\tmem_avail_mb\trepaired\n")
 
 
 def _read(path: str) -> str:
@@ -84,9 +120,31 @@ def _paths(d: str) -> dict[str, str]:
 
 
 def available_tokens(fd: int) -> int:
+    """The tokens physically in the FIFO. THE ground truth for the pool.
+
+    FIONREAD on a FIFO is the number of bytes queued for reading, and one
+    token is one byte, so this is the pool's occupancy exactly -- no inference
+    about who holds what."""
     buf = array.array("i", [0])
     fcntl.ioctl(fd, termios.FIONREAD, buf)
     return buf[0]
+
+
+def _fifo_avail(fifo: str) -> int:
+    """`available_tokens` for a caller that has no descriptor open."""
+    fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        return available_tokens(fd)
+    finally:
+        os.close(fd)
+
+
+def pool_size(fifo: str) -> int:
+    """N: the pool size the daemon published (dir/tokens)."""
+    try:
+        return int(_read(os.path.join(os.path.dirname(fifo), "tokens")))
+    except (OSError, ValueError):
+        return 0
 
 
 def _fifo_holders(fifo: str, self_pid: int) -> list[int]:
@@ -136,28 +194,59 @@ def _comm(pid: int) -> str:
         return ""
 
 
-def expected_outstanding(fifo: str, self_pid: int) -> tuple[int, int, int]:
-    """(tokens the holders should be holding, make/ninja holders, launchers).
+class Observation(NamedTuple):
+    """What the daemon can SEE. Every field is measured, none is inferred."""
+    available: int    # tokens physically in the FIFO (FIONREAD)
+    held: int        # tokens - available: the tokens checked OUT of the pool
+    builds: int      # joined make/ninja processes holding the FIFO
+    build_jobs: int  # running jobs under those builds
+    launchers: int   # launcher processes (holding + waiting + handing back)
+    tok_held: int    # launchers holding one token each
+    tok_wait: int    # launchers queued for a token
 
-    A make running k children holds k-1 tokens (one child uses its implicit
-    slot). A build_token.sh launcher holds one token while its comm is
-    `bzl-tok-held` and none while it waits or hands it back. Other holders
-    (e.g. a `status` probe) hold none."""
-    held = 0
-    makes = 0
-    launchers = 0
+
+def observe(fifo: str, self_pid: int, avail: int | None = None,
+            tokens: int | None = None) -> Observation:
+    """Measure the pool and its holders.
+
+    `avail` and `tokens` can be passed in by a caller that already has the
+    FIFO open (the daemon's audit loop) so the two are read as close together
+    as possible."""
+    if avail is None:
+        avail = _fifo_avail(fifo)
+    if tokens is None:
+        tokens = pool_size(fifo)
+    tok_held = tok_wait = builds = build_jobs = launchers = 0
     for pid in _fifo_holders(fifo, self_pid):
         comm = _comm(pid)
-        # Fedora installs ninja as `ninja-build`; an unrecognised holder's
-        # tokens read as a leak and get re-minted (R22: pool unbounded).
+        # Fedora installs ninja as `ninja-build`.
         if comm in BUILD_TOOLS:
-            makes += 1
-            held += max(0, _children_count(pid) - 1)
+            builds += 1
+            build_jobs += _children_count(pid)
         elif comm.startswith(LAUNCHER_PREFIX):
             launchers += 1
             if comm == LAUNCHER_HOLDING:
-                held += 1
-    return held, makes, launchers
+                tok_held += 1
+            elif comm == LAUNCHER_WAITING:
+                tok_wait += 1
+            # LAUNCHER_DONE: handing the token back; it holds nothing.
+    return Observation(available=avail, held=tokens - avail, builds=builds,
+                       build_jobs=build_jobs, launchers=launchers,
+                       tok_held=tok_held, tok_wait=tok_wait)
+
+
+def expected_outstanding(fifo: str, self_pid: int) -> tuple[int, int, int]:
+    """(tokens checked out of the pool, joined build tools, launcher processes).
+
+    COMPAT SHIM, kept because the token-launcher tests call it. This used to
+    return a GUESS: a joined make with k children was assumed to hold k-1
+    tokens. That is only true while the build runs at its peak concurrency; a
+    build running its last job holds one token with one child, which the
+    guess read as zero -- and the daemon then minted a token that was really
+    held. The count is now the OBSERVED one (pool size minus the FIFO
+    occupancy), which is exact."""
+    obs = observe(fifo, self_pid)
+    return obs.held, obs.builds, obs.launchers
 
 
 def _count_procs(names: tuple[str, ...]) -> int:
@@ -226,80 +315,71 @@ def serve(d: str, tokens: int, interval: float, confirm: int) -> int:
     log = open(p["samples.tsv"], "a", buffering=1)
     if last_header != SAMPLES_HEADER:
         log.write(SAMPLES_HEADER)
-    streak: list[int] = []   # per-audit deficits while the pool looks short
-    surplus_streak: list[int] = []  # per-audit surpluses while it looks over-full
-    idle_audits = 0
+    streak: list[int] = []       # per-audit deficits of tokens NOBODY holds
+    surplus_streak: list[int] = []  # per-audit surpluses of tokens in the FIFO
     try:
         while not stop:
             time.sleep(interval)
-            # A make that has read a token but not yet forked its child looks
-            # like a leak for a moment. Take the MINIMUM deficit over a few
-            # quick sub-samples, and repair only the minimum that persisted
-            # across `confirm` consecutive audits: a transient never inflates
-            # the pool, a real leak (it never comes back) is repaired.
-            # A surplus (pool OVER-full) is real only if it persists: take it
-            # as the minimum over the same sub-samples (the maximum d_k). The
-            # /proc scan is not an atomic snapshot, so a single sample can
-            # skew either way; make itself reaps a child before releasing its
-            # token, so the zombie window reads as a deficit, not a surplus.
-            deficit = None
-            dmax = None
+            # A holder that has just taken a token flips its comm a few
+            # microseconds later (the launcher) and a build that has read a
+            # token forks its child a few milliseconds later, so a single
+            # sample can read as a deficit that is not one. Take the MINIMUM
+            # claimed deficit over a few quick sub-samples, and repair only
+            # the minimum that persisted across `confirm` consecutive audits:
+            # a transient never inflates the pool, a real leak (it never comes
+            # back) is repaired.
+            #
+            # The claimed deficit is `held - tok_held - (build_jobs + builds)`:
+            # the tokens checked out of the pool, minus the ones the launchers
+            # demonstrably hold, minus the most the joined builds could be
+            # holding (one token per running job, plus one per build for the
+            # window in which a build has read a token and not yet forked).
+            # What is left is PROVABLY lost: no holder can be holding it.
+            unaccounted = None
+            surplus = None
+            obs = None
+            avail = tokens
             for k in range(5):
                 if k:
                     time.sleep(0.05)
                 avail = available_tokens(fd)
-                held, makes, launchers = expected_outstanding(p["fifo"], os.getpid())
-                d_k = tokens - avail - held  # >0: tokens nobody holds
-                deficit = d_k if deficit is None else min(deficit, d_k)
-                dmax = d_k if dmax is None else max(dmax, d_k)
+                obs = observe(p["fifo"], os.getpid(), avail=avail, tokens=tokens)
+                u = obs.held - obs.tok_held - (obs.build_jobs + obs.builds)
+                s = avail - tokens
+                unaccounted = u if unaccounted is None else min(unaccounted, u)
+                surplus = s if surplus is None else max(surplus, s)
             repaired = 0
-            if makes == 0 and launchers == 0:
-                # Idle: the pool must hold exactly N. Restore it both ways
-                # (a lost token, or an over-return) once idle is confirmed.
-                streak.clear()
-                surplus_streak.clear()
-                idle_audits += 1
-                if idle_audits >= 2 and avail != tokens:
-                    if avail < tokens:
-                        repaired = tokens - avail
+            if unaccounted > 0:
+                streak.append(unaccounted)
+                if len(streak) >= confirm:
+                    repaired = max(0, min(min(streak), tokens - available_tokens(fd)))
+                    if repaired:
                         os.write(fd, TOKEN * repaired)
-                    else:
+                    streak.clear()
+            else:
+                streak.clear()
+            # Over-full while busy: a daemon restarted under live builds
+            # publishes a fresh N while the old holders still return theirs,
+            # so the FIFO ends up holding more than the whole pool. That is a
+            # fact about the FIFO (available > N), not a guess about holders,
+            # so it can be drained: the bytes in the FIFO are free tokens.
+            if surplus > 0:
+                surplus_streak.append(surplus)
+                if len(surplus_streak) >= confirm:
+                    want = min(min(surplus_streak), available_tokens(fd) - tokens)
+                    if want > 0:
                         try:
-                            repaired = -len(os.read(fd, avail - tokens))
+                            repaired -= len(os.read(fd, want))
                         except BlockingIOError:
                             pass
-            else:
-                idle_audits = 0
-                if deficit > 0:
-                    streak.append(deficit)
-                    if len(streak) >= confirm:
-                        repaired = max(0, min(min(streak), tokens - available_tokens(fd)))
-                        if repaired:
-                            os.write(fd, TOKEN * repaired)
-                        streak.clear()
-                else:
-                    streak.clear()
-                # Over-full while busy: a daemon restarted under live builds
-                # publishes a fresh N while the old holders still return
-                # theirs, so the box would run N + (held) jobs until the next
-                # idle moment, which a long wave may never reach. Drain the
-                # confirmed surplus; never try to read more than is in the pipe.
-                if dmax < 0:
-                    surplus_streak.append(-dmax)
-                    if len(surplus_streak) >= confirm:
-                        want = min(min(surplus_streak), available_tokens(fd))
-                        if want > 0:
-                            try:
-                                repaired = -len(os.read(fd, want))
-                            except BlockingIOError:
-                                pass
-                        surplus_streak.clear()
-                else:
                     surplus_streak.clear()
+            else:
+                surplus_streak.clear()
             log.write(
-                f"{int(time.time())}\t{avail}\t{held}\t{makes}\t"
+                f"{int(time.time())}\t{avail}\t{obs.held}\t{obs.tok_held}\t"
+                f"{obs.tok_wait}\t{obs.builds}\t{obs.build_jobs}\t"
                 f"{_count_procs(('clang', 'clang++', 'cc1plus'))}\t"
-                f"{_mem_available_kb() // 1024}\t{repaired}\t{launchers}\n"
+                f"{_mem_available_kb() // 1024}\t{repaired}\n"
             )
     finally:
         # features first: a launcher must never see it without a live pid.
@@ -339,28 +419,33 @@ def status(d: str) -> int:
     if not alive(d):
         print(f"build_jobserver: no live daemon for {d}")
         return 1
-    fd = os.open(p["fifo"], os.O_RDONLY | os.O_NONBLOCK)
-    try:
-        avail = available_tokens(fd)
-    finally:
-        os.close(fd)
-    held, makes, launchers = expected_outstanding(p["fifo"], os.getpid())
+    obs = observe(p["fifo"], os.getpid())
     n = _read(p["tokens"])
     pid = _read(p["pid"])
+    # The pool's own state comes first and in this order, because
+    # `run_status.sh` shows the first 80 characters of this line and the
+    # operator reads it there:
+    #   available  tokens physically in the FIFO (the pool's occupancy)
+    #   held       tokens checked OUT of the pool (pool size - occupancy)
+    #   tok_held   launchers holding a token each (a job that has a slot)
+    #   tok_wait   launchers queued for a token (a job waiting for a slot)
+    #   builds     joined make/ninja holders, each with ONE implicit job slot
+    #   jobs       the box-wide cap: N + builds
     # `clang` is measured HERE, synchronously, not read back from the
     # daemon's periodic samples.tsv (which can be up to --interval stale and
     # sits several lines below in the "last audits" table `jobserver_ctl.sh
     # status` tails). Printing it on the SAME line as `held` is the point: an
-    # orchestrator heartbeat (or a human) can compare the two at a glance —
-    # `held` says how many tokens the pool THINKS are checked out, `clang`
-    # says how many compiler processes actually exist system-wide — without
-    # having to correlate a TSV column against this line by hand. A large,
-    # persistent gap between them (clang far above held + #makes) is the
-    # leak signature this field exists to make visible immediately.
+    # orchestrator heartbeat (or a human) can compare the two at a glance --
+    # `held` says how many tokens are checked out, `clang` says how many
+    # compiler processes actually exist system-wide -- without having to
+    # correlate a TSV column against this line by hand. A large, persistent
+    # gap between them (clang far above held + #builds) is the leak signature
+    # this field exists to make visible immediately.
     clang = _count_procs(("clang", "clang++", "cc1plus"))
-    print(f"build_jobserver: pid={pid} tokens={n} available={avail} "
-          f"held~{held} makes={makes} launchers={launchers} clang={clang} "
-          f"fifo={p['fifo']}")
+    print(f"build_jobserver: available={obs.available} held={obs.held} "
+          f"tok_held={obs.tok_held} tok_wait={obs.tok_wait} "
+          f"builds={obs.builds} jobs={int(n) + obs.builds} "
+          f"clang={clang} tokens={n} pid={pid} fifo={p['fifo']}")
     return 0
 
 
