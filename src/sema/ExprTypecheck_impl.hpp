@@ -5023,7 +5023,10 @@ private:
     // of the by-name built-ins (DateTime, TimeSpan, DateOnly, TimeOnly, Guid,
     // Random, StringBuilder), asked for every receiver spelling.
     std::string_view builtinClosedRecordHead(const ast::Expr* target);
-    bool anyExtensionDeclaresMemberNamed(std::string_view name);
+    bool anyExtensionAppliesToBuiltin(const TypeRef* recv,
+                                      std::string_view head,
+                                      std::string_view name,
+                                      bool* importedBlockApplies = nullptr);
     std::string builtinClosedRecordMemberReason(const ast::Expr* target,
                                                 std::string_view mbr);
     void checkBuiltinClosedRecordMember(const ast::MemberAccessExpr& ma,

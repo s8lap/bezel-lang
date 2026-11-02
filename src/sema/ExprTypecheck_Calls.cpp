@@ -636,7 +636,8 @@ std::string builtinRecordSurfaceReason(std::string_view head,
                "`: stdlib \xC2\xA7" + std::string(s.section) +
                " (v0.350) declares `" + h + "` with a closed member "
                "surface and `" + m + "` is not on it, no \xC2\xA7""26.5 "
-               "extension declares a member named `" + m + "`, and the "
+               "extension block whose head applies to `" + h + "` declares "
+               "a member named `" + m + "`, and the "
                "universal `ToString`/`Equals`/`GetHashCode`/`GetType` "
                "(\xC2\xA7""8.1) are its only other members";
     }
@@ -28158,6 +28159,12 @@ std::string_view ExprTC::builtinClosedRecordHead(const ast::Expr* target) {
         return {};
     };
     if (!target) return {};
+    // fix #7951 (§2.3, v0.309): a bare head the visitor already refused as
+    // ambiguous with an imported public (fix #5140) is not "the built-in"; a
+    // second "no member" error on the same access would only cascade.
+    if (const auto* id = dynamic_cast<const ast::IdentifierExpr*>(target))
+        if (ambiguousAlwaysAvailableNames_.count(std::string(id->name)))
+            return {};
     if (const TypeRef* t = ctx_.exprType(*target)) return headOfType(t);
     Symbol* sym = ctx_.exprSymbol(*target);
     if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
@@ -28171,28 +28178,6 @@ std::string_view ExprTC::builtinClosedRecordHead(const ast::Expr* target) {
                 return headOfType(ctx_.resolvedType(*ad->aliasedType));
     }
     return {};
-}
-
-// fix #7661 (§26.5, v0.350): does ANY extension block in scope (this module's,
-// or one an import carries) declare a member named `name`? Deliberately
-// coarser than §26.5's applicability: the closed-surface check below must
-// never claim "no §26.5 extension declares it" about a name some block does
-// declare, whatever that block's target — an `extension TimeSpan` or
-// `extension Object` member is not dispatched on every built-in receiver
-// today, and that gap is not this check's to turn into a "no member" error.
-bool ExprTC::anyExtensionDeclaresMemberNamed(std::string_view name) {
-    auto declares = [&](const ExtensionSymbol* e) {
-        for (const Symbol* m : e->members)
-            if (m && m->name == name) return true;
-        return false;
-    };
-    if (ctx_.module())
-        for (Symbol* c : ctx_.module()->children)
-            if (auto* e = dynamic_cast<ExtensionSymbol*>(c))
-                if (declares(e)) return true;
-    for (const ExtensionSymbol* e : importedExtensions_)
-        if (e && declares(e)) return true;
-    return false;
 }
 
 // fix #7661: the reason a member access on a by-name built-in receiver names
@@ -28215,7 +28200,22 @@ std::string ExprTC::builtinClosedRecordMemberReason(const ast::Expr* target,
                "compiler, so a read is refused rather than degraded to a "
                "zero value";
     std::string reason = builtinRecordSurfaceReason(head, mbr);
-    if (reason.empty() || anyExtensionDeclaresMemberNamed(mbr)) return {};
+    if (reason.empty()) return {};
+    // fix #7951 (§26.5 rule 2, v0.350): only an extension block whose head
+    // is applicable to this receiver excuses the name.
+    bool importedBlockApplies = false;
+    if (anyExtensionAppliesToBuiltin(target ? ctx_.exprType(*target) : nullptr,
+                                     head, mbr, &importedBlockApplies))
+        return {};
+    // An extension PROPERTY an imported module declares on a built-in head is
+    // not carried across the module boundary today (the exporter classifies
+    // the null-declaration head as a resolution-only shape and ships no
+    // property body; see the importer's extension-property carriage), so this
+    // check cannot see it. Say so rather than claim the name is undeclared.
+    if (importedBlockApplies)
+        reason += "; an extension property that an imported module declares "
+                  "on a built-in type is not visible to this compiler, so "
+                  "it cannot be read here";
     return reason;
 }
 

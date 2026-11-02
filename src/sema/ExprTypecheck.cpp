@@ -14095,6 +14095,80 @@ static const TypeRef* stdlibLinqApplicableAncestor(
     return nullptr;
 }
 
+// fix #7951 (§26.5 rule 2, v0.350): does any extension block in scope (this
+// module's, or one an import carries) that declares a member named `name`
+// have a head APPLICABLE to a receiver of the by-name built-in `head` --
+// §26.5 rule 2's "x's type, base types, or implemented interfaces": the
+// built-in itself, `Object`, or an interface it implements? The closed-surface
+// check of #7661 (`builtinClosedRecordMemberReason`) uses it to decide whether
+// an undeclared member name may still be an extension's. A block whose head
+// is another type (`extension int { property Shared }`) is no candidate for
+// a `Random` receiver and does not excuse `random.Shared`.
+//
+// `recv` is the receiver's TypeRef when the access has one (a value), null for
+// a type-name receiver (`Random.Shared`). The applicability predicate is
+// `extensionFindMatchingAncestor`, the one `lookupExtensionMember` uses. Two
+// head spellings are admitted by NAME on top of it, so this predicate errs
+// only toward "applicable" (a refusal must never claim an applicable block
+// absent): the built-in's own name, whichever TypeRef shape a receiver carries
+// (a by-name call result carries `builtinClassSym`, an annotation a null
+// declaration, and the matcher compares those two shapes as unequal), and
+// `Object`, which the matcher reaches only for a user-declared receiver.
+bool ExprTC::anyExtensionAppliesToBuiltin(const TypeRef* recv,
+                                          std::string_view head,
+                                          std::string_view name,
+                                          bool* importedBlockApplies) {
+    std::vector<std::unique_ptr<TypeRef>> owned;
+    auto applies = [&](const ExtensionSymbol* e) {
+        auto* decl = dynamic_cast<const ast::ExtensionDecl*>(e->decl);
+        if (!decl || !decl->targetType) return false;
+        const TypeRef* target = ctx_.resolvedType(*decl->targetType);
+        if (!target) return false;
+        if (target->kind == TypeRef::Kind::Primitive &&
+            target->primitive == PrimitiveType::Object)
+            return true;
+        if (target->kind == TypeRef::Kind::Named &&
+            namedTypeSimpleName(target) == head)
+            return true;
+        // The interfaces the by-name built-ins implement (stdlib §2.5, §2.6:
+        // `: IComparable<Self>, IEquatable<Self>` on the time values and
+        // Guid; Random and StringBuilder implement none). The generic
+        // matcher below knows only the collection built-ins' hierarchy.
+        if (target->kind == TypeRef::Kind::Named &&
+            (head == "DateTime" || head == "TimeSpan" || head == "DateOnly" ||
+             head == "TimeOnly" || head == "Guid") &&
+            (namedTypeSimpleName(target) == "IComparable" ||
+             namedTypeSimpleName(target) == "IEquatable"))
+            return true;
+        if (!recv) return false;
+        std::unordered_set<std::string_view> freeVars;
+        for (const auto& gc : decl->genericConstraints)
+            freeVars.insert(gc.typeParam);
+        return extensionFindMatchingAncestor(target, recv, freeVars, owned) !=
+               nullptr;
+    };
+    auto declares = [&](const ExtensionSymbol* e) {
+        for (const Symbol* m : e->members)
+            if (m && m->name == name) return true;
+        return false;
+    };
+    if (ctx_.module())
+        for (Symbol* c : ctx_.module()->children)
+            if (auto* e = dynamic_cast<ExtensionSymbol*>(c))
+                if (declares(e) && applies(e)) return true;
+    for (const ExtensionSymbol* e : importedExtensions_) {
+        if (!e) continue;
+        const bool ap = applies(e);
+        if (ap && declares(e)) return true;
+        // An imported block that applies to the receiver but lists no member
+        // of the name: the caller words its refusal for that case (an
+        // extension PROPERTY an import declares on a built-in head does not
+        // cross the module boundary today, so this check cannot see it).
+        if (ap && importedBlockApplies) *importedBlockApplies = true;
+    }
+    return false;
+}
+
 Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
