@@ -17391,6 +17391,66 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         return sobj;
     };
 
+    // fix #7982 (§22.5, v0.350): the §22.5 BINDING of a NAMED argument at a
+    // `File` / `Directory` member call.
+    //
+    // §22.5: "Each supplied argument binds exactly one parameter ... naming
+    // an argument changes which parameter it binds to, never when it runs."
+    // Sema binds the names correctly — the registry carries the DECLARED
+    // parameter names (stdlib §7.3 `File`, §7.4 `Directory`) — and PUBLISHES
+    // the binding (`ExprTC::checkBuiltinNamedArgs` ->
+    // `SemaContext::setBuiltinCallBinding`). An arm that reads `call.args[i]`
+    // POSITIONALLY ignores that binding, so a reordered named call hands each
+    // parameter the value of a DIFFERENT parameter:
+    // `File.Copy(destination := DST, source := SRC, overwrite := true)` copied
+    // DST over SRC and DESTROYED THE SOURCE — the #3398/#3423 wrong-answer
+    // class this fixes.
+    //
+    // `fsParamSrc(p)` is the SOURCE argument index bound to PARAMETER `p`, or
+    // -1 when the parameter takes its DEFAULT (the call omits it). A call with
+    // no published binding (a positional call, or a named call already in
+    // DECLARATION order — the identity permutation, which sema does not
+    // publish) keeps the positional read byte for byte.
+    const auto* fsBnd = ctx_.builtinCallBinding(call);
+    auto fsParamSrc = [&](std::size_t p) -> int {
+        if (fsBnd && p < fsBnd->size()) {
+            const int ai = (*fsBnd)[p];
+            if (ai < 0) return -1;  // the parameter takes its default
+            if (static_cast<std::size_t>(ai) < call.args.size()) return ai;
+            return -1;
+        }
+        if (p < call.args.size()) return static_cast<int>(p);
+        return -1;  // the call omits the parameter: it takes its default
+    };
+    // Lower the supplied arguments into PARAMETER order, evaluating the
+    // expressions in CALL-SITE TEXTUAL order (§22.5's evaluation-order rule:
+    // "the supplied argument expressions are evaluated in call-site textual
+    // order - left to right as written, for positional and named arguments
+    // alike"). `srcIdx[p]` is the source argument of PARAMETER `p` (-1: the
+    // parameter takes its default, and `out[p]` stays null).
+    auto fsLowerByParam = [&](const std::vector<int>& srcIdx,
+                              std::vector<llvm::Value*>& out) -> bool {
+        const std::size_t n = srcIdx.size();
+        out.assign(n, nullptr);
+        std::vector<bool> done(n, false);
+        for (std::size_t step = 0; step < n; ++step) {
+            // The parameter whose source argument comes next in TEXTUAL order.
+            std::size_t best = n;
+            for (std::size_t p = 0; p < n; ++p) {
+                if (done[p] || srcIdx[p] < 0) continue;
+                if (best == n || srcIdx[p] < srcIdx[best]) best = p;
+            }
+            if (best == n) break;
+            const std::size_t s = static_cast<std::size_t>(srcIdx[best]);
+            if (s >= call.args.size() || !call.args[s].value) return false;
+            llvm::Value* v = lowerExpr(*call.args[s].value);
+            if (!v) return false;
+            out[best] = v;
+            done[best] = true;
+        }
+        return true;
+    };
+
     if (cls == "File") {
         if (m == "Exists" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* s = lowerExpr(*call.args[0].value);
@@ -17425,8 +17485,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         if (m == "WriteAllText" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* path = lowerExpr(*call.args[0].value);
-            llvm::Value* text = lowerExpr(*call.args[1].value);
+            // fix #7982 (§22.5, v0.350): `path` and `contents` are PARAMETERS
+            // — a named argument binds the parameter it NAMES, so each
+            // parameter's value comes from the published §22.5 binding.
+            std::vector<llvm::Value*> v;
+            if (!fsLowerByParam({fsParamSrc(0), fsParamSrc(1)}, v))
+                return nullptr;
+            llvm::Value* path = v[0];
+            llvm::Value* text = v[1];
             if (!path || !text) return nullptr;
             auto [td, tl] = loadBzString(text);
             auto* fn = declareC("bz_file_write_all_text", i32(),
@@ -17435,8 +17501,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         if (m == "AppendAllText" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* path = lowerExpr(*call.args[0].value);
-            llvm::Value* text = lowerExpr(*call.args[1].value);
+            std::vector<llvm::Value*> v;
+            if (!fsLowerByParam({fsParamSrc(0), fsParamSrc(1)}, v))
+                return nullptr;
+            llvm::Value* path = v[0];
+            llvm::Value* text = v[1];
             if (!path || !text) return nullptr;
             auto [td, tl] = loadBzString(text);
             auto* fn = declareC("bz_file_append_all_text", i32(),
@@ -17476,11 +17545,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // ~line 483) and `GetString` (fix #3889, LlvmBackend_Calls2.cpp).
         if (m == "WriteAllBytes" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* pathStr = lowerExpr(*call.args[0].value);
-            llvm::Value* contents = lowerExpr(*call.args[1].value);
+            // fix #7982 (§22.5, v0.350): `path` and `contents` are PARAMETERS
+            // — a named argument binds the parameter it NAMES.
+            std::vector<llvm::Value*> v;
+            if (!fsLowerByParam({fsParamSrc(0), fsParamSrc(1)}, v))
+                return nullptr;
+            llvm::Value* pathStr = v[0];
+            llvm::Value* contents = v[1];
             if (!pathStr || !contents) return nullptr;
             llvm::Value* pathC = strToPath(pathStr);
-            const sema::TypeRef* contentsTy = ctx_.exprType(*call.args[1].value);
+            const int contentsSrc = fsParamSrc(1);
+            const sema::TypeRef* contentsTy =
+                contentsSrc >= 0
+                    ? ctx_.exprType(*call.args[static_cast<std::size_t>(
+                                        contentsSrc)].value)
+                    : nullptr;
             if (contents->getType()->isStructTy() &&
                 isSpanLikeTypeName(contentsTy)) {
                 // Span arg: extract bz_array_t* source, byte start, length.
@@ -17513,19 +17592,33 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // In practice callers pass Array<string> (bz_array_t* of bz_string*).
         if (m == "WriteAllLines" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* path = lowerExpr(*call.args[0].value);
-            llvm::Value* arr  = lowerExpr(*call.args[1].value);
+            // fix #7982 (§22.5, v0.350): `path` and `lines` are PARAMETERS —
+            // a named argument binds the parameter it NAMES.
+            std::vector<llvm::Value*> v;
+            if (!fsLowerByParam({fsParamSrc(0), fsParamSrc(1)}, v))
+                return nullptr;
+            llvm::Value* path = v[0];
+            llvm::Value* arr  = v[1];
             if (!path || !arr) return nullptr;
             auto* fn = declareC("bz_file_write_all_lines", i32(),
                                 {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {strToPath(path), arr});
         }
         // §7.3: File.Copy(source, destination, overwrite: bool).
+        //
+        // fix #7982 (§22.5, v0.350): `source`, `destination` and `overwrite`
+        // are PARAMETERS — a named argument binds the parameter it NAMES. Read
+        // positionally, `File.Copy(destination := DST, source := SRC,
+        // overwrite := true)` copied DST over SRC and DESTROYED THE SOURCE.
         if (m == "Copy" && call.args.size() == 3 &&
             call.args[0].value && call.args[1].value && call.args[2].value) {
-            llvm::Value* src  = lowerExpr(*call.args[0].value);
-            llvm::Value* dst  = lowerExpr(*call.args[1].value);
-            llvm::Value* over = lowerExpr(*call.args[2].value);
+            std::vector<llvm::Value*> v;
+            if (!fsLowerByParam({fsParamSrc(0), fsParamSrc(1), fsParamSrc(2)},
+                                v))
+                return nullptr;
+            llvm::Value* src  = v[0];
+            llvm::Value* dst  = v[1];
+            llvm::Value* over = v[2];
             if (!src || !dst || !over) return nullptr;
             auto* fn = declareC("bz_file_copy", i32(),
                                 {ptrTy(), ptrTy(), i1()});
@@ -17534,8 +17627,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // §7.3: File.Move(source, destination).
         if (m == "Move" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
-            llvm::Value* src = lowerExpr(*call.args[0].value);
-            llvm::Value* dst = lowerExpr(*call.args[1].value);
+            // fix #7982 (§22.5, v0.350): `source` and `destination` are
+            // PARAMETERS — a named argument binds the parameter it NAMES.
+            std::vector<llvm::Value*> v;
+            if (!fsLowerByParam({fsParamSrc(0), fsParamSrc(1)}, v))
+                return nullptr;
+            llvm::Value* src = v[0];
+            llvm::Value* dst = v[1];
             if (!src || !dst) return nullptr;
             auto* fn = declareC("bz_file_move", i32(), {ptrTy(), ptrTy()});
             return builder_.CreateCall(fn, {strToPath(src), strToPath(dst)});
@@ -17555,14 +17653,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             return builder_.CreateCall(fn, {strToPath(s)});
         }
         if (m == "Delete" && call.args.size() >= 1 && call.args[0].value) {
-            llvm::Value* s = lowerExpr(*call.args[0].value);
+            // fix #7982 (§22.5, v0.350): §7.4 declares
+            // `Delete(path: string, recursive: bool := false)` — `path` and
+            // `recursive` are PARAMETERS, so a named argument binds the
+            // parameter it NAMES: `Directory.Delete(recursive := true, path :=
+            // P)` deletes P. Read positionally it passed the BOOLEAN as the
+            // path, and the emitted IR failed verification.
+            std::vector<llvm::Value*> v;
+            if (!fsLowerByParam({fsParamSrc(0), fsParamSrc(1)}, v))
+                return nullptr;
+            llvm::Value* s = v[0];
             if (!s) return nullptr;
             // Second arg: recursive (bool), default false
             llvm::Value* recursive = builder_.getFalse();
-            if (call.args.size() >= 2 && call.args[1].value) {
-                llvm::Value* r = lowerExpr(*call.args[1].value);
-                if (r) recursive = r;
-            }
+            if (v[1]) recursive = v[1];
             auto* fn = declareC("bz_dir_delete", i32(), {ptrTy(), i1()});
             return builder_.CreateCall(fn, {strToPath(s), recursive});
         }

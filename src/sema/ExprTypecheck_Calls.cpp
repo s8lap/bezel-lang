@@ -16342,8 +16342,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          "WriteAllLines(path, IEnumerable<string>), "
                          "WriteAllTextAsync(path, contents, "
                          "token := CancellationToken.None), "
-                         "Exists(path), Delete(path), Copy(source, dest, "
-                         "overwrite), Move(source, dest)",
+                         "Exists(path), Delete(path), Copy(source, "
+                         "destination, overwrite), Move(source, destination)",
                          "7.3"},
                         // §7.4 Directory — 5 method names (Delete is two
                         // arities; one entry covers both).
@@ -23482,6 +23482,44 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
     }
     const std::string what = "argument to `" + std::string(head) + "." +
                              std::string(member) + "`";
+    // fix #7982 (§7 / §7.3 / §22.5, v0.350): the heads whose NAMED argument
+    // is checked at the POSITION THE NAME BINDS TO.
+    //
+    // The §7 gate reads a position by the argument's INDEX, so it SKIPS a
+    // named argument wherever the compiler honours the name — and it may only
+    // do that where a check at the BOUND position exists. `Math` and
+    // `Convert` have one (`checkBuiltinMathConvertCallArgs`); `File` and
+    // `Directory` did NOT, so honouring the name there LOST the §7
+    // diagnostic: `File.Exists(path := null)` compiled clean where the
+    // positional spelling `File.Exists(null)` is refused, and the program
+    // SEGFAULTED (exit 139) on the `null` path. The check below is that
+    // replacement: the same `reportBuiltinArgIfNullable`, asked at the
+    // parameter the name binds to.
+    //
+    // `Path` carries the SAME hole from #7732 (its head is in the named-arg
+    // table and no bound-position check exists for it). That is a PRE-EXISTING
+    // gap, filed separately; it is deliberately NOT widened here.
+    const bool boundPositionNullability =
+        (head == "File" || head == "Directory");
+    // The §22.5 BINDING, established LOCALLY over the registry's declared
+    // names (the published binding is not available here — it is published at
+    // the END of `typeCall`), exactly as `checkBuiltinMathConvertCallArgs`
+    // does. PARAMETER index -> SOURCE argument index.
+    std::vector<int> paramToArg;
+    if (anyNamed && namesHonoured && boundPositionNullability) {
+        for (const auto& cand : common::builtinParamNameCandidates(
+                 head, member, ce.args.size())) {
+            BindResult br = bindArgsToParams(
+                sema::FormalsView::ofNames(cand.names, cand.required), ce.args,
+                ce.span.begin,
+                "call to built-in `" + std::string(head) + "." +
+                    std::string(member) + "`",
+                /*emit=*/false);
+            if (!br.ok) continue;  // not this overload's binding
+            paramToArg = br.paramToArg;
+            break;
+        }
+    }
     for (std::size_t i = 0; i < ce.args.size(); ++i) {
         const auto& a = ce.args[i];
         // A named argument binds by name, not position, WHERE THE COMPILER
@@ -23491,8 +23529,28 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
         // position.
         if (!a.value || a.isDiscard || !a.modifier.empty())
             continue;
-        if (!a.name.empty() && namesHonoured)
+        if (!a.name.empty() && namesHonoured) {
+            if (!boundPositionNullability) continue;
+            // The PARAMETER this argument binds to (§22.5): the index the
+            // binder paired it with. A call that binds no candidate (an
+            // unknown name, a doubly-bound parameter, an unbound required
+            // parameter) leaves the binding empty — `checkBuiltinNamedArgs`
+            // reports that violation, and this gate keeps out of its way.
+            int boundParam = -1;
+            for (std::size_t p = 0; p < paramToArg.size(); ++p)
+                if (paramToArg[p] == static_cast<int>(i)) {
+                    boundParam = static_cast<int>(p);
+                    break;
+                }
+            if (boundParam < 0) continue;
+            if (!common::builtinParamIsNonNullable(head, member, ce.args.size(),
+                                                   static_cast<std::size_t>(
+                                                       boundParam)))
+                continue;
+            reportBuiltinArgIfNullable(a.value.get(), what);
+            publishNarrowedBuiltinArg(a.value.get());
             continue;
+        }
         if (!common::builtinParamIsNonNullable(head, member, ce.args.size(),
                                                i))
             continue;

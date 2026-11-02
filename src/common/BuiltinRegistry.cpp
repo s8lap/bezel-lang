@@ -1104,22 +1104,52 @@ constexpr std::array<BuiltinParamRow, 355> kBuiltinParams = {{
     // non-nullable, so `CString.From(null)` reaches no candidate (§7.3).
     {"CString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"WString", "From", 1, 1, 0x01, {"s", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllText", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllText", 2, 2, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllBytes", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllBytes", 2, 2, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "ReadAllLines", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "WriteAllLines", 2, 2, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Exists", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Delete", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Copy", 3, 3, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"File", "Move", 2, 2, 0x03, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Exists", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "CreateDirectory", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Delete", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "Delete", 2, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "GetFiles", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
-    {"Directory", "GetDirectories", 1, 1, 0x01, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    // fix #7982 (stdlib §7.3, §7.4, §22.5, v0.350): the DECLARED PARAMETER
+    // NAMES of the SYNCHRONOUS `File` / `Directory` members, transcribed from
+    // the standard library's own listing:
+    //
+    //   §7.3 `File`: ReadAllText(path), WriteAllText(path, contents),
+    //        ReadAllBytes(path), WriteAllBytes(path, contents),
+    //        ReadAllLines(path), WriteAllLines(path, lines), Exists(path),
+    //        Delete(path), Copy(source, destination, overwrite),
+    //        Move(source, destination).
+    //   §7.4 `Directory`: Exists(path), CreateDirectory(path),
+    //        Delete(path, recursive := false), GetFiles(path),
+    //        GetDirectories(path).
+    //
+    // stdlib §1 makes the parameter names API surface ("parameter names are
+    // API surface (named arguments, spec §22.5)"), so a named argument to
+    // these members binds to the parameter it NAMES (§22.5) — and a name the
+    // member does not declare is refused. The `nonNullable` column already
+    // carried these rows' §7.3 nullability; the NAMES are what was missing,
+    // so the §22.5 binder had nothing to match a name against and every
+    // argument bound POSITIONALLY — `File.Copy(destination := DST, source :=
+    // SRC, overwrite := true)` copied DST over SRC and DESTROYED THE SOURCE
+    // (the #3398/#3423 wrong-answer class).
+    //
+    // The ASYNC members (`ReadAllTextAsync(path, token := ...)`,
+    // `WriteAllTextAsync(path, contents, token := ...)`) carry NO row: their
+    // declared surface is the async one, and a row with names would make
+    // `checkBuiltinNamedArgs` honour a named argument at a position the
+    // compiler cannot lower (the async arms do not lower at all today), so
+    // they keep the loud "named arguments are not supported on this built-in
+    // member" refusal.
+    {"File", "ReadAllText", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllText", 2, 2, 0x03, {"path", "contents", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllBytes", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllBytes", 2, 2, 0x01, {"path", "contents", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "ReadAllLines", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "WriteAllLines", 2, 2, 0x01, {"path", "lines", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Exists", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Delete", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Copy", 3, 3, 0x03, {"source", "destination", "overwrite", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"File", "Move", 2, 2, 0x03, {"source", "destination", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Exists", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "CreateDirectory", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Delete", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "Delete", 2, 1, 0x01, {"path", "recursive", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "GetFiles", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
+    {"Directory", "GetDirectories", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Path", "Combine", 2, 2, 0x03, {"a", "b", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Path", "GetFileName", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
     {"Path", "GetExtension", 1, 1, 0x01, {"path", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, ""},
@@ -1148,11 +1178,24 @@ constexpr std::array<std::string_view, 3> kBuiltinCtorSurfaceClosedByRowsHeads =
 // The heads `kStringParamNames` / `kEncodingParamNames` /
 // `kStringBuilderParamNames` answer for. See the header for the two roles this
 // predicate plays at the call site.
-constexpr std::array<std::string_view, 7> kBuiltinNamedArgTableHeads = {
+//
+// fix #7982 (stdlib §7.3, §7.4, §22.5, v0.350): `File` and `Directory` join
+// the table. The compiler now HONOURS a parameter NAME written at a call to
+// one of their members (the rows above carry the declared names), and this
+// predicate is where "the compiler honours the name" is recorded — it is what
+// `checkBuiltinNamedArgs` reads to CLAIM the call (so a name the member does
+// not declare is refused rather than silently bound positionally) and what
+// the §7 nullability gate reads to know that a named argument's INDEX is not
+// its POSITION (the bound-position check that replaces the index read is
+// `ExprTC::checkBuiltinNamedArgNullability`).
+constexpr std::array<std::string_view, 9> kBuiltinNamedArgTableHeads = {
     "string", "String", "Encoding", "StringBuilder", "Math", "Convert",
     // fix #7732 (§22.5, v0.350; stdlib §7.4 `Path`): `Combine(a, b)` and the
     // `path` parameter of the other members are DECLARED names.
     "Path",
+    // fix #7982 (§22.5, v0.350; stdlib §7.3 `File`, §7.4 `Directory`): the
+    // declared parameter names of the synchronous members.
+    "File", "Directory",
 };
 
 // fix #3589 (stdlib §5 / §9.6): see the header — the string-receiver LINQ
