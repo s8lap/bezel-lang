@@ -25022,29 +25022,54 @@ static void checkBuiltinPathCallArity(
     if (calleeSym) return;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
     if (!ma || !ma->target) return;
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    if (!id || ctx.exprType(*ma->target)) return;
-    // fix #7985 (§2.3, §2.2, v0.350; #5140): a bare head that is AMBIGUOUS
-    // is already reported as ambiguous — §2.3: "a same-named public exported
-    // by an explicitly imported module does not shadow it but makes the bare
-    // name ambiguous in that file under §2.2's collision rule". A second,
-    // misleading arity error on the same access would only cascade: the
-    // reader is told the call supplies the wrong number of arguments, when
-    // the call's callee is not even resolved yet.
-    //
-    // The set is the ALWAYS-AVAILABLE names an imported public shadows. `File`
-    // and `Directory` are NOT always-available (they live in `System.IO`,
-    // which §2.3 requires an explicit import for), so a user module that
-    // exports one of them SHADOWS the standard library's — the bare name is
-    // not ambiguous and the gate's own arity question is the right one.
-    if (ambiguousHeads.count(std::string(id->name))) return;
+    // The target is not a VALUE: a member read on a value is not a type path,
+    // and a target that carries a type is a resolved one (its own machinery
+    // answers for it).
+    if (ctx.exprType(*ma->target)) return;
+    std::string_view head;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+        head = id->name;
+        // fix #7985 (§2.3, §2.2, v0.350; #5140): a bare head that is
+        // AMBIGUOUS is already reported as ambiguous — §2.3: "a same-named
+        // public exported by an explicitly imported module does not shadow it
+        // but makes the bare name **ambiguous** in that file under §2.2's
+        // collision rule". A second, misleading arity error on the same
+        // access would only cascade: the reader is told the call supplies the
+        // wrong number of arguments, when the call's callee is not even
+        // resolved yet.
+        //
+        // The set is the ALWAYS-AVAILABLE names an imported public shadows.
+        // `File` and `Directory` are NOT always-available (they live in
+        // `System.IO`, which §2.3 requires an explicit import for), so a user
+        // module that exports one of them SHADOWS the standard library's —
+        // the bare name is not ambiguous and the gate's own arity question
+        // is the right one.
+        if (ambiguousHeads.count(std::string(head))) return;
+    } else if (auto* q =
+                   dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
+        // fix #7983 (stdlib §7.3, §7.4, §22.6, v0.350): the class may be
+        // written MODULE-QUALIFIED (`System.IO.File.Exists(..)`, or through
+        // an import alias `sio.File.Exists(..)`). The head is then the
+        // TRAILING member of a type-less qualifier chain, not a bare
+        // identifier, and the gate keyed on the bare identifier alone — so
+        // such a call BYPASSED it: `sio.File.Exists("a", "b")` compiled with
+        // only the #3079 "failed to lower" warning, and the over-arity call
+        // was admitted where §22.6 makes it a compile error.
+        //
+        // A qualifier that carries a VALUE type is a member read on a value,
+        // not a module path, and is left alone.
+        if (!q->target || ctx.exprType(*q->target)) return;
+        head = q->member;
+    } else {
+        return;
+    }
     const char* section = nullptr;  // the stdlib section declaring the class
-    if (id->name == "Path" || id->name == "Directory") section = "7.4";
-    else if (id->name == "File") section = "7.3";
-    else if (id->name == "Environment") section = "2.4";
+    if (head == "Path" || head == "Directory") section = "7.4";
+    else if (head == "File") section = "7.3";
+    else if (head == "Environment") section = "2.4";
     else return;
     const std::vector<common::BuiltinParamForm> forms = common::builtinParamForms(
-        id->name, ma->member, common::kBuiltinAnyArity);
+        head, ma->member, common::kBuiltinAnyArity);
     if (forms.empty()) return;  // not a declared method: the surface check's
     const std::size_t argc = ce.args.size();
     std::string expectation;
@@ -25056,7 +25081,7 @@ static void checkBuiltinPathCallArity(
     }
     ctx.diagnostics().report(
         Severity::Error, ce.span.begin,
-        "the call to `" + std::string(id->name) + "." + std::string(ma->member) +
+        "the call to `" + std::string(head) + "." + std::string(ma->member) +
             "` supplies " + std::to_string(argc) + " argument(s) but stdlib §" +
             section + " declares `" + std::string(ma->member) + "` with " +
             (forms.size() == 1 ? "exactly " : "") + expectation +
