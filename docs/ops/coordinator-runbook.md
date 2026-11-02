@@ -719,6 +719,25 @@ dispose-count/ASan-clean for a double-free.
 - Uncommitted WIP recovered from a crashed run is an **unverified hypothesis**,
   not work that is 80% done. Re-derive the diagnosis from the issue and HEAD:
   5 of 5 inherited WIPs were once defective, and two would have shipped a bug.
+  Concretely, after a restart run `git status --short` **and read the diff** in
+  EVERY lane worktree, not just the ones you remember: a crashed session can
+  leave a fail-WITHOUT revert in the tree (the `git checkout -- <file>` for the
+  proof, killed before the restore), which inverts the fix under review while
+  the branch still looks correct.
+- **Never wrap `git switch` or `git checkout` in a `timeout`.** A killed
+  checkout leaves a HALF-switched tree — some paths updated, others not — and
+  the damage reads as a crashed lane's WIP rather than as the damage it is.
+  Let it finish, or check `git status` and repair by hand.
+- **Never `checkout -f --detach` in another lane's worktree.** A reviewer's
+  "reclaim" clobbered a live lane once; every worktree's reflog is the
+  witness. Two reviewers must not share a worktree either: their fail-WITHOUT
+  reverts interleave, and neither can say which one is in the tree.
+- **Lock the warm lane pool.** `scripts/gc_scratch.sh` reaps every landed
+  worktree after a push, and with it the in-tree `build/` and any reference
+  compiler it holds. `git worktree lock --reason '<run> warm lane pool'` each
+  lane worktree (and any worktree holding a reference build); gc honours
+  locks — it skips every worktree the porcelain list marks `locked`. Unlock and
+  `git worktree remove` explicitly at close-out.
 
 ### ⚠ At most TWO lanes may cold-build `--area codegen` at once
 
@@ -821,9 +840,19 @@ burns budget re-reading state that has not moved.
    `check_toolchain_skip_surface` RED.** That is a *denominator* rise, not a new
    silent-skip site. Before `--update --force`, verify what the ratchet's own
    diagnostic asks: the new rows carry no `wasSkipped()`/`find("SKIP")` guard, no
-   early return, assert `r.ran` unconditionally, and `absorbing_sites` did **not**
-   rise. Bank it **once at batch level**, not per lane — several lanes adding checked
-   rows would otherwise all collide on the single baseline file.
+   early return, assert `r.ran` unconditionally, and `absorbing_sites` **strictly
+   fell** — a flat count is not a fall, and `--update` refuses a rise in
+   `checked_calls` unless `absorbing_sites` fell (`chk_m > chk_b and
+   abs_m >= abs_b` is the refusal). Bank it **once at batch level, on the merged
+   tree**, not per lane — several lanes adding checked rows would otherwise all
+   collide on the single baseline file, and the counts are only correct on the
+   tree that carries all of them.
+   ⚠ **A `src/` COMMENT edit is not free.** Several ratchets read the source
+   text, so a comment that changes a shape, a word or a count can move a site
+   from one bucket to another — `check_src_citations.py` alone greps every `§`
+   in `src/` and fails the cycle on one that resolves nowhere. "Comment-only"
+   means token-identical, not byte-identical. After **any** `src/` edit, comment
+   or not, re-run `scripts/ratchet_sweep.sh` before the gate.
 5. **No untracked `scripts/`** — ratchet #3413 fails the cycle on any `.sh`
    hardcoding an absolute checkout path. Park strays in
    `/var/tmp/bezel-scratch/<run>/parked/`.
