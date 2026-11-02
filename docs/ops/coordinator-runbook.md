@@ -1058,6 +1058,33 @@ nothing could kill it by session. The reviewer then launched its own sweep of th
 two ran at once, and the kill was refused as not verifiably this session's. Hence `kill -0` on every PID before handback,
 including detached children.
 
+### Publishing a static release
+
+*Added 2026-11-02. The release is the owner's side task (asked for in R34, cut in R37), and the
+procedure lived in a scratch script where it was one reaping away from being lost.*
+
+The repository publishes a **fully static musl `bezelc`** as a GitHub pre-release, so a user can
+download one file and run it with nothing else installed. The build is
+`scripts/release_static.sh --full`; the publishing glue is **`scripts/publish_release.sh`**:
+
+```sh
+scripts/publish_release.sh <worktree> <tag> <title> <body-file> [branch]
+```
+
+Run it **after the gate has pushed `origin/main`**, in the worktree that holds that commit, with a
+clean tree: the script refuses a dirty tree and refuses to build from anything that is not
+`origin/main`'s tip, because a release of an unpushed commit is a release nobody can reproduce. The
+tag and the tarball name carry the 8-character short sha (`r37-db3bdf98`,
+`bezelc-0.0.0-db3bdf98-linux-x86_64.tar.gz`), matching the R34/R35/R37 pre-releases.
+
+Two `gh` facts, measured 2026-10-30 (gh 2.87.3), cost one run each and are now encoded in the
+script's header: **this `gh` has no `--body-file`** (it is `-F` / `--notes-file`), and **`--target`
+wants the full 40-character sha** — a short sha is rejected with *Release.target_commitish is
+invalid* (422).
+
+Publishing to a public repository is a coordinator decision, and whether to cut a release at all is
+the owner's call.
+
 ### Merging into the conformance corpus
 
 A conformance case is a **whole file with its id in its name**, so a merge of
