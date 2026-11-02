@@ -17848,6 +17848,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* dataSzG = builder_.CreateAdd(lenG, builder_.getInt64(1));
             llvm::Value* dataCpG = builder_.CreateCall(mallocFn3, {dataSzG});
             builder_.CreateCall(memcpyFn3, {dataCpG, cstrG, lenG});
+            // fix #8024 (stdlib §7.4 / §28.9, v0.350): `cstrG` is the
+            // runtime's OWN `strdup`'d copy of one entry (the runtime
+            // `strdup`s `fullpath` per entry into its `results` vector). The
+            // `memcpy` above is its LAST use -- the `bz.string`'s payload is
+            // the fresh `dataCpG` buffer -- so the entry is DEAD here and the
+            // runtime kept no handle on it: the CALLER releases it. See the
+            // ownership note on `rawArr` below.
+            freeCStr(cstrG);
             llvm::Value* nulPtrG = builder_.CreateGEP(i8Ty3, dataCpG, lenG);
             builder_.CreateStore(llvm::ConstantInt::get(i8Ty3, 0), nulPtrG);
             llvm::Value* strObjG = builder_.CreateCall(callocFn4,
@@ -17863,6 +17871,44 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             builder_.CreateStore(builder_.CreateAdd(iG, builder_.getInt64(1)), idxSlotG);
             builder_.CreateBr(cG);
             builder_.SetInsertPoint(eG);
+            // fix #8024 (stdlib §7.4 / §28.9, v0.350): the runtime's `char**`
+            // RETURN BUFFER, and the entries in it, are the CALLER's to
+            // release.
+            //
+            // WHY (the ownership rule, established from the spec and from the
+            // runtime's own code):
+            //
+            //  * §28.9, v0.350: "How the runtime manages their lifecycle
+            //    (reference counting, region allocation, or other) is not part
+            //    of this specification", and "the implementation reclaims the
+            //    production". The `char**` is the implementation's own scratch
+            //    on the way to the production stdlib §7.4 declares --
+            //    `Directory.GetFiles(path: string): owned Array<string>` -- and
+            //    §28.9's carve fixes the OUTCOME (the implementation reclaims
+            //    it), not the mechanism. So the spec leaves the mechanism to
+            //    the implementation, and the implementation's own code decides
+            //    it.
+            //  * `bz_dir_get_files` / `bz_dir_get_dirs`
+            //    (src/runtime/bezel_runtime_fileio.cpp) `malloc` the `char**`
+            //    and `strdup` each entry into a LOCAL `std::vector<char*>`
+            //    that dies at the `return`. After the call the runtime holds
+            //    NO handle on either the array or its entries, so there is NO
+            //    runtime-side reclamation point for them -- the runtime
+            //    cannot free them later even in principle. They are a
+            //    hand-over, not a runtime-owned arena.
+            //  * Every entry is DEAD once the loop has copied it into the
+            //    fresh `bz.string` payload above (`memcpy` -- the copy is
+            //    independent), and the `char**` is DEAD once the loop ends.
+            //    This arm is the only party that still holds them.
+            //  * The allocator matches: the runtime allocates with libc
+            //    `malloc` / `strdup` (`<stdlib.h>` / `<string.h>`) and this arm
+            //    releases with libc `free` -- the same allocator, the same
+            //    process.
+            //
+            // The `free` of a null `rawArr` is a no-op: for a directory that
+            // does not exist the runtime returns `nullptr` with a count of 0,
+            // so the loop never runs and there is nothing to release.
+            freeCStr(rawArr);
             return result;
         };
         if (m == "GetFiles") return makeFilesList("bz_dir_get_files");
