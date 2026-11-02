@@ -803,6 +803,16 @@ burns budget re-reading state that has not moved.
    every known regression on the candidate HEAD first; if any FAILs, fix forward
    and re-check before launching. A gate you know will fail is performative and
    creates push pressure that leads to weakened oracles.
+   ⚠ **Fetch before you measure, and compare DATES, not only refs.**
+   `origin/main` is a remote-tracking ref: it moves only when you fetch. A
+   coordinator who has not fetched since the last push measures staging against
+   a stale `origin/main`, sees staging ahead, and concludes the batch is level —
+   while the remote has moved on since. The mandatory merge (the gate cannot
+   fast-forward a behind tree) then lands late, after the batch was validated,
+   and it can conflict with the fix it carries. So `git fetch origin` first, and
+   when you ask whether you are level with main, compare the **commit dates**
+   (`git log -1 --format='%ci'`) as well as the refs: a ref that looks current
+   can be days older than the branch it is compared against.
 2. **Zero agents for the gate's full duration (~50 min)** — no fix, review or
    probe agents, and no replacements dispatched. Read-only work is fine. "It's
    just reading code" is a snapshot, not a guarantee: an agent can move to
