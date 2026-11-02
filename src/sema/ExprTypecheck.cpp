@@ -9177,13 +9177,38 @@ void ExprTC::checkAssignable(
             freeTypeParamNames->count(toTpHead);
         if (!toTpHead.empty() && !toIsCalleeFreeParam &&
             currentScopeGenericParamNames().count(toTpHead)) {
-            // A concrete class or record: has a declaration, is not Object.
+            // A concrete class or record: it HAS a declaration.
+            //
+            // fix #7997 / #7992 (§5.1, §8.1, v0.350): the exemption this
+            // check used to carry for the ROOT `Object` was NAME-KEYED
+            // (`from->headName() != "Object"`). That clause was DEAD CODE
+            // for the root and LIVE for a USER type: the root `Object`
+            // resolves to a `Kind::Primitive` ref
+            // (`PrimitiveType::Object`, §3.4 / §8.1), so it never reaches
+            // this branch at all — the `from->kind == Kind::Named &&
+            // from->declaration` requirement already excludes it. The
+            // clause's ONLY reachable effect was to exempt a USER class
+            // spelled `Object` from §5.1's "no conversion from a concrete
+            // class or record to a bare type parameter" rule.
+            //
+            // §8.1 makes that name a DIFFERENT name — "a generic `Object<T>`
+            // is a different name (§2.2)" — so it buys no exemption, and
+            // the exemption was a MISCOMPILE, not a missing diagnostic: a
+            // user `Object<T>` instance was returned where a bare `T` was
+            // declared, so a program that declared `var x: int := M<int>()`
+            // read a heap address as an `int` (the review's P31 probe
+            // printed `151413536`, then `42`).
+            //
+            // The exemption is now CATEGORY-BLIND: the ROOT is exempted by
+            // its RESOLVED IDENTITY (a declaration-less ref — the root is a
+            // `Kind::Primitive` Object ref and so never reaches here at
+            // all), never by its SPELLING. Any ref that HAS a declaration
+            // is subject to the rule, whatever it is called.
             bool fromIsConcreteClassRecord =
                 from->kind == TypeRef::Kind::Named &&
                 from->declaration &&
                 (from->declaration->kind == ast::TypeDeclKind::Class ||
-                 from->declaration->kind == ast::TypeDeclKind::Record) &&
-                from->headName() != "Object";
+                 from->declaration->kind == ast::TypeDeclKind::Record);
             if (fromIsConcreteClassRecord) {
                 std::string fromName(from->headName());
                 reportNotConvertible(

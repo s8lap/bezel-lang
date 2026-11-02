@@ -4624,10 +4624,63 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
     // a type parameter, module type or imported type of the same bare name
     // must not capture it (§2.2 "the import stays reachable by qualifier").
     const bool qualifiedBuiltin = t.aliasQualifiedBuiltin;
+    // fix #7992 (§8.1, §2.2, v0.350): does the scope chain bind `name` to a
+    // TYPE DECLARATION — a class / record / enum / interface / choice, a
+    // nested type, or a type alias — rather than to a local, a parameter or a
+    // generic-parameter marker? §2.7 rule 1's order, walked exactly the way
+    // `lookupBareTypeName` walks it, so the answer is the SAME candidate the
+    // ordinary resolution path below would bind. A generic-parameter marker
+    // (`nullptr`) and a non-type symbol are NOT declarations of a type.
+    //
+    // §8.1, in its own words: "User code cannot redeclare or replace
+    // `Object`. The ban is on a user module-level type declaration — a
+    // class, record, enum, interface, choice or type alias — named `Object`
+    // with no type parameters, in any user module and at any visibility.
+    // Every other declaration of the name is ordinary: a generic `Object<T>`
+    // is a different name (§2.2)". So a declaration of the name at arity > 0
+    // is a USER type, and §2.2's arity rule — "names are compared together
+    // with their generic arity ... a reference resolves to the first, in that
+    // rule's order, whose arity its type-argument list fixes" — selects it
+    // over the root `Object` (arity 0) for a reference that SUPPLIES type
+    // arguments.
+    auto bindsTypeDeclaration = [&](std::string_view name) -> bool {
+        TypeSymbol* stoppedAt = nullptr;
+        Symbol* cand = lookupBareTypeName(name, scope, &stoppedAt, &t);
+        // §2.7's stop: an enclosing type's member of that name blocks the
+        // bare name entirely — the ordinary path reports that shape, not a
+        // type binding, so it is not a declaration of the name here either.
+        if (stoppedAt) return false;
+        if (!cand) return false;  // a generic-parameter marker, or nothing
+        if (dynamic_cast<TypeSymbol*>(cand)) return true;
+        if (auto* nts = dynamic_cast<NestedTypeSymbol*>(cand))
+            return nts->type != nullptr;
+        if (dynamic_cast<TypeAliasSymbol*>(cand)) return true;
+        return false;
+    };
     // Primitive check first.
     if (t.name->parts.size() == 1) {
         PrimitiveType prim = primitiveFromName(first);
-        if (prim != PrimitiveType::None) {
+        // fix #7992 (§8.1, §2.2, v0.350): the root `Object` (arity 0) and a
+        // user's generic `Object<T>` (arity 1) are TWO names, not one — §8.1
+        // "a generic `Object<T>` is a different name (§2.2)" — and §2.2's arity
+        // rule selects between them by the arity the reference's type-argument
+        // list fixes. So a reference that SUPPLIES type arguments does not
+        // name the root at all: when the current module declares a type of
+        // that name, the reference must resolve to THAT declaration, and the
+        // ordinary name-resolution path below resolves it like any other user
+        // type. The root keeps its own spelling (`Object`, and `System.Object`
+        // — §2.7 rule 2), and a bare `Object` still names the root.
+        //
+        // The predicate is deliberately narrow: it is asked only of the
+        // `Object` primitive, only of a reference that supplies type
+        // arguments, and never of a name reached by its HOME module's
+        // qualified name (`System.Object`, `import System as S; S.Object`) —
+        // §2.3's row and §8.1's "and `System.Object` still reaches it" make
+        // the qualified spelling name the ROOT by definition.
+        const bool userDeclaredObject =
+            prim == PrimitiveType::Object && !qualifiedBuiltin &&
+            !t.genericArgs.empty() && bindsTypeDeclaration(first);
+        if (prim != PrimitiveType::None && !userDeclaredObject) {
             ref.kind = TypeRef::Kind::Primitive;
             ref.primitive = prim;
             // Primitives shouldn't have generic args (sema enforces);
@@ -4636,9 +4689,23 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if (ga) resolveType(*ga, scope);
             }
             if (!t.genericArgs.empty()) {
-                ctx_.diagnostics().report(
-                    Severity::Error, t.span.begin,
-                    "primitive type cannot take generic arguments");
+                // fix #7992 (§8.1, §2.2, v0.350): the root `Object` gets its
+                // OWN message — the root was named, and a generic `Object<T>`
+                // is a DIFFERENT name the user may declare. The generic
+                // primitive message stays for every other primitive, whose
+                // name no user declaration can claim (§3.4).
+                if (prim == PrimitiveType::Object) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        "`Object` is the root type and takes no generic "
+                        "arguments (\xC2\xA7""8.1) \xE2\x80\x94 a generic "
+                        "`Object<T>` is a different name (\xC2\xA7""2.2) and "
+                        "must be declared by the user");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        "primitive type cannot take generic arguments");
+                }
             }
             return;
         }
@@ -4671,9 +4738,18 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if (ga) resolveType(*ga, scope);
             }
             if (!t.genericArgs.empty()) {
+                // fix #7992 (§8.1, §2.2, v0.350): the qualified spelling
+                // names the ROOT by definition (§2.3's row: the root is
+                // reached by its module's qualified name; §8.1: "and
+                // `System.Object` still reaches it"), so the message names
+                // the root — a user's generic `Object<T>` is a different
+                // name (§2.2) and is unaffected by this rejection.
                 ctx_.diagnostics().report(
                     Severity::Error, t.span.begin,
-                    "primitive type cannot take generic arguments");
+                    "`Object` is the root type and takes no generic "
+                    "arguments (\xC2\xA7""8.1) \xE2\x80\x94 a generic "
+                    "`Object<T>` is a different name (\xC2\xA7""2.2) and "
+                    "must be declared by the user");
             }
             return;
         }
