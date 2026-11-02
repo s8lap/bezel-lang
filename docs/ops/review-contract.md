@@ -54,7 +54,10 @@ Run every check that applies, and quote what each one printed.
 7. **Re-measure what the producer called pre-existing.** Any divergence or failure the handback
    dismisses as "pre-existing" or "unrelated" is measured again at the base.
 8. **A conflict resolution claimed as a UNION:** read `git diff <base>..<sha>` on each conflicted
-   file and confirm both sides' rows and logic survive. Passing tests do not show this.
+   file and confirm both sides' rows and logic survive. Passing tests do not show this. A conflict
+   under `tests/conformance/rules/cases/` is an **id collision** until proven textual, and
+   `--ours`/`--theirs` deletes the other side's program outright (runbook, *Merging into the
+   conformance corpus*).
 9. **Areas.** Run the full `--area` of every area whose `src/` the fix touches, and quote the gtest
    `N passed, 0 failed, N total` line (not the lit discovered-tests count).
 10. **ASan,** when the fix touches allocation, layout, retain/release or disposal:
@@ -65,6 +68,12 @@ Run every check that applies, and quote what each one printed.
 11. **Corpus rows** (`tests/conformance/rules/`): `python3 tests/conformance/rules/corpus.py lint`,
     `python3 tests/conformance/rules/corpus.py check`, and `python3 scripts/gate_rule_corpus_baseline.py --strict`, quoting its
     REGRESSION and UNBANKED counts. `corpus.py --strict` is not a valid invocation, and it exits 0.
+    Read the `manifest.tsv` diff **line by line** and quote the spec sentence that governs each
+    changed row: `manifest.tsv` is derived from the case headers, so a changed `expect:` or
+    `diagnostic:` is a semantic change, and it is invisible to the gtest and lit needle greps of
+    check 5. The doc-example corpus (`tests/conformance/`) is a separate track with its own
+    manifest: a change to what a program prints breaks its `run:` expectation, and no gtest or lit
+    grep finds it.
 
 ## Verdict
 

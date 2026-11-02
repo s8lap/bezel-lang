@@ -450,6 +450,18 @@ the stale needle never earned its own failure. Two defects, one row, both had to
 be fixed. It also left 10 `tests/lit/sema/*.bzl` `CHECK-NOT`s passing
 vacuously.
 
+**The two conformance corpora are a third and fourth track, and no gtest/lit
+needle grep reaches them.** `tests/conformance/` holds the doc examples and
+`tests/conformance/rules/` the rule cases. A rule case's `stdout:`/`output:`
+header and a doc-example row's `run:<first line>` expectation are needles in
+exactly the sense a gtest string literal is, and neither is found by grepping
+`tests/**/*.cpp` or `tests/lit/**`. A flip that changes what a program PRINTS
+breaks both. A flip that changes a diagnostic's WORDING breaks neither — the
+wording of a reject or warn diagnostic is deliberately not gated (`runner.py`:
+*which wording is the diagnostic report's business, not the gate's*) — but
+adding or removing a diagnostic breaks a `quiet` case, and removing one breaks
+a `warn` case, or a `run` case carrying a `warns:` header.
+
 ### Keep a batch ledger naming the authoring pool
 
 The integrating coordinator records, per commit in the batch, **which pool
@@ -944,6 +956,56 @@ hunk at pick, although the changes were independent. The integrator banks corpus
 nothing could kill it by session. The reviewer then launched its own sweep of the same half, so
 two ran at once, and the kill was refused as not verifiably this session's. Hence `kill -0` on every PID before handback,
 including detached children.
+
+### Merging into the conformance corpus
+
+A conformance case is a **whole file with its id in its name**, so a merge of
+two branches that both added cases is not a textual merge — it is an id-space
+merge. R28 (2026-10-09) is the incident: staging and `origin/main` each added
+a *different* program under the same ids `s14_2_0021`/`s14_2_0022`, the files
+conflicted as `add/add`, and `manifest.tsv` **auto-merged** carrying both
+registrations under one id. The corpus would have run one case and silently
+dropped the other, with no error anywhere.
+
+- **A conformance `.bzl` conflict is an ID COLLISION until proven textual.**
+  Compare the two sides' `//! case:` headers before reaching for a union.
+  Union is *impossible*: one file cannot carry two `//! case:` headers and two
+  `module Conf;` blocks.
+- **`--ours` / `--theirs` on a conformance case DELETES the other side's
+  program.** The resolution looks clean — no conflict markers are left, and
+  `git rm --cached` does not error — while one side's case is simply gone.
+  Restore with `git show <ref>:<path> > <path>` and re-`git add`, then verify
+  by grepping the `title:` header, not by the absence of conflict markers.
+- **`manifest.tsv` auto-merging is NOT evidence the merge is sound.** It
+  happily holds two rows under one id. After any merge run
+  `corpus.py check`: it is byte-exact, so a manifest row whose case file was
+  deleted by `--ours`, or a row duplicated under one id, shows as *stale*.
+- **Renumber to a VERIFIED-FREE id, and check all three tracks**: the case
+  file, `manifest.tsv` and `baseline.tsv`. A baseline row is a `pass` for both
+  `expect: accept` and `expect: reject` — it records the observed verdict
+  conforming, not the polarity.
+
+**`manifest.tsv` is derived, and it is derived byte-exactly.** Every column
+comes from the case's `//!` header: the `check` column is the header's
+`diagnostic:`, `stdout:` or `output:`. `corpus.py check` compares the file
+byte-for-byte against the regenerated text, and `corpus.py build` rewrites it
+wholesale — so a hand-edited manifest is either RED or silently reverted by
+the next build. Change the header, then build. And **read the diff**: a build
+whose diff touches rows you did not author means another case changed, which
+is worth knowing before you commit it.
+
+**Bank a baseline row as an in-place edit, not a regeneration.**
+`runner.py --update` rewrites `baseline.tsv` in section order, so re-running
+it over the whole corpus re-sorts the file and turns a one-row change into a
+large diff. Edit the row where it belongs.
+
+**The re-bank lands LAST.** Close the batch, pick everything, rebuild
+`build/bezelc` for the final tip, run
+`scripts/gate_rule_corpus_baseline.py --strict` once on that tip, and bank
+exactly the UNBANKED rows that run reports. Every pick before the gate can
+create a new UNBANKED row, so the strict run's count is the authority — not
+the list of rows you expected to bank. Re-banking earlier is not wrong, it is
+just work that gets redone.
 
 ### Harvest review probes into the corpus
 
