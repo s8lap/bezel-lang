@@ -111,10 +111,71 @@ class RunStatusTest(unittest.TestCase):
         self.assertNotIn("ACTION: jobserver", out)
 
     def test_bad_arguments_exit_64_instead_of_looping(self):
-        for argv in (["--target"], ["--staging"], ["--target", "abc"], ["--target", "-1"]):
+        for argv in (["--target"], ["--staging"], ["--target", "abc"], ["--target", "-1"],
+                     ["--pool"], ["--claims"], ["--pool", "x"]):
             r = subprocess.run([str(SCRIPTS / "run_status.sh")] + argv, cwd=str(self.d),
                                env=self.env, capture_output=True, text=True, timeout=20)
             self.assertEqual(r.returncode, 64, argv)
+
+    # ---- the pool row -------------------------------------------------
+    #
+    # The pool is a FIRM size, refilled in the same turn a slot frees, and
+    # until 2026-11-02 nothing could see it: a run left a slot empty for
+    # nineteen minutes and no row said so. The pool row counts the DISTINCT
+    # lanes holding a live claim (one lane fixing three issues is one lane),
+    # flags a PARTIAL pool, and stays quiet for a DRAINED one (which is what a
+    # gate wants).
+
+    def claims(self, *rows):
+        p = self.d / "claims.tsv"
+        p.write_text("issue\tlane\tbranch\tworktree\thot\tstart\tstatus\n" +
+                     "".join("\t".join(r) + "\n" for r in rows))
+        return str(p)
+
+    def test_pool_counts_distinct_lanes_not_claims(self):
+        c = self.claims(
+            ("#1", "laneA", "b1", "/w/a", "f", "t", "live:producing"),
+            ("#2", "laneA", "b1", "/w/a", "f", "t", "live:producing"),
+            ("#3", "laneB", "b2", "/w/b", "f", "t", "live:reviewing"),
+        )
+        out = self.status("--claims", c, "--pool", "2")
+        pool = self.row(out, "pool")
+        self.assertIn(" OK ", pool)
+        self.assertIn("2 live lane(s) of 2", pool)
+        self.assertNotIn("ACTION: pool", out)
+
+    def test_partial_pool_is_flagged_with_an_action(self):
+        c = self.claims(("#1", "laneA", "b1", "/w/a", "f", "t", "live:producing"))
+        out = self.status("--claims", c, "--pool", "7")
+        self.assertIn("FLAG", self.row(out, "pool"))
+        self.assertIn("1 live lane(s) of 7", self.row(out, "pool"))
+        self.assertIn("ACTION: pool:", out)
+
+    def test_a_queued_claim_is_not_a_live_lane(self):
+        # A lane that also holds a QUEUED claim for a later issue is still
+        # live -- which is why live rows are counted and queued ones ignored,
+        # rather than one status per lane.
+        c = self.claims(
+            ("#1", "laneA", "b1", "/w/a", "f", "t", "live:producing"),
+            ("#2", "laneA", "b1", "/w/a", "f", "t", "queued:waiting on another lane"),
+        )
+        out = self.status("--claims", c, "--pool", "1")
+        self.assertIn("1 live lane(s) of 1", self.row(out, "pool"))
+        self.assertNotIn("ACTION: pool", out)
+
+    def test_drained_pool_is_info_not_an_action(self):
+        # A drained pool is legitimate -- it is what a gate wants -- so 0
+        # lanes must not cry for a refill.
+        c = self.claims(("#1", "laneA", "b1", "/w/a", "f", "t", "done"))
+        out = self.status("--claims", c, "--pool", "7")
+        self.assertIn(" INFO ", self.row(out, "pool"))
+        self.assertIn("0 live lane(s) of 7", self.row(out, "pool"))
+        self.assertNotIn("ACTION: pool", out)
+
+    def test_missing_claims_file_is_info_not_a_crash(self):
+        out = self.status("--claims", str(self.d / "nope.tsv"), "--pool", "7")
+        self.assertIn(" INFO ", self.row(out, "pool"))
+        self.assertNotIn("ACTION: pool", out)
 
 if __name__ == "__main__":
     unittest.main()

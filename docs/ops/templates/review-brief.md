@@ -63,7 +63,7 @@ and holds the eleven checks, the verdicts, and what a reviewer never does.
 
 ### Run overrides
 
-- **Pool size:** `<N>` lanes, not the standing 6 — `<reason>`.
+- **Pool size:** `<N>` lanes, not the standing 7 — `<reason>`.
 - **Model:** `<model>` for every lane in this run, not the standing Sonnet/Opus tiers — `<reason>`.
 - **Trailer:** not the reviewer's concern — the reviewer makes no commit. (If the run needs the
   reviewer to fix a required pre-pick correction, the **producer** does it in its own tree, or the

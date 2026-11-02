@@ -1005,12 +1005,32 @@ pool at zero agents until the fix lands and the targeted filters are green.
 ### Pool size and model choice
 
 Fan-out is the standard mode, not an escalation: the build/test loop is ~2 min
-while most of the per-merge time is serial cognition. Run a **firm N=6** agents
+while most of the per-merge time is serial cognition. Run a **firm N=7** agents
 in flight (producers + reviewers) and refill a slot in the same turn it frees —
 except during a gate, when it is zero. Keep lanes **file-disjoint**: no two on
 the same hot dispatch function (`typeCall`, `lowerBinary`, the `tryLower*Call`
 family), and at most one disposal/ownership/async/iterator lane at a time.
 Bundle at most 2–3 closely-related issues per lane, one commit per issue.
+
+**The pool size is NOT the build budget, and the two were confused once already.**
+The measured limit is **concurrent cold `--area codegen` builds (2)**, not the
+number of lanes — see *At most TWO lanes may cold-build `--area codegen` at
+once* below, whose incident is three lanes, not six. So **N=7 means seven lanes
+and a cold-build QUEUE**, not seven simultaneous cold builds: a coordinator
+running 7 producers must stage their first builds, two at a time. Raising the
+pool does not raise the cap, and the cap is what keeps a lane's build from
+being killed by the slice — a kill with zero `error:` lines reads exactly like
+a build failure and is not one.
+
+**Counting the live pool.** `claims.tsv` is append-only and a claim's CURRENT
+status is its LAST row; the `status` vocabulary is `live` (with an optional
+role after a colon, e.g. `live:producing`), `queued`, `done` and `standdown`
+(`CLAUDE.md`, *Claims*). So the live pool is countable, and
+`scripts/run_status.sh --claims <path> --pool N` counts it and **flags a pool
+below its target** — which is the check that catches a run leaving a slot
+empty. It did not exist until 2026-11-02, when a pool ran at 4 for nineteen
+minutes because a lane that stood down was not refilled in the same turn and
+nothing could see it.
 
 **Sonnet is the default; dispatch Opus UPFRONT** — never as a fallback after a
 Sonnet attempt came back short — when the task spans ≥2 predicates across files,

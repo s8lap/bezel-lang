@@ -21,11 +21,13 @@ dispatches.
 
 ## Your pool
 
-- **Size:** <6> agents (producers and reviewers), refilled in the same turn a slot frees.
+- **Size:** <7> agents (producers and reviewers), refilled in the same turn a slot frees.
 - **Models:** <e.g. "Sonnet only, set `model: "sonnet"` explicitly on every dispatch; hand
   refuted or HALTed issues to me with MEASURED evidence">.
 - **Resource shares:** at most <1> cold `--area codegen` build and <1>
-  disposal/ownership/async/iterator lane in your pool at a time.
+  disposal/ownership/async/iterator lane in your pool at a time. **The pool size is NOT the build
+  budget** — the cold-build share is what the machine can survive, and it does not rise with the
+  pool.
 - **Pool name** for `claims.tsv` and `pick_stage.sh --pool`: `<pool>`.
 
 ## Files

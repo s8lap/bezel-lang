@@ -11,10 +11,13 @@
 # ACTION line only for the rows that need one. It never acts itself.
 #
 # Usage:  scripts/run_status.sh [--staging <worktree-path>] [--target N (default 100)]
+#                               [--pool N (default 7)] [--claims <path>]
 # --target is the OWNER's "gate 100 fixes at a time" directive (R35), not a
 # coordinator-chosen number: the staging row FLAGS and prints an ACTION line
 # once that many fix issues are banked. Raise it with --target for a run whose
 # directive says otherwise.
+# --pool is the run's firm pool size (the standing rule is 7 agents); --claims
+# is the run's claims.tsv, whose live claims are counted to report the pool.
 # Exit 0 always, unless the script itself errors. Every probe is tolerant: a
 # missing tool or file reads `n/a`, never a crash.
 #
@@ -24,6 +27,9 @@
 #   jobserver  systemctl --user is-active bezel-jobserver (+ jobserver_ctl status).
 #              INFO (not FLAG) when inactive: the jobserver is opt-in.
 #   builders   scripts/no_builders.sh.  FLAG: a gate is running AND builders exist.
+#              The row also carries a 5-second window: a single-instant sample
+#              of a box that alternates between building and analysing reads
+#              "CLEAN" while every lane is mid-run.
 #   memory     MemAvailable.  FLAG: < 6G AND vmstat `so` > 0 in both of the last
 #              two `vmstat 1 3` samples (sustained swap-out, not a blip).
 #   disk       /mnt/fast use%; aot-bincache and aot-harness must be symlinks.
@@ -31,7 +37,13 @@
 #   staging    (with --staging) branch, tip, commits over origin/main, and distinct
 #              fix issues banked (scripts/pick_ledger.sh: kind=fix commits
 #              only, see scripts/pick_issues.sh). FLAG: banked >= --target.
-#   lanes      active lane count from scripts/lane_status.sh.
+#   lanes      active lane count from scripts/lane_status.sh, with the live
+#              per-lane build-process count and the box-wide heavy-process count.
+#   pool       live lanes of the firm pool, counted from the run's claims.tsv
+#              (a lane is live while it holds a `live` claim). FLAG: a PARTIAL
+#              pool (0 < live < --pool) — the rule is "refilled in the same
+#              turn a slot frees". INFO: 0 lanes (a drained pool is gate-ready),
+#              or no claims file to count.
 #   stale      dry-run count of stale dev processes/waiters (scripts/reap_stale.sh).
 #              INFO, never FLAG and never an ACTION line: a non-zero count is
 #              NORMAL between sweeps and just means "reap_stale.sh --kill".
@@ -41,6 +53,7 @@
 #   BEZEL_SCRATCH          scratch root (default /var/tmp/bezel-scratch)
 #   BEZEL_AOT_FAST_ROOT    fast-disk mount (default /mnt/fast, as pregate.sh)
 #   BEZEL_MEMINFO          meminfo file (default /proc/meminfo)
+#   BEZEL_STATUS_CLAIMS    claims.tsv path (default $BEZEL_SCRATCH/claims.tsv)
 #   BEZEL_STATUS_SKIP      space-separated row names to omit (e.g. "lanes jobserver")
 set -uo pipefail
 
@@ -52,20 +65,28 @@ FAST="${BEZEL_AOT_FAST_ROOT-/mnt/fast}"
 MEMINFO="${BEZEL_MEMINFO:-/proc/meminfo}"
 SKIP=" ${BEZEL_STATUS_SKIP:-} "
 STAGING="" TARGET=100
+POOL=7
+CLAIMS="${BEZEL_STATUS_CLAIMS:-$SCRATCH/claims.tsv}"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --staging|--target)
+    --staging|--target|--pool|--claims)
       if [ $# -lt 2 ] || [ -z "$2" ]; then
         echo "run_status: $1 needs a value" >&2; exit 64
       fi
-      if [ "$1" = --staging ]; then STAGING="$2"; else TARGET="$2"; fi
+      case "$1" in
+        --staging) STAGING="$2" ;;
+        --target)  TARGET="$2" ;;
+        --pool)    POOL="$2" ;;
+        --claims)  CLAIMS="$2" ;;
+      esac
       shift 2 ;;
-    -h|--help) sed -n '13,15p' "$0"; exit 0 ;;
+    -h|--help) sed -n '13,16p' "$0"; exit 0 ;;
     *) echo "run_status: unknown argument '$1'" >&2; exit 64 ;;
   esac
 done
 
 case "$TARGET" in ''|*[!0-9]*) echo "run_status: --target must be a non-negative integer, got '$TARGET'" >&2; exit 64 ;; esac
+case "$POOL"   in ''|*[!0-9]*) echo "run_status: --pool must be a non-negative integer, got '$POOL'" >&2; exit 64 ;; esac
 
 ACTIONS=()
 row() { printf '%-10s %-4s  %s\n' "$1" "$2" "$3"; }
@@ -191,6 +212,43 @@ probe_staging() {
   row staging "$st" "${br:-(detached)} @ $tip | +$ahead over origin/main | banked $banked/$TARGET"
 }
 
+# The LIVE POOL. A claim's CURRENT status is its LAST row (claims.tsv is
+# append-only), and a lane is LIVE while it holds at least one claim whose
+# status is `live` (the role may follow a colon: `live:producing`,
+# `live:reviewing`). The count is of DISTINCT LANES holding a live claim, not
+# of claims: one lane fixing three issues is one lane. A lane that also holds
+# a QUEUED claim for a later issue is still live, which is why the live rows
+# are counted and the queued ones ignored rather than one status per lane.
+#
+# WHY THIS ROW EXISTS. The pool is a firm size, refilled in the same turn a
+# slot frees, and until 2026-11-02 nothing could SEE it: a run left a slot
+# empty for nineteen minutes and no row said so. A drained pool is legitimate
+# (it is what a gate wants), so 0 lanes is INFO, not a flag; a PARTIAL pool is
+# a flag, because the rule is "refilled in the same turn a slot frees".
+probe_pool() {
+  local st=OK lanes="" detail
+  if [ ! -f "$CLAIMS" ]; then
+    row pool INFO "n/a (no claims file at $CLAIMS — pass --claims <path>)"
+    return 0
+  fi
+  lanes="$(awk -F'\t' '$1 != "issue" && $NF ~ /^live/ {c[$2]=1} END {n=0; for (l in c) n++; print n+0}' "$CLAIMS")"
+  [ -n "$lanes" ] || lanes=0
+  detail="$lanes live lane(s) of $POOL"
+  if [ "$GATE_RUNNING" -eq 1 ]; then
+    row pool OK "$detail — a gate is running, and the pool is zero by rule"
+    return 0
+  fi
+  if [ "$lanes" -eq 0 ]; then
+    row pool INFO "$detail — the pool is drained (gate-ready?)"
+  elif [ "$lanes" -lt "$POOL" ]; then
+    st=FLAG
+    ACTIONS+=("pool: $lanes live lane(s) of a $POOL-lane pool — refill a slot in the SAME turn it frees")
+    row pool "$st" "$detail"
+  else
+    row pool "$st" "$detail"
+  fi
+}
+
 probe_lanes() {
   local out n procs heavy
   out="$("$HERE/lane_status.sh" 2>/dev/null)" || true
@@ -250,6 +308,7 @@ want memory && probe_memory
 want disk && probe_disk
 [ -n "$STAGING" ] && want staging && probe_staging
 want lanes && probe_lanes
+want pool && probe_pool
 want stale && probe_stale
 for a in "${ACTIONS[@]}"; do echo "ACTION: $a"; done
 exit 0

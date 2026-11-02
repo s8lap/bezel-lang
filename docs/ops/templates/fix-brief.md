@@ -72,7 +72,7 @@ elaborates `CLAUDE.md`; this brief adds only what is specific to this assignment
 ### Run overrides
 
 <!-- Only deviations from CLAUDE.md / lane-contract.md, each with its reason. "None." if none. -->
-- **Pool size:** `<N>` lanes, not the standing 6 — `<reason>`.
+- **Pool size:** `<N>` lanes, not the standing 7 — `<reason>`.
 - **Model:** `<model>` for every lane in this run, not the standing Sonnet/Opus tiers — `<reason>`.
 - **Trailer:** `Co-Authored-By: <model> <noreply@anthropic.com>` — `lane-contract.md` §15 names
   the model that actually wrote the commit, and this run's model is not a Claude one.
