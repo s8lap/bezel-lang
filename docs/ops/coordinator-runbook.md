@@ -836,6 +836,17 @@ burns budget re-reading state that has not moved.
      python3 "$s" --strict >/dev/null 2>&1 && echo PASS || echo FAIL
    done
    ```
+   ⚠ **The checkers fail CLOSED, so a checker run from the wrong directory cannot
+   report a clean pass.** Measured 2026-11-02: every one of the 28
+   `scripts/check_*.py`, run from a directory that is not a checkout, either
+   measured its own tree correctly (they resolve it from `__file__`, not from the
+   cwd) or exited non-zero with a diagnostic — `check_src_citations` printing
+   *no document headings found -- wrong root?*, `check_dangling_capture` and
+   `check_internal_residual` exiting 2 for a missing compile database or
+   `bezelc`, `check_commit_trailers` exiting 1 for an unlistable range. None
+   printed "clean" while having measured nothing. So a wrong invocation looks
+   like a FAILURE here, never like a pass — and `ratchet_sweep.sh` cds to its own
+   repository before it runs anything.
    ⚠ **Adding `runAotChecked` rows legitimately raises `checked_calls` and turns
    `check_toolchain_skip_surface` RED.** That is a *denominator* rise, not a new
    silent-skip site. Before `--update --force`, verify what the ratchet's own
