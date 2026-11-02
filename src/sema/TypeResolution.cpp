@@ -321,6 +321,35 @@ void Resolver::run(const ast::SourceFile& src) {
         std::unordered_map<std::pair<std::string, std::size_t>,
                            std::vector<std::string>, PairHash>
             importOrigins;
+        // fix #7994 (§2.2 / §2.3, v0.350): the GENERIC ARITY of an
+        // §2.3 always-available name — the arity §2.2 compares names by.
+        //
+        // `builtinTypeArity` states the arity of every always-available name
+        // the compiler knows as a TYPE. The always-available names it does
+        // NOT state are listed here with the arity the §2.3 table gives them:
+        //   * `Object` — the root primitive (§8.1), arity 0.
+        //   * `Console`, `Math`, `Convert`, `Environment` — the `System`
+        //     auto-imported STATIC classes (§2.3 Row 8), non-generic.
+        //   * `BitReader`, `BitWriter`, `ArrayBitReader`, `ArrayBitWriter`,
+        //     `SlotHandle` — §2.3 Row 10 lists these WITHOUT type parameters
+        //     (unlike `Array<T>`, `LinkedList<T>`, `Counter<K>`, ...), so they
+        //     are non-generic.
+        //   * `Counter` — §2.3 Row 10's `Counter<K>`, arity 1. The #5140 HOLD
+        //     keeps `Counter` out of the always-available set, so this value
+        //     is never consulted for it.
+        // A name this does not know is reported as `kNotBuiltin` and the
+        // conservative answer (the import claims the name, as before) is used.
+        auto alwaysAvailableArityOf = [](std::string_view n) -> int {
+            const int builtin = builtinTypeArity(n);
+            if (builtin != kNotBuiltin) return builtin;
+            if (n == "Object") return 0;
+            if (n == "Console" || n == "Math" || n == "Convert" ||
+                n == "Environment") return 0;
+            if (n == "BitReader" || n == "BitWriter" || n == "ArrayBitReader" ||
+                n == "ArrayBitWriter" || n == "SlotHandle") return 0;
+            if (n == "Counter") return 1;
+            return kNotBuiltin;
+        };
         for (const auto& imp : src.imports) {
             if (!imp || !imp->name) continue;
             std::string dotted;
@@ -357,12 +386,92 @@ void Resolver::run(const ast::SourceFile& src) {
                 // HOLD: `Counter` (§2.3 Row 10 / stdlib §4.14) is excluded here
                 // pending the companion spec question on (identifier, generic
                 // arity) keying — see issue #5140.
+                //
+                // fix #7994 (§2.2 / §2.3 / §8.1, v0.350): the set above was
+                // keyed on the NAME alone, while §2.2 keys names together with
+                // their generic arity:
+                //
+                //   "For this collision rule and the shadowing rule below,
+                //   names are compared together with their generic arity ...
+                //   a non-generic `Counter` and the always-available
+                //   `Counter<K>` are two names, neither colliding with nor
+                //   shadowing the other ..., while an imported `Counter<T>` and
+                //   `Counter<K>` collide."
+                //
+                // So an imported public of the SAME identifier as an
+                // always-available name claims that name ONLY when the two
+                // have the SAME arity. An imported GENERIC public does not
+                // claim an always-available NON-GENERIC name: they are two
+                // names, so there is no §2.2 collision and no §2.3 ambiguity —
+                // the imported type is an ordinary import, reachable at its
+                // OWN arity. §8.1 names the root case: "a generic `Object<T>`
+                // is a different name (§2.2)".
+                //
+                // HELD (#5140): two rows keep today's behaviour, because
+                // #5140 holds them pending their own (identifier, generic
+                // arity) ruling and the always-available names' ordinary
+                // resolution must not move:
+                //   * a NON-GENERIC imported public claims the name for EVERY
+                //     always-available name (the shape the `Counter` hold
+                //     above covers — `Counter`, `Array`, `Set`, ...);
+                //   * an always-available GENERIC name (`Array<T>`,
+                //     `Counter<K>`, `Span<T>`, the `Task` family, ...) claims
+                //     the name against an imported public of ANY arity, so
+                //     the same-arity collision (`Array<T>` vs `Array<T>`) is
+                //     still the §2.3 ambiguity it is today.
+                // Whether this imported public takes the bare-name scope slot
+                // (the #7994 note below says when it does not).
+                bool takesBareNameScopeSlot = true;
                 if (isAlwaysAvailableBareName(t->name) &&
                     t->name != "Counter") {
-                    ambiguousAlwaysAvailableNames_.insert(std::string(t->name));
-                    ambiguousAlwaysAvailableNameImportingModule_.emplace(
-                        std::string(t->name), dotted);
-                    continue;
+                    const int aaArity = alwaysAvailableArityOf(t->name);
+                    const std::size_t importedArity = t->genericParams.size();
+                    // The always-available name is GENERIC when the compiler
+                    // states an arity above 0, and the `Task` family is
+                    // generic at 0 AND 1 (`kBuiltinTaskLike`).
+                    const bool alwaysAvailableIsGeneric =
+                        (aaArity == kBuiltinTaskLike) || (aaArity > 0);
+                    const bool alwaysAvailableClaimsName =
+                        (aaArity == kNotBuiltin)   // arity unknown: be
+                            ? true                 // conservative, as before
+                            : (alwaysAvailableIsGeneric
+                                   ? true         // HELD (#5140)
+                                   : (importedArity == 0));
+                    if (alwaysAvailableClaimsName) {
+                        ambiguousAlwaysAvailableNames_.insert(
+                            std::string(t->name));
+                        ambiguousAlwaysAvailableNameImportingModule_.emplace(
+                            std::string(t->name), dotted);
+                        continue;
+                    }
+                    // Otherwise the two are DIFFERENT names: the imported
+                    // GENERIC type is an ordinary import — it takes the
+                    // arity-keyed side table, exactly as any other imported
+                    // public — and the always-available name of the OTHER
+                    // arity is reached by its own spelling (§2.3: the
+                    // always-available one by its module's qualified name).
+                    //
+                    // The bare-name scope slot holds ONE symbol per
+                    // identifier, so the slot may only be given to the
+                    // imported public when the compiler KNOWS a type for the
+                    // always-available name (then the arity-0 reference keeps
+                    // naming the always-available type: through the #5172
+                    // arity fallback at the generic-arity check for a
+                    // built-in type, through the PRIMITIVE arm for the root
+                    // `Object` — whose primitive arm #7992's fix defers to
+                    // this very slot). For the §2.3 names the compiler knows
+                    // NO type for (`Console`, `Math`, `Convert`,
+                    // `Environment`, `BitReader`, `BitWriter`,
+                    // `ArrayBitReader`, `ArrayBitWriter`, `SlotHandle` — a
+                    // pre-existing gap, see
+                    // inherited_nested_type_bare_name_7012), the slot stays
+                    // free: the arity-0 reference keeps resolving exactly as
+                    // it does without the import ("unresolved type name
+                    // `Console`"), and the imported generic is reached through
+                    // the arity-keyed side table (`importedByArity_`).
+                    takesBareNameScopeSlot =
+                        (builtinTypeArity(t->name) != kNotBuiltin) ||
+                        (primitiveFromName(t->name) != PrimitiveType::None);
                 }
                 // fix #5172 (§2.2, v0.310): key the collision on
                 // (name, arity). The arity is the imported type's own
@@ -384,7 +493,16 @@ void Resolver::run(const ast::SourceFile& src) {
                     // First import to export this (name, arity) — add it to
                     // scope. A second (name, arity) from a different module
                     // is the §2.2 collision and is recorded below.
-                    moduleScope.names.emplace(std::string_view(t->name), t);
+                    //
+                    // fix #7994 (§2.2, v0.350): the bare-name scope slot is
+                    // given to the imported public only when it is the name
+                    // the identifier denotes (the always-available
+                    // non-generic name keeps the slot in the case above);
+                    // the arity-keyed side table below records it either way,
+                    // so the imported generic stays reachable at its own
+                    // arity.
+                    if (takesBareNameScopeSlot)
+                        moduleScope.names.emplace(std::string_view(t->name), t);
                     // Track every imported type by (name, arity) so
                     // resolveNamed's arity-selecting lookup (§2.2 v0.310)
                     // can reach an arity-matching import even when a local
