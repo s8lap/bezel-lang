@@ -28080,6 +28080,70 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #8016 (stdlib §7.3 / §4.6 / §28.9, v0.350): `File.ReadAllText(path)`
+    // is a +1 string PRODUCER — the §7.3 sibling of #7865's §7.4 `Path` arm
+    // above.
+    //
+    // WHY IT IS A PRODUCER. stdlib §7.3 declares `File` a `public static
+    // class`, and `ReadAllText` is the ONE member whose result is a `string`:
+    //
+    //   public static method ReadAllText(path: string): string;
+    //
+    // (Every other §7.3 `File` member returns `bool`, nothing, an `owned
+    // Array<byte>` / `owned Array<string>`, or a `Task<string>` — none of
+    // which is a `string` production.)
+    //
+    // The `File` arm of `tryLowerBuiltinClassCall` (LlvmBackend_Calls.cpp)
+    // mints that result with `ptrToStr` — a `calloc`'d header with rc := 1
+    // (`initStringRc`) whose data field is the `bz_file_read_all_text`
+    // buffer — so the CALLER owns exactly ONE reference to it. §28.9 is the
+    // ground: `string` is runtime-managed ("How the runtime manages their
+    // lifecycle (reference counting, region allocation, or other) is not part
+    // of this specification"), and "the implementation reclaims the
+    // production" — so a fresh production the implementation mints and hands
+    // to the caller is the CALLER's to discharge, exactly once.
+    //
+    // WITHOUT THIS ARM every consumer treated the result as a BORROW and
+    // RETAINED on top of the producer's +1 (rc 1 -> 2), so the scope-end
+    // release dropped only the consumer's own share (rc 2 -> 1) and the
+    // producer's reference was never discharged: the 32-byte header AND its
+    // data buffer leaked on every call. MEASURED (issue #8016; generated-code
+    // LeakSanitizer, 100-iteration loop of `var s := File.ReadAllText(
+    // "/no/such/file")`): 200 allocations / 4600 B before this arm — 100
+    // headers (32 B) + 100 data buffers (14 B) + the 100 `strToPath` C-string
+    // copies the call site now frees (fix #8016's other half).
+    //
+    // A bound local TRANSFERS the single reference (no extra retain) and the
+    // scope-end release drops rc 1->0 exactly once; a call argument and the
+    // `Console.Write` #1031 arm discharge it at the end of the full
+    // expression. No double free: an ESCAPING local is excluded from the
+    // scope-end release by the escape walk (its +1 then leaks — the safe
+    // direction).
+    //
+    // Matched like the `Path` arm above (a CallExpr on the `File` type
+    // keyword, the callee NOT resolved by sema, the receiver NOT a
+    // user-declared type), so a USER type that merely spells `File` — or a
+    // user extension of it — is NOT this builtin.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->callee && !calleeResolvedBySema(*call, ctx_)) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->target &&
+                    !sema::isUserDeclaredTypeSym(ctx_.exprSymbol(*ma->target))) {
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get())) {
+                        if (tid->name == "File") {
+                            // §7.3 `ReadAllText(path: string): string` — the
+                            // only §7.3 `File` member with a `string` result.
+                            if (ma->member == "ReadAllText" &&
+                                call->args.size() == 1)
+                                return true;  // ptrToStr → rc=1
+                        }
+                    }
+                }
+            }
+        }
+    }
     // #2199 / stdlib §9.6 / §4.6 / §28.9 (v0.220): the stdlib `string` INSTANCE
     // methods that transform self into a fresh heap `bz.string` at rc := 1. Each
     // lowers (in tryLowerStringMethod, LlvmBackend_String.cpp) to either an inline

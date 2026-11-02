@@ -17387,6 +17387,45 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         builder_.CreateStore(builder_.getInt8(0), nul);
         return buf;
     };
+    // fix #8016 (stdlib §7.3 / §7.4 / §4.6 / §28.9, v0.350): release the
+    // `strToPath` C-string COPY.
+    //
+    // `strToPath` above mallocs a NUL-terminated COPY of the argument's bytes
+    // so the `bz_*` runtime entry point can take a `const char*`. Every
+    // `bz_file_*` / `bz_dir_*` / `bz_path_*` entry point only READS that
+    // pointer — `fopen`, `access`, `unlink`, `opendir`, `strdup`+copy — and
+    // NONE of them takes ownership of it — so the copy is the CALLER's to
+    // release, and nobody released it: the malloc'd buffer was unreachable the
+    // moment the call returned.
+    //
+    // MEASURED (issue #8016; generated-code LeakSanitizer, 100-iteration
+    // loops, on the staging tip `8993d643` — the same numbers the reviewer
+    // measured):
+    //
+    //   File.Exists("/no/such/file")        99 allocations / 1386 B
+    //   File.ReadAllText("/no/such/file")  200 allocations / 4600 B
+    //   Directory.Exists("/no/such/dir")     99 allocations / 1287 B
+    //   Directory.GetFiles("/no/such/dir")  100 allocations / 1300 B
+    //   File.WriteAllText(p, "x")           99 allocations / 4950 B
+    //   File.Copy(a, b, false)             199 allocations / 2189 B
+    //   File.ReadAllLines(p)               100 allocations / 1400 B
+    //   File.ReadAllBytes(p)                99 allocations / 1386 B
+    //
+    // The `Path` arms (fix #7865) already released their copies; the `File` /
+    // `Directory` arms did not. `free()` the copy right after the call — the
+    // runtime has already consumed it.
+    //
+    // §28.9: `string` is runtime-managed — "How the runtime manages their
+    // lifecycle (reference counting, region allocation, or other) is not part
+    // of this specification" — so the implementation reclaims the production.
+    // The copy is part of that implementation's own scratch: the runtime never
+    // kept it, so the compiler must.
+    auto freeCStr = [&](llvm::Value* p) {
+        if (!p) return;
+        auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_),
+                                {ptrTy()});
+        builder_.CreateCall(freeFn, {p});
+    };
     auto ptrToStr = [&](llvm::Value* ptr, llvm::Value* lenVal) -> llvm::Value* {
         // Build a bz.string from a malloc'd C string (ptr, len, width=1).
         // #422: allocate the full header size (now 32 bytes incl. rc).
@@ -17464,27 +17503,48 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     };
 
     if (cls == "File") {
+        // fix #8016 (stdlib §7.3 / §4.6 / §28.9, v0.350): every §7.3 `File`
+        // arm that takes a path leaked the `strToPath` C-string COPY of that
+        // path — the runtime only READS the pointer, so the copy is the
+        // caller's to release. See `freeCStr` above (and #7865's `Path` arms,
+        // the sibling fix).
         if (m == "Exists" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* s = lowerExpr(*call.args[0].value);
             if (!s) return nullptr;
             llvm::Value* path = strToPath(s);
             auto* fn = declareC("bz_file_exists", i1(), {ptrTy()});
-            return builder_.CreateCall(fn, {path});
+            llvm::Value* r = builder_.CreateCall(fn, {path});
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(path);
+            return r;
         }
         if (m == "Delete" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* s = lowerExpr(*call.args[0].value);
             if (!s) return nullptr;
+            llvm::Value* path = strToPath(s);
             auto* fn = declareC("bz_file_delete", i1(), {ptrTy()});
-            return builder_.CreateCall(fn, {strToPath(s)});
+            llvm::Value* r = builder_.CreateCall(fn, {path});
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(path);
+            return r;
         }
         if (m == "ReadAllText" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* s = lowerExpr(*call.args[0].value);
             if (!s) return nullptr;
             auto* outSlot = entryAlloca(ptrTy());
             auto* lenSlot = entryAlloca(i64());
+            llvm::Value* path = strToPath(s);
             auto* fn = declareC("bz_file_read_all_text", i32(),
                                 {ptrTy(), ptrTy(), ptrTy()});
-            builder_.CreateCall(fn, {strToPath(s), outSlot, lenSlot});
+            builder_.CreateCall(fn, {path, outSlot, lenSlot});
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            // The RESULT is a different ownership: `bz_file_read_all_text`
+            // hands back a malloc'd byte buffer which becomes the string's
+            // DATA field (`ptrToStr`), so the string owns it and
+            // `bz_string_release` frees it with the header — no separate free
+            // here. The RESULT's own reference count is the classifier's
+            // business (`isPlusOneStringProducer`, LlvmBackend_Setup.cpp).
+            freeCStr(path);
             llvm::Value* ptr = builder_.CreateLoad(ptrTy(), outSlot);
             llvm::Value* len = builder_.CreateLoad(i64(), lenSlot);
             return ptrToStr(ptr, len);
@@ -17492,8 +17552,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         if (m == "ReadAllLines" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* s = lowerExpr(*call.args[0].value);
             if (!s) return nullptr;
+            llvm::Value* path = strToPath(s);
             auto* fn = declareC("bz_file_read_all_lines", ptrTy(), {ptrTy()});
-            return builder_.CreateCall(fn, {strToPath(s)}, "lines.arr");
+            llvm::Value* r = builder_.CreateCall(fn, {path}, "lines.arr");
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(path);
+            return r;
         }
         if (m == "WriteAllText" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
@@ -17507,9 +17571,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* text = v[1];
             if (!path || !text) return nullptr;
             auto [td, tl] = loadBzString(text);
+            llvm::Value* pathC = strToPath(path);
             auto* fn = declareC("bz_file_write_all_text", i32(),
                                 {ptrTy(), ptrTy(), i64()});
-            return builder_.CreateCall(fn, {strToPath(path), td, tl});
+            llvm::Value* r = builder_.CreateCall(fn, {pathC, td, tl});
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(pathC);
+            return r;
         }
         if (m == "AppendAllText" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
@@ -17520,16 +17588,24 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* text = v[1];
             if (!path || !text) return nullptr;
             auto [td, tl] = loadBzString(text);
+            llvm::Value* pathC = strToPath(path);
             auto* fn = declareC("bz_file_append_all_text", i32(),
                                 {ptrTy(), ptrTy(), i64()});
-            return builder_.CreateCall(fn, {strToPath(path), td, tl});
+            llvm::Value* r = builder_.CreateCall(fn, {pathC, td, tl});
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(pathC);
+            return r;
         }
         // §7.3: File.ReadAllBytes(path) → owned Array<byte> (bz_array_t* elem_size=1).
         if (m == "ReadAllBytes" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* s = lowerExpr(*call.args[0].value);
             if (!s) return nullptr;
+            llvm::Value* path = strToPath(s);
             auto* fn = declareC("bz_file_read_all_bytes_arr", ptrTy(), {ptrTy()});
-            return builder_.CreateCall(fn, {strToPath(s)}, "bytes.arr");
+            llvm::Value* r = builder_.CreateCall(fn, {path}, "bytes.arr");
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(path);
+            return r;
         }
         // §7.3: File.WriteAllBytes(path, contents: Array<byte>).
         // The `contents` arg may be an Array<byte> (bz_array_t* ptr) or a
@@ -17586,7 +17662,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     {src, start, builder_.getInt64(1)}, "span.data");
                 auto* fn = declareC("bz_file_write_all_bytes", i32(),
                                     {ptrTy(), ptrTy(), i64()});
-                return builder_.CreateCall(fn, {pathC, dataPtr, slen});
+                llvm::Value* r = builder_.CreateCall(fn, {pathC, dataPtr, slen});
+                // fix #8016: the C-string copy is ours — the runtime only read it.
+                freeCStr(pathC);
+                return r;
             }
             // Array<byte> arg: bz_array_t* passed directly. A struct-typed
             // argument that is NOT a recognized span (a Range<int>, a record,
@@ -17598,7 +17677,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // error: IR verification failed`) — never a silent miscompile.
             auto* fn = declareC("bz_file_write_all_bytes_arr", i32(),
                                 {ptrTy(), ptrTy()});
-            return builder_.CreateCall(fn, {pathC, contents});
+            llvm::Value* r = builder_.CreateCall(fn, {pathC, contents});
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(pathC);
+            return r;
         }
         // §7.3: File.WriteAllLines(path, lines: IEnumerable<string>).
         // In practice callers pass Array<string> (bz_array_t* of bz_string*).
@@ -17612,9 +17694,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* path = v[0];
             llvm::Value* arr  = v[1];
             if (!path || !arr) return nullptr;
+            llvm::Value* pathC = strToPath(path);
             auto* fn = declareC("bz_file_write_all_lines", i32(),
                                 {ptrTy(), ptrTy()});
-            return builder_.CreateCall(fn, {strToPath(path), arr});
+            llvm::Value* r = builder_.CreateCall(fn, {pathC, arr});
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(pathC);
+            return r;
         }
         // §7.3: File.Copy(source, destination, overwrite: bool).
         //
@@ -17632,9 +17718,16 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* dst  = v[1];
             llvm::Value* over = v[2];
             if (!src || !dst || !over) return nullptr;
+            llvm::Value* srcC = strToPath(src);
+            llvm::Value* dstC = strToPath(dst);
             auto* fn = declareC("bz_file_copy", i32(),
                                 {ptrTy(), ptrTy(), i1()});
-            return builder_.CreateCall(fn, {strToPath(src), strToPath(dst), over});
+            llvm::Value* r = builder_.CreateCall(fn, {srcC, dstC, over});
+            // fix #8016: BOTH C-string copies are ours — the runtime only read
+            // them (`bz_file_copy` copies the source out before it unlinks).
+            freeCStr(srcC);
+            freeCStr(dstC);
+            return r;
         }
         // §7.3: File.Move(source, destination).
         if (m == "Move" && call.args.size() == 2 &&
@@ -17647,22 +17740,42 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* src = v[0];
             llvm::Value* dst = v[1];
             if (!src || !dst) return nullptr;
+            llvm::Value* srcC = strToPath(src);
+            llvm::Value* dstC = strToPath(dst);
             auto* fn = declareC("bz_file_move", i32(), {ptrTy(), ptrTy()});
-            return builder_.CreateCall(fn, {strToPath(src), strToPath(dst)});
+            llvm::Value* r = builder_.CreateCall(fn, {srcC, dstC});
+            // fix #8016: BOTH C-string copies are ours — the runtime only read
+            // them (`bz_file_move` renames, it does not keep the paths).
+            freeCStr(srcC);
+            freeCStr(dstC);
+            return r;
         }
     }
     if (cls == "Directory") {
+        // fix #8016 (stdlib §7.4 / §4.6 / §28.9, v0.350): every §7.4
+        // `Directory` arm that takes a path leaked the `strToPath` C-string
+        // COPY of that path. See `freeCStr` above (and #7865's `Path` arms,
+        // the sibling fix).
         if (m == "Exists" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* s = lowerExpr(*call.args[0].value);
             if (!s) return nullptr;
+            llvm::Value* path = strToPath(s);
             auto* fn = declareC("bz_dir_exists", i1(), {ptrTy()});
-            return builder_.CreateCall(fn, {strToPath(s)});
+            llvm::Value* r = builder_.CreateCall(fn, {path});
+            // fix #8016: the C-string copy is ours — the runtime only read it.
+            freeCStr(path);
+            return r;
         }
         if (m == "CreateDirectory" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* s = lowerExpr(*call.args[0].value);
             if (!s) return nullptr;
+            llvm::Value* path = strToPath(s);
             auto* fn = declareC("bz_dir_create", i32(), {ptrTy()});
-            return builder_.CreateCall(fn, {strToPath(s)});
+            llvm::Value* r = builder_.CreateCall(fn, {path});
+            // fix #8016: the C-string copy is ours — the runtime only read it
+            // (`bz_dir_create` `strdup`s the path into its own scratch).
+            freeCStr(path);
+            return r;
         }
         if (m == "Delete" && call.args.size() >= 1 && call.args[0].value) {
             // fix #7982 (§22.5, v0.350): §7.4 declares
@@ -17679,8 +17792,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // Second arg: recursive (bool), default false
             llvm::Value* recursive = builder_.getFalse();
             if (v[1]) recursive = v[1];
+            llvm::Value* path = strToPath(s);
             auto* fn = declareC("bz_dir_delete", i32(), {ptrTy(), i1()});
-            return builder_.CreateCall(fn, {strToPath(s), recursive});
+            llvm::Value* r = builder_.CreateCall(fn, {path, recursive});
+            // fix #8016: the C-string copy is ours — the runtime only read it
+            // (`bz_dir_delete` copies the path into its own 4 KiB scratch
+            // buffer for the recursive walk).
+            freeCStr(path);
+            return r;
         }
     }
     // §7: Directory.GetFiles / GetDirectories — return Array<string>
@@ -17694,8 +17813,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* cntSlotG = entryAlloca(i64());
             auto* getFilesFn = declareC(fnName, ptrTy(), {ptrTy(), ptrTy()});
             // Returns char** (array of NUL-terminated paths)
+            llvm::Value* pathC = strToPath(s);
             llvm::Value* rawArr = builder_.CreateCall(getFilesFn,
-                {strToPath(s), cntSlotG});
+                {pathC, cntSlotG});
+            // fix #8016: the C-string copy is ours — the runtime only read it
+            // (`bz_dir_get_files` copies each entry out of it into a fresh
+            // `strdup`).
+            freeCStr(pathC);
             llvm::Value* cnt = builder_.CreateLoad(i64(), cntSlotG);
             auto* allocFn3 = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
             llvm::Value* result = builder_.CreateCall(allocFn3,
@@ -17756,7 +17880,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // malloc'd buffer was unreachable the moment the call returned. The
         // issue's own repro measured it: `Path.Combine("x","y")` leaked exactly
         // 2 allocations, the two copies (4 bytes). `free()` them right after
-        // the call — the runtime has already consumed them.
+        // the call — the runtime has already consumed them. The `freeCStr`
+        // helper is the one hoisted to the §7 block above (fix #8016) and
+        // shared with the `File` / `Directory` arms.
         //
         // (B) THE PRODUCER ARGUMENT. §28.3: a non-`owned` argument position is
         // a BORROWING use whatever the callee's body does with the parameter,
@@ -17771,12 +17897,6 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // the later-produced argument first. A BORROW argument (a named local
         // read) is not a producer and is left alone — releasing it would drop
         // the owner's only reference.
-        auto freeCStr = [&](llvm::Value* p) {
-            if (!p) return;
-            auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy()});
-            builder_.CreateCall(freeFn, {p});
-        };
         auto releaseProducerArg = [&](const ast::Expr* e, llvm::Value* v) {
             if (!e || !v || !v->getType()->isPointerTy()) return;
             if (!isPlusOneStringProducer(e)) return;
