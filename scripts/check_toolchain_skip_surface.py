@@ -42,6 +42,15 @@ BASELINE IS EXACT, NOT A CEILING. A count below its baseline fails as STALE
 HEADROOM (same rule as every sibling ratchet). absorbing_sites may only fall.
 checked_calls may rise, but only when absorbing_sites did not rise.
 
+⇒ READ "did not rise" LITERALLY: a FLAT absorbing_sites SANCTIONS a
+checked_calls rise. Only a RISE in absorbing_sites blocks one — and that rise
+already fails on its OWN first check ("absorbing_sites ROSE"), so the
+checked_calls condition in check() is a SECOND, redundant report of the same
+event, never the only thing that catches it. (The condition used to be
+`abs_m >= abs_b`, so a FLAT count blocked the rise as well: once the #3733
+burn-down reached 0 the ratchet became UNSATISFIABLE — no new checked test
+could ever be added without `--force`. Issue #6622.)
+
 Usage:  scripts/check_toolchain_skip_surface.py [--strict] [--self-test]
                                                  [--update [--force]] [--list]
 """
@@ -286,10 +295,12 @@ def write_baseline(absorbing, checked, support, path=BASELINE):
         '#',
         '# Regenerate with scripts/check_toolchain_skip_surface.py --update',
         '# after a burn-down step. --update REFUSES to raise absorbing_sites',
-        '# (it may only fall) and REFUSES to raise checked_calls without a',
-        '# contemporaneous drop in absorbing_sites (a real rise means a new',
-        '# absorbing call site, which is the defect the ratchet exists to',
-        '# catch).',
+        '# (it may only fall) and REFUSES to raise checked_calls while',
+        '# absorbing_sites RISES (a rise means a new absorbing call site,',
+        '# which is the defect the ratchet exists to catch). A FLAT',
+        '# absorbing_sites SANCTIONS a checked_calls rise — that is the rule',
+        '# the module docstring states ("only when absorbing_sites did not',
+        '# rise"), and the condition implements it.',
         '#',
         '# EXACT, not a ceiling: a count below its baseline fails as STALE',
         '# HEADROOM (same rule as every sibling ratchet in this family).',
@@ -338,14 +349,16 @@ def check(root, baseline_path=BASELINE, stale=True):
             'tests/support/aot_result_asserts.hpp::'
             'failedAtCompileTimeWithRealLocation(r).'
             % (abs_b, abs_m, abs_m - abs_b))
-    if chk_m > chk_b and abs_m >= abs_b:
+    if chk_m > chk_b and abs_m > abs_b:
         bad.append(
             'checked_calls ROSE: baseline %d, tree has %d (+%d). A new '
             'runAotChecked{,,Lenient,Disposal} call site was added — that '
             'is fine ON ITS OWN, but it is paired here with absorbing_sites '
-            'not falling, which is the shape of a real new absorbing site. '
-            'Either bank a drop in absorbing_sites alongside the rise, or '
-            'verify the new call site does not absorb a toolchain SKIP.'
+            'RISING, which is the shape of a real new absorbing site. '
+            'Fix the new absorbing site (delete the guard, or replace it '
+            'with tests/support/aot_result_asserts.hpp::'
+            'failedAtCompileTimeWithRealLocation) before re-running '
+            '--update.'
             % (chk_b, chk_m, chk_m - chk_b))
     if stale:
         if abs_m < abs_b:
@@ -796,6 +809,63 @@ def self_test():
             'untouched',
             cpost[0] == cpre[0] and cpost[2] == cpre[2]
             and cpost[1] == cpre[1] - 1)
+
+        # ── The documented coupling, pinned in BOTH directions.
+        #
+        # Issue #6622: the module docstring says "checked_calls may rise, but
+        # only when absorbing_sites did not rise", while the condition was
+        # `abs_m >= abs_b` — so a FLAT absorbing_sites blocked the rise too,
+        # and the ratchet became UNSATISFIABLE once the #3733 burn-down
+        # reached 0 (no new checked test could ever be added without
+        # `--force`). The condition now fires only when absorbing_sites
+        # ROSE, which is what the docstring states.
+        #
+        # Two properties, pinned here so the rule cannot drift back:
+        #   (a) a checked_calls rise with absorbing_sites FLAT is SANCTIONED;
+        #   (b) an absorbing_sites RISE is still caught — on that SAME
+        #       flat-absorbing tree, so (a) cannot be satisfied by a
+        #       detector that simply stopped looking.
+        flat = root / 'flat_fixture'
+        fb = flat / 'baseline'
+        _mk(flat, 'tests/codegen/plain_test.cpp',
+            'BEZEL_TEST(codegen_flat, plain) {\n'
+            '  auto r = runAotChecked("module M;");\n'
+            '  BEZEL_EXPECT_FALSE(r.ran);\n'
+            '}\n')
+        fpre = measure(flat)
+        write_baseline(fpre[2], fpre[0], fpre[1], fb)
+        chk('the flat fixture starts green',
+            check(flat, fb, stale=True)[0])
+        # One more PLAIN (non-absorbing) checked call site: absorbing FLAT.
+        _mk(flat, 'tests/codegen/another_test.cpp',
+            'BEZEL_TEST(codegen_flat, another) {\n'
+            '  auto r = runAotChecked("module M;");\n'
+            '  BEZEL_EXPECT_FALSE(r.ran);\n'
+            '}\n')
+        fpost = measure(flat)
+        chk('the flat fixture adds one checked call and NO absorbing site',
+            fpost[0] == fpre[0] + 1 and fpost[2] == fpre[2])
+        good, msgs = check(flat, fb, stale=True)
+        chk('a checked_calls rise with absorbing_sites FLAT is SANCTIONED '
+            '(the documented rule)', good)
+        # And an absorbing RISE is still caught on that same tree.
+        _mk(flat, 'tests/codegen/absorbing_test.cpp',
+            'namespace { bool wasSkipped(const JitResult& r) {\n'
+            '  if (r.ran) return false;\n'
+            '  for (const auto& d : r.diagnostics.diagnostics())\n'
+            '    if (d.message.find("SKIP") != std::string::npos) return true;\n'
+            '  return false;\n'
+            '} }\n'
+            'BEZEL_TEST(codegen_flat, new_absorbing) {\n'
+            '  auto r = runAotChecked("module M;");\n'
+            '  if (wasSkipped(r)) return;\n'
+            '  BEZEL_EXPECT_FALSE(r.ran);\n'
+            '}\n')
+        good, msgs = check(flat, fb, stale=True)
+        chk('an absorbing_sites rise is still caught on the flat tree',
+            not good and any('absorbing_sites ROSE' in m for m in msgs))
+        chk('the same rise is ALSO reported as a checked_calls rise',
+            any('checked_calls ROSE' in m for m in msgs))
 
     print('check_toolchain_skip_surface --self-test: ' +
           ('PASS' if ok else 'FAIL'))

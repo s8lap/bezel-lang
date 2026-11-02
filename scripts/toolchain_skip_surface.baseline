@@ -5,10 +5,12 @@
 #
 # Regenerate with scripts/check_toolchain_skip_surface.py --update
 # after a burn-down step. --update REFUSES to raise absorbing_sites
-# (it may only fall) and REFUSES to raise checked_calls without a
-# contemporaneous drop in absorbing_sites (a real rise means a new
-# absorbing call site, which is the defect the ratchet exists to
-# catch).
+# (it may only fall) and REFUSES to raise checked_calls while
+# absorbing_sites RISES (a rise means a new absorbing call site,
+# which is the defect the ratchet exists to catch). A FLAT
+# absorbing_sites SANCTIONS a checked_calls rise — that is the rule
+# the module docstring states ("only when absorbing_sites did not
+# rise"), and the condition implements it.
 #
 # EXACT, not a ceiling: a count below its baseline fails as STALE
 # HEADROOM (same rule as every sibling ratchet in this family).
@@ -26,5 +28,5 @@
 #                   from checked_calls only when a file moves into
 #                   or out of tests/support/.
 absorbing_sites = 0
-checked_calls   = 3980
-support_calls   = 3997
+checked_calls   = 4008
+support_calls   = 4025

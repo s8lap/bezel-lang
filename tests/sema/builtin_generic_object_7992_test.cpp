@@ -114,6 +114,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::diagnosticMessageContains;
+using bezel::test::failedAtCompileTimeWithRealLocation;
 using bezel::test::JitResult;
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
@@ -281,8 +282,16 @@ BEZEL_TEST(builtin_generic_object_7992,
         "    return 0; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // STRENGTHENED (issue #3892's oracle, not the ambiguous pair): a bare
+    // `BEZEL_EXPECT_FALSE(r.ran)` + `hasErrors()` is ONE claim about one
+    // variable, and it is satisfied just as well by a program that compiled
+    // and then died from a runtime signal (runAot reports a crash, a signal,
+    // a timeout and an ASan report as ordinary Error diagnostics at
+    // SourceLocation{0:0}). `failedAtCompileTimeWithRealLocation` excludes
+    // exactly those outcomes and demands a diagnostic carrying a REAL
+    // source location, and the text check names the rule that rejected it.
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(rootNamedDiagnostic(r));
 }
 
 // =====================================================================
@@ -329,8 +338,13 @@ BEZEL_TEST(builtin_generic_object_7992,
         "    return 0; "
         "  end Main; "
         "end Program;");
-    BEZEL_EXPECT_FALSE(r.ran);
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    // STRENGTHENED, same oracle and same reason as ROW 5: the qualified
+    // spelling must be rejected AT COMPILE TIME with a real location, and
+    // with the SAME root-naming text as the bare spelling (§2.3's row and
+    // §8.1's "and `System.Object` still reaches it" make the qualified
+    // spelling name the ROOT by definition).
+    BEZEL_EXPECT_TRUE(failedAtCompileTimeWithRealLocation(r));
+    BEZEL_EXPECT_TRUE(rootNamedDiagnostic(r));
 }
 
 // =====================================================================
