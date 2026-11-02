@@ -542,6 +542,32 @@ marked `*`, when:
 Recovery computes one patch-id per note in `refs/notes/bezel-picks`, so its
 cost grows with the notes ref; nothing prunes that ref yet.
 
+**Amending is where a reviewed commit can lose its content.** Two rules, both
+paid for:
+
+- **`git commit --amend` composes a NEW tree from the INDEX, not from HEAD's
+  tree.** So a `git checkout <ref> -- <path>` used as "cleanup" — which leaves
+  the worktree and index mixed — is caught by the next amend, which commits
+  the mixture. At R25 (2026-10-01) a nine-file fix became an EMPTY tree while
+  its message still named all nine files: the trailer had been indented, the
+  message was rewritten with `--amend -F`, and the index (not HEAD) became the
+  new tree. Before amending a message, verify that `git diff HEAD` **and**
+  `git diff --cached HEAD` are both empty, and `git reset --hard HEAD` first
+  if either is not. Never `git checkout <ref> -- <path>` in a producer's
+  worktree to "clean up" — `git reset --hard HEAD` keeps the worktree in
+  lockstep with HEAD. If the destructive amend already happened, the reflog
+  retains the pre-amend SHA: `git reset --hard <pre-amend-SHA>`, re-amend, then
+  compare `git rev-parse HEAD^{tree}` with `<pre-amend-SHA>^{tree}` — they must
+  be identical.
+- **Amend in the worktree where the BRANCH is checked out.** `--amend` in a
+  detached worktree does not move the branch, so the branch keeps the old
+  subject. That matters most for a subject change: `fix #N` is a GitHub
+  closing keyword and `narrow #N` is not, so a partial fix whose subject was
+  never actually changed closes the whole issue when the gate pushes. Amend
+  before the pick (the pick records the SHA; the push closes), and prove the
+  amend was lossless with the patch-id, not with a tree diff — the SHA changes
+  either way, so report both SHAs.
+
 Limits worth knowing:
 - notes are local refs and are not pushed, so the ledger lives on this machine;
 - git 2.55 runs `pre-commit` for `commit` and `commit --amend` but **not** for

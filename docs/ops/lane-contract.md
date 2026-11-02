@@ -83,6 +83,20 @@ SPECIFIC to its assignment.*
     A brief that tells you to write another model's name is wrong; follow this rule and say so in
     your handback.
     Never run `git config user.*`; the author is whatever the harness default is.
+15a. **A subject that names an issue CLOSES it.** GitHub's closing keywords are
+    `close`/`closes`/`closed`/`fix`/`fixes`/`fixed`/`resolve`/`resolves`/`resolved`, so `fix #N` in a
+    subject closes #N when the commit is pushed. A fix that closes only PART of an issue must say
+    `narrow #N`, which is not a closing keyword. A test-only subject (`test #N: …`) does not close
+    either. Measure the issue's parts before you choose: "this issue has three parts" is a claim
+    until each part has been measured on the current tip.
+15b. **Amend a subject in the worktree where the BRANCH is checked out, and prove the amend was
+    lossless.** `git commit --amend` in a detached worktree does not move the branch, so the branch
+    keeps the old subject and the auto-close still fires. And `--amend` composes a NEW tree from
+    the INDEX, not from HEAD's tree — so before amending, verify that `git diff HEAD` **and**
+    `git diff --cached HEAD` are both empty, and `git reset --hard HEAD` first if either is not.
+    Prove the content did not change with `git diff <old> HEAD --stat` (must be empty) **and**
+    `git show <old> | git patch-id --stable` (must equal the new one): a tree diff alone does not
+    show that the reviewed diff is the same diff. The SHA changes, so report the old and the new.
 16. **Commit incrementally.** Land each self-contained increment as it is proven, rather than one
     commit at the end — a lane that runs out of time should leave landable work, not a dirty tree.
 17. **Do not push.** Hand the branch back to your coordinator, who integrates and gates it. Never
