@@ -111,6 +111,67 @@ bool isAlwaysAvailableBareName(std::string_view n) {
         n == "IGrouping" || n == "IOrderedEnumerable";
 }
 
+// fix #8002 (§2.2 / §2.3, v0.350): the GENERIC ARITY of the §2.3
+// always-available name `n` — the arity §2.2 compares names by.
+//
+// `builtinTypeArity` states the arity of every always-available name the
+// compiler knows as a TYPE. The always-available names it does NOT state are
+// listed here with the arity the §2.3 table gives them:
+//   * `Object` — the root primitive (§8.1), arity 0.
+//   * `Console`, `Math`, `Convert`, `Environment` — the `System`
+//     auto-imported STATIC classes (§2.3 Row 8), non-generic.
+//   * `BitReader`, `BitWriter`, `ArrayBitReader`, `ArrayBitWriter`,
+//     `SlotHandle` — §2.3 Row 10 lists these WITHOUT type parameters
+//     (unlike `Array<T>`, `LinkedList<T>`, `Counter<K>`, ...), so they are
+//     non-generic.
+//   * `Counter` — §2.3 Row 10's `Counter<K>`, arity 1. The #5140 HOLD keeps
+//     `Counter` out of the always-available set, so this value is never
+//     consulted for it.
+// A name this does not know is reported as `kNotBuiltin` and the conservative
+// answer (the import claims the name) is used.
+int Resolver::alwaysAvailableTypeArity(std::string_view n) {
+    const int builtin = builtinTypeArity(n);
+    if (builtin != kNotBuiltin) return builtin;
+    if (n == "Object") return 0;
+    if (n == "Console" || n == "Math" || n == "Convert" ||
+        n == "Environment") return 0;
+    if (n == "BitReader" || n == "BitWriter" || n == "ArrayBitReader" ||
+        n == "ArrayBitWriter" || n == "SlotHandle") return 0;
+    if (n == "Counter") return 1;
+    return kNotBuiltin;
+}
+
+// fix #8002 (§2.2 / §2.3, v0.350): does the §2.3 always-available name `n`
+// CLAIM the bare name against an imported public of arity `importedArity`?
+//
+// §2.2 compares names together with their GENERIC ARITY, so the
+// always-available name and the imported public are ONE name only when their
+// arities AGREE. An always-available NON-GENERIC name (arity 0) and an
+// imported GENERIC public (arity > 0) are TWO names: no §2.2 collision, no
+// §2.3 ambiguity, and the imported public is an ordinary import reachable at
+// its own arity. §8.1 names the root case: "a generic `Object<T>` is a
+// different name (§2.2)".
+//
+// HELD (#5140): two rows keep the pre-#8002 behaviour, because #5140 holds
+// them pending their own (identifier, generic arity) ruling:
+//   * an always-available GENERIC name (`Array<T>`, `Counter<K>`, `Span<T>`,
+//     the `Task` family, ...) claims the name against an imported public of
+//     ANY arity — the same-arity collision is still the §2.3 ambiguity it
+//     has always been;
+//   * an always-available name whose arity the compiler does not know claims
+//     the name (the conservative answer).
+bool Resolver::alwaysAvailableClaimsImportedName(std::string_view n,
+                                                 std::size_t importedArity) {
+    const int aaArity = alwaysAvailableTypeArity(n);
+    if (aaArity == kNotBuiltin) return true;   // arity unknown: claim
+    // The `Task` family is generic at 0 AND 1 (`kBuiltinTaskLike`), and any
+    // arity above 0 is generic.
+    const bool alwaysAvailableIsGeneric =
+        (aaArity == kBuiltinTaskLike) || (aaArity > 0);
+    if (alwaysAvailableIsGeneric) return true;  // HELD (#5140)
+    return importedArity == 0;
+}
+
 PrimitiveType primitiveFromName(std::string_view name) {
     if (name == "bool")    return PrimitiveType::Bool;
     if (name == "char")    return PrimitiveType::Char;
@@ -323,33 +384,11 @@ void Resolver::run(const ast::SourceFile& src) {
             importOrigins;
         // fix #7994 (§2.2 / §2.3, v0.350): the GENERIC ARITY of an
         // §2.3 always-available name — the arity §2.2 compares names by.
-        //
-        // `builtinTypeArity` states the arity of every always-available name
-        // the compiler knows as a TYPE. The always-available names it does
-        // NOT state are listed here with the arity the §2.3 table gives them:
-        //   * `Object` — the root primitive (§8.1), arity 0.
-        //   * `Console`, `Math`, `Convert`, `Environment` — the `System`
-        //     auto-imported STATIC classes (§2.3 Row 8), non-generic.
-        //   * `BitReader`, `BitWriter`, `ArrayBitReader`, `ArrayBitWriter`,
-        //     `SlotHandle` — §2.3 Row 10 lists these WITHOUT type parameters
-        //     (unlike `Array<T>`, `LinkedList<T>`, `Counter<K>`, ...), so they
-        //     are non-generic.
-        //   * `Counter` — §2.3 Row 10's `Counter<K>`, arity 1. The #5140 HOLD
-        //     keeps `Counter` out of the always-available set, so this value
-        //     is never consulted for it.
-        // A name this does not know is reported as `kNotBuiltin` and the
-        // conservative answer (the import claims the name, as before) is used.
-        auto alwaysAvailableArityOf = [](std::string_view n) -> int {
-            const int builtin = builtinTypeArity(n);
-            if (builtin != kNotBuiltin) return builtin;
-            if (n == "Object") return 0;
-            if (n == "Console" || n == "Math" || n == "Convert" ||
-                n == "Environment") return 0;
-            if (n == "BitReader" || n == "BitWriter" || n == "ArrayBitReader" ||
-                n == "ArrayBitWriter" || n == "SlotHandle") return 0;
-            if (n == "Counter") return 1;
-            return kNotBuiltin;
-        };
+        // The table is `Resolver::alwaysAvailableTypeArity`
+        // (TypeResolution_impl.hpp), and the §2.2 arity QUESTION is
+        // `Resolver::alwaysAvailableClaimsImportedName` — the same function
+        // the EXPRESSION-position arm consults (fix #8002), so the two arms
+        // cannot drift apart.
         for (const auto& imp : src.imports) {
             if (!imp || !imp->name) continue;
             std::string dotted;
@@ -424,20 +463,22 @@ void Resolver::run(const ast::SourceFile& src) {
                 bool takesBareNameScopeSlot = true;
                 if (isAlwaysAvailableBareName(t->name) &&
                     t->name != "Counter") {
-                    const int aaArity = alwaysAvailableArityOf(t->name);
                     const std::size_t importedArity = t->genericParams.size();
-                    // The always-available name is GENERIC when the compiler
-                    // states an arity above 0, and the `Task` family is
-                    // generic at 0 AND 1 (`kBuiltinTaskLike`).
-                    const bool alwaysAvailableIsGeneric =
-                        (aaArity == kBuiltinTaskLike) || (aaArity > 0);
-                    const bool alwaysAvailableClaimsName =
-                        (aaArity == kNotBuiltin)   // arity unknown: be
-                            ? true                 // conservative, as before
-                            : (alwaysAvailableIsGeneric
-                                   ? true         // HELD (#5140)
-                                   : (importedArity == 0));
-                    if (alwaysAvailableClaimsName) {
+                    // fix #8002 (§2.2 / §2.3, v0.350): the §2.2 arity
+                    // QUESTION is asked of the SHARED predicate, so the TYPE
+                    // position and the EXPRESSION position
+                    // (`src/sema/ExprTypecheck.cpp`'s import loop) decide it
+                    // the same way and cannot drift apart. The predicate
+                    // implements:
+                    //   * an arity the compiler does not know → the import
+                    //     claims the name (the conservative answer);
+                    //   * an always-available GENERIC name → the import
+                    //     claims the name (HELD #5140);
+                    //   * an always-available NON-GENERIC name → the import
+                    //     claims the name only against a NON-GENERIC
+                    //     imported public.
+                    if (alwaysAvailableClaimsImportedName(t->name,
+                                                          importedArity)) {
                         ambiguousAlwaysAvailableNames_.insert(
                             std::string(t->name));
                         ambiguousAlwaysAvailableNameImportingModule_.emplace(

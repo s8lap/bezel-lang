@@ -23,6 +23,12 @@
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 #include "sema/TypeResolution.hpp"
+// fix #8002 (§2.2 / §2.3, v0.350): `Resolver::alwaysAvailableClaimsImportedName`
+// — the SHARED §2.2 arity predicate the TYPE position asks
+// (`src/sema/TypeResolution.cpp`'s import loop) and this pass's import loop
+// ask, so the two arms of the §2.3 always-available collision decide the
+// arity question the same way.
+#include "sema/TypeResolution_impl.hpp"
 
 namespace bezel::sema {
 
@@ -305,10 +311,51 @@ void ExprTC::run(const ast::SourceFile& src) {
                     // available fallback runs; the IdentifierExpr visitor
                     // consults `ambiguousAlwaysAvailableNames_` to emit
                     // the same §2.3 diagnostic in expression position.
+                    //
+                    // fix #8002 (§2.2 / §2.3, v0.350): §2.2 compares names
+                    // together with their GENERIC ARITY, so an always-
+                    // available name and an imported public are ONE name
+                    // only when their arities AGREE. An always-available
+                    // NON-GENERIC name (arity 0) and an imported GENERIC
+                    // public (arity > 0) are TWO names: no §2.2 collision
+                    // and no §2.3 ambiguity, and the imported public is an
+                    // ordinary import, reachable at its OWN arity. §8.1
+                    // names the root case ("a generic `Object<T>` is a
+                    // different name (§2.2)"); the §2.3 row names the static
+                    // classes ("`Console`, `Math`, `Convert`, `Environment`"
+                    // are non-generic).
+                    //
+                    // THE TYPE POSITION ALREADY DECIDES THIS (fix #7994,
+                    // `src/sema/TypeResolution.cpp`'s import loop). This arm
+                    // was still keyed on the NAME alone, so the two arms
+                    // disagreed: a file importing a module that exports a
+                    // generic `Console<T>` was rejected at the EXPRESSION
+                    // arm ("bare name `Console` is ambiguous") even though
+                    // the TYPE arm resolved the imported generic. The
+                    // decision is now asked of the SHARED predicate
+                    // (`Resolver::alwaysAvailableClaimsImportedName`, the
+                    // one the type position uses), so the two arms cannot
+                    // drift apart — this is the expression-position mirror
+                    // `82bb7eb3` reported as its known limitation.
                     if (isAlwaysAvailableBareName(t->name) &&
                         t->name != "Counter") {
-                        ambiguousAlwaysAvailableNames_.insert(
-                            std::string(t->name));
+                        if (Resolver::alwaysAvailableClaimsImportedName(
+                                t->name, t->genericParams.size())) {
+                            ambiguousAlwaysAvailableNames_.insert(
+                                std::string(t->name));
+                        }
+                        // The imported public does NOT take the bare-name
+                        // scope slot here, in EITHER case: the always-
+                        // available name owns it in EXPRESSION position (the
+                        // built-in static-class surface the IdentifierExpr
+                        // visitor resolves — `Console.WriteLine`,
+                        // `Object.ReferenceEquals`, ...), and the imported
+                        // GENERIC public is reached at its own arity by the
+                        // TYPE position (the §2.2 arity-keyed side table
+                        // `src/sema/TypeResolution.cpp` keeps). This arm has
+                        // no arity-keyed side table, so it cannot offer both
+                        // names at one slot; the always-available name is
+                        // the one an arity-0 expression reference fixes.
                         continue;
                     }
                     auto [originIt, inserted] =

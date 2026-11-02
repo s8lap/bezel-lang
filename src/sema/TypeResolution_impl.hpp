@@ -85,6 +85,63 @@ public:
         return builtinTypeArity(n) != kNotBuiltin;
     }
 
+    // fix #8002 (§2.2 / §2.3, v0.350): the GENERIC ARITY of the §2.3
+    // always-available name `n` — the arity §2.2 compares names by.
+    //
+    // `builtinTypeArity` states the arity of every always-available name the
+    // compiler knows as a TYPE. The always-available names it does NOT state
+    // are listed here with the arity the §2.3 table gives them:
+    //   * `Object` — the root primitive (§8.1), arity 0.
+    //   * `Console`, `Math`, `Convert`, `Environment` — the `System`
+    //     auto-imported STATIC classes (§2.3 Row 8), non-generic.
+    //   * `BitReader`, `BitWriter`, `ArrayBitReader`, `ArrayBitWriter`,
+    //     `SlotHandle` — §2.3 Row 10 lists these WITHOUT type parameters
+    //     (unlike `Array<T>`, `LinkedList<T>`, `Counter<K>`, ...), so they
+    //     are non-generic.
+    //   * `Counter` — §2.3 Row 10's `Counter<K>`, arity 1. The #5140 HOLD
+    //     keeps `Counter` out of the always-available set, so this value is
+    //     never consulted for it.
+    // A name this does not know is reported as `kNotBuiltin` and the
+    // conservative answer (the import claims the name) is used.
+    //
+    // PUBLIC (unlike `builtinTypeArity`) because the EXPRESSION-position arm
+    // of the §2.3 always-available collision must decide the SAME question
+    // (fix #8002): §2.2 compares names together with their generic arity, so
+    // an always-available name and an imported public are ONE name only when
+    // their arities agree. `src/sema/ExprTypecheck.cpp` consults this table
+    // through `alwaysAvailableClaimsImportedName`, so the TYPE position and
+    // the EXPRESSION position cannot drift apart.
+    static int alwaysAvailableTypeArity(std::string_view n);
+
+    // fix #8002 (§2.2 / §2.3, v0.350): does the §2.3 always-available name
+    // `n` CLAIM the bare name against an imported public of arity
+    // `importedArity`?
+    //
+    // §2.2 *Imports* (docs/Bezel_Language_Spec.md, v0.350):
+    //
+    //   "For this collision rule and the shadowing rule below, names are
+    //   compared together with their generic arity, the component §2.8.3
+    //   rule 3 adds to a type's identifier, and every reference fixes that
+    //   arity by its type-argument list ...: a non-generic `Counter` and the
+    //   always-available `Counter<K>` are two names, neither colliding with
+    //   nor shadowing the other ..., while an imported `Counter<T>` and
+    //   `Counter<K>` collide."
+    //
+    // So an always-available NON-GENERIC name and an imported GENERIC public
+    // are TWO names: there is no §2.2 collision and no §2.3 ambiguity, and
+    // the imported public is an ordinary import, reachable at its OWN arity.
+    //
+    // HELD (#5140): two rows keep the pre-#8002 behaviour, because #5140
+    // holds them pending their own (identifier, generic arity) ruling:
+    //   * an always-available GENERIC name (`Array<T>`, `Counter<K>`,
+    //     `Span<T>`, the `Task` family, ...) claims the name against an
+    //     imported public of ANY arity — the same-arity collision is still
+    //     the §2.3 ambiguity it has always been;
+    //   * an always-available name whose arity the compiler does not know
+    //     claims the name (the conservative answer).
+    static bool alwaysAvailableClaimsImportedName(std::string_view n,
+                                                  std::size_t importedArity);
+
     // §9.8 / #2325: the CLASS half of checkSerializationEligibility's
     // component-eligibility and constructor-selection checks. Split into its
     // own LATE pass — called from INSIDE typecheckExpressions() itself
