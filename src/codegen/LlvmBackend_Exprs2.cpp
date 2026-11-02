@@ -8654,9 +8654,51 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 }
                 return dtCompose(ticks, kindBits);
             }
-            // §2.5: new TimeSpan(ticks: long) — construct from raw tick count.
-            // No heap allocation — TimeSpan is a scalar i64.
+            // §2.5: new TimeSpan(ticks: long) — construct from raw tick count,
+            // and new TimeSpan(hours, minutes, seconds) — construct from the
+            // span's components. No heap allocation — TimeSpan is a scalar i64.
             if (colName == "TimeSpan") {
+                // fix #7899 (stdlib §2.5, v0.350): the THREE-argument form is
+                // the COMPONENT constructor — `new TimeSpan(hours, minutes,
+                // seconds)` is the span of `hours` hours + `minutes` minutes +
+                // `seconds` seconds. The arm read ONLY the first argument and
+                // used it as the raw tick count, so `new TimeSpan(1,2,3)` built
+                // a span of ONE TICK (rendered "00:00:00.0000001", `Ticks` = 1)
+                // and the minutes and the seconds were dropped SILENTLY: every
+                // component read 0 and every `Total<Unit>` read the tick
+                // fraction of a second.
+                //
+                // A tick is 100 ns — stdlib §2.5: "10,000,000 to the second,
+                // 864,000,000,000 to the day" — so the span is
+                //   h*36_000_000_000 + m*600_000_000 + s*10_000_000
+                // the same tick ratios the `TimeSpan.From<Unit>` factories use
+                // (LlvmBackend_Calls.cpp). The ONE-argument form is UNCHANGED:
+                // `new TimeSpan(ticks: long)` is the raw tick count.
+                if (ne.args.size() == 3) {
+                    auto getI64ts = [&](std::size_t idx) -> llvm::Value* {
+                        const ast::CallArgument* a = ctorArgFor(idx);
+                        if (!a || !a->value) return builder_.getInt64(0);
+                        llvm::Value* v = lowerExpr(*a->value);
+                        if (!v) return builder_.getInt64(0);
+                        // §5.1: a narrow integer argument is EXTENDED by its
+                        // OWN signedness (the #7863 house rule) — a `byte`
+                        // 200 is 200, not -56.
+                        return ctorIntTo(v, *a->value, i64());
+                    };
+                    llvm::Value* h  = getI64ts(0);
+                    llvm::Value* mi = getI64ts(1);
+                    llvm::Value* sec = getI64ts(2);
+                    llvm::Value* ticks = builder_.CreateAdd(
+                        builder_.CreateAdd(
+                            builder_.CreateMul(h,
+                                builder_.getInt64(36000000000LL)),
+                            builder_.CreateMul(mi,
+                                builder_.getInt64(600000000LL))),
+                        builder_.CreateMul(sec,
+                            builder_.getInt64(10000000LL)),
+                        "ts.ctor.ticks");
+                    return ticks;
+                }
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* v = lowerExpr(*ne.args[0].value);
                     if (v && !v->getType()->isIntegerTy(64))
