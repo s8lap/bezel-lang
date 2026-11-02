@@ -12042,8 +12042,20 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* argsV = lowerExpr(*call.args[argsArgIdx].value);
             if (!fmtV || !argsV) return nullptr;
             auto* fn = declareC("bz_sb_append_format", llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy(), ptrTy()});
-            builder_.CreateCall(fn, {recv, fmtV, argsV});
+                                {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+            // fix #7244 (spec §8.6 / §12.7 / §9.6 + stdlib §3.1, v0.350): the
+            // args are `Object` slots, and an `Object` slot holds EITHER a
+            // vtable-bearing value OR a `string` (whose word 0 is its DATA
+            // pointer, not a vtable). The runtime helper resolves each
+            // argument's string form with `bz_obj_is_string(arg, vtable_table)`
+            // — the SAME discriminator the `Object.ToString()` route uses
+            // (`lowerObjectToString`) — so the table is passed in: it is the
+            // per-module global `bz$vtable$table` the CODEGEN emits and owns
+            // (src/codegen/LlvmBackend_Setup.cpp's `vtableTablePtr`), and the
+            // runtime has no other way to reach it. Without it the helper read
+            // a string argument's DATA pointer as a vtable and called slot 3
+            // through it: a wild call, i.e. a SEGFAULT (exit 139).
+            builder_.CreateCall(fn, {recv, fmtV, argsV, vtableTablePtr()});
             // fix #7748 (§28.3 / §28.9, v0.350): `bz_sb_append_format` reads the
             // format's code points and keeps none of it (the builder's new part
             // is a fresh string), so a `format` that is itself a fresh +1

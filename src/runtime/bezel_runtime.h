@@ -1800,8 +1800,17 @@ void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value
 // of object pointers (Array<Object>); args beyond Count or a null arg → "".
 // Alignment/sub-format specifiers after the index are skipped; {{ }} are literal
 // braces. fix #1179 (was a silent no-op: no codegen/runtime case existed).
+// fix #7244 (§8.6 / §12.7 / §9.6, v0.350): an `Object` slot holds EITHER a
+// vtable-bearing value (a class instance / boxed value) OR a `string` (whose
+// word 0 is its DATA pointer), so the argument's string form is resolved with
+// the SAME discriminator the `Object.ToString()` route uses —
+// `bz_obj_is_string(arg, vtable_table)` — and a `string` argument's form is
+// the string ITSELF (§9.6: a string's ToString is the identity). `vtable_table`
+// is the module's vtable table (`bz$vtable$table`), a per-module global the
+// CODEGEN emits and owns; the runtime cannot find it, so the AppendFormat
+// lowering (src/codegen/LlvmBackend_Calls.cpp) passes it in.
 void bz_sb_append_format(void* parts_arr, const void* format_ptr,
-                         const void* args_arr);
+                         const void* args_arr, void** vtable_table);
 
 // ---------------------------------------------------------------------------
 // per §32.5/§32.6: re-encode a bz_string (layout {ptr data, i64 len, i8 width})

@@ -1626,8 +1626,45 @@ void bz_sb_replace(void* parts_arr, const void* old_value, const void* new_value
 // format contributes its literal text. This is the #1179 fix: AppendFormat
 // previously had no codegen/runtime case and emitted nothing. `format` is a
 // bz.string*; `args` is a bz_array_t* of object pointers (Array<Object>).
+//
+// fix #7244 (spec §8.5 / §8.6 / §12.7 / §9.6 + stdlib §3.1, v0.350): the
+// VTABLE half — a `string` argument has NO vtable.
+//
+// WHAT WAS WRONG. `args` is an `Array<Object>`, and an `Object` slot holds a
+// value in one of TWO representations (spec §8.6 / §12.7, v0.350): a class
+// instance / boxed value / built-in exception carries a VTABLE at word 0, and
+// a `string` carries its DATA pointer at word 0. The helper read word 0 as a
+// vtable unconditionally and called slot 3 through it, so a `string` argument
+// made the program JUMP INTO THE STRING'S OWN BYTES: a wild call through a
+// data pointer, i.e. a SEGFAULT (MEASURED: exit 139, the issue's own repro).
+//
+// WHAT THIS DOES. It asks the SAME question the `Object.ToString()` route
+// asks — `bz_obj_is_string(obj, vtable_table)` — and then takes the SAME two
+// arms. stdlib §3.1 (v0.350) says AppendFormat substitutes "the string form
+// of args[N]", and spec §8.5 (v0.350) makes that "the value's ordinary
+// `ToString()`"; `args[N].ToString()` on an `Object` element is lowered by
+// `lowerObjectToString` (src/codegen/LlvmBackend_String.cpp), which
+// discriminates with `bz_obj_is_string(recv, vtableTablePtr())` and, for a
+// string, answers with the string ITSELF (§9.6: a string's ToString is the
+// identity). So the two routes must AGREE, and this helper now computes the
+// same thing the `Object.ToString()` route computes.
+//
+// WHY THE TABLE IS A PARAMETER. `bz_obj_is_string` needs the module's vtable
+// table (`bz$vtable$table`), a per-module global the CODEGEN emits and owns —
+// the runtime has no way to find it. So the AppendFormat lowering in
+// src/codegen/LlvmBackend_Calls.cpp passes it in. That is the whole of the
+// codegen-side change: ONE extra argument to this helper.
+//
+// THE RESIDUAL IS THE CODEBASE'S, NOT THIS FIX'S. `bz_obj_is_string` answers
+// "not a vtable ⇒ a string", so a vtable-LESS built-in in an `Object` slot
+// (LinkedList, Dictionary, the dict-backed sets, Semaphore, Random — see
+// bz_obj_is_string's own comment in src/runtime/bezel_runtime_refcounting.cpp)
+// is mis-reported as a string. That residual is ALREADY the behaviour of the
+// `Object.ToString()` route, so this helper now mis-reports exactly what
+// `args[N].ToString()` mis-reports — the same pre-existing defect, on one
+// more route, and not a NEW class of wrongness introduced here.
 void bz_sb_append_format(void* parts_arr, const void* format_ptr,
-                         const void* args_arr) {
+                         const void* args_arr, void** vtable_table) {
     auto* arr = (bz_array_t*)parts_arr;
     if (!arr || !format_ptr) return;
     auto* fmt = (bz_string_struct*)format_ptr;
@@ -1710,32 +1747,56 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
     // a uniform release over every rendered argument is sound — the same
     // reasoning `bz_sb_reset_to` (below) applies to the builder's own parts.
     //
-    // THE STRUCT IS DELIBERATELY 16 BYTES — the SAME SIZE the pre-fix
-    // `{const char* data; int64_t len;}` was. The rendered string's DATA
-    // pointer is DERIVED from the owned string object rather than cached
-    // beside it, so this fix adds no field and grows no allocation. That
-    // matters: #7244's `string`-argument SEGFAULT reads the argument's DATA
-    // pointer as a vtable and then reads slot 3 out of the DATA BUFFER, so
-    // whether it faults depends on the bytes that follow the buffer — i.e. on
-    // the heap layout. Changing this allocation's size would silently change
-    // #7244's reproduction.
+    // THE STRUCT IS 24 BYTES — it grew from the pre-fix 16 (`{const char*
+    // data; int64_t len;}`) by the ONE field the vtable half needs: the
+    // `owned` flag that separates a BORROWED `string` argument (the
+    // `Array<Object>` owns it) from the +1 a class/box argument's slot-3
+    // renderer MINTED (this helper owns it, #7272). The rendered string's
+    // DATA pointer is still DERIVED from the string object rather than
+    // cached beside it, so no other field was added. (The pre-fix comment
+    // here held the struct at 16 bytes so that the allocation's SIZE would
+    // not move the heap layout and so change #7244's SEGFAULT reproduction;
+    // that reason is spent — the crash is gone, and the reproduction is now
+    // pinned by a VALUE oracle, which does not depend on the layout.)
     //
     // #7244 HAS TWO HALVES. The WIDTH half — this function's byte-level
     // rendering of the format and of each rendered argument — is repaired
     // here (see the code-point-domain comment above). The VTABLE half — a
     // `string` argument has no vtable, so the slot-3 dispatch below reads the
-    // string's DATA pointer as one — is NOT repairable here: the sound
-    // discriminator is `bz_obj_is_string(obj, vtable_table)`
-    // (src/runtime/bezel_runtime.h), and the vtable table is the per-module
-    // global the CODEGEN emits, so only the AppendFormat lowering in
-    // src/codegen/LlvmBackend_Calls.cpp can supply it. That half stays OPEN.
-    struct ArgStr { void* owned; int64_t len; };
+    // string's DATA pointer as one — is repaired here too, by the
+    // `bz_obj_is_string` discriminator the `Object.ToString()` route uses
+    // (the vtable table is the per-module global the CODEGEN emits, so it
+    // arrives as this helper's fourth parameter).
+    //
+    // `str` is the string object whose CODE POINTS this helper reads: for a
+    // `string` argument it is the ARGUMENT ITSELF (borrowed — the array owns
+    // it, this helper does not); for a class/box argument it is the +1 the
+    // slot-3 renderer minted (owned — this helper discharges it). `owned`
+    // says which, so the discharge below releases exactly the minted
+    // references and leaves the borrowed ones alone.
+    struct ArgStr { void* str; int64_t len; bool owned; };
     ArgStr* astr = (ArgStr*)malloc((size_t)(nargs > 0 ? nargs : 1) * sizeof(ArgStr));
     for (int64_t k = 0; k < nargs; k++) {
-        astr[k].owned = nullptr;
+        astr[k].str = nullptr;
         astr[k].len = 0;
+        astr[k].owned = false;
         void* obj = argSlots ? argSlots[k] : nullptr;
         if (!obj) continue;
+        // fix #7244 (spec §8.6 / §12.7 / §9.6, v0.350): a `string` in an
+        // `Object` slot carries its DATA pointer at word 0, NOT a vtable. Ask
+        // the same question the `Object.ToString()` route asks
+        // (`bz_obj_is_string(recv, vtableTablePtr())`), so the two routes
+        // agree; a string's ToString is the IDENTITY (§9.6), so the
+        // argument's own text IS its string form.
+        if (bz_obj_is_string(obj, vtable_table)) {
+            auto* s = (bz_string_struct*)obj;
+            astr[k].str = obj;                       // BORROWED: the array owns it
+            astr[k].len = s->len;                    // a CODE-POINT count (§4.6)
+            astr[k].owned = false;
+            continue;
+        }
+        // A class instance / boxed value / built-in exception: a vtable at
+        // word 0, and slot 3 is its ToString.
         void* vtable; memcpy(&vtable, obj, sizeof(void*));
         if (!vtable) continue;
         void* toStrFnP; memcpy(&toStrFnP,
@@ -1746,13 +1807,14 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
         if (!strObj) continue;
         auto* s = (bz_string_struct*)strObj;
         astr[k].len = s->len;                        // a CODE-POINT count (§4.6)
-        astr[k].owned = strObj;                    // the +1 this helper owns
+        astr[k].str = strObj;                       // the +1 this helper owns
+        astr[k].owned = true;
     }
-    // The rendered CODE POINTS live in the owned string's own data buffer (at
-    // that string's own width); a null/undispatchable argument has no owned
-    // string and renders as "".
+    // The rendered CODE POINTS live in the string's own data buffer (at that
+    // string's own width); a null/undispatchable argument has no string and
+    // renders as "".
     auto argCps = [&](int64_t k, int64_t i) -> uint32_t {
-        return scp((const bz_string_struct*)astr[k].owned, i);
+        return scp((const bz_string_struct*)astr[k].str, i);
     };
 
     // Parse one placeholder beginning at fcp(i)=='{'. On success sets idx/close
@@ -1834,8 +1896,15 @@ void bz_sb_append_format(void* parts_arr, const void* format_ptr,
     // `bz_char_to_string`, `emitPrimitiveToString`) OR an immortal sentinel
     // (the §8.5 default type name, the array's stamped descriptor name). This
     // is the same reasoning `bz_sb_reset_to` applies to the builder's parts.
+    //
+    // fix #7244 (spec §28.9, v0.350): the release is over the MINTED
+    // references only (`astr[k].owned`). A `string` ARGUMENT is BORROWED —
+    // the `Array<Object>` owns it, this helper does not — so releasing it
+    // here would free a string the program still holds: a use-after-free.
+    // The borrowed string's CODE POINTS are read during the second pass
+    // above, while the array is alive, so no retain is needed either.
     for (int64_t k = 0; k < nargs; k++)
-        if (astr[k].owned) bz_string_release(astr[k].owned);
+        if (astr[k].owned && astr[k].str) bz_string_release(astr[k].str);
     free(astr);
 
     // Wrap the formatted CODE POINTS as a fresh +1 part and append it (like
