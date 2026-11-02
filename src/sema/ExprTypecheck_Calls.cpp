@@ -6042,8 +6042,9 @@ static void checkBuiltinStringCallArity(SemaContext& ctx,
 // argument check (below), used by `typeCall` (earlier in this file).
 static void checkBuiltinCollectionCallArity(SemaContext& ctx,
                                              const ast::CallExpr& ce);
-static void checkBuiltinPathCallArity(SemaContext& ctx, const ast::CallExpr& ce,
-                                       Symbol* calleeSym);
+static void checkBuiltinPathCallArity(
+    SemaContext& ctx, const ast::CallExpr& ce, Symbol* calleeSym,
+    const std::unordered_set<std::string>& ambiguousHeads);
 
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
@@ -19379,7 +19380,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // assertion, exit 134). Run the §7 check against the instantiated
     // element/key type so the builtin path agrees with the user-method path.
     checkBuiltinCollectionCallArity(ctx_, ce);
-    checkBuiltinPathCallArity(ctx_, ce, calleeSym);
+    checkBuiltinPathCallArity(ctx_, ce, calleeSym, ambiguousAlwaysAvailableNames_);
     checkBuiltinCollectionCallArgs(ce);
 
     // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin — a builtin
@@ -25013,8 +25014,9 @@ static void checkBuiltinCollectionCallArity(SemaContext& ctx,
 // built-ins' admission gate read it; a call at a count no row takes reached no
 // lowering and degraded to the #3079 warning, emitting nothing. A call whose
 // count no declared form takes is a compile error.
-static void checkBuiltinPathCallArity(SemaContext& ctx, const ast::CallExpr& ce,
-                                       Symbol* calleeSym) {
+static void checkBuiltinPathCallArity(
+    SemaContext& ctx, const ast::CallExpr& ce, Symbol* calleeSym,
+    const std::unordered_set<std::string>& ambiguousHeads) {
     // A resolved callee is a user static class of the same name, bound by
     // `checkCallArity`.
     if (calleeSym) return;
@@ -25022,6 +25024,20 @@ static void checkBuiltinPathCallArity(SemaContext& ctx, const ast::CallExpr& ce,
     if (!ma || !ma->target) return;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
     if (!id || ctx.exprType(*ma->target)) return;
+    // fix #7985 (§2.3, §2.2, v0.350; #5140): a bare head that is AMBIGUOUS
+    // is already reported as ambiguous — §2.3: "a same-named public exported
+    // by an explicitly imported module does not shadow it but makes the bare
+    // name ambiguous in that file under §2.2's collision rule". A second,
+    // misleading arity error on the same access would only cascade: the
+    // reader is told the call supplies the wrong number of arguments, when
+    // the call's callee is not even resolved yet.
+    //
+    // The set is the ALWAYS-AVAILABLE names an imported public shadows. `File`
+    // and `Directory` are NOT always-available (they live in `System.IO`,
+    // which §2.3 requires an explicit import for), so a user module that
+    // exports one of them SHADOWS the standard library's — the bare name is
+    // not ambiguous and the gate's own arity question is the right one.
+    if (ambiguousHeads.count(std::string(id->name))) return;
     const char* section = nullptr;  // the stdlib section declaring the class
     if (id->name == "Path" || id->name == "Directory") section = "7.4";
     else if (id->name == "File") section = "7.3";
