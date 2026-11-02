@@ -17146,10 +17146,99 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
             // either static type, so no representation question arises. A
             // type PARAMETER that shadows an exception name is not the
             // built-in and stays excluded with every other bare `T`.
+            //
+            // fix #7991 (§12.7, v0.350): …or a STDLIB CLASS — a declaration-less
+            // `Kind::Named` whose head names a compiler built-in CLASS rather
+            // than a type parameter. §12.7 states the narrowing over `T`
+            // without qualification — "`is T` tests whether a value is an
+            // instance of `T` and produces `bool`. When the test succeeds and
+            // the tested expression is one of [§7.4]'s narrowing carriers, the
+            // carrier is **flow-narrowed** to `T` within the controlled block"
+            // — and its "Narrowing at an `Object` or interface location"
+            // paragraph names exactly this carrier ("When the narrowed
+            // carrier's *declared* type is `Object`, an interface, or the
+            // nullable form of either …"), and says of the reference-type case
+            // that "Narrowing to a *reference* type is unaffected: no box is
+            // involved, and writes through the narrowed binding are ordinary
+            // reference-type writes."
+            //
+            // The built-in CLASSES carry no `TypeSymbol` (`Resolver`'s §2.3
+            // admission "makes the type name resolvable to a Named ref with a
+            // null declaration"), so before this arm a stdlib class target
+            // matched NONE of the three clauses above: `tt->declaration` is
+            // null, a stdlib class is not one of the five boxable value
+            // builtins, and it is not a built-in exception name. NO narrowing
+            // was therefore recorded for `if o is Stopwatch then … end` over
+            // `o: Object`, the carrier kept its DECLARED `Object` type inside
+            // the block, and the member read that §12.7's own spelling makes
+            // legal ("animal.Bark(); // animal narrowed to Dog") failed to
+            // dispatch — the program compiled and the call was a silent no-op
+            // behind an `internal:` warning (#2477 / #2547 / #3079).
+            //
+            // The discriminator is BY NAME, exactly as the built-in-exception
+            // clause above already does it: a declaration-less `Kind::Named`
+            // is either a compiler built-in or a type parameter, and
+            // `currentScopeGenericParamNames()` (the enclosing type's, the
+            // enclosing method's and the enclosing extension's own parameters)
+            // is what tells them apart. A type PARAMETER that shadows a stdlib
+            // class name is not the built-in and stays excluded with every
+            // other bare `T`. A generic instantiation (`tt->genericArgs`
+            // non-empty) stays excluded too: the carrier's narrowed type would
+            // have to be the instantiation, and the built-in generic classes
+            // have no member surface sema can dispatch against (a separate
+            // gap from this one).
+            //
+            // Scope, and WHY the population is the heap-pointer builtins and
+            // not "every declaration-less Named": the narrowing is a RETYPE of
+            // the carrier, so the carrier's STORAGE must be able to hold the
+            // target. §12.7's "Narrowing at an `Object` or interface location"
+            // paragraph splits the two cases — "When the narrowed carrier's
+            // *declared* type is `Object`, an interface, or the nullable form
+            // of either … and the tested type `T` is a **value type**, that
+            // carrier's storage is a [§8.6] box" (so the read must come out of
+            // the box) — against the reference case, "Narrowing to a
+            // *reference* type is unaffected: no box is involved, and writes
+            // through the narrowed binding are ordinary reference-type writes."
+            //
+            // So a target is safe to narrow to when its runtime value at an
+            // `Object` location is a POINTER (a class / interface), or when it
+            // is one of the §8.6-BOXABLE value builtins (the five above, whose
+            // box payload codegen's #3090 unbox path already reads). A built-in
+            // VALUE type that does NOT box (`IntPtr`, `UIntPtr`,
+            // `ReadOnlyStringSpan`, `Boolean`, `JsonOptions`, `ExceptionInfo`,
+            // the span views) has no representation at an `Object` location at
+            // all: narrowing to one would make the narrowed read load the
+            // `Object` slot AS the value type. MEASURED on this fix's own
+            // first draft (which admitted every declaration-less Named):
+            // `var o: Object := 5; if o is ReadOnlyStringSpan then
+            // Console.WriteLine(o.Length); end;` SEGFAULTED the COMPILER
+            // (LlvmBackend_Exprs.cpp:6827, a `CreateExtractValue` on the
+            // non-aggregate `Object` slot). `common::isHeapPointerReferenceBuiltin`
+            // is the ONE shared table that answers "is this builtin's runtime
+            // value a pointer?" — the same question codegen's `lowerTypeRef`
+            // asks when it lowers the head — so it is the population this arm
+            // admits: every name in it lowers to `ptr` on both of codegen's
+            // representation paths, so the narrowed read is the same pointer
+            // the carrier already held (§12.7's reference-type sentence).
+            //
+            // The built-in CLASSES the table does not carry (`TextWriter`,
+            // `TextReader`, `Stream`, `Encoding`, and the static classes
+            // `Console`, `File`, `Directory`, `Path`, `BitConverter`, `Debug`,
+            // …) keep their pre-fix behaviour — no narrowing — because
+            // codegen does not lower them to `ptr` today either (a
+            // `TextWriter`-typed local is a separate, already-filed gap: the
+            // `Console.Out` initializer degrades with #2434). Narrowing them
+            // would reproduce exactly the representation mismatch the
+            // ReadOnlyStringSpan crash has.
             narrowable = tt->declaration != nullptr ||
                          isBoxableValueBuiltin(tt->headName()) ||
                          (tt->genericArgs.empty() &&
                           common::isBuiltinExceptionName(tt->headName()) &&
+                          currentScopeGenericParamNames().count(
+                              tt->headName()) == 0) ||
+                         (tt->genericArgs.empty() &&
+                          common::isHeapPointerReferenceBuiltin(
+                              tt->headName()) &&
                           currentScopeGenericParamNames().count(
                               tt->headName()) == 0);
             break;
