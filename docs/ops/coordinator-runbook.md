@@ -1110,7 +1110,7 @@ just work that gets redone.
 ### Harvest review probes into the corpus
 
 *Added 2026-10-21 (R34), at the owner's request, after the same lapse happened twice. Revised
-2026-11-02: the R37 per-case self-check, the effort tier and the 60-case cap, after R37's H9 and
+2026-11-02: the R37 per-case self-check, the effort tier and the case size, after R37's H9 and
 H10 were both rejected.*
 
 Reviewers and producers write dozens of probe programs per fix: base/tip matrices,
@@ -1122,9 +1122,8 @@ Turned into conformance cases, they run at every gate. The owner asked for this 
   directories (the reviewer's harvest list and the producer's handback name them; both live under
   `/var/tmp/bezel-scratch/`) to `harvest.tsv`, beside the run's `claims.tsv`, in the same turn as
   the pick. A peer does the same when it hands an ACCEPT to the integrator. Once the queue holds
-  4–6 picks, and always before the gate, dispatch a harvest lane: a producer at **Sonnet with
-  effort HIGH**, taking a pool slot, with scope `tests/conformance/rules/cases/` plus the derived
-  `manifest.tsv`.
+  4–6 picks, and always before the gate, dispatch a harvest lane: a producer taking a pool slot,
+  with scope `tests/conformance/rules/cases/` plus the derived `manifest.tsv`.
 - **The harvest list is a file, not a paragraph.** The reviewer writes a structured `harvest.tsv`
   row per probe — probe, kind, expected, §, quoted sentence, SHA — and the harvest lane globs
   those files for the picked SHAs. A prose list in the handback is a transcription step, and the
@@ -1157,7 +1156,9 @@ Turned into conformance cases, they run at every gate. The owner asked for this 
   handback. Effort is not a substitute for the checks: R37's H9 and H10 were both REJECTED, H10
   with 45 of 116 cases bad, and both were dispatched at Sonnet with default effort.
 - **Manifest and baseline.** The harvest commit carries its regenerated `manifest.tsv`
-  (`corpus.py build`, as `AUTHORING.md` says), so `corpus.py check` passes on the branch. Two
+  (`corpus.py build`, as `AUTHORING.md` says), so `corpus.py check` passes on the branch. The
+  manifest is derived and byte-exact, so **read the build's diff** — a diff touching rows you did
+  not author means another case changed (*Merging into the conformance corpus*). Two
   harvest lanes are never in flight at once, so the derived file cannot conflict. Banking
   `baseline.tsv` rows for the new cases is the integrator's, after the pick (*Corpus rows are
   banked centrally*); the README's "bank it in the same commit" applies to a fix that closes a
