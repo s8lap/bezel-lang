@@ -141,3 +141,16 @@ SPECIFIC to its assignment.*
 22. **A denied tool call is reported, not routed around.** Say what was denied and carry on with
     the rest; never ask your coordinator or another agent to perform it for you.
 23. Do not hand back while a process you started is still running.
+24. **NEVER READ A FILE OVER 50 KB INTO YOUR CONTEXT.** Before you read ANY file, run `wc -c
+    <file>`. Over 50 KB means you extract from it — `grep`, `tail -n`, `head -n`, `awk`, `cut` — and
+    never `read` it whole. This is not advice, it is the **measured cause of two lane deaths**:
+    on 2026-11-03 a reviewer wrote a 1.6 MB enumeration of every codegen test name into its scratch
+    and then read it in, which is ~400 000 tokens — it died with the enumeration in its context and
+    produced no verdict. The same applies to build logs, gtest logs, generated sources and
+    enumerations. **You want the `N passed, 0 failed` summary line, not the 22 000 lines above it.**
+25. **Write your report to disk as you go, and keep your final message short.** After each
+    substantial step, append what you have found to your report file. If you are interrupted, the
+    file holds everything you finished — a lane that dies mid-run with its findings only in its
+    context has to redo all of it. **Your final message is a summary (the verdict, the findings, the
+    measurements, the report's path), not the report.** Two lane deaths on 2026-11-03 happened
+    while assembling an enormous final message.

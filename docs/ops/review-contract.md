@@ -107,3 +107,9 @@ cases (runbook, *Harvest review probes into the corpus*). Keep the directory und
 - Run anything in a worktree while another lane's build or codegen sweep runs there.
 - Hand back while a process you started is still running. Check each PID with `kill -0`,
   including `setsid`/`nohup` children.
+- **Read a file over 50 KB into your context.** Run `wc -c <file>` before every read; over 50 KB,
+  extract with `grep`/`tail`/`head`/`awk`/`cut` instead. This is the **measured cause of two
+  reviewer deaths on 2026-11-03**: a 1.6 MB enumeration of every codegen test name was read into
+  the context (~400 000 tokens) and the reviewer died with it, leaving no verdict. **Write your
+  report to disk as you go and keep your final message to a summary** — the report lives in the
+  file, not in the message.

@@ -15,6 +15,19 @@ its first command. If this run overrides a standing rule, say so explicitly unde
 your lane will be handed to), then this brief. `docs/ops/lane-contract.md` is binding and
 elaborates `CLAUDE.md`; this brief adds only what is specific to this assignment.
 
+**BEFORE YOUR FIRST COMMAND, TWO RULES THAT ARE MEASURED, NOT ADVICE.** On 2026-11-03 a lane
+**died** by reading a 1.6 MB file into its context (~400 000 tokens) — and a second died
+assembling an enormous final message. So:
+
+1. **NEVER READ A FILE OVER 50 KB INTO YOUR CONTEXT.** Run `wc -c <file>` before every read; over
+   50 KB, extract with `grep`/`tail -n`/`head -n`/`awk`/`cut` instead. This applies to build logs,
+   gtest logs, enumerations and generated sources. You want the `N passed, 0 failed` summary line,
+   not the 22 000 lines above it.
+2. **WRITE YOUR REPORT TO DISK AS YOU GO, AND KEEP YOUR FINAL MESSAGE SHORT.** After each
+   substantial step, append what you have found to your report file — a lane interrupted with its
+   findings only in its context has to redo all of it. Your final message is a **summary** (the
+   verdict, the findings, the measurements, the report's path), **not the report**.
+
 ## Slots the coordinator fills
 
 ### Run

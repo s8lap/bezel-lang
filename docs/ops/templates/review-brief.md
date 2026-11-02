@@ -14,6 +14,20 @@ reads both before its first command. If this run overrides a standing rule, say 
 `CLAUDE.md`, then `docs/ops/review-contract.md`, then this brief. `review-contract.md` is binding
 and holds the eleven checks, the verdicts, and what a reviewer never does.
 
+**BEFORE YOUR FIRST COMMAND, TWO RULES THAT ARE MEASURED, NOT ADVICE.** On 2026-11-03 **this very
+review** was attempted twice and **both attempts died** — one by reading a 1.6 MB file into its
+context (~400 000 tokens), one while assembling an enormous final message. So:
+
+1. **NEVER READ A FILE OVER 50 KB INTO YOUR CONTEXT.** Run `wc -c <file>` before every read; over
+   50 KB, extract with `grep`/`tail -n`/`head -n`/`awk`/`cut` instead. This applies to build logs,
+   gtest logs, enumerations and generated sources. You want the `N passed, 0 failed` summary line,
+   not the 22 000 lines above it.
+2. **WRITE YOUR REPORT TO DISK AS YOU GO, AND KEEP YOUR FINAL MESSAGE SHORT.** After each
+   substantial step, append what you have found to your report file — a reviewer interrupted with
+   its findings only in its context has to redo all of it, and the commit it was reviewing waits on
+   it. Your final message is a **summary** (the verdict, the findings, the measurements, the
+   report's path), **not the report**.
+
 ## Slots the coordinator fills
 
 ### Run
