@@ -353,6 +353,49 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 claimedVtablelessBuiltinRecv = recv;
             }
         }
+    } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // fix #8009 / §28.3 *Unbound owned temporaries* / K8.1 (v0.350): the
+        // PROPERTY-READ face of the SAME shape — `Mk().Count` with
+        // `Mk(): owned OwningArray<Cell>`. §28.3.11 lists "as a member or
+        // index access" among the BORROWING USES of an unbound owned temporary,
+        // so the temporary is disposed at the full expression's end here too.
+        // MEASURED on this fix's parent: a 100-iteration `Mk().Count` loop
+        // leaked 22400 B in 300 allocations — the array backing AND the
+        // element it held.
+        //
+        // WHY ONLY THE OWNING COLLECTION FAMILY IS CLAIMED HERE. The BORROWING
+        // family's property face is ALREADY reclaimed inline — the
+        // `.Length`/`.Count` arm calls `freeUnboundOwnedBorrowingArrayTemp`
+        // (LlvmBackend_Calls3.cpp) — so claiming it here would free it TWICE
+        // (a double free). That helper declines the `Owning*` heads precisely
+        // because an owning collection owes an ELEMENT CASCADE, not a backing
+        // free (stdlib §4.5; #6352's own note) — which is why the asymmetry
+        // this fix closes is the owning family's alone. The vtable-less
+        // NON-collection builtins are not claimed here either: #7906's
+        // population is the CALL face, and no builtin of that family has a
+        // property whose value cannot alias its receiver.
+        //
+        // The head test is `common::isOwningCollectionHead` — the ONE registry
+        // that names the six element-owning collection classes (the same
+        // registry the release predicate consults), so no name list is spelled
+        // a second time.
+        const ast::Expr* recv = ma->target.get();
+        if (recv) {
+            const sema::TypeRef* rt = ctx_.exprType(*recv);
+            // A PROPERTY always carries a type, so the result gate below reads
+            // a real TypeRef (never the "no type recorded" case the CALL face
+            // admits for a unit-returning call) — and a property whose value
+            // could alias the receiver is declined by it.
+            if (rt && rt->kind == sema::TypeRef::Kind::Named &&
+                !rt->declaration && !rt->nullable &&
+                common::isOwningCollectionHead(builtinTypeName(rt)) &&
+                ctx_.exprType(*ma) &&
+                freshOwnedVtablelessBuiltinReceiverEligible(
+                    recv, ctx_.exprType(*ma))) {
+                freshVtablelessBuiltinRoots_.insert(recv);
+                claimedVtablelessBuiltinRecv = recv;
+            }
+        }
     }
     llvm::Value* v = lowerExprInner(e);
     // fix #7906: the receiver's OWN lowering consumed the claim above and

@@ -8839,9 +8839,37 @@ void Emitter::registerFreshBuiltinNewReceiverTempK8(const ast::Expr* recvExpr,
 //     be freed by a WILD JUMP, so it keeps the pre-fix leak: the sound
 //     direction, and exactly the trade `emitVtablelessBuiltinRelease`'s own
 //     declaration documents.
+//
+// fix #8009 (v0.350) — the OWNING COLLECTION family joins this population,
+// and it is the ONE member of the "no release route" list above whose release
+// is not MISSING but is NOT NAME-KEYED.
+//
+// WHY IT IS NOT IN `vtablelessBuiltinReleaseIsKnown`. That predicate asks
+// `classifyVtablelessBuiltinRelease`, whose parameter is a NAME — one list
+// both the classifier and the emitter read, so the two cannot drift (#4185
+// round 2). A COLLECTION's release is not name-keyed: it is the runtime free
+// (`bz_array_free` / `bz_dict_free` / `bz_llist_free`) PLUS the §28.11
+// element/value disposer, and the disposer is a function of the ELEMENT type,
+// which the head name does not carry — `OwningArray<Cell>` and
+// `OwningArray<int>` are the SAME name and DIFFERENT releases (the first
+// cascades a class destructor, the second frees only the backing). This is
+// the same reason #6368's `emitOwnedCaptureCollectionRelease` gives for
+// routing a collection through `buildCollectionTempDisposal` instead of
+// through a name table.
+//
+// ⇒ THE FAMILY IS ADMITTED BY ITS CONCRETE HEAD TEST —
+// `common::isOwningCollectionHead`, the ONE registry that names the six
+// element-owning collection classes (`OwningArray` / `OwningDictionary` /
+// `OwningSet` / `OwningStack` / `OwningQueue` / `OwningLinkedList`; stdlib
+// §4.5 / §4.7 / §4.9 / §4.10 / §4.11). The INTERFACE heads
+// (`IOwningCollection<T>` / `IOwningList<T>`) are NOT in it, and must not be:
+// §8.1 makes a user class a legal implementer of those, so the declared type
+// does not determine the runtime backing there — the same exclusion
+// `emitOwnedCaptureCollectionRelease` records (a user class behind
+// `bz_array_free` would be a WILD FREE, not a leak).
 bool Emitter::freshOwnedVtablelessBuiltinReceiverEligible(
         const ast::Expr* recvExpr, const sema::TypeRef* resultTy) const {
-    if (!recvExpr || !resultTy) return false;
+    if (!recvExpr) return false;
     const sema::TypeRef* rt = ctx_.exprType(*recvExpr);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     // A USER class (`rt->declaration` non-null) is the heap-class path's
@@ -8852,18 +8880,25 @@ bool Emitter::freshOwnedVtablelessBuiltinReceiverEligible(
     if (rt->nullable) return false;
     const std::string_view bn = builtinTypeName(rt);
     if (bn.empty()) return false;
-    if (!vtablelessBuiltinReleaseIsKnown(bn)) return false;
-    // fix #7906 (v0.350): `StringBuilder` is EXCLUDED BY NAME — #7733's path
-    // already owns that population (`markFreshStringBuilderChainRoot` +
-    // `registerFreshBuiltinNewReceiverTempK8`), and admitting it here would
-    // register the SAME receiver root TWICE — a double free. The release table
-    // alone does not separate them (both have a known release route), so the
-    // separation is made here, explicitly, rather than left to an argument
-    // about which members happen to return a value-like type. Nothing is lost:
-    // #7733's path covers the StringBuilder chain-root shape already, and no
-    // StringBuilder member returns a value-like (unit/primitive) result, so
-    // this path would never have fired on one anyway.
-    if (bn == "StringBuilder") return false;
+    // fix #8009 (v0.350): the OWNING COLLECTION family — admitted by its
+    // CONCRETE head, with a release that is the collection's OWN arm (the
+    // comment above). Every other name still needs the name-keyed table.
+    const bool owningCollection = common::isOwningCollectionHead(bn);
+    if (!owningCollection) {
+        if (!vtablelessBuiltinReleaseIsKnown(bn)) return false;
+        // fix #7906 (v0.350): `StringBuilder` is EXCLUDED BY NAME — #7733's path
+        // already owns that population (`markFreshStringBuilderChainRoot` +
+        // `registerFreshBuiltinNewReceiverTempK8`), and admitting it here would
+        // register the SAME receiver root TWICE — a double free. The release
+        // table alone does not separate them (both have a known release route),
+        // so the separation is made here, explicitly, rather than left to an
+        // argument about which members happen to return a value-like type.
+        // Nothing is lost: #7733's path covers the StringBuilder chain-root
+        // shape already, and no StringBuilder member returns a value-like
+        // (unit/primitive) result, so this path would never have fired on one
+        // anyway.
+        if (bn == "StringBuilder") return false;
+    }
     // The PRODUCER test — the `owned` marker, not the type.
     bool producer = false;
     if (dynamic_cast<const ast::NewExpr*>(recvExpr)) {
@@ -8873,6 +8908,46 @@ bool Emitter::freshOwnedVtablelessBuiltinReceiverEligible(
     }
     if (!producer) return false;
     // The RESULT gate, shared with the heap-class path.
+    //
+    // fix #8009 (v0.350) — A UNIT-RETURNING COLLECTION MEMBER CALL HAS NO
+    // RESULT TYPE. A built-in COLLECTION member call is not typed by sema's
+    // ordinary call path (the collection heads carry no member table), so
+    // `ctx_.exprType` on the call is EMPTY when the member's result is unit
+    // and carries the result's TypeRef when it is not. MEASURED on this fix's
+    // parent: `Mk().Clear()` → no type, `Mk().Count` → `int`, `Mk().Contains(x)`
+    // → `bool`, `Mk().Drain()` → `IOwningEnumerable<T>`, `Mk().Peek()` →
+    // `Cell`.
+    // #7906's predicate read `!resultTy` as "no result ⇒ not eligible", so
+    // every UNIT-returning member call — `Clear()`, `Add()`, `Remove()` — was
+    // excluded from the population, and its receiver leaked: that is the
+    // issue's own probe (`Mk().Clear()`), MEASURED at 20800 B / 200
+    // allocations.
+    //
+    // ⇒ A MISSING RESULT TYPE IS THE UNIT RESULT, and unit is the MOST
+    // value-like result there is: it cannot alias the receiver. The gate's
+    // purpose ("the result must not alias the receiver") is satisfied
+    // vacuously, so the receiver may be disposed at the boundary.
+    //
+    // ⇒ AND THE REFERENCE-RESULT SHAPES ARE NOT REACHED: a member that
+    // returns a reference IS typed (`Drain()` → `IOwningEnumerable<T>`,
+    // `Peek()` → `Cell`), so it reaches the gate below and is judged on its
+    // own TypeRef — and a reference result is NOT value-like (a class /
+    // interface / builtin head without an `owned` marker is a borrow), so
+    // the receiver is left alone. MEASURED: `Mk().Peek()` still leaks the
+    // collection (22400 B / 300 allocations — the pre-fix behaviour) and
+    // reads no freed memory (no use-after-free), which is the sound
+    // direction.
+    //
+    // ⇒ AND THE RULE IS SCOPED TO THE FAMILY IT IS MEASURED ON. The
+    // "no recorded type ⇒ unit" convention is a property of the COLLECTION
+    // member-call path (which records no type at all), not of sema at large:
+    // an ordinary method call that returns unit IS stamped `Kind::Unit`
+    // (#2819's `t.Wait()`), so a missing type there means "sema did not
+    // type this expression", which is NOT a proof of unit. For every other
+    // built-in the pre-#7906 reading is kept (`!resultTy` ⇒ not eligible),
+    // so #7906's population is unchanged by this fix and a missing type
+    // keeps the pre-fix leak — the sound direction.
+    if (!resultTy) return owningCollection;
     return freshReceiverResultIsValueLike(resultTy, /*calleeReturnsOwned=*/false);
 }
 
@@ -8898,12 +8973,25 @@ void Emitter::registerFreshOwnedVtablelessBuiltinReceiverTempK8(
         rt->nullable)
         return;
     const std::string_view bn = builtinTypeName(rt);
-    if (bn.empty() || !vtablelessBuiltinReleaseIsKnown(bn)) return;
-    // The SAME `StringBuilder` separation as the predicate's, repeated at the
-    // CONSUMPTION point: a root claimed by any other route cannot be
-    // registered here as well (that would be a double free with #7733's
-    // `registerFreshBuiltinNewReceiverTempK8`).
-    if (bn == "StringBuilder") return;
+    if (bn.empty()) return;
+    // fix #8009 (§28.3 K8.1 / §28.11, v0.350): the OWNING COLLECTION family
+    // joins the population. Its release is NOT name-keyed, so it is NOT
+    // admitted by `vtablelessBuiltinReleaseIsKnown`; the collection's OWN
+    // `Disposal` (built by `buildCollectionTempDisposal` — the same helper the
+    // callee-side `registerUnwindOwnedParam`, the `using var` side
+    // `registerUsingDisposal`, the async-frame side
+    // `emitOwnedCaptureCollectionRelease`, and the `case`-scrutinee side
+    // `freeUnboundOwnedOwningCollectionTemp` already use) carries the release:
+    // the runtime free plus the §28.11 element/value disposer.
+    const bool owningCollection = common::isOwningCollectionHead(bn);
+    if (!owningCollection) {
+        if (!vtablelessBuiltinReleaseIsKnown(bn)) return;
+        // The SAME `StringBuilder` separation as the predicate's, repeated at the
+        // CONSUMPTION point: a root claimed by any other route cannot be
+        // registered here as well (that would be a double free with #7733's
+        // `registerFreshBuiltinNewReceiverTempK8`).
+        if (bn == "StringBuilder") return;
+    }
     if (!recvPtr->getType()->isPointerTy()) return;
     if (llvm::isa<llvm::ConstantPointerNull>(recvPtr)) return;
     if (disposeStack_.empty() || emittingDisposerBody_ || !currentFn_) return;
@@ -8916,8 +9004,36 @@ void Emitter::registerFreshOwnedVtablelessBuiltinReceiverTempK8(
     Disposal d{slot, nullptr};
     d.unwindOnly = true;      // the normal edge is the K8 flush
     d.dynamicDispose = false;
-    d.vtablelessBuiltin = std::string(bn);
-    disposeStack_.back().push_back(d);
+    if (owningCollection) {
+        // The COLLECTION's own release — `bz_array_free` / `bz_dict_free` /
+        // `bz_llist_free` with the §28.11 element/value disposer that
+        // `buildCollectionTempDisposal` derives from the ELEMENT type (null
+        // for value elements, the owning-class cascade for class elements).
+        //
+        // `releaseOnUnwindOnly` (NOT `unwindOnly`) is the flag that shape
+        // needs, and the choice is load-bearing:
+        //   * `unwindOnly` reaches `emitDisposals`' unwind-only arm FIRST
+        //     (LlvmBackend_Disposal.cpp's `if (it->unwindOnly && !it->owning-
+        //     Choice)`), whose dispatch chain ends at `emitDisposeAndReclaim` —
+        //     a VTABLE dispatch. A `bz_array_t` has no Bezel vtable at word 0,
+        //     so that is a WILD JUMP, not a leak.
+        //   * `releaseOnUnwindOnly` is honoured by the COLLECTION arm itself
+        //     (the `if (it->releaseOnUnwindOnly && !dropUndischarged) continue;`
+        //     gate that #3036 added to `registerUnwindOwnedParam`'s collection
+        //     branch): the entry is SKIPPED on the NORMAL edge and FIRES on the
+        //     EXCEPTION edge. That is exactly the two-edge discipline of the
+        //     K8 boundary ("on the normal edge as on the exception edge",
+        //     §28.3 K8.1): the normal edge is the K8 flush below, the
+        //     exception edge is the scope's unwind walk.
+        Disposal coll = buildCollectionTempDisposal(slot, rt);
+        coll.unwindOnly = false;
+        coll.dynamicDispose = false;
+        coll.releaseOnUnwindOnly = true;
+        disposeStack_.back().push_back(coll);
+    } else {
+        d.vtablelessBuiltin = std::string(bn);
+        disposeStack_.back().push_back(d);
+    }
     k8RecvTemps_.push_back(K8RecvTemp{slot, currentFn_, std::string(bn)});
 }
 
@@ -8969,6 +9085,65 @@ void Emitter::flushK8RecvTemps() {
     for (const auto& t : k8RecvTemps_) {
         if (t.fn != currentFn_) { keep.push_back(t); continue; }
         if (!live) continue;
+        // fix #8009 (§28.3 K8.1 / §28.11, v0.350): a COLLECTION temporary's
+        // release is the COLLECTION'S OWN arm — the runtime free
+        // (`bz_array_free` / `bz_dict_free` / `bz_llist_free`) plus the §28.11
+        // element/value disposer — and it is NOT name-keyed, so the name in
+        // `K8RecvTemp::vtablelessBuiltin` cannot select it. The release travels
+        // with the `Disposal` that `registerFreshOwnedVtablelessBuiltinReceiver-
+        // TempK8` registered for this very slot, so it is found HERE by the
+        // slot. A collection entry is recognised by the disposal KIND
+        // (`collection` / `dict` / `linkedList`) — the three arms
+        // `buildCollectionTempDisposal` produces for the concrete collection
+        // heads — so the recognition cannot drift from the release.
+        //
+        // NOT A WILD JUMP: the collection's release is emitted by the very same
+        // `emitDisposals` arm that owns it, so it is `bz_*_free` and never a
+        // vtable dispatch (a `bz_array_t` has no Bezel vtable at word 0).
+        //
+        // WHY THE SLOT IS THE KEY. `K8RecvTemp` carries a slot and a name; the
+        // element disposer is a `llvm::Value*` that a NAME cannot carry, and
+        // the `K8RecvTemp` struct is not this lane's to widen
+        // (`LlvmBackend_impl.hpp` is held elsewhere). The registered
+        // `Disposal` already carries the disposer (`collectionElemDisposer` /
+        // `dictValueDisposer`), so the slot is the one key that identifies it:
+        // the slot is a FRESH entry-block alloca per registration
+        // (`entryAllocaNullPtr`), so no two registrations share one.
+        //
+        // IF THE ENTRY IS NOT FOUND the release falls back to the NAME-keyed
+        // path below, and `emitVtablelessBuiltinRelease` has NO arm for a
+        // collection head — so the temporary keeps the pre-fix leak. That is
+        // the sound direction (a leak, never a wrong free), and it is
+        // unreachable in practice: the entry is pushed on `disposeStack_` at the
+        // registration, and the flush runs at the same expression's boundary,
+        // with the scope still live.
+        const Disposal* collDisposal = nullptr;
+        for (const auto& sc : disposeStack_) {
+            for (const auto& d : sc) {
+                if (d.slot == t.slot &&
+                    (d.collection || d.dict || d.linkedList)) {
+                    collDisposal = &d;
+                    break;
+                }
+            }
+            if (collDisposal) break;
+        }
+        if (collDisposal) {
+            // The K8 flush IS the normal edge for this temporary, so the copy
+            // drops the unwind-only gate: `releaseOnUnwindOnly` is what keeps
+            // the REGISTERED entry off the normal edge (the scope-end pass
+            // skips it) and on the EXCEPTION edge (the scope's unwind walk
+            // fires it). The copy nulls the slot, so the registered entry's
+            // later pass reads null and skips — exactly once, on both edges.
+            Disposal one = *collDisposal;
+            one.unwindOnly = false;
+            one.releaseOnUnwindOnly = false;
+            std::vector<Disposal> oneScope{one};
+            emitDisposals(oneScope, /*isUnwind=*/false);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 t.slot);
+            continue;
+        }
         llvm::Value* obj = builder_.CreateLoad(ptrTy(), t.slot, "k8recv.load");
         llvm::Value* isNull = builder_.CreateICmpEQ(
             obj, llvm::ConstantPointerNull::get(ptrTy()));
