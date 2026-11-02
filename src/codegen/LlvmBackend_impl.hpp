@@ -12905,9 +12905,44 @@ private:
                        std::unordered_set<size_t>> calleeParamNonEscape_;
 
     // fix #2952: pending releases for argument-position fresh boxes, appended
-    // by buildOrderedArgs and consumed (bz_box_release emitted) by the caller's
-    // post-CreateCall block. Cleared after each call.
-    std::vector<llvm::Value*> pendingArgBoxReleases_;
+    // by buildOrderedArgs and consumed (bz_box_release emitted) by the CALL's
+    // own post-call block.
+    //
+    // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the queue is ONE RECORD PER
+    // CALL, not one flat list of boxes for the whole emitting function. A call
+    // OPENS a record before its arguments are built; the boxes its
+    // buildOrderedArgs mints go into THAT record; the call's own post-call
+    // point DISCHARGES exactly that record and pops it. The records are a
+    // STACK: a nested call's record sits above its caller's and is popped
+    // first, so a nested call's discharge can never touch an outer call's
+    // still-live box.
+    //
+    // Before #7998 the queue was a flat list drained WHOLESALE by whichever
+    // call reached a discharge point first, so an INNER call's discharge
+    // released the OUTER call's box while the outer callee was still reading
+    // it — a use-after-free, and (because glibc's free() overwrites the box's
+    // first word) a SILENTLY WRONG VALUE.
+    struct PendingArgBoxCall {
+        std::vector<llvm::Value*> boxes;
+    };
+    std::vector<PendingArgBoxCall> pendingArgBoxReleases_;
+
+    // fix #7998: the sentinel for "this call has no argument-box record"
+    // (a call that never built its arguments through buildOrderedArgs).
+    static constexpr std::size_t kNoArgBoxCall = static_cast<std::size_t>(-1);
+
+    // fix #7998: open the record for the call that is about to build its
+    // arguments; returns the record's index — the call's discharge handle.
+    std::size_t beginArgBoxCall();
+    // fix #7998: discharge the record at `idx` (and any record above it):
+    // emit bz_box_release for each box it holds, then pop it. Idempotent — a
+    // second call with the same `idx` finds the stack already truncated and
+    // does nothing.
+    void dischargeArgBoxCall(std::size_t idx);
+    // fix #7998: DROP the record at `idx` (and any above it) WITHOUT
+    // releasing: the call never ran, so its boxes are garbage (the
+    // conservative leak, as before #7998).
+    void dropArgBoxCall(std::size_t idx);
 
     // fix #2952: the callee Decl (MethodDecl or ConstructorDecl) for the call
     // currently being lowered. Set by the call site BEFORE buildOrderedArgs so
@@ -25915,13 +25950,22 @@ private:
     // `var a := this; a.M();` is a checked call exactly as the spec says.
     // Defaulted false: every synthesized caller (ToString / Equals / operator
     // dispatch / iterator protocol) is a non-`this` call by construction.
+    //
+    // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): `argBoxCallIdx` is the
+    // §8.6 argument-box record the CALL opened (beginArgBoxCall). The
+    // ORDINARY path discharges exactly that record here, at the call's own
+    // post-call point; the GENERIC arms return before this point and leave
+    // the record to the call site's own post-call discharge. The default
+    // (`kNoArgBoxCall`) means "this call built no arguments through
+    // buildOrderedArgs" — nothing to discharge.
     llvm::Value* emitMethodCall(sema::MethodSymbol* ms,
                                 std::vector<llvm::Value*>& args,
                                 bool baseQualified,
                                 const std::vector<const ast::Expr*>* argExprs
                                     = nullptr,
                                 SourceLocation callLoc = {},
-                                bool thisReceiver = false);
+                                bool thisReceiver = false,
+                                std::size_t argBoxCallIdx = kNoArgBoxCall);
 
     // §12 / §14 (issue #585): compute the concrete generic substitution for an
     // ANCESTOR generic class reached through inheritance from `recvTy`. When a

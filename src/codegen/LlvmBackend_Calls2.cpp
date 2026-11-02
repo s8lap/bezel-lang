@@ -15454,6 +15454,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // local-MethodDecl arm below so the restore need not re-read ms->decl
     // (the imported else-branch records no entries).
     const std::vector<ast::Param>* bareTParamUnwrapParams = nullptr;
+    // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the §8.6 argument box's
+    // release belongs to the CALL that minted it, so the pending releases are
+    // held ONE RECORD PER CALL (a stack). This call's record is opened before
+    // its arguments are built (below, in the local-MethodDecl arm) and
+    // discharged at this call's OWN post-call point — after the call returns
+    // (the ordinary path, inside emitMethodCall) or after the inlined generic
+    // body (the generic arms, at the post-call point below). A nested call's
+    // record sits above this one and is popped first, so a nested call's
+    // discharge can never release this call's still-live box.
+    std::size_t argBoxCallIdx = kNoArgBoxCall;
     {
         // fix #4813 (§14.1 / §14.5 / §15.4, v0.307): a collection-literal
         // argument is built at the callee's FORMAL type (see buildOrderedArgs),
@@ -15969,11 +15979,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // bail-out, post-CreateCall release emission).
             currentCallee_ = md;
             bareTParamUnwrapParams = &md->params;
+            argBoxCallIdx = beginArgBoxCall();
             if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
                                   /*nullTransferredOwned=*/true,
                                   &accessorRefArgs)) {
                 currentCallee_ = nullptr;
-                pendingArgBoxReleases_.clear();
+                // fix #7998: the call never runs, so the box minted for its
+                // argument is garbage — DROP this call's record (the
+                // conservative leak; the emission point may be a diverged
+                // block). The records of ENCLOSING calls stay pending: their
+                // boxes are still live.
+                dropArgBoxCall(argBoxCallIdx);
                 // Restore before early-return.
                 if (didPrePass) {
                     genericSubst_ = std::move(preSavedSubst);
@@ -17724,8 +17740,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         markMoveOnlyChoiceArgsMovedFrom(call, /*atCallSite=*/true, ms,
                                         baseQualified);
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
-                                         call.span.begin, thisReceiver);
+                                         call.span.begin, thisReceiver,
+                                         argBoxCallIdx);
     unwindTarget_ = savedClArgUnwind;
+    // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the NORMAL-return discharge of
+    // an argument-position §8.6 box — the same boundary the releases below sit
+    // on. emitMethodCall discharges this call's own record on its ORDINARY
+    // path; its GENERIC arms (the inline / specialization routes) RETURN
+    // before that point, so the record is still open here and is discharged
+    // NOW — after the inlined body, i.e. after the box's LAST USE.
+    //
+    // The discharge releases exactly THIS call's boxes: a nested call's record
+    // was opened above this one and popped at that nested call's own
+    // post-call point, so the outer call's still-live box is untouched. That
+    // is the whole of #7998: the discharge is keyed to the CALL, not to the
+    // emitting function.
+    //
+    // It is emitted unconditionally (like the ordinary path's release was):
+    // a diverged call has already branched to its unwind edge, so this is
+    // the §28.3 "Exception-path discharge" of the box.
+    dischargeArgBoxCall(argBoxCallIdx);
     if (!diverged_) {
         // fix-forward #5262-ff: the throw edge no longer leaks these — the
         // cleanup above drops the same vector on the propagating path.
@@ -19457,12 +19491,76 @@ bool Emitter::methodCallDispatchesDynamically(sema::MethodSymbol* ms,
     return vtableSlot_.count(ms) != 0;
 }
 
+
+// fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the §8.6 ARGUMENT BOX's lifetime.
+//
+// §8.6: a value-typed argument bound to an `Object`/interface parameter is
+// boxed; §28.3 discharges an unbound owned temporary "at the end of the full
+// expression in which it is produced"; §28.9 makes the box runtime-managed.
+// The box for an ARGUMENT is produced in the CALLER, so its release belongs
+// to the CALL that built it — and to THAT call alone.
+//
+// THE DEFECT (measured). Before #7998 the pending-release queue was a FLAT
+// list of boxes for the whole emitting function, drained WHOLESALE by
+// whichever call reached a discharge point first. When a generic callee is
+// INLINED into the caller (emitInlineGenericMethod "emits into the CALLER's
+// own function"), the callee's body — and any call inside it — sits BETWEEN
+// the outer call's argument mint and the outer call's post-call point. The
+// nested call's discharge therefore released the OUTER call's box while the
+// outer callee was still reading it: a use-after-free, and (because glibc's
+// free() overwrites the box's first word, so the `as` type test on the freed
+// box always fails) a SILENTLY WRONG VALUE.
+//
+// THE RULE. One record per CALL. A call opens a record before its arguments
+// are built; buildOrderedArgs puts the boxes it mints into THAT record; the
+// call's own post-call point discharges exactly that record and pops it. The
+// records are a stack, so a nested call's record is above its caller's and is
+// popped first — an inner call's discharge can never reach an outer call's
+// still-live box.
+//
+// The cross-function guard below is belt and braces: a box whose defining
+// function is not the function being emitted is NEVER released here (it would
+// be the LLVM verifier's "Referring to an instruction in another function!"),
+// so such an entry is dropped instead — the safe direction.
+std::size_t Emitter::beginArgBoxCall() {
+    pendingArgBoxReleases_.push_back(PendingArgBoxCall{});
+    return pendingArgBoxReleases_.size() - 1;
+}
+
+void Emitter::dischargeArgBoxCall(std::size_t idx) {
+    if (idx == kNoArgBoxCall || idx >= pendingArgBoxReleases_.size()) return;
+    // The function the release would join.
+    llvm::Function* scope = nullptr;
+    if (llvm::BasicBlock* ib = builder_.GetInsertBlock())
+        scope = ib->getParent();
+    for (std::size_t i = idx; i < pendingArgBoxReleases_.size(); ++i) {
+        for (llvm::Value* b : pendingArgBoxReleases_[i].boxes) {
+            if (!b) continue;
+            // fix #7998: a box minted in ANOTHER function must not be released
+            // here — the release would reference an instruction of another
+            // function. Such an entry is dropped (a leak), never released.
+            if (auto* inst = llvm::dyn_cast<llvm::Instruction>(b)) {
+                if (llvm::Function* owner = inst->getFunction())
+                    if (scope && owner != scope) continue;
+            }
+            emitBoxRelease(b);
+        }
+    }
+    pendingArgBoxReleases_.resize(idx);
+}
+
+void Emitter::dropArgBoxCall(std::size_t idx) {
+    if (idx == kNoArgBoxCall || idx >= pendingArgBoxReleases_.size()) return;
+    pendingArgBoxReleases_.resize(idx);
+}
+
 llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             std::vector<llvm::Value*>& args,
                             bool baseQualified,
                             const std::vector<const ast::Expr*>* argExprs,
                             SourceLocation callLoc,
-                            bool thisReceiver) {
+                            bool thisReceiver,
+                            std::size_t argBoxCallIdx) {
     // issue #421 / #410: is the argument at index `ai` an unsigned source?
     // Defaults to false (signed) when no source expression is known for the
     // slot (e.g. the receiver) or no argExprs vector was supplied.
@@ -20798,10 +20896,14 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // non-escape check. bz_box_release is null-safe (the call's argument list
     // might never have produced a box, e.g. for a reference source). Then
     // clear state so the next call starts fresh.
-    for (llvm::Value* b : pendingArgBoxReleases_) {
-        if (b) emitBoxRelease(b);
-    }
-    pendingArgBoxReleases_.clear();
+    //
+    // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the discharge is keyed to the
+    // CALL — it releases exactly the boxes THIS call's buildOrderedArgs minted
+    // (the record `argBoxCallIdx` names), never the whole pending set. The
+    // GENERIC arms above RETURN before this point, so they leave their record
+    // to the call site's own post-call discharge (lowerCallDispatch's), which
+    // runs after the inlined body — i.e. after the box's last use.
+    dischargeArgBoxCall(argBoxCallIdx);
     currentCallee_ = nullptr;
     return r;
 }
@@ -24061,16 +24163,25 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     // placement. (A plain/`owned`/`scoped` argument's own value-lowering is
     // unaffected — only the `ref`/`out` shaping changes.)
     std::vector<AccessorRefArg> accessorRefArgs;
+    //
+    // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the `?.` twin of the `.`
+    // form's per-call §8.6 argument-box record — the release belongs to the
+    // CALL that minted the box, and the call's own post-call point
+    // discharges exactly that record.
+    std::size_t argBoxCallIdx = kNoArgBoxCall;
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
         // fix #2952: install the callee so buildOrderedArgs's argument-position
         // §8.6 box escape analysis can walk `md`'s body. Cleared on every exit
         // below (success, early bail-out, post-CreateCall release emission).
         currentCallee_ = md;
+        argBoxCallIdx = beginArgBoxCall();
         if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
                               /*nullTransferredOwned=*/true,
                               &accessorRefArgs)) {
             currentCallee_ = nullptr;
-            pendingArgBoxReleases_.clear();
+            // fix #7998: the call never runs — drop THIS call's record (the
+            // conservative leak) and leave an enclosing call's record alone.
+            dropArgBoxCall(argBoxCallIdx);
             // #1302: the call never runs, so no §22.3 write-back is owed —
             // release the pinned receiver/index values.
             emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
@@ -24430,7 +24541,14 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         markMoveOnlyChoiceArgsMovedFrom(call, /*atCallSite=*/true, ms,
                                         /*baseQualified=*/false);
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs,
-                                    call.span.begin);
+                                    call.span.begin, /*thisReceiver=*/false,
+                                    argBoxCallIdx);
+    // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the `?.` twin of the `.`
+    // form's post-call discharge of THIS call's §8.6 argument box. The
+    // ordinary path already discharged it inside emitMethodCall; the generic
+    // arms left the record open, and it is discharged HERE — after the
+    // inlined body, i.e. after the box's last use.
+    dischargeArgBoxCall(argBoxCallIdx);
     genericSubst_ = std::move(savedNcSubst);
     genericSubstSemaTy_ = std::move(savedNcSemaTy);
     // fix #1302 / §22.3: the copy-OUT half of every accessor-mediated

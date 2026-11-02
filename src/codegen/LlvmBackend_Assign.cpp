@@ -17425,8 +17425,20 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // unit-source rescue), so nothing to release.
             if (v && lastBoxMint_ && v == lastBoxMint_ &&
                 currentCallee_ != nullptr) {
-                if (isCalleeParamNonEscaping(currentCallee_, idx))
-                    pendingArgBoxReleases_.push_back(v);
+                if (isCalleeParamNonEscaping(currentCallee_, idx)) {
+                    // fix #7998 (§8.6 / §28.9 / §28.3, v0.350): the box is
+                    // queued in the record of the CALL that is building THIS
+                    // argument, not in a function-wide list. The record is the
+                    // top of the stack (a nested call's record is above it and
+                    // is popped at that nested call's own post-call point), so
+                    // the call that minted the box is the only one that can
+                    // discharge it. A function-wide list let an INNER call's
+                    // discharge release the OUTER call's still-live box — a
+                    // use-after-free and a silently wrong value.
+                    if (pendingArgBoxReleases_.empty())
+                        pendingArgBoxReleases_.push_back(PendingArgBoxCall{});
+                    pendingArgBoxReleases_.back().boxes.push_back(v);
+                }
             }
             lastBoxMint_ = savedBoxMint;
             // §29.2 (#437/#1067/#1068/#552): when an Array<T> / (Owned)LinkedList
