@@ -183,6 +183,26 @@ command under a root) refuses a bare `cmake --build`/make/ninja in a build dir, 
 or `MAKEFLAGS=` override, and an Agent prompt or `*brief*` file that tells a lane
 to run one, and names the command to run instead. Denials are logged to
 `/var/tmp/bezel-scratch/build-guard/denials.log`. After changing the hook, re-copy it.
+(3) OpenCode sessions have no `~/.claude/settings.json` hook, so
+`scripts/claude_hooks/opencode_build_guard.js` is installed as
+`~/.config/opencode/plugins/bezel-build-guard.js` and asks the SAME rule set
+what to do with each shell command (`build_guard.py --route`, one subprocess per
+call). It ROUTES instead of refusing: a bare `cmake --build …`, or `make`/`ninja`
+in a CMake build dir, is rewritten to `scripts/dev_heavy.sh build <tool> …` —
+the same build dir, the same targets, the same output paths, but joining the
+token pool and the memory-capped slice. A build the rewriter cannot see (a
+wrapper prefix, a `$( )` payload) keeps its own words and only gets the
+jobserver env (`MAKEFLAGS` with the FIFO auth, `BEZEL_JOBSERVER=on`, no
+`CMAKE_BUILD_PARALLEL_LEVEL`), so it still takes a token per compile. Only two
+things are refused: a pool opt-out (`BEZEL_JOBSERVER=off`, a hand-set
+`MAKEFLAGS`, `--jobserver-auth`) and a by-name kill — neither can be routed, and
+a kill is not a build. Refusing a build costs a lane a round-trip, and an agent
+that does not understand the refusal retries with a slightly different bare
+build; routing keeps the lane's intent and changes only the mechanism. The
+route mode is pinned by `scripts/gate/tests/test_build_guard_route.py`, the
+deny mode by `scripts/gate/tests/test_build_guard_hook.py`. After changing the
+hook, re-copy it to BOTH `~/.claude/hooks/bezel_build_guard.py` and
+`~/.config/opencode/plugins/bezel-build-guard.js`.
 `start` refuses to run from a linked worktree. A *dedicated* daemon worktree (e.g.
 `/mnt/fast/wt-jobserver21`) needs `BEZEL_JOBSERVER_ALLOW_WORKTREE=1`. The unit name is
 `bezel-jobserver` for the default token dir, and `bezel-jobserver-<hash8>` for any other

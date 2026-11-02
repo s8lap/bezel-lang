@@ -203,36 +203,49 @@ def _split_heredocs(text: str) -> tuple[str, list[str]]:
     return "\n".join(out), shell_bodies
 
 
-def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
+def tokenize(s: str, spans: bool = False):
     """Approximate POSIX shell word splitting. Returns (simple commands as word
-    lists, nested command strings from $( ), backticks and <( ))."""
+    lists, nested command strings from $( ), backticks and <( )).
+
+    With spans=True it also returns the (start, end) offsets of every simple
+    command and of every nested string in `s`, so a caller can splice the
+    ORIGINAL text (quotes and all) without lexing it a second time."""
     cmds: list[list[str]] = []
     nested: list[str] = []
+    cmd_spans: list[tuple[int, int]] = []
+    nested_spans: list[tuple[int, int]] = []
     words: list[str] = []
     cur: list[str] | None = None
+    cmd_start = 0
+    cmd_end = 0
     skip_word = False  # the next word is a redirection target
     n = len(s)
     i = 0
 
     def end_word():
-        nonlocal cur, skip_word
+        nonlocal cur, skip_word, cmd_end
         if cur is not None:
             if skip_word:
                 skip_word = False
             else:
                 words.append("".join(cur))
+                cmd_end = i
             cur = None
 
     def end_cmd():
         end_word()
         if words:
             cmds.append(words[:])
+            cmd_spans.append((cmd_start, cmd_end))
             words.clear()
 
     def add(text):
-        nonlocal cur
+        nonlocal cur, cmd_start
         if cur is None:
             cur = []
+            if not words:
+                # The first word of this simple command starts its span.
+                cmd_start = i
         cur.append(text)
 
     while i < n:
@@ -261,6 +274,7 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
                 if s.startswith("$(", j) and not s.startswith("$((", j):
                     k = _match_close(s, j + 1)
                     nested.append(s[j + 2:k])
+                    nested_spans.append((j + 2, k))
                     buf.append(s[j:k + 1])
                     j = k + 1
                     continue
@@ -268,6 +282,7 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
                     k = s.find("`", j + 1)
                     k = n if k < 0 else k
                     nested.append(s[j + 1:k])
+                    nested_spans.append((j + 1, k))
                     buf.append(s[j:k + 1])
                     j = k + 1
                     continue
@@ -279,6 +294,7 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
         if c == "$" and s.startswith("$(", i) and not s.startswith("$((", i):
             k = _match_close(s, i + 1)
             nested.append(s[i + 2:k])
+            nested_spans.append((i + 2, k))
             add(s[i:k + 1])
             i = k + 1
             continue
@@ -286,6 +302,7 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
             k = s.find("`", i + 1)
             k = n if k < 0 else k
             nested.append(s[i + 1:k])
+            nested_spans.append((i + 1, k))
             add(s[i:k + 1])  # keep it in the word, like $( ): `kill `pgrep x``
             i = k + 1
             continue
@@ -293,6 +310,7 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
             if i + 1 < n and s[i + 1] == "(":
                 k = _match_close(s, i + 1)
                 nested.append(s[i + 2:k])
+                nested_spans.append((i + 2, k))
                 i = k + 1
                 continue
             if cur is not None and "".join(cur).isdigit():
@@ -326,6 +344,8 @@ def tokenize(s: str) -> tuple[list[list[str]], list[str]]:
         add(c)
         i += 1
     end_cmd()
+    if spans:
+        return cmds, nested, cmd_spans, nested_spans
     return cmds, nested
 
 
@@ -338,11 +358,22 @@ class Guard:
         self.roots = roots or []
         self.reasons: list[str] = []
         self.kill_reasons: list[str] = []
+        self.hard_reasons: list[str] = []  # refusals that cannot be routed
         self.pid_vars: set[str] = set()  # shell variables holding pgrep/pidof output
         self.unscoped_finder = False  # this script runs a by-name pgrep/pidof/ps
 
     def deny(self, why: str, instead: str | None = None):
         msg = why if not instead else f"{why}\n  Run instead: {instead}"
+        if msg not in self.reasons:
+            self.reasons.append(msg)
+
+    def deny_hard(self, why: str, instead: str | None = None):
+        """A refusal that cannot be routed: a pool opt-out is a decision about
+        a shared machine that is not the lane's to make, so no rewrite can
+        stand in for it."""
+        msg = why if not instead else f"{why}\n  Run instead: {instead}"
+        if msg not in self.hard_reasons:
+            self.hard_reasons.append(msg)
         if msg not in self.reasons:
             self.reasons.append(msg)
 
@@ -407,18 +438,18 @@ class Guard:
         if m:
             var, val = m.group(1), m.group(2)
             if var == "BEZEL_JOBSERVER" and val not in ("", "on"):
-                self.deny(f"`{word}` opts a build out of the machine-wide jobserver. Only "
-                          "gate.sh may do that (it runs with zero other builders).",
-                          "the same command without the assignment")
+                self.deny_hard(f"`{word}` opts a build out of the machine-wide jobserver. Only "
+                               "gate.sh may do that (it runs with zero other builders).",
+                               "the same command without the assignment")
             elif var in ("MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS"):
-                self.deny(f"`{var}=` overrides the jobserver auth that dev_heavy.sh sets.",
-                          "the same command without the assignment; dev_heavy.sh sets MAKEFLAGS")
+                self.deny_hard(f"`{var}=` overrides the jobserver auth that dev_heavy.sh sets.",
+                               "the same command without the assignment; dev_heavy.sh sets MAKEFLAGS")
             elif var.startswith("BEZEL_BUILD_TOKEN_"):
-                self.deny(f"`{var}=` changes the build token launcher's limits.",
-                          "the same command without the assignment")
+                self.deny_hard(f"`{var}=` changes the build token launcher's limits.",
+                               "the same command without the assignment")
         if "--jobserver-auth" in word:
-            self.deny("`--jobserver-auth` hand-wires a jobserver. dev_heavy.sh does that.",
-                      "scripts/dev_heavy.sh build <cmake|make|ninja> ...")
+            self.deny_hard("`--jobserver-auth` hand-wires a jobserver. dev_heavy.sh does that.",
+                           "scripts/dev_heavy.sh build <cmake|make|ninja> ...")
 
     def command_index(self, words: list[str], i: int) -> int | None:
         """Index of the command word, skipping assignments and wrappers."""
@@ -726,24 +757,58 @@ class Guard:
                 return True
         return False
 
-    def check_build(self, argv: list[str], raw: bool):
+    def bare_build(self, argv: list[str]) -> bool:
+        """Is `argv` a build that would bypass the machine-wide jobserver?"""
         name = _base(argv[0])
         if self.compiles_nothing(argv):
-            return
+            return False
         if name == "cmake":
-            if "--build" not in argv[1:]:
-                return  # configure, -E, --install: not a compile wave
-            if raw:
-                self.deny("`cmake --build` outside `scripts/dev_heavy.sh build` bypasses the "
-                          "machine-wide jobserver and the heavy slice (a bare `-j` is "
-                          "unlimited `make -j`: 499 clang and a box-wide OOM on 2026-09-30).",
-                          self.cmake_instead(argv))
-        elif name in BUILD_TOOLS:
+            return "--build" in argv[1:]  # configure, -E, --install: no wave
+        if name in BUILD_TOOLS:
+            return self.is_cmake_build_dir(self.build_tool_dir(argv))
+        return False
+
+    def route_prefix(self, argv: list[str]) -> str | None:
+        """The dev_heavy.sh prefix that puts `argv` into the machine-wide pool,
+        or None when `argv` is not a bare build, or when no dev_heavy.sh can
+        be found for it -- then the caller leaves the command alone and only
+        injects the jobserver env, which is better than a prefix that does
+        not exist.
+
+        The prefix is `<dev_heavy.sh> build`; the caller splices it in front of
+        the command's OWN text, so the build dir, the targets and the output
+        paths stay exactly as the lane wrote them.
+        """
+        if not self.bare_build(argv):
+            return None
+        name = _base(argv[0])
+        if name == "cmake":
+            bdir = None
+            for i, a in enumerate(argv):
+                if a == "--build" and i + 1 < len(argv):
+                    bdir = argv[i + 1]
+                    break
+            dh = _dev_heavy_cmd(self.resolve(bdir, self.vcwd) if bdir else None, self.vcwd)
+        else:
+            dh = _dev_heavy_cmd(self.build_tool_dir(argv), self.vcwd)
+        if dh is None:
+            return None
+        return f"{dh} build"
+
+    def check_build(self, argv: list[str], raw: bool):
+        if not raw or not self.bare_build(argv):
+            return
+        name = _base(argv[0])
+        if name == "cmake":
+            self.deny("`cmake --build` outside `scripts/dev_heavy.sh build` bypasses the "
+                      "machine-wide jobserver and the heavy slice (a bare `-j` is "
+                      "unlimited `make -j`: 499 clang and a box-wide OOM on 2026-09-30).",
+                      self.cmake_instead(argv))
+        else:
             d = self.build_tool_dir(argv)
-            if raw and self.is_cmake_build_dir(d):
-                self.deny(f"`{name}` in the CMake build dir {d} bypasses the machine-wide "
-                          "jobserver and the heavy slice.",
-                          f"{self.dev_heavy_for(d)} build {' '.join(self.strip_j(argv))}")
+            self.deny(f"`{name}` in the CMake build dir {d} bypasses the machine-wide "
+                      "jobserver and the heavy slice.",
+                      f"{self.dev_heavy_for(d)} build {' '.join(self.strip_j(argv))}")
 
     @staticmethod
     def strip_j(argv: list[str]) -> list[str]:
@@ -987,6 +1052,205 @@ def decide_safely(event, roots: list[str]) -> str | None:
         return None
 
 
+# ------------------------------------------------------------- route mode --
+#
+# The hook above REFUSES a build that would bypass the machine-wide jobserver
+# and says which command to run instead. A refusal costs the lane a round-trip,
+# and an agent that does not understand the refusal may retry with a slightly
+# different bare build. The route mode below does the same job the other way
+# round: it REWRITES the command so that it runs the sanctioned way. The rules
+# are the same rules -- the same Guard class, the same check_script walk -- only
+# the outcome differs.
+#
+# What is routed, and what is not:
+#
+#   * a bare `cmake --build ...`, or `make`/`ninja` in a CMake build dir:
+#     rewritten to `scripts/dev_heavy.sh build <tool> ...`, which joins the
+#     machine-wide token pool and runs the build inside the memory-capped
+#     slice. The build dir, the targets and the output paths are unchanged.
+#   * `bash -c "<build>"` and `dev_heavy.sh build <wrapper> <build>`: rewritten
+#     to the same dev_heavy form, so the build tool is argv[0] again.
+#   * a build the rewriter cannot see (a payload that is not a single build
+#     command, a build behind a wrapper prefix): not rewritten, but the caller
+#     injects the jobserver env, so the build still takes a token per compile.
+#   * a pool opt-out (BEZEL_JOBSERVER=off, a hand-set MAKEFLAGS, a
+#     --jobserver-auth) and a by-name kill: REFUSED. Neither can be routed: a
+#     kill is not a build, and opting out of a pool shared by every lane is not
+#     the lane's decision to make.
+
+JOBSERVER_DIR = os.environ.get("BEZEL_JOBSERVER_DIR", "/var/tmp/bezel-scratch/jobserver")
+
+
+def jobserver_env() -> dict[str, str]:
+    """The env that makes a build join the machine-wide token pool."""
+    return {
+        "MAKEFLAGS": f"-j --jobserver-auth=fifo:{JOBSERVER_DIR}/fifo",
+        "BEZEL_JOBSERVER": "on",
+    }
+
+
+def _dev_heavy_owner(bdir: str | None) -> str | None:
+    """The scripts/dev_heavy.sh of the tree that owns `bdir`, found by walking
+    up from the build dir (no CMakeCache needed)."""
+    p = bdir
+    for _ in range(6):
+        if not p:
+            break
+        cand = os.path.join(p, "scripts", "dev_heavy.sh")
+        if os.path.isfile(cand):
+            return cand
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return None
+
+
+def _dev_heavy_cmd(bdir: str | None, vcwd: str) -> str | None:
+    """The dev_heavy.sh a routed build is prefixed with, or None when no
+    absolute one can be found (then the build is left alone and only gets the
+    jobserver env, which is better than a prefix that does not exist)."""
+    dh = Guard.dev_heavy_for(bdir)
+    if dh != "scripts/dev_heavy.sh":
+        return dh
+    owner = _dev_heavy_owner(bdir)
+    if owner:
+        return owner
+    local = os.path.join(vcwd, "scripts", "dev_heavy.sh")
+    if os.path.isfile(local):
+        return local
+    return None
+
+
+def _splice(text: str, edits: list[tuple[int, int, str]]) -> str:
+    out = text
+    for s, e, rep in sorted(edits, key=lambda x: x[0], reverse=True):
+        out = out[:s] + rep + out[e:]
+    return out
+
+
+def _plan(text: str, cwd: str, roots: list[str], depth: int = 0):
+    """The (edits, routes) for the bare builds in `text`.
+
+    edits: (start, end, replacement) spans into `text`; routes: the routed
+    commands, in the order they appear."""
+    if depth > MAX_DEPTH or not text:
+        return [], []
+    g = Guard(cwd, roots)
+    cmds, _nested, cspans, _nspans = tokenize(text, spans=True)
+    edits: list[tuple[int, int, str]] = []
+    routes: list[str] = []
+    for words, (s, e) in zip(cmds, cspans):
+        c = g.command_index(words, 0)
+        if c is None:
+            continue
+        name = _base(words[c])
+        args = words[c + 1:]
+        if name in ("cd", "pushd") and c == 0:
+            g.change_dir(args)
+            continue
+        if c != 0:
+            # A wrapper or an assignment prefix: splicing would change what
+            # the wrapper does, so this build keeps its own words and only
+            # gets the jobserver env.
+            continue
+        if name in SHELLS:
+            payload = g.shell_payload(args)
+            if payload is None:
+                continue
+            r = _route_of(payload, g.vcwd, roots, depth + 1)
+            if r is not None:
+                edits.append((s, e, r))
+                routes.append(r)
+            continue
+        if name == "dev_heavy.sh":
+            r = _dev_heavy_route(args, g, roots, depth)
+            if r is not None:
+                edits.append((s, e, r))
+                routes.append(r)
+            continue
+        prefix = g.route_prefix(words)
+        if prefix is not None:
+            r = f"{prefix} {text[s:e]}"
+            edits.append((s, e, r))
+            routes.append(r)
+    return edits, routes
+
+
+def _route_of(text: str, cwd: str, roots: list[str], depth: int = 0) -> str | None:
+    """The routed form of `text`, when `text` is exactly one bare build."""
+    edits, _routes = _plan(text, cwd, roots, depth)
+    if len(edits) != 1:
+        return None
+    s, e, _ = edits[0]
+    off = len(text) - len(text.lstrip())
+    if s != off or e != off + len(text.strip()):
+        return None
+    return _splice(text, edits)
+
+
+def _dev_heavy_route(args: list[str], g: "Guard", roots: list[str], depth: int) -> str | None:
+    """The routed form of a `dev_heavy.sh <kind> <build>` command whose build
+    does not reach the pool (a wrapper payload, or the wrong kind)."""
+    if not args:
+        return None
+    kind, payload = args[0], args[1:]
+    if not payload:
+        return None
+    pname = _base(payload[0])
+    if kind == "build" and (pname in BUILD_TOOLS or pname == "cmake"):
+        return None  # already the pooled shape
+    if kind == "build":
+        inner = g.shell_payload(payload[1:]) if pname in SHELLS else None
+        if inner is None:
+            return None
+        return _route_of(inner, g.vcwd, roots, depth + 1)
+    prefix = g.route_prefix(payload)
+    if prefix is None:
+        return None
+    return f"{prefix} {' '.join(payload)}"
+
+
+def route_command(text: str, cwd: str, roots: list[str]) -> dict:
+    """What to do with a shell command that may bypass the jobserver.
+
+    "allow" -- nothing to do.
+    "route" -- the command would bypass the machine-wide jobserver. "command"
+               is the rewritten form (unchanged when the build could not be
+               rewritten) and "env" is the jobserver env to inject, so that
+               even an unrewritten build joins the pool.
+    "deny"  -- the command cannot be routed (a pool opt-out or a by-name
+               kill); "reason" says why.
+    """
+    in_scope = under_roots(cwd, roots)
+    if not in_scope and not any(r in text for r in roots):
+        return {"action": "allow"}
+    g = Guard(cwd, roots)
+    g.check_script(text)
+    if g.kill_reasons:
+        return {"action": "deny", "kind": "kill",
+                "reason": KILL_REFUSAL + "\n- " + "\n- ".join(g.kill_reasons)}
+    if g.hard_reasons:
+        return {"action": "deny", "kind": "opt-out",
+                "reason": "build_guard: refused, this command opts out of the "
+                          "machine-wide build jobserver, and on a machine shared by "
+                          "every lane that is not the lane's decision to make.\n- " +
+                          "\n- ".join(g.hard_reasons) +
+                          "\nWhy: scripts/build_token.sh header (2026-09-30 OOM). Only "
+                          "scripts/gate.sh may opt out (it runs with zero other builders)."}
+    if not g.reasons:
+        return {"action": "allow"}
+    edits, routes = _plan(text, cwd, roots)
+    new_text = _splice(text, edits)
+    out = {"action": "route", "command": new_text, "routed": routes,
+           "env": jobserver_env()}
+    if new_text == text:
+        out["note"] = ("this build could not be rewritten into the dev_heavy.sh form; "
+                       "the jobserver env was injected instead, so it still takes a "
+                       "token per compile")
+    return out
+
+
 def _log(path: str, event: dict, reason: str):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1005,6 +1269,7 @@ def _log(path: str, event: dict, reason: str):
 def main(argv: list[str]) -> int:
     roots: list[str] = []
     deny_log = DENY_LOG
+    route = False
     i = 0
     while i < len(argv):
         if argv[i] == "--root" and i + 1 < len(argv):
@@ -1013,8 +1278,34 @@ def main(argv: list[str]) -> int:
         elif argv[i] == "--deny-log" and i + 1 < len(argv):
             deny_log = argv[i + 1]
             i += 2
+        elif argv[i] == "--route":
+            route = True
+            i += 1
         else:
             i += 1
+    if route:
+        # The OpenCode plugin asks what to do with one shell command and acts on
+        # the answer. A JSON object on stdin: {"command": ..., "cwd": ...}; a
+        # bare JSON string is taken as the command.
+        try:
+            payload = json.load(sys.stdin)
+        except Exception:
+            return 0
+        if isinstance(payload, str):
+            payload = {"command": payload}
+        if not isinstance(payload, dict):
+            return 0
+        text = payload.get("command") or ""
+        cwd = payload.get("cwd") or os.getcwd()
+        try:
+            out = route_command(text, cwd, roots)
+        except Exception as e:
+            # A broken rule set must never stop a session: the launcher still
+            # bounds the build.
+            print(f"build_guard: internal error, not checked: {e!r}", file=sys.stderr)
+            out = {"action": "allow"}
+        json.dump(out, sys.stdout)
+        return 0
     try:
         event = json.load(sys.stdin)
     except Exception:
