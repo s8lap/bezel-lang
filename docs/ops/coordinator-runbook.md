@@ -903,6 +903,16 @@ cause, has a suspect root cause, follows a *refuted* partial fix, or is **any
 gate-failure fix-forward** (always Opus). Judge difficulty, not topic. If a
 Sonnet fix regresses more than it fixes, revert it and re-dispatch as Opus.
 
+**EFFORT is a separate dial from the model, and it is set per dispatch.**
+Medium for a mechanical lane whose brief carries the diagnosis; high for a lane
+that must rule on a spec question, for every soundness review, and for every
+gate-failure fix-forward. Effort cannot be changed on a lane that is already
+running, so the dispatch is the only chance to set it. A refuted Opus lane gets
+a **second Opus attempt** before the model is escalated: escalating on the first
+refutation spends the strongest model on a hypothesis that was never tested.
+Escalate the model only after two refutations, or when there is no root-cause
+hypothesis to act on at all.
+
 ### Review and dispatch: where the contract rules came from
 
 *Added 2026-10-04. Until then these rules lived only in coordinators' memory files and in
