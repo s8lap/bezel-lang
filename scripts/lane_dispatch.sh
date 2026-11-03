@@ -44,7 +44,14 @@
 set -u
 
 TITLE=""; LOG=""; BRIEF_FILE=""; MODEL="minimax/MiniMax-M3.1-Flash"; AGENT="general"
-BRIEF=""; PROJECT="${OPENCODE_PROJECT:-/home/stepan/w/code/bezel-lang}"; RESUME=""
+# The project root is DERIVED FROM THIS SCRIPT'S OWN LOCATION, never a literal
+# checkout path: a hardcoded absolute path is the defect the gate's
+# repo-identity self-test (scripts/gate/tests/test_repo_identity.py,
+# #3413) fails a cycle for -- and this script had one, so the gate's own
+# self-test phase was RED on it.  The same rule scripts/ratchet_sweep.sh
+# follows ("REPO-relative, never an absolute checkout path").
+_SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BRIEF=""; PROJECT="${OPENCODE_PROJECT:-$(cd -- "$_SELF_DIR/.." && pwd)}"; RESUME=""
 
 die() { echo "lane_dispatch: $*" >&2; exit 64; }
 
