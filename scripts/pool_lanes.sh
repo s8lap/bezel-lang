@@ -74,9 +74,18 @@ except Exception:
     ps_ok = False
 agent_sessions = set()
 for line in ps_out.splitlines():
-    if "opencode run" not in line:
-        continue
     parts = line.split()
+    # THE ARGV MUST LOOK LIKE THE AGENT'S, not merely CONTAIN IT.  A shell
+    # command line that merely MENTIONS the words -- e.g. the coordinator's
+    # own `ps ... | grep -F "opencode run --session ses_..."` -- would
+    # otherwise be read as an AGENT, and a DEAD lane would be counted LIVE
+    # (measured 2026-11-03: the scan invented two sessions, one of them
+    # the coordinator's own grep).  So: argv[0] must be the opencode
+    # binary and argv[1] must be `run`.
+    if len(parts) < 3:
+        continue
+    if os.path.basename(parts[0]) != "opencode" or parts[1] != "run":
+        continue
     if "--session" in parts:
         i = parts.index("--session")
         if i + 1 < len(parts):
