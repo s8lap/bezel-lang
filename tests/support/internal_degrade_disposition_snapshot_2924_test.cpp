@@ -103,7 +103,9 @@ struct Entry {
 // interpolation-part and case-arm dead-template-body degrades at v0.307;
 // #5327's split of the two #2961 assignment-RHS sites at v0.315 — two entries
 // became four, all WrongValue, because the split added report CALLS without
-// adding dispositions),
+// adding dispositions; #8000's built-in-CLASS arm of the #2775 dropped-test
+// site at v0.350 — one entry became two, both WrongValue, for the same
+// reason: the split added a report CALL without adding a disposition),
 // each with the judgement #2924 asks for.  Ordered by file, then by the tag.
 // The live count is `kN`, derived from this array — the prose above is a
 // changelog, not the number the test asserts.
@@ -191,6 +193,22 @@ const Entry kWarningDegrades[] = {
      "the dropped `is` test reads as `false`, an i1. Wrong answer, never a "
      "pointer — and the shapes where a non-answer is legitimate (dead template "
      "stub, erased operand) are excluded from the report"},
+
+    {"src/codegen/LlvmBackend_Layout.cpp", "#8000",
+     Disposition::WrongValue,
+     "the SAME dropped-test site as the #2775 entry above, reported through "
+     "the BUILT-IN-CLASS arm: an `is` test against a vtable-less built-in "
+     "CLASS has no runtime type tag to walk, so the test is dropped. For the "
+     "`is`/`is not` spelling the substituted value is the BOOLEAN `false`, an "
+     "i1 — a wrong answer, never a pointer, and the class carries no Bezel "
+     "vtable at word 0 for anything to dereference. The `as` spelling of the "
+     "same drop substitutes a NULL, but `as` produces `T?` (§17.4) and so the "
+     "null can only land in a NULLABLE slot: §7 refuses a non-nullable target "
+     "and §7.4 refuses an unguarded member access, so the only way past is the "
+     "checked `!` unwrap, which raises NullReferenceException rather than "
+     "faulting. The substitutions in those nullable slots are recorded by "
+     "their own entries (#2434 local init, #2491 return, #2961 assignment, "
+     "#3079 call argument) — the same reasoning as the #3025 `??=` entry"},
 
     {"src/codegen/LlvmBackend_Setup.cpp", "#2491",
      Disposition::UnsafePointer,
