@@ -35,11 +35,11 @@ public interface IPostingRule                // the `I` is the stdlib's own conv
 end IPostingRule;
 ```
 
-**Constants split by kind.** A class-level `const` and a compile-time `const` local are PascalCase — `const MaxUsers := 1000;` is spec §21.1's own example. A **runtime** `const` local (§21.1) is an ordinary local that happens not to be reassignable, and takes camelCase: `const openingBalance := account.Balance;`, matching §21.1's `const n := items.Count + 1;`.
+**Constants split by kind.** A class-level `const` and a compile-time `const` local are PascalCase — `const MaxUsers := 1000;` is spec §21.1's own example. A runtime `const` local (§21.1) is an ordinary local that happens not to be reassignable, and takes camelCase: `const openingBalance := account.Balance;`, matching §21.1's `const n := items.Count + 1;`.
 
 **The three access tiers have three names** — plain (`Parse`), `XOrNull` (`ParseOrNull`), `TryX` (`TryParse`) — and stdlib §1 defines what each name promises (taught in Guide 2 §2). Invent no fourth spelling — `GetSafe`, `MaybeGet`, `Get2` say nothing the tier names do not. Domain methods borrow the same vocabulary: the tour's store is `Find`/`Add`/`Update`/`Remove`, verbs a reader already knows from the collections.
 
-**`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1) is narrower than the habit: the suffix marks the asynchronous half of a **sync/async pair** — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists **only** asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
+**`Async` marks a pair, not a signature.** The rule the stdlib actually follows (stdlib §1) is narrower than the habit: the suffix marks the asynchronous half of a **sync/async pair** — `Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`. An operation that exists only asynchronously carries no suffix at all: `Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`. `Receive` beside `SendAsync` on one endpoint pair is the rule working, not an inconsistency. So an `async method Post` with no synchronous sibling is named `Post`, and adding a synchronous sibling later is what renames it.
 
 **Booleans read as predicates.** `IsEmpty`, `HasEntries`, `CanPost`, `Done` — or a verb the caller can read as a question: `Contains`, `TryAdd`, `Admits`. Never a noun that reads as data (`Status`, `Flag`).
 
@@ -63,9 +63,9 @@ using var settled := postings.Where(                              // anything mo
 
 **Two spaces per level, no tabs.** A member body is one level in from its declaration, a nested block one more.
 
-**Close a declaration with its name.** `end Ledger;`, `end Post;`, `end constructor;`. Spec §1.6 admits a bare `end;` everywhere and §11.4 recommends the named form; this guide requires it on every *declaration* — class, interface, record, enum, choice, method, block property, constructor, destructor, operator — because after a long body the name is the reader's anchor, and the compiler verifies it matches. Inside a body, close statement blocks with the bare `end;`: `if`, `for`, `while`, `do`, `try`, `case`. Two closers are not a choice: an indexer block closes `end;` (an indexer has no name), and a **labeled** loop closes `end scan;` — the keyword closer is rejected once the loop is labeled (§1.6).
+**Close a declaration with its name.** `end Ledger;`, `end Post;`, `end constructor;`. Spec §1.6 admits a bare `end;` everywhere and §11.4 recommends the named form; this guide requires it on every *declaration* — class, interface, record, enum, choice, method, block property, constructor, destructor, operator — because after a long body the name is the reader's anchor, and the compiler verifies it matches. Inside a body, close statement blocks with the bare `end;`: `if`, `for`, `while`, `do`, `try`, `case`. Two closers are not a choice: an indexer block closes `end;` (an indexer has no name), and a labeled loop closes `end scan;` — the keyword closer is rejected once the loop is labeled (§1.6).
 
-**One statement per line, and every `if` in block form** — the condition on its own line, the body indented, `end;` on the last, as §21.2's own examples are written. Never `if account = null then return false; end;`. The grammar admits it — every statement ends in `;`, so a block can be typed on one line — but a one-line conditional hides its own branch from a scan and from a diff. Brevity has its own form: the §20 `if` **expression**, `(if a > b then a else b)`, whose `else` is mandatory and which is an expression, not a squeezed statement.
+**One statement per line, and every `if` in block form** — the condition on its own line, the body indented, `end;` on the last, as §21.2's own examples are written. Never `if account = null then return false; end;`. The grammar admits it — every statement ends in `;`, so a block can be typed on one line — but a one-line conditional hides its own branch from a scan and from a diff. Brevity has its own form: the §20 `if` expression, `(if a > b then a else b)`, whose `else` is mandatory and which is an expression, not a squeezed statement.
 
 **A blank line between the logical steps of a body.** Acquire, compute, store, return; in a test, arrange, act, assert. A two-line body gets none.
 
@@ -140,7 +140,7 @@ end;
 
 Class-level constants and fields, constructors, the destructor if there is one, properties, public methods, private methods. A reader meets the state, then the ways it is built, then the surface, then the machinery.
 
-**One rule here is not taste.** §28.4's generated `Dispose()` disposes owned-bearing fields in **reverse declaration order**, so a field declared later is torn down while an earlier one is still intact. Read forward: **a later field may borrow from an earlier one, never the reverse** — and the field that owns the borrowers is declared **last**.
+**One rule here is not taste.** §28.4's generated `Dispose()` disposes owned-bearing fields in reverse declaration order, so a field declared later is torn down while an earlier one is still intact. Read forward: a later field may borrow from an earlier one, never the reverse — and the field that owns the borrowers is declared last.
 
 ```bezel
 public sealed class Ledger
@@ -149,7 +149,7 @@ public sealed class Ledger
 end Ledger;
 ```
 
-The worked case is `0002-http-server.md` §4.1: the root service declares `_deps` — whose store the mounted children borrow — and then `_routes`, which *owns* those children. `_routes` is disposed first, the children die while `_deps` is intact, and §28.3's back-reference residual (the programmer's obligation that the source outlive the object) is discharged **structurally**, by declaration order, with no runtime backstop. Swap the two lines and the borrow outlives its source — a residual §28.3 places on the field order, reported at disposal if at all, never at either declaration. Where the ordering carries this weight, say so in a trailing comment — the reader cannot see it, which is §3's whole test.
+The worked case is `0002-http-server.md` §4.1: the root service declares `_deps` — whose store the mounted children borrow — and then `_routes`, which *owns* those children. `_routes` is disposed first, the children die while `_deps` is intact, and §28.3's back-reference residual (the programmer's obligation that the source outlive the object) is discharged structurally, by declaration order, with no runtime backstop. Swap the two lines and the borrow outlives its source — a residual §28.3 places on the field order, reported at disposal if at all, never at either declaration. Where the ordering carries this weight, say so in a trailing comment — the reader cannot see it, which is §3's whole test.
 
 ---
 
