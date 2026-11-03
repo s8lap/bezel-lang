@@ -1109,12 +1109,46 @@ BEZEL_TEST(linq_refcount, owned_fold_bound_using_var_no_double_free_1006b) {
 }
 
 // SOUNDNESS: an OWNING-collection owned result (`Build(): owned OwningArray<Cell>`)
-// chained as `.Count` UNBOUND. The #1006b free is gated to the BORROWING `Array`
-// name-head, so an `OwningArray<T>` temp is NEVER freed here — freeing it (with an
-// element cascade) would double-free the uniquely-owned Cell elements. This
-// proves no double-free / UAF on the owning family (a leak of the owning temp is
-// the safe, deferred direction — leak-not-dangle, §28.7). Count is 3; the Cells
-// are not disposed (Cell.n stays 3), so Main returns 3 + 3 = 6.
+// chained as `.Count` UNBOUND.
+//
+// fix #8009 (§28.3.11 / K8.1 / §28.11, v0.350) CHANGES WHAT THIS ROW ASSERTS, and
+// the change is the POINT of that fix.
+//
+// WHAT THIS ROW USED TO ASSERT (and why it is no longer true). The #1006b free was
+// gated to the BORROWING `Array` name-head, so an `OwningArray<T>` temp was NEVER
+// freed at its full expression's boundary — it LEAKED — and this row recorded that
+// leak as "the safe, deferred direction (leak-not-dangle, §28.7)" and pinned the
+// program's observable to it: "the Cells are not disposed (Cell.n stays 3), so Main
+// returns 3 + 3 = 6".
+//
+// The reasoning behind that pinning was that freeing the owning temp "would
+// double-free the uniquely-owned Cell elements". THAT REASONING IS FALSE, and
+// #8009 is what proves it. An owning collection UNIQUELY owns its elements
+// (§28.11: "the collection's `Dispose()` cascades through every element"), so
+// disposing the collection disposes each element EXACTLY ONCE — that is the
+// collection's own contract, not a second owner racing it.
+//
+// MEASURED, on the two compilers, with ASan's `exitcode=99` (so a UAF or a DOUBLE
+// FREE is 99 and the program's own value is anything else):
+//
+//   pre-#8009 compiler : the program returns 6 (the Cells are alive at
+//                         `return v + Cell.n`), AND LSan reports
+//                         "SUMMARY: AddressSanitizer: 256 byte(s) leaked in 5
+//                         allocation(s)" — the collection, its backing, and its
+//                         three elements.
+//   post-#8009 compiler: the temporary is an unbound owned temporary (§28.3.11:
+//                         used only by a borrowing operation — "as a member or
+//                         index access" — so K8.1 disposes it at the end of the
+//                         full expression) and the §28.11 cascade destroys the
+//                         three `Cell`s at that boundary ⇒ `Cell.n` reads 0 ⇒ the
+//                         program returns 3. LSan reports NO leak. The ASan leg
+//                         exits 3, NOT 99 ⇒ the collection and its elements are
+//                         released EXACTLY ONCE — no double free, no UAF.
+//
+// ⇒ THE ROW'S ORACLE IS NOW STRONGER, NOT WEAKER: it asserts the new value, that
+// the program is LSan-CLEAN (the pre-fix compiler leaked 256 B / 5 allocations),
+// AND that there is no corruption (the ASan leg would exit 99 on a UAF or a
+// double free; it exits the program's own 3).
 const char* kOwningCollOwnedTempCountUnbound =
     "module M; "
     "class Cell "
@@ -1140,9 +1174,29 @@ const char* kOwningCollOwnedTempCountUnbound =
     "end P;";
 
 BEZEL_TEST(linq_refcount, owning_coll_owned_temp_count_unbound_no_double_free_1006b) {
-    // No leak leg here (the owning temp leak is the deliberate deferred direction);
-    // assert correctness AND no UAF / double-free of the owned Cell elements.
-    expectValueAndNoCorruption(kOwningCollOwnedTempCountUnbound, 6);
+    // fix #8009 (§28.3.11 / K8.1 / §28.11, v0.350): the expected value moves 6 → 3
+    // because the owning-collection temporary is now reclaimed at its full
+    // expression's boundary and the §28.11 cascade disposes the three `Cell`s
+    // there (`Cell.n` reads 0). See the block comment above the program for the
+    // two-compiler measurement.
+    //
+    // The "no double free" half of the row's name is the point: the ASan leg
+    // runs with `detect_leaks=0:exitcode=99`, so a UAF or a DOUBLE FREE of the
+    // uniquely-owned `Cell` elements would exit 99, not the program's own 3.
+    expectValueAndNoCorruption(kOwningCollOwnedTempCountUnbound, 3);
+    // AND the leak leg: the fixed compiler is LSan-clean, so a re-introduced leak
+    // of the collection (or its backing) fails here.
+    //
+    // ⇒ MEASURED NOTE ON WHAT THIS LEG DISCRIMINATES (review r38-w60-8009, F3):
+    // the 256 B / 5 allocations figure belongs to the `bezelc --sanitize=address`
+    // AOT build of this program — the harness's OWN LSan leg does NOT fail on the
+    // pre-fix compiler, because the leaked collection's pointer is still reachable
+    // on the stack, so LSan reports that program as CLEAN (raw exit 6, not 99).
+    // ⇒ THE DISCRIMINATING ASSERTION IS THE VALUE (3 vs 6) AND THE NO-CORRUPTION
+    // EXIT CODE (99 on a UAF or a double free), not the leak leg on this program.
+    // The leak leg still guards the FIXED compiler: a re-introduced leak makes the
+    // program return 6 ≠ 3, and a double cascade makes `Cell.n` −3 → 0 ≠ 3.
+    expectValueAndLeakFree(kOwningCollOwnedTempCountUnbound, 3);
 }
 
 // #1013 / §28.3 / stdlib §5: an UNBOUND `a.ToDictionary(...)` temporary used as
