@@ -24850,8 +24850,33 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
         if (id->name == "string") {
             isStringHead = true;
         } else if (id->name == "String") {
+            // fix #8046 (§3.4, v0.353; §22.5, §5.1; stdlib §9.6, v0.353): the
+            // §3.4 PascalCase ALIAS.
+            //
+            // The old test claimed the alias only when the symbol was a
+            // `TypeSymbol` with `decl == nullptr` — the compiler-intrinsic
+            // `builtinClassSym` shape. The §3.4 primitive alias is NOT such
+            // a symbol, so the whole §9.6 declared-parameter gate STOOD DOWN
+            // at the alias spelling, and #7535's own defect re-appeared
+            // there together with a §5.1 hole beside it:
+            //
+            //   String.Repeat(c := "ab", count := 2)  -> compiled; "abab"
+            //   string.Repeat(c := "ab", count := 2)  -> REFUSED
+            //   String.Repeat(unit := 5, count := 2)  -> compiled CLEAN
+            //   string.Repeat(unit := 5, count := 2)  -> REFUSED
+            //
+            // §3.4: "The PascalCase standard-library names in the table
+            // above (...) are RESERVED TYPE NAMES: a program may not declare
+            // a user type (class, record, enum, interface, or type alias)
+            // whose name is one of them." So at THIS shape — a bare
+            // identifier with no value type, i.e. a TYPE NAME — the
+            // spelling `String` can only name the primitive alias: a user
+            // type of that name is a compile error in its own right
+            // (`SymbolCollection.cpp`'s reserved-alias check), and the
+            // exclusion below keeps the gate away from a user type that
+            // somehow carries one.
             auto* ts = dynamic_cast<TypeSymbol*>(ctx_.exprSymbol(*tgt));
-            if (ts && ts->decl == nullptr) isStringHead = true;
+            if (!ts || ts->decl == nullptr) isStringHead = true;
         }
     }
     if (!isStringHead) return;
