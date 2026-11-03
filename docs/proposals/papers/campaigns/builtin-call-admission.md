@@ -2748,6 +2748,74 @@ already written in `/var/tmp/bezel-scratch/r37-rev-c2-43b/probes/`, and the lane
 confirms)** · reviewers `r38-w91-review2` (#7811 + #6024) · `r38-w92-review3` (#7287) · `r38-w93-review4`
 (#7601) · `r38-w94-rereview8027` (#8027).
 
+## Coordinator block — 2026-11-03 18:50 → 19:20 (THE GATE BLOCKER WAS MINE; THE #8027 PREMISE WAS WRONG; THE HAUL IS 68/75)
+
+**⇒ THE GATE'S OWN SELF-TEST WAS RED AT THE TIP, AND THE CAUSE WAS `scripts/lane_dispatch.sh` — MY OWN INFRASTRUCTURE.**
+`python3 -m unittest discover -s scripts/gate/tests` on the tip reported `FAILED (failures=1)`:
+
+    FAIL: test_no_absolute_repo_literal_survives_in_scripts (test_repo_identity.RootResolutionTest)
+    AssertionError: Lists differ: ['scripts/lane_dispatch.sh:47: BRIEF=""; P[68 chars]=""'] != []
+
+⇒ The gate's self-test phase runs that discovery, so **the one gate at the end of the run would have failed on the
+dispatcher's own default** — a hardcoded checkout path in a script that hardcodes a checkout path because the
+reviewer of it never ran the gate's self-test. ⇒ **⇒ FIXED AND PICKED** (`5b501476` → `db3c76aad3`): the default
+is now derived from the script's own location (`_SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"`),
+the rule `scripts/ratchet_sweep.sh` already states. ⇒ **⇒ MEASURED AFTER THE PICK: the repo-identity self-test
+is `Ran 36 tests … OK`.** ⇒ ⇒ **⇒ LESSON, RECORDED: A NEW SCRIPT IN `scripts/` IS NOT DONE UNTIL THE GATE'S OWN
+SELF-TEST DISCOVERY IS GREEN WITH IT IN THE TREE.** (The `check_internal_residual` RED in the sweep is the other
+one, and it is an ARTIFACT: the staging worktree's `build/bezelc` is STALE — the final gate must rebuild `bezelc`
+and the test binaries ON THE TIP before the sweep.)
+
+**⇒ THE #8027 PREMISE WAS WRONG, AND THE REVIEWER CORRECTED IT — MEASURED, NOT ARGUED.**
+This block earlier claimed that the AMEND `a454fd69` was ratchet-RED. **⇒ MEASURED, all three trees, with the
+checker run on each file under a `*_test.cpp` name (the checker only scans `*_test.cpp`, so a file named `t.cpp`
+reports "clean" VACUOUSLY — that is how the mistake was made):**
+
+    3086ff5c (the ORIGINAL)  -> VACUOUS (RED): the four control rows' EXPECT_FALSE(hasErrorContaining(...))
+                                over a helper that could match a Warning/Note
+    a454fd69 (the AMEND)     -> clean: the severity filter made the predicate REJECT-ONLY, so the checker
+                                classed it as a benign class-A redundancy, not a vacuous assertion
+    095f79a4 (the CURRENT)  -> clean, and the negative is GONE outright
+
+⇒ ⇒ **THE ORIGINAL WAS THE RED ONE, AND THE AMEND WAS ALREADY GREEN** ⇒ ⇒ **THE ORIGINAL REVIEW'S REJECT WAS
+RIGHT ABOUT `3086ff5c`, AND BOTH THE PRODUCER AND THE REVIEWER WERE RIGHT WHEN THEY SAID SO** (my premise was
+the wrong one). ⇒ ⇒ ⇒ **THE PICK IS `095f79a4` (picked as `c169c848`)**, whose re-review (`r38-w94-rereview8027`,
+ACCEPT-W-NOTES) verified: the vacuity is gone (F2), the four REFUSAL rows are real positives over a non-empty
+diagnostics list with the exact text and the offending type (F3), the fail-without reproduces (F4), the body's
+mechanism claims are true (F5), `src/` is byte-identical to the amend (F6), the ratchets are green (F7), and the
+closure names exactly `#8027` (F8).
+
+**⇒ THE SECOND CLOSING BINDING: ITS SOURCE, AND WHY IT IS A NOTE AND NOT A BLOCKER.**
+GitHub binds a closing keyword to the reference that FOLLOWS it **immediately** (only whitespace and an optional
+`:` may sit between) ⇒ **a QUOTED COMMIT SUBJECT binds, but arbitrary prose does not.** ⇒ Measured on `6d9c4a46`:
+the second binding is **body line 8** — `WHAT FIXED IT. commit 275fab52 -- "fix #7329: …"` — and deleting THAT
+line alone makes `pick_issues.sh --github` print exactly `#7287`; deleting the prose line 13 leaves the second
+binding in place. ⇒ ⇒ **⇒ AND THE HAUL LEDGER IS NOT INFLATED BY IT:** `scripts/pick_ledger.sh` builds the GH set
+from `pick_issues.sh --github` as an ASSOCIATIVE set of DISTINCT issues, and `#7329` is already counted from
+`275fab52` — the union is IDENTICAL with and without the extra binding. ⇒ ⇒ ⇒ **⇒ THE CORRECTED RULE: A SECOND
+CLOSING BINDING IS A HOUSE-STYLE NOTE, NOT A PICK BLOCKER — UNLESS IT NAMES AN ISSUE THAT IS STILL OPEN, WHICH
+WOULD BE A FALSE CLOSURE.** ⇒ The producer is told to reword future bodies (quote the subject without the
+keyword), but a picked body is not re-picked.
+
+**THE PICKS OF THIS BLOCK.** `0b154fdc` (#8012 #8015 #8020, from the `r38-w69-membergate` ACCEPT-W-NOTES — its
+F1/F2/F3 were all about the ORIGINAL `45bdd87a` and the FIX-FORWARD `9f8f9c22` had already answered all three) ·
+`23e82994` (infra: the pool measures agent PROCESSES) · `eedb40f3` (docs: this block's earlier text) ·
+`db3c76aad3` (infra: the dispatcher's own path — the gate blocker above) · `c169c848` (#8027) · `38210acd`
+(#7287, from the `r38-w92-review3` ACCEPT-W-NOTES; its F1 is the binding note above, F2 is a MATRIX HOLE the
+sibling file already covers, F3 is prose about the RED arm's observed value — the oracle itself is sound).
+
+**⇒ THE HAUL: 68 DISTINCT CREDITED FIX ISSUES, 75 GitHub-closable, of the 100 the one gate must carry.** ⇒ **⇒
+THE BINDING CONSTRAINT IS STILL THE HAUL, AND THE ONLY LEVERS THAT REACH IT ARE CLUSTER COMMITS AND RESIDUAL
+CLOSURES.** ⇒ ⇒ **THE POOL IS 7 PRODUCERS + 5 REVIEWERS (12 lanes):** producers `r38-p86-cluster` ·
+`r38-p87-registry` (resumed for its own body's bindings and the registry's next work) · `r38-p88-residual6` ·
+`r38-p89-residual5` · `r38-p90-objsurface` · `r38-p91-extarity` (the §26.5 rule-1 cluster) · `r38-p92-sweep6`
+(the replacement for the finished sweep lane) · reviewers `r38-w91-review2` (#7811 + #6024) ·
+`r38-w95-review5` (#7828) · `r38-w96-review6` (the sweep-three closures: #7749 #7695 #7767 #7363).
+**⇒ AND ONE HOUSE RULE LEARNED FROM THE SWEEP LANE THAT FINISHED: #7601 WAS PRODUCED TWICE** — `r38-p85`'s
+`8e37e2ee` and `r38-p89`'s `943ca6a7` — **⇒ THE COORDINATOR CREDITS #7601 FROM `943ca6a7` (it is in review) AND
+`8e37e2ee` IS NOT PICKED** (a second closure of one issue would be a duplicate, and the ledger's CREDIT set is
+subject-only, so the second commit's `Fixes #7601` would bind an issue that is already closed).
+
 ## Exit review
 
 *(to be written by the campaign's exit reviewer — not this lane)*
