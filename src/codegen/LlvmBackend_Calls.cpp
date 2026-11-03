@@ -15331,6 +15331,84 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         auto mathCmpKey = [&](llvm::Value* v) -> llvm::Value* {
             return v->getType()->isIntegerTy(64) ? dtTicksOf(v) : v;
         };
+        // fix #7947 (stdlib §2.5, v0.350): the ORDERING HEAD of a `Math`
+        // operand that is a builtin VALUE type -- `DateTime`, `TimeSpan`,
+        // `DateOnly` or `TimeOnly`. stdlib §2.5 declares `IComparable<Self>`
+        // on each of the four, so each has an order of its own (for a
+        // `DateTime` it is TICK order, "Kind not normalized"). A PRIMITIVE
+        // and a user type have no such head: they are not one of the four.
+        // An IMPORTED user type named `DateTime` is not the builtin either
+        // -- `builtinTypeName` returns {} for it (its `moduleName` is
+        // non-empty), so it keeps the path it had.
+        auto mathTimeValueHead = [&](const ast::Expr* e) -> std::string {
+            if (!e) return {};
+            const sema::TypeRef* t = resolveTypeParamRef(ctx_.exprType(*e));
+            if (!t) return {};
+            // §7.4 / §22.6: a NARROWED `T?` read is of type `T`; an
+            // un-narrowed one is refused by the front end (§14.2).
+            if (t->nullable && !ctx_.isNarrowedValueRead(*e)) return {};
+            const std::string_view head = builtinTypeName(t);
+            if (head == "DateTime" || head == "TimeSpan" ||
+                head == "DateOnly" || head == "TimeOnly")
+                return std::string(head);
+            return {};
+        };
+        // fix #7947 (spec §14.5, stdlib §2.2, v0.350): a `Math` call whose
+        // operands do NOT agree on ONE ordering type cannot be compared at
+        // all. §2.2 declares a single type parameter for the whole call --
+        //     Min<T>(a: T, b: T): T                  where T: IComparable<T>
+        //     Max<T>(a: T, b: T): T                  where T: IComparable<T>
+        //     Clamp<T>(value: T, low: T, high: T): T where T: IComparable<T>
+        // -- so §14.5's "all arguments for a type parameter must agree" is
+        // what admits the call, and a PRIMITIVE beside a TIME VALUE is a
+        // disagreement: an `int` is not a `TimeSpan`.
+        //
+        // The front-end check (#7900) takes its probe from the FIRST
+        // argument only, so it fires for `Math.Max(ts, 1)` and stays SILENT
+        // for `Math.Max(1, ts)` -- the mirror image. The silent case reached
+        // codegen, and the lowering compared the two operands' raw words:
+        // the `int` is an i32 and the `TimeSpan` an i64, so the compiler
+        // emitted `icmp sgt i32 1, i64 %7` and the IR VERIFIER rejected the
+        // module ("Both operands to ICmp instruction are not of the same
+        // type!") -- the compiler ABORTED on a program that must be
+        // REJECTED with a diagnostic. The same shape with a `long` beside a
+        // `DateTime` did not even abort: both are i64, so the comparison was
+        // well-typed and the call returned the PRIMITIVE where the order
+        // says the `DateTime` -- a silently wrong answer.
+        //
+        // This arm FAILS CLOSED with exactly the §14.5 wording the front
+        // end uses for the mirror-image spelling ("type parameter `T` of
+        // `Math.<member>` is `<head>`, but this argument is not"), so the
+        // two orders of the same mistake read the same. The front end's own
+        // check stops the build before this arm is reached wherever it
+        // already fires.
+        auto rejectMixedMathOperands =
+            [&](const std::vector<const ast::Expr*>& args) -> bool {
+            // The probe is the FIRST time-value head among the operands --
+            // the same head the front end names when it reports the
+            // mirror-image spelling.
+            std::string probe;
+            for (const ast::Expr* e : args) {
+                const std::string h = mathTimeValueHead(e);
+                if (!h.empty()) { probe = h; break; }
+            }
+            // No time value among the operands: whatever disagreement there
+            // is, it is not this one (the front end's #6909 check owns the
+            // primitive-versus-primitive case).
+            if (probe.empty()) return false;
+            for (const ast::Expr* e : args) {
+                if (!e) continue;
+                if (mathTimeValueHead(e) == probe) continue;
+                ctx_.diagnostics().report(
+                    Severity::Error, e->span.begin,
+                    "inconsistent type-argument inference: type parameter `T` "
+                    "of `Math." + std::string(m) + "` is `" + probe +
+                    "`, but this argument is not (§14.5, stdlib §2.2); all "
+                    "arguments for a type parameter must agree");
+                return true;
+            }
+            return false;
+        };
         // Fails CLOSED: a null result falls through to #2786's guard, which
         // reports a spec-cited Error, rather than to the aborting SIToFP.
         auto emitDecCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
@@ -15729,6 +15807,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                                         call.args[bSrc].value.get());
             a = mathConvertToT(a, call.args[aSrc].value.get());   // #6948
             b = mathConvertToT(b, call.args[bSrc].value.get());
+            // fix #7947: the two operands must agree on ONE ordering type
+            // (§14.5 / stdlib §2.2) -- a primitive beside a time value is
+            // not a `Math` call at all.
+            if ((m == "Min" || m == "Max") &&
+                rejectMixedMathOperands({call.args[0].value.get(),
+                                         call.args[1].value.get()}))
+                return nullptr;
             if (m == "Min") {
                 // Handle int or double operands.
                 if (a->getType()->isIntegerTy()) {
@@ -15877,6 +15962,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         // Math.Clamp(value, min, max): clamp value to [min, max].
         if (m == "Clamp" && call.args.size() == 3 &&
             call.args[0].value && call.args[1].value && call.args[2].value) {
+            // fix #7947: the three operands must agree on ONE ordering type
+            // (§14.5 / stdlib §2.2) -- a primitive beside a time value is
+            // not a `Math` call at all.
+            if (rejectMixedMathOperands({call.args[0].value.get(),
+                                         call.args[1].value.get(),
+                                         call.args[2].value.get()}))
+                return nullptr;
             // fix #7199 (§22.5, v0.343): `value`, `low` and `high` are
             // PARAMETERS (stdlib §2.2: `Clamp<T>(value: T, low: T, high: T)`),
             // and a named argument binds the parameter it NAMES. Read
