@@ -735,9 +735,32 @@ constexpr std::array<BuiltinParamRow, 384> kBuiltinParams = {{
     {"StringBuilder", "Append", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Append(value: string): StringBuilder"},
     {"StringBuilder", "AppendLine", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(): StringBuilder"},
     {"StringBuilder", "AppendLine", 1, 1, 0x01, {"value", "", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "AppendLine(value: string): StringBuilder"},
+    // fix #8020 (stdlib §3.1, §7.3, v0.350): the `AppendFormat` row's
+    // `args` position is the ONE other §3.1-`StringBuilder` position of this
+    // class — stdlib §3.1 spells `args: Array<Object>` WITHOUT `?` and the
+    // mask leaves the bit UNASSERTED — and it is NOT transcribed here, for a
+    // stated reason: the DEDICATED `ExprTC::checkBuiltinStringBuilderCall`
+    // gate already refuses a nullable argument at that position (it checks
+    // the DECLARED TYPE `Array<Object>` from §3.1's own text), so asserting
+    // the bit would make the §7.3 gate report a SECOND diagnostic on the
+    // same call — and the house rule is ONE diagnostic per call. MEASURED
+    // with the bit asserted: `sb.AppendFormat("{0}", nullableArray)` reports
+    // BOTH "no matching overload of `StringBuilder.AppendFormat` … the `args`
+    // argument must be an `Array<Object>`" and "the argument to
+    // `StringBuilder.AppendFormat` is nullable but the target type is
+    // non-nullable (§7)".
     {"StringBuilder", "AppendFormat", 2, 2, 0x01, {"format", "args", "", "", "", "", "", ""}, {kBPTString, 0, 0, 0, 0, 0, 0, 0}, "AppendFormat(format: string, args: Array<Object>): StringBuilder"},
-    {"StringBuilder", "Insert", 2, 2, 0x02, {"index", "value", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Insert(index: int, value: string): StringBuilder"},
-    {"StringBuilder", "Remove", 2, 2, 0x00, {"startIndex", "length", "", "", "", "", "", ""}, {kBPTInt, kBPTInt, 0, 0, 0, 0, 0, 0}, "Remove(startIndex: int, length: int): StringBuilder"},
+    // fix #8020 (stdlib §3.1, §7.3, v0.350): the §7.3 NULLABILITY of the
+    // `index` / `startIndex` / `length` positions. stdlib §3.1 spells
+    // `Insert(index: int, value: string)` and `Remove(startIndex: int,
+    // length: int)` — NEITHER parameter carries a `?` — so all three
+    // positions are NON-nullable and the mask says so. The mask was
+    // `0x02` (the VALUE position only) for `Insert` and `0x00` for
+    // `Remove`, so the table did not STATE the nullability the document
+    // states; the §7.3 gate read the mask and had nothing to read at those
+    // positions.
+    {"StringBuilder", "Insert", 2, 2, 0x03, {"index", "value", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Insert(index: int, value: string): StringBuilder"},
+    {"StringBuilder", "Remove", 2, 2, 0x03, {"startIndex", "length", "", "", "", "", "", ""}, {kBPTInt, kBPTInt, 0, 0, 0, 0, 0, 0}, "Remove(startIndex: int, length: int): StringBuilder"},
     {"StringBuilder", "Replace", 2, 2, 0x03, {"oldValue", "newValue", "", "", "", "", "", ""}, {kBPTString, kBPTString, 0, 0, 0, 0, 0, 0}, "Replace(oldValue: string, newValue: string): StringBuilder"},
     {"StringBuilder", "Clear", 0, 0, 0x00, {"", "", "", "", "", "", "", ""}, {0, 0, 0, 0, 0, 0, 0, 0}, "Clear(): StringBuilder"},
     {"Math", "Abs", 1, 1, 0x01, {"x", "", "", "", "", "", "", ""}, {kBPTInt, 0, 0, 0, 0, 0, 0, 0}, "Abs(x: int): int"},

@@ -2403,19 +2403,32 @@ void ExprTC::checkBuiltinCtorArgTypes(const ast::NewExpr& ne,
         // gate's own positions (fix #7621 / #7692, §22.6).
         publishNarrowedBuiltinArg(arg.value.get());
         if (target == PrimitiveType::None) {
-            // A NAMED declared type: the argument reaches it when its own
-            // type IS that type (§5.1's reference conversions are the
-            // subtyping ones, and the declared type here is a record the
-            // standard library names).
-            if (argTy->kind == TypeRef::Kind::Named &&
-                argTy->headName() == namedTarget)
+            // fix #8015 (spec §5.1, stdlib §2.15, v0.350): the argument
+            // reaches a NAMED declared type when its own type IS THE SAME
+            // DECLARED ENTITY — not when it merely SHARES THE NAME.
+            //
+            // A NAME is not an identity. The standard library's `JsonOptions`
+            // is the compiler's own intrinsic record; a USER's own
+            // `record JsonOptions` is a DIFFERENT type with a different
+            // layout, and admitting the user's where the library's is
+            // declared hands the serializer an options object whose fields
+            // the serializer does not expect. The check therefore compares
+            // the DECLARED ENTITY (`builtinArgIsDeclaredEntity`), not the
+            // head name.
+            //
+            // The diagnostic says what was ACTUALLY VERIFIED — that the
+            // argument's type is not the standard library's declared type —
+            // and it names the parameter it is about.
+            if (builtinArgIsDeclaredEntity(argTy, namedTarget))
                 continue;  // admitted
             ctx_.diagnostics().report(
                 Severity::Error, arg.value->span.begin,
                 "the `" + std::string(pname) + "` argument of the `" + head +
                     "` constructor has a type that is not implicitly "
                     "convertible to the target type (\xC2\xA7""5.1): the "
-                    "declared type is a `" + std::string(namedTarget) + "`");
+                    "declared type is the standard library's `" +
+                    std::string(namedTarget) + "`, and the argument's type "
+                    "is not that type");
             continue;
         }
         checkAssignable(

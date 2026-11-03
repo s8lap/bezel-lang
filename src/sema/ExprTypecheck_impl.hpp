@@ -288,6 +288,52 @@ std::string otherValueTypePatternMessage(std::string_view patName);
 // out: ExprTypecheck_Calls.cpp.
 bool builtinHeadReachesObjectExtension(std::string_view head);
 
+// fix #8012 (stdlib §2.5, §5.1, v0.350): a DECLARED PARAMETER TYPE the
+// ONE built-in parameter table's `kinds` bit set cannot express — the
+// RECORD types stdlib §2.5's temporal records declare at their member
+// parameters (`span: TimeSpan`, `other: DateTime`, `time: TimeOnly`).
+//
+// The vocabulary the table's bit set is written over names the SCALAR kinds
+// and a few NAMED ones; it names no bit for a record, so a position whose
+// declared type is one of them carries NO type opinion at all (`kBPTAny`)
+// and the §5.1 gate SKIPPED it — `dt.Add(5)`, an `int` at a declared
+// `TimeSpan` parameter, COMPILED.
+//
+// This is the "ONE DECLARED TYPE PER POSITION" spelling #8012 asks for: the
+// declared type is NAMED, not bit-coded, and a position's declared OVERLOAD
+// SET (stdlib §2.5 declares `DateTime.Subtract(other: DateTime): TimeSpan`
+// beside `DateTime.Subtract(span: TimeSpan): DateTime`) is a SET of these.
+enum class BuiltinDeclaredType : std::uint8_t {
+    None = 0,
+    TimeSpan = 1u << 0,
+    DateTime = 1u << 1,
+    DateOnly = 1u << 2,
+    TimeOnly = 1u << 3,
+};
+
+// fix #8015 (spec §5.1, v0.350): is `argTy` the standard library's DECLARED
+// type `name` — the same DECLARED ENTITY, not a type that merely SHARES THE
+// NAME?
+//
+// A NAME is not an identity: a user's own `record JsonOptions` is a DIFFERENT
+// type from the standard library's `JsonOptions`, and admitting the user's
+// where the library's is declared hands the callee an object whose layout the
+// callee does not expect.
+//
+// The standard library's built-in types are the compiler's OWN intrinsic
+// types: the resolver admits those names to a Named TypeRef with no
+// declaration behind it, and where a symbol stands behind one it is the
+// compiler's own (no user AST behind it, and no module). A USER's type always
+// carries its own TypeSymbol — and an imported one its module — so "the
+// standard library's `TimeSpan`" is exactly "a Named type that is not a user
+// type's", and a user's `record TimeSpan` is a DIFFERENT ENTITY.
+//
+// Used on BOTH sides of the call: the MEMBER side
+// (`ExprTC::builtinArgAdmitsKind`, ExprTypecheck_Calls.cpp) and the
+// CONSTRUCTOR side (`ExprTC::checkBuiltinCtorArgTypes`,
+// ExprTypecheck_Exprs.cpp). Defined in ExprTypecheck_Calls.cpp.
+bool builtinArgIsDeclaredEntity(const TypeRef* argTy, std::string_view name);
+
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}
@@ -4823,10 +4869,16 @@ private:
     void checkBuiltinByteSpanArgAdmission(const ast::CallExpr& ce);
     // Is the argument at `p` admissible at a parameter whose DECLARED type
     // is `kind`? `std::nullopt` means "this position is not the admission
-    // question" (an untyped argument, a discard, a `ref`/`out` slot).
+    // question" (an untyped argument, a discard, or a `ref`/`out` slot).
+    //
+    // `declared` is the position's DECLARED TYPE SET (fix #8012) — the named
+    // types stdlib declares at that position, for the positions the table's
+    // `kinds` bit set cannot spell. `DeclaredType::None` means the table
+    // carries the opinion (its `kinds` bit set) and this gate asks about it.
     std::optional<bool> builtinArgAdmittedAt(const ast::CallExpr& ce,
                                              std::size_t p,
-                                             std::uint32_t kind);
+                                             std::uint32_t kind,
+                                             BuiltinDeclaredType declared);
     // Is the argument admissible at a parameter whose DECLARED type is
     // `kind`? §5.1's identity and widening, then §5.1's constant narrowing.
     // `kBPTAny` (no type opinion) and `kBPTOut` (an `out` slot) admit

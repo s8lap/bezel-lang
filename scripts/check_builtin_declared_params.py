@@ -700,36 +700,62 @@ NULLABLE_ALLOWED = _bind({
 # the rest of the table (every other `int` parameter the table carries
 # asserts its bit), so the disagreement is listed rather than hidden.
 NULLABILITY_DEVIATION = _bind({
-    ("StringBuilder", "Insert", 0):
-        "the table's {sec} `Insert` row leaves the `index: int` position's "
-        "{nullability} bit UNASSERTED (the mask is 0x02 — the VALUE position "
-        "only) while {sec} spells `index: int` without `?`; the DECLARED "
-        "TYPE there is `int` and the DEDICATED "
-        "`ExprTC::checkBuiltinStringBuilderCall` gate refuses the null "
-        "through its `checkAssignable` path against the declared `int` (the "
-        "§5.1 kind gate does NOT include `StringBuilder` in "
-        "`isBuiltinValueParamHead`, so it never reaches this position), so "
-        "no null reaches it",
-    ("StringBuilder", "Remove", 0):
-        "the table's {sec} `Remove` row leaves the `startIndex: int` "
-        "position's {nullability} bit UNASSERTED (the mask is 0x00) while "
-        "{sec} spells `startIndex: int` without `?`; the DECLARED TYPE there "
-        "is `int` and the DEDICATED "
-        "`ExprTC::checkBuiltinStringBuilderCall` gate refuses the null "
-        "through its `checkAssignable` path against the declared `int` (the "
-        "§5.1 kind gate does NOT include `StringBuilder` in "
-        "`isBuiltinValueParamHead`, so it never reaches this position), so "
-        "no null reaches it",
-    ("StringBuilder", "Remove", 1):
-        "the table's {sec} `Remove` row leaves the `length: int` position's "
-        "{nullability} bit UNASSERTED (the mask is 0x00) while {sec} spells "
-        "`length: int` without `?`; the DECLARED TYPE there is `int` and the "
-        "DEDICATED `ExprTC::checkBuiltinStringBuilderCall` gate refuses the "
-        "null through its `checkAssignable` path against the declared `int` "
-        "(the §5.1 kind gate does NOT include `StringBuilder` in "
-        "`isBuiltinValueParamHead`, so it never reaches this position), so "
-        "no null reaches it",
+    # fix #8020 (stdlib §3.1, §7.3, v0.350): EMPTY — the three recorded
+    # deviations are RETIRED.
+    #
+    # The entries this list held were:
+    #   ("StringBuilder", "Insert", 0) — the `index: int` position's §7.3 bit
+    #   ("StringBuilder", "Remove", 0) — the `startIndex: int` position's bit
+    #   ("StringBuilder", "Remove", 1) — the `length: int` position's bit
+    # and each of them recorded that the table's `nonNullable` mask left the
+    # position UNASSERTED while stdlib §3.1 spells the parameter WITHOUT `?`.
+    #
+    # The table now states the document's own nullability (`Insert`'s mask is
+    # 0x03 and `Remove`'s is 0x03), so the deviations no longer hold and the
+    # checker's own retirement rule ("the recorded §7.3 deviation no longer
+    # holds: the table now states the document's own nullability ... so this
+    # entry can be deleted") says to delete them.
+    #
+    # THEY ARE DELETED, and that is the POINT of #8020: a recorded deviation
+    # is a SUPPRESSION (the checker reports it and does not fail on it), so a
+    # stale entry would HIDE a re-introduced deviation at exactly the
+    # positions the ratchet is asked to cover — "reintroduce the deviation
+    # (clear the §7.3 bit at one of these positions) and the checker must
+    # exit non-zero and name the member and the position". With the entries
+    # gone, the §7.3 comparison compares the mask against the document with
+    # nothing suppressed, and the self-test's new mutation
+    # ("StringBuilder", "Remove", 2, 0, ("nullable",)) PROVES it.
 })
+
+def nullability_deviation_holds(stdlib, table, head, member, i):
+    """Does the recorded §7.3 deviation STILL hold — i.e. does the table's
+    `nonNullable` mask still disagree with the DOCUMENT's spelling?
+
+    fix #8020: the recorded deviations are a SUPPRESSION list: while a
+    deviation holds, the checker reports it and does not fail on it (the
+    table is the subject of this ratchet, not its property). Once the table
+    is CORRECTED, the entry must be RETIRED — a stale suppression would hide
+    a re-introduced deviation, which is exactly what the ratchet exists to
+    catch. So the suppression is conditional on the deviation holding, and
+    the retirement is reported.
+    """
+    rows = table.get((head, member))
+    if not rows:
+        return False
+    nn_all = 0xFF
+    for _key, _idx, _kinds, nn in rows:
+        nn_all &= nn
+    params = stdlib.get((head, member))
+    if not params:
+        return False
+    nullable_doc = any(
+        params[i][1].endswith("?")
+        for params in stdlib[(head, member)]
+        if len(params) > i)
+    if nullable_doc:
+        return bool(nn_all & (1 << i))
+    return not (nn_all & (1 << i))
+
 
 # The declared types the document declares in a NOTE BESIDE its listing —
 # stdlib §7.4's \"#1355\": per-type `Write` / `WriteLine` overloads for
@@ -1307,7 +1333,8 @@ def compare(stdlib, table):
             else:
                 if not (nn_all & (1 << i)) and \
                         (head, member, i) not in NULLABLE_ALLOWED and \
-                        (head, member, i) not in NULLABILITY_DEVIATION:
+                        not nullability_deviation_holds(
+                            stdlib, table, head, member, i):
                     errors.append(
                         "stdlib declares `%s%s` at position %d as a "
                         "NON-nullable type, but the table marks it "
@@ -1443,6 +1470,19 @@ def known_uncovered(stdlib, table):
     for (head, member, i), reason in sorted(NULLABILITY_DEVIATION.items()):
         if head not in covered:
             continue
+        # fix #8020: a RECORDED deviation is RETIRED once the table carries
+        # the document's own value — the same shape as the `required`
+        # deviation's retirement below — so a corrected row stops SUPPRESSING
+        # the §7.3 comparison and a re-introduced deviation is caught.
+        if not nullability_deviation_holds(stdlib, table, head, member, i):
+            out.append(("deviation",
+                        "`%s%s` at position %d — the recorded §7.3 deviation "
+                        "no longer holds: the table now states the document's "
+                        "own nullability (the parameter is declared WITHOUT "
+                        "`?`), so this entry can be deleted"
+                        % (head, ("." + member) if member else
+                           "'s constructor", i)))
+            continue
         out.append(("deviation",
                     "`%s%s` at position %d — the table's §7.3 mask and the "
                     "document's spelling DISAGREE, and the checker reports it "
@@ -1510,6 +1550,13 @@ SELF_TEST_MUTATIONS = [
     ("JsonDeserializer", "", 2, 1, ("extra", "int")),
     ("BinaryDeserializer", "", 2, 1, ("extra", "int")),
     ("StringBuilder", "AppendLine", 1, 0, ("extra", "int")),
+    # fix #8020 (stdlib §3.1, §7.3, v0.350): the class the issue asks the
+    # ratchet to cover — a CLEARED §7.3 bit at one of the three positions
+    # whose nullability the table now states (the `startIndex: int`
+    # position of `Remove`). The mutation clears the bit, so the table
+    # disagrees with stdlib §3.1's spelling again, and the checker must
+    # DETECT it.
+    ("StringBuilder", "Remove", 2, 0, ("nullable",)),
     ("FileStream", "", 2, 0, ("extra", "int")),
     ("CString", "From", 1, 0, ("extra", "int")),
     ("WString", "From", 1, 0, ("extra", "int")),

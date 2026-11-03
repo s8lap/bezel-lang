@@ -995,6 +995,62 @@ static std::string_view callsNamedTypeSimpleName(const TypeRef* ref) {
     return {};
 }
 
+// fix #8015 (spec §5.1, v0.350): is `t` the compiler's OWN built-in type — the
+// standard library's DECLARED ENTITY — and not a USER's type that merely
+// shares the name?
+//
+// The standard library's built-in types are the compiler's OWN intrinsic
+// types: the resolver admits those names to a Named TypeRef with NO
+// declaration behind it (`TypeResolution_Names.cpp`: "the admission here
+// makes the type name resolvable to a Named ref with a null declaration"),
+// and where a symbol stands behind one it is the compiler's own (no user AST
+// behind it, and no module). The built-in `Range<T>` is the one that carries
+// a symbol — the compiler's own, stamped as such.
+//
+// A USER's type always carries its own TypeSymbol — and an imported one its
+// module — so "the standard library's `TimeSpan`" is exactly "a Named type
+// that is not a user type's", and a user's `record TimeSpan` is a DIFFERENT
+// ENTITY.
+//
+// WHY THE QUESTION IS ASKED AT ALL. A NAME is not an identity: the built-in
+// parameter table's `kinds` column names the DECLARED TYPE at a position
+// (`ReadOnlyStringSpan`, `JsonOptions`, `Span<byte>`, `Range<int>`,
+// `Array<char>`, …), and a gate that matched that name would admit a USER's
+// type of the same name — handing the callee an object whose layout the
+// callee does not expect. The stdlib's `ReadOnlyStringSpan` is §3.3's own
+// record and a user's `record ReadOnlyStringSpan` is a different record;
+// stdlib §2.15's `JsonOptions` is a five-field options record and a user's
+// `record JsonOptions` is whatever the user declared.
+static bool builtinTypeIsCompilerBuiltin(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    if (!t->declaration) return true;  // a compiler built-in (no symbol)
+    // The built-in `Range<T>`: the compiler's own, stamped as such.
+    if (t->declaration->isBuiltinRangeSym()) return true;
+    // A built-in CLASS symbol: no user AST behind it, and no module. A
+    // user's own type has the AST (a local one) or the module (an imported
+    // one) — either way it is a DIFFERENT ENTITY.
+    return t->declaration->decl == nullptr &&
+           t->declaration->moduleName.empty();
+}
+
+// fix #8015 (spec §5.1, v0.350): is `argTy` the standard library's DECLARED
+// type `name` — the same DECLARED ENTITY, not a type that merely SHARES THE
+// NAME?
+//
+// Declared in `src/sema/ExprTypecheck_impl.hpp` and used on BOTH sides of the
+// call: the MEMBER side (`ExprTC::builtinArgAdmitsKind`, this file) and the
+// CONSTRUCTOR side (`ExprTC::checkBuiltinCtorArgTypes`,
+// `src/sema/ExprTypecheck_Exprs.cpp`).
+bool builtinArgIsDeclaredEntity(const TypeRef* argTy, std::string_view name) {
+    if (!argTy || argTy->kind != TypeRef::Kind::Named) return false;
+    if (argTy->nullable) return false;
+    // The SIMPLE name of the type — the declaration's own name for a typed
+    // ref, the imported name for an inferred one (`TypeRef::headName` reads
+    // the AST node, which an INFERRED builtin type does not carry).
+    if (callsNamedTypeSimpleName(argTy) != name) return false;
+    return builtinTypeIsCompilerBuiltin(argTy);
+}
+
 // per §15.4 (#1174): the admissible TARGET types for a collection literal are a
 // CLOSED list — an inline array, `Array<T>`/`OwningArray<T>`, `Set`, `Stack`,
 // `Queue`, `LinkedList`, `Dictionary`, and user types declared
@@ -1517,6 +1573,11 @@ static bool isWritableByteSpanType(const TypeRef* t) {
     // A READ-ONLY view is never a writable destination (§4.14 / §4.15).
     if (h == "ReadOnlySpan" || h == "ReadOnlyArraySpan") return false;
     if (h != "Span" && h != "ArraySpan") return false;
+    // fix #8015 (spec §5.1, stdlib §3.2, §4.14, §4.15, v0.350): the
+    // compiler's OWN span view — a USER's `record Span` (or `record
+    // ReadOnlySpan`, …) merely SHARES the name, and admitting it hands the
+    // callee an object whose layout is not a span's.
+    if (!builtinTypeIsCompilerBuiltin(t)) return false;
     if (t->genericArgs.empty() || !t->genericArgs[0])
         return true;  // the element type is not carried: no opinion
     const TypeRef* el = t->genericArgs[0];
@@ -23880,6 +23941,140 @@ bool builtinParamTypePrimitive(std::uint32_t bit, PrimitiveType* out) {
 }
 
 // The phrase for a declared parameter type, as the diagnostic spells it.
+// fix #8012 (stdlib §2.5, §5.1, v0.350): the DECLARED PARAMETER TYPE at a
+// built-in MEMBER position the ONE built-in parameter table
+// (`src/common/BuiltinRegistry.cpp`'s `kBuiltinParams`) carries NO type
+// opinion for.
+//
+// THE DEFECT. The ONE table carries, per DECLARED FORM, the parameter NAME
+// (§22.5), the parameter TYPE (§5.1) and the parameter NULLABILITY (§7.3).
+// Its `kinds` column is a BIT SET over a fixed vocabulary — the scalar kinds
+// and a few named ones — and stdlib §2.5's temporal records declare their
+// member parameters with RECORD types:
+//
+//   public method Add(span: TimeSpan): DateTime;
+//   public method Subtract(other: DateTime): TimeSpan;
+//   public method Subtract(span: TimeSpan): DateTime;
+//   public method CompareTo(other: DateTime): int;
+//   public method CompareTo(other: TimeSpan): int;
+//   public method CompareTo(other: DateOnly): int;
+//   public method ToDateTime(time: TimeOnly): DateTime;
+//   public method CompareTo(other: TimeOnly): int;
+//
+// The vocabulary names NO bit for a record, so those positions carry NO type
+// opinion at all (`kBPTAny`) and the §5.1 gate SKIPPED them: `dt.Add(5)` —
+// an `int` at a declared `TimeSpan` parameter — COMPILED, and so did
+// `dt.Subtract(5)`, `dt.CompareTo(5)`, `ts.CompareTo(5)`, `d.CompareTo(5)`,
+// `d.ToDateTime(5)` and `t.CompareTo(5)` (MEASURED on this tip, before this
+// change).
+//
+// THE SPELLING IS "ONE DECLARED TYPE PER POSITION": the declared type is
+// NAMED, not bit-coded, and a position's DECLARED OVERLOAD SET (stdlib §2.5
+// declares `DateTime.Subtract(other: DateTime): TimeSpan` BESIDE
+// `DateTime.Subtract(span: TimeSpan): DateTime`) is a SET of the names.
+//
+// WHY THE TABLE IS NOT EDITED. The `kinds` column is a bit set over the
+// vocabulary in `src/common/BuiltinRegistry.hpp`, and that vocabulary names
+// no bit for a record — so a table row cannot spell these positions, and the
+// "one declared type per position" spelling belongs with the gate that asks
+// the §5.1 question.
+//
+// THE POSITIONS THIS TABLE DOES NOT NAME are answered by the gate that owns
+// them, and are EXAMINED there (the fix's report lists each one): the
+// `Math` positions (a TYPE PARAMETER — §14.5's type-argument inference
+// decides them), the `string` head's positions (§9.6's own gate), the
+// `Encoding` union position (§3.2's own gate), `StringBuilder.Append` (§3.1
+// declares `Append(value: Object)` BESIDE the per-type overloads, so §5.1's
+// "any type to `Object`" admits every type there — that position is
+// ADMITTED by the spec's own rule), and the CONSTRUCTOR positions (#8005's
+// side of the same table).
+struct BuiltinMemberDeclaredType {
+    std::string_view head;    // the built-in head, as the table keys it
+    std::string_view member;  // the member
+    std::size_t position;     // the argument position
+    BuiltinDeclaredType types;  // the DECLARED TYPE(S) at that position
+};
+
+constexpr std::array<BuiltinMemberDeclaredType, 7> kBuiltinMemberDeclaredTypes = {{
+    {"DateTime", "Add", 0, BuiltinDeclaredType::TimeSpan},
+    {"DateTime", "Subtract", 0,
+     static_cast<BuiltinDeclaredType>(
+         static_cast<std::uint8_t>(BuiltinDeclaredType::DateTime) |
+         static_cast<std::uint8_t>(BuiltinDeclaredType::TimeSpan))},
+    {"DateTime", "CompareTo", 0, BuiltinDeclaredType::DateTime},
+    {"TimeSpan", "CompareTo", 0, BuiltinDeclaredType::TimeSpan},
+    {"DateOnly", "CompareTo", 0, BuiltinDeclaredType::DateOnly},
+    {"DateOnly", "ToDateTime", 0, BuiltinDeclaredType::TimeOnly},
+    {"TimeOnly", "CompareTo", 0, BuiltinDeclaredType::TimeOnly},
+}};
+
+// The DECLARED TYPE SET at a member position, or `None` where the ONE table
+// carries the opinion (its `kinds` bit set).
+constexpr BuiltinDeclaredType builtinMemberDeclaredTypeAt(
+    std::string_view head, std::string_view member, std::size_t position) {
+    for (const auto& e : kBuiltinMemberDeclaredTypes) {
+        if (e.head != head || e.member != member) continue;
+        if (e.position != position) continue;
+        return e.types;
+    }
+    return BuiltinDeclaredType::None;
+}
+
+// Does the DECLARED TYPE SET carry `bit`?
+constexpr bool declaredTypeHas(BuiltinDeclaredType set,
+                                BuiltinDeclaredType bit) {
+    return (static_cast<std::uint8_t>(set) & static_cast<std::uint8_t>(bit)) ==
+           static_cast<std::uint8_t>(bit);
+}
+
+// The NAME of a DECLARED TYPE in the set, and the set's own entries.
+struct BuiltinDeclaredTypeEntry {
+    BuiltinDeclaredType bit;
+    const char* name;
+};
+
+// The ORDER is the standard library's own declaration order (stdlib §2.5
+// declares `DateTime.Subtract(other: DateTime)` BESIDE
+// `DateTime.Subtract(span: TimeSpan)`, and this reads "a `DateTime` or a
+// `TimeSpan`").
+constexpr BuiltinDeclaredTypeEntry kBuiltinDeclaredTypeEntries[] = {
+    {BuiltinDeclaredType::DateTime, "DateTime"},
+    {BuiltinDeclaredType::TimeSpan, "TimeSpan"},
+    {BuiltinDeclaredType::DateOnly, "DateOnly"},
+    {BuiltinDeclaredType::TimeOnly, "TimeOnly"},
+};
+
+// The DECLARED TYPE at a position, as the diagnostic phrases it: "a
+// `TimeSpan`", "a `DateTime` or a `TimeSpan`" — the standard library's own
+// words, with the article that follows the first letter's sound.
+std::string builtinDeclaredTypePhrase(BuiltinDeclaredType types) {
+    std::string out;
+    std::size_t n = 0;
+    for (const auto& e : kBuiltinDeclaredTypeEntries) {
+        if (!declaredTypeHas(types, e.bit)) continue;
+        if (n) out += (n == 1) ? " or " : ", ";
+        const char first = static_cast<char>(
+            (e.name[0] >= 'A' && e.name[0] <= 'Z') ? e.name[0] + 32 : e.name[0]);
+        const bool vowel = first == 'a' || first == 'e' || first == 'i' ||
+                           first == 'o' || first == 'u';
+        out += vowel ? "an `" : "a `";
+        out += e.name;
+        out += "`";
+        ++n;
+    }
+    return out;
+}
+
+// Does the DECLARED TYPE SET carry a type named `name`?
+bool builtinDeclaredTypeHasName(BuiltinDeclaredType types,
+                                 std::string_view name) {
+    for (const auto& e : kBuiltinDeclaredTypeEntries) {
+        if (!declaredTypeHas(types, e.bit)) continue;
+        if (name == e.name) return true;
+    }
+    return false;
+}
+
 std::string builtinParamTypePhrase(std::uint32_t kind) {
     if (kind & common::kBPTString) return "a `string`";
     if (kind & common::kBPTSpan) return "a `ReadOnlyStringSpan`";
@@ -23974,6 +24169,29 @@ bool builtinParamTypeIsInteger(std::uint32_t kind, PrimitiveType* out) {
     return false;
 }
 
+// The NAME of a NAMED declared type in a `kinds` bit set, or "" when the set
+// names no named type.
+//
+// fix #8015 (spec §5.1, v0.350): the named bits of the vocabulary are the
+// positions whose declared type is a RECORD (`ReadOnlyStringSpan`,
+// `JsonOptions`) or a GENERIC (`Span<byte>`, `Range<int>`, `Array<char>`) —
+// the types a USER's own declaration can share a NAME with.
+std::string_view builtinNamedKindSpelling(std::uint32_t kinds) {
+    for (std::uint32_t bit = 1; bit; bit <<= 1) {
+        if (!(kinds & bit)) continue;
+        switch (bit) {
+            case common::kBPTSpan: return "ReadOnlyStringSpan";
+            case common::kBPTRangeInt: return "Range";
+            case common::kBPTArrayChar: return "Array";
+            case common::kBPTEnumerableChar: return "Array";
+            case common::kBPTEnumerableString: return "Array";
+            case common::kBPTJsonOptions: return "JsonOptions";
+            default: break;
+        }
+    }
+    return {};
+}
+
 // HOW CLOSE a candidate's DECLARED type at the failing position is to the
 // argument's own type class — the §5.1 question that candidate is asking.
 // Smaller is closer, and the resolver reports against the closest candidate
@@ -23996,7 +24214,20 @@ bool builtinParamTypeIsInteger(std::uint32_t kind, PrimitiveType* out) {
 // was reported as "the `format` argument must be a `string`" — the wrong
 // parameter and the wrong conversion. The seven rows of
 // `uint_radix_rejected_7271` pin the precise wording.
+//
+// fix #8015 (spec §5.1, v0.350) adds a leg 0: a NAMED declared type whose
+// NAME the argument's own type SHARES is the CLOSEST candidate — the argument
+// was reaching for THAT type, and the refusal is about its IDENTITY (the
+// argument's type is a USER's record of the same name), not about a
+// conversion to something else. Without it the report named the `string`
+// overload of `int.Parse` for an argument whose type is named
+// `ReadOnlyStringSpan`, and the reason it gave was a conversion question the
+// caller never asked.
 int builtinCandidateDistance(std::uint32_t kind, TypeRef* argTy) {
+    const std::string_view namedKind = builtinNamedKindSpelling(kind);
+    if (!namedKind.empty() && argTy && argTy->kind == TypeRef::Kind::Named &&
+        callsNamedTypeSimpleName(argTy) == namedKind)
+        return 0;
     PrimitiveType declared = PrimitiveType::None;
     if (builtinParamTypeIsInteger(kind, &declared)) {
         const bool argIsInt =
@@ -24017,17 +24248,48 @@ int builtinCandidateDistance(std::uint32_t kind, TypeRef* argTy) {
 //    as a COMPILE-TIME CONSTANT (the constant-narrowing rule), and a constant
 //    whose value does not fit the target's range is a compile error at the
 //    conversion site — never a silent truncation;
+//  - fix #8015: the argument's type SHARES THE NAME with the declared type
+//    and is NOT it — a USER's own record where the standard library's is
+//    declared. The conversion rule is not what failed: the argument's type is
+//    not the declared type at all, and the diagnostic says THAT;
 //  - otherwise the conversion §5.1 does not make implicit.
 std::string builtinArgWhy(const ast::Expr* argExpr,
                           std::optional<long long> cv, TypeRef* argTy,
-                          std::uint32_t kind) {
-    const std::string targetPhrase = builtinParamTypePhrase(kind);
+                          std::uint32_t kind,
+                          BuiltinDeclaredType declaredTypes =
+                              BuiltinDeclaredType::None) {
+    // fix #8012 (stdlib §2.5, §5.1, v0.350): the DECLARED TYPE the ONE
+    // table's `kinds` bit set cannot spell — a RECORD type — is named in
+    // the reason too, so the diagnostic says what was actually checked.
+    const std::string targetPhrase =
+        declaredTypes != BuiltinDeclaredType::None
+            ? builtinDeclaredTypePhrase(declaredTypes)
+            : builtinParamTypePhrase(kind);
     const std::string targetName = builtinParamTypeSpelling(kind);
     if (argTy->nullable)
         return "a `" + spellTypeRefForDiag(argTy) +
                "` is never implicitly convertible to " + targetPhrase +
                " (§5.1's nullable lifting converts a `T` to a `T?`, never the "
                "other way)";
+    // fix #8015 (spec §5.1, v0.350): the argument's type is a `T` that is NOT
+    // the standard library's `T` — the DECLARED ENTITY differs even though the
+    // NAME does not. (After the nullable leg above, so a `T?` is still
+    // reported as the nullability it is.)
+    //
+    // The declared type is either the `kinds` bit set's named type
+    // (`ReadOnlyStringSpan`, `Range<int>`, …) or the §2.5 declared-type set
+    // (`TimeSpan`, `DateTime`, …), and the argument's type shares a NAME with
+    // one of them.
+    if (argTy->kind == TypeRef::Kind::Named) {
+        const std::string_view argName = callsNamedTypeSimpleName(argTy);
+        const std::string_view namedKind = builtinNamedKindSpelling(kind);
+        if (!argName.empty() &&
+            (argName == namedKind ||
+             (declaredTypes != BuiltinDeclaredType::None &&
+              builtinDeclaredTypeHasName(declaredTypes, argName))))
+            return "the argument's type is a `" + std::string(argName) +
+                   "` that is NOT the standard library's — a different type";
+    }
     PrimitiveType declared = PrimitiveType::None;
     if (argTy->kind == TypeRef::Kind::Primitive &&
         isIntegerPrimitiveTypeForOverload(argTy->primitive) &&
@@ -24080,6 +24342,7 @@ bool isBuiltinValueParamHead(std::string_view head) {
            head == "Debug";
 }
 
+
 }  // namespace
 
 // §5.1: is the argument admissible at a parameter whose DECLARED type is
@@ -24097,10 +24360,21 @@ bool ExprTC::builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
         if (!(kind & bit)) continue;
         PrimitiveType declared = PrimitiveType::None;
         if (!builtinParamTypePrimitive(bit, &declared)) {
-            // `ReadOnlyStringSpan` is a record, not a primitive: the name
-            // decides.
-            if (bit == common::kBPTSpan && argTy->kind == TypeRef::Kind::Named &&
-                argTy->headName() == "ReadOnlyStringSpan")
+            // fix #8015 (spec §5.1, v0.350): a NAMED declared type is
+            // matched by the DECLARED ENTITY, not by the HEAD NAME. The
+            // standard library's `ReadOnlyStringSpan` is the compiler's own
+            // intrinsic record; a USER's `record ReadOnlyStringSpan` is a
+            // DIFFERENT type that merely shares the name, and admitting it
+            // at a parameter declared `ReadOnlyStringSpan` hands the callee
+            // an object whose layout it does not expect.
+            //
+            // (`kBPTJsonOptions` — the JSON agents' `options` parameter — is
+            // the SAME rule, and it is applied where that bit is USED: the
+            // CONSTRUCTOR side, `ExprTC::checkBuiltinCtorArgTypes` in
+            // `src/sema/ExprTypecheck_Exprs.cpp`, which owns the `new
+            // JsonSerializer(options: JsonOptions)` position.)
+            if (bit == common::kBPTSpan &&
+                builtinArgIsDeclaredEntity(argTy, "ReadOnlyStringSpan"))
                 return true;
             // fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): a BYTE
             // SPAN is not a primitive either — it is §4.14's `Span<byte>` /
@@ -24152,7 +24426,8 @@ bool ExprTC::builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
 // `scoped` slot, whose type the callee's own rules govern (§22.3).
 std::optional<bool> ExprTC::builtinArgAdmittedAt(const ast::CallExpr& ce,
                                                   std::size_t p,
-                                                  std::uint32_t kind) {
+                                                  std::uint32_t kind,
+                                                  BuiltinDeclaredType declared) {
     const auto& a = ce.args[p];
     if (!a.value) return std::nullopt;
     // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
@@ -24187,6 +24462,26 @@ std::optional<bool> ExprTC::builtinArgAdmittedAt(const ast::CallExpr& ce,
     }
     // §5.1's nullable lifting: `S?` converts to `T?` and never to `T`.
     if (effTy->nullable) return false;
+    // fix #8012 (stdlib §2.5, §5.1, v0.350): the DECLARED TYPE the ONE
+    // table's `kinds` bit set cannot spell — a RECORD type. §5.1's rule at
+    // such a position is the IDENTITY (and the reference conversions that
+    // go with it): the argument's type must BE the declared type, i.e. the
+    // same DECLARED ENTITY the standard library declares there.
+    if (declared != BuiltinDeclaredType::None) {
+        if (declaredTypeHas(declared, BuiltinDeclaredType::TimeSpan) &&
+            builtinArgIsDeclaredEntity(effTy, "TimeSpan"))
+            return true;
+        if (declaredTypeHas(declared, BuiltinDeclaredType::DateTime) &&
+            builtinArgIsDeclaredEntity(effTy, "DateTime"))
+            return true;
+        if (declaredTypeHas(declared, BuiltinDeclaredType::DateOnly) &&
+            builtinArgIsDeclaredEntity(effTy, "DateOnly"))
+            return true;
+        if (declaredTypeHas(declared, BuiltinDeclaredType::TimeOnly) &&
+            builtinArgIsDeclaredEntity(effTy, "TimeOnly"))
+            return true;
+        return false;
+    }
     return builtinArgAdmitsKind(a.value.get(), effTy, kind);
 }
 
@@ -24195,7 +24490,8 @@ std::optional<bool> ExprTC::builtinArgAdmittedAt(const ast::CallExpr& ce,
 bool ExprTC::builtinFormApplicable(const ast::CallExpr& ce,
                                     const common::BuiltinParamForm& form) {
     for (std::size_t p = 0; p < form.total && p < ce.args.size(); ++p) {
-        auto admitted = builtinArgAdmittedAt(ce, p, form.kinds[p]);
+        auto admitted = builtinArgAdmittedAt(ce, p, form.kinds[p],
+                                             BuiltinDeclaredType::None);
         if (admitted && !*admitted) return false;
     }
     return true;
@@ -24314,9 +24610,15 @@ std::string builtinStringDeclaredForms(
 }
 
 // Is the argument's type an `Array<T>` with the element type `elem`?
+//
+// fix #8015 (spec §5.1, stdlib §4.4, §9.6, v0.350): the compiler's OWN
+// `Array<T>` — a USER's `record Array<T>` merely SHARES the name, and
+// admitting it at a declared `Array<char>` position hands the callee an
+// object whose layout is not an array's.
 bool builtinArgIsArrayOf(TypeRef* argTy, PrimitiveType elem) {
     if (!argTy || argTy->kind != TypeRef::Kind::Named) return false;
     if (argTy->headName() != "Array") return false;
+    if (!builtinTypeIsCompilerBuiltin(argTy)) return false;
     if (argTy->genericArgs.size() != 1 || !argTy->genericArgs[0]) return false;
     const TypeRef* e = argTy->genericArgs[0];
     return e->kind == TypeRef::Kind::Primitive && e->primitive == elem &&
@@ -24333,12 +24635,20 @@ bool builtinArgIsArrayOf(TypeRef* argTy, PrimitiveType elem) {
 // ABSENT element type is admitted rather than refused. A DECLARED
 // `Range<char>` carries its element and is refused here, because §9.6's
 // declared form is `Range<int>`.
+//
+// fix #8015 (spec §5.1, stdlib §9.6, v0.350): a USER's `record Range` is a
+// DIFFERENT type that merely shares the name — and admitting it at §9.6's
+// `AsSpan(r: Range<int>)` position hands the callee an object that is not a
+// range at all (MEASURED on this lane's base: the call reached CODEGEN and
+// the compiler emitted "Both operands to ICmp instruction are not of the
+// same type!").
 bool builtinArgIsRangeOf(TypeRef* argTy, PrimitiveType elem) {
     if (!argTy || argTy->kind != TypeRef::Kind::Named) return false;
     const bool isRange =
         (argTy->declaration && argTy->declaration->isBuiltinRangeSym()) ||
         argTy->headName() == "Range";
     if (!isRange) return false;
+    if (!builtinTypeIsCompilerBuiltin(argTy)) return false;
     if (argTy->genericArgs.empty()) return true;  // the element is not carried
     if (argTy->genericArgs.size() != 1 || !argTy->genericArgs[0]) return false;
     const TypeRef* e = argTy->genericArgs[0];
@@ -24668,7 +24978,7 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
         bool admitted = false;
         if (scalarKinds) {
             auto a = builtinArgAdmittedAt(ce, static_cast<std::size_t>(ai),
-                                          scalarKinds);
+                                          scalarKinds, BuiltinDeclaredType::None);
             if (!a) continue;  // no opinion (a discard, a modifier, an error)
             admitted = *a;
         }
@@ -24967,7 +25277,12 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
         std::size_t fail = 0;
         bool fails = false;
         for (std::size_t p = 0; p < f.total && p < ce.args.size(); ++p) {
-            auto admitted = builtinArgAdmittedAt(ce, p, f.kinds[p]);
+            // fix #8012 (stdlib §2.5, §5.1, v0.350): the DECLARED TYPE at
+            // this position, where the ONE table's `kinds` bit set cannot
+            // spell it — the standard library's own RECORD types.
+            auto admitted = builtinArgAdmittedAt(
+                ce, p, f.kinds[p],
+                builtinMemberDeclaredTypeAt(head, member, p));
             if (!admitted) continue;
             if (*admitted) { ++admits; continue; }
             if (!fails) { fail = p; fails = true; }
@@ -24995,6 +25310,11 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
     }
     const std::uint32_t kind =
         best && bestFail < best->kinds.size() ? best->kinds[bestFail] : 0;
+    // fix #8012 (stdlib §2.5, §5.1, v0.350): the NAMED DECLARED TYPE at
+    // the failing position — the RECORD type stdlib §2.5 declares there,
+    // which the ONE table's `kinds` bit set cannot spell.
+    const BuiltinDeclaredType declaredAt =
+        builtinMemberDeclaredTypeAt(head, member, bestFail);
     // THE PARAMETER the best candidate misses, by its DECLARED NAME (§22.5) —
     // "`radix`", not "position 1": the standard library names its parameters,
     // and the diagnostic that cites the declaration names them too.
@@ -25022,14 +25342,16 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
                 isIntegerPrimitiveTypeForOverload(effTy->primitive))
                 cv = foldIntConstExprTC(*ce.args[bestFail].value);
             why = builtinArgWhy(ce.args[bestFail].value.get(), cv,
-                                effTy ? effTy : argTy, kind);
+                                effTy ? effTy : argTy, kind, declaredAt);
         }
     }
     ctx_.diagnostics().report(
         Severity::Error, ce.span.begin,
         "no matching overload of `" + callee + "` — " + sec + " declares " +
             decls + ", so " + param + " must be " +
-            builtinParamTypePhrase(kind) +
+            (declaredAt != BuiltinDeclaredType::None
+                 ? builtinDeclaredTypePhrase(declaredAt)
+                 : builtinParamTypePhrase(kind)) +
             // fix #7443 / #7421 (spec §5.1 *Implicit conversions*, v0.350):
             // the §-RULE the argument misses is named here, and not only
             // §22.6's "no candidates cited" — a §-only assertion is vacuous

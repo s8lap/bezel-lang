@@ -356,16 +356,103 @@ class RequiredColumn(unittest.TestCase):
                             'the checker does not detect a `required` count '
                             'of %d on the FileStream row' % bad)
 
-    def test_the_deviation_text_names_the_gate_that_decides(self):
-        # fix #8023: the §5.1 kind gate does NOT include `StringBuilder`.
-        for (head, member, i), reason in sorted(
-                c.NULLABILITY_DEVIATION.items()):
-            self.assertIn("checkBuiltinStringBuilderCall", reason,
-                          'the deviation for `%s.%s` does not name the gate '
-                          'that decides it' % (head, member))
-            self.assertIn("checkAssignable", reason,
-                          'the deviation for `%s.%s` does not name the '
-                          '`checkAssignable` path' % (head, member))
+class NullabilityDeviation(unittest.TestCase):
+    """fix #8020: the three §7.3 deviations are RETIRED, and a re-introduced
+    one is DETECTED.
+
+    `NULLABILITY_DEVIATION` used to hold three entries — the `StringBuilder`
+    positions whose §7.3 (NON-nullable) bit the table left UNASSERTED.  A
+    recorded deviation was a SUPPRESSION: the §7.3 comparison did not FAIL on
+    it, it was listed in `known_uncovered` as a reported deviation instead.
+    So a STALE entry would HIDE a re-introduced deviation at exactly the
+    positions the ratchet is asked to cover.
+
+    fix #8020 corrects the TABLE (the `nonNullable` mask of `Insert` and
+    `Remove` is 0x03, so the table states the document's own nullability) and
+    RETIRES the three entries.  The oracle is therefore STRONGER, not weaker:
+    the §7.3 comparison compares the mask against the document with NOTHING
+    suppressed, and a deviation at one of those three positions is now a
+    FAILURE that names the member and the position.
+
+    THIS CLASS REPLACES A VACUOUS TEST.  The test that stood here iterated
+    `NULLABILITY_DEVIATION` — which the fix emptied — so its body ran ZERO
+    times and asserted NOTHING.  What is here instead holds whatever the
+    registry contains, and FAILS if the checker stops catching a re-introduced
+    deviation at these positions.
+    """
+
+    # the three positions fix #8020 retired, with the ARITY each row carries
+    # in the table (`Insert` and `Remove` are both two-parameter rows).
+    RETIRED = (("StringBuilder", "Insert", 0, 2),
+               ("StringBuilder", "Remove", 0, 2),
+               ("StringBuilder", "Remove", 1, 2))
+
+    @classmethod
+    def setUpClass(cls):
+        cls.stdlib = c.parse_stdlib(c.read(c.STDLIB), c.read(c.SPEC))
+        cls.table = c.parse_table(c.read(c.REGISTRY))
+
+    def test_the_three_retired_deviations_are_gone_and_a_reintroduced_one_fails(self):
+        # (1) the three positions are NO LONGER deviations: a recorded
+        #     deviation is a SUPPRESSION, so a stale entry would HIDE a
+        #     re-introduced deviation at exactly the positions the ratchet is
+        #     asked to cover.
+        for (head, member, position, _arity) in self.RETIRED:
+            self.assertNotIn(
+                (head, member, position), c.NULLABILITY_DEVIATION,
+                'the §7.3 deviation for `%s.%s` at position %d is still '
+                'recorded; a stale suppression would HIDE a re-introduced '
+                'deviation at exactly the position the ratchet is asked to '
+                'cover' % (head, member, position))
+        self.assertEqual(
+            {}, dict(c.NULLABILITY_DEVIATION),
+            'the §7.3 deviation registry is not empty: %s'
+            % sorted(c.NULLABILITY_DEVIATION))
+        # (2) the three positions AGREE with the document, so a deviation
+        #     there is a real disagreement with the document, not a no-op.
+        errors = c.compare(self.stdlib, self.table)
+        for (head, member, position, _arity) in self.RETIRED:
+            named = [e for e in errors
+                     if ("`%s.%s`" % (head, member)) in e
+                     and ("position %d" % position) in e]
+            self.assertEqual(
+                [], named,
+                'the table still disagrees with the document at `%s.%s` '
+                'position %d: %s'
+                % (head, member, position, "; ".join(named)))
+        # (3) a RE-INTRODUCED §7.3 deviation at each of them is DETECTED —
+        #     the oracle is STRONGER than the base's, which suppressed it.
+        for (head, member, position, arity) in self.RETIRED:
+            mutated = c.apply_mutation(self.table, head, member, arity,
+                                       position, ("nullable",))
+            errors = c.compare(self.stdlib, mutated)
+            self.assertTrue(
+                errors,
+                'the checker does not DETECT a re-introduced §7.3 deviation '
+                'at `%s.%s` position %d (the table marks it nullable while '
+                'the document declares it NON-nullable)'
+                % (head, member, position))
+            named = [e for e in errors
+                     if ("`%s.%s`" % (head, member)) in e
+                     and ("position %d" % position) in e]
+            self.assertTrue(
+                named,
+                'the checker detects a re-introduced §7.3 deviation at '
+                '`%s.%s` position %d but does not NAME the member and the '
+                'position: %s'
+                % (head, member, position, "; ".join(errors)))
+            self.assertTrue(
+                any("NON-nullable" in e for e in named),
+                'the checker detects a re-introduced §7.3 deviation at '
+                '`%s.%s` position %d but does not name the rule it applies: '
+                '%s' % (head, member, position, "; ".join(named)))
+        # (4) the checker's own mutation leg still corrupts one of these
+        #     positions, so the ratchet proves it can fail.
+        self.assertIn(
+            ("StringBuilder", "Remove", 2, 0, ("nullable",)),
+            c.SELF_TEST_MUTATIONS,
+            "the checker's own self-test no longer mutates the §7.3 bit at "
+            "`StringBuilder.Remove` position 0")
 
 
 if __name__ == '__main__':
