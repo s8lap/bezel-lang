@@ -8456,6 +8456,50 @@ bool Emitter::emitExplicitDisposeChain(const ast::Expr& target,
         auto* relFn = declareC("bz_closure_release",
                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(relFn, {recv});
+    } else if (isTaskTypeName(recvTy)) {
+        // fix #7972 (§28.2 / §28.3 / §30.5 / §30.3, v0.353): a TASK
+        // receiver's explicit `Dispose()` is the TASK DISPOSAL PROTOCOL, not a
+        // vtable dispatch — and it must DISPOSE THE TASK, not merely drop the
+        // carrier.
+        //
+        // §30.3 gives the task family a `destructor;` whose body is the
+        // runtime's continuation cleanup, and §30.5 makes a task's disposal
+        // ABANDONMENT (stdlib §6.7: "at scope end, the task's `Dispose()`
+        // runs but does not block waiting for completion"). The established
+        // protocol for that is `emitTaskDisposal`
+        // (src/codegen/LlvmBackend_Disposal.cpp): §30.9's fault-object
+        // ownership preamble, then the per-`T` result disposer for an
+        // unconsumed `OwningTask<T:class>` result, then
+        // `bz_task_fire_and_forget` — whose already-done fast path calls
+        // `bz_task_free`, reclaiming BOTH the task struct and its result
+        // buffer.
+        //
+        // THE DEFECT. `common::isVtableLessBuiltinClassName` DOES list "Task"
+        // (a `bz_task_t*` is a runtime struct with no Bezel vtable at word 0),
+        // so a Task receiver REACHED the vtable-less-builtin arm below — but
+        // `Emitter::classifyVtablelessBuiltinRelease` has NO Task entry, so
+        // `emitVtablelessBuiltinRelease` returned false and emitted NOTHING.
+        // That is #2874/#2823's recorded trade ("a bounded leak in place of
+        // corrupted control flow") — but for the Task family it is not
+        // bounded, and the chain's own §28.2 exactly-once bookkeeping then
+        // made it PERMANENT: the chain's single exit nulls the receiver's
+        // slot (`nullExplicitlyDisposedBuiltinSlot`), so the §28.3 scope-end
+        // auto-drop reloads null and discharges nothing either.
+        //
+        // MEASURED pre-fix (base c05c35bf, LeakSanitizer): `var t:
+        // Task<int>? := Task.FromResult(2); t?.Dispose();` leaked
+        //     Direct leak of 184 byte(s) in 1 object(s)      (the task struct)
+        //     Indirect leak of 4 byte(s) in 1 object(s)      (the result buffer)
+        //       #1 bz_task_from_result src/runtime/bezel_runtime_concurrency.cpp:1290
+        //     SUMMARY: AddressSanitizer: 188 byte(s) leaked in 2 allocation(s).
+        // — for the `?.` spelling, for the dotted spelling, for an inferred
+        // (non-nullable) receiver, and for a double dispose.
+        //
+        // §28.2 exactly-once is preserved: this arm runs BEFORE the
+        // vtable-less-builtin arm (which has no Task release) and the chain's
+        // exit still nulls the slot, so a second `Dispose()` reloads null and
+        // skips — one reclaim, no double free.
+        emitTaskDisposal(recvTy, recv);
     } else if (common::isVtableLessBuiltinClassName(
                    builtinTypeName(recvTy))) {
         // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
