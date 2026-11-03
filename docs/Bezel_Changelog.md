@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.351 — November 2026**
+**Companion to the Bezel Language Specification, v0.352 — November 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -15627,6 +15627,21 @@ The independent critique accepted the train with fixes. Its substantive findings
 - `scripts/check_docs.sh` (all phases), `check_proposals.sh`, `build_book.py --check` and `check_src_citations.py` are clean.
 - The site was rendered with mdBook 0.4.52. At 1280 px, §28.3.5's summary table fits with no horizontal scroll.
 - A non-author critic reviewed every lane. Mechanically, each bolding edit changes markup only. By spot-check, it restored two lost definition labels and eight contrastive emphases, and corrected six statements in the rewritten rationale sections against the spec text.
+
+**Migration:** doc-only.
+
+---
+
+### v0.352 changelog (v0.351 → v0.352)
+
+**Editorial: rationale §5.1's freeze paragraph and the planned trust-admission work.** At the owner's request (2026-11-03). Class: **editorial** (spec-change process §2). No rule changes.
+
+- **The freeze paragraph's lead-in.** It was a bolded sentence about "silent kills" and "announced kills". It is now the short label *The freeze*, followed by the same sentence in plain text, so the word *kills* no longer stands out.
+- **The trust paragraph** now says that shrinking the recorded set is planned work. It summarises the [trust-admissions-by-kind research](research/trust-admissions-by-kind/README.md) and links the work package [#7509](https://github.com/s8lap/bezel-lang/issues/7509):
+  - derived retention for short-lived helpers ([proposal 0132](proposals/0132-derived-retention-study.md)'s mechanism, which the model finds sound);
+  - a weak reference over ordinary owned objects for long-lived observers;
+  - `scoped` for calls whose body the compiler cannot see;
+  - an opt-in strict mode once the trust report is complete.
 
 **Migration:** doc-only.
 
