@@ -1487,27 +1487,36 @@ static bool byteBufferArgRejected(const TypeRef* t, bool allowSpan) {
     }
 }
 
-// fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): is `t` a BYTE SPAN —
-// a span over `byte`?
+// fix #7999 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): is `t` a WRITABLE
+// BYTE SPAN — a span over `byte` that may be WRITTEN THROUGH?
 //
 // The four span families the standard library declares: §4.14's `Span<T>` /
 // `ReadOnlySpan<T>` (over an `OwningBuffer<T>`) and §4.15's `ArraySpan<T>` /
 // `ReadOnlyArraySpan<T>` (over an `Array<T>`).  A span over a DIFFERENT
 // element type (`Span<char>`) is not a byte span, and an `Array<byte>` is an
-// ARRAY (§4.4), not a span — stdlib §3.2 declares the `destination`
-// parameter as `Span<byte>`, and §5.1's table admits no conversion from an
-// array to a span.
+// ARRAY (§4.4), not a span.
 //
-// An element type the compiler did not settle is admitted: this test answers
-// "is it DEFINITELY not a byte span?", so a type it cannot judge is left to
-// the caller's own gate (the same fail-safe direction
-// `byteBufferArgRejected` takes).
-static bool isByteSpanType(const TypeRef* t) {
+// fix #8027 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): THE READ-ONLY HALF
+// OF THE FAMILY IS NOT A WRITABLE DESTINATION. stdlib §3.2 declares
+//
+//   public abstract method GetBytes(s: string, destination: Span<byte>): int;
+//
+// and §4.14's `ReadOnlySpan<T>` / §4.15's `ReadOnlyArraySpan<T>` are
+// READ-ONLY VIEWS of the very memory the writable span writes — so a
+// read-only byte span is not admissible at a `Span<byte>` parameter. §5.1's
+// conversion table carries NO span-to-span conversion at all, so there is no
+// path by which a read-only view reaches a writable parameter.
+//
+// The read-only-ness is decided by the HEAD NAME alone, which the compiler
+// always knows — so a read-only view is refused whatever its element type is
+// settled to, and the "no opinion" case below stays where it was (a WRITABLE
+// span whose element type the compiler did not settle is still admitted).
+static bool isWritableByteSpanType(const TypeRef* t) {
     if (!t || t->kind != TypeRef::Kind::Named) return false;
     const std::string_view h = t->headName();
-    if (h != "Span" && h != "ReadOnlySpan" &&
-        h != "ArraySpan" && h != "ReadOnlyArraySpan")
-        return false;
+    // A READ-ONLY view is never a writable destination (§4.14 / §4.15).
+    if (h == "ReadOnlySpan" || h == "ReadOnlyArraySpan") return false;
+    if (h != "Span" && h != "ArraySpan") return false;
     if (t->genericArgs.empty() || !t->genericArgs[0])
         return true;  // the element type is not carried: no opinion
     const TypeRef* el = t->genericArgs[0];
@@ -21891,9 +21900,27 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     // is that PARAMETER position for source argument `i`. The binding is
     // established locally over the registry's declared names, exactly as
     // `checkBuiltinStringDeclaredParams` does (the published binding is not
-    // yet available here). A positional-only call, or a call that binds no
-    // candidate (`checkBuiltinNamedArgs` reports that), keeps the identity
-    // reading.
+    // yet available here).
+    //
+    // fix #7846 (§22.5, v0.350): THE IDENTITY-MAPPING FALLBACK IS GONE. A
+    // call that binds NO candidate — a name no declared overload declares, a
+    // parameter bound twice, a positional argument after a named one — used
+    // to keep the IDENTITY reading here, so every argument was typed against
+    // the parameter at its own INDEX, and the type check reported a SECOND
+    // diagnostic on a call the §22.5 binder had already refused:
+    //
+    //   "ab".PadLeft(totalWidth := 5, totalWidth := 6)
+    //     -> "the argument to `string.PadLeft` has a type that is not
+    //         implicitly convertible to the target type (§5.1)"   [SPURIOUS]
+    //     -> "call to built-in `string.PadLeft`: parameter `totalWidth` is
+    //         bound more than once (§22.5)"                     [CORRECT]
+    //
+    // The spurious error blamed an argument for a type mismatch it does not
+    // have (the `6` was checked against the `char` parameter, because the
+    // identity mapping put it at position 1). The §22.5 diagnostic is the
+    // ONE that describes the mistake, so this gate now stands down for a
+    // call that binds no candidate: `checkBuiltinNamedArgs` reports the §22.5
+    // violation and the program is refused with that diagnostic alone.
     std::vector<std::size_t> paramPos(ce.args.size());
     for (std::size_t i = 0; i < paramPos.size(); ++i) paramPos[i] = i;
     {
@@ -21901,6 +21928,7 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         for (const auto& a : ce.args)
             if (!a.name.empty()) { anyNamed = true; break; }
         if (anyNamed) {
+            bool bound = false;
             for (const auto& cand : common::builtinParamNameCandidates(
                      "string", m, ce.args.size())) {
                 BindResult br = bindArgsToParams(
@@ -21909,6 +21937,7 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
                     "call to built-in `string." + std::string(m) + "`",
                     /*emit=*/false);
                 if (!br.ok) continue;
+                bound = true;
                 for (std::size_t p = 0; p < br.paramToArg.size(); ++p) {
                     const int ai = br.paramToArg[p];
                     if (ai >= 0 && static_cast<std::size_t>(ai) < paramPos.size())
@@ -21916,6 +21945,11 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
                 }
                 break;
             }
+            // fix #7846 (§22.5, v0.350): the call binds NO candidate — the
+            // §22.5 binder reports the violation (`checkBuiltinNamedArgs`,
+            // which runs later in `typeCall`), and the type check must not
+            // add a second, spurious diagnostic on top of it.
+            if (!bound) return;
         }
     }
     for (std::size_t srcIdx = 0; srcIdx < ce.args.size(); ++srcIdx) {
@@ -22412,6 +22446,34 @@ std::string mathConvertTypeList(const std::vector<std::uint32_t>& kinds) {
     return out;
 }
 
+// fix #8036 (§2.2, §2.3, §22.3, §22.5, v0.350): the MINIMUM ARITY of a
+// declared form.
+//
+// A form's `required` column counts the LEADING parameters that declare no
+// default. §22.3 ("an `out` slot IS an argument") and §22.5 ("`out` can
+// never carry a default") add one more rule: the `out` slot of a form is
+// ALWAYS required, so a form that binds one has a minimum arity of its FULL
+// parameter count.
+//
+// The ONE built-in parameter table carries an `out` slot as an EMPTY name
+// slot — an `out` parameter is positional-only (§22.3), so it cannot be
+// named — and it is exactly the parameter that widens a form's arity range
+// beyond the form's required count. So the `out` slot is the LAST parameter
+// of a form whose name slot is empty while the form's `total` exceeds its
+// `required`.
+//
+// THE RULE IS THE SAME BEFORE AND AFTER the table's `required` column is
+// corrected for `Math.DivRem` (#8034): with `required == 2` the `out` slot
+// raises the minimum to 3, and with `required == 3` the minimum is 3
+// already. stdlib §2.2 declares `DivRem(a: int, b: int, out remainder: int)`
+// — three parameters, every one of them bound.
+std::size_t builtinFormMinArity(const common::BuiltinParamForm& f) {
+    if (f.total > f.required && !f.names.empty() &&
+        f.names[f.total - 1].empty())
+        return f.total;  // the `out` slot is required too
+    return f.required;
+}
+
 }  // namespace
 
 void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
@@ -22426,6 +22488,95 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     if (!ts || ts->decl != nullptr) return;
     const std::string_view head = ts->name;
     if (head != "Math" && head != "Convert") return;
+    // fix #8036 (§2.2, §2.3, §22.3, §22.5, v0.350): THE ARITY GATE ON THE
+    // `Math` / `Convert` HEAD.
+    //
+    // THE DEFECT, MEASURED (base 48353f2b, `build/bezelc`):
+    //
+    //   var q := Math.DivRem(17, 5);
+    //     -> "warning: internal: lowerLocalDecl's initializer expression
+    //         failed to lower to a value for this local's slot (degraded to a
+    //         zero-initialized value) — #2434"
+    //     -> the program prints 0.  THE CORRECT ANSWER IS 3 (17 = 3*5 + 2).
+    //
+    // stdlib §2.2 (v0.350) declares `DivRem(a: int, b: int, out remainder:
+    // int)`: THREE parameters, and §22.3 says an `out` slot IS an argument
+    // while §22.5 says "`out` can never carry a default" — so the declared
+    // minimum arity is THREE and the two-argument spelling is
+    // UNDER-SUPPLIED.
+    //
+    // NOTHING REFUSED IT. `checkBuiltinMathConvertCallArgs` (the §5.1 gate
+    // below) stands down for a member the parameter table declares no form
+    // at that EXACT arity, and `checkBuiltinCallAdmission` (the shared
+    // resolver) does not cover the `Math` / `Convert` head at all — it
+    // reaches the VALUE built-ins (`int`, `float`, `Guid`, `DateTime`, …).
+    // So the whole `Math` / `Convert` head had NO arity gate, and EVERY
+    // under-supplied call on it degraded to a zero-initialized placeholder
+    // instead of being refused:
+    //
+    //   Math.Pow(2.0)        -> 0        Math.Abs()         -> 0
+    //   Math.Min(3)          -> 0        Math.Clamp(5, 10)  -> 0
+    //   Convert.ToString(255, 16, 2) -> ""        Convert.TryToInt32("42") -> False
+    //
+    // A SILENTLY WRONG ANSWER is worse than a refusal, so the gate is here.
+    //
+    // THE DECLARED FORMS, at EVERY arity: the arity question is not the
+    // exact-arity question the §5.1 gate below asks, so the forms are read
+    // at `kBuiltinAnyArity` and the call's argument count is matched against
+    // each form's arity RANGE.
+    const std::vector<common::BuiltinParamForm> arityForms =
+        common::builtinParamForms(head, member, common::kBuiltinAnyArity);
+    if (arityForms.empty()) return;  // the table declares no form for it
+    {
+        bool admitted = false;
+        bool outSlotRequired = false;
+        for (const auto& f : arityForms) {
+            const std::size_t lo = builtinFormMinArity(f);
+            if (lo > f.required) outSlotRequired = true;
+            if (ce.args.size() < lo || ce.args.size() > f.total) continue;
+            admitted = true;
+            break;
+        }
+        if (!admitted) {
+            // ONE diagnostic per call: a check that already spoke about THIS
+            // call has the first word.
+            for (const auto& d : ctx_.diagnostics().diagnostics()) {
+                if (d.severity != Severity::Error) continue;
+                if (d.location.line != ce.span.begin.line) continue;
+                if (d.location.offset < ce.span.begin.offset) continue;
+                if (d.location.offset > ce.span.end.offset) continue;
+                return;
+            }
+            std::string decls;
+            for (const auto& f : arityForms) {
+                const std::string one =
+                    f.sig.empty()
+                        ? "`" + std::string(member) + "` at " +
+                              std::to_string(builtinFormMinArity(f)) +
+                              " argument(s)"
+                        : "`" + std::string(f.sig) + "`";
+                if (decls.find(one) != std::string::npos) continue;  // once
+                if (!decls.empty()) decls += " / ";
+                decls += one;
+            }
+            const std::string cite =
+                head == "Math" ? "stdlib §2.2" : "stdlib §2.3";
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "no matching overload of `" + std::string(head) + "." +
+                    std::string(member) + "` — the call supplies " +
+                    std::to_string(ce.args.size()) + " argument(s) but " +
+                    cite + " declares " + decls +
+                    (outSlotRequired
+                         ? " — an `out` slot is an argument and carries no "
+                           "default, so every declared parameter must be "
+                           "bound (§22.3, §22.5)"
+                         : "") +
+                    " — the call is a compile error with no candidates cited "
+                    "(§22.6)");
+            return;
+        }
+    }
     // The DECLARED FORMS of this member at this arity, read out of the ONE
     // built-in parameter table (`common::kBuiltinParams`) — the same table the
     // admission gate and the §7 nullability gate read, so the parameter
@@ -22433,7 +22584,7 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
     // (§7.3) of a form cannot disagree.
     //
     // A call at an arity no declared form has is NOT this check's question
-    // (the ARITY rule and #7140's family own it), so the check stands down.
+    // (the ARITY rule above owns it), so the check stands down.
     const std::vector<common::BuiltinParamForm> forms =
         common::builtinParamForms(head, member, ce.args.size());
     if (forms.empty()) return;
@@ -22573,6 +22724,11 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         if (!isNarrowedNonNullRead(e)) return t;
         return operandStaticTypeAt(e, t);
     };
+    // fix #6810 (§7 / §22.5, v0.350): the §7 gate now reads the BOUND
+    // position for the NAMED spelling too — it no longer skips a named
+    // argument — so it may already have refused this very nullability. The
+    // gate records the calls it refused (`builtinNullabilityRefused_`), and
+    // this gate stands down for them: ONE diagnostic per call.
     for (std::size_t p = 0; p < forms.front().total; ++p) {
         // The declared kinds at this position, across the declared forms.
         std::vector<std::uint32_t> admitted;
@@ -22620,6 +22776,13 @@ void ExprTC::checkBuiltinMathConvertCallArgs(const ast::CallExpr& ce) {
         if (bound && !arg.name.empty() &&
             common::builtinParamIsNonNullable(head, member, ce.args.size(),
                                                static_cast<int>(p))) {
+            // fix #6810 (§7 / §22.5, v0.350): the §7 nullability GATE reads
+            // the BOUND position for the NAMED spelling too — it no longer
+            // skips a named argument — so it may already have refused THIS
+            // nullability. The §7 gate records the calls it refused
+            // (`builtinNullabilityRefused_`), and this gate stands down for
+            // them: ONE diagnostic per call.
+            if (builtinNullabilityAlreadyRefused(ce)) return;
             // The gate reports only a NULLABLE argument (or the `null`
             // literal); a named argument of a NON-nullable type is not its
             // question, and the §5.1 probe below still is. So the call is
@@ -23521,40 +23684,73 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
     }
     const std::string what = "argument to `" + std::string(head) + "." +
                              std::string(member) + "`";
-    // fix #7982 (§7 / §7.3 / §22.5, v0.350): the heads whose NAMED argument
-    // is checked at the POSITION THE NAME BINDS TO.
+    // ONE diagnostic per call: a check that already spoke about THIS call
+    // has the first word. The §7 nullability GATE must not add a second
+    // diagnostic to a call whose dedicated gate has already refused the
+    // argument (the same discipline `checkBuiltinStringDeclaredParams` and
+    // `checkBuiltinCallAdmission` follow).
+    for (const auto& d : ctx_.diagnostics().diagnostics()) {
+        if (d.severity != Severity::Error) continue;
+        if (d.location.line != ce.span.begin.line) continue;
+        if (d.location.offset < ce.span.begin.offset) continue;
+        if (d.location.offset > ce.span.end.offset) continue;
+        return;
+    }
+    // fix #6810 (§7 / §7.3 / §22.5, v0.350): THE §7 GATE READS THE POSITION
+    // THE NAME BINDS TO.
     //
-    // The §7 gate reads a position by the argument's INDEX, so it SKIPS a
-    // named argument wherever the compiler honours the name — and it may only
-    // do that where a check at the BOUND position exists. `Math` and
-    // `Convert` have one (`checkBuiltinMathConvertCallArgs`); `File` and
-    // `Directory` did NOT, so honouring the name there LOST the §7
-    // diagnostic: `File.Exists(path := null)` compiled clean where the
-    // positional spelling `File.Exists(null)` is refused, and the program
-    // SEGFAULTED (exit 139) on the `null` path. The check below is that
-    // replacement: the same `reportBuiltinArgIfNullable`, asked at the
-    // parameter the name binds to.
+    // §22.5 (v0.350): "a named argument binds the parameter it names, in any
+    // order". So the parameter a NAMED argument supplies is the one it
+    // NAMES — not the one at its own INDEX. This gate read the position by
+    // the argument's INDEX, so it SKIPPED every named argument wherever the
+    // compiler HONOURS the name, and the §7 refusal was LOST for the named
+    // spelling of a call whose positional spelling is refused.
     //
-    // `Path` carried the SAME hole from #7732 (its head has been in the
-    // named-arg table since then, and no bound-position check existed for it)
-    // — fix #7995 (§7 / §7.3 / §22.5, v0.350) widened the check to it: the
-    // named spelling `Path.Combine(a := null, b := "x")` compiled clean where
-    // the positional spelling `Path.Combine(null, "x")` is refused, and the
-    // `null` reached the runtime unchecked and the program SEGFAULTED (exit
-    // 139). stdlib §7.4 declares every `Path` parameter a NON-nullable
-    // `string`, so the check below now covers the `Path` head as well; the
-    // registry rows (`Path.Combine` mask 0x03, the `path` parameter of
-    // `GetFileName` / `GetExtension` / `GetFileNameWithoutExtension` /
-    // `GetDirectoryName` / `GetFullPath` mask 0x01) already carried the
-    // declared names and the non-nullable positions this reads.
-    const bool boundPositionNullability =
-        (head == "File" || head == "Directory" || head == "Path");
+    // THE HOLE, MEASURED (base 48353f2b, `build/bezelc`):
+    //
+    //   sb.Append(null)            -> "the argument to `StringBuilder.Append`
+    //                                   is nullable but the target type is
+    //                                   non-nullable (§7)"      [REFUSED]
+    //   sb.Append(value := null)   -> compiled clean, ran        [ACCEPTED]
+    //
+    // stdlib §3.1 (v0.350) declares `Append(value: string): StringBuilder`
+    // and `value` is NOT nullable, so the two spellings of ONE overload
+    // disagreed in ADMISSION, and the `null` reached the runtime unchecked
+    // (the `StringBuilder` runtime copies the string with `strlen`).
+    // `AppendLine(value: string)` and `Replace(oldValue: string, newValue:
+    // string)` carried the SAME hole.
+    //
+    // The #7982 fix closed it for the `File` / `Directory` heads and the
+    // #7995 fix for the `Path` head, by adding those heads to a list of the
+    // heads whose named argument is checked at the BOUND position. The list
+    // was the WRONG SHAPE: the rule is not a property of the head but of the
+    // BINDING — every head whose names the compiler honours binds a named
+    // argument to the parameter it names, so every one of them must be
+    // checked at the BOUND position. The head list is GONE; the check below
+    // reads the §22.5 binding for EVERY head this gate reaches.
+    //
+    // The heads this gate does NOT reach are unchanged: the `string` head's
+    // nullability is owned by `checkBuiltinStringDeclaredParams` (the
+    // registry query `builtinParamIsNonNullable` stands down for it, so the
+    // check below never fires there), and the `StringBuilder` head's
+    // nullability is owned by THIS gate (its own dedicated gate,
+    // `checkBuiltinStringBuilderCall`, deliberately stands down for a
+    // nullable argument at a non-nullable position — the §7 rule is the
+    // gate's own business).
+    //
     // The §22.5 BINDING, established LOCALLY over the registry's declared
     // names (the published binding is not available here — it is published at
     // the END of `typeCall`), exactly as `checkBuiltinMathConvertCallArgs`
     // does. PARAMETER index -> SOURCE argument index.
-    std::vector<int> paramToArg;
-    if (anyNamed && namesHonoured && boundPositionNullability) {
+    //
+    // #6810's CONSERVATIVE RULE (the direction the issue proposes): the
+    // POSITION a named argument binds to is read only where EVERY candidate
+    // of this argument count AGREES on it. A disagreement — or no candidate
+    // at all — is a SKIP, never a rejection, so a valid program is never
+    // refused over a binding this gate cannot read with confidence.
+    std::vector<int> boundPos(ce.args.size(), -1);
+    std::vector<bool> boundDisagree(ce.args.size(), false);
+    if (anyNamed && namesHonoured) {
         for (const auto& cand : common::builtinParamNameCandidates(
                  head, member, ce.args.size())) {
             BindResult br = bindArgsToParams(
@@ -23564,8 +23760,17 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
                     std::string(member) + "`",
                 /*emit=*/false);
             if (!br.ok) continue;  // not this overload's binding
-            paramToArg = br.paramToArg;
-            break;
+            for (std::size_t p = 0; p < br.paramToArg.size(); ++p) {
+                const int ai = br.paramToArg[p];
+                if (ai < 0 || static_cast<std::size_t>(ai) >= ce.args.size())
+                    continue;
+                if (boundPos[static_cast<std::size_t>(ai)] < 0)
+                    boundPos[static_cast<std::size_t>(ai)] =
+                        static_cast<int>(p);
+                else if (boundPos[static_cast<std::size_t>(ai)] !=
+                         static_cast<int>(p))
+                    boundDisagree[static_cast<std::size_t>(ai)] = true;
+            }
         }
     }
     for (std::size_t i = 0; i < ce.args.size(); ++i) {
@@ -23578,24 +23783,27 @@ void ExprTC::checkBuiltinNullableArgs(const ast::CallExpr& ce,
         if (!a.value || a.isDiscard || !a.modifier.empty())
             continue;
         if (!a.name.empty() && namesHonoured) {
-            if (!boundPositionNullability) continue;
             // The PARAMETER this argument binds to (§22.5): the index the
             // binder paired it with. A call that binds no candidate (an
             // unknown name, a doubly-bound parameter, an unbound required
             // parameter) leaves the binding empty — `checkBuiltinNamedArgs`
             // reports that violation, and this gate keeps out of its way.
-            int boundParam = -1;
-            for (std::size_t p = 0; p < paramToArg.size(); ++p)
-                if (paramToArg[p] == static_cast<int>(i)) {
-                    boundParam = static_cast<int>(p);
-                    break;
-                }
+            // A candidate set that DISAGREES on the position is a skip too.
+            const int boundParam = boundPos[i];
             if (boundParam < 0) continue;
+            if (boundDisagree[i]) continue;
             if (!common::builtinParamIsNonNullable(head, member, ce.args.size(),
                                                    static_cast<std::size_t>(
                                                        boundParam)))
                 continue;
+            const std::size_t diagsBefore =
+                ctx_.diagnostics().diagnostics().size();
             reportBuiltinArgIfNullable(a.value.get(), what);
+            // The gate SPOKE about this call: the `Math` / `Convert` gate
+            // (`checkBuiltinMathConvertCallArgs`) reads the same registry
+            // rows and must not report the same nullability a second time.
+            if (ctx_.diagnostics().diagnostics().size() > diagsBefore)
+                builtinNullabilityRefused_.push_back(&ce);
             publishNarrowedBuiltinArg(a.value.get());
             continue;
         }
@@ -23899,7 +24107,12 @@ bool ExprTC::builtinArgAdmitsKind(const ast::Expr* argExpr, TypeRef* argTy,
             // `ReadOnlySpan<byte>` and §4.15's `ArraySpan<byte>` /
             // `ReadOnlyArraySpan<byte>`, the span views over `byte`.  The
             // element type decides: a `Span<char>` is not a byte span.
-            if (bit == common::kBPTSpanByte && isByteSpanType(argTy))
+            //
+            // fix #8027 (stdlib §3.2, §4.14, §4.15, §5.1, v0.350): only a
+            // WRITABLE byte span is admissible at §3.2's `Span<byte>`
+            // destination — a read-only view is not (§5.1 carries no
+            // span-to-span conversion).
+            if (bit == common::kBPTSpanByte && isWritableByteSpanType(argTy))
                 return true;
             continue;
         }
@@ -24268,6 +24481,53 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
     const std::vector<common::BuiltinParamForm> forms =
         common::builtinParamForms("string", member, ce.args.size());
     if (forms.empty()) return;
+    // fix #7535 (§22.5, v0.350): THE CANDIDATE SET IS THE FORMS THAT DECLARE
+    // THE WRITTEN NAMES. §22.5 resolves a named argument PER OVERLOAD — "a
+    // named argument binds the parameter it names" — so the overload is the
+    // one that DECLARES that name, and the argument's type is checked
+    // against THAT overload's declared type, not against the UNION over
+    // every declared overload of this argument count.
+    //
+    // The union is the right rule for a POSITIONAL argument (§22.6 picks the
+    // candidate by applicability), and it is what this gate used for a named
+    // one too — so the NAME and the TYPE could come from DIFFERENT overloads:
+    //
+    //   string.Repeat(c := "ab", count := 2)
+    //     -> compiled clean and printed "abab"
+    //
+    // stdlib §9.6 declares `Repeat(c: char, count: int): string` and
+    // `Repeat(unit: string, count: int): string`; the name `c` belongs to
+    // the CHAR overload and the `string` argument belongs to the STRING one,
+    // so NO declared overload matches both the name and the type, and the
+    // call must be refused (§22.5 / §5.1).
+    std::vector<common::BuiltinParamForm> candForms = forms;
+    {
+        // Whether the call writes NAMED arguments at all — read HERE, so this
+        // block stands alone (it does not depend on the binding block below).
+        bool anyNamed = false;
+        for (const auto& a : ce.args)
+            if (!a.name.empty()) { anyNamed = true; break; }
+        if (anyNamed) {
+            std::vector<common::BuiltinParamForm> narrowed;
+            for (const auto& f : forms) {
+                bool admits = true;
+                for (std::size_t p = 0; p < ce.args.size() && p < f.total; ++p) {
+                    const std::string_view an = ce.args[p].name;
+                    if (an.empty()) continue;
+                    bool found = false;
+                    for (std::size_t k = 0; k < f.total; ++k)
+                        if (f.names[k] == an) { found = true; break; }
+                    if (!found) { admits = false; break; }
+                }
+                if (admits) narrowed.push_back(f);
+            }
+            // A name NO form declares is the §22.5 binder's question
+            // (`checkBuiltinNamedArgs` reports it for the `string` head), so
+            // the unfiltered set is kept and this gate does not report it a
+            // second time.
+            if (!narrowed.empty()) candForms = narrowed;
+        }
+    }
     // THE §22.5 BINDING: a named argument binds to the parameter it NAMES,
     // so the parameter an argument supplies is read through the binder, not
     // by position. The published binding is not available here (it is
@@ -24276,9 +24536,13 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
     // #7207 uses for `StringBuilder` — so no second name table is
     // introduced. A call that binds no candidate keeps the POSITIONAL
     // reading: `checkBuiltinNamedArgs` reports the §22.5 violation, and the
-    // arguments must still be type-checked here.
+    // arguments are still type-checked here when the call writes no name.
     std::vector<int> paramToArg;
     std::vector<std::string_view> paramNames;
+    bool callHasNamedArg = false;
+    for (const auto& a : ce.args)
+        if (!a.name.empty()) { callHasNamedArg = true; break; }
+    bool boundCandidate = false;
     for (const auto& cand : common::builtinParamNameCandidates(
              "string", member, ce.args.size())) {
         BindResult br = bindArgsToParams(
@@ -24289,8 +24553,30 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
         if (!br.ok) continue;
         paramToArg = br.paramToArg;
         paramNames = cand.names;
+        boundCandidate = true;
         break;
     }
+    // fix #7846 (§22.5, v0.350): THE IDENTITY-MAPPING FALLBACK IS GONE — the
+    // same shape `checkBuiltinStringCallArgs` now has. A call that binds NO
+    // candidate (a name no declared overload declares, a parameter bound
+    // twice, a positional argument after a named one) used to keep the
+    // POSITIONAL reading here, so every argument was typed against the
+    // parameter at its own INDEX, and the type check reported a SECOND
+    // diagnostic on a call the §22.5 binder had already refused:
+    //
+    //   "ab".PadLeft(totalWidth := 5, totalWidth := 6)
+    //     -> "the argument to `string.PadLeft` has a type that is not
+    //         implicitly convertible to the target type (§5.1)"   [SPURIOUS]
+    //     -> "call to built-in `string.PadLeft`: parameter `totalWidth` is
+    //         bound more than once (§22.5)"                     [CORRECT]
+    //
+    // The spurious error blamed an argument for a type mismatch it does not
+    // have (the `6` was checked against the `char` parameter, because the
+    // identity mapping put it at position 1). The §22.5 diagnostic is the
+    // ONE that describes the mistake, so this gate now stands down for a
+    // call that binds no candidate: `checkBuiltinNamedArgs` reports the §22.5
+    // violation and the program is refused with that diagnostic alone.
+    if (callHasNamedArg && !boundCandidate) return;
     if (paramToArg.empty()) {
         for (std::size_t i = 0; i < ce.args.size(); ++i)
             paramToArg.push_back(static_cast<int>(i));
@@ -24305,16 +24591,18 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
         // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
         // the caller slot under its own rule; skip.
         if (!arg.modifier.empty()) continue;
-        // THE DECLARED TYPES at this position: the union over the declared
-        // overloads of this argument count — §22.6's candidate set.
+        // THE DECLARED TYPES at this position: the union over the CANDIDATE
+        // overloads of this argument count — §22.6's candidate set. For a
+        // call that writes NAMED arguments the candidate set is the overloads
+        // that DECLARE those names (fix #7535, above).
         std::uint32_t kinds = 0;
-        for (const auto& f : forms)
+        for (const auto& f : candForms)
             if (p < f.kinds.size()) kinds |= f.kinds[p];
         if (kinds == 0) continue;  // no type opinion at this position
         // THE DECLARED NULLABILITY at this position: non-nullable when EVERY
-        // declared overload of this argument count declares it non-nullable.
-        bool nonNullable = !forms.empty();
-        for (const auto& f : forms)
+        // candidate overload of this argument count declares it non-nullable.
+        bool nonNullable = !candForms.empty();
+        for (const auto& f : candForms)
             if (p >= f.total || !(f.nonNullable & (1u << p)))
                 nonNullable = false;
         TypeRef* argTy = ctx_.exprType(*arg.value);
@@ -24401,7 +24689,7 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
         // and the position is given as well.
         std::string nameAt;
         bool namesAgree = true;
-        for (const auto& f : forms) {
+        for (const auto& f : candForms) {
             if (p >= f.names.size() || f.names[p].empty()) continue;
             if (nameAt.empty()) nameAt = std::string(f.names[p]);
             else if (nameAt != f.names[p]) namesAgree = false;
@@ -24411,7 +24699,7 @@ void ExprTC::checkBuiltinStringDeclaredParams(const ast::CallExpr& ce) {
             nameAt = std::string(paramNames[p]);
         if (!namesAgree) {
             std::size_t best = 0;
-            for (const auto& f : forms) {
+            for (const auto& f : candForms) {
                 const std::size_t n =
                     (p < f.kinds.size())
                         ? static_cast<std::size_t>(__builtin_popcount(f.kinds[p]))
@@ -24518,11 +24806,55 @@ void ExprTC::checkBuiltinCallAdmission(const ast::CallExpr& ce) {
     // ADMITTED and rendered "10" — the radix — a SILENT WRONG ANSWER for a
     // call §22.5/§5.1 refuse.
     //
-    // A name NO declared form declares is not this resolver's business: the
-    // §22.5 binder (`checkBuiltinNamedArgs`) reports the names no form
-    // declares for the heads it claims, and this resolver's heads it does
-    // not claim. The unfiltered set is kept for those, so their behaviour
-    // is unchanged.
+    // fix #7622 (§22.5, v0.350): A NAME NO DECLARED FORM DECLARES IS NOW
+    // REFUSED. The §22.5 binder (`checkBuiltinNamedArgs`) reports the names
+    // no form declares for the heads it CLAIMS — the `string` /
+    // `StringBuilder` / `Math` / `Convert` / `Encoding` / `Path` / `File` /
+    // `Directory` family — and this resolver's heads it does NOT claim, so
+    // nothing reported the unknown name there and the call was ADMITTED with
+    // the name silently ignored:
+    //
+    //   int.Parse(s := "ff", bogus := 1)
+    //     -> compiled clean, ran, and threw ArgumentException at RUNTIME
+    //
+    // §22.5 (v0.350): "a named argument binds the parameter it names" — so a
+    // name no declared parameter bears is a compile error, not a synonym for
+    // the parameter at the argument's own index. The diagnostic is the SHARED
+    // binder's own wording (`bindArgsToParams`), so the same mistake draws
+    // the same sentence on a built-in and on a user-declared callee.
+    //
+    // ONLY the unknown-name rule is applied here. The binder's other §22.5
+    // rules — a parameter bound twice, a positional argument after a named
+    // one, a required parameter left unbound — are NOT this resolver's
+    // business at these heads: a positional `out` argument after a named one
+    // (`int.TryParse(s := "42", out v)`) is a shape the standard library's
+    // own surface uses, and refusing it here would be a refusal this
+    // resolver has no surface to judge.
+    {
+        bool anyNamed = false;
+        for (const auto& a : ce.args)
+            if (!a.name.empty()) { anyNamed = true; break; }
+        if (anyNamed) {
+            // The names the callee DECLARES, over every declared form of the
+            // member (a parameter is declared by the overload that carries
+            // it). A name no form declares is an unknown parameter.
+            for (const auto& a : ce.args) {
+                if (a.name.empty()) continue;
+                bool declared = false;
+                for (const auto& f : allForms) {
+                    for (std::size_t k = 0; k < f.names.size(); ++k)
+                        if (f.names[k] == a.name) { declared = true; break; }
+                    if (declared) break;
+                }
+                if (declared) continue;
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "call to built-in `" + callee + "` has no parameter named `" +
+                        std::string(a.name) + "` (§22.5)");
+                return;
+            }
+        }
+    }
     {
         std::vector<common::BuiltinParamForm> nameForms;
         for (const auto& f : forms) {

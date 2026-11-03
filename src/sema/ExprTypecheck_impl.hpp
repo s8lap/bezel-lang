@@ -4771,7 +4771,26 @@ private:
     // fix #6782 (§7, §7.3, v0.340): the member and static twin of the check
     // above, for the built-in receivers and type names it does not claim. A
     // resolved `calleeSym` (user or imported method) is left to checkCallArity.
+    //
+    // fix #6810 (§7, §7.3, §22.5, v0.350): the gate reads the POSITION the
+    // NAME binds to (§22.5), never the argument's index, so a named argument
+    // is checked at the parameter it names. `builtinNullabilityRefused_`
+    // records the calls this gate has already refused that way, so the
+    // `Math` / `Convert` gate — which reads the same registry rows — does
+    // not report the same nullability a second time (one diagnostic per
+    // call).
     void checkBuiltinNullableArgs(const ast::CallExpr& ce, Symbol* calleeSym);
+    // fix #6810 (§7 / §22.5, v0.350): the calls whose nullability the §7
+    // gate above has already refused at the BOUND position (§22.5's
+    // binding).
+    std::vector<const ast::CallExpr*> builtinNullabilityRefused_;
+    // fix #6810 (§7 / §22.5, v0.350): has the §7 gate already refused this
+    // call's nullability?
+    bool builtinNullabilityAlreadyRefused(const ast::CallExpr& ce) const {
+        for (const ast::CallExpr* c : builtinNullabilityRefused_)
+            if (c == &ce) return true;
+        return false;
+    }
     // fix #6782 (§7, §7.4, v0.340): the nullness-only report both checks
     // share: `arg` is the `null` literal or nullable after §7.4 narrowing
     // (readonly fields included). Never a type check.
