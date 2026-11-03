@@ -2646,6 +2646,34 @@ vacuous-assertion / imported-symbol / enumerable-grid / internal-residual phases
 LOADED BOX** — a real cost against the run's remaining time, and the reason the pool's cold-build
 budget was blown while it ran.
 
+### Coordinator action items that a future lane MUST honour (2026-11-03)
+
+**⇒ THE #6112 LANE MUST FLIP BACK FIVE ROWS.** The picked #7973 fix flips the five
+`*_keep_the_object_fold_pending_6112` rows in `tests/sema/case_null_arm_join_6086_test.cpp` to
+assert the new §8.1 refusal (`!r.ran` + "no member `V` on type `Object`"). ⇒ **THE ROW NAMES STILL
+SAY "pending 6112" AND THE ROWS WILL FAIL WHEN #6112 LANDS**: #6112 makes the fold produce
+`Bx<B>?`, the program compiles again, and the diagnostic no longer names `Object`. ⇒ **⇒ THE #6112
+LANE MUST FLIP THOSE FIVE ROWS BACK** (and the comment that claims the row would survive the
+#6112 fix is wrong). Flagged by the `r38-w83-objname` review; not a defect in #7973 itself.
+
+**⇒ #7846 IS **NOT** CLOSED — IT WAS DELIBERATELY UN-NAMED.** The picked named-argument commit
+fixed the binder's general case, but the two SPECIAL gates (`ExprTypecheck_Calls.cpp:6570`
+`string.Join`, `:6444` `string.Repeat`) keep the identity-mapping fallback, so #7846's own shapes
+still draw the spurious second diagnostic, identically on the base and on the fixed tree. ⇒ The
+commit therefore does NOT name it (a commit that names an issue it did not resolve is a false
+closure), the issue stays OPEN, and its residual shape is recorded as a comment on the issue.
+
+**⇒ SIX NEW DEFECTS WERE FILED FROM THE TWO REVIEWS** (each is a future closure):
+**#8041** (the §8.1 closed surface is closed by NAME but not by ARITY — `o.Equals()`,
+`o.GetHashCode(1)`, `o.ToString(1)` compile and yield wrong values) · **#8042** (a wrong-arity
+call to an extension member over `Object` gets a diagnostic that asserts the opposite of the
+truth) · **#8043** (`o.ReferenceEquals(a, b)` — an instance call of §8.1's static — is still
+admitted) · **#8044** (a user's generic `Object<T>` shadows the root `Object` in a bare type-test
+pattern) · **#8045** (48 of the 57 built-in named-argument heads are missing from
+`kBuiltinNamedArgTableHeads`, so a reordered name binds positionally) · **#8046** (the §9.6
+declared-parameter gate stands down at the §3.4 `String` alias — the twin of #7535, plus a §5.1
+hole beside it).
+
 **⇒ THE LESSON, RECORDED SO IT IS NOT REPEATED:** A GATE IS THE COORDINATOR'S ACT ALONE. No
 lane launches `scripts/gate.sh`, `scripts/gate_full_cycle.sh` or `scripts/gate_and_push.sh`; a
 lane that wants the gate's phases runs the named PHASES (the ratchet sweep, the gate's own
