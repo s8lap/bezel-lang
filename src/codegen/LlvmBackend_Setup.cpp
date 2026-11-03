@@ -30822,6 +30822,36 @@ struct StringEscapeWalker {
     // record-call-result eligibility pass sets it; the
     // string/dict/grouping/borrowing-Array walks leave it false.
     bool recordFieldReleaseMode = false;
+    // fix #7804 (§15.1.2 / §26.2, v0.353): OPT-IN gate for the INLINE-ARRAY
+    // member-read relaxation in the MemberAccessExpr / NullCondMemberExpr arms
+    // below. Set ONLY by collectInlineArrayStringCallResultReleaseEligible's
+    // candidates loop — the inline-array walk — and only there, so every other
+    // reuse of this walker (string / dict / grouping / borrowing-Array /
+    // value-like-choice / record) is bit-identical to before.
+    //
+    // WHY THE RELAXATION IS SOUND. An inline array's member surface is FIXED
+    // and COMPILER-PROVIDED: §26.2's "What cannot be extended" lists "Inline-
+    // array types (`extension [N]T`)" among the types that CANNOT be
+    // extended, and §15.1.2 enumerates the whole surface — `arr.Length`, the
+    // indexer, `arr.ToArray()`, `arr.Contains(item)`. No user code can run on
+    // an inline-array receiver, so the receiver's VALUE copy cannot be stored
+    // anywhere that outlives the call: the read is a CALL-BOUNDED read, and a
+    // scope-end release of the local's string elements cannot dangle anything.
+    //
+    // The one member that COPIES the elements — `ToArray()`, which builds "a
+    // fresh heap array of the N slots" (§15.1.2) — RETAINS them: the
+    // inline-array lowering calls `bz_array_retain_strings` on the result
+    // (src/codegen/LlvmBackend_Calls3.cpp's `ToArray` arm, the #1342 line), so
+    // the fresh array co-owns a +1 per slot and the local's scope-end release
+    // leaves it valid.
+    //
+    // WITHOUT the relaxation the conservative record rule (recordFieldReleaseMode
+    // — "a member access whose member RUNS USER CODE receives `this` as a
+    // pointer to the value struct and may copy the whole record") fired on the
+    // inline-array local too, and the walk reported ESCAPE: the local's
+    // scope-end `inlineArrayStringFields` release was never armed, and the +1
+    // its string element held was never discharged.
+    bool inlineArrayReleaseMode = false;
     // fix #5853 (§8.6 "Boxing of borrow-bearing records", §28.3, v0.334):
     // OPT-IN gate for the BOXED-ARGUMENT call-bounded-borrow relaxation in
     // walkCallArgs. Set ONLY by collectRecordCallResultReleaseEligible's
@@ -31878,6 +31908,41 @@ struct StringEscapeWalker {
                 a.name.empty() && isConsoleNonRetainingStringArg(callee, i) &&
                 isTargetIdent(a.value.get()))
                 safeArg = true;
+            // fix #7804 (stdlib §2.1, §8.5, §15.1.2, v0.353): an INLINE ARRAY
+            // passed at the CONSOLE's NON-RETAINING argument position
+            // (`Console.Write` / `Console.WriteLine`'s `value: Object`) is a
+            // CALL-BOUNDED borrow, not an escape. The console RENDERS the value
+            // and writes the text; it stores nothing, so the array's own
+            // elements — the +1s the local's scope-end
+            // `inlineArrayStringFields` release discharges — are not retained
+            // by the callee. The box the console's `Object` parameter takes
+            // (§8.6 *Boxing of inline arrays*) is a full-expression temporary
+            // that co-owns and releases its OWN +1 per element, so the local's
+            // +1 and the box's +1 are two holders of one reference count and
+            // each holder's release balances its own.
+            //
+            // The recognizer is the SAME one the string-shaped console
+            // relaxation above uses (`isConsoleNonRetainingArg`, the #1994 change) —
+            // keyed on the callee shapes the console lowering keys on, so the
+            // escape decision and the lowering stay in lockstep. It is gated
+            // on `inlineArrayReleaseMode`, so it fires ONLY in the INLINE-ARRAY
+            // walk (the one whose release target is the array's string
+            // elements): the string / dict / grouping / borrowing-Array walks
+            // keep their conservative ESCAPE, and this arm cannot change any
+            // of them.
+            //
+            // MEASURED before the fix (200 iterations, ASan/LSan): the same
+            // 35 B / 2 allocations per iteration as the `.ToString()` shape
+            // (the 32-byte `bz.string` header of the "x1" element plus its
+            // 3-byte data buffer) — the local's scope-end release was never
+            // armed, so the element's +1 was never discharged.
+            if (!safeArg && inlineArrayReleaseMode && a.modifier.empty() &&
+                a.name.empty() && isTargetIdent(a.value.get()) &&
+                isConsoleNonRetainingArg(callee, i, &ctx)) {
+                const sema::TypeRef* at = ctx.exprType(*a.value.get());
+                if (at && at->kind == sema::TypeRef::Kind::InlineArray)
+                    safeArg = true;
+            }
             // fix #3304 / §22.3 / §28.9: a pre-declared `out n: string`
             // recipient — `out n` at a non-nullable `string` formal of a
             // resolved user/imported method — is a WRITE into the recipient's
@@ -32396,7 +32461,19 @@ struct StringEscapeWalker {
             // `t->decl`), and because the wrong answer here is the wrong
             // answer to this family's question.
             bool recSafe = true;
-            if (recordFieldReleaseMode && isTargetIdent(m->target.get())) {
+            // fix #7804 (§15.1.2 / §26.2, v0.353): an INLINE ARRAY's member
+            // surface is FIXED and compiler-provided — §26.2 forbids extending
+            // an inline-array type and §15.1.2 enumerates the whole surface
+            // (`Length`, the indexer, `ToArray()`, `Contains(item)`) — so no
+            // user code runs on the receiver and its VALUE copy cannot be
+            // stored anywhere that outlives the call. The read is therefore a
+            // CALL-BOUNDED read, and a scope-end release of the local's string
+            // elements cannot dangle anything. (`ToArray()`, the one member
+            // that copies the elements, RETAINS them — see the
+            // `inlineArrayReleaseMode` flag's own comment.)
+            if (inlineArrayReleaseMode && isTargetIdent(m->target.get())) {
+                recSafe = true;
+            } else if (recordFieldReleaseMode && isTargetIdent(m->target.get())) {
                 sema::Symbol* sym = ctx.exprSymbol(*m);
                 bool storageRead =
                     (dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) ||
@@ -32411,7 +32488,11 @@ struct StringEscapeWalker {
             // arm above, for the null-conditional `p?.Member` / `p?.Method()`
             // form.
             bool recSafe = true;
-            if (recordFieldReleaseMode && isTargetIdent(m->target.get())) {
+            // fix #7804 (§15.1.2 / §26.2, v0.353): the INLINE-ARRAY twin of
+            // the relaxation in the MemberAccessExpr arm above.
+            if (inlineArrayReleaseMode && isTargetIdent(m->target.get())) {
+                recSafe = true;
+            } else if (recordFieldReleaseMode && isTargetIdent(m->target.get())) {
                 sema::Symbol* sym = ctx.exprSymbol(*m);
                 bool storageRead =
                     (dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) ||
@@ -32960,6 +33041,10 @@ struct StringEscapeWalker {
                 isTargetIdent(ld->initializer.get())) {
                 StringEscapeWalker w2{ctx, static_cast<const void*>(ld)};
                 w2.recordFieldReleaseMode = true;
+                // fix #7804 (§15.1.2 / §26.2, v0.353): the copy is of the
+                // SAME KIND as the tracked local — propagate the INLINE-ARRAY
+                // member-read relaxation to it.
+                w2.inlineArrayReleaseMode = inlineArrayReleaseMode;
                 w2.scrutineeBorrowMode = true;
                 w2.wholeBody = wholeBody;  // chain: r2 itself may be copied onward
                 for (auto& s2 : *wholeBody) {
@@ -33092,6 +33177,9 @@ struct StringEscapeWalker {
                 isTargetIdent(lc->value.get())) {
                 StringEscapeWalker w2{ctx, static_cast<const void*>(lc)};
                 w2.recordFieldReleaseMode = true;
+                // fix #7804 (§15.1.2 / §26.2, v0.353): the INLINE-ARRAY
+                // member-read relaxation, propagated to the copy.
+                w2.inlineArrayReleaseMode = inlineArrayReleaseMode;
                 w2.scrutineeBorrowMode = true;
                 w2.wholeBody = wholeBody;
                 for (auto& s2 : *wholeBody) {
@@ -39695,6 +39783,11 @@ void Emitter::collectInlineArrayStringCallResultReleaseEligible(
                         // StringEscapeWalker infrastructure as records.
                         StringEscapeWalker w{ctx_, static_cast<const void*>(s)};
                         w.recordFieldReleaseMode = true;
+                        // fix #7804 (§15.1.2 / §26.2, v0.353): the tracked
+                        // local is an INLINE ARRAY, whose member surface is
+                        // fixed and compiler-provided — so a member read on it
+                        // is a CALL-BOUNDED read, not an escape.
+                        w.inlineArrayReleaseMode = true;
                         w.wholeBody = &body;
                         w.scrutineeBorrowMode = true;
                         for (auto& bs : body) {
@@ -39779,6 +39872,10 @@ void Emitter::collectInlineArrayStringCallResultReleaseEligible(
                     inlineArrayElementCarriesString(tr)) {
                     StringEscapeWalker w{ctx_, static_cast<const void*>(kv.first)};
                     w.recordFieldReleaseMode = true;
+                    // fix #7804 (§15.1.2 / §26.2, v0.353): the INLINE-ARRAY
+                    // member-read relaxation — see the init-side candidate
+                    // loop's own comment.
+                    w.inlineArrayReleaseMode = true;
                     // fix #4307: the SET (not single pointer) holds one
                     // AssignmentStmt* per path; for this inline-array
                     // single-path shape it has exactly one member.
