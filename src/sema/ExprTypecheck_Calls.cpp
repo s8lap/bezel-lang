@@ -2349,14 +2349,22 @@ bool hashableCheckDefers(const TypeRef* t) {
 // type the call, false to reject; defers (returns true) on unresolved
 // generic parameters so an extension body is not spuriously rejected
 // before its per-instantiation gate runs.
+// fix #7811 (stdlib §4 *Equality search*, spec §14.2 / §9.2, v0.350): the
+// `stdlibCite` parameter names the section that states the CONDITION the
+// call is admitted under, so the §4 family (`Array<T>.IndexOf` /
+// `LastIndexOf`) cites §4's *Equality search* rather than §5's constrained
+// block. The PREDICATE is unchanged — `isEqualityBearing`, the one §3.6
+// computation — so a member of the §4 family and the §5 block's member of
+// the same name can never disagree about the element type.
 bool linqHashableCheck(std::string_view m, const TypeRef* srcElem,
-                       SourceLocation loc, SemaContext& ctx) {
+                       SourceLocation loc, SemaContext& ctx,
+                       const char* stdlibCite = "stdlib \xC2\xA7""5, "
+                                                "proposal 0116 D9") {
     if (hashableCheckDefers(srcElem)) return true;
     if (isEqualityBearing(srcElem, ctx)) return true;
     std::string msg =
         std::string("operator `") + std::string(m) +
-        "` requires `T: hashable` (\xC2\xA7""14.2; stdlib \xC2\xA7""5, "
-        "proposal 0116 D9)";
+        "` requires `T: hashable` (\xC2\xA7""14.2; " + std::string(stdlibCite) + ")";
     const std::string detail = hashableFailureComponentPath(srcElem, ctx);
     if (!detail.empty()) msg += detail;
     ctx.diagnostics().report(Severity::Error, loc, msg);
@@ -2532,13 +2540,24 @@ std::string igroupingBareMemberReject(std::string_view name) {
 // rejection. An inline array whose element is a non-hashable RECORD keeps the
 // gate: such a record has no first-kind equality (`Array<NH>.Contains` is
 // rejected), and stdlib §4 names "or an inline array of one" with it.
+// fix #7811 (stdlib §4 *Equality search*, spec §14.2 / §9.2, v0.350): the
+// §4 family also holds `Array<T>.IndexOf` and `Array<T>.LastIndexOf`
+// ("`Array<T>.IndexOf` and `LastIndexOf`" are named in §4's equality-search
+// list beside `Contains` and `Remove(item)`), so the FUNCTION-element
+// exemption the `Contains` arm already carries extends to them: §27.7.1's
+// first-kind equality exists at a function element type, so the §4 search is
+// admitted there exactly as `Contains` is. `IndexOf` on the OTHER heads is
+// not a §4 equality search — the `Stack`/`Queue`/`Set`/`LinkedList` families
+// do not declare `IndexOf` at all (stdlib §4.6/§4.7/§4.10/§4.11) — so the
+// exemption stays confined to `Array`, the head that declares the two
+// members.
 bool linqHashableGateApplies(std::string_view colName, std::string_view m,
                              const TypeRef* srcElem = nullptr) {
     if (colName == "SortedSet" && m == "Contains") return false;
     const TypeRef* searched = srcElem;
     while (searched && searched->kind == TypeRef::Kind::InlineArray)
         searched = searched->arrayElement;
-    if (m == "Contains" && searched &&
+    if ((m == "Contains" || m == "IndexOf" || m == "LastIndexOf") && searched &&
         searched->kind == TypeRef::Kind::Function &&
         (colName == "Array" || colName == "Stack" || colName == "Queue" ||
          colName == "LinkedList"))
@@ -13335,8 +13354,53 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // §22.5 member-not-found arm below.
                         else if (m == "IndexOf") {
                             if (colName == "Array" || colName == "OwningArray") {
-                                ctx_.setExprType(&ce,
-                                                 ctx_.primitiveTypeRef(P::Int));
+                                // fix #7811 (stdlib §4 *Equality search*, spec
+                                // §14.2 / §9.2, v0.350): `Array<T>.IndexOf` is
+                                // a MEMBER of the equality search family §4
+                                // names — "`Array<T>.IndexOf` and
+                                // `LastIndexOf`" sit in the same list as
+                                // `Contains` and `Remove(item)` — and §4 states
+                                // the family's condition: "Their signatures are
+                                // unconstrained, and they are conditionally-
+                                // admitted members (language spec §14.2): a
+                                // call is admitted only where the element type,
+                                // nullability stripped, has a member for the
+                                // comparison language spec §9.2 calls the first
+                                // kind, `Equals` with an argument of that type."
+                                // The `Contains` arm of this same chain has
+                                // carried the gate since #3331; `IndexOf` and
+                                // `LastIndexOf` did not, so a record with a
+                                // function-typed field — neither auto-hashable
+                                // nor declaring custom equality (§9.2 /
+                                // §25.2) — was accepted by `IndexOf` and
+                                // `LastIndexOf` and refused by `Contains`:
+                                // the same element type, two different
+                                // verdicts. The gate is the ONE §3.6
+                                // computation (`isEqualityBearing`, through
+                                // `linqHashableCheck`) the `Contains` arm
+                                // uses, so the three members can never
+                                // disagree.
+                                //
+                                // `OwningArray<T>` (§4.5) is NOT gated: §4's
+                                // equality-search list names `Array<T>`'s two
+                                // members, and §4 states that "the owning
+                                // collections' members of the same names fire
+                                // the rule only at that ambiguity, since their
+                                // `where T: class` element type otherwise
+                                // always has the member".
+                                if (colName == "Array" &&
+                                    !recvTy->genericArgs.empty() &&
+                                    recvTy->genericArgs[0] &&
+                                    linqHashableGateApplies(
+                                        colName, m, recvTy->genericArgs[0]) &&
+                                    !linqHashableCheck(m, recvTy->genericArgs[0],
+                                                       ce.span.begin, ctx_,
+                                                       "stdlib \xC2\xA7""4 "
+                                                       "(*Equality search*)"))
+                                    linqHashableRejected = true;  // gate fired — suppress typeLinqOperator fallback's duplicate
+                                else
+                                    ctx_.setExprType(&ce,
+                                                     ctx_.primitiveTypeRef(P::Int));
                             } else {
                                 // Stack/Queue/Set/LinkedList and their owning
                                 // twins, plus SortedSet — none declares
@@ -13366,8 +13430,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // not, and none of the other isArrLike heads do.
                         else if (m == "LastIndexOf") {
                             if (colName == "Array" && ce.args.size() == 1) {
-                                ctx_.setExprType(&ce,
-                                                 ctx_.primitiveTypeRef(P::Int));
+                                // fix #7811 (stdlib §4 *Equality search*, spec
+                                // §14.2 / §9.2, v0.350): the same gate the
+                                // `IndexOf` arm above carries — §4 names
+                                // "`Array<T>.IndexOf` and `LastIndexOf`" in
+                                // ONE clause of its equality-search list, so
+                                // the two members share the family's condition
+                                // and can never disagree about an element type.
+                                if (!recvTy->genericArgs.empty() &&
+                                    recvTy->genericArgs[0] &&
+                                    linqHashableGateApplies(
+                                        colName, m, recvTy->genericArgs[0]) &&
+                                    !linqHashableCheck(m, recvTy->genericArgs[0],
+                                                       ce.span.begin, ctx_,
+                                                       "stdlib \xC2\xA7""4 "
+                                                       "(*Equality search*)"))
+                                    linqHashableRejected = true;  // gate fired — suppress typeLinqOperator fallback's duplicate
+                                else
+                                    ctx_.setExprType(&ce,
+                                                     ctx_.primitiveTypeRef(P::Int));
                             } else if (colName == "Array") {
                                 // §4.4 gives `LastIndexOf` exactly one
                                 // parameter; any other arity is no member.
